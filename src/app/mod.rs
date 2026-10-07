@@ -2651,6 +2651,9 @@ pub struct TourRun {
     pub tour: crate::tour::Tour,
     pub scratch: PathBuf,
     pub previous_root: PathBuf,
+    /// The current step opened a palette, Quick Open or a picker, whose Esc
+    /// then leaves the tour rather than only closing it (#863).
+    pub step_opened_modal: bool,
 }
 
 /// The live ssh-pane workspace offer (#364): which pane's foreground became
@@ -2983,6 +2986,9 @@ pub struct App {
     /// mouse selection lands on the clipboard without an explicit Cmd+C.
     /// Loaded from prefs at startup, toggled in the Settings hub.
     copy_on_select: bool,
+    /// The project's `files_exclude` globs (#1345), as last applied to the
+    /// Explorer, so a settings reload re-lists the tree only on a change.
+    files_exclude: Vec<String>,
     /// Tailspin highlighting in rendered log views (#466): the inverse of
     /// the `disable_log_highlight` preference. Pushed into `log_view`'s
     /// default for views opened later and into every open view on toggle.
@@ -3040,6 +3046,10 @@ pub struct App {
     /// commit diff, a COMMITS patch): a large repo's `git show` or rename
     /// walk froze the editor when run inline. A newer click replaces it.
     git_view_job: Option<std::sync::mpsc::Receiver<GitNetDone>>,
+    /// The `vim_mode` pref as last applied (#1286). A settings reload
+    /// changes the live mode only when the pref itself changed, so an
+    /// unrelated edit to config.json does not reset the mode in use.
+    vim_mode_pref: bool,
     /// User pref: show the current-line inline blame annotation (default on).
     inline_blame_enabled: bool,
     /// The provenance lens (#349): who typed each line, in the gutter and
@@ -4067,6 +4077,11 @@ pub struct App {
     /// debounce, and when it settled — occurrences' idle pattern.
     linked_observed: Option<(PathBuf, usize, usize, u64)>,
     linked_observed_at: std::time::Instant,
+    /// A request already went out for `linked_observed` (#1299). Kept
+    /// apart from `linked_request`, which the reply clears: a `null`
+    /// answer left nothing to say the position was asked, so every UI
+    /// wake asked again while the caret stayed put.
+    linked_asked: bool,
     /// In-flight Expand Selection request (#254). Extra Shift+Alt+Right
     /// presses while the chains are in flight stack up and apply
     /// together on drain; an `unsupported` verdict resolves them via
@@ -5587,6 +5602,7 @@ impl App {
             snippets: crate::snippets::SnippetSet::load(&crate::snippets::snippets_path()),
             format_on_save: loaded_prefs.format_on_save,
             copy_on_select: loaded_prefs.copy_on_select,
+            files_exclude: Vec::new(),
             log_highlight: !loaded_prefs.disable_log_highlight,
             secret_redaction: !loaded_prefs.disable_secret_redaction,
             redaction_reveal_until: None,
@@ -5632,6 +5648,7 @@ impl App {
             blame_fetched: None,
             git_net_job: None,
             git_view_job: None,
+            vim_mode_pref: false,
             inline_blame_enabled: !loaded_prefs.disable_inline_blame,
             provenance_overlay: false,
             indent_guides_enabled: !loaded_prefs.disable_indent_guides,
@@ -6240,6 +6257,7 @@ impl App {
             linked_request: None,
             linked_observed: None,
             linked_observed_at: std::time::Instant::now(),
+            linked_asked: false,
             selection_range_request: None,
             occ_observed: None,
             occ_observed_at: std::time::Instant::now(),
@@ -6250,6 +6268,8 @@ impl App {
         // focused-but-not-gradient: the Black-theme gradient border only
         // arms on the first focus change because nothing ran the sync at
         // construction time.
+        // #1286: start in Vim mode when it was saved as the default.
+        app.follow_vim_mode_pref(loaded_prefs.vim_mode);
         // #256: the PROBLEMS scope comes from prefs; set it after
         // construction so the panel keeps one plain `new()`.
         app.problems.scope =
@@ -6278,6 +6298,7 @@ impl App {
         }
         // The agent review queue as this workspace last left it (#345).
         let root = app.workspace_root().to_path_buf();
+        app.apply_project_excludes(&loaded_prefs);
         app.agent_ledger = app.load_agent_ledger(&root);
         app.sync_agent_lane_decorations();
         Ok(app)
@@ -8097,7 +8118,7 @@ impl App {
         // next scan honours them (VS Code's Search filter inputs).
         let _ = self.search_query_tx.send(SearchRequest::SetFilter(
             self.search.include.clone(),
-            self.search.exclude.clone(),
+            self.search.effective_exclude(),
         ));
         let _ = self.search_query_tx.send(SearchRequest::Query(
             self.search.query.clone(),
@@ -8119,11 +8140,13 @@ impl App {
     pub fn drain_search_results(&mut self) -> bool {
         use crate::widgets::search::SearchEvent;
         let mut applied = false;
+        // Every batch waiting is merged in one pass (#1340).
+        let mut arrived = Vec::new();
         while let Ok(event) = self.search_results_rx.try_recv() {
             match event {
                 SearchEvent::Hits(q, opts, batch) => {
                     if q == self.search.query && opts == self.search.opts {
-                        self.search.hits.extend(batch);
+                        arrived.extend(batch);
                         applied = true;
                     }
                 }
@@ -8135,6 +8158,7 @@ impl App {
                 }
             }
         }
+        self.search.add_hits(arrived);
         applied
     }
 
@@ -8922,55 +8946,83 @@ impl App {
     /// ids so a slow earlier reply cannot clobber a fresher popup. Returns
     /// true when the popup state changed and the next frame should redraw.
     pub fn drain_lsp_completion(&mut self) -> bool {
-        let Some(lsp) = self.lsp.as_ref() else {
-            return false;
-        };
         let mut changed = false;
-        while let Some(result) = lsp.drain_completion() {
-            if Some(result.request_id) != self.completion_request_id {
-                continue;
-            }
-            let Some((cx, cy)) = self.editor.cursor_screen_pos() else {
-                continue;
-            };
-            let prefix = self.editor.word_before_cursor();
-            let server_count = result.items.len();
-            // Merge user snippets whose prefix matches the typed word into the
-            // suggestion list (VS Code shows snippets in the suggest widget);
-            // the popup's own prefix filter narrows them further.
-            let mut items = result.items;
-            let lang = self.editor.scope_id();
-            for snip in self.snippets.matching(&prefix, lang) {
-                items.push(snippet_completion_item(snip));
-            }
-            if items.is_empty() {
-                if self.completion_popup.is_some() {
-                    self.completion_popup = None;
-                    changed = true;
-                }
-                continue;
-            }
-            let popup = crate::widgets::completion_popup::CompletionPopup::new(
-                items,
-                prefix.clone(),
-                (cx, cy),
-                result.path,
-                result.request_id,
-            );
-            let filtered = popup.visible_indices().len();
-            crate::lsp::log_file::log(&format!(
-                "popup filter: prefix={prefix:?} server={server_count} visible={filtered}"
-            ));
-            if popup.visible_is_empty() {
-                self.completion_popup = None;
-                self.status =
-                    format!("No completions match '{prefix}' ({server_count} from server)");
-            } else {
-                self.completion_popup = Some(popup);
-            }
-            changed = true;
+        while let Some(result) = self.lsp.as_ref().and_then(|lsp| lsp.drain_completion()) {
+            changed |= self.apply_completion_result(result);
         }
         changed
+    }
+
+    /// Open the popup for one completion reply; the drain loop delegates here
+    /// because the reply channel's sender lives inside the LSP worker. Returns
+    /// true when the popup state changed.
+    fn apply_completion_result(&mut self, result: crate::lsp::manager::CompletionResult) -> bool {
+        if Some(result.request_id) != self.completion_request_id {
+            return false;
+        }
+        // A matching id is not enough: nothing but the open popup clears the
+        // id, so a reply that lands after an Enter moved the caret would open
+        // on the next line with an empty prefix, and the next Enter accepted
+        // its first item instead of breaking the line (#842).
+        if !self.completion_origin_covers_caret(&result.path) {
+            self.completion_request_id = None;
+            return false;
+        }
+        let Some((cx, cy)) = self.editor.cursor_screen_pos() else {
+            return false;
+        };
+        let prefix = self.editor.word_before_cursor();
+        let server_count = result.items.len();
+        // Merge user snippets whose prefix matches the typed word into the
+        // suggestion list (VS Code shows snippets in the suggest widget);
+        // the popup's own prefix filter narrows them further.
+        let mut items = result.items;
+        let lang = self.editor.scope_id();
+        for snip in self.snippets.matching(&prefix, lang) {
+            items.push(snippet_completion_item(snip));
+        }
+        if items.is_empty() {
+            return self.completion_popup.take().is_some();
+        }
+        let popup = crate::widgets::completion_popup::CompletionPopup::new(
+            items,
+            prefix.clone(),
+            (cx, cy),
+            result.path,
+            result.request_id,
+        );
+        let filtered = popup.visible_indices().len();
+        crate::lsp::log_file::log(&format!(
+            "popup filter: prefix={prefix:?} server={server_count} visible={filtered}"
+        ));
+        if popup.visible_is_empty() {
+            self.completion_popup = None;
+            self.status = format!("No completions match '{prefix}' ({server_count} from server)");
+        } else {
+            self.completion_popup = Some(popup);
+        }
+        true
+    }
+
+    /// Whether the caret is still in the word the pending completion was
+    /// requested for: the same buffer and row, not left of the request point,
+    /// and only word characters typed since. VS Code likewise cancels its
+    /// suggest session the moment the caret leaves the word.
+    fn completion_origin_covers_caret(&self, path: &Path) -> bool {
+        let Some((row, col)) = self.completion_origin else {
+            return false;
+        };
+        let caret = self.editor.cursor_col;
+        if self.editor.path.as_deref() != Some(path) || self.editor.cursor_row != row || caret < col
+        {
+            return false;
+        }
+        self.editor.lines.get(row).is_some_and(|line| {
+            line.chars()
+                .skip(col)
+                .take(caret - col)
+                .all(is_word_continuation)
+        })
     }
 
     /// Tab in the editor: advance a live snippet, else expand a user snippet
@@ -10697,7 +10749,11 @@ impl App {
                 .as_ref()
                 .map_or(self.editor.cursor_row, |v| v.cursor_row) as u32;
             let symbols = self.outline.symbols();
-            for i in breadcrumb_symbol_chain(symbols, line) {
+            let col = self
+                .scrub_view
+                .as_ref()
+                .map_or(self.editor.cursor_col, |v| v.cursor_col) as u32;
+            for i in breadcrumb_symbol_chain(symbols, line, col) {
                 let s = &symbols[i];
                 crumbs.push(Crumb {
                     label: s.name.clone(),
@@ -10724,7 +10780,7 @@ impl App {
         }
         let top = self.editor.scroll as u32;
         let symbols = self.outline.symbols();
-        breadcrumb_symbol_chain(symbols, top)
+        breadcrumb_symbol_chain(symbols, top, 0)
             .into_iter()
             .map(|i| symbols[i].range_start_line)
             .filter(|&l| l < top)
@@ -11850,6 +11906,7 @@ impl App {
         let Some(path) = self.editor.path.clone().filter(|_| eligible) else {
             self.linked_observed = None;
             self.linked_request = None;
+            self.linked_asked = false;
             self.editor.clear_linked_ranges();
             return mirrored;
         };
@@ -11868,13 +11925,10 @@ impl App {
             self.linked_observed = Some(cur);
             self.linked_observed_at = std::time::Instant::now();
             self.linked_request = None;
+            self.linked_asked = false;
             return mirrored;
         }
-        let already = self
-            .linked_request
-            .as_ref()
-            .is_some_and(|(_, p, s)| (p, s) == (&cur.0, &cur.3));
-        if already || self.linked_observed_at.elapsed() < LINKED_IDLE {
+        if self.linked_asked || self.linked_observed_at.elapsed() < LINKED_IDLE {
             return mirrored;
         }
         let (uline, uchar) = self.editor.cursor_position_utf16();
@@ -11883,6 +11937,7 @@ impl App {
         };
         let id = lsp.request_linked_editing(cur.0.clone(), uline, uchar);
         self.linked_request = Some((id, cur.0, cur.3));
+        self.linked_asked = true;
         mirrored
     }
 
@@ -13381,6 +13436,21 @@ impl App {
         self.status = format!("Deleted {n} {}", if n == 1 { "line" } else { "lines" });
     }
 
+    /// Kill from the caret to the end of its line, yanking the text to the
+    /// clipboard (emacs `kill-line`). `Ctrl+K` in the editor on macOS and in
+    /// vim mode; elsewhere `Ctrl+K` leads the `Cmd+K` chords (#843), and the
+    /// palette's "Kill to End of Line" is the way here.
+    fn kill_to_end_of_line(&mut self) {
+        if self.editor.has_non_text_view() {
+            return;
+        }
+        let killed = self.editor.kill_to_eol();
+        if !killed.is_empty() {
+            copy_to_clipboard(&killed);
+            self.status = format!("Killed {} chars", killed.chars().count());
+        }
+    }
+
     /// VS Code "Rename Symbol" (F2): prompt for a new name pre-filled with the
     /// identifier under the cursor; committing fires an LSP `rename` request.
     fn start_rename_symbol(&mut self) {
@@ -13953,6 +14023,21 @@ impl App {
                     self.status = format!("Merge complete: removed {rel}");
                 }
                 Err(e) => self.status = format!("Remove failed: {e}"),
+            }
+            return;
+        }
+        // The merge of an agent's proposal with unsaved edits (#1353): the
+        // save is the approval, and the file is croft's scratch copy, which
+        // no repository should stage.
+        if self
+            .approval_edit
+            .as_ref()
+            .is_some_and(|(_, scratch)| *scratch == path)
+        {
+            if self.editor.dirty {
+                self.save();
+            } else {
+                self.approve_saved_edit(&path);
             }
             return;
         }
@@ -17262,6 +17347,7 @@ impl App {
             self.editor.cursor_row = row.min(self.editor.lines.len().saturating_sub(1));
             self.editor.cursor_col = 0;
         }
+        mv.proposal_from = Some(agent.clone());
         self.editor.merge = Some(mv);
         self.approval_merge_into = Some(target);
         self.status = format!(
@@ -17946,6 +18032,12 @@ impl App {
     /// non-zero problem count rides the PROBLEMS label as a badge.
     fn paint_panel_tabs(&mut self, frame: &mut ratatui::Frame, strip: Rect) {
         use ratatui::widgets::Block;
+        // The labels go through `set_stringn`, which indexes the buffer
+        // directly, so a strip with no row inside the frame paints nothing.
+        let strip = strip.intersection(frame.area());
+        if strip.is_empty() {
+            return;
+        }
         let strip_bg = self.theme.editor_bg();
         frame.render_widget(Block::default().style(Style::default().bg(strip_bg)), strip);
         let brand = self.theme.gradient();
@@ -19008,11 +19100,14 @@ impl App {
             // The panel group's tab strip (PROBLEMS / TERMINAL) takes the top
             // row; the active tab's view fills the rest. Mirrors VS Code's
             // bottom-panel tab bar.
+            // `min(1)`: at a one-row window the band is zero rows high just
+            // below the frame, and a one-row strip there writes outside the
+            // buffer (#1133).
             let strip = Rect {
                 x: area.x,
                 y: area.y,
                 width: area.width,
-                height: 1,
+                height: area.height.min(1),
             };
             let content = if area.height > 1 {
                 Rect {
@@ -19946,7 +20041,6 @@ impl App {
         }
         self.render_port_toast(frame);
         self.render_update_toast(frame);
-        self.render_tour_caption(frame);
         self.render_context_menu(frame);
         self.render_commit_dropdown(frame);
         self.render_prompt(frame);
@@ -19966,6 +20060,9 @@ impl App {
         self.render_terminal_find(frame);
         self.render_file_finder(frame);
         self.render_command_palette(frame);
+        // Above the pickers a tour step opens (#863), so they never hide
+        // the caption explaining them.
+        self.render_tour_caption(frame);
         self.render_go_to_symbol(frame);
         self.render_workspace_symbols(frame);
         self.render_process_picker(frame);
@@ -21409,6 +21506,17 @@ impl App {
         }
     }
 
+    /// [`ctrl_k_leads`] for the pane that has the keyboard now.
+    fn ctrl_k_leads_here(&self) -> bool {
+        let shell_focused = self.focus == Pane::Terminal
+            && matches!(self.bottom_panel_tab, BottomPanelTab::Terminal);
+        ctrl_k_leads(
+            cfg!(target_os = "macos"),
+            shell_focused,
+            self.vim.enabled && self.focus == Pane::Editor,
+        )
+    }
+
     /// Dispatch the second key of a `Cmd+K`-prefixed chord (VS Code's two-key
     /// model). Returns `true` if the key completed a chord and was consumed,
     /// `false` if it matched nothing (the caller then processes it normally).
@@ -21417,6 +21525,10 @@ impl App {
     fn handle_cmd_k_chord(&mut self, key: KeyEvent) -> bool {
         let plain = !key.modifiers.contains(KeyModifiers::ALT);
         let shifted = key.modifiers.contains(KeyModifiers::SHIFT);
+        // `Cmd` held on the second key, for the chords that ask for it. Off
+        // macOS `Ctrl` counts, as it does for the leader (#843): VS Code's
+        // Linux `Ctrl+K Ctrl+S` is the Keyboard Shortcuts editor.
+        let cmd_held = has_cmd_or_linux_ctrl(key.modifiers);
         match key.code {
             // Cmd+K N in the editor: leave a sticky note on this line (#367).
             // In a terminal the same chord keeps its meaning (below).
@@ -21454,9 +21566,7 @@ impl App {
             // Cmd+K Cmd+S (Cmd held on the second key): the Keyboard Shortcuts
             // editor, VS Code's binding (#612). Before the plain S arm, which
             // keeps Select for Compare.
-            KeyCode::Char(c)
-                if c.eq_ignore_ascii_case(&'s') && has_cmd(key.modifiers) && !shifted =>
-            {
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'s') && cmd_held && !shifted => {
                 self.open_keyboard_shortcuts();
                 true
             }
@@ -21550,9 +21660,7 @@ impl App {
             // Cmd+K Cmd+Q: Go to Last Edit Location (VS Code's chord; the
             // second key carries Cmd, which keeps it distinct from the
             // navigator's plain Cmd+K Q below).
-            KeyCode::Char(c)
-                if c.eq_ignore_ascii_case(&'q') && key.modifiers.contains(KeyModifiers::SUPER) =>
-            {
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'q') && cmd_held => {
                 self.goto_last_edit_location();
                 true
             }
@@ -22020,6 +22128,31 @@ impl App {
             self.handle_shortcuts_modal_key(key);
             return Ok(());
         }
+        // The tour (#377): Esc leaves it at any time, as its first caption
+        // and its keys row say, from a palette, Quick Open or picker its step
+        // opened too (#863). Esc there closed only that, so at the theme
+        // picker a user taking the caption at its word stayed in the tour.
+        // A modal the user opens mid-tour is theirs: its Esc just closes it.
+        if key.code == KeyCode::Esc
+            && key.modifiers.is_empty()
+            && key.kind == KeyEventKind::Press
+            && self.tour.as_ref().is_some_and(|run| run.step_opened_modal)
+            && (self.command_palette.is_some()
+                || self.file_finder.is_some()
+                || self.context_menu.is_some())
+        {
+            if self.command_palette.is_some() {
+                self.close_command_palette();
+            }
+            if self.file_finder.is_some() {
+                self.close_file_finder();
+            }
+            if self.context_menu.take().is_some() {
+                self.overlays.activity.mark_dirty();
+            }
+            self.finish_tour();
+            return Ok(());
+        }
         if self.file_finder.is_some() {
             self.handle_file_finder_key(key);
             return Ok(());
@@ -22299,10 +22432,9 @@ impl App {
         }
         // Arm the `Cmd+K` leader (VS Code's two-key chord prefix). The next
         // keystroke is interpreted by `handle_cmd_k_chord`, checked at the top
-        // of this fn. Cmd is SUPER everywhere; Ctrl doubles as Cmd only on
-        // Termux — on desktop Linux a bare Ctrl+K stays the editor's
-        // kill-to-end-of-line (see `is_cmd_k_leader_key`).
-        if is_cmd_k_leader_key(key) {
+        // of this fn. Cmd is SUPER everywhere; off macOS Ctrl+K arms it too,
+        // except in a focused shell and the vim-mode editor (`ctrl_k_leads`).
+        if is_cmd_k_leader_key(key, self.ctrl_k_leads_here()) {
             self.cmd_k_leader = Some(std::time::Instant::now());
             return Ok(());
         }
@@ -22481,6 +22613,15 @@ impl App {
             self.save_all();
             return Ok(());
         }
+        // Ctrl+Shift+H in the live shell stays its command history; Cmd+Shift+H
+        // and every other pane's Ctrl+Shift+H are Replace in Files (#860).
+        let terminal_owns_ctrl_shift_h = self.focus == Pane::Terminal
+            && self.bottom_panel_tab == BottomPanelTab::Terminal
+            && key.modifiers.contains(KeyModifiers::CONTROL);
+        if is_replace_in_files_key(key) && !terminal_owns_ctrl_shift_h {
+            self.open_replace_in_files();
+            return Ok(());
+        }
         if self.is_remote && is_drop_to_local_key(key) {
             self.drop_to_local = true;
             self.quit = true;
@@ -22636,6 +22777,17 @@ impl App {
             }
             return;
         }
+        // VS Code's Alt+C / Alt+W / Alt+R flip the Aa / ab / .* toggles from
+        // any Search input, and Alt+D opens or closes the include / exclude
+        // rows (#860).
+        if let Some(toggle) = search_toggle_for_key(key) {
+            self.toggle_search_opt(toggle);
+            return;
+        }
+        if is_search_details_key(key) {
+            self.search.toggle_details();
+            return;
+        }
         // Tab cycles through the visible inputs (Query → Replace → include →
         // exclude → Query), mirroring VS Code. Shift+Tab is left to fall
         // through to default since BackTab arrives as its own key code.
@@ -22690,6 +22842,32 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Flip one of the Search side bar's mode toggles, from a click or a key,
+    /// and re-run the query under it. The status line names the new state:
+    /// the toggle's glyph is two cells in a panel that may be off-screen.
+    fn toggle_search_opt(&mut self, toggle: crate::widgets::search::SearchToggle) {
+        use crate::widgets::search::SearchToggle;
+        let on = self.search.toggle_opt(toggle);
+        let name = match toggle {
+            SearchToggle::CaseSensitive => "Match Case",
+            SearchToggle::WholeWord => "Match Whole Word",
+            SearchToggle::UseRegex => "Use Regular Expression",
+        };
+        self.status = format!("Search: {name} {}", if on { "on" } else { "off" });
+        self.submit_search_query();
+    }
+
+    /// Search: Replace in Files (#860, `Cmd+Shift+H`): the Search side bar
+    /// with its Replace row expanded and focused, the way the chevron opens
+    /// it.
+    fn open_replace_in_files(&mut self) {
+        // As for the Search jump: a live find bar would keep painting over
+        // the editor and shadow the side bar's input.
+        self.close_editor_find();
+        self.set_sidebar_view(SidebarView::Search);
+        self.search.open_replace();
     }
 
     /// Re-run the search after a field edit, but only when the edited field
@@ -25509,9 +25687,9 @@ impl App {
 
     /// `program`'s bare version number, or why it could not be read.
     fn read_codeql_version(program: &std::path::Path) -> Result<String, String> {
-        let out = std::process::Command::new(program)
-            .args(crate::codeql_query::version_args())
-            .output();
+        let out = crate::review_ops::output_retrying_busy(
+            std::process::Command::new(program).args(crate::codeql_query::version_args()),
+        );
         match out {
             Ok(o) if o.status.success() => {
                 Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -27630,10 +27808,11 @@ impl App {
     /// Refuse suite `suite` when it selects a query whose results are not
     /// alerts (#578): `database analyze` cannot produce those tables.
     fn check_codeql_suite(program: &Path, suite: &Path) -> Result<(), String> {
-        let out = std::process::Command::new(program)
-            .args(crate::codeql_query::resolve_suite_args(suite))
-            .output()
-            .map_err(|e| format!("could not run codeql: {e}"))?;
+        let out = crate::review_ops::output_retrying_busy(
+            std::process::Command::new(program)
+                .args(crate::codeql_query::resolve_suite_args(suite)),
+        )
+        .map_err(|e| format!("could not run codeql: {e}"))?;
         if !out.status.success() {
             return Err(crate::codeql_query::failure_reason(
                 &String::from_utf8_lossy(&out.stderr),
@@ -27752,13 +27931,14 @@ impl App {
         if cancel.load(Ordering::SeqCst) {
             return Err(String::from("cancelled"));
         }
-        let mut child = std::process::Command::new(program)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("could not run codeql: {e}"))?;
+        let mut child = crate::review_ops::spawn_retrying_busy(
+            std::process::Command::new(program)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped()),
+        )
+        .map_err(|e| format!("could not run codeql: {e}"))?;
         let mut stderr = child.stderr.take();
         let reader = std::thread::spawn(move || {
             let mut text = String::new();
@@ -27985,10 +28165,9 @@ impl App {
     /// Run `codeql` with `args` and return what it printed on stdout; a
     /// failure is read as [`Self::codeql_command`] reads it.
     fn codeql_stdout(program: &Path, args: &[String]) -> Result<String, String> {
-        let out = std::process::Command::new(program)
-            .args(args)
-            .output()
-            .map_err(|e| format!("could not run codeql: {e}"))?;
+        let out =
+            crate::review_ops::output_retrying_busy(std::process::Command::new(program).args(args))
+                .map_err(|e| format!("could not run codeql: {e}"))?;
         if out.status.success() {
             return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
         }
@@ -28679,10 +28858,9 @@ impl App {
     /// Run `codeql` with `args` and wait. A failure is the reason and the
     /// fix the CLI printed on stderr ([`crate::codeql_query::failure_reason`]).
     fn codeql_command(program: &Path, args: &[String]) -> Result<(), String> {
-        let out = std::process::Command::new(program)
-            .args(args)
-            .output()
-            .map_err(|e| format!("could not run codeql: {e}"))?;
+        let out =
+            crate::review_ops::output_retrying_busy(std::process::Command::new(program).args(args))
+                .map_err(|e| format!("could not run codeql: {e}"))?;
         if out.status.success() {
             return Ok(());
         }
@@ -32455,12 +32633,20 @@ impl App {
     /// for `croft <root> --open-file <path>` (the new window spawned by Move /
     /// Copy into New Window opens the handed-off file this way). Best-effort: a
     /// missing / unreadable file just leaves the editor on the welcome screen.
+    /// A relative `path` is taken under the workspace root, so the tab gets
+    /// the absolute path its language server is keyed by; a file that can't
+    /// be opened says why instead of opening nothing (#1193).
     pub fn open_file_at_launch(&mut self, path: &Path) {
-        if self.editor.open_pinned(path).is_ok() {
-            // Launch is not a user focus gesture: collapsing here would hide
-            // the sidebar before the user has interacted at all (#260).
-            self.without_auto_hide(|app| app.focus_pane(Pane::Editor));
-            self.sync_open_file_poll_mtime();
+        let path = self.workspace_root().join(path);
+        match self.editor.open_pinned(&path) {
+            Ok(_) => {
+                // Launch is not a user focus gesture: collapsing here would
+                // hide the sidebar before the user has interacted at all
+                // (#260).
+                self.without_auto_hide(|app| app.focus_pane(Pane::Editor));
+                self.sync_open_file_poll_mtime();
+            }
+            Err(e) => self.status = format!("Couldn't open {}: {e}", path.display()),
         }
     }
 
@@ -32934,41 +33120,48 @@ impl App {
         let Some(message) = self.require_commit_message() else {
             return;
         };
-        let r = crate::git::commit_staged(&self.scm_root(), &message);
-        if r.is_ok() {
-            self.source_control.clear_message();
-        }
-        self.run_scm_op("commit -m", r, "Committed staged");
+        let root = self.scm_root();
+        let committed = message.clone();
+        self.spawn_commit(
+            message,
+            move || crate::git::commit_staged(&root, &committed),
+            |app, r| app.run_scm_op("commit -m", r, "Committed staged"),
+        );
     }
 
     fn commit_all_source_control(&mut self) {
         let Some(message) = self.require_commit_message() else {
             return;
         };
-        if let Err(err) = crate::git::stage_all(&self.scm_root()) {
-            self.run_scm_op("add -A", Err(err), "Stage all");
-            return;
-        }
-        let r = crate::git::commit_staged(&self.scm_root(), &message);
-        if r.is_ok() {
-            self.source_control.clear_message();
-        }
-        self.run_scm_op("commit (all)", r, "Committed all");
+        let root = self.scm_root();
+        let committed = message.clone();
+        self.spawn_commit(
+            message,
+            move || {
+                crate::git::stage_all(&root).map_err(|err| format!("stage all failed: {err}"))?;
+                crate::git::commit_staged(&root, &committed)
+            },
+            |app, r| app.run_scm_op("commit (all)", r, "Committed all"),
+        );
     }
 
     fn commit_amend_source_control(&mut self) {
         // Amend keeps the prior message when the box is empty, otherwise
         // rewrites it — matching VS Code's amend.
         let message = self.source_control.message.trim().to_string();
-        let r = if message.is_empty() {
-            crate::git::commit_amend_no_edit(&self.scm_root())
-        } else {
-            crate::git::commit_amend(&self.scm_root(), &message)
-        };
-        if r.is_ok() {
-            self.source_control.clear_message();
-        }
-        self.run_scm_op("commit --amend", r, "Amended commit");
+        let root = self.scm_root();
+        let committed = message.clone();
+        self.spawn_commit(
+            message,
+            move || {
+                if committed.is_empty() {
+                    crate::git::commit_amend_no_edit(&root)
+                } else {
+                    crate::git::commit_amend(&root, &committed)
+                }
+            },
+            |app, r| app.run_scm_op("commit --amend", r, "Amended commit"),
+        );
     }
 
     /// Undo Last Commit (#1350): the last commit goes back to Staged and
@@ -33010,16 +33203,22 @@ impl App {
         let Some(message) = self.require_commit_message() else {
             return;
         };
-        let commit = crate::git::commit_all_tracked(&self.scm_root(), &message);
-        self.log_git("commit -am", &commit);
-        if let Err(err) = commit {
-            self.source_control.commit_feedback = Some(err.clone());
-            self.source_control.commit_feedback_is_error = true;
-            self.status = format!("Commit failed: {err}");
-            return;
-        }
-        self.source_control.clear_message();
-        self.sync_source_control();
+        let root = self.scm_root();
+        let committed = message.clone();
+        self.spawn_commit(
+            message,
+            move || crate::git::commit_all_tracked(&root, &committed),
+            |app, commit| {
+                app.log_git("commit -am", &commit);
+                if let Err(err) = commit {
+                    app.source_control.commit_feedback = Some(err.clone());
+                    app.source_control.commit_feedback_is_error = true;
+                    app.status = format!("Commit failed: {err}");
+                    return;
+                }
+                app.sync_source_control();
+            },
+        );
     }
 
     fn publish_branch_source_control(&mut self) {
@@ -35030,11 +35229,7 @@ impl App {
         let Some(file) = collab_file_key(&self.tree.root, &path) else {
             return false;
         };
-        let Some(kind) = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .and_then(crate::highlight::lang_for_extension)
-        else {
+        let Some(kind) = crate::highlight::lang_for_path(&path) else {
             return false;
         };
         let Some(old) = host.last_seen(&file) else {
@@ -35238,12 +35433,25 @@ impl App {
         // land in a real buffer that saves, auto-saves, and reloads through
         // the one code path.
         let events = session.poll(|file| self.owner_buffer_text(&root, file));
+        // One undo step per author per file per tick (#1207): a peer's edit
+        // reaches us as one op per changed run, and undoing them run by run
+        // walked through texts nobody ever wrote.
+        let mut tick_groups: std::collections::HashMap<(String, u64), u64> =
+            std::collections::HashMap::new();
         for event in events {
             changed = true;
             match event {
-                CollabEvent::RemoteEdit { file, spans } => {
+                CollabEvent::RemoteEdit { file, site, spans } => {
                     let doc_gen = session.doc_gen(&file).unwrap_or(0);
-                    self.apply_collab_spans(&root, &file, &spans, doc_gen);
+                    // An AI stream's fragments span many ticks; the whole
+                    // stream is one step, as its cancel already is.
+                    let group = match self.collab_stream.as_ref() {
+                        Some(st) if st.file == file && st.site == site => st.undo_group,
+                        _ => *tick_groups
+                            .entry((file.clone(), site))
+                            .or_insert_with(next_remote_undo_group),
+                    };
+                    self.apply_collab_spans(&root, &file, &spans, doc_gen, group);
                 }
                 CollabEvent::Bootstrapped { file, text } => {
                     let doc_gen = session.doc_gen(&file).unwrap_or(0);
@@ -35330,7 +35538,24 @@ impl App {
                     // Truncate like caret names: a badge can never paint a
                     // whole status row.
                     let name: String = name.chars().take(24).collect();
-                    self.collab_stream = active.then_some(CollabStreamInfo { file, name, site });
+                    let same = |st: &CollabStreamInfo| st.file == file && st.site == site;
+                    let previous = self.collab_stream.take();
+                    let undo_group = match &previous {
+                        Some(st) if active && same(st) => st.undo_group,
+                        _ => next_remote_undo_group(),
+                    };
+                    // A stream that ended (or gave way to another) closes
+                    // its undo step; one whose cancel restored the text
+                    // leaves none.
+                    if let Some(st) = previous.filter(|st| !(active && same(st))) {
+                        self.end_collab_undo_group(&root, &st.file, st.undo_group);
+                    }
+                    self.collab_stream = active.then_some(CollabStreamInfo {
+                        file,
+                        name,
+                        site,
+                        undo_group,
+                    });
                 }
                 // The cancel request is for the streaming pilot, not for
                 // viewers; the badge clears via StreamState(inactive).
@@ -35564,10 +35789,29 @@ impl App {
         (ed.diff.is_none() && ed.image.is_none() && ed.sheet.is_none()).then(|| ed.lines.join("\n"))
     }
 
+    /// Close a remote undo group in every text tab of `file` (#1207).
+    fn end_collab_undo_group(&mut self, root: &Path, file: &str, group: u64) {
+        let Some(path) = crate::collab::contained_path(root, file) else {
+            return;
+        };
+        let groups = self.editor_layout.inactive_groups_mut();
+        for ed in self
+            .editor
+            .editors
+            .iter_mut()
+            .chain(groups.into_iter().flat_map(|g| g.editors.iter_mut()))
+        {
+            if ed.path.as_deref() == Some(path.as_path()) && !ed.has_non_text_view() {
+                ed.end_remote_undo_group(group);
+            }
+        }
+    }
+
     /// Replay resolved remote spans onto every open buffer for `file`,
     /// converting each byte span to the editor's char coordinates. Spans are
     /// sequential (each relative to the text with earlier ones applied), so
-    /// they go through `apply_span_edits` one at a time. Every ATTACHED pane
+    /// they go through `apply_remote_span_edits` one at a time, all in
+    /// `undo_group`'s one undo step (#1207). Every ATTACHED pane
     /// gets them (attached panes hold identical text, so the byte offsets
     /// are valid in each); a never-attached pane still holds stale disk
     /// text where the offsets would splice garbage — the attach pass seeds
@@ -35578,6 +35822,7 @@ impl App {
         file: &str,
         spans: &[crate::collab::ResolvedSpan],
         doc_gen: u64,
+        undo_group: u64,
     ) {
         let Some(path) = crate::collab::contained_path(root, file) else {
             return;
@@ -35597,12 +35842,15 @@ impl App {
             for s in spans {
                 let (sr, sc) = crate::collab::position(&ed.lines, s.at);
                 let (er, ec) = crate::collab::position(&ed.lines, s.at + s.deleted);
-                ed.apply_span_edits(&[crate::widgets::editor::TextSpanEdit {
-                    start: (sr, sc),
-                    end: (er, ec),
-                    new_text: s.inserted.clone(),
-                    utf16: false,
-                }]);
+                ed.apply_remote_span_edits(
+                    &[crate::widgets::editor::TextSpanEdit {
+                        start: (sr, sc),
+                        end: (er, ec),
+                        new_text: s.inserted.clone(),
+                        utf16: false,
+                    }],
+                    undo_group,
+                );
             }
             // Echo suppression: apply_span_edits bumped edit_seq, which would
             // re-arm the tick diff and rebroadcast what was just applied.
@@ -36041,6 +36289,7 @@ impl App {
                     "toggle:indent_guides" => self.toggle_indent_guides(),
                     "toggle:bracket_colors" => self.toggle_bracket_colors(),
                     "toggle:render_whitespace" => self.toggle_render_whitespace(),
+                    "toggle:vim_mode" => self.toggle_vim_mode(),
                     "toggle:inline_values" => self.toggle_inline_values(),
                     "toggle:inlay_hints" => self.toggle_inlay_hints(),
                     "toggle:copy_on_select" => self.toggle_copy_on_select(),
@@ -36179,6 +36428,14 @@ impl App {
                     "Editor: Render Whitespace: {}{}",
                     self.whitespace_mode.label(),
                     prov("render_whitespace")
+                ),
+            },
+            ListRow {
+                id: String::from("toggle:vim_mode"),
+                label: format!(
+                    "Editor: Vim Mode: {}{}",
+                    on_off(self.vim.enabled),
+                    prov("vim_mode")
                 ),
             },
             ListRow {
@@ -36633,25 +36890,31 @@ impl App {
             self.source_control.commit_feedback_is_error = true;
             return;
         }
-        let commit_summary = match crate::git::commit_all_tracked(&self.scm_root(), &message) {
-            Ok(s) => s,
-            Err(err) => {
-                self.source_control.commit_feedback = Some(err.clone());
-                self.source_control.commit_feedback_is_error = true;
-                self.status = format!("Commit failed: {err}");
-                return;
-            }
-        };
-        self.source_control.clear_message();
-        self.status = format!("Committed: {commit_summary}");
         let root = self.scm_root();
-        self.spawn_git_net("push", move || {
-            let r = crate::git::push_or_publish(&root);
-            Box::new(move |app: &mut App| app.finish_commit_and_push(commit_summary, r))
-        });
-        self.active_git_bypass_debounce();
-        self.refresh_git_status_debounced();
-        self.refresh_source_control();
+        let committed = message.clone();
+        self.spawn_commit(
+            message,
+            move || crate::git::commit_all_tracked(&root, &committed),
+            |app, r| {
+                let commit_summary = match r {
+                    Ok(s) => s,
+                    Err(err) => {
+                        app.source_control.commit_feedback = Some(err.clone());
+                        app.source_control.commit_feedback_is_error = true;
+                        app.status = format!("Commit failed: {err}");
+                        return;
+                    }
+                };
+                let root = app.scm_root();
+                app.spawn_git_net("push", move || {
+                    let r = crate::git::push_or_publish(&root);
+                    Box::new(move |app: &mut App| app.finish_commit_and_push(commit_summary, r))
+                });
+                app.active_git_bypass_debounce();
+                app.refresh_git_status_debounced();
+                app.refresh_source_control();
+            },
+        );
     }
 
     fn finish_commit_and_push(&mut self, commit_summary: String, push: Result<String, String>) {
@@ -36705,7 +36968,7 @@ impl App {
     /// active tab isn't a working-tree diff or no hunk is at the cursor.
     fn diff_hunk_patch_at_caret(&mut self) -> Option<(String, String)> {
         let built = match self.editor.diff.as_ref() {
-            None => Err("Hunk actions work inside a Source Control diff"),
+            None => self.editor_hunk_patch_at_caret(),
             Some(diff) if !diff.left_is_git_head => {
                 Err("Hunk actions need a working-tree diff from Source Control")
             }
@@ -36727,6 +36990,59 @@ impl App {
                 None
             }
         }
+    }
+
+    /// Stage / Unstage / Revert Hunk from an editor tab (#1352): the hunk
+    /// whose change bar the caret is on, as a patch of the file on disk
+    /// against HEAD, the same pair the gutter's bars come from. Refused
+    /// with unsaved edits, since the patch is applied to the saved file.
+    fn editor_hunk_patch_at_caret(&mut self) -> Result<(String, String), &'static str> {
+        let Some(path) = self.editor.path.clone() else {
+            return Err("Hunk actions need a file in a git repository");
+        };
+        if self.editor.dirty {
+            return Err("Save the file first: hunk actions apply to the file on disk");
+        }
+        let row = self.editor.cursor_row;
+        let Some(mark) = self.editor.current_git_mark_at(row) else {
+            return Err("No change at the cursor");
+        };
+        let rel = self
+            .repo_relative_path(&path)
+            .ok_or("File is outside the repository")?;
+        let head = crate::git::read_file_at_head(&self.scm_root(), &rel)
+            .map_err(|_| "This file has no version in HEAD")?;
+        let disk = std::fs::read_to_string(&path).map_err(|_| "Could not read the file")?;
+        let data = crate::widgets::diff::DiffData::build_with_byte_check(
+            PathBuf::from(&rel),
+            path,
+            head.lines().map(str::to_string).collect(),
+            disk.lines().map(str::to_string).collect(),
+            Some(&head),
+            Some(&disk),
+        );
+        // The diff row showing this line; a deletion bar sits on the line
+        // after the removed run, so its hunk is the row just above.
+        use crate::widgets::diff::DiffRow;
+        let at = data
+            .rows
+            .iter()
+            .position(|r| match *r {
+                DiffRow::Equal { right, .. }
+                | DiffRow::Added { right }
+                | DiffRow::Replaced { right, .. } => right == row,
+                DiffRow::Removed { .. } => false,
+            })
+            .map(|i| {
+                if mark == crate::widgets::editor::GitMark::Deleted {
+                    i.saturating_sub(1)
+                } else {
+                    i
+                }
+            })
+            .ok_or("No change at the cursor")?;
+        let range = data.hunk_range_at(at).ok_or("No change at the cursor")?;
+        Ok((rel.clone(), data.hunk_patch(&rel, range)))
     }
 
     /// The workspace-relative path + patch for the SELECTED lines of the
@@ -36955,6 +37271,11 @@ impl App {
             Ok(_) => {
                 self.status = format!("Reverted hunk in {}", pr.rel_path);
                 self.refresh_after_hunk_op();
+                // Reverted from an editor tab (#1352): show the restored text
+                // now rather than on the next file-system sweep.
+                if self.editor.diff.is_none() && self.editor.reload_if_clean().is_some() {
+                    self.sync_open_file_poll_mtime();
+                }
                 // The revert rewrote the working file; force the HEAD-side rebuild
                 // of the open view so it refreshes even if the rewrite landed
                 // within the stamp's granularity. Forced by the root the VIEW is
@@ -37167,22 +37488,57 @@ impl App {
             self.source_control.commit_feedback_is_error = true;
             return;
         }
-        match crate::git::commit_all_tracked(&self.scm_root(), &message) {
-            Ok(summary) => {
-                self.source_control.clear_message();
-                self.source_control.commit_feedback = Some(summary.clone());
-                self.source_control.commit_feedback_is_error = false;
-                self.status = format!("Committed: {summary}");
-                self.active_git_bypass_debounce();
-                self.refresh_git_status_debounced();
-                self.refresh_source_control();
-            }
-            Err(err) => {
-                self.source_control.commit_feedback = Some(err.clone());
-                self.source_control.commit_feedback_is_error = true;
-                self.status = format!("Commit failed: {err}");
-            }
+        let root = self.scm_root();
+        let committed = message.clone();
+        self.spawn_commit(
+            message,
+            move || crate::git::commit_all_tracked(&root, &committed),
+            |app, r| match r {
+                Ok(summary) => {
+                    app.source_control.commit_feedback = Some(summary.clone());
+                    app.source_control.commit_feedback_is_error = false;
+                    app.status = format!("Committed: {summary}");
+                    app.active_git_bypass_debounce();
+                    app.refresh_git_status_debounced();
+                    app.refresh_source_control();
+                }
+                Err(err) => {
+                    app.source_control.commit_feedback = Some(err.clone());
+                    app.source_control.commit_feedback_is_error = true;
+                    app.status = format!("Commit failed: {err}");
+                }
+            },
+        );
+    }
+
+    /// Run a commit on the git worker (#1153). The repository's hooks
+    /// (pre-commit, commit-msg) can run for minutes; inline, the whole UI
+    /// froze until they ended and every key pressed meanwhile fired at once.
+    /// The message stays in the box until the commit lands, and is cleared
+    /// then only if it is still the one committed. `done` applies the
+    /// result on the UI thread.
+    fn spawn_commit(
+        &mut self,
+        message: String,
+        commit: impl FnOnce() -> Result<String, String> + Send + 'static,
+        done: impl FnOnce(&mut App, Result<String, String>) + Send + 'static,
+    ) {
+        if self.git_net_busy() {
+            return;
         }
+        self.spawn_git_net("commit", move || {
+            let r = commit();
+            Box::new(move |app: &mut App| {
+                if r.is_ok() && app.source_control.message.trim() == message.trim() {
+                    app.source_control.clear_message();
+                }
+                done(app, r)
+            })
+        });
+        let running = String::from("Committing\u{2026} (running hooks)");
+        self.source_control.commit_feedback = Some(running.clone());
+        self.source_control.commit_feedback_is_error = false;
+        self.status = running;
     }
 
     /// Housekeeping for the ssh-pane offer (#364), from the top of `render`
@@ -37435,7 +37791,11 @@ impl App {
                 return;
             }
         };
-        let scratch = match crate::tour::create_scratch(&croft_cache_dir().join("demo")) {
+        // A tour ended by closing croft's terminal left its scratch folder
+        // behind (#863): clear those whose croft is gone before adding one.
+        let demo_dir = croft_cache_dir().join("demo");
+        crate::tour::sweep_dead_scratch(&demo_dir, process_is_alive);
+        let scratch = match crate::tour::create_scratch(&demo_dir) {
             Ok(d) => d,
             Err(e) => {
                 self.status = format!("The tour could not create its sample project: {e}");
@@ -37449,6 +37809,7 @@ impl App {
             tour,
             scratch,
             previous_root,
+            step_opened_modal: false,
         });
         if let Some(action) = first {
             self.perform_tour_action(action);
@@ -37495,9 +37856,14 @@ impl App {
 
     fn perform_tour_action(&mut self, action: crate::tour::TourAction) {
         use crate::tour::TourAction as A;
-        let Some(scratch) = self.tour.as_ref().map(|r| r.scratch.clone()) else {
+        let Some(run) = self.tour.as_mut() else {
             return;
         };
+        run.step_opened_modal = matches!(
+            action,
+            A::QuickOpen | A::FindFile(_) | A::CommandPalette | A::Palette(_) | A::ThemePicker
+        );
+        let scratch = run.scratch.clone();
         match action {
             A::Open(rel) => {
                 if let Err(e) = self.open_at(&scratch.join(rel), 0, 0) {
@@ -37560,41 +37926,109 @@ impl App {
         }
     }
 
-    /// The caption chip (#377): step, caption and keys, above the status bar.
+    /// The caption panel (#377): the step's caption, wrapped, over a row of
+    /// its own for the progress and the keys, above the status bar.
+    ///
+    /// The keys have that row so no caption can push them off (#863): one
+    /// clamped line of progress, caption, then keys cut the keys first, and
+    /// at 80 columns every step lost them.
     fn render_tour_caption(&mut self, frame: &mut ratatui::Frame) {
+        let Some((rect, caption)) = self.tour_caption_panel(frame.area()) else {
+            return;
+        };
         let Some(run) = self.tour.as_ref() else {
             return;
         };
-        let Some(step) = run.tour.current() else {
-            return;
+        let style = Style::default()
+            .fg(self.theme.accent_contrast_fg())
+            .bg(self.theme.accent())
+            .add_modifier(Modifier::BOLD);
+        let body = Rect {
+            x: rect.x + 1,
+            width: rect.width.saturating_sub(2),
+            height: rect.height - 1,
+            ..rect
         };
-        let area = frame.area();
-        if area.width < 20 || area.height < 4 {
-            return;
-        }
-        let text = format!(
-            " {}  {}   Enter next \u{b7} Esc leave ",
-            run.tour.progress(),
-            step.caption
-        );
-        let width = (text.chars().count() as u16 + 2).min(area.width - 2);
-        let status_h: u16 = if self.status_bar_visible { 1 } else { 0 };
-        let rect = Rect {
-            x: area.x + (area.width - width) / 2,
-            y: area.y + area.height - status_h - 2,
-            width,
+        let keys = Rect {
+            y: rect.bottom() - 1,
             height: 1,
+            ..body
         };
         frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(ratatui::widgets::Block::new().style(style), rect);
         frame.render_widget(
-            ratatui::widgets::Paragraph::new(text).style(
-                Style::default()
-                    .fg(self.theme.accent_contrast_fg())
-                    .bg(self.theme.accent())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            rect,
+            Paragraph::new(caption).wrap(ratatui::widgets::Wrap { trim: true }),
+            body,
         );
+        let progress = run.tour.progress();
+        let gap = (keys.width as usize)
+            .saturating_sub(progress.len() + Line::from(Self::TOUR_KEYS).width());
+        // Too narrow for both, the keys win: they are what moves the tour.
+        let row = if gap >= 2 {
+            Line::from(format!("{progress}{}{}", " ".repeat(gap), Self::TOUR_KEYS))
+        } else {
+            Line::from(Self::TOUR_KEYS).right_aligned()
+        };
+        frame.render_widget(Paragraph::new(row), keys);
+    }
+
+    /// The caption panel's key hint, on the panel's last row.
+    const TOUR_KEYS: &str = "Enter next \u{b7} Esc leave";
+
+    /// Where the tour's caption panel goes in `area`, with the caption it
+    /// shows: centred above the status bar, as tall as the wrapped caption
+    /// plus the keys row. A menu it would overlap moves it beside the menu
+    /// (#863): the theme picker a step opens stands the frame's full height
+    /// on the left, and covered the caption's start. `None` between steps,
+    /// or in a frame too small to hold it.
+    fn tour_caption_panel(&self, area: Rect) -> Option<(Rect, String)> {
+        let run = self.tour.as_ref()?;
+        let step = run.tour.current()?;
+        if area.width < 20 || area.height < 4 {
+            return None;
+        }
+        let caption = step.caption_text();
+        let status_h: u16 = if self.status_bar_visible { 1 } else { 0 };
+        let bottom = area.bottom().saturating_sub(status_h);
+        // As wide as the caption on one row, or as the keys row, within the
+        // columns `left..right`; a column of padding on each side.
+        let needed = Line::from(caption.as_str())
+            .width()
+            .max(run.tour.progress().len() + 2 + Line::from(Self::TOUR_KEYS).width())
+            + 2;
+        let panel = |left: u16, right: u16| {
+            let room = right.saturating_sub(left);
+            let width = u16::try_from(needed).unwrap_or(u16::MAX).min(room);
+            let rows = Paragraph::new(caption.as_str())
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .line_count(width.saturating_sub(2)) as u16;
+            let height = rows.saturating_add(1).min(bottom.saturating_sub(area.y));
+            Rect {
+                x: left + (room - width) / 2,
+                y: bottom - height,
+                width,
+                height,
+            }
+        };
+        let mut rect = panel(area.x + 1, area.right() - 1);
+        if let Some(menu) = self.menu_rect()
+            && menu.intersects(rect)
+        {
+            // The wider side of the menu, while it leaves a readable column;
+            // on a frame too narrow for that, the panel covers the menu.
+            let before = (area.x + 1, menu.x.saturating_sub(1));
+            let after = (menu.right() + 1, area.right() - 1);
+            let span = |(l, r): (u16, u16)| r.saturating_sub(l);
+            let side = if span(after) >= span(before) {
+                after
+            } else {
+                before
+            };
+            if span(side) >= 40 {
+                rect = panel(side.0, side.1);
+            }
+        }
+        Some((rect, caption))
     }
 
     /// Close every picker and palette a tour step may have opened.
@@ -38432,16 +38866,14 @@ impl App {
         // a confirmation saying "run on 5 hosts?" asks them to approve a list
         // they cannot see, which is not consent. `*` is how to say "all of
         // them" deliberately.
-        let Some((picked, command)) =
-            crate::fleet::parse_request_with_groups(command, &known, &self.fleet_groups)
-        else {
-            self.status = format!(
-                "Fleet run needs 'hosts: command' — e.g. '{}: uptime', or '*: uptime' for all {}",
-                known[0],
-                known.len()
-            );
-            return;
-        };
+        let (picked, command) =
+            match crate::fleet::parse_request_with_groups(command, &known, &self.fleet_groups) {
+                Ok(parsed) => parsed,
+                Err(refusal) => {
+                    self.status = refusal.message(&known);
+                    return;
+                }
+            };
         let hosts: Vec<String> = picked.into_iter().cloned().collect();
         if self.fleet_running {
             self.status = String::from("A fleet run is already in flight");
@@ -39155,11 +39587,8 @@ impl App {
         }
         // Highlighting only: no language server hears about a tab with no
         // file behind it.
-        self.editor.set_language(
-            path.extension()
-                .and_then(|x| x.to_str())
-                .and_then(crate::highlight::lang_for_extension),
-        );
+        self.editor
+            .set_language(crate::highlight::lang_for_path(&path));
         self.close_scrubber_for_tab();
         self.status = format!("{rel} at {} — {}", commit.short_hash, commit.summary);
     }
@@ -40773,6 +41202,31 @@ impl App {
                 .set_search_highlight(None, crate::widgets::search::SearchOpts::default());
             self.status = String::from("vim mode off");
         }
+        // Saved as the mode the next launch starts in (#1286). Under test
+        // only into a config dir the test chose, never the developer's.
+        self.vim_mode_pref = self.vim.enabled;
+        if !cfg!(test) || self.config_dir != crate::prefs::config_dir() {
+            let _ = crate::prefs::save_vim_mode_in(&self.config_dir, self.vim.enabled);
+        }
+    }
+
+    /// Follow the `vim_mode` pref (#1286) at launch and on a settings
+    /// reload: Vim mode on when it is set and the `vim` extension is
+    /// enabled. Only a change of the pref moves the live mode, so a reload
+    /// for another setting leaves the mode, and Insert or Normal, as it is.
+    fn follow_vim_mode_pref(&mut self, want: bool) {
+        if want == self.vim_mode_pref {
+            return;
+        }
+        self.vim_mode_pref = want;
+        let on = want && self.is_extension_enabled("vim");
+        if on != self.vim.enabled {
+            self.vim.toggle();
+            if !on {
+                self.editor
+                    .set_search_highlight(None, crate::widgets::search::SearchOpts::default());
+            }
+        }
     }
 
     /// True when the active editor tab holds an editable text buffer (not a
@@ -40896,6 +41350,12 @@ impl App {
         // exist, so F7 keeps its normal meaning everywhere else.
         if matches!(key.code, KeyCode::F(7)) && !self.editor.conflicts().is_empty() {
             self.jump_conflict(key.modifiers.contains(KeyModifiers::SHIFT));
+            return;
+        }
+        // F7 / Shift+F7 elsewhere: Go to Next / Previous Change over the
+        // gutter's change bars (#1352), as the diff view walks its hunks.
+        if matches!(key.code, KeyCode::F(7)) && self.editor.merge.is_none() {
+            self.jump_editor_change(!key.modifiers.contains(KeyModifiers::SHIFT));
             return;
         }
         // Merge editor (#253): F7 hops the tracked Result regions (the
@@ -41423,6 +41883,9 @@ impl App {
             self.refresh_sarif_preview();
             return;
         }
+        if self.editor.log.is_some() && self.handle_log_key(key) {
+            return;
+        }
         // Image preview tabs are read-only. PDF tabs page with every
         // navigation key (arrows, PageUp/PageDown, Space, Home/End) and with
         // the wheel; everything else is swallowed.
@@ -41469,11 +41932,7 @@ impl App {
             return;
         }
         if is_editor_kill_to_eol_key(key) {
-            let killed = self.editor.kill_to_eol();
-            if !killed.is_empty() {
-                copy_to_clipboard(&killed);
-                self.status = format!("Killed {} chars", killed.chars().count());
-            }
+            self.kill_to_end_of_line();
             return;
         }
         if is_editor_kill_to_bol_key(key) {
@@ -42772,12 +43231,12 @@ impl App {
             return None;
         };
         let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let vars = crate::http_file::load_env(&dir);
+        let vars = crate::http_file::variables(&text, crate::http_file::load_env(&dir));
         let (resolved, missing) = crate::http_file::resolve(&req, &vars);
         if !missing.is_empty() {
             let holes: Vec<String> = missing.iter().map(|m| format!("{{{{{m}}}}}")).collect();
             self.status = format!(
-                "HTTP: no value for {} (add it to {} beside the file, or $env)",
+                "HTTP: no value for {} (set it with @name = … in the file, in {} beside it, or $env)",
                 holes.join(", "),
                 crate::http_file::ENV_FILE
             );
@@ -43652,7 +44111,7 @@ impl App {
             .find(|(_, r)| row >= r.lines.0 && row < r.lines.1)
         else {
             self.status = String::from(
-                "Cmd+Enter: put the caret inside a runnable shell fence (sh/bash/zsh/fish; not {run=false})",
+                "Run code block: put the caret inside a runnable shell fence (sh/bash/zsh/fish; not {run=false})",
             );
             return true;
         };
@@ -44127,6 +44586,7 @@ impl App {
                     finder.push_char(c);
                 }
             }
+            self.follow_quick_open_prefix();
             return;
         }
         // The in-file find bar is a pane-scoped widget, not a modal: it only
@@ -46909,8 +47369,9 @@ impl App {
                 let arc = std::sync::Arc::new(entries);
                 self.file_finder_index = Some(arc.clone());
                 self.file_finder_index_rx = None;
+                let visible = self.without_project_excludes(arc);
                 if let Some(finder) = self.file_finder.as_mut() {
-                    finder.replace_entries(arc);
+                    finder.replace_entries(visible);
                 }
                 if self.file_finder_index_dirty {
                     self.kick_file_finder_index_rebuild();
@@ -46965,6 +47426,7 @@ impl App {
             .file_finder_index
             .clone()
             .unwrap_or_else(|| std::sync::Arc::new(Vec::new()));
+        let entries = self.without_project_excludes(entries);
         let count = entries.len();
         self.file_finder = Some(crate::widgets::file_finder::FileFinder::new(entries));
         self.overlays.file_finder_clear.request();
@@ -47001,6 +47463,7 @@ impl App {
                     }
                 }
             }
+            self.follow_quick_open_prefix();
             return;
         }
         let Some(finder) = self.file_finder.as_mut() else {
@@ -47034,16 +47497,44 @@ impl App {
             }
             _ => {}
         }
-        // VS Code's shared quick input: a leading `#` turns Quick Open into
-        // Go to Symbol in Workspace, carrying any text after it as the query.
-        let hash_query = self
-            .file_finder
-            .as_ref()
-            .and_then(|f| f.query.strip_prefix('#'))
-            .map(str::to_string);
-        if let Some(q) = hash_query {
-            self.close_file_finder();
-            self.open_workspace_symbols(&q);
+        self.follow_quick_open_prefix();
+    }
+
+    /// VS Code's shared quick input: the first character of Quick Open's
+    /// query picks the mode, and the text after it carries over as the new
+    /// query. `#` is Go to Symbol in Workspace, `>` the Command Palette
+    /// (#1306), `@` Go to Symbol in Editor, and `:` Go to Line, which is
+    /// Go to Symbol's own `:N` mode. Anything else stays a file search,
+    /// `name:12` included.
+    fn follow_quick_open_prefix(&mut self) {
+        let Some(query) = self.file_finder.as_ref().map(|f| f.query.clone()) else {
+            return;
+        };
+        let mut chars = query.chars();
+        let (Some(prefix), rest) = (chars.next(), chars.as_str()) else {
+            return;
+        };
+        if !matches!(prefix, '#' | '>' | '@' | ':') {
+            return;
+        }
+        self.close_file_finder();
+        match prefix {
+            '#' => self.open_workspace_symbols(rest),
+            '>' => {
+                self.open_command_palette();
+                if let Some(palette) = self.command_palette.as_mut() {
+                    palette.set_query(rest);
+                }
+            }
+            _ => {
+                self.open_go_to_symbol();
+                if let Some(picker) = self.go_to_symbol.as_mut() {
+                    let carried = if prefix == ':' { &query } else { rest };
+                    for c in carried.chars() {
+                        picker.push_char(c);
+                    }
+                }
+            }
         }
     }
 
@@ -48345,6 +48836,7 @@ impl App {
             }
             Cmd::JoinLines => self.editor.join_lines(),
             Cmd::DeleteLine => self.delete_current_line(),
+            Cmd::KillToEndOfLine => self.kill_to_end_of_line(),
             Cmd::TransformUpper => self.editor.transform_selection_case(CaseTransform::Upper),
             Cmd::TransformLower => self.editor.transform_selection_case(CaseTransform::Lower),
             Cmd::TransformTitle => self.editor.transform_selection_case(CaseTransform::Title),
@@ -48407,6 +48899,14 @@ impl App {
             Cmd::ToggleInlineValues => self.toggle_inline_values(),
             Cmd::ToggleInlayHints => self.toggle_inlay_hints(),
             Cmd::ToggleMarkdownPreview => self.toggle_markdown_preview(),
+            // Cmd+Enter's run from any terminal (#843): the same confirm popup.
+            Cmd::RunCodeBlockAtCursor => {
+                if !self.run_fence_at_cursor() {
+                    self.status = String::from(
+                        "Run code block: open a Markdown file's source (not its preview) and put the caret in a runnable fence",
+                    );
+                }
+            }
             Cmd::ToggleTerminalTimestamps => self.toggle_terminal_timestamps(),
             Cmd::ToggleLogHighlight => self.toggle_log_highlight(),
             Cmd::CollapseTerminalPane => self.collapse_active_terminal_pane(),
@@ -48476,6 +48976,8 @@ impl App {
                     self.jump_conflict(false)
                 }
             }
+            Cmd::GoToNextChange => self.jump_editor_change(true),
+            Cmd::GoToPrevChange => self.jump_editor_change(false),
             Cmd::MergePrevConflict => {
                 if self.editor.merge.is_some() {
                     self.merge_jump(true);
@@ -48504,6 +49006,15 @@ impl App {
             Cmd::DebugAddWatch => self.open_add_watch_prompt(),
             Cmd::PeekDefinition => self.peek_definition_at_cursor(),
             Cmd::PeekReferences => self.peek_references_at_cursor(),
+            // Cmd+F12's request (#843), which has no `Ctrl` form.
+            Cmd::GoToImplementations => {
+                if self.editor.diff.is_none()
+                    && self.editor.sheet.is_none()
+                    && self.editor.image.is_none()
+                {
+                    self.request_implementation_at_cursor();
+                }
+            }
             // Position-carrying commands (#259). They read the click the
             // dispatcher set, and do nothing from the keyboard: invoked from
             // the palette there is no click to act on, and guessing the
@@ -48705,6 +49216,8 @@ impl App {
                 }
             }
             Cmd::ReopenClosedEditor => self.reopen_closed_tab(),
+            // The Explorer's Cmd+Z (#843), which has no `Ctrl` form.
+            Cmd::ZoxideJump => self.open_zoxide_jump(),
             // The tab menu's rows (#852), on the active tab and through the
             // same methods its clicks and the Cmd+K chords use.
             Cmd::CloseOtherEditors => self.close_other_tabs(self.editor.active_index()),
@@ -48715,6 +49228,10 @@ impl App {
             Cmd::UnpinEditor => self.set_active_tab_pinned(false),
             Cmd::KeepEditor => self.keep_tab_open(self.editor.active_index()),
             Cmd::SplitEditor => self.split_editor(),
+            // The chords' own moves (#843): Cmd+Opt+Left / Right have no
+            // `Ctrl` form off macOS.
+            Cmd::FocusLeftEditorGroup => self.focus_editor_group(true),
+            Cmd::FocusRightEditorGroup => self.focus_editor_group(false),
             Cmd::QuickOpen => self.open_file_finder(),
             Cmd::TakeTheTour => self.start_demo(),
             Cmd::SarifNextResult => self.step_sarif_result(true),
@@ -48756,6 +49273,26 @@ impl App {
             }
             Cmd::ShowExplorer => self.set_sidebar_view(SidebarView::Explorer),
             Cmd::ShowSearch => self.set_sidebar_view(SidebarView::Search),
+            Cmd::ReplaceInFiles => self.open_replace_in_files(),
+            // Run from the palette the side bar may be hidden, so it is
+            // revealed first: a toggle flipped out of sight is a toggle the
+            // user cannot confirm.
+            Cmd::SearchToggleMatchCase => {
+                self.set_sidebar_view(SidebarView::Search);
+                self.toggle_search_opt(crate::widgets::search::SearchToggle::CaseSensitive);
+            }
+            Cmd::SearchToggleWholeWord => {
+                self.set_sidebar_view(SidebarView::Search);
+                self.toggle_search_opt(crate::widgets::search::SearchToggle::WholeWord);
+            }
+            Cmd::SearchToggleRegex => {
+                self.set_sidebar_view(SidebarView::Search);
+                self.toggle_search_opt(crate::widgets::search::SearchToggle::UseRegex);
+            }
+            Cmd::SearchToggleDetails => {
+                self.set_sidebar_view(SidebarView::Search);
+                self.search.toggle_details();
+            }
             Cmd::ShowSourceControl => self.set_sidebar_view(SidebarView::SourceControl),
             Cmd::AddWorkspaceFolder => self.open_add_folder_picker(),
             Cmd::SaveWorkspaceAs => {
@@ -49266,6 +49803,18 @@ impl App {
                 self.status = format!("Problems: {}", self.problems.scope.label());
             }
             Cmd::DiffToggleIgnoreWhitespace => self.diff_cycle_whitespace_mode(),
+            // Cmd+] / Cmd+[ (#843), which have no `Ctrl` form. The chords
+            // work in the terminal pane; from the palette the commands bring
+            // it up and focus it first, as VS Code's do.
+            Cmd::FocusNextTerminal | Cmd::FocusPreviousTerminal => {
+                self.show_terminal = true;
+                self.focus_pane(Pane::Terminal);
+                if cmd == Cmd::FocusNextTerminal {
+                    self.cycle_terminal();
+                } else {
+                    self.cycle_terminal_back();
+                }
+            }
             Cmd::NewTerminal => match self.split_terminal() {
                 Ok(()) => {
                     self.terminal_status(format!(
@@ -53454,24 +54003,17 @@ impl App {
                         self.run_search_replace_all();
                         return;
                     }
+                    if self.search.project_exclude_toggle_at(m.column, m.row) {
+                        self.toggle_project_excludes();
+                        return;
+                    }
                     // Click inside one of the input boxes focuses that field.
                     if let Some(field) = self.search.field_at(m.column, m.row) {
                         self.search.focus_field(field);
                         return;
                     }
                     if let Some(t) = self.search.toggle_at(m.column, m.row) {
-                        match t {
-                            crate::widgets::search::SearchToggle::CaseSensitive => {
-                                self.search.opts.case_sensitive = !self.search.opts.case_sensitive;
-                            }
-                            crate::widgets::search::SearchToggle::WholeWord => {
-                                self.search.opts.whole_word = !self.search.opts.whole_word;
-                            }
-                            crate::widgets::search::SearchToggle::UseRegex => {
-                                self.search.opts.use_regex = !self.search.opts.use_regex;
-                            }
-                        }
-                        self.submit_search_query();
+                        self.toggle_search_opt(t);
                         return;
                     }
                     // Click on a result row: open it. Mirrors the Explorer's
@@ -53954,9 +54496,7 @@ impl App {
                                 (d.cur_row, d.cur_col)
                             };
                             let was_here = pr == r && pc == c;
-                            if !was_here && let Some(edit) = view.editing.take() {
-                                view.sheets[current].set_cell(pr, pc, edit.value);
-                                view.dirty = true;
+                            if !was_here && view.commit_edit().is_some() {
                                 self.editor.dirty = true;
                             }
                             let view = self.editor.sheet.as_mut().expect("checked");
@@ -55019,6 +55559,9 @@ impl App {
         // in a second buffer with a different map.
         let mut saved_paths: Vec<(PathBuf, crate::provenance::Provenance, Option<Vec<u8>>)> =
             Vec::new();
+        // And each saved tab's text, for a server whose didSave carries it
+        // (#854).
+        let mut saved_texts: Vec<String> = Vec::new();
         // The tabs of a file with a symbol tab mirror each other (#369), so
         // they hold one text: the first write saves them all, and writing a
         // second would read the first as an external change. Settle them
@@ -55096,6 +55639,7 @@ impl App {
                             // recorder can tell whether they are still the
                             // ones on disk when its worker reads (#349).
                             saved_paths.push((p, e.provenance_to_record(), e.bytes_for_disk()));
+                            saved_texts.push(e.lines.join("\n"));
                         }
                     }
                     // The latch also removes the tab from `due`, so this is
@@ -55166,8 +55710,8 @@ impl App {
             self.reload_config_for_path(path);
         }
         if let Some(lsp) = self.lsp.as_ref() {
-            for (path, ..) in &saved_paths {
-                lsp.save_doc(path.clone());
+            for ((path, ..), text) in saved_paths.iter().zip(saved_texts) {
+                lsp.save_doc(path.clone(), text);
             }
         }
         for (path, seats, described) in saved_paths {
@@ -55336,7 +55880,10 @@ impl App {
             .map(|&cmd| {
                 let shown = match self.keymap.chord_for(cmd) {
                     Some(user) => format!("{user}  (yours)"),
-                    None if !cmd.keybinding_hint().is_empty() => cmd.keybinding_hint().to_string(),
+                    None if !cmd.keybinding_hint().is_empty() => {
+                        crate::widgets::command_palette::platform_hint(cmd.keybinding_hint())
+                            .into_owned()
+                    }
                     None => String::from("\u{2014}"),
                 };
                 ListRow {
@@ -56567,6 +57114,14 @@ impl App {
             }
             return;
         }
+        // A cell still being typed into is part of the save (#1140): commit
+        // it the way Enter does, so it reaches the file.
+        if let Some(view) = self.editor.sheet.as_mut()
+            && view.editable()
+            && view.commit_edit().is_some()
+        {
+            self.editor.dirty = true;
+        }
         // A CSV/TSV sheet with grid edits saves through its own
         // serialisation path (#177), same shape as the hex branch above.
         if self.editor.sheet.as_ref().is_some_and(|v| v.dirty) {
@@ -56613,7 +57168,22 @@ impl App {
         // choke-point guard in `write_buffer_to_disk` backstops every
         // other path.
         if self.editor.has_non_text_view() {
-            self.status = String::from("Nothing to save: this tab is a read-only preview");
+            // An editable grid or hex view with nothing to write isn't a
+            // preview (#1140).
+            let editable = self.editor.sheet.as_ref().is_some_and(|v| v.editable())
+                || self.editor.hex.is_some();
+            self.status = if self
+                .editor
+                .hex
+                .as_ref()
+                .is_some_and(|v| v.pending_nibble.is_some())
+            {
+                String::from("Type the byte's second hex digit, then save")
+            } else if editable {
+                String::from("No changes to save")
+            } else {
+                String::from("Nothing to save: this tab is a read-only preview")
+            };
             return;
         }
         // Guests in a collab session never write shared files: the owner is
@@ -56775,6 +57345,65 @@ impl App {
         }
     }
 
+    /// Flip the Search panel's project exclusions on or off (#1345), VS
+    /// Code's "Use Exclude Settings and Ignore Files", and search again.
+    fn toggle_project_excludes(&mut self) {
+        self.search.use_exclude_settings = !self.search.use_exclude_settings;
+        self.status = String::from(if self.search.use_exclude_settings {
+            "Search: project exclusions on"
+        } else {
+            "Search: project exclusions off, searching every folder"
+        });
+        if !crate::widgets::search::as_typed(&self.search.query).is_empty() {
+            self.submit_search_query();
+        }
+    }
+
+    /// Apply the project's `files_exclude` / `search_exclude` globs
+    /// (#1345): the Explorer hides `files_exclude`, Search and Go to File
+    /// leave out both. Re-lists the tree and re-runs a live search only
+    /// when the globs changed.
+    fn apply_project_excludes(&mut self, p: &crate::prefs::Prefs) {
+        let mut search = p.files_exclude.clone();
+        search.extend(p.search_exclude.iter().cloned());
+        if search != self.search.project_exclude {
+            self.search.project_exclude = search;
+            if !crate::widgets::search::as_typed(&self.search.query).is_empty() {
+                self.submit_search_query();
+            }
+        }
+        if p.files_exclude != self.files_exclude {
+            self.files_exclude = p.files_exclude.clone();
+            self.tree.exclude = crate::widgets::search::PathFilter::excluding(&self.files_exclude);
+            self.tree.refresh_children(0);
+        }
+    }
+
+    /// The Go to File index without the files the project excludes
+    /// (#1345): VS Code's file search honours both exclude settings.
+    fn without_project_excludes(
+        &self,
+        entries: std::sync::Arc<Vec<crate::widgets::file_finder::FileEntry>>,
+    ) -> std::sync::Arc<Vec<crate::widgets::file_finder::FileEntry>> {
+        if self.search.project_exclude.is_empty() {
+            return entries;
+        }
+        let filter = crate::widgets::search::PathFilter::excluding(&self.search.project_exclude);
+        let kept = entries
+            .iter()
+            .filter(|e| {
+                let root = self
+                    .roots
+                    .iter()
+                    .find(|r| e.path.starts_with(r))
+                    .map_or_else(|| self.roots.primary().to_path_buf(), |r| r.to_path_buf());
+                !filter.excludes(&root, &e.path)
+            })
+            .cloned()
+            .collect();
+        std::sync::Arc::new(kept)
+    }
+
     /// Re-run the layered settings merge (#251) and apply everything that can
     /// apply live: theme, editor toggles, save behavior, host accents. Called
     /// when any file of the chain is saved in the editor; layout and other
@@ -56814,6 +57443,7 @@ impl App {
         self.auto_save = p.auto_save;
         self.auto_save_on_focus_change = p.auto_save_on_focus_change;
         self.copy_on_select = p.copy_on_select;
+        self.apply_project_excludes(p);
         // The ssh-pane offer's switches apply live like every other pref
         // here (#364); turning it off also takes down an offer on screen.
         self.remote_offer_disabled = p.disable_remote_offer;
@@ -56879,6 +57509,7 @@ impl App {
         }
         self.auto_close_pairs = !p.disable_auto_close_pairs;
         self.editor.auto_close_pairs = self.auto_close_pairs;
+        self.follow_vim_mode_pref(p.vim_mode);
         if !p.disable_inline_blame && !self.inline_blame_enabled {
             // Re-enabling refetches, like toggle_inline_blame.
             self.blame_fetched = None;
@@ -56919,7 +57550,7 @@ impl App {
     /// panel never refreshes after a save (issue #37).
     fn lsp_notify_saved(&mut self) {
         if let (Some(lsp), Some(path)) = (self.lsp.as_ref(), self.editor.path.clone()) {
-            lsp.save_doc(path);
+            lsp.save_doc(path, self.editor.lines.join("\n"));
         }
     }
 
@@ -57135,10 +57766,11 @@ impl App {
             Ok(SaveOutcome::Saved) => {
                 let seats = editor.provenance_to_record();
                 let described = editor.bytes_for_disk();
+                let text = editor.lines.join("\n");
                 self.status = editor.status.clone();
                 self.record_history_snapshot_of(path, seats, described);
                 if let Some(lsp) = self.lsp.as_ref() {
-                    lsp.save_doc(path.to_path_buf());
+                    lsp.save_doc(path.to_path_buf(), text);
                 }
                 self.reload_config_for_path(path);
             }
@@ -59720,6 +60352,29 @@ impl App {
     /// full viewport, Home/End jump to the first/last row, Tab/Shift+Tab
     /// switch worksheets. Anything else is swallowed so a stray keystroke
     /// can't insert characters into a buffer the user can't see.
+    /// Go to Next / Previous Change (#1352): in a diff tab its hunks, in a
+    /// buffer with merge conflicts its conflicts, otherwise the editor's
+    /// change bars, wrapping at the ends.
+    fn jump_editor_change(&mut self, forward: bool) {
+        if self.editor.diff.is_some() {
+            self.jump_diff_change(forward);
+            return;
+        }
+        if !self.editor.conflicts().is_empty() {
+            self.jump_conflict(!forward);
+            return;
+        }
+        let row = self.editor.cursor_row;
+        match self.editor.git_change_from(row, forward) {
+            Some(line) => {
+                self.editor.clear_selection();
+                self.editor.goto_line_centered(line);
+                self.status = format!("Change at line {}", line + 1);
+            }
+            None => self.status = String::from("No changes in this file"),
+        }
+    }
+
     /// Scroll the active diff to the next change hunk (forward=true) or
     /// the previous one (forward=false), wrapping around the ends so a
     /// user can keep clicking the same arrow to cycle through every
@@ -59969,16 +60624,7 @@ impl App {
                     self.status = String::from("This view is read-only");
                     return;
                 }
-                let edit = sheet.editing.take().expect("checked");
-                let (r, c) = {
-                    let data = &mut sheet.sheets[current];
-                    data.set_cell(data.cur_row, data.cur_col, edit.value);
-                    (data.cur_row, data.cur_col)
-                };
-                if !sheet.cell_edits.contains(&(current, r, c)) {
-                    sheet.cell_edits.push((current, r, c));
-                }
-                sheet.dirty = true;
+                let (r, c) = sheet.commit_edit().expect("checked");
                 self.editor.dirty = true;
                 let data = &mut self.editor.sheet.as_mut().expect("checked").sheets[current];
                 data.cur_row = r
@@ -60030,6 +60676,16 @@ impl App {
                     return;
                 }
                 data.cur_row = data.cur_row.saturating_sub(visible);
+            }
+            KeyCode::Home | KeyCode::End
+                if sheet.kind == crate::sheet::SheetKind::Sqlite
+                    && (key.modifiers.contains(KeyModifiers::CONTROL)
+                        || key.modifiers.contains(KeyModifiers::SUPER)) =>
+            {
+                // The table's first or last row, not the loaded batch's
+                // (#1222).
+                self.sqlite_jump(key.code == KeyCode::End, visible);
+                return;
             }
             KeyCode::Home => {
                 data.cur_col = 0;
@@ -62244,6 +62900,30 @@ impl App {
         };
     }
 
+    /// Rendered log keys (#1189): the arrows move a line, PageUp/PageDown a
+    /// screen, Home/End (with or without Ctrl) go to the top and the tail.
+    /// The tab's text side is a one-line stub, so every other key is
+    /// swallowed: reaching the editor, it pinned the view to line 1 and
+    /// typing marked the read-only tab modified. Copy, Esc and the
+    /// tab-number jumps are left to the editor (false), which handles them
+    /// for a log.
+    fn handle_log_key(&mut self, key: KeyEvent) -> bool {
+        if is_editor_copy_key(key) || jump_to_tab_index(key).is_some() || key.code == KeyCode::Esc {
+            return false;
+        }
+        let page = self.editor.visible_rows().saturating_sub(2).max(1);
+        match key.code {
+            KeyCode::Down => self.editor.scroll_down(1),
+            KeyCode::Up => self.editor.scroll_up(1),
+            KeyCode::PageDown => self.editor.scroll_down(page),
+            KeyCode::PageUp => self.editor.scroll_up(page),
+            KeyCode::End => self.editor.scroll_down(usize::MAX / 2),
+            KeyCode::Home => self.editor.scroll_up(usize::MAX / 2),
+            _ => {}
+        }
+        true
+    }
+
     /// Archive browser keys (#179): selection movement, Enter extracts
     /// the member to scratch and opens it through the normal dispatch,
     /// E prompts for an extraction folder.
@@ -62507,14 +63187,11 @@ impl App {
     /// Step the active SQLite table to an adjacent page (#201 review),
     /// replacing the sheet's rows and keeping the cursor sane.
     fn sqlite_page_step(&mut self, delta: i64) {
-        let Some(path) = self.editor.path.clone() else {
-            return;
-        };
-        let Some(view) = self.editor.sheet.as_mut() else {
+        let Some(view) = self.editor.sheet.as_ref() else {
             return;
         };
         let idx = view.current_sheet;
-        let Some((table, page)) = view.sqlite_pages.get(idx).cloned() else {
+        let Some(&(_, page)) = view.sqlite_pages.get(idx) else {
             return;
         };
         let next = page.saturating_add_signed(delta as isize);
@@ -62528,15 +63205,73 @@ impl App {
         } else if page == 0 {
             return;
         }
+        self.sqlite_load_page(next, delta < 0);
+    }
+
+    /// Ctrl+Home / Ctrl+End in a SQLite table (#1222): the table's first or
+    /// last row, loading its page, not the loaded batch's.
+    fn sqlite_jump(&mut self, to_end: bool, visible: usize) {
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let Some(view) = self.editor.sheet.as_ref() else {
+            return;
+        };
+        let idx = view.current_sheet;
+        let Some((table, page)) = view.sqlite_pages.get(idx).cloned() else {
+            return;
+        };
+        let target = if to_end {
+            match crate::sqlite_view::last_page(&path, &table) {
+                Ok(last) => last,
+                Err(e) => {
+                    self.status = format!("Page fetch failed: {e}");
+                    return;
+                }
+            }
+        } else {
+            0
+        };
+        if target != page {
+            self.sqlite_load_page(target, to_end);
+        }
+        if let Some(view) = self.editor.sheet.as_mut() {
+            let data = &mut view.sheets[idx];
+            (data.cur_row, data.cur_col) = if to_end {
+                (
+                    data.row_count().saturating_sub(1),
+                    data.col_count().saturating_sub(1),
+                )
+            } else {
+                (0, 0)
+            };
+            sheet_follow_cursor(view, idx, visible);
+        }
+    }
+
+    /// Replace the current SQLite sheet with page `next` of its table, the
+    /// cursor on its last row when `at_end`.
+    fn sqlite_load_page(&mut self, next: usize, at_end: bool) {
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let Some(view) = self.editor.sheet.as_mut() else {
+            return;
+        };
+        let idx = view.current_sheet;
+        let Some((table, _)) = view.sqlite_pages.get(idx).cloned() else {
+            return;
+        };
         match crate::sqlite_view::table_page(&path, &table, next) {
             Ok((headers, rows, more)) if !rows.is_empty() || next == 0 => {
                 let got = rows.len();
                 let label = crate::sqlite_view::page_label(&table, next, got, more);
-                view.sheets[idx] = crate::sheet::sheet_data_from_parts(label, headers, rows);
-                if delta < 0 {
-                    let last = view.sheets[idx].row_count().saturating_sub(1);
-                    view.sheets[idx].cur_row = last;
+                let mut data = crate::sheet::sheet_data_from_parts(label, headers, rows);
+                data.row_base = next * crate::sqlite_view::ROW_CAP;
+                if at_end {
+                    data.cur_row = data.row_count().saturating_sub(1);
                 }
+                view.sheets[idx] = data;
                 view.sqlite_pages[idx].1 = next;
             }
             Ok(_) => self.status = String::from("Last page"),
@@ -63619,6 +64354,12 @@ fn has_cmd(mods: KeyModifiers) -> bool {
     cmd_active(mods, crate::iterm2_inline::detect_termux())
 }
 
+/// [`has_cmd`], or off macOS a `Ctrl`: the command modifier LINUX.md
+/// promises there (#843), for the chords whose `Ctrl` spelling is free.
+fn has_cmd_or_linux_ctrl(mods: KeyModifiers) -> bool {
+    has_cmd(mods) || (cfg!(not(target_os = "macos")) && mods.contains(KeyModifiers::CONTROL))
+}
+
 /// Build the OSC 0 escape sequence that sets the terminal's window/icon title.
 ///
 /// Format: `ESC ] 0 ; <title> BEL`.  Control bytes that would break the escape
@@ -63992,8 +64733,9 @@ fn is_go_to_symbol_key(key: KeyEvent) -> bool {
 /// `Cmd+K` (macOS) / `Ctrl+K` (Linux / Termux): the leader for croft's
 /// `Cmd+K`-prefixed chords (Color Theme, Close to the Right, Select for /
 /// Compare with Selected, Close All). Rejects Shift and Alt so it never
-/// shadows a future `Cmd+K`+modifier chord.
-fn is_cmd_k_leader_key(key: KeyEvent) -> bool {
+/// shadows a future `Cmd+K`+modifier chord. `ctrl_leads` is
+/// [`ctrl_k_leads`] for the focused pane.
+fn is_cmd_k_leader_key(key: KeyEvent, ctrl_leads: bool) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
     };
@@ -64003,11 +64745,19 @@ fn is_cmd_k_leader_key(key: KeyEvent) -> bool {
     if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
-    // SUPER everywhere; CONTROL only on Termux (where Ctrl is the cmd
-    // surrogate). Off Termux a bare Ctrl+K must fall through to the editor's
-    // kill-to-end-of-line rather than arming the leader — using `has_cmd`
-    // keeps this consistent with every other croft chord (e.g. Cmd+\ split).
-    has_cmd(key.modifiers)
+    has_cmd(key.modifiers) || (ctrl_leads && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+/// Whether a bare `Ctrl+K` arms the `Cmd+K` leader (#843). Off macOS it
+/// does, as in VS Code's Linux keymap: Super reaches croft only over the
+/// kitty keyboard protocol, so in GNOME Terminal, Konsole, xterm or tmux no
+/// leader chord was reachable at all. Two places keep `Ctrl+K` for their
+/// own job: a focused shell (readline's kill-line) and the editor in vim
+/// mode (kill to end of line, also the palette's "Kill to End of Line").
+/// On macOS `Ctrl+K` stays kill-line and Cmd leads; on Termux `Ctrl` is
+/// the command key outright ([`cmd_active`]), so this is not consulted.
+fn ctrl_k_leads(macos: bool, shell_focused: bool, vim_editing: bool) -> bool {
+    !macos && !shell_focused && !vim_editing
 }
 
 /// `Cmd+/` (macOS) / `Ctrl+/` (Linux / Termux): Toggle Line Comment. Rejects
@@ -64251,6 +65001,37 @@ fn is_show_output_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'u')
 }
 
+/// `Ctrl/Cmd+Shift+H`: Search: Replace in Files, VS Code's chord (#860). In
+/// the live terminal `Ctrl+Shift+H` stays `is_command_history_key`'s; the
+/// dispatcher checks that before this.
+fn is_replace_in_files_key(key: KeyEvent) -> bool {
+    is_cmd_shift_letter(key, 'h')
+}
+
+/// `Alt+C` / `Alt+W` / `Alt+R` while a Search side bar input has focus: the
+/// `Aa` / `ab` / `.*` toggle each flips, VS Code's search-input keys (#860).
+/// Only a bare Alt: a macOS terminal that sends Option+C as `ç` is typing,
+/// and taking that glyph would eat it on the keyboards that have it.
+fn search_toggle_for_key(key: KeyEvent) -> Option<crate::widgets::search::SearchToggle> {
+    use crate::widgets::search::SearchToggle;
+    if key.modifiers != KeyModifiers::ALT {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('c' | 'C') => Some(SearchToggle::CaseSensitive),
+        KeyCode::Char('w' | 'W') => Some(SearchToggle::WholeWord),
+        KeyCode::Char('r' | 'R') => Some(SearchToggle::UseRegex),
+        _ => None,
+    }
+}
+
+/// `Alt+D` while a Search side bar input has focus: show or hide the "files
+/// to include / exclude" rows (#860). VS Code's own chord, `Ctrl+Shift+J`, is
+/// croft's maximize-terminal, so D for details.
+fn is_search_details_key(key: KeyEvent) -> bool {
+    key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('d' | 'D'))
+}
+
 /// `Cmd+Opt+S` / `Ctrl+Alt+S`: File: Save All (#852). VS Code's macOS chord;
 /// its Linux `Ctrl+K S` is croft's Select for Compare. Shift is rejected:
 /// `Cmd+Opt+Shift+S` converts indentation to spaces.
@@ -64326,10 +65107,13 @@ fn is_markdown_preview_key(key: KeyEvent) -> bool {
 }
 
 /// Cmd+Enter (#353): run the shell fence under the caret in a Markdown
-/// source buffer.
+/// source buffer. Off macOS `Ctrl`+`Enter` too (#843): there it only
+/// duplicated `Enter`, and Super reaches croft only over the kitty keyboard
+/// protocol. Where a terminal sends `Ctrl`+`Enter` as a bare `Enter`, the
+/// palette's "Markdown: Run Code Block at Cursor" runs it.
 fn is_run_fence_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Enter)
-        && key.modifiers.contains(KeyModifiers::SUPER)
+        && has_cmd_or_linux_ctrl(key.modifiers)
         // Cmd+Shift+Enter is "insert line above"; Alt chords stay the
         // editor's.
         && !key
@@ -64830,28 +65614,31 @@ fn outline_parses_inline(lines: &[String]) -> bool {
         .is_some()
 }
 
-/// The breadcrumb scope chain for `line`: the indices of every outline symbol
-/// whose range encloses the caret line, ordered outermost first (the enclosing
-/// class before the method inside it). Sibling symbols never overlap, so the
-/// enclosing symbols form a single nesting chain and ordering by decreasing
-/// span puts the outermost first.
+/// The breadcrumb scope chain for the caret at (`line`, `col`): the indices
+/// of every outline symbol whose range encloses that position, ordered
+/// outermost first (the enclosing class before the method inside it).
+/// Columns count (#1221): symbols sharing a line, such as a one-line
+/// interface's fields or a minified bundle's functions, are siblings, and
+/// only the one the caret is in belongs to the chain. Enclosing ranges nest,
+/// so the earliest start (then the latest end) is the outermost.
 fn breadcrumb_symbol_chain(
     symbols: &[crate::lsp::manager::OutlineSymbol],
     line: u32,
+    col: u32,
 ) -> Vec<usize> {
+    let start =
+        |s: &crate::lsp::manager::OutlineSymbol| (s.range_start_line, s.range_start_character);
+    let end = |s: &crate::lsp::manager::OutlineSymbol| (s.range_end_line, s.range_end_character);
     let mut hits: Vec<usize> = symbols
         .iter()
         .enumerate()
-        .filter(|(_, s)| line >= s.range_start_line && line <= s.range_end_line)
+        .filter(|(_, s)| start(s) <= (line, col) && (line, col) <= end(s))
         .map(|(i, _)| i)
         .collect();
     hits.sort_by(|&a, &b| {
-        let span = |i: usize| symbols[i].range_end_line - symbols[i].range_start_line;
-        span(b).cmp(&span(a)).then(
-            symbols[a]
-                .range_start_line
-                .cmp(&symbols[b].range_start_line),
-        )
+        start(&symbols[a])
+            .cmp(&start(&symbols[b]))
+            .then(end(&symbols[b]).cmp(&end(&symbols[a])))
     });
     hits
 }
@@ -67882,6 +68669,16 @@ struct CollabStreamInfo {
     file: String,
     name: String,
     site: u64,
+    /// The undo group the stream's edits share (#1207), so the whole
+    /// stream undoes in one step.
+    undo_group: u64,
+}
+
+/// A fresh remote undo group id (#1207), unique for the process.
+fn next_remote_undo_group() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// The name this participant broadcasts on its carets: `CROFT_COLLAB_NAME`
@@ -67928,7 +68725,7 @@ fn collab_caret_color(navigator_sites: &[u64], site: u64) -> Color {
 /// The tree-sitter grammar for `path`, by extension: what symbol tabs
 /// (#369) parse to re-find a renamed or displaced symbol.
 fn syntax_kind_of(path: &Path) -> Option<crate::highlight::LangKind> {
-    crate::highlight::lang_for_extension(path.extension()?.to_str()?)
+    crate::highlight::lang_for_path(path)
 }
 
 /// `path` relative to `repo_root` with forward slashes, as GitHub names it.

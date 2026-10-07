@@ -93,7 +93,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Cmd/Ctrl+K",
-                description: "Chord leader: press, then a follow-up key for extra accelerators",
+                description: "Chord leader: press, then a follow-up key for extra accelerators (off macOS Ctrl+K leads everywhere but the terminal and the vim-mode editor)",
                 handler: "is_cmd_k_leader_key",
             },
             ShortcutEntry {
@@ -152,6 +152,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_save_all_key",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+H",
+                description: "Replace in Files: the Search sidebar with its Replace row open and focused (in the terminal, Ctrl+Shift+H is command history)",
+                handler: "is_replace_in_files_key",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+Shift+B",
                 description: "Run the project's build task, auto-detected from its manifests (Makefile, package.json, Cargo.toml, …)",
                 handler: "is_run_build_task_key",
@@ -163,7 +168,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Cmd+Opt+Left / Right",
-                description: "Move focus to the left / right editor group while split",
+                description: "Move focus to the left / right editor group while split (also the palette's View: Focus Left / Right Editor Group)",
                 handler: "is_focus_group_left_key is_focus_group_right_key",
             },
             ShortcutEntry {
@@ -248,7 +253,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Cmd+Z",
-                description: "Jump to a directory via zoxide; re-roots the workspace and cd's the active terminal",
+                description: "Jump to a directory via zoxide; re-roots the workspace and cd's the active terminal (also the palette's Explorer: Jump to Directory (zoxide))",
                 handler: "is_tree_zoxide_jump_key",
             },
             ShortcutEntry {
@@ -352,8 +357,8 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_markdown_preview_key",
             },
             ShortcutEntry {
-                keys: "Cmd+Enter",
-                description: "Markdown: run the runnable fence under the caret in a named pane, new or reused (confirms first)",
+                keys: "Cmd/Ctrl+Enter",
+                description: "Markdown: run the runnable fence under the caret in a named pane, new or reused (confirms first; also the palette's Markdown: Run Code Block at Cursor)",
                 handler: "is_run_fence_key",
             },
             ShortcutEntry {
@@ -403,7 +408,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Cmd/Ctrl+A",
-                description: "Select the entire buffer",
+                description: "Select the entire buffer (in the editor off macOS Ctrl+A is line start: the palette's Select All)",
                 handler: "is_editor_select_all_key",
             },
             ShortcutEntry {
@@ -437,8 +442,8 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_completion_trigger_key",
             },
             ShortcutEntry {
-                keys: "Cmd/Ctrl+E",
-                description: "Toggle native modal (vim) editing",
+                keys: "Cmd+E",
+                description: "Toggle native modal (vim) editing (off macOS Ctrl+E is end of line: Super+E, or the palette's Toggle Vim Mode)",
                 handler: "is_vim_toggle_key",
             },
             ShortcutEntry {
@@ -588,7 +593,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Cmd+F12",
-                description: "Go to implementations",
+                description: "Go to implementations (off macOS Ctrl+F12 is Type Definition: the palette's Go to Implementations)",
                 handler: "is_go_to_implementation_key",
             },
             ShortcutEntry {
@@ -618,7 +623,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Ctrl+K",
-                description: "Kill from cursor to end of line",
+                description: "Kill from cursor to end of line (macOS, or vim mode; elsewhere palette \"Kill to End of Line\")",
                 handler: "is_editor_kill_to_eol_key",
             },
             ShortcutEntry {
@@ -953,7 +958,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Cmd+[ / Cmd+]",
-                description: "Cycle to the previous / next terminal",
+                description: "Cycle to the previous / next terminal (also the palette's Terminal: Focus Previous / Next Terminal)",
                 handler: "is_terminal_cycle_back_key is_terminal_cycle_key",
             },
             ShortcutEntry {
@@ -1045,6 +1050,16 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 keys: "Click Aa / ab / .*",
                 description: "Case-sensitive / whole-word / regex toggles",
                 handler: "",
+            },
+            ShortcutEntry {
+                keys: "Alt+C / Alt+W / Alt+R",
+                description: "Toggle match case / whole word / regex from any Search input",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Alt+D",
+                description: "Show or hide the files to include / exclude inputs",
+                handler: "is_search_details_key",
             },
             ShortcutEntry {
                 keys: "Up / Down + Enter",
