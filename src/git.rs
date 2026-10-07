@@ -62,7 +62,8 @@ pub fn query(root: &Path) -> GitStatus {
     } else {
         None
     };
-    let porcelain = run_git(root, &["status", "--porcelain"]).unwrap_or_default();
+    let porcelain =
+        run_git(root, &["status", "--porcelain", "--untracked-files=all"]).unwrap_or_default();
     let dirty = parse_porcelain_dirty(&porcelain);
     let changed_count = porcelain.lines().filter(|l| !l.trim().is_empty()).count();
     let (ahead, behind) = match run_git(
@@ -648,7 +649,7 @@ pub fn query_changes(root: &Path) -> Vec<ChangeEntry> {
     let output = match Command::new("git")
         // Poll without taking index.lock; see run_git.
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .args(["-C", path_str, "status", "--porcelain"])
+        .args(["-C", path_str, "status", "--porcelain", "--untracked-files=all"])
         .output()
     {
         Ok(o) if o.status.success() => o,
@@ -788,17 +789,7 @@ pub fn read_bytes_at_head(root: &Path, rel_path: &str) -> Result<Vec<u8>, String
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
     let spec = format!("HEAD:{rel_path}");
-    // A filtered file (Git LFS) is stored in its clean form, a pointer, while
-    // the working tree holds the smudged content: read HEAD through the
-    // filter so the diff compares like with like (#1238).
-    let read = match path_filter(root, rel_path) {
-        Some(_) => ["cat-file", "--filters"],
-        None => ["show", ""],
-    };
-    let output = Command::new("git")
-        .args(["-C", path_str])
-        .args(read.iter().filter(|a| !a.is_empty()))
-        .arg(&spec)
+    let output = show_blob(Path::new(path_str), &spec, rel_path)
         .output()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
     if !output.status.success() {
@@ -815,17 +806,32 @@ pub fn read_bytes_at_head(root: &Path, rel_path: &str) -> Result<Vec<u8>, String
     Ok(output.stdout)
 }
 
+/// The `git` command that prints the blob `spec` names, for `rel_path`.
+///
+/// A filtered file (Git LFS) is stored in its clean form, a pointer, while
+/// the working tree holds the smudged content: such a blob is read through
+/// the filter (`cat-file --filters`), so every view of a past version shows
+/// the file and not the pointer (#1238, #1338). Anything else is read with
+/// `git show`, byte for byte as git stores it.
+fn show_blob(root: &Path, spec: &str, rel_path: &str) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(root);
+    match path_filter(root, rel_path) {
+        Some(_) => cmd.args(["cat-file", "--filters"]),
+        None => cmd.arg("show"),
+    };
+    cmd.arg(spec);
+    cmd
+}
+
 /// The contents of `rel_path` (relative to `root`) at revision `rev`, via
-/// `git show <rev>:./<rel_path>`. The `./` makes the path relative to
+/// `git show <rev>:./<rel_path>` (through the filter for a filtered file). The `./` makes the path relative to
 /// `root` rather than to the repository top, so a workspace opened in a
 /// subdirectory of a repo still reads the right file. `Err` when the file
 /// did not exist at that revision or is not UTF-8.
 pub fn read_file_at_rev(root: &Path, rev: &str, rel_path: &str) -> Result<String, String> {
     let spec = format!("{rev}:./{rel_path}");
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["show", &spec])
+    let output = show_blob(root, &spec, rel_path)
         .output()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
     if !output.status.success() {
@@ -845,8 +851,7 @@ pub fn read_file_at_stage(root: &Path, rel_path: &str, stage: u8) -> Result<Stri
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
     let spec = format!(":{stage}:{rel_path}");
-    let output = Command::new("git")
-        .args(["-C", path_str, "show", &spec])
+    let output = show_blob(Path::new(path_str), &spec, rel_path)
         .output()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
     if !output.status.success() {
@@ -1102,8 +1107,12 @@ pub fn commit_all_tracked(root: &Path, message: &str) -> Result<String, String> 
     let path_str = root
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
-    let output = Command::new("git")
-        .args(["-C", path_str, "commit", "-am", message])
+    // A hook or signing helper that wants a terminal fails fast with its
+    // own message instead of fighting croft for the screen (#1153).
+    let mut cmd = Command::new("git");
+    cmd.args(["-C", path_str, "commit", "-am", message]);
+    never_prompt(&mut cmd);
+    let output = cmd
         .output()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1281,6 +1290,9 @@ pub fn parse_file_history(out: &str, now: i64) -> Vec<FileHistoryEntry> {
 /// Raw `git show <hash> -- <rel_path>` text: the file's diff in that commit,
 /// for opening a TIMELINE entry in the side-by-side diff viewer.
 pub fn show_commit_file_diff(root: &Path, hash: &str, rel_path: &str) -> Result<String, String> {
+    if path_filter(root, rel_path).is_some() {
+        return filtered_commit_file_diff(root, hash, rel_path);
+    }
     let has_diff = |raw: &str| raw.lines().any(|l| l.starts_with("diff --git"));
     let raw = diff_text(root, &["show", hash, "--", rel_path])?;
     if has_diff(&raw) {
@@ -1293,6 +1305,28 @@ pub fn show_commit_file_diff(root: &Path, hash: &str, rel_path: &str) -> Result<
         Some(old) if old != rel_path => diff_text(root, &["show", hash, "--", &old]),
         _ => Ok(raw),
     }
+}
+
+/// [`show_commit_file_diff`] for a filtered file (#1338). `git show` diffs
+/// the stored blobs, which for Git LFS are pointers whose only change is the
+/// `oid` line, so the two sides are read through the filter instead and
+/// diffed here, under the commit's own `git show` header, in the shape the
+/// viewer parses for an unfiltered file.
+fn filtered_commit_file_diff(root: &Path, hash: &str, rel_path: &str) -> Result<String, String> {
+    let name = match read_file_at_rev(root, hash, rel_path) {
+        Ok(_) => rel_path.to_string(),
+        Err(_) => path_at_commit(root, hash, rel_path).unwrap_or_else(|| rel_path.to_string()),
+    };
+    let new = read_file_at_rev(root, hash, &name)?;
+    // Absent before this commit (the file was added here, or this is the
+    // root commit): every line is new.
+    let old = read_file_at_rev(root, &format!("{hash}^"), &name).unwrap_or_default();
+    let body = similar::TextDiff::from_lines(&old, &new)
+        .unified_diff()
+        .header(&format!("a/{name}"), &format!("b/{name}"))
+        .to_string();
+    let header = diff_text(root, &["show", "-s", hash])?;
+    Ok(format!("{header}\ndiff --git a/{name} b/{name}\n{body}"))
 }
 
 /// The name `rel_path` had in commit `hash`, from the same `--follow` walk
@@ -3478,6 +3512,55 @@ mod tests {
         assert!(commit_all_tracked(tmp.path(), "   \n").is_err());
     }
 
+    /// GIT_TERMINAL_PROMPT and a null stdin are checked too, but the session
+    /// is what tells: a test runner has no terminal to hand on and may set
+    /// GIT_TERMINAL_PROMPT=0 itself, while a hook still in croft's session
+    /// can open croft's `/dev/tty`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn commit_all_tracked_never_offers_its_hooks_the_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(args)
+                .output()
+                .unwrap();
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "a@b"]);
+        git(&["config", "user.name", "a"]);
+        std::fs::write(p.join("f.txt"), "one\n").unwrap();
+        git(&["add", "f.txt"]);
+        git(&["commit", "-qm", "init"]);
+        let hook = p.join(".git/hooks/pre-commit");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\necho \"prompt=$GIT_TERMINAL_PROMPT\" > seen\n\
+             if [ -t 0 ]; then echo stdin=tty >> seen; else echo stdin=none >> seen; fi\n\
+             if [ \"$(cut -d' ' -f6 /proc/$$/stat)\" = \"$(cat croft_sid)\" ]; \
+             then echo session=croft >> seen; else echo session=own >> seen; fi\n",
+        )
+        .unwrap();
+        // SAFETY: getsid(0) only reads the calling process's session id.
+        let sid = unsafe { libc::getsid(0) };
+        std::fs::write(p.join("croft_sid"), sid.to_string()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(p.join("f.txt"), "two\n").unwrap();
+        commit_all_tracked(p, "two").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(p.join("seen")).unwrap(),
+            "prompt=0\nstdin=none\nsession=own\n"
+        );
+    }
+
     #[test]
     fn commit_all_tracked_creates_a_commit_in_a_real_repo() {
         let tmp = TempDir::new().unwrap();
@@ -3931,6 +4014,48 @@ mod tests {
             None,
             "outside a repo there is no toplevel"
         );
+    }
+
+    /// A new folder lists each of its files (#1279), not one `dir/` row
+    /// that opens nothing and has no line count.
+    #[test]
+    fn a_new_folder_lists_each_of_its_files() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::create_dir_all(p.join("src/billing")).unwrap();
+        std::fs::write(
+            p.join("src/billing/invoice.py"),
+            "def invoice(total):\n    return round(total * 1.2, 2)\n",
+        )
+        .unwrap();
+        std::fs::write(p.join("src/billing/tax.py"), "RATE = 0.2\n").unwrap();
+        let entries = query_changes(p);
+        let untracked: Vec<(&str, usize)> = entries
+            .iter()
+            .filter(|e| e.kind == ChangeKind::Untracked)
+            .map(|e| (e.path.as_str(), e.additions))
+            .collect();
+        assert_eq!(
+            untracked,
+            [("src/billing/invoice.py", 2), ("src/billing/tax.py", 1)]
+        );
+        assert_eq!(query(p).changed_count, 2, "the badge counts files too");
+    }
+
+    #[test]
+    fn an_ignored_folder_still_lists_nothing() {
+        // Negative: `-uall` lists untracked files, never ignored ones.
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join(".gitignore"), "build/\n").unwrap();
+        sh_git(p, &["add", ".gitignore"]);
+        sh_git(p, &["commit", "-qm", "ignore"]);
+        std::fs::create_dir_all(p.join("build/out")).unwrap();
+        std::fs::write(p.join("build/out/a.o"), "x").unwrap();
+        assert!(query_changes(p).is_empty());
+        assert_eq!(query(p).changed_count, 0);
     }
 
     /// git's prepared message for a conflicted merge (#1282), comments
@@ -5078,6 +5203,94 @@ filename seed.txt
             work.contains("row FIVE\n"),
             "the working file is untouched: {work}"
         );
+    }
+
+    /// [`filtered_repo`] with its edits committed: HEAD~1 holds `row 5`,
+    /// HEAD holds `row FIVE`, in both the filtered and the plain file.
+    fn filtered_history(root: &Path) {
+        filtered_repo(root);
+        sh_git(root, &["commit", "-q", "-am", "Rename row 5"]);
+    }
+
+    /// The `-`/`+` lines of a unified diff, headers left out.
+    fn changed_lines(diff: &str) -> Vec<&str> {
+        diff.lines()
+            .filter(|l| l.starts_with(['-', '+']) && !l.starts_with("---") && !l.starts_with("+++"))
+            .collect()
+    }
+
+    #[test]
+    fn a_filtered_files_past_versions_read_as_the_file_not_what_git_stores() {
+        // #1338: Scrub History read the pointer (here, rot13 text) at every
+        // past commit, and the merge editor's sides had the same gap.
+        let tmp = TempDir::new().unwrap();
+        filtered_history(tmp.path());
+        let past = read_file_at_rev(tmp.path(), "HEAD~1", "data.txt").unwrap();
+        assert!(past.starts_with("row 1\n"), "{past}");
+        assert!(past.contains("row 5\n") && !past.contains("FIVE"), "{past}");
+        let now = read_file_at_rev(tmp.path(), "HEAD", "data.txt").unwrap();
+        assert!(now.contains("row FIVE\n"), "{now}");
+        let staged = read_file_at_stage(tmp.path(), "data.txt", 0).unwrap();
+        assert_eq!(staged, now, "an index stage reads through the filter too");
+    }
+
+    #[test]
+    fn a_filtered_files_timeline_diff_shows_what_changed_in_the_file() {
+        let tmp = TempDir::new().unwrap();
+        filtered_history(tmp.path());
+        let hash = sh_git(tmp.path(), &["rev-parse", "--short", "HEAD"]);
+        let raw = show_commit_file_diff(tmp.path(), hash.trim(), "data.txt").unwrap();
+        assert!(
+            raw.starts_with("commit ") && raw.contains("    Rename row 5\n\ndiff --git"),
+            "the commit header an unfiltered file's diff carries: {raw}"
+        );
+        assert_eq!(
+            changed_lines(&raw),
+            vec!["-row 5", "+row FIVE"],
+            "the content change, not the stored form's: {raw}"
+        );
+        let view = crate::widgets::diff::DiffData::build_side_by_side_from_git_text(
+            std::path::PathBuf::from("data.txt"),
+            &raw,
+        );
+        assert!(
+            view.left_lines.iter().any(|l| l == "row 5"),
+            "{view:?}",
+            view = view.left_lines
+        );
+        assert!(
+            view.right_lines.iter().any(|l| l == "row FIVE"),
+            "{view:?}",
+            view = view.right_lines
+        );
+
+        // The commit that added the file: every line is new, nothing fails.
+        let first = sh_git(tmp.path(), &["rev-parse", "--short", "HEAD~1"]);
+        let raw = show_commit_file_diff(tmp.path(), first.trim(), "data.txt").unwrap();
+        let lines = changed_lines(&raw);
+        assert_eq!(lines.len(), 12, "{raw}");
+        assert_eq!(lines[0], "+row 1");
+    }
+
+    #[test]
+    fn an_unfiltered_files_history_reads_exactly_as_git_shows_it() {
+        let tmp = TempDir::new().unwrap();
+        filtered_history(tmp.path());
+        assert_eq!(path_filter(tmp.path(), "notes.md"), None, "precondition");
+        assert_eq!(
+            read_file_at_rev(tmp.path(), "HEAD~1", "notes.md").unwrap(),
+            sh_git(tmp.path(), &["show", "HEAD~1:notes.md"])
+        );
+        let hash = sh_git(tmp.path(), &["rev-parse", "--short", "HEAD"]);
+        let raw = show_commit_file_diff(tmp.path(), hash.trim(), "notes.md").unwrap();
+        assert_eq!(
+            raw,
+            sh_git(tmp.path(), &["show", hash.trim(), "--", "notes.md"]),
+            "an unfiltered file keeps git's own diff, commit header and all"
+        );
+        // And what git stores for the filtered file is still the cleaned
+        // form: only croft's reading of it changed.
+        assert!(sh_git(tmp.path(), &["show", "HEAD~1:data.txt"]).starts_with("ebj 1"));
     }
 
     #[test]

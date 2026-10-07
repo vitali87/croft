@@ -433,24 +433,32 @@ pub fn sanitize_extension(raw: &str) -> Option<String> {
 /// The test is deliberately strict (every one of the first lines must
 /// carry the SAME non-zero count of the delimiter) because the cost of a
 /// false positive (prose opening in a grid) is worse than the cost of a
-/// false negative (a `--as csv` away).
+/// false negative (a `--as csv` away). Fields are counted per record with
+/// CSV's quoting rules, so a quoted comma (`"Doe, John"`, `"1,200"`) or a
+/// quoted line break is part of its field, not a column (#1217); TSV has no
+/// quoting, so its tabs are counted as written.
 pub fn looks_delimited(bytes: &[u8]) -> Option<&'static str> {
     if bytes.contains(&0) {
         return None;
     }
-    let text = std::str::from_utf8(bytes).ok()?;
-    let lines: Vec<&str> = text
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .take(8)
-        .collect();
-    // One line is a sentence, not a table: a header alone tells us nothing.
-    if lines.len() < 2 {
-        return None;
-    }
-    for (delim, ext) in [(',', "csv"), ('\t', "tsv")] {
-        let first = lines[0].matches(delim).count();
-        if first > 0 && lines.iter().all(|l| l.matches(delim).count() == first) {
+    std::str::from_utf8(bytes).ok()?;
+    for (delim, quoting, ext) in [(b',', true, "csv"), (b'\t', false, "tsv")] {
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(true)
+            .delimiter(delim)
+            .quoting(quoting)
+            .from_reader(bytes);
+        let widths: Vec<usize> = reader
+            .records()
+            .map_while(Result::ok)
+            .filter(|r| !(r.len() == 1 && r[0].trim().is_empty()))
+            .take(8)
+            .map(|r| r.len())
+            .collect();
+        // One record is a sentence, not a table: a header alone tells us
+        // nothing.
+        if widths.len() >= 2 && widths[0] > 1 && widths.iter().all(|&w| w == widths[0]) {
             return Some(ext);
         }
     }
@@ -659,9 +667,10 @@ const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 /// like `croft view`, and with `wait` return only once its tab is closed,
 /// which is what `$GIT_SEQUENCE_EDITOR` and `$EDITOR` callers expect. A
 /// croft that goes away counts as closed: git then carries on with the file
-/// as it was last saved, rather than hanging forever.
+/// as it was last saved, rather than hanging forever. A path that does not
+/// exist yet is created empty first, as any `$EDITOR` would start it (#848).
 pub fn edit(target: &std::ffi::OsStr, wait: bool, cache_dir: &Path) -> anyhow::Result<()> {
-    run(target, None, cache_dir)?;
+    run(Verb::Edit, target, None, cache_dir)?;
     if !wait {
         return Ok(());
     }
@@ -710,16 +719,103 @@ fn wait_step(reply: std::io::Result<ViewReply>) -> WaitStep {
     }
 }
 
-/// `croft view <path>` / `croft view -`.
+/// Which command the user typed (#848). It names every message [`run`]
+/// prints, so a failed `croft edit` no longer reports itself as `croft
+/// view`, and it decides what a path that does not exist yet means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verb {
+    /// `croft view`: a missing file is refused, as there is nothing to show.
+    View,
+    /// `croft edit`: a missing file is a new one, created empty.
+    Edit,
+}
+
+impl Verb {
+    /// The subcommand's name, as typed after `croft`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Verb::View => "view",
+            Verb::Edit => "edit",
+        }
+    }
+}
+
+/// Which file a `croft edit` call created: its device and inode. A call
+/// that cannot open the file takes back only this one, never a file
+/// something else has put at the same path since.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Created {
+    dev: u64,
+    ino: u64,
+}
+
+/// The absolute path `target` names, resolved against `cwd` and checked
+/// before any croft is asked to open it, and the file this call created
+/// there, if it created one.
+/// Checked here rather than at the server so the message names the path the
+/// USER typed, resolved against the cwd they typed it in.
+///
+/// A missing file is refused for `view`. For `edit` it is created empty when
+/// its directory exists, as `vim new.py` or `code --wait new.py` start one,
+/// so `EDITOR="croft edit --wait"` works for tools that name a file they
+/// have not written yet (#848). A missing directory is still an error: an
+/// editor creates a file, not the folders above it.
+fn resolve_target(
+    verb: Verb,
+    cwd: &Path,
+    target: &Path,
+) -> anyhow::Result<(PathBuf, Option<Created>)> {
+    use std::os::unix::fs::MetadataExt;
+    let v = verb.name();
+    let path = resolve(cwd, target);
+    if path.exists() {
+        return Ok((path, None));
+    }
+    if verb == Verb::View {
+        anyhow::bail!("croft {v}: no such file: {}", path.display());
+    }
+    let dir = path.parent().unwrap_or(cwd);
+    if !dir.is_dir() {
+        anyhow::bail!(
+            "croft {v}: cannot create {}: no such directory {}",
+            path.display(),
+            dir.display()
+        );
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        // Read from the handle, so it names the file this call made. Without
+        // it nothing can be shown to be ours, and nothing is taken back.
+        Ok(file) => {
+            let created = file.metadata().ok().map(|m| Created {
+                dev: m.dev(),
+                ino: m.ino(),
+            });
+            Ok((path, created))
+        }
+        // Something else created it since the check: open what is there
+        // rather than truncate it.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok((path, None)),
+        Err(e) => anyhow::bail!("croft {v}: cannot create {}: {e}", path.display()),
+    }
+}
+
+/// `croft view <path>` / `croft view -`, and the opening half of `croft
+/// edit`, with `verb` saying which of the two the user typed.
 pub fn run(
+    verb: Verb,
     target: &std::ffi::OsStr,
     as_hint: Option<&str>,
     cache_dir: &Path,
 ) -> anyhow::Result<()> {
+    let v = verb.name();
     let socket = match std::env::var_os(SOCK_ENV).filter(|s| !s.is_empty()) {
         Some(s) => PathBuf::from(s),
         None => anyhow::bail!(
-            "croft view needs a croft to view in: run it from a pane inside croft ({SOCK_ENV} is unset)"
+            "croft {v} needs a croft to {v} in: run it from a pane inside croft ({SOCK_ENV} is unset)"
         ),
     };
 
@@ -730,31 +826,53 @@ pub fn run(
     // a chosen extension, and a named file already has one.
     if target != "-" && as_hint.is_some() {
         anyhow::bail!(
-            "croft view --as applies only to piped input (`croft view - --as csv`); \
+            "croft {v} --as applies only to piped input (`croft {v} - --as csv`); \
              a named file is routed by its own extension"
         );
     }
 
-    let path = if target == "-" {
+    let (path, created) = if target == "-" {
         let buf = read_capped(std::io::stdin(), MAX_STAGED_STDIN_BYTES)?;
         if buf.is_empty() {
-            anyhow::bail!("croft view -: nothing arrived on stdin");
+            anyhow::bail!("croft {v} -: nothing arrived on stdin");
         }
-        stage_stdin(cache_dir, &buf, as_hint)?
+        (stage_stdin(cache_dir, &buf, as_hint)?, None)
     } else {
-        let cwd = std::env::current_dir()?;
-        let path = resolve(&cwd, Path::new(target));
-        // Checked here rather than at the server so the message names the
-        // path the USER typed, resolved against the cwd they typed it in.
-        if !path.exists() {
-            anyhow::bail!("croft view: no such file: {}", path.display());
-        }
-        path
+        // After the socket check, so `croft edit` run outside croft leaves
+        // no empty file behind.
+        resolve_target(verb, &std::env::current_dir()?, Path::new(target))?
     };
 
-    match send(&socket, &ViewRequest::new(&path)) {
+    let opened = open_in_croft(v, &socket, &path);
+    // Nor does one whose croft cannot open it: a stale socket (the croft
+    // that set it has exited) or a refusal takes back the empty file created
+    // just above, and never a file that was already there (#848).
+    if opened.is_err()
+        && let Some(created) = created
+    {
+        take_back(&path, created);
+    }
+    opened
+}
+
+/// Remove the file `created` names from `path`: only while that same file
+/// is still there and still empty. Compared by device and inode, not by
+/// path, and without following a link put in its place.
+fn take_back(path: &Path, created: Created) {
+    use std::os::unix::fs::MetadataExt;
+    let ours = std::fs::symlink_metadata(path)
+        .is_ok_and(|m| m.dev() == created.dev && m.ino() == created.ino && m.len() == 0);
+    if ours {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Ask the croft listening on `socket` to open `path`, naming the command
+/// `v` in every refusal.
+fn open_in_croft(v: &str, socket: &Path, path: &Path) -> anyhow::Result<()> {
+    match send(socket, &ViewRequest::new(path)) {
         Ok(ViewReply::Ok) => Ok(()),
-        Ok(ViewReply::Err { message }) => anyhow::bail!("croft view: {message}"),
+        Ok(ViewReply::Err { message }) => anyhow::bail!("croft {v}: {message}"),
         Err(e)
             if matches!(
                 e.kind(),
@@ -767,11 +885,11 @@ pub fn run(
             // The env var outlives the croft that set it: a dtach session
             // reattached to a new croft, or a pane that survived its parent.
             anyhow::bail!(
-                "croft view: the croft that opened this pane is gone (socket {})",
+                "croft {v}: the croft that opened this pane is gone (socket {})",
                 socket.display()
             )
         }
-        Err(e) => anyhow::bail!("croft view: {e}"),
+        Err(e) => anyhow::bail!("croft {v}: {e}"),
     }
 }
 
@@ -827,6 +945,135 @@ mod tests {
         assert_eq!(
             resolve(Path::new("/home/u"), Path::new("/etc/hosts")),
             PathBuf::from("/etc/hosts")
+        );
+    }
+
+    /// #848: `croft edit TODO.md` on a file not yet on disk was refused, so
+    /// `EDITOR="croft edit --wait"` broke for any tool that names a file it
+    /// has not written, where `vim` or `code --wait` start one.
+    #[test]
+    fn edit_creates_a_missing_file_in_an_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, created) = resolve_target(Verb::Edit, dir.path(), Path::new("TODO.md")).unwrap();
+        assert_eq!(path, dir.path().join("TODO.md"));
+        assert!(created.is_some(), "this call made it");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"",
+            "the new file is created empty"
+        );
+
+        // An existing file is opened as it is, never truncated.
+        std::fs::write(&path, "keep me").unwrap();
+        let (_, created) = resolve_target(Verb::Edit, dir.path(), Path::new("TODO.md")).unwrap();
+        assert_eq!(
+            created, None,
+            "an existing file is not this call's to take back"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+    }
+
+    /// #848 review: a `croft edit` whose croft cannot open the file takes
+    /// back the empty file it created. Only that one: an empty file another
+    /// process has put at the same path since is left alone.
+    #[test]
+    fn only_the_file_this_call_created_is_taken_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, created) = resolve_target(Verb::Edit, dir.path(), Path::new("TODO.md")).unwrap();
+        let created = created.expect("this call made it");
+        // Made while the first exists, so it cannot reuse its inode.
+        let other = dir.path().join("other.md");
+        std::fs::write(&other, b"").unwrap();
+        std::fs::rename(&other, &path).unwrap();
+        take_back(&path, created);
+        assert!(
+            path.exists(),
+            "an empty file this call did not create stays"
+        );
+    }
+
+    /// #848 guard: the empty file this call created, still in place, is
+    /// taken back; one it created but that has since been written to, or a
+    /// file that was already there, is not.
+    #[test]
+    fn the_created_file_is_taken_back_while_it_is_still_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, created) = resolve_target(Verb::Edit, dir.path(), Path::new("new.md")).unwrap();
+        take_back(&path, created.unwrap());
+        assert!(!path.exists(), "the empty file this call made is gone");
+
+        let (path, created) = resolve_target(Verb::Edit, dir.path(), Path::new("kept.md")).unwrap();
+        std::fs::write(&path, "written since").unwrap();
+        take_back(&path, created.unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "written since");
+    }
+
+    /// #848: an editor creates a file, not the folders above it, and the
+    /// refusal names `croft edit`, the command the user typed.
+    #[test]
+    fn edit_refuses_a_missing_directory_and_says_croft_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_target(Verb::Edit, dir.path(), Path::new("no/such/TODO.md"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("croft edit: ") && err.contains("no such directory"),
+            "names the command and the reason: {err}"
+        );
+        assert!(err.contains("TODO.md"), "names the path: {err}");
+        assert!(!dir.path().join("no").exists(), "no folders were created");
+    }
+
+    /// `croft view` keeps refusing a missing file, as there is nothing to
+    /// preview, and creates nothing on the way out (#848).
+    #[test]
+    fn view_still_refuses_a_missing_file_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_target(Verb::View, dir.path(), Path::new("nope.pdf"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("croft view: no such file") && err.contains("nope.pdf"),
+            "{err}"
+        );
+        assert!(!dir.path().join("nope.pdf").exists());
+
+        std::fs::write(dir.path().join("here.pdf"), "x").unwrap();
+        assert_eq!(
+            resolve_target(Verb::View, dir.path(), Path::new("here.pdf")).unwrap(),
+            (dir.path().join("here.pdf"), None)
+        );
+    }
+
+    /// #848 guard: `croft edit newdir/` names a folder, not a file. The
+    /// trailing slash must not be read as a new file called `newdir`.
+    #[test]
+    fn edit_never_turns_a_path_ending_in_a_slash_into_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_target(Verb::Edit, dir.path(), Path::new("newdir/"));
+        assert!(err.is_err(), "{err:?}");
+        assert!(
+            !dir.path().join("newdir").exists(),
+            "neither a file nor a folder was created"
+        );
+    }
+
+    /// #848 guard: only `edit` creates. The refusal wording stays `view`'s
+    /// own, and a missing folder is refused as a missing file, not created.
+    #[test]
+    fn view_never_creates_even_where_edit_would() {
+        let dir = tempfile::tempdir().unwrap();
+        for target in ["new.md", "no/such/new.md"] {
+            let err = resolve_target(Verb::View, dir.path(), Path::new(target))
+                .unwrap_err()
+                .to_string();
+            assert!(err.starts_with("croft view: no such file"), "{err}");
+            assert!(!err.contains("edit"), "{err}");
+        }
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "nothing was created"
         );
     }
 
@@ -1084,6 +1331,34 @@ mod tests {
             None,
             "the eighth row is INSIDE the window, so it must reject the sniff"
         );
+    }
+
+    /// A quoted field holding a comma is one field, so piped CSV with names
+    /// or thousands separators still opens in the grid (#1217).
+    #[test]
+    fn a_quoted_comma_is_part_of_its_field_in_the_sniff() {
+        assert_eq!(looks_delimited(b"\"Doe, John\",42\nRoe,7\n"), Some("csv"));
+        let data = b"name,qty,price\nwidget,3,9.99\ngadget,10,1.50\n\"comma, inc\",1,100\n";
+        assert_eq!(looks_delimited(data), Some("csv"));
+        // A quoted line break stays inside its record too.
+        assert_eq!(
+            looks_delimited(b"note,id\n\"two\nlines\",1\nok,2\n"),
+            Some("csv")
+        );
+    }
+
+    /// Negative: prose with commas is still not a table, a quoted comma
+    /// doesn't paper over a row that really has a column too many, and a
+    /// tab inside quotes still counts for TSV, which has no quoting.
+    #[test]
+    fn prose_and_ragged_rows_are_still_not_a_table() {
+        assert_eq!(
+            looks_delimited(b"Hello, world.\nThis is prose, really, honestly.\n"),
+            None
+        );
+        assert_eq!(looks_delimited(b"a,b\n\"x, y\",1,2\n"), None);
+        assert_eq!(looks_delimited(b"a\tb\n\"x\ty\"\t1\n"), None);
+        assert_eq!(looks_delimited(b"a\tb\nx\t1\n"), Some("tsv"));
     }
 
     #[test]

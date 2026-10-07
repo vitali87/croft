@@ -130,6 +130,10 @@ pub struct MergeView {
     /// its pane is empty because the file is gone there, not because it was
     /// emptied, and taking it means removing the file.
     pub deleted: Option<CheckSide>,
+    /// The agent whose proposal this merges with a tab's unsaved edits
+    /// (#1353), when it is that merge rather than a git conflict: saving
+    /// the Result approves it, and nothing is staged.
+    pub proposal_from: Option<String>,
 }
 
 impl MergeView {
@@ -159,6 +163,7 @@ impl MergeView {
             check_spans: Vec::new(),
             last_panes_area: ratatui::layout::Rect::default(),
             deleted: None,
+            proposal_from: None,
         };
         (view, result)
     }
@@ -556,6 +561,7 @@ pub fn view_from_markers(lines: &[String]) -> Option<(MergeView, Vec<String>)> {
         check_spans: Vec::new(),
         last_panes_area: ratatui::layout::Rect::default(),
         deleted: None,
+        proposal_from: None,
     };
     Some((view, result))
 }
