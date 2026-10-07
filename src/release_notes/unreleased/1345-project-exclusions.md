@@ -1,0 +1,1 @@
+fix: `files_exclude` / `search_exclude` settings, also read from `.vscode/settings.json` `files.exclude` / `search.exclude`, hide folders from the Explorer, Go to File and Search; a Search checkbox turns them off for one search (#1345)

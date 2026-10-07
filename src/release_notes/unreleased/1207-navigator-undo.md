@@ -1,0 +1,1 @@
+fix: A navigator (`croft pair`) edit now undoes in one step instead of one streamed fragment at a time, a cancelled stream leaves nothing to undo, and a collab peer's multi-run edit (a Replace All) undoes as one step instead of through texts nobody wrote.
