@@ -167,7 +167,7 @@ pub fn fleet_ssh_args(host: &str, command: &str) -> Vec<String> {
 /// choosing who to run on is the decision, and a user typing left to right
 /// should have to make it before writing anything that could execute.
 ///
-/// `None` when no host list is given. That refusal is the point: without it
+/// `Err` when no host list is given. That refusal is the point: without it
 /// "Fleet Run" means "run on every host in your ~/.ssh/config", which on an
 /// ordinary machine is every remote you have ever configured — a live
 /// production box beside a `github.com` entry that is not a shell host at
@@ -194,11 +194,11 @@ pub fn parse_request_with_groups<'a>(
     input: &str,
     known: &'a [String],
     groups: &std::collections::BTreeMap<String, Vec<String>>,
-) -> Option<(Vec<&'a String>, String)> {
-    let (spec, command) = split_request(input)?;
+) -> Result<(Vec<&'a String>, String), RequestError> {
+    let (spec, command) = split_request(input).ok_or(RequestError::Syntax)?;
     let command = command.trim();
     if command.is_empty() {
-        return None;
+        return Err(RequestError::Syntax);
     }
     let spec = spec.trim();
     if spec == "*" {
@@ -206,12 +206,13 @@ pub fn parse_request_with_groups<'a>(
         // shell or container joining it unasked would change what the same
         // request runs on.
         let hosts: Vec<&String> = known.iter().filter(|k| !is_local_target(k)).collect();
-        return Some((hosts, command.to_string()));
+        return Ok((hosts, command.to_string()));
     }
     let mut hosts = Vec::new();
     for name in spec.split(',').map(str::trim).filter(|n| !n.is_empty()) {
         // A group expands to the names it holds; anything else is one name.
-        let members: Vec<&str> = match groups.iter().find(|(g, _)| g.eq_ignore_ascii_case(name)) {
+        let group = groups.iter().find(|(g, _)| g.eq_ignore_ascii_case(name));
+        let members: Vec<&str> = match group {
             Some((_, members)) => members.iter().map(String::as_str).collect(),
             None => vec![name],
         };
@@ -221,19 +222,120 @@ pub fn parse_request_with_groups<'a>(
         // one box, which is the harm the unknown-host check below exists to
         // prevent. Every other refusal in this function is loud.
         if members.is_empty() {
-            return None;
+            return Err(RequestError::EmptyGroup(name.to_string()));
         }
         for member in members {
             // Only hosts croft actually knows: a typo must not become an ssh
             // attempt against a hostname the user never configured, and a
             // group cannot smuggle one past that check either.
-            let found = known.iter().find(|k| k.eq_ignore_ascii_case(member))?;
+            let found = known
+                .iter()
+                .find(|k| k.eq_ignore_ascii_case(member))
+                .ok_or_else(|| RequestError::UnknownHost {
+                    name: member.to_string(),
+                    group: group.map(|(g, _)| g.clone()),
+                })?;
             if !hosts.contains(&found) {
                 hosts.push(found);
             }
         }
     }
-    (!hosts.is_empty()).then_some((hosts, command.to_string()))
+    if hosts.is_empty() {
+        return Err(RequestError::Syntax);
+    }
+    Ok((hosts, command.to_string()))
+}
+
+/// Why a fleet request was refused (#1301).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestError {
+    /// Not `hosts: command`: no separator, no host named, or no command.
+    Syntax,
+    /// A name that is not a known target, typed or listed in `group`.
+    UnknownHost { name: String, group: Option<String> },
+    /// A saved group with no members.
+    EmptyGroup(String),
+}
+
+impl RequestError {
+    /// The status-bar line for this refusal. `known` is every target the
+    /// request could name.
+    pub fn message(&self, known: &[String]) -> String {
+        match self {
+            RequestError::Syntax => {
+                // `*` runs on the ssh hosts only, so that is what it counts.
+                let ssh: Vec<&String> = known.iter().filter(|k| !is_local_target(k)).collect();
+                match (ssh.first(), known.first()) {
+                    (Some(first), _) => format!(
+                        "Fleet run needs 'hosts: command' — e.g. '{first}: uptime', or '*: uptime' for all {}",
+                        ssh.len()
+                    ),
+                    (None, Some(first)) => {
+                        format!("Fleet run needs 'hosts: command' — e.g. '{first}: uptime'")
+                    }
+                    (None, None) => String::from("Fleet run needs 'hosts: command'"),
+                }
+            }
+            RequestError::UnknownHost { name, group } => {
+                let place = match group {
+                    Some(g) => format!("\"{name}\" in group \"{g}\""),
+                    None => format!("\"{name}\""),
+                };
+                let mut msg = format!(
+                    "Fleet run: {place} is not in ~/.ssh/config (or localhost / docker:<name>)"
+                );
+                if let Some(close) = closest_target(name, known) {
+                    msg.push_str(&format!(" — did you mean \"{close}\"?"));
+                }
+                msg
+            }
+            RequestError::EmptyGroup(g) => format!("Fleet run: group \"{g}\" has no hosts"),
+        }
+    }
+}
+
+/// The known target a mistyped `name` most likely meant: the nearest by
+/// edit distance (a swap of two neighbours counts as one edit), within a
+/// quarter of the name's length and at least one edit. `None` when nothing
+/// is that close, so an unrelated name gets no guess.
+fn closest_target<'a>(name: &str, known: &'a [String]) -> Option<&'a String> {
+    let name: Vec<char> = name.to_lowercase().chars().collect();
+    let limit = (name.len() / 4).max(1);
+    known
+        .iter()
+        .map(|k| {
+            (
+                edit_distance(&name, &k.to_lowercase().chars().collect::<Vec<_>>()),
+                k,
+            )
+        })
+        .filter(|(d, _)| *d <= limit)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, k)| k)
+}
+
+/// Optimal string alignment distance: insertions, deletions, substitutions
+/// and adjacent transpositions each cost one.
+fn edit_distance(a: &[char], b: &[char]) -> usize {
+    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in d[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            d[i][j] = (d[i - 1][j] + 1)
+                .min(d[i][j - 1] + 1)
+                .min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
+            }
+        }
+    }
+    d[a.len()][b.len()]
 }
 
 /// Split `hosts: command` at the colon that ends the host list. A colon that
@@ -719,13 +821,13 @@ mod tests {
         let known: Vec<String> = ["web1"].iter().map(|s| s.to_string()).collect();
         let g = groups(&[("web", &["web1", "not-configured"])]);
         assert!(
-            parse_request_with_groups("web: uname -r", &known, &g).is_none(),
+            parse_request_with_groups("web: uname -r", &known, &g).is_err(),
             "an unknown member refuses the whole request rather than running on the rest"
         );
         // Paired presence: the same group without the stray member parses,
         // so the refusal above is the check and not a broken fixture.
         let ok = groups(&[("web", &["web1"])]);
-        assert!(parse_request_with_groups("web: uname -r", &known, &ok).is_some());
+        assert!(parse_request_with_groups("web: uname -r", &known, &ok).is_ok());
     }
 
     /// A group that resolves to nothing refuses rather than narrowing the
@@ -739,11 +841,11 @@ mod tests {
         let known: Vec<String> = ["web1", "db1"].iter().map(|s| s.to_string()).collect();
         let empty = groups(&[("web", &[])]);
         assert!(
-            parse_request_with_groups("web: uptime", &known, &empty).is_none(),
+            parse_request_with_groups("web: uptime", &known, &empty).is_err(),
             "an empty group alone refuses"
         );
         assert!(
-            parse_request_with_groups("web,db1: uptime", &known, &empty).is_none(),
+            parse_request_with_groups("web,db1: uptime", &known, &empty).is_err(),
             "and mixed with a real host it refuses too, rather than running on db1"
         );
         // Paired presence: the same spec with a populated group parses, so
@@ -761,13 +863,82 @@ mod tests {
         let known: Vec<String> = ["web1"].iter().map(|s| s.to_string()).collect();
         let looped = groups(&[("web", &["web"])]);
         assert!(
-            parse_request_with_groups("web: uptime", &known, &looped).is_none(),
+            parse_request_with_groups("web: uptime", &known, &looped).is_err(),
             "'web' expands once to 'web', which is not a known host"
         );
         let mutual = groups(&[("a", &["b"]), ("b", &["a"])]);
         assert!(
-            parse_request_with_groups("a: uptime", &known, &mutual).is_none(),
+            parse_request_with_groups("a: uptime", &known, &mutual).is_err(),
             "mutual references terminate the same way"
+        );
+    }
+
+    fn refusal(input: &str, known: &[&str], g: &[(&str, &[&str])]) -> String {
+        let known: Vec<String> = known.iter().map(|s| s.to_string()).collect();
+        let err = parse_request_with_groups(input, &known, &groups(g)).expect_err("refused");
+        err.message(&known)
+    }
+
+    /// A typo in one name is refused by naming it, not by blaming the
+    /// syntax the request already has (#1301).
+    #[test]
+    fn an_unknown_host_is_named_with_the_closest_known_one() {
+        let known: Vec<String> = ["box", "localhost"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            parse_request_with_groups("box, localhost, lcoalhost: uptime", &known, &groups(&[])),
+            Err(RequestError::UnknownHost {
+                name: String::from("lcoalhost"),
+                group: None
+            })
+        );
+        assert_eq!(
+            refusal(
+                "box, localhost, lcoalhost: uptime",
+                &["box", "localhost"],
+                &[]
+            ),
+            "Fleet run: \"lcoalhost\" is not in ~/.ssh/config (or localhost / docker:<name>) — did you mean \"localhost\"?"
+        );
+        // Nothing close: no guess.
+        assert_eq!(
+            refusal("box, zebra: uptime", &["box", "localhost"], &[]),
+            "Fleet run: \"zebra\" is not in ~/.ssh/config (or localhost / docker:<name>)"
+        );
+    }
+
+    #[test]
+    fn an_unknown_group_member_and_an_empty_group_are_named() {
+        assert_eq!(
+            refusal(
+                "web: uptime",
+                &["web1", "localhost"],
+                &[("web", &["web1", "wbe2"])]
+            ),
+            "Fleet run: \"wbe2\" in group \"web\" is not in ~/.ssh/config (or localhost / docker:<name>)"
+        );
+        assert_eq!(
+            refusal("web, db1: uptime", &["db1", "localhost"], &[("web", &[])]),
+            "Fleet run: group \"web\" has no hosts"
+        );
+    }
+
+    /// Negative: a request without the `hosts: command` shape keeps the
+    /// syntax hint, and its count is what `*` would run on: the ssh hosts,
+    /// not `localhost` or a container.
+    #[test]
+    fn the_syntax_hint_stays_for_a_malformed_request_and_counts_ssh_hosts() {
+        let known = ["box", "localhost", "docker:web"];
+        for bad in ["uptime", "box:", ": uptime", " , : uptime"] {
+            assert_eq!(
+                refusal(bad, &known, &[]),
+                "Fleet run needs 'hosts: command' — e.g. 'box: uptime', or '*: uptime' for all 1",
+                "{bad:?}"
+            );
+        }
+        // With no ssh host, the hint offers what is there and no `*`.
+        assert_eq!(
+            refusal("uptime", &["localhost"], &[]),
+            "Fleet run needs 'hosts: command' — e.g. 'localhost: uptime'"
         );
     }
 
@@ -970,6 +1141,7 @@ mod tests {
             .collect();
         let p = |input: &str| {
             parse_request_with_groups(input, &known, &std::collections::BTreeMap::new())
+                .ok()
                 .map(|(h, c)| (h.iter().map(|s| s.as_str()).collect::<Vec<_>>(), c))
         };
 

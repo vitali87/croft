@@ -129,7 +129,7 @@ fn gh_error(out: &std::process::Output) -> String {
 /// meanwhile still holds the write descriptor, until that child execs,
 /// which takes microseconds. A freshly installed or updated `gh` can hit it,
 /// and a test's stand-in script hits it whenever another test forks.
-fn spawn_retrying_busy(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+pub(crate) fn spawn_retrying_busy(cmd: &mut Command) -> std::io::Result<std::process::Child> {
     const ETXTBSY: i32 = 26;
     let mut tries = 0;
     loop {
@@ -141,6 +141,15 @@ fn spawn_retrying_busy(cmd: &mut Command) -> std::io::Result<std::process::Child
             other => return other,
         }
     }
+}
+
+/// [`Command::output`] through [`spawn_retrying_busy`]: stdin closed, stdout
+/// and stderr captured, waiting out a moment of "Text file busy".
+pub(crate) fn output_retrying_busy(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    spawn_retrying_busy(cmd)?.wait_with_output()
 }
 
 fn gh(program: &str, root: &Path, args: &[&str], stdin: Option<&str>) -> Result<String, String> {

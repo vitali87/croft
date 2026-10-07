@@ -60,6 +60,9 @@ pub struct FileTree {
     /// [`Self::hides_agent_touched`]). Fed from `AgentLedger` on the app's
     /// sync.
     pub agent_touched: Arc<HashSet<PathBuf>>,
+    /// The project's `files_exclude` globs (#1345): matching entries are
+    /// not listed, like VS Code's `files.exclude`.
+    pub exclude: crate::widgets::search::PathFilter,
     /// Text painted after a ROOT row's name (#348): a worktree lane's
     /// branch and the badge of the agent seated in its pane, keyed by the
     /// root path. Swapped in by the app whenever a lane or a seat changes;
@@ -126,6 +129,7 @@ impl FileTree {
             ignored: Arc::default(),
             scrub_tree: None,
             agent_touched: Arc::default(),
+            exclude: Default::default(),
             note_counts: Arc::default(),
             root_badges: Arc::default(),
             last_inner: Rect::default(),
@@ -449,6 +453,7 @@ impl FileTree {
                     .unwrap_or_else(|_| p.is_dir());
                 (p, is_dir)
             })
+            .filter(|(p, _)| !self.exclude.excludes(&self.root, p))
             .collect();
         entries.sort_by(|a, b| match (a.1, b.1) {
             (true, false) => std::cmp::Ordering::Less,
