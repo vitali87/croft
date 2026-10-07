@@ -1,0 +1,1 @@
+fix: Typing a Python f-string such as `print(f"{x}")` no longer leaves a stray `")` behind: quotes don't auto-pair inside strings or comments, and `f"`, `r'` and `b"` prefixes pair as in VS Code (#844).

@@ -9,15 +9,17 @@
 //! Like the DAP transport this is deliberately blocking + thread-based (not
 //! tokio): an MCP server is a single stdio child, so one reader thread that
 //! frames stdout lines into an mpsc channel — plus a stdin writer behind a mutex
-//! — is the simplest correct shape. The server's stderr is captured but never
-//! treated as an error (the spec reserves stderr for free-form server logging).
+//! — is the simplest correct shape. The server's stderr is drained on its own
+//! thread into a bounded tail, never treated as an error (the spec reserves
+//! stderr for free-form server logging), but read back to say why a server
+//! that exited without answering died.
 
 use std::collections::BTreeMap;
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -74,6 +76,30 @@ impl LineDecoder {
 /// the bound keeps one that ignores EOF from stalling the caller.
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 
+/// How much of the end of a server's stderr is kept: enough for a Python
+/// traceback, bounded so a chatty server costs nothing.
+const STDERR_TAIL_BYTES: usize = 8 * 1024;
+
+/// The last [`STDERR_TAIL_BYTES`] a server wrote to stderr, and whether the
+/// stream has ended.
+#[derive(Default)]
+struct StderrTail {
+    bytes: Vec<u8>,
+    closed: bool,
+}
+
+/// The line that says why a server died: the last non-blank line of its
+/// stderr tail (a Python traceback ends with the exception), cut to a
+/// status-bar length. `None` when it wrote nothing.
+pub fn last_stderr_line(tail: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(tail);
+    let line = text.lines().map(str::trim).rfind(|l| !l.is_empty())?;
+    Some(match line.char_indices().nth(200) {
+        Some((cut, _)) => format!("{}…", &line[..cut]),
+        None => line.to_string(),
+    })
+}
+
 /// A running MCP server connection plus its message plumbing. Owns the child
 /// process, a line-framed reader thread feeding `incoming`, and a stdin writer.
 pub struct McpTransport {
@@ -83,6 +109,8 @@ pub struct McpTransport {
     /// Drained by the client: every decoded incoming message (responses,
     /// server-initiated notifications and requests alike).
     pub incoming: Receiver<Value>,
+    /// The end of the server's stderr, kept by the drain thread.
+    stderr_tail: Arc<Mutex<StderrTail>>,
 }
 
 impl McpTransport {
@@ -104,10 +132,10 @@ impl McpTransport {
             .envs(env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            // Null, not piped: nothing read the pipe, and a server logging
-            // over ~64 KiB there (MCP puts logs on stderr) blocked on the
-            // write and stopped answering.
-            .stderr(Stdio::null());
+            // Piped and drained on its own thread: a server logging over
+            // ~64 KiB there (MCP puts logs on stderr) must never block on a
+            // full pipe, and only the tail is kept to explain an exit.
+            .stderr(Stdio::piped());
         // Detach into its own session before exec (mirrors the DAP transport):
         // a sidecar must never be able to touch croft's controlling tty. MCP
         // rides the piped stdio, so the detach loses nothing.
@@ -127,6 +155,13 @@ impl McpTransport {
 
         let stdin = child.stdin.take().context("MCP server stdin missing")?;
         let stdout = child.stdout.take().context("MCP server stdout missing")?;
+        let stderr = child.stderr.take().context("MCP server stderr missing")?;
+        let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
+        let tail = Arc::clone(&stderr_tail);
+        std::thread::Builder::new()
+            .name("mcp-stderr".into())
+            .spawn(move || stderr_loop(stderr, &tail))
+            .context("spawning mcp-stderr thread")?;
 
         let (tx, rx): (Sender<Value>, Receiver<Value>) = std::sync::mpsc::channel();
         std::thread::Builder::new()
@@ -138,7 +173,30 @@ impl McpTransport {
             child,
             writer: Mutex::new(Some(Box::new(stdin))),
             incoming: rx,
+            stderr_tail,
         })
+    }
+
+    /// Why the server stopped answering, for a request whose reply never
+    /// came because stdout closed: the last line of its stderr (waiting up
+    /// to `wait` for the drain thread to reach the end), or a plain "exited"
+    /// when it wrote nothing (#1297).
+    pub fn exit_reason(&self, wait: Duration) -> String {
+        let deadline = Instant::now() + wait;
+        loop {
+            let tail = self
+                .stderr_tail
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if tail.closed || Instant::now() >= deadline {
+                return match last_stderr_line(&tail.bytes) {
+                    Some(line) => format!("the server exited: {line}"),
+                    None => String::from("the server exited before responding"),
+                };
+            }
+            drop(tail);
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Write an already-built JSON-RPC message to the server.
@@ -203,6 +261,27 @@ fn reader_loop<R: Read>(source: R, tx: Sender<Value>) {
             }
         }
     }
+}
+
+/// Drain the server's stderr until EOF, keeping only its last
+/// [`STDERR_TAIL_BYTES`].
+fn stderr_loop<R: Read>(mut source: R, tail: &Mutex<StderrTail>) {
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = match source.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        let mut t = tail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        t.bytes.extend_from_slice(&chunk[..n]);
+        let over = t.bytes.len().saturating_sub(STDERR_TAIL_BYTES);
+        t.bytes.drain(..over);
+    }
+    tail.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .closed = true;
 }
 
 #[cfg(test)]
@@ -354,5 +433,20 @@ mod tests {
             took < budget,
             "shutdown took {took:?} (budget {budget:?}): the SIGKILL backstop did not fire"
         );
+    }
+
+    #[test]
+    fn last_stderr_line_is_the_final_non_blank_line_cut_to_fit() {
+        let tb = b"Traceback (most recent call last):\n  File \"x.py\", line 1\nImportError: no McpError\n\n";
+        assert_eq!(
+            last_stderr_line(tb).as_deref(),
+            Some("ImportError: no McpError")
+        );
+        assert_eq!(last_stderr_line(b"\n  \n"), None);
+        assert_eq!(last_stderr_line(b""), None);
+        let long = "é".repeat(300);
+        let cut = last_stderr_line(long.as_bytes()).unwrap();
+        assert_eq!(cut.chars().count(), 201, "200 chars and an ellipsis");
+        assert!(cut.ends_with('…'));
     }
 }
