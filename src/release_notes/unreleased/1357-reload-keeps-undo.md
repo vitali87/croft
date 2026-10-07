@@ -1,0 +1,1 @@
+fix: Reloading a file after an external change (an agent, a formatter, a checkout) no longer wipes its undo history: Ctrl+Z brings back the text from before the rewrite, and what you typed before it stays undoable.

@@ -1,0 +1,1 @@
+fix: Terminal: Fleet Run names a host it does not know ("lcoalhost" is not in ~/.ssh/config, did you mean "localhost"?) and an empty group, instead of blaming the syntax; the hint now counts only the hosts `*` runs on.

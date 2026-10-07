@@ -388,9 +388,11 @@ pub enum CliCommand {
     ///
     /// Like `croft view`, plus `--wait`: return only once the tab is
     /// closed. croft points `GIT_SEQUENCE_EDITOR` at `croft edit --wait`, so
-    /// `git rebase -i` opens its plan here.
+    /// `git rebase -i` opens its plan here. A file that does not exist yet
+    /// is created empty (its folder must exist), so `EDITOR="croft edit
+    /// --wait"` works for tools that name a new file.
     Edit {
-        /// File to open.
+        /// File to open, created empty if it does not exist yet.
         path: std::ffi::OsString,
         /// Block until the file's tab is closed.
         #[arg(long, default_value_t = false)]
@@ -402,9 +404,10 @@ pub enum CliCommand {
     },
     /// Print a JSON template for translating croft's UI into `lang` (#621).
     ///
-    /// Every palette title, with your own or the built-in translation filled
-    /// in where one exists. `--write` updates `<config>/locales/<lang>.json`
-    /// in place, keeping what it already holds; fill in the rest there.
+    /// Every palette title and every other string croft translates, with
+    /// your own or the built-in translation filled in where one exists.
+    /// `--write` updates `<config>/locales/<lang>.json` in place, keeping what
+    /// it already holds; fill in the rest there.
     LocaleTemplate {
         /// Language code, such as `de` or `fr`.
         lang: String,
@@ -709,7 +712,11 @@ impl Cli {
                     std::fs::create_dir_all(dir)?;
                 }
                 crate::collab::ensure_relay(&socket)?;
-                crate::collab_agent::run(&socket, name.unwrap_or_else(|| "claude".into()))
+                crate::collab_agent::run(
+                    &socket,
+                    &workspace,
+                    name.unwrap_or_else(|| "claude".into()),
+                )
             }
             Some(CliCommand::Pr { number }) => {
                 let Some(selector) = crate::pr_review::parse_pr_selector(&number) else {
@@ -741,9 +748,12 @@ impl Cli {
                 // set in this repo's CI, where the one-line-of-stderr test
                 // measured 42. Someone running `croft view` at a prompt
                 // should get a sentence about their file, not croft's stack.
-                if let Err(e) =
-                    crate::view_ipc::run(&path, as_ext.as_deref(), &crate::app::croft_cache_dir())
-                {
+                if let Err(e) = crate::view_ipc::run(
+                    crate::view_ipc::Verb::View,
+                    &path,
+                    as_ext.as_deref(),
+                    &crate::app::croft_cache_dir(),
+                ) {
                     eprintln!("{e}");
                     std::process::exit(1);
                 }
@@ -839,7 +849,10 @@ impl Cli {
                     "Run `croft locale-template {code} --write` to update locales/{code}.json in croft's config directory in place."
                 );
                 let user = std::fs::read_to_string(&path).ok();
-                println!("{}", crate::i18n::template(&code, user.as_deref(), &[]));
+                println!(
+                    "{}",
+                    crate::i18n::template(&code, user.as_deref(), crate::i18n::TRANSLATABLE)
+                );
                 Ok(())
             }
             Some(CliCommand::Devcontainer { path, rebuild }) => {
@@ -1966,10 +1979,38 @@ fn resolve_workspace(
     path: &Path,
     open_file: Option<PathBuf>,
 ) -> Result<(PathBuf, Option<PathBuf>, Vec<PathBuf>)> {
-    let path = path
+    let cwd = std::env::current_dir().context("reading the current directory")?;
+    resolve_workspace_from(path, open_file, &cwd)
+}
+
+/// An `--open-file` path made absolute: a relative one names a file under
+/// `cwd` (as the shell typed it), else under the workspace `root`, so the
+/// tab is keyed by the absolute path its language server tracks (#1193).
+/// A path that exists is canonicalized like the workspace itself.
+fn resolve_open_file(open_file: PathBuf, root: &Path, cwd: &Path) -> PathBuf {
+    let candidates = if open_file.is_absolute() {
+        vec![open_file]
+    } else {
+        vec![cwd.join(&open_file), root.join(&open_file)]
+    };
+    candidates
+        .iter()
+        .find_map(|p| p.canonicalize().ok())
+        .unwrap_or_else(|| candidates[candidates.len() - 1].clone())
+}
+
+/// [`resolve_workspace`] with the directory croft was launched from.
+fn resolve_workspace_from(
+    path: &Path,
+    open_file: Option<PathBuf>,
+    cwd: &Path,
+) -> Result<(PathBuf, Option<PathBuf>, Vec<PathBuf>)> {
+    let path = cwd
+        .join(path)
         .canonicalize()
         .with_context(|| format!("resolving workspace path {}", path.display()))?;
     if path.is_dir() {
+        let open_file = open_file.map(|f| resolve_open_file(f, &path, cwd));
         return Ok((path, open_file, Vec::new()));
     }
     // A VS Code-compatible workspace file (#163): the first folder is the
@@ -1980,12 +2021,14 @@ fn resolve_workspace(
             .map_err(|e| anyhow::anyhow!("workspace file: {e}"))?;
         let mut it = folders.into_iter();
         let primary = it.next().expect("parse guarantees at least one folder");
+        let open_file = open_file.map(|f| resolve_open_file(f, &primary, cwd));
         return Ok((primary, open_file, it.collect()));
     }
     let parent = path
         .parent()
         .with_context(|| format!("{} has no parent directory", path.display()))?
         .to_path_buf();
+    let open_file = open_file.map(|f| resolve_open_file(f, &parent, cwd));
     Ok((parent, open_file.or(Some(path)), Vec::new()))
 }
 
@@ -2473,6 +2516,52 @@ mod tests {
         let (root, open, _) = resolve_workspace(&file, Some(other.clone())).unwrap();
         assert_eq!(root, dir.path().canonicalize().unwrap());
         assert_eq!(open, Some(other));
+    }
+
+    /// `croft . --open-file pkg/util.py` and `croft rn --open-file
+    /// pkg/util.py` from the parent both open the absolute file, so its tab
+    /// gets a language server (#1193).
+    #[test]
+    fn a_relative_open_file_is_made_absolute_under_the_cwd_or_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("rn");
+        std::fs::create_dir_all(ws.join("pkg")).unwrap();
+        std::fs::write(ws.join("pkg/util.py"), "x = 1\n").unwrap();
+        let util = ws.join("pkg/util.py").canonicalize().unwrap();
+        let rel = Some(PathBuf::from("pkg/util.py"));
+        let (_, open, _) = resolve_workspace_from(Path::new("."), rel.clone(), &ws).unwrap();
+        assert_eq!(open, Some(util.clone()), "from the workspace root");
+        let (root, open, _) = resolve_workspace_from(Path::new("rn"), rel, dir.path()).unwrap();
+        assert_eq!(root, ws.canonicalize().unwrap());
+        assert_eq!(open, Some(util), "from another directory");
+    }
+
+    /// Negative: a relative path that names a file under the cwd keeps
+    /// meaning that file, an absolute path is left alone, and a file that
+    /// doesn't exist yet is still anchored to the workspace for the launch
+    /// to report.
+    #[test]
+    fn an_open_file_under_the_cwd_or_absolute_or_missing_keeps_its_meaning() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(dir.path().join("notes.md"), "").unwrap();
+        std::fs::write(ws.join("notes.md"), "").unwrap();
+        let (_, open, _) =
+            resolve_workspace_from(Path::new("ws"), Some(PathBuf::from("notes.md")), dir.path())
+                .unwrap();
+        assert_eq!(
+            open,
+            Some(dir.path().join("notes.md").canonicalize().unwrap())
+        );
+        let abs = ws.join("notes.md").canonicalize().unwrap();
+        let (_, open, _) =
+            resolve_workspace_from(Path::new("ws"), Some(abs.clone()), dir.path()).unwrap();
+        assert_eq!(open, Some(abs));
+        let (root, open, _) =
+            resolve_workspace_from(Path::new("ws"), Some(PathBuf::from("new.rs")), dir.path())
+                .unwrap();
+        assert_eq!(open, Some(root.join("new.rs")));
     }
 
     #[test]

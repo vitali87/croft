@@ -561,6 +561,190 @@ fn view_from_an_empty_pipe_says_nothing_arrived() {
     );
 }
 
+/// #848 end to end: `croft edit --wait` on a file that does not exist yet
+/// creates it empty, asks the croft to open it, and returns once a probe
+/// says its tab closed. That is what `EDITOR="croft edit --wait"` needs from
+/// a tool that names a file it has not written, and it used to be refused.
+#[test]
+fn edit_wait_creates_a_new_file_opens_it_and_returns_once_it_closes() {
+    use std::io::{BufRead, BufReader, Write};
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("v.sock");
+    let target = tmp.path().join("TODO.md");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+    // The open, answered ok, then the wait's first probe, answered closed.
+    let server = std::thread::spawn(move || {
+        let replies: [&[u8]; 2] = [
+            b"{\"status\":\"ok\"}\n",
+            b"{\"status\":\"err\",\"message\":\"closed\"}\n",
+        ];
+        let mut requests = Vec::new();
+        for reply in replies {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            stream.write_all(reply).unwrap();
+            requests.push(line);
+        }
+        requests
+    });
+
+    Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", &sock)
+        .current_dir(tmp.path())
+        .args(["edit", "--wait", "TODO.md"])
+        .assert()
+        .success();
+
+    let requests = server.join().unwrap();
+    assert!(
+        !requests[0].contains("probe"),
+        "first the open: {requests:?}"
+    );
+    assert!(
+        requests[1].contains("\"probe\":true"),
+        "then the wait's probe: {requests:?}"
+    );
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"",
+        "the new file was created, empty"
+    );
+}
+
+/// #848: every `croft edit` message said `croft view`. Outside croft it now
+/// names itself, and leaves no empty file behind for a path it cannot open.
+#[test]
+fn edit_outside_croft_names_itself_and_creates_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env_remove("CROFT_VIEW_SOCK")
+        .current_dir(tmp.path())
+        .args(["edit", "new.txt"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("croft edit needs a croft") && !stderr.contains("croft view"),
+        "stderr must name the command the user typed, was: {stderr}"
+    );
+    assert!(!tmp.path().join("new.txt").exists());
+}
+
+/// #848 guard: a new file's folder must exist. `croft edit` into a missing
+/// one is refused before any croft is asked to open it, and creates neither
+/// the file nor the folders above it.
+#[test]
+fn edit_refuses_a_missing_folder_without_bothering_the_socket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("v.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", &sock)
+        .current_dir(tmp.path())
+        .args(["edit", "no/such/TODO.md"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.starts_with("croft edit: ") && stderr.contains("no such directory"),
+        "stderr must name the command and the reason, was: {stderr}"
+    );
+    assert!(
+        matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "no croft was asked to open anything"
+    );
+    assert!(!tmp.path().join("no").exists(), "no folders were created");
+}
+
+/// #848: with a stale `CROFT_VIEW_SOCK` (the croft that set it has exited),
+/// `croft edit` created the new file, failed to open it, and left the empty
+/// file behind. A failed open takes back the file this call created.
+#[test]
+fn edit_against_a_vanished_croft_leaves_no_new_file_behind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", tmp.path().join("nobody.sock"))
+        .current_dir(tmp.path())
+        .args(["edit", "new.txt"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("croft edit: the croft that opened this pane is gone"),
+        "stderr must name the command and the situation, was: {stderr}"
+    );
+    assert!(
+        !tmp.path().join("new.txt").exists(),
+        "the empty file this call created was left behind"
+    );
+}
+
+/// #848: a croft that answers but refuses to open the new file leaves
+/// nothing behind either.
+#[test]
+fn edit_refused_by_the_croft_leaves_no_new_file_behind() {
+    use std::io::{BufRead, BufReader, Write};
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("v.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        stream
+            .write_all(b"{\"status\":\"err\",\"message\":\"cannot open that here\"}\n")
+            .unwrap();
+    });
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .env("CROFT_VIEW_SOCK", &sock)
+        .current_dir(tmp.path())
+        .args(["edit", "new.txt"])
+        .assert();
+    server.join().unwrap();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("croft edit: cannot open that here"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        !tmp.path().join("new.txt").exists(),
+        "the empty file this call created was left behind"
+    );
+}
+
+/// #848 guard: a failed open takes back only a file THIS call created. A
+/// file that was already there, even an empty one, is never removed.
+#[test]
+fn edit_against_a_vanished_croft_never_removes_an_existing_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (name, body) in [("keep.txt", "keep me"), ("empty.txt", "")] {
+        let path = tmp.path().join(name);
+        std::fs::write(&path, body).unwrap();
+        Command::cargo_bin("croft")
+            .unwrap()
+            .env("CROFT_VIEW_SOCK", tmp.path().join("nobody.sock"))
+            .current_dir(tmp.path())
+            .args(["edit", name])
+            .assert()
+            .failure()
+            .code(1);
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some(body),
+            "{name} must survive a failed open untouched"
+        );
+    }
+}
+
 /// #682 end to end: croft over a pty with an image protocol on (iTerm2's,
 /// forced) must not stream images on every keystroke. Before the fix, 20
 /// keystrokes in a file cost about 175 KB of escape output (the minimap and
@@ -680,6 +864,151 @@ fn locale_template_accepts_a_full_locale() {
         .count();
     assert!(filled > 0, "the built-in German entries seed it");
     assert!(stderr.contains("locales/de.json"), "{stderr}");
+}
+
+/// The text a Rust string literal's body (between its quotes) spells: one
+/// pass over its escapes (`\\`, `\"`, `\'`, `\n`, `\r`, `\t`, `\0`,
+/// `\xNN`, `\u{...}`), as the compiler reads them.
+fn unescape_rust_literal(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('0') => out.push('\0'),
+            Some('x') => {
+                let hex: String = chars.by_ref().take(2).collect();
+                out.push(char::from(u8::from_str_radix(&hex, 16).unwrap()));
+            }
+            Some('u') => {
+                let hex: String = chars.by_ref().skip(1).take_while(|&c| c != '}').collect();
+                out.push(char::from_u32(u32::from_str_radix(&hex, 16).unwrap()).unwrap());
+            }
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// #849 review: the scan reads translated strings out of Rust literals, so
+/// it has to spell every escape a literal can hold the way the compiler
+/// does, or a string with a newline or tab would be looked up by the wrong
+/// key.
+#[test]
+fn unescape_rust_literal_reads_every_rust_escape() {
+    for (body, text) in [
+        (r"plain", "plain"),
+        (r#"a \"quoted\" word"#, "a \"quoted\" word"),
+        (r"back\\slash", "back\\slash"),
+        (r"line\nbreak", "line\nbreak"),
+        (r"tab\there", "tab\there"),
+        (r"cr\r", "cr\r"),
+        (r"nul\0", "nul\0"),
+        (r"it\'s", "it's"),
+        (r"hex\x41", "hexA"),
+        (r"\u{2026}\u{1F600}", "\u{2026}\u{1F600}"),
+        (
+            r"\\n stays a backslash and an n",
+            "\\n stays a backslash and an n",
+        ),
+    ] {
+        assert_eq!(unescape_rust_literal(body), text, "{body}");
+    }
+}
+
+/// Every string literal croft hands to `tr` at runtime, read from its own
+/// sources, with the file each came from: `tr("…")` calls, and context-menu
+/// labels, which `ContextMenu::localize` runs through `tr` wholesale. Test
+/// code is skipped: its strings are never shown.
+fn strings_croft_translates() -> std::collections::BTreeMap<String, String> {
+    let lit = r#""((?:[^"\\]|\\.)*)""#;
+    let patterns: Vec<regex::Regex> = [
+        format!(r"\btr\(\s*{lit}\s*\)"),
+        format!(r"MenuEntry::(?:item|header)\(\s*{lit}"),
+        format!(r"MenuEntry::item\(\s*if [^{{]*\{{\s*{lit}\s*\}}\s*else\s*\{{\s*{lit}\s*\}}"),
+        format!(r"MenuEntry::Submenu\s*\{{\s*label:\s*(?:String::from\(\s*)?{lit}"),
+        format!(r"\(\s*String::from\(\s*{lit}\s*\)\s*,\s*MenuAction::"),
+        format!(r"\(\s*{lit}\s*\.(?:to_string|to_owned|into)\(\)\s*,\s*MenuAction::"),
+    ]
+    .iter()
+    .map(|p| regex::Regex::new(p).unwrap())
+    .collect();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut dirs = vec![root.clone()];
+    let mut found = std::collections::BTreeMap::new();
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") || path.ends_with("app/tests.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let text = text
+                .find("#[cfg(test)]\nmod tests")
+                .map_or(text.as_str(), |i| &text[..i]);
+            let file = path.strip_prefix(&root).unwrap().display().to_string();
+            for re in &patterns {
+                for caps in re.captures_iter(text) {
+                    for m in caps.iter().skip(1).flatten() {
+                        found.insert(unescape_rust_literal(m.as_str()), file.clone());
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// #849: `croft locale-template` must offer every string croft translates,
+/// not only the palette titles and whatever a built-in catalog happens to
+/// list. Context-menu labels (Close to the Right, Keep Open, the Customize
+/// Layout headers, ...) and `tr("CodeQL")` were missing from every
+/// language's template, so no translator could ever reach them.
+#[test]
+fn locale_template_lists_every_string_croft_translates() {
+    let found = strings_croft_translates();
+    for known in [
+        "Close to the Right",
+        "Panel Alignment",
+        "CodeQL",
+        "Pin",
+        "Unpin",
+    ] {
+        assert!(
+            found.contains_key(known),
+            "the source scan still sees {known:?}; update it with the code"
+        );
+    }
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .args(["locale-template", "xx"])
+        .assert()
+        .success();
+    let template: std::collections::HashMap<String, String> =
+        serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let missing: Vec<String> = found
+        .iter()
+        .filter(|(s, _)| !template.contains_key(*s))
+        .map(|(s, file)| format!("{s:?} ({file})"))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{} string(s) croft translates are missing from the template; add them to \
+         i18n::TRANSLATABLE:\n{}",
+        missing.len(),
+        missing.join("\n")
+    );
 }
 
 /// A French translation in progress, as `locales/fr.json` under a scratch
