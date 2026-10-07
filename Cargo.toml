@@ -75,6 +75,14 @@ tree-sitter-ql = "0.23"
 # CodeQL `.dbscheme` highlighting (#578). MIT; ships no highlights query,
 # so croft carries its own.
 tree-sitter-ql-dbscheme = "0.23"
+# Grammars for files most repositories carry even when written in another
+# language (#1226): Java, Ruby, C#, SQL, Makefiles and Dockerfiles.
+tree-sitter-java = "0.23"
+tree-sitter-ruby = "0.23"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-sequel = "0.3"
+tree-sitter-make = "1.1"
+tree-sitter-containerfile = "0.9"
 
 # CommonMark parser behind the rendered Markdown preview (Cmd+Shift+V).
 # rustdoc / mdBook's engine; parser only, no HTML output needed.

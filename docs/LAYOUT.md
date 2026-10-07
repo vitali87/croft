@@ -18,6 +18,12 @@ A `⋯` "Views and More Actions" button on the EXPLORER title line toggles which
 
 Each section is individually collapsible, grows to at most half the region, and scrolls independently under the mouse wheel; the file tree absorbs the leftover rows. OUTLINE and TIMELINE start collapsed to their header chevron until expanded (matching VS Code), so they claim no rows from the tree on a fresh launch. Search and a Remote (SSH) explorer swap in via the activity bar.
 
+### Search
+
+![Search: find TODO across the workspace and open a hit at its line](images/search.gif)
+
+`Cmd`/`Ctrl`+`Shift`+`F` opens Search in the sidebar: find in files on the ripgrep engine as you type, with match case, whole word and regex toggles (`Aa`, `ab`, `.*`), "files to include" / "files to exclude" globs behind the `⋯`, and Replace All. Click a hit to open the file at that line.
+
 ### Activity bar
 
 The icon strip down the far left: view icons (Explorer, Search, Source Control, Remote, Run and Debug, Extensions, Testing) at the top, a settings gear at the bottom.
@@ -52,6 +58,8 @@ All three panes resize by dragging the seams between them, including the seam be
 
 ## Customize Layout
 
+![Customize Layout: move the side bar right, hide and show the panel and the status bar](images/customize-layout.gif)
+
 The `⛶` icon at the top-right of the editor (and the welcome screen), or the settings gear → **Customize Layout**, opens a popup mirroring VS Code's title-bar layout controls. Two icons beside it toggle the primary side bar (`▢`) and the panel (`▭`) directly. The popup groups:
 
 * Visibility toggles: Activity Bar, Primary Side Bar, Secondary Side Bar, Panel, Status Bar.
@@ -81,6 +89,8 @@ The collapse is also held off whenever something else on screen depends on the s
 
 ## Command Palette
 
+![Command Palette: run Preferences: Color Theme and pick Tokyo Night](images/command-palette.gif)
+
 `Cmd`/`Ctrl`+`Shift`+`P` fuzzy-searches and runs every named command, the same surface VS Code uses to make actions reachable without memorising a chord. Go to Symbol (`Cmd`/`Ctrl`+`Shift`+`O`) fuzzy-jumps within a file (or to a line with a `:` prefix), and a `#` prefix in Quick Open searches symbols across the whole workspace through the language servers.
 
 ## Editor
@@ -91,6 +101,9 @@ The collapse is also held off whenever something else on screen depends on the s
 * Inline previews for images / PDFs / spreadsheets. The rendered Markdown / notebook / document view is selectable: drag to select the text you can see, `Cmd`/`Ctrl`+`C` copies the rendered text rather than the source, `Esc` clears.
 * A minimap: a rasterized file preview in a right-edge strip; click or drag to jump, right-click to toggle or re-side it.
 * A breadcrumbs bar: the file path plus the enclosing symbol trail at the caret, click to jump.
+* Symbol tabs: `Cmd`+`K` `Shift`+`V` opens the function or class at the caret as its own tab. The tab shows only that symbol, edits land in the file, and it follows the symbol as the file changes.
+
+  ![A symbol tab: perimeter opened as its own tab beside shapes.rs](images/symbol-tabs.gif)
 * Sticky scroll: the enclosing scope headers pinned to the top while you scroll.
 * Code folding: LSP fold ranges when the server provides them, with an indentation + `#region`-marker + comment-run fallback. Collapse from a gutter chevron or `Cmd`/`Ctrl`+`K` chords, including Fold All Block Comments and Fold/Unfold All Regions.
 * Document links (`textDocument/documentLink`): Ctrl+click a URL, import specifier, or path the server marked as a link and croft follows it — files into the editor, web targets to the system opener, other schemes refused.
@@ -128,6 +141,8 @@ Make it yours: rebind any command in `keybindings.json`, define `Tab`-expandable
 
 ## Terminal
 
+![Terminal: run a build, split a second pane, and the gutter dots marking each command's result](images/terminal.gif)
+
 The TERMINAL tab is your `$SHELL` on a real PTY, splittable into side-by-side panes.
 
 * **Shell integration:** OSC 133 auto-installs for zsh, bash 4.4+, and fish, so `Cmd`/`Ctrl`+`Opt`+`Up`/`Down` jumps between command prompts. Every finished command gets a VS Code-style gutter dot on the pane border (blue for success, red for failure); click it for the exit code, runtime, and a menu to copy or select that command's output or re-run it. Long commands finishing in an unfocused pane announce themselves, new splits inherit the shell's exact cwd, and OSC 9 notifications surface in the status bar.
@@ -149,6 +164,8 @@ The TERMINAL tab is your `$SHELL` on a real PTY, splittable into side-by-side pa
 
 **Command suggestions.** As you type at a prompt, the rest of the newest matching command from croft's history appears after the cursor in grey (preferring one that succeeded in the same folder); `Right` at the end of the line accepts it, as in fish. A shell that draws its own suggestions (fish, zsh-autosuggestions) is left alone, and **Terminal: Toggle Command Suggestions** turns croft's off.
 ## Source Control
+
+![Source Control: open a changed file's diff against HEAD and commit it; the commit graph updates](images/source-control.gif)
 
 Source Control mirrors VS Code's git flow: stage, unstage, and discard per file or in bulk, commit / amend / push / pull / sync, branches, stashes, and tags, with clickable change rows opening a side-by-side diff against HEAD.
 
