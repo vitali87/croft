@@ -64,8 +64,10 @@ pub fn render(header: &Header, hits: &[SearchHit], root: &Path) -> String {
         paths.dedup();
         paths.len()
     };
+    // Occurrences, not lines, as the Search side bar counts them (#860).
+    let results: usize = sorted.iter().map(|h| h.matches).sum();
     out.push('\n');
-    out.push_str(&match (sorted.len(), files) {
+    out.push_str(&match (results, files) {
         (0, _) => String::from("No results"),
         (1, _) => String::from("1 result - 1 file"),
         (n, 1) => format!("{n} results - 1 file"),
@@ -158,6 +160,7 @@ mod tests {
             path: PathBuf::from(path),
             line_no,
             line_text: text.to_string(),
+            matches: 1,
         }
     }
 
@@ -189,6 +192,22 @@ mod tests {
              3 results - 2 files\n\nsrc/a.rs:\n   2: use foo;\n  12: let foo = 1;\n\n\
              src/b.rs:\n   3: foo()\n"
         );
+    }
+
+    /// #860: two matches on one line are two results, as in the side bar.
+    #[test]
+    fn the_summary_counts_occurrences_not_lines() {
+        let mut twice = hit("/p/a.rs", 1, "foo(foo)");
+        twice.matches = 2;
+        let text = render(
+            &Header {
+                query: String::from("foo"),
+                ..Header::default()
+            },
+            &[twice, hit("/p/b.rs", 4, "foo")],
+            Path::new("/p"),
+        );
+        assert!(text.contains("\n3 results - 2 files\n"), "{text}");
     }
 
     #[test]

@@ -1615,6 +1615,11 @@ fn open_region(st: &mut PairState, file: &str, start: (usize, usize), end: (usiz
     }
     let original = doc[s..e].to_string();
     let new = format!("{}{}", &doc[..s], &doc[e..]);
+    // Announce the stream before its first edit, the region's delete: the
+    // host groups the stream's edits into one undo step from the moment it
+    // sees the announcement, so a delete sent first was a step of its own
+    // (#1207).
+    st.session.send_stream_state(file, true);
     st.session.local_change(file, &new);
     // Anchors at or inside the range are about to be collapsed by the
     // delete (and then dragged along by the streamed inserts): record
@@ -1640,7 +1645,6 @@ fn open_region(st: &mut PairState, file: &str, start: (usize, usize), end: (usiz
         displaced,
     });
     st.discarding = false;
-    st.session.send_stream_state(file, true);
     let lines: Vec<String> = new.split('\n').map(String::from).collect();
     let (row, col) = position(&lines, s);
     st.caret_now(file, row, col);
@@ -1692,7 +1696,7 @@ fn pump_session(state: &Mutex<PairState>, sink: &TurnSink, req_id: &AtomicU64) {
         let events = st.session.poll(|_| None);
         for event in events {
             match event {
-                CollabEvent::RemoteEdit { file, spans } => {
+                CollabEvent::RemoteEdit { file, spans, .. } => {
                     if let Some(r) = st.region.as_mut()
                         && r.file == file
                     {
@@ -2993,6 +2997,65 @@ mod tests {
             "conversation history carries the fence verbatim"
         );
         assert!(!state.lock().unwrap().turn_active());
+        stop.store(true, Ordering::Relaxed);
+        pump.join().unwrap();
+    }
+
+    /// #1207: the stream is announced before its first edit (the region's
+    /// delete), so the host folds every edit of it, delete included, into
+    /// one undo step; announced after, the delete was a step of its own.
+    #[test]
+    fn a_stream_is_announced_before_its_first_edit() {
+        let harness = OwnerHarness::start("hello world");
+        let (state, stop, pump) = pumped_state(&harness);
+        let (base_url, server) = serve_sse_once(vec![
+            "<<<EDIT demo.txt:0:6-0:11>>>\n",
+            "streamed",
+            "\n<<<END>>>\n",
+        ]);
+        let (turn_tx, _turn_rx) = std::sync::mpsc::channel();
+        let mut messages = vec![json!({ "role": "user", "content": "fix demo.txt" })];
+        local::stream_turn(
+            &base_url,
+            "test-model",
+            PAIR_SYSTEM_PROMPT,
+            &mut messages,
+            &state,
+            &turn_tx,
+        );
+        server.join().unwrap();
+        harness.wait_until("the streamed edit to converge", |h| {
+            h.doc().as_deref() == Some("hello streamed")
+        });
+        harness.wait_until("the stream to end", |h| {
+            h.events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, CollabEvent::StreamState { active: false, .. }))
+        });
+        let events = harness.events.lock().unwrap();
+        let first = |pred: &dyn Fn(&CollabEvent) -> bool| events.iter().position(pred);
+        let announced = first(&|e| matches!(e, CollabEvent::StreamState { active: true, .. }))
+            .expect("the stream is announced");
+        let edited =
+            first(&|e| matches!(e, CollabEvent::RemoteEdit { .. })).expect("the stream edits");
+        let ended = first(&|e| matches!(e, CollabEvent::StreamState { active: false, .. }))
+            .expect("the stream ends");
+        assert!(
+            announced < edited,
+            "announced at {announced}, first edit at {edited}"
+        );
+        // Negative: the end still follows the last edit.
+        let last_edit = events
+            .iter()
+            .rposition(|e| matches!(e, CollabEvent::RemoteEdit { .. }))
+            .unwrap();
+        assert!(
+            last_edit < ended,
+            "last edit at {last_edit}, ended at {ended}"
+        );
+        drop(events);
         stop.store(true, Ordering::Relaxed);
         pump.join().unwrap();
     }
