@@ -48,8 +48,8 @@
 //!
 //! Every pane's buffer draws on one [`RewindBudget`], split evenly between
 //! the panes that are open, so the total is a single figure however many
-//! panes there are. It is the `terminal_rewind_mb` setting, with a smaller
-//! default on a remote host ([`configured_budget_bytes`]).
+//! panes there are. It is the `terminal_rewind_mb` setting, off when unset
+//! until something can replay the buffer ([`configured_budget_bytes`]).
 //!
 //! # Why this module never renders a screen itself
 //!
@@ -66,20 +66,16 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, Weak};
 
-/// The rewind memory ALL panes share on a local machine, in bytes (#694).
+/// The rewind memory ALL panes share when `terminal_rewind_mb` is unset, in
+/// bytes: none (#1342).
 ///
-/// A process-wide figure rather than a per-pane one. The per-pane 64 MiB
-/// this replaced made the ceiling a function of how many panes were open —
-/// ten busy panes was 640 MiB before a single keyframe — and nothing replays
-/// the buffer yet, so every byte of it was pure cost. The budget is split
-/// evenly across live panes by [`RewindBudget`].
-pub const DEFAULT_BUDGET_BYTES: usize = 128 * 1024 * 1024;
-
-/// The shared budget on a remote host (an SSH session), in bytes.
-///
-/// Remotes are where croft was OOM-killed: small VPSes running croft next
-/// to rust-analyzer and builds, where the whole machine may have 8 GB.
-pub const REMOTE_DEFAULT_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+/// Nothing replays the buffer yet (there is no Session: Rewind to show it),
+/// so recording by default only held memory nobody could use: up to 128 MiB
+/// locally and 32 MiB over SSH, where croft was being OOM-killed (#694). The
+/// change that adds the overlay gives this a default again. Until then the
+/// recorder runs only for someone who sets `terminal_rewind_mb`, and that
+/// figure is split evenly across live panes by [`RewindBudget`].
+pub const DEFAULT_BUDGET_BYTES: usize = 0;
 
 /// The largest `terminal_rewind_mb` honoured. A typo of a few extra zeros
 /// must not hand the rewind buffer the machine.
@@ -87,11 +83,10 @@ pub const MAX_BUDGET_MB: usize = 4096;
 
 /// The shared budget in bytes for a `terminal_rewind_mb` setting.
 ///
-/// Unset picks the default for where croft runs; `0` turns rewind off; any
-/// other value is megabytes, clamped to [`MAX_BUDGET_MB`].
-pub fn configured_budget_bytes(setting_mb: Option<usize>, remote: bool) -> usize {
+/// Unset is [`DEFAULT_BUDGET_BYTES`] (off); `0` turns rewind off; any other
+/// value is megabytes, clamped to [`MAX_BUDGET_MB`].
+pub fn configured_budget_bytes(setting_mb: Option<usize>) -> usize {
     match setting_mb {
-        None if remote => REMOTE_DEFAULT_BUDGET_BYTES,
         None => DEFAULT_BUDGET_BYTES,
         // Saturating: 4096 MiB is exactly 2^32, which wraps to 0 on a 32-bit
         // host and would turn rewind off instead of maximising it.
@@ -1345,23 +1340,38 @@ mod tests {
         assert_eq!(budget.held_bytes(), 0, "a zero total turns rewind off");
     }
 
-    /// Unset follows where croft runs; 0 is off; values are megabytes and
-    /// clamped.
+    /// Unset is off until something can show what was recorded (#1342); 0
+    /// is off; values are megabytes and clamped.
     #[test]
     fn the_setting_maps_to_a_budget() {
-        assert_eq!(configured_budget_bytes(None, false), DEFAULT_BUDGET_BYTES);
+        assert_eq!(configured_budget_bytes(None), 0);
+        assert_eq!(configured_budget_bytes(Some(0)), 0);
+        assert_eq!(configured_budget_bytes(Some(32)), 32 << 20);
         assert_eq!(
-            configured_budget_bytes(None, true),
-            REMOTE_DEFAULT_BUDGET_BYTES
-        );
-        const { assert!(REMOTE_DEFAULT_BUDGET_BYTES < DEFAULT_BUDGET_BYTES) };
-        assert_eq!(configured_budget_bytes(Some(0), false), 0);
-        assert_eq!(configured_budget_bytes(Some(32), true), 32 << 20);
-        assert_eq!(
-            configured_budget_bytes(Some(usize::MAX), false),
+            configured_budget_bytes(Some(usize::MAX)),
             MAX_BUDGET_MB.saturating_mul(1 << 20),
             "an absurd value must clamp, not overflow"
         );
+    }
+
+    /// #1342: no Session: Rewind exists to show the buffer, so with no
+    /// setting a pane records nothing and holds no memory for it.
+    #[test]
+    fn with_no_setting_a_pane_records_nothing() {
+        let budget = RewindBudget::new(configured_budget_bytes(None));
+        let rb = budget.register();
+        rb.lock().unwrap().push(1, b"a long build log");
+        assert!(rb.lock().unwrap().is_empty());
+        assert_eq!(budget.held_bytes(), 0);
+    }
+
+    #[test]
+    fn an_explicit_setting_still_records() {
+        let budget = RewindBudget::new(configured_budget_bytes(Some(64)));
+        let rb = budget.register();
+        rb.lock().unwrap().push(1, b"a long build log");
+        assert!(!rb.lock().unwrap().is_empty());
+        assert!(budget.held_bytes() > 0);
     }
 
     /// #694 review: output that trickles in a byte at a time must not cost

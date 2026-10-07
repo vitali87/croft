@@ -1,0 +1,1 @@
+fix: Opening the diff of a heavily changed file (a lockfile after `npm install`, regenerated code) no longer freezes croft for minutes; the line diff stops searching after half a second, shows a coarser but exact diff, and the diff header says so.

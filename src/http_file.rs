@@ -1,7 +1,8 @@
 //! `.http` / `.rest` request files (#370): the REST-Client format — requests
 //! separated by `###`, `Name: value` headers, a blank line before the body,
-//! `{{variables}}` from a `.http.env.json` beside the file — parsed, sent,
-//! and rendered as a response document the editor opens as an ordinary tab.
+//! `{{variables}}` from the file's own `@name = value` lines or a
+//! `.http.env.json` beside the file — parsed, sent, and rendered as a
+//! response document the editor opens as an ordinary tab.
 //!
 //! One divergence from REST Client worth knowing: `ureq` replaces duplicate
 //! request headers, so two `Accept:` lines in a file send only the last.
@@ -52,14 +53,33 @@ pub fn is_http_file(path: &Path) -> bool {
 }
 
 /// Parse every request block in `text`. Blocks are separated by lines
-/// starting with `###`; within a block, `#` and `//` lines are comments,
-/// the first remaining line is `[METHOD] URL [HTTP/version]`, headers follow
-/// until a blank line, and everything after is the body.
+/// starting with `###`; within a block, `#` and `//` lines are comments and
+/// `@name = value` lines are file variables, the first remaining line is
+/// `[METHOD] URL [HTTP/version]`, headers follow until a blank line, and
+/// everything after is the body. A block of only variables and comments is
+/// no request (#1186).
 pub fn parse_requests(text: &str) -> Vec<HttpRequest> {
-    // A leading BOM (routine from Windows editors) must not defeat the
-    // method test on the first request line.
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let lines: Vec<&str> = text.lines().collect();
+    let lines = file_lines(text);
+    let mut out = Vec::new();
+    for (s, e) in blocks(&lines) {
+        if let Some(req) = parse_block(&lines, s, e) {
+            out.push(req);
+        }
+    }
+    out
+}
+
+/// The file's lines. A leading BOM (routine from Windows editors) must not
+/// defeat the method test on the first request line.
+fn file_lines(text: &str) -> Vec<&str> {
+    text.strip_prefix('\u{feff}')
+        .unwrap_or(text)
+        .lines()
+        .collect()
+}
+
+/// The `[start, end)` rows of each `###`-separated block.
+fn blocks(lines: &[&str]) -> Vec<(usize, usize)> {
     let mut blocks: Vec<(usize, usize)> = Vec::new();
     let mut start = 0usize;
     for (i, line) in lines.iter().enumerate() {
@@ -73,29 +93,60 @@ pub fn parse_requests(text: &str) -> Vec<HttpRequest> {
     if lines.len() > start {
         blocks.push((start, lines.len()));
     }
-    let mut out = Vec::new();
-    for (s, e) in blocks {
-        if let Some(req) = parse_block(&lines, s, e) {
-            out.push(req);
+    blocks
+}
+
+/// The first row of a block that is neither the separator, a blank, a
+/// comment nor a file variable: its request line, if it has one.
+fn request_row(lines: &[&str], start: usize, end: usize) -> Option<usize> {
+    (start..end).find(|&i| {
+        let t = lines[i].trim();
+        !(t.is_empty() || t.starts_with('#') || t.starts_with("//") || file_variable(t).is_some())
+    })
+}
+
+/// REST Client's file variable, `@name = value` (#1186): the name and the
+/// value with its outer blanks trimmed.
+fn file_variable(line: &str) -> Option<(&str, &str)> {
+    let rest = line.trim().strip_prefix('@')?;
+    let (name, value) = rest.split_once('=')?;
+    let name = name.trim_end();
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    let valid = (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    valid.then(|| (name, value.trim()))
+}
+
+/// Every `@name = value` file variable in `text`, from the lines before
+/// each block's request line (a body that starts with `@` is not one). A
+/// later definition of a name wins, as in REST Client.
+pub fn file_variables(text: &str) -> BTreeMap<String, String> {
+    let lines = file_lines(text);
+    let mut out = BTreeMap::new();
+    for (s, e) in blocks(&lines) {
+        let stop = request_row(&lines, s, e).unwrap_or(e);
+        for line in &lines[s..stop] {
+            if let Some((name, value)) = file_variable(line) {
+                out.insert(name.to_string(), value.to_string());
+            }
         }
     }
     out
 }
 
+/// The variables a request in `text` resolves against: the file's own
+/// `@name = value` lines over `env` (the `.http.env.json` values), as REST
+/// Client ranks them (#1186).
+pub fn variables(text: &str, env: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut vars = env;
+    vars.extend(file_variables(text));
+    vars
+}
+
 fn parse_block(lines: &[&str], start: usize, end: usize) -> Option<HttpRequest> {
-    let mut i = start;
-    // Skip the separator itself, blanks, and comments to the request line.
-    while i < end {
-        let t = lines[i].trim();
-        if t.is_empty() || t.starts_with('#') || t.starts_with("//") {
-            i += 1;
-            continue;
-        }
-        break;
-    }
-    if i >= end {
-        return None;
-    }
+    // Skip the separator, blanks, comments and variables to the request line.
+    let mut i = request_row(lines, start, end)?;
     let line_row = i;
     let mut parts = lines[i].split_whitespace();
     let first = parts.next()?;
@@ -181,11 +232,31 @@ pub fn load_env(dir: &Path) -> BTreeMap<String, String> {
 
 /// Fill every `{{name}}` hole from `vars` (or the process environment for
 /// `{{$env.NAME}}`), returning the result and the names that had no value.
-/// An unknown hole is left verbatim so the caller can refuse to send a
-/// request whose secrets or hosts would otherwise go out literally.
+/// A value may itself hold holes (`@url = {{base}}/v1`), which are filled
+/// the same way; a name whose value refers back to itself (`@a = {{a}}`),
+/// or one past the expansion budget, counts as missing. An unknown hole is
+/// left verbatim so the caller can refuse to send a request whose secrets
+/// or hosts would otherwise go out literally.
 pub fn substitute(text: &str, vars: &BTreeMap<String, String>) -> (String, Vec<String>) {
-    let mut out = String::with_capacity(text.len());
     let mut missing = Vec::new();
+    let mut expanding = Vec::new();
+    let mut budget = EXPANSION_BUDGET;
+    let out = expand(text, vars, &mut expanding, &mut budget, &mut missing);
+    (out, missing)
+}
+
+/// How many variable values one substitution may expand, so a file whose
+/// variables each repeat the next many times cannot stall the send.
+const EXPANSION_BUDGET: usize = 10_000;
+
+fn expand<'a>(
+    text: &str,
+    vars: &'a BTreeMap<String, String>,
+    expanding: &mut Vec<&'a str>,
+    budget: &mut usize,
+    missing: &mut Vec<String>,
+) -> String {
+    let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(open) = rest.find("{{") {
         out.push_str(&rest[..open]);
@@ -199,7 +270,16 @@ pub fn substitute(text: &str, vars: &BTreeMap<String, String>) -> (String, Vec<S
         let value = if let Some(env_name) = name.strip_prefix("$env.") {
             std::env::var(env_name).ok()
         } else {
-            vars.get(name).cloned()
+            match vars.get_key_value(name) {
+                Some((key, v)) if *budget > 0 && !expanding.contains(&key.as_str()) => {
+                    *budget -= 1;
+                    expanding.push(key);
+                    let v = expand(v, vars, expanding, budget, missing);
+                    expanding.pop();
+                    Some(v)
+                }
+                _ => None,
+            }
         };
         match value {
             Some(v) => out.push_str(&v),
@@ -213,7 +293,7 @@ pub fn substitute(text: &str, vars: &BTreeMap<String, String>) -> (String, Vec<S
         rest = &after[close + 2..];
     }
     out.push_str(rest);
-    (out, missing)
+    out
 }
 
 /// A request with its variables already substituted, ready to send.
@@ -718,5 +798,98 @@ DELETE {{host}}/users/1\n";
             response_kind("application/hal+json"),
             ResponseKind::Text("jsonc")
         );
+    }
+
+    /// The issue's file: `@base` on line 1 fills `{{base}}` in the request
+    /// below it, and the `@base` line is not itself a request (#1186).
+    const VARS: &str = "@base = http://127.0.0.1:8765\n\n### Fetch the hello document\nGET {{base}}/hello.json\nAccept: application/json\n";
+
+    #[test]
+    fn file_variables_fill_the_requests_below_them() {
+        let reqs = parse_requests(VARS);
+        assert_eq!(reqs.len(), 1, "the @base block is no request: {reqs:?}");
+        let req = request_at(&reqs, 3).unwrap();
+        let (resolved, missing) = resolve(req, &variables(VARS, BTreeMap::new()));
+        assert!(missing.is_empty(), "{missing:?}");
+        assert_eq!(resolved.url, "http://127.0.0.1:8765/hello.json");
+        assert!(request_at(&reqs, 0).is_none(), "nothing to send on line 1");
+    }
+
+    /// Variables may refer to each other and to `.http.env.json` values,
+    /// and the file's own definition wins over the env file's.
+    #[test]
+    fn file_variables_nest_and_outrank_the_env_file() {
+        let text = "@host = {{scheme}}://api.test\n@url = {{host}}/v{{version}}\n@version = 2\n\nGET {{url}}/users\nAuthorization: Bearer {{token}}\n";
+        let env = BTreeMap::from([
+            (String::from("scheme"), String::from("https")),
+            (String::from("token"), String::from("t0k")),
+            (String::from("version"), String::from("1")),
+        ]);
+        let reqs = parse_requests(text);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].line, 4);
+        let (resolved, missing) = resolve(&reqs[0], &variables(text, env));
+        assert!(missing.is_empty(), "{missing:?}");
+        assert_eq!(resolved.url, "https://api.test/v2/users");
+        assert_eq!(resolved.headers[0].1, "Bearer t0k");
+    }
+
+    /// Negative: a variable that refers to itself, or to a name nobody
+    /// defines, refuses to send instead of sending its holes; a value that
+    /// repeats the next one many times cannot stall the send.
+    #[test]
+    fn a_cyclic_or_undefined_file_variable_still_refuses() {
+        let text = "@a = {{b}}\n@b = {{a}}\n@c = {{nope}}/x\n\nGET {{a}}/{{c}}\n";
+        let reqs = parse_requests(text);
+        let (_, missing) = resolve(&reqs[0], &variables(text, BTreeMap::new()));
+        assert!(missing.contains(&String::from("a")), "{missing:?}");
+        assert!(missing.contains(&String::from("nope")), "{missing:?}");
+
+        let mut bomb = String::new();
+        for i in 0..30 {
+            bomb.push_str(&format!(
+                "@v{i} = {{{{v{}}}}}{{{{v{}}}}}{{{{v{}}}}}\n",
+                i + 1,
+                i + 1,
+                i + 1
+            ));
+        }
+        bomb.push_str("@v30 = x\nGET http://h/{{v0}}\n");
+        let started = std::time::Instant::now();
+        let reqs = parse_requests(&bomb);
+        let (_, missing) = resolve(&reqs[0], &variables(&bomb, BTreeMap::new()));
+        assert!(
+            !missing.is_empty(),
+            "past the budget a name counts as unresolved"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    /// Negative: only `@name = value` before a request line is a variable.
+    /// A body or header starting with `@`, an `@` line with no `=`, and a
+    /// `# @name` request-name comment are left as they were.
+    #[test]
+    fn only_a_variable_line_before_the_request_is_a_variable() {
+        let text =
+            "POST http://h/x\nX-At: @me\n\n@body = not a var\n\n###\n# @name login\n@notavar\n";
+        assert!(
+            file_variables(text).is_empty(),
+            "{:?}",
+            file_variables(text)
+        );
+        let reqs = parse_requests(text);
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].body.as_deref(), Some("@body = not a var"));
+        assert_eq!(reqs[0].headers[0].1, "@me");
+        assert_eq!(
+            reqs[1].url, "@notavar",
+            "no `=`: still a (bad) request line"
+        );
+        // `.http.env.json` alone resolves exactly as before.
+        let env = BTreeMap::from([(String::from("host"), String::from("http://x"))]);
+        let reqs = parse_requests("GET {{host}}/a\n");
+        let (resolved, missing) = resolve(&reqs[0], &variables("GET {{host}}/a\n", env));
+        assert!(missing.is_empty());
+        assert_eq!(resolved.url, "http://x/a");
     }
 }

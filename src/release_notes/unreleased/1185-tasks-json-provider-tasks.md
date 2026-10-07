@@ -1,0 +1,1 @@
+fix: tasks.json entries with no `command` are no longer dropped: an `"type": "npm"` task (what Configure Default Build Task writes) runs its script with the repo's runner, so Ctrl+Shift+B runs the configured default build instead of package.json's `build`; other provider types and `dependsOn`-only tasks are listed and refused with the reason.
