@@ -59937,6 +59937,8 @@ impl App {
             }
         }
         let mut saved: Vec<(PathBuf, crate::provenance::Provenance, Option<Vec<u8>>)> = Vec::new();
+        // The saved text of each, for the language server's didSave (#854).
+        let mut saved_texts: Vec<String> = Vec::new();
         let mut left: Vec<(Option<PathBuf>, String)> = Vec::new();
         let mut save = |ed: &mut Editor| {
             if !holds_unsaved(ed) {
@@ -59984,6 +59986,7 @@ impl App {
             let why = match outcome {
                 Ok(SaveOutcome::Saved) if !ed.dirty => {
                     saved.push((path, ed.provenance_to_record(), ed.bytes_for_disk()));
+                    saved_texts.push(ed.lines.join("\n"));
                     return;
                 }
                 // A workbook save that held formula cells back names them.
@@ -60017,8 +60020,8 @@ impl App {
             self.reload_config_for_path(path);
         }
         if let Some(lsp) = self.lsp.as_ref() {
-            for (path, ..) in &saved {
-                lsp.save_doc(path.clone());
+            for ((path, ..), text) in saved.iter().zip(saved_texts) {
+                lsp.save_doc(path.clone(), text);
             }
         }
         for (path, seats, described) in saved {
