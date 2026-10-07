@@ -158,8 +158,8 @@ pub struct SourceControlPanel {
     /// render, like `message_scroll`, to keep the caret's line visible.
     pub message_line_scroll: usize,
     pub status: GitStatus,
-    /// The prepared merge message last put in the box (#1282), to tell an
-    /// untouched seed from the user's own text.
+    /// The prepared merge message last put in the box (#1282), whole
+    /// (#1336), to tell an untouched seed from the user's own text.
     seeded_message: Option<String>,
     pub entries: Vec<ChangeEntry>,
     /// The multi-root repositories overview (#161), pushed by the App per
@@ -491,25 +491,28 @@ impl SourceControlPanel {
         self.message_cursor = self.message.chars().count();
     }
 
-    /// Fill an empty box with the subject of git's prepared message
-    /// (#1282), so finishing a merge commits `Merge branch 'other'` rather
-    /// than "Empty commit message". Text the user typed, or edited from the
-    /// seed, is never replaced; a seed the user cleared is not put back;
-    /// and an untouched seed goes once the merge is committed or aborted.
+    /// Fill an empty box with git's prepared message (#1282), so finishing
+    /// a merge commits `Merge branch 'other'` rather than "Empty commit
+    /// message". The whole message, body included (#1336): a revert's
+    /// "This reverts commit …" and a cherry-pick's "(cherry picked from
+    /// commit …)" are what tie the commit to the one it came from. Text the
+    /// user typed, or edited from the seed, is never replaced; a seed the
+    /// user cleared is not put back; and an untouched seed goes once the
+    /// merge is committed or aborted.
     pub fn seed_prepared_message(&mut self) {
-        let subject = self
+        let prepared = self
             .status
             .prepared_message
             .as_deref()
-            .map(|m| m.lines().next().unwrap_or("").trim().to_string());
-        match subject {
-            Some(subject) => {
+            .map(|m| m.trim().to_string());
+        match prepared {
+            Some(prepared) => {
                 if self.message.is_empty()
-                    && !subject.is_empty()
-                    && self.seeded_message.as_deref() != Some(subject.as_str())
+                    && !prepared.is_empty()
+                    && self.seeded_message.as_deref() != Some(prepared.as_str())
                 {
-                    self.insert_str(&subject);
-                    self.seeded_message = Some(subject);
+                    self.insert_str(&prepared);
+                    self.seeded_message = Some(prepared);
                 }
             }
             None => {
@@ -2973,15 +2976,38 @@ mod tests {
         assert_eq!(p.message, "", "the merge was committed or aborted");
     }
 
-    /// Only the subject line goes in while the box is one line.
+    /// #1336: the whole prepared message goes in, body and all, so a revert
+    /// keeps "This reverts commit …" and a cherry-pick its "(cherry picked
+    /// from commit …)". The caret lands at its end, and an untouched seed
+    /// still goes once the revert is over.
     #[test]
-    fn a_prepared_message_with_a_body_fills_its_subject() {
+    fn a_prepared_message_with_a_body_fills_the_whole_message() {
+        let mut p = SourceControlPanel::new();
+        let prepared = "Revert \"x\"\n\nThis reverts commit abc.";
+        p.set_status(merging(Some(prepared)), Vec::new());
+        assert_eq!(p.message, prepared);
+        assert_eq!(p.message_cursor, p.message.chars().count());
+        p.set_status(merging(Some(prepared)), Vec::new());
+        assert_eq!(p.message, prepared, "a refresh doesn't seed it twice");
+        p.set_status(merging(None), Vec::new());
+        assert_eq!(p.message, "", "the revert was committed or aborted");
+    }
+
+    /// Negative (#1336): an edited body is the user's text, so the end of
+    /// the revert leaves it in the box.
+    #[test]
+    fn an_edited_body_is_kept_when_the_revert_ends() {
         let mut p = SourceControlPanel::new();
         p.set_status(
             merging(Some("Revert \"x\"\n\nThis reverts commit abc.")),
             Vec::new(),
         );
-        assert_eq!(p.message, "Revert \"x\"");
+        p.insert_str(" It broke checkout.");
+        p.set_status(merging(None), Vec::new());
+        assert_eq!(
+            p.message,
+            "Revert \"x\"\n\nThis reverts commit abc. It broke checkout."
+        );
     }
 
     #[test]
