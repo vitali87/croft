@@ -191,7 +191,6 @@ pub const TRANSLATABLE: &[&str] = &[
     "Focus Right Group",
     "Go to Declaration",
     "Go to Definition",
-    "Go to Implementations",
     "Go to References",
     "Go to Symbol",
     "Go to Type Definition",
