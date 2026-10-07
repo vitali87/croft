@@ -97,12 +97,16 @@ impl MemoryReport {
                 human(grid)
             );
         }
-        let _ = writeln!(
-            out,
-            "  Rewind total: {} of {} shared budget",
-            human(rewind_total),
-            human(self.rewind_budget)
-        );
+        if self.rewind_budget == 0 && rewind_total == 0 {
+            out.push_str("  Rewind: off (set terminal_rewind_mb in config.json to record)\n");
+        } else {
+            let _ = writeln!(
+                out,
+                "  Rewind total: {} of {} shared budget",
+                human(rewind_total),
+                human(self.rewind_budget)
+            );
+        }
         let _ = writeln!(
             out,
             "  Grid total: ~{} est. (rows × columns × {} B per cell)",
@@ -240,6 +244,23 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("Total: 40.0 MiB (text only)"), "{text}");
+    }
+
+    /// #1342: rewind is off unless configured, and the report says so
+    /// rather than measuring a recording against a budget of nothing.
+    #[test]
+    fn rewind_off_reads_as_off() {
+        let mut off = report();
+        off.rewind_budget = 0;
+        for t in &mut off.terminals {
+            t.rewind_bytes = 0;
+        }
+        let text = off.format();
+        assert!(
+            text.contains("Rewind: off (set terminal_rewind_mb in config.json to record)"),
+            "{text}"
+        );
+        assert!(!text.contains("shared budget"), "{text}");
     }
 
     /// The buffer holding the most history is listed first.
