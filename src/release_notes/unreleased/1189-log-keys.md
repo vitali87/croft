@@ -1,0 +1,1 @@
+fix: A rendered colour log now scrolls from the keyboard (arrows, PageUp/PageDown, Home/End, Ctrl+Home/End), a key no longer throws a wheel-scrolled log back to line 1, and typing no longer marks the read-only log modified.

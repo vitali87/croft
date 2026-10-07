@@ -26,6 +26,7 @@ pub enum Command {
     ToggleBlockComment,
     JoinLines,
     DeleteLine,
+    KillToEndOfLine,
     TransformUpper,
     TransformLower,
     TransformTitle,
@@ -46,6 +47,8 @@ pub enum Command {
     MergeAcceptAllIncoming,
     MergeNextConflict,
     MergePrevConflict,
+    GoToNextChange,
+    GoToPrevChange,
     MergeComplete,
     MergeOpenEditor,
     MergeToggleBase,
@@ -55,6 +58,9 @@ pub enum Command {
     DebugClearWatch,
     PeekDefinition,
     PeekReferences,
+    /// Go to Implementations (#843): Cmd+F12, which has no `Ctrl` form
+    /// (`Ctrl+F12` is Go to Type Definition).
+    GoToImplementations,
     MouseAddCursorAtClick,
     MouseGoToDefinitionAtClick,
     MouseOpenLinkAtClick,
@@ -114,9 +120,15 @@ pub enum Command {
     ToggleInlineValues,
     ToggleInlayHints,
     ToggleMarkdownPreview,
+    /// Markdown: Run Code Block at Cursor (#843): Cmd+Enter's run of the
+    /// fence under the caret, from any terminal.
+    RunCodeBlockAtCursor,
     RestoreSnapshot,
     CloseEditor,
     ReopenClosedEditor,
+    /// Explorer: Jump to Directory (zoxide) (#843): the Explorer's Cmd+Z,
+    /// which has no `Ctrl` form.
+    ZoxideJump,
     /// The editor tab menu's close / pin / keep rows as commands (#852),
     /// VS Code's names, each on the active tab of the focused group.
     CloseOtherEditors,
@@ -130,6 +142,10 @@ pub enum Command {
     UnpinEditor,
     KeepEditor,
     SplitEditor,
+    /// View: Focus Left / Right Editor Group (#843): Cmd+Opt+Left / Right,
+    /// which have no `Ctrl` form off macOS.
+    FocusLeftEditorGroup,
+    FocusRightEditorGroup,
     QuickOpen,
     TakeTheTour,
     SarifNextResult,
@@ -152,6 +168,15 @@ pub enum Command {
     // --- View / navigation ---
     ShowExplorer,
     ShowSearch,
+    /// Search: Replace in Files (#860): the Search side bar with its Replace
+    /// row expanded and focused.
+    ReplaceInFiles,
+    /// The Search side bar's `Aa` / `ab` / `.*` toggles and its `...`
+    /// include / exclude row, from the keyboard (#860).
+    SearchToggleMatchCase,
+    SearchToggleWholeWord,
+    SearchToggleRegex,
+    SearchToggleDetails,
     ShowSourceControl,
     AddWorkspaceFolder,
     RemoveWorkspaceFolder,
@@ -291,6 +316,10 @@ pub enum Command {
     ProblemsToggleScope,
     DiffToggleIgnoreWhitespace,
     NewTerminal,
+    /// Terminal: Focus Next / Previous Terminal (#843): Cmd+] / Cmd+[, which
+    /// have no `Ctrl` form (`Ctrl+[` is `Esc`).
+    FocusNextTerminal,
+    FocusPreviousTerminal,
     // --- Run / debug ---
     StartDebugging,
     SelectDebugConfig,
@@ -442,6 +471,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ToggleBlockComment,
     Command::JoinLines,
     Command::DeleteLine,
+    Command::KillToEndOfLine,
     Command::TransformUpper,
     Command::TransformLower,
     Command::TransformTitle,
@@ -462,6 +492,8 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::MergeAcceptAllIncoming,
     Command::MergeNextConflict,
     Command::MergePrevConflict,
+    Command::GoToNextChange,
+    Command::GoToPrevChange,
     Command::MergeComplete,
     Command::MergeOpenEditor,
     Command::MergeToggleBase,
@@ -471,6 +503,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::DebugClearWatch,
     Command::PeekDefinition,
     Command::PeekReferences,
+    Command::GoToImplementations,
     Command::MouseAddCursorAtClick,
     Command::MouseGoToDefinitionAtClick,
     Command::MouseOpenLinkAtClick,
@@ -524,9 +557,11 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ToggleInlineValues,
     Command::ToggleInlayHints,
     Command::ToggleMarkdownPreview,
+    Command::RunCodeBlockAtCursor,
     Command::RestoreSnapshot,
     Command::CloseEditor,
     Command::ReopenClosedEditor,
+    Command::ZoxideJump,
     Command::CloseOtherEditors,
     Command::CloseEditorsToTheRight,
     Command::CloseSavedEditors,
@@ -535,6 +570,8 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::UnpinEditor,
     Command::KeepEditor,
     Command::SplitEditor,
+    Command::FocusLeftEditorGroup,
+    Command::FocusRightEditorGroup,
     Command::QuickOpen,
     Command::TakeTheTour,
     Command::SarifNextResult,
@@ -552,6 +589,11 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::MacroReplayTimes,
     Command::ShowExplorer,
     Command::ShowSearch,
+    Command::ReplaceInFiles,
+    Command::SearchToggleMatchCase,
+    Command::SearchToggleWholeWord,
+    Command::SearchToggleRegex,
+    Command::SearchToggleDetails,
     Command::ShowSourceControl,
     Command::AddWorkspaceFolder,
     Command::RemoveWorkspaceFolder,
@@ -680,6 +722,8 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ProblemsToggleScope,
     Command::DiffToggleIgnoreWhitespace,
     Command::NewTerminal,
+    Command::FocusNextTerminal,
+    Command::FocusPreviousTerminal,
     Command::StartDebugging,
     Command::SelectDebugConfig,
     Command::AddDebugConfig,
@@ -810,6 +854,7 @@ impl Command {
             Command::ToggleBlockComment => "Toggle Block Comment",
             Command::JoinLines => "Join Lines",
             Command::DeleteLine => "Delete Line",
+            Command::KillToEndOfLine => "Kill to End of Line",
             Command::TransformUpper => "Transform to Uppercase",
             Command::TransformLower => "Transform to Lowercase",
             Command::TransformTitle => "Transform to Title Case",
@@ -830,6 +875,8 @@ impl Command {
             Command::MergeAcceptAllIncoming => "Merge Conflict: Accept All Incoming",
             Command::MergeNextConflict => "Merge Conflict: Next Conflict",
             Command::MergePrevConflict => "Merge Conflict: Previous Conflict",
+            Command::GoToNextChange => "Go to Next Change",
+            Command::GoToPrevChange => "Go to Previous Change",
             Command::MergeComplete => "Merge: Complete Merge (stage file)",
             Command::MergeOpenEditor => "Merge: Open Merge Editor",
             Command::MergeToggleBase => "Merge: Show Base",
@@ -839,6 +886,7 @@ impl Command {
             Command::DebugClearWatch => "Debug: Remove All Watch Expressions",
             Command::PeekDefinition => "Peek Definition",
             Command::PeekReferences => "Peek References",
+            Command::GoToImplementations => "Go to Implementations",
             Command::MouseAddCursorAtClick => "Mouse: Add Cursor at Click",
             Command::MouseGoToDefinitionAtClick => "Mouse: Go to Definition at Click",
             Command::MouseOpenLinkAtClick => "Mouse: Open Link at Click",
@@ -892,9 +940,11 @@ impl Command {
             Command::ToggleInlineValues => "Debug: Toggle Inline Values",
             Command::ToggleInlayHints => "Editor: Toggle Inlay Hints",
             Command::ToggleMarkdownPreview => "Markdown: Toggle Preview",
+            Command::RunCodeBlockAtCursor => "Markdown: Run Code Block at Cursor",
             Command::RestoreSnapshot => "Local History: Restore Snapshot",
             Command::CloseEditor => "View: Close Editor",
             Command::ReopenClosedEditor => "View: Reopen Closed Editor",
+            Command::ZoxideJump => "Explorer: Jump to Directory (zoxide)",
             Command::CloseOtherEditors => "View: Close Other Editors in Group",
             Command::CloseEditorsToTheRight => "View: Close Editors to the Right in Group",
             Command::CloseSavedEditors => "View: Close Saved Editors in Group",
@@ -903,6 +953,8 @@ impl Command {
             Command::UnpinEditor => "View: Unpin Editor",
             Command::KeepEditor => "View: Keep Editor",
             Command::SplitEditor => "View: Split Editor",
+            Command::FocusLeftEditorGroup => "View: Focus Left Editor Group",
+            Command::FocusRightEditorGroup => "View: Focus Right Editor Group",
             Command::QuickOpen => "Go to File",
             Command::TakeTheTour => "Help: Take the Tour",
             Command::SarifNextResult => "SARIF: Next Result",
@@ -920,6 +972,11 @@ impl Command {
             Command::MacroReplayTimes => "Macro: Replay N Times…",
             Command::ShowExplorer => "View: Show Explorer",
             Command::ShowSearch => "View: Show Search",
+            Command::ReplaceInFiles => "Search: Replace in Files",
+            Command::SearchToggleMatchCase => "Search: Toggle Match Case",
+            Command::SearchToggleWholeWord => "Search: Toggle Match Whole Word",
+            Command::SearchToggleRegex => "Search: Toggle Use Regular Expression",
+            Command::SearchToggleDetails => "Search: Toggle Search Details",
             Command::ShowSourceControl => "View: Show Source Control",
             Command::AddWorkspaceFolder => "Workspaces: Add Folder to Workspace",
             Command::SaveWorkspaceAs => "Workspaces: Save Workspace As",
@@ -1052,6 +1109,8 @@ impl Command {
             Command::ProblemsToggleScope => "Problems: Toggle Scope (Open Files / Whole Project)",
             Command::DiffToggleIgnoreWhitespace => "Diff: Toggle Ignore Whitespace",
             Command::NewTerminal => "Terminal: Create New Terminal",
+            Command::FocusNextTerminal => "Terminal: Focus Next Terminal",
+            Command::FocusPreviousTerminal => "Terminal: Focus Previous Terminal",
             Command::StartDebugging => "Debug: Start Debugging",
             Command::SelectDebugConfig => "Debug: Select and Start Debugging",
             Command::AddDebugConfig => "Debug: Add Configuration…",
@@ -1157,13 +1216,23 @@ impl Command {
 
     /// The default key-binding hint shown right-aligned on the row, or an
     /// empty string for palette-only commands. The label uses the macOS chord
-    /// names; on Linux/Android the command modifier is `Ctrl`.
+    /// names; on Linux/Android the command modifier is `Ctrl`, and
+    /// [`platform_hint`] spells it that way where it is shown.
     pub fn keybinding_hint(self) -> &'static str {
         match self {
             Command::MoveLineUp => "Alt+↑",
             Command::MoveLineDown => "Alt+↓",
             Command::JoinLines => "Cmd+Opt+Shift+J",
             Command::DeleteLine => "Cmd+Shift+K",
+            // macOS keeps `Ctrl+K`; off it `Ctrl+K` is the `Cmd+K` leader
+            // except in vim mode (#843), so the palette is the way there.
+            Command::KillToEndOfLine => {
+                if cfg!(target_os = "macos") {
+                    "Ctrl+K"
+                } else {
+                    ""
+                }
+            }
             Command::TransformUpper => "Cmd+Opt+Shift+U",
             Command::TransformLower => "Cmd+Opt+Shift+L",
             Command::TransformTitle => "Cmd+Opt+Shift+C",
@@ -1191,6 +1260,7 @@ impl Command {
             Command::ToggleInlineValues => "",
             Command::ToggleInlayHints => "",
             Command::ToggleMarkdownPreview => "Cmd+Shift+V",
+            Command::RunCodeBlockAtCursor => "Cmd+Enter",
             Command::RestoreSnapshot => "",
             Command::MergeAcceptCurrent => "Cmd+.",
             Command::MergeAcceptIncoming => "Cmd+.",
@@ -1199,6 +1269,8 @@ impl Command {
             Command::MergeAcceptAllIncoming => "",
             Command::MergeNextConflict => "F7",
             Command::MergePrevConflict => "Shift+F7",
+            Command::GoToNextChange => "F7",
+            Command::GoToPrevChange => "Shift+F7",
             Command::MergeComplete => "",
             Command::MergeOpenEditor => "",
             Command::MergeToggleBase => "",
@@ -1208,6 +1280,7 @@ impl Command {
             Command::DebugClearWatch => "",
             Command::PeekDefinition => "Alt+F12",
             Command::PeekReferences => "Alt+Shift+F12",
+            Command::GoToImplementations => "Cmd+F12",
             Command::MouseAddCursorAtClick => "",
             Command::MouseGoToDefinitionAtClick => "",
             Command::MouseOpenLinkAtClick => "",
@@ -1255,6 +1328,7 @@ impl Command {
             Command::SelectAll => "Cmd+A",
             Command::CloseEditor => "Cmd+W",
             Command::ReopenClosedEditor => "Cmd+K Shift+W",
+            Command::ZoxideJump => "Cmd+Z in Explorer",
             // No chord: the tab menu's ⌥⌘T hint is iTerm2's own New Tab
             // chord, which croft leaves alone.
             Command::CloseOtherEditors => "",
@@ -1267,6 +1341,8 @@ impl Command {
             Command::UnpinEditor => "Cmd+K P",
             Command::KeepEditor => "Cmd+K Shift+P",
             Command::SplitEditor => "Cmd+\\",
+            Command::FocusLeftEditorGroup => "Cmd+Opt+←",
+            Command::FocusRightEditorGroup => "Cmd+Opt+→",
             Command::QuickOpen => "Cmd+P",
             Command::TakeTheTour => "",
             Command::SarifNextResult => "",
@@ -1284,6 +1360,15 @@ impl Command {
             Command::MacroReplayTimes => "",
             Command::ShowExplorer => "Cmd+Shift+E",
             Command::ShowSearch => "Cmd+Shift+F",
+            Command::ReplaceInFiles => "Cmd+Shift+H",
+            // VS Code's search-input keys, live while a Search input has
+            // focus; run from the palette they reveal the side bar first.
+            Command::SearchToggleMatchCase => "Alt+C",
+            Command::SearchToggleWholeWord => "Alt+W",
+            Command::SearchToggleRegex => "Alt+R",
+            // VS Code binds none that is free here (its Ctrl+Shift+J is
+            // croft's maximize-terminal); D for details.
+            Command::SearchToggleDetails => "Alt+D",
             Command::ShowSourceControl => "Cmd+Shift+S",
             Command::AddWorkspaceFolder => "",
             Command::SaveWorkspaceAs => "",
@@ -1412,6 +1497,8 @@ impl Command {
             Command::ProblemsToggleScope => "",
             Command::DiffToggleIgnoreWhitespace => "",
             Command::NewTerminal => "Cmd+T",
+            Command::FocusNextTerminal => "Cmd+]",
+            Command::FocusPreviousTerminal => "Cmd+[",
             Command::KeyboardShortcuts => "F1",
             Command::UpdateCroft => "Cmd+Shift+F9",
             Command::StartDebugging => "F5",
@@ -1533,6 +1620,7 @@ impl Command {
             Command::ToggleBlockComment => "toggle_block_comment",
             Command::JoinLines => "join_lines",
             Command::DeleteLine => "delete_line",
+            Command::KillToEndOfLine => "kill_to_end_of_line",
             Command::TransformUpper => "transform_upper",
             Command::TransformLower => "transform_lower",
             Command::TransformTitle => "transform_title",
@@ -1553,6 +1641,8 @@ impl Command {
             Command::MergeAcceptAllIncoming => "merge_accept_all_incoming",
             Command::MergeNextConflict => "merge_next_conflict",
             Command::MergePrevConflict => "merge_prev_conflict",
+            Command::GoToNextChange => "next_change",
+            Command::GoToPrevChange => "previous_change",
             Command::MergeComplete => "merge_complete",
             Command::MergeOpenEditor => "merge_open_editor",
             Command::MergeToggleBase => "merge_toggle_base",
@@ -1562,6 +1652,7 @@ impl Command {
             Command::DebugClearWatch => "debug_clear_watch",
             Command::PeekDefinition => "peek_definition",
             Command::PeekReferences => "peek_references",
+            Command::GoToImplementations => "go_to_implementations",
             Command::MouseAddCursorAtClick => "mouse_add_cursor_at_click",
             Command::MouseGoToDefinitionAtClick => "mouse_go_to_definition_at_click",
             Command::MouseOpenLinkAtClick => "mouse_open_link_at_click",
@@ -1615,9 +1706,11 @@ impl Command {
             Command::ToggleInlineValues => "toggle_inline_values",
             Command::ToggleInlayHints => "toggle_inlay_hints",
             Command::ToggleMarkdownPreview => "toggle_markdown_preview",
+            Command::RunCodeBlockAtCursor => "run_code_block_at_cursor",
             Command::RestoreSnapshot => "restore_snapshot",
             Command::CloseEditor => "close_editor",
             Command::ReopenClosedEditor => "reopen_closed_editor",
+            Command::ZoxideJump => "zoxide_jump",
             Command::CloseOtherEditors => "close_other_editors",
             Command::CloseEditorsToTheRight => "close_editors_to_the_right",
             Command::CloseSavedEditors => "close_saved_editors",
@@ -1626,6 +1719,8 @@ impl Command {
             Command::UnpinEditor => "unpin_editor",
             Command::KeepEditor => "keep_editor",
             Command::SplitEditor => "split_editor",
+            Command::FocusLeftEditorGroup => "focus_left_editor_group",
+            Command::FocusRightEditorGroup => "focus_right_editor_group",
             Command::QuickOpen => "quick_open",
             Command::TakeTheTour => "help_take_the_tour",
             Command::SarifNextResult => "sarif_next_result",
@@ -1643,6 +1738,11 @@ impl Command {
             Command::MacroReplayTimes => "macro_replay_times",
             Command::ShowExplorer => "show_explorer",
             Command::ShowSearch => "show_search",
+            Command::ReplaceInFiles => "replace_in_files",
+            Command::SearchToggleMatchCase => "search_toggle_match_case",
+            Command::SearchToggleWholeWord => "search_toggle_whole_word",
+            Command::SearchToggleRegex => "search_toggle_regex",
+            Command::SearchToggleDetails => "search_toggle_details",
             Command::ShowSourceControl => "show_source_control",
             Command::AddWorkspaceFolder => "add_workspace_folder",
             Command::SaveWorkspaceAs => "save_workspace_as",
@@ -1771,6 +1871,8 @@ impl Command {
             Command::ProblemsToggleScope => "problems_toggle_scope",
             Command::DiffToggleIgnoreWhitespace => "diff_toggle_ignore_whitespace",
             Command::NewTerminal => "new_terminal",
+            Command::FocusNextTerminal => "focus_next_terminal",
+            Command::FocusPreviousTerminal => "focus_previous_terminal",
             Command::StartDebugging => "start_debugging",
             Command::SelectDebugConfig => "select_debug_config",
             Command::AddDebugConfig => "add_debug_config",
@@ -1894,6 +1996,52 @@ impl Command {
     }
 }
 
+/// The `Cmd` chords with no `Ctrl` form off macOS (the table in
+/// docs/LINUX.md), by their hint, with what the hint reads there instead:
+/// `Super`, which is `Cmd` on Linux and reaches croft over the kitty keyboard
+/// protocol, or the chord Linux uses. `Cmd+Shift+T` (focus the terminal) is
+/// here for when a palette row carries it: `Ctrl+Shift+T` splits one.
+const HINTS_WITHOUT_A_CTRL_FORM: &[(&str, &str)] = &[
+    ("Cmd+\\", "Super+\\"),
+    ("Cmd+Shift+\\", "Super+Shift+\\"),
+    ("Cmd+Opt+\\", "Super+Alt+\\"),
+    ("Cmd+Opt+←", "Super+Alt+←"),
+    ("Cmd+Opt+→", "Super+Alt+→"),
+    ("Cmd+]", "Super+]"),
+    ("Cmd+[", "Super+["),
+    ("Cmd+T", "Ctrl+Shift+T"),
+    ("Cmd+Shift+T", "Super+Shift+T"),
+    ("Cmd+A", "Super+A"),
+    ("Cmd+E", "Super+E"),
+    ("Cmd+F12", "Super+F12"),
+    ("Cmd+Z in Explorer", "Super+Z in Explorer"),
+];
+
+/// `hint` spelled for the platform croft runs on: [`hint_for_platform`].
+pub fn platform_hint(hint: &str) -> std::borrow::Cow<'_, str> {
+    hint_for_platform(hint, cfg!(target_os = "macos"))
+}
+
+/// A keybinding hint as a Mac (`macos`) or anything else spells it (#843).
+/// The hints are written with the macOS names; off macOS the command
+/// modifier is `Ctrl` (docs/LINUX.md), so `Cmd+/` reads `Ctrl+/` there and
+/// `Opt` reads `Alt`, except the chords with no `Ctrl` form, which read as
+/// [`HINTS_WITHOUT_A_CTRL_FORM`] says. A hint without `Cmd` or `Opt` is the
+/// same everywhere.
+pub fn hint_for_platform(hint: &str, macos: bool) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if macos || !(hint.contains("Cmd") || hint.contains("Opt")) {
+        return Cow::Borrowed(hint);
+    }
+    if let Some((_, there)) = HINTS_WITHOUT_A_CTRL_FORM
+        .iter()
+        .find(|(mac, _)| *mac == hint)
+    {
+        return Cow::Borrowed(there);
+    }
+    Cow::Owned(hint.replace("Cmd", "Ctrl").replace("Opt", "Alt"))
+}
+
 /// A palette command contributed by an MCP sidecar extension. Carries its own
 /// runtime `title` (so the built-in [`Command`] enum stays a closed, `Copy`,
 /// `&'static`-titled set) plus the ids needed to dispatch and gate it. The app
@@ -1926,7 +2074,7 @@ impl PaletteItem {
 
     /// The right-aligned keybinding hint. Extension commands have none (they are
     /// palette-only), so they show a blank hint.
-    pub fn keybinding_hint(&self) -> &str {
+    pub fn keybinding_hint(&self) -> &'static str {
         match self {
             PaletteItem::Builtin(c) => c.keybinding_hint(),
             PaletteItem::Extension(_) => "",
@@ -2292,7 +2440,7 @@ pub fn render_command_palette(
         };
         let prefix = if is_selected { "> " } else { "  " };
         let title = crate::i18n::tr(cmd.title());
-        let hint = cmd.keybinding_hint();
+        let hint = platform_hint(cmd.keybinding_hint());
         // Right-align the keybinding hint: pad between the title and the hint
         // so the chord sits at the row's right edge, like VS Code.
         let used = 2 + title.chars().count() + hint.chars().count();
@@ -2301,7 +2449,8 @@ pub fn render_command_palette(
             Span::styled(prefix.to_string(), row_style),
             Span::styled(title.to_string(), row_style),
             Span::styled(" ".repeat(pad), row_style),
-            Span::styled(hint.to_string(), hint_style),
+            // Borrowed as written unless the platform respells it.
+            Span::styled(hint, hint_style),
         ];
         lines.push(Line::from(spans));
     }
@@ -2516,6 +2665,91 @@ mod tests {
     fn every_command_has_a_nonempty_title() {
         for cmd in ALL_COMMANDS {
             assert!(!cmd.title().is_empty(), "{cmd:?} has empty title");
+        }
+    }
+
+    /// #843: off macOS the command modifier is `Ctrl` (LINUX.md), so the row
+    /// for Toggle Line Comment shows `Ctrl+/`, not the macOS `Cmd+/` its hint
+    /// is written with.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_palette_row_spells_cmd_as_ctrl_off_macos() {
+        let mut palette = CommandPalette::new();
+        palette.set_query("toggle line comment");
+        assert_eq!(
+            palette.results.first(),
+            Some(&builtin(Command::ToggleLineComment))
+        );
+        let area = Rect::new(0, 0, 100, 20);
+        let mut buf = Buffer::empty(area);
+        render_command_palette(
+            &mut palette,
+            area,
+            &mut buf,
+            crate::theme::Theme::default(),
+            false,
+        );
+        let row = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .find(|line| line.contains("Toggle Line Comment"))
+            .expect("the row is painted");
+        assert!(row.contains("Ctrl+/"), "{row:?}");
+        assert!(!row.contains("Cmd"), "{row:?}");
+    }
+
+    /// #843: off macOS a hint's `Cmd` reads `Ctrl` and its `Opt` reads `Alt`,
+    /// on every chord of a sequence.
+    #[test]
+    fn off_macos_a_hint_reads_ctrl_for_cmd_and_alt_for_opt() {
+        for (mac, linux) in [
+            ("Cmd+/", "Ctrl+/"),
+            ("Shift+Cmd+Z", "Shift+Ctrl+Z"),
+            ("Cmd+Opt+Shift+J", "Ctrl+Alt+Shift+J"),
+            ("Cmd+K Cmd+T", "Ctrl+K Ctrl+T"),
+            ("Cmd+K Z", "Ctrl+K Z"),
+            ("Cmd+Enter", "Ctrl+Enter"),
+        ] {
+            assert_eq!(hint_for_platform(mac, false), linux);
+        }
+    }
+
+    /// Guard (#843): on macOS every hint keeps its written `Cmd` / `Opt`
+    /// names, and a hint without them is the same on every platform.
+    #[test]
+    fn a_hint_keeps_its_names_on_macos_and_without_cmd() {
+        for hint in ["Cmd+/", "Cmd+Opt+Shift+J", "Cmd+E", "Cmd+\\", "Cmd+T"] {
+            assert_eq!(hint_for_platform(hint, true), hint);
+        }
+        for hint in ["Alt+\u{2191}", "F5", "Shift+F9", "Ctrl+J", "Ctrl+-", ""] {
+            assert_eq!(hint_for_platform(hint, true), hint);
+            assert_eq!(hint_for_platform(hint, false), hint);
+        }
+    }
+
+    /// Guard (#843): a chord LINUX.md lists without a `Ctrl` form never reads
+    /// `Ctrl`+ the same key off macOS (that `Ctrl` chord does something else,
+    /// or nothing): it reads `Super`, or the chord Linux uses instead.
+    #[test]
+    fn a_chord_without_a_ctrl_form_never_reads_as_one() {
+        for (mac, linux) in [
+            ("Cmd+E", "Super+E"),
+            ("Cmd+A", "Super+A"),
+            ("Cmd+\\", "Super+\\"),
+            ("Cmd+Shift+\\", "Super+Shift+\\"),
+            ("Cmd+Opt+\\", "Super+Alt+\\"),
+            ("Cmd+Opt+\u{2190}", "Super+Alt+\u{2190}"),
+            ("Cmd+Opt+\u{2192}", "Super+Alt+\u{2192}"),
+            ("Cmd+]", "Super+]"),
+            ("Cmd+[", "Super+["),
+            ("Cmd+T", "Ctrl+Shift+T"),
+            ("Cmd+F12", "Super+F12"),
+            ("Cmd+Z in Explorer", "Super+Z in Explorer"),
+        ] {
+            assert_eq!(hint_for_platform(mac, false), linux);
         }
     }
 }

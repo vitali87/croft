@@ -140,6 +140,10 @@ pub struct DiffData {
     /// so the user understands why no red/green bands are painted even
     /// though git reports the file as modified.
     pub bytes_differ_but_lines_equal: bool,
+    /// True when the line diff ran out of [`DIFF_DEADLINE`] (#1152): the
+    /// rows are exact but coarser than the smallest diff, and the header
+    /// says so, as VS Code does when it stops a diff early.
+    pub coarse: bool,
     /// True when the diff should render as a single-column unified view
     /// instead of the two-column side-by-side. Set by
     /// `build_unified_deletion` so a tombstone for a file the source-
@@ -307,7 +311,7 @@ impl DiffData {
         left_raw: Option<&str>,
         right_raw: Option<&str>,
     ) -> Self {
-        let mut rows = build_diff_rows(&left_lines, &right_lines);
+        let (mut rows, coarse) = build_diff_rows_within(&left_lines, &right_lines, DIFF_DEADLINE);
         // `str::lines()` (the display split) strips `\r` and forgets whether
         // the file ended in a newline; record both so `hunk_patch` can emit
         // byte-exact lines and the `\ No newline at end of file` marker.
@@ -358,6 +362,7 @@ impl DiffData {
             scroll: 0,
             scroll_x: 0,
             bytes_differ_but_lines_equal,
+            coarse,
             unified: false,
             selection: None,
             find: DiffFindState::default(),
@@ -396,6 +401,7 @@ impl DiffData {
             scroll: 0,
             scroll_x: 0,
             bytes_differ_but_lines_equal: false,
+            coarse: false,
             unified: true,
             selection: None,
             find: DiffFindState::default(),
@@ -453,6 +459,7 @@ impl DiffData {
                 scroll: 0,
                 scroll_x: 0,
                 bytes_differ_but_lines_equal: false,
+                coarse: false,
                 unified: false,
                 selection: None,
                 find: DiffFindState::default(),
@@ -555,6 +562,7 @@ impl DiffData {
             scroll: 0,
             scroll_x: 0,
             bytes_differ_but_lines_equal: false,
+            coarse: false,
             unified: false,
             selection: None,
             find: DiffFindState::default(),
@@ -1707,15 +1715,35 @@ fn parse_diff_git_new_path(text: &str) -> Option<String> {
     Some(rest[idx + 3..].to_string())
 }
 
+/// How long a line diff may search for the smallest edit script (#1152).
+/// Myers' cost grows with file length times lines changed: a 200k-line
+/// lockfile with half its lines changed ran for minutes on the UI thread.
+/// Past the deadline the rest of the change is reported as plain removals
+/// and additions: coarser, but still exactly the two texts, so staging a
+/// hunk stays correct. VS Code caps its diff the same way.
+pub const DIFF_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Run a line-level diff over `left` vs `right` and emit one DiffRow per
 /// visual row. Adjacent Delete + Insert runs are paired (so a one-line
 /// "edit" becomes a single Replaced row, not a Removed row above an Added
 /// row), which is what makes the side-by-side alignment readable.
 pub fn build_diff_rows(left: &[String], right: &[String]) -> Vec<DiffRow> {
+    build_diff_rows_within(left, right, DIFF_DEADLINE).0
+}
+
+/// [`build_diff_rows`] with its search bounded by `budget`; the flag is
+/// true when the budget ran out and the rows are the coarser diff.
+pub fn build_diff_rows_within(
+    left: &[String],
+    right: &[String],
+    budget: std::time::Duration,
+) -> (Vec<DiffRow>, bool) {
     use similar::{ChangeTag, TextDiff};
     let l: Vec<&str> = left.iter().map(|s| s.as_str()).collect();
     let r: Vec<&str> = right.iter().map(|s| s.as_str()).collect();
-    let diff = TextDiff::from_slices(&l, &r);
+    let started = std::time::Instant::now();
+    let diff = TextDiff::configure().timeout(budget).diff_slices(&l, &r);
+    let coarse = started.elapsed() >= budget;
     let changes: Vec<_> = diff.iter_all_changes().collect();
     let mut rows = Vec::new();
     let mut li = 0usize;
@@ -1761,7 +1789,7 @@ pub fn build_diff_rows(left: &[String], right: &[String]) -> Vec<DiffRow> {
             }
         }
     }
-    rows
+    (rows, coarse)
 }
 
 #[cfg(test)]
@@ -1934,6 +1962,116 @@ mod seat_group_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- A huge change is diffed within a deadline (#1152) ----
+
+    /// The issue's lockfile, `packages` entries long, before and after an
+    /// `npm install` that rewrote every version and integrity line.
+    fn lockfile_bump(packages: usize) -> (Vec<String>, Vec<String>) {
+        let (mut before, mut after) = (Vec::new(), Vec::new());
+        for i in 0..packages {
+            let hash = format!("{:040x}", i * 7919);
+            let rev: String = hash.chars().rev().collect();
+            for (side, version, hash) in [(&mut before, 0, &hash), (&mut after, 1, &rev)] {
+                side.push(format!("    \"node_modules/pkg-{i}\": {{"));
+                side.push(format!("      \"version\": \"1.{}.{version}\",", i % 7));
+                side.push(format!("      \"integrity\": \"sha512-{hash}\""));
+                side.push(String::from("    },"));
+            }
+        }
+        (before, after)
+    }
+
+    /// Both texts as the rows walk them: every line of each side exactly
+    /// once and in order, and an Equal row only pairs identical lines.
+    fn assert_rows_rebuild(rows: &[DiffRow], left: &[String], right: &[String]) {
+        let (mut l, mut r) = (0, 0);
+        for row in rows {
+            let (lo, ro) = match *row {
+                DiffRow::Equal { left: a, right: b } => {
+                    assert_eq!(left[a], right[b]);
+                    (Some(a), Some(b))
+                }
+                DiffRow::Replaced { left: a, right: b } => (Some(a), Some(b)),
+                DiffRow::Removed { left: a } => (Some(a), None),
+                DiffRow::Added { right: b } => (None, Some(b)),
+            };
+            if let Some(a) = lo {
+                assert_eq!(a, l, "left lines skipped or repeated");
+                l += 1;
+            }
+            if let Some(b) = ro {
+                assert_eq!(b, r, "right lines skipped or repeated");
+                r += 1;
+            }
+        }
+        assert_eq!((l, r), (left.len(), right.len()));
+    }
+
+    #[test]
+    fn a_lockfile_sized_change_is_diffed_within_the_deadline() {
+        let (before, after) = lockfile_bump(50_000);
+        let started = std::time::Instant::now();
+        let data = DiffData::build(
+            PathBuf::from("package-lock.json (HEAD)"),
+            PathBuf::from("package-lock.json"),
+            before.clone(),
+            after.clone(),
+        );
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "200k lines, 100k changed: the diff took {took:?}"
+        );
+        assert!(data.coarse, "the header must say the diff stopped early");
+        assert_rows_rebuild(&data.rows, &before, &after);
+    }
+
+    #[test]
+    fn a_small_change_still_gets_the_exact_diff() {
+        let (before, mut after) = lockfile_bump(500);
+        after.clone_from(&before);
+        after[1001] = String::from("      \"version\": \"9.9.9\",");
+        let data = DiffData::build(
+            PathBuf::from("a (HEAD)"),
+            PathBuf::from("a"),
+            before.clone(),
+            after.clone(),
+        );
+        assert!(!data.coarse);
+        let changed: Vec<_> = data
+            .rows
+            .iter()
+            .filter(|r| !matches!(r, DiffRow::Equal { .. }))
+            .collect();
+        assert_eq!(
+            changed,
+            vec![&DiffRow::Replaced {
+                left: 1001,
+                right: 1001
+            }]
+        );
+        assert_rows_rebuild(&data.rows, &before, &after);
+    }
+
+    #[test]
+    fn a_diff_out_of_budget_is_coarser_but_still_both_texts() {
+        let (before, after) = lockfile_bump(2_000);
+        let (rows, coarse) = build_diff_rows_within(&before, &after, std::time::Duration::ZERO);
+        assert!(coarse);
+        assert_rows_rebuild(&rows, &before, &after);
+        let (exact, coarse) =
+            build_diff_rows_within(&before, &after, std::time::Duration::from_secs(60));
+        assert!(!coarse);
+        assert_rows_rebuild(&exact, &before, &after);
+        let equal = |rows: &[DiffRow]| {
+            rows.iter()
+                .filter(|r| matches!(r, DiffRow::Equal { .. }))
+                .count()
+        };
+        assert!(equal(&exact) >= 4_000, "names and braces are unchanged");
+        assert!(equal(&rows) <= equal(&exact));
+    }
 
     fn lines(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()

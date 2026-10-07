@@ -1,0 +1,1 @@
+fix: Search results are listed by workspace folder, then path, then line, so the same query shows the same list in the same order on every run instead of the order the parallel file walk happened to finish in; the selected result stays put as more files arrive.
