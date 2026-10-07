@@ -31,6 +31,13 @@ terminal scrollback) still need a relaunch. The hub shows where a value came
 from (`· workspace`, `· user-local`, …) whenever a layer other than your own
 user config decided it.
 
+The **Preferences: Open Settings** hub is also a searchable editor over the
+settings themselves. Type to filter, Enter flips a toggle or asks for a
+value, and Tab switches which layer the change is written to: your user
+config or the workspace.
+
+![Settings editor: search a setting, flip a toggle, set a number, then write to the workspace layer](images/settings-editor.gif)
+
 In a multi-root workspace the workspace layers come from the **primary**
 root. Re-rooting re-merges against the new primary.
 
@@ -89,7 +96,8 @@ allowlist — appearance and editor/terminal behavior:
 `theme`, `format_on_save`, `format_on_type`, `auto_save`, `auto_save_on_focus_change`,
 `render_whitespace`, `disable_inline_blame`, `disable_auto_close_pairs`, `disable_paste_reindent`,
 `disable_inline_values`, `disable_bracket_colors`, `disable_indent_guides`,
-`disable_inlay_hints`, `copy_on_select`, `disable_secret_redaction`, `disable_log_highlight`, `explorer_views`.
+`disable_inlay_hints`, `copy_on_select`, `disable_secret_redaction`, `disable_log_highlight`, `explorer_views`,
+`files_exclude`, `search_exclude`.
 
 Everything else — `disabled_extensions`, `mcp_consented`, `disable_remote_offer`, `remote_offer_excluded_hosts`, `config_sync_excluded_hosts`, `config_sync_excluded_files`, `fleet_groups`, `code_scanning`, `lane_agent`,
 `mcp_tool_fingerprints`, `host_accents`, `notifications`, `screen_reader`, `screen_reader_command`, `codeql_cli_path`, `locale`, and any future key not explicitly
@@ -117,6 +125,8 @@ means the same thing whichever path reads it.
 | `editor.inlayHints.enabled` | `disable_inlay_hints` (negated) |
 | `editor.autoClosingBrackets: "never"` | `disable_auto_close_pairs` |
 | `terminal.integrated.copyOnSelection` | `copy_on_select` |
+| `files.exclude` | `files_exclude` (the globs set to `true`; `false` entries and `when` clauses are left out) |
+| `search.exclude` | `search_exclude` (same) |
 
 Keys croft honours only as user config (a terminal scrollback, say) are
 mapped by `croft import-vscode` but ignored here, since a workspace may not
@@ -124,6 +134,27 @@ set them.
 
 The mapped values sit **below** `.croft/config.json` in the chain, so a
 croft-native workspace file always wins over the VS Code one.
+
+## Project exclusions
+
+`files_exclude` and `search_exclude` are lists of globs, matched against
+workspace-relative paths; a glob that matches a folder hides everything
+inside it, and a pattern with no `/` matches at any depth, as in the
+Search panel's exclude box.
+
+```json
+{ "files_exclude": ["**/generated"], "search_exclude": ["**/tests/fixtures"] }
+```
+
+| Setting | Explorer | Go to File | Search and Replace All |
+|---------|----------|------------|------------------------|
+| `files_exclude` | hidden | skipped | skipped |
+| `search_exclude` | listed | skipped | skipped |
+
+Search adds what you type in "files to exclude" to these. With the box
+open, a `[x] project excludes: ...` row under it names the active globs;
+click it to search every folder for a while (VS Code's "Use Exclude
+Settings and Ignore Files"), and again to turn them back on.
 
 ## Config sync to remotes
 
