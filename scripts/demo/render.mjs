@@ -47,7 +47,7 @@ await page.evaluate(async () => {
 });
 await page.evaluate(({ cols, rows }) => {
   window.term = new Terminal({
-    cols, rows, fontFamily: "NF, monospace", fontSize: 14, lineHeight: 1.0,
+    cols, rows, fontFamily: "NF, monospace", fontSize: 14, lineHeight: 1.1,
     cursorBlink: false, cursorInactiveStyle: "none",
     theme: { background: "#1e1e1e", foreground: "#d4d4d4" },
   });

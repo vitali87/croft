@@ -151,7 +151,7 @@ pub fn list(path: &Path, kind: ArchiveKind) -> std::io::Result<ArchiveView> {
             for i in 0..z.len() {
                 let e = z.by_index_raw(i).map_err(std::io::Error::other)?;
                 entries.push(ArchiveEntry {
-                    path: e.name().to_string(),
+                    path: zip_member_name(&e),
                     size: e.size(),
                     dir: e.is_dir(),
                 });
@@ -217,7 +217,15 @@ pub fn extract_member(
         ArchiveKind::Zip => {
             let f = std::fs::File::open(path)?;
             let mut z = zip::ZipArchive::new(f).map_err(std::io::Error::other)?;
-            let mut e = z.by_name(member).map_err(std::io::Error::other)?;
+            // By the name as listed, which can differ from the crate's own
+            // reading of it (#1224).
+            let index = (0..z.len())
+                .find(|&i| {
+                    z.by_index_raw(i)
+                        .is_ok_and(|e| zip_member_name(&e) == member)
+                })
+                .ok_or_else(|| std::io::Error::other(format!("no such member: {member}")))?;
+            let mut e = z.by_index(index).map_err(std::io::Error::other)?;
             if e.size() > MEMBER_CAP {
                 return Err(std::io::Error::other(format!(
                     "member too large ({} bytes)",
@@ -248,6 +256,21 @@ pub fn extract_member(
         }
     }
     Ok(dest)
+}
+
+/// A zip member's name as `unzip`, libarchive and 7-Zip read it (#1224):
+/// UTF-8 when the raw bytes are UTF-8, even without general-purpose flag
+/// bit 11, which Info-ZIP `zip` 3.0 never sets; CP437 (the crate's reading)
+/// only for bytes that aren't. CP437 names with high bytes are almost never
+/// valid UTF-8, so a real DOS archive still reads as CP437.
+/// An ASCII raw name is left to the crate, which prefers a Unicode Path
+/// extra field when an archiver stored one beside a placeholder name.
+fn zip_member_name<R: std::io::Read>(e: &zip::read::ZipFile<'_, R>) -> String {
+    let raw = e.name_raw();
+    match std::str::from_utf8(raw) {
+        Ok(name) if !raw.is_ascii() => name.to_string(),
+        _ => e.name().to_string(),
+    }
 }
 
 fn write_out(dest: &Path, read: &mut dyn std::io::Read) -> std::io::Result<()> {
@@ -682,6 +705,66 @@ mod tests {
         assert!(extract_member(&zp, ArchiveKind::Zip, "../escape.txt", &dest).is_err());
         assert!(extract_member(&zp, ArchiveKind::Zip, "/abs.txt", &dest).is_err());
         assert!(!dest.join("..").join("escape.txt").exists());
+    }
+
+    /// A zip of `name` holding `body`, written as Info-ZIP `zip` 3.0 does:
+    /// general-purpose flag bit 11 (names are UTF-8) cleared in every
+    /// header. `patch` replaces a placeholder byte of the name with a raw
+    /// one, for names the writer can't take as a `&str`.
+    fn info_zip_style(p: &Path, name: &str, body: &[u8], patch: Option<(u8, u8)>) {
+        let mut out = std::io::Cursor::new(Vec::new());
+        let mut z = zip::ZipWriter::new(&mut out);
+        let o = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        z.start_file(name, o).unwrap();
+        z.write_all(body).unwrap();
+        z.finish().unwrap();
+        let mut bytes = out.into_inner();
+        for i in 0..bytes.len().saturating_sub(10) {
+            let flags_at = match &bytes[i..i + 4] {
+                b"PK\x03\x04" => i + 6,
+                b"PK\x01\x02" => i + 8,
+                _ => continue,
+            };
+            bytes[flags_at + 1] &= !0x08;
+        }
+        if let Some((from, to)) = patch {
+            for b in bytes.iter_mut().filter(|b| **b == from) {
+                *b = to;
+            }
+        }
+        std::fs::write(p, bytes).unwrap();
+    }
+
+    /// #1224: Info-ZIP stores UTF-8 names without flag bit 11; they list
+    /// and extract under their real names, not as CP437 mojibake.
+    #[test]
+    fn a_utf8_name_without_the_utf8_flag_lists_and_extracts_as_utf8() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zp = tmp.path().join("w.zip");
+        let name = "src/ünï cödé/файл.txt";
+        info_zip_style(&zp, name, b"x\n", None);
+        let v = list(&zp, ArchiveKind::Zip).unwrap();
+        assert_eq!(v.entries[0].path, name);
+        let dest = tmp.path().join("out");
+        let got = extract_member(&zp, ArchiveKind::Zip, name, &dest).unwrap();
+        assert_eq!(got, dest.join(name));
+        assert_eq!(std::fs::read(&got).unwrap(), b"x\n");
+    }
+
+    /// Negative (#1224): a name that isn't UTF-8 is still CP437, as the zip
+    /// spec says for a clear bit 11, and extracts under that reading.
+    #[test]
+    fn a_cp437_name_still_reads_as_cp437() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zp = tmp.path().join("dos.zip");
+        // 0x82 is CP437 `é`, and on its own no UTF-8 at all.
+        info_zip_style(&zp, "caf~.txt", b"menu", Some((b'~', 0x82)));
+        let v = list(&zp, ArchiveKind::Zip).unwrap();
+        assert_eq!(v.entries[0].path, "café.txt");
+        let dest = tmp.path().join("out");
+        let got = extract_member(&zp, ArchiveKind::Zip, "café.txt", &dest).unwrap();
+        assert_eq!(std::fs::read(&got).unwrap(), b"menu");
     }
 
     #[test]

@@ -234,6 +234,21 @@ pub fn delve_zero_config_request(file: &Path) -> Value {
     })
 }
 
+/// A delve `launch` request with `outputMode: "remote"` unless it names a
+/// mode: delve then forwards the program's stdout and stderr as DAP `output`
+/// events for the Debug Console, as vscode-go does. In delve's default
+/// `local` mode they go to delve's own stdout and stderr, which croft
+/// discards, so nothing the program printed was shown (#1205). An `attach`
+/// is left alone: the process's output is not delve's to forward.
+pub fn with_remote_output(mut request: Value) -> Value {
+    if request["command"] == "launch"
+        && let Some(args) = request.get_mut("arguments").and_then(Value::as_object_mut)
+    {
+        args.entry("outputMode").or_insert_with(|| json!("remote"));
+    }
+    request
+}
+
 /// delve's `test` mode for the package in `dir`, with `args` for the test
 /// binary: `-test.run` scopes it to one test (#264).
 pub fn delve_test_request(dir: &Path, args: &[String]) -> Value {
@@ -1071,6 +1086,9 @@ pub struct DapSession {
     /// The session attached to a process croft did not start, so ending
     /// it must leave that process running.
     attached: bool,
+    /// Where delve built the program it launched (#1206). Declared after
+    /// `transport`, so delve is gone before the folder is removed.
+    build_dir: Option<DebugBuildDir>,
 }
 
 impl DapSession {
@@ -1177,6 +1195,13 @@ impl DapSession {
         start_request: Value,
         breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
     ) -> Result<DapSession> {
+        let build_dir = delve_builds(&start_request)
+            .then(DebugBuildDir::create)
+            .and_then(std::io::Result::ok);
+        let start_request = match &build_dir {
+            Some(dir) => with_build_output(start_request, dir.path()),
+            None => start_request,
+        };
         let host = "127.0.0.1";
         let port = super::transport::free_port()?;
         let args = vec![String::from("dap"), format!("--listen={host}:{port}")];
@@ -1184,9 +1209,10 @@ impl DapSession {
             DapTransport::connect_tcp_server(&dlv.to_string_lossy(), &args, cwd, host, port, None)?;
         transport.send(initialize_request())?;
         let attached = is_attach(&start_request);
-        transport.send(start_request)?;
+        transport.send(with_remote_output(start_request))?;
         let mut session = Self::new_with_transport(transport, breakpoints, None);
         session.attached = attached;
+        session.build_dir = build_dir;
         Ok(session)
     }
 
@@ -1224,6 +1250,7 @@ impl DapSession {
             data_breakpoints: Vec::new(),
             pending_data_info: std::collections::HashMap::new(),
             attached: false,
+            build_dir: None,
         }
     }
 
@@ -1752,6 +1779,69 @@ fn is_attach(request: &Value) -> bool {
     request["command"] == "attach"
 }
 
+/// Whether delve builds the program for this request: a `launch` in
+/// `debug`, `test` or `auto` mode (delve's default is `debug`) whose
+/// launch.json names no `output`. An `exec`, a core dump or an attach
+/// builds nothing (#1206).
+pub fn delve_builds(request: &Value) -> bool {
+    let args = &request["arguments"];
+    request["command"] == "launch"
+        && args.get("output").is_none()
+        && matches!(
+            args["mode"].as_str(),
+            None | Some("debug" | "test" | "auto")
+        )
+}
+
+/// The launch request with delve's `output` set to a `__debug_bin` in `dir`,
+/// so the binary it builds lands outside the workspace. Left in the package
+/// folder, it stayed behind whenever croft ended delve before delve could
+/// delete it, showing in the Explorer and as untracked in git (#1206).
+pub fn with_build_output(mut request: Value, dir: &Path) -> Value {
+    let bin = dir.join(format!("__debug_bin{}", std::env::consts::EXE_SUFFIX));
+    if let Some(args) = request.get_mut("arguments").and_then(Value::as_object_mut) {
+        args.insert("output".into(), json!(bin.to_string_lossy()));
+    }
+    request
+}
+
+/// A private temp folder for one delve session's build, removed with the
+/// session however delve ended (#1206).
+#[derive(Debug)]
+pub struct DebugBuildDir(PathBuf);
+
+impl DebugBuildDir {
+    /// A fresh folder under the system temp dir. `create_dir` refuses one
+    /// that already exists, so a path someone else planted is never used.
+    pub fn create() -> std::io::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "croft-dlv-{}-{}-{nanos}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&dir)?;
+        Ok(Self(dir))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for DebugBuildDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// `disconnect`, ending the debuggee only when the session launched it.
 fn disconnect_request(attached: bool) -> Value {
     json!({
@@ -2044,6 +2134,76 @@ while True:
         let test = delve_zero_config_request(Path::new("/w/pkg/util_test.go"));
         assert_eq!(test["arguments"]["mode"], "test");
         assert_eq!(test["arguments"]["program"], "/w/pkg");
+    }
+
+    /// Every delve launch asks for its program's output as DAP `output`
+    /// events, whichever builder made it (#1205).
+    #[test]
+    fn delve_launches_forward_the_program_output() {
+        let zero = with_remote_output(delve_zero_config_request(Path::new("/w/main.go")));
+        assert_eq!(zero["arguments"]["outputMode"], "remote");
+        let test = with_remote_output(delve_test_request(Path::new("/w"), &[]));
+        assert_eq!(test["arguments"]["outputMode"], "remote");
+    }
+
+    /// Negative: a launch.json `outputMode` wins, and an attach (whose
+    /// process prints wherever it already does) gets none.
+    #[test]
+    fn an_explicit_output_mode_or_an_attach_is_left_alone() {
+        let local = json!({"command": "launch", "arguments": {"outputMode": "local"}});
+        assert_eq!(
+            with_remote_output(local)["arguments"]["outputMode"],
+            "local"
+        );
+        let attach = json!({"command": "attach", "arguments": {"processId": 7}});
+        assert!(
+            with_remote_output(attach)["arguments"]
+                .get("outputMode")
+                .is_none()
+        );
+    }
+
+    /// End to end against a real delve: what the program prints to stdout
+    /// and stderr reaches the session as `output` events (#1205). Needs Go
+    /// and `dlv`; run it with `--ignored`.
+    #[test]
+    #[ignore]
+    fn delve_shows_the_program_output() {
+        let dlv = std::env::var_os("CROFT_TEST_DLV")
+            .map(PathBuf::from)
+            .or_else(|| crate::dap::install::dlv_program().ok())
+            .expect("dlv");
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("go.mod"), "module t\n\ngo 1.21\n").unwrap();
+        let main = tmp.path().join("main.go");
+        std::fs::write(
+            &main,
+            "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\nfunc main() {\n\tfmt.Println(\"starting up\")\n\tfmt.Fprintln(os.Stderr, \"warning: done\")\n}\n",
+        )
+        .unwrap();
+        let main = main.canonicalize().unwrap();
+        let mut s = DapSession::launch_delve(
+            &dlv,
+            main.parent().unwrap(),
+            delve_zero_config_request(&main),
+            BTreeMap::new(),
+        )
+        .expect("delve starts");
+        let mut output = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while s.phase != SessionPhase::Terminated && std::time::Instant::now() < deadline {
+            for ev in s.poll() {
+                if let DapEvent::Output { text, .. } = ev {
+                    output.push_str(&text);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(output.contains("starting up"), "stdout missing: {output:?}");
+        assert!(
+            output.contains("warning: done"),
+            "stderr missing: {output:?}"
+        );
     }
 
     /// End to end against a real delve: a breakpoint in a small Go program
@@ -3910,5 +4070,114 @@ def stopped():"#,
         assert_eq!(line, 3);
         // debugpy echoes the launched (symlinked) path, NOT the canonical one.
         assert_eq!(loc, via_link, "debugpy must report the path as launched");
+    }
+
+    /// A delve launch builds into croft's own temp folder, never the
+    /// package folder, whether it debugs the package or its tests (#1206).
+    #[test]
+    fn a_delve_launch_builds_outside_the_workspace() {
+        let dir = Path::new("/tmp/croft-dlv-x");
+        for request in [
+            delve_zero_config_request(Path::new("/w/main.go")),
+            delve_zero_config_request(Path::new("/w/main_test.go")),
+            json!({"command": "launch", "arguments": {"program": "/w"}}),
+        ] {
+            assert!(delve_builds(&request), "{request}");
+            let out = with_build_output(request, dir);
+            let bin = out["arguments"]["output"].as_str().unwrap();
+            assert!(bin.starts_with("/tmp/croft-dlv-x/__debug_bin"), "{bin}");
+        }
+    }
+
+    /// Negative: a launch.json `output`, an `exec` of a built binary, a core
+    /// dump and an attach keep what they asked for; none gets croft's folder.
+    #[test]
+    fn an_explicit_output_or_a_launch_that_builds_nothing_is_left_alone() {
+        for request in [
+            json!({"command": "launch", "arguments": {"mode": "debug", "output": "./bin/app"}}),
+            json!({"command": "launch", "arguments": {"mode": "exec", "program": "/w/app"}}),
+            json!({"command": "launch", "arguments": {"mode": "core", "program": "/w/app"}}),
+            json!({"command": "attach", "arguments": {"processId": 7}}),
+        ] {
+            assert!(!delve_builds(&request), "{request}");
+        }
+    }
+
+    /// The build folder is private and goes away with the session, the
+    /// binary in it included; two sessions never share one.
+    #[test]
+    fn the_build_folder_is_removed_with_the_session() {
+        let a = DebugBuildDir::create().unwrap();
+        let b = DebugBuildDir::create().unwrap();
+        assert_ne!(a.path(), b.path());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(a.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        let bin = a.path().join("__debug_bin");
+        std::fs::write(&bin, "x").unwrap();
+        let path = a.path().to_path_buf();
+        drop(a);
+        assert!(!path.exists());
+        assert!(b.path().is_dir());
+    }
+
+    /// End to end against a real delve: stopping a session at a breakpoint,
+    /// or letting the program run to its end, leaves no `__debug_bin` in the
+    /// package folder (#1206). Needs Go and `dlv`; run it with `--ignored`.
+    #[test]
+    #[ignore]
+    fn delve_leaves_no_debug_binary_in_the_package() {
+        let dlv = std::env::var_os("CROFT_TEST_DLV")
+            .map(PathBuf::from)
+            .or_else(|| crate::dap::install::dlv_program().ok())
+            .expect("dlv");
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("go.mod"), "module t\n\ngo 1.21\n").unwrap();
+        let main = tmp.path().join("main.go");
+        std::fs::write(
+            &main,
+            "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tx := 41\n\tx++\n\tfmt.Println(x)\n}\n",
+        )
+        .unwrap();
+        let main = main.canonicalize().unwrap();
+        let leftovers = || {
+            std::fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("__debug_bin"))
+                .collect::<Vec<_>>()
+        };
+        for stop_at_breakpoint in [true, false] {
+            let mut bps = BTreeMap::new();
+            if stop_at_breakpoint {
+                bps.insert(main.clone(), vec![SourceBreakpoint::plain(7)]);
+            }
+            let mut s = DapSession::launch_delve(
+                &dlv,
+                main.parent().unwrap(),
+                delve_zero_config_request(&main),
+                bps,
+            )
+            .expect("delve starts");
+            let want = if stop_at_breakpoint {
+                SessionPhase::Stopped
+            } else {
+                SessionPhase::Terminated
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+            while s.phase != want && std::time::Instant::now() < deadline {
+                s.poll();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert_eq!(s.phase, want);
+            s.disconnect();
+            drop(s);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(leftovers().is_empty(), "left behind: {:?}", leftovers());
+        }
     }
 }
