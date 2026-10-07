@@ -70977,6 +70977,21 @@ fn a_recorded_frame_keeps_the_panes_colours_and_cursor() {
         height: 10,
     };
     app.terminals[0].resize(60, 10);
+    // The pane runs a live shell: let its prompt land first, or a late one
+    // moves the cursor between the recording and the read below.
+    let mut last = app.terminals[0].screen_ansi_wrapped();
+    let mut quiet_since = std::time::Instant::now();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while quiet_since.elapsed() < std::time::Duration::from_millis(500)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        let now = app.terminals[0].screen_ansi_wrapped();
+        if now != last {
+            last = now;
+            quiet_since = std::time::Instant::now();
+        }
+    }
     app.terminals[0].feed_bytes_for_test(b"\r\n\x1b[1;31mQQRED\x1b[0m plain\r\n");
 
     app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
