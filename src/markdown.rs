@@ -6,7 +6,7 @@
 //! file would. Paragraph text is emitted unwrapped — the editor renders the
 //! lines through a wrapping `Paragraph`, so the preview reflows with the pane.
 
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -741,6 +741,13 @@ fn code_line_spans(line: &str, spans: &[HiSpan], code_fg: Color) -> Vec<Span<'st
     out
 }
 
+/// Screen cells `text` takes in the preview, measured the way the painter
+/// advances (#404): a CJK character or an emoji is two, a combining mark
+/// none.
+fn cells(text: &str) -> usize {
+    usize::from(crate::cell_map::CellMap::new(text).width())
+}
+
 struct Renderer<'r> {
     theme: Theme,
     registry: &'r mut LangRegistry,
@@ -776,6 +783,9 @@ struct Renderer<'r> {
     outputs: BlockOutputs,
     /// Rows of cell texts while inside a table (row 0 is the header).
     table: Option<Vec<Vec<String>>>,
+    /// The open table's per-column alignment from its delimiter row
+    /// (`---:`, `:---:`), one entry per column (#861).
+    table_aligns: Vec<Alignment>,
     /// Directory local image paths resolve against (#176); None keeps
     /// every image a placeholder.
     base_dir: Option<std::path::PathBuf>,
@@ -996,14 +1006,23 @@ impl Renderer<'_> {
         let Some(rows) = self.table.take() else {
             return;
         };
+        let aligns = std::mem::take(&mut self.table_aligns);
         if rows.is_empty() {
             return;
         }
         let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+        // Widths in screen cells, not characters (#861): the preview paints
+        // `食費` across four cells, and padding it as two pushed that row's
+        // `│` two columns right of every other row's. Each cell is measured
+        // once, for both its column's width and its own padding.
+        let cell_widths: Vec<Vec<usize>> = rows
+            .iter()
+            .map(|row| row.iter().map(|cell| cells(cell)).collect())
+            .collect();
         let mut widths = vec![0usize; cols];
-        for row in &rows {
-            for (i, cell) in row.iter().enumerate() {
-                widths[i] = widths[i].max(cell.chars().count());
+        for row in &cell_widths {
+            for (i, w) in row.iter().enumerate() {
+                widths[i] = widths[i].max(*w);
             }
         }
         for (r, row) in rows.iter().enumerate() {
@@ -1023,8 +1042,19 @@ impl Renderer<'_> {
                     ));
                 }
                 let cell = row.get(i).map(String::as_str).unwrap_or("");
-                let pad = width.saturating_sub(cell.chars().count());
-                spans.push(Span::styled(format!("{cell}{}", " ".repeat(pad)), style));
+                let used = cell_widths[r].get(i).copied().unwrap_or(0);
+                let pad = width.saturating_sub(used);
+                // The delimiter row's colons place the text in its column;
+                // a centred cell's odd cell of slack goes on the right.
+                let (left, right) = match aligns.get(i) {
+                    Some(Alignment::Right) => (pad, 0),
+                    Some(Alignment::Center) => (pad / 2, pad - pad / 2),
+                    Some(Alignment::Left | Alignment::None) | None => (0, pad),
+                };
+                spans.push(Span::styled(
+                    format!("{}{cell}{}", " ".repeat(left), " ".repeat(right)),
+                    style,
+                ));
             }
             self.out.push(Line::from(spans));
             if r == 0 {
@@ -1119,6 +1149,7 @@ pub fn render_markdown_mapped(
         runnables: Vec::new(),
         outputs,
         table: None,
+        table_aligns: Vec::new(),
         base_dir: base_dir.map(|p| p.to_path_buf()),
         images: Vec::new(),
         suppress_inline: false,
@@ -1255,9 +1286,10 @@ pub fn render_markdown_mapped(
                         r.cur.push(Span::styled(format!("({dest_url}) "), style));
                     }
                 }
-                Tag::Table(_) => {
+                Tag::Table(aligns) => {
                     r.ensure_blank();
                     r.table = Some(Vec::new());
+                    r.table_aligns = aligns;
                 }
                 Tag::TableHead => {
                     if let Some(rows) = r.table.as_mut() {
@@ -2285,6 +2317,135 @@ mod tests {
         assert!(
             text.contains("\u{2500}\u{253c}\u{2500}"),
             "a rule must separate the header; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn table_columns_follow_the_delimiter_row_alignment() {
+        // #861: `---:` right-aligns, `:---:` centres (the odd cell of slack
+        // on the right), and `:---` and `---` stay on the left.
+        let lines = render(
+            "| item | amount | note | kind |\n\
+             | :--- | ---: | :---: | --- |\n\
+             | rent | 1200 | due | x |\n\
+             | tea | 5 | ok, paid | yy |",
+        );
+        let rows: Vec<String> = lines.iter().map(text_of).collect();
+        let row = |first: &str| {
+            rows.iter()
+                .find(|r| r.starts_with(first))
+                .unwrap_or_else(|| panic!("no row starting {first:?} in {rows:#?}"))
+                .clone()
+        };
+        assert_eq!(
+            row("item"),
+            "item \u{2502} amount \u{2502}   note   \u{2502} kind"
+        );
+        assert_eq!(
+            row("rent"),
+            "rent \u{2502}   1200 \u{2502}   due    \u{2502} x   "
+        );
+        assert_eq!(
+            row("tea"),
+            "tea  \u{2502}      5 \u{2502} ok, paid \u{2502} yy  "
+        );
+    }
+
+    #[test]
+    fn a_wide_character_row_keeps_its_separators_in_line() {
+        // #861: `食費` is two characters but four cells; padding by
+        // character count put this row's `│` two columns right of the rest.
+        let lines =
+            render("| category | amount |\n| --- | ---: |\n| 食費 (food) | 300 |\n| rent | 1200 |");
+        let seams: Vec<(String, usize)> = lines
+            .iter()
+            .map(text_of)
+            .filter_map(|t| {
+                let at = t.find(['\u{2502}', '\u{253c}'])?;
+                Some((t.clone(), cells(&t[..at])))
+            })
+            .collect();
+        assert_eq!(seams.len(), 4, "header, rule and two rows: {seams:#?}");
+        assert!(
+            seams.iter().all(|(_, col)| *col == seams[0].1),
+            "every row's seam must sit on the same screen column: {seams:#?}"
+        );
+        let widths: Vec<usize> = seams.iter().map(|(t, _)| cells(t)).collect();
+        assert!(
+            widths.iter().all(|w| *w == widths[0]),
+            "every row must end on the same column: {seams:#?}"
+        );
+    }
+
+    #[test]
+    fn a_wide_character_cell_is_padded_by_screen_cells() {
+        // #861, read off the rendered text alone: `食費 (food)` is nine
+        // characters but eleven cells, so its column is eleven cells wide
+        // and every shorter cell is padded out to it.
+        let lines =
+            render("| category | amount |\n| --- | --- |\n| 食費 (food) | 300 |\n| rent | 1200 |");
+        let rows: Vec<String> = lines
+            .iter()
+            .map(text_of)
+            .filter(|t| t.contains('\u{2502}'))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "category    \u{2502} amount",
+                "食費 (food) \u{2502} 300   ",
+                "rent        \u{2502} 1200  ",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_combining_mark_takes_no_cell_in_a_table() {
+        // #861 guard, the other way round from a wide character: `café`
+        // spelled with a combining accent is five characters but four
+        // cells, and must not be padded as five.
+        let lines = render("| name | n |\n| --- | --- |\n| cafe\u{301} | 1 |\n| tea | 2 |");
+        let rows: Vec<String> = lines
+            .iter()
+            .map(text_of)
+            .filter(|t| t.contains('\u{2502}'))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "name \u{2502} n",
+                "cafe\u{301} \u{2502} 1",
+                "tea  \u{2502} 2",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_missing_cell_in_an_aligned_column_is_blank_padding() {
+        // #861 guard: a row that stops short leaves a blank cell as wide as
+        // its column, whatever the column's alignment, so the seams of the
+        // rows below do not move.
+        let lines = render("| a | b |\n| --- | ---: |\n| x |\n| yy | 12 |");
+        let rows: Vec<String> = lines
+            .iter()
+            .map(text_of)
+            .filter(|t| t.contains('\u{2502}'))
+            .collect();
+        assert_eq!(rows, ["a  \u{2502}  b", "x  \u{2502}   ", "yy \u{2502} 12"]);
+    }
+
+    #[test]
+    fn a_tables_alignment_does_not_carry_into_the_next_table() {
+        // #861 guard: the delimiter row's alignment belongs to its own
+        // table. A plain table after a right-aligned one is left-aligned.
+        let lines =
+            render("| n |\n| ---: |\n| 1 |\n| 100 |\n\ntext\n\n| m |\n| --- |\n| 1 |\n| 100 |");
+        let rows: Vec<String> = lines.iter().map(text_of).collect();
+        let ones: Vec<&String> = rows.iter().filter(|r| r.trim() == "1").collect();
+        assert_eq!(
+            ones,
+            ["  1", "1  "],
+            "right-aligned in the first table, left in the second: {rows:#?}"
         );
     }
 

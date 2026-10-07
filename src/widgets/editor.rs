@@ -9,9 +9,10 @@ use ratatui::{
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::highlight::{
-    HiSpan, LangKind, LangRegistry, compute_line_starts, decode_semantic_tokens, lang_for_extension,
+    HiSpan, LangKind, LangRegistry, compute_line_starts, decode_semantic_tokens,
 };
 use crate::widgets::scrollbar;
 
@@ -740,7 +741,7 @@ fn render_sheet(
 
     // Reserve a row-number gutter so the user can see the absolute row
     // index even after horizontal scrolling.
-    let gutter_w = (row_count.max(1).to_string().len() as u16 + 2).max(4);
+    let gutter_w = ((sheet.row_base + row_count).max(1).to_string().len() as u16 + 2).max(4);
     if grid_w <= gutter_w + 2 {
         return;
     }
@@ -801,7 +802,13 @@ fn render_sheet(
             buf[(x, y)].set_style(style);
             buf[(x, y)].set_symbol(" ");
         }
-        let row_label = format!(" {:>width$} ", row_idx + 1, width = (gutter_w - 2) as usize);
+        // Numbered by place in the source (#1222): a SQLite page's rows
+        // continue from the pages before it.
+        let row_label = format!(
+            " {:>width$} ",
+            sheet.row_base + row_idx + 1,
+            width = (gutter_w - 2) as usize
+        );
         buf.set_string(
             inner.x,
             y,
@@ -870,8 +877,17 @@ fn render_sheet(
         .last()
         .map(|(c, _)| *c + 1)
         .unwrap_or(visible_col_first);
+    // A SQLite page names its rows by place in the table, with no total:
+    // nobody counted the table (#1222), and the sheet name says whether
+    // more rows follow.
+    let rows = if view.kind == crate::sheet::SheetKind::Sqlite {
+        let base = sheet.row_base;
+        format!("rows {}–{}", base + visible_first, base + visible_last)
+    } else {
+        format!("rows {visible_first}–{visible_last} of {row_count}")
+    };
     let status = format!(
-        " rows {visible_first}–{visible_last} of {row_count} · cols {visible_col_first}–{visible_col_last} of {col_count} · ←/→ ↑/↓ PgUp/PgDn Tab=next sheet "
+        " {rows} · cols {visible_col_first}–{visible_col_last} of {col_count} · ←/→ ↑/↓ PgUp/PgDn Tab=next sheet "
     );
     buf.set_string(
         inner.x,
@@ -924,10 +940,12 @@ fn render_merge_panes(
         buf[(x, inner.y)].set_style(head_style);
         buf[(x, inner.y)].set_symbol(" ");
     }
-    let src = if mv.from_markers {
-        "markers"
+    let src = if let Some(agent) = mv.proposal_from.as_deref() {
+        format!("{agent}'s proposal \u{2194} your unsaved edits")
+    } else if mv.from_markers {
+        String::from("markers")
     } else {
-        "git stages"
+        String::from("git stages")
     };
     let header = format!(
         " MERGE ({src})  {resolved}/{total} conflict{} resolved \u{2022} F7 next \u{2022} Alt+\u{2191}\u{2193} scroll sources ",
@@ -943,13 +961,12 @@ fn render_merge_panes(
         buf[(x, sep_y)].set_style(sep_style);
         buf[(x, sep_y)].set_symbol(" ");
     }
-    buf.set_stringn(
-        inner.x,
-        sep_y,
-        " RESULT (editable) \u{2014} \"Merge: Complete Merge\" stages the file ",
-        inner.width as usize,
-        sep_style,
-    );
+    let result_hint = if mv.proposal_from.is_some() {
+        " RESULT (editable) \u{2014} save to approve \u{b7} close unsaved to go back "
+    } else {
+        " RESULT (editable) \u{2014} \"Merge: Complete Merge\" stages the file "
+    };
+    buf.set_stringn(inner.x, sep_y, result_hint, inner.width as usize, sep_style);
 
     // The panes: Current | (Base) | Incoming, or stacked when narrow.
     struct Pane<'a> {
@@ -979,6 +996,8 @@ fn render_merge_panes(
     panes.push(Pane {
         title: if mv.deleted == Some(CheckSide::Current) {
             "CURRENT (yours): deleted"
+        } else if mv.proposal_from.is_some() {
+            "CURRENT (your unsaved edits)"
         } else {
             "CURRENT (yours)"
         },
@@ -1013,6 +1032,8 @@ fn render_merge_panes(
     panes.push(Pane {
         title: if mv.deleted == Some(CheckSide::Incoming) {
             "INCOMING (theirs): deleted"
+        } else if mv.proposal_from.is_some() {
+            "INCOMING (the agent's proposal)"
         } else {
             "INCOMING (theirs)"
         },
@@ -1266,6 +1287,11 @@ fn render_diff(
     // be told what they mean and who is in them (#349).
     let header = if diff.group_by_seat {
         format!("{header}\u{2022} by seat: {} ", diff.seat_summary())
+    } else {
+        header
+    };
+    let header = if diff.coarse {
+        format!("{header}\u{2022} large change: diff stopped early ")
     } else {
         header
     };
@@ -2716,9 +2742,9 @@ pub struct Editor {
     pub dirty: bool,
     /// Bumped on every SAVE (`mark_synced_with_disk`, reached only from
     /// `write_buffer_to_disk`). Undo snapshots record it so a restore across
-    /// a save point re-dirties. Load/reload paths do not bump it; they clear
-    /// the undo stacks instead, so no stale snapshot can span them — a
-    /// change that preserves undo history across a reload must bump it too.
+    /// a save point re-dirties. A load clears the undo stacks instead, so no
+    /// stale snapshot can span it; a reload keeps them and bumps this
+    /// (`carry_history_across_reload`).
     save_seq: u64,
     pub status: String,
     pub last_area: Rect,
@@ -2889,6 +2915,10 @@ pub struct Editor {
     /// fresh edit (`push_undo`) so a new edit branches history like VS Code.
     redo_stack: Vec<Snapshot>,
     last_edit_kind: Option<EditKind>,
+    /// The group of the remote edit that opened the undo step on top of
+    /// the stack (#1207): further remote spans of that group join the step
+    /// instead of opening their own. Any other edit, undo or redo ends it.
+    remote_undo_group: Option<u64>,
     lang: Option<LangKind>,
     /// Explicit indentation preference set from the status-bar pill. `None`
     /// falls back to the language default (2 spaces for YAML, 4 otherwise);
@@ -2935,6 +2965,15 @@ pub struct Editor {
     /// passes, never per frame. App-synced from prefs; on by default.
     pub show_bracket_colors: bool,
     bracket_colors: Vec<Vec<(usize, u8)>>,
+    /// Byte ranges of every string and comment in the buffer (lines joined
+    /// by `\n`), from the same highlight pass as `bracket_colors`. Quote
+    /// auto-pairing reads it to see a string or block comment an earlier
+    /// line opened, which a scan of the caret's line alone cannot (#844).
+    protected_ranges: Vec<(usize, usize)>,
+    /// Whether `protected_ranges` describes the text as it is now. Byte
+    /// ranges are not carried through edits the way spans are (#850), so an
+    /// edit leaves them stale until the next pass over the edited text lands.
+    protected_current: bool,
     /// Inline color-literal decorations (the "no colour-swatch decorations"
     /// gap in `vscode_extensions.rs`, matching `naumovs.color-highlight`):
     /// per line, the `(start char col, end char col, background, foreground)`
@@ -3283,6 +3322,7 @@ impl Editor {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             last_edit_kind: None,
+            remote_undo_group: None,
             lang: None,
             indent_override: None,
             detected_indent: None,
@@ -3295,6 +3335,8 @@ impl Editor {
             show_indent_guides: true,
             show_bracket_colors: true,
             bracket_colors: Vec::new(),
+            protected_ranges: Vec::new(),
+            protected_current: false,
             show_color_swatches: true,
             color_swatches: Vec::new(),
             whitespace_mode: WhitespaceMode::default(),
@@ -4190,10 +4232,7 @@ impl Editor {
         if e.lines.is_empty() {
             e.lines.push(String::new());
         }
-        e.lang = path
-            .extension()
-            .and_then(|x| x.to_str())
-            .and_then(lang_for_extension);
+        e.lang = crate::highlight::lang_for_path(path);
         // Built off the UI thread, and no tick polls a scrubber view: take
         // the whole pass here rather than leaving it to land later.
         e.recompute_highlights_within(None);
@@ -4229,10 +4268,52 @@ impl Editor {
         self.content_cols();
     }
 
+    /// Go to Next / Previous Change in an editor tab (#1352): the first
+    /// line of the next (or previous) run of change-bar lines, wrapping at
+    /// either end as the diff view's F7 does. `None` when the file has no
+    /// change bars.
+    pub fn git_change_from(&mut self, row: usize, forward: bool) -> Option<usize> {
+        self.refresh_git_marks();
+        let mut lines: Vec<usize> = self.git_marks.keys().copied().collect();
+        lines.sort_unstable();
+        let starts: Vec<usize> = lines
+            .iter()
+            .copied()
+            .filter(|&l| l == 0 || !self.git_marks.contains_key(&(l - 1)))
+            .collect();
+        if forward {
+            starts
+                .iter()
+                .copied()
+                .find(|&s| s > row)
+                .or_else(|| starts.first().copied())
+        } else {
+            // From inside a run, "previous" is the run before this one.
+            let here = starts.iter().copied().rev().find(|&s| s <= row);
+            let from = match here {
+                Some(s) if self.git_marks.contains_key(&row) => s,
+                _ => row,
+            };
+            starts
+                .iter()
+                .copied()
+                .rev()
+                .find(|&s| s < from)
+                .or_else(|| starts.last().copied())
+        }
+    }
+
     /// The git-gutter mark for 0-based buffer line `line`, if any. Reads the
     /// last computed marks (call after a render, or after `refresh_git_marks`).
     pub fn git_mark_at(&self, line: usize) -> Option<GitMark> {
         self.git_marks.get(&line).copied()
+    }
+
+    /// `git_mark_at` after bringing the marks up to date with the buffer,
+    /// for callers outside the render pass that computes them.
+    pub fn current_git_mark_at(&mut self, line: usize) -> Option<GitMark> {
+        self.refresh_git_marks();
+        self.git_mark_at(line)
     }
 
     /// Soft-wrap mode: long lines fold onto multiple visual rows instead of
@@ -4690,7 +4771,7 @@ impl Editor {
             .find(|&(s, _)| s == seg_start)
             .unwrap_or((seg_start, seg_start));
         self.cursor_row = line;
-        self.cursor_col = (s + goal_col).min(e).min(self.line_char_len(line));
+        self.cursor_col = floor_grapheme_col(&self.lines[line], (s + goal_col).min(e));
     }
 
     /// Identifier chars immediately to the left of the cursor on the
@@ -5009,10 +5090,7 @@ impl Editor {
         // encoded as is no longer this tab's problem.
         self.encoding_loss = false;
         self.lossy_save_armed = false;
-        self.lang = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .and_then(lang_for_extension);
+        self.lang = crate::highlight::lang_for_path(path);
         self.wrap_override = None;
         // Folds are line numbers into the OLD file. A preview tab is reused for
         // the next single-click, so without this the incoming file arrives with
@@ -6192,6 +6270,7 @@ impl Editor {
     /// pass (`None`: until it finishes).
     fn recompute_highlights_within(&mut self, wait: Option<std::time::Duration>) {
         self.highlight_requests = self.highlight_requests.wrapping_add(1);
+        self.protected_current = false;
         match self.lang {
             Some(kind) => {
                 carry_highlights(
@@ -6218,6 +6297,7 @@ impl Editor {
                 self.highlight_job = None;
                 self.highlight_base = Vec::new();
                 self.highlights = vec![Vec::new(); self.lines.len()];
+                self.protected_ranges.clear();
                 // No grammar means no string/comment knowledge; brackets in
                 // plain text still colorize (VS Code does the same) — unless
                 // the buffer is big enough that the per-edit scan would make
@@ -6332,6 +6412,13 @@ impl Editor {
         self.highlight_cost = pass.cost;
         self.highlights = pass.spans;
         self.bracket_colors = pass.brackets;
+        // String and comment ranges hold only for the text the pass read.
+        self.protected_current = pass.lines == self.lines;
+        self.protected_ranges = if self.protected_current {
+            pass.protected
+        } else {
+            Vec::new()
+        };
         self.highlight_base = pass.lines;
         carry_highlights(
             &mut self.highlight_base,
@@ -7030,22 +7117,37 @@ impl Editor {
         // whitespace, a closer or punctuation. Anything else, a string's
         // closing quote above all, means the opener is text: `"("` typed
         // inside a string left a stray `)` (#1183). Quote guard: never
-        // before or after a word character or the same quote.
+        // before or after a word character or the same quote, unless the
+        // word before is a Python string prefix, which is part of the opener
+        // (`f"` pairs to `f""`, as VS Code's Python configuration lists it).
         let next_ok = match is_pair_quote(c) {
             true => next.is_none_or(|n| !n.is_alphanumeric() && n != '_' && n != c),
             false => next.is_none_or(|n| AUTO_CLOSE_BEFORE.contains(n)),
         };
-        let prev = if self.cursor_col == 0 {
-            None
-        } else {
-            self.lines
-                .get(self.cursor_row)
-                .and_then(|l| l.chars().nth(self.cursor_col - 1))
-        };
-        let prev_ok =
-            !is_pair_quote(c) || prev.is_none_or(|p| !p.is_alphanumeric() && p != '_' && p != c);
+        let before =
+            &self.lines[self.cursor_row][..self.byte_index(self.cursor_row, self.cursor_col)];
+        let prev_ok = !is_pair_quote(c)
+            || before
+                .chars()
+                .next_back()
+                .is_none_or(|p| !p.is_alphanumeric() && p != '_' && p != c)
+            || (self.lang == Some(LangKind::Python)
+                && is_python_string_prefix(trailing_word(before)));
         if !next_ok || !prev_ok {
             return false;
+        }
+        // A quote typed inside a string or comment is text there, or that
+        // string's closing quote, never an opener: pairing the closing `"`
+        // of `print(f"{x}` left a stray `")` behind (#844). One opened on an
+        // earlier line (a docstring body, a block comment) comes from the
+        // highlight pass; the line scan starts where it closes.
+        if is_pair_quote(c) {
+            let Some(from) = self.earlier_construct_end(self.cursor_row, before.len()) else {
+                return false;
+            };
+            if ends_in_string_or_comment(&before[from..], self.lang) {
+                return false;
+            }
         }
         self.pin_on_edit();
         self.push_undo(EditKind::InsertChar);
@@ -7058,6 +7160,33 @@ impl Editor {
         self.recompute_highlights();
         self.auto_pair_at = Some((self.cursor_row, self.cursor_col, self.edit_seq));
         true
+    }
+
+    /// Where line `row` leaves a string or comment that an earlier line
+    /// opened, as a byte index into the line: `Some(0)` when none reaches the
+    /// line, and `None` while one still covers `caret` (a byte index too).
+    /// Read from the last highlight pass, since a scan of one line cannot
+    /// know it starts inside a docstring or a block comment (#844). While an
+    /// edit's pass is still out (#850) nothing is read: `Some(0)`, so the
+    /// caret's line alone decides, as it did before #844.
+    fn earlier_construct_end(&self, row: usize, caret: usize) -> Option<usize> {
+        if !self.protected_current {
+            return Some(0);
+        }
+        let line_start: usize = self.lines[..row].iter().map(|l| l.len() + 1).sum();
+        let first = self
+            .protected_ranges
+            .partition_point(|&(_, end)| end <= line_start);
+        match self.protected_ranges.get(first) {
+            Some(&(start, end)) if start < line_start => {
+                if end > line_start + caret {
+                    None
+                } else {
+                    Some(end - line_start)
+                }
+            }
+            _ => Some(0),
+        }
     }
 
     /// [`Self::apply_span_edits`] for text another seat wrote (#349): the line
@@ -7096,17 +7225,47 @@ impl Editor {
     /// marking the tab dirty (the user saves to persist). Returns the number
     /// of edits applied.
     pub fn apply_span_edits(&mut self, edits: &[TextSpanEdit]) -> usize {
+        self.apply_span_edits_grouped(edits, None)
+    }
+
+    /// [`Self::apply_span_edits`] for text a collab peer wrote (#1207). Every
+    /// call with the same `group` lands in one undo step while nothing else
+    /// edits the buffer in between: the runs of one peer edit, which arrive
+    /// one span at a time, and the fragments of one AI stream. Undo then
+    /// restores the text from before the group, never a mix of halves.
+    pub fn apply_remote_span_edits(&mut self, edits: &[TextSpanEdit], group: u64) -> usize {
+        self.apply_span_edits_grouped(edits, Some(group))
+    }
+
+    fn apply_span_edits_grouped(&mut self, edits: &[TextSpanEdit], group: Option<u64>) -> usize {
         if edits.is_empty() {
             return 0;
         }
         self.pin_on_edit();
-        self.push_undo(EditKind::Paste);
+        self.push_undo_step(EditKind::Paste, group);
         let n = apply_span_edits_to_lines(&mut self.lines, edits);
         if n > 0 {
             self.mark_buffer_changed();
             self.recompute_highlights();
         }
         n
+    }
+
+    /// Close a remote edit group (#1207): later spans open a new undo step,
+    /// and a group that left the text as it found it (a cancelled AI stream
+    /// whose revert undid every fragment) leaves no step behind.
+    pub fn end_remote_undo_group(&mut self, group: u64) {
+        if self.remote_undo_group != Some(group) {
+            return;
+        }
+        self.remote_undo_group = None;
+        if self
+            .undo_stack
+            .last()
+            .is_some_and(|s| s.lines == self.lines)
+        {
+            self.undo_stack.pop();
+        }
     }
 
     /// The buffer's active indentation style, in precedence order: the
@@ -7525,7 +7684,12 @@ impl Editor {
 
         self.insert_newline_raw();
 
-        let new_indent = format!("{leading}{extra}");
+        let new_indent = if self.lang == Some(LangKind::Yaml) {
+            let prefix: String = prefix_chars.iter().collect();
+            yaml_newline_indent(&prefix, &unit)
+        } else {
+            format!("{leading}{extra}")
+        };
         for c in new_indent.chars() {
             self.insert_char_raw(c);
         }
@@ -7579,11 +7743,11 @@ impl Editor {
         }
         if self.cursor_col > 0 {
             let row = self.cursor_row;
-            let col = self.cursor_col - 1;
+            let col = prev_grapheme_col(&self.lines[row], self.cursor_col);
             let from = self.byte_index(row, col);
-            let to = self.byte_index(row, col + 1);
+            let to = self.byte_index(row, self.cursor_col);
             self.lines[row].replace_range(from..to, "");
-            self.cursor_col -= 1;
+            self.cursor_col = col;
             self.mark_buffer_changed();
         } else if self.cursor_row > 0 {
             let cur = self.lines.remove(self.cursor_row);
@@ -7613,7 +7777,8 @@ impl Editor {
         let len = self.line_char_len(row);
         if self.cursor_col < len {
             let from = self.byte_index(row, self.cursor_col);
-            let to = self.byte_index(row, self.cursor_col + 1);
+            let next = next_grapheme_col(&self.lines[row], self.cursor_col);
+            let to = self.byte_index(row, next);
             self.lines[row].replace_range(from..to, "");
             self.mark_buffer_changed();
         } else if row + 1 < self.lines.len() {
@@ -9094,6 +9259,12 @@ impl Editor {
     /// Coalesces consecutive `InsertChar` ops into one step so a typing
     /// burst is undone as one unit; everything else opens a new step.
     fn push_undo(&mut self, kind: EditKind) {
+        self.push_undo_step(kind, None);
+    }
+
+    /// [`Self::push_undo`], joining the open step when `group` is the remote
+    /// edit group that opened it (#1207).
+    fn push_undo_step(&mut self, kind: EditKind, group: Option<u64>) {
         // The pre-edit text, for bookmarks to be diffed against afterwards.
         self.seed_bookmark_shadow();
         // Where the edit about to happen begins — the linked-editing
@@ -9102,8 +9273,10 @@ impl Editor {
         // Where the edit about to happen begins — the merge editor's
         // region tracker reads this when it reconciles (#253).
         self.merge_edit_row = self.cursor_row;
-        let coalesce =
-            kind == EditKind::InsertChar && self.last_edit_kind == Some(EditKind::InsertChar);
+        let coalesce = (kind == EditKind::InsertChar
+            && self.last_edit_kind == Some(EditKind::InsertChar))
+            || (group.is_some() && group == self.remote_undo_group && !self.undo_stack.is_empty());
+        self.remote_undo_group = group;
         if !coalesce {
             self.undo_stack.push(self.snapshot());
             self.trim_undo_stack();
@@ -9122,6 +9295,7 @@ impl Editor {
         let Some(snap) = self.undo_stack.pop() else {
             return false;
         };
+        self.remote_undo_group = None;
         // Stash the pre-undo state so `redo` can reinstate it.
         self.redo_stack.push(self.snapshot());
         self.restore_snapshot(snap);
@@ -9136,6 +9310,7 @@ impl Editor {
         let Some(snap) = self.redo_stack.pop() else {
             return false;
         };
+        self.remote_undo_group = None;
         self.undo_stack.push(self.snapshot());
         self.restore_snapshot(snap);
         self.undo_step_id = next_undo_step_id();
@@ -9286,7 +9461,21 @@ impl Editor {
         // A SARIF viewer keeps the reader's place, and the logs added to
         // it, across a rewrite of its log (#577).
         let old_sarif = self.sarif.take();
+        // `open` starts a text tab's history afresh. A reload keeps it
+        // (#1357): the text from before an agent's or formatter's rewrite is
+        // one undo away, with everything typed before that behind it.
+        let history = (!self.has_non_text_view()).then(|| {
+            (
+                self.snapshot(),
+                std::mem::take(&mut self.undo_stack),
+                std::mem::take(&mut self.redo_stack),
+                self.encoding,
+            )
+        });
         let result = self.open(&path);
+        if let Some((before, undo, redo, encoding)) = history {
+            self.carry_history_across_reload(before, undo, redo, encoding, result.is_ok());
+        }
         if let (Some(old), Some(view)) = (old_sarif.as_ref(), self.sarif.as_mut()) {
             view.carry_from(old);
         }
@@ -9299,6 +9488,45 @@ impl Editor {
         self.cursor_col = prev_col.min(self.line_char_len(self.cursor_row));
         self.scroll = prev_scroll.min(self.lines.len().saturating_sub(1));
         result
+    }
+
+    /// Put back the history [`Self::reload_from_disk`] took aside, with the
+    /// pre-reload text as one more step when the reload changed it. Dropped
+    /// when the file came back as something other than text in the same
+    /// encoding, where the old lines mean nothing; kept untouched when the
+    /// open failed and the buffer was never replaced.
+    fn carry_history_across_reload(
+        &mut self,
+        before: Snapshot,
+        mut undo: Vec<Snapshot>,
+        redo: Vec<Snapshot>,
+        encoding: &'static encoding_rs::Encoding,
+        reloaded: bool,
+    ) {
+        if !reloaded {
+            self.undo_stack = undo;
+            self.redo_stack = redo;
+            return;
+        }
+        if self.has_non_text_view() || self.encoding != encoding {
+            return;
+        }
+        if before.lines == self.lines {
+            // Only the stamp moved (`touch`, a formatter with nothing to
+            // do): no step that undoes to the same text.
+            self.undo_stack = undo;
+            self.redo_stack = redo;
+        } else {
+            // Its own step, never merged with typing; like any new edit it
+            // ends the redo branch.
+            undo.push(before);
+            self.undo_stack = undo;
+            self.trim_undo_stack();
+            self.undo_step_id = next_undo_step_id();
+            self.mirrored_step = None;
+        }
+        // A new buffer<->disk sync point: every kept step restores as dirty.
+        self.save_seq = self.save_seq.wrapping_add(1);
     }
 
     /// Discard local edits and reload from disk unconditionally — the
@@ -9390,10 +9618,7 @@ impl Editor {
         self.disk_conflict = false;
         let outcome = self.write_buffer_to_disk();
         if matches!(outcome, Ok(SaveOutcome::Saved)) {
-            let lang = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .and_then(lang_for_extension);
+            let lang = crate::highlight::lang_for_path(path);
             if lang != self.lang {
                 self.set_language(lang);
             }
@@ -9530,7 +9755,17 @@ impl Editor {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(&path, encoded)?;
+        if let Err(e) = crate::prefs::replace_file_contents(&path, &encoded) {
+            // Only a write that got as far as changing the file makes what
+            // is on disk croft's own doing: a stale stamp then made the sync
+            // sweep offer to "reload" it over the only good copy. An
+            // untouched file keeps its stamp, so an edit made outside croft
+            // is still noticed and not overwritten by the next save.
+            if e.touched {
+                self.disk_stamp = Self::disk_stamp_of(&path);
+            }
+            return Err(e.error.into());
+        }
         self.decode_lossy = false;
         self.encoding_loss = false;
         self.lossy_save_armed = false;
@@ -9551,7 +9786,7 @@ impl Editor {
         } else if self.cursor_row > 0 {
             // Step over a collapsed region, as `move_down` does.
             self.cursor_row = self.prev_visible_line(self.cursor_row - 1);
-            self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+            self.cursor_col = floor_grapheme_col(&self.lines[self.cursor_row], self.cursor_col);
         }
         self.last_edit_kind = None;
     }
@@ -9565,7 +9800,7 @@ impl Editor {
             // the user can actually see.
             if let Some(next) = self.next_visible_line(self.cursor_row + 1) {
                 self.cursor_row = next;
-                self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+                self.cursor_col = floor_grapheme_col(&self.lines[self.cursor_row], self.cursor_col);
             }
         }
         self.last_edit_kind = None;
@@ -9958,7 +10193,7 @@ impl Editor {
 
     pub fn move_left(&mut self) {
         if self.cursor_col > 0 {
-            self.cursor_col -= 1;
+            self.cursor_col = prev_grapheme_col(&self.lines[self.cursor_row], self.cursor_col);
         } else if self.cursor_row > 0 {
             self.cursor_row -= 1;
             self.cursor_col = self.line_char_len(self.cursor_row);
@@ -9969,7 +10204,7 @@ impl Editor {
 
     pub fn move_right(&mut self) {
         if self.cursor_col < self.line_char_len(self.cursor_row) {
-            self.cursor_col += 1;
+            self.cursor_col = next_grapheme_col(&self.lines[self.cursor_row], self.cursor_col);
         } else if self.cursor_row + 1 < self.lines.len() {
             self.cursor_row += 1;
             self.cursor_col = 0;
@@ -11871,7 +12106,7 @@ impl Editor {
             }
         };
         self.cursor_row = target_line;
-        self.cursor_col = target_col.min(self.line_char_len(target_line));
+        self.cursor_col = floor_grapheme_col(&self.lines[target_line], target_col);
         self.last_edit_kind = None;
         // A click is a deliberate reposition; any multi-cursor session ends.
         self.carets.clear();
@@ -12063,6 +12298,59 @@ fn char_byte(s: &str, char_idx: usize) -> usize {
         .unwrap_or(s.len())
 }
 
+/// Char column of the extended grapheme cluster boundary before `col` on
+/// `line`, so one step never stops inside a ZWJ emoji, a flag or a letter with
+/// its combining accent (#1196). Columns stay char-indexed: every cluster
+/// boundary is a char boundary.
+fn prev_grapheme_col(line: &str, col: usize) -> usize {
+    if line.is_ascii() {
+        return col.saturating_sub(1);
+    }
+    let mut start = 0;
+    let mut prev = 0;
+    for g in line.graphemes(true) {
+        if start >= col {
+            break;
+        }
+        prev = start;
+        start += g.chars().count();
+    }
+    prev
+}
+
+/// Char column of the extended grapheme cluster boundary after `col` on
+/// `line`, saturating at the line's end (#1196).
+fn next_grapheme_col(line: &str, col: usize) -> usize {
+    if line.is_ascii() {
+        return (col + 1).min(line.len());
+    }
+    let mut end = 0;
+    for g in line.graphemes(true) {
+        end += g.chars().count();
+        if end > col {
+            return end;
+        }
+    }
+    end
+}
+
+/// `col` moved back to the start of the grapheme cluster it falls inside, so
+/// a vertical move or a click never leaves the caret mid-cluster (#1196).
+fn floor_grapheme_col(line: &str, col: usize) -> usize {
+    if line.is_ascii() {
+        return col.min(line.len());
+    }
+    let mut start = 0;
+    for g in line.graphemes(true) {
+        let len = g.chars().count();
+        if start + len > col {
+            return start;
+        }
+        start += len;
+    }
+    start
+}
+
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
@@ -12141,8 +12429,12 @@ fn line_comment_token(lang: Option<LangKind>) -> Option<&'static str> {
         Some(LangKind::Python)
         | Some(LangKind::Yaml)
         | Some(LangKind::Toml)
-        | Some(LangKind::Bash) => Some("#"),
-        Some(LangKind::Lua) => Some("--"),
+        | Some(LangKind::Bash)
+        | Some(LangKind::Ruby)
+        | Some(LangKind::Make)
+        | Some(LangKind::Dockerfile) => Some("#"),
+        Some(LangKind::Java) | Some(LangKind::CSharp) => Some("//"),
+        Some(LangKind::Lua) | Some(LangKind::Sql) => Some("--"),
         _ => None,
     }
 }
@@ -12165,6 +12457,7 @@ fn block_comment_tokens(lang: Option<LangKind>) -> Option<(&'static str, &'stati
         | Some(LangKind::Dbscheme) => Some(("/*", "*/")),
         Some(LangKind::Html) | Some(LangKind::Markdown) => Some(("<!--", "-->")),
         Some(LangKind::Lua) => Some(("--[[", "]]")),
+        Some(LangKind::Java) | Some(LangKind::CSharp) | Some(LangKind::Sql) => Some(("/*", "*/")),
         // Python has no true block comment; VS Code's language config maps
         // Toggle Block Comment onto a triple-quoted string (`""" """`).
         Some(LangKind::Python) => Some(("\"\"\"", "\"\"\"")),
@@ -12356,6 +12649,8 @@ struct HighlightPass {
     lines: Vec<String>,
     spans: Vec<Vec<HiSpan>>,
     brackets: BracketColors,
+    /// Byte ranges of the strings and comments the grammar found (#844).
+    protected: Vec<(usize, usize)>,
     cost: std::time::Duration,
 }
 
@@ -12378,6 +12673,7 @@ fn run_highlight_pass(kind: LangKind, text: String) -> HighlightPass {
         lines,
         spans,
         brackets,
+        protected,
         cost: started.elapsed(),
     }
 }
@@ -13055,6 +13351,12 @@ pub fn language_label(lang: Option<LangKind>) -> &'static str {
         Some(LangKind::Lua) => "Lua",
         Some(LangKind::Ql) => "CodeQL",
         Some(LangKind::Dbscheme) => "CodeQL Database Scheme",
+        Some(LangKind::Java) => "Java",
+        Some(LangKind::Ruby) => "Ruby",
+        Some(LangKind::CSharp) => "C#",
+        Some(LangKind::Sql) => "SQL",
+        Some(LangKind::Make) => "Makefile",
+        Some(LangKind::Dockerfile) => "Dockerfile",
     }
 }
 
@@ -13083,6 +13385,12 @@ pub fn language_scope_id(lang: Option<LangKind>) -> &'static str {
         Some(LangKind::Lua) => "lua",
         Some(LangKind::Ql) => "ql",
         Some(LangKind::Dbscheme) => "dbscheme",
+        Some(LangKind::Java) => "java",
+        Some(LangKind::Ruby) => "ruby",
+        Some(LangKind::CSharp) => "csharp",
+        Some(LangKind::Sql) => "sql",
+        Some(LangKind::Make) => "makefile",
+        Some(LangKind::Dockerfile) => "dockerfile",
     }
 }
 
@@ -13107,6 +13415,12 @@ pub const SELECTABLE_LANGUAGES: &[LangKind] = &[
     LangKind::Lua,
     LangKind::Ql,
     LangKind::Dbscheme,
+    LangKind::Java,
+    LangKind::Ruby,
+    LangKind::CSharp,
+    LangKind::Sql,
+    LangKind::Make,
+    LangKind::Dockerfile,
 ];
 
 /// Number of leading whitespace bytes to strip for one outdent step, matching
@@ -13145,9 +13459,86 @@ fn extra_indent_triggered(lang: Option<LangKind>, last_non_ws: Option<char>) -> 
         | Some(LangKind::Go)
         | Some(LangKind::Css)
         | Some(LangKind::Lua)
-        | Some(LangKind::Ql) => matches!(last, '(' | '[' | '{'),
+        | Some(LangKind::Ql)
+        | Some(LangKind::Java)
+        | Some(LangKind::CSharp) => matches!(last, '(' | '[' | '{'),
         _ => false,
     }
+}
+
+/// The indent for the line Enter opens after `prefix` in YAML (#1309).
+/// A key with no value (`services:`), a block scalar (`run: |`) or an open
+/// flow collection (`args: [`) starts a nested block one `unit` deeper. In a
+/// list item (`- name: x`) the base column is the item's content, so the
+/// next key lines up with `name`; anything else keeps the line's indent.
+fn yaml_newline_indent(prefix: &str, unit: &str) -> String {
+    let leading: String = prefix
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect();
+    let mut content = &prefix[leading.len()..];
+    let mut base = leading.clone();
+    while let Some(rest) = content.strip_prefix('-')
+        && (rest.is_empty() || rest.starts_with(' '))
+    {
+        let after = rest.trim_start_matches(' ');
+        base.push_str(&" ".repeat(content.len() - after.len()));
+        content = after;
+    }
+    let content = yaml_strip_comment(content).trim_end();
+    let Some(colon) = yaml_key_colon(content) else {
+        return leading;
+    };
+    let value = content[colon + 1..].trim();
+    let opens_block = value.is_empty()
+        || value.ends_with('[')
+        || value.ends_with('{')
+        || (value.starts_with(['|', '>'])
+            && value[1..]
+                .chars()
+                .all(|c| matches!(c, '-' | '+') || c.is_ascii_digit()));
+    if opens_block {
+        format!("{base}{unit}")
+    } else {
+        base
+    }
+}
+
+/// `line` up to a `#` comment: a `#` at the start or after whitespace,
+/// outside quotes.
+fn yaml_strip_comment(line: &str) -> &str {
+    let mut quote = None;
+    let mut prev_ws = true;
+    for (i, c) in line.char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c == '#' && prev_ws => return &line[..i],
+            None => {}
+        }
+        prev_ws = c.is_whitespace();
+    }
+    line
+}
+
+/// Byte offset of the `:` that ends a mapping key in `content`: the first
+/// one outside quotes followed by a space or the end of the line.
+fn yaml_key_colon(content: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut chars = content.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if (c == '\'' || c == '"') && i == 0 => quote = Some(c),
+            None if c == ':' && chars.peek().is_none_or(|(_, n)| n.is_whitespace()) => {
+                return Some(i);
+            }
+            None => {}
+        }
+    }
+    None
 }
 
 fn is_bracket_pair_split(lang: Option<LangKind>, prev: Option<char>, next: Option<char>) -> bool {
@@ -13163,6 +13554,8 @@ fn is_bracket_pair_split(lang: Option<LangKind>, prev: Option<char>, next: Optio
             | Some(LangKind::Css)
             | Some(LangKind::Lua)
             | Some(LangKind::Ql)
+            | Some(LangKind::Java)
+            | Some(LangKind::CSharp)
     );
     if !bracket_aware {
         return false;
@@ -15895,6 +16288,121 @@ fn ends_in_script_string_or_comment(prefix: &str) -> bool {
     quote.is_some() || block_comment
 }
 
+/// Whether the end of `prefix`, the current line up to the caret, sits inside
+/// a string literal or a comment of `lang`, where a typed quote is never
+/// paired (#844). A lexical scan of the one line rather than the syntax tree:
+/// the string being typed is unterminated, which is exactly where a parser's
+/// error recovery is least trustworthy. A string or block comment opened on
+/// an earlier line goes unseen, which leaves pairing there as it always was.
+fn ends_in_string_or_comment(prefix: &str, lang: Option<LangKind>) -> bool {
+    let line_comment = line_comment_token(lang);
+    // Python's "block comment" is a triple-quoted string, scanned as one.
+    let block_comment = block_comment_tokens(lang).filter(|_| lang != Some(LangKind::Python));
+    // A shell or YAML `#` opens a comment only at the start of a word:
+    // `${#a[@]}` and `a#b` are not comments.
+    let hash_needs_space = matches!(lang, Some(LangKind::Bash | LangKind::Yaml));
+    let mut quote: Option<(char, bool)> = None; // (delimiter, triple-quoted)
+    let mut in_block = false;
+    let mut i = 0;
+    while let Some(c) = prefix[i..].chars().next() {
+        let rest = &prefix[i..];
+        let mut step = c.len_utf8();
+        if in_block {
+            if let Some((_, close)) = block_comment
+                && rest.starts_with(close)
+            {
+                in_block = false;
+                step = close.len();
+            }
+        } else if let Some((q, triple)) = quote {
+            if c == '\\' && backslash_escapes(q, lang) {
+                step += rest[step..].chars().next().map_or(0, char::len_utf8);
+            } else if c == q && (!triple || rest.chars().take(3).eq([q, q, q])) {
+                quote = None;
+                if triple {
+                    step = 3;
+                }
+            }
+        } else if let Some((open, _)) = block_comment
+            && rest.starts_with(open)
+        {
+            in_block = true;
+            step = open.len();
+        } else if line_comment.is_some_and(|t| rest.starts_with(t))
+            && (!hash_needs_space
+                || prefix[..i]
+                    .chars()
+                    .next_back()
+                    .is_none_or(char::is_whitespace))
+        {
+            return true;
+        } else if is_pair_quote(c) && quote_opens_string(&prefix[..i], rest, lang) {
+            let triple =
+                lang == Some(LangKind::Python) && c != '`' && rest.chars().take(3).eq([c, c, c]);
+            quote = Some((c, triple));
+            if triple {
+                step = 3;
+            }
+        }
+        i += step;
+    }
+    quote.is_some() || in_block
+}
+
+/// Whether the quote that starts `rest` opens a string, given the line text
+/// `before` it. A `"` always does. A `'` or backtick after a word character is
+/// an apostrophe (`don't`, C++'s `1'000`) unless that word is a Python string
+/// prefix, and a Rust `'` opens a char literal, never a lifetime or a label.
+fn quote_opens_string(before: &str, rest: &str, lang: Option<LangKind>) -> bool {
+    let mut chars = rest.chars();
+    let q = chars.next();
+    if q == Some('"') {
+        return true;
+    }
+    let word = trailing_word(before);
+    let prefixed = lang == Some(LangKind::Python) && is_python_string_prefix(word);
+    if !word.is_empty() && !prefixed {
+        return false;
+    }
+    if lang == Some(LangKind::Rust) && q == Some('\'') {
+        return matches!(
+            (chars.next(), chars.next()),
+            (None, _) | (Some('\\'), _) | (Some(_), Some('\''))
+        );
+    }
+    true
+}
+
+/// Whether a backslash escapes the next character inside a `q`-quoted string
+/// of `lang`. Shell, YAML and TOML single quotes and Go's backtick raw strings
+/// take every character literally.
+fn backslash_escapes(q: char, lang: Option<LangKind>) -> bool {
+    !matches!(
+        (q, lang),
+        ('\'', Some(LangKind::Bash | LangKind::Yaml | LangKind::Toml)) | ('`', Some(LangKind::Go))
+    )
+}
+
+/// Python's string prefixes (`f"…"`, `rb'…'`, in any case): letters that
+/// belong to the string's opening quote rather than being a word before it.
+fn is_python_string_prefix(word: &str) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "f" | "r" | "b" | "u" | "rb" | "br" | "fr" | "rf"
+    )
+}
+
+/// The run of word characters that ends `s`.
+fn trailing_word(s: &str) -> &str {
+    let start = s
+        .char_indices()
+        .rev()
+        .take_while(|&(_, c)| is_word_char(c))
+        .last()
+        .map_or(s.len(), |(i, _)| i);
+    &s[start..]
+}
+
 /// Apply the selection background colour to columns `[start_char..end_char)`
 /// of row `y`, where columns are character indices within the editor's text
 /// area.  Clamps to the visible width.
@@ -17355,8 +17863,11 @@ pub(crate) fn disambiguated_tab_labels(editors: &[Editor]) -> Vec<String> {
     for (i, e) in editors.iter().enumerate() {
         // A symbol tab's label already differs from its file's tab, and the
         // two share a path, so no parent suffix could tell them apart.
+        // A proposal merge's scratch copy is labelled as one, and its
+        // parent is a cache token that would only add noise (#1353).
         if e.diff.is_none()
             && e.symbol_view.is_none()
+            && !e.merge.as_ref().is_some_and(|m| m.proposal_from.is_some())
             && let Some(name) = e.path.as_deref().and_then(|p| p.file_name())
         {
             groups
@@ -17498,7 +18009,9 @@ fn tab_label(e: &Editor) -> String {
     };
     // The merge editor is text underneath (dirty dot still applies), but
     // the tab says which flavour of the file it is showing.
-    let name = if e.merge.is_some() {
+    let name = if e.merge.as_ref().is_some_and(|m| m.proposal_from.is_some()) {
+        format!("{name} (proposal merge)")
+    } else if e.merge.is_some() {
         format!("{name} (merge)")
     } else if let Some(view) = e.symbol_view.as_ref() {
         // A symbol tab (#369) leads with its symbol; the file says where.
@@ -21794,6 +22307,98 @@ mod tests {
         assert_eq!(lines, vec!["abC".to_string(), "Def".to_string()]);
     }
 
+    /// An insert of `text` at the end of row 0, as a remote span.
+    fn append_span(e: &Editor, text: &str) -> TextSpanEdit {
+        let col = e.lines[0].chars().count();
+        TextSpanEdit {
+            start: (0, col),
+            end: (0, col),
+            new_text: text.to_string(),
+            utf16: false,
+        }
+    }
+
+    /// #1207: every span of one remote group (the runs of a peer's edit,
+    /// the fragments of an AI stream) is one undo step.
+    #[test]
+    fn remote_spans_of_one_group_undo_as_one_step() {
+        let mut e = editor_with("def add(a, b):");
+        for frag in [" return", " a", " +", " b"] {
+            let span = append_span(&e, frag);
+            e.apply_remote_span_edits(&[span], 5);
+        }
+        assert_eq!(e.lines[0], "def add(a, b): return a + b");
+        assert!(e.undo());
+        assert_eq!(
+            e.lines[0], "def add(a, b):",
+            "one undo drops the whole group"
+        );
+        assert!(!e.undo(), "and it was the only step");
+        assert!(e.redo());
+        assert_eq!(e.lines[0], "def add(a, b): return a + b");
+    }
+
+    /// Negative (#1207): another group, a local keystroke in between, or
+    /// ungrouped span edits still open steps of their own.
+    #[test]
+    fn a_local_edit_or_another_group_splits_remote_steps() {
+        let mut e = editor_with("x");
+        let span = append_span(&e, "1");
+        e.apply_remote_span_edits(&[span], 5);
+        let span = append_span(&e, "2");
+        e.apply_remote_span_edits(&[span], 6);
+        e.cursor_col = e.lines[0].chars().count();
+        e.insert_char('3');
+        let span = append_span(&e, "4");
+        e.apply_remote_span_edits(&[span], 6);
+        for _ in 0..2 {
+            let span = append_span(&e, "5");
+            e.apply_span_edits(&[span]);
+        }
+        let mut seen = vec![e.lines[0].clone()];
+        while e.undo() {
+            seen.push(e.lines[0].clone());
+        }
+        assert_eq!(
+            seen,
+            ["x123455", "x12345", "x1234", "x123", "x12", "x1", "x"]
+        );
+    }
+
+    /// #1207: a group whose edits restored the text it started from (a
+    /// cancelled stream's revert) leaves no undo step once it ends; one
+    /// that changed the text keeps its step.
+    #[test]
+    fn an_ended_group_that_restored_its_text_leaves_no_step() {
+        let mut e = editor_with("return a - b");
+        let span = append_span(&e, "\n    raise TypeError(");
+        e.apply_remote_span_edits(&[span], 7);
+        let len = e.lines[1].chars().count();
+        let revert = TextSpanEdit {
+            start: (0, 12),
+            end: (1, len),
+            new_text: String::new(),
+            utf16: false,
+        };
+        e.apply_remote_span_edits(&[revert], 7);
+        assert_eq!(e.lines, vec!["return a - b".to_string()]);
+        e.end_remote_undo_group(7);
+        assert!(
+            !e.undo(),
+            "nothing to undo: the stream left the text as it was"
+        );
+
+        let span = append_span(&e, " + c");
+        e.apply_remote_span_edits(&[span], 8);
+        e.end_remote_undo_group(8);
+        let span = append_span(&e, " + d");
+        e.apply_remote_span_edits(&[span], 8);
+        assert!(e.undo());
+        assert_eq!(e.lines[0], "return a - b + c", "an ended group is closed");
+        assert!(e.undo());
+        assert_eq!(e.lines[0], "return a - b");
+    }
+
     #[test]
     fn editor_apply_span_edits_marks_dirty_and_one_undo() {
         let mut e = editor_with("name = 1\nprint(name)");
@@ -21872,6 +22477,160 @@ mod tests {
         assert_eq!(e.line_char_len(0), 5);
         e.lines[0] = String::from("日本語");
         assert_eq!(e.line_char_len(0), 3);
+    }
+
+    // #1196: the caret and single-character deletes step by extended
+    // grapheme cluster, so a ZWJ emoji, a flag or a decomposed accent is
+    // never split.
+    const FAMILY: &str = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+    const FLAG: &str = "\u{1F1EB}\u{1F1F7}";
+
+    #[test]
+    fn move_right_steps_over_a_zwj_emoji_whole() {
+        let mut e = editor_with(&format!("a{FAMILY}b"));
+        e.move_right();
+        assert_eq!(e.cursor_col, 1);
+        e.move_right();
+        assert_eq!(e.cursor_col, 6, "one Right crosses all five code points");
+        e.move_right();
+        assert_eq!(e.cursor_col, 7);
+    }
+
+    #[test]
+    fn move_left_steps_over_a_flag_whole() {
+        let mut e = editor_with(&format!("{FLAG} France"));
+        e.cursor_col = 2;
+        e.move_left();
+        assert_eq!(e.cursor_col, 0, "one Left crosses both regional indicators");
+    }
+
+    #[test]
+    fn typing_after_two_rights_lands_after_the_emoji() {
+        let mut e = editor_with(&format!("a{FAMILY}b"));
+        e.move_right();
+        e.move_right();
+        e.insert_char('Z');
+        assert_eq!(e.lines[0], format!("a{FAMILY}Zb"));
+    }
+
+    #[test]
+    fn typing_after_a_decomposed_accent_keeps_it_on_its_letter() {
+        let mut e = editor_with("cafe\u{301}!");
+        for _ in 0..4 {
+            e.move_right();
+        }
+        assert_eq!(e.cursor_col, 5, "the fourth Right crosses e and its accent");
+        e.insert_char('Y');
+        assert_eq!(e.lines[0], "cafe\u{301}Y!");
+    }
+
+    #[test]
+    fn backspace_removes_a_whole_flag() {
+        let mut e = editor_with(&format!("{FLAG} France"));
+        e.cursor_col = 2;
+        e.backspace();
+        assert_eq!(e.lines[0], " France");
+        assert_eq!(e.cursor_col, 0);
+    }
+
+    #[test]
+    fn delete_forward_removes_a_whole_zwj_emoji() {
+        let mut e = editor_with(&format!("a{FAMILY}b"));
+        e.cursor_col = 1;
+        e.delete_forward();
+        assert_eq!(e.lines[0], "ab");
+        assert_eq!(e.cursor_col, 1);
+    }
+
+    #[test]
+    fn move_down_snaps_out_of_a_cluster() {
+        let mut e = editor_with(&format!("abcdef\na{FAMILY}b"));
+        e.cursor_col = 3;
+        e.move_down();
+        assert_eq!(
+            (e.cursor_row, e.cursor_col),
+            (1, 1),
+            "col 3 is inside the emoji"
+        );
+        e.cursor_row = 0;
+        e.cursor_col = 3;
+        e.wrap_override = Some(true);
+        let _ = first_row_text(&mut e);
+        e.move_down();
+        assert_eq!(
+            (e.cursor_row, e.cursor_col),
+            (1, 1),
+            "wrapped lines snap the same way"
+        );
+    }
+
+    #[test]
+    fn click_inside_a_cluster_snaps_to_its_start() {
+        let mut e = editor_with(&format!("x{FAMILY}y\ncafe\u{301}!"));
+        let _ = first_row_text(&mut e);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y = e.last_inner.y;
+        for dx in 0..8 {
+            e.click(text_x + dx, y);
+            assert!(
+                [0, 1, 6, 7].contains(&e.cursor_col),
+                "a click at cell {dx} left the caret at col {}, inside the emoji",
+                e.cursor_col
+            );
+        }
+    }
+
+    #[test]
+    fn shift_right_selects_a_whole_emoji() {
+        let mut e = editor_with(&format!("a{FAMILY}b"));
+        e.cursor_col = 1;
+        e.start_selection_at_cursor();
+        e.move_right();
+        e.extend_selection_to_cursor();
+        assert_eq!(e.selection_text(), FAMILY);
+    }
+
+    #[test]
+    fn plain_and_cjk_text_still_step_one_char() {
+        let mut e = editor_with("ab\u{65E5}\u{672C}c");
+        for want in 1..=5 {
+            e.move_right();
+            assert_eq!(e.cursor_col, want);
+        }
+        for want in (0..5).rev() {
+            e.move_left();
+            assert_eq!(e.cursor_col, want);
+        }
+        e.cursor_col = 3;
+        e.backspace();
+        assert_eq!(e.lines[0], "ab\u{672C}c");
+        e.delete_forward();
+        assert_eq!(e.lines[0], "abc");
+    }
+
+    #[test]
+    fn backspace_and_delete_still_join_lines_at_the_edges() {
+        let mut e = editor_with(&format!("{FLAG}\nx"));
+        e.cursor_row = 1;
+        e.cursor_col = 0;
+        e.backspace();
+        assert_eq!(e.lines, vec![format!("{FLAG}x")]);
+        assert_eq!(e.cursor_col, 2);
+        let mut e = editor_with(&format!("{FLAG}\nx"));
+        e.cursor_col = 2;
+        e.delete_forward();
+        assert_eq!(e.lines, vec![format!("{FLAG}x")]);
+    }
+
+    #[test]
+    fn a_lone_combining_mark_and_a_lone_indicator_are_one_step_each() {
+        let mut e = editor_with("\u{301}\u{1F1EB}x");
+        e.move_right();
+        assert_eq!(e.cursor_col, 1);
+        e.move_right();
+        assert_eq!(e.cursor_col, 2);
+        e.backspace();
+        assert_eq!(e.lines[0], "\u{301}x");
     }
 
     #[test]
@@ -22315,8 +23074,59 @@ mod tests {
         e.lang = Some(LangKind::Yaml);
         e.cursor_col = e.line_char_len(0);
         e.insert_newline();
-        assert_eq!(e.lines, vec!["  key:".to_string(), "  ".to_string()]);
-        assert_eq!(e.cursor_col, 2);
+        assert_eq!(e.lines, vec!["  key:".to_string(), "    ".to_string()]);
+        assert_eq!(e.cursor_col, 4);
+    }
+
+    /// Enter at the end of a YAML line; returns the new line's indent.
+    fn yaml_enter(line: &str) -> String {
+        let mut e = editor_with(line);
+        e.lang = Some(LangKind::Yaml);
+        e.cursor_col = e.line_char_len(0);
+        e.insert_newline();
+        assert_eq!(e.lines.len(), 2, "one new line for {line:?}");
+        assert_eq!(e.cursor_row, 1);
+        assert_eq!(e.cursor_col, e.lines[1].chars().count());
+        e.lines[1].clone()
+    }
+
+    #[test]
+    fn yaml_enter_after_a_key_that_opens_a_mapping_indents_one_step() {
+        assert_eq!(yaml_enter("services:"), "  ");
+        assert_eq!(yaml_enter("  web:  # the app"), "    ");
+        assert_eq!(yaml_enter("run: |"), "  ");
+        assert_eq!(yaml_enter("  script: >-"), "    ");
+        assert_eq!(yaml_enter("\"quoted key\":"), "  ");
+        assert_eq!(yaml_enter("args: ["), "  ");
+    }
+
+    #[test]
+    fn yaml_enter_in_a_list_item_lines_up_with_the_item_content() {
+        assert_eq!(yaml_enter("  - name: x"), "    ");
+        assert_eq!(yaml_enter("- name:"), "    ");
+        assert_eq!(yaml_enter("  - run: |"), "      ");
+    }
+
+    #[test]
+    fn yaml_enter_after_a_plain_value_keeps_the_indent() {
+        // Negative: nothing opens a block, so the caret stays in the column.
+        assert_eq!(yaml_enter("image: nginx"), "");
+        assert_eq!(yaml_enter("  ports:  [80]"), "  ");
+        assert_eq!(yaml_enter("  - \"80:80\""), "  ");
+        assert_eq!(yaml_enter("- plain item"), "");
+        assert_eq!(yaml_enter("url: http://x.io/a"), "");
+        assert_eq!(yaml_enter("  note: 'ends with a colon:'"), "  ");
+        assert_eq!(yaml_enter("# todo:"), "");
+        assert_eq!(yaml_enter("cmd: echo hi # really:"), "");
+    }
+
+    #[test]
+    fn enter_after_a_colon_does_not_indent_outside_yaml_and_python() {
+        let mut e = editor_with("key:");
+        e.lang = Some(LangKind::Rust);
+        e.cursor_col = e.line_char_len(0);
+        e.insert_newline();
+        assert_eq!(e.lines, vec!["key:".to_string(), String::new()]);
     }
 
     #[test]
@@ -23218,6 +24028,37 @@ mod tests {
         assert_eq!(&out[3..6], b"hi!");
     }
 
+    /// #1226: a Dockerfile, a Makefile, SQL and Java open in their own
+    /// language, so Toggle Line Comment uses that language's marker.
+    #[test]
+    fn common_repository_files_open_in_their_language() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cases = [
+            ("Dockerfile", "FROM alpine", "Dockerfile", "# FROM alpine"),
+            ("Makefile", "all: build", "Makefile", "# all: build"),
+            ("q.sql", "SELECT 1;", "SQL", "-- SELECT 1;"),
+            ("A.java", "int x = 1;", "Java", "// int x = 1;"),
+            ("app.rb", "puts 1", "Ruby", "# puts 1"),
+            ("P.cs", "int x = 1;", "C#", "// int x = 1;"),
+        ];
+        for (name, text, label, commented) in cases {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            let mut e = Editor::new();
+            e.open(&path).unwrap();
+            assert_eq!(e.language_label(), label, "{name}");
+            assert!(e.toggle_line_comment(), "{name}");
+            assert_eq!(e.lines, vec![commented], "{name}");
+        }
+        // Negative: an unknown file stays Plain Text with no comment marker.
+        let path = tmp.path().join("notes.txt");
+        std::fs::write(&path, "hello").unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        assert_eq!(e.language_label(), "Plain Text");
+        assert!(!e.toggle_line_comment());
+    }
+
     #[test]
     fn set_language_updates_the_label() {
         let mut e = editor_with("x = 1");
@@ -23554,6 +24395,284 @@ mod tests {
         assert_eq!(written, "hello\nworld");
     }
 
+    /// Run the test named `child` in a fresh copy of this test binary whose
+    /// files can't grow past `fsize` bytes (RLIMIT_FSIZE, with SIGXFSZ
+    /// ignored so a write past it fails with EFBIG instead of killing the
+    /// process). That is a disk that fills up mid-write, scoped to one
+    /// process, so it can't reach the other tests running in parallel.
+    #[cfg(target_os = "linux")]
+    fn run_with_file_size_limit(child: &str, file: &std::path::Path, fsize: u64) {
+        use std::os::unix::process::CommandExt as _;
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([child, "--exact", "--test-threads=1", "--nocapture"])
+            .env("CROFT_TEST_FSIZE_FILE", file);
+        // SAFETY: only async-signal-safe libc calls between fork and exec.
+        unsafe {
+            cmd.pre_exec(move || {
+                let lim = libc::rlimit {
+                    rlim_cur: fsize,
+                    rlim_max: fsize,
+                };
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &lim) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        let out = cmd.output().unwrap();
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{child} failed:\n{log}");
+        assert!(log.contains("1 passed"), "{child} did not run:\n{log}");
+    }
+
+    /// #1124: a save that runs out of space must leave the file as it was,
+    /// and must not make croft's own failed write look like someone else's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_save_that_runs_out_of_space_leaves_the_file_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("notes.md");
+        let original: String = (0..400).map(|i| format!("- entry {i:04}\n")).collect();
+        std::fs::write(&f, &original).unwrap();
+        // The file is ~5.6 KB; the child can write at most 4 KB of any file.
+        run_with_file_size_limit(
+            "widgets::editor::tests::child_saves_a_grown_buffer_under_a_file_size_limit",
+            &f,
+            4096,
+        );
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            original,
+            "the failed save cut the file short"
+        );
+        let stray: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "notes.md")
+            .collect();
+        assert!(stray.is_empty(), "temp files left behind: {stray:?}");
+    }
+
+    /// The child half of the test above; a no-op unless run by it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_saves_a_grown_buffer_under_a_file_size_limit() {
+        let Some(f) = std::env::var_os("CROFT_TEST_FSIZE_FILE") else {
+            return;
+        };
+        let mut e = Editor::new();
+        e.open(std::path::Path::new(&f)).unwrap();
+        e.insert_str("# A new entry at the top\n");
+        assert!(
+            e.save_to_disk().is_err(),
+            "the write must fail past the limit"
+        );
+        assert!(e.dirty, "the edits are still only in the buffer");
+        assert!(
+            !e.disk_changed_externally(),
+            "croft's own failed write must not read as an external change"
+        );
+    }
+
+    #[test]
+    fn saving_keeps_the_mode_and_writes_through_a_symlink() {
+        // Negative: writing aside and renaming in must not change what a
+        // save changes: the file keeps its mode, a symlink stays a link
+        // to the file it named, and a new file is still created.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("run.sh");
+        std::fs::write(&real, "echo a\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let link = dir.path().join("link.sh");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut e = Editor::new();
+        e.open(&link).unwrap();
+        e.insert_str("# hi\n");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "# hi\necho a\n");
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        assert!(!e.disk_changed_externally());
+
+        let fresh = dir.path().join("new.txt");
+        let mut e = Editor::new();
+        e.path = Some(fresh.clone());
+        e.insert_str("x");
+        e.save_to_disk().unwrap();
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "x");
+    }
+
+    /// #1190 review: a save that fails before the file is touched must
+    /// not refresh the disk stamp: an overwrite of an outside edit that
+    /// fails leaves that edit on disk, and the next plain save must still
+    /// stop at the conflict instead of silently replacing it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_save_keeps_an_external_edit_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("notes.md");
+        let original: String = (0..400).map(|i| format!("- entry {i:04}\n")).collect();
+        std::fs::write(&f, &original).unwrap();
+        run_with_file_size_limit(
+            "widgets::editor::tests::child_fails_a_save_after_an_external_edit",
+            &f,
+            4096,
+        );
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "edited elsewhere\n");
+    }
+
+    /// The child half of the test above; a no-op unless run by it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_fails_a_save_after_an_external_edit() {
+        let Some(f) = std::env::var_os("CROFT_TEST_FSIZE_FILE") else {
+            return;
+        };
+        let f = std::path::PathBuf::from(f);
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        std::fs::write(&f, "edited elsewhere\n").unwrap();
+        e.insert_str("# A new entry at the top\n");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::DiskConflict);
+        assert!(
+            e.save_to_disk_force().is_err(),
+            "the overwrite must fail past the limit"
+        );
+        assert!(
+            e.disk_changed_externally(),
+            "the failed overwrite left the outside edit on disk, still unresolved"
+        );
+    }
+
+    /// #1190 review: a hard link is written in place (a rename would split
+    /// it from its other names); running out of space there must still
+    /// leave the file whole.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hard_linked_file_that_runs_out_of_space_stays_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("notes.md");
+        let original: String = (0..400).map(|i| format!("- entry {i:04}\n")).collect();
+        std::fs::write(&f, &original).unwrap();
+        std::fs::hard_link(&f, dir.path().join("other-name.md")).unwrap();
+        run_with_file_size_limit(
+            "widgets::editor::tests::child_saves_a_grown_buffer_under_a_file_size_limit",
+            &f,
+            4096,
+        );
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), original);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("other-name.md")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn a_file_with_a_long_name_still_saves() {
+        // #1190 review: the temp name grew with the file's own, so a name
+        // near the 255-byte limit could not be saved at all.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join(format!("{}.md", "n".repeat(240)));
+        std::fs::write(&f, "a\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.insert_str("b\n");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "b\na\n");
+    }
+
+    #[test]
+    fn a_save_never_touches_a_file_named_like_a_temp_file() {
+        // #1190 review: the temp name was predictable and a file already
+        // at it was removed first, so a save could delete an unrelated one.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("notes.md");
+        std::fs::write(&f, "a\n").unwrap();
+        let planted = dir
+            .path()
+            .join(format!(".notes.md.croft-save-{}", std::process::id()));
+        std::fs::write(&planted, "not croft's\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.insert_str("b\n");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert_eq!(std::fs::read_to_string(&planted).unwrap(), "not croft's\n");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "no temp file is left behind: {names:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_keeps_the_files_group() {
+        // #1190 review: the renamed-in file took the default group.
+        use std::os::unix::fs::MetadataExt as _;
+        let mut groups = vec![0 as libc::gid_t; 64];
+        let n = unsafe { libc::getgroups(groups.len() as i32, groups.as_mut_ptr()) };
+        let egid = unsafe { libc::getegid() };
+        let Some(&other) = groups[..n.max(0) as usize].iter().find(|&&g| g != egid) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("shared.txt");
+        std::fs::write(&f, "a\n").unwrap();
+        std::os::unix::fs::chown(&f, None, Some(other)).unwrap();
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.insert_str("b\n");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert_eq!(std::fs::metadata(&f).unwrap().gid(), other);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn saving_keeps_the_files_extended_attributes() {
+        // #1190 review: xattrs, and the POSIX ACLs stored in them, were
+        // left behind on the old inode.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("tagged.txt");
+        std::fs::write(&f, "a\n").unwrap();
+        let c = std::ffi::CString::new(f.as_os_str().as_encoded_bytes()).unwrap();
+        let name = c"user.croft-test";
+        let set =
+            unsafe { libc::setxattr(c.as_ptr(), name.as_ptr(), b"kept".as_ptr().cast(), 4, 0) };
+        if set != 0 {
+            return; // the filesystem has no user xattrs
+        }
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.insert_str("b\n");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        let mut buf = [0u8; 16];
+        let got = unsafe {
+            libc::getxattr(
+                c.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        assert_eq!(got, 4, "the xattr is gone");
+        assert_eq!(&buf[..4], b"kept");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "b\na\n");
+    }
+
     #[test]
     fn dirty_flag_lifecycle() {
         let mut e = editor_with("abc");
@@ -23755,6 +24874,76 @@ mod tests {
         assert!(!e.disk_conflict);
         // A second sweep with no further change is a no-op.
         assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Unchanged);
+    }
+
+    /// #1357: a clean tab reloaded after an external rewrite (an agent, a
+    /// formatter, a checkout) kept no history, so Ctrl+Z said "Nothing to
+    /// undo" and could take back neither the rewrite nor what came before.
+    #[test]
+    fn an_external_reload_is_one_undo_step_and_keeps_the_history_before_it() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "def total(xs):\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.cursor_row = 0;
+        e.cursor_col = e.lines[0].len();
+        e.insert_str(" # typed");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        std::fs::write(tmp.path(), "def total(xs):\n    return sum(xs)\n").unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert_eq!(e.lines, vec!["def total(xs):", "    return sum(xs)"]);
+        assert!(!e.dirty);
+
+        assert!(e.undo(), "the reload itself is undoable");
+        assert_eq!(e.lines, vec!["def total(xs): # typed"]);
+        assert!(e.dirty, "the restored text no longer matches disk");
+        assert!(e.undo(), "and so is what was typed before it");
+        assert_eq!(e.lines, vec!["def total(xs):"]);
+        assert!(e.dirty);
+
+        assert!(e.redo() && e.redo(), "redo walks forward again");
+        assert_eq!(e.lines, vec!["def total(xs):", "    return sum(xs)"]);
+        assert!(
+            !e.dirty,
+            "back at the reloaded text, which is what disk holds"
+        );
+    }
+
+    #[test]
+    fn a_reload_that_changes_no_text_pushes_no_undo_step() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "a\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.cursor_col = 1;
+        e.insert_str("b");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        let steps = e.undo_stack.len();
+        // Same bytes, new mtime: `touch`, or a formatter with nothing to do.
+        let f = std::fs::File::options()
+            .write(true)
+            .open(tmp.path())
+            .unwrap();
+        f.set_modified(SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert_eq!(e.undo_stack.len(), steps, "no empty step to undo through");
+        assert!(e.undo());
+        assert_eq!(e.lines[0], "a", "the typing before it is one undo away");
+    }
+
+    #[test]
+    fn a_file_reloaded_as_a_different_view_starts_its_history_afresh() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "text\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.insert_str("x");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        std::fs::write(tmp.path(), [0u8, 159, 146, 150, 0, 1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert!(e.hex.is_some(), "precondition: the file is binary now");
+        assert!(!e.undo(), "text history cannot be undone into a hex view");
     }
 
     #[test]
@@ -31000,6 +32189,283 @@ mod tests {
         e.cursor_col = 3;
         e.insert_char('\'');
         assert_eq!(e.lines[0], "don'", "no auto-pair after a word character");
+    }
+
+    /// An editor in `lang` with `text` typed into it one key at a time.
+    fn typed_in(lang: Option<LangKind>, text: &str) -> Editor {
+        let mut e = editor_with("");
+        e.lang = lang;
+        for c in text.chars() {
+            e.insert_char(c);
+        }
+        e
+    }
+
+    #[test]
+    fn python_strings_typed_key_by_key_come_out_exactly_as_typed() {
+        // The f-string's closing `"` used to pair (it follows `}`), leaving a
+        // stray `")` behind; the prefix now opens the pair instead (#844).
+        for text in [
+            "print(f\"{category:<12} {total:>10}\")",
+            "print(f\"{x}\")",
+            "r'\\d'",
+            "x = Rb'\\x00' + fr\"{y}\"",
+        ] {
+            let e = typed_in(Some(LangKind::Python), text);
+            assert_eq!(e.lines, [text], "typing {text:?}");
+        }
+        let mut e = typed_in(Some(LangKind::Python), "print(f");
+        e.insert_char('"');
+        assert_eq!(e.lines[0], "print(f\"\")", "a string prefix opens the pair");
+        let mut e = typed_in(Some(LangKind::Python), "elif");
+        e.insert_char('"');
+        assert_eq!(e.lines[0], "elif\"", "a word that is not a prefix does not");
+    }
+
+    /// `text` in `lang` with the caret at its `|` (which is not kept), and
+    /// the text either side of the caret.
+    fn with_caret(lang: Option<LangKind>, text: &str) -> (Editor, &str, &str) {
+        let (head, tail) = text.split_once('|').expect("a caret marker");
+        let mut e = editor_with(&format!("{head}{tail}"));
+        e.lang = lang;
+        e.cursor_col = head.chars().count();
+        (e, head, tail)
+    }
+
+    #[test]
+    fn a_quote_typed_inside_a_string_or_comment_never_pairs() {
+        for (lang, text) in [
+            // The #844 line once `f"` had not paired but the `(` had.
+            (Some(LangKind::Python), "print(f\"{x}|)"),
+            (Some(LangKind::Python), "s = 'it is |"),
+            (Some(LangKind::Python), "doc = \"\"\"say \"hi\" |"),
+            (Some(LangKind::Python), "x = 1  # see |"),
+            (Some(LangKind::Rust), "let s = \"a \\\" b |"),
+            (Some(LangKind::Rust), "f(x); // see |"),
+            (Some(LangKind::JavaScript), "/* see |"),
+            (Some(LangKind::Bash), "echo 'a\\' \"b |"),
+            (None, "He said \"hi, |"),
+        ] {
+            let (mut e, head, tail) = with_caret(lang, text);
+            e.insert_char('"');
+            assert_eq!(e.lines[0], format!("{head}\"{tail}"), "{lang:?}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_quote_outside_strings_and_comments_still_pairs() {
+        for (lang, text) in [
+            (None, "x = |"),
+            (Some(LangKind::Python), "d = {'a': 1, |}"),
+            (Some(LangKind::Python), "doc = \"\"\"a\"\"\" + |"),
+            (Some(LangKind::Rust), "fn f<'a>(s: &'a str) { g(|"),
+            (Some(LangKind::Rust), "let c = '\"'; h(|"),
+            (Some(LangKind::Cpp), "int n = 1'000; f(|"),
+            (Some(LangKind::Bash), "echo ${#a[@]} |"),
+            (Some(LangKind::JavaScript), "/* a */ f(|"),
+            (None, "don't say |"),
+        ] {
+            let (mut e, head, tail) = with_caret(lang, text);
+            e.insert_char('"');
+            assert_eq!(
+                e.lines[0],
+                format!("{head}\"\"{tail}"),
+                "{lang:?}: {text:?}"
+            );
+        }
+    }
+
+    /// The line scan starts every line outside a string, so a quote typed in
+    /// a docstring body, a template literal or a block comment that an
+    /// earlier line opened still paired; the highlight pass knows (#844).
+    #[test]
+    fn a_quote_in_a_string_or_comment_from_an_earlier_line_pairs_only_once_it_closes() {
+        let typed_at_caret = |lang: LangKind, text: &str| {
+            let (head, tail) = text.split_once('|').expect("a caret marker");
+            let mut e = editor_with(&format!("{head}{tail}"));
+            e.lang = Some(lang);
+            e.recompute_highlights();
+            e.cursor_row = head.matches('\n').count();
+            e.cursor_col = head.rsplit('\n').next().unwrap_or("").chars().count();
+            e.insert_char('"');
+            (e.lines.join("\n"), head.to_string(), tail.to_string())
+        };
+        for (lang, text) in [
+            (
+                LangKind::Python,
+                "def f():\n    \"\"\"Doc\n    said | here\n    \"\"\"",
+            ),
+            (LangKind::JavaScript, "const s = `a\nb | c`;"),
+            (LangKind::Rust, "/* start\n   see | */"),
+        ] {
+            let (got, head, tail) = typed_at_caret(lang, text);
+            assert_eq!(got, format!("{head}\"{tail}"), "{lang:?}: {text:?}");
+        }
+        for (lang, text) in [
+            (LangKind::Python, "doc = \"\"\"a\nb\"\"\" + |"),
+            (LangKind::Rust, "/* a\n b */ f(|"),
+        ] {
+            let (got, head, tail) = typed_at_caret(lang, text);
+            assert_eq!(got, format!("{head}\"\"{tail}"), "{lang:?}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_string_prefix_opens_a_pair_only_in_python_and_only_as_a_prefix() {
+        // #844 guard: `f"` pairs because Python's `f` is part of the
+        // opener. In any other language, or after a word Python does not
+        // take as a prefix, a quote after a word character stays single.
+        for lang in [None, Some(LangKind::Rust), Some(LangKind::JavaScript)] {
+            let mut e = typed_in(lang, "f");
+            e.insert_char('"');
+            assert_eq!(e.lines[0], "f\"", "{lang:?}");
+        }
+        for word in ["ub", "fu", "bb", "rbf", "print"] {
+            let mut e = typed_in(Some(LangKind::Python), word);
+            e.insert_char('\'');
+            assert_eq!(e.lines[0], format!("{word}'"), "{word:?} is no prefix");
+        }
+        let mut e = typed_in(Some(LangKind::Python), "x = U");
+        e.insert_char('\'');
+        assert_eq!(e.lines[0], "x = U''", "a prefix in either case");
+    }
+
+    #[test]
+    fn a_closing_quote_inside_a_string_is_still_typed_over() {
+        // #844 guard: refusing to pair inside a string comes after
+        // type-over, so the quote that closes a string steps over the one
+        // already at the caret instead of adding a second.
+        for (lang, text) in [
+            (Some(LangKind::Python), "s = \"abc|\""),
+            (Some(LangKind::Rust), "let s = \"a \\\" b|\";"),
+            (None, "say \"hi|\""),
+        ] {
+            let (mut e, head, tail) = with_caret(lang, text);
+            e.insert_char('"');
+            assert_eq!(e.lines[0], format!("{head}{tail}"), "{lang:?}: {text:?}");
+            assert_eq!(e.cursor_col, head.chars().count() + 1, "{lang:?}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_selection_inside_a_string_is_still_wrapped_in_quotes() {
+        // #844 guard: wrapping a selection is not auto-pairing. A quote
+        // typed over a selection inside a string still surrounds it.
+        let mut e = editor_with("s = \"a word here\"");
+        e.set_language(Some(LangKind::Python));
+        e.selection = Some(EditorSelection {
+            anchor: (0, 7),
+            head: (0, 11),
+        }); // "word"
+        e.cursor_col = 11;
+        e.insert_char('\'');
+        assert_eq!(e.lines[0], "s = \"a 'word' here\"");
+    }
+
+    #[test]
+    fn a_docstring_an_edit_removed_no_longer_holds_back_a_pair() {
+        // #844 guard: the string ranges are the highlight pass's after every
+        // edit, never stale. Inside a docstring a quote does not pair; once
+        // its opener is deleted, the same quote on the same line does.
+        let mut e = editor_with("doc = \"\"\"\nx = \n\"\"\"");
+        e.set_language(Some(LangKind::Python));
+        e.cursor_row = 1;
+        e.cursor_col = 4;
+        e.insert_char('"');
+        assert_eq!(e.lines[1], "x = \"", "inside the docstring: no pair");
+        e.backspace();
+        e.cursor_row = 0;
+        e.cursor_col = 9;
+        for _ in 0..3 {
+            e.backspace();
+        }
+        assert_eq!(e.lines[0], "doc = ");
+        e.cursor_row = 1;
+        e.cursor_col = 4;
+        e.insert_char('"');
+        assert_eq!(e.lines[1], "x = \"\"", "no docstring left: the quote pairs");
+    }
+
+    #[test]
+    fn string_ranges_are_not_read_while_the_pass_over_an_edit_is_out() {
+        // #844 x #850 guard: the string and comment ranges are byte offsets
+        // into the text one syntax pass read, and are not carried through
+        // edits. While the pass over an edit is still out (a file past the
+        // inline budget), the docstring the edit removed must not hold back
+        // a pair: the caret's line decides, as before #844.
+        let mut e = editor_with("doc = \"\"\"\nx = \n\"\"\"");
+        e.set_language(Some(LangKind::Python));
+        e.defer_highlights_for_test();
+        e.cursor_row = 0;
+        e.cursor_col = 9;
+        for _ in 0..3 {
+            e.backspace();
+        }
+        assert_eq!(e.lines[0], "doc = ");
+        assert!(e.highlight_pending(), "the edit's pass has not landed");
+        e.cursor_row = 1;
+        e.cursor_col = 4;
+        e.insert_char('"');
+        assert_eq!(e.lines[1], "x = \"\"", "the stale docstring is not read");
+    }
+
+    #[test]
+    fn a_pass_that_edits_overtook_does_not_make_its_string_ranges_count() {
+        // #844 x #850 guard: a pass that lands after more edits were made
+        // read older text. Its spans are carried over; its string ranges
+        // are not, so the docstring the later edits removed stays unread.
+        let mut e = editor_with("doc = \"\"\"\nx = \n\"\"\"");
+        e.set_language(Some(LangKind::Python));
+        e.defer_highlights_for_test();
+        let settled = e.highlight_generation();
+        e.insert_char('a'); // starts a pass over text that has the docstring
+        e.cursor_row = 0;
+        e.cursor_col = 10;
+        for _ in 0..3 {
+            e.backspace();
+        }
+        assert_eq!(e.lines[0], "adoc = ");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !e.poll_highlights() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pass never landed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            e.highlight_generation(),
+            settled + 1,
+            "the first pass landed"
+        );
+        assert!(
+            e.highlight_pending(),
+            "and the edits after it started another"
+        );
+        e.cursor_row = 1;
+        e.cursor_col = 4;
+        e.insert_char('"');
+        assert_eq!(
+            e.lines[1], "x = \"\"",
+            "the older text's docstring is not read"
+        );
+    }
+
+    #[test]
+    fn string_ranges_count_again_once_the_pass_over_the_edit_lands() {
+        // #844 x #850 guard against going too far: the fallback lasts only
+        // while the pass is out. Once it lands on the edited text, a quote
+        // inside the docstring an earlier line opened is text again.
+        let mut e = editor_with("doc = \"\"\"\nx = \n\"\"\"");
+        e.set_language(Some(LangKind::Python));
+        e.defer_highlights_for_test();
+        e.cursor_row = 1;
+        e.cursor_col = 4;
+        e.insert_char(' ');
+        e.await_highlight_pass(None);
+        assert!(!e.highlight_pending());
+        e.insert_char('"');
+        assert_eq!(e.lines[1], "x =  \"", "inside the docstring: no pair");
     }
 
     #[test]
