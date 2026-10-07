@@ -73879,6 +73879,7 @@ fn search_results_are_announced_with_the_count_and_the_selected_match() {
         path: tmp.path().join(file),
         line_no,
         line_text: text.into(),
+        matches: 1,
     };
     app.search.hits = vec![
         hit("app.py", 1, "def total(xs):"),
