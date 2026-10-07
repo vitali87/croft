@@ -25,7 +25,7 @@
 # by the next run: each run folds every fragment pending on main when it
 # starts.
 #
-# Tags and GitHub releases stay manual: pushing `v<version>` still runs
+# tag.yml then tags the pushed release commit `v<version>` and starts
 # release.yml, which publishes src/release_notes/<version>.md as the body.
 name: version bump
 

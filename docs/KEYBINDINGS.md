@@ -5,6 +5,7 @@ Every action in croft is reachable from the keyboard. Press `F1` inside croft fo
 Per platform:
 
 * **macOS** — the `Cmd` chords below only reach croft after a one-time terminal setup: `croft setup-iterm2` (see [iTerm2 key mappings](#iterm2-key-mappings)) or `croft setup-ghostty` (see [Ghostty key mappings](#ghostty-key-mappings)).
+* **Linux** — `Ctrl` is the command modifier, as in VS Code: `Cmd` chords work as the same chord with `Ctrl`, the `Cmd+K` chords included (`Ctrl`+`K` leads everywhere except the terminal pane and the vim-mode editor). A handful whose `Ctrl` form is taken need `Super`; [LINUX.md](LINUX.md#the-command-modifier) lists them.
 * **Termux/Android** — there is no Cmd key, so `Ctrl` is the command modifier and every `Cmd` chord works as the same chord with `Ctrl`.
 * **Touch, no hardware keyboard** — every chord comes through croft's built-in on-screen keyboard: tap the editor, terminal, or Search input to raise it, then tap its one-shot `ctrl` / `alt` keys before a letter (e.g. `ctrl` then `p` opens Quick Open); `⌄` dismisses it.
 
@@ -15,7 +16,7 @@ Per platform:
 | `Ctrl+s` / `Cmd+s` | Save the open file. A folder of its path that is gone (removed by a `git checkout`, say) is created again |
 | Command Palette: `File: Save As…` | Write the open file's buffer to a prompted path (workspace-relative, prefilled with its own) and make the tab that file. Missing folders are created; an existing file is never overwritten. Bind `save_as` in keybindings.json for a key |
 | Command Palette: `File: Revert File` | Drop the open file's unsaved edits for the text on disk, as one undo step: `Cmd`+`Z` brings the edits back. A tab with nothing unsaved is left alone. Bind `revert_file` in keybindings.json for a key |
-| Typing `(` `[` `{` or a quote | Auto-closing pairs: the pair inserts with the caret between (openers never before a word, quotes never after one); typing the closer steps over; a selection is surrounded; backspace inside an empty pair deletes both. Settings gear → "Auto Closing Pairs" toggles |
+| Typing `(` `[` `{` or a quote | Auto-closing pairs: the pair inserts with the caret between (openers never before a word; quotes never after one, a Python string prefix such as `f"` or `rb'` excepted, nor inside a string or comment); typing the closer steps over; a selection is surrounded; backspace inside an empty pair deletes both. Settings gear → "Auto Closing Pairs" toggles |
 | `Ctrl+q` | Quit (from any pane but a focused terminal, where it goes to the app running there: vim, nano, the shell's XON) |
 | `F1` | Open the shortcuts modal |
 | `F6` | Cycle focus across panes (tree → editor → terminal → tree) |
@@ -24,9 +25,10 @@ Per platform:
 | `Ctrl+j` | Toggle the terminal pane |
 | `Ctrl+Shift+j` | Maximize the terminal pane (press again to restore the split) |
 | `Cmd+\` | Split the editor into two side-by-side columns; each keeps its own tabs, scroll, and cursor. Closing the last tab in a column collapses the split |
-| `Cmd+Opt+←` / `Cmd+Opt+→` | Move focus to the left / right editor group while split (or click a column) |
+| `Cmd+Opt+←` / `Cmd+Opt+→` | Move focus to the left / right editor group while split (or click a column, or the Command Palette's "View: Focus Left Editor Group" / "View: Focus Right Editor Group") |
 | `Ctrl+p` / `Cmd+p` | Quick Open: fuzzy-search workspace files and jump to one (auto-reveals it in the Explorer). Add `:236` after the name to land on that line, `:236:7` for a column, or `:236-239` to open with those lines selected. Results are mouse-friendly: click a row to open it, wheel to move the selection, and the same goes for all the quick-pick popups (Command Palette, Go to Symbol, the branch and directory pickers, and the Debug: Attach to Python Process list) |
 | `Ctrl+p` / `Cmd+p`, then `#` | Go to Symbol in Workspace: the query goes to every running language server as a `workspace/symbol` search; Enter opens the picked symbol's file at its definition (also Command Palette "Go to Symbol in Workspace") |
+| `Ctrl+p` / `Cmd+p`, then `>`, `@` or `:` | As in VS Code, the first character picks the mode and the rest carries over: `>` runs commands (the Command Palette), `@` goes to a symbol in the open file (Go to Symbol in Editor), and `:12` goes to line 12 of it. A file name with a line, `a.py:12`, is still a file search |
 | `Ctrl+Shift+p` / `Cmd+Shift+p` | Command Palette: fuzzy-search every named command and run it, with its keybinding shown alongside |
 | `Ctrl+Shift+e` / `Cmd+Shift+e` | Jump to the Explorer sidebar |
 | `Ctrl+Shift+f` / `Cmd+Shift+f` | Jump to the Search sidebar |
@@ -40,6 +42,7 @@ Per platform:
 | `Ctrl+Shift+u` / `Cmd+Shift+u` | Show the OUTPUT tab; the palette's "Output: Select Channel…" picks its channel from the keyboard. Where the desktop's input method claims `Ctrl+Shift+u` for Unicode entry (IBus), use the palette's "View: Show Output" |
 | `Cmd+Shift+t` | Focus the terminal pane, un-hiding the panel and bringing its TERMINAL tab forward over PROBLEMS / OUTPUT / PORTS / CAPTURES (also the palette's "Terminal: Focus Terminal") |
 | `Ctrl+Alt+s` / `Cmd+Opt+s` | Save All: the active tab saves as `Cmd+S` does, then every other tab with unsaved edits, in every split. A tab that must not be written blind (changed on disk, an encoding that would lose characters, an unresolved merge, a hex or sheet edit) is left for its own `Cmd+S`, and the status line says how many |
+| `Ctrl+Shift+h` / `Cmd+Shift+h` | Replace in Files: jump to the Search sidebar with its Replace row expanded and focused (VS Code's chord). In the terminal pane `Ctrl+Shift+h` stays command history; `Cmd+Shift+h` works there too |
 | Click a pinned row in the Explorer's sticky band | Scrolled deep in a directory, its ancestor rows pin to the top of the tree; clicking one selects that directory and scrolls it to the top (right-click opens its context menu) |
 | Click activity-bar icons | Switch between Explorer, Search, Source Control, Run and Debug, Remote, Extensions, and Testing |
 | Click the settings gear | Open settings → Color Theme picker (Croft Black / Croft Dark Blue / Croft Light, a full VS Code Light Modern-style light theme that recolors the whole session including the host terminal, plus ten editor-inspired dark themes: One Dark Pro, Dracula, Monokai, Nord, Gruvbox Dark, Tokyo Night, Catppuccin Mocha, Solarized Dark, GitHub Dark, Darcula) or Customize Layout |
@@ -48,7 +51,7 @@ Per platform:
 
 ### `Cmd+K` chords
 
-`Cmd`/`Ctrl`+`K` is a leader (VS Code's two-key model): press it, then a second key within 1.5s. Pressing anything that completes no chord cancels the leader and keeps its normal meaning.
+`Cmd`/`Ctrl`+`K` is a leader (VS Code's two-key model): press it, then a second key within 1.5s. Pressing anything that completes no chord cancels the leader and keeps its normal meaning. On Linux `Ctrl`+`K` leads everywhere except the terminal pane, where it goes to the shell, and the editor while vim mode is on, where it kills to the end of the line; a `Cmd` on the second key (`Cmd+K` `Cmd+S`) is `Ctrl` there too.
 
 | Keys | Action |
 |------|--------|
@@ -126,7 +129,7 @@ Every choice except the side-bar / panel visibility persists across launches in 
 
 ## Command Palette
 
-`Cmd`/`Ctrl`+`Shift`+`P` opens the Command Palette: type to fuzzy-search every named command, `↑`/`↓` to move, `Enter` to run, `Esc` to close. Every command carries a chord and shows it on the right, so the palette is both a second way to reach commands and a discovery surface for their accelerators.
+`Cmd`/`Ctrl`+`Shift`+`P` opens the Command Palette: type to fuzzy-search every named command, `↑`/`↓` to move, `Enter` to run, `Esc` to close. Every command carries a chord and shows it on the right, so the palette is both a second way to reach commands and a discovery surface for their accelerators. Off macOS the chord reads with `Ctrl` for `Cmd` and `Alt` for `Opt`, and with `Super` for the few chords [LINUX.md](LINUX.md#the-command-modifier) lists without a `Ctrl` form; the Keyboard Shortcuts view does the same.
 
 | Command | Chord | Action |
 |---------|-------|--------|
@@ -139,6 +142,12 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | Debug: Attach to Python Process | `Ctrl`+`F5` | Pick a running CPython 3.14+ process and drop a `pdb` REPL into it (PEP 768 `sys.remote_exec`); the debugger runs in a croft terminal, elevating with `sudo` when the OS requires it |
 | Preferences: Color Theme | `Cmd`+`K` `Cmd`+`T` | Pick the active color theme (also via the settings gear) |
 | Session: Participants | `Cmd`+`K` `A` | List who is attached to this multiplayer session (docs/MULTIPLAYER.md); pick a participant to grant/revoke write control or disconnect them. The status bar shows an "N attached" badge whenever someone else is on |
+| Markdown: Run Code Block at Cursor | `Cmd`+`Enter` | Run the runnable fence under the caret in a Markdown source, through the same confirm popup as the chord: the route on a terminal that sends `Ctrl`+`Enter` as a bare `Enter` |
+| Select All | `Cmd`+`A` | Select the whole active editor buffer. The palette is the Linux route: there `Ctrl`+`A` is line start |
+| View: Focus Left Editor Group / View: Focus Right Editor Group | `Cmd`+`Opt`+`←` / `Cmd`+`Opt`+`→` | Move focus to the left / right editor group while split: the Linux route, where `Ctrl`+`Alt`+arrows switch desktop workspaces |
+| Terminal: Focus Next Terminal / Terminal: Focus Previous Terminal | `Cmd`+`]` / `Cmd`+`[` | Focus the terminal pane and cycle to the next / previous terminal: the Linux route, where `Ctrl`+`[` is `Esc` |
+| Go to Implementations | `Cmd`+`F12` | Go to the concrete implementors of the trait / interface at the caret: the Linux route, where `Ctrl`+`F12` is Go to Type Definition |
+| Explorer: Jump to Directory (zoxide) | `Cmd`+`Z` in the Explorer | Open the zoxide jump popup from any pane: the Linux route, where `Ctrl`+`Z` is kept out of the Explorer |
 | Session: Detach | `Cmd`+`K` `Shift`+`Q` | Detach this client from the persistent session; the session keeps running. Run the same `croft attach` / `croft remote` command to reattach |
 | File: New File… / File: New Folder… | palette only (`Cmd`+`F` / `Cmd`+`Shift`+`N` while the Explorer is focused) | The Explorer's create prompt from any pane: beside the active file, or in the Explorer selection while the Explorer has focus (or no file is open) |
 | Select All | `Cmd`+`A` | Select the whole active editor buffer. The palette is the Linux route: there `Ctrl`+`A` is line start |
@@ -193,7 +202,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Ctrl`+`C` / `Cmd`+`C` | Copy selected paths to the explorer clipboard |
 | `Ctrl`+`X` / `Cmd`+`X` | Cut selected paths |
 | `Ctrl`+`V` / `Cmd`+`V` | Paste into the focused folder (move on Cut, copy on Copy) |
-| `Cmd`+`Z` | Jump to a directory via zoxide: a fuzzy popup over your frecency-ranked dirs, then re-roots the workspace and `cd`s the terminal. Shares one database with the shell's `j` command; croft installs zoxide and wires the shell hook on first launch if needed |
+| `Cmd`+`Z` (Linux: `Super`+`Z`, or the Command Palette's "Explorer: Jump to Directory (zoxide)" from any pane) | Jump to a directory via zoxide: a fuzzy popup over your frecency-ranked dirs, then re-roots the workspace and `cd`s the terminal. Shares one database with the shell's `j` command; croft installs zoxide and wires the shell hook on first launch if needed |
 | Drag a row onto a folder | Move the selection into it (`Alt`-drag to copy instead) |
 | `Delete` / `Backspace` / `Cmd`+`Backspace` | Move every selected path to the OS Trash (after a confirmation popup — `Enter` to trash, `Esc` to keep) |
 | `Cmd`+`Opt`+`R` (local macOS only) | Reveal the selected entry in Finder |
@@ -210,13 +219,14 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 
 | Keys | Action |
 |------|--------|
-| Type | Live `.gitignore`-aware workspace search, per keystroke (off the UI thread; every match is returned, no cap). Unsaved buffers are searched in-memory, so unsaved edits are findable before you save |
+| Type | Live `.gitignore`-aware workspace search, per keystroke (off the UI thread; every match is returned, no cap). Unsaved buffers are searched in-memory, so unsaved edits are findable before you save. The caption above the results counts every occurrence, as VS Code does ("4 results in 2 files"): two matches on one line are two results, the same count the Replace All confirmation gives |
 | Click `Aa` / `ab` / `.*` (inset at the right of the search field) | Toggle case-sensitive / whole-word / regex; active toggles show an accent chip |
+| `Alt`+`C` / `Alt`+`W` / `Alt`+`R` | The same three toggles from the keyboard, from any Search input (VS Code's keys; also the palette's "Search: Toggle Match Case" / "Toggle Match Whole Word" / "Toggle Use Regular Expression"). On macOS the terminal must send Option as Alt (iTerm2: Option key "Esc+"); one that types `ç` / `∑` / `®` instead keeps typing them |
 | Click the header refresh icon | Re-run the current query |
 | Click the header clear icon | Clear the search query and results |
-| Click the left chevron (`▸`/`▾`) | Expand / collapse the Replace row (expanding focuses it); while a replacement is typed, every result row previews the match crossed out with the expanded replacement beside it |
+| Click the left chevron (`▸`/`▾`), or `Ctrl`/`Cmd`+`Shift`+`H` from anywhere | Expand / collapse the Replace row (expanding focuses it; the chord, "Search: Replace in Files" in the palette, only ever opens it); while a replacement is typed, every result row previews the match crossed out with the expanded replacement beside it |
 | Type in Replace, then `Enter` or click the replace-all icon | Raise the Replace All confirmation — "Replace N occurrence(s) across M file(s)?" — then `Enter`/`Y` rewrites on disk, `Esc` cancels (regex mode honours `$1` capture references); files open with unsaved changes are skipped and named, and the search re-runs afterward |
-| Click the `...` icon | Expand / collapse the "files to include" and "files to exclude" glob inputs |
+| Click the `...` icon, or `Alt`+`D` in a Search input | Expand / collapse the "files to include" and "files to exclude" glob inputs (also the palette's "Search: Toggle Search Details"; VS Code's `Ctrl+Shift+J` is croft's maximize-terminal) |
 | Type globs into include / exclude | Restrict the search to / from matching files (comma-separated, VS Code style; a bare `*.rs` matches at any depth, and brace alternates like `*.{ts,tsx}` are one glob). A glob that doesn't compile shows as `invalid glob: …` in red above its box, and an include box with no valid glob matches nothing. Editing re-runs the search live |
 | `Tab` | Cycle focus through the visible inputs (search → replace → include → exclude) |
 | `↑` / `↓` + `Enter`, or click a result | Open the file at the matched line in the replaceable preview tab |
@@ -228,13 +238,15 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 |------|--------|
 | Type in the message box | Edit the commit message (the box scrolls horizontally when the message outgrows it, and grows a row per line up to six, then scrolls). Pasted text keeps its line breaks |
 | `Shift`+`Enter` / `Alt`+`Enter` | Start a new line in the commit message (a blank line, then the body and trailers); `Up` / `Down` move between its lines |
-| `Enter` | Commit all tracked changes with the message |
+| `Enter` | Commit all tracked changes with the message. The commit runs in the background, so croft keeps responding while the repository's hooks run; the message stays in the box until the commit lands, and a hook's rejection shows below it |
 | Click ✓ Commit | Same as `Enter` |
 | Click a change row | Open that file's diff against HEAD in a read-only editor tab |
 | `S` in a diff tab | Stage only the change hunk under the cursor (click a row or `F7` to pick the hunk). With a selection dragged across rows, stages only the SELECTED lines instead (VS Code's Stage Selected Ranges): unselected additions stay out of the index and unselected deletions stay in it |
 | `U` in a diff tab | Unstage only the change hunk under the cursor, or only the selected lines when a selection spans rows |
 | `R` in a diff tab | Revert only the change hunk under the cursor after a `Y`/`N` confirm modal |
 | `F7` / `Shift`+`F7` in a diff tab | Jump to the next / previous change hunk |
+| `F7` / `Shift`+`F7` in an editor tab | Jump to the next / previous change bar in the gutter, wrapping (VS Code's Go to Next / Previous Change; also in the Command Palette). In a file with conflicts, F7 hops conflicts instead |
+| Command Palette "Git: Stage Hunk" / "Git: Unstage Hunk" / "Git: Revert Hunk" in an editor tab | Act on the change bar under the caret, against HEAD, without opening a diff. Save first: the hunk is taken from the file on disk |
 | Command Palette: `Git: Toggle Inline Blame` | Show/hide the GitLens-style current-line blame annotation (author, age, summary trailing the cursor's line; on by default, persisted) |
 | Command Palette: `Editor: Toggle Provenance` | Show/hide who typed each line: a bar in the gutter lane coloured per seat (you, navigator, agent, peer, generated) and the seat's name on the inline-blame annotation (which needs `Git: Toggle Inline Blame` on); lines with no record show nothing, and conflict blocks keep their [Accept …] actions. Off by default, session-only |
 | Command Palette: `Diff: Toggle Group by Seat` | In a Source Control diff of the working tree, mark who wrote each line the change ADDS: a bar in the right gutter in that seat's colour, and a per-seat tally in the diff header, so a change reads as "the agent's part" and "my part". Lines with no record are counted as `unrecorded` and painted nothing. Unchanged lines are not marked: their seat describes earlier work. Off by default, per-view |
@@ -295,11 +307,11 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Ctrl`+`V` / `Cmd`+`V` | Paste at the cursor (replaces any selection) |
 | `Ctrl`+`Z` / `Cmd`+`Z` | Undo (typing bursts coalesce; backspace, paste, cut, replace are each one step) |
 | `Shift`+`Ctrl`+`Z` / `Shift`+`Cmd`+`Z` | Redo the most recently undone step; a fresh edit after an undo discards the redo branch (also Command Palette "Redo") |
-| `Cmd`+`A` | Select the entire buffer |
+| `Cmd`+`A` | Select the entire buffer (on Linux `Ctrl`+`A` is line start: the Command Palette's "Select All") |
 | `Ctrl`+`f` / `Cmd`+`f` | Inline Find bar: pre-filled from the selection or word under the cursor; active match in orange, the rest in yellow; `Enter`/`F3` forward, `Shift+Enter`/`Shift+F3` back, `Esc` closes |
 | `Ctrl`+`Alt`+`f` / `Cmd`+`Opt`+`f` | Replace in File: the Find bar expanded with a replace row; `Tab` switches field, `Enter` in the replace row replaces the current match and advances, `Cmd`+`Opt`+`Enter` (`Ctrl`+`Alt`+`Enter` on Linux) replaces all as one undo step; `$1` capture references work in regex mode |
 | `Ctrl`+`A` / `Ctrl`+`E` | Move to start / end of line |
-| `Ctrl`+`K` / `Ctrl`+`U` | Kill to end / start of line (yanks to clipboard) |
+| `Ctrl`+`K` / `Ctrl`+`U` | Kill to end / start of line (yanks to clipboard). On Linux (outside vim mode) and Termux `Ctrl`+`K` is the `Cmd+K` leader instead; the Command Palette's "Kill to End of Line" kills there, or bind `ctrl+k` to `kill_to_end_of_line` in `keybindings.json` |
 | `Cmd`+`o` / `Cmd`+`Shift`+`Enter` | Open a new line below / above, inheriting indent |
 | `Ctrl`+`Shift`+`o` / `Cmd`+`Shift`+`O` | Go to Symbol in Editor: fuzzy-search the file's symbols and jump (type `:` then a number to go to a line) |
 | `Cmd`+`g` `g` | Go to the top of the file (`Cmd`+`N` `Cmd`+`g` `g` for line N) |
@@ -312,7 +324,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Cmd`+`F2` / `Ctrl`+`F2` | Change All Occurrences of the word under the cursor at once |
 | `Esc` | Clear the selection, or collapse multi-cursors back to one |
 | `Cmd`+`.` / `Ctrl`+`.` | Quick Fix: ask the language server for the code actions at the cursor (auto-import, fix-all, organize imports, refactors) and pick one from a menu; the diagnostics on the line ride along as context. One action with a deferred edit resolves and applies on pick (`codeAction/resolve`); also on the editor right-click menu and as Command Palette "Quick Fix"|
-| `Cmd`+`Enter` / `Ctrl`+`Enter` (in a `.http`/`.rest` file; iTerm2 maps `Cmd+Enter` to fullscreen and never delivers it, so use `Ctrl+Enter` there) | Send the request under the caret (REST Client's format: requests separated by `###`, `{{variables}}` filled from a `.http.env.json` beside the file or `{{$env.NAME}}`; a variable with no value refuses to send). The response opens as a tab — status, timing, and headers as comments, JSON pretty-printed, images rendered — and the request lands in command history with its variables **unresolved**, so secrets stay in the env file. The palette carries **HTTP: Send Request Under Caret** and **HTTP: Copy Request as curl** |
+| `Cmd`+`Enter` / `Ctrl`+`Enter` (in a `.http`/`.rest` file; iTerm2 maps `Cmd+Enter` to fullscreen and never delivers it, so use `Ctrl+Enter` there) | Send the request under the caret (REST Client's format: requests separated by `###`, `{{variables}}` filled from the file's own `@name = value` lines, a `.http.env.json` beside the file, or `{{$env.NAME}}`; a variable with no value refuses to send). The response opens as a tab — status, timing, and headers as comments, JSON pretty-printed, images rendered — and the request lands in command history with its variables **unresolved**, so secrets stay in the env file. The palette carries **HTTP: Send Request Under Caret** and **HTTP: Copy Request as curl** |
 | `Cmd`+`.` / `Ctrl`+`.` inside a merge conflict | Resolve Merge Conflict picker: Accept Current / Accept Incoming / Accept Both (also Command Palette "Merge Conflict: Accept Current / Incoming / Both"); conflict regions render with VS Code's green (current) / blue (incoming) tints, and each conflict's header row carries clickable `[Accept Current] [Accept Incoming] [Accept Both]` actions |
 | `F7` / `Shift`+`F7` in a buffer with conflicts | Jump to the next / previous conflict, wrapping (the status counts "Conflict k of n"); clicking a MERGE CONFLICTS entry in Source Control opens the three-way merge editor (below), with the marker flow one "Reopen as Text" away |
 | Command Palette "Merge Conflict: Accept All Current / Incoming" | Resolve every block in the file one way |
@@ -335,19 +347,19 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Shift`+`F12` | Go to References (project-wide; one use jumps, several open a picker) |
 | `Ctrl`+`Shift`+`F12` | Go to Declaration (where the server implements it; hidden for TypeScript) |
 | `Ctrl`+`F12` | Go to Type Definition |
-| `Cmd`+`F12` | Go to Implementations (concrete implementors of a trait / interface) |
+| `Cmd`+`F12` | Go to Implementations (concrete implementors of a trait / interface). On Linux `Ctrl`+`F12` is Go to Type Definition, so it is `Super`+`F12` or the Command Palette's "Go to Implementations" |
 | Hover or click/tap (300 ms rest) | Hover popup: any diagnostic over the point first, then type / signature info. A click or tap arms the same dwell, so touch screens (Termux) get the popup by tapping an identifier and resting; releasing the press keeps it open |
 | Hover a tab (300 ms dwell) | Tooltip with the tab's full path (tells two same-named files apart) |
 | Hover a chrome control (300 ms dwell) | Button hint naming the control under the pointer: activity-bar icons (Explorer, Search, …), the EXPLORER header toolbar (New File, New Folder, Refresh Explorer, Collapse Folders, Views and More Actions), the Remote / Source Control header actions, and the SEARCH panel's actions and toggles (Refresh, Clear Search Results, Match Case, Use Regular Expression, …) |
 | Right-click | Editor symbol menu: the Go to / Rename / Change All actions above |
-| `Cmd`+`E` | Toggle native modal (vim) editing (see below) |
+| `Cmd`+`E` | Toggle native modal (vim) editing (see below). On Linux `Ctrl`+`E` stays end of line, so it is `Super`+`E` or the Command Palette's "Toggle Vim Mode" |
 | `Ctrl`+`W` / `Cmd`+`W` | Close the active editor tab (no-op on the last tab) |
 
 ## Editor: vim mode (modal editing)
 
 `Cmd`+`E` toggles a native, Rust-implemented modal layer over the editor. It emulates the common daily-driver subset rather than embedding neovim, so it carries no `nvim` dependency and behaves identically local and remote. For full vim with your own plugins, run `nvim` in the shell pane.
 
-The toggle is global and app-wide: it works from any pane and with no file open, and stays on as you switch files. A coloured mode pill (`NORMAL` blue, `INSERT` green, `VISUAL` purple) and the active `:`/`/` line show in the status bar. While off, the editor behaves exactly as the tables above describe, and `Cmd`/`Ctrl` shortcuts keep working in Normal mode, since modal editing only claims unmodified keys.
+The toggle is global and app-wide: it works from any pane and with no file open, and stays on as you switch files. It is also remembered: croft saves it as `vim_mode` in `config.json`, and the next launch starts in the mode you left. Settings has the same switch as **Editor: Vim Mode**, and `croft import-vscode` turns it on when VSCodeVim is installed. A coloured mode pill (`NORMAL` blue, `INSERT` green, `VISUAL` purple) and the active `:`/`/` line show in the status bar. While off, the editor behaves exactly as the tables above describe, and `Cmd`/`Ctrl` shortcuts keep working in Normal mode, since modal editing only claims unmodified keys.
 
 | Keys | Action |
 |------|--------|
@@ -379,6 +391,7 @@ Image tabs (`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp`) are read-only; eve
 
 | Keys | Action |
 |------|--------|
+| `Up` / `Down`, `PageUp` / `PageDown`, `Home` / `End` (also with `Ctrl`) | Scroll the log a line, a screen, or to the top / the tail. The tab is read-only, so typed keys change nothing |
 | Highlighting (palette toggle) | Plain lines in the rendered log are coloured by [tailspin](https://github.com/bensadeh/tailspin): dates, durations, numbers, UUIDs, IPs, URLs, paths, quotes, severity keywords (ERROR/WARN/INFO/DEBUG), booleans and null, and HTTP methods. Lines that already carry their own colours are left as printed. The rendered view still opens only for a file carrying ANSI colour in its first 8 KiB (an uncoloured `.log` stays an ordinary editable file), so this colours the plain lines of a log that is coloured elsewhere: a build log, pytest output, a structured logger's file. "Log: Toggle Highlighting (tailspin)" switches it for every open log and for logs opened later, persisted as `disable_log_highlight` in `config.json` (also a row in Settings) |
 
 **PDF (`.pdf`)**
@@ -399,7 +412,7 @@ CSV, TSV, and xlsx grids are editable (xlsx cell edits write through a real xlsx
 |------|--------|
 | `↑` / `↓` / `←` / `→` | Move the cell cursor (viewport follows) |
 | `PageUp` / `PageDown` | Move a full viewport vertically |
-| `Home` / `End` | First / last column; with `Cmd`/`Ctrl` also first / last row |
+| `Home` / `End` | First / last column; with `Cmd`/`Ctrl` also first / last row (in a SQLite table, of the whole table: its first or last 500-row page is loaded) |
 | Type a character | Start editing the cell, REPLACING its value (spreadsheet convention) |
 | `Enter` / `F2` | Edit the cell in place (caret at the end) |
 | `Enter` (while editing) | Commit and move down; `Tab` commits and moves right; `Esc` cancels |
@@ -541,7 +554,7 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 | Keys | Action |
 |------|--------|
 | Any key croft does not bind | Forwarded to the shell PTY (arrows, most `Ctrl+letter`, `Alt+x`, function keys translated to VT escapes) |
-| A chord croft binds | **Claimed by croft, whatever pane has focus** - the shell never sees it. Measured by driving every letter through the real key path and watching which ones reach the PTY:<br>`Ctrl` + **F J P S**, and `Ctrl+Shift` + **B C D E F H J L M O P R S T U V W X Y**<br>`Cmd` + **B C E F K P S T V W**, and `Cmd+Shift` + **B C D E F L M O P R S T U V W X**<br>Everything else is forwarded, so the chords a shell leans on - `Ctrl+A` `C` `D` `E` `K` `L` `R` `U` `W` `Z` - all reach the app, and so do `Ctrl+B`, `Ctrl+Q` and `Ctrl+V` while the terminal pane is focused (#304, #1290), which is what lets Claude Code background a running command and vim enter visual block; `Cmd+B` still reaches croft from anywhere |
+| A chord croft binds | **Claimed by croft, whatever pane has focus** - the shell never sees it. Measured by driving every letter through the real key path and watching which ones reach the PTY:<br>`Ctrl` + **F J P S**, and `Ctrl+Shift` + **B C D E F H J L M O P R S T U V W X Y**<br>`Cmd` + **B C E F K P S T V W**, and `Cmd+Shift` + **B C D E F H L M O P R S T U V W X**<br>Everything else is forwarded, so the chords a shell leans on - `Ctrl+A` `C` `D` `E` `K` `L` `R` `U` `W` `Z` - all reach the app, and so do `Ctrl+B`, `Ctrl+Q` and `Ctrl+V` while the terminal pane is focused (#304, #1290), which is what lets Claude Code background a running command and vim enter visual block; `Cmd+B` still reaches croft from anywhere |
 | Bare `F5` / `F9` / `F10` / `F11` | Forwarded while the terminal is focused and no debug session is live, so process-compose's `F10` and htop's `F9` work. Modified, they keep their debug meaning everywhere |
 | Mouse drag | Select text, pinned to the scrollback content; drag past an edge to auto-scroll through history. Inside a full-screen app that scrolls by repainting (Claude Code, a pager), the highlight follows its text across the app's own scrolling. Rows covered by the app's chrome (an input box, a floating pill) drop out, while a row with an overlay in its middle keeps both intact ends; the surviving rows stay highlighted, the selection hides entirely only when none remain (copy still yields the whole selection), and it reappears as the text scrolls back. A drag held past an edge forwards wheel ticks, so the app scrolls under the drag |
 | `Shift`+click | Extend the existing selection to the clicked cell instead of starting a new one |
@@ -554,11 +567,11 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 | Click a gutter dot on the pane's left border | Each finished command gets a VS Code-style decoration dot at its prompt row: blue for success, red for a non-zero exit. Clicking it opens the command's menu, headed by its exit code and runtime: **Copy Output**, **Select Output**, **Re-run Command**. A command over 10s finishing in a pane you're not focused on announces itself in the status bar on its own |
 | `Cmd+K` `Shift+C` / `Shift+S` / `Shift+R` | Keyboard forms of the decoration menu, applied to the last finished command in the active pane: copy its output, select its output, re-run it |
 | `Ctrl+Shift+Y` | Copy mode (WezTerm/tmux): a keyboard cursor walks the grid and scrollback with vi keys — `h`/`j`/`k`/`l` or arrows, `w`/`b`/`e` word motions, `0`/`$` line start/end, `g`/`G` oldest/newest line, `Ctrl+U`/`Ctrl+D` half page, `PageUp`/`PageDown` full page. `v` starts a character selection, `V` full lines, `Ctrl+V` a rectangular block; `y` (or `Enter`) copies it to the clipboard and exits, `Esc`/`q` exits without copying. The cursor paints as a green block |
-| `Ctrl+Shift+H` | Command history (atuin's model, embedded): search every command croft's shell integration has seen this machine run — across sessions and restarts — each recorded with its directory, exit code, duration, and time. Type to filter (case-insensitive; duplicates collapse to the newest run), `↑`/`↓` select, `Ctrl+R` cycles the scope (all / this directory / failed only), `Enter` types the pick at your prompt without running it, `Esc` closes. Plain `Ctrl+R` still reaches your shell's own reverse search |
+| `Ctrl+Shift+H` | In the terminal pane (elsewhere it is Replace in Files): command history (atuin's model, embedded): search every command croft's shell integration has seen this machine run — across sessions and restarts — each recorded with its directory, exit code, duration, and time. Type to filter (case-insensitive; duplicates collapse to the newest run), `↑`/`↓` select, `Ctrl+R` cycles the scope (all / this directory / failed only), `Enter` types the pick at your prompt without running it, `Esc` closes. Plain `Ctrl+R` still reaches your shell's own reverse search |
 | `Cmd+K` `Shift+T` | Reopen the closed terminal: for 10s after closing a pane its process and scrollback stay alive in the background, and this brings it back exactly where it was (the browser reopen-tab convention). After the grace window the pane is disposed for real |
 | `Cmd+K` `Shift+W` | Reopen the closed editor tab (VS Code's Reopen Closed Editor, paired with `Cmd+W` the way `Shift+T` pairs with the terminal close): restores the most recently closed tab with its pin state, cursor, and scroll, walking back through the last 20 closes. Files deleted since their close are skipped. Also Command Palette "View: Reopen Closed Editor" |
 | `Ctrl+Shift+Space` | Quick select (WezTerm's hint mode): every URL, filesystem path (including `path:line:col`), git SHA, UUID, IP, hex colour/address, and long number on screen gets a short home-row label overlaid, with the bottom-most match labelled cheapest. Type a label to copy the match to the clipboard; type it in UPPERCASE to also paste it into the shell; `Backspace` erases a typed char, `Esc` cancels |
-| `Cmd+Enter` (Markdown) / click `▷` (preview) | Runnable docs: every `sh`/`bash`/`zsh`/`fish` fence (and `python`/`node` when the interpreter is on PATH) wears a `▷` on its first line in the Markdown preview. Clicking it - or `Cmd+Enter` with the caret in the fence in the source - shows a confirm popup with the whole block, the pane it will run in (`<file>:<n>`) and its directory (the document's, or the workspace root with `{cwd=root}`); `Y` types it there, reusing that pane when it sits idle at a prompt. Every block confirms, because a README is untrusted input; blocks that look destructive (`rm -rf`, `sudo`, `curl … \| sh`, redirects, `nc`, `chmod`, `--force`, `git reset --hard`) or say `{confirm}` turn the popup red. `{run=false}` removes the glyph; a block carrying a control or bidi/zero-width character is never runnable; the pane is named by the document's path under the workspace. After a block finishes, its output appears under the fence in the preview: the last twelve rows, coloured as the pane printed them, with the exit code named when it is not zero, or a note that croft stopped waiting while the block kept running. `{persist}` WRITES that output back into the document as a fence croft replaces on each run — the only attribute that touches the file on disk, and off unless asked for. `{timeout=N}` stops the capture after N seconds without stopping the block. |
+| `Cmd+Enter` (Markdown; `Ctrl+Enter` on Linux) / click `▷` (preview) | Runnable docs: every `sh`/`bash`/`zsh`/`fish` fence (and `python`/`node` when the interpreter is on PATH) wears a `▷` on its first line in the Markdown preview. Clicking it - or `Cmd+Enter` with the caret in the fence in the source, or the Command Palette's "Markdown: Run Code Block at Cursor" - shows a confirm popup with the whole block, the pane it will run in (`<file>:<n>`) and its directory (the document's, or the workspace root with `{cwd=root}`); `Y` types it there, reusing that pane when it sits idle at a prompt. Every block confirms, because a README is untrusted input; blocks that look destructive (`rm -rf`, `sudo`, `curl … \| sh`, redirects, `nc`, `chmod`, `--force`, `git reset --hard`) or say `{confirm}` turn the popup red. `{run=false}` removes the glyph; a block carrying a control or bidi/zero-width character is never runnable; the pane is named by the document's path under the workspace. After a block finishes, its output appears under the fence in the preview: the last twelve rows, coloured as the pane printed them, with the exit code named when it is not zero, or a note that croft stopped waiting while the block kept running. `{persist}` WRITES that output back into the document as a fence croft replaces on each run — the only attribute that touches the file on disk, and off unless asked for. `{timeout=N}` stops the capture after N seconds without stopping the block. |
 | Triggers (no chord) | iTerm2-style output triggers from `~/.config/croft/triggers.json` (palette: "Preferences: Open Terminal Triggers (JSON)", reloaded on save): each rule is a regex plus an action: `highlight` recolours every visible occurrence live (per-rule `#rrggbb` fg/bg, scrollback included), `notify` posts a status-bar notice (`\0` whole match, `\1`-`\9` capture groups), `bell` posts a bell notice, `capture` collects the whole matching line into the CAPTURES panel tab (iTerm2's Capture Output; click an entry there to jump its pane back to that line), `redact` masks the match (capture group 1 when the regex has one) as `••••` at paint time — the grid keeps the real text, a click on the mask pops it, copies carry the real value unless the rule says `"copy": "masked"`, and the `Cmd+K D` scrollback dump is always masked. A built-in redact set (AWS keys, `sk-`/`ghp_`/`xox` tokens, JWTs, bearer tokens) is on by default (Settings: "Terminal: Redact Secrets"); the status bar counts masks on screen, and "Terminal: Reveal Redacted Secrets for 10s" lifts them briefly. notify/bell/capture fire once per completed output line, capped and never inside full-screen apps |
 | Agents: Show Changed Files (palette) | The review queue, one row per agent, grouped by the workspace root its files are in: a worktree lane's group is named by its branch (`agent/fix-login 4`), any other root by its display label (its folder name, disambiguated by the parent when two roots share it, else its full path). A grouped row carries labels and counts (`claude: 6 to review — croft 2; agent/fix-login 4`) rather than file names, since the one-row status bar elides the middle of anything longer; a row whose files all sit under one root keeps the flat `agent: n to review (a.rs, b.rs)` shape, with a sample of at most three names ending in `…` when there are more. Should a file ever be recorded outside every root it is counted under "outside the workspace" rather than dropped |
 | Agents: Open Agent Lane (palette) | Show the Explorer's AGENT LANE section, open: each coding agent that changed files, then those files (unreviewed first, marked `●`). Clicking a file opens its diff against the reviewed snapshot; clicking an agent's row folds its files away, or back. The queue and what you marked reviewed are kept per workspace, so they survive a restart. The section is also toggled from the EXPLORER ⋯ menu, and takes no room until an agent has changed something |
@@ -581,7 +594,7 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 | `Cmd+C` / `Ctrl+Shift+c` | Copy the terminal's current selection. On a remote session the text goes to the clipboard of the machine you are typing at, not the remote box's. Inside a program that has asked for mouse tracking a plain drag belongs to that program, so **Shift+drag** is what selects there. A program that has not asked still selects on a plain drag |
 | `Cmd+T` / `Ctrl+Shift+t` | Open another terminal beside the current one (each has its own PTY, scrollback, selection) |
 | `Cmd+W` / `Ctrl+Shift+w` | Close the active terminal (no-op when one is left; `Ctrl+J` hides the pane) |
-| `Cmd+]` / `Cmd+[` | Cycle to the next / previous terminal (or click one to focus it) |
+| `Cmd+]` / `Cmd+[` | Cycle to the next / previous terminal (or click one to focus it). The Command Palette's "Terminal: Focus Next Terminal" / "Terminal: Focus Previous Terminal" do the same from any pane and focus the terminal |
 | Click the `⌄` caret (beside `+`) | Drop the terminal profile menu anchored under the caret: pick a shell (from `/etc/shells` + `$SHELL`) to launch a new pane |
 | `Cmd+K` `R` | Rename the active terminal pane (a blank name clears it, restoring the auto label) |
 | `Cmd+K` `K` | Clear the active terminal's screen and scrollback (VS Code clears with `Cmd+K`) |

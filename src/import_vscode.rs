@@ -131,6 +131,20 @@ fn as_scrollback(v: &Value) -> Option<Value> {
     v.as_u64().map(Value::from)
 }
 
+/// VS Code's `files.exclude` / `search.exclude` object (#1345): the globs
+/// set to `true`. A `false` entry switches a glob off, and a `when` clause
+/// hides a file only next to a sibling croft does not look for, so both are
+/// left out: a dropped entry shows a file, a misread one would hide it.
+fn as_enabled_globs(v: &Value) -> Option<Value> {
+    let obj = v.as_object()?;
+    Some(Value::from(
+        obj.iter()
+            .filter(|(_, on)| on.as_bool() == Some(true))
+            .map(|(glob, _)| glob.clone())
+            .collect::<Vec<String>>(),
+    ))
+}
+
 const SETTINGS: &[SettingMap] = &[
     SettingMap {
         vscode: "editor.formatOnSave",
@@ -182,6 +196,16 @@ const SETTINGS: &[SettingMap] = &[
         croft: "copy_on_select",
         convert: as_bool,
     },
+    SettingMap {
+        vscode: "files.exclude",
+        croft: "files_exclude",
+        convert: as_enabled_globs,
+    },
+    SettingMap {
+        vscode: "search.exclude",
+        croft: "search_exclude",
+        convert: as_enabled_globs,
+    },
 ];
 
 /// VS Code command id to croft palette command id.
@@ -205,6 +229,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("explorer.newFolder", "new_folder"),
     ("editor.action.selectAll", "select_all"),
     ("workbench.action.quickOpen", "quick_open"),
+    ("workbench.action.editor.nextChange", "next_change"),
+    ("workbench.action.editor.previousChange", "previous_change"),
     ("workbench.action.gotoSymbol", "go_to_symbol"),
     ("workbench.action.showAllSymbols", "go_to_workspace_symbol"),
     ("workbench.action.closeActiveEditor", "close_editor"),
@@ -239,6 +265,16 @@ const COMMANDS: &[(&str, &str)] = &[
         "toggle_terminal",
     ),
     ("workbench.action.terminal.new", "new_terminal"),
+    ("workbench.action.terminal.focusNext", "focus_next_terminal"),
+    (
+        "workbench.action.terminal.focusPrevious",
+        "focus_previous_terminal",
+    ),
+    ("workbench.action.focusLeftGroup", "focus_left_editor_group"),
+    (
+        "workbench.action.focusRightGroup",
+        "focus_right_editor_group",
+    ),
     ("workbench.action.terminal.focus", "focus_terminal"),
     ("workbench.actions.view.problems", "show_problems"),
     ("workbench.action.toggleZenMode", "toggle_zen_mode"),
@@ -257,6 +293,14 @@ const COMMANDS: &[(&str, &str)] = &[
     ("workbench.action.customizeLayout", "customize_layout"),
     ("workbench.view.explorer", "show_explorer"),
     ("workbench.view.search", "show_search"),
+    ("workbench.action.replaceInFiles", "replace_in_files"),
+    ("toggleSearchCaseSensitive", "search_toggle_match_case"),
+    ("toggleSearchWholeWord", "search_toggle_whole_word"),
+    ("toggleSearchRegex", "search_toggle_regex"),
+    (
+        "workbench.action.search.toggleQueryDetails",
+        "search_toggle_details",
+    ),
     ("workbench.view.scm", "show_source_control"),
     ("workbench.view.debug", "show_run_debug"),
     ("workbench.view.testing", "show_testing"),
@@ -281,6 +325,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("editor.action.moveLinesUpAction", "move_line_up"),
     ("editor.action.moveLinesDownAction", "move_line_down"),
     ("editor.action.deleteLines", "delete_line"),
+    ("deleteAllRight", "kill_to_end_of_line"),
     ("editor.action.joinLines", "join_lines"),
     ("editor.action.transformToUppercase", "transform_upper"),
     ("editor.action.transformToLowercase", "transform_lower"),
@@ -731,6 +776,14 @@ pub fn scan_profile_with_extensions(dir: &Path, extension_dirs: &[PathBuf]) -> R
     if let Some(doc) = read_jsonc(&dir.join("keybindings.json"))? {
         convert_keybindings(&doc, &mut report);
     }
+    // VSCodeVim maps to croft's built-in Vim mode (#1286): a Vim user who
+    // imports their profile starts croft in it rather than typing `dd`
+    // into the first file they open.
+    if vscodevim_installed(extension_dirs) {
+        report
+            .settings
+            .insert(String::from("vim_mode"), Value::Bool(true));
+    }
     let snippets_dir = dir.join("snippets");
     if snippets_dir.is_dir() {
         let mut entries: Vec<PathBuf> = std::fs::read_dir(&snippets_dir)
@@ -753,6 +806,17 @@ pub fn scan_profile_with_extensions(dir: &Path, extension_dirs: &[PathBuf]) -> R
         }
     }
     Ok(report)
+}
+
+/// Whether VSCodeVim (`vscodevim.vim`) is installed in any of
+/// `extension_dirs`, each holding `publisher.name-version` directories.
+fn vscodevim_installed(extension_dirs: &[PathBuf]) -> bool {
+    extension_dirs
+        .iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flatten()
+        .filter_map(|e| e.ok())
+        .any(|e| e.path().is_dir() && extension_order(&e.path()).0 == "vscodevim.vim")
 }
 
 /// Whether `path` carries JSONC extras croft would destroy by rewriting it:
@@ -1084,6 +1148,52 @@ mod tests {
                 "{key} is not a field of Prefs, so croft would ignore it"
             );
         }
+    }
+
+    /// #1345: `files.exclude` / `search.exclude` carry the globs set to
+    /// `true`; a `false` entry or a `when` clause (sibling-file rule croft
+    /// has no equivalent for) is left out rather than hiding files.
+    #[test]
+    fn exclude_settings_keep_only_the_globs_set_to_true() {
+        let mut report = Report::default();
+        convert_settings(
+            &json!({
+                "files.exclude": {
+                    "**/generated": true,
+                    "**/keep": false,
+                    "**/*.js": { "when": "$(basename).ts" }
+                },
+                "search.exclude": { "**/tests/fixtures": true }
+            }),
+            &mut report,
+        );
+        assert_eq!(report.settings["files_exclude"], json!(["**/generated"]));
+        assert_eq!(
+            report.settings["search_exclude"],
+            json!(["**/tests/fixtures"])
+        );
+        let parsed: crate::prefs::Prefs = serde_json::from_value(serde_json::Value::Object(
+            report.settings.clone().into_iter().collect(),
+        ))
+        .unwrap();
+        assert_eq!(parsed.files_exclude, vec![String::from("**/generated")]);
+    }
+
+    /// #1345 negative: an exclude setting that is not an object maps to
+    /// nothing and is reported, not read as "exclude everything".
+    #[test]
+    fn a_malformed_exclude_setting_maps_to_nothing() {
+        let mut report = Report::default();
+        convert_settings(&json!({ "files.exclude": "**/generated" }), &mut report);
+        assert!(!report.settings.contains_key("files_exclude"));
+        assert!(
+            report
+                .unmapped_settings
+                .iter()
+                .any(|k| k.starts_with("files.exclude")),
+            "{:?}",
+            report.unmapped_settings
+        );
     }
 
     /// A converted value must ROUND-TRIP through the consumer that reads it.
@@ -1689,6 +1799,36 @@ mod tests {
             "{:?}",
             report.dropped_keybindings
         );
+    }
+
+    /// #1286: VSCodeVim installed in the profile's product turns croft's
+    /// Vim mode on, so a Vim user's first `dd` after the import is a
+    /// command rather than text.
+    #[test]
+    fn an_installed_vscodevim_turns_vim_mode_on() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = dir.path().join("User");
+        std::fs::create_dir_all(&profile).unwrap();
+        let extensions = dir.path().join("extensions");
+        std::fs::create_dir_all(extensions.join("vscodevim.vim-1.30.1")).unwrap();
+        let report = scan_profile_with_extensions(&profile, &[extensions]).unwrap();
+        assert_eq!(report.settings.get("vim_mode"), Some(&json!(true)));
+        assert!(!report.is_empty(), "the import has something to write");
+    }
+
+    /// #1286 negative: without VSCodeVim (another extension whose name
+    /// merely starts the same way included), the import leaves Vim mode
+    /// alone.
+    #[test]
+    fn without_vscodevim_the_import_leaves_vim_mode_alone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = dir.path().join("User");
+        std::fs::create_dir_all(&profile).unwrap();
+        let extensions = dir.path().join("extensions");
+        std::fs::create_dir_all(extensions.join("vscodevim.vimish-0.1.0")).unwrap();
+        std::fs::create_dir_all(extensions.join("rust-lang.rust-analyzer-0.3.2")).unwrap();
+        let report = scan_profile_with_extensions(&profile, &[extensions]).unwrap();
+        assert_eq!(report.settings.get("vim_mode"), None);
     }
 
     /// Build a VS Code extensions directory holding one colour theme.

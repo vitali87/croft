@@ -358,6 +358,18 @@ impl Node {
             && self.children.is_empty()
     }
 
+    /// `{text}` with no tag, id, class or attribute: emitted as bare text,
+    /// never wrapped in the parent's implicit tag (#1197).
+    fn is_text_only(&self) -> bool {
+        !self.group
+            && self.name.is_empty()
+            && self.id.is_none()
+            && self.classes.is_empty()
+            && self.attrs.is_empty()
+            && self.text.is_some()
+            && self.children.is_empty()
+    }
+
     fn is_bare(&self) -> bool {
         self.name.is_empty()
             && self.id.is_none()
@@ -413,6 +425,12 @@ impl Parser<'_> {
             if node.repeat == 0 || node.repeat > MAX_REPEAT {
                 return None;
             }
+            // Emmet takes an element's `#id`, `.class`, `[attrs]` and
+            // `{text}` on either side of the multiplier: `li*3{Item $}` is
+            // `li{Item $}*3` (#1197). A group has no tag to put them on.
+            if !node.group {
+                self.suffixes(&mut node)?;
+            }
         }
         if self.eat('>') {
             let kids = self.sequence()?;
@@ -448,6 +466,15 @@ impl Parser<'_> {
             ..Node::default()
         };
         node.name = self.ident();
+        self.suffixes(&mut node)?;
+        if node.is_bare() {
+            return None;
+        }
+        Some(node)
+    }
+
+    /// `('#'id | '.'class | '['attrs']' | '{'text'}')*` onto `node`.
+    fn suffixes(&mut self, node: &mut Node) -> Option<()> {
         loop {
             match self.peek() {
                 Some('#') => {
@@ -476,13 +503,9 @@ impl Parser<'_> {
                     self.pos += 1;
                     node.text = Some(self.text()?);
                 }
-                _ => break,
+                _ => return Some(()),
             }
         }
-        if node.is_bare() {
-            return None;
-        }
-        Some(node)
     }
 
     /// A tag / class / id name. `$` is kept so the renderer can substitute
@@ -611,6 +634,15 @@ impl Renderer<'_> {
         if node.group {
             return self.render_all(&node.children, parent, depth, index);
         }
+        // A text node is its text on its own line, as Emmet lays out
+        // `p>{Click }+a{here}+{ to continue}` (#1197).
+        if node.is_text_only() {
+            let text = number(node.text.as_deref().unwrap_or(""), index);
+            self.out.push_str(&self.indent.repeat(depth));
+            self.out.push_str(&text);
+            self.out.push('\n');
+            return Some(());
+        }
         let name = if node.name.is_empty() {
             implicit_tag(parent).to_string()
         } else {
@@ -628,6 +660,10 @@ impl Renderer<'_> {
         self.out.push_str(&pad);
         self.out.push('<');
         self.out.push_str(&name);
+        // Emmet's HTML snippets give a link an empty `href` to fill in.
+        if name == "a" && !node.attrs.iter().any(|(k, _)| k == "href") {
+            self.out.push_str(" href=\"\"");
+        }
         if let Some(id) = &node.id {
             self.out.push_str(&format!(" id=\"{}\"", number(id, index)));
         }
@@ -783,6 +819,55 @@ mod tests {
         assert_eq!(ex("tr>.cell"), "<tr>\n  <td class=\"cell\"></td>\n</tr>\n");
     }
 
+    /// #1197: `{text}`, `.class` and the rest may follow the multiplier, as
+    /// in Emmet.
+    #[test]
+    fn text_after_the_multiplier_belongs_to_the_element() {
+        assert_eq!(
+            ex("li*3{Item $}"),
+            "<li>Item 1</li>\n<li>Item 2</li>\n<li>Item 3</li>\n"
+        );
+        assert_eq!(
+            ex("ul>li.item$*2{Item $}"),
+            "<ul>\n  <li class=\"item1\">Item 1</li>\n  <li class=\"item2\">Item 2</li>\n</ul>\n"
+        );
+        assert_eq!(
+            ex("li*2.x"),
+            "<li class=\"x\"></li>\n<li class=\"x\"></li>\n"
+        );
+    }
+
+    /// #1197: a `{text}` with no tag is bare text on its own line, the
+    /// example from Emmet's docs, never a `<div>`.
+    #[test]
+    fn a_text_node_is_bare_text() {
+        assert_eq!(
+            ex("p>{Click }+a{here}+{ to continue}"),
+            "<p>\n  Click \n  <a href=\"\">here</a>\n   to continue\n</p>\n"
+        );
+        assert_eq!(ex("ul>{Item $}*2"), "<ul>\n  Item 1\n  Item 2\n</ul>\n");
+    }
+
+    /// Emmet's HTML profile gives a link an empty `href`; one the
+    /// abbreviation names is kept as it is.
+    #[test]
+    fn a_link_gets_an_empty_href_unless_it_names_one() {
+        assert_eq!(ex("a"), "<a href=\"\"></a>\n");
+        assert_eq!(ex("a[href=#top]"), "<a href=\"#top\"></a>\n");
+    }
+
+    /// Negative (#1197): text on a tag, class or id is still that element's
+    /// content, text before the multiplier still works, and a group or junk
+    /// after the multiplier still refuses to expand.
+    #[test]
+    fn text_on_an_element_and_bad_multipliers_are_unchanged() {
+        assert_eq!(ex(".x{hi}"), "<div class=\"x\">hi</div>\n");
+        assert_eq!(ex("ul>.x{hi}"), "<ul>\n  <li class=\"x\">hi</li>\n</ul>\n");
+        assert_eq!(ex("li{Item $}*2"), "<li>Item 1</li>\n<li>Item 2</li>\n");
+        assert!(expand("(li)*2{x}", "  ").is_none());
+        assert!(expand("li*3x", "  ").is_none());
+    }
+
     #[test]
     fn the_dollar_placeholder_numbers_each_repetition() {
         assert_eq!(
@@ -821,7 +906,7 @@ mod tests {
     fn groups_repeat_as_a_unit() {
         assert_eq!(
             ex("(li>a)*2"),
-            "<li>\n  <a></a>\n</li>\n<li>\n  <a></a>\n</li>\n"
+            "<li>\n  <a href=\"\"></a>\n</li>\n<li>\n  <a href=\"\"></a>\n</li>\n"
         );
     }
 
@@ -898,7 +983,7 @@ mod tests {
     #[test]
     fn markup_inside_an_attribute_value_does_not_capture_the_caret() {
         let (out, caret) = expand("a[title=\"></\"]", "  ").unwrap();
-        assert_eq!(out, "<a title=\"></\"></a>\n");
+        assert_eq!(out, "<a href=\"\" title=\"></\"></a>\n");
         assert_eq!(&out[caret..], "</a>\n");
     }
 

@@ -1,0 +1,1 @@
+fix: `croft --open-file` with a relative path opens the file by its absolute path (relative to where croft was started, else to the workspace), so the tab gets its language server: diagnostics show and F2 renames instead of hanging on "Renaming symbol". A launch file that cannot be opened now says why, and a rename for a file no server tracks always resolves.
