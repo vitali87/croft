@@ -15490,6 +15490,60 @@ fn an_unsaved_tab_outside_the_repo_does_not_hold_the_commit() {
     assert_eq!(last_commit_message(tmp.path()), "bump seed\n\n");
 }
 
+/// #1438: a spreadsheet cell still being typed into is an unsaved edit:
+/// Commit asks first, and Save All & Commit writes the typed value.
+#[test]
+fn a_sheet_cell_being_typed_into_holds_the_commit() {
+    let (tmp, mut app) = scm_ready_to_commit();
+    let csv = tmp.path().join("stock.csv");
+    std::fs::write(&csv, "item,qty\nbolt,4\n").unwrap();
+    app.editor.open(&csv).unwrap();
+    assert!(app.editor.sheet.is_some());
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_sheet(&mut app, "40");
+    assert!(!app.editor.dirty, "the typed cell is not committed yet");
+    app.source_control.message = "bump seed".to_string();
+    app.source_control.message_cursor = app.source_control.message.chars().count();
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    let pending = app.pending_unsaved_scm.as_ref().expect("the prompt opens");
+    assert_eq!(pending.files, vec![csv.clone()]);
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    wait_for_git_net(&mut app);
+    assert!(app.pending_unsaved_scm.is_none());
+    assert_eq!(
+        std::fs::read_to_string(&csv).unwrap(),
+        "item,qty\nbolt,40\n",
+        "{}",
+        app.status
+    );
+}
+
+/// #1438: the prompt's write stays bound to the repository it was asked
+/// for. When Source Control has moved to another root by the time the
+/// choice is made (a click on another root's tab), nothing is committed.
+#[test]
+fn the_unsaved_prompt_does_not_commit_after_source_control_moved_repos() {
+    let (tmp, mut app) = scm_with_unsaved_tab();
+    let head = git_out(tmp.path(), &["rev-parse", "HEAD"]);
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    let other = tempfile::tempdir().unwrap();
+    app.pending_unsaved_scm
+        .as_mut()
+        .expect("the prompt opens")
+        .root = other.path().to_path_buf();
+    app.handle_key(key(KeyCode::Char('c'), KeyModifiers::NONE))
+        .unwrap();
+    wait_for_git_net(&mut app);
+    assert!(app.pending_unsaved_scm.is_none());
+    assert_eq!(git_out(tmp.path(), &["rev-parse", "HEAD"]), head);
+    assert!(
+        app.status.contains("moved to another repository"),
+        "{}",
+        app.status
+    );
+}
+
 /// #1438: with every repository tab saved, Commit asks nothing.
 #[test]
 fn a_saved_tab_does_not_hold_the_commit() {

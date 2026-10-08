@@ -2649,9 +2649,13 @@ impl ScmWrite {
 
 /// The unsaved-changes prompt in front of a commit or stash (#1438): `op`
 /// waits while `files` (dirty tabs under the repository) are unsaved.
+/// `root` is the repository the request was made against: the mouse stays
+/// live while the prompt is open, so focus can move Source Control to
+/// another root before the choice, and the write must not follow it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingUnsavedScm {
     op: ScmWrite,
+    root: PathBuf,
     files: Vec<PathBuf>,
 }
 
@@ -3693,7 +3697,7 @@ pub struct App {
     scm_unsaved_cleared: bool,
     /// A write waiting on a format-on-save reply: Save All armed the
     /// active tab's deferred write, and the commit runs once it lands.
-    scm_after_format_save: Option<ScmWrite>,
+    scm_after_format_save: Option<(ScmWrite, PathBuf)>,
     /// Armed by R in a Source-Control diff; reverting a hunk destroys
     /// uncommitted work, so the confirm modal always runs first.
     pending_revert_hunk: Option<PendingRevertHunk>,
@@ -20701,7 +20705,7 @@ impl App {
             .files
             .iter()
             .map(|p| {
-                p.strip_prefix(self.scm_root())
+                p.strip_prefix(&pending.root)
                     .unwrap_or(p)
                     .display()
                     .to_string()
@@ -33272,12 +33276,19 @@ impl App {
 
     /// The files of tabs with unsaved edits under the repository, each
     /// once, in tab order. Untitled tabs and files outside the repository
-    /// are not the commit's business (#1438).
+    /// are not the commit's business (#1438). A spreadsheet cell still being
+    /// typed into counts: its value is on screen but not yet in the buffer.
     fn unsaved_repo_files(&self) -> Vec<PathBuf> {
         let root = self.scm_root();
         let mut files: Vec<PathBuf> = Vec::new();
         let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
-        for ed in groups.flat_map(|g| g.editors.iter()).filter(|e| e.dirty) {
+        let unsaved = |e: &&crate::widgets::editor::Editor| {
+            e.dirty
+                || e.sheet
+                    .as_ref()
+                    .is_some_and(|s| s.editable() && s.editing.is_some())
+        };
+        for ed in groups.flat_map(|g| g.editors.iter()).filter(unsaved) {
             if let Some(p) = ed.path.as_ref()
                 && p.starts_with(&root)
                 && !files.contains(p)
@@ -33301,7 +33312,26 @@ impl App {
         if files.is_empty() {
             return false;
         }
-        self.pending_unsaved_scm = Some(PendingUnsavedScm { op, files });
+        let root = self.scm_root();
+        self.pending_unsaved_scm = Some(PendingUnsavedScm { op, root, files });
+        true
+    }
+
+    /// Whether Source Control now points at a repository other than `root`,
+    /// the one `op` was asked for (focus moved to another root's tab while
+    /// the prompt was open). The write is then dropped rather than run
+    /// against the wrong repository, and the status says so.
+    fn scm_root_moved(&mut self, op: ScmWrite, root: &Path) -> bool {
+        if self.scm_root() == root {
+            return false;
+        }
+        let msg = format!(
+            "{} cancelled: Source Control moved to another repository",
+            op.verb()
+        );
+        self.status = msg.clone();
+        self.source_control.commit_feedback = Some(msg);
+        self.source_control.commit_feedback_is_error = true;
         true
     }
 
@@ -33331,18 +33361,38 @@ impl App {
         let Some(pending) = self.pending_unsaved_scm.take() else {
             return;
         };
+        if self.scm_root_moved(pending.op, &pending.root) {
+            return;
+        }
+        // A cell still being typed into is part of the save, as Cmd+S
+        // treats it (#1140): commit it so Save All writes it.
+        for group in
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
+        {
+            for ed in &mut group.editors {
+                if let Some(view) = ed.sheet.as_mut()
+                    && view.editable()
+                    && view.commit_edit().is_some()
+                {
+                    ed.dirty = true;
+                }
+            }
+        }
         self.save_all();
         if self.save_after_format.is_some() {
             // The active tab is written when its formatter replies.
-            self.scm_after_format_save = Some(pending.op);
+            self.scm_after_format_save = Some((pending.op, pending.root));
             return;
         }
-        self.finish_scm_after_save(pending.op);
+        self.finish_scm_after_save(pending.op, &pending.root);
     }
 
     /// Run `op` once Save All is done, or say which files kept it from
     /// running.
-    fn finish_scm_after_save(&mut self, op: ScmWrite) {
+    fn finish_scm_after_save(&mut self, op: ScmWrite, root: &Path) {
+        if self.scm_root_moved(op, root) {
+            return;
+        }
         let left = self.unsaved_repo_files();
         if left.is_empty() {
             self.run_scm_write(op);
@@ -33372,7 +33422,9 @@ impl App {
     /// "Commit Anyway" (or Stash): run the write on the files as they are on
     /// disk, as croft did before it asked.
     pub fn continue_pending_scm_without_saving(&mut self) {
-        if let Some(pending) = self.pending_unsaved_scm.take() {
+        if let Some(pending) = self.pending_unsaved_scm.take()
+            && !self.scm_root_moved(pending.op, &pending.root)
+        {
             self.run_scm_write(pending.op);
         }
     }
@@ -55750,8 +55802,8 @@ impl App {
         }
         // As in `save`: the file's other tabs hold the text just written.
         self.sync_symbol_views();
-        if let Some(op) = self.scm_after_format_save.take() {
-            self.finish_scm_after_save(op);
+        if let Some((op, root)) = self.scm_after_format_save.take() {
+            self.finish_scm_after_save(op, &root);
         }
     }
 
