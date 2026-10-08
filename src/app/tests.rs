@@ -14654,6 +14654,69 @@ fn a_late_completion_reply_opens_only_while_the_caret_is_in_its_word() {
     assert!(app.completion_popup.is_none());
 }
 
+/// TypeScript on a possibly-undefined object: vtsls's member items replace
+/// the `.` with `?.`, so their filter text starts at the dot. Typing a
+/// letter filtered them on the bare word and hid every member (#1472).
+#[test]
+fn optional_members_survive_the_first_typed_letter() {
+    use crate::lsp::manager::CompletionResult;
+    use crate::widgets::editor::TextSpanEdit;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("opt.ts");
+    std::fs::write(&path, "user.n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 6;
+    app.completion_request_id = Some(1);
+    app.completion_origin = Some((0, 6));
+    draw(&mut app, 100, 30);
+    let member = |name: &str| crate::lsp::CompletionItem {
+        label: name.to_string(),
+        filter_text: Some(format!(".?.{name}")),
+        text_edit: Some(TextSpanEdit {
+            start: (0, 4),
+            end: (0, 6),
+            new_text: format!("?.{name}"),
+            utf16: true,
+        }),
+        ..Default::default()
+    };
+    assert!(app.apply_completion_result(CompletionResult {
+        request_id: 1,
+        path: path.clone(),
+        items: vec![member("email"), member("name")],
+    }));
+    let popup = app.completion_popup.as_ref().expect("the popup opens");
+    assert_eq!(
+        popup.selected_item().map(|i| i.label.as_str()),
+        Some("name"),
+        "status: {}",
+        app.status
+    );
+    // Typing on narrows it the same way, and Backspace widens it again.
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE))
+        .unwrap();
+    let popup = app
+        .completion_popup
+        .as_ref()
+        .expect("still open after `na`");
+    assert_eq!(popup.visible_indices().len(), 1);
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    let popup = app.completion_popup.as_ref().expect("still open after `.`");
+    assert_eq!(popup.visible_indices().len(), 2);
+    // Enter takes the server's edit: the `.` becomes `?.`.
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines, ["user?.name"]);
+}
+
 /// A buffer holding `import lo` with the caret at its end, and a sender that
 /// lands completion replies where a server's do, so a test can deliver one
 /// at the moment a slow server would: after the keys typed since the ask.

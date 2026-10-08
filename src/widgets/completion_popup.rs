@@ -55,19 +55,8 @@ impl CompletionPopup {
             return (0..self.items.len()).collect();
         }
         let needle = self.prefix.to_ascii_lowercase();
-        self.items
-            .iter()
-            .enumerate()
-            .filter_map(|(i, item)| {
-                if filter_haystack(item)
-                    .to_ascii_lowercase()
-                    .starts_with(&needle)
-                {
-                    Some(i)
-                } else {
-                    None
-                }
-            })
+        (0..self.items.len())
+            .filter(|&i| matches_typed(&self.items[i], &needle))
             .collect()
     }
 
@@ -76,11 +65,7 @@ impl CompletionPopup {
             return self.items.is_empty();
         }
         let needle = self.prefix.to_ascii_lowercase();
-        !self.items.iter().any(|item| {
-            filter_haystack(item)
-                .to_ascii_lowercase()
-                .starts_with(&needle)
-        })
+        !self.items.iter().any(|item| matches_typed(item, &needle))
     }
 
     pub fn move_up(&mut self) {
@@ -223,6 +208,20 @@ impl Widget for &CompletionPopup {
             crate::gradient::paint_gradient_box(buf, area);
         }
     }
+}
+
+/// Whether `item` survives the typed word `needle` (lower-cased): its
+/// filter text starts with it, or does once the punctuation it opens with
+/// is skipped. The typed word never holds that punctuation: vtsls's member
+/// of a possibly-undefined object filters on `.?.name` (its edit turns the
+/// `.` into `?.`), a quoted key on `.content-type`, and matching those on
+/// the bare word hid every one of them (#1472).
+fn matches_typed(item: &CompletionItem, needle: &str) -> bool {
+    let haystack = filter_haystack(item).to_ascii_lowercase();
+    haystack.starts_with(needle)
+        || haystack
+            .trim_start_matches(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .starts_with(needle)
 }
 
 fn filter_haystack(item: &CompletionItem) -> &str {
@@ -374,6 +373,65 @@ mod tests {
             "match",
         );
         assert_eq!(p.visible_indices(), vec![0]);
+    }
+
+    /// An item whose filter text starts with punctuation the typed word
+    /// cannot hold: vtsls's member of a possibly-undefined object
+    /// (`.?.name`, its edit turns the `.` into `?.`) or a quoted key
+    /// (`.content-type`).
+    fn punctuated(label: &str, filter: &str) -> CompletionItem {
+        CompletionItem {
+            label: label.to_string(),
+            filter_text: Some(filter.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_filter_text_that_starts_with_punctuation_matches_the_word_after_it() {
+        let p = popup(
+            vec![
+                punctuated("email", ".?.email"),
+                punctuated("name", ".?.name"),
+            ],
+            "n",
+        );
+        assert_eq!(p.visible_indices(), vec![1], "`n` matches `.?.name` only");
+        assert!(!p.visible_is_empty());
+    }
+
+    #[test]
+    fn a_quoted_key_survives_its_first_letter() {
+        let p = popup(
+            vec![
+                punctuated("accept", ".accept"),
+                punctuated("content-type", ".content-type"),
+            ],
+            "c",
+        );
+        assert_eq!(p.visible_indices(), vec![1]);
+    }
+
+    /// Negative: past the punctuation the word still has to match.
+    #[test]
+    fn a_punctuated_filter_text_still_hides_what_does_not_match() {
+        let p = popup(
+            vec![
+                punctuated("email", ".?.email"),
+                punctuated("name", ".?.name"),
+            ],
+            "x",
+        );
+        assert!(p.visible_is_empty());
+        assert!(p.visible_indices().is_empty());
+    }
+
+    /// Negative: only the leading punctuation is skipped. `na` sits inside
+    /// `.x_name` but not at the start of its word, so it does not match.
+    #[test]
+    fn only_the_leading_punctuation_is_skipped() {
+        let p = popup(vec![punctuated("x_name", ".x_name")], "na");
+        assert!(p.visible_is_empty());
     }
 
     #[test]
