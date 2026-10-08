@@ -65147,13 +65147,6 @@ fn is_cmd_shift_letter(key: KeyEvent, letter: char) -> bool {
     has_shift && has_ctrl_or_super
 }
 
-/// The status line shown after a keybindings reload.
-///
-/// Split out of `reload_config_for_path` so it can be tested against a keymap
-/// built in memory. The alternative — a test that writes the real
-/// `~/.config/croft/keybindings.json` — would leak into every one of the
-/// thousands of concurrent tests that construct an `App`, since `App::new`
-/// loads that path unconditionally.
 /// Load the snippets file, writing what could not be read to OUTPUT ·
 /// Snippets: one bad entry used to empty the whole set without a word (#1483).
 fn load_snippets(path: &std::path::Path) -> crate::snippets::SnippetSet {
@@ -65164,6 +65157,7 @@ fn load_snippets(path: &std::path::Path) -> crate::snippets::SnippetSet {
     set
 }
 
+/// The status line shown after a snippets reload, tested the same way.
 fn snippets_reload_status(warns: &[String]) -> String {
     match warns.len() {
         0 => String::from("Snippets reloaded"),
@@ -65174,6 +65168,13 @@ fn snippets_reload_status(warns: &[String]) -> String {
     }
 }
 
+/// The status line shown after a keybindings reload.
+///
+/// Split out of `reload_config_for_path` so it can be tested against a keymap
+/// built in memory. The alternative — a test that writes the real
+/// `~/.config/croft/keybindings.json` — would leak into every one of the
+/// thousands of concurrent tests that construct an `App`, since `App::new`
+/// loads that path unconditionally.
 fn keybindings_reload_status(warns: &[String]) -> String {
     if warns.is_empty() {
         String::from(
