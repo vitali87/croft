@@ -1472,6 +1472,63 @@ fn a_croft_that_refuses_the_plan_is_not_replaced_by_gits_editor() {
     );
 }
 
+/// #1452 negative: a croft that took the plan and closed without a reply may
+/// have opened it, so git's editor must not open the same plan a second time.
+#[test]
+fn a_croft_that_closes_without_replying_is_not_replaced_by_gits_editor() {
+    use std::io::{BufRead, BufReader};
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = tmp.path().join("git-rebase-todo");
+    std::fs::write(&plan, "pick 1234567 one\n").unwrap();
+    let sock = tmp.path().join("v.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+    });
+    let out = sequence_editor_command(tmp.path(), "echo edited >>")
+        .env("CROFT_VIEW_SOCK", &sock)
+        .args(["edit", "--wait", "--sequence-editor", "git-rebase-todo"])
+        .assert();
+    server.join().unwrap();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(!stderr.contains("not running"), "stderr was: {stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&plan).unwrap(),
+        "pick 1234567 one\n"
+    );
+}
+
+/// #1452 negative: where git itself names no editor (a dumb terminal with
+/// none set), the fallback fails as git would rather than inventing `vi`.
+#[test]
+fn the_sequence_editor_fails_when_git_names_no_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = tmp.path().join("git-rebase-todo");
+    std::fs::write(&plan, "pick 1234567 one\n").unwrap();
+    let out = sequence_editor_command(tmp.path(), "unused")
+        .env_remove("GIT_EDITOR")
+        .env_remove("VISUAL")
+        .env_remove("EDITOR")
+        .env("TERM", "dumb")
+        .env("CROFT_VIEW_SOCK", tmp.path().join("nobody.sock"))
+        .args(["edit", "--wait", "--sequence-editor", "git-rebase-todo"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(!stderr.contains("using"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains("the croft that opened this pane is gone"),
+        "stderr was: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&plan).unwrap(),
+        "pick 1234567 one\n"
+    );
+}
+
 /// #1452 negative: with its croft alive the plan opens there, exactly as
 /// before, and git's editor never runs.
 #[test]

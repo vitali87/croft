@@ -804,7 +804,10 @@ impl Cli {
                         if sequence_editor
                             && e.downcast_ref::<crate::view_ipc::NoCroft>().is_some() =>
                     {
-                        let editor = git_editor();
+                        let Some(editor) = git_editor() else {
+                            eprintln!("{e}");
+                            std::process::exit(1);
+                        };
                         eprintln!("croft is not running; using {editor}");
                         std::process::exit(run_git_editor(&editor, &path));
                     }
@@ -1071,16 +1074,17 @@ fn configured_sequence_editor() -> Option<String> {
 
 /// The editor git itself would run: `GIT_EDITOR`, `core.editor`, `VISUAL`,
 /// `EDITOR`, then git's built-in default, as `git var GIT_EDITOR` reports.
-fn git_editor() -> String {
+/// `None` when git names none (a dumb terminal with no editor set): git
+/// fails there, so no editor is invented. git's own reason reaches stderr.
+fn git_editor() -> Option<String> {
     std::process::Command::new("git")
         .args(["var", "GIT_EDITOR"])
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
         .output()
         .ok()
         .filter(|out| out.status.success())
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
         .filter(|editor| !editor.is_empty())
-        .unwrap_or_else(|| String::from("vi"))
 }
 
 /// Run the editor value `editor` on `path` exactly as git itself runs one,
