@@ -15385,6 +15385,170 @@ fn scm_ready_to_commit() -> (tempfile::TempDir, App) {
     (tmp, app)
 }
 
+/// #1438: the committed repo with `seed.txt` open in a tab whose edit
+/// (`edited changed`) is not saved, and the message box filled.
+fn scm_with_unsaved_tab() -> (tempfile::TempDir, App) {
+    let (tmp, mut app) = scm_ready_to_commit();
+    app.editor
+        .open_pinned(&tmp.path().join("seed.txt"))
+        .unwrap();
+    app.editor.insert_str("edited ");
+    assert!(app.editor.dirty);
+    app.source_control.message = "bump seed".to_string();
+    app.source_control.message_cursor = app.source_control.message.chars().count();
+    (tmp, app)
+}
+
+/// #1438: Commit with an unsaved tab in the repository asks first, and
+/// commits nothing until an answer is given.
+#[test]
+fn commit_with_an_unsaved_tab_in_the_repo_asks_before_committing() {
+    let (tmp, mut app) = scm_with_unsaved_tab();
+    let head = git_out(tmp.path(), &["rev-parse", "HEAD"]);
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_git_net(&mut app);
+    let pending = app.pending_unsaved_scm.as_ref().expect("the prompt opens");
+    assert_eq!(pending.op, ScmWrite::Commit);
+    assert_eq!(pending.files, vec![tmp.path().join("seed.txt")]);
+    assert_eq!(
+        git_out(tmp.path(), &["rev-parse", "HEAD"]),
+        head,
+        "no commit yet"
+    );
+    let rendered = screen_text_863(&mut app, 120, 40);
+    assert!(rendered.contains("UNSAVED CHANGES"), "{rendered}");
+    assert!(rendered.contains("Save All & Commit"), "{rendered}");
+    assert!(rendered.contains("seed.txt"), "{rendered}");
+}
+
+/// #1438: Save All & Commit writes the tab, then commits the editor text.
+#[test]
+fn save_all_and_commit_commits_the_text_in_the_tab() {
+    let (tmp, mut app) = scm_with_unsaved_tab();
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    wait_for_git_net(&mut app);
+    assert!(app.pending_unsaved_scm.is_none());
+    assert!(!app.editor.dirty, "the tab was saved");
+    assert_eq!(
+        git_out(tmp.path(), &["show", "HEAD:seed.txt"]),
+        "edited changed\n"
+    );
+    assert_eq!(last_commit_message(tmp.path()), "bump seed\n\n");
+}
+
+/// #1438: Commit Anyway keeps the old behaviour: the disk text is
+/// committed and the tab stays unsaved.
+#[test]
+fn commit_anyway_commits_the_disk_text_and_leaves_the_tab_unsaved() {
+    let (tmp, mut app) = scm_with_unsaved_tab();
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    app.handle_key(key(KeyCode::Char('c'), KeyModifiers::NONE))
+        .unwrap();
+    wait_for_git_net(&mut app);
+    assert!(app.pending_unsaved_scm.is_none());
+    assert_eq!(git_out(tmp.path(), &["show", "HEAD:seed.txt"]), "changed\n");
+    assert!(app.editor.dirty, "Commit Anyway saves nothing");
+}
+
+/// #1438: Esc closes the prompt with no commit and the edit still unsaved.
+#[test]
+fn cancelling_the_unsaved_prompt_commits_nothing() {
+    let (tmp, mut app) = scm_with_unsaved_tab();
+    let head = git_out(tmp.path(), &["rev-parse", "HEAD"]);
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    wait_for_git_net(&mut app);
+    assert!(app.pending_unsaved_scm.is_none());
+    assert_eq!(git_out(tmp.path(), &["rev-parse", "HEAD"]), head);
+    assert!(app.editor.dirty);
+    assert_eq!(
+        app.source_control.message, "bump seed",
+        "the message is kept"
+    );
+}
+
+/// #1438: an unsaved tab outside the repository is not the commit's
+/// business, so the commit runs straight away.
+#[test]
+fn an_unsaved_tab_outside_the_repo_does_not_hold_the_commit() {
+    let (tmp, mut app) = scm_ready_to_commit();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let other = elsewhere.path().join("scratch.txt");
+    std::fs::write(&other, "scratch\n").unwrap();
+    app.editor.open_pinned(&other).unwrap();
+    app.editor.insert_str("more ");
+    assert!(app.editor.dirty);
+    app.source_control.message = "bump seed".to_string();
+    app.source_control.message_cursor = app.source_control.message.chars().count();
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_git_net(&mut app);
+    assert!(app.pending_unsaved_scm.is_none(), "no prompt");
+    assert_eq!(git_out(tmp.path(), &["show", "HEAD:seed.txt"]), "changed\n");
+    assert_eq!(last_commit_message(tmp.path()), "bump seed\n\n");
+}
+
+/// #1438: with every repository tab saved, Commit asks nothing.
+#[test]
+fn a_saved_tab_does_not_hold_the_commit() {
+    let (tmp, mut app) = scm_ready_to_commit();
+    app.editor
+        .open_pinned(&tmp.path().join("seed.txt"))
+        .unwrap();
+    app.source_control.message = "bump seed".to_string();
+    app.source_control.message_cursor = app.source_control.message.chars().count();
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_git_net(&mut app);
+    assert!(app.pending_unsaved_scm.is_none());
+    assert_eq!(last_commit_message(tmp.path()), "bump seed\n\n");
+}
+
+/// #1438: an empty message is refused before anything is asked.
+#[test]
+fn an_empty_message_is_refused_before_the_unsaved_prompt() {
+    let (_tmp, mut app) = scm_with_unsaved_tab();
+    app.source_control.message.clear();
+    app.source_control.message_cursor = 0;
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.pending_unsaved_scm.is_none());
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("Empty commit message")
+    );
+}
+
+/// #1438: Stash asks too, and Save All & Stash stashes the editor text,
+/// leaving the tab saved.
+#[test]
+fn save_all_and_stash_stashes_the_text_in_the_tab() {
+    let (tmp, mut app) = scm_with_unsaved_tab();
+    app.stash_source_control();
+    let pending = app.pending_unsaved_scm.as_ref().expect("the prompt opens");
+    assert_eq!(pending.op, ScmWrite::Stash);
+    assert_eq!(
+        git_out(tmp.path(), &["stash", "list"]),
+        "",
+        "nothing stashed yet"
+    );
+    let rendered = screen_text_863(&mut app, 120, 40);
+    assert!(rendered.contains("Save All & Stash"), "{rendered}");
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.pending_unsaved_scm.is_none());
+    assert!(!app.editor.dirty, "the tab was saved");
+    assert_eq!(
+        git_out(tmp.path(), &["show", "stash@{0}:seed.txt"]),
+        "edited changed\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
+        "seed\n",
+        "the stash put the work aside"
+    );
+}
+
 fn last_commit_message(root: &std::path::Path) -> String {
     let out = std::process::Command::new("git")
         .arg("-C")

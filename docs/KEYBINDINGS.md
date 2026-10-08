@@ -237,7 +237,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 |------|--------|
 | Type in the message box | Edit the commit message (the box scrolls horizontally when the message outgrows it, and grows a row per line up to six, then scrolls). Pasted text keeps its line breaks |
 | `Shift`+`Enter` / `Alt`+`Enter` | Start a new line in the commit message (a blank line, then the body and trailers); `Up` / `Down` move between its lines |
-| `Enter` | Commit all tracked changes with the message. The commit runs in the background, so croft keeps responding while the repository's hooks run; the message stays in the box until the commit lands, and a hook's rejection shows below it |
+| `Enter` | Commit all tracked changes with the message. The commit runs in the background, so croft keeps responding while the repository's hooks run; the message stays in the box until the commit lands, and a hook's rejection shows below it. If a tab under the repository has unsaved edits, every commit and stash variant first asks, as VS Code does: `S`/`Enter` Save All & Commit (or Stash), which saves the tabs and goes ahead only once all of them are saved; `C` Commit (or Stash) Anyway, with the files as they are on disk; `Esc` cancels |
 | Click ✓ Commit | Same as `Enter` |
 | Click a change row | Open that file's diff against HEAD in a read-only editor tab |
 | `S` in a diff tab | Stage only the change hunk under the cursor (click a row or `F7` to pick the hunk). With a selection dragged across rows, stages only the SELECTED lines instead (VS Code's Stage Selected Ranges): unselected additions stay out of the index and unselected deletions stay in it |
