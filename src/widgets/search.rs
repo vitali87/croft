@@ -134,6 +134,15 @@ fn split_globs(raw: &str) -> impl Iterator<Item = &str> {
 }
 
 fn compile_glob(pat: &str) -> Option<Glob> {
+    // A leading `/` anchors the pattern to the root, as in .gitignore: the
+    // form a VS Code exclude setting's bare `build` arrives in (#1479). Its
+    // `*` stays within one folder, so `/*.log` is the root's logs only.
+    if let Some(anchored) = pat.strip_prefix('/') {
+        return globset::GlobBuilder::new(anchored)
+            .literal_separator(true)
+            .build()
+            .ok();
+    }
     // VS Code convention: a pattern without a path separator matches at
     // any depth, so `*.rs` finds Rust files in every subdirectory.
     let expanded = if pat.contains('/') {
@@ -4118,6 +4127,36 @@ mod tests {
             .join("\n");
         assert!(text.contains("invalid glob: *.{ts"), "{text}");
         assert!(text.contains("files to exclude\u{20}"), "{text}");
+    }
+
+    /// #1479: a leading `/` anchors a glob to the root (gitignore's rule):
+    /// `/build` is the root's `build` folder, not `scripts/build`.
+    #[test]
+    fn a_leading_slash_anchors_an_exclude_glob_to_the_root() {
+        let root = Path::new("/r");
+        let f = PathFilter::excluding(&[String::from("/build")]);
+        assert!(f.excludes(root, Path::new("/r/build/out.js")));
+        assert!(f.excludes(root, Path::new("/r/build")));
+        assert!(!f.excludes(root, Path::new("/r/scripts/build/release.py")));
+        assert!(!f.excludes(root, Path::new("/r/rebuild/x")));
+        let f = PathFilter::excluding(&[String::from("/*.log")]);
+        assert!(f.excludes(root, Path::new("/r/app.log")));
+        assert!(!f.excludes(root, Path::new("/r/logs/app.log")));
+    }
+
+    /// #1479 negative: croft's own bare glob still matches at any depth, as
+    /// documented, and `**/` still does.
+    #[test]
+    fn a_bare_or_starred_exclude_glob_still_matches_at_any_depth() {
+        let root = Path::new("/r");
+        for glob in ["build", "**/build"] {
+            let f = PathFilter::excluding(&[String::from(glob)]);
+            assert!(f.excludes(root, Path::new("/r/build/out.js")), "{glob}");
+            assert!(
+                f.excludes(root, Path::new("/r/scripts/build/release.py")),
+                "{glob}"
+            );
+        }
     }
 
     /// #1345: the project's exclusions show under the exclude box as a
