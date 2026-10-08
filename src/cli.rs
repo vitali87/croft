@@ -32,7 +32,8 @@ const VERBOSE_VERSION: &str = concat!(
 #[command(name = "croft", version = VERSION, about = "Terminal-based VS Code replica")]
 pub struct Cli {
     /// Workspace folder to open (defaults to current directory). A file works
-    /// too: the workspace roots at its parent and the file opens in the editor.
+    /// too: the workspace roots at its parent and the file opens in the editor,
+    /// at a line with `file:line` or `file:line:col`.
     #[arg(value_name = "PATH")]
     pub path: Option<PathBuf>,
 
@@ -346,7 +347,8 @@ pub enum CliCommand {
     /// cwd and handed to the running croft, which opens it exactly as an
     /// Explorer click would.
     View {
-        /// File to open, or `-` to read the content from stdin.
+        /// File to open (`file:line[:col]` opens it there), or `-` to read the
+        /// content from stdin.
         ///
         /// `OsString`, not `String`: a filename is bytes on Unix, and the
         /// wire format goes to some trouble to carry those bytes intact.
@@ -393,6 +395,7 @@ pub enum CliCommand {
     /// --wait"` works for tools that name a new file.
     Edit {
         /// File to open, created empty if it does not exist yet.
+        /// `file:line[:col]` opens an existing file there.
         path: std::ffi::OsString,
         /// Block until the file's tab is closed.
         #[arg(long, default_value_t = false)]
@@ -1042,7 +1045,8 @@ impl Cli {
                 let path = self
                     .path
                     .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
-                let (path, open_file, folders) = resolve_workspace(&path, self.open_file)?;
+                let cwd = std::env::current_dir().context("reading the current directory")?;
+                let (path, open_file, folders) = resolve_launch(&path, self.open_file, &cwd)?;
                 crate::app::run(path, self.restore_session, open_file, self.zen, folders)
             }
         }
@@ -1895,6 +1899,7 @@ fn setup_ghostty(yes: bool) -> Result<()> {
 /// opens the file, so `croft pitch_deck.tex` works and the macOS launcher can
 /// pass a double-clicked document straight through. An explicit `--open-file`
 /// always wins.
+#[cfg(test)]
 fn resolve_workspace(
     path: &Path,
     open_file: Option<PathBuf>,
@@ -1919,16 +1924,40 @@ fn resolve_open_file(open_file: PathBuf, root: &Path, cwd: &Path) -> PathBuf {
         .unwrap_or_else(|| candidates[candidates.len() - 1].clone())
 }
 
+/// A file to open at launch, and where to put the caret in it.
+type LaunchFile = (PathBuf, Option<crate::file_location::FileLocation>);
+
+/// What `croft PATH [--open-file FILE]` opens, resolved against `cwd`, with
+/// a `:line[:col]` on either argument split off as where the caret goes:
+/// `croft four.c:5:5` and `--open-file four.c:5` (#1487).
+fn resolve_launch(
+    path: &Path,
+    open_file: Option<PathBuf>,
+    cwd: &Path,
+) -> Result<(PathBuf, Option<LaunchFile>, Vec<PathBuf>)> {
+    let (path, path_at) = crate::file_location::split(path, cwd);
+    let (open_file, at) = match open_file {
+        Some(f) => {
+            let (f, at) = crate::file_location::split(&f, cwd);
+            (Some(f), at)
+        }
+        None => (None, path_at),
+    };
+    let (root, open_file, folders) = resolve_workspace_from(&path, open_file, cwd)?;
+    Ok((root, open_file.map(|f| (f, at)), folders))
+}
+
 /// [`resolve_workspace`] with the directory croft was launched from.
 fn resolve_workspace_from(
     path: &Path,
     open_file: Option<PathBuf>,
     cwd: &Path,
 ) -> Result<(PathBuf, Option<PathBuf>, Vec<PathBuf>)> {
+    let typed = path;
     let path = cwd
         .join(path)
         .canonicalize()
-        .context("resolving workspace path")?;
+        .with_context(|| format!("no such file or folder: {}", typed.display()))?;
     if path.is_dir() {
         let open_file = open_file.map(|f| resolve_open_file(f, &path, cwd));
         return Ok((path, open_file, Vec::new()));
@@ -2922,5 +2951,56 @@ mod tests {
             }
             _ => panic!("expected Remote"),
         }
+    }
+
+    // ── #1487: `croft file:line[:col]` opens the file at that spot ──
+
+    #[test]
+    fn a_line_and_column_after_the_file_open_it_there() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("four.c"), "int x;\n").unwrap();
+        let (root, open, _) = resolve_launch(Path::new("four.c:5:5"), None, dir.path()).unwrap();
+        assert_eq!(root, dir.path().canonicalize().unwrap());
+        assert_eq!(
+            open,
+            Some((
+                dir.path().canonicalize().unwrap().join("four.c"),
+                Some(crate::file_location::FileLocation {
+                    line: 5,
+                    col: Some(5)
+                })
+            ))
+        );
+    }
+
+    #[test]
+    fn an_open_file_flag_takes_a_line_too() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let (_, open, _) =
+            resolve_launch(Path::new("."), Some(PathBuf::from("a.rs:12")), dir.path()).unwrap();
+        let (file, at) = open.unwrap();
+        assert_eq!(file, dir.path().canonicalize().unwrap().join("a.rs"));
+        assert_eq!(
+            at,
+            Some(crate::file_location::FileLocation {
+                line: 12,
+                col: None
+            })
+        );
+    }
+
+    /// Negative: a folder opens with no caret position, and a path that
+    /// names nothing is an error that says which path.
+    #[test]
+    fn a_folder_has_no_location_and_a_missing_path_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, open, _) = resolve_launch(Path::new("."), None, dir.path()).unwrap();
+        assert_eq!(open, None);
+        let err = resolve_launch(Path::new("gone.c:5:5"), None, dir.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no such file or folder: gone.c:5:5"),
+            "{err:#}"
+        );
     }
 }
