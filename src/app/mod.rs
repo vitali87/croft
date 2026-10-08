@@ -36792,7 +36792,22 @@ impl App {
                 return;
             }
         };
-        let label = std::path::PathBuf::from(format!("git diff {branch}"));
+        // Name the base the diff starts from (#1444): the merge base, or
+        // the branch tip when the two share no history.
+        let (title, said) = match crate::git::merge_base(&self.scm_root(), &branch) {
+            Some(base) => (
+                format!(
+                    "git diff {} (merge base with {branch})",
+                    &base[..base.len().min(7)]
+                ),
+                format!("Showing changes since this branch left {branch}"),
+            ),
+            None => (
+                format!("git diff {branch}"),
+                format!("Showing git diff {branch}: no history in common, so against its tip"),
+            ),
+        };
+        let label = std::path::PathBuf::from(title);
         if let Err(err) = self.editor.open_git_diff_side_by_side(&label, &raw) {
             self.source_control.commit_feedback = Some(format!("open failed: {err}"));
             self.source_control.commit_feedback_is_error = true;
@@ -36805,7 +36820,7 @@ impl App {
         });
         self.default_branch_label = Some(branch.clone());
         self.source_control.commit_feedback = None;
-        self.status = format!("Showing git diff {branch}");
+        self.status = said;
         self.focus_pane(Pane::Editor);
     }
 

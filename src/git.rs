@@ -1160,12 +1160,27 @@ pub fn diff_staged(root: &Path) -> Result<String, String> {
     diff_text(root, &["diff", "--staged"])
 }
 
-/// Raw `git diff <branch>` text — working-tree state versus the tip of
-/// `branch`. Used by the Source Control dropdown's "View Changes vs
-/// <default>" so users can preview every uncommitted-plus-committed change
-/// on the current branch in one view.
+/// The working tree against the point the current branch left `branch`
+/// (its merge base), as a pull request diff shows it: every committed and
+/// uncommitted change on this branch, and nothing `branch` gained since
+/// (#1444). Diffing against `branch`'s tip listed that later work as this
+/// branch deleting or reverting it. With no shared history it falls back
+/// to the tip. Used by the Source Control dropdown's "View Changes vs
+/// <default>" and that tab's refresh.
+/// The commit HEAD and `branch` last had in common (`git merge-base`), or
+/// None when they share no history or `branch` does not resolve.
+pub fn merge_base(root: &Path, branch: &str) -> Option<String> {
+    diff_text(root, &["merge-base", "HEAD", branch])
+        .ok()
+        .map(|out| out.trim().to_string())
+        .filter(|sha| !sha.is_empty())
+}
+
 pub fn diff_against_branch(root: &Path, branch: &str) -> Result<String, String> {
-    diff_text(root, &["diff", branch])
+    match merge_base(root, branch) {
+        Some(base) => diff_text(root, &["diff", &base]),
+        None => diff_text(root, &["diff", branch]),
+    }
 }
 
 /// Raw `git diff HEAD~1` text — working-tree state versus the commit
@@ -4598,6 +4613,128 @@ mod tests {
             out.contains("+three"),
             "diff vs branch must include the new +three line: {out}"
         );
+    }
+
+    /// #1444 fixture: `feature` branched from `main` and added
+    /// `feature.py`; `main` then got a teammate's `teammate.py` and an
+    /// `app.py` change. HEAD is `feature`.
+    fn branch_behind_a_moved_main() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        let git = |args: &[&str]| {
+            let o = Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "a@b"]);
+        git(&["config", "user.name", "a"]);
+        std::fs::write(p.join("app.py"), "def a():\n    return 1\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        git(&["checkout", "-qb", "feature"]);
+        std::fs::write(p.join("feature.py"), "def feature():\n    return 2\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "add feature"]);
+        git(&["checkout", "-q", "main"]);
+        std::fs::write(p.join("teammate.py"), "def teammate():\n    return 3\n").unwrap();
+        std::fs::write(p.join("app.py"), "def a():\n    return 10\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "teammate work"]);
+        git(&["checkout", "-q", "feature"]);
+        tmp
+    }
+
+    /// #1444: the view holds the branch's own changes only, as a pull
+    /// request diff does, not main's later work shown in reverse.
+    #[test]
+    fn diff_against_branch_starts_from_the_merge_base() {
+        let tmp = branch_behind_a_moved_main();
+        let out = diff_against_branch(tmp.path(), "main").unwrap();
+        assert!(out.contains("+++ b/feature.py"), "{out}");
+        assert!(!out.contains("teammate.py"), "{out}");
+        assert!(!out.contains("app.py"), "{out}");
+    }
+
+    /// #1444: uncommitted work on the branch is still in the view.
+    #[test]
+    fn diff_against_branch_keeps_uncommitted_edits() {
+        let tmp = branch_behind_a_moved_main();
+        std::fs::write(
+            tmp.path().join("feature.py"),
+            "def feature():\n    return 22\n",
+        )
+        .unwrap();
+        let out = diff_against_branch(tmp.path(), "main").unwrap();
+        assert!(out.contains("+    return 22"), "{out}");
+        assert!(!out.contains("teammate.py"), "{out}");
+    }
+
+    /// #1444 negative: when main has not moved, the view is exactly
+    /// `git diff main`, as before.
+    #[test]
+    fn diff_against_an_unmoved_branch_is_the_plain_diff() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["checkout", "-qb", "feature"]);
+        std::fs::write(p.join("seed.txt"), "one\ntwo\nthree\n").unwrap();
+        git(&["commit", "-qam", "three"]);
+        std::fs::write(p.join("new.txt"), "x\n").unwrap();
+        git(&["add", "new.txt"]);
+        let plain = String::from_utf8(git(&["diff", "main"]).stdout).unwrap();
+        assert!(plain.contains("+three"), "{plain}");
+        assert_eq!(diff_against_branch(p, "main").unwrap(), plain);
+    }
+
+    /// #1444 negative: with no shared history there is no merge base, and
+    /// the view falls back to the tip diff instead of failing.
+    #[test]
+    fn diff_against_an_unrelated_branch_falls_back_to_its_tip() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["checkout", "-q", "--orphan", "other"]);
+        git(&["rm", "-rfq", "."]);
+        std::fs::write(p.join("other.txt"), "other\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "other root"]);
+        assert_eq!(merge_base(p, "main"), None);
+        let plain = String::from_utf8(git(&["diff", "main"]).stdout).unwrap();
+        assert!(plain.contains("seed.txt"), "{plain}");
+        assert_eq!(diff_against_branch(p, "main").unwrap(), plain);
+    }
+
+    /// #1444 negative: a branch git does not know still errors, as before.
+    #[test]
+    fn diff_against_an_unknown_branch_still_errors() {
+        let tmp = TempDir::new().unwrap();
+        init_repo_with_commit(tmp.path());
+        assert!(diff_against_branch(tmp.path(), "no-such-branch").is_err());
     }
 
     #[test]
