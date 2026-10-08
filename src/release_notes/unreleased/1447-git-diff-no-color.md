@@ -1,0 +1,1 @@
+fix: View Staged Changes, View Changes vs previous or the default branch, and commit patches no longer show escape-code fragments with `color.ui = always` in your gitconfig, or an external diff tool's output with `diff.external` set.
