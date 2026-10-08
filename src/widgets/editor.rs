@@ -7346,9 +7346,17 @@ impl Editor {
         };
         let line = self.lines.get(sr).cloned().unwrap_or_default();
         let before: String = line.chars().take(sc).collect();
+        // A caret inside a string or comment takes the paste as text: shifting
+        // its later lines would change the string's value. Read before the
+        // insert, while the highlight pass still describes this buffer.
+        let protected = self
+            .earlier_construct_end(sr, before.len())
+            .is_none_or(|from| ends_in_string_or_comment(&before[from..], self.lang));
         self.insert_str(&text);
         let code = !matches!(self.lang, None | Some(LangKind::Markdown));
-        if !reindent || !code || !text.contains('\n') {
+        // At column zero there is no caret indentation to fit, so the paste
+        // keeps the clipboard's own indentation.
+        if !reindent || !code || sc == 0 || protected || !text.contains('\n') {
             return;
         }
         let at_indent = before.chars().all(char::is_whitespace);
@@ -13846,8 +13854,8 @@ pub(crate) fn split_into_lines(text: &str) -> Vec<String> {
 /// every later line moves under `base` (the caret line's indentation) by its
 /// indentation relative to the least-indented line, written in the buffer's
 /// style. The first line counts toward that least indentation when the paste
-/// starts in the caret line's leading whitespace, and then loses its own
-/// leading whitespace (the caret's column already indents it). Lines that are
+/// starts in the caret line's leading whitespace, and then keeps only its
+/// indentation beyond that least (the caret's column already indents it). Lines that are
 /// only whitespace are emptied; a final segment that is only whitespace is
 /// left alone, as the rest of the caret's line follows it.
 fn paste_reindent_edits(
@@ -13895,9 +13903,15 @@ fn paste_reindent_edits(
         utf16: false,
     };
     let mut edits = Vec::new();
-    let (first_chars, _) = ws_of(segs[0]);
+    let (first_chars, first_width) = ws_of(segs[0]);
     if at_indent && first_chars > 0 {
-        edits.push(edit(row, col, col + first_chars, String::new()));
+        let keep = match blank(segs[0]) {
+            true => String::new(),
+            false => render(first_width - least),
+        };
+        if segs[0].chars().take(first_chars).collect::<String>() != keep {
+            edits.push(edit(row, col, col + first_chars, keep));
+        }
     }
     for (i, seg) in segs.iter().enumerate().skip(1) {
         let (chars, width) = ws_of(seg);
@@ -19726,6 +19740,47 @@ mod tests {
             e.lines[1], "",
             "a paste needing no re-indent is one undo step"
         );
+    }
+
+    #[test]
+    fn an_indented_paste_at_column_zero_keeps_its_indentation() {
+        let mut e = editor_with("x = 1\n\nz");
+        e.lang = Some(LangKind::Python);
+        e.cursor_row = 1;
+        e.cursor_col = 0;
+        e.paste_str("    if x:\n        run()", true);
+        assert_eq!(&e.lines[1..3], &["    if x:", "        run()"]);
+    }
+
+    #[test]
+    fn a_first_line_deeper_than_a_later_one_keeps_the_difference() {
+        let mut e = shop();
+        e.paste_str("    if cond:\n        body()\nelse:", true);
+        assert_eq!(
+            &e.lines[4..7],
+            &[
+                "                if cond:",
+                "                    body()",
+                "            else:",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_paste_inside_a_docstring_is_left_verbatim() {
+        let mut e = editor_with("def f():\n    \"\"\"\n    \n    \"\"\"");
+        e.lang = Some(LangKind::Python);
+        e.recompute_highlights();
+        e.cursor_row = 2;
+        e.cursor_col = 4;
+        e.paste_str("hello\nworld", true);
+        assert_eq!(&e.lines[2..4], &["    hello", "world"]);
+        let mut e = editor_with("def f():\n    x = \"\"\"a");
+        e.lang = Some(LangKind::Python);
+        e.cursor_row = 1;
+        e.cursor_col = 14;
+        e.paste_str("hello\nworld", true);
+        assert_eq!(&e.lines[1..3], &["    x = \"\"\"ahello", "world"]);
     }
 
     #[test]
