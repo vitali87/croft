@@ -3601,6 +3601,14 @@ impl Editor {
             .unwrap_or(0)
     }
 
+    /// Whether the open file `path` has anything keyed by line that must
+    /// follow edits: bookmarks, breakpoint state, or collapsed folds (#1509).
+    fn has_line_marks(&self, path: &Path) -> bool {
+        self.bookmarks.contains_key(path)
+            || self.has_breakpoints_in(path)
+            || !self.folded.is_empty()
+    }
+
     /// Whether `path` has any line-keyed breakpoint state to carry through
     /// edits (see [`Self::sync_bookmarks_to_buffer`]).
     fn has_breakpoints_in(&self, path: &Path) -> bool {
@@ -3618,7 +3626,7 @@ impl Editor {
         let Some(path) = self.path.as_ref() else {
             return;
         };
-        if !(self.bookmarks.contains_key(path) || self.has_breakpoints_in(path))
+        if !self.has_line_marks(path)
             || self
                 .bookmark_shadow
                 .as_ref()
@@ -3629,7 +3637,8 @@ impl Editor {
         self.bookmark_shadow = Some((path.clone(), self.lines.clone()));
     }
 
-    /// Re-align the open file's bookmarks with the buffer after it changed.
+    /// Re-align the open file's bookmarks, breakpoints and collapsed folds
+    /// with the buffer after it changed.
     /// The single choke point for line shifts: called from
     /// [`mark_buffer_changed`](Self::mark_buffer_changed) (every edit),
     /// [`restore_snapshot`](Self::restore_snapshot) (undo / redo) and the
@@ -3646,11 +3655,12 @@ impl Editor {
             self.bookmark_shadow = None;
             return;
         };
-        if !self.bookmarks.contains_key(&path) && !self.has_breakpoints_in(&path) {
+        if !self.has_line_marks(&path) {
             self.bookmark_shadow = None;
             return;
         }
         let len = self.lines.len();
+        let mut folds_moved = false;
         let mut shadow = match self.bookmark_shadow.take() {
             Some((shadow_path, old)) if shadow_path == path => {
                 let map = line_mapper(&old, &self.lines);
@@ -3675,11 +3685,26 @@ impl Editor {
                             .collect();
                     }
                 }
+                // Folds too: their headers are line numbers, and the render
+                // guard dropped every fold on any change in line count.
+                if !self.folded.is_empty() && old.len() != len {
+                    self.folded = self
+                        .folded
+                        .iter()
+                        .filter_map(|&h| map(h + 1).map(|l| l - 1))
+                        .collect();
+                    folds_moved = true;
+                }
                 drop(map);
                 old
             }
             _ => Vec::new(),
         };
+        if folds_moved {
+            self.fold_epoch_lines = len;
+            self.refresh_fold_tables();
+            self.rebuild_hidden_ranges();
+        }
         let in_range = |l: &usize| (1..=len).contains(l);
         if let Some(set) = self.bookmarks.get_mut(&path) {
             set.retain(in_range);
@@ -3705,7 +3730,7 @@ impl Editor {
                 }
             }
         }
-        if !self.bookmarks.contains_key(&path) && !self.has_breakpoints_in(&path) {
+        if !self.has_line_marks(&path) {
             return;
         }
         // Bring the shadow up to date in place rather than cloning the whole
@@ -28656,6 +28681,121 @@ mod tests {
         e.cursor_col = 7; // inside "beta"
         e.transform_selection_case(CaseTransform::Upper);
         assert_eq!(e.lines, vec!["alpha BETA"]);
+    }
+
+    // ---- Folds follow line inserts and deletes (#1509) ----
+
+    const FOLDS_PY: &str = "import os\n\n\ndef alpha():\n    a = 1\n    b = 2\n    return a + b\n\n\ndef beta():\n    return 3\n\n\ndef gamma():\n    x = 1\n    y = 2\n    z = 3\n    return x + y + z\n";
+
+    /// The issue's file open from disk, with `alpha` (row 3) and `beta`
+    /// (row 9) folded.
+    fn folded_alpha_and_beta() -> (tempfile::TempDir, Editor) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.py");
+        std::fs::write(&path, FOLDS_PY).unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        e.toggle_fold(3);
+        e.toggle_fold(9);
+        assert_eq!(e.folded, std::collections::BTreeSet::from([3, 9]));
+        (dir, e)
+    }
+
+    /// Paint a frame: the render pass is where folds used to be dropped.
+    fn paint(e: &mut Editor) {
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        (&mut *e).render(area, &mut buf);
+    }
+
+    fn folded_rows(e: &Editor) -> Vec<usize> {
+        e.folded.iter().copied().collect()
+    }
+
+    #[test]
+    fn a_new_line_below_the_folds_keeps_them_folded() {
+        let (_dir, mut e) = folded_alpha_and_beta();
+        e.cursor_row = 17;
+        e.cursor_col = e.lines[17].chars().count();
+        e.insert_newline();
+        for c in "w = 4".chars() {
+            e.insert_char(c);
+        }
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![3, 9]);
+        assert!(
+            e.is_line_hidden(4) && e.is_line_hidden(10),
+            "bodies stay hidden"
+        );
+    }
+
+    #[test]
+    fn a_new_line_above_the_folds_moves_them_down() {
+        let (_dir, mut e) = folded_alpha_and_beta();
+        e.cursor_row = 0;
+        e.cursor_col = e.lines[0].chars().count();
+        e.insert_newline();
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![4, 10]);
+        assert_eq!(e.lines[4], "def alpha():");
+        assert!(e.is_line_hidden(5) && !e.is_line_hidden(4));
+    }
+
+    #[test]
+    fn a_line_deleted_between_the_folds_moves_only_the_lower_one() {
+        let (_dir, mut e) = folded_alpha_and_beta();
+        // The blank line 8 (row 7): backspace from the start of row 8.
+        e.cursor_row = 8;
+        e.cursor_col = 0;
+        e.backspace();
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![3, 8]);
+        assert_eq!(e.lines[8], "def beta():");
+    }
+
+    #[test]
+    fn undo_and_paste_keep_the_folds_too() {
+        let (_dir, mut e) = folded_alpha_and_beta();
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        e.insert_str("# one\n# two\n");
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![5, 11]);
+        assert!(e.undo());
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![3, 9]);
+    }
+
+    /// Negative: deleting a folded header's own line drops that fold only.
+    #[test]
+    fn deleting_a_folded_header_line_drops_only_that_fold() {
+        let (_dir, mut e) = folded_alpha_and_beta();
+        e.unfold_all();
+        e.toggle_fold(3);
+        e.toggle_fold(13);
+        // Delete the whole `def beta():` line (row 9) and its body.
+        e.selection = Some(EditorSelection {
+            anchor: (9, 0),
+            head: (11, 0),
+        });
+        e.cursor_row = 11;
+        e.cursor_col = 0;
+        e.delete_selection();
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![3, 11], "gamma moved up by two");
+        assert_eq!(e.lines[11], "def gamma():");
+    }
+
+    /// Negative: an edit inside a folded body still opens that fold (the
+    /// caret goes where the user is typing), and only that one.
+    #[test]
+    fn an_edit_inside_a_folded_body_opens_only_that_fold() {
+        let (_dir, mut e) = folded_alpha_and_beta();
+        e.cursor_row = 5;
+        e.cursor_col = 9;
+        e.insert_newline();
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![10]);
     }
 
     // ---- Sort Lines ----
