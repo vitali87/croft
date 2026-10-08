@@ -14401,6 +14401,24 @@ fn committing_mid_rebase_continues_the_rebase() {
     assert_eq!(git_stdout(p, &["symbolic-ref", "--short", "HEAD"]), "feat");
 }
 
+/// #1356: Commit & Push mid-rebase continues the rebase before pushing,
+/// so the push is never made from the rebase's detached HEAD.
+#[test]
+fn commit_and_push_mid_rebase_continues_the_rebase_first() {
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    assert!(git_succeeds(p, &["checkout", "-q", "feat"]));
+    assert!(!git_succeeds(p, &["rebase", "main"]));
+    std::fs::write(p.join("f"), "resolved\n").unwrap();
+    assert!(git_succeeds(p, &["add", "f"]));
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.source_control.message = String::from("feat");
+    app.commit_and_push_source_control();
+    wait_for_git_net(&mut app);
+    assert_eq!(crate::git::repo_operation(p), None, "{}", app.status);
+    assert_eq!(git_stdout(p, &["symbolic-ref", "--short", "HEAD"]), "feat");
+}
+
 /// #1356: Skip drops the conflicting commit and finishes the rebase.
 #[test]
 fn skip_drops_the_conflicting_rebase_commit() {

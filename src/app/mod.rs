@@ -33010,13 +33010,15 @@ impl App {
     /// After a commit made from Source Control mid-rebase (#1356, the #989
     /// path): carry on with the rebase, as VS Code's Commit button does
     /// there, instead of leaving HEAD detached with the rest unapplied.
-    fn continue_rebase_after_commit(&mut self) {
+    fn continue_rebase_after_commit(&mut self) -> bool {
         let root = self.scm_root();
         let Some(op @ crate::git::RepoOp::Rebase { .. }) = crate::git::repo_operation(&root) else {
-            return;
+            return true;
         };
         let r = crate::git::continue_operation(&root, op);
+        let continued = r.is_ok();
         self.report_git_operation_step(op, r, "Committed and continued");
+        continued
     }
 
     /// Run an immediate git operation: log it, surface its summary or error
@@ -33291,6 +33293,10 @@ impl App {
                     app.source_control.commit_feedback = Some(err.clone());
                     app.source_control.commit_feedback_is_error = true;
                     app.status = format!("Commit failed: {err}");
+                    return;
+                }
+                // Mid-rebase, sync only once the rebase is back on its branch.
+                if !app.continue_rebase_after_commit() {
                     return;
                 }
                 app.sync_source_control();
@@ -36986,6 +36992,11 @@ impl App {
                         return;
                     }
                 };
+                // Mid-rebase, push only once the rebase is back on its
+                // branch, never from the detached HEAD it works on.
+                if !app.continue_rebase_after_commit() {
+                    return;
+                }
                 let root = app.scm_root();
                 app.spawn_git_net("push", move || {
                     let r = crate::git::push_or_publish(&root);
