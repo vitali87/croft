@@ -853,10 +853,10 @@ fn replace_in_line(
                             .filter(|c| c.get(0).is_some_and(|m| m.range() == (0..end - start)))
                     })
             });
-            match caps {
-                Some(caps) if opts.use_regex => {
+            match caps.zip(full) {
+                Some((caps, re)) if opts.use_regex => {
                     let mut expanded = String::new();
-                    caps.expand(&brace_group_refs(replacement), &mut expanded);
+                    caps.expand(&brace_group_refs(replacement, re), &mut expanded);
                     out.push_str(&expanded);
                 }
                 _ => out.push_str(replacement),
@@ -909,34 +909,54 @@ fn trim_leading_context(lead: &str, avail: usize, need: usize) -> Option<String>
     Some(lead[start..].to_string())
 }
 
-/// `replacement` with each numbered capture reference braced (`$1_old` to
-/// `${1}_old`). The regex crate reads `$1_old` as a group NAMED `1_old`,
-/// which expands to nothing and deletes the match; VS Code reads group 1
-/// then `_old`. `$$` stays a literal dollar.
-pub fn brace_group_refs(replacement: &str) -> String {
+/// `replacement` made safe for `Captures::expand` against `re`, read the way
+/// VS Code reads it. A numbered reference is braced (`$1_old` to
+/// `${1}_old`): the regex crate reads `$1_old` as a group NAMED `1_old`,
+/// which expands to nothing and deletes the match, where VS Code reads group
+/// 1 then `_old`. `$&` is the whole match and `$$` a literal dollar. A
+/// `$NAME` or `${NAME}` expands only when `re` has a group of that name;
+/// any other `$` is text (#1399), so a shell, PHP or Perl variable such as
+/// `$PREFIX` survives instead of expanding to nothing.
+pub fn brace_group_refs(replacement: &str, re: &regex::Regex) -> String {
+    let is_group = |name: &str| re.capture_names().flatten().any(|n| n == name);
+    let is_name = |c: &char| c.is_ascii_alphanumeric() || *c == '_';
     let mut out = String::with_capacity(replacement.len());
-    let mut chars = replacement.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '$' {
-            out.push(c);
-            continue;
-        }
-        if chars.peek() == Some(&'$') {
-            chars.next();
-            out.push_str("$$");
-            continue;
-        }
-        let mut digits = String::new();
-        while let Some(&d) = chars.peek().filter(|d| d.is_ascii_digit()) {
-            digits.push(d);
-            chars.next();
-        }
-        if digits.is_empty() {
-            out.push('$');
+    let mut rest = replacement;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        let digits = after.len() - after.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        let name_len = after
+            .chars()
+            .take_while(is_name)
+            .map(char::len_utf8)
+            .sum::<usize>();
+        let braced = after
+            .strip_prefix('{')
+            .and_then(|b| b.find('}').map(|end| &b[..end]));
+        let (expansion, used) = if after.starts_with('$') {
+            (String::from("$$"), 1)
+        } else if after.starts_with('&') {
+            (String::from("${0}"), 1)
+        } else if digits > 0 {
+            (format!("${{{}}}", &after[..digits]), digits)
+        } else if let Some(name) = braced {
+            let group =
+                name.chars().all(|c| c.is_ascii_digit()) && !name.is_empty() || is_group(name);
+            if group {
+                (format!("${{{name}}}"), name.len() + 2)
+            } else {
+                (String::from("$$"), 0)
+            }
+        } else if name_len > 0 && is_group(&after[..name_len]) {
+            (format!("${{{}}}", &after[..name_len]), name_len)
         } else {
-            out.push_str(&format!("${{{digits}}}"));
-        }
+            (String::from("$$"), 0)
+        };
+        out.push_str(&expansion);
+        rest = &after[used..];
     }
+    out.push_str(rest);
     out
 }
 
@@ -994,7 +1014,7 @@ pub fn expand_replacement(
         return replacement.to_string();
     };
     if opts.use_regex {
-        re.replace(matched, brace_group_refs(replacement).as_str())
+        re.replace(matched, brace_group_refs(replacement, &re).as_str())
             .into_owned()
     } else {
         replacement.to_string()
@@ -4465,6 +4485,46 @@ mod tests {
         let (out, n) = replace_in_text("a1 b2 c3", r"([a-z])(\d)", "$2$1", opts).unwrap();
         assert_eq!(n, 3);
         assert_eq!(out, "1a 2b 3c");
+    }
+
+    /// #1399: a `$NAME` that is no group of the pattern is text, as in VS
+    /// Code: a shell, PHP or Perl variable in the replacement survives.
+    #[test]
+    fn a_dollar_name_that_is_no_group_stays_literal() {
+        let opts = SearchOpts {
+            use_regex: true,
+            ..Default::default()
+        };
+        let replace =
+            |text: &str, find: &str, with: &str| replace_in_text(text, find, with, opts).unwrap().0;
+        assert_eq!(
+            replace("cp a /opt/app\n", r"/opt/(\S+)", "$PREFIX/$1"),
+            "cp a $PREFIX/app\n"
+        );
+        assert_eq!(replace("x", "x", "${HOME}/x"), "${HOME}/x");
+        assert_eq!(replace("x", "x", "cost $"), "cost $");
+        assert_eq!(replace("x", "x", "$_ and $@"), "$_ and $@");
+        // VS Code's `$&` is the whole match.
+        assert_eq!(replace("abc", "b", "[$&]"), "a[b]c");
+        // The preview row shows the same text Replace All writes.
+        assert_eq!(
+            expand_replacement("/opt/app", r"/opt/(\S+)", "$PREFIX/$1", opts),
+            "$PREFIX/app"
+        );
+    }
+
+    /// #1399 negative: real references keep their meaning.
+    #[test]
+    fn real_capture_references_still_expand() {
+        let opts = SearchOpts {
+            use_regex: true,
+            ..Default::default()
+        };
+        let replace =
+            |text: &str, find: &str, with: &str| replace_in_text(text, find, with, opts).unwrap().0;
+        assert_eq!(replace("ab", "(a)(b)", "$2$1 $0 ${1} $$"), "ba ab a $");
+        assert_eq!(replace("foo", "(foo)", "$1_old"), "foo_old");
+        assert_eq!(replace("cat", r"(?P<HOME>\w+)", "${HOME}/$HOME"), "cat/cat");
     }
 
     #[test]
