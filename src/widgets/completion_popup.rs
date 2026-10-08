@@ -215,13 +215,17 @@ impl Widget for &CompletionPopup {
 /// is skipped. The typed word never holds that punctuation: vtsls's member
 /// of a possibly-undefined object filters on `.?.name` (its edit turns the
 /// `.` into `?.`), a quoted key on `.content-type`, and matching those on
-/// the bare word hid every one of them (#1472).
+/// the bare word hid every one of them (#1472). Only an item with its own
+/// edit gets the skip: that edit is what accounts for the punctuation. A
+/// user snippet has none, so `!html` still needs its `!` typed, as
+/// `Snippets::matching` requires.
 fn matches_typed(item: &CompletionItem, needle: &str) -> bool {
     let haystack = filter_haystack(item).to_ascii_lowercase();
     haystack.starts_with(needle)
-        || haystack
-            .trim_start_matches(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .starts_with(needle)
+        || (item.text_edit.is_some()
+            && haystack
+                .trim_start_matches(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .starts_with(needle))
 }
 
 fn filter_haystack(item: &CompletionItem) -> &str {
@@ -383,8 +387,29 @@ mod tests {
         CompletionItem {
             label: label.to_string(),
             filter_text: Some(filter.to_string()),
+            text_edit: Some(crate::widgets::editor::TextSpanEdit {
+                start: (0, 0),
+                end: (0, 1),
+                new_text: label.to_string(),
+                utf16: true,
+            }),
             ..Default::default()
         }
+    }
+
+    /// Negative: an item without its own edit, like a user snippet `!html`,
+    /// keeps exact filtering, so `h` does not show it.
+    #[test]
+    fn punctuation_is_not_skipped_for_an_item_without_an_edit() {
+        let snippet = CompletionItem {
+            label: "!html".to_string(),
+            filter_text: Some("!html".to_string()),
+            is_snippet: true,
+            ..Default::default()
+        };
+        let p = popup(vec![snippet], "h");
+        assert!(p.visible_is_empty());
+        assert!(p.visible_indices().is_empty());
     }
 
     #[test]
