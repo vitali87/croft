@@ -708,13 +708,13 @@ enum Cmd {
     RequestSemanticTokensRange {
         path: PathBuf,
         start_line: u32,
-        end_line: u32,
+        end: Position,
         seq: u64,
         generation: u64,
     },
     RequestInlayHints {
         path: PathBuf,
-        line_count: u32,
+        end: Position,
         seq: u64,
     },
     RequestDocumentLinks {
@@ -1006,6 +1006,28 @@ impl Drop for LspManager {
     }
 }
 
+/// Where a document ends, as an LSP position: the last line's index and its
+/// length in UTF-16 units. A text ending in `\n` ends at the start of the
+/// empty line after it. This is the end of a whole-document request range;
+/// strict servers such as rust-analyzer reject any later end (#1490).
+pub fn document_end(text: &str) -> Position {
+    let line = text.matches('\n').count() as u32;
+    let last = text.rsplit('\n').next().unwrap_or("");
+    Position::new(line, last.encode_utf16().count() as u32)
+}
+
+/// The end of a range over a document's rows up to `end_row` (exclusive):
+/// the start of that row, or the document's end when the range reaches it,
+/// since a row past the last one is out of range (#1490).
+pub fn rows_end(text: &str, end_row: u32) -> Position {
+    let end = document_end(text);
+    if end_row <= end.line {
+        Position::new(end_row, 0)
+    } else {
+        end
+    }
+}
+
 impl LspManager {
     pub fn new(workspace_root: PathBuf) -> Result<Self> {
         let runtime = LspRuntime::new()?;
@@ -1269,21 +1291,22 @@ impl LspManager {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Ask the server for semantic tokens covering only `start_line..end_line`
-    /// (zero-based, half-open). Fire this on open with the editor's viewport so
-    /// the visible code colours immediately, ahead of the whole-file request.
+    /// Ask the server for semantic tokens covering only `start_line` up to
+    /// `end` (zero-based, end exclusive; see [`rows_end`]). Fire this on open
+    /// with the editor's viewport so the visible code colours immediately,
+    /// ahead of the whole-file request.
     pub fn request_semantic_tokens_range(
         &self,
         path: PathBuf,
         start_line: u32,
-        end_line: u32,
+        end: Position,
         seq: u64,
     ) {
         let generation = self.next_semantic_generation();
         let _ = self.cmd_tx.send(Cmd::RequestSemanticTokensRange {
             path,
             start_line,
-            end_line,
+            end,
             seq,
             generation,
         });
@@ -1297,12 +1320,9 @@ impl LspManager {
     /// like the semantic-token requests; the reply lands in
     /// [`drain_inlay_hints`] tagged with `seq` so the app can drop a stale
     /// batch. A no-op when no spawned server advertises an `inlayHintProvider`.
-    pub fn request_inlay_hints(&self, path: PathBuf, line_count: u32, seq: u64) {
-        let _ = self.cmd_tx.send(Cmd::RequestInlayHints {
-            path,
-            line_count,
-            seq,
-        });
+    /// `end` is where the document ends ([`document_end`]).
+    pub fn request_inlay_hints(&self, path: PathBuf, end: Position, seq: u64) {
+        let _ = self.cmd_tx.send(Cmd::RequestInlayHints { path, end, seq });
     }
 
     pub fn drain_inlay_hints(&self) -> Option<InlayHintsUpdate> {
@@ -2329,7 +2349,7 @@ async fn worker_loop(
             Cmd::RequestSemanticTokensRange {
                 path,
                 start_line,
-                end_line,
+                end,
                 seq,
                 generation,
             } => {
@@ -2337,20 +2357,16 @@ async fn worker_loop(
                     .request_semantic_tokens_range(
                         path,
                         start_line,
-                        end_line,
+                        end,
                         seq,
                         generation,
                         &tx.semantic_tokens,
                     )
                     .await
             }
-            Cmd::RequestInlayHints {
-                path,
-                line_count,
-                seq,
-            } => {
+            Cmd::RequestInlayHints { path, end, seq } => {
                 state
-                    .request_inlay_hints(path, line_count, seq, &tx.inlay_hints)
+                    .request_inlay_hints(path, end, seq, &tx.inlay_hints)
                     .await
             }
             Cmd::RequestCodeLens { path, seq } => {
@@ -3644,7 +3660,7 @@ impl WorkerState {
     async fn request_inlay_hints(
         &mut self,
         path: PathBuf,
-        line_count: u32,
+        end: Position,
         seq: u64,
         tx: &std_mpsc::Sender<InlayHintsUpdate>,
     ) {
@@ -3670,7 +3686,7 @@ impl WorkerState {
         let tx = tx.clone();
         tokio::spawn(async move {
             let mut client = client_arc.lock().await.requests();
-            let resp = client.inlay_hints(uri, line_count).await;
+            let resp = client.inlay_hints(uri, end).await;
             drop(client);
             let hints = match resp {
                 Ok(Some(hints)) => hints.into_iter().map(normalise_inlay_hint).collect(),
@@ -4038,7 +4054,7 @@ impl WorkerState {
         &mut self,
         path: PathBuf,
         start_line: u32,
-        end_line: u32,
+        end: Position,
         seq: u64,
         generation: u64,
         tx: &std_mpsc::Sender<SemanticTokensUpdate>,
@@ -4073,9 +4089,7 @@ impl WorkerState {
         let path_clone = path.clone();
         tokio::spawn(async move {
             let mut client = client_arc.lock().await.requests();
-            let resp = client
-                .semantic_tokens_range(uri, start_line, end_line)
-                .await;
+            let resp = client.semantic_tokens_range(uri, start_line, end).await;
             drop(client);
             let data: Vec<u32> = match resp {
                 Ok(Some(SemanticTokensRangeResult::Tokens(t))) => flatten_semantic_tokens(&t.data),
@@ -4089,8 +4103,9 @@ impl WorkerState {
                 }
             };
             log_file::log(&format!(
-                "semantic_tokens range response server={server_name} path={} lines={start_line}..{end_line} tokens={}",
+                "semantic_tokens range response server={server_name} path={} lines={start_line}..{} tokens={}",
                 path_clone.display(),
+                end.line,
                 data.len() / 5
             ));
             let _ = tx.send(SemanticTokensUpdate {
@@ -9535,7 +9550,7 @@ while True:
         let manager = LspManager::new(root).expect("manager");
         manager.open_doc(file.clone(), text.clone());
         std::thread::sleep(Duration::from_millis(2500));
-        manager.request_semantic_tokens_range(file.clone(), 0, 2, 0);
+        manager.request_semantic_tokens_range(file.clone(), 0, rows_end(&text, 2), 0);
 
         let update = drain_semantic_blocking(&manager, Duration::from_secs(30))
             .expect("range semantic tokens arrived");
@@ -10713,6 +10728,180 @@ while True:
         break
 "#;
 
+    /// A server as strict as rust-analyzer about positions (#1490): it
+    /// remembers each opened document and answers an inlay-hint request whose
+    /// range ends past the document with `-32603 Invalid offset`.
+    const FAKE_LSP_STRICT_INLAY: &str = r#"
+import json, sys
+
+def read_msg():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    if length is None:
+        return None
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(msg):
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+docs = {}
+while True:
+    msg = read_msg()
+    if msg is None:
+        break
+    method = msg.get("method", "")
+    params = msg.get("params") or {}
+    if method == "textDocument/didOpen":
+        doc = params["textDocument"]
+        docs[doc["uri"]] = doc["text"]
+    if "id" in msg:
+        if method == "initialize":
+            send({"jsonrpc": "2.0", "id": msg["id"],
+                  "result": {"capabilities": {"inlayHintProvider": True}}})
+        elif method == "textDocument/inlayHint":
+            lines = docs.get(params["textDocument"]["uri"], "").split("\n")
+            end = params["range"]["end"]
+            line, col = end["line"], end["character"]
+            in_range = line < len(lines) and col <= len(lines[line].encode("utf-16-le")) // 2
+            if in_range:
+                send({"jsonrpc": "2.0", "id": msg["id"], "result": [
+                    {"position": {"line": 1, "character": 9}, "label": ": u32"},
+                ]})
+            else:
+                send({"jsonrpc": "2.0", "id": msg["id"], "error": {
+                    "code": -32603,
+                    "message": "Invalid offset LineCol { line: %d, col: %d }" % (line, col)}})
+        else:
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+    if method == "exit":
+        break
+"#;
+
+    /// Opens `text` on the strict server and asks for inlay hints ending at
+    /// `end`; returns the hints that reach the drain channel.
+    fn strict_inlay_hints(text: &str, end: Position) -> Vec<InlayHintItem> {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let file = root.join("main.py");
+        std::fs::write(&file, text).expect("write demo");
+        let script = root.join("fake_strict_lsp.py");
+        std::fs::write(&script, FAKE_LSP_STRICT_INLAY).expect("write fake server");
+        let mut registry = ServerRegistry::new();
+        registry.register(
+            Language::PYTHON,
+            ServerConfig {
+                name: "fake-strict",
+                command: "python3".into(),
+                args: vec![script.display().to_string()],
+                language: Language::PYTHON,
+                initialization_options: None,
+                provision: None,
+            },
+        );
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut state = WorkerState {
+            workspace_root: root.clone(),
+            extra_roots: Vec::new(),
+            registry,
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+            restarts: ServerRestarts::default(),
+        };
+        let (tx, rx) = std_mpsc::channel();
+        let runtime = LspRuntime::new().expect("runtime");
+        runtime.handle().clone().block_on(async {
+            state.open_doc(file.clone(), text.to_string()).await;
+            state.request_inlay_hints(file.clone(), end, 7, &tx).await;
+        });
+        let update = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("an inlay-hint reply must reach the drain channel");
+        runtime.handle().clone().block_on(state.shutdown_all());
+        update.hints
+    }
+
+    #[test]
+    fn a_strict_server_answers_inlay_hints_for_the_whole_document() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let text = "def main():\n    v = 40 + 2\n    print(v)\n";
+        let hints = strict_inlay_hints(text, document_end(text));
+        assert_eq!(
+            hints,
+            vec![InlayHintItem {
+                line: 1,
+                character: 9,
+                label: String::from(": u32"),
+            }],
+            "a range ending at the document's end must not be rejected"
+        );
+    }
+
+    #[test]
+    fn a_strict_server_answers_inlay_hints_without_a_final_newline() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let text = "def main():\n    v = 40 + 2\n    print(v)";
+        assert_eq!(strict_inlay_hints(text, document_end(text)).len(), 1);
+    }
+
+    /// Negative: the fake server really is strict, so the tests above would
+    /// catch a range one line past the end (what croft used to send).
+    #[test]
+    fn a_strict_server_rejects_a_range_one_line_past_the_end() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let text = "def main():\n    v = 40 + 2\n    print(v)\n";
+        let end = document_end(text);
+        assert!(strict_inlay_hints(text, Position::new(end.line + 1, 0)).is_empty());
+    }
+
+    #[test]
+    fn document_end_is_the_last_line_and_its_utf16_length() {
+        assert_eq!(document_end(""), Position::new(0, 0));
+        assert_eq!(document_end("x = 1\n"), Position::new(1, 0));
+        assert_eq!(document_end("a\nbc"), Position::new(1, 2));
+        assert_eq!(document_end("a\n\n"), Position::new(2, 0));
+        // UTF-16 units, not bytes or chars: `é` is one, `😀` is two.
+        assert_eq!(document_end("x\né😀"), Position::new(1, 3));
+    }
+
+    #[test]
+    fn rows_end_stops_at_the_document_end() {
+        let text = "a\nb\nc\n";
+        // Within the document: the start of the row after the range.
+        assert_eq!(rows_end(text, 0), Position::new(0, 0));
+        assert_eq!(rows_end(text, 2), Position::new(2, 0));
+        assert_eq!(rows_end(text, 3), Position::new(3, 0));
+        // A viewport taller than the file ends where the file does.
+        assert_eq!(rows_end(text, 19), Position::new(3, 0));
+        assert_eq!(rows_end("a\nbc", 19), Position::new(1, 2));
+    }
+
     /// The full worker wire path: capability gate, `textDocument/inlayHint`
     /// request, label normalisation, and the seq-tagged reply on the drain
     /// channel.
@@ -10764,7 +10953,9 @@ while True:
             state
                 .open_doc(file.clone(), String::from("x = f(1)\n"))
                 .await;
-            state.request_inlay_hints(file.clone(), 2, 42, &tx).await;
+            state
+                .request_inlay_hints(file.clone(), document_end("x = f(1)\n"), 42, &tx)
+                .await;
         });
 
         let update = rx

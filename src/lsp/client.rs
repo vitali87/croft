@@ -1103,7 +1103,7 @@ impl LspRequests {
     pub async fn inlay_hints(
         &mut self,
         uri: Url,
-        line_count: u32,
+        end: Position,
     ) -> Result<Option<Vec<lsp_types::InlayHint>>> {
         self.server
             .inlay_hint(lsp_types::InlayHintParams {
@@ -1113,10 +1113,7 @@ impl LspRequests {
                         line: 0,
                         character: 0,
                     },
-                    end: Position {
-                        line: line_count,
-                        character: 0,
-                    },
+                    end,
                 },
                 work_done_progress_params: WorkDoneProgressParams::default(),
             })
@@ -1421,7 +1418,7 @@ impl LspRequests {
         &mut self,
         uri: Url,
         start: u32,
-        end: u32,
+        end: Position,
     ) -> Result<Option<SemanticTokensRangeResult>> {
         self.server
             .semantic_tokens_range(SemanticTokensRangeParams {
@@ -1431,10 +1428,7 @@ impl LspRequests {
                         line: start,
                         character: 0,
                     },
-                    end: Position {
-                        line: end,
-                        character: 0,
-                    },
+                    end,
                 },
                 work_done_progress_params: WorkDoneProgressParams::default(),
                 partial_result_params: PartialResultParams::default(),

@@ -1,0 +1,1 @@
+fix: Rust files now show inlay hints: croft asked rust-analyzer for hints up to a line past the end of the file, which it rejects, and the first-paint semantic colour request for a short file did the same.
