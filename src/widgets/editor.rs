@@ -10665,47 +10665,68 @@ impl Editor {
             return;
         }
         self.push_undo(EditKind::TransformCase);
-        // From the bottom up, so an edit never moves a range still to come.
-        let mut order: Vec<usize> = (0..sels.len()).collect();
-        order.sort_by_key(|&i| std::cmp::Reverse(ranges[i].map_or(sels[i].head, |r| r.0)));
-        // Where the last rewritten range began: one that reaches past it
-        // (a second caret in the same word) was rewritten already.
-        let mut rewritten_from: Option<(usize, usize)> = None;
+        // Overlapping ranges (two carets in one word, nested selections)
+        // merge into one span, so each character is rewritten exactly once.
+        let mut by_start: Vec<usize> = (0..sels.len()).filter(|&i| ranges[i].is_some()).collect();
+        by_start.sort_by_key(|&i| ranges[i].map(|r| r.0));
+        let mut spans: Vec<(BPos, BPos, Vec<usize>)> = Vec::new();
+        for i in by_start {
+            let Some((start, end)) = ranges[i] else {
+                continue;
+            };
+            match spans.last_mut() {
+                Some(span) if start < span.1 || start == span.0 => {
+                    span.1 = span.1.max(end);
+                    span.2.push(i);
+                }
+                _ => spans.push((start, end, vec![i])),
+            }
+        }
+        // From the bottom up, so an edit never moves a span still to come.
+        // A caret with no word is a span with nothing to rewrite.
+        for i in 0..sels.len() {
+            if ranges[i].is_none() {
+                spans.push((sels[i].head, sels[i].head, vec![i]));
+            }
+        }
+        spans.sort_by_key(|span| std::cmp::Reverse(span.0));
         let mut pinned = vec![((0, 0), (0, 0)); sels.len()];
-        for i in order {
-            let sel = sels[i];
-            let mut after = sel;
-            if let Some((start, end)) = ranges[i]
-                && rewritten_from.is_none_or(|from| end <= from)
-            {
-                let text = self.char_range_text(start, end);
-                let new = match kind {
-                    CaseTransform::Upper => text.to_uppercase(),
-                    CaseTransform::Lower => text.to_lowercase(),
-                    CaseTransform::Title => title_case(&text),
-                };
+        for (start, end, members) in spans {
+            let text = self.char_range_text(start, end);
+            // Each endpoint as a char offset into the span, so it lands on
+            // the same character once the span is rewritten.
+            let offset = |e: &Self, pos: BPos| {
+                e.char_range_text(start, pos.max(start).min(end))
+                    .chars()
+                    .count()
+            };
+            let offsets: Vec<(usize, usize)> = members
+                .iter()
+                .map(|&i| (offset(self, sels[i].anchor), offset(self, sels[i].head)))
+                .collect();
+            let new = match kind {
+                CaseTransform::Upper => text.to_uppercase(),
+                CaseTransform::Lower => text.to_lowercase(),
+                CaseTransform::Title => title_case(&text),
+            };
+            if !text.is_empty() {
                 self.replace_char_range(start, end, &new);
-                let new_end = text_end(start, &new);
-                after = if !sel.has_area() {
-                    let at = sel.head.min(new_end);
-                    EditorSelection::new(at.0, at.1)
-                } else if sel.anchor <= sel.head {
-                    EditorSelection {
-                        anchor: start,
-                        head: new_end,
-                    }
+            }
+            let at = |k: usize| text_end(start, &new.chars().take(k).collect::<String>());
+            for (&i, &(anchor, head)) in members.iter().zip(&offsets) {
+                let after = if text.is_empty() {
+                    sels[i]
                 } else {
                     EditorSelection {
-                        anchor: new_end,
-                        head: start,
+                        anchor: at(anchor),
+                        head: at(head),
                     }
                 };
-                rewritten_from = Some(start);
+                pinned[i] = (
+                    self.pin_from_end(after.anchor),
+                    self.pin_from_end(after.head),
+                );
             }
-            pinned[i] = (
-                self.pin_from_end(after.anchor),
-                self.pin_from_end(after.head),
-            );
         }
         let all: Vec<EditorSelection> = pinned
             .iter()
@@ -29057,6 +29078,39 @@ mod tests {
         e.transform_selection_case(CaseTransform::Title);
         assert_eq!(e.lines, vec!["Foo bar Foo"]);
         assert_eq!(selected_texts(&e), vec!["Foo", "Foo"]);
+    }
+
+    #[test]
+    fn transform_case_rewrites_all_of_nested_selections() {
+        let mut e = editor_with("hello world");
+        e.selection = Some(EditorSelection {
+            anchor: (0, 2),
+            head: (0, 3),
+        });
+        e.carets = vec![EditorSelection {
+            anchor: (0, 0),
+            head: (0, 5),
+        }];
+        e.transform_selection_case(CaseTransform::Upper);
+        assert_eq!(e.lines, vec!["HELLO world"]);
+        assert_eq!(selected_texts(&e), vec!["HELLO", "L"]);
+    }
+
+    #[test]
+    fn transform_case_rewrites_all_of_partly_overlapping_selections() {
+        let mut e = editor_with("hello world");
+        e.selection = Some(EditorSelection {
+            anchor: (0, 8),
+            head: (0, 3),
+        });
+        e.carets = vec![EditorSelection {
+            anchor: (0, 0),
+            head: (0, 5),
+        }];
+        e.transform_selection_case(CaseTransform::Upper);
+        assert_eq!(e.lines, vec!["HELLO WOrld"]);
+        assert_eq!(selected_texts(&e), vec!["HELLO", "LO WO"]);
+        assert_eq!(e.selection.unwrap().head, (0, 3), "direction is kept");
     }
 
     #[test]
