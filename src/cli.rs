@@ -398,7 +398,8 @@ pub enum CliCommand {
         #[arg(long, default_value_t = false)]
         wait: bool,
         /// Running as git's sequence editor: defer to `sequence.editor`
-        /// when the repository's git config names one.
+        /// when the repository's git config names one, and to git's own
+        /// editor when no croft is there to open the plan.
         #[arg(long, default_value_t = false, hide = true)]
         sequence_editor: bool,
     },
@@ -791,20 +792,30 @@ impl Cli {
                 sequence_editor,
             }) => {
                 if sequence_editor && let Some(configured) = configured_sequence_editor() {
-                    // Exactly how git itself runs an editor value.
-                    let status = std::process::Command::new("sh")
-                        .arg("-c")
-                        .arg(format!("{configured} \"$@\""))
-                        .arg(configured.as_str())
-                        .arg(&path)
-                        .status();
-                    std::process::exit(status.ok().and_then(|s| s.code()).unwrap_or(1));
+                    std::process::exit(run_git_editor(&configured, &path));
                 }
-                if let Err(e) = crate::view_ipc::edit(&path, wait, &crate::app::croft_cache_dir()) {
-                    eprintln!("{e}");
-                    std::process::exit(1);
+                match crate::view_ipc::edit(&path, wait, &crate::app::croft_cache_dir()) {
+                    Ok(()) => Ok(()),
+                    // A shell that outlived its croft (a tmux server started
+                    // from a pane) keeps GIT_SEQUENCE_EDITOR: git's rebase
+                    // then needs an editor, not croft (#1452). A plain
+                    // `croft edit` asked for croft, so it still fails.
+                    Err(e)
+                        if sequence_editor
+                            && e.downcast_ref::<crate::view_ipc::NoCroft>().is_some() =>
+                    {
+                        let Some(editor) = git_editor() else {
+                            eprintln!("{e}");
+                            std::process::exit(1);
+                        };
+                        eprintln!("croft is not running; using {editor}");
+                        std::process::exit(run_git_editor(&editor, &path));
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
                 }
-                Ok(())
             }
             Some(CliCommand::Hook { action }) => {
                 // Printed and exited, like `view`: a one-line reason, never
@@ -1059,6 +1070,33 @@ fn configured_sequence_editor() -> Option<String> {
         .ok()?;
     let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !value.is_empty()).then_some(value)
+}
+
+/// The editor git itself would run: `GIT_EDITOR`, `core.editor`, `VISUAL`,
+/// `EDITOR`, then git's built-in default, as `git var GIT_EDITOR` reports.
+/// `None` when git names none (a dumb terminal with no editor set): git
+/// fails there, so no editor is invented. git's own reason reaches stderr.
+fn git_editor() -> Option<String> {
+    std::process::Command::new("git")
+        .args(["var", "GIT_EDITOR"])
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|editor| !editor.is_empty())
+}
+
+/// Run the editor value `editor` on `path` exactly as git itself runs one,
+/// and return its exit code.
+fn run_git_editor(editor: &str, path: &std::ffi::OsStr) -> i32 {
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$@\""))
+        .arg(editor)
+        .arg(path)
+        .status();
+    status.ok().and_then(|s| s.code()).unwrap_or(1)
 }
 
 /// `croft open-link` (#359): check the link, then become the `croft remote`
