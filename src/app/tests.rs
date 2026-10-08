@@ -73825,6 +73825,20 @@ fn a_format_on_save_with_no_reply_writes_the_file_unformatted_after_a_bounded_wa
     );
 }
 
+/// #1491: a tab closed while its format-on-save waited is not written, so
+/// the timeout keeps "Save skipped" rather than claiming it saved the file.
+#[test]
+fn a_format_on_save_timeout_after_the_tab_closed_does_not_claim_a_save() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_waiting_on_format_on_save(tmp.path());
+    app.editor.close_tab(0);
+    let after = std::time::Instant::now() + FORMAT_ON_SAVE_TIMEOUT * 2;
+    assert!(app.drain_lsp_format_at(after));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "x = 1\n");
+    assert!(app.save_after_format.is_none());
+    assert_eq!(app.status, "Save skipped: the tab was closed");
+}
+
 /// #1491: pressing Ctrl+S again while the formatter is silent writes the
 /// file at once instead of changing nothing.
 #[test]

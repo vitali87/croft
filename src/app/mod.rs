@@ -13815,9 +13815,9 @@ impl App {
         self.format_request_seq = None;
         self.format_request_selection = false;
         self.complete_pending_save();
-        // A refused write (a disk conflict, a lossy encoding) keeps the
-        // prompt it put in the status bar.
-        if !self.path_is_dirty(&path) {
+        // A refused write (a disk conflict, a lossy encoding) or a skipped
+        // one (the tab was closed meanwhile) keeps the status it set.
+        if self.path_is_saved(&path) {
             self.status = format!(
                 "Saved {} without formatting: {reason}",
                 self.status_path(&path)
@@ -13825,12 +13825,16 @@ impl App {
         }
     }
 
-    /// Whether any open tab of `path`, in any split, has unsaved edits.
-    fn path_is_dirty(&self, path: &Path) -> bool {
-        std::iter::once(&self.editor)
+    /// Whether `path` is open in some tab, in any split, and none of its
+    /// tabs has unsaved edits. A closed file was not written, so it is not
+    /// saved either.
+    fn path_is_saved(&self, path: &Path) -> bool {
+        let mut tabs = std::iter::once(&self.editor)
             .chain(self.editor_layout.inactive_groups())
             .flat_map(|g| g.editors.iter())
-            .any(|e| e.dirty && e.path.as_deref() == Some(path))
+            .filter(|e| e.path.as_deref() == Some(path))
+            .peekable();
+        tabs.peek().is_some() && tabs.all(|e| !e.dirty)
     }
 
     /// Apply a formatter's reply to the request in flight, then finish a
