@@ -872,6 +872,13 @@ fn standard_captures(query: &str) -> String {
     out
 }
 
+/// A C or C++ char literal is a string, as VS Code colours it, not the
+/// `@number` tree-sitter-c gives it. Bracket-pair colorization skips only
+/// strings and comments, so as a number the `(` in `'('` counted as code and
+/// reddened every later closing brace (#1510). Last, because the last
+/// pattern to capture a node wins.
+const C_CHAR_OVERLAY_QUERY: &str = "(char_literal) @string";
+
 fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
     let mut cfg = match kind {
         LangKind::Rust => {
@@ -1091,19 +1098,25 @@ fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
         LangKind::C => HighlightConfiguration::new(
             tree_sitter_c::LANGUAGE.into(),
             "c",
-            tree_sitter_c::HIGHLIGHT_QUERY,
+            &format!("{}\n{C_CHAR_OVERLAY_QUERY}", tree_sitter_c::HIGHLIGHT_QUERY),
             "",
             "",
         )
         .ok()?,
-        LangKind::Cpp => HighlightConfiguration::new(
-            tree_sitter_cpp::LANGUAGE.into(),
-            "cpp",
-            tree_sitter_cpp::HIGHLIGHT_QUERY,
-            "",
-            "",
-        )
-        .ok()?,
+        LangKind::Cpp => {
+            // tree-sitter-cpp's highlights.scm only adds C++'s captures on
+            // top of C's: its tree-sitter.json lists C's query first, and
+            // tree-sitter-highlight does not follow that, so on its own it
+            // left comments, strings, `#include` and most keywords plain
+            // (#1510). Concatenated by hand, as for TypeScript over JS.
+            let combined = format!(
+                "{}\n{}\n{C_CHAR_OVERLAY_QUERY}",
+                tree_sitter_c::HIGHLIGHT_QUERY,
+                tree_sitter_cpp::HIGHLIGHT_QUERY,
+            );
+            HighlightConfiguration::new(tree_sitter_cpp::LANGUAGE.into(), "cpp", &combined, "", "")
+                .ok()?
+        }
         LangKind::Lua => {
             let highlights = format!(
                 "{}\n{}",
@@ -2497,6 +2510,62 @@ def f() -> Config:\n\
                 span.style.fg,
                 Some(ATTRIBUTE_COLOR),
                 "JSX attribute name '{name}' must render in the @attribute colour"
+            );
+        }
+    }
+
+    /// The issue's C++ sample (#1510): a comment, a preprocessor include,
+    /// keywords, a string and a char literal, each holding a bracket.
+    const CPP_SAMPLE: &str = "// greet the user (politely\n#include <string>\nint main() {\n    std::string s = \"smile :)\";\n    char c = '(';\n    return s.size() + c;\n}\n";
+
+    /// The style of the span over `needle` on whichever line holds it.
+    fn style_of(h: &[Vec<HiSpan>], src: &str, needle: &str) -> Option<Style> {
+        src.lines()
+            .zip(h)
+            .find(|(line, _)| line.contains(needle))
+            .and_then(|(line, spans)| span_at(spans, line, needle))
+            .map(|sp| sp.style)
+    }
+
+    #[test]
+    fn cpp_colours_comments_strings_preprocessor_and_keywords_like_c() {
+        let mut reg = LangRegistry::new();
+        let starts = compute_line_starts(CPP_SAMPLE.as_bytes());
+        let cpp = highlight_text(&mut reg, LangKind::Cpp, CPP_SAMPLE.as_bytes(), &starts);
+        let c = highlight_text(&mut reg, LangKind::C, CPP_SAMPLE.as_bytes(), &starts);
+        let plain = style_for_name("").fg;
+        for needle in ["// greet", "#include", "\"smile :)\"", "return", "int"] {
+            let got = style_of(&cpp, CPP_SAMPLE, needle).map(|s| s.fg);
+            assert!(
+                got.is_some() && got != Some(plain),
+                "C++ leaves {needle:?} in the plain colour"
+            );
+            assert_eq!(
+                got,
+                style_of(&c, CPP_SAMPLE, needle).map(|s| s.fg),
+                "C++ colours {needle:?} as C does"
+            );
+        }
+        // C++'s own captures still apply on top of C's.
+        assert!(style_of(&cpp, CPP_SAMPLE, "std").is_some(), "namespace");
+    }
+
+    #[test]
+    fn a_char_literal_is_a_string_in_c_and_cpp() {
+        let mut reg = LangRegistry::new();
+        let starts = compute_line_starts(CPP_SAMPLE.as_bytes());
+        for kind in [LangKind::C, LangKind::Cpp] {
+            let (h, protected) =
+                highlight_text_with_protected(&mut reg, kind, CPP_SAMPLE.as_bytes(), &starts);
+            assert_eq!(
+                style_of(&h, CPP_SAMPLE, "'('").map(|s| s.fg),
+                style_of(&h, CPP_SAMPLE, "\"smile :)\"").map(|s| s.fg),
+                "{kind:?}: a char literal takes the string colour"
+            );
+            let at = CPP_SAMPLE.find("'('").unwrap() + 1;
+            assert!(
+                protected.iter().any(|&(s, e)| s <= at && at < e),
+                "{kind:?}: the '(' in a char literal is not code"
             );
         }
     }
