@@ -57,10 +57,10 @@ def ready():
     emit({"ev": "ready", "kernel": name, "display": display})
 
 
-# msg_id of an execute request -> [cell id, execution_count, status]
+# msg_id of an execute request -> [cell id, execution_count, status]. Only
+# the kernel thread below touches it.
 cells = {}
-cells_lock = threading.Lock()
-stopping = threading.Event()
+requests = queue.Queue()
 
 
 def as_output(kind, c):
@@ -89,51 +89,89 @@ def as_output(kind, c):
     return None
 
 
-def pump_iopub():
-    while not stopping.is_set():
+def on_iopub(msg):
+    parent = msg.get("parent_header", {}).get("msg_id")
+    cell = cells.get(parent)
+    if cell is None:
+        return
+    kind = msg["msg_type"]
+    c = msg["content"]
+    if kind == "execute_input":
+        cell[1] = c.get("execution_count")
+    elif kind == "clear_output":
+        emit({"ev": "clear", "id": cell[0]})
+    elif kind == "status" and c.get("execution_state") == "idle":
+        cells.pop(parent, None)
+        emit({"ev": "done", "id": cell[0], "execution_count": cell[1], "status": cell[2]})
+    else:
+        out = as_output(kind, c)
+        if out is not None:
+            if kind == "error":
+                cell[2] = "error"
+            emit({"ev": "output", "id": cell[0], "output": out})
+
+
+def settle_lost_cells():
+    # The old kernel never answers what it was running or had queued, so no
+    # idle status will settle those cells: settle them here, as failed, or
+    # they show In [*] for good.
+    lost = list(cells.values())
+    cells.clear()
+    for cell in lost:
+        emit({"ev": "done", "id": cell[0], "execution_count": cell[1], "status": "error"})
+
+
+def handle(req):
+    op = req.get("op")
+    try:
+        if op == "execute":
+            msg_id = kc.execute(req.get("code", ""), store_history=True)
+            cells[msg_id] = [req.get("id", ""), None, "ok"]
+        elif op == "interrupt":
+            km.interrupt_kernel()
+        elif op == "restart":
+            try:
+                km.restart_kernel(now=False)
+                kc.wait_for_ready(timeout=60)
+            finally:
+                settle_lost_cells()
+            ready()
+    except Exception as e:  # noqa: BLE001 - keep serving after a failed op
+        emit({"ev": "error", "message": f"{op}: {e}"})
+
+
+def kernel_loop():
+    # The one thread that talks to the kernel (#1477). zmq sockets are not
+    # thread-safe, and `wait_for_ready` during a restart reads the shell and
+    # iopub channels itself: with a second thread polling them, it lost the
+    # reply or corrupted the frames, and the notebook hung at In [*].
+    while True:
         try:
-            msg = kc.get_iopub_msg(timeout=0.2)
+            req = requests.get_nowait()
         except queue.Empty:
-            continue
+            req = None
+        if req is not None:
+            if req.get("op") == "shutdown":
+                return
+            handle(req)
+        try:
+            on_iopub(kc.get_iopub_msg(timeout=0.05))
+        except queue.Empty:
+            pass
         except Exception:  # noqa: BLE001 - channel closed on shutdown
             return
-        parent = msg.get("parent_header", {}).get("msg_id")
-        with cells_lock:
-            cell = cells.get(parent)
-        if cell is None:
-            continue
-        kind = msg["msg_type"]
-        c = msg["content"]
-        if kind == "execute_input":
-            cell[1] = c.get("execution_count")
-        elif kind == "clear_output":
-            emit({"ev": "clear", "id": cell[0]})
-        elif kind == "status" and c.get("execution_state") == "idle":
-            with cells_lock:
-                cells.pop(parent, None)
-            emit({"ev": "done", "id": cell[0], "execution_count": cell[1], "status": cell[2]})
-        else:
-            out = as_output(kind, c)
-            if out is not None:
-                if kind == "error":
-                    cell[2] = "error"
-                emit({"ev": "output", "id": cell[0], "output": out})
-
-
-def drain_shell():
-    # Execute replies are not needed (iopub carries everything), but they
-    # must be read or they pile up for the kernel's lifetime.
-    while not stopping.is_set():
+        # Execute replies are not needed (iopub carries everything), but
+        # they must be read or they pile up for the kernel's lifetime.
         try:
-            kc.get_shell_msg(timeout=0.2)
+            kc.get_shell_msg(timeout=0)
         except queue.Empty:
-            continue
+            pass
         except Exception:  # noqa: BLE001
             return
 
 
-threading.Thread(target=pump_iopub, daemon=True).start()
-threading.Thread(target=drain_shell, daemon=True).start()
+worker = threading.Thread(target=kernel_loop, daemon=True)
+worker.start()
 ready()
 
 for line in sys.stdin:
@@ -141,32 +179,13 @@ for line in sys.stdin:
         req = json.loads(line)
     except ValueError:
         continue
-    op = req.get("op")
-    try:
-        if op == "execute":
-            with cells_lock:
-                msg_id = kc.execute(req.get("code", ""), store_history=True)
-                cells[msg_id] = [req.get("id", ""), None, "ok"]
-        elif op == "interrupt":
-            km.interrupt_kernel()
-        elif op == "restart":
-            km.restart_kernel(now=False)
-            kc.wait_for_ready(timeout=60)
-            # The old kernel never answers what it was running or had
-            # queued, so no idle status will settle those cells: settle
-            # them here, as failed, or they show In [*] for good.
-            with cells_lock:
-                lost = list(cells.values())
-                cells.clear()
-            for cell in lost:
-                emit({"ev": "done", "id": cell[0], "execution_count": cell[1], "status": "error"})
-            ready()
-        elif op == "shutdown":
-            break
-    except Exception as e:  # noqa: BLE001 - keep serving after a failed op
-        emit({"ev": "error", "message": f"{op}: {e}"})
+    requests.put(req)
+    if req.get("op") == "shutdown":
+        break
+else:
+    requests.put({"op": "shutdown"})
 
-stopping.set()
+worker.join(timeout=70)
 try:
     kc.stop_channels()
     km.shutdown_kernel(now=True)
