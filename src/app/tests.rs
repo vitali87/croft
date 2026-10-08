@@ -23548,6 +23548,63 @@ fn run_active_file_with_python_file_spawns_a_new_terminal_and_focuses_it() {
     assert!(!app.run_debug.feedback_is_error);
 }
 
+/// #1444: View Changes vs main on a branch behind a moved main shows the
+/// branch's own work and names the merge base it starts from.
+#[test]
+fn view_changes_vs_default_branch_starts_from_the_merge_base() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().canonicalize().unwrap();
+    let git = |args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&p)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "a@b"]);
+    git(&["config", "user.name", "a"]);
+    std::fs::write(p.join("app.py"), "def a():\n    return 1\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "init"]);
+    let base = git(&["rev-parse", "--short=7", "HEAD"]);
+    git(&["checkout", "-qb", "feature"]);
+    std::fs::write(p.join("feature.py"), "def feature():\n    return 2\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "add feature"]);
+    git(&["checkout", "-q", "main"]);
+    std::fs::write(p.join("teammate.py"), "def teammate():\n    return 3\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "teammate work"]);
+    git(&["checkout", "-q", "feature"]);
+    let mut app = App::new(p.clone()).unwrap();
+    app.view_default_branch_diff_source_control();
+    assert_eq!(app.status, "Showing changes since this branch left main");
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(std::path::Path::new(&format!(
+            "git diff {base} (merge base with main)"
+        )))
+    );
+    let diff = app.editor.diff.as_ref().expect("a diff tab opened");
+    let text = format!("{:?}", diff);
+    assert!(
+        text.contains("feature"),
+        "the branch's own file is in the view"
+    );
+    assert!(
+        !text.contains("teammate"),
+        "main's later work is not: {text}"
+    );
+}
+
 #[test]
 fn focus_flag_only_set_on_active_terminal() {
     let tmp = tempfile::tempdir().unwrap();
