@@ -126,7 +126,7 @@ means the same thing whichever path reads it.
 | `editor.autoClosingBrackets: "never"` | `disable_auto_close_pairs` |
 | `debug.saveBeforeStart: "none"` | `disable_save_before_debug` (every other value saves before a launch) |
 | `terminal.integrated.copyOnSelection` | `copy_on_select` |
-| `files.exclude` | `files_exclude` (the globs set to `true`; `false` entries and `when` clauses are left out) |
+| `files.exclude` | `files_exclude` (the globs set to `true`; `false` entries and `when` clauses are left out). VS Code reads a bare glob such as `build` from the workspace root, so it arrives anchored, as `/build`, and `scripts/build/` stays visible |
 | `search.exclude` | `search_exclude` (same) |
 
 Keys croft honours only as user config (a terminal scrollback, say) are
@@ -141,7 +141,9 @@ croft-native workspace file always wins over the VS Code one.
 `files_exclude` and `search_exclude` are lists of globs, matched against
 workspace-relative paths; a glob that matches a folder hides everything
 inside it, and a pattern with no `/` matches at any depth, as in the
-Search panel's exclude box.
+Search panel's exclude box. A leading `/` anchors a glob to the workspace
+root, as in `.gitignore`: `/build` hides the top-level `build/` only, and
+its `*` stays within one folder.
 
 ```json
 { "files_exclude": ["**/generated"], "search_exclude": ["**/tests/fixtures"] }

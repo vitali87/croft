@@ -139,12 +139,25 @@ fn as_scrollback(v: &Value) -> Option<Value> {
 /// set to `true`. A `false` entry switches a glob off, and a `when` clause
 /// hides a file only next to a sibling croft does not look for, so both are
 /// left out: a dropped entry shows a file, a misread one would hide it.
+///
+/// VS Code matches these globs against the workspace-relative path, so a
+/// bare `build` is the root's `build` only, where croft's own bare glob
+/// matches at any depth and hid `scripts/build/` too (#1479). Such a glob
+/// crosses anchored, as `/build`. A glob that already starts with `/`
+/// matches no workspace-relative path in VS Code, so it is left out rather
+/// than read as croft's root anchor, which would hide a file VS Code shows.
 fn as_enabled_globs(v: &Value) -> Option<Value> {
     let obj = v.as_object()?;
     Some(Value::from(
         obj.iter()
-            .filter(|(_, on)| on.as_bool() == Some(true))
-            .map(|(glob, _)| glob.clone())
+            .filter(|(glob, on)| on.as_bool() == Some(true) && !glob.starts_with('/'))
+            .map(|(glob, _)| {
+                if glob.contains('/') || glob.starts_with("**") {
+                    glob.clone()
+                } else {
+                    format!("/{glob}")
+                }
+            })
             .collect::<Vec<String>>(),
     ))
 }
@@ -1184,6 +1197,37 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(parsed.files_exclude, vec![String::from("**/generated")]);
+    }
+
+    /// #1479: VS Code matches an exclude glob against the workspace-relative
+    /// path, so a bare `build` is the root's `build` only. It crosses over
+    /// anchored (`/build`), where croft's own bare globs match at any depth;
+    /// a glob that already says where it applies crosses unchanged, and one
+    /// with its own leading `/` (which VS Code never matches) is left out.
+    #[test]
+    fn a_bare_vscode_exclude_glob_stays_anchored_to_the_root() {
+        let mut report = Report::default();
+        convert_settings(
+            &json!({
+                "files.exclude": {
+                    "build": true,
+                    "*.log": true,
+                    "**/node_modules": true,
+                    "src/gen": true,
+                    "/dist": true
+                },
+                "search.exclude": { "coverage": true }
+            }),
+            &mut report,
+        );
+        let mut files: Vec<String> =
+            serde_json::from_value(report.settings["files_exclude"].clone()).unwrap();
+        files.sort();
+        assert_eq!(
+            files,
+            vec!["**/node_modules", "/*.log", "/build", "src/gen"]
+        );
+        assert_eq!(report.settings["search_exclude"], json!(["/coverage"]));
     }
 
     /// #1345 negative: an exclude setting that is not an object maps to

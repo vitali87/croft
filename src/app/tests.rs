@@ -14654,6 +14654,69 @@ fn a_late_completion_reply_opens_only_while_the_caret_is_in_its_word() {
     assert!(app.completion_popup.is_none());
 }
 
+/// TypeScript on a possibly-undefined object: vtsls's member items replace
+/// the `.` with `?.`, so their filter text starts at the dot. Typing a
+/// letter filtered them on the bare word and hid every member (#1472).
+#[test]
+fn optional_members_survive_the_first_typed_letter() {
+    use crate::lsp::manager::CompletionResult;
+    use crate::widgets::editor::TextSpanEdit;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("opt.ts");
+    std::fs::write(&path, "user.n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 6;
+    app.completion_request_id = Some(1);
+    app.completion_origin = Some((0, 6));
+    draw(&mut app, 100, 30);
+    let member = |name: &str| crate::lsp::CompletionItem {
+        label: name.to_string(),
+        filter_text: Some(format!(".?.{name}")),
+        text_edit: Some(TextSpanEdit {
+            start: (0, 4),
+            end: (0, 6),
+            new_text: format!("?.{name}"),
+            utf16: true,
+        }),
+        ..Default::default()
+    };
+    assert!(app.apply_completion_result(CompletionResult {
+        request_id: 1,
+        path: path.clone(),
+        items: vec![member("email"), member("name")],
+    }));
+    let popup = app.completion_popup.as_ref().expect("the popup opens");
+    assert_eq!(
+        popup.selected_item().map(|i| i.label.as_str()),
+        Some("name"),
+        "status: {}",
+        app.status
+    );
+    // Typing on narrows it the same way, and Backspace widens it again.
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE))
+        .unwrap();
+    let popup = app
+        .completion_popup
+        .as_ref()
+        .expect("still open after `na`");
+    assert_eq!(popup.visible_indices().len(), 1);
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    let popup = app.completion_popup.as_ref().expect("still open after `.`");
+    assert_eq!(popup.visible_indices().len(), 2);
+    // Enter takes the server's edit: the `.` becomes `?.`.
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines, ["user?.name"]);
+}
+
 /// A buffer holding `import lo` with the caret at its end, and a sender that
 /// lands completion replies where a server's do, so a test can deliver one
 /// at the moment a slow server would: after the keys typed since the ask.
@@ -23604,6 +23667,63 @@ fn f5_with_nothing_unsaved_writes_nothing() {
     assert!(!app.status.contains("unsaved"), "{}", app.status);
 }
 
+/// #1444: View Changes vs main on a branch behind a moved main shows the
+/// branch's own work and names the merge base it starts from.
+#[test]
+fn view_changes_vs_default_branch_starts_from_the_merge_base() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().canonicalize().unwrap();
+    let git = |args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&p)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "a@b"]);
+    git(&["config", "user.name", "a"]);
+    std::fs::write(p.join("app.py"), "def a():\n    return 1\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "init"]);
+    let base = git(&["rev-parse", "--short=7", "HEAD"]);
+    git(&["checkout", "-qb", "feature"]);
+    std::fs::write(p.join("feature.py"), "def feature():\n    return 2\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "add feature"]);
+    git(&["checkout", "-q", "main"]);
+    std::fs::write(p.join("teammate.py"), "def teammate():\n    return 3\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "teammate work"]);
+    git(&["checkout", "-q", "feature"]);
+    let mut app = App::new(p.clone()).unwrap();
+    app.view_default_branch_diff_source_control();
+    assert_eq!(app.status, "Showing changes since this branch left main");
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(std::path::Path::new(&format!(
+            "git diff {base} (merge base with main)"
+        )))
+    );
+    let diff = app.editor.diff.as_ref().expect("a diff tab opened");
+    let text = format!("{:?}", diff);
+    assert!(
+        text.contains("feature"),
+        "the branch's own file is in the view"
+    );
+    assert!(
+        !text.contains("teammate"),
+        "main's later work is not: {text}"
+    );
+}
+
 #[test]
 fn focus_flag_only_set_on_active_terminal() {
     let tmp = tempfile::tempdir().unwrap();
@@ -25913,6 +26033,96 @@ fn quick_open_skips_excluded_files() {
             .any(|r| r.starts_with("generated/") || r.starts_with("tests/")),
         "{rels:?}"
     );
+}
+
+/// #1479: the issue's repo. `.vscode/settings.json` hides `build`, meaning
+/// the root's output folder; `scripts/build/release.py` is source.
+fn app_excluding_vscode_build() -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    for dir in [".vscode", "build", "scripts/build", "src"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    std::fs::write(
+        root.join(".vscode/settings.json"),
+        r#"{ "files.exclude": { "build": true } }"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("build/out.js"), "release_step()\n").unwrap();
+    std::fs::write(
+        root.join("scripts/build/release.py"),
+        "def release_step(): ...\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/main.py"), "release_step()\n").unwrap();
+    let app = App::new(root.to_path_buf()).unwrap();
+    (app, tmp)
+}
+
+/// #1479: Search skips the root's `build/` and still finds the definition
+/// in `scripts/build/`.
+#[test]
+fn a_vscode_exclude_of_build_keeps_scripts_build_in_search() {
+    let (mut app, t) = app_excluding_vscode_build();
+    assert_eq!(
+        search_hit_paths(&mut app, t.path(), "release_step"),
+        vec![
+            String::from("scripts/build/release.py"),
+            String::from("src/main.py")
+        ]
+    );
+}
+
+/// #1479: Go to File keeps a nested folder that shares a bare VS Code
+/// exclude's name. (`gen` here: Go to File skips every `build` folder on
+/// its own, as noise, whatever the settings say.)
+#[test]
+fn a_vscode_exclude_of_a_bare_name_keeps_nested_folders_in_go_to_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    for dir in [".vscode", "gen", "scripts/gen"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    std::fs::write(
+        root.join(".vscode/settings.json"),
+        r#"{ "files.exclude": { "gen": true } }"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("gen/out.py"), "\n").unwrap();
+    std::fs::write(root.join("scripts/gen/release.py"), "\n").unwrap();
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    app.open_file_finder();
+    let rels: Vec<String> = app
+        .file_finder
+        .as_ref()
+        .unwrap()
+        .entries
+        .iter()
+        .map(|e| e.rel.clone())
+        .collect();
+    assert!(
+        rels.contains(&String::from("scripts/gen/release.py")),
+        "{rels:?}"
+    );
+    assert!(!rels.iter().any(|r| r.starts_with("gen/")), "{rels:?}");
+}
+
+/// #1479: the Explorer hides the root's `build/` and lists
+/// `scripts/build/` once `scripts/` is expanded.
+#[test]
+fn a_vscode_exclude_of_build_keeps_scripts_build_in_the_explorer() {
+    let (mut app, t) = app_excluding_vscode_build();
+    let release = t.path().join("scripts/build/release.py");
+    assert!(
+        app.tree.reveal_path(&release),
+        "scripts/build/release.py is listed"
+    );
+    let listed: Vec<_> = app.tree.nodes.iter().map(|n| n.path.clone()).collect();
+    assert!(
+        listed.contains(&t.path().join("scripts/build")),
+        "{listed:?}"
+    );
+    assert!(!listed.contains(&t.path().join("build")), "{listed:?}");
 }
 
 /// Open a file into the focused editor group of a fresh App.
@@ -73900,4 +74110,133 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     let _ = render_buf(&mut app);
     assert!(app.source_control.nested_repos.is_empty());
     assert!(app.source_control.last_init_repo_button_area.width > 0);
+}
+
+/// A format-on-save in flight for `m.py`, with `x` typed and not yet on
+/// disk: the state Ctrl+S leaves while it waits on the formatter.
+fn app_waiting_on_format_on_save(tmp: &Path) -> (App, PathBuf) {
+    let mut app = app_with_open_file(tmp, "m.py", "x = 1\n");
+    let file = app.editor.path.clone().unwrap();
+    app.editor.insert_char('y');
+    app.arm_deferred_save();
+    app.format_request_id = Some(41);
+    app.format_request_seq = app.format_target_seq(&file);
+    (app, file)
+}
+
+/// #1491: with Format on Save on, a server that never answered
+/// `textDocument/formatting` left the file unwritten forever (the tab dirty,
+/// "Formatting document" in the status bar). After a bounded wait the file
+/// is written unformatted, as VS Code does, and the late reply is dropped.
+#[test]
+fn a_format_on_save_with_no_reply_writes_the_file_unformatted_after_a_bounded_wait() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_waiting_on_format_on_save(tmp.path());
+    let start = std::time::Instant::now();
+
+    // Within the wait nothing is written: the reply may still come.
+    assert!(!app.drain_lsp_format_at(start));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "x = 1\n");
+    assert!(app.save_after_format.is_some());
+
+    let after = start + FORMAT_ON_SAVE_TIMEOUT + std::time::Duration::from_millis(50);
+    assert!(app.drain_lsp_format_at(after), "redraw for the save");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "yx = 1\n");
+    assert!(!app.editor.dirty, "the tab is saved");
+    assert!(app.save_after_format.is_none());
+    assert!(
+        app.format_request_id.is_none(),
+        "a reply that turns up later is not applied to the saved text"
+    );
+    assert_eq!(
+        app.status,
+        "Saved m.py without formatting: the formatter did not answer in 2 s"
+    );
+}
+
+/// #1491: a tab closed while its format-on-save waited is not written, so
+/// the timeout keeps "Save skipped" rather than claiming it saved the file.
+#[test]
+fn a_format_on_save_timeout_after_the_tab_closed_does_not_claim_a_save() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_waiting_on_format_on_save(tmp.path());
+    app.editor.close_tab(0);
+    let after = std::time::Instant::now() + FORMAT_ON_SAVE_TIMEOUT * 2;
+    assert!(app.drain_lsp_format_at(after));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "x = 1\n");
+    assert!(app.save_after_format.is_none());
+    assert_eq!(app.status, "Save skipped: the tab was closed");
+}
+
+/// #1491: pressing Ctrl+S again while the formatter is silent writes the
+/// file at once instead of changing nothing.
+#[test]
+fn a_second_save_while_the_formatter_is_silent_writes_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_waiting_on_format_on_save(tmp.path());
+    app.save();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "yx = 1\n");
+    assert!(!app.editor.dirty);
+    assert!(app.save_after_format.is_none());
+    assert!(app.format_request_id.is_none());
+    assert_eq!(
+        app.status,
+        "Saved m.py without formatting: saved again before the formatter answered"
+    );
+}
+
+/// #1491 negative: a reply inside the wait still formats, then saves, and
+/// the wait does not fire afterwards.
+#[test]
+fn a_format_reply_inside_the_wait_still_formats_before_saving() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_waiting_on_format_on_save(tmp.path());
+    let formatted = vec![crate::widgets::editor::TextSpanEdit {
+        start: (0, 0),
+        end: (0, 6),
+        new_text: String::from("yx = 2"),
+        utf16: false,
+    }];
+    app.format_request_id = None;
+    app.land_format(Some(formatted), false, Some(file.clone()));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "yx = 2\n");
+    let saved = app.status.clone();
+    let later = std::time::Instant::now() + FORMAT_ON_SAVE_TIMEOUT * 2;
+    assert!(!app.drain_lsp_format_at(later), "nothing left to time out");
+    assert_eq!(app.status, saved);
+}
+
+/// #1491 negative: a plain Format Document (no save waiting) is never cut
+/// short; a slow formatter may still answer it.
+#[test]
+fn a_slow_format_document_without_a_save_is_left_to_finish() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "m.py", "x = 1\n");
+    app.format_request_id = Some(41);
+    let later = std::time::Instant::now() + FORMAT_ON_SAVE_TIMEOUT * 2;
+    assert!(!app.drain_lsp_format_at(later));
+    assert_eq!(app.format_request_id, Some(41));
+}
+
+/// #1491: Save All said "Saved 1 editor" while the file still waited on
+/// its formatter. It now says the file is being formatted.
+#[test]
+fn save_all_does_not_report_a_file_waiting_on_its_formatter_as_saved() {
+    assert_eq!(
+        save_all_summary(1, 0, Some("m.py"), String::new()),
+        "Formatting m.py before saving it"
+    );
+    assert_eq!(
+        save_all_summary(3, 0, Some("m.py"), String::new()),
+        "Saved 2 editors; formatting m.py before saving it"
+    );
+    // Negative: with nothing waiting, the count stands as before.
+    assert_eq!(
+        save_all_summary(2, 0, None, String::new()),
+        "Saved 2 editors"
+    );
+    assert_eq!(
+        save_all_summary(1, 0, None, String::new()),
+        "Saved 1 editor"
+    );
 }

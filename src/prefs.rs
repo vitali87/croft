@@ -850,9 +850,13 @@ fn write_in_place(target: &Path, bytes: &[u8]) -> Result<(), ReplaceError> {
             error,
             touched: false,
         })?;
-    let before = file.metadata().ok();
-    let old_len = before.as_ref().map_or(0, |m| m.len());
     let new_len = bytes.len() as u64;
+    // The reservation is Linux-only, and so is everything it reads: built
+    // anywhere else these were unused, and the release build warned (#1463).
+    #[cfg(target_os = "linux")]
+    let before = file.metadata().ok();
+    #[cfg(target_os = "linux")]
+    let old_len = before.as_ref().map_or(0, |m| m.len());
     #[cfg(target_os = "linux")]
     if new_len > old_len {
         use std::os::unix::io::AsRawFd as _;
