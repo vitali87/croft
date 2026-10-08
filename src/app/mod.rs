@@ -68945,6 +68945,13 @@ pub fn run(
     // Snapshot the terminal panel for the next launch (cwds are read live
     // here, so plain `cd`s during the session are captured at quit).
     app.save_terminal_session();
+    // Quitting mid-debug ends the program as Stop Debugging does (#1536):
+    // nothing sent `disconnect` here, and the debuggee outlived croft.
+    // The teardowns run while the terminal is restored and are joined
+    // below, before any exit path.
+    if !app.debug_sessions.is_empty() {
+        app.debug_stop();
+    }
 
     disable_raw_mode().ok();
     {
@@ -68984,6 +68991,7 @@ pub fn run(
     // disabled, pilot death): those threads race process exit, and a thread
     // that dies mid-grace-kill leaves the claude child running.
     crate::pair_host::join_teardowns();
+    crate::dap::transport::join_teardowns();
 
     result?;
     if app.drop_to_local {

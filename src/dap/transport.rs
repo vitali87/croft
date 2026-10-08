@@ -15,14 +15,18 @@
 
 use std::io::{BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
 
 const CONTENT_LENGTH: &str = "Content-Length";
+/// How long a dropped session's adapter gets to answer `disconnect` and end
+/// its debuggee before croft kills it (#1536).
+const DISCONNECT_GRACE: Duration = Duration::from_secs(2);
 const HEADER_SEP: &[u8] = b"\r\n\r\n";
 
 /// Frame a DAP message body for the wire: `Content-Length: N\r\n\r\n<json>`.
@@ -110,6 +114,44 @@ pub struct DapTransport {
     /// Drained by the session: every decoded incoming message (responses,
     /// events, reverse-requests).
     pub incoming: Receiver<Value>,
+    /// What the teardown on drop needs from the wire, shared with the reader.
+    teardown: Arc<(Mutex<Teardown>, Condvar)>,
+}
+
+/// What the reader and `send` have seen that decides how a dropped
+/// transport ends its adapter (#1536).
+#[derive(Default)]
+struct Teardown {
+    /// `Some(terminateDebuggee)` once a `disconnect` went out.
+    disconnect: Option<bool>,
+    /// The adapter answered `disconnect`, or its output closed.
+    answered: bool,
+    /// The debuggee's pid from the adapter's `process` event.
+    debuggee: Option<i32>,
+    /// An `exited` / `terminated` event: the debuggee is gone, so its pid
+    /// may already belong to something else.
+    debuggee_ended: bool,
+}
+
+impl Teardown {
+    fn observe(&mut self, msg: &Value) {
+        let kind = msg.get("type").and_then(Value::as_str);
+        let name = msg
+            .get("event")
+            .or_else(|| msg.get("command"))
+            .and_then(Value::as_str);
+        match (kind, name) {
+            (Some("event"), Some("process")) => {
+                self.debuggee = msg["body"]["systemProcessId"]
+                    .as_i64()
+                    .and_then(|p| i32::try_from(p).ok())
+                    .filter(|p| *p > 0);
+            }
+            (Some("event"), Some("exited" | "terminated")) => self.debuggee_ended = true,
+            (Some("response"), Some("disconnect")) => self.answered = true,
+            _ => {}
+        }
+    }
 }
 
 impl DapTransport {
@@ -172,9 +214,11 @@ impl DapTransport {
         }
 
         let (tx, rx): (Sender<Value>, Receiver<Value>) = std::sync::mpsc::channel();
+        let teardown = Arc::new((Mutex::new(Teardown::default()), Condvar::new()));
+        let seen = teardown.clone();
         std::thread::Builder::new()
             .name("dap-reader".into())
-            .spawn(move || reader_loop(stdout, tx))
+            .spawn(move || reader_loop(stdout, tx, &seen))
             .context("spawning dap-reader thread")?;
 
         Ok(DapTransport {
@@ -182,6 +226,7 @@ impl DapTransport {
             writer: Mutex::new(Box::new(stdin)),
             seq: AtomicI64::new(0),
             incoming: rx,
+            teardown,
         })
     }
 
@@ -248,15 +293,18 @@ impl DapTransport {
         let reader = stream.try_clone().context("cloning DAP socket for reads")?;
         let writer = stream;
         let (tx, rx): (Sender<Value>, Receiver<Value>) = std::sync::mpsc::channel();
+        let teardown = Arc::new((Mutex::new(Teardown::default()), Condvar::new()));
+        let seen = teardown.clone();
         std::thread::Builder::new()
             .name("dap-reader".into())
-            .spawn(move || reader_loop(reader, tx))
+            .spawn(move || reader_loop(reader, tx, &seen))
             .context("spawning dap-reader thread")?;
         Ok(DapTransport {
             child,
             writer: Mutex::new(Box::new(writer)),
             seq: AtomicI64::new(0),
             incoming: rx,
+            teardown,
         })
     }
 
@@ -271,6 +319,12 @@ impl DapTransport {
         if let Some(obj) = message.as_object_mut() {
             obj.insert("seq".into(), Value::from(seq));
         }
+        if message.get("command").and_then(Value::as_str) == Some("disconnect") {
+            let terminate = message["arguments"]["terminateDebuggee"]
+                .as_bool()
+                .unwrap_or(true);
+            self.teardown.0.lock().unwrap().disconnect = Some(terminate);
+        }
         let bytes = encode(&message);
         super::log::log(&format!(
             "send seq={seq} {}",
@@ -284,31 +338,92 @@ impl DapTransport {
         writer.flush().context("flushing adapter")?;
         Ok(seq)
     }
+}
 
-    /// Best-effort terminate the adapter process tree, if this transport owns
-    /// one. The adapter was `setsid`'d at spawn, so its pid is its own
-    /// process-group id; signalling the whole group (`killpg`) reaps the
-    /// debuggee it forked too, not just the direct child. `child.kill()` then
-    /// covers the direct child belt-and-suspenders, and `wait()` reaps the
-    /// zombie so a long-lived croft never accumulates defunct adapters.
-    ///
-    /// vscode-js-debug's `watchdog` `setsid`s into a *separate* session, so it
-    /// is deliberately outside this group; the graceful `disconnect` handshake
-    /// and the startup orphan sweep ([`crate::dap::reaper`]) are what retire it.
-    pub fn kill(&mut self) {
-        if let Some(child) = self.child.as_mut() {
-            let pid = child.id() as i32;
-            // SAFETY: `killpg` is a plain libc call; `pid` is this child's pgid
-            // (it `setsid`'d), distinct from croft's, so only the adapter tree
-            // is signalled.
-            unsafe {
-                libc::killpg(pid, libc::SIGKILL);
-            }
-            let _ = child.kill();
-            let _ = child.wait();
+/// Best-effort terminate an adapter process tree. The adapter was `setsid`'d
+/// at spawn, so its pid is its own process-group id; signalling the whole
+/// group (`killpg`) reaps what it forked into that group too, not just the
+/// direct child. `child.kill()` then covers the direct child
+/// belt-and-suspenders, and `wait()` reaps the zombie so a long-lived croft
+/// never accumulates defunct adapters. debugpy's launcher starts the
+/// debuggee in a group of its own, which `finish_teardown` covers (#1536).
+///
+/// vscode-js-debug's `watchdog` `setsid`s into a *separate* session, so it
+/// is deliberately outside this group; the graceful `disconnect` handshake
+/// and the startup orphan sweep ([`crate::dap::reaper`]) are what retire it.
+fn kill_tree(child: &mut Child) {
+    let pid = child.id() as i32;
+    // SAFETY: `killpg` is a plain libc call; `pid` is this child's pgid
+    // (it `setsid`'d), distinct from croft's, so only the adapter tree
+    // is signalled.
+    unsafe {
+        libc::killpg(pid, libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Whether `pid` is still running. A zombie (exited, not yet reaped by
+/// whoever inherited it) counts as gone.
+fn is_running(pid: i32) -> bool {
+    // SAFETY: signal 0 sends nothing; it only checks that the pid exists.
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => !stat
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+        Err(_) => true,
+    }
+}
+
+/// End a disconnected session's adapter (#1536). Killing it the moment
+/// `disconnect` is written gives it no chance to act on it, and debugpy's
+/// launcher puts the debuggee in its own process group, out of reach of
+/// `killpg`: the program ran on under PID 1. So wait for the answer (or
+/// the deadline), let the debuggee finish exiting, then kill the adapter's
+/// group, and, for a launch, the debuggee the adapter reported if it is
+/// still there.
+fn finish_teardown(mut child: Child, teardown: &(Mutex<Teardown>, Condvar), grace: Duration) {
+    let deadline = Instant::now() + grace;
+    let (lock, answered) = teardown;
+    let mut seen = lock.lock().unwrap();
+    while !seen.answered {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        seen = answered.wait_timeout(seen, left).unwrap().0;
+    }
+    let debuggee = match (seen.disconnect, seen.debuggee) {
+        (Some(true), Some(pid)) if !seen.debuggee_ended => Some(pid),
+        _ => None,
+    };
+    drop(seen);
+    if let Some(pid) = debuggee {
+        while is_running(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    kill_tree(&mut child);
+    // Read after the wait: an `exited` that landed meanwhile means the pid
+    // is no longer the debuggee's.
+    if let Some(pid) = debuggee
+        && !lock.lock().unwrap().debuggee_ended
+        && is_running(pid)
+    {
+        // SAFETY: `pid` is the debuggee the adapter reported for this
+        // launch, still running and not reported as ended.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
         }
     }
 }
+
+/// Teardown threads `Drop` detached; the exit path joins them so croft
+/// does not quit halfway through ending a debuggee.
+static TEARDOWNS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
 
 /// Connect to `host:port`, retrying for a short window while the freshly-spawned
 /// debug server binds its listener. Fails after the window with the last error.
@@ -352,19 +467,47 @@ pub fn free_port() -> Result<u16> {
     Ok(port)
 }
 
+/// Join every disconnect teardown a dropped transport detached. Bounded by
+/// `DISCONNECT_GRACE`, since they run side by side.
+pub fn join_teardowns() {
+    let handles: Vec<_> = std::mem::take(&mut *TEARDOWNS.lock().unwrap());
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
 impl Drop for DapTransport {
     fn drop(&mut self) {
-        self.kill();
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if self.teardown.0.lock().unwrap().disconnect.is_none() {
+            kill_tree(&mut child);
+            return;
+        }
+        // Off the UI thread: Stop Debugging stays instant on screen.
+        let teardown = self.teardown.clone();
+        let spawned = std::thread::Builder::new()
+            .name("dap-teardown".into())
+            .spawn(move || finish_teardown(child, &teardown, DISCONNECT_GRACE));
+        if let Ok(handle) = spawned {
+            let mut reg = TEARDOWNS.lock().unwrap();
+            reg.retain(|h| !h.is_finished());
+            reg.push(handle);
+        }
     }
 }
 
 /// Read framed messages off the adapter's stdout until EOF, forwarding each to
 /// the session. Exits quietly when the channel receiver is dropped or stdout
 /// closes.
-fn reader_loop<R: Read>(source: R, tx: Sender<Value>) {
+fn reader_loop<R: Read>(source: R, tx: Sender<Value>, teardown: &(Mutex<Teardown>, Condvar)) {
     let mut reader = BufReader::new(source);
     let mut decoder = FrameDecoder::new();
     let mut chunk = [0u8; 8192];
+    // Reading goes on after the session is dropped (#1536): the teardown
+    // waits on the `disconnect` answer that arrives then.
+    let mut forward = true;
     loop {
         match reader.read(&mut chunk) {
             Ok(0) | Err(_) => break,
@@ -379,13 +522,21 @@ fn reader_loop<R: Read>(source: R, tx: Sender<Value>) {
                             .and_then(Value::as_str)
                             .unwrap_or("?")
                     ));
-                    if tx.send(msg).is_err() {
-                        return;
+                    let mut seen = teardown.0.lock().unwrap();
+                    seen.observe(&msg);
+                    if seen.answered {
+                        teardown.1.notify_all();
+                    }
+                    drop(seen);
+                    if forward && tx.send(msg).is_err() {
+                        forward = false;
                     }
                 }
             }
         }
     }
+    teardown.0.lock().unwrap().answered = true;
+    teardown.1.notify_all();
 }
 
 #[cfg(test)]
@@ -478,5 +629,169 @@ mod tests {
             child_sid, our_sid,
             "adapter must be in its own session, detached from croft's tty"
         );
+    }
+
+    /// A DAP adapter stand-in (#1536). It starts a "debuggee" (`sleep`) in
+    /// its own session, as debugpy's launcher does, reports its pid in a
+    /// `process` event, then serves `disconnect` per `mode`: `answer` waits
+    /// 100 ms, ends the debuggee when asked to, and replies; `silent`
+    /// never replies.
+    const FAKE_ADAPTER: &str = r#"
+import json, os, subprocess, sys, time
+mode = sys.argv[1]
+deb = subprocess.Popen(["sleep", "30"], start_new_session=True)
+def send(m):
+    b = json.dumps(m).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(b) + b)
+    sys.stdout.buffer.flush()
+def read():
+    hdr = b""
+    while not hdr.endswith(b"\r\n\r\n"):
+        c = sys.stdin.buffer.read(1)
+        if not c:
+            sys.exit(0)
+        hdr += c
+    n = int(hdr.split(b":")[1].split(b"\r\n")[0])
+    return json.loads(sys.stdin.buffer.read(n))
+send({"seq": 1, "type": "event", "event": "process",
+      "body": {"name": "loop.py", "systemProcessId": deb.pid}})
+while True:
+    m = read()
+    if m.get("command") == "disconnect" and mode == "answer":
+        time.sleep(0.1)
+        if m["arguments"].get("terminateDebuggee"):
+            deb.kill()
+            deb.wait()
+        send({"seq": 2, "type": "response", "request_seq": m["seq"],
+              "command": "disconnect", "success": True})
+"#;
+
+    /// `join_teardowns` joins every test's teardowns; one at a time, so
+    /// none returns before its own thread is done.
+    static TEARDOWN_TESTS: Mutex<()> = Mutex::new(());
+
+    /// Spawn the stand-in and return it with its debuggee's pid.
+    fn fake_session(mode: &str) -> (DapTransport, i32, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("adapter.py");
+        std::fs::write(&script, FAKE_ADAPTER).unwrap();
+        let t = DapTransport::spawn(
+            "python3",
+            &[script.display().to_string(), mode.to_string()],
+            dir.path(),
+        )
+        .expect("spawn fake adapter");
+        let event = t
+            .incoming
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("process event");
+        let pid = event["body"]["systemProcessId"].as_i64().unwrap() as i32;
+        (t, pid, dir)
+    }
+
+    /// Alive and not a zombie (an unreaped child of a killed adapter).
+    fn running(pid: i32) -> bool {
+        // SAFETY: signal 0 only checks that the pid exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => !stat
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+            Err(_) => true,
+        }
+    }
+
+    /// SIGKILL lands asynchronously: give a just-killed pid a moment.
+    fn ends_soon(pid: i32) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while running(pid) {
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        true
+    }
+
+    fn end(pid: i32) {
+        // SAFETY: test cleanup of a pid this test started.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+
+    fn disconnect(terminate: bool) -> Value {
+        json!({"type": "request", "command": "disconnect",
+               "arguments": {"terminateDebuggee": terminate}})
+    }
+
+    /// #1536: Stop Debugging sends `disconnect` and drops the session at
+    /// once. The adapter must get to answer before it is killed, or it
+    /// never ends the debuggee, which runs on under PID 1.
+    #[test]
+    fn a_dropped_session_lets_the_adapter_end_the_debuggee() {
+        let _one = TEARDOWN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let (t, pid, _dir) = fake_session("answer");
+        assert!(running(pid));
+        t.send(disconnect(true)).unwrap();
+        let started = std::time::Instant::now();
+        drop(t);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "dropping must not block the UI thread"
+        );
+        join_teardowns();
+        let ok = ends_soon(pid);
+        end(pid);
+        assert!(ok, "the debuggee outlived Stop Debugging");
+    }
+
+    /// #1536 backstop: an adapter that never answers `disconnect` is
+    /// killed after the grace period, and the debuggee it reported is
+    /// ended too (its own session puts it out of the adapter's group).
+    #[test]
+    fn a_silent_adapter_does_not_leave_its_debuggee_running() {
+        let _one = TEARDOWN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let (t, pid, _dir) = fake_session("silent");
+        t.send(disconnect(true)).unwrap();
+        drop(t);
+        join_teardowns();
+        let ok = ends_soon(pid);
+        end(pid);
+        assert!(ok, "the reported debuggee survived the teardown");
+    }
+
+    /// #1536 negative: an attach session disconnects with
+    /// `terminateDebuggee: false`. croft did not start that process, so the
+    /// teardown leaves it running.
+    #[test]
+    fn an_attached_process_is_left_running() {
+        let _one = TEARDOWN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let (t, pid, _dir) = fake_session("silent");
+        t.send(disconnect(false)).unwrap();
+        drop(t);
+        join_teardowns();
+        let ok = running(pid);
+        end(pid);
+        assert!(ok, "the attached process was killed");
+    }
+
+    /// #1536 negative: without a `disconnect` there is nothing to wait for,
+    /// so the adapter is killed at once, as before, and no reported pid is
+    /// signalled.
+    #[test]
+    fn a_session_dropped_without_disconnect_is_killed_at_once() {
+        let _one = TEARDOWN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let (t, pid, _dir) = fake_session("silent");
+        let adapter = t.child.as_ref().unwrap().id() as i32;
+        drop(t);
+        join_teardowns();
+        let adapter_gone = ends_soon(adapter);
+        let debuggee_kept = running(pid);
+        end(pid);
+        assert!(adapter_gone, "the adapter outlived its transport");
+        assert!(debuggee_kept, "no disconnect, so no debuggee kill");
     }
 }
