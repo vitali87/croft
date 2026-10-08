@@ -477,23 +477,31 @@ impl SheetData {
 /// file is: every field (R `write.csv`, Python `QUOTE_ALL`), every field
 /// but numbers (`QUOTE_NONNUMERIC`), or only where csv needs it.
 pub fn serialize_delimited(data: &SheetData, delim: u8, crlf: bool, original: &[u8]) -> Vec<u8> {
-    let terminator: &[u8] = if crlf { b"\r\n" } else { b"\n" };
     let records = raw_records(original, delim);
+    // The file's record terminator, read from its first record rather than
+    // its first `\n`, which may sit inside a quoted field.
+    let terminator: &[u8] = match records.first() {
+        Some(r) if !r.term.is_empty() => &original[r.term.clone()],
+        _ if crlf => b"\r\n",
+        _ => b"\n",
+    };
     // Never quoted for TSV, as it was read (#1136).
     let quote_style = if delim == b'\t' {
         csv::QuoteStyle::Never
     } else {
         file_quote_style(&records, original, delim)
     };
-    let mut unchanged: std::collections::HashMap<&[String], std::collections::VecDeque<&[u8]>> =
+    // Record indexes by values, in file order. A row takes the record at
+    // its own position when that one has its values, so of two equal rows
+    // written differently each keeps its own bytes; a moved row (a sort)
+    // takes the first one left.
+    let mut unchanged: std::collections::HashMap<&[String], Vec<usize>> =
         std::collections::HashMap::new();
-    for (fields, span) in &records {
-        unchanged
-            .entry(fields.as_slice())
-            .or_default()
-            .push_back(&original[span.clone()]);
+    for (i, r) in records.iter().enumerate() {
+        unchanged.entry(r.fields.as_slice()).or_default().push(i);
     }
     let mut out = Vec::new();
+    let mut at = 0usize;
     let mut write = |record: &[String]| {
         // A row with no fields is a blank line the file had (see
         // `parse_delimited`); the writer would emit `""` for it instead.
@@ -501,18 +509,30 @@ pub fn serialize_delimited(data: &SheetData, delim: u8, crlf: bool, original: &[
             out.extend_from_slice(terminator);
             return;
         }
-        if let Some(raw) = unchanged.get_mut(record).and_then(|q| q.pop_front()) {
-            out.extend_from_slice(raw);
-            out.extend_from_slice(terminator);
+        let pos = at;
+        at += 1;
+        let reused = unchanged.get_mut(record).and_then(|q| {
+            let k = q.iter().position(|&i| i == pos).unwrap_or(0);
+            (!q.is_empty()).then(|| q.remove(k))
+        });
+        if let Some(i) = reused {
+            let r = &records[i];
+            out.extend_from_slice(&original[r.span.clone()]);
+            // Its own line ending; none only for the file's last line.
+            out.extend_from_slice(if r.term.is_empty() {
+                terminator
+            } else {
+                &original[r.term.clone()]
+            });
             return;
         }
         let mut w = csv::WriterBuilder::new()
             .delimiter(delim)
             .flexible(true)
-            .terminator(if crlf {
+            .terminator(if terminator == b"\r\n" {
                 csv::Terminator::CRLF
             } else {
-                csv::Terminator::Any(b'\n')
+                csv::Terminator::Any(terminator[0])
             })
             .quote_style(quote_style)
             .from_writer(&mut out);
@@ -525,21 +545,42 @@ pub fn serialize_delimited(data: &SheetData, delim: u8, crlf: bool, original: &[
     for r in &data.rows {
         write(r);
     }
+    // A file that ended without a line ending still does, unless its last
+    // row is a blank line, which is nothing but its line ending.
+    let unterminated = original.last().is_some_and(|b| !matches!(b, b'\r' | b'\n'));
+    if unterminated && data.rows.last().is_none_or(|r| !r.is_empty()) {
+        let cut = if out.ends_with(b"\r\n") {
+            2
+        } else {
+            usize::from(matches!(out.last(), Some(b'\r' | b'\n')))
+        };
+        out.truncate(out.len() - cut);
+    }
     out
 }
 
-/// Every record of a delimited file with the byte span it was read from,
-/// its line ending and any blank lines around it left out (#1375). Read as
-/// [`parse_delimited`] reads, so a record's values are the ones the grid
-/// shows. A file that does not parse yields none.
-fn raw_records(bytes: &[u8], delim: u8) -> Vec<(Vec<String>, std::ops::Range<usize>)> {
+/// One record of a delimited file as it is on disk (#1375).
+struct RawRecord {
+    /// Its values, as the grid shows them.
+    fields: Vec<String>,
+    /// Its bytes, line ending and blank lines around it left out.
+    span: std::ops::Range<usize>,
+    /// Its line ending: `\r\n`, `\n`, `\r`, or empty at the end of a file
+    /// with none.
+    term: std::ops::Range<usize>,
+}
+
+/// Every record of a delimited file with the bytes it was read from (#1375).
+/// Read as [`parse_delimited`] reads, so a record's values are the ones the
+/// grid shows. A file that does not parse yields none.
+fn raw_records(bytes: &[u8], delim: u8) -> Vec<RawRecord> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)
         .delimiter(delim)
         .quoting(delim != b'\t')
         .from_reader(bytes);
-    let mut out: Vec<(Vec<String>, std::ops::Range<usize>)> = Vec::new();
+    let mut out: Vec<RawRecord> = Vec::new();
     for record in reader.records() {
         let Ok(r) = record else {
             return Vec::new();
@@ -547,20 +588,32 @@ fn raw_records(bytes: &[u8], delim: u8) -> Vec<(Vec<String>, std::ops::Range<usi
         // Where the reader began looking for this record: the end of the
         // previous one, line ending included.
         let at = r.position().map_or(0, |p| p.byte() as usize);
-        if let Some((_, prev)) = out.last_mut() {
-            prev.end = at;
+        if let Some(prev) = out.last_mut() {
+            prev.span.end = at;
         }
         // Past the blank lines (and a CRLF's `\n`) the reader skipped.
         let mut start = at;
         while matches!(bytes.get(start), Some(b'\r' | b'\n')) {
             start += 1;
         }
-        out.push((r.iter().map(str::to_string).collect(), start..bytes.len()));
+        out.push(RawRecord {
+            fields: r.iter().map(str::to_string).collect(),
+            span: start..bytes.len(),
+            term: 0..0,
+        });
     }
-    for (_, span) in &mut out {
+    for r in &mut out {
+        let span = &mut r.span;
         while span.end > span.start && matches!(bytes[span.end - 1], b'\r' | b'\n') {
             span.end -= 1;
         }
+        let rest = &bytes[span.end..];
+        let len = if rest.starts_with(b"\r\n") {
+            2
+        } else {
+            usize::from(matches!(rest.first(), Some(b'\r' | b'\n')))
+        };
+        r.term = span.end..span.end + len;
     }
     out
 }
@@ -569,15 +622,19 @@ fn raw_records(bytes: &[u8], delim: u8) -> Vec<(Vec<String>, std::ops::Range<usi
 /// every field quoted, or exactly the fields that are not numbers, or
 /// neither (quote where needed). A number is what the csv writer's
 /// `NonNumeric` style takes as one, so that style writes such a file back.
-fn file_quote_style(
-    records: &[(Vec<String>, std::ops::Range<usize>)],
-    bytes: &[u8],
-    delim: u8,
-) -> csv::QuoteStyle {
+fn file_quote_style(records: &[RawRecord], bytes: &[u8], delim: u8) -> csv::QuoteStyle {
     let is_number = |s: &str| s.parse::<f64>().is_ok() || s.parse::<i128>().is_ok();
     let (mut quoted, mut bare_numbers, mut bare_other) = (0usize, 0usize, 0usize);
-    for (fields, span) in records {
-        let flags = quoted_fields(&bytes[span.clone()], delim);
+    for RawRecord { fields, span, .. } in records {
+        let raw = &bytes[span.clone()];
+        // The reader drops a UTF-8 BOM from the first value; a quote after
+        // it still opens that field.
+        let raw = if span.start == 0 {
+            raw.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(raw)
+        } else {
+            raw
+        };
+        let flags = quoted_fields(raw, delim);
         if flags.len() != fields.len() {
             return csv::QuoteStyle::Necessary;
         }
@@ -1593,6 +1650,63 @@ mod tests {
         assert_eq!(
             super::serialize_delimited(&d, b',', true, src),
             src.to_vec()
+        );
+    }
+
+    /// #1375: of two equal rows written differently, the untouched one
+    /// keeps its own bytes when the other is edited.
+    #[test]
+    fn equal_rows_written_differently_each_keep_their_bytes() {
+        let src = b"h\n\"x\"\nx\n";
+        let mut d = super::parse_delimited(src, b',', "S").unwrap();
+        d.set_cell(0, 0, String::from("y"));
+        let out = super::serialize_delimited(&d, b',', false, src);
+        assert_eq!(String::from_utf8(out).unwrap(), "h\ny\nx\n");
+    }
+
+    /// #1375: each untouched record keeps its own line ending, and a file
+    /// without a final one still has none.
+    #[test]
+    fn untouched_records_keep_their_own_line_endings() {
+        let src = b"h\na\nb";
+        let mut d = super::parse_delimited(src, b',', "S").unwrap();
+        d.set_cell(0, 0, String::from("z"));
+        let out = super::serialize_delimited(&d, b',', false, src);
+        assert_eq!(String::from_utf8(out).unwrap(), "h\nz\nb");
+        let src = b"h\r\na\nb\r\n";
+        let mut d = super::parse_delimited(src, b',', "S").unwrap();
+        d.set_cell(1, 0, String::from("c"));
+        let out = super::serialize_delimited(&d, b',', true, src);
+        assert_eq!(String::from_utf8(out).unwrap(), "h\r\na\nc\r\n");
+    }
+
+    /// #1375: a CRLF file whose first field holds a newline is still CRLF
+    /// for an edited row, whatever the caller guessed from its first `\n`.
+    #[test]
+    fn a_quoted_newline_does_not_set_the_line_ending() {
+        let src = b"\"first\nsecond\",b\r\n1,2\r\n";
+        let mut d = super::parse_delimited(src, b',', "S").unwrap();
+        d.set_cell(0, 0, String::from("3"));
+        let out = super::serialize_delimited(&d, b',', false, src);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\"first\nsecond\",b\r\n3,2\r\n"
+        );
+    }
+
+    /// #1375: a UTF-8 BOM before a fully quoted header does not hide that
+    /// the file quotes every field.
+    #[test]
+    fn a_bom_does_not_hide_quote_all() {
+        let mut src = b"\xEF\xBB\xBF".to_vec();
+        src.extend_from_slice(QUOTED_CSV);
+        let mut d = super::parse_delimited(&src, b',', "S").unwrap();
+        d.set_cell(0, 3, String::from("95"));
+        let out = super::serialize_delimited(&d, b',', false, &src);
+        assert!(out.starts_with(&src[..3]), "the BOM stays");
+        assert_eq!(
+            changed_lines(&src, &out),
+            vec![(1, String::from("\"1\",\"Ada\",\"London\",\"95\""))]
         );
     }
 
