@@ -1183,7 +1183,21 @@ fn diff_text(root: &Path, args: &[&str]) -> Result<String, String> {
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
     let mut cmd = Command::new("git");
-    cmd.args(["-C", path_str]).args(args);
+    cmd.args(["-C", path_str]);
+    match args.split_first() {
+        // The patch croft parses, never the user's display settings
+        // (#1447): `color.ui = always` wrapped every line in escape codes,
+        // and a `diff.external` tool (difftastic) printed its own view in
+        // place of the patch.
+        Some((sub, rest)) if matches!(*sub, "diff" | "show") => {
+            cmd.arg(sub)
+                .args(["--no-color", "--no-ext-diff"])
+                .args(rest);
+        }
+        _ => {
+            cmd.args(args);
+        }
+    }
     let output = cmd
         .output()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
@@ -4585,6 +4599,80 @@ mod tests {
         init_repo_with_commit(p);
         let b = default_branch(p).expect("default branch must resolve");
         assert_eq!(b, "main", "freshly init -b main repo must resolve to main");
+    }
+
+    /// #1447 fixture: a repo with `app.py` committed and an edit staged.
+    fn repo_with_a_staged_edit() -> (TempDir, String) {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        let head = sh_git(p, &["rev-parse", "HEAD"]);
+        std::fs::write(p.join("seed.txt"), "one\nTWO\n").unwrap();
+        sh_git(p, &["add", "seed.txt"]);
+        (tmp, head.trim().to_string())
+    }
+
+    /// #1447: `color.ui = always` (here in the repo's own config, which
+    /// git reads the same way as `~/.gitconfig`) never reaches the text
+    /// croft parses as a patch.
+    #[test]
+    fn git_diff_views_ignore_a_color_always_config() {
+        let (tmp, head) = repo_with_a_staged_edit();
+        let p = tmp.path();
+        sh_git(p, &["config", "color.ui", "always"]);
+        sh_git(p, &["config", "color.diff", "always"]);
+        let coloured = sh_git(p, &["diff", "--staged"]);
+        assert!(
+            coloured.contains('\x1b'),
+            "the config colours git's own output: {coloured:?}"
+        );
+        let staged = diff_staged(p).unwrap();
+        assert!(staged.starts_with("diff --git"), "{staged:?}");
+        assert!(!staged.contains('\x1b'), "{staged:?}");
+        assert!(staged.contains("\n+TWO\n"), "{staged:?}");
+        let previous = diff_against_branch(p, &head).unwrap();
+        assert!(!previous.contains('\x1b'), "{previous:?}");
+        sh_git(p, &["commit", "-qm", "two"]);
+        let commit = show_commit(p, "HEAD").unwrap();
+        assert!(commit.starts_with("commit "), "{commit:?}");
+        assert!(!commit.contains('\x1b'), "{commit:?}");
+        let file = show_commit_file_diff(p, "HEAD", "seed.txt").unwrap();
+        assert!(!file.contains('\x1b'), "{file:?}");
+        assert!(!diff_previous_commit(p).unwrap().contains('\x1b'));
+    }
+
+    /// #1447: a `diff.external` tool (difftastic's recommended setup) does
+    /// not replace the patch with its own output.
+    #[test]
+    fn git_diff_views_ignore_an_external_diff_tool() {
+        let (tmp, _) = repo_with_a_staged_edit();
+        let p = tmp.path();
+        let tool = p.join("external-diff.sh");
+        std::fs::write(&tool, "#!/bin/sh\necho EXTERNAL\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        sh_git(p, &["config", "diff.external", tool.to_str().unwrap()]);
+        assert!(sh_git(p, &["diff", "--staged"]).contains("EXTERNAL"));
+        let staged = diff_staged(p).unwrap();
+        assert!(staged.starts_with("diff --git"), "{staged:?}");
+        assert!(!staged.contains("EXTERNAL"), "{staged:?}");
+    }
+
+    /// #1447 negative: with git's default colour settings the text is
+    /// exactly what plain `git diff` / `git show` print.
+    #[test]
+    fn git_diff_views_are_unchanged_without_colour_config() {
+        let (tmp, _) = repo_with_a_staged_edit();
+        let p = tmp.path();
+        assert_eq!(diff_staged(p).unwrap(), sh_git(p, &["diff", "--staged"]));
+        sh_git(p, &["commit", "-qm", "two"]);
+        assert_eq!(
+            show_commit(p, "HEAD").unwrap(),
+            sh_git(p, &["show", "--stat", "--patch", "HEAD"])
+        );
     }
 
     #[test]
