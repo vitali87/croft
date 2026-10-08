@@ -1310,6 +1310,10 @@ pub fn follow_names(root: &Path, rel_path: &str, limit: usize) -> Vec<(String, S
         &[
             "log",
             "--follow",
+            // The scrubber walks first parents: a rename merged from a side
+            // branch then lands on the merge, which a full walk skips for
+            // the side branch's own commits (#1304).
+            "--first-parent",
             &format!("-n{limit}"),
             "--name-only",
             "--relative",
@@ -4726,6 +4730,46 @@ mod tests {
             .collect();
         assert_eq!(names, ["new.py", "old.py"]);
         assert!(follow_names(p, "missing.py", 10).is_empty());
+    }
+
+    /// #1304: a rename merged from a side branch is listed on the merge,
+    /// one of the first-parent commits the scrubber walks. A full walk
+    /// went down the side branch and skipped the merge, so the scrubber
+    /// read the merge under the old name, which did not exist there.
+    #[test]
+    fn follow_names_lists_a_rename_merged_from_a_side_branch_on_the_merge() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "a@b"]);
+        git(&["config", "user.name", "a"]);
+        std::fs::write(p.join("old.py"), "a = 1\nb = 2\nc = 3\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "add"]);
+        let added = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "-q", "-b", "side"]);
+        git(&["mv", "old.py", "new.py"]);
+        git(&["commit", "-q", "-m", "rename"]);
+        git(&["checkout", "-q", "main"]);
+        std::fs::write(p.join("other.txt"), "x\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "other"]);
+        git(&["merge", "-q", "--no-ff", "side", "-m", "merge"]);
+        let merge = git(&["rev-parse", "HEAD"]);
+        assert_eq!(
+            follow_names(p, "new.py", 10),
+            [(merge, "new.py".to_string()), (added, "old.py".to_string())]
+        );
     }
 
     #[test]
