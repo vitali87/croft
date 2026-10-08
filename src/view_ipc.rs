@@ -844,9 +844,12 @@ pub fn run(
     let v = verb.name();
     let socket = match std::env::var_os(SOCK_ENV).filter(|s| !s.is_empty()) {
         Some(s) => PathBuf::from(s),
-        None => anyhow::bail!(
-            "croft {v} needs a croft to {v} in: run it from a pane inside croft ({SOCK_ENV} is unset)"
-        ),
+        None => {
+            return Err(NoCroft(format!(
+                "croft {v} needs a croft to {v} in: run it from a pane inside croft ({SOCK_ENV} is unset)"
+            ))
+            .into());
+        }
     };
 
     // Refused rather than ignored, for the same reason an unusable `--as`
@@ -889,6 +892,20 @@ pub fn run(
     opened
 }
 
+/// No croft to open the file in: `CROFT_VIEW_SOCK` is unset, or the croft
+/// that set it is gone. Told apart from a croft that refused the file, so
+/// git's sequence editor can fall back to git's own editor (#1452).
+#[derive(Debug)]
+pub struct NoCroft(String);
+
+impl std::fmt::Display for NoCroft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoCroft {}
+
 /// Remove the file `created` names from `path`: only while that same file
 /// is still there and still empty. Compared by device and inode, not by
 /// path, and without following a link put in its place.
@@ -922,16 +939,24 @@ fn open_in_croft(
                 std::io::ErrorKind::ConnectionRefused
                     | std::io::ErrorKind::NotFound
                     | std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::UnexpectedEof
             ) =>
         {
             // The env var outlives the croft that set it: a dtach session
             // reattached to a new croft, or a pane that survived its parent.
-            anyhow::bail!(
+            // Nothing read the request, so nothing was opened.
+            Err(NoCroft(format!(
                 "croft {v}: the croft that opened this pane is gone (socket {})",
                 socket.display()
-            )
+            ))
+            .into())
         }
+        // A croft took the request and then closed without a reply: it may
+        // have opened the file, so this is not NoCroft, and git's sequence
+        // editor must not open the same plan in a second editor.
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => anyhow::bail!(
+            "croft {v}: the croft that opened this pane is gone (socket {})",
+            socket.display()
+        ),
         Err(e) => anyhow::bail!("croft {v}: {e}"),
     }
 }
