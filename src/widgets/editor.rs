@@ -29738,6 +29738,42 @@ mod tests {
         assert_eq!(out[1], vec![(1, 0), (2, 0)]);
     }
 
+    /// #1510: a bracket in a C++ string or comment, or in a C or C++ char
+    /// literal, is text. One `'('` reddened every later closing brace.
+    #[test]
+    fn brackets_in_c_and_cpp_strings_comments_and_chars_are_text() {
+        let cpp = "// greet the user (politely\n#include <string>\nint main() {\n    std::string s = \"smile :)\";\n    char c = '(';\n    return s.size() + c;\n}\n";
+        let c = "int main() {\n    char c = '(';\n    int v[] = {1};\n    return c;\n}\n";
+        for (kind, src) in [(LangKind::Cpp, cpp), (LangKind::C, c)] {
+            let pass = run_highlight_pass(kind, src.to_string());
+            let red: Vec<(usize, usize)> = pass
+                .brackets
+                .iter()
+                .enumerate()
+                .flat_map(|(row, bs)| {
+                    bs.iter()
+                        .filter(|b| b.1 == UNEXPECTED_BRACKET)
+                        .map(move |b| (row, b.0))
+                })
+                .collect();
+            assert!(
+                red.is_empty(),
+                "{kind:?}: brackets marked unmatched at {red:?}"
+            );
+        }
+    }
+
+    /// #1510 negative: a brace that really is unmatched in C++ code is still
+    /// marked.
+    #[test]
+    fn an_unmatched_cpp_brace_in_code_is_still_marked() {
+        let pass = run_highlight_pass(
+            LangKind::Cpp,
+            String::from("int f() {\n    return 0;\n}}\n"),
+        );
+        assert_eq!(pass.brackets[2], vec![(0, 0), (1, UNEXPECTED_BRACKET)]);
+    }
+
     #[test]
     fn scan_depth_cycles_past_the_palette() {
         let lines = vec![String::from("([{(x)}])")];
