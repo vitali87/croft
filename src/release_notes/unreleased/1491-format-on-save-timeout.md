@@ -1,0 +1,1 @@
+fix: With Format on Save on, Ctrl+S now writes the file unformatted when the language server doesn't answer within 2 seconds (or when you press Ctrl+S again), instead of never saving it; Save All no longer reports such a file as saved.
