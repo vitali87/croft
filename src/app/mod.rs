@@ -5596,7 +5596,7 @@ impl App {
                 // machine (#262): applied on arrival like the files above.
                 crate::config_layers::synced_config_path(),
             ]),
-            snippets: crate::snippets::SnippetSet::load(&crate::snippets::snippets_path()),
+            snippets: load_snippets(&crate::snippets::snippets_path()),
             format_on_save: loaded_prefs.format_on_save,
             copy_on_select: loaded_prefs.copy_on_select,
             files_exclude: Vec::new(),
@@ -55824,7 +55824,7 @@ impl App {
         }
         let (map, _) = crate::keymap::Keymap::load_with_warnings(&self.keybindings_file);
         self.keymap = map;
-        self.snippets = crate::snippets::SnippetSet::load(&crate::snippets::snippets_path());
+        self.snippets = load_snippets(&crate::snippets::snippets_path());
         self.status = format!(
             "Profile: {}; keybindings and snippets applied, settings apply at the next launch",
             name.as_deref().unwrap_or("Default")
@@ -57262,8 +57262,8 @@ impl App {
             }
             self.status = keybindings_reload_status(&warns);
         } else if path == crate::snippets::snippets_path() {
-            self.snippets = crate::snippets::SnippetSet::load(path);
-            self.status = String::from("Snippets reloaded");
+            self.snippets = load_snippets(path);
+            self.status = snippets_reload_status(self.snippets.warnings());
         } else if path == crate::agents::agents_path() {
             self.agents = crate::agents::AgentTable::load(path);
             let dropped = self.agents.dropped_patterns();
@@ -65154,6 +65154,26 @@ fn is_cmd_shift_letter(key: KeyEvent, letter: char) -> bool {
 /// `~/.config/croft/keybindings.json` — would leak into every one of the
 /// thousands of concurrent tests that construct an `App`, since `App::new`
 /// loads that path unconditionally.
+/// Load the snippets file, writing what could not be read to OUTPUT ·
+/// Snippets: one bad entry used to empty the whole set without a word (#1483).
+fn load_snippets(path: &std::path::Path) -> crate::snippets::SnippetSet {
+    let set = crate::snippets::SnippetSet::load(path);
+    for w in set.warnings() {
+        crate::output::push("Snippets", crate::output::OutputLevel::Warn, w);
+    }
+    set
+}
+
+fn snippets_reload_status(warns: &[String]) -> String {
+    match warns.len() {
+        0 => String::from("Snippets reloaded"),
+        n => format!(
+            "Snippets reloaded with {n} warning{} — see OUTPUT · Snippets",
+            if n == 1 { "" } else { "s" }
+        ),
+    }
+}
+
 fn keybindings_reload_status(warns: &[String]) -> String {
     if warns.is_empty() {
         String::from(

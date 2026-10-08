@@ -1290,7 +1290,7 @@ Durable user preferences — color theme, Customize Layout chrome, format-on-sav
 
 ### snippets.rs
 
-User snippets loaded from `~/.config/croft/snippets.json` in VS Code format: prefix, body as a string or array, and an optional language scope. It reloads on save.
+User snippets loaded from `~/.config/croft/snippets.json` in VS Code format: prefix as a string or array, body as a string or array, and an optional language scope. Entries load one by one, so a malformed one is skipped and reported instead of emptying the set. It reloads on save.
 
 **`parse_body` turns tab-stop syntax into stops the editor drives.** A body's `$1`/`$0`/`${1:placeholder}` syntax becomes insert text plus ordered stops that the editor walks on Tab.
 

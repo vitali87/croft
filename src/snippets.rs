@@ -236,17 +236,44 @@ impl Snippet {
 #[derive(Debug, Clone, Default)]
 pub struct SnippetSet {
     snippets: Vec<Snippet>,
+    /// What could not be loaded: the file itself, or one entry by name. The
+    /// rest still loads (#1483).
+    warnings: Vec<String>,
 }
 
-/// The on-disk value shape: `body` is a string or an array of lines; `scope` is
-/// an optional comma-separated language list.
+/// The on-disk value shape: `prefix` is a string or an array of them (VS Code
+/// allows both); `body` is a string or an array of lines; `scope` is an
+/// optional comma-separated language list.
 #[derive(Debug, Deserialize)]
 struct RawSnippet {
-    prefix: String,
+    #[serde(default)]
+    prefix: Prefix,
     #[serde(default)]
     body: Body,
     #[serde(default)]
     scope: Option<String>,
+}
+
+/// A snippet's trigger words. VS Code lets one snippet answer to several
+/// (`"prefix": ["for", "fori"]`), and to none when it is only meant for
+/// Insert Snippet.
+#[derive(Debug, Deserialize, Default)]
+#[serde(untagged)]
+enum Prefix {
+    #[default]
+    Missing,
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Prefix {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Prefix::Missing => Vec::new(),
+            Prefix::One(p) => vec![p],
+            Prefix::Many(ps) => ps,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -276,32 +303,65 @@ impl SnippetSet {
         Self::from_json(&json)
     }
 
+    /// Entry by entry, so one snippet croft cannot read is skipped and named
+    /// in [`warnings`](Self::warnings) instead of taking every other snippet
+    /// with it (#1483).
     pub fn from_json(json: &str) -> Self {
         let stripped = crate::keymap::strip_line_comments(json);
-        let raw: std::collections::BTreeMap<String, RawSnippet> =
-            serde_json::from_str(&stripped).unwrap_or_default();
-        let snippets = raw
-            .into_values()
-            .filter(|r| !r.prefix.is_empty())
-            .map(|r| Snippet {
-                prefix: r.prefix,
-                body: r.body.joined(),
-                scope: r
-                    .scope
-                    .map(|s| {
-                        s.split(',')
-                            .map(|p| p.trim().to_string())
-                            .filter(|p| !p.is_empty())
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            })
-            .collect();
-        Self { snippets }
+        if stripped.trim().is_empty() {
+            return Self::default();
+        }
+        let entries: serde_json::Map<String, serde_json::Value> =
+            match serde_json::from_str(&stripped) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    return Self {
+                        snippets: Vec::new(),
+                        warnings: vec![format!("snippets.json could not be read: {e}")],
+                    };
+                }
+            };
+        let mut snippets = Vec::new();
+        let mut warnings = Vec::new();
+        for (name, value) in entries {
+            let raw: RawSnippet = match serde_json::from_value(value) {
+                Ok(raw) => raw,
+                Err(e) => {
+                    warnings.push(format!("snippet {name:?} skipped: {e}"));
+                    continue;
+                }
+            };
+            let body = raw.body.joined();
+            let scope: Vec<String> = raw
+                .scope
+                .map(|s| {
+                    s.split(',')
+                        .map(|p| p.trim().to_string())
+                        .filter(|p| !p.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            for prefix in raw.prefix.into_vec() {
+                if prefix.is_empty() {
+                    continue;
+                }
+                snippets.push(Snippet {
+                    prefix,
+                    body: body.clone(),
+                    scope: scope.clone(),
+                });
+            }
+        }
+        Self { snippets, warnings }
     }
 
     pub fn is_empty(&self) -> bool {
         self.snippets.is_empty()
+    }
+
+    /// What could not be loaded, one line each, for OUTPUT · Snippets.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     /// Snippets in `language` whose prefix begins with `word` (case-sensitive,
@@ -329,8 +389,8 @@ pub fn snippets_path() -> PathBuf {
 
 /// Seeded on first "Configure User Snippets" so the user starts from a working
 /// example rather than a blank buffer.
-pub const TEMPLATE: &str = r#"// croft user snippets. Keyed by name; each has a "prefix" you type then expand
-// with Tab, a "body" (string or array of lines), and an optional "scope"
+pub const TEMPLATE: &str = r#"// croft user snippets. Keyed by name; each has a "prefix" (or an array of
+// them) you type then expand with Tab, a "body" (string or array of lines), and an optional "scope"
 // (comma-separated language ids; omit for all languages).
 // Tab stops: $1, $2 … in order, $0 final caret, ${1:placeholder} with default text.
 {
@@ -530,5 +590,89 @@ mod tests {
     fn junk_json_is_empty_not_fatal() {
         assert!(SnippetSet::from_json("not json").is_empty());
         assert!(SnippetSet::from_json("").is_empty());
+    }
+
+    #[test]
+    fn an_array_prefix_expands_from_each_of_its_words() {
+        let json = r#"{
+            "For loop": {
+                "prefix": ["for", "fori"],
+                "body": ["for ${1:i} in range(${2:10}):", "    $0"],
+                "scope": "python"
+            }
+        }"#;
+        let set = SnippetSet::from_json(json);
+        for word in ["for", "fori"] {
+            let s = set
+                .exact(word, "python")
+                .unwrap_or_else(|| panic!("{word} must expand"));
+            assert_eq!(s.body, "for ${1:i} in range(${2:10}):\n    $0");
+        }
+        assert!(set.exact("fori", "rust").is_none(), "scope still applies");
+        assert!(set.warnings().is_empty());
+    }
+
+    #[test]
+    fn an_array_prefix_does_not_hide_the_other_snippets() {
+        let json = format!(
+            "{}, \"For loop\": {{ \"prefix\": [\"for\", \"fori\"], \"body\": \"x\" }} }}",
+            TEMPLATE.trim_end().trim_end_matches('}').trim_end()
+        );
+        let set = SnippetSet::from_json(&json);
+        assert!(
+            set.exact("log", "javascript").is_some(),
+            "template snippets stay"
+        );
+        assert!(set.exact("fori", "python").is_some());
+    }
+
+    #[test]
+    fn a_malformed_entry_is_skipped_and_named_while_the_rest_load() {
+        let json = r#"{
+            "Log": { "prefix": "log", "body": "console.log($1)" },
+            "Broken": { "prefix": 42, "body": "x" },
+            "Main": { "prefix": "main", "body": "if __name__ == '__main__':" }
+        }"#;
+        let set = SnippetSet::from_json(json);
+        assert!(set.exact("log", "javascript").is_some());
+        assert!(set.exact("main", "python").is_some());
+        assert_eq!(set.warnings().len(), 1, "{:?}", set.warnings());
+        assert!(
+            set.warnings()[0].contains("\"Broken\""),
+            "{:?}",
+            set.warnings()
+        );
+    }
+
+    #[test]
+    fn an_entry_with_no_prefix_is_not_an_error() {
+        // Legal in VS Code: such a snippet is only reachable from Insert Snippet.
+        let json = r##"{
+            "Header": { "body": "# header" },
+            "Log": { "prefix": "log", "body": "x" }
+        }"##;
+        let set = SnippetSet::from_json(json);
+        assert!(set.exact("log", "javascript").is_some());
+        assert!(set.warnings().is_empty(), "{:?}", set.warnings());
+    }
+
+    #[test]
+    fn an_unreadable_file_reports_an_error_instead_of_loading_nothing_silently() {
+        let set = SnippetSet::from_json("{ \"Log\": { \"prefix\": \"log\", ");
+        assert!(set.is_empty());
+        assert_eq!(set.warnings().len(), 1);
+        assert!(set.warnings()[0].starts_with("snippets.json could not be read"));
+    }
+
+    /// Negative: an empty or comment-only file is not a mistake.
+    #[test]
+    fn an_empty_file_has_no_warnings() {
+        assert!(SnippetSet::from_json("").warnings().is_empty());
+        assert!(
+            SnippetSet::from_json("// nothing yet\n")
+                .warnings()
+                .is_empty()
+        );
+        assert!(SnippetSet::from_json("{}").warnings().is_empty());
     }
 }
