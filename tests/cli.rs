@@ -1342,3 +1342,168 @@ fn ctrl_shift_s_as_tmux_sends_it_does_not_save_while_ctrl_s_does() {
         "Ctrl+Shift+S opens Source Control"
     );
 }
+
+/// `croft edit --sequence-editor`, as git runs it from `GIT_SEQUENCE_EDITOR`,
+/// with git's own editor set to `editor` and no git config in the way.
+fn sequence_editor_command(dir: &std::path::Path, editor: &str) -> Command {
+    let no_config = dir.join("empty.gitconfig");
+    std::fs::write(&no_config, "").unwrap();
+    let mut cmd = Command::cargo_bin("croft").unwrap();
+    cmd.env("GIT_EDITOR", editor)
+        .env("GIT_CONFIG_GLOBAL", &no_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .current_dir(dir);
+    cmd
+}
+
+/// #1452: a shell that outlived its croft (a tmux server started from a
+/// croft pane) keeps `GIT_SEQUENCE_EDITOR` and `CROFT_VIEW_SOCK`. Every
+/// `git rebase -i` there failed with "the croft that opened this pane is
+/// gone". As the sequence editor, croft now hands the plan to git's own
+/// editor instead.
+#[test]
+fn the_sequence_editor_falls_back_to_gits_editor_when_its_croft_is_gone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = tmp.path().join("git-rebase-todo");
+    std::fs::write(&plan, "pick 1234567 one\n").unwrap();
+    let out = sequence_editor_command(tmp.path(), "echo edited >>")
+        .env("CROFT_VIEW_SOCK", tmp.path().join("nobody.sock"))
+        .args(["edit", "--wait", "--sequence-editor", "git-rebase-todo"])
+        .assert();
+    let out = out.success();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("croft is not running; using echo edited >>"),
+        "says which editor it used, was: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&plan).unwrap(),
+        "pick 1234567 one\nedited\n",
+        "git's editor ran on the plan"
+    );
+}
+
+/// #1452: the same with no socket at all (the variable was dropped but
+/// `GIT_SEQUENCE_EDITOR` kept).
+#[test]
+fn the_sequence_editor_falls_back_when_no_croft_socket_is_set() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = tmp.path().join("git-rebase-todo");
+    std::fs::write(&plan, "pick 1234567 one\n").unwrap();
+    sequence_editor_command(tmp.path(), "echo edited >>")
+        .env_remove("CROFT_VIEW_SOCK")
+        .args(["edit", "--wait", "--sequence-editor", "git-rebase-todo"])
+        .assert()
+        .success();
+    assert!(
+        std::fs::read_to_string(&plan)
+            .unwrap()
+            .ends_with("edited\n")
+    );
+}
+
+/// #1452: the fallback editor's own failure is git's to see: its exit code
+/// comes back, so git aborts the rebase as it would without croft.
+#[test]
+fn a_failing_fallback_editor_fails_the_sequence_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("git-rebase-todo"), "pick 1234567 one\n").unwrap();
+    let out = sequence_editor_command(tmp.path(), "exit 3;")
+        .env("CROFT_VIEW_SOCK", tmp.path().join("nobody.sock"))
+        .args(["edit", "--wait", "--sequence-editor", "git-rebase-todo"])
+        .assert();
+    let out = out.failure().code(3);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("using exit 3;"), "stderr was: {stderr}");
+}
+
+/// #1452 negative: a plain `croft edit` asked for croft by name, so a gone
+/// croft is still an error there and no other editor runs.
+#[test]
+fn a_plain_edit_against_a_gone_croft_still_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = tmp.path().join("notes.txt");
+    std::fs::write(&plan, "keep\n").unwrap();
+    let out = sequence_editor_command(tmp.path(), "echo edited >>")
+        .env("CROFT_VIEW_SOCK", tmp.path().join("nobody.sock"))
+        .args(["edit", "--wait", "notes.txt"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("the croft that opened this pane is gone"),
+        "stderr was: {stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(&plan).unwrap(), "keep\n");
+}
+
+/// #1452 negative: a croft that is running but refuses the file is not a
+/// gone croft. Its refusal stands, and git's editor does not run.
+#[test]
+fn a_croft_that_refuses_the_plan_is_not_replaced_by_gits_editor() {
+    use std::io::{BufRead, BufReader, Write};
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = tmp.path().join("git-rebase-todo");
+    std::fs::write(&plan, "pick 1234567 one\n").unwrap();
+    let sock = tmp.path().join("v.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        stream
+            .write_all(b"{\"status\":\"err\",\"message\":\"cannot open that here\"}\n")
+            .unwrap();
+    });
+    let out = sequence_editor_command(tmp.path(), "echo edited >>")
+        .env("CROFT_VIEW_SOCK", &sock)
+        .args(["edit", "--wait", "--sequence-editor", "git-rebase-todo"])
+        .assert();
+    server.join().unwrap();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("cannot open that here"),
+        "stderr was: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&plan).unwrap(),
+        "pick 1234567 one\n"
+    );
+}
+
+/// #1452 negative: with its croft alive the plan opens there, exactly as
+/// before, and git's editor never runs.
+#[test]
+fn a_live_croft_still_gets_the_plan() {
+    use std::io::{BufRead, BufReader, Write};
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = tmp.path().join("git-rebase-todo");
+    std::fs::write(&plan, "pick 1234567 one\n").unwrap();
+    let sock = tmp.path().join("v.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let server = std::thread::spawn(move || {
+        let replies: [&[u8]; 2] = [
+            b"{\"status\":\"ok\"}\n",
+            b"{\"status\":\"err\",\"message\":\"closed\"}\n",
+        ];
+        for reply in replies {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            stream.write_all(reply).unwrap();
+        }
+    });
+    let out = sequence_editor_command(tmp.path(), "echo edited >>")
+        .env("CROFT_VIEW_SOCK", &sock)
+        .args(["edit", "--wait", "--sequence-editor", "git-rebase-todo"])
+        .assert();
+    server.join().unwrap();
+    let out = out.success();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(!stderr.contains("not running"), "stderr was: {stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&plan).unwrap(),
+        "pick 1234567 one\n"
+    );
+}
