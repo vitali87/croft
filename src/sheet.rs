@@ -466,34 +466,54 @@ impl SheetData {
 }
 
 /// Serialize the sheet back to delimited bytes: the header row first
-/// (it is the file's own row 0, split off at parse), then the body,
-/// quoted per csv rules with the delimiter the file was READ with. `crlf`
-/// keeps a CRLF file CRLF: rewritten with LF, editing one cell made the
-/// whole file a diff.
-pub fn serialize_delimited(data: &SheetData, delim: u8, crlf: bool) -> Vec<u8> {
-    let terminator = if crlf {
-        csv::Terminator::CRLF
+/// (it is the file's own row 0, split off at parse), then the body, with
+/// the delimiter the file was READ with. `crlf` keeps a CRLF file CRLF:
+/// rewritten with LF, editing one cell made the whole file a diff.
+///
+/// `original` is the file as it is on disk (empty for a new file). A row
+/// whose values match one of its records goes back as that record's own
+/// bytes, so an edit changes its own line only, whatever quoting the file
+/// was written with (#1375). A changed or new row is quoted the way the
+/// file is: every field (R `write.csv`, Python `QUOTE_ALL`), every field
+/// but numbers (`QUOTE_NONNUMERIC`), or only where csv needs it.
+pub fn serialize_delimited(data: &SheetData, delim: u8, crlf: bool, original: &[u8]) -> Vec<u8> {
+    let terminator: &[u8] = if crlf { b"\r\n" } else { b"\n" };
+    let records = raw_records(original, delim);
+    // Never quoted for TSV, as it was read (#1136).
+    let quote_style = if delim == b'\t' {
+        csv::QuoteStyle::Never
     } else {
-        csv::Terminator::Any(b'\n')
+        file_quote_style(&records, original, delim)
     };
+    let mut unchanged: std::collections::HashMap<&[String], std::collections::VecDeque<&[u8]>> =
+        std::collections::HashMap::new();
+    for (fields, span) in &records {
+        unchanged
+            .entry(fields.as_slice())
+            .or_default()
+            .push_back(&original[span.clone()]);
+    }
     let mut out = Vec::new();
     let mut write = |record: &[String]| {
         // A row with no fields is a blank line the file had (see
         // `parse_delimited`); the writer would emit `""` for it instead.
         if record.is_empty() {
-            out.extend_from_slice(if crlf { b"\r\n" } else { b"\n" });
+            out.extend_from_slice(terminator);
             return;
         }
-        // Never quoted for TSV, as it was read (#1136).
-        let quote_style = if delim == b'\t' {
-            csv::QuoteStyle::Never
-        } else {
-            csv::QuoteStyle::Necessary
-        };
+        if let Some(raw) = unchanged.get_mut(record).and_then(|q| q.pop_front()) {
+            out.extend_from_slice(raw);
+            out.extend_from_slice(terminator);
+            return;
+        }
         let mut w = csv::WriterBuilder::new()
             .delimiter(delim)
             .flexible(true)
-            .terminator(terminator)
+            .terminator(if crlf {
+                csv::Terminator::CRLF
+            } else {
+                csv::Terminator::Any(b'\n')
+            })
             .quote_style(quote_style)
             .from_writer(&mut out);
         let _ = w.write_record(record);
@@ -506,6 +526,102 @@ pub fn serialize_delimited(data: &SheetData, delim: u8, crlf: bool) -> Vec<u8> {
         write(r);
     }
     out
+}
+
+/// Every record of a delimited file with the byte span it was read from,
+/// its line ending and any blank lines around it left out (#1375). Read as
+/// [`parse_delimited`] reads, so a record's values are the ones the grid
+/// shows. A file that does not parse yields none.
+fn raw_records(bytes: &[u8], delim: u8) -> Vec<(Vec<String>, std::ops::Range<usize>)> {
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .delimiter(delim)
+        .quoting(delim != b'\t')
+        .from_reader(bytes);
+    let mut out: Vec<(Vec<String>, std::ops::Range<usize>)> = Vec::new();
+    for record in reader.records() {
+        let Ok(r) = record else {
+            return Vec::new();
+        };
+        // Where the reader began looking for this record: the end of the
+        // previous one, line ending included.
+        let at = r.position().map_or(0, |p| p.byte() as usize);
+        if let Some((_, prev)) = out.last_mut() {
+            prev.end = at;
+        }
+        // Past the blank lines (and a CRLF's `\n`) the reader skipped.
+        let mut start = at;
+        while matches!(bytes.get(start), Some(b'\r' | b'\n')) {
+            start += 1;
+        }
+        out.push((r.iter().map(str::to_string).collect(), start..bytes.len()));
+    }
+    for (_, span) in &mut out {
+        while span.end > span.start && matches!(bytes[span.end - 1], b'\r' | b'\n') {
+            span.end -= 1;
+        }
+    }
+    out
+}
+
+/// The quoting a delimited file was written with, read from its records:
+/// every field quoted, or exactly the fields that are not numbers, or
+/// neither (quote where needed). A number is what the csv writer's
+/// `NonNumeric` style takes as one, so that style writes such a file back.
+fn file_quote_style(
+    records: &[(Vec<String>, std::ops::Range<usize>)],
+    bytes: &[u8],
+    delim: u8,
+) -> csv::QuoteStyle {
+    let is_number = |s: &str| s.parse::<f64>().is_ok() || s.parse::<i128>().is_ok();
+    let (mut quoted, mut bare_numbers, mut bare_other) = (0usize, 0usize, 0usize);
+    for (fields, span) in records {
+        let flags = quoted_fields(&bytes[span.clone()], delim);
+        if flags.len() != fields.len() {
+            return csv::QuoteStyle::Necessary;
+        }
+        for (field, was_quoted) in fields.iter().zip(flags) {
+            match (was_quoted, is_number(field)) {
+                (true, _) => quoted += 1,
+                (false, true) => bare_numbers += 1,
+                (false, false) => bare_other += 1,
+            }
+        }
+    }
+    match (quoted, bare_numbers, bare_other) {
+        (1.., 0, 0) => csv::QuoteStyle::Always,
+        (1.., 1.., 0) => csv::QuoteStyle::NonNumeric,
+        _ => csv::QuoteStyle::Necessary,
+    }
+}
+
+/// For each field of one raw record, whether it was written in quotes.
+fn quoted_fields(raw: &[u8], delim: u8) -> Vec<bool> {
+    let mut flags = Vec::new();
+    let mut i = 0;
+    loop {
+        let quoted = raw.get(i) == Some(&b'"');
+        flags.push(quoted);
+        if quoted {
+            // Past the closing quote; `""` inside is an escaped quote.
+            i += 1;
+            while i < raw.len() {
+                if raw[i] == b'"' {
+                    if raw.get(i + 1) == Some(&b'"') {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+        }
+        match raw[i.min(raw.len())..].iter().position(|&b| b == delim) {
+            Some(off) => i += off + 1,
+            None => return flags,
+        }
+    }
 }
 
 /// Outcome of an xlsx edit save (#178).
@@ -1292,7 +1408,7 @@ mod tests {
         assert_eq!(d.headers, vec!["a", "b", "c"]);
         d.set_cell(0, 2, String::from("x,y"));
         assert_eq!(d.cell(0, 2), "x,y", "short row grew to hold the cell");
-        let out = super::serialize_delimited(&d, b',', false);
+        let out = super::serialize_delimited(&d, b',', false, b"");
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "a,b,c\n1,2,\"x,y\"\n",
@@ -1319,7 +1435,7 @@ mod tests {
     fn a_tsv_cell_edit_rewrites_only_that_cell() {
         let mut d = super::parse_delimited(PRODUCTS_TSV, b'\t', "S").unwrap();
         d.set_cell(0, 3, String::from("12"));
-        let out = super::serialize_delimited(&d, b'\t', false);
+        let out = super::serialize_delimited(&d, b'\t', false, b"");
         let want = String::from_utf8(PRODUCTS_TSV.to_vec())
             .unwrap()
             .replacen("5\"\t10", "5\"\t12", 1);
@@ -1335,7 +1451,7 @@ mod tests {
             d.rows,
             vec![vec!["x,y".to_string(), "two\nlines".to_string()]]
         );
-        let out = super::serialize_delimited(&d, b',', false);
+        let out = super::serialize_delimited(&d, b',', false, b"");
         assert_eq!(out, b"a,b\n\"x,y\",\"two\nlines\"\n".to_vec());
     }
 
@@ -1344,7 +1460,10 @@ mod tests {
     fn a_plain_tsv_round_trips() {
         let src = b"h1\th2\n1\t2\n\n3\t\n";
         let d = super::parse_delimited(src, b'\t', "S").unwrap();
-        assert_eq!(super::serialize_delimited(&d, b'\t', false), src.to_vec());
+        assert_eq!(
+            super::serialize_delimited(&d, b'\t', false, b""),
+            src.to_vec()
+        );
     }
 
     #[test]
@@ -1352,19 +1471,135 @@ mod tests {
         let src = b"name\nann\n\nbob\n\n\n\"x\ny\"\n";
         let d = super::parse_delimited(src, b',', "S").unwrap();
         assert_eq!(d.rows.len(), 6, "{:?}", d.rows);
-        let out = super::serialize_delimited(&d, b',', false);
+        let out = super::serialize_delimited(&d, b',', false, b"");
         assert_eq!(out, src.to_vec(), "{}", String::from_utf8_lossy(&out));
         let lead = super::parse_delimited(b"\n\nh\n1\n", b',', "S").unwrap();
         assert_eq!(lead.headers, vec!["h"]);
         let crlf = b"a,b\r\n1,2\r\n\r\n3,4\r\n";
         let d = super::parse_delimited(crlf, b',', "S").unwrap();
-        assert_eq!(super::serialize_delimited(&d, b',', true), crlf.to_vec());
+        assert_eq!(
+            super::serialize_delimited(&d, b',', true, b""),
+            crlf.to_vec()
+        );
+    }
+
+    /// #1375: the repro, R `write.csv` / Python `QUOTE_ALL` style.
+    const QUOTED_CSV: &[u8] = b"\"id\",\"name\",\"city\",\"score\"\n\"1\",\"Ada\",\"London\",\"91\"\n\"2\",\"Grace\",\"New York\",\"88\"\n\"3\",\"Linus\",\"Helsinki\",\"79\"\n";
+
+    fn changed_lines(before: &[u8], after: &[u8]) -> Vec<(usize, String)> {
+        let before = String::from_utf8_lossy(before);
+        let after = String::from_utf8_lossy(after);
+        let (b, a): (Vec<&str>, Vec<&str>) = (before.lines().collect(), after.lines().collect());
+        assert_eq!(b.len(), a.len(), "line count changed:\n{after}");
+        a.iter()
+            .zip(&b)
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(i, (a, _))| (i, a.to_string()))
+            .collect()
+    }
+
+    /// #1375: one cell edited in a fully quoted file changes that line only,
+    /// and the line stays fully quoted.
+    #[test]
+    fn a_quote_all_csv_edit_rewrites_only_that_line_and_keeps_its_quotes() {
+        let mut d = super::parse_delimited(QUOTED_CSV, b',', "S").unwrap();
+        d.set_cell(0, 3, String::from("95"));
+        let out = super::serialize_delimited(&d, b',', false, QUOTED_CSV);
+        assert_eq!(
+            changed_lines(QUOTED_CSV, &out),
+            vec![(1, String::from("\"1\",\"Ada\",\"London\",\"95\""))]
+        );
+    }
+
+    /// #1375: a `QUOTE_NONNUMERIC` file keeps numbers bare and text quoted
+    /// on the edited line.
+    #[test]
+    fn a_quote_nonnumeric_csv_edit_keeps_numbers_bare_and_text_quoted() {
+        let src = b"\"id\",\"name\",\"score\"\n1,\"Ada\",91\n2,\"Grace\",88.5\n";
+        let mut d = super::parse_delimited(src, b',', "S").unwrap();
+        d.set_cell(1, 1, String::from("Grace H"));
+        let out = super::serialize_delimited(&d, b',', false, src);
+        assert_eq!(
+            changed_lines(src, &out),
+            vec![(2, String::from("2,\"Grace H\",88.5"))]
+        );
+    }
+
+    /// #1375: a row added to a fully quoted file is quoted like the rest,
+    /// its empty cells included.
+    #[test]
+    fn a_row_inserted_into_a_quote_all_csv_is_quoted_too() {
+        let mut d = super::parse_delimited(QUOTED_CSV, b',', "S").unwrap();
+        d.insert_row(3);
+        d.set_cell(3, 1, String::from("Ken"));
+        let out =
+            String::from_utf8(super::serialize_delimited(&d, b',', false, QUOTED_CSV)).unwrap();
+        assert!(
+            out.starts_with(std::str::from_utf8(QUOTED_CSV).unwrap()),
+            "{out}"
+        );
+        assert!(out.ends_with("\"\",\"Ken\",\"\",\"\"\n"), "{out}");
+    }
+
+    /// #1375: sorting moves rows but each keeps its own bytes.
+    #[test]
+    fn sorted_rows_keep_their_original_bytes() {
+        let mut d = super::parse_delimited(QUOTED_CSV, b',', "S").unwrap();
+        d.sort_by_column(3);
+        let out =
+            String::from_utf8(super::serialize_delimited(&d, b',', false, QUOTED_CSV)).unwrap();
+        assert_eq!(
+            out,
+            "\"id\",\"name\",\"city\",\"score\"\n\"3\",\"Linus\",\"Helsinki\",\"79\"\n\"2\",\"Grace\",\"New York\",\"88\"\n\"1\",\"Ada\",\"London\",\"91\"\n"
+        );
+    }
+
+    /// #1375 negative: an unquoted file saves as it always has, quoting only
+    /// a cell that needs it.
+    #[test]
+    fn an_unquoted_csv_edit_still_quotes_only_when_needed() {
+        let src = b"id,name,city\n1,Ada,London\n2,Grace,Paris\n";
+        let mut d = super::parse_delimited(src, b',', "S").unwrap();
+        d.set_cell(0, 2, String::from("London, UK"));
+        let out = super::serialize_delimited(&d, b',', false, src);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "id,name,city\n1,Ada,\"London, UK\"\n2,Grace,Paris\n"
+        );
+    }
+
+    /// #1375 negative: a file that mixes styles (R's bare `NA`) leaves its
+    /// untouched lines alone and writes the edited one with the minimal
+    /// quoting, rather than guessing a style the file does not have.
+    #[test]
+    fn a_mixed_quoting_csv_keeps_untouched_lines_and_quotes_the_edit_minimally() {
+        let src = b"\"id\",\"name\",\"score\"\n1,\"Ada\",NA\n2,\"Grace\",88\n";
+        let mut d = super::parse_delimited(src, b',', "S").unwrap();
+        d.set_cell(1, 2, String::from("90"));
+        let out = super::serialize_delimited(&d, b',', false, src);
+        assert_eq!(
+            changed_lines(src, &out),
+            vec![(2, String::from("2,Grace,90"))]
+        );
+    }
+
+    /// #1375 negative: a saved file the grid did not touch is byte-identical,
+    /// odd spacing and a CRLF ending included.
+    #[test]
+    fn an_untouched_csv_saves_byte_for_byte() {
+        let src = b"\"a\" ,b\r\n\"1\",2\r\n";
+        let d = super::parse_delimited(src, b',', "S").unwrap();
+        assert_eq!(
+            super::serialize_delimited(&d, b',', true, src),
+            src.to_vec()
+        );
     }
 
     #[test]
     fn a_crlf_file_saves_as_crlf() {
         let d = super::parse_delimited(b"a,b\r\n1,2\r\n", b',', "S").unwrap();
-        let out = super::serialize_delimited(&d, b',', true);
+        let out = super::serialize_delimited(&d, b',', true, b"");
         assert_eq!(String::from_utf8(out).unwrap(), "a,b\r\n1,2\r\n");
     }
 
@@ -1404,7 +1639,7 @@ mod tests {
         assert_eq!(d.headers, vec!["a", "b"]);
         assert_eq!(d.cell(1, 1), "4");
         assert!(!d.delete_col(9), "out of range refuses");
-        let out = super::serialize_delimited(&d, b',', false);
+        let out = super::serialize_delimited(&d, b',', false, b"");
         assert_eq!(String::from_utf8(out).unwrap(), "a,b\n1,2\n3,4\n");
     }
 
@@ -1417,7 +1652,7 @@ mod tests {
         assert_eq!(d.headers, vec![String::new()], "the header cell exists");
         d.insert_row(0);
         d.set_cell(0, 0, String::from("v"));
-        let out = super::serialize_delimited(&d, b',', false);
+        let out = super::serialize_delimited(&d, b',', false, b"");
         let again = super::parse_delimited(&out, b',', "S").unwrap();
         assert_eq!(again.rows.len(), 1, "the body row survives the reopen");
         assert_eq!(again.cell(0, 0), "v");
@@ -1427,7 +1662,7 @@ mod tests {
     fn tsv_round_trips_with_its_own_delimiter() {
         let mut d = super::parse_delimited(b"x\ty\n1\t2\n", b'\t', "S").unwrap();
         d.set_cell(0, 0, String::from("9"));
-        let out = super::serialize_delimited(&d, b'\t', false);
+        let out = super::serialize_delimited(&d, b'\t', false, b"");
         assert_eq!(String::from_utf8(out).unwrap(), "x\ty\n9\t2\n");
     }
 

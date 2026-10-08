@@ -10354,6 +10354,30 @@ fn xlsx_grid_editing_saves_cells_and_holds_formulas_for_consent() {
     assert_eq!(ws3.cell((2u32, 3u32)).unwrap().value(), "8");
 }
 
+/// #1375 end-to-end: one cell typed into a fully quoted CSV and saved
+/// changes that line only, still fully quoted.
+#[test]
+fn saving_a_quoted_csv_from_the_grid_changes_only_the_edited_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("scores.csv");
+    let src = "\"id\",\"name\",\"score\"\n\"1\",\"Ada\",\"91\"\n\"2\",\"Grace\",\"88\"\n";
+    std::fs::write(&p, src).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    for c in "95".chars() {
+        app.handle_sheet_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    app.handle_sheet_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    app.save();
+    assert!(!app.editor.dirty);
+    assert_eq!(
+        std::fs::read_to_string(&p).unwrap(),
+        src.replace("\"91\"", "\"95\"")
+    );
+}
+
 #[test]
 fn sheet_grid_editing_types_commits_and_saves_with_the_delimiter() {
     // #177 end-to-end: cell cursor, type-to-replace, commit-and-advance,
