@@ -12648,9 +12648,6 @@ fn block_comment_tokens(lang: Option<LangKind>) -> Option<(&'static str, &'stati
     }
 }
 
-/// Title-case a string: the first alphanumeric of each run is upper-cased,
-/// the rest lower-cased, separators preserved. Used by Transform to Title
-/// Case.
 /// Sort `(first, last)` row blocks and merge the ones that overlap, and
 /// with `touching` also the ones that meet end to end.
 fn merge_row_blocks(mut blocks: Vec<(usize, usize)>, touching: bool) -> Vec<(usize, usize)> {
@@ -12698,6 +12695,9 @@ fn text_end(start: (usize, usize), text: &str) -> (usize, usize) {
     }
 }
 
+/// Title-case a string: the first alphanumeric of each run is upper-cased,
+/// the rest lower-cased, separators preserved. Used by Transform to Title
+/// Case.
 fn title_case(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_alnum = false;
