@@ -901,4 +901,30 @@ class KernelManager:
             "{events:?}"
         );
     }
+
+    /// A long Run All behind a silent cell: the bridge must not wait on
+    /// iopub between queued requests, or each one costs the poll timeout
+    /// and an Interrupt or Restart queued after them is held back.
+    #[test]
+    fn queued_requests_do_not_each_wait_on_a_silent_kernel() {
+        if !crate::lsp::manager::is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let mut requests: Vec<String> = (0..250)
+            .map(|i| format!(r#"{{"op":"execute","id":"h{i}","code":"hang"}}"#))
+            .collect();
+        requests.push(r#"{"op":"execute","id":"a","code":"x = 1"}"#.into());
+        let requests: Vec<&str> = requests.iter().map(String::as_str).collect();
+        let start = std::time::Instant::now();
+        let (events, _) = bridge_against_fake(&requests, false);
+        let took = start.elapsed();
+        assert_eq!(done_status(&events, "a").as_deref(), Some("ok"));
+        // Waiting per queued cell would add 250 polls (5s) on top of the
+        // helper's 0.8s pause.
+        assert!(
+            took < std::time::Duration::from_secs(3),
+            "queued requests were slowed by iopub polls: {took:?}"
+        );
+    }
 }

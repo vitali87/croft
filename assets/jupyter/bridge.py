@@ -154,8 +154,12 @@ def kernel_loop():
             if req.get("op") == "shutdown":
                 return
             handle(req)
+        # Only wait on iopub when nothing is queued: a Run All of many cells
+        # behind a silent cell would otherwise pay the timeout per request,
+        # holding back the rest and any Interrupt or Restart behind them.
         try:
-            on_iopub(kc.get_iopub_msg(timeout=0.05))
+            wait = 0 if not requests.empty() else 0.05
+            on_iopub(kc.get_iopub_msg(timeout=wait))
         except queue.Empty:
             pass
         except Exception:  # noqa: BLE001 - channel closed on shutdown
