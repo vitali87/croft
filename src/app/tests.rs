@@ -73782,3 +73782,118 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     assert!(app.source_control.nested_repos.is_empty());
     assert!(app.source_control.last_init_repo_button_area.width > 0);
 }
+
+/// A format-on-save in flight for `m.py`, with `x` typed and not yet on
+/// disk: the state Ctrl+S leaves while it waits on the formatter.
+fn app_waiting_on_format_on_save(tmp: &Path) -> (App, PathBuf) {
+    let mut app = app_with_open_file(tmp, "m.py", "x = 1\n");
+    let file = app.editor.path.clone().unwrap();
+    app.editor.insert_char('y');
+    app.arm_deferred_save();
+    app.format_request_id = Some(41);
+    app.format_request_seq = app.format_target_seq(&file);
+    (app, file)
+}
+
+/// #1491: with Format on Save on, a server that never answered
+/// `textDocument/formatting` left the file unwritten forever (the tab dirty,
+/// "Formatting document" in the status bar). After a bounded wait the file
+/// is written unformatted, as VS Code does, and the late reply is dropped.
+#[test]
+fn a_format_on_save_with_no_reply_writes_the_file_unformatted_after_a_bounded_wait() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_waiting_on_format_on_save(tmp.path());
+    let start = std::time::Instant::now();
+
+    // Within the wait nothing is written: the reply may still come.
+    assert!(!app.drain_lsp_format_at(start));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "x = 1\n");
+    assert!(app.save_after_format.is_some());
+
+    let after = start + FORMAT_ON_SAVE_TIMEOUT + std::time::Duration::from_millis(50);
+    assert!(app.drain_lsp_format_at(after), "redraw for the save");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "yx = 1\n");
+    assert!(!app.editor.dirty, "the tab is saved");
+    assert!(app.save_after_format.is_none());
+    assert!(
+        app.format_request_id.is_none(),
+        "a reply that turns up later is not applied to the saved text"
+    );
+    assert_eq!(
+        app.status,
+        "Saved m.py without formatting: the formatter did not answer in 2 s"
+    );
+}
+
+/// #1491: pressing Ctrl+S again while the formatter is silent writes the
+/// file at once instead of changing nothing.
+#[test]
+fn a_second_save_while_the_formatter_is_silent_writes_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_waiting_on_format_on_save(tmp.path());
+    app.save();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "yx = 1\n");
+    assert!(!app.editor.dirty);
+    assert!(app.save_after_format.is_none());
+    assert!(app.format_request_id.is_none());
+    assert_eq!(
+        app.status,
+        "Saved m.py without formatting: saved again before the formatter answered"
+    );
+}
+
+/// #1491 negative: a reply inside the wait still formats, then saves, and
+/// the wait does not fire afterwards.
+#[test]
+fn a_format_reply_inside_the_wait_still_formats_before_saving() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_waiting_on_format_on_save(tmp.path());
+    let formatted = vec![crate::widgets::editor::TextSpanEdit {
+        start: (0, 0),
+        end: (0, 6),
+        new_text: String::from("yx = 2"),
+        utf16: false,
+    }];
+    app.format_request_id = None;
+    app.land_format(Some(formatted), false, Some(file.clone()));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "yx = 2\n");
+    let saved = app.status.clone();
+    let later = std::time::Instant::now() + FORMAT_ON_SAVE_TIMEOUT * 2;
+    assert!(!app.drain_lsp_format_at(later), "nothing left to time out");
+    assert_eq!(app.status, saved);
+}
+
+/// #1491 negative: a plain Format Document (no save waiting) is never cut
+/// short; a slow formatter may still answer it.
+#[test]
+fn a_slow_format_document_without_a_save_is_left_to_finish() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "m.py", "x = 1\n");
+    app.format_request_id = Some(41);
+    let later = std::time::Instant::now() + FORMAT_ON_SAVE_TIMEOUT * 2;
+    assert!(!app.drain_lsp_format_at(later));
+    assert_eq!(app.format_request_id, Some(41));
+}
+
+/// #1491: Save All said "Saved 1 editor" while the file still waited on
+/// its formatter. It now says the file is being formatted.
+#[test]
+fn save_all_does_not_report_a_file_waiting_on_its_formatter_as_saved() {
+    assert_eq!(
+        save_all_summary(1, 0, Some("m.py"), String::new()),
+        "Formatting m.py before saving it"
+    );
+    assert_eq!(
+        save_all_summary(3, 0, Some("m.py"), String::new()),
+        "Saved 2 editors; formatting m.py before saving it"
+    );
+    // Negative: with nothing waiting, the count stands as before.
+    assert_eq!(
+        save_all_summary(2, 0, None, String::new()),
+        "Saved 2 editors"
+    );
+    assert_eq!(
+        save_all_summary(1, 0, None, String::new()),
+        "Saved 1 editor"
+    );
+}

@@ -3014,6 +3014,9 @@ pub struct App {
     /// Latch set while a save is waiting on a format reply. `drain_lsp_format`
     /// consumes it to write the (now formatted) buffer to disk.
     save_after_format: Option<PathBuf>,
+    /// When a format-on-save stops waiting on its formatter and writes the
+    /// file unformatted (#1491). Set with `save_after_format`.
+    format_save_deadline: Option<std::time::Instant>,
     /// Background `git log` results for the TIMELINE, keyed by the file they
     /// describe so a stale reply for a since-closed file is ignored on drain.
     timeline_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<crate::git::FileHistoryEntry>)>,
@@ -5607,6 +5610,7 @@ impl App {
             auto_save_on_focus_change: loaded_prefs.auto_save_on_focus_change,
             last_focus_signature: None,
             save_after_format: None,
+            format_save_deadline: None,
             outline,
             open_editors,
             timeline,
@@ -13762,14 +13766,19 @@ impl App {
     }
 
     pub fn drain_lsp_format(&mut self) -> bool {
+        self.drain_lsp_format_at(std::time::Instant::now())
+    }
+
+    /// Apply a formatter reply that has arrived, or, once a format-on-save
+    /// has waited `FORMAT_ON_SAVE_TIMEOUT` with none, write its file
+    /// unformatted: a busy, hung or unreachable server left it unsaved for
+    /// good (#1491). Returns true when the next frame should redraw.
+    fn drain_lsp_format_at(&mut self, now: std::time::Instant) -> bool {
         let mut arrived = false;
         let mut edits: Option<Vec<crate::widgets::editor::TextSpanEdit>> = None;
         let mut unsupported = false;
         let mut path: Option<PathBuf> = None;
-        {
-            let Some(lsp) = self.lsp.as_ref() else {
-                return false;
-            };
+        if let Some(lsp) = self.lsp.as_ref() {
             while let Some(result) = lsp.drain_formatting() {
                 if Some(result.request_id) != self.format_request_id {
                     continue;
@@ -13781,11 +13790,47 @@ impl App {
             }
         }
         if !arrived {
-            return false;
+            let overdue = self.save_after_format.is_some()
+                && self
+                    .format_save_deadline
+                    .is_some_and(|deadline| now >= deadline);
+            if overdue {
+                let secs = FORMAT_ON_SAVE_TIMEOUT.as_secs();
+                self.save_without_formatting(&format!("the formatter did not answer in {secs} s"));
+            }
+            return overdue;
         }
         self.format_request_id = None;
         self.land_format(edits, unsupported, path);
         true
+    }
+
+    /// Write a format-on-save's file now, unformatted, and drop the reply
+    /// it was waiting on, which would otherwise land on the saved text.
+    fn save_without_formatting(&mut self, reason: &str) {
+        let Some(path) = self.save_after_format.clone() else {
+            return;
+        };
+        self.format_request_id = None;
+        self.format_request_seq = None;
+        self.format_request_selection = false;
+        self.complete_pending_save();
+        // A refused write (a disk conflict, a lossy encoding) keeps the
+        // prompt it put in the status bar.
+        if !self.path_is_dirty(&path) {
+            self.status = format!(
+                "Saved {} without formatting: {reason}",
+                self.status_path(&path)
+            );
+        }
+    }
+
+    /// Whether any open tab of `path`, in any split, has unsaved edits.
+    fn path_is_dirty(&self, path: &Path) -> bool {
+        std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .any(|e| e.dirty && e.path.as_deref() == Some(path))
     }
 
     /// Apply a formatter's reply to the request in flight, then finish a
@@ -55439,11 +55484,13 @@ impl App {
             self.write_tab_to_disk(&pending);
         }
         self.save_after_format = self.editor.path.clone();
+        self.format_save_deadline = Some(std::time::Instant::now() + FORMAT_ON_SAVE_TIMEOUT);
     }
 
     /// Write the deferred buffer to disk once its format reply has landed.
     /// A no-op unless [`Self::save`] armed `save_after_format`.
     fn complete_pending_save(&mut self) {
+        self.format_save_deadline = None;
         let Some(path) = std::mem::take(&mut self.save_after_format) else {
             return;
         };
@@ -55699,24 +55746,19 @@ impl App {
         self.sweep_dirty_buffers(false, true);
         // A format-on-save write lands with its formatter reply: it is on
         // its way, not left behind.
-        let pending = usize::from(self.save_after_format.is_some());
-        let left = self.unsaved_count().saturating_sub(pending);
-        self.status = if left == 0 {
-            format!(
-                "Saved {before} editor{}",
-                if before == 1 { "" } else { "s" }
-            )
-        } else if self.editor.dirty && pending == 0 {
-            // The active tab's own refusal names the reason and the key
-            // that consents; a summary would bury it.
+        let pending = self
+            .save_after_format
+            .clone()
+            .map(|path| self.status_path(&path));
+        let left = self
+            .unsaved_count()
+            .saturating_sub(usize::from(pending.is_some()));
+        let active_refusal = if self.editor.dirty {
             active_status
         } else {
-            format!(
-                "Save All: {left} editor{} still unsaved - open {} and press Cmd+S",
-                if left == 1 { "" } else { "s" },
-                if left == 1 { "it" } else { "each" }
-            )
+            String::new()
         };
+        self.status = save_all_summary(before, left, pending.as_deref(), active_refusal);
     }
 
     fn toggle_auto_save(&mut self) {
@@ -57200,6 +57242,12 @@ impl App {
                 }
                 Err(e) => self.status = format!("Save failed: {e}"),
             }
+            return;
+        }
+        // Saved again while the formatter has still not answered: write now
+        // rather than wait on it a second time (#1491).
+        if self.save_after_format.is_some() && self.save_after_format == self.editor.path {
+            self.save_without_formatting("saved again before the formatter answered");
             return;
         }
         // Format-on-save: defer the write until the format reply arrives, then
@@ -65734,6 +65782,47 @@ fn is_delete_node_key(key: KeyEvent) -> bool {
 /// Case-insensitive on the letter so Shift+Ctrl+S also works.
 fn is_word_continuation(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// How long a format-on-save waits for the formatter before writing the
+/// file unformatted (#1491).
+const FORMAT_ON_SAVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Save All's status line: `before` editors were unsaved, `left` still are,
+/// `pending` names the file whose write waits on its formatter, and
+/// `active_refusal` is the active tab's own reason it is still unsaved.
+fn save_all_summary(
+    before: usize,
+    left: usize,
+    pending: Option<&str>,
+    active_refusal: String,
+) -> String {
+    let editors = |n: usize| format!("{n} editor{}", if n == 1 { "" } else { "s" });
+    if left == 0
+        && let Some(file) = pending
+    {
+        // Its write waits on the formatter (at most FORMAT_ON_SAVE_TIMEOUT):
+        // not saved yet, so not counted as saved (#1491).
+        match before.saturating_sub(1) {
+            0 => format!("Formatting {file} before saving it"),
+            saved => format!(
+                "Saved {}; formatting {file} before saving it",
+                editors(saved)
+            ),
+        }
+    } else if left == 0 {
+        format!("Saved {}", editors(before))
+    } else if !active_refusal.is_empty() && pending.is_none() {
+        // The active tab's own refusal names the reason and the key
+        // that consents; a summary would bury it.
+        active_refusal
+    } else {
+        format!(
+            "Save All: {left} editor{} still unsaved - open {} and press Cmd+S",
+            if left == 1 { "" } else { "s" },
+            if left == 1 { "it" } else { "each" }
+        )
+    }
 }
 
 /// Characters that open or advance a call, triggering parameter hints.
