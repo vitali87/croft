@@ -33,7 +33,19 @@ pub fn split(arg: &Path, cwd: &Path) -> (PathBuf, Option<FileLocation>) {
     let Some((rest, last)) = split_number(bytes) else {
         return (arg.to_path_buf(), None);
     };
-    // `file:line:col` first, then `file:line`.
+    // `file:line` first, so the longer name wins when both it and a
+    // shorter one exist: `notes:5:3` is `notes:5` at line 3, not `notes`.
+    let path = Path::new(OsStr::from_bytes(rest));
+    if !rest.is_empty() && exists(path) {
+        return (
+            path.to_path_buf(),
+            Some(FileLocation {
+                line: last.max(1),
+                col: None,
+            }),
+        );
+    }
+    // Then `file:line:col`.
     if let Some((prefix, line)) = split_number(rest) {
         let path = Path::new(OsStr::from_bytes(prefix));
         if !prefix.is_empty() && exists(path) {
@@ -45,16 +57,6 @@ pub fn split(arg: &Path, cwd: &Path) -> (PathBuf, Option<FileLocation>) {
                 }),
             );
         }
-    }
-    let path = Path::new(OsStr::from_bytes(rest));
-    if !rest.is_empty() && exists(path) {
-        return (
-            path.to_path_buf(),
-            Some(FileLocation {
-                line: last.max(1),
-                col: None,
-            }),
-        );
     }
     (arg.to_path_buf(), None)
 }
@@ -150,6 +152,20 @@ mod tests {
                 "{arg}"
             );
         }
+    }
+
+    /// With both `notes` and `notes:5` present, `notes:5:3` names line 3
+    /// of the longer one.
+    #[test]
+    fn the_longest_existing_name_wins() {
+        let tmp = dir_with(&["notes", "notes:5"]);
+        assert_eq!(
+            split(Path::new("notes:5:3"), tmp.path()),
+            (
+                PathBuf::from("notes:5"),
+                Some(FileLocation { line: 3, col: None })
+            )
+        );
     }
 
     #[test]
