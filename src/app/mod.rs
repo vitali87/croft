@@ -56270,14 +56270,11 @@ impl App {
         if hits.is_empty() {
             return (name, None);
         }
-        let files = hits
-            .iter()
-            .map(|h| &h.path)
-            .collect::<std::collections::HashSet<_>>()
-            .len();
+        // The Search header's own totals: a line with two matches counts two.
+        let (matches, files) = self.search.result_counts();
         let focus = format!(
             "{name}, {} in {}",
-            a11y_count(hits.len(), "match", "matches"),
+            a11y_count(matches, "match", "matches"),
             a11y_count(files, "file", "files")
         );
         let item = self.search.selected_hit().map(|h| {

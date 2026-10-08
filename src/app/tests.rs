@@ -73910,6 +73910,23 @@ fn search_results_are_announced_with_the_count_and_the_selected_match() {
     assert_eq!(snap.item.as_deref(), Some("b.py line 3: total += i"));
 }
 
+/// #1295: the announced total counts matches, not matching lines, the same
+/// as the Search header: a line with two matches is two.
+#[test]
+fn search_announces_every_match_on_a_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Tree;
+    app.sidebar_view = SidebarView::Search;
+    app.search.hits = vec![crate::widgets::search::SearchHit {
+        path: tmp.path().join("b.py"),
+        line_no: 3,
+        line_text: "total += total".into(),
+        matches: 2,
+    }];
+    assert_eq!(app.a11y_snapshot().focus, "Search, 2 matches in 1 file");
+}
+
 #[test]
 fn the_selected_source_control_change_is_announced() {
     use crate::git::{ChangeEntry, ChangeKind};
