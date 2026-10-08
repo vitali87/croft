@@ -10354,6 +10354,30 @@ fn xlsx_grid_editing_saves_cells_and_holds_formulas_for_consent() {
     assert_eq!(ws3.cell((2u32, 3u32)).unwrap().value(), "8");
 }
 
+/// #1375 end-to-end: one cell typed into a fully quoted CSV and saved
+/// changes that line only, still fully quoted.
+#[test]
+fn saving_a_quoted_csv_from_the_grid_changes_only_the_edited_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("scores.csv");
+    let src = "\"id\",\"name\",\"score\"\n\"1\",\"Ada\",\"91\"\n\"2\",\"Grace\",\"88\"\n";
+    std::fs::write(&p, src).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    for c in "95".chars() {
+        app.handle_sheet_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    app.handle_sheet_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    app.save();
+    assert!(!app.editor.dirty);
+    assert_eq!(
+        std::fs::read_to_string(&p).unwrap(),
+        src.replace("\"91\"", "\"95\"")
+    );
+}
+
 #[test]
 fn sheet_grid_editing_types_commits_and_saves_with_the_delimiter() {
     // #177 end-to-end: cell cursor, type-to-replace, commit-and-advance,
@@ -14659,6 +14683,69 @@ fn a_late_completion_reply_opens_only_while_the_caret_is_in_its_word() {
     assert!(app.completion_popup.is_none());
 }
 
+/// TypeScript on a possibly-undefined object: vtsls's member items replace
+/// the `.` with `?.`, so their filter text starts at the dot. Typing a
+/// letter filtered them on the bare word and hid every member (#1472).
+#[test]
+fn optional_members_survive_the_first_typed_letter() {
+    use crate::lsp::manager::CompletionResult;
+    use crate::widgets::editor::TextSpanEdit;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("opt.ts");
+    std::fs::write(&path, "user.n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 6;
+    app.completion_request_id = Some(1);
+    app.completion_origin = Some((0, 6));
+    draw(&mut app, 100, 30);
+    let member = |name: &str| crate::lsp::CompletionItem {
+        label: name.to_string(),
+        filter_text: Some(format!(".?.{name}")),
+        text_edit: Some(TextSpanEdit {
+            start: (0, 4),
+            end: (0, 6),
+            new_text: format!("?.{name}"),
+            utf16: true,
+        }),
+        ..Default::default()
+    };
+    assert!(app.apply_completion_result(CompletionResult {
+        request_id: 1,
+        path: path.clone(),
+        items: vec![member("email"), member("name")],
+    }));
+    let popup = app.completion_popup.as_ref().expect("the popup opens");
+    assert_eq!(
+        popup.selected_item().map(|i| i.label.as_str()),
+        Some("name"),
+        "status: {}",
+        app.status
+    );
+    // Typing on narrows it the same way, and Backspace widens it again.
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE))
+        .unwrap();
+    let popup = app
+        .completion_popup
+        .as_ref()
+        .expect("still open after `na`");
+    assert_eq!(popup.visible_indices().len(), 1);
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    let popup = app.completion_popup.as_ref().expect("still open after `.`");
+    assert_eq!(popup.visible_indices().len(), 2);
+    // Enter takes the server's edit: the `.` becomes `?.`.
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines, ["user?.name"]);
+}
+
 /// A buffer holding `import lo` with the caret at its end, and a sender that
 /// lands completion replies where a server's do, so a test can deliver one
 /// at the moment a slow server would: after the keys typed since the ask.
@@ -15388,6 +15475,224 @@ fn scm_ready_to_commit() -> (tempfile::TempDir, App) {
     });
     app.set_sidebar_view(SidebarView::SourceControl);
     (tmp, app)
+}
+
+/// #1438: the committed repo with `seed.txt` open in a tab whose edit
+/// (`edited changed`) is not saved, and the message box filled.
+fn scm_with_unsaved_tab() -> (tempfile::TempDir, App) {
+    let (tmp, mut app) = scm_ready_to_commit();
+    app.editor
+        .open_pinned(&tmp.path().join("seed.txt"))
+        .unwrap();
+    app.editor.insert_str("edited ");
+    assert!(app.editor.dirty);
+    app.source_control.message = "bump seed".to_string();
+    app.source_control.message_cursor = app.source_control.message.chars().count();
+    (tmp, app)
+}
+
+/// #1438: Commit with an unsaved tab in the repository asks first, and
+/// commits nothing until an answer is given.
+#[test]
+fn commit_with_an_unsaved_tab_in_the_repo_asks_before_committing() {
+    let (tmp, mut app) = scm_with_unsaved_tab();
+    let head = git_out(tmp.path(), &["rev-parse", "HEAD"]);
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_git_net(&mut app);
+    let pending = app.pending_unsaved_scm.as_ref().expect("the prompt opens");
+    assert_eq!(pending.op, ScmWrite::Commit);
+    assert_eq!(pending.files, vec![tmp.path().join("seed.txt")]);
+    assert_eq!(
+        git_out(tmp.path(), &["rev-parse", "HEAD"]),
+        head,
+        "no commit yet"
+    );
+    let rendered = screen_text_863(&mut app, 120, 40);
+    assert!(rendered.contains("UNSAVED CHANGES"), "{rendered}");
+    assert!(rendered.contains("Save All & Commit"), "{rendered}");
+    assert!(rendered.contains("seed.txt"), "{rendered}");
+}
+
+/// #1438: Save All & Commit writes the tab, then commits the editor text.
+#[test]
+fn save_all_and_commit_commits_the_text_in_the_tab() {
+    let (tmp, mut app) = scm_with_unsaved_tab();
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    wait_for_git_net(&mut app);
+    assert!(app.pending_unsaved_scm.is_none());
+    assert!(!app.editor.dirty, "the tab was saved");
+    assert_eq!(
+        git_out(tmp.path(), &["show", "HEAD:seed.txt"]),
+        "edited changed\n"
+    );
+    assert_eq!(last_commit_message(tmp.path()), "bump seed\n\n");
+}
+
+/// #1438: Commit Anyway keeps the old behaviour: the disk text is
+/// committed and the tab stays unsaved.
+#[test]
+fn commit_anyway_commits_the_disk_text_and_leaves_the_tab_unsaved() {
+    let (tmp, mut app) = scm_with_unsaved_tab();
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    app.handle_key(key(KeyCode::Char('c'), KeyModifiers::NONE))
+        .unwrap();
+    wait_for_git_net(&mut app);
+    assert!(app.pending_unsaved_scm.is_none());
+    assert_eq!(git_out(tmp.path(), &["show", "HEAD:seed.txt"]), "changed\n");
+    assert!(app.editor.dirty, "Commit Anyway saves nothing");
+}
+
+/// #1438: Esc closes the prompt with no commit and the edit still unsaved.
+#[test]
+fn cancelling_the_unsaved_prompt_commits_nothing() {
+    let (tmp, mut app) = scm_with_unsaved_tab();
+    let head = git_out(tmp.path(), &["rev-parse", "HEAD"]);
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    wait_for_git_net(&mut app);
+    assert!(app.pending_unsaved_scm.is_none());
+    assert_eq!(git_out(tmp.path(), &["rev-parse", "HEAD"]), head);
+    assert!(app.editor.dirty);
+    assert_eq!(
+        app.source_control.message, "bump seed",
+        "the message is kept"
+    );
+}
+
+/// #1438: an unsaved tab outside the repository is not the commit's
+/// business, so the commit runs straight away.
+#[test]
+fn an_unsaved_tab_outside_the_repo_does_not_hold_the_commit() {
+    let (tmp, mut app) = scm_ready_to_commit();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let other = elsewhere.path().join("scratch.txt");
+    std::fs::write(&other, "scratch\n").unwrap();
+    app.editor.open_pinned(&other).unwrap();
+    app.editor.insert_str("more ");
+    assert!(app.editor.dirty);
+    app.source_control.message = "bump seed".to_string();
+    app.source_control.message_cursor = app.source_control.message.chars().count();
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_git_net(&mut app);
+    assert!(app.pending_unsaved_scm.is_none(), "no prompt");
+    assert_eq!(git_out(tmp.path(), &["show", "HEAD:seed.txt"]), "changed\n");
+    assert_eq!(last_commit_message(tmp.path()), "bump seed\n\n");
+}
+
+/// #1438: a spreadsheet cell still being typed into is an unsaved edit:
+/// Commit asks first, and Save All & Commit writes the typed value.
+#[test]
+fn a_sheet_cell_being_typed_into_holds_the_commit() {
+    let (tmp, mut app) = scm_ready_to_commit();
+    let csv = tmp.path().join("stock.csv");
+    std::fs::write(&csv, "item,qty\nbolt,4\n").unwrap();
+    app.editor.open(&csv).unwrap();
+    assert!(app.editor.sheet.is_some());
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_sheet(&mut app, "40");
+    assert!(!app.editor.dirty, "the typed cell is not committed yet");
+    app.source_control.message = "bump seed".to_string();
+    app.source_control.message_cursor = app.source_control.message.chars().count();
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    let pending = app.pending_unsaved_scm.as_ref().expect("the prompt opens");
+    assert_eq!(pending.files, vec![csv.clone()]);
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    wait_for_git_net(&mut app);
+    assert!(app.pending_unsaved_scm.is_none());
+    assert_eq!(
+        std::fs::read_to_string(&csv).unwrap(),
+        "item,qty\nbolt,40\n",
+        "{}",
+        app.status
+    );
+}
+
+/// #1438: the prompt's write stays bound to the repository it was asked
+/// for. When Source Control has moved to another root by the time the
+/// choice is made (a click on another root's tab), nothing is committed.
+#[test]
+fn the_unsaved_prompt_does_not_commit_after_source_control_moved_repos() {
+    let (tmp, mut app) = scm_with_unsaved_tab();
+    let head = git_out(tmp.path(), &["rev-parse", "HEAD"]);
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    let other = tempfile::tempdir().unwrap();
+    app.pending_unsaved_scm
+        .as_mut()
+        .expect("the prompt opens")
+        .root = other.path().to_path_buf();
+    app.handle_key(key(KeyCode::Char('c'), KeyModifiers::NONE))
+        .unwrap();
+    wait_for_git_net(&mut app);
+    assert!(app.pending_unsaved_scm.is_none());
+    assert_eq!(git_out(tmp.path(), &["rev-parse", "HEAD"]), head);
+    assert!(
+        app.status.contains("moved to another repository"),
+        "{}",
+        app.status
+    );
+}
+
+/// #1438: with every repository tab saved, Commit asks nothing.
+#[test]
+fn a_saved_tab_does_not_hold_the_commit() {
+    let (tmp, mut app) = scm_ready_to_commit();
+    app.editor
+        .open_pinned(&tmp.path().join("seed.txt"))
+        .unwrap();
+    app.source_control.message = "bump seed".to_string();
+    app.source_control.message_cursor = app.source_control.message.chars().count();
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_git_net(&mut app);
+    assert!(app.pending_unsaved_scm.is_none());
+    assert_eq!(last_commit_message(tmp.path()), "bump seed\n\n");
+}
+
+/// #1438: an empty message is refused before anything is asked.
+#[test]
+fn an_empty_message_is_refused_before_the_unsaved_prompt() {
+    let (_tmp, mut app) = scm_with_unsaved_tab();
+    app.source_control.message.clear();
+    app.source_control.message_cursor = 0;
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.pending_unsaved_scm.is_none());
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("Empty commit message")
+    );
+}
+
+/// #1438: Stash asks too, and Save All & Stash stashes the editor text,
+/// leaving the tab saved.
+#[test]
+fn save_all_and_stash_stashes_the_text_in_the_tab() {
+    let (tmp, mut app) = scm_with_unsaved_tab();
+    app.stash_source_control();
+    let pending = app.pending_unsaved_scm.as_ref().expect("the prompt opens");
+    assert_eq!(pending.op, ScmWrite::Stash);
+    assert_eq!(
+        git_out(tmp.path(), &["stash", "list"]),
+        "",
+        "nothing stashed yet"
+    );
+    let rendered = screen_text_863(&mut app, 120, 40);
+    assert!(rendered.contains("Save All & Stash"), "{rendered}");
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.pending_unsaved_scm.is_none());
+    assert!(!app.editor.dirty, "the tab was saved");
+    assert_eq!(
+        git_out(tmp.path(), &["show", "stash@{0}:seed.txt"]),
+        "edited changed\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
+        "seed\n",
+        "the stash put the work aside"
+    );
 }
 
 fn last_commit_message(root: &std::path::Path) -> String {
@@ -23556,6 +23861,63 @@ fn run_active_file_with_python_file_spawns_a_new_terminal_and_focuses_it() {
     assert!(!app.run_debug.feedback_is_error);
 }
 
+/// #1444: View Changes vs main on a branch behind a moved main shows the
+/// branch's own work and names the merge base it starts from.
+#[test]
+fn view_changes_vs_default_branch_starts_from_the_merge_base() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().canonicalize().unwrap();
+    let git = |args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&p)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "a@b"]);
+    git(&["config", "user.name", "a"]);
+    std::fs::write(p.join("app.py"), "def a():\n    return 1\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "init"]);
+    let base = git(&["rev-parse", "--short=7", "HEAD"]);
+    git(&["checkout", "-qb", "feature"]);
+    std::fs::write(p.join("feature.py"), "def feature():\n    return 2\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "add feature"]);
+    git(&["checkout", "-q", "main"]);
+    std::fs::write(p.join("teammate.py"), "def teammate():\n    return 3\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "teammate work"]);
+    git(&["checkout", "-q", "feature"]);
+    let mut app = App::new(p.clone()).unwrap();
+    app.view_default_branch_diff_source_control();
+    assert_eq!(app.status, "Showing changes since this branch left main");
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(std::path::Path::new(&format!(
+            "git diff {base} (merge base with main)"
+        )))
+    );
+    let diff = app.editor.diff.as_ref().expect("a diff tab opened");
+    let text = format!("{:?}", diff);
+    assert!(
+        text.contains("feature"),
+        "the branch's own file is in the view"
+    );
+    assert!(
+        !text.contains("teammate"),
+        "main's later work is not: {text}"
+    );
+}
+
 #[test]
 fn focus_flag_only_set_on_active_terminal() {
     let tmp = tempfile::tempdir().unwrap();
@@ -25865,6 +26227,96 @@ fn quick_open_skips_excluded_files() {
             .any(|r| r.starts_with("generated/") || r.starts_with("tests/")),
         "{rels:?}"
     );
+}
+
+/// #1479: the issue's repo. `.vscode/settings.json` hides `build`, meaning
+/// the root's output folder; `scripts/build/release.py` is source.
+fn app_excluding_vscode_build() -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    for dir in [".vscode", "build", "scripts/build", "src"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    std::fs::write(
+        root.join(".vscode/settings.json"),
+        r#"{ "files.exclude": { "build": true } }"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("build/out.js"), "release_step()\n").unwrap();
+    std::fs::write(
+        root.join("scripts/build/release.py"),
+        "def release_step(): ...\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/main.py"), "release_step()\n").unwrap();
+    let app = App::new(root.to_path_buf()).unwrap();
+    (app, tmp)
+}
+
+/// #1479: Search skips the root's `build/` and still finds the definition
+/// in `scripts/build/`.
+#[test]
+fn a_vscode_exclude_of_build_keeps_scripts_build_in_search() {
+    let (mut app, t) = app_excluding_vscode_build();
+    assert_eq!(
+        search_hit_paths(&mut app, t.path(), "release_step"),
+        vec![
+            String::from("scripts/build/release.py"),
+            String::from("src/main.py")
+        ]
+    );
+}
+
+/// #1479: Go to File keeps a nested folder that shares a bare VS Code
+/// exclude's name. (`gen` here: Go to File skips every `build` folder on
+/// its own, as noise, whatever the settings say.)
+#[test]
+fn a_vscode_exclude_of_a_bare_name_keeps_nested_folders_in_go_to_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    for dir in [".vscode", "gen", "scripts/gen"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    std::fs::write(
+        root.join(".vscode/settings.json"),
+        r#"{ "files.exclude": { "gen": true } }"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("gen/out.py"), "\n").unwrap();
+    std::fs::write(root.join("scripts/gen/release.py"), "\n").unwrap();
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    app.open_file_finder();
+    let rels: Vec<String> = app
+        .file_finder
+        .as_ref()
+        .unwrap()
+        .entries
+        .iter()
+        .map(|e| e.rel.clone())
+        .collect();
+    assert!(
+        rels.contains(&String::from("scripts/gen/release.py")),
+        "{rels:?}"
+    );
+    assert!(!rels.iter().any(|r| r.starts_with("gen/")), "{rels:?}");
+}
+
+/// #1479: the Explorer hides the root's `build/` and lists
+/// `scripts/build/` once `scripts/` is expanded.
+#[test]
+fn a_vscode_exclude_of_build_keeps_scripts_build_in_the_explorer() {
+    let (mut app, t) = app_excluding_vscode_build();
+    let release = t.path().join("scripts/build/release.py");
+    assert!(
+        app.tree.reveal_path(&release),
+        "scripts/build/release.py is listed"
+    );
+    let listed: Vec<_> = app.tree.nodes.iter().map(|n| n.path.clone()).collect();
+    assert!(
+        listed.contains(&t.path().join("scripts/build")),
+        "{listed:?}"
+    );
+    assert!(!listed.contains(&t.path().join("build")), "{listed:?}");
 }
 
 /// Open a file into the focused editor group of a fresh App.
@@ -74775,4 +75227,133 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     let _ = render_buf(&mut app);
     assert!(app.source_control.nested_repos.is_empty());
     assert!(app.source_control.last_init_repo_button_area.width > 0);
+}
+
+/// A format-on-save in flight for `m.py`, with `x` typed and not yet on
+/// disk: the state Ctrl+S leaves while it waits on the formatter.
+fn app_waiting_on_format_on_save(tmp: &Path) -> (App, PathBuf) {
+    let mut app = app_with_open_file(tmp, "m.py", "x = 1\n");
+    let file = app.editor.path.clone().unwrap();
+    app.editor.insert_char('y');
+    app.arm_deferred_save();
+    app.format_request_id = Some(41);
+    app.format_request_seq = app.format_target_seq(&file);
+    (app, file)
+}
+
+/// #1491: with Format on Save on, a server that never answered
+/// `textDocument/formatting` left the file unwritten forever (the tab dirty,
+/// "Formatting document" in the status bar). After a bounded wait the file
+/// is written unformatted, as VS Code does, and the late reply is dropped.
+#[test]
+fn a_format_on_save_with_no_reply_writes_the_file_unformatted_after_a_bounded_wait() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_waiting_on_format_on_save(tmp.path());
+    let start = std::time::Instant::now();
+
+    // Within the wait nothing is written: the reply may still come.
+    assert!(!app.drain_lsp_format_at(start));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "x = 1\n");
+    assert!(app.save_after_format.is_some());
+
+    let after = start + FORMAT_ON_SAVE_TIMEOUT + std::time::Duration::from_millis(50);
+    assert!(app.drain_lsp_format_at(after), "redraw for the save");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "yx = 1\n");
+    assert!(!app.editor.dirty, "the tab is saved");
+    assert!(app.save_after_format.is_none());
+    assert!(
+        app.format_request_id.is_none(),
+        "a reply that turns up later is not applied to the saved text"
+    );
+    assert_eq!(
+        app.status,
+        "Saved m.py without formatting: the formatter did not answer in 2 s"
+    );
+}
+
+/// #1491: a tab closed while its format-on-save waited is not written, so
+/// the timeout keeps "Save skipped" rather than claiming it saved the file.
+#[test]
+fn a_format_on_save_timeout_after_the_tab_closed_does_not_claim_a_save() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_waiting_on_format_on_save(tmp.path());
+    app.editor.close_tab(0);
+    let after = std::time::Instant::now() + FORMAT_ON_SAVE_TIMEOUT * 2;
+    assert!(app.drain_lsp_format_at(after));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "x = 1\n");
+    assert!(app.save_after_format.is_none());
+    assert_eq!(app.status, "Save skipped: the tab was closed");
+}
+
+/// #1491: pressing Ctrl+S again while the formatter is silent writes the
+/// file at once instead of changing nothing.
+#[test]
+fn a_second_save_while_the_formatter_is_silent_writes_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_waiting_on_format_on_save(tmp.path());
+    app.save();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "yx = 1\n");
+    assert!(!app.editor.dirty);
+    assert!(app.save_after_format.is_none());
+    assert!(app.format_request_id.is_none());
+    assert_eq!(
+        app.status,
+        "Saved m.py without formatting: saved again before the formatter answered"
+    );
+}
+
+/// #1491 negative: a reply inside the wait still formats, then saves, and
+/// the wait does not fire afterwards.
+#[test]
+fn a_format_reply_inside_the_wait_still_formats_before_saving() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_waiting_on_format_on_save(tmp.path());
+    let formatted = vec![crate::widgets::editor::TextSpanEdit {
+        start: (0, 0),
+        end: (0, 6),
+        new_text: String::from("yx = 2"),
+        utf16: false,
+    }];
+    app.format_request_id = None;
+    app.land_format(Some(formatted), false, Some(file.clone()));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "yx = 2\n");
+    let saved = app.status.clone();
+    let later = std::time::Instant::now() + FORMAT_ON_SAVE_TIMEOUT * 2;
+    assert!(!app.drain_lsp_format_at(later), "nothing left to time out");
+    assert_eq!(app.status, saved);
+}
+
+/// #1491 negative: a plain Format Document (no save waiting) is never cut
+/// short; a slow formatter may still answer it.
+#[test]
+fn a_slow_format_document_without_a_save_is_left_to_finish() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "m.py", "x = 1\n");
+    app.format_request_id = Some(41);
+    let later = std::time::Instant::now() + FORMAT_ON_SAVE_TIMEOUT * 2;
+    assert!(!app.drain_lsp_format_at(later));
+    assert_eq!(app.format_request_id, Some(41));
+}
+
+/// #1491: Save All said "Saved 1 editor" while the file still waited on
+/// its formatter. It now says the file is being formatted.
+#[test]
+fn save_all_does_not_report_a_file_waiting_on_its_formatter_as_saved() {
+    assert_eq!(
+        save_all_summary(1, 0, Some("m.py"), String::new()),
+        "Formatting m.py before saving it"
+    );
+    assert_eq!(
+        save_all_summary(3, 0, Some("m.py"), String::new()),
+        "Saved 2 editors; formatting m.py before saving it"
+    );
+    // Negative: with nothing waiting, the count stands as before.
+    assert_eq!(
+        save_all_summary(2, 0, None, String::new()),
+        "Saved 2 editors"
+    );
+    assert_eq!(
+        save_all_summary(1, 0, None, String::new()),
+        "Saved 1 editor"
+    );
 }
