@@ -1939,6 +1939,15 @@ fn resolve_launch(
     let (open_file, at) = match open_file {
         Some(f) => {
             let (f, at) = crate::file_location::split(&f, cwd);
+            // A relative `--open-file` may name a file under the workspace
+            // root rather than the cwd (#1193): split it against the root
+            // too, as `resolve_open_file` looks there for the file itself.
+            let (f, at) = if at.is_none() && !cwd.join(&f).exists() {
+                let (root, _, _) = resolve_workspace_from(&path, None, cwd)?;
+                crate::file_location::split(&f, &root)
+            } else {
+                (f, at)
+            };
             (Some(f), at)
         }
         None => (None, path_at),
@@ -2987,6 +2996,34 @@ mod tests {
                 line: 12,
                 col: None
             })
+        );
+    }
+
+    /// `croft /repo --open-file src/main.rs:12` from outside the repo: the
+    /// location splits off a file that exists only under the workspace root.
+    #[test]
+    fn an_open_file_under_the_workspace_root_takes_a_line_too() {
+        let cwd = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        let (root, open, _) = resolve_launch(
+            repo.path(),
+            Some(PathBuf::from("src/main.rs:12")),
+            cwd.path(),
+        )
+        .unwrap();
+        let root_canon = repo.path().canonicalize().unwrap();
+        assert_eq!(root, root_canon);
+        assert_eq!(
+            open,
+            Some((
+                root_canon.join("src/main.rs"),
+                Some(crate::file_location::FileLocation {
+                    line: 12,
+                    col: None
+                })
+            ))
         );
     }
 

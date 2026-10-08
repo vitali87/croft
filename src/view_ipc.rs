@@ -682,7 +682,7 @@ pub fn edit(target: &std::ffi::OsStr, wait: bool, cache_dir: &Path) -> anyhow::R
     let Some(socket) = std::env::var_os(SOCK_ENV).filter(|s| !s.is_empty()) else {
         return Ok(());
     };
-    let path = resolve(&std::env::current_dir()?, Path::new(target));
+    let path = wait_path(&std::env::current_dir()?, Path::new(target));
     let probe = ViewRequest::probe(&path);
     loop {
         std::thread::sleep(WAIT_POLL);
@@ -694,6 +694,14 @@ pub fn edit(target: &std::ffi::OsStr, wait: bool, cache_dir: &Path) -> anyhow::R
             ),
         }
     }
+}
+
+/// The file `croft edit --wait <target>` waits on: the one `run` opened,
+/// so `file.c:5` waits on `file.c`'s tab rather than on a path no tab has
+/// (#1487).
+fn wait_path(cwd: &Path, target: &Path) -> PathBuf {
+    let (target, _) = crate::file_location::split(target, cwd);
+    resolve(cwd, &target)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1684,6 +1692,21 @@ mod tests {
             })
         );
         assert!(!dir.path().join("four.c:5:5").exists(), "no junk file");
+    }
+
+    /// `croft edit --wait file.c:5` waits on file.c's tab, the one it opened.
+    #[test]
+    fn edit_wait_with_a_location_waits_on_the_opened_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.c"), "int x;\n").unwrap();
+        assert_eq!(
+            wait_path(dir.path(), Path::new("file.c:5")),
+            dir.path().join("file.c")
+        );
+        assert_eq!(
+            wait_path(dir.path(), Path::new("new.c")),
+            dir.path().join("new.c")
+        );
     }
 
     /// Negative: a new file named without a location is still created,
