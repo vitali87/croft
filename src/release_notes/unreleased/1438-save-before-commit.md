@@ -1,0 +1,1 @@
+fix: Commit and Stash in Source Control now ask first when a tab under the repository has unsaved edits, offering Save All & Commit (or Stash), Commit Anyway or Cancel, so a commit no longer silently records the old disk text (#1438)
