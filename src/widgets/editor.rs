@@ -2525,11 +2525,12 @@ pub struct Editor {
     /// debugger or the LSP reads them.
     pub bookmarks: std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
     /// The text the open file's [`bookmarks`](Self::bookmarks) currently
-    /// describe, keyed by the path it was taken for. Every buffer change is
+    /// describe, keyed by the path it was taken for (`None` for an untitled
+    /// buffer, whose folds follow edits too). Every buffer change is
     /// diffed against it so marks follow their lines through inserts,
     /// deletes, undo and reloads (see [`shift_bookmark_lines`]). Held only
-    /// while the open file has marks, so an unmarked file pays nothing.
-    bookmark_shadow: Option<(PathBuf, Vec<String>)>,
+    /// while the open buffer has marks, so an unmarked file pays nothing.
+    bookmark_shadow: Option<(Option<PathBuf>, Vec<String>)>,
     /// Set while a multi-character insert (a paste) runs its per-character
     /// helpers, so the bookmark sync runs once at the end instead of once per
     /// character.
@@ -3601,12 +3602,12 @@ impl Editor {
             .unwrap_or(0)
     }
 
-    /// Whether the open file `path` has anything keyed by line that must
-    /// follow edits: bookmarks, breakpoint state, or collapsed folds (#1509).
-    fn has_line_marks(&self, path: &Path) -> bool {
-        self.bookmarks.contains_key(path)
-            || self.has_breakpoints_in(path)
-            || !self.folded.is_empty()
+    /// Whether the open buffer has anything keyed by line that must follow
+    /// edits: bookmarks or breakpoint state for its file, or collapsed folds
+    /// (#1509), which an untitled buffer has too.
+    fn has_line_marks(&self, path: Option<&Path>) -> bool {
+        !self.folded.is_empty()
+            || path.is_some_and(|p| self.bookmarks.contains_key(p) || self.has_breakpoints_in(p))
     }
 
     /// Whether `path` has any line-keyed breakpoint state to carry through
@@ -3618,23 +3619,22 @@ impl Editor {
             || self.breakpoint_hit_conditions.contains_key(path)
     }
 
-    /// Record the text the open file's bookmarks describe, ahead of an edit
+    /// Record the text the open buffer's marks describe, ahead of an edit
     /// (called from [`push_undo`](Self::push_undo), which every user edit
-    /// passes through before it mutates). A no-op when the file has no marks
-    /// or the shadow already belongs to this file.
+    /// passes through before it mutates). A no-op when the buffer has no
+    /// marks or the shadow already belongs to it. Keyed by the optional path
+    /// so an untitled buffer's folds follow edits too.
     fn seed_bookmark_shadow(&mut self) {
-        let Some(path) = self.path.as_ref() else {
-            return;
-        };
+        let path = self.path.as_deref();
         if !self.has_line_marks(path)
             || self
                 .bookmark_shadow
                 .as_ref()
-                .is_some_and(|(p, _)| p == path)
+                .is_some_and(|(p, _)| p.as_deref() == path)
         {
             return;
         }
-        self.bookmark_shadow = Some((path.clone(), self.lines.clone()));
+        self.bookmark_shadow = Some((self.path.clone(), self.lines.clone()));
     }
 
     /// Re-align the open file's bookmarks, breakpoints and collapsed folds
@@ -3642,20 +3642,17 @@ impl Editor {
     /// The single choke point for line shifts: called from
     /// [`mark_buffer_changed`](Self::mark_buffer_changed) (every edit),
     /// [`restore_snapshot`](Self::restore_snapshot) (undo / redo) and the
-    /// file loaders (reload, reopen with encoding). When the line count moved
-    /// and the shadow describes this file, marks are mapped through
-    /// [`shift_bookmark_lines`]; either way, any mark left past the last line
-    /// is dropped, so a change whose mapping is unknown (a reload with no
-    /// shadow) still never leaves a mark beyond the buffer.
+    /// file loaders (reload, reopen with encoding). When the shadow
+    /// describes this buffer, marks are mapped through [`line_mapper`];
+    /// either way, any mark left past the last line is dropped, so a change
+    /// whose mapping is unknown (a reload with no shadow) still never leaves
+    /// a mark beyond the buffer.
     fn sync_bookmarks_to_buffer(&mut self) {
         if self.bookmark_sync_paused {
             return;
         }
-        let Some(path) = self.path.clone() else {
-            self.bookmark_shadow = None;
-            return;
-        };
-        if !self.has_line_marks(&path) {
+        let path = self.path.clone();
+        if !self.has_line_marks(path.as_deref()) {
             self.bookmark_shadow = None;
             return;
         }
@@ -3664,36 +3661,44 @@ impl Editor {
         let mut shadow = match self.bookmark_shadow.take() {
             Some((shadow_path, old)) if shadow_path == path => {
                 let map = line_mapper(&old, &self.lines);
-                if let Some(set) = self.bookmarks.get_mut(&path) {
-                    *set = set.iter().filter_map(|&l| map(l)).collect();
-                }
-                // Breakpoints follow the same edits: they were plain line
-                // numbers, so an Enter above one left it on the line that
-                // moved into its place, and the debugger stopped there.
-                if let Some(set) = self.breakpoints.get_mut(&path) {
-                    *set = set.iter().filter_map(|&l| map(l)).collect();
-                }
-                for per_line in [
-                    &mut self.breakpoint_conditions,
-                    &mut self.breakpoint_logs,
-                    &mut self.breakpoint_hit_conditions,
-                ] {
-                    if let Some(m) = per_line.get_mut(&path) {
-                        *m = std::mem::take(m)
-                            .into_iter()
-                            .filter_map(|(l, v)| map(l).map(|n| (n, v)))
-                            .collect();
+                if let Some(path) = &path {
+                    if let Some(set) = self.bookmarks.get_mut(path) {
+                        *set = set.iter().filter_map(|&l| map(l)).collect();
+                    }
+                    // Breakpoints follow the same edits: they were plain line
+                    // numbers, so an Enter above one left it on the line that
+                    // moved into its place, and the debugger stopped there.
+                    if let Some(set) = self.breakpoints.get_mut(path) {
+                        *set = set.iter().filter_map(|&l| map(l)).collect();
+                    }
+                    for per_line in [
+                        &mut self.breakpoint_conditions,
+                        &mut self.breakpoint_logs,
+                        &mut self.breakpoint_hit_conditions,
+                    ] {
+                        if let Some(m) = per_line.get_mut(path) {
+                            *m = std::mem::take(m)
+                                .into_iter()
+                                .filter_map(|(l, v)| map(l).map(|n| (n, v)))
+                                .collect();
+                        }
                     }
                 }
                 // Folds too: their headers are line numbers, and the render
-                // guard dropped every fold on any change in line count.
-                if !self.folded.is_empty() && old.len() != len {
-                    self.folded = self
+                // guard dropped every fold on any change in line count. An
+                // edit that keeps the count (lines deleted on one side of a
+                // fold and as many inserted on the other) can still move a
+                // header, so remap whenever the text changed.
+                if !self.folded.is_empty() && old != self.lines {
+                    let moved: std::collections::BTreeSet<usize> = self
                         .folded
                         .iter()
                         .filter_map(|&h| map(h + 1).map(|l| l - 1))
                         .collect();
-                    folds_moved = true;
+                    if moved != self.folded || old.len() != len {
+                        self.folded = moved;
+                        folds_moved = true;
+                    }
                 }
                 drop(map);
                 old
@@ -3705,32 +3710,34 @@ impl Editor {
             self.refresh_fold_tables();
             self.rebuild_hidden_ranges();
         }
-        let in_range = |l: &usize| (1..=len).contains(l);
-        if let Some(set) = self.bookmarks.get_mut(&path) {
-            set.retain(in_range);
-            if set.is_empty() {
-                self.bookmarks.remove(&path);
+        if let Some(path) = &path {
+            let in_range = |l: &usize| (1..=len).contains(l);
+            if let Some(set) = self.bookmarks.get_mut(path) {
+                set.retain(in_range);
+                if set.is_empty() {
+                    self.bookmarks.remove(path);
+                }
             }
-        }
-        if let Some(set) = self.breakpoints.get_mut(&path) {
-            set.retain(in_range);
-            if set.is_empty() {
-                self.breakpoints.remove(&path);
+            if let Some(set) = self.breakpoints.get_mut(path) {
+                set.retain(in_range);
+                if set.is_empty() {
+                    self.breakpoints.remove(path);
+                }
             }
-        }
-        for per_line in [
-            &mut self.breakpoint_conditions,
-            &mut self.breakpoint_logs,
-            &mut self.breakpoint_hit_conditions,
-        ] {
-            if let Some(m) = per_line.get_mut(&path) {
-                m.retain(|l, _| in_range(l));
-                if m.is_empty() {
-                    per_line.remove(&path);
+            for per_line in [
+                &mut self.breakpoint_conditions,
+                &mut self.breakpoint_logs,
+                &mut self.breakpoint_hit_conditions,
+            ] {
+                if let Some(m) = per_line.get_mut(path) {
+                    m.retain(|l, _| in_range(l));
+                    if m.is_empty() {
+                        per_line.remove(path);
+                    }
                 }
             }
         }
-        if !self.has_line_marks(&path) {
+        if !self.has_line_marks(path.as_deref()) {
             return;
         }
         // Bring the shadow up to date in place rather than cloning the whole
@@ -28764,6 +28771,38 @@ mod tests {
         assert!(e.undo());
         paint(&mut e);
         assert_eq!(folded_rows(&e), vec![3, 9]);
+    }
+
+    /// An edit that keeps the line count (one line gone above the folds,
+    /// one added below) still moves the folded headers with their text.
+    #[test]
+    fn a_net_zero_line_count_edit_still_moves_the_folds() {
+        let (_dir, mut e) = folded_alpha_and_beta();
+        let mut lines = e.lines[1..].to_vec();
+        lines.push("# tail".to_string());
+        assert_eq!(lines.len(), e.lines.len());
+        e.replace_all_lines(lines);
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![2, 8]);
+        assert_eq!(e.lines[2], "def alpha():");
+        assert!(e.is_line_hidden(3) && !e.is_line_hidden(2));
+    }
+
+    /// An untitled buffer has no path, and its folds follow edits too.
+    #[test]
+    fn an_untitled_buffers_folds_follow_a_new_line_above_them() {
+        let mut e = Editor::new();
+        assert!(e.path.is_none());
+        e.insert_str(FOLDS_PY);
+        e.toggle_fold(3);
+        e.toggle_fold(9);
+        assert_eq!(folded_rows(&e), vec![3, 9]);
+        e.cursor_row = 0;
+        e.cursor_col = e.lines[0].chars().count();
+        e.insert_newline();
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![4, 10]);
+        assert_eq!(e.lines[4], "def alpha():");
     }
 
     /// Negative: deleting a folded header's own line drops that fold only.
