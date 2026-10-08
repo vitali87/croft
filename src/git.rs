@@ -1160,13 +1160,6 @@ pub fn diff_staged(root: &Path) -> Result<String, String> {
     diff_text(root, &["diff", "--staged"])
 }
 
-/// The working tree against the point the current branch left `branch`
-/// (its merge base), as a pull request diff shows it: every committed and
-/// uncommitted change on this branch, and nothing `branch` gained since
-/// (#1444). Diffing against `branch`'s tip listed that later work as this
-/// branch deleting or reverting it. With no shared history it falls back
-/// to the tip. Used by the Source Control dropdown's "View Changes vs
-/// <default>" and that tab's refresh.
 /// The commit HEAD and `branch` last had in common (`git merge-base`), or
 /// None when they share no history or `branch` does not resolve.
 pub fn merge_base(root: &Path, branch: &str) -> Option<String> {
@@ -1176,6 +1169,13 @@ pub fn merge_base(root: &Path, branch: &str) -> Option<String> {
         .filter(|sha| !sha.is_empty())
 }
 
+/// The working tree against the point the current branch left `branch`
+/// (its merge base), as a pull request diff shows it: every committed and
+/// uncommitted change on this branch, and nothing `branch` gained since
+/// (#1444). Diffing against `branch`'s tip listed that later work as this
+/// branch deleting or reverting it. With no shared history it falls back
+/// to the tip. Used by the Source Control dropdown's "View Changes vs
+/// <default>" and that tab's refresh.
 pub fn diff_against_branch(root: &Path, branch: &str) -> Result<String, String> {
     match merge_base(root, branch) {
         Some(base) => diff_text(root, &["diff", &base]),
