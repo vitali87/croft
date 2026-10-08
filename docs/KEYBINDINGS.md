@@ -488,6 +488,8 @@ Mapped fields: `name`, `type` (`python`/`debugpy`, `lldb`/`cppdbg`, `node`/`pwa-
 
 "Debug: Add Configuration…" writes a new entry for you ([#250](https://github.com/vitali87/croft/issues/250)). It goes to `.croft/launch.json`, which croft rewrites whole. A `.croft/launch.json` with comments or trailing commas would lose them, so it is left alone and the entry is shown for you to paste in, and a `.vscode/launch.json` is never touched. Pick a configuration with "Debug: Select and Start Debugging" or the config row under the Run and Debug panel's button. The pick is what `F5` and restart launch until changed, and an edited launch.json re-reads on the next `F5`.
 
+Every launch (`F5`, restart, a picked configuration or compound, Debug Test, and the Run button) first saves the unsaved editors, as VS Code's `debug.saveBeforeStart` does ([#1400](https://github.com/vitali87/croft/issues/1400)): the debuggee reads its files from disk, while breakpoints follow the buffer. They are written as typed, without format on save, whose edits could move lines after the breakpoints were sent. A file changed on disk since it was opened is never overwritten to start a launch; it stays unsaved and the status line names it. Set `"disable_save_before_debug": true` (or VS Code's `"debug.saveBeforeStart": "none"`) to launch without saving; the status line then names the unsaved files the launch runs without.
+
 | Keys | Action |
 |------|--------|
 | `F5` | Start debugging (the selected `launch.json` configuration, or the active file when none is selected), or resume when paused at a breakpoint |

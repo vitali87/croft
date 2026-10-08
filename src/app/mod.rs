@@ -3072,6 +3072,10 @@ pub struct App {
     /// Debugger inline values (#135): on by default; rebuilt on every
     /// `InspectionUpdated`, cleared wherever the stop arrow clears.
     inline_values_enabled: bool,
+    /// Save unsaved editors before every debug or run launch (#1400), so
+    /// the debuggee runs the text its breakpoints were set against. Off
+    /// only by `disable_save_before_debug` (`debug.saveBeforeStart: none`).
+    save_before_debug: bool,
     /// Auto-closing pairs (#121), persisted; synced onto the active editor
     /// beside the blame flag.
     auto_close_pairs: bool,
@@ -5657,6 +5661,7 @@ impl App {
                 &loaded_prefs.diff_ignore_whitespace,
             ),
             inline_values_enabled: !loaded_prefs.disable_inline_values,
+            save_before_debug: !loaded_prefs.disable_save_before_debug,
             auto_close_pairs: !loaded_prefs.disable_auto_close_pairs,
             inlay_hints_enabled: !loaded_prefs.disable_inlay_hints,
             // Keep the suite off the user's real ~/.config/croft/history: a
@@ -24051,11 +24056,15 @@ impl App {
     /// binary launches under lldb-dap with the name as its libtest filter.
     /// Shared by debug-at-cursor and Alt+click on the gutter play glyph.
     fn debug_named_test(&mut self, name: String) {
-        use std::collections::BTreeMap;
         if !self.debug_sessions.is_empty() {
             self.status = String::from("A debug session is already running (Shift+F5 stops it)");
             return;
         }
+        self.launch_with_unsaved_saved(|app| app.debug_named_test_now(name));
+    }
+
+    fn debug_named_test_now(&mut self, name: String) {
+        use std::collections::BTreeMap;
         let root = self.tree.root.clone();
         // #373: if the last run of this test failed and named a place in
         // the user's own code, break there — the whole point of "debug this
@@ -30345,6 +30354,68 @@ impl App {
         self.status = msg;
     }
 
+    /// Run `launch` with every unsaved editor written first (#1400), as VS
+    /// Code's `debug.saveBeforeStart` does: the debuggee reads its files
+    /// from disk, while breakpoints and the stop arrow follow the buffer,
+    /// so launching over unsaved edits pauses on the wrong lines.
+    ///
+    /// The tabs are written as typed, through the auto-save sweep: a
+    /// format-on-save reply lands later and could move lines the launch
+    /// already sent breakpoints for. The sweep never overwrites a file that
+    /// changed on disk (or writes a lossy encoding, a hex or sheet edit, an
+    /// unresolved merge); whatever is still unsaved after it, or everything
+    /// with `disable_save_before_debug`, is named in front of the launch's
+    /// own status.
+    fn launch_with_unsaved_saved(&mut self, launch: impl FnOnce(&mut Self)) {
+        if self.save_before_debug && self.unsaved_count() > 0 {
+            self.sweep_dirty_buffers(false, false);
+        }
+        let unsaved = self.unsaved_editor_names();
+        launch(self);
+        if unsaved.is_empty() {
+            return;
+        }
+        let (names, verb) = match unsaved.as_slice() {
+            [one] => (one.clone(), "has"),
+            [first, second] => (format!("{first} and {second}"), "have"),
+            [first, rest @ ..] => (format!("{first} and {} more", rest.len()), "have"),
+            [] => unreachable!("checked above"),
+        };
+        let warning = format!("{names} {verb} unsaved changes: the launch uses the file on disk");
+        self.status = if self.status.is_empty() {
+            warning
+        } else {
+            format!("{warning} - {}", self.status)
+        };
+    }
+
+    /// File names of the editors with unsaved edits, deduped, the active
+    /// tab first: what [`Self::launch_with_unsaved_saved`] warns about.
+    fn unsaved_editor_names(&self) -> Vec<String> {
+        let mut seen: Vec<&std::path::Path> = Vec::new();
+        let mut names = Vec::new();
+        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
+        let active = self.editor.editors.get(self.editor.active_index());
+        let tabs = active
+            .into_iter()
+            .chain(groups.flat_map(|g| g.editors.iter()));
+        for ed in tabs.filter(|e| e.dirty) {
+            let Some(path) = ed.path.as_deref() else {
+                continue;
+            };
+            if seen.contains(&path) {
+                continue;
+            }
+            seen.push(path);
+            names.push(
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string()),
+            );
+        }
+        names
+    }
+
     /// F5: start debugging the active file, or resume if already paused.
     pub fn debug_start_or_continue(&mut self) {
         use crate::dap::session::SessionPhase;
@@ -30364,6 +30435,10 @@ impl App {
     /// Configs are re-read here so an edited launch.json applies on the next
     /// F5 without reopening the picker.
     fn start_selected_debug(&mut self) {
+        self.launch_with_unsaved_saved(Self::start_selected_debug_now);
+    }
+
+    fn start_selected_debug_now(&mut self) {
         if let Some(name) = self.selected_debug_compound.clone() {
             let root = self.active_workspace_root();
             self.debug_compounds = crate::dap::configs::discover_compounds(&root);
@@ -32452,9 +32527,16 @@ impl App {
     }
 
     pub fn run_active_file(&mut self) {
-        let Some(path) = self.editor.path.clone() else {
+        if self.editor.path.is_none() {
             self.run_debug.feedback = Some(String::from("Open a file first"));
             self.run_debug.feedback_is_error = true;
+            return;
+        }
+        self.launch_with_unsaved_saved(Self::run_active_file_now);
+    }
+
+    fn run_active_file_now(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
             return;
         };
         let run_root = self
@@ -36113,7 +36195,7 @@ impl App {
                         self.selected_debug_config = None;
                         self.selected_debug_compound = Some(compound.name.clone());
                         self.run_debug.selected_config = Some(compound.name.clone());
-                        self.launch_compound(&compound);
+                        self.launch_with_unsaved_saved(|app| app.launch_compound(&compound));
                     }
                 } else if row.id == "add" {
                     self.open_add_debug_config();
@@ -36132,7 +36214,7 @@ impl App {
                     self.selected_debug_config = Some(cfg.name.clone());
                     self.selected_debug_compound = None;
                     self.run_debug.selected_config = Some(cfg.name.clone());
-                    self.launch_debug_config(&cfg);
+                    self.launch_with_unsaved_saved(|app| app.launch_debug_config(&cfg));
                 }
             }
             ListPurpose::SessionParticipant => {
@@ -57500,6 +57582,7 @@ impl App {
             self.inline_values_enabled = true;
             self.refresh_inline_values();
         }
+        self.save_before_debug = !p.disable_save_before_debug;
         self.explorer_views = ExplorerViewVisibility::from_prefs(p.explorer_views);
         self.set_host_accents(&p.host_accents);
     }
