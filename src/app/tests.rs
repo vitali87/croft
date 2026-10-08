@@ -25859,6 +25859,96 @@ fn quick_open_skips_excluded_files() {
     );
 }
 
+/// #1479: the issue's repo. `.vscode/settings.json` hides `build`, meaning
+/// the root's output folder; `scripts/build/release.py` is source.
+fn app_excluding_vscode_build() -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    for dir in [".vscode", "build", "scripts/build", "src"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    std::fs::write(
+        root.join(".vscode/settings.json"),
+        r#"{ "files.exclude": { "build": true } }"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("build/out.js"), "release_step()\n").unwrap();
+    std::fs::write(
+        root.join("scripts/build/release.py"),
+        "def release_step(): ...\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/main.py"), "release_step()\n").unwrap();
+    let app = App::new(root.to_path_buf()).unwrap();
+    (app, tmp)
+}
+
+/// #1479: Search skips the root's `build/` and still finds the definition
+/// in `scripts/build/`.
+#[test]
+fn a_vscode_exclude_of_build_keeps_scripts_build_in_search() {
+    let (mut app, t) = app_excluding_vscode_build();
+    assert_eq!(
+        search_hit_paths(&mut app, t.path(), "release_step"),
+        vec![
+            String::from("scripts/build/release.py"),
+            String::from("src/main.py")
+        ]
+    );
+}
+
+/// #1479: Go to File keeps a nested folder that shares a bare VS Code
+/// exclude's name. (`gen` here: Go to File skips every `build` folder on
+/// its own, as noise, whatever the settings say.)
+#[test]
+fn a_vscode_exclude_of_a_bare_name_keeps_nested_folders_in_go_to_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    for dir in [".vscode", "gen", "scripts/gen"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    std::fs::write(
+        root.join(".vscode/settings.json"),
+        r#"{ "files.exclude": { "gen": true } }"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("gen/out.py"), "\n").unwrap();
+    std::fs::write(root.join("scripts/gen/release.py"), "\n").unwrap();
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    app.open_file_finder();
+    let rels: Vec<String> = app
+        .file_finder
+        .as_ref()
+        .unwrap()
+        .entries
+        .iter()
+        .map(|e| e.rel.clone())
+        .collect();
+    assert!(
+        rels.contains(&String::from("scripts/gen/release.py")),
+        "{rels:?}"
+    );
+    assert!(!rels.iter().any(|r| r.starts_with("gen/")), "{rels:?}");
+}
+
+/// #1479: the Explorer hides the root's `build/` and lists
+/// `scripts/build/` once `scripts/` is expanded.
+#[test]
+fn a_vscode_exclude_of_build_keeps_scripts_build_in_the_explorer() {
+    let (mut app, t) = app_excluding_vscode_build();
+    let release = t.path().join("scripts/build/release.py");
+    assert!(
+        app.tree.reveal_path(&release),
+        "scripts/build/release.py is listed"
+    );
+    let listed: Vec<_> = app.tree.nodes.iter().map(|n| n.path.clone()).collect();
+    assert!(
+        listed.contains(&t.path().join("scripts/build")),
+        "{listed:?}"
+    );
+    assert!(!listed.contains(&t.path().join("build")), "{listed:?}");
+}
+
 /// Open a file into the focused editor group of a fresh App.
 fn app_with_open_file(tmp: &std::path::Path, name: &str, body: &str) -> App {
     let f = tmp.join(name);
