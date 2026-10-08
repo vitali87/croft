@@ -15,7 +15,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
 
-use crate::dap::discovery::{PyTarget, elide_middle};
+use crate::dap::discovery::PyTarget;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// The picker's owned state.
 pub struct ProcessPicker {
@@ -79,9 +80,10 @@ const LABEL_SEPARATOR: &str = "  ·  ";
 /// `label` cut to `room` columns (#1283). The command line after the PID
 /// and version loses its middle, marked with `…`, so the row keeps its PID
 /// and version at the start and the script and arguments at the end, which
-/// tell processes apart. Before, the end was cut off with no mark.
+/// tell processes apart. Before, the end was cut off with no mark. Widths
+/// are terminal columns, so a double-width character counts as two.
 fn fit_label(label: &str, room: usize) -> String {
-    if label.chars().count() <= room {
+    if label.width() <= room {
         return label.to_string();
     }
     let cmd_at = label
@@ -89,16 +91,51 @@ fn fit_label(label: &str, room: usize) -> String {
         .nth(1)
         .map(|(at, sep)| at + sep.len());
     match cmd_at {
-        Some(at) if label[..at].chars().count() < room => {
-            let fixed = label[..at].chars().count();
+        Some(at) if label[..at].width() < room => {
+            let fixed = label[..at].width();
             format!(
                 "{}{}",
                 &label[..at],
-                elide_middle(&label[at..], room - fixed)
+                elide_middle_cols(&label[at..], room - fixed)
             )
         }
-        _ => elide_middle(label, room),
+        _ => elide_middle_cols(label, room),
     }
+}
+
+/// `s` cut to at most `max` terminal columns by dropping its middle for one
+/// `…`, keeping a third of what fits from the start and the rest from the
+/// end, like [`crate::dap::discovery::elide_middle`] but by display width.
+fn elide_middle_cols(s: &str, max: usize) -> String {
+    if s.width() <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let head_room = keep / 3;
+    let mut head = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w > head_room {
+            break;
+        }
+        used += w;
+        head.push(c);
+    }
+    let tail_room = keep - used;
+    let mut tail: Vec<char> = Vec::new();
+    let mut tail_used = 0;
+    for c in s[head.len()..].chars().rev() {
+        let w = c.width().unwrap_or(0);
+        if tail_used + w > tail_room {
+            break;
+        }
+        tail_used += w;
+        tail.push(c);
+    }
+    head.push('…');
+    head.extend(tail.iter().rev());
+    head
 }
 
 pub fn render_process_picker(
@@ -114,7 +151,7 @@ pub fn render_process_picker(
     let rows_width = picker
         .targets
         .iter()
-        .map(|t| t.label.chars().count() + ROW_PREFIX.chars().count() + ROW_END_GAP + 2)
+        .map(|t| t.label.width() + ROW_PREFIX.chars().count() + ROW_END_GAP + 2)
         .max()
         .unwrap_or(0);
     let rows_width = u16::try_from(rows_width).unwrap_or(u16::MAX);
@@ -286,6 +323,29 @@ mod tests {
         );
         assert!(row.contains("d…d"), "{row}");
         assert!(row.contains("http.server 8766 "), "{row}");
+    }
+
+    /// #1283: a command line with double-width characters is cut by the
+    /// columns it takes on screen, not its character count, so the
+    /// arguments at its end still show instead of running past the border.
+    #[test]
+    fn a_row_with_wide_characters_keeps_its_arguments() {
+        let cmd = format!("python3.14 {} --queue emails", "界".repeat(60));
+        let mut p = ProcessPicker::new(vec![labelled(42, &cmd)]);
+        let area = Rect::new(0, 0, 160, 30);
+        let mut buf = Buffer::empty(area);
+        render_process_picker(&mut p, area, &mut buf, crate::theme::Theme::default());
+        let rect = p.last_rect;
+        let row = (rect.y..rect.y + rect.height)
+            .map(|y| {
+                (rect.x..rect.x + rect.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .find(|r| r.contains("PID 42"))
+            .expect("the row is drawn");
+        assert!(row.contains("…"), "{row}");
+        assert!(row.contains("--queue emails "), "{row}");
     }
 
     /// #1283 negative: a row that fits is drawn as is, with no ellipsis,
