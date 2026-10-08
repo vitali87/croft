@@ -73782,3 +73782,70 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     assert!(app.source_control.nested_repos.is_empty());
     assert!(app.source_control.last_init_repo_button_area.width > 0);
 }
+
+/// #1433: the bytes croft writes for one frame, through the real crossterm
+/// backend, at `depth`.
+fn frame_bytes_at(depth: crate::color_depth::ColorDepth) -> String {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.py"), "print(1)\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&tmp.path().join("a.py")).unwrap();
+    app.color_depth = depth;
+    struct Sink(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let bytes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let backend = ratatui::backend::CrosstermBackend::new(Sink(bytes.clone()));
+    let mut term = ratatui::Terminal::with_options(
+        backend,
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 100, 30)),
+        },
+    )
+    .unwrap();
+    term.draw(|f| app.render_for_terminal(f)).unwrap();
+    drop(term);
+    String::from_utf8_lossy(&bytes.borrow()).into_owned()
+}
+
+/// #1433: on a 256-colour terminal the frame carries no 24-bit colour
+/// sequence, only palette indexes.
+#[test]
+fn a_256_colour_terminal_gets_no_24_bit_colour() {
+    let out = frame_bytes_at(crate::color_depth::ColorDepth::Ansi256);
+    assert_eq!(out.matches(";2;").count(), 0, "{out:?}");
+    assert!(out.contains("48;5;"), "background indexes are written");
+}
+
+/// #1433: the Linux console gets the 16 ANSI colours only (crossterm
+/// writes them as palette entries 0-15).
+#[test]
+fn a_16_colour_terminal_gets_only_the_16_ansi_colours() {
+    let out = frame_bytes_at(crate::color_depth::ColorDepth::Ansi16);
+    assert_eq!(out.matches(";2;").count(), 0, "{out:?}");
+    let indexes: Vec<u32> = out
+        .split("8;5;")
+        .skip(1)
+        .map(|rest| {
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().unwrap()
+        })
+        .collect();
+    assert!(!indexes.is_empty());
+    assert!(indexes.iter().all(|&i| i < 16), "{indexes:?}");
+}
+
+/// #1433 negative: a truecolor terminal still gets the theme's exact
+/// 24-bit colours.
+#[test]
+fn a_truecolor_terminal_keeps_24_bit_colour() {
+    let out = frame_bytes_at(crate::color_depth::ColorDepth::TrueColor);
+    assert!(out.matches(";2;").count() > 50, "{out:?}");
+}

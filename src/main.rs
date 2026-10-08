@@ -24,6 +24,7 @@ mod codeql_submit;
 mod codeql_variant;
 mod collab;
 mod collab_agent;
+mod color_depth;
 mod command_history;
 mod config_layers;
 mod config_sync;

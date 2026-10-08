@@ -309,3 +309,13 @@ Profiles live in `~/.config/croft/profiles/<name>/`. History, macros and session
 * `"locale": "de"` picks the UI language; unset, croft follows `LC_ALL`, `LC_MESSAGES` or `LANG`. Menus, palette titles and status messages are translated where the catalog has an entry, and the palette matches queries in either language. German (`de`) and Spanish (`es`) ship as starter catalogs. For another language or to fix a translation, run `croft locale-template <lang> --write` and fill in the values it leaves empty in `~/.config/croft/locales/<lang>.json`; entries there override the built-in ones. Run it again after an upgrade to add new strings: it keeps every value you already wrote. Don't redirect the plain command onto that file, since the shell empties the file before croft can read it. A key with `{}` is a pattern: `"Saved {}": "Gespeichert: {}"`.
 
 All three are user-config only.
+
+## Terminal colour depth
+
+Themes are written in 24-bit colour. On a terminal that only understands 256 or 16 colours, croft converts every colour to the nearest one the terminal can show, so the screen stays readable instead of turning into stray escape codes or wrong colours.
+
+croft picks the depth on its own: 24-bit when `COLORTERM` is `truecolor` or `24bit`, when `TERM_PROGRAM` names a terminal known to support it (iTerm2, WezTerm, Ghostty, VS Code, tmux and others) or `TERM` does (kitty, alacritty, foot and others); otherwise 256 colours when `TERM` contains `256color`, else 16. When the guess is wrong, for example inside an ssh session or `screen` that drops `COLORTERM`, set it yourself:
+
+* `"color_depth": "truecolor"` (also `"24bit"`), `"256"` or `"16"`.
+
+User-config only; it is read at startup.
