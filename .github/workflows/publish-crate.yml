@@ -1,0 +1,207 @@
+# Publish to crates.io every PUBLISH_EVERY version bumps.
+#
+# croft bumps its version on every shipped merge, which is far more often
+# than crates.io needs a release. This mirrors code-graph-rag's cadence: on
+# each push to main, count the versions main has carried since the newest
+# one crates.io already holds (scripts/publish_cadence.py, anchored on the
+# crates.io index rather than on a counter kept in the repo), and when the
+# count reaches PUBLISH_EVERY, publish the head, tag it, and hand the tag to
+# release.yml for the prebuilt archives, the GitHub release and the Homebrew
+# formula.
+#
+# Authentication is crates.io Trusted Publishing: the job exchanges its OIDC
+# token for a short-lived crates.io token scoped to this crate, so there is
+# no long-lived CARGO_REGISTRY_TOKEN to store or rotate. It needs a one-time
+# configuration on crates.io (crate settings -> Trusted Publishing): owner
+# vitali87, repository croft, workflow publish-crate.yml, environment
+# crates-io.
+#
+# The tag is pushed with the workflow's own token, and a push made with that
+# token never triggers another workflow, so release.yml is dispatched by name
+# on the tag ref instead. It runs there with github.ref = refs/tags/v<version>,
+# which is what its publish job and its cosign identity key on.
+name: publish crate
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Publish main's head now, regardless of the cadence"
+        type: boolean
+        default: false
+
+# Read at the top level; the publish job alone takes what it needs.
+permissions:
+  contents: read
+
+env:
+  PUBLISH_EVERY: 50
+  CARGO_TERM_COLOR: always
+
+# Two merges in quick succession queue rather than cancel: a publish that is
+# half way through uploading must finish before the next decision is made.
+concurrency:
+  group: publish-crate
+  cancel-in-progress: false
+
+jobs:
+  decide:
+    name: count bumps since the last publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      publish: ${{ steps.cadence.outputs.publish }}
+      version: ${{ steps.cadence.outputs.version }}
+      already_published: ${{ steps.cadence.outputs.already_published }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history: the count walks main's first-parent chain back to
+          # the newest published version, which can be hundreds of merges.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Refuse a ref other than main
+        # A push run is main by the trigger; a manual dispatch can name any
+        # branch, and a forced run there would publish that branch's code.
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::publish-crate publishes main only, not $GITHUB_REF"
+          exit 1
+
+      - name: Decide
+        id: cadence
+        env:
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          head="$(sed -n 's/^version *= *"\([0-9.]*\)".*/\1/p' Cargo.toml | head -n1)"
+          flags=()
+          [ "$FORCE" = "true" ] && flags+=(--force)
+          # A head already on crates.io but not yet tagged is an upload whose
+          # handoff never ran; the script makes that due on its own. Exit 2
+          # from ls-remote is "no such tag"; anything else is a failure.
+          rc=0
+          git ls-remote --exit-code --tags origin "refs/tags/v$head" >/dev/null || rc=$?
+          case "$rc" in
+            0) flags+=(--tagged) ;;
+            2) ;;
+            *) echo "::error::git ls-remote failed with exit $rc"; exit 1 ;;
+          esac
+          # The script prints nothing on a refusal, so a partial answer never
+          # reaches GITHUB_OUTPUT; `set -e` then fails the job on its exit 2.
+          python3 scripts/publish_cadence.py --every "$PUBLISH_EVERY" \
+            --head "$head" --from-git --fetch "${flags[@]}" | tee -a "$GITHUB_OUTPUT"
+
+  publish:
+    name: publish ${{ needs.decide.outputs.version }}
+    needs: decide
+    if: needs.decide.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: crates-io
+    permissions:
+      # The OIDC token crates.io exchanges for a publish token.
+      id-token: write
+      # Pushing the tag.
+      contents: write
+      # Dispatching release.yml on that tag.
+      actions: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The token is not needed after the fetch; leaving it
+          # in .git/config lets any later step push with it.
+          persist-credentials: false
+          # Full history: a handoff after an earlier upload tags the commit
+          # that introduced the version, found by walking back to it.
+          fetch-depth: 0
+
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: publish-crate
+
+      - name: Check crates.io for this version
+        # Asked again here rather than taken from decide: re-running only this
+        # job after an upload that succeeded (cargo's index wait can time out
+        # after the upload lands) reuses decide's stale answer.
+        id: index
+        env:
+          VERSION: ${{ needs.decide.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, "scripts")
+          import publish_cadence as pc
+          uploaded = os.environ["VERSION"] in pc.parse_index(pc.fetch_index(pc.CRATE))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"uploaded={str(uploaded).lower()}\n")
+          PY
+
+      - name: Mint a crates.io token
+        # Skipped when the head is already on crates.io: a re-run after a
+        # publish that succeeded but failed to tag has nothing to upload.
+        if: steps.index.outputs.uploaded != 'true'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish to crates.io
+        if: steps.index.outputs.uploaded != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        # --locked: the lockfile is what CI tested, so it is what ships.
+        run: cargo publish --locked
+
+      - name: Tag and hand off to release.yml
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.decide.outputs.version }}
+          UPLOADED_EARLIER: ${{ steps.index.outputs.uploaded }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::refusing malformed version '$VERSION'"
+            exit 1
+          fi
+          tag="v${VERSION}"
+          # A handoff after an earlier upload whose tagging failed tags the
+          # commit that introduced this version, not main's head: the head
+          # may have moved on without a bump, and the release must build what
+          # crates.io already holds. Without an earlier upload this job just
+          # published the head.
+          commit="$GITHUB_SHA"
+          if [ "$UPLOADED_EARLIER" = "true" ]; then
+            commit="$(git log --first-parent -1 --format=%H -G "^version *= *\"${VERSION//./\\.}\"" -- Cargo.toml)"
+            if [ -z "$commit" ]; then
+              echo "::error::could not find the commit that set version $VERSION"
+              exit 1
+            fi
+          fi
+          # An existing tag is reused only if it names the commit this job
+          # published: release.yml builds whatever the tag points at. An
+          # annotated tag's `^{}` line is the commit it peels to.
+          target="$(git ls-remote --tags origin "refs/tags/$tag" "refs/tags/$tag^{}" \
+            | awk -v t="refs/tags/$tag" '$2 == t "^{}" { p = $1 } $2 == t { d = $1 } END { print (p != "" ? p : d) }')"
+          if [ -n "$target" ]; then
+            if [ "$target" != "$commit" ]; then
+              echo "::error::$tag already points at $target, not at $commit, the commit published"
+              exit 1
+            fi
+            echo "$tag already exists at $commit"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$tag" -m "croft $VERSION" "$commit"
+            # gh's credential helper, not a token in the remote URL, so the
+            # token never lands in .git/config or the log.
+            gh auth setup-git
+            git push origin "refs/tags/$tag"
+          fi
+          gh workflow run release.yml --ref "$tag"
+          echo "- published **${VERSION}** to crates.io and dispatched release.yml on \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
