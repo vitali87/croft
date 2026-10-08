@@ -2404,6 +2404,26 @@ pub fn undo_last_commit(root: &Path) -> Result<String, String> {
     if run_git(root, &["rev-parse", "--verify", "-q", "HEAD~1"]).is_ok() {
         run_mutation(root, &["reset", "--soft", "HEAD~1"])?;
     } else {
+        // A shallow checkout cuts history at a commit that still has a
+        // parent: deleting the ref there would drop the branch tip.
+        let raw = run_git(root, &["cat-file", "commit", "HEAD"])
+            .map_err(|_| String::from("cannot read the last commit"))?;
+        if raw
+            .lines()
+            .take_while(|l| !l.is_empty())
+            .any(|l| l.starts_with("parent "))
+        {
+            return Err(String::from(
+                "the parent commit is not in this shallow checkout; deepen it before undoing a commit",
+            ));
+        }
+        // On a detached HEAD, `update-ref -d HEAD` deletes `.git/HEAD`
+        // itself and the repository stops being one.
+        if run_git(root, &["symbolic-ref", "-q", "HEAD"]).is_err() {
+            return Err(String::from(
+                "HEAD is detached; check out a branch before undoing its root commit",
+            ));
+        }
         run_mutation(root, &["update-ref", "-d", "HEAD"])?;
     }
     Ok(message)
@@ -2433,9 +2453,25 @@ fn operation_in_progress(root: &Path) -> Option<&'static str> {
 
 /// Whether HEAD is already on its upstream (`HEAD` is an ancestor of
 /// `@{u}`), so undoing it rewrites published history and needs a force
-/// push later (#1350). No upstream is not pushed.
+/// push later (#1350). No upstream is not pushed; an upstream that is
+/// configured but cannot be checked (its tracking ref missing) counts as
+/// pushed, so the warning errs on the side of showing.
 pub fn head_is_on_upstream(root: &Path) -> bool {
-    run_git(root, &["merge-base", "--is-ancestor", "HEAD", "@{u}"]).is_ok()
+    let code = Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .arg("-C")
+        .arg(root)
+        .args(["merge-base", "--is-ancestor", "HEAD", "@{u}"])
+        .output()
+        .ok()
+        .and_then(|o| o.status.code());
+    match code {
+        Some(0) => true,
+        Some(1) => false,
+        _ => run_git(root, &["symbolic-ref", "-q", "HEAD"])
+            .and_then(|branch| run_git(root, &["for-each-ref", "--format=%(upstream)", &branch]))
+            .is_ok_and(|upstream| !upstream.is_empty()),
+    }
 }
 
 // --- Bulk staging --------------------------------------------------------
@@ -4136,6 +4172,48 @@ mod tests {
         git_in(p, &["add", "c.txt"]);
         git_in(p, &["commit", "-q", "-m", "local only"]);
         assert!(!head_is_on_upstream(p), "a local commit is not pushed");
+        git_in(p, &["update-ref", "-d", "refs/remotes/origin/main"]);
+        assert!(
+            head_is_on_upstream(p),
+            "an upstream whose tracking ref is missing cannot be ruled out"
+        );
+    }
+
+    /// #1350 negative: in a shallow checkout HEAD~1 is missing but the
+    /// commit has a parent; deleting the ref would drop the branch tip.
+    #[test]
+    fn undo_last_commit_refuses_at_a_shallow_boundary() {
+        let src = TempDir::new().unwrap();
+        init_repo_with_commit(src.path());
+        std::fs::write(src.path().join("b.txt"), "b\n").unwrap();
+        git_in(src.path(), &["add", "b.txt"]);
+        git_in(src.path(), &["commit", "-q", "-m", "Add b"]);
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("shallow");
+        let url = format!("file://{}", src.path().display());
+        git_in(
+            tmp.path(),
+            &["clone", "-q", "--depth=1", &url, p.to_str().unwrap()],
+        );
+        let head = git_in(&p, &["rev-parse", "HEAD"]);
+        let err = undo_last_commit(&p).unwrap_err();
+        assert!(err.contains("shallow"), "{err}");
+        assert_eq!(git_in(&p, &["rev-parse", "HEAD"]), head);
+    }
+
+    /// #1350 negative: a detached HEAD on a root commit is refused, since
+    /// `update-ref -d HEAD` would delete `.git/HEAD` itself.
+    #[test]
+    fn undo_last_commit_refuses_a_detached_root_commit() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        git_in(p, &["checkout", "-q", "--detach"]);
+        let head = git_in(p, &["rev-parse", "HEAD"]);
+        let err = undo_last_commit(p).unwrap_err();
+        assert!(err.contains("detached"), "{err}");
+        assert!(p.join(".git/HEAD").exists());
+        assert_eq!(git_in(p, &["rev-parse", "HEAD"]), head);
     }
 
     #[test]
