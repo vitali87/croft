@@ -73871,3 +73871,35 @@ fn a_plain_tsconfig_still_gets_one_no_emit_run() {
         assert_eq!(status, "Whole-project check: no problems", "{tsconfig}");
     }
 }
+
+/// A root tsconfig with `references` that also owns files gets its own
+/// `--noEmit` run: tsc does not check references on a plain project
+/// check, so skipping the root would hide its files' errors (#1291).
+#[cfg(unix)]
+#[test]
+fn a_root_with_references_and_its_own_files_is_checked_too() {
+    let tmp = fake_tsc_workspace(
+        r#"{ "include": ["src"], "references": [{ "path": "./tsconfig.app.json" }] }"#,
+    );
+    let (status, calls) = run_project_check(&tmp);
+    assert_eq!(calls, "--noEmit\n-p ./tsconfig.app.json --noEmit\n");
+    assert_eq!(status, "Whole-project check: 1 problem");
+}
+
+/// A reference that is itself a solution-style config is followed to its
+/// leaves rather than run on its own, which would compile nothing (#1291).
+#[cfg(unix)]
+#[test]
+fn a_nested_solution_reference_is_checked_through_its_leaves() {
+    let tmp = fake_tsc_workspace(r#"{ "files": [], "references": [{ "path": "./web" }] }"#);
+    std::fs::create_dir_all(tmp.path().join("web")).unwrap();
+    std::fs::write(
+        tmp.path().join("web/tsconfig.json"),
+        r#"{ "files": [], "references": [{ "path": "./tsconfig.app.json" }, { "path": ".." }] }"#,
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("web/tsconfig.app.json"), "{}").unwrap();
+    let (status, calls) = run_project_check(&tmp);
+    assert_eq!(calls, "-p ./web/./tsconfig.app.json --noEmit\n");
+    assert_eq!(status, "Whole-project check: 1 problem");
+}

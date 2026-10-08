@@ -10198,37 +10198,22 @@ impl App {
     /// nothing on its own: plain `tsc --noEmit` exits 0 having checked no
     /// file, which read as a clean project (#1291). Each referenced project
     /// is checked instead, `tsc -p <ref> --noEmit`, which writes nothing (no
-    /// `.tsbuildinfo`, unlike `tsc -b`). A root that names no files and no
-    /// references is `ProjectCheck::Empty`, never run and never "clean".
+    /// `.tsbuildinfo`, unlike `tsc -b`); nested solution configs are followed
+    /// to their leaves, and a root that also owns files is checked too. A
+    /// root that names no files and no references is `ProjectCheck::Empty`,
+    /// never run and never "clean". Because nothing is emitted, a project
+    /// importing another referenced project whose declarations were never
+    /// built gets tsc's TS6305 error: reported as a problem, not hidden.
     fn project_check_command(root: &Path) -> Option<ProjectCheck> {
         let text = std::fs::read_to_string(root.join("tsconfig.json")).ok()?;
-        let config: serde_json::Value =
-            serde_json::from_str(&crate::tasks::strip_jsonc(&text)).unwrap_or_default();
-        let references: Vec<String> = config
-            .get("references")
-            .and_then(|r| r.as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|r| r.get("path")?.as_str().map(String::from))
-            .collect();
-        let names_no_files = config
-            .get("files")
-            .and_then(|f| f.as_array())
-            .is_some_and(|f| f.is_empty())
-            && config.get("include").is_none()
-            // An `extends` base may supply the files.
-            && config.get("extends").is_none();
-        let runs: Vec<Vec<String>> = if references.is_empty() {
-            if names_no_files {
-                return Some(ProjectCheck::Empty);
-            }
-            vec![vec![String::from("--noEmit")]]
-        } else {
-            references
-                .into_iter()
-                .map(|r| vec![String::from("-p"), r, String::from("--noEmit")])
-                .collect()
-        };
+        let mut runs: Vec<Vec<String>> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let root_config = root.join("tsconfig.json");
+        seen.insert(std::fs::canonicalize(&root_config).unwrap_or(root_config));
+        Self::collect_tsc_runs(root, None, &text, &mut seen, &mut runs);
+        if runs.is_empty() {
+            return Some(ProjectCheck::Empty);
+        }
         let local = root.join("node_modules").join(".bin").join("tsc");
         let (program, prefix): (std::ffi::OsString, &[&str]) = if local.is_file() {
             (local.into_os_string(), &[])
@@ -10244,6 +10229,79 @@ impl App {
                 })
                 .collect(),
         ))
+    }
+
+    /// The `tsc` runs that check the tsconfig at `rel` (`None` = the root
+    /// `tsconfig.json`), whose contents are `text` (#1291).
+    ///
+    /// A config that owns files gets its own `--noEmit` run, even when it
+    /// also has `references`: tsc does not check references during a plain
+    /// project check, and skipping the root would hide its own files'
+    /// errors. Each reference is then followed, so a referenced
+    /// solution-style config is checked through its leaves rather than run
+    /// on its own and compiling nothing. A reference that can't be read
+    /// is still run, so tsc reports it. `seen` stops a reference cycle.
+    fn collect_tsc_runs(
+        root: &Path,
+        rel: Option<&str>,
+        text: &str,
+        seen: &mut std::collections::HashSet<PathBuf>,
+        runs: &mut Vec<Vec<String>>,
+    ) {
+        let config: serde_json::Value =
+            serde_json::from_str(&crate::tasks::strip_jsonc(text)).unwrap_or_default();
+        let names_no_files = config
+            .get("files")
+            .and_then(|f| f.as_array())
+            .is_some_and(|f| f.is_empty())
+            && config.get("include").is_none()
+            // An `extends` base may supply the files.
+            && config.get("extends").is_none();
+        if !names_no_files {
+            runs.push(match rel {
+                None => vec![String::from("--noEmit")],
+                Some(rel) => vec![
+                    String::from("-p"),
+                    rel.to_string(),
+                    String::from("--noEmit"),
+                ],
+            });
+        }
+        // References resolve against the directory of the config naming them.
+        let base = rel.map(|rel| {
+            let p = Path::new(rel);
+            if root.join(p).is_dir() {
+                p.to_path_buf()
+            } else {
+                p.parent().map(Path::to_path_buf).unwrap_or_default()
+            }
+        });
+        let references = config
+            .get("references")
+            .and_then(|r| r.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r.get("path")?.as_str());
+        for reference in references {
+            let child = match &base {
+                None => reference.to_string(),
+                Some(base) => base.join(reference).to_string_lossy().into_owned(),
+            };
+            let on_disk = root.join(&child);
+            let file = if on_disk.is_dir() {
+                on_disk.join("tsconfig.json")
+            } else {
+                on_disk
+            };
+            let key = std::fs::canonicalize(&file).unwrap_or(file.clone());
+            if !seen.insert(key) {
+                continue;
+            }
+            match std::fs::read_to_string(&file) {
+                Ok(text) => Self::collect_tsc_runs(root, Some(&child), &text, seen, runs),
+                Err(_) => runs.push(vec![String::from("-p"), child, String::from("--noEmit")]),
+            }
+        }
     }
 
     /// How many rows the last project check contributed (#256).
