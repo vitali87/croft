@@ -85,11 +85,34 @@ fn build_matcher(query: &str, opts: SearchOpts) -> Option<RegexMatcher> {
     if query.is_empty() {
         return None;
     }
+    compile_matcher(query, opts).ok()
+}
+
+fn compile_matcher(query: &str, opts: SearchOpts) -> Result<RegexMatcher, grep_regex::Error> {
     let mut b = RegexMatcherBuilder::new();
     b.case_insensitive(!opts.case_sensitive);
     b.word(opts.whole_word);
     b.fixed_strings(!opts.use_regex);
-    b.build(query).ok()
+    b.build(query)
+}
+
+/// Why the query can't run, for the sidebar to show where the result count
+/// would be (#1496): every search path drops a pattern that fails to compile,
+/// so without this an unclosed `(` or a look-ahead read as "0 results".
+/// `None` for an empty query or one that compiles. The parser's multi-line
+/// report (pattern, caret, `error: ...`) is cut to its `error:` line.
+pub fn query_error(query: &str, opts: SearchOpts) -> Option<String> {
+    let q = as_typed(query);
+    if q.is_empty() {
+        return None;
+    }
+    let err = compile_matcher(q, opts).err()?.to_string();
+    let reason = err
+        .lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix("error: "))
+        .unwrap_or_else(|| err.lines().next().unwrap_or("").trim());
+    Some(format!("Invalid regex: {reason}"))
 }
 
 fn build_searcher() -> Searcher {
@@ -1064,6 +1087,9 @@ pub struct SearchPanel {
     /// name when more than one folder is open.
     pub roots: Vec<PathBuf>,
     pub opts: SearchOpts,
+    /// `(query, opts, error)` behind `query_error`, so the caption doesn't
+    /// rebuild the regex every frame.
+    query_error_memo: Option<(String, SearchOpts, Option<String>)>,
     /// Per-toggle absolute screen column captured by the most recent render.
     /// Used by `App::handle_mouse` to map clicks on `Aa`, `ab`, `.*` into
     /// flag flips. Zero means the row was too narrow to render that toggle.
@@ -1175,6 +1201,7 @@ impl SearchPanel {
             last_area: Rect::default(),
             root,
             opts: SearchOpts::default(),
+            query_error_memo: None,
             toggle_case_x: 0,
             toggle_word_x: 0,
             toggle_regex_x: 0,
@@ -1724,6 +1751,20 @@ impl SearchPanel {
         }
         merged.extend(new);
         self.hits = merged;
+    }
+
+    /// `query_error` for the current query and toggles, compiled once per
+    /// change rather than on every frame.
+    pub fn query_error(&mut self) -> Option<String> {
+        let fresh = matches!(&self.query_error_memo,
+            Some((q, o, _)) if *q == self.query && *o == self.opts);
+        if !fresh {
+            let error = query_error(&self.query, self.opts);
+            self.query_error_memo = Some((self.query.clone(), self.opts, error));
+        }
+        self.query_error_memo
+            .as_ref()
+            .and_then(|(_, _, e)| e.clone())
     }
 
     /// Run the current query, store the results, and reset selection.
@@ -2454,24 +2495,40 @@ impl Widget for &mut SearchPanel {
             }
         }
         let caption_y = separator_y + 1;
-        let results_start_y = caption_y + 1;
+        let mut results_start_y = caption_y + 1;
+        if caption_y < inner.y + inner.height && !as_typed(&self.query).is_empty() {
+            if let Some(error) = self.query_error() {
+                // Wrapped, not cut off: the sidebar is narrow and the
+                // reason sits at the end of the message.
+                let style = Style::default().fg(self.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c)));
+                let rows = crate::sarif::render::wrap(&error, inner.width.max(1) as usize);
+                let mut y = caption_y;
+                for row in rows {
+                    if y >= inner.y + inner.height {
+                        break;
+                    }
+                    buf.set_stringn(inner.x, y, &row, inner.width as usize, style);
+                    y += 1;
+                }
+                results_start_y = y.max(caption_y + 1);
+            } else {
+                let (results, files) = self.result_counts();
+                let header = format!(
+                    "{results} result{} in {files} file{}",
+                    if results == 1 { "" } else { "s" },
+                    if files == 1 { "" } else { "s" }
+                );
+                let caption = Line::from(Span::styled(
+                    header,
+                    Style::default()
+                        .fg(self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)))
+                        .add_modifier(Modifier::ITALIC),
+                ));
+                buf.set_line(inner.x, caption_y, &caption, inner.width);
+            }
+        }
         // Record where results begin so scrolling / click mapping stay aligned.
         self.results_start_offset = results_start_y.saturating_sub(inner.y);
-        if caption_y < inner.y + inner.height && !as_typed(&self.query).is_empty() {
-            let (results, files) = self.result_counts();
-            let header = format!(
-                "{results} result{} in {files} file{}",
-                if results == 1 { "" } else { "s" },
-                if files == 1 { "" } else { "s" }
-            );
-            let caption = Line::from(Span::styled(
-                header,
-                Style::default()
-                    .fg(self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)))
-                    .add_modifier(Modifier::ITALIC),
-            ));
-            buf.set_line(inner.x, caption_y, &caption, inner.width);
-        }
 
         // Results
         self.last_scrollbar = Rect::default();
@@ -3649,6 +3706,121 @@ mod tests {
         assert!(
             out.is_empty(),
             "invalid regex must not crash, just yield no hits"
+        );
+    }
+
+    /// #1496: a regex that won't compile is an error, not "no matches".
+    /// Typos and the look-around / backreference syntax VS Code runs
+    /// through PCRE2 each name what is wrong.
+    #[test]
+    fn a_regex_that_will_not_compile_names_the_problem() {
+        let re = SearchOpts {
+            use_regex: true,
+            ..SearchOpts::default()
+        };
+        assert_eq!(
+            query_error("foo(", re).as_deref(),
+            Some("Invalid regex: unclosed group")
+        );
+        let look_ahead = query_error(r"foo(?=\()", re).unwrap();
+        assert!(
+            look_ahead.starts_with("Invalid regex: look-around"),
+            "{look_ahead}"
+        );
+        let backref = query_error(r"(a)\1", re).unwrap();
+        assert!(
+            backref.starts_with("Invalid regex: backreferences"),
+            "{backref}"
+        );
+    }
+
+    /// #1496 negative: valid patterns, literal mode and an empty box carry
+    /// no error, so the count header still shows.
+    #[test]
+    fn valid_and_literal_queries_have_no_regex_error() {
+        let re = SearchOpts {
+            use_regex: true,
+            ..SearchOpts::default()
+        };
+        assert_eq!(query_error(r"foo\(", re), None);
+        assert_eq!(query_error(r"get_(user_\w+)", re), None);
+        assert_eq!(query_error("", re), None);
+        // The same `foo(` is a plain literal with the regex chip off.
+        assert_eq!(query_error("foo(", SearchOpts::default()), None);
+        let whole_word = SearchOpts {
+            whole_word: true,
+            ..re
+        };
+        assert_eq!(query_error("foo", whole_word), None);
+    }
+
+    /// #1496: the sidebar shows the error where the count would be, not
+    /// "0 results in 0 files" over a search that never ran.
+    #[test]
+    fn the_sidebar_shows_the_regex_error_in_place_of_the_count() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp.path().join("a.py"), "def foo(x):\n    return foo(1)\n");
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.opts.use_regex = true;
+        panel.query = "foo(".into();
+        panel.run_query();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 14,
+        };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let text = buffer_to_string(&buf);
+        assert!(text.contains("Invalid regex: unclosed group"), "{text}");
+        assert!(!text.contains("0 results"), "{text}");
+        // Fixing the pattern brings the count back.
+        panel.query = r"foo\(".into();
+        panel.run_query();
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let text = buffer_to_string(&buf);
+        assert!(text.contains("2 results in 1 file"), "{text}");
+        assert!(!text.contains("Invalid regex"), "{text}");
+    }
+
+    /// #1496: the sidebar is narrow, so a long error (look-around's runs to
+    /// 70 columns) wraps onto the rows below instead of being cut off, and
+    /// the result list starts under its last line.
+    #[test]
+    fn a_long_regex_error_wraps_in_a_narrow_sidebar() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp.path().join("a.py"), "foo(1)\n");
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.opts.use_regex = true;
+        panel.query = r"foo(?=\()".into();
+        panel.run_query();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 32,
+            height: 14,
+        };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let text = buffer_to_string(&buf);
+        let flat: String = text
+            .lines()
+            .map(|l| l.trim_matches(|c: char| c == '│' || c.is_whitespace()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(flat.contains("is not supported"), "{text}");
+        let error_rows = text
+            .lines()
+            .filter(|l| l.contains("look-") || l.contains("supported"))
+            .count();
+        assert!(error_rows >= 2, "{text}");
+        let header = panel.last_inner.y + panel.results_start_offset;
+        let last_error_row = text.lines().position(|l| l.contains("supported")).unwrap() as u16;
+        assert!(
+            header > last_error_row,
+            "results start under the error\n{text}"
         );
     }
 
