@@ -2368,7 +2368,9 @@ pub fn unmerged_paths(root: &Path) -> Vec<String> {
     let Ok(out) = Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["diff", "--name-only", "--diff-filter=U", "-z"])
+        // `--no-relative`: with `diff.relative` set, a subdirectory root
+        // would hide the conflicts outside it, and `git add -A` stages them.
+        .args(["diff", "--no-relative", "--name-only", "--diff-filter=U", "-z"])
         .output()
     else {
         return Vec::new();
@@ -5206,6 +5208,19 @@ git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' README.md >
         assert!(commit_amend(p, "amended").is_err());
         assert!(commit_amend_no_edit(p).is_err());
         assert_eq!(head_of(p), before);
+    }
+
+    #[test]
+    fn a_subdirectory_root_with_diff_relative_still_sees_the_conflicts() {
+        // `diff.relative` scoped the check to the subdirectory, so a
+        // conflict outside it slipped past the guard.
+        let tmp = repo_in_a_conflicted_merge();
+        let p = tmp.path();
+        run_mutation(p, &["config", "diff.relative", "true"]).unwrap();
+        let sub = p.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        assert_eq!(unmerged_paths(&sub), vec![String::from("README.md")]);
+        assert!(refuse_unmerged(&sub).is_err());
     }
 
     #[test]
