@@ -1,0 +1,1 @@
+fix: On a remote (relay) session, Copy Output, copy mode, quick select and copy on select now put the text on your own machine's clipboard, as a terminal selection copy already did, instead of the remote box's.

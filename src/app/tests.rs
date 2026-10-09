@@ -24110,6 +24110,198 @@ fn copying_on_a_relay_session_pushes_the_text_to_the_local_clipboard() {
     );
 }
 
+/// Run `copy` on a relay session and return what it sent home to the local
+/// clipboard, or `None` when nothing went over the relay.
+fn relay_copied(app: &mut App, copy: impl FnOnce(&mut App)) -> Option<String> {
+    let home = tempfile::tempdir().unwrap();
+    app.is_relay_session = true;
+    let (log, inbox) = with_relay_home(home.path(), || {
+        let log = app.relay_log_path().expect("relay log path derivable");
+        let inbox = app.relay_inbox_path().expect("relay inbox path derivable");
+        copy(app);
+        (log, inbox)
+    });
+    let written = std::fs::read_to_string(&log).ok()?;
+    let id = written.lines().last()?.strip_prefix("copy\t")?.to_string();
+    std::fs::read_to_string(inbox.join(format!("{id}.txt"))).ok()
+}
+
+/// A pane whose script emits one OSC 133 command printing `out-1667`, and
+/// that command's decoration.
+fn app_with_one_finished_command(
+    tmp: &std::path::Path,
+) -> (App, crate::widgets::terminal::CommandDecoration) {
+    let mut app = App::new(tmp.to_path_buf()).unwrap();
+    let script = "x=out; printf '\\033]133;A\\007$ \\033]133;B\\007cmd\\n\\033]133;C\\007'\"$x\"'-1667\\n\\033]133;D;0\\007'; sleep 30";
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), script.into()],
+        tmp,
+    )
+    .unwrap();
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the shell to finish its command",
+        || !app.terminals[0].command_decorations().is_empty(),
+    );
+    let deco = app.terminals[0].command_decorations()[0];
+    (app, deco)
+}
+
+/// #1667: Copy Output on a relay session sends the output home to the
+/// clipboard the user pastes from, like a selection copy does (#538). It
+/// wrote the remote box's clipboard, which nothing on the user's machine can
+/// paste from.
+#[test]
+fn copy_output_on_a_relay_session_reaches_the_local_clipboard() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, deco) = app_with_one_finished_command(tmp.path());
+    let sent = relay_copied(&mut app, |app| app.copy_command_output(0, deco));
+    assert_eq!(sent.as_deref().map(str::trim_end), Some("out-1667"));
+    assert_eq!(
+        app.status,
+        "Copied command output (1 line) to the local clipboard"
+    );
+}
+
+/// #1667: copy mode, quick select and copy on select go home on a relay
+/// session too, so no terminal copy is left writing the remote box.
+#[test]
+fn every_terminal_copy_on_a_relay_session_reaches_the_local_clipboard() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let script = "x=de40; printf \"sha ${x}bdf12ab34\\n\"; sleep 60";
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from(script)],
+        tmp.path(),
+    )
+    .unwrap();
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the pane output \"de40bdf12ab34\"",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.starts_with("sha de40bdf12ab34"))
+        },
+    );
+    app.show_terminal = true;
+    app.focus_pane(Pane::Terminal);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    // Quick select: commit the hash's label.
+    let sent = relay_copied(&mut app, |app| {
+        app.handle_terminal_key(key(
+            KeyCode::Char(' '),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        let label = app
+            .terminal_quick_select
+            .as_ref()
+            .expect("Ctrl+Shift+Space enters quick select")
+            .hints
+            .iter()
+            .find(|h| h.text == "de40bdf12ab34")
+            .expect("the hash is labelled")
+            .label
+            .clone();
+        for c in label.chars() {
+            app.handle_terminal_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    });
+    assert_eq!(sent.as_deref(), Some("de40bdf12ab34"), "quick select");
+    assert!(
+        app.status.ends_with("to the local clipboard"),
+        "{}",
+        app.status
+    );
+
+    // Copy mode: a line selection on the hash's row, then y.
+    let (lines, _) = app.terminals[0].grid_lines();
+    let row = lines
+        .iter()
+        .position(|l| l.starts_with("sha de40bdf12ab34"))
+        .unwrap();
+    let sent = relay_copied(&mut app, |app| {
+        app.handle_terminal_key(key(
+            KeyCode::Char('y'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert!(
+            app.terminal_copy_mode.is_some(),
+            "Ctrl+Shift+Y enters copy mode"
+        );
+        app.handle_terminal_key(key(KeyCode::Char('g'), KeyModifiers::NONE));
+        for _ in 0..row {
+            app.handle_terminal_key(key(KeyCode::Char('j'), KeyModifiers::NONE));
+        }
+        app.handle_terminal_key(key(KeyCode::Char('V'), KeyModifiers::NONE));
+        app.handle_terminal_key(key(KeyCode::Char('y'), KeyModifiers::NONE));
+    });
+    assert_eq!(
+        sent.as_deref().map(str::trim_end),
+        Some("sha de40bdf12ab34"),
+        "copy mode"
+    );
+    assert!(
+        app.status.ends_with("to the local clipboard"),
+        "{}",
+        app.status
+    );
+
+    // Copy on select: a finished drag over the hash's row.
+    app.copy_on_select = true;
+    let inner = app.terminals[0].last_inner;
+    let (lines, top) = app.terminals[0].grid_lines();
+    let vrow = (top
+        + lines
+            .iter()
+            .position(|l| l.starts_with("sha de40bdf12ab34"))
+            .unwrap() as i32) as u16;
+    app.terminals[0].start_selection_at(inner.x, inner.y + vrow);
+    app.terminals[0].extend_selection_to(inner.x + 2, inner.y + vrow);
+    let expected = app.terminals[0].selection_text();
+    assert!(expected.starts_with("sh"), "precondition: {expected:?}");
+    let sent = relay_copied(&mut app, |app| {
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            inner.x + 2,
+            inner.y + vrow,
+        ));
+    });
+    assert_eq!(sent, Some(expected), "copy on select");
+}
+
+/// #1667 negative: off a relay session Copy Output still writes this
+/// machine's clipboard and queues nothing for a relay.
+#[test]
+fn copy_output_off_a_relay_session_writes_this_machines_clipboard() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (mut app, deco) = app_with_one_finished_command(tmp.path());
+    assert!(!app.is_relay_session);
+    let log = with_relay_home(home.path(), || {
+        app.copy_command_output(0, deco);
+        app.relay_log_path().expect("relay log path derivable")
+    });
+    assert!(!log.exists(), "nothing goes over a relay");
+    let clip = crate::clipboard::read_string().unwrap_or_default();
+    assert_eq!(clip.trim_end(), "out-1667");
+    assert!(
+        app.status.starts_with("Copied command output (1 line)"),
+        "{}",
+        app.status
+    );
+}
+
 #[test]
 fn pure_path_payload_distinguishes_finder_drag_from_text_paste() {
     // A genuine Finder drag carries only absolute path tokens.
