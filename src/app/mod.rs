@@ -11342,9 +11342,10 @@ impl App {
                 .unwrap_or(encoding_rs::UTF_8);
             let text = enc.decode(&content).0.into_owned();
             let label = std::path::PathBuf::from(format!("{rel} (local snapshot)"));
+            let unsaved = self.unsaved_text_in_any_group(&path);
             if let Err(e) = self
                 .editor
-                .open_head_diff_with_text(label, &text, &path, false)
+                .open_head_diff_with_text_resolved(label, &text, &path, false, unsaved)
             {
                 self.status = format!("Could not open snapshot diff: {e}");
                 return;
@@ -22256,23 +22257,25 @@ impl App {
             // Cmd+K C: diff the active file against the compare anchor.
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'c') => {
                 match (self.compare_anchor.clone(), self.editor.path.clone()) {
-                    (Some(anchor), Some(other)) => match self.editor.open_diff(&anchor, &other) {
-                        Ok(()) => {
-                            self.focus_pane(Pane::Editor);
-                            self.compare_anchor = None;
-                            self.sync_open_file_poll_mtime();
-                            let l = anchor
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| anchor.display().to_string());
-                            let r = other
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| other.display().to_string());
-                            self.status = format!("Diff: {l} \u{2194} {r}");
+                    (Some(anchor), Some(other)) => {
+                        match self.open_diff_across_groups(&anchor, &other) {
+                            Ok(()) => {
+                                self.focus_pane(Pane::Editor);
+                                self.compare_anchor = None;
+                                self.sync_open_file_poll_mtime();
+                                let l = anchor
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| anchor.display().to_string());
+                                let r = other
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| other.display().to_string());
+                                self.status = format!("Diff: {l} \u{2194} {r}");
+                            }
+                            Err(e) => self.status = format!("Diff failed: {e}"),
                         }
-                        Err(e) => self.status = format!("Diff failed: {e}"),
-                    },
+                    }
                     (None, _) => {
                         self.status = String::from("Compare with Selected: nothing selected yet")
                     }
@@ -33209,10 +33212,10 @@ impl App {
                 match crate::git::read_file_at_head(&scm_root, &entry.path) {
                     Ok(head_text) => {
                         let label = std::path::PathBuf::from(format!("{} (HEAD)", entry.path));
-                        match self
-                            .editor
-                            .open_head_diff_with_text(label, &head_text, &abs, true)
-                        {
+                        let unsaved = self.unsaved_text_in_any_group(&abs);
+                        match self.editor.open_head_diff_with_text_resolved(
+                            label, &head_text, &abs, true, unsaved,
+                        ) {
                             Ok(()) => {
                                 self.tag_open_diff(
                                     crate::widgets::diff::DiffSource::HeadVsWorking {
@@ -38478,6 +38481,24 @@ impl App {
     /// during every write burst for a HEAD that had not moved.
     /// A view whose content came back identical is left untouched: no reset
     /// of selection or find, no redraw.
+    /// The unsaved text of `path` in whichever editor group holds it dirty
+    /// (#1572): a split shows the same file in several groups, and the dirty
+    /// copy may sit in an inactive one while the active group's is clean.
+    fn unsaved_text_in_any_group(&self, path: &Path) -> Option<String> {
+        std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .find_map(|group| group.unsaved_text_of(path))
+    }
+
+    /// Open a two-file diff in the active group, each side's unsaved text
+    /// resolved across every editor group.
+    fn open_diff_across_groups(&mut self, left: &Path, right: &Path) -> anyhow::Result<()> {
+        let left_unsaved = self.unsaved_text_in_any_group(left);
+        let right_unsaved = self.unsaved_text_in_any_group(right);
+        self.editor
+            .open_diff_resolved(left, right, left_unsaved, right_unsaved)
+    }
+
     pub fn refresh_open_diff_views(
         &mut self,
         git_too: bool,
@@ -38521,6 +38542,10 @@ impl App {
                     if let Some(cur) = ed.diff.as_mut() {
                         cur.left_stamp = fresh.left_stamp;
                         cur.right_stamp = fresh.right_stamp;
+                        // A rebuild reads the right side from disk: rows
+                        // identical to an unsaved view mean the save landed,
+                        // so hunk actions apply again (#1572).
+                        cur.right_is_unsaved = fresh.right_is_unsaved;
                     }
                     continue;
                 }
@@ -40762,12 +40787,13 @@ impl App {
             return;
         };
         let label = PathBuf::from(format!("{rel} @ {}", commit.short_hash));
+        let unsaved = self.unsaved_text_in_any_group(&path);
         // A file the commit predates diffs as all added, which is what
         // happened to it since.
         let text = text.unwrap_or_default();
         if let Err(e) = self
             .editor
-            .open_head_diff_with_text(label, &text, &path, false)
+            .open_head_diff_with_text_resolved(label, &text, &path, false, unsaved)
         {
             self.status = format!("Could not diff {rel}: {e}");
             return;
@@ -47479,9 +47505,10 @@ impl App {
             Err(_) => path.display().to_string(),
         };
         let label = std::path::PathBuf::from(format!("{rel} (reviewed)"));
+        let unsaved = self.unsaved_text_in_any_group(path);
         if let Err(e) = self
             .editor
-            .open_head_diff_with_text(label, &text, path, false)
+            .open_head_diff_with_text_resolved(label, &text, path, false, unsaved)
         {
             self.status = format!("Could not open the reviewed diff: {e}");
             return;
@@ -60420,7 +60447,7 @@ impl App {
             MenuAction::MoveIntoNewWindow(idx) => self.move_into_new_window(idx),
             MenuAction::CopyIntoNewWindow(idx) => self.copy_into_new_window(idx),
             MenuAction::CompareWithSelected { anchor, other } => {
-                match self.editor.open_diff(&anchor, &other) {
+                match self.open_diff_across_groups(&anchor, &other) {
                     Ok(()) => {
                         self.focus_pane(Pane::Editor);
                         self.compare_anchor = None;
@@ -66036,7 +66063,7 @@ impl App {
             }
             Some(anchor) => {
                 let anchor_clone = anchor.clone();
-                match self.editor.open_diff(&anchor_clone, &path) {
+                match self.open_diff_across_groups(&anchor_clone, &path) {
                     Ok(()) => {
                         self.focus_pane(Pane::Editor);
                         self.compare_anchor = None;

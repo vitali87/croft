@@ -79134,6 +79134,44 @@ fn hunk_actions_refuse_a_source_control_diff_of_unsaved_text() {
 }
 
 #[test]
+fn the_source_control_diff_finds_the_unsaved_copy_in_an_inactive_split_group() {
+    let (_tmp, _f, mut app, idx) = scm_app_with_an_unsaved_modified_file();
+    // The new active group opens seed.txt clean from disk; the dirty copy
+    // now sits in the inactive group.
+    app.split_editor();
+    assert!(
+        !app.editor.dirty,
+        "staging: the active group's copy is clean"
+    );
+    app.open_source_control_entry(idx);
+    let diff = app.editor.diff.as_ref().expect("a diff view is open");
+    assert_eq!(
+        diff.right_lines,
+        vec!["# a = 2".to_string()],
+        "the unsaved text from the other split, not the disk"
+    );
+    assert!(diff.right_is_unsaved, "hunk actions must refuse this view");
+}
+
+#[test]
+fn saving_the_file_lets_hunk_actions_run_on_its_unsaved_source_control_diff() {
+    let (_tmp, f, mut app, idx) = scm_app_with_an_unsaved_modified_file();
+    app.open_source_control_entry(idx);
+    assert!(app.editor.diff.as_ref().unwrap().right_is_unsaved);
+    // The save writes exactly the text the view already shows, so the
+    // rebuilt rows are identical to the rendered ones.
+    std::fs::write(&f, "# a = 2\n").unwrap();
+    let touched = std::collections::BTreeSet::from([f.clone()]);
+    app.refresh_open_diff_views(false, &[], &touched);
+    assert!(
+        !app.editor.diff.as_ref().unwrap().right_is_unsaved,
+        "the saved transition clears the marker even with identical rows"
+    );
+    app.stage_hunk_at_caret();
+    assert_eq!(app.status, "Staged hunk in seed.txt");
+}
+
+#[test]
 fn hunk_actions_still_stage_from_a_source_control_diff_of_a_saved_file() {
     let (tmp, f) = repo_with_seed("a = 1\n");
     std::fs::write(&f, "a = 2\n").unwrap();
