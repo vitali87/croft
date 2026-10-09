@@ -2053,7 +2053,22 @@ impl PtyTerminal {
             let mut cmd_start: Option<std::time::Instant> = None;
             let mut buf = [0u8; 65536];
             loop {
-                if !wait_pty_readable(pty_fd, &shutdown_r) {
+                // A dev-server URL that ended the last read is held back in
+                // case the next read extends it; when the output goes quiet
+                // instead, it is sent as it stands (#1449).
+                let ready = if port_sniffer.has_pending() {
+                    match poll_pty(pty_fd, &shutdown_r, PORT_URL_SETTLE_MS) {
+                        PtyWait::Ready => true,
+                        PtyWait::Closed => false,
+                        PtyWait::Idle => {
+                            port_sniffer.flush(&port_tx);
+                            continue;
+                        }
+                    }
+                } else {
+                    wait_pty_readable(pty_fd, &shutdown_r)
+                };
+                if !ready {
                     break;
                 }
                 match reader.read(&mut buf) {
@@ -4406,6 +4421,30 @@ impl PaneLink {
 /// the shell dies, so the read never returns and joining the reader would
 /// freeze the UI for as long as the job runs.
 fn wait_pty_readable(pty_fd: std::os::fd::RawFd, shutdown: &std::io::PipeReader) -> bool {
+    matches!(poll_pty(pty_fd, shutdown, -1), PtyWait::Ready)
+}
+
+/// How long the reader waits for more output before sending a held-back
+/// dev-server URL as it stands.
+const PORT_URL_SETTLE_MS: i32 = 150;
+
+/// What [`poll_pty`] saw.
+#[derive(Debug, PartialEq, Eq)]
+enum PtyWait {
+    /// The pty has output.
+    Ready,
+    /// Shutdown was signalled, or polling failed.
+    Closed,
+    /// `timeout_ms` passed with neither.
+    Idle,
+}
+
+/// [`wait_pty_readable`] with a timeout in milliseconds (`-1` waits forever).
+fn poll_pty(
+    pty_fd: std::os::fd::RawFd,
+    shutdown: &std::io::PipeReader,
+    timeout_ms: i32,
+) -> PtyWait {
     use std::os::fd::AsRawFd;
     let mut fds = [
         libc::pollfd {
@@ -4420,18 +4459,21 @@ fn wait_pty_readable(pty_fd: std::os::fd::RawFd, shutdown: &std::io::PipeReader)
         },
     ];
     loop {
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
         if n < 0 {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            return false;
+            return PtyWait::Closed;
+        }
+        if n == 0 {
+            return PtyWait::Idle;
         }
         if fds[1].revents != 0 {
-            return false;
+            return PtyWait::Closed;
         }
         if fds[0].revents != 0 {
-            return true;
+            return PtyWait::Ready;
         }
     }
 }

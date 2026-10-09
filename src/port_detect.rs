@@ -6,9 +6,10 @@
 //!   terminal reader thread (right beside `sniff_bracketed_paste_mode`),
 //!   matching the `http://localhost:PORT` banners and `listening on :PORT`
 //!   lines that dev servers print. Cheap: two precompiled regexes over a small
-//!   carry buffer. Emission is position-based — only a match in the freshly
-//!   read bytes fires, so the carried tail is never re-emitted, yet a banner
-//!   reprinted by a restarted server is. Deduping live ports is the app's job.
+//!   carry buffer of the printed text, escape codes stripped (#1449).
+//!   Emission is position-based — only a match in the freshly read bytes
+//!   fires, so the carried tail is never re-emitted, yet a banner reprinted
+//!   by a restarted server is. Deduping live ports is the app's job.
 //! * **Socket poll** — [`poll_listeners`] shells out to `lsof`/`ss` on a low
 //!   cadence to catch servers that bind a port without announcing it. Scoped to
 //!   the shell's own process subtree so system daemons don't leak in. On a
@@ -162,6 +163,66 @@ fn parse_port(s: &str) -> Option<u16> {
 /// sniffer's — which is what lets a restart re-toast.
 pub struct PortSniffer {
     carry: String,
+    /// Where in `carry` the text not yet reported on starts: its end, or
+    /// the start of a URL that ended a read and may still be growing.
+    fresh: usize,
+    /// The escape sequence a read ended inside, if any.
+    esc: Esc,
+    /// URL hits held back because they ended a read and may still grow;
+    /// [`PortSniffer::flush`] sends them when no further read comes.
+    pending: Vec<PortHit>,
+}
+
+/// Where a read left the escape-sequence stripper (#1449), so a sequence
+/// split across two reads is still dropped whole.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Esc {
+    #[default]
+    Text,
+    /// After ESC.
+    Start,
+    /// After ESC and a charset designator (`ESC ( B`): one more byte.
+    Charset,
+    /// Inside `ESC [ …`, up to its final byte.
+    Csi,
+    /// Inside `ESC ] …`, up to BEL or ST.
+    Osc,
+    /// ESC inside an OSC: `\` ends it (ST).
+    OscSt,
+}
+
+/// `text` with its CSI, OSC and two-byte escape sequences removed, picking
+/// up in `state` from the previous read and leaving it for the next. Only
+/// the printed text is scanned: Vite colours its URL and bolds the port,
+/// so the raw bytes read `\e[36mhttp://localhost:\e[1m5173\e[22m/`. A
+/// newline always ends a sequence, so a malformed one cannot swallow the
+/// rest of the output.
+fn strip_escapes(state: &mut Esc, text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        *state = match (*state, c) {
+            (_, '\n') => {
+                out.push(c);
+                Esc::Text
+            }
+            (Esc::Text, '\x1b') => Esc::Start,
+            (Esc::Text, c) => {
+                out.push(c);
+                Esc::Text
+            }
+            (Esc::Start, '[') => Esc::Csi,
+            (Esc::Start, ']') => Esc::Osc,
+            (Esc::Start, '(' | ')' | '*' | '+') => Esc::Charset,
+            (Esc::Start | Esc::Charset, _) => Esc::Text,
+            (Esc::Csi, '\x20'..='\x3f') => Esc::Csi,
+            (Esc::Csi, _) => Esc::Text,
+            (Esc::Osc, '\x07') => Esc::Text,
+            (Esc::Osc | Esc::OscSt, '\x1b') => Esc::OscSt,
+            (Esc::OscSt, '\\') => Esc::Text,
+            (Esc::Osc | Esc::OscSt, _) => Esc::Osc,
+        };
+    }
+    out
 }
 
 /// How many trailing chars of the combined text to keep for the next scan,
@@ -172,6 +233,9 @@ impl PortSniffer {
     pub fn new() -> Self {
         Self {
             carry: String::new(),
+            fresh: 0,
+            esc: Esc::Text,
+            pending: Vec::new(),
         }
     }
 
@@ -180,24 +244,62 @@ impl PortSniffer {
     /// is best-effort: a dropped hit just means the app learns of the port from
     /// the next line or the socket poll.
     pub fn sniff(&mut self, chunk: &[u8], tx: &std::sync::mpsc::Sender<PortHit>) {
-        // ANSI colour codes around a URL are outside the match, and a colour
-        // reset mid-URL is vanishingly rare, so a string scan is enough without
-        // a full terminal parse.
-        let carry_len = self.carry.len();
-        let text = format!("{}{}", self.carry, String::from_utf8_lossy(chunk));
-        for (end, hit) in scan_with_pos(&text) {
+        // The printed text, not the bytes: escape codes sit around and even
+        // inside a URL (#1449).
+        let printed = strip_escapes(&mut self.esc, &String::from_utf8_lossy(chunk));
+        // Held-back hits are rescanned from the carry with this read added.
+        self.pending.clear();
+        let fresh = self.fresh;
+        let text = format!("{}{printed}", self.carry);
+        // A URL that ends the text may still be growing (`localhost:` with
+        // its port in the next read): it waits for that read instead of
+        // going out as port 80, or as `:51` of `:5173`.
+        let mut growing_from: Option<usize> = None;
+        for (start, end, hit) in scan_with_pos(&text) {
             // A match ending within the carried prefix was already scanned last
             // call; only emit one that reaches into the freshly read bytes.
-            if end > carry_len {
-                let _ = tx.send(hit);
+            if end <= fresh {
+                continue;
             }
+            // Bounded, so a URL that never stops growing cannot grow the
+            // carry without limit.
+            if hit.url.is_some()
+                && matches!(&text[end..], "" | ":")
+                && text.len() - start <= CARRY_BYTES
+            {
+                growing_from = Some(growing_from.map_or(start, |g| g.min(start)));
+                self.pending.push(hit);
+                continue;
+            }
+            let _ = tx.send(hit);
         }
         // Keep the tail (on a char boundary) for the next call's split coverage.
         let mut keep_from = text.len().saturating_sub(CARRY_BYTES);
+        if let Some(g) = growing_from {
+            keep_from = keep_from.min(g);
+        }
         while keep_from < text.len() && !text.is_char_boundary(keep_from) {
             keep_from += 1;
         }
         self.carry = text[keep_from..].to_string();
+        // Any match ending past a growing URL's start is reported next time,
+        // even when the next read adds nothing to the URL itself.
+        self.fresh = growing_from.map_or(self.carry.len(), |g| g - keep_from);
+    }
+
+    /// Whether a URL is held back waiting for the next read.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// The output went quiet (or ended) after a URL that ended a read: it
+    /// has stopped growing, so send it as it stands. Everything carried
+    /// counts as reported, so the next read does not send it again.
+    pub fn flush(&mut self, tx: &std::sync::mpsc::Sender<PortHit>) {
+        for hit in self.pending.drain(..) {
+            let _ = tx.send(hit);
+        }
+        self.fresh = self.carry.len();
     }
 }
 
@@ -211,14 +313,14 @@ impl Default for PortSniffer {
 /// hits for the same port (the URL carries scheme and path).
 #[cfg(test)]
 fn scan(text: &str) -> Vec<PortHit> {
-    scan_with_pos(text).into_iter().map(|(_, h)| h).collect()
+    scan_with_pos(text).into_iter().map(|(_, _, h)| h).collect()
 }
 
-/// Like [`scan`] but pairs each hit with the byte offset where its match ends,
-/// so [`PortSniffer::sniff`] can tell a hit in the freshly read bytes from one
-/// that only lives in the carried-over prefix.
-fn scan_with_pos(text: &str) -> Vec<(usize, PortHit)> {
-    let mut out: Vec<(usize, PortHit)> = Vec::new();
+/// Like [`scan`] but pairs each hit with the byte offsets where its match
+/// starts and ends, so [`PortSniffer::sniff`] can tell a hit in the freshly
+/// read bytes from one that only lives in the carried-over prefix.
+fn scan_with_pos(text: &str) -> Vec<(usize, usize, PortHit)> {
+    let mut out: Vec<(usize, usize, PortHit)> = Vec::new();
     for cap in URL_RE.captures_iter(text) {
         let m = cap.get(0).expect("group 0 always present");
         let whole = m.as_str().to_string();
@@ -231,6 +333,7 @@ fn scan_with_pos(text: &str) -> Vec<(usize, PortHit)> {
             },
         );
         out.push((
+            m.start(),
             m.end(),
             PortHit {
                 port,
@@ -243,9 +346,9 @@ fn scan_with_pos(text: &str) -> Vec<(usize, PortHit)> {
         if let Some(g) = cap.get(1)
             && !is_clock_time(text, g.start(), g.as_str())
             && let Some(port) = parse_port(g.as_str())
-            && !out.iter().any(|(_, h)| h.port == port)
+            && !out.iter().any(|(_, _, h)| h.port == port)
         {
-            out.push((g.end(), PortHit::bare(port)));
+            out.push((g.start(), g.end(), PortHit::bare(port)));
         }
     }
     out
@@ -666,6 +769,97 @@ mod tests {
         let got: Vec<_> = rx.try_iter().collect();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].port, 4173);
+    }
+
+    /// Every hit `chunks` produce, fed to one sniffer in order.
+    fn sniff_all(chunks: &[&[u8]]) -> Vec<PortHit> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut s = PortSniffer::new();
+        for c in chunks {
+            s.sniff(c, &tx);
+        }
+        rx.try_iter().collect()
+    }
+
+    /// #1449: Vite colours its URL and bolds the port, so the bytes hide
+    /// the URL behind escape codes. The scrape reads the text, not them.
+    #[test]
+    fn sniffer_reads_a_vite_url_through_its_colour_codes() {
+        let got = sniff_all(&[
+            b"  \xe2\x9e\x9c  Local:   \x1b[36mhttp://localhost:\x1b[1m5173\x1b[22m/\x1b[39m\n",
+        ]);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].port, 5173);
+        assert_eq!(got[0].url.as_deref(), Some("http://localhost:5173/"));
+        let bold = sniff_all(&[b"\x1b[1mhttp://127.0.0.1:8000\x1b[0m\n"]);
+        assert_eq!(bold.len(), 1, "{bold:?}");
+        assert_eq!(bold[0].port, 8000);
+        assert_eq!(bold[0].url.as_deref(), Some("http://127.0.0.1:8000"));
+    }
+
+    /// #1449: an escape code split across two reads is still dropped whole,
+    /// and the URL it sat in is reported once, with its port.
+    #[test]
+    fn sniffer_reads_a_url_whose_escape_code_is_split_across_reads() {
+        let got = sniff_all(&[
+            b"Local: \x1b[36mhttp://localhost:\x1b[",
+            b"1m5173\x1b[22m/\x1b[39m\n",
+        ]);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].port, 5173);
+        assert_eq!(got[0].url.as_deref(), Some("http://localhost:5173/"));
+        // An OSC (a window title) split the same way is dropped too.
+        let osc = sniff_all(&[
+            b"\x1b]0;vite ht",
+            b"tp://localhost:1\x07up at http://localhost:4000/\n",
+        ]);
+        assert_eq!(osc.iter().map(|h| h.port).collect::<Vec<_>>(), vec![4000]);
+    }
+
+    /// #1449 negative: a read that ends right after `localhost:` is not a
+    /// URL on port 80; the port is still to come.
+    #[test]
+    fn a_url_cut_before_its_port_is_not_reported_on_port_80() {
+        let got = sniff_all(&[b"Local: http://localhost:", b"5173/\n"]);
+        assert_eq!(got.iter().map(|h| h.port).collect::<Vec<_>>(), vec![5173]);
+    }
+
+    /// #1449: a URL that ends the server's output, with no newline and no
+    /// further read, is held back only until the output goes quiet: the
+    /// reader's flush sends it, once.
+    #[test]
+    fn a_url_ending_the_output_is_sent_by_the_flush_once() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut s = PortSniffer::new();
+        s.sniff(b"Local: \x1b[36mhttp://localhost:5173\x1b[39m", &tx);
+        assert!(rx.try_iter().next().is_none(), "held back, may still grow");
+        assert!(s.has_pending());
+        s.flush(&tx);
+        let got: Vec<_> = rx.try_iter().collect();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].url.as_deref(), Some("http://localhost:5173"));
+        assert!(!s.has_pending());
+        s.sniff(b"\n", &tx);
+        assert!(rx.try_iter().next().is_none(), "not sent a second time");
+    }
+
+    /// #1449 negative: a URL at the very end of a read waits for the next
+    /// read, and is reported then even when nothing more of it arrives.
+    #[test]
+    fn a_url_ending_a_read_is_reported_with_the_next_read() {
+        let got = sniff_all(&[b"up at http://localhost:3000/", b"\n"]);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].url.as_deref(), Some("http://localhost:3000/"));
+        let longer = sniff_all(&[b"up at http://localhost:30", b"00/app\n"]);
+        assert_eq!(longer.len(), 1, "{longer:?}");
+        assert_eq!(longer[0].url.as_deref(), Some("http://localhost:3000/app"));
+    }
+
+    /// #1449 negative: the numbers inside an escape code are never a port.
+    #[test]
+    fn digits_inside_an_escape_code_are_not_a_port() {
+        let got = sniff_all(&[b"server listening\x1b[38:2::255:100:0m on \x1b[0mthe socket\n"]);
+        assert!(got.is_empty(), "{got:?}");
     }
 
     #[test]
