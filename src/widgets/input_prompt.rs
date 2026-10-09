@@ -153,6 +153,10 @@ pub enum InputPurpose {
         number: u64,
         reason: usize,
     },
+    /// A new value for the setting `key` (#612).
+    SettingValue {
+        key: String,
+    },
     /// Find in a hex tab (#172): the typed value is hex byte pairs
     /// ("de ad be ef") or, when it does not parse as hex, literal ASCII.
     /// Submitting stores the query on the view and jumps to the first
@@ -238,6 +242,9 @@ pub struct InputPrompt {
     /// Whether Enter on an empty field submits (an optional field left
     /// blank) rather than waiting for a value.
     pub allow_blank: bool,
+    /// The line under the field; `None` is the generic "Enter to confirm ·
+    /// Esc to cancel".
+    pub hint: Option<String>,
 }
 
 impl InputPrompt {
@@ -254,7 +261,15 @@ impl InputPrompt {
             cursor: 0,
             last_rect: Rect::default(),
             allow_blank: false,
+            hint: None,
         }
+    }
+
+    /// Say under the field what Enter and Esc do, when it is more than
+    /// confirm and cancel.
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
     }
 
     /// Let Enter submit an empty field, for a value that is optional.
@@ -371,7 +386,9 @@ pub fn render_input_prompt(
     Widget::render(block, rect, buf);
     if theme.gradient() {
         crate::gradient::paint_gradient_box(buf, rect);
-        buf.set_span(rect.x + 1, rect.y, &title, title.width() as u16);
+        // Clipped to the box like the block's own title: at full width it
+        // ran past the border and the screen edge (#910).
+        buf.set_span(rect.x + 1, rect.y, &title, rect.width.saturating_sub(2));
     }
     if inner.width == 0 || inner.height == 0 {
         return;
@@ -418,10 +435,14 @@ pub fn render_input_prompt(
     }
 
     if inner.height >= 3 {
-        buf.set_string(
+        buf.set_stringn(
             inner.x,
             inner.y + 2,
-            "Enter to confirm · Esc to cancel",
+            prompt
+                .hint
+                .as_deref()
+                .unwrap_or("Enter to confirm · Esc to cancel"),
+            inner.width as usize,
             Style::default().fg(theme.ui(Color::Rgb(0x7a, 0x82, 0x90))),
         );
     }
@@ -430,6 +451,27 @@ pub fn render_input_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_title_stays_inside_the_box_under_the_gradient_theme() {
+        // #910: the gradient repaint drew the title at full width, past the
+        // border and the screen edge, taking "unsaved edits" with it.
+        let mut p = InputPrompt::new(
+            InputPurpose::CreateTag,
+            format!(
+                "{} changed on disk and you have unsaved edits.",
+                "x/".repeat(60)
+            ),
+            "",
+        );
+        let screen = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(screen);
+        render_input_prompt(&mut p, screen, &mut buf, crate::theme::Theme::BLACK);
+        let r = p.last_rect;
+        for x in r.x + r.width..screen.width {
+            assert_eq!(buf[(x, r.y)].symbol(), " ", "column {x} of the title row");
+        }
+    }
 
     #[test]
     fn submit_value_trims_and_rejects_blank() {
