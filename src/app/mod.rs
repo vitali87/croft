@@ -33942,7 +33942,12 @@ impl App {
             self.source_control.insert_str(message.trim());
         }
         let summary = outcome.map(|m| m.lines().next().unwrap_or("").trim().to_string());
-        self.run_scm_op("reset --soft HEAD~1", summary, "Undid last commit");
+        self.run_scm_op(
+            "reset --soft HEAD~1",
+            summary,
+            "Undid last commit",
+            "Undo last commit",
+        );
     }
 
     fn commit_and_sync_source_control(&mut self) {
