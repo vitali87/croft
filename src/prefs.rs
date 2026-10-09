@@ -530,6 +530,7 @@ impl Prefs {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let json = serde_json::to_string_pretty(&self.document()?).context("serializing prefs")?;
+        let before = crate::config_sync::stamp(path);
         // Written aside and renamed in: a reader on another thread (the MCP
         // worker's fingerprint check) must never see a truncated file, and a
         // crash mid-write must not leave one.
@@ -546,7 +547,7 @@ impl Prefs {
         })?;
         // croft's own write, already applied: the settings watch must not
         // re-merge it as if it came from outside (#1435).
-        crate::config_sync::note_own_write(path);
+        crate::config_sync::note_own_write(path, before);
         Ok(())
     }
 
