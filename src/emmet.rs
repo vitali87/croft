@@ -12,8 +12,12 @@
 //! * The climb-up operator `^`. It only ever saves a pair of parentheses,
 //!   and it is the one piece of the grammar whose meaning readers argue
 //!   about.
-//! * CSS abbreviations (`m10-20`), snippets (`!`, `link:css`) and lorem
-//!   ipsum. They are separate features that happen to share a keystroke.
+//! * CSS abbreviations (`m10-20`) and the document snippet `!`. They are
+//!   separate features that happen to share a keystroke.
+//!
+//! Emmet's HTML aliases (`input:email`, `btn:s`, `link:css`, ...) and lorem
+//! ipsum (`lorem`, `lorem5`) are in (#1230): a form is mostly typed inputs,
+//! and a colon name that is no alias would otherwise become a made-up tag.
 //!
 //! An abbreviation that does not parse expands to nothing, so the chord is
 //! inert on prose rather than mangling it.
@@ -62,6 +66,312 @@ struct Node {
     children: Vec<Node>,
     /// A `(...)` group: contributes its children and no tag of its own.
     group: bool,
+    /// Lorem ipsum (#1230): `text` on a line of its own, with no tag.
+    bare_text: bool,
+}
+
+/// One alias: the colon name, the tag it stands for, and that tag's attributes.
+type Alias = (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+);
+
+/// Emmet's HTML aliases (#1230): a colon name, the tag it stands for, and
+/// that tag's attributes. An empty value is written as `name=""`, as Emmet
+/// writes it, for the author to fill in.
+const ALIASES: &[Alias] = &[
+    ("input:hidden", "input", &[("type", "hidden"), ("name", "")]),
+    ("input:h", "input", &[("type", "hidden"), ("name", "")]),
+    (
+        "input:text",
+        "input",
+        &[("type", "text"), ("name", ""), ("id", "")],
+    ),
+    (
+        "input:t",
+        "input",
+        &[("type", "text"), ("name", ""), ("id", "")],
+    ),
+    (
+        "input:search",
+        "input",
+        &[("type", "search"), ("name", ""), ("id", "")],
+    ),
+    (
+        "input:email",
+        "input",
+        &[("type", "email"), ("name", ""), ("id", "")],
+    ),
+    (
+        "input:url",
+        "input",
+        &[("type", "url"), ("name", ""), ("id", "")],
+    ),
+    (
+        "input:password",
+        "input",
+        &[("type", "password"), ("name", ""), ("id", "")],
+    ),
+    (
+        "input:p",
+        "input",
+        &[("type", "password"), ("name", ""), ("id", "")],
+    ),
+    (
+        "input:datetime",
+        "input",
+        &[("type", "datetime"), ("name", ""), ("id", "")],
+    ),
+    (
+        "input:date",
+        "input",
+        &[("type", "date"), ("name", ""), ("id", "")],
+    ),
+    (
+        "input:datetime-local",
+        "input",
+        &[("type", "datetime-local"), ("name", ""), ("id", "")],
+    ),
+    (
+        "input:month",
+        "input",
+        &[("type", "month"), ("name", ""), ("id", "")],
+    ),
+    (
+        "input:week",
+        "input",
+        &[("type", "week"), ("name", ""), ("id", "")],
+    ),
+    (
+        "input:time",
+        "input",
+        &[("type", "time"), ("name", ""), ("id", "")],
+    ),
+    (
+        "input:tel",
+        "input",
+        &[("type", "tel"), ("name", ""), ("id", "")],
+    ),
+    (
+        "input:number",
+        "input",
+        &[("type", "number"), ("name", ""), ("id", "")],
+    ),
+    (
+        "input:color",
+        "input",
+        &[("type", "color"), ("name", ""), ("id", "")],
+    ),
+    (
+        "input:checkbox",
+        "input",
+        &[("type", "checkbox"), ("name", ""), ("id", "")],
+    ),
+    (
+        "input:c",
+        "input",
+        &[("type", "checkbox"), ("name", ""), ("id", "")],
+    ),
+    (
+        "input:radio",
+        "input",
+        &[("type", "radio"), ("name", ""), ("id", "")],
+    ),
+    (
+        "input:r",
+        "input",
+        &[("type", "radio"), ("name", ""), ("id", "")],
+    ),
+    (
+        "input:range",
+        "input",
+        &[("type", "range"), ("name", ""), ("id", "")],
+    ),
+    (
+        "input:file",
+        "input",
+        &[("type", "file"), ("name", ""), ("id", "")],
+    ),
+    (
+        "input:f",
+        "input",
+        &[("type", "file"), ("name", ""), ("id", "")],
+    ),
+    (
+        "input:submit",
+        "input",
+        &[("type", "submit"), ("value", "")],
+    ),
+    ("input:s", "input", &[("type", "submit"), ("value", "")]),
+    (
+        "input:image",
+        "input",
+        &[("type", "image"), ("src", ""), ("alt", "")],
+    ),
+    (
+        "input:i",
+        "input",
+        &[("type", "image"), ("src", ""), ("alt", "")],
+    ),
+    (
+        "input:button",
+        "input",
+        &[("type", "button"), ("value", "")],
+    ),
+    ("input:b", "input", &[("type", "button"), ("value", "")]),
+    ("input:reset", "input", &[("type", "reset"), ("value", "")]),
+    ("btn:s", "button", &[("type", "submit")]),
+    ("btn:r", "button", &[("type", "reset")]),
+    ("btn:d", "button", &[("disabled", "")]),
+    ("button:s", "button", &[("type", "submit")]),
+    ("button:submit", "button", &[("type", "submit")]),
+    ("button:r", "button", &[("type", "reset")]),
+    ("button:reset", "button", &[("type", "reset")]),
+    ("button:d", "button", &[("disabled", "")]),
+    ("button:disabled", "button", &[("disabled", "")]),
+    ("a:link", "a", &[("href", "http://")]),
+    ("a:mail", "a", &[("href", "mailto:")]),
+    ("a:tel", "a", &[("href", "tel:+")]),
+    (
+        "link:css",
+        "link",
+        &[("rel", "stylesheet"), ("href", "style.css")],
+    ),
+    (
+        "link:favicon",
+        "link",
+        &[
+            ("rel", "shortcut icon"),
+            ("type", "image/x-icon"),
+            ("href", "favicon.ico"),
+        ],
+    ),
+    ("script:src", "script", &[("src", "")]),
+    ("form:get", "form", &[("action", ""), ("method", "get")]),
+    ("form:post", "form", &[("action", ""), ("method", "post")]),
+    ("meta:utf", "meta", &[("charset", "UTF-8")]),
+    (
+        "meta:vp",
+        "meta",
+        &[
+            ("name", "viewport"),
+            ("content", "width=device-width, initial-scale=1.0"),
+        ],
+    ),
+];
+
+fn alias(name: &str) -> Option<&'static Alias> {
+    ALIASES.iter().find(|(n, _, _)| *n == name)
+}
+
+/// The standard lorem ipsum opening, cycled for longer runs.
+const LOREM: &[&str] = &[
+    "lorem",
+    "ipsum",
+    "dolor",
+    "sit",
+    "amet",
+    "consectetur",
+    "adipisicing",
+    "elit",
+    "sed",
+    "do",
+    "eiusmod",
+    "tempor",
+    "incididunt",
+    "ut",
+    "labore",
+    "et",
+    "dolore",
+    "magna",
+    "aliqua",
+    "ut",
+    "enim",
+    "ad",
+    "minim",
+    "veniam",
+    "quis",
+    "nostrud",
+    "exercitation",
+    "ullamco",
+    "laboris",
+    "nisi",
+];
+
+/// How many words `lorem`, `loremN`, `lipsum` or `lipsumN` asks for: 30
+/// without a count, as in Emmet. `None` for any other word, and for a zero
+/// or absurd count.
+fn lorem_words(name: &str) -> Option<usize> {
+    let rest = name
+        .strip_prefix("lorem")
+        .or_else(|| name.strip_prefix("lipsum"))?;
+    if rest.is_empty() {
+        return Some(30);
+    }
+    if !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse().ok().filter(|n| (1..=MAX_REPEAT).contains(n))
+}
+
+/// `n` words of lorem ipsum as one sentence: capitalised, full stop.
+fn lorem_text(n: usize) -> String {
+    let words: Vec<&str> = LOREM.iter().copied().cycle().take(n).collect();
+    let mut text = words.join(" ");
+    if let Some(first) = text.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    text.push('.');
+    text
+}
+
+/// Resolve aliases and lorem in `nodes` for `profile` (#1230). In HTML and
+/// JSX a colon name must be an alias, or the abbreviation is refused
+/// rather than written as a made-up tag; XML keeps namespaced names.
+fn resolve(nodes: &mut [Node], profile: Profile) -> Option<()> {
+    for node in nodes.iter_mut() {
+        resolve(&mut node.children, profile)?;
+        if node.group {
+            continue;
+        }
+        if let Some(n) = lorem_words(&node.name)
+            && node.is_lone_word()
+        {
+            node.name.clear();
+            node.text = Some(lorem_text(n));
+            node.bare_text = true;
+            continue;
+        }
+        if profile == Profile::Xml || !node.name.contains(':') {
+            continue;
+        }
+        let (_, tag, defaults) = alias(&node.name)?;
+        node.name = tag.to_string();
+        let mut attrs: Vec<(String, String)> = defaults
+            .iter()
+            .filter(|(k, _)| !(*k == "id" && node.id.is_some()))
+            .filter(|(k, _)| !(*k == "class" && !node.classes.is_empty()))
+            .map(|(k, v)| match node.attrs.iter().position(|(a, _)| a == k) {
+                Some(i) => node.attrs.remove(i),
+                None => (k.to_string(), v.to_string()),
+            })
+            .collect();
+        attrs.append(&mut node.attrs);
+        node.attrs = attrs;
+    }
+    // A lone lorem child is its parent's text, as `p>lorem5` writes
+    // `<p>Lorem ipsum dolor sit amet.</p>` on one line.
+    for node in nodes.iter_mut() {
+        if node.text.is_none()
+            && node.children.len() == 1
+            && node.children[0].bare_text
+            && node.children[0].repeat == 1
+        {
+            node.text = node.children.pop().and_then(|c| c.text);
+        }
+    }
+    Some(())
 }
 
 /// The expansion of `abbr`, indented one level per depth with `indent`, or
@@ -71,7 +381,17 @@ struct Node {
 /// content position, which is where typing continues. It is a byte offset
 /// into the returned string.
 pub fn expand(abbr: &str, indent: &str, profile: Profile) -> Option<(String, usize)> {
-    let nodes = parse(abbr)?;
+    let mut nodes = parse(abbr)?;
+    // An alias on its own is HTML; XML reads the word as a namespaced tag,
+    // which a bare word is not allowed to be.
+    if profile == Profile::Xml
+        && nodes.len() == 1
+        && nodes[0].is_lone_word()
+        && alias(&nodes[0].name).is_some()
+    {
+        return None;
+    }
+    resolve(&mut nodes, profile)?;
     if element_count(&nodes) > MAX_ELEMENTS {
         return None;
     }
@@ -338,7 +658,11 @@ fn parse(abbr: &str) -> Option<Vec<Node>> {
     }
     if nodes.len() == 1 && nodes[0].is_lone_word() {
         let name = nodes[0].name.as_str();
-        if !name.contains('-') && !KNOWN_TAGS.contains(&name) {
+        if !name.contains('-')
+            && !KNOWN_TAGS.contains(&name)
+            && alias(name).is_none()
+            && lorem_words(name).is_none()
+        {
             return None;
         }
     }
@@ -634,6 +958,13 @@ impl Renderer<'_> {
         if node.group {
             return self.render_all(&node.children, parent, depth, index);
         }
+        if node.bare_text {
+            self.out.push_str(&self.indent.repeat(depth));
+            self.out.push_str(node.text.as_deref().unwrap_or(""));
+            self.out.push('\n');
+            return Some(());
+        }
+
         // A text node is its text on its own line, as Emmet lays out
         // `p>{Click }+a{here}+{ to continue}` (#1197).
         if node.is_text_only() {
@@ -1120,5 +1451,108 @@ mod tests {
     fn nothing_to_the_left_means_no_abbreviation() {
         assert!(abbreviation_before("   ", 3).is_none());
         assert!(abbreviation_before("div", 0).is_none());
+    }
+
+    // ---- Aliases and lorem (#1230) -----------------------------------------
+
+    /// #1230: the issue's abbreviation expands like Emmet: typed inputs with
+    /// no closing tag, a submit button, and lorem text in the paragraph.
+    #[test]
+    fn colon_aliases_and_lorem_expand_inside_a_compound() {
+        let out = expand("form>input:email+input:password+btn:s+p>lorem5", "  ")
+            .unwrap()
+            .0;
+        assert_eq!(
+            out,
+            "<form>\n  <input type=\"email\" name=\"\" id=\"\">\n  \
+             <input type=\"password\" name=\"\" id=\"\">\n  \
+             <button type=\"submit\"></button>\n  \
+             <p>Lorem ipsum dolor sit amet.</p>\n</form>\n"
+        );
+    }
+
+    /// #1230: an alias on its own is an abbreviation now, like the tag it
+    /// names.
+    #[test]
+    fn a_lone_alias_expands() {
+        assert_eq!(
+            expand("input:text", "  ").unwrap().0,
+            "<input type=\"text\" name=\"\" id=\"\">\n"
+        );
+        assert_eq!(
+            expand("a:link", "  ").unwrap().0,
+            "<a href=\"http://\"></a>\n"
+        );
+        assert_eq!(
+            expand("link:css", "  ").unwrap().0,
+            "<link rel=\"stylesheet\" href=\"style.css\">\n"
+        );
+        assert_eq!(
+            expand("form:post", "  ").unwrap().0,
+            "<form action=\"\" method=\"post\"></form>\n"
+        );
+    }
+
+    /// #1230: what the abbreviation spells wins over the alias's defaults,
+    /// and an `#id` replaces the alias's empty `id` rather than doubling it.
+    #[test]
+    fn an_alias_takes_the_abbreviations_own_id_and_attributes() {
+        assert_eq!(
+            expand("input:text#q[name=query]", "  ").unwrap().0,
+            "<input id=\"q\" type=\"text\" name=\"query\">\n"
+        );
+    }
+
+    /// #1230: JSX closes the aliased void element its own way.
+    #[test]
+    fn an_alias_in_jsx_is_self_closed() {
+        assert_eq!(
+            super::expand("input:checkbox", "  ", Profile::Jsx)
+                .unwrap()
+                .0,
+            "<input type=\"checkbox\" name=\"\" id=\"\" />\n"
+        );
+    }
+
+    /// #1230: lorem on its own, or beside other elements, is bare text;
+    /// `loremN` takes N words and ends a sentence.
+    #[test]
+    fn lorem_is_text() {
+        assert_eq!(expand("lorem3", "  ").unwrap().0, "Lorem ipsum dolor.\n");
+        assert_eq!(
+            expand("div>h1+lorem4", "  ").unwrap().0,
+            "<div>\n  <h1></h1>\n  Lorem ipsum dolor sit.\n</div>\n"
+        );
+        let words = expand("lorem", "  ").unwrap().0;
+        assert_eq!(words.split_whitespace().count(), 30, "{words}");
+    }
+
+    /// #1230 negative: a colon name that is no alias refuses the whole
+    /// abbreviation in HTML, instead of writing `<input:bogus>`.
+    #[test]
+    fn an_unknown_colon_name_refuses_in_html() {
+        assert!(expand("form>input:bogus", "  ").is_none());
+        assert!(expand("div>svg:rect", "  ").is_none());
+        assert!(super::expand("form>btn:x", "  ", Profile::Jsx).is_none());
+    }
+
+    /// #1230 negative: XML keeps namespaced names as they are, and does not
+    /// read HTML aliases into them.
+    #[test]
+    fn xml_keeps_namespaced_names() {
+        assert_eq!(
+            super::expand("xsl:template>xsl:value-of", "  ", Profile::Xml)
+                .unwrap()
+                .0,
+            "<xsl:template>\n  <xsl:value-of></xsl:value-of>\n</xsl:template>\n"
+        );
+        assert!(super::expand("input:email", "  ", Profile::Xml).is_none());
+    }
+
+    /// #1230 negative: a word that only starts like lorem is still prose.
+    #[test]
+    fn a_word_like_lorem_is_not_lorem() {
+        assert!(expand("loremipsum", "  ").is_none());
+        assert!(expand("lorem0", "  ").is_none());
     }
 }
