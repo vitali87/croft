@@ -23617,6 +23617,16 @@ impl App {
                 self.source_control.move_cursor_right();
                 self.poke_cursor();
             }
+            // Home/End stay on the caret's line; with Ctrl they take the
+            // whole message (#1334).
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.source_control.message_start();
+                self.poke_cursor();
+            }
+            KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.source_control.message_end();
+                self.poke_cursor();
+            }
             KeyCode::Home => {
                 self.source_control.home();
                 self.poke_cursor();

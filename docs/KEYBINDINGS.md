@@ -238,6 +238,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 |------|--------|
 | Type in the message box | Edit the commit message (the box scrolls horizontally when the message outgrows it, and grows a row per line up to six, then scrolls). Pasted text keeps its line breaks |
 | `Shift`+`Enter` / `Alt`+`Enter` | Start a new line in the commit message (a blank line, then the body and trailers); `Up` / `Down` move between its lines |
+| `Home` / `End` | Start / end of the caret's line in the commit message; with `Ctrl`, the start / end of the whole message |
 | `Enter` | Commit all tracked changes with the message. The commit runs in the background, so croft keeps responding while the repository's hooks run; the message stays in the box until the commit lands, and a hook's rejection shows below it. If a tab under the repository has unsaved edits, every commit and stash variant first asks, as VS Code does: `S`/`Enter` Save All & Commit (or Stash), which saves the tabs and goes ahead only once all of them are saved; `C` Commit (or Stash) Anyway, with the files as they are on disk; `Esc` cancels |
 | Click ✓ Commit | Same as `Enter` |
 | Click a change row | Open that file's diff against HEAD in a read-only editor tab |

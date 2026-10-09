@@ -483,11 +483,26 @@ impl SourceControlPanel {
         }
     }
 
+    /// Caret to the start of its line (#1334): a message has a subject and
+    /// a body, and Home works within the line as in the editor.
     pub fn home(&mut self) {
+        let (line, _) = self.caret_line_col();
+        self.set_caret_line_col(line, 0);
+    }
+
+    /// Caret to the end of its line (#1334).
+    pub fn end(&mut self) {
+        let (line, _) = self.caret_line_col();
+        self.set_caret_line_col(line, usize::MAX);
+    }
+
+    /// Caret to the start of the whole message (Ctrl+Home).
+    pub fn message_start(&mut self) {
         self.message_cursor = 0;
     }
 
-    pub fn end(&mut self) {
+    /// Caret to the end of the whole message (Ctrl+End).
+    pub fn message_end(&mut self) {
         self.message_cursor = self.message.chars().count();
     }
 
@@ -2176,6 +2191,49 @@ mod tests {
             rendered.contains("croft"),
             "the box must scroll horizontally to reveal the tail near the cursor; rendered window was {rendered:?}"
         );
+    }
+
+    /// #1334: Home and End stay on the caret's line of a multi-line
+    /// message, as in the editor.
+    #[test]
+    fn home_and_end_move_within_the_carets_line() {
+        let mut p = SourceControlPanel::new();
+        p.insert_str("Add rounding\n\nRounds to cents.\nFixes 42");
+        assert!(p.move_cursor_up());
+        p.home();
+        p.insert_char('[');
+        p.end();
+        p.insert_char(']');
+        assert_eq!(p.message, "Add rounding\n\n[Rounds to cents.]\nFixes 42");
+        // The empty line between subject and body: both stay on it.
+        let mut p = SourceControlPanel::new();
+        p.insert_str("a\n\nbody");
+        assert!(p.move_cursor_up());
+        p.end();
+        assert_eq!(p.message_cursor, 2);
+        p.home();
+        assert_eq!(p.message_cursor, 2);
+    }
+
+    /// Negative (#1334): on a one-line message Home and End reach its start
+    /// and end as before, and the whole-message moves still reach index 0
+    /// and the end from any line.
+    #[test]
+    fn single_line_home_end_and_whole_message_moves_are_unchanged() {
+        let mut p = SourceControlPanel::new();
+        p.insert_str("one line");
+        p.home();
+        assert_eq!(p.message_cursor, 0);
+        p.end();
+        assert_eq!(p.message_cursor, 8);
+        let mut p = SourceControlPanel::new();
+        p.insert_str("subject\n\nbody\nlast");
+        assert!(p.move_cursor_up());
+        p.message_start();
+        assert_eq!(p.message_cursor, 0);
+        assert!(p.move_cursor_down());
+        p.message_end();
+        assert_eq!(p.message_cursor, p.message.chars().count());
     }
 
     #[test]
