@@ -29688,14 +29688,14 @@ impl App {
         let language = match parts.next() {
             Some(l) => l.to_string(),
             None => {
-                let out = std::process::Command::new(gh)
-                    .args([
-                        "api",
-                        &format!("/repos/{repo}/code-scanning/codeql/databases"),
-                        "--jq",
-                        ".[].language",
-                    ])
-                    .output()
+                let mut cmd = std::process::Command::new(gh);
+                cmd.args([
+                    "api",
+                    &format!("/repos/{repo}/code-scanning/codeql/databases"),
+                    "--jq",
+                    ".[].language",
+                ]);
+                let out = crate::review_ops::output_retrying_busy(&mut cmd)
                     .map_err(|e| format!("could not run gh: {e}"))?;
                 if !out.status.success() {
                     return Err(format!(
@@ -29725,11 +29725,13 @@ impl App {
         let tmp = cache.join(format!("{name}.download.zip"));
         std::fs::create_dir_all(cache).map_err(|e| e.to_string())?;
         let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-        let out = std::process::Command::new(gh)
-            .args(crate::codeql_db::github_database_args(&repo, &language))
+        let mut cmd = std::process::Command::new(gh);
+        cmd.args(crate::codeql_db::github_database_args(&repo, &language))
             .stdin(std::process::Stdio::null())
             .stdout(file)
-            .output()
+            .stderr(std::process::Stdio::piped());
+        let out = crate::review_ops::spawn_retrying_busy(&mut cmd)
+            .and_then(std::process::Child::wait_with_output)
             .map_err(|e| format!("could not run gh: {e}"))?;
         if !out.status.success() {
             let _ = std::fs::remove_file(&tmp);
@@ -62931,10 +62933,9 @@ impl App {
     /// the first line of what it said went wrong: GitHub's own message when
     /// the API sent one, else gh's.
     fn run_gh(&self, args: &[String]) -> Result<String, String> {
-        let out = std::process::Command::new(&self.gh_program)
-            .args(args)
-            .current_dir(self.active_workspace_root())
-            .output()
+        let mut cmd = std::process::Command::new(&self.gh_program);
+        cmd.args(args).current_dir(self.active_workspace_root());
+        let out = crate::review_ops::output_retrying_busy(&mut cmd)
             .map_err(|e| format!("could not run gh: {e}"))?;
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         if out.status.success() {
@@ -63025,11 +63026,11 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let gh_json = |git_ref: Option<&str>| -> Result<String, String> {
-                let out = std::process::Command::new(&gh)
-                    .args(github::analyses_args(git_ref))
+                let mut cmd = std::process::Command::new(&gh);
+                cmd.args(github::analyses_args(git_ref))
                     .current_dir(&root)
-                    .stdin(std::process::Stdio::null())
-                    .output()
+                    .stdin(std::process::Stdio::null());
+                let out = crate::review_ops::output_retrying_busy(&mut cmd)
                     .map_err(|e| format!("could not run gh: {e}"))?;
                 Ok(String::from_utf8_lossy(&out.stdout).into_owned())
             };
@@ -63139,11 +63140,11 @@ impl App {
             let files = chosen
                 .iter()
                 .map(|a| {
-                    let out = std::process::Command::new(&gh)
-                        .args(crate::sarif::github::sarif_args(a.id))
+                    let mut cmd = std::process::Command::new(&gh);
+                    cmd.args(crate::sarif::github::sarif_args(a.id))
                         .current_dir(&root)
-                        .stdin(std::process::Stdio::null())
-                        .output()
+                        .stdin(std::process::Stdio::null());
+                    let out = crate::review_ops::output_retrying_busy(&mut cmd)
                         .map_err(|e| format!("could not run gh: {e}"))?;
                     if !out.status.success() {
                         return Err(format!("analysis #{} could not be downloaded", a.id));
