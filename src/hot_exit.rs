@@ -268,8 +268,8 @@ pub fn owned_by_a_running_croft(path: &Path) -> bool {
 /// a launch takes over the backups and notes an earlier croft kept under
 /// the cache directory. A file already at its new path (an older croft
 /// still writing to the cache) keeps whichever copy is newer. A rename
-/// that cannot cross filesystems is a copy, which keeps the owner-only
-/// mode, then a removal. A file `stays` picks is left where it is. Emptied
+/// that cannot cross filesystems is an owner-only atomic copy, then a
+/// removal. A file `stays` picks is left where it is. Emptied
 /// old directories go. Best-effort: what cannot be moved stays where it
 /// is, for the next launch to try again.
 pub fn move_tree(old: &Path, new: &Path, stays: &dyn Fn(&Path) -> bool) {
@@ -298,11 +298,20 @@ pub fn move_tree(old: &Path, new: &Path, stays: &dyn Fn(&Path) -> bool) {
         } else if std::fs::create_dir_all(new).is_err() {
             return;
         }
-        if std::fs::rename(&from, &to).is_err() && std::fs::copy(&from, &to).is_ok() {
+        if std::fs::rename(&from, &to).is_err() && copy_privately(&from, &to) {
             let _ = std::fs::remove_file(&from);
         }
     }
     let _ = std::fs::remove_dir(old);
+}
+
+/// The copy [`move_tree`] falls back on where a rename cannot cross
+/// filesystems: written owner-only beside `to`, synced, then renamed in, so
+/// a copy that fails partway never leaves a partial `to`, which a later
+/// launch would take for the newer copy and delete the intact source for.
+fn copy_privately(from: &Path, to: &Path) -> bool {
+    std::fs::read(from)
+        .is_ok_and(|bytes| crate::session_state::write_private_atomically(to, &bytes).is_ok())
 }
 
 #[cfg(test)]
@@ -538,6 +547,34 @@ mod tests {
         let mode = std::fs::metadata(&moved).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "still owner-only");
         assert!(!old.exists(), "the emptied cache directories go");
+    }
+
+    /// #1578 review: the cross-filesystem fallback writes an owner-only
+    /// copy whole or not at all. Negative: a source that cannot be read
+    /// leaves no destination behind.
+    #[cfg(unix)]
+    #[test]
+    fn the_fallback_copy_is_private_and_never_partial() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("a.json");
+        std::fs::write(&from, "{\"unsaved\":1}").unwrap();
+        std::fs::set_permissions(&from, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let to = dir.path().join("state").join("a.json");
+        assert!(copy_privately(&from, &to));
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "{\"unsaved\":1}");
+        let mode = std::fs::metadata(&to).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let missing = dir.path().join("state").join("b.json");
+        assert!(!copy_privately(&dir.path().join("gone.json"), &missing));
+        assert!(!missing.exists());
+        let names: Vec<_> = std::fs::read_dir(dir.path().join("state"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(names, ["a.json"], "no temporary file is left");
     }
 
     /// #1578 review: a backup whose croft still runs (an older croft that
