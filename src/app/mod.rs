@@ -4507,6 +4507,8 @@ pub struct App {
     /// visual operator deletes/yanks whole lines.
     vim_visual_line: bool,
     shortcuts_modal: Option<crate::widgets::shortcuts::ShortcutsModal>,
+    /// The Settings editor (#612).
+    settings_editor: Option<crate::widgets::settings_editor::SettingsEditor>,
     shortcuts_hit_rect: Option<Rect>,
     /// Status-bar clickable-segment hit rects, recorded each render. Empty when
     /// the bar is hidden or the segment doesn't fit. Diagnostics → PROBLEMS;
@@ -6137,6 +6139,7 @@ impl App {
             vim_last_find: None,
             vim_visual_line: false,
             shortcuts_modal: None,
+            settings_editor: None,
             shortcuts_hit_rect: None,
             status_diag_rect: Rect::default(),
             status_codeql_rect: Rect::default(),
@@ -11509,11 +11512,13 @@ impl App {
     pub fn drain_lsp_definition(&mut self) -> bool {
         let mut target = None;
         let mut peek = None;
+        let mut empty_reply = false;
         {
             let Some(lsp) = self.lsp.as_ref() else {
                 return false;
             };
             let mut peek_replied = false;
+            let mut replied = false;
             while let Some(result) = lsp.drain_definition() {
                 if Some(result.request_id) == self.peek_definition_request_id {
                     peek_replied = true;
@@ -11523,6 +11528,7 @@ impl App {
                 if Some(result.request_id) != self.definition_request_id {
                     continue;
                 }
+                replied = true;
                 target = result.target;
             }
             if peek_replied && peek.is_none() {
@@ -11531,8 +11537,17 @@ impl App {
                 self.peek_definition_request_id = None;
                 self.status = String::from("No definition found");
             }
+            if replied {
+                self.definition_request_id = None;
+                // An empty F12 reply said nothing (#1302): a slow server, a
+                // missing one and "nothing here" all looked alike.
+                if target.is_none() {
+                    self.status = String::from("No definition found");
+                    empty_reply = true;
+                }
+            }
         }
-        let mut changed = false;
+        let mut changed = empty_reply;
         if let Some((path, line, col)) = peek {
             self.peek_definition_request_id = None;
             self.open_peek_popup(path, line, col);
@@ -11655,6 +11670,7 @@ impl App {
     pub fn drain_lsp_declaration(&mut self) -> bool {
         let mut target = None;
         let mut unsupported = false;
+        let mut replied = false;
         {
             let Some(lsp) = self.lsp.as_ref() else {
                 return false;
@@ -11663,9 +11679,13 @@ impl App {
                 if Some(result.request_id) != self.declaration_request_id {
                     continue;
                 }
+                replied = true;
                 target = result.target;
                 unsupported = result.unsupported;
             }
+        }
+        if replied {
+            self.declaration_request_id = None;
         }
         match target {
             // The jump itself is identical to definition: open the target file,
@@ -11682,6 +11702,10 @@ impl App {
                     String::from("Go to Declaration: not supported by this file's language server");
                 true
             }
+            None if replied => {
+                self.status = String::from("No declaration found");
+                true
+            }
             None => false,
         }
     }
@@ -11689,6 +11713,7 @@ impl App {
     pub fn drain_lsp_type_definition(&mut self) -> bool {
         let mut target = None;
         let mut unsupported = false;
+        let mut replied = false;
         {
             let Some(lsp) = self.lsp.as_ref() else {
                 return false;
@@ -11697,9 +11722,13 @@ impl App {
                 if Some(result.request_id) != self.type_definition_request_id {
                     continue;
                 }
+                replied = true;
                 target = result.target;
                 unsupported = result.unsupported;
             }
+        }
+        if replied {
+            self.type_definition_request_id = None;
         }
         match target {
             // The jump itself is identical to definition: open the target file,
@@ -11712,6 +11741,10 @@ impl App {
                 self.status = String::from(
                     "Go to Type Definition: not supported by this file's language server",
                 );
+                true
+            }
+            None if replied => {
+                self.status = String::from("No type definition found");
                 true
             }
             None => false,
@@ -20397,6 +20430,9 @@ impl App {
         self.render_command_history_popup(frame);
         self.render_branch_picker(frame);
         self.render_scm_menu(frame);
+        // Below the input prompt: Enter on a number or text setting opens
+        // the prompt over the editor, and drawn after it the editor hid it.
+        self.render_settings_editor(frame);
         self.render_input_prompt(frame);
         self.render_list_picker(frame);
         self.render_shortcuts_modal(frame);
@@ -22622,6 +22658,11 @@ impl App {
             self.handle_shortcuts_modal_key(key);
             return Ok(());
         }
+        if self.settings_editor.is_some() && self.input_prompt.is_none() {
+            self.handle_settings_editor_key(key);
+            return Ok(());
+        }
+
         // The tour (#377): Esc leaves it at any time, as its first caption
         // and its keys row say, from a palette, Quick Open or picker its step
         // opened too (#863). Esc there closed only that, so at the theme
@@ -23585,6 +23626,16 @@ impl App {
             }
             KeyCode::Right => {
                 self.source_control.move_cursor_right();
+                self.poke_cursor();
+            }
+            // Home/End stay on the caret's line; with Ctrl they take the
+            // whole message (#1334).
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.source_control.message_start();
+                self.poke_cursor();
+            }
+            KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.source_control.message_end();
                 self.poke_cursor();
             }
             KeyCode::Home => {
@@ -34126,6 +34177,13 @@ impl App {
         let Some(message) = self.require_commit_message() else {
             return;
         };
+        // Before `add -A`, which would mark a conflict resolved with its
+        // markers still in it (#989).
+        if let Err(err) = crate::git::refuse_unmerged(&self.scm_root()) {
+            self.run_scm_op("add -A", Err(err), "Stage all", "Stage all");
+            return;
+        }
+
         if self.hold_for_unsaved(ScmWrite::CommitAll) {
             return;
         }
@@ -34675,6 +34733,10 @@ impl App {
                 } else {
                     self.submit_sarif_locate(&value);
                 }
+            }
+            InputPurpose::SettingValue { key } => {
+                self.close_input_prompt();
+                self.submit_setting_value(&key, &value);
             }
             InputPurpose::FleetCommand => {
                 // Closed FIRST, like every sibling arm. Leaving it open hides
@@ -47787,16 +47849,46 @@ impl App {
     }
 
     /// Populate and run the Search panel from a parsed terminal search
-    /// command line. Returns false when `input` isn't a recognisable search.
+    /// command line, scoped to the paths it searched from the focused pane's
+    /// directory. Returns false when `input` isn't a recognisable search.
     fn seed_search_from_command(&mut self, input: &str) -> bool {
+        let cwd = self
+            .terminals
+            .get(self.active_terminal)
+            .and_then(|t| t.pid())
+            .and_then(cwd_of_pid)
+            .filter(|p| p.is_dir());
+        let Some(cwd) = cwd else {
+            // Guessing the workspace root would widen `rg foo` run from a
+            // subdirectory to every file (#1201).
+            if crate::quickfix::parse_search_command(input).is_none() {
+                return false;
+            }
+            self.status = String::from(
+                "Search not seeded: can't tell which directory the terminal searched from",
+            );
+            return true;
+        };
+        self.seed_search_from_command_in(input, &cwd)
+    }
+
+    /// [`Self::seed_search_from_command`] for a command run in `cwd`. A
+    /// search whose scope can't be reproduced exactly is refused with the
+    /// reason in the status bar and leaves the panel alone (still true:
+    /// the input was a search), so Replace All never widens past it (#1201).
+    fn seed_search_from_command_in(&mut self, input: &str, cwd: &Path) -> bool {
         let Some(sc) = crate::quickfix::parse_search_command(input) else {
             return false;
         };
-        self.search.seed(
-            sc.pattern.clone(),
-            sc.include.unwrap_or_default(),
-            sc.exclude.unwrap_or_default(),
-        );
+        let (include, exclude) =
+            match crate::quickfix::scope_filters(&sc, cwd, self.workspace_root()) {
+                Ok(filters) => filters,
+                Err(why) => {
+                    self.status = format!("Search not seeded: {why}");
+                    return true;
+                }
+            };
+        self.search.seed(sc.pattern.clone(), include, exclude);
         self.search.opts.case_sensitive = sc.case_sensitive;
         self.search.opts.whole_word = sc.whole_word;
         self.search.opts.use_regex = sc.use_regex;
@@ -48425,6 +48517,172 @@ impl App {
                 self.status = String::from("Open link cancelled");
             }
             _ => {}
+        }
+    }
+
+    /// The merged settings as the Settings editor sees them: the user layers
+    /// from `self.config_dir`, the workspace layers from the primary root.
+    fn merged_settings_here(&self) -> crate::config_layers::MergedConfig {
+        crate::config_layers::load_merged_from(
+            &self.config_dir,
+            Some(self.roots.primary()),
+            crate::config_layers::current_platform(),
+        )
+    }
+
+    /// Open the Settings editor (#612).
+    fn open_settings_editor(&mut self) {
+        let merged = self.merged_settings_here();
+        self.settings_editor = Some(crate::widgets::settings_editor::SettingsEditor::new(
+            crate::settings_editor::rows(&merged.prefs, &merged.provenance),
+        ));
+    }
+
+    /// Write `key = value` into the Settings editor's target layer, re-merge
+    /// and apply it live, and refresh the editor's rows.
+    fn write_setting(&mut self, key: &str, value: serde_json::Value) {
+        use crate::config_layers::LayerKind;
+        let Some(target) = self.settings_editor.as_ref().map(|e| e.target) else {
+            return;
+        };
+        let path = match target {
+            LayerKind::Workspace => {
+                if !crate::config_layers::WORKSPACE_ALLOWED_KEYS.contains(&key) {
+                    self.status =
+                        format!("{key} can only be set in your user settings (Tab switches layer)");
+                    return;
+                }
+                crate::config_layers::workspace_config_path(self.roots.primary())
+            }
+            _ => self.config_dir.join("config.json"),
+        };
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let new = match crate::settings_editor::set_key(&text, key, value) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = format!("{}: {e}", path.display());
+                return;
+            }
+        };
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&path, new));
+        if let Err(e) = written {
+            self.status = format!("{}: {e}", path.display());
+            return;
+        }
+        let merged = self.merged_settings_here();
+        for w in &merged.warnings {
+            crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
+        }
+        self.apply_merged_settings(&merged.prefs);
+        self.settings_provenance = merged.provenance.clone();
+        if let Some(ed) = self.settings_editor.as_mut() {
+            ed.rows = crate::settings_editor::rows(&merged.prefs, &merged.provenance);
+        }
+        self.status = format!("{key} saved to {}", path.display());
+    }
+
+    /// Keys while the Settings editor is open (#612): typing searches, Enter
+    /// edits the selected setting, Tab switches between the user and the
+    /// workspace layer.
+    fn handle_settings_editor_key(&mut self, key: KeyEvent) {
+        use crate::config_layers::LayerKind;
+        use crate::settings_editor::Kind;
+        let Some(ed) = self.settings_editor.as_mut() else {
+            return;
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.settings_editor = None,
+            (KeyCode::Up, _) => ed.move_selection(-1),
+            (KeyCode::Down, _) => ed.move_selection(1),
+            (KeyCode::PageUp, _) => ed.move_selection(-10),
+            (KeyCode::PageDown, _) => ed.move_selection(10),
+            (KeyCode::Tab, _) | (KeyCode::BackTab, _) => {
+                ed.target = if ed.target == LayerKind::Workspace {
+                    LayerKind::User
+                } else {
+                    LayerKind::Workspace
+                };
+            }
+            (KeyCode::Enter, _) => {
+                let Some(row) = ed.selected_row().cloned() else {
+                    return;
+                };
+                match row.kind {
+                    Kind::Bool | Kind::Choice(_) => {
+                        if let Some(v) = crate::settings_editor::next_value(&row) {
+                            self.write_setting(&row.key, v);
+                        }
+                    }
+                    Kind::Number | Kind::Text => {
+                        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+                        let now = crate::settings_editor::display(&row.value);
+                        self.open_input_prompt(
+                            InputPrompt::new(
+                                InputPurpose::SettingValue {
+                                    key: row.key.clone(),
+                                },
+                                row.key.replace('_', " "),
+                                String::from("new value"),
+                            )
+                            .with_value(now),
+                        );
+                    }
+                    Kind::Json => {
+                        self.settings_editor = None;
+                        self.status =
+                            format!("{} is edited in the JSON file", row.key.replace('_', " "));
+                        self.open_config_file_in_editor(
+                            self.config_dir.join("config.json"),
+                            ConfigFileSeed::Settings,
+                        );
+                    }
+                }
+            }
+            (KeyCode::Backspace, _) => {
+                let mut q = ed.query.clone();
+                q.pop();
+                ed.set_query(q);
+            }
+            (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
+                let mut q = ed.query.clone();
+                q.push(c);
+                ed.set_query(q);
+            }
+            _ => {}
+        }
+    }
+
+    /// A typed value for setting `key` (#612): numbers must parse as one.
+    fn submit_setting_value(&mut self, key: &str, value: &str) {
+        let Some(row) = self
+            .settings_editor
+            .as_ref()
+            .and_then(|e| e.rows.iter().find(|r| r.key == key).cloned())
+        else {
+            return;
+        };
+        let v = value.trim();
+        let parsed = match row.kind {
+            crate::settings_editor::Kind::Number => match v.parse::<u64>() {
+                Ok(n) => serde_json::Value::from(n),
+                Err(_) => {
+                    self.status = format!("{key} needs a whole number, not \"{v}\"");
+                    return;
+                }
+            },
+            _ => serde_json::Value::from(v),
+        };
+        self.write_setting(key, parsed);
+    }
+
+    fn render_settings_editor(&mut self, frame: &mut ratatui::Frame) {
+        let area = frame.area();
+        let theme = self.theme;
+        if let Some(ed) = self.settings_editor.as_mut() {
+            crate::widgets::settings_editor::render(ed, area, frame.buffer_mut(), theme);
         }
     }
 
@@ -51144,6 +51402,7 @@ impl App {
             Cmd::KeyboardShortcuts => self.open_shortcuts_modal(),
             Cmd::UpdateCroft => self.update_croft(),
             Cmd::OpenSettings => self.open_settings_view(),
+            Cmd::OpenSettingsEditor => self.open_settings_editor(),
             Cmd::OpenSettingsJson => self
                 .open_config_file_in_editor(crate::prefs::config_path(), ConfigFileSeed::Settings),
             Cmd::OpenWorkspaceSettingsJson => self.open_workspace_settings(false),
@@ -66980,14 +67239,13 @@ fn is_toggle_wrap_key(key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
-/// Explorer-pane shortcut: `Cmd+Z` — open the zoxide jump popup. `z` for
-/// **z**oxide; the user's shell still uses `j` for the same jump. Requires
-/// SUPER (iTerm2 already forwards Cmd+Z as `Char('z') + SUPER` for the
-/// editor's undo via the `CMD_Z` GlobalKeyMap entry). Off Termux it rejects
-/// CONTROL so a terminal `Ctrl+Z` suspend never reaches it and it stays
-/// distinct from the Ctrl-based terminal-toggle chords on `j`; on Termux,
-/// where Ctrl is the Cmd surrogate, `Ctrl+Z` opens the popup (this predicate
-/// only runs while the Explorer is focused, so there is no suspend to clash).
+/// Explorer-pane shortcut: `Cmd+Z` / `Ctrl+Z` — open the zoxide jump popup.
+/// `z` for **z**oxide; the user's shell still uses `j` for the same jump.
+/// `Ctrl+Z` counts on every platform, as the Make Root chords do (#1294):
+/// xterm, GNOME Terminal, Konsole and tmux never deliver Super, and this
+/// predicate only runs while the Explorer is focused, so a `Ctrl+Z` here is
+/// never a shell's suspend or the editor's undo. The Explorer has no undo
+/// of its own to clash with.
 /// SHIFT is rejected because `Cmd+Shift+Z` is the reserved redo chord.
 /// Editor-pane `Cmd+Z` is untouched: this predicate is only consulted from
 /// `handle_explorer_shortcut`, which runs solely when the Explorer is
@@ -67002,10 +67260,7 @@ fn is_tree_zoxide_jump_key(key: KeyEvent) -> bool {
     if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
-    // `has_cmd` is SUPER-only off Termux (so a terminal `Ctrl+Z` suspend is
-    // never swallowed); on Termux Ctrl is the command key, and this predicate
-    // only runs while the Explorer is focused, so there is no suspend to clash.
-    has_cmd(key.modifiers)
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
 /// Explorer-pane shortcut: `Cmd+F` / `Ctrl+F` (no Shift, no Alt) - "New File".

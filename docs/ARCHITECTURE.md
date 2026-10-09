@@ -1042,7 +1042,7 @@ Which SEAT wrote each line: a `Seat` (you, navigator, agent-by-pane, or collab p
 
 ### quickfix.rs
 
-Parses the last `grep`, `rg` or `git grep` command line into a pattern, Search toggles, and include/exclude glob lists, so "Terminal: Search & Replace from Last grep/rg" can seed and run the Search sidebar — reusing its multi-file replace-all — from a terminal search.
+Parses the last `grep`, `rg` or `git grep` command line into a pattern, Search toggles, and include/exclude glob lists (its paths, resolved from the pane's cwd, and rg types become `./`-anchored include globs via `scope_filters`; a scope it can't reproduce is refused), so "Terminal: Search & Replace from Last grep/rg" can seed and run the Search sidebar — reusing its multi-file replace-all — from a terminal search.
 
 **Flag handling.** `-g`/`--glob`s accumulate comma-separated. rg's `!`-negated globs and grep's `--exclude`/`--exclude-dir` land in files-to-exclude. rg and ag treat `-s` as forcing case sensitivity, while grep's `-s` stays the no-messages flag.
 
