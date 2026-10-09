@@ -1,0 +1,1 @@
+fix: A snippet whose `"prefix"` is an array (`["for", "fori"]`, as VS Code allows and `croft import-vscode` copies in) now expands from each of its words, instead of silently disabling every snippet; a snippet croft cannot read is skipped and named in OUTPUT · Snippets while the rest still load.
