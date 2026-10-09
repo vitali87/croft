@@ -31,6 +31,7 @@ pub enum ScmAction {
     CommitStaged,
     CommitAll,
     CommitAmend,
+    UndoLastCommit,
     CommitAndPush,
     CommitAndSync,
     // Changes submenu.
@@ -132,6 +133,7 @@ const COMMIT_ITEMS: &[Leaf] = &[
     leaf(ScmAction::CommitStaged, "Commit Staged", ICON_CHECK),
     leaf(ScmAction::CommitAll, "Commit All", ICON_CHECK),
     leaf(ScmAction::CommitAmend, "Commit (Amend)", ICON_EDIT),
+    leaf(ScmAction::UndoLastCommit, "Undo Last Commit", ICON_DISCARD),
     leaf(ScmAction::CommitAndPush, "Commit & Push", ICON_CLOUD_UPLOAD),
     leaf(ScmAction::CommitAndSync, "Commit & Sync", ICON_SYNC),
 ];
@@ -390,7 +392,7 @@ fn action_color(action: ScmAction) -> Color {
         | CommitAndPush | CommitAndSync => ACCENT_BLUE,
         CheckoutTo | CreateBranch | CreateBranchFrom => ACCENT_CYAN,
         Commit | CommitStaged | CommitAll | StageAll | AddRemote => ACCENT_GREEN,
-        CommitAmend | RenameBranch => ACCENT_AMBER,
+        CommitAmend | UndoLastCommit | RenameBranch => ACCENT_AMBER,
         Merge | Rebase => ACCENT_PURPLE,
         DiscardAll | DeleteBranch | RemoveRemote | DropStash | DeleteTag => ACCENT_RED,
         Stash
