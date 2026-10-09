@@ -2063,7 +2063,6 @@ const HINTS_WITHOUT_A_CTRL_FORM: &[(&str, &str)] = &[
     ("Cmd+A", "Super+A"),
     ("Cmd+E", "Super+E"),
     ("Cmd+F12", "Super+F12"),
-    ("Cmd+Z in Explorer", "Super+Z in Explorer"),
 ];
 
 /// `hint` spelled for the platform croft runs on: [`hint_for_platform`].
@@ -2867,7 +2866,6 @@ mod tests {
             ("Cmd+[", "Super+["),
             ("Cmd+T", "Ctrl+Shift+T"),
             ("Cmd+F12", "Super+F12"),
-            ("Cmd+Z in Explorer", "Super+Z in Explorer"),
         ] {
             assert_eq!(hint_for_platform(mac, false), linux);
         }

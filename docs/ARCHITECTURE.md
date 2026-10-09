@@ -40,6 +40,7 @@ src/
 ├── asciicast.rs          writing a session as an asciicast v2 recording, behind "Session: Record Terminal as Asciicast"; payloads go through `serde_json`, backwards timestamps are clamped
 ├── archive.rs            archive browser core: zip/jar/whl and tar/tar.gz member listing without payload reads, size-gated before the parse; extract_member writes one member under a strictly lexical containment check; the tab is read-only
 ├── highlight.rs          tree-sitter highlight registry per language; every span, captured or not, styles from the active theme's `SyntaxPalette`, snapshotted once per pass rather than a hardcoded Base16 literal; Markdown alone resolves injections (the inline grammar, fenced code by its language, front matter), each with its children included since the block grammar leaves delimiter hints inside the ranges it hands off
+├── hot_exit.rs           hot exit (#862): the workspace's unsaved buffers backed up while unsaved under `~/.cache/croft/hot-exit/<workspace digest>/<pid>.json`, one file per running croft; a launch restores only the files of crofts that are gone, as unsaved tabs, and a clean quit removes its own
 ├── history.rs            local history: per-save snapshots under `~/.config/croft/history` (raw bytes, deduped, capped, 10s merge window), merged into the Explorer timeline, backing snapshot diff/restore plus a per-line `.seats` authorship sidecar
 ├── icons.rs             Codicon and file-type Nerd Font glyphs and per-language colors
 ├── install_session.rs   streams install-progress events while a remote host builds / installs the croft binary
@@ -1101,7 +1102,7 @@ SVG file-preview rasterisation: `usvg` parse plus `resvg` render into a PNG that
 
 ### tasks.rs
 
-Auto-detected project tasks. It reads the manifests the repo already has — `.vscode/tasks.json` with JSONC tolerated, Makefile, justfile, `package.json` with a lockfile-matched runner, `Cargo.toml`, `pyproject.toml` — into runnable `Task` commands, backing "Tasks: Run Task" and the Cmd+Shift+B default build. A `tasks.json` `isDefault` outranks the first build task.
+Auto-detected project tasks. It reads the manifests the repo already has — `.vscode/tasks.json` with JSONC tolerated, Makefile, justfile, `package.json` with a lockfile-matched runner, `Cargo.toml`, `pyproject.toml` with the runner its project uses (uv, Poetry, PDM or the project venv) — into runnable `Task` commands, backing "Tasks: Run Task" and the Cmd+Shift+B default build. A `tasks.json` `isDefault` outranks the first build task.
 
 **Terminal-pane reuse is strict about the directory.** Each task runs in a named terminal pane that is reused only while its shell sits idle at EXACTLY the task's directory; a shell that has cd'd into a subdirectory is not reused. Where the platform cannot report a cwd at all (Android, a remote pane's ssh process), reuse falls back to the pane's name alone. The cwd is kernel-reported, and the write clears a half-typed prompt line first.
 

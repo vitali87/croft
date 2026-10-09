@@ -15,8 +15,9 @@ Per platform:
 |------|--------|
 | `Ctrl+s` / `Cmd+s` | Save the open file. A folder of its path that is gone (removed by a `git checkout`, say) is created again |
 | Command Palette: `File: Save As…` | Write the open file's buffer to a prompted path (workspace-relative, prefilled with its own) and make the tab that file. Missing folders are created; an existing file is never overwritten. Bind `save_as` in keybindings.json for a key |
+| A file you have unsaved edits in changes on disk | A prompt asks what to do. Typing `reload` + Enter replaces the buffer with the disk version, after recording your unsaved version in Local History (TIMELINE). Esc, or Enter on any other answer (keys typed before you noticed the prompt), keeps your edits; the box says so under the field |
 | Typing `(` `[` `{` or a quote | Auto-closing pairs: the pair inserts with the caret between (openers never before a word; quotes never after one, a Python string prefix such as `f"` or `rb'` excepted, nor inside a string or comment); typing the closer steps over; a selection is surrounded; backspace inside an empty pair deletes both. Settings gear → "Auto Closing Pairs" toggles |
-| `Ctrl+q` | Quit (from any pane but a focused terminal, where it goes to the app running there: vim, nano, the shell's XON) |
+| `Ctrl+q` | Quit (from any pane but a focused terminal, where it goes to the app running there: vim, nano, the shell's XON). If any tab in any editor group has unsaved changes, a prompt asks first: `S` / `Enter` saves them all and quits, `D` quits without saving, `Esc` / `N` cancels. Save all stays open, naming each file, when anything cannot be saved: an untitled buffer (it has no file to go to; copy its text out or choose `D`), a file changed on disk, text its encoding cannot hold, a merge with conflicts left, a file open in two editor groups with different unsaved text (the same text in both is saved once). Unsaved buffers are also backed up a few seconds after the last edit (hot exit, under `~/.cache/croft/hot-exit/`), so a kill or crash loses only the edits since the last backup that was written, usually those few seconds. A write that fails is said in the status line and tried again every 5 s; until one lands, the last backup written is what a crash leaves. The next launch of the workspace brings them back as unsaved tabs, nothing written to their files, and names any file changed on disk since. A clean quit, `S` once the saves land, and `D` remove the backup, so for a quit the prompt is still the last chance to keep unsaved edits |
 | `F1` | Open the shortcuts modal |
 | `F6` | Cycle focus across panes (tree → editor → terminal → tree) |
 | `Ctrl+b` / `Cmd+b` | Toggle the primary side bar (left pane) |
@@ -36,7 +37,7 @@ Per platform:
 | `Ctrl+Shift+d` / `Cmd+Shift+d` | Jump to Run and Debug |
 | `Ctrl+Shift+r` / `Cmd+Shift+r` | Jump to Remote (SSH) |
 | `Ctrl+Shift+x` / `Cmd+Shift+x` | Jump to Extensions |
-| `Ctrl+Shift+l` / `Cmd+Shift+l` | While on a remote, disconnect and return to the local croft at the directory you connected from |
+| `Ctrl+Shift+l` / `Cmd+Shift+l` | While on a remote, disconnect and return to the local croft at the directory you connected from (asks first about unsaved changes, as `Ctrl+q` does) |
 | `Ctrl+Shift+m` / `Cmd+Shift+m` | Show the PROBLEMS tab of the bottom panel (VS Code's "View: Focus Problems") |
 | `Ctrl+Shift+u` / `Cmd+Shift+u` | Show the OUTPUT tab; the palette's "Output: Select Channel…" picks its channel from the keyboard. Where the desktop's input method claims `Ctrl+Shift+u` for Unicode entry (IBus), use the palette's "View: Show Output" |
 | `Cmd+Shift+t` | Focus the terminal pane, un-hiding the panel and bringing its TERMINAL tab forward over PROBLEMS / OUTPUT / PORTS / CAPTURES (also the palette's "Terminal: Focus Terminal") |
@@ -69,14 +70,14 @@ Per platform:
 | (box focused) type / `Backspace` / `←` `→` | Edit the box's reply draft (the buffer is untouched) |
 | (box focused) `Enter` | Send the reply to the navigator (a comment-only turn) |
 | (box focused) `Esc` | Leave the box; the keyboard returns to the buffer |
-| `Cmd+K` `→` | Close the editor tabs to the right of the active one (also the palette's "View: Close Editors to the Right in Group") |
+| `Cmd+K` `→` | Close the editor tabs to the right of the active one; tabs with unsaved changes stay open (also the palette's "View: Close Editors to the Right in Group") |
 | `Cmd+K` `S` | Select the active file as the compare anchor |
 | `Cmd+K` `C` | Diff the active file against the compare anchor |
-| `Cmd+K` `W` | Close all editor tabs, in every split (also the palette's "View: Close All Editors") |
+| `Cmd+K` `W` | Close all editor tabs, in every split, keeping tabs with unsaved changes open (close one with `Cmd+W` to be asked about it; also the palette's "View: Close All Editors") |
 | `Cmd+K` `U` | Close all saved (non-dirty) editor tabs of the focused group, keeping unsaved ones (also the palette's "View: Close Saved Editors in Group") |
 | `Cmd+K` `E` | Reveal the active file in the Explorer tree (expand parents, select, focus) |
 | `Cmd+K` `O` | Copy into New Window: open the active file in a new window of your terminal, focused on just the file (Explorer + terminal hidden; the current window is untouched; Ghostty / iTerm2 / Terminal; macOS only) |
-| `Cmd+K` `Shift+O` | Move into New Window: same, and close the file's tab here (macOS only) |
+| `Cmd+K` `Shift+O` | Move into New Window: same, and close the file's tab here (macOS only; save a tab with unsaved changes first) |
 | `Cmd+K` `Z` | Toggle Zen Mode: hide the activity bar, both side bars, the panel, and the status bar; press again to restore exactly what was shown before |
 | `Cmd+K` `V` | Toggle Live Run for the active Python file: it re-runs on every pause in typing, and each line shows the values it produced, what it printed or returned, and the exception it died with. Line numbers go green for statements that ran and red for ones that never did. Also in the palette as "Python: Toggle Live Run" |
 | `Cmd+K` `B` | Show the Testing view (beaker icon); it discovers tests on first open (`cargo test` for Rust, `pytest` for Python). In the view: Enter runs all tests, `r` re-discovers, `o` opens OUTPUT on the Test Runner channel (as does clicking the "see OUTPUT › Test Runner" pointer a failed discovery or run shows), click a test's play/status glyph to run just it, click its name to jump to its source, click a suite header's play glyph to run the whole suite, click a row's eye to watch that test or suite (it reruns on every save under the project; the header's eye or `w` watches everything), ↑/↓ scroll or drag the scrollbar |
@@ -201,7 +202,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Ctrl`+`C` / `Cmd`+`C` | Copy selected paths to the explorer clipboard |
 | `Ctrl`+`X` / `Cmd`+`X` | Cut selected paths |
 | `Ctrl`+`V` / `Cmd`+`V` | Paste into the focused folder (move on Cut, copy on Copy) |
-| `Cmd`+`Z` (Linux: `Super`+`Z`, or the Command Palette's "Explorer: Jump to Directory (zoxide)" from any pane) | Jump to a directory via zoxide: a fuzzy popup over your frecency-ranked dirs, then re-roots the workspace and `cd`s the terminal. Shares one database with the shell's `j` command; croft installs zoxide and wires the shell hook on first launch if needed |
+| `Ctrl`+`Z` / `Cmd`+`Z` | Jump to a directory via zoxide: a fuzzy popup over your frecency-ranked dirs, then re-roots the workspace and `cd`s the terminal. Shares one database with the shell's `j` command; croft installs zoxide and wires the shell hook on first launch if needed. From any pane, the Command Palette's "Explorer: Jump to Directory (zoxide)" opens the same popup |
 | Drag a row onto a folder | Move the selection into it (`Alt`-drag to copy instead) |
 | `Delete` / `Backspace` / `Cmd`+`Backspace` | Move every selected path to the OS Trash (after a confirmation popup — `Enter` to trash, `Esc` to keep) |
 | `Cmd`+`Opt`+`R` (local macOS only) | Reveal the selected entry in Finder |
@@ -352,7 +353,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | Hover a chrome control (300 ms dwell) | Button hint naming the control under the pointer: activity-bar icons (Explorer, Search, …), the EXPLORER header toolbar (New File, New Folder, Refresh Explorer, Collapse Folders, Views and More Actions), the Remote / Source Control header actions, and the SEARCH panel's actions and toggles (Refresh, Clear Search Results, Match Case, Use Regular Expression, …) |
 | Right-click | Editor symbol menu: the Go to / Rename / Change All actions above |
 | `Cmd`+`E` | Toggle native modal (vim) editing (see below). On Linux `Ctrl`+`E` stays end of line, so it is `Super`+`E` or the Command Palette's "Toggle Vim Mode" |
-| `Ctrl`+`W` / `Cmd`+`W` | Close the active editor tab (no-op on the last tab) |
+| `Ctrl`+`W` / `Cmd`+`W` | Close the active editor tab (no-op on the last tab). A tab with unsaved changes asks first: `S` / `Enter` saves and closes, `D` closes without saving, `Esc` / `N` cancels; the tab's `✕`, its context menu's Close and View: Close Editor ask the same way. Close Others and Close to the Right keep unsaved tabs open |
 
 ## Editor: vim mode (modal editing)
 
@@ -378,7 +379,7 @@ The toggle is global and app-wide: it works from any pane and with no file open,
 | `Ctrl`+`r` | Redo |
 | `v` `V` | Charwise / linewise Visual; a motion extends, `d` `y` `c` operate |
 | `/` `?` then `Enter`, `n` `N` | Search forward / back, jump to next / previous match |
-| `:w` `:q` `:wq` `:x` `:q!` `:qa`, `:{n}` | Write, close tab, write-and-close, quit-all, or jump to line n |
+| `:w` `:q` `:wq` `:x` `:q!` `:qa`, `:{n}` | Write, close tab, write-and-close, quit-all, or jump to line n. `:q`, `:wq` whose write did not land, and `:qa` ask about unsaved changes as `Cmd+W` and `Ctrl+q` do; `:q!` and `:qa!` discard them without asking |
 
 When vim mode is on it supersedes the always-on `Cmd`+`d` `d` / `Cmd`+`g` `g` chords; turn it off to get those back.
 
