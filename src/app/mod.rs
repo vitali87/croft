@@ -8980,13 +8980,14 @@ impl App {
         if items.is_empty() {
             return self.completion_popup.take().is_some();
         }
-        let popup = crate::widgets::completion_popup::CompletionPopup::new(
+        let mut popup = crate::widgets::completion_popup::CompletionPopup::new(
             items,
             prefix.clone(),
             (cx, cy),
             result.path,
             result.request_id,
         );
+        popup.is_incomplete = result.is_incomplete;
         let filtered = popup.visible_indices().len();
         crate::lsp::log_file::log(&format!(
             "popup filter: prefix={prefix:?} server={server_count} visible={filtered}"
@@ -14718,10 +14719,38 @@ impl App {
             return;
         };
         popup.set_prefix(prefix);
-        if popup.visible_is_empty() {
+        let empty = popup.visible_is_empty();
+        // A capped list (`isIncomplete`) only holds what matched the word
+        // as it was (#1529): ask the server again for the word as it is.
+        // The old matches stay up until the reply replaces them, and with
+        // none left the pending reply still opens the popup.
+        if popup.is_incomplete && self.request_completion_for_incomplete() {
+            if empty {
+                self.completion_popup = None;
+            }
+            return;
+        }
+        if empty {
             self.completion_popup = None;
             self.completion_request_id = None;
         }
+    }
+
+    /// Re-ask at the caret for an incomplete list, keeping the session's
+    /// origin so the reply opens as long as the caret stays in the word.
+    fn request_completion_for_incomplete(&mut self) -> bool {
+        let Some(path) = self.editor.path.clone() else {
+            return false;
+        };
+        let (line, character) = self
+            .editor
+            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
+        let Some(lsp) = self.lsp.as_mut() else {
+            return false;
+        };
+        let id = lsp.request_completion_for_incomplete(path, line, character);
+        self.completion_request_id = Some(id);
+        true
     }
 
     fn drain_fs_events(&mut self) -> bool {

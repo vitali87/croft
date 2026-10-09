@@ -21,6 +21,9 @@ pub struct CompletionPopup {
     pub anchor: (u16, u16),
     pub path: PathBuf,
     pub request_id: u64,
+    /// The server marked this list incomplete: each keystroke asks it again
+    /// (#1529).
+    pub is_incomplete: bool,
     /// Black theme: gradient border + muted dark-teal selection instead of the
     /// legacy bright-blue. Set by the app before render from `popup_gradient`.
     pub theme: crate::theme::Theme,
@@ -41,6 +44,7 @@ impl CompletionPopup {
             anchor,
             path,
             request_id,
+            is_incomplete: false,
             theme: crate::theme::Theme::default(),
         }
     }

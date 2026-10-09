@@ -154,7 +154,7 @@ src/
     ├── mod.rs
     ├── command_palette.rs   VS Code Command Palette (Cmd/Ctrl+Shift+P): a static command registry + fuzzy-filtered picker; the App's run_command dispatches each entry
     ├── commit_graph.rs       the Source Control COMMITS section: a repo-wide commit graph with box-drawing lane rails; `layout_graph` is the pure lane algorithm, run on the fetch thread
-    ├── completion_popup.rs  LSP completion popup (anchored at the cursor, filterable; `area_for` clamps to the editor pane on all four edges — a popup wider than a narrow pane used to be pushed left past the pane's own edge and paint over the Explorer)
+    ├── completion_popup.rs  LSP completion popup (anchored at the cursor, filterable; a list the server marked `isIncomplete` re-asks it on each keystroke with trigger kind 3, keeping the old matches up until the reply replaces them (#1529); `area_for` clamps to the editor pane on all four edges — a popup wider than a narrow pane used to be pushed left past the pane's own edge and paint over the Explorer)
     ├── signature_help_popup.rs  LSP signature help / parameter hints: a one-line popup above the caret with the active parameter bolded, auto-triggered on `(`/`,` and dismissed on `)`/Esc (manager `RequestSignatureHelp` + `normalise_signature_help`)
     ├── connect_dialog.rs    remote SSH connect modal (host + auth prompt phases)
     ├── dependencies.rs       collapsible, language-aware DEPENDENCIES section: detects the workspace's package ecosystems from root manifests (Cargo.toml, pyproject.toml, package.json, go.mod), resolves packages off-thread; display-only, gated on detection

@@ -14595,6 +14595,7 @@ fn a_late_completion_reply_opens_only_while_the_caret_is_in_its_word() {
     app.focus_pane(Pane::Editor);
     let reply = |request_id| CompletionResult {
         request_id,
+        is_incomplete: false,
         path: path.clone(),
         items: vec![crate::lsp::CompletionItem {
             label: String::from("load"),
@@ -14679,6 +14680,112 @@ fn completion_reply_app() -> (
     (tmp, path, app, tx)
 }
 
+/// #1529: a reply the server marked incomplete, offering `labels`.
+fn incomplete_reply(
+    request_id: u64,
+    path: &Path,
+    labels: &[&str],
+) -> crate::lsp::manager::CompletionResult {
+    crate::lsp::manager::CompletionResult {
+        is_incomplete: true,
+        ..completion_reply(request_id, path, labels)
+    }
+}
+
+/// #1529: clangd caps its list at 100 and marks it incomplete. Typing on
+/// past the first list's names must ask the server again, not close the
+/// popup: `lo` gave `load` only, `lox` has to reach the server's `loxodrome`.
+#[test]
+fn typing_into_an_incomplete_list_asks_the_server_again() {
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.trigger_completion();
+    let first = app.completion_request_id.expect("the ask went out");
+    draw(&mut app, 100, 30);
+    tx.send(incomplete_reply(first, &path, &["load"])).unwrap();
+    assert!(app.drain_lsp_completion());
+    assert!(app.completion_popup.is_some());
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    let again = app
+        .completion_request_id
+        .expect("an incomplete list keeps a request in flight");
+    assert_ne!(again, first, "typing into an incomplete list re-asks");
+    draw(&mut app, 100, 30);
+    tx.send(incomplete_reply(again, &path, &["loxodrome"]))
+        .unwrap();
+    assert!(app.drain_lsp_completion());
+    let popup = app.completion_popup.as_ref().expect("the new list opens");
+    assert_eq!(popup.prefix, "lox");
+    let labels: Vec<&str> = popup
+        .visible_indices()
+        .into_iter()
+        .map(|i| popup.items[i].label.as_str())
+        .collect();
+    assert_eq!(labels, ["loxodrome"]);
+}
+
+/// #1529: while the re-ask is out, the old list's matches stay on screen,
+/// and a stale reply to the first ask can't replace the newer one.
+#[test]
+fn an_incomplete_list_keeps_its_matches_until_the_new_reply_lands() {
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.trigger_completion();
+    let first = app.completion_request_id.unwrap();
+    draw(&mut app, 100, 30);
+    tx.send(incomplete_reply(first, &path, &["load", "local"]))
+        .unwrap();
+    app.drain_lsp_completion();
+    app.handle_key(key(KeyCode::Char('c'), KeyModifiers::NONE))
+        .unwrap();
+    let popup = app
+        .completion_popup
+        .as_ref()
+        .expect("`local` still matches");
+    assert_eq!(popup.visible_indices().len(), 1);
+    // The first ask answering late is dropped by id.
+    tx.send(incomplete_reply(first, &path, &["stale"])).unwrap();
+    assert!(!app.drain_lsp_completion());
+    let again = app.completion_request_id.unwrap();
+    assert_ne!(again, first);
+}
+
+/// #1529 negative: a complete list is only filtered. No second request
+/// goes out, and when nothing matches the popup closes, as before.
+#[test]
+fn typing_into_a_complete_list_only_filters_it() {
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.trigger_completion();
+    let first = app.completion_request_id.unwrap();
+    draw(&mut app, 100, 30);
+    tx.send(completion_reply(first, &path, &["load", "local"]))
+        .unwrap();
+    app.drain_lsp_completion();
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.completion_request_id, Some(first), "no re-ask");
+    assert!(app.completion_popup.is_some());
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.completion_popup.is_none(), "nothing matches `loax`");
+    assert_eq!(app.completion_request_id, None);
+}
+
+/// #1529 negative: leaving the word (a space) ends an incomplete list's
+/// session too; no re-ask follows the caret out of the word.
+#[test]
+fn leaving_the_word_ends_an_incomplete_list() {
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.trigger_completion();
+    let first = app.completion_request_id.unwrap();
+    draw(&mut app, 100, 30);
+    tx.send(incomplete_reply(first, &path, &["load"])).unwrap();
+    app.drain_lsp_completion();
+    app.handle_key(key(KeyCode::Char(' '), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.completion_popup.is_none());
+    assert_eq!(app.completion_request_id, None);
+}
+
 /// One completion reply for `path`, offering each of `labels`.
 fn completion_reply(
     request_id: u64,
@@ -14687,6 +14794,7 @@ fn completion_reply(
 ) -> crate::lsp::manager::CompletionResult {
     crate::lsp::manager::CompletionResult {
         request_id,
+        is_incomplete: false,
         path: path.to_path_buf(),
         items: labels
             .iter()
