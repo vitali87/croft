@@ -1,0 +1,1 @@
+fix: Source Control has Undo Last Commit (⋯ → Commit, and Git: Undo Last Commit in the palette): it runs git reset --soft HEAD~1, puts the commit's message back in the box, refuses mid-merge or mid-rebase, and warns before undoing a commit that is already pushed.
