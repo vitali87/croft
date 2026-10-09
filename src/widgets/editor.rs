@@ -1181,6 +1181,51 @@ fn clip_pad_cells(text: &str, skip: usize, width: usize) -> String {
     out
 }
 
+/// Paint the changed characters `range` (char indices) of a diff line
+/// drawn at `text_x` from char `skip`, `width` cells wide, in `bg` (#1351).
+/// Cells follow display width, so a wide character before the change does
+/// not shift the mark (#1248). A range wholly past either edge puts a `›`
+/// or `‹` on that edge in `bg` instead, so a change off-screen still shows.
+#[allow(clippy::too_many_arguments)]
+fn paint_intraline_range(
+    buf: &mut Buffer,
+    text_x: u16,
+    y: u16,
+    width: u16,
+    text: &str,
+    skip: usize,
+    (start, end): (usize, usize),
+    bg: Color,
+    fg: Color,
+) {
+    if start >= end || width == 0 {
+        return;
+    }
+    let edge = Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
+    if end <= skip {
+        buf.set_string(text_x, y, "\u{2039}", edge);
+        return;
+    }
+    let mut cell = 0u16;
+    let mut painted = false;
+    for (i, c) in text.chars().enumerate().skip(skip) {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as u16;
+        if cell + w > width {
+            break;
+        }
+        if (start..end).contains(&i) {
+            for dx in 0..w {
+                buf[(text_x + cell + dx, y)].set_bg(bg);
+            }
+            painted = true;
+        }
+        cell += w;
+    }
+    if !painted {
+        buf.set_string(text_x + width - 1, y, "\u{203a}", edge);
+    }
+}
+
 /// Returns the hit-test rects of the prev / next change arrows painted
 /// in the diff header (in that order). Both are `Rect::default()` when
 /// the header was too narrow to allocate them.
@@ -1407,6 +1452,25 @@ fn render_diff(
                 })
                 .bg(l_cell_bg),
         );
+        // The changed characters of a replaced line (#1351), on both sides.
+        let intraline = match row {
+            DiffRow::Replaced { .. } => crate::widgets::diff::changed_char_ranges(&l_text, &r_text),
+            _ => None,
+        };
+        if let Some((range, _)) = intraline {
+            let (r, g, b) = crate::widgets::diff::INTRALINE_REMOVED_BG;
+            paint_intraline_range(
+                buf,
+                l_text_x,
+                y,
+                l_text_w,
+                &l_text,
+                diff.scroll_x,
+                range,
+                theme.ui(Color::Rgb(r, g, b)),
+                removed_fg,
+            );
+        }
 
         // Right column.
         let r_right_idx = match row {
@@ -1474,6 +1538,20 @@ fn render_diff(
                 })
                 .bg(r_cell_bg),
         );
+        if let Some((_, range)) = intraline {
+            let (r, g, b) = crate::widgets::diff::INTRALINE_ADDED_BG;
+            paint_intraline_range(
+                buf,
+                r_text_x,
+                y,
+                r_text_w,
+                &r_text,
+                diff.scroll_x,
+                range,
+                theme.ui(Color::Rgb(r, g, b)),
+                added_fg,
+            );
+        }
 
         // Inline-find highlight: overpaint every occurrence of the needle
         // on top of the text just laid down, lighting the active match in
@@ -2525,11 +2603,12 @@ pub struct Editor {
     /// debugger or the LSP reads them.
     pub bookmarks: std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
     /// The text the open file's [`bookmarks`](Self::bookmarks) currently
-    /// describe, keyed by the path it was taken for. Every buffer change is
+    /// describe, keyed by the path it was taken for (`None` for an untitled
+    /// buffer, whose folds follow edits too). Every buffer change is
     /// diffed against it so marks follow their lines through inserts,
     /// deletes, undo and reloads (see [`shift_bookmark_lines`]). Held only
-    /// while the open file has marks, so an unmarked file pays nothing.
-    bookmark_shadow: Option<(PathBuf, Vec<String>)>,
+    /// while the open buffer has marks, so an unmarked file pays nothing.
+    bookmark_shadow: Option<(Option<PathBuf>, Vec<String>)>,
     /// Set while a multi-character insert (a paste) runs its per-character
     /// helpers, so the bookmark sync runs once at the end instead of once per
     /// character.
@@ -3601,6 +3680,14 @@ impl Editor {
             .unwrap_or(0)
     }
 
+    /// Whether the open buffer has anything keyed by line that must follow
+    /// edits: bookmarks or breakpoint state for its file, or collapsed folds
+    /// (#1509), which an untitled buffer has too.
+    fn has_line_marks(&self, path: Option<&Path>) -> bool {
+        !self.folded.is_empty()
+            || path.is_some_and(|p| self.bookmarks.contains_key(p) || self.has_breakpoints_in(p))
+    }
+
     /// Whether `path` has any line-keyed breakpoint state to carry through
     /// edits (see [`Self::sync_bookmarks_to_buffer`]).
     fn has_breakpoints_in(&self, path: &Path) -> bool {
@@ -3610,69 +3697,85 @@ impl Editor {
             || self.breakpoint_hit_conditions.contains_key(path)
     }
 
-    /// Record the text the open file's bookmarks describe, ahead of an edit
+    /// Record the text the open buffer's marks describe, ahead of an edit
     /// (called from [`push_undo`](Self::push_undo), which every user edit
-    /// passes through before it mutates). A no-op when the file has no marks
-    /// or the shadow already belongs to this file.
+    /// passes through before it mutates). A no-op when the buffer has no
+    /// marks or the shadow already belongs to it. Keyed by the optional path
+    /// so an untitled buffer's folds follow edits too.
     fn seed_bookmark_shadow(&mut self) {
-        let Some(path) = self.path.as_ref() else {
-            return;
-        };
-        if !(self.bookmarks.contains_key(path) || self.has_breakpoints_in(path))
+        let path = self.path.as_deref();
+        if !self.has_line_marks(path)
             || self
                 .bookmark_shadow
                 .as_ref()
-                .is_some_and(|(p, _)| p == path)
+                .is_some_and(|(p, _)| p.as_deref() == path)
         {
             return;
         }
-        self.bookmark_shadow = Some((path.clone(), self.lines.clone()));
+        self.bookmark_shadow = Some((self.path.clone(), self.lines.clone()));
     }
 
-    /// Re-align the open file's bookmarks with the buffer after it changed.
+    /// Re-align the open file's bookmarks, breakpoints and collapsed folds
+    /// with the buffer after it changed.
     /// The single choke point for line shifts: called from
     /// [`mark_buffer_changed`](Self::mark_buffer_changed) (every edit),
     /// [`restore_snapshot`](Self::restore_snapshot) (undo / redo) and the
-    /// file loaders (reload, reopen with encoding). When the line count moved
-    /// and the shadow describes this file, marks are mapped through
-    /// [`shift_bookmark_lines`]; either way, any mark left past the last line
-    /// is dropped, so a change whose mapping is unknown (a reload with no
-    /// shadow) still never leaves a mark beyond the buffer.
+    /// file loaders (reload, reopen with encoding). When the shadow
+    /// describes this buffer, marks are mapped through [`line_mapper`];
+    /// either way, any mark left past the last line is dropped, so a change
+    /// whose mapping is unknown (a reload with no shadow) still never leaves
+    /// a mark beyond the buffer.
     fn sync_bookmarks_to_buffer(&mut self) {
         if self.bookmark_sync_paused {
             return;
         }
-        let Some(path) = self.path.clone() else {
-            self.bookmark_shadow = None;
-            return;
-        };
-        if !self.bookmarks.contains_key(&path) && !self.has_breakpoints_in(&path) {
+        let path = self.path.clone();
+        if !self.has_line_marks(path.as_deref()) {
             self.bookmark_shadow = None;
             return;
         }
         let len = self.lines.len();
+        let mut folds_moved = false;
         let mut shadow = match self.bookmark_shadow.take() {
             Some((shadow_path, old)) if shadow_path == path => {
                 let map = line_mapper(&old, &self.lines);
-                if let Some(set) = self.bookmarks.get_mut(&path) {
-                    *set = set.iter().filter_map(|&l| map(l)).collect();
+                if let Some(path) = &path {
+                    if let Some(set) = self.bookmarks.get_mut(path) {
+                        *set = set.iter().filter_map(|&l| map(l)).collect();
+                    }
+                    // Breakpoints follow the same edits: they were plain line
+                    // numbers, so an Enter above one left it on the line that
+                    // moved into its place, and the debugger stopped there.
+                    if let Some(set) = self.breakpoints.get_mut(path) {
+                        *set = set.iter().filter_map(|&l| map(l)).collect();
+                    }
+                    for per_line in [
+                        &mut self.breakpoint_conditions,
+                        &mut self.breakpoint_logs,
+                        &mut self.breakpoint_hit_conditions,
+                    ] {
+                        if let Some(m) = per_line.get_mut(path) {
+                            *m = std::mem::take(m)
+                                .into_iter()
+                                .filter_map(|(l, v)| map(l).map(|n| (n, v)))
+                                .collect();
+                        }
+                    }
                 }
-                // Breakpoints follow the same edits: they were plain line
-                // numbers, so an Enter above one left it on the line that
-                // moved into its place, and the debugger stopped there.
-                if let Some(set) = self.breakpoints.get_mut(&path) {
-                    *set = set.iter().filter_map(|&l| map(l)).collect();
-                }
-                for per_line in [
-                    &mut self.breakpoint_conditions,
-                    &mut self.breakpoint_logs,
-                    &mut self.breakpoint_hit_conditions,
-                ] {
-                    if let Some(m) = per_line.get_mut(&path) {
-                        *m = std::mem::take(m)
-                            .into_iter()
-                            .filter_map(|(l, v)| map(l).map(|n| (n, v)))
-                            .collect();
+                // Folds too: their headers are line numbers, and the render
+                // guard dropped every fold on any change in line count. An
+                // edit that keeps the count (lines deleted on one side of a
+                // fold and as many inserted on the other) can still move a
+                // header, so remap whenever the text changed.
+                if !self.folded.is_empty() && old != self.lines {
+                    let moved: std::collections::BTreeSet<usize> = self
+                        .folded
+                        .iter()
+                        .filter_map(|&h| map(h + 1).map(|l| l - 1))
+                        .collect();
+                    if moved != self.folded || old.len() != len {
+                        self.folded = moved;
+                        folds_moved = true;
                     }
                 }
                 drop(map);
@@ -3680,32 +3783,39 @@ impl Editor {
             }
             _ => Vec::new(),
         };
-        let in_range = |l: &usize| (1..=len).contains(l);
-        if let Some(set) = self.bookmarks.get_mut(&path) {
-            set.retain(in_range);
-            if set.is_empty() {
-                self.bookmarks.remove(&path);
-            }
+        if folds_moved {
+            self.fold_epoch_lines = len;
+            self.refresh_fold_tables();
+            self.rebuild_hidden_ranges();
         }
-        if let Some(set) = self.breakpoints.get_mut(&path) {
-            set.retain(in_range);
-            if set.is_empty() {
-                self.breakpoints.remove(&path);
+        if let Some(path) = &path {
+            let in_range = |l: &usize| (1..=len).contains(l);
+            if let Some(set) = self.bookmarks.get_mut(path) {
+                set.retain(in_range);
+                if set.is_empty() {
+                    self.bookmarks.remove(path);
+                }
             }
-        }
-        for per_line in [
-            &mut self.breakpoint_conditions,
-            &mut self.breakpoint_logs,
-            &mut self.breakpoint_hit_conditions,
-        ] {
-            if let Some(m) = per_line.get_mut(&path) {
-                m.retain(|l, _| in_range(l));
-                if m.is_empty() {
-                    per_line.remove(&path);
+            if let Some(set) = self.breakpoints.get_mut(path) {
+                set.retain(in_range);
+                if set.is_empty() {
+                    self.breakpoints.remove(path);
+                }
+            }
+            for per_line in [
+                &mut self.breakpoint_conditions,
+                &mut self.breakpoint_logs,
+                &mut self.breakpoint_hit_conditions,
+            ] {
+                if let Some(m) = per_line.get_mut(path) {
+                    m.retain(|l, _| in_range(l));
+                    if m.is_empty() {
+                        per_line.remove(path);
+                    }
                 }
             }
         }
-        if !self.bookmarks.contains_key(&path) && !self.has_breakpoints_in(&path) {
+        if !self.has_line_marks(path.as_deref()) {
             return;
         }
         // Bring the shadow up to date in place rather than cloning the whole
@@ -5943,12 +6053,13 @@ impl Editor {
                     None => anyhow::bail!("No worksheet"),
                 };
                 // The file's own line ending, read from its first line.
-                let crlf = std::fs::read(&path).is_ok_and(|b| {
-                    b.iter()
-                        .position(|&c| c == b'\n')
-                        .is_some_and(|i| i > 0 && b[i - 1] == b'\r')
-                });
-                let bytes = crate::sheet::serialize_delimited(data, delim, crlf);
+                let original = std::fs::read(&path).unwrap_or_default();
+                let crlf = original
+                    .iter()
+                    .position(|&c| c == b'\n')
+                    .is_some_and(|i| i > 0 && original[i - 1] == b'\r');
+                // Unchanged rows go back as the file had them (#1375).
+                let bytes = crate::sheet::serialize_delimited(data, delim, crlf, &original);
                 std::fs::write(&path, &bytes)
                     .map_err(|e| anyhow::anyhow!("Sheet save failed: {e}"))?;
                 view.dirty = false;
@@ -26560,6 +26671,108 @@ mod tests {
         (from..to).map(|x| buf[(x, y)].symbol()).collect()
     }
 
+    /// The x of the left text column and the row showing `left_text` in a
+    /// diff rendered by [`render_wide_diff`].
+    fn left_text_at(
+        buf: &ratatui::buffer::Buffer,
+        inner: Rect,
+        lines: usize,
+        left_text: &str,
+    ) -> (u16, u16) {
+        let l_text_x = inner.x + (lines + 1).to_string().len() as u16 + 1 + 2;
+        let y = (inner.y..inner.bottom())
+            .find(|&y| row_text(buf, y, l_text_x, inner.x + inner.width / 2).starts_with(left_text))
+            .expect("the changed row is drawn");
+        (l_text_x, y)
+    }
+
+    fn intraline(rgb: (u8, u8, u8)) -> Color {
+        Color::Rgb(rgb.0, rgb.1, rgb.2)
+    }
+
+    /// #1351: a one-character edit marks just that character on each side,
+    /// in a stronger tint than the rest of the changed line.
+    #[test]
+    fn a_one_character_change_is_marked_within_the_line() {
+        use crate::widgets::diff::{INTRALINE_ADDED_BG, INTRALINE_REMOVED_BG};
+        let (buf, inner, r_text_x) = render_wide_diff("x\nbackoff=1.5\n", "x\nbackoff=2.5\n");
+        let (l_text_x, y) = left_text_at(&buf, inner, 2, "backoff=1.5");
+        assert_eq!(buf[(l_text_x + 8, y)].symbol(), "1");
+        assert_eq!(buf[(l_text_x + 8, y)].bg, intraline(INTRALINE_REMOVED_BG));
+        assert_eq!(buf[(r_text_x + 8, y)].symbol(), "2");
+        assert_eq!(buf[(r_text_x + 8, y)].bg, intraline(INTRALINE_ADDED_BG));
+        for col in [0u16, 7, 9, 10] {
+            assert_ne!(
+                buf[(l_text_x + col, y)].bg,
+                intraline(INTRALINE_REMOVED_BG),
+                "col {col}"
+            );
+            assert_ne!(
+                buf[(r_text_x + col, y)].bg,
+                intraline(INTRALINE_ADDED_BG),
+                "col {col}"
+            );
+        }
+    }
+
+    /// #1351 negative: a line rewritten from scratch gets no character
+    /// marks, so it does not turn into confetti.
+    #[test]
+    fn a_rewritten_line_gets_no_character_marks() {
+        use crate::widgets::diff::{INTRALINE_ADDED_BG, INTRALINE_REMOVED_BG};
+        let (buf, inner, _) = render_wide_diff("x\nalpha beta gamma\n", "x\nquite other words\n");
+        let marked = (inner.y..inner.bottom())
+            .flat_map(|y| (inner.x..inner.right()).map(move |x| (x, y)))
+            .filter(|&p| {
+                let bg = buf[p].bg;
+                bg == intraline(INTRALINE_REMOVED_BG) || bg == intraline(INTRALINE_ADDED_BG)
+            })
+            .count();
+        assert_eq!(marked, 0);
+    }
+
+    /// #1351: a change past the right edge of a side is flagged with `›` at
+    /// that edge, so two lines that look the same on screen say they differ.
+    #[test]
+    fn a_change_past_the_right_edge_is_flagged_at_the_edge() {
+        use crate::widgets::diff::INTRALINE_ADDED_BG;
+        let line = |v: &str| {
+            format!(
+                "TIMEOUT_SECONDS = compute_timeout(base=30, retries=3, backoff={v}, jitter=True)"
+            )
+        };
+        let (buf, inner, r_text_x) = render_wide_diff(
+            &format!("x\n{}\n", line("1.5")),
+            &format!("x\n{}\n", line("2.5")),
+        );
+        let (_, y) = left_text_at(&buf, inner, 2, "TIMEOUT_SECONDS");
+        let edge = inner.right() - 1;
+        assert!(
+            r_text_x + 64 > edge,
+            "precondition: the change is off-screen"
+        );
+        assert_eq!(buf[(edge, y)].symbol(), "\u{203a}");
+        assert_eq!(buf[(edge, y)].bg, intraline(INTRALINE_ADDED_BG));
+    }
+
+    /// #1351: wide characters before the change keep the mark on the right
+    /// cells (#1248): `語` takes two cells, so `b` is at cell 6.
+    #[test]
+    fn the_mark_stays_aligned_after_wide_characters() {
+        use crate::widgets::diff::INTRALINE_ADDED_BG;
+        let (buf, inner, r_text_x) = render_wide_diff("x\n日本語a\n", "x\n日本語b\n");
+        let (_, y) = left_text_at(&buf, inner, 2, "日");
+        assert_eq!(buf[(r_text_x + 6, y)].symbol(), "b");
+        assert_eq!(buf[(r_text_x + 6, y)].bg, intraline(INTRALINE_ADDED_BG));
+        for col in 0..6u16 {
+            assert_ne!(
+                buf[(r_text_x + col, y)].bg,
+                intraline(INTRALINE_ADDED_BG),
+                "col {col}"
+            );
+        }
+    }
+
     /// Wide (CJK) characters take two cells: each side is clipped to its
     /// half by display width, so the seam survives on every row and the
     /// right side starts where it should (#1248).
@@ -28678,6 +28891,153 @@ mod tests {
         assert_eq!(e.lines, vec!["alpha BETA"]);
     }
 
+    // ---- Folds follow line inserts and deletes (#1509) ----
+
+    const FOLDS_PY: &str = "import os\n\n\ndef alpha():\n    a = 1\n    b = 2\n    return a + b\n\n\ndef beta():\n    return 3\n\n\ndef gamma():\n    x = 1\n    y = 2\n    z = 3\n    return x + y + z\n";
+
+    /// The issue's file open from disk, with `alpha` (row 3) and `beta`
+    /// (row 9) folded.
+    fn folded_alpha_and_beta() -> (tempfile::TempDir, Editor) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.py");
+        std::fs::write(&path, FOLDS_PY).unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        e.toggle_fold(3);
+        e.toggle_fold(9);
+        assert_eq!(e.folded, std::collections::BTreeSet::from([3, 9]));
+        (dir, e)
+    }
+
+    /// Paint a frame: the render pass is where folds used to be dropped.
+    fn paint(e: &mut Editor) {
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        (&mut *e).render(area, &mut buf);
+    }
+
+    fn folded_rows(e: &Editor) -> Vec<usize> {
+        e.folded.iter().copied().collect()
+    }
+
+    #[test]
+    fn a_new_line_below_the_folds_keeps_them_folded() {
+        let (_dir, mut e) = folded_alpha_and_beta();
+        e.cursor_row = 17;
+        e.cursor_col = e.lines[17].chars().count();
+        e.insert_newline();
+        for c in "w = 4".chars() {
+            e.insert_char(c);
+        }
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![3, 9]);
+        assert!(
+            e.is_line_hidden(4) && e.is_line_hidden(10),
+            "bodies stay hidden"
+        );
+    }
+
+    #[test]
+    fn a_new_line_above_the_folds_moves_them_down() {
+        let (_dir, mut e) = folded_alpha_and_beta();
+        e.cursor_row = 0;
+        e.cursor_col = e.lines[0].chars().count();
+        e.insert_newline();
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![4, 10]);
+        assert_eq!(e.lines[4], "def alpha():");
+        assert!(e.is_line_hidden(5) && !e.is_line_hidden(4));
+    }
+
+    #[test]
+    fn a_line_deleted_between_the_folds_moves_only_the_lower_one() {
+        let (_dir, mut e) = folded_alpha_and_beta();
+        // The blank line 8 (row 7): backspace from the start of row 8.
+        e.cursor_row = 8;
+        e.cursor_col = 0;
+        e.backspace();
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![3, 8]);
+        assert_eq!(e.lines[8], "def beta():");
+    }
+
+    #[test]
+    fn undo_and_paste_keep_the_folds_too() {
+        let (_dir, mut e) = folded_alpha_and_beta();
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        e.insert_str("# one\n# two\n");
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![5, 11]);
+        assert!(e.undo());
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![3, 9]);
+    }
+
+    /// An edit that keeps the line count (one line gone above the folds,
+    /// one added below) still moves the folded headers with their text.
+    #[test]
+    fn a_net_zero_line_count_edit_still_moves_the_folds() {
+        let (_dir, mut e) = folded_alpha_and_beta();
+        let mut lines = e.lines[1..].to_vec();
+        lines.push("# tail".to_string());
+        assert_eq!(lines.len(), e.lines.len());
+        e.replace_all_lines(lines);
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![2, 8]);
+        assert_eq!(e.lines[2], "def alpha():");
+        assert!(e.is_line_hidden(3) && !e.is_line_hidden(2));
+    }
+
+    /// An untitled buffer has no path, and its folds follow edits too.
+    #[test]
+    fn an_untitled_buffers_folds_follow_a_new_line_above_them() {
+        let mut e = Editor::new();
+        assert!(e.path.is_none());
+        e.insert_str(FOLDS_PY);
+        e.toggle_fold(3);
+        e.toggle_fold(9);
+        assert_eq!(folded_rows(&e), vec![3, 9]);
+        e.cursor_row = 0;
+        e.cursor_col = e.lines[0].chars().count();
+        e.insert_newline();
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![4, 10]);
+        assert_eq!(e.lines[4], "def alpha():");
+    }
+
+    /// Negative: deleting a folded header's own line drops that fold only.
+    #[test]
+    fn deleting_a_folded_header_line_drops_only_that_fold() {
+        let (_dir, mut e) = folded_alpha_and_beta();
+        e.unfold_all();
+        e.toggle_fold(3);
+        e.toggle_fold(13);
+        // Delete the whole `def beta():` line (row 9) and its body.
+        e.selection = Some(EditorSelection {
+            anchor: (9, 0),
+            head: (11, 0),
+        });
+        e.cursor_row = 11;
+        e.cursor_col = 0;
+        e.delete_selection();
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![3, 11], "gamma moved up by two");
+        assert_eq!(e.lines[11], "def gamma():");
+    }
+
+    /// Negative: an edit inside a folded body still opens that fold (the
+    /// caret goes where the user is typing), and only that one.
+    #[test]
+    fn an_edit_inside_a_folded_body_opens_only_that_fold() {
+        let (_dir, mut e) = folded_alpha_and_beta();
+        e.cursor_row = 5;
+        e.cursor_col = 9;
+        e.insert_newline();
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![10]);
+    }
+
     // ---- Sort Lines ----
 
     #[test]
@@ -29756,6 +30116,42 @@ mod tests {
         let out = scan_bracket_colors(&lines, &[(1, 2)]);
         assert!(out[0].is_empty(), "the protected '(' does not participate");
         assert_eq!(out[1], vec![(1, 0), (2, 0)]);
+    }
+
+    /// #1510: a bracket in a C++ string or comment, or in a C or C++ char
+    /// literal, is text. One `'('` reddened every later closing brace.
+    #[test]
+    fn brackets_in_c_and_cpp_strings_comments_and_chars_are_text() {
+        let cpp = "// greet the user (politely\n#include <string>\nint main() {\n    std::string s = \"smile :)\";\n    char c = '(';\n    return s.size() + c;\n}\n";
+        let c = "int main() {\n    char c = '(';\n    int v[] = {1};\n    return c;\n}\n";
+        for (kind, src) in [(LangKind::Cpp, cpp), (LangKind::C, c)] {
+            let pass = run_highlight_pass(kind, src.to_string());
+            let red: Vec<(usize, usize)> = pass
+                .brackets
+                .iter()
+                .enumerate()
+                .flat_map(|(row, bs)| {
+                    bs.iter()
+                        .filter(|b| b.1 == UNEXPECTED_BRACKET)
+                        .map(move |b| (row, b.0))
+                })
+                .collect();
+            assert!(
+                red.is_empty(),
+                "{kind:?}: brackets marked unmatched at {red:?}"
+            );
+        }
+    }
+
+    /// #1510 negative: a brace that really is unmatched in C++ code is still
+    /// marked.
+    #[test]
+    fn an_unmatched_cpp_brace_in_code_is_still_marked() {
+        let pass = run_highlight_pass(
+            LangKind::Cpp,
+            String::from("int f() {\n    return 0;\n}}\n"),
+        );
+        assert_eq!(pass.brackets[2], vec![(0, 0), (1, UNEXPECTED_BRACKET)]);
     }
 
     #[test]

@@ -843,6 +843,15 @@ fn git_status_spans<'a>(status: &'a crate::git::GitStatus) -> Vec<Span<'a>> {
         label,
         Style::default().fg(pill_color).add_modifier(Modifier::BOLD),
     ));
+    // The operation git stopped in (#1356), as `main | MERGING`.
+    if let Some(op) = status.operation {
+        spans.push(Span::styled(
+            format!(" | {}", op.label()),
+            Style::default()
+                .fg(GIT_DIRTY_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if status.ahead > 0 {
         spans.push(Span::styled(
             format!(" \u{2191}{}", status.ahead),
@@ -2616,6 +2625,49 @@ struct Prompt {
     error: Option<String>,
 }
 
+/// A Source Control write that records the files on disk (#1438): a commit
+/// variant or a stash. Held while the unsaved-changes prompt is open, and
+/// across a format-on-save write, so the choice runs the request it
+/// interrupted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScmWrite {
+    Commit,
+    CommitStaged,
+    CommitAll,
+    Amend,
+    CommitAndSync,
+    CommitAndPush,
+    Stash,
+    StashIncludeUntracked,
+    StashStaged,
+}
+
+impl ScmWrite {
+    fn is_stash(self) -> bool {
+        matches!(
+            self,
+            Self::Stash | Self::StashIncludeUntracked | Self::StashStaged
+        )
+    }
+
+    /// The verb the prompt's buttons and status lines use.
+    fn verb(self) -> &'static str {
+        if self.is_stash() { "Stash" } else { "Commit" }
+    }
+}
+
+/// The unsaved-changes prompt in front of a commit or stash (#1438): `op`
+/// waits while `files` (dirty tabs under the repository) are unsaved.
+/// `root` is the repository the request was made against: the mouse stays
+/// live while the prompt is open, so focus can move Source Control to
+/// another root before the choice, and the write must not follow it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingUnsavedScm {
+    op: ScmWrite,
+    root: PathBuf,
+    files: Vec<PathBuf>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingDiscard {
     rel_path: String,
@@ -3014,6 +3066,9 @@ pub struct App {
     /// Latch set while a save is waiting on a format reply. `drain_lsp_format`
     /// consumes it to write the (now formatted) buffer to disk.
     save_after_format: Option<PathBuf>,
+    /// When a format-on-save stops waiting on its formatter and writes the
+    /// file unformatted (#1491). Set with `save_after_format`.
+    format_save_deadline: Option<std::time::Instant>,
     /// Background `git log` results for the TIMELINE, keyed by the file they
     /// describe so a stale reply for a since-closed file is ignored on drain.
     timeline_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<crate::git::FileHistoryEntry>)>,
@@ -3646,6 +3701,15 @@ pub struct App {
     /// tracked discard runs `git checkout HEAD -- <path>`). Both paths
     /// destroy uncommitted work, so the modal must always run first.
     pending_discard: Option<PendingDiscard>,
+    /// A commit or stash asked for while tabs under the repository held
+    /// unsaved edits (#1438). The write records the files on disk, so the
+    /// modal asks first: save them all, go ahead without them, or cancel.
+    pending_unsaved_scm: Option<PendingUnsavedScm>,
+    /// Set for the one call that runs a write the prompt already cleared.
+    scm_unsaved_cleared: bool,
+    /// A write waiting on a format-on-save reply: Save All armed the
+    /// active tab's deferred write, and the commit runs once it lands.
+    scm_after_format_save: Option<(ScmWrite, PathBuf)>,
     /// Armed by R in a Source-Control diff; reverting a hunk destroys
     /// uncommitted work, so the confirm modal always runs first.
     pending_revert_hunk: Option<PendingRevertHunk>,
@@ -5607,6 +5671,7 @@ impl App {
             auto_save_on_focus_change: loaded_prefs.auto_save_on_focus_change,
             last_focus_signature: None,
             save_after_format: None,
+            format_save_deadline: None,
             outline,
             open_editors,
             timeline,
@@ -5852,6 +5917,9 @@ impl App {
             view_drain_budget: std::time::Duration::from_millis(20),
             pending_local_open: None,
             pending_discard: None,
+            pending_unsaved_scm: None,
+            scm_unsaved_cleared: false,
+            scm_after_format_save: None,
             pending_revert_hunk: None,
             run_tasks: Vec::new(),
             last_task: None,
@@ -13762,14 +13830,19 @@ impl App {
     }
 
     pub fn drain_lsp_format(&mut self) -> bool {
+        self.drain_lsp_format_at(std::time::Instant::now())
+    }
+
+    /// Apply a formatter reply that has arrived, or, once a format-on-save
+    /// has waited `FORMAT_ON_SAVE_TIMEOUT` with none, write its file
+    /// unformatted: a busy, hung or unreachable server left it unsaved for
+    /// good (#1491). Returns true when the next frame should redraw.
+    fn drain_lsp_format_at(&mut self, now: std::time::Instant) -> bool {
         let mut arrived = false;
         let mut edits: Option<Vec<crate::widgets::editor::TextSpanEdit>> = None;
         let mut unsupported = false;
         let mut path: Option<PathBuf> = None;
-        {
-            let Some(lsp) = self.lsp.as_ref() else {
-                return false;
-            };
+        if let Some(lsp) = self.lsp.as_ref() {
             while let Some(result) = lsp.drain_formatting() {
                 if Some(result.request_id) != self.format_request_id {
                     continue;
@@ -13781,11 +13854,51 @@ impl App {
             }
         }
         if !arrived {
-            return false;
+            let overdue = self.save_after_format.is_some()
+                && self
+                    .format_save_deadline
+                    .is_some_and(|deadline| now >= deadline);
+            if overdue {
+                let secs = FORMAT_ON_SAVE_TIMEOUT.as_secs();
+                self.save_without_formatting(&format!("the formatter did not answer in {secs} s"));
+            }
+            return overdue;
         }
         self.format_request_id = None;
         self.land_format(edits, unsupported, path);
         true
+    }
+
+    /// Write a format-on-save's file now, unformatted, and drop the reply
+    /// it was waiting on, which would otherwise land on the saved text.
+    fn save_without_formatting(&mut self, reason: &str) {
+        let Some(path) = self.save_after_format.clone() else {
+            return;
+        };
+        self.format_request_id = None;
+        self.format_request_seq = None;
+        self.format_request_selection = false;
+        self.complete_pending_save();
+        // A refused write (a disk conflict, a lossy encoding) or a skipped
+        // one (the tab was closed meanwhile) keeps the status it set.
+        if self.path_is_saved(&path) {
+            self.status = format!(
+                "Saved {} without formatting: {reason}",
+                self.status_path(&path)
+            );
+        }
+    }
+
+    /// Whether `path` is open in some tab, in any split, and none of its
+    /// tabs has unsaved edits. A closed file was not written, so it is not
+    /// saved either.
+    fn path_is_saved(&self, path: &Path) -> bool {
+        let mut tabs = std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .filter(|e| e.path.as_deref() == Some(path))
+            .peekable();
+        tabs.peek().is_some() && tabs.all(|e| !e.dirty)
     }
 
     /// Apply a formatter's reply to the request in flight, then finish a
@@ -16839,6 +16952,56 @@ impl App {
         } else {
             format!("{label} receives broadcast input again")
         };
+    }
+
+    /// Terminal: Run Selected Text in Active Terminal (#1292): send the
+    /// editor's selection, or with none the caret's line, to the active
+    /// pane, then Enter. A block goes as one paste, bracketed when the
+    /// program in the pane asked for it, and Enter follows outside the
+    /// brackets so it runs. Without a selection the caret steps to the next
+    /// non-blank line, so repeated runs walk through a script. Focus stays
+    /// in the editor.
+    fn run_selected_text_in_terminal(&mut self) {
+        if !self.editor_is_text() {
+            self.status = String::from("Run Selected Text works on text tabs");
+            return;
+        }
+        let selected = self.editor.selection_text();
+        let stepping = selected.is_empty();
+        let text = if stepping {
+            self.editor
+                .lines
+                .get(self.editor.cursor_row)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            selected
+        };
+        let text = text.trim_end_matches(['\n', '\r']);
+        if stepping {
+            let next = (self.editor.cursor_row + 1..self.editor.lines.len())
+                .find(|&r| !self.editor.lines[r].trim().is_empty());
+            if let Some(row) = next {
+                self.editor.cursor_row = row;
+                self.editor.cursor_col = 0;
+            }
+        }
+        if text.trim().is_empty() {
+            self.status = String::from("Nothing to run on this line");
+            return;
+        }
+        let lines = text.lines().count();
+        let text = text.to_string();
+        self.show_terminal = true;
+        self.bottom_panel_tab = BottomPanelTab::Terminal;
+        self.reveal_terminal_pane(self.active_terminal);
+        self.paste_terminal_input(text.as_bytes());
+        self.write_terminal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        self.status = format!(
+            "Ran {lines} line{} in {}",
+            if lines == 1 { "" } else { "s" },
+            self.terminal().label()
+        );
     }
 
     /// Paste counterpart of [`Self::write_terminal_key`] (bracketed-paste
@@ -20044,6 +20207,7 @@ impl App {
         self.render_discard_confirm(frame);
         self.render_revert_hunk_confirm(frame);
         self.render_discard_all_confirm(frame);
+        self.render_unsaved_scm_confirm(frame);
         self.render_replace_all_confirm(frame);
         self.render_broadcast_confirm(frame);
         self.render_run_block_confirm(frame);
@@ -20602,6 +20766,88 @@ impl App {
         )));
         frame.render_widget(
             Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+            inner,
+        );
+    }
+
+    /// The unsaved-changes prompt in front of a commit or stash (#1438):
+    /// names the unsaved files and offers Save All & Commit, Commit Anyway
+    /// or Cancel, as VS Code does.
+    fn render_unsaved_scm_confirm(&self, frame: &mut ratatui::Frame) {
+        let Some(pending) = self.pending_unsaved_scm.as_ref() else {
+            return;
+        };
+        let area = frame.area();
+        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
+        let height: u16 = 8;
+        let rect = Rect {
+            x: (area.width.saturating_sub(width)) / 2 + area.x,
+            y: (area.height.saturating_sub(height)) / 2 + area.y,
+            width,
+            height,
+        };
+        let rect = rect.intersection(area);
+        let accent = self.theme.ui(Color::Rgb(0xe5, 0xc0, 0x7b));
+        let verb = pending.op.verb();
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(accent))
+            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
+            .title(ratatui::text::Span::styled(
+                " UNSAVED CHANGES ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(block, rect);
+        let inner = Rect {
+            x: rect.x + 2,
+            y: rect.y + 1,
+            width: rect.width.saturating_sub(4),
+            height: rect.height.saturating_sub(2),
+        };
+        let n = pending.files.len();
+        let names: Vec<String> = pending
+            .files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&pending.root)
+                    .unwrap_or(p)
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        let white = Style::default().fg(self.theme.ui(Color::White));
+        let dim = Style::default().fg(self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8)));
+        let key = Style::default().fg(accent).add_modifier(Modifier::BOLD);
+        let body = ratatui::text::Text::from(vec![
+            ratatui::text::Line::from(ratatui::text::Span::styled(
+                format!(
+                    "{n} file{} {} unsaved changes: {}",
+                    if n == 1 { "" } else { "s" },
+                    if n == 1 { "has" } else { "have" },
+                    names.join(", ")
+                ),
+                white,
+            )),
+            ratatui::text::Line::from(ratatui::text::Span::styled(
+                format!("{verb} records the files on disk, without these edits."),
+                dim,
+            )),
+            ratatui::text::Line::from(""),
+            ratatui::text::Line::from(vec![
+                ratatui::text::Span::styled("[S]", key),
+                ratatui::text::Span::raw(format!(" Save All & {verb}   ")),
+                ratatui::text::Span::styled("[C]", key),
+                ratatui::text::Span::raw(format!(" {verb} Anyway   ")),
+                ratatui::text::Span::styled("[Esc]", key),
+                ratatui::text::Span::raw(" Cancel"),
+            ]),
+        ]);
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: false }),
             inner,
         );
     }
@@ -22196,6 +22442,21 @@ impl App {
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.cancel_pending_replace_all();
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        if self.pending_unsaved_scm.is_some() {
+            match key.code {
+                KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Enter => {
+                    self.save_all_then_pending_scm();
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    self.continue_pending_scm_without_saving();
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.cancel_pending_unsaved_scm();
                 }
                 _ => {}
             }
@@ -32839,6 +33100,9 @@ impl App {
     /// Stash the working tree (`git stash push`). Reached from the commit
     /// dropdown's "Stash" item.
     pub fn stash_source_control(&mut self) {
+        if self.hold_for_unsaved(ScmWrite::Stash) {
+            return;
+        }
         match crate::git::stash_push(&self.scm_root()) {
             Ok(summary) => {
                 self.source_control.commit_feedback = Some(format!("stashed: {summary}"));
@@ -32919,6 +33183,99 @@ impl App {
         }
     }
 
+    /// The repository's operation in progress (#1356), read fresh, or
+    /// `None` with a status saying there is none.
+    fn git_operation_or_say(&mut self) -> Option<crate::git::RepoOp> {
+        let op = crate::git::repo_operation(&self.scm_root());
+        if op.is_none() {
+            self.status =
+                String::from("No merge, rebase, cherry-pick, revert or bisect in progress");
+        }
+        op
+    }
+
+    /// Abort the merge, rebase, cherry-pick or revert in progress, or reset
+    /// a bisect (#1356; VS Code's Abort Merge / Abort Rebase).
+    fn abort_git_operation(&mut self) {
+        if self.repo_git_busy() {
+            return;
+        }
+        let Some(op) = self.git_operation_or_say() else {
+            return;
+        };
+        let r = crate::git::abort_operation(&self.scm_root(), op);
+        let done = match op {
+            crate::git::RepoOp::Bisect => String::from("Bisect reset"),
+            _ => format!("Aborted the {}", op.command()),
+        };
+        self.run_scm_op(op.command(), r, &done);
+    }
+
+    /// Continue the rebase, cherry-pick or revert in progress once its
+    /// conflicts are resolved and staged (#1356; VS Code's Continue Rebase).
+    fn continue_git_operation(&mut self) {
+        if self.repo_git_busy() {
+            return;
+        }
+        let Some(op) = self.git_operation_or_say() else {
+            return;
+        };
+        let r = crate::git::continue_operation(&self.scm_root(), op);
+        self.report_git_operation_step(op, r, "Continued");
+    }
+
+    /// Skip the commit the rebase, cherry-pick or revert stopped on
+    /// (#1356).
+    fn skip_git_operation(&mut self) {
+        if self.repo_git_busy() {
+            return;
+        }
+        let Some(op) = self.git_operation_or_say() else {
+            return;
+        };
+        let r = crate::git::skip_operation(&self.scm_root(), op);
+        self.report_git_operation_step(op, r, "Skipped a commit of");
+    }
+
+    /// Mark the commit a bisect is on good or bad (#1356).
+    fn bisect_mark_source_control(&mut self, good: bool) {
+        if self.repo_git_busy() {
+            return;
+        }
+        let r = crate::git::bisect_mark(&self.scm_root(), good);
+        self.run_scm_op("bisect", r, if good { "Marked good" } else { "Marked bad" });
+    }
+
+    /// Report a Continue or Skip, saying where the operation stands now:
+    /// finished, or stopped again (the next conflict, with its step).
+    fn report_git_operation_step(
+        &mut self,
+        op: crate::git::RepoOp,
+        r: Result<String, String>,
+        verb: &str,
+    ) {
+        let now = crate::git::repo_operation(&self.scm_root());
+        let done = match now {
+            None => format!("{verb} the {}, which is done", op.command()),
+            Some(next) => format!("{verb} the {}, now {}", op.command(), next.label()),
+        };
+        self.run_scm_op(op.command(), r, &done);
+    }
+
+    /// After a commit made from Source Control mid-rebase (#1356, the #989
+    /// path): carry on with the rebase, as VS Code's Commit button does
+    /// there, instead of leaving HEAD detached with the rest unapplied.
+    fn continue_rebase_after_commit(&mut self) -> bool {
+        let root = self.scm_root();
+        let Some(op @ crate::git::RepoOp::Rebase { .. }) = crate::git::repo_operation(&root) else {
+            return true;
+        };
+        let r = crate::git::continue_operation(&root, op);
+        let continued = r.is_ok();
+        self.report_git_operation_step(op, r, "Committed and continued");
+        continued
+    }
+
     /// Run an immediate git operation: log it, surface its summary or error
     /// in the commit-feedback line, and refresh the panel. The single path
     /// every "⋯"-menu leaf that acts now (vs. opening a modal) flows through.
@@ -32926,13 +33283,14 @@ impl App {
         self.log_git(label, &outcome);
         match outcome {
             Ok(summary) => {
-                self.source_control.commit_feedback = Some(if summary.is_empty() {
+                let said = if summary.is_empty() {
                     ok_prefix.to_string()
                 } else {
                     format!("{ok_prefix}: {summary}")
-                });
+                };
+                self.source_control.commit_feedback = Some(said.clone());
                 self.source_control.commit_feedback_is_error = false;
-                self.status = format!("{ok_prefix}: {summary}");
+                self.status = said;
             }
             Err(err) => {
                 self.source_control.commit_feedback = Some(format!("{ok_prefix} failed: {err}"));
@@ -33100,6 +33458,183 @@ impl App {
         self.run_scm_op("checkout -- .", r, "Discarded all changes");
     }
 
+    /// `git stash push -u` from the commit dropdown.
+    fn stash_include_untracked_source_control(&mut self) {
+        if self.hold_for_unsaved(ScmWrite::StashIncludeUntracked) {
+            return;
+        }
+        let r = crate::git::stash_push_untracked(&self.scm_root());
+        self.run_scm_op("stash push -u", r, "Stashed (incl. untracked)");
+    }
+
+    /// `git stash push --staged` from the commit dropdown.
+    fn stash_staged_source_control(&mut self) {
+        if self.hold_for_unsaved(ScmWrite::StashStaged) {
+            return;
+        }
+        let r = crate::git::stash_push_staged(&self.scm_root());
+        self.run_scm_op("stash push --staged", r, "Stashed staged");
+    }
+
+    /// The files of tabs with unsaved edits under the repository, each
+    /// once, in tab order. Untitled tabs and files outside the repository
+    /// are not the commit's business (#1438). A spreadsheet cell still being
+    /// typed into counts: its value is on screen but not yet in the buffer.
+    fn unsaved_repo_files(&self) -> Vec<PathBuf> {
+        let root = self.scm_root();
+        let mut files: Vec<PathBuf> = Vec::new();
+        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
+        let unsaved = |e: &&crate::widgets::editor::Editor| {
+            e.dirty
+                || e.sheet
+                    .as_ref()
+                    .is_some_and(|s| s.editable() && s.editing.is_some())
+        };
+        for ed in groups.flat_map(|g| g.editors.iter()).filter(unsaved) {
+            if let Some(p) = ed.path.as_ref()
+                && p.starts_with(&root)
+                && !files.contains(p)
+            {
+                files.push(p.clone());
+            }
+        }
+        files
+    }
+
+    /// Whether `op` must wait for the unsaved-changes prompt (#1438). A
+    /// commit or stash records the files on disk, so an edit still only in
+    /// a tab would be left out with nothing said; VS Code asks first
+    /// (`git.promptToSaveFilesBeforeCommit` / `...BeforeStash`). True when
+    /// the prompt opened and the caller must stop.
+    fn hold_for_unsaved(&mut self, op: ScmWrite) -> bool {
+        if std::mem::take(&mut self.scm_unsaved_cleared) {
+            return false;
+        }
+        let files = self.unsaved_repo_files();
+        if files.is_empty() {
+            return false;
+        }
+        let root = self.scm_root();
+        self.pending_unsaved_scm = Some(PendingUnsavedScm { op, root, files });
+        true
+    }
+
+    /// Whether Source Control now points at a repository other than `root`,
+    /// the one `op` was asked for (focus moved to another root's tab while
+    /// the prompt was open). The write is then dropped rather than run
+    /// against the wrong repository, and the status says so.
+    fn scm_root_moved(&mut self, op: ScmWrite, root: &Path) -> bool {
+        if self.scm_root() == root {
+            return false;
+        }
+        let msg = format!(
+            "{} cancelled: Source Control moved to another repository",
+            op.verb()
+        );
+        self.status = msg.clone();
+        self.source_control.commit_feedback = Some(msg);
+        self.source_control.commit_feedback_is_error = true;
+        true
+    }
+
+    /// Run `op` past the unsaved-changes check, which already had its say.
+    fn run_scm_write(&mut self, op: ScmWrite) {
+        self.scm_unsaved_cleared = true;
+        match op {
+            ScmWrite::Commit => self.commit_source_control(),
+            ScmWrite::CommitStaged => self.commit_staged_source_control(),
+            ScmWrite::CommitAll => self.commit_all_source_control(),
+            ScmWrite::Amend => self.commit_amend_source_control(),
+            ScmWrite::CommitAndSync => self.commit_and_sync_source_control(),
+            ScmWrite::CommitAndPush => self.commit_and_push_source_control(),
+            ScmWrite::Stash => self.stash_source_control(),
+            ScmWrite::StashIncludeUntracked => self.stash_include_untracked_source_control(),
+            ScmWrite::StashStaged => self.stash_staged_source_control(),
+        }
+        // A write that stopped before its check (busy git, empty message)
+        // must not carry the clearance to the next request.
+        self.scm_unsaved_cleared = false;
+    }
+
+    /// "Save All & Commit" (or Stash): save every dirty tab, then run the
+    /// write only when nothing under the repository is left unsaved, so the
+    /// commit never records half of the edits.
+    pub fn save_all_then_pending_scm(&mut self) {
+        let Some(pending) = self.pending_unsaved_scm.take() else {
+            return;
+        };
+        if self.scm_root_moved(pending.op, &pending.root) {
+            return;
+        }
+        // A cell still being typed into is part of the save, as Cmd+S
+        // treats it (#1140): commit it so Save All writes it.
+        for group in
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
+        {
+            for ed in &mut group.editors {
+                if let Some(view) = ed.sheet.as_mut()
+                    && view.editable()
+                    && view.commit_edit().is_some()
+                {
+                    ed.dirty = true;
+                }
+            }
+        }
+        self.save_all();
+        if self.save_after_format.is_some() {
+            // The active tab is written when its formatter replies.
+            self.scm_after_format_save = Some((pending.op, pending.root));
+            return;
+        }
+        self.finish_scm_after_save(pending.op, &pending.root);
+    }
+
+    /// Run `op` once Save All is done, or say which files kept it from
+    /// running.
+    fn finish_scm_after_save(&mut self, op: ScmWrite, root: &Path) {
+        if self.scm_root_moved(op, root) {
+            return;
+        }
+        let left = self.unsaved_repo_files();
+        if left.is_empty() {
+            self.run_scm_write(op);
+            return;
+        }
+        let names: Vec<String> = left
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            })
+            .collect();
+        self.status = format!(
+            "{} cancelled: {} still unsaved - open it and press Cmd+S",
+            op.verb(),
+            names.join(", ")
+        );
+        self.source_control.commit_feedback = Some(format!(
+            "{} cancelled: {} not saved",
+            op.verb(),
+            names.join(", ")
+        ));
+        self.source_control.commit_feedback_is_error = true;
+    }
+
+    /// "Commit Anyway" (or Stash): run the write on the files as they are on
+    /// disk, as croft did before it asked.
+    pub fn continue_pending_scm_without_saving(&mut self) {
+        if let Some(pending) = self.pending_unsaved_scm.take()
+            && !self.scm_root_moved(pending.op, &pending.root)
+        {
+            self.run_scm_write(pending.op);
+        }
+    }
+
+    pub fn cancel_pending_unsaved_scm(&mut self) {
+        self.pending_unsaved_scm = None;
+    }
+
     /// The commit message currently in the input box, trimmed, or an error
     /// surfaced when it is empty (shared by the Commit submenu variants).
     fn require_commit_message(&mut self) -> Option<String> {
@@ -33116,12 +33651,21 @@ impl App {
         let Some(message) = self.require_commit_message() else {
             return;
         };
+        if self.hold_for_unsaved(ScmWrite::CommitStaged) {
+            return;
+        }
         let root = self.scm_root();
         let committed = message.clone();
         self.spawn_commit(
             message,
             move || crate::git::commit_staged(&root, &committed),
-            |app, r| app.run_scm_op("commit -m", r, "Committed staged"),
+            |app, r| {
+                let committed = r.is_ok();
+                app.run_scm_op("commit -m", r, "Committed staged");
+                if committed {
+                    app.continue_rebase_after_commit();
+                }
+            },
         );
     }
 
@@ -33129,6 +33673,9 @@ impl App {
         let Some(message) = self.require_commit_message() else {
             return;
         };
+        if self.hold_for_unsaved(ScmWrite::CommitAll) {
+            return;
+        }
         let root = self.scm_root();
         let committed = message.clone();
         self.spawn_commit(
@@ -33137,13 +33684,22 @@ impl App {
                 crate::git::stage_all(&root).map_err(|err| format!("stage all failed: {err}"))?;
                 crate::git::commit_staged(&root, &committed)
             },
-            |app, r| app.run_scm_op("commit (all)", r, "Committed all"),
+            |app, r| {
+                let committed = r.is_ok();
+                app.run_scm_op("commit (all)", r, "Committed all");
+                if committed {
+                    app.continue_rebase_after_commit();
+                }
+            },
         );
     }
 
     fn commit_amend_source_control(&mut self) {
         // Amend keeps the prior message when the box is empty, otherwise
         // rewrites it — matching VS Code's amend.
+        if self.hold_for_unsaved(ScmWrite::Amend) {
+            return;
+        }
         let message = self.source_control.message.trim().to_string();
         let root = self.scm_root();
         let committed = message.clone();
@@ -33167,6 +33723,9 @@ impl App {
         let Some(message) = self.require_commit_message() else {
             return;
         };
+        if self.hold_for_unsaved(ScmWrite::CommitAndSync) {
+            return;
+        }
         let root = self.scm_root();
         let committed = message.clone();
         self.spawn_commit(
@@ -33178,6 +33737,10 @@ impl App {
                     app.source_control.commit_feedback = Some(err.clone());
                     app.source_control.commit_feedback_is_error = true;
                     app.status = format!("Commit failed: {err}");
+                    return;
+                }
+                // Mid-rebase, sync only once the rebase is back on its branch.
+                if !app.continue_rebase_after_commit() {
                     return;
                 }
                 app.sync_source_control();
@@ -33292,6 +33855,11 @@ impl App {
                 self.spawn_scm_op("fetch --all --prune", "Fetched", crate::git::fetch_all);
             }
             ScmAction::ShowGitOutput => self.show_git_output(),
+            ScmAction::ContinueOperation => self.continue_git_operation(),
+            ScmAction::SkipOperation => self.skip_git_operation(),
+            ScmAction::AbortOperation => self.abort_git_operation(),
+            ScmAction::BisectGood => self.bisect_mark_source_control(true),
+            ScmAction::BisectBad => self.bisect_mark_source_control(false),
             ScmAction::Commit => self.commit_source_control(),
             ScmAction::CommitStaged => self.commit_staged_source_control(),
             ScmAction::CommitAll => self.commit_all_source_control(),
@@ -33342,14 +33910,8 @@ impl App {
             )),
             ScmAction::RemoveRemote => self.open_remote_picker(ListPurpose::RemoveRemote),
             ScmAction::Stash => self.stash_source_control(),
-            ScmAction::StashIncludeUntracked => {
-                let r = crate::git::stash_push_untracked(&self.scm_root());
-                self.run_scm_op("stash push -u", r, "Stashed (incl. untracked)");
-            }
-            ScmAction::StashStaged => {
-                let r = crate::git::stash_push_staged(&self.scm_root());
-                self.run_scm_op("stash push --staged", r, "Stashed staged");
-            }
+            ScmAction::StashIncludeUntracked => self.stash_include_untracked_source_control(),
+            ScmAction::StashStaged => self.stash_staged_source_control(),
             ScmAction::ApplyStash => self.open_stash_picker(ListPurpose::StashApply),
             ScmAction::PopStashLatest => self.stash_pop_source_control(),
             ScmAction::PopStashPick => self.open_stash_picker(ListPurpose::StashPop),
@@ -36792,7 +37354,22 @@ impl App {
                 return;
             }
         };
-        let label = std::path::PathBuf::from(format!("git diff {branch}"));
+        // Name the base the diff starts from (#1444): the merge base, or
+        // the branch tip when the two share no history.
+        let (title, said) = match crate::git::merge_base(&self.scm_root(), &branch) {
+            Some(base) => (
+                format!(
+                    "git diff {} (merge base with {branch})",
+                    &base[..base.len().min(7)]
+                ),
+                format!("Showing changes since this branch left {branch}"),
+            ),
+            None => (
+                format!("git diff {branch}"),
+                format!("Showing git diff {branch}: no history in common, so against its tip"),
+            ),
+        };
+        let label = std::path::PathBuf::from(title);
         if let Err(err) = self.editor.open_git_diff_side_by_side(&label, &raw) {
             self.source_control.commit_feedback = Some(format!("open failed: {err}"));
             self.source_control.commit_feedback_is_error = true;
@@ -36805,7 +37382,7 @@ impl App {
         });
         self.default_branch_label = Some(branch.clone());
         self.source_control.commit_feedback = None;
-        self.status = format!("Showing git diff {branch}");
+        self.status = said;
         self.focus_pane(Pane::Editor);
     }
 
@@ -36853,6 +37430,9 @@ impl App {
             self.source_control.commit_feedback_is_error = true;
             return;
         }
+        if self.hold_for_unsaved(ScmWrite::CommitAndPush) {
+            return;
+        }
         let root = self.scm_root();
         let committed = message.clone();
         self.spawn_commit(
@@ -36868,6 +37448,11 @@ impl App {
                         return;
                     }
                 };
+                // Mid-rebase, push only once the rebase is back on its
+                // branch, never from the detached HEAD it works on.
+                if !app.continue_rebase_after_commit() {
+                    return;
+                }
                 let root = app.scm_root();
                 app.spawn_git_net("push", move || {
                     let r = crate::git::push_or_publish(&root);
@@ -37451,6 +38036,9 @@ impl App {
             self.source_control.commit_feedback_is_error = true;
             return;
         }
+        if self.hold_for_unsaved(ScmWrite::Commit) {
+            return;
+        }
         let root = self.scm_root();
         let committed = message.clone();
         self.spawn_commit(
@@ -37464,6 +38052,7 @@ impl App {
                     app.active_git_bypass_debounce();
                     app.refresh_git_status_debounced();
                     app.refresh_source_control();
+                    app.continue_rebase_after_commit();
                 }
                 Err(err) => {
                     app.source_control.commit_feedback = Some(err.clone());
@@ -49764,6 +50353,7 @@ impl App {
                 self.status = format!("Problems: {}", self.problems.scope.label());
             }
             Cmd::DiffToggleIgnoreWhitespace => self.diff_cycle_whitespace_mode(),
+            Cmd::RunSelectedText => self.run_selected_text_in_terminal(),
             // Cmd+] / Cmd+[ (#843), which have no `Ctrl` form. The chords
             // work in the terminal pane; from the palette the commands bring
             // it up and focus it first, as VS Code's do.
@@ -49801,6 +50391,9 @@ impl App {
             Cmd::ToggleCodeLens => self.toggle_code_lens(),
             Cmd::OpenSearchEditor => self.open_search_editor(),
             Cmd::RebaseAbort => self.abort_rebase_todo(),
+            Cmd::GitContinueOperation => self.continue_git_operation(),
+            Cmd::GitSkipOperation => self.skip_git_operation(),
+            Cmd::GitAbortOperation => self.abort_git_operation(),
             Cmd::ToggleTerminalSuggestions => self.toggle_terminal_suggestions(),
             Cmd::ToggleScreenReader => self.toggle_screen_reader(),
             Cmd::OpenKeyboardShortcuts => self.open_keyboard_shortcuts(),
@@ -54033,6 +54626,9 @@ impl App {
                     if self.source_control.click_more(m.column, m.row) {
                         self.commit_menu_open = false;
                         self.scm_menu.open = !self.scm_menu.open;
+                        if self.scm_menu.open {
+                            self.scm_menu.operation = crate::git::repo_operation(&self.scm_root());
+                        }
                         if !self.scm_menu.open {
                             self.scm_menu.close();
                         }
@@ -55440,11 +56036,13 @@ impl App {
             self.write_tab_to_disk(&pending);
         }
         self.save_after_format = self.editor.path.clone();
+        self.format_save_deadline = Some(std::time::Instant::now() + FORMAT_ON_SAVE_TIMEOUT);
     }
 
     /// Write the deferred buffer to disk once its format reply has landed.
     /// A no-op unless [`Self::save`] armed `save_after_format`.
     fn complete_pending_save(&mut self) {
+        self.format_save_deadline = None;
         let Some(path) = std::mem::take(&mut self.save_after_format) else {
             return;
         };
@@ -55458,6 +56056,9 @@ impl App {
         }
         // As in `save`: the file's other tabs hold the text just written.
         self.sync_symbol_views();
+        if let Some((op, root)) = self.scm_after_format_save.take() {
+            self.finish_scm_after_save(op, &root);
+        }
     }
 
     /// Flip `editor.formatOnSave`, persist it, and report the new state.
@@ -55700,24 +56301,19 @@ impl App {
         self.sweep_dirty_buffers(false, true);
         // A format-on-save write lands with its formatter reply: it is on
         // its way, not left behind.
-        let pending = usize::from(self.save_after_format.is_some());
-        let left = self.unsaved_count().saturating_sub(pending);
-        self.status = if left == 0 {
-            format!(
-                "Saved {before} editor{}",
-                if before == 1 { "" } else { "s" }
-            )
-        } else if self.editor.dirty && pending == 0 {
-            // The active tab's own refusal names the reason and the key
-            // that consents; a summary would bury it.
+        let pending = self
+            .save_after_format
+            .clone()
+            .map(|path| self.status_path(&path));
+        let left = self
+            .unsaved_count()
+            .saturating_sub(usize::from(pending.is_some()));
+        let active_refusal = if self.editor.dirty {
             active_status
         } else {
-            format!(
-                "Save All: {left} editor{} still unsaved - open {} and press Cmd+S",
-                if left == 1 { "" } else { "s" },
-                if left == 1 { "it" } else { "each" }
-            )
+            String::new()
         };
+        self.status = save_all_summary(before, left, pending.as_deref(), active_refusal);
     }
 
     fn toggle_auto_save(&mut self) {
@@ -56385,6 +56981,15 @@ impl App {
             .as_deref()
             .is_some_and(crate::rebase_todo::is_todo)
         {
+            // Outside the plan tab, a rebase stopped on a conflict is the
+            // one this means (#1356).
+            if matches!(
+                crate::git::repo_operation(&self.scm_root()),
+                Some(crate::git::RepoOp::Rebase { .. })
+            ) {
+                self.abort_git_operation();
+                return;
+            }
             self.status = String::from("Rebase: Abort works in a git-rebase-todo tab");
             return;
         }
@@ -57201,6 +57806,12 @@ impl App {
                 }
                 Err(e) => self.status = format!("Save failed: {e}"),
             }
+            return;
+        }
+        // Saved again while the formatter has still not answered: write now
+        // rather than wait on it a second time (#1491).
+        if self.save_after_format.is_some() && self.save_after_format == self.editor.path {
+            self.save_without_formatting("saved again before the formatter answered");
             return;
         }
         // Format-on-save: defer the write until the format reply arrives, then
@@ -65756,6 +66367,47 @@ fn is_delete_node_key(key: KeyEvent) -> bool {
 /// Case-insensitive on the letter so Shift+Ctrl+S also works.
 fn is_word_continuation(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// How long a format-on-save waits for the formatter before writing the
+/// file unformatted (#1491).
+const FORMAT_ON_SAVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Save All's status line: `before` editors were unsaved, `left` still are,
+/// `pending` names the file whose write waits on its formatter, and
+/// `active_refusal` is the active tab's own reason it is still unsaved.
+fn save_all_summary(
+    before: usize,
+    left: usize,
+    pending: Option<&str>,
+    active_refusal: String,
+) -> String {
+    let editors = |n: usize| format!("{n} editor{}", if n == 1 { "" } else { "s" });
+    if left == 0
+        && let Some(file) = pending
+    {
+        // Its write waits on the formatter (at most FORMAT_ON_SAVE_TIMEOUT):
+        // not saved yet, so not counted as saved (#1491).
+        match before.saturating_sub(1) {
+            0 => format!("Formatting {file} before saving it"),
+            saved => format!(
+                "Saved {}; formatting {file} before saving it",
+                editors(saved)
+            ),
+        }
+    } else if left == 0 {
+        format!("Saved {}", editors(before))
+    } else if !active_refusal.is_empty() && pending.is_none() {
+        // The active tab's own refusal names the reason and the key
+        // that consents; a summary would bury it.
+        active_refusal
+    } else {
+        format!(
+            "Save All: {left} editor{} still unsaved - open {} and press Cmd+S",
+            if left == 1 { "" } else { "s" },
+            if left == 1 { "it" } else { "each" }
+        )
+    }
 }
 
 /// Characters that open or advance a call, triggering parameter hints.
