@@ -33205,6 +33205,32 @@ impl App {
                     }
                 }
             }
+            // A submodule has no HEAD blob to diff against (`git show
+            // HEAD:lib` is "bad object"): show what moved in it, read-only,
+            // the way a commit's patch opens (#1235).
+            ChangeKind::Modified | ChangeKind::StagedModified
+                if crate::git::is_submodule(&scm_root, &entry.path) =>
+            {
+                match crate::git::submodule_diff(&scm_root, &entry.path) {
+                    Ok(text) => {
+                        let label = format!("{} (submodule)", entry.path);
+                        match self.editor.open_text_buffer(Path::new(&label), &text) {
+                            Ok(()) => {
+                                self.status = format!("Submodule {}", entry.path);
+                                true
+                            }
+                            Err(e) => {
+                                self.status = format!("Open failed: {e}");
+                                false
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.status = format!("git diff on submodule failed: {e}");
+                        false
+                    }
+                }
+            }
             ChangeKind::Modified | ChangeKind::StagedModified => {
                 match crate::git::read_file_at_head(&scm_root, &entry.path) {
                     Ok(head_text) => {
