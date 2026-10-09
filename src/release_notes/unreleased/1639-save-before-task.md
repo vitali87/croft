@@ -1,0 +1,1 @@
+fix: Tasks: Run Task, the build task, Rerun Last Task, a code lens Run Test and every Testing run save unsaved editors first, as F5 does, so a build or test no longer runs the old file on disk; with `disable_save_before_debug` the status line names the files left out.

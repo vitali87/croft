@@ -26356,6 +26356,130 @@ fn f5_with_nothing_unsaved_writes_nothing() {
     assert!(!app.status.contains("unsaved"), "{}", app.status);
 }
 
+/// #1639 fixture: [`app_with_unsaved_pinned_file`] with a tasks.json task
+/// `run hello` that cats the file.
+fn app_with_unsaved_file_and_task(name: &str) -> (tempfile::TempDir, App, PathBuf) {
+    let (tmp, app, file) = app_with_unsaved_pinned_file(name);
+    let vscode = tmp.path().join(".vscode");
+    std::fs::create_dir_all(&vscode).unwrap();
+    std::fs::write(
+        vscode.join("tasks.json"),
+        format!(
+            r#"{{ "version": "2.0.0", "tasks": [ {{ "label": "run hello", "type": "shell", "command": "cat {name}", "group": {{ "kind": "build", "isDefault": true }} }} ] }}"#
+        ),
+    )
+    .unwrap();
+    (tmp, app, file)
+}
+
+/// #1639: Tasks: Run Task writes the unsaved tab before the command
+/// starts, as F5 and Run do since #1400, so the task runs the text shown.
+#[test]
+fn run_task_saves_the_unsaved_buffer_before_the_task_starts() {
+    use crate::widgets::list_picker::ListPurpose;
+    let (_tmp, mut app, file) = app_with_unsaved_file_and_task("hello.py");
+    app.run_command(crate::widgets::command_palette::Command::RunTask);
+    assert_eq!(
+        app.list_picker.as_ref().map(|p| p.purpose),
+        Some(ListPurpose::RunTask)
+    );
+    app.confirm_list_picker();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    assert!(!app.editor.dirty);
+    assert_eq!(app.status, "Running run hello");
+}
+
+/// #1639: the build task and Rerun Last Task save first too.
+#[test]
+fn the_build_task_and_rerun_last_task_save_first() {
+    let (_tmp, mut app, file) = app_with_unsaved_file_and_task("hello.py");
+    app.run_build_task();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    app.editor.insert_str("newer\n");
+    app.rerun_last_task();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nnewer\nold\n");
+    assert_eq!(app.unsaved_count(), 0);
+}
+
+/// #1639: with saving before a run turned off, the task leaves the disk
+/// alone and the status names the file it did not see.
+#[test]
+fn with_save_before_run_off_a_task_names_the_unsaved_file() {
+    let (_tmp, mut app, file) = app_with_unsaved_file_and_task("hello.py");
+    app.save_before_debug = false;
+    app.run_build_task();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+    assert_eq!(
+        app.status,
+        "hello.py has unsaved changes: the task uses the file on disk - Running run hello"
+    );
+}
+
+/// #1639: a Testing run writes unsaved tabs first: the runner compiles or
+/// imports the files on disk.
+#[test]
+fn a_test_run_saves_the_unsaved_buffer_first() {
+    let (tmp, mut app, file) = app_with_unsaved_pinned_file("lib.rs");
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"t\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+    app.run_all_tests();
+    assert_ne!(app.status, crate::testing::NO_RUNNER_STATUS);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    app.editor.insert_str("newer\n");
+    app.testing.apply_case(crate::testing::model::TestCase {
+        name: "parse::run".into(),
+        status: crate::testing::model::TestStatus::NotRun,
+    });
+    app.run_named_test(String::from("run"));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nnewer\nold\n");
+    assert_eq!(app.status, "Running test parse::run");
+}
+
+/// #1639: a rust-analyzer "Run Test" code lens is a task too, and saves
+/// first: cargo builds the file on disk.
+#[test]
+fn a_code_lens_test_run_saves_the_unsaved_buffer_first() {
+    let (tmp, mut app, file) = app_with_unsaved_pinned_file("lib.rs");
+    let mut lens = lens_at(0, "new", "Run Test", "rust-analyzer.runSingle");
+    lens.arguments = vec![serde_json::json!({
+        "label": "test tests::it_works",
+        "kind": "cargo",
+        "args": {
+            "cwd": tmp.path().canonicalize().unwrap(),
+            "cargoArgs": ["test", "--lib"],
+            "executableArgs": ["tests::it_works", "--exact"]
+        }
+    })];
+    app.editor.code_lenses = vec![lens];
+    app.run_code_lens(0);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    assert_eq!(app.status, "Running test tests::it_works");
+}
+
+/// #1639 negative: with nothing unsaved, a task writes nothing and says
+/// nothing about saving; a workspace with no test runner saves nothing.
+#[test]
+fn a_task_with_nothing_unsaved_writes_nothing() {
+    let (tmp, mut app, file) = app_with_unsaved_file_and_task("hello.py");
+    app.save_all();
+    let stamp = std::fs::metadata(&file).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    app.run_build_task();
+    assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), stamp);
+    assert_eq!(app.status, "Running run hello");
+
+    let other = tmp.path().canonicalize().unwrap().join("notes.txt");
+    std::fs::write(&other, "old\n").unwrap();
+    app.editor.open_pinned(&other).unwrap();
+    app.editor.insert_str("new\n");
+    app.run_all_tests();
+    assert_eq!(app.status, crate::testing::NO_RUNNER_STATUS);
+    assert_eq!(std::fs::read_to_string(&other).unwrap(), "old\n");
+}
+
 /// #1444: View Changes vs main on a branch behind a moved main shows the
 /// branch's own work and names the merge base it starts from.
 #[test]
@@ -63826,6 +63950,56 @@ fn a_run_asked_for_mid_run_does_not_take_over_the_first_runs_outcome() {
         "{}",
         s.app.status
     );
+}
+
+/// #1639: a test run started with saving turned off shows the unsaved
+/// file's warning in front of its "Running …" status, and its outcome
+/// still replaces that status when it ends.
+#[cfg(unix)]
+#[test]
+fn a_test_run_started_with_the_unsaved_warning_still_reports_its_outcome() {
+    let mut s = CodeqlStandIn::new();
+    s.will(STAND_IN_PASS, 0);
+    let file = PathBuf::from(&s.root).join("test/Find/Find.ql");
+    std::fs::write(&file, "old\n").unwrap();
+    s.app.editor.open_pinned(&file).unwrap();
+    s.app.editor.insert_str("new\n");
+    s.app.save_before_debug = false;
+    s.app.run_named_test(String::from("Find.qlref"));
+    assert_eq!(
+        s.app.status,
+        "Find.ql has unsaved changes: the test run uses the file on disk - Running test test/Find::Find.qlref"
+    );
+    s.finish();
+    assert!(
+        s.app.status.starts_with("Find.qlref passed ("),
+        "{}",
+        s.app.status
+    );
+}
+
+/// #1639: with a watched scope, the save a test run makes before it
+/// starts schedules no second, watched run after it.
+#[cfg(unix)]
+#[test]
+fn the_save_before_a_test_run_schedules_no_watched_rerun() {
+    let mut s = CodeqlStandIn::new();
+    s.will(STAND_IN_PASS, 0);
+    s.app
+        .testing
+        .watch
+        .toggle(crate::testing::watch::WatchScope::All);
+    let file = PathBuf::from(&s.root).join("test/Find/Find.ql");
+    assert!(file.starts_with(&s.app.active_test_root));
+    std::fs::write(&file, "old\n").unwrap();
+    s.app.editor.open_pinned(&file).unwrap();
+    s.app.editor.insert_str("new\n");
+    s.app.run_named_test(String::from("Find.qlref"));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    assert_eq!(s.app.testing.watch.due_at(), None);
+    s.finish();
+    assert!(!s.app.testing.is_busy());
+    assert_eq!(s.app.testing.watch.due_at(), None);
 }
 
 /// #856 guard: a coverage run that never ran (CodeQL tests have no source
