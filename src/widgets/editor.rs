@@ -2067,10 +2067,21 @@ pub struct TextSpanEdit {
 /// earlier replacement never shifts the coordinates of a later one. Returns
 /// the number of edits applied. Out-of-range edits are skipped.
 pub fn apply_span_edits_to_lines(lines: &mut Vec<String>, edits: &[TextSpanEdit]) -> usize {
-    // Every edit names the ORIGINAL text, so its UTF-16 columns convert
-    // against the lines as they are before any edit lands.
+    let mut applied = 0;
+    for (e, count) in in_application_order(char_span_edits(lines, edits)) {
+        if replace_span(lines, &e) {
+            applied += count;
+        }
+    }
+    applied
+}
+
+/// `edits` with their UTF-16 columns read as chars. Every edit names the
+/// ORIGINAL text, so the columns convert against `lines` as they are before
+/// any edit lands.
+fn char_span_edits(lines: &[String], edits: &[TextSpanEdit]) -> Vec<TextSpanEdit> {
     let col = |row: usize, c: usize| lines.get(row).map_or(c, |l| utf16_to_char_col(l, c as u32));
-    let converted: Vec<TextSpanEdit> = edits
+    edits
         .iter()
         .map(|e| match e.utf16 {
             true => TextSpanEdit {
@@ -2081,16 +2092,59 @@ pub fn apply_span_edits_to_lines(lines: &mut Vec<String>, edits: &[TextSpanEdit]
             },
             false => e.clone(),
         })
-        .collect();
-    let mut order: Vec<&TextSpanEdit> = converted.iter().collect();
-    order.sort_by_key(|e| std::cmp::Reverse(e.start));
-    let mut applied = 0;
-    for e in order {
-        if replace_span(lines, e) {
-            applied += 1;
+        .collect()
+}
+
+/// `edits` bottom-up, the order they apply in, each with the number of edits
+/// it stands for. Edits that start at one position are joined into one, their
+/// texts in the order sent: the LSP spec puts them in array order, and
+/// applying them one by one bottom-up reversed them, so vtsls's `"\n"` then
+/// `"  "` landed as trailing spaces above an unindented line (#1633).
+fn in_application_order(mut edits: Vec<TextSpanEdit>) -> Vec<(TextSpanEdit, usize)> {
+    edits.sort_by_key(|e| e.start);
+    let mut joined: Vec<(TextSpanEdit, usize)> = Vec::with_capacity(edits.len());
+    for e in edits {
+        match joined.last_mut() {
+            Some((last, count)) if last.start == e.start => {
+                last.end = last.end.max(e.end);
+                last.new_text.push_str(&e.new_text);
+                *count += 1;
+            }
+            _ => joined.push((e, 1)),
         }
     }
-    applied
+    joined.reverse();
+    joined
+}
+
+/// Where `pos` (char columns) lands once `edits` apply to `lines`: moved by
+/// the text every edit before it adds or removes. A position inside an edit
+/// lands at the end of its new text.
+pub fn position_after_span_edits(
+    lines: &[String],
+    pos: (usize, usize),
+    edits: &[TextSpanEdit],
+) -> (usize, usize) {
+    let mut pos = pos;
+    for (e, _) in in_application_order(char_span_edits(lines, edits)) {
+        if pos < e.start || (pos == e.start && e.start != e.end) {
+            continue;
+        }
+        let rows = e.new_text.matches('\n').count();
+        let last = e.new_text.rsplit('\n').next().unwrap_or("").chars().count();
+        let new_end = match rows {
+            0 => (e.start.0, e.start.1 + last),
+            _ => (e.start.0 + rows, last),
+        };
+        pos = if pos < e.end {
+            new_end
+        } else if pos.0 == e.end.0 {
+            (new_end.0, new_end.1 + pos.1 - e.end.1)
+        } else {
+            (pos.0 + new_end.0 - e.end.0, pos.1)
+        };
+    }
+    pos
 }
 
 fn replace_span(lines: &mut Vec<String>, e: &TextSpanEdit) -> bool {
@@ -7287,9 +7341,7 @@ impl Editor {
         self.push_undo(EditKind::Paste);
         let n = apply_span_edits_to_lines(&mut self.lines, edits);
         if n > 0 {
-            let mut order: Vec<&TextSpanEdit> = edits.iter().collect();
-            order.sort_by_key(|e| std::cmp::Reverse(e.start));
-            for e in order {
+            for (e, _) in in_application_order(edits.to_vec()) {
                 let removed = e.end.0.saturating_sub(e.start.0) + 1;
                 let added = e.new_text.matches('\n').count() + 1;
                 self.provenance.splice(e.start.0, removed, added);
@@ -7300,6 +7352,20 @@ impl Editor {
             self.mark_buffer_changed();
             self.recompute_highlights();
         }
+        n
+    }
+
+    /// [`Self::apply_span_edits`], the caret carried through the edits so it
+    /// stays beside the same text: format on type rewrites the line just
+    /// typed, and a clamp left the caret on the row above the `;` (#1633).
+    pub fn apply_span_edits_moving_caret(&mut self, edits: &[TextSpanEdit]) -> usize {
+        let caret = (self.cursor_row, self.cursor_col);
+        let moved = position_after_span_edits(&self.lines, caret, edits);
+        let n = self.apply_span_edits(edits);
+        if n > 0 {
+            (self.cursor_row, self.cursor_col) = moved;
+        }
+        self.clamp_cursor();
         n
     }
 
@@ -22702,6 +22768,117 @@ mod tests {
         ];
         assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 2);
         assert_eq!(lines, vec!["baz bar baz".to_string()]);
+    }
+
+    /// An insert of `text` at `(row, col)`, in UTF-16 columns as a
+    /// language server sends it.
+    fn lsp_insert(row: usize, col: usize, text: &str) -> TextSpanEdit {
+        TextSpanEdit {
+            start: (row, col),
+            end: (row, col),
+            new_text: text.to_string(),
+            utf16: true,
+        }
+    }
+
+    /// vtsls 0.3.0's Format Document reply for
+    /// `export function f(a: number) {if(a>1){return  0;}`, captured with a
+    /// minimal LSP client (#1633). The first two edits share a position.
+    fn vtsls_format_reply() -> Vec<TextSpanEdit> {
+        let mut edits = vec![
+            lsp_insert(0, 30, "\n"),
+            lsp_insert(0, 30, "  "),
+            lsp_insert(0, 32, " "),
+            lsp_insert(0, 34, " "),
+            lsp_insert(0, 35, " "),
+            lsp_insert(0, 37, " "),
+            lsp_insert(0, 38, " "),
+        ];
+        edits.push(TextSpanEdit {
+            start: (0, 44),
+            end: (0, 46),
+            new_text: " ".to_string(),
+            utf16: true,
+        });
+        edits.push(lsp_insert(0, 48, " "));
+        edits
+    }
+
+    /// #1633: edits that start at one position land in the order the server
+    /// sent them, as the LSP spec says.
+    #[test]
+    fn inserts_at_one_position_land_in_the_order_sent() {
+        let mut lines = vec!["ab".to_string()];
+        let edits = vec![lsp_insert(0, 1, "\n"), lsp_insert(0, 1, "  ")];
+        assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 2);
+        assert_eq!(lines, vec!["a".to_string(), "  b".to_string()]);
+        // An insert sent before a replacement of the text after it.
+        let mut lines = vec!["foobar".to_string()];
+        let edits = vec![
+            lsp_insert(0, 0, "X"),
+            TextSpanEdit {
+                start: (0, 0),
+                end: (0, 3),
+                new_text: String::new(),
+                utf16: true,
+            },
+        ];
+        assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 2);
+        assert_eq!(lines, vec!["Xbar".to_string()]);
+    }
+
+    /// #1633: the issue's TypeScript sample formats to an indented line with
+    /// no trailing spaces.
+    #[test]
+    fn a_vtsls_format_reply_indents_the_line_it_breaks() {
+        let mut lines: Vec<String> = [
+            "export function f(a: number) {if(a>1){return  0;}",
+            "  return a;",
+            "}",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            apply_span_edits_to_lines(&mut lines, &vtsls_format_reply()),
+            9
+        );
+        assert_eq!(
+            lines,
+            [
+                "export function f(a: number) {",
+                "  if (a > 1) { return 0; }",
+                "  return a;",
+                "}"
+            ]
+            .map(String::from)
+            .to_vec()
+        );
+    }
+
+    /// #1633 negative: edits at different positions, and a replacement sent
+    /// before an insert at its start, keep their meaning.
+    #[test]
+    fn edits_at_different_positions_keep_their_places() {
+        let mut lines = vec!["a b c".to_string()];
+        let edits = vec![
+            lsp_insert(0, 4, "Z"),
+            lsp_insert(0, 0, "X"),
+            lsp_insert(0, 2, "Y"),
+        ];
+        assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 3);
+        assert_eq!(lines, vec!["Xa Yb Zc".to_string()]);
+        let mut lines = vec!["foobar".to_string()];
+        let edits = vec![
+            TextSpanEdit {
+                start: (0, 0),
+                end: (0, 3),
+                new_text: String::new(),
+                utf16: true,
+            },
+            lsp_insert(0, 0, "X"),
+        ];
+        assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 2);
+        assert_eq!(lines, vec!["Xbar".to_string()]);
     }
 
     #[test]

@@ -12100,16 +12100,28 @@ impl App {
                 OnTypeReply::Apply => self.on_type_request = None,
             }
             if let Some(edits) = result.edits.filter(|e| !e.is_empty())
-                && self
-                    .editor
-                    .apply_rename_to_open_tab(&result.path, &edits)
-                    .is_some()
+                && self.apply_on_type_edits(&result.path, &edits)
             {
-                self.editor.clamp_cursor();
                 changed = true;
             }
         }
         changed
+    }
+
+    /// Apply an on-type formatting reply for `path`, the active tab's file
+    /// (the reply's disposition checked that), keeping the caret beside the
+    /// text that was just typed.
+    pub(crate) fn apply_on_type_edits(
+        &mut self,
+        path: &std::path::Path,
+        edits: &[crate::widgets::editor::TextSpanEdit],
+    ) -> bool {
+        if self.editor.path.as_deref() == Some(path) {
+            return self.editor.apply_span_edits_moving_caret(edits) > 0;
+        }
+        let applied = self.editor.apply_rename_to_open_tab(path, edits).is_some();
+        self.editor.clamp_cursor();
+        applied
     }
 
     /// Linked editing (#254): replay the last keystroke across the

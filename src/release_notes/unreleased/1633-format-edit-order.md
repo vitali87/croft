@@ -1,0 +1,1 @@
+fix: Format Document, format on save and format on type apply a language server's edits at one position in the order sent, so TypeScript formatting no longer leaves trailing spaces above an unindented line, and format on type keeps the caret after the text just typed.

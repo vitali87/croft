@@ -45482,6 +45482,87 @@ fn an_on_type_reply_applies_only_while_its_buffer_and_tab_are_unmoved() {
     );
 }
 
+/// vtsls 0.3.0's on-type reply after typing `if(a>1){return  0;` right
+/// after the `{` of `export function f(a: number) {` (#1633), captured with
+/// a minimal LSP client. Pairs of edits share a position.
+fn vtsls_on_type_reply() -> Vec<crate::widgets::editor::TextSpanEdit> {
+    let edit = |col: usize, end: usize, text: &str| crate::widgets::editor::TextSpanEdit {
+        start: (0, col),
+        end: (0, end),
+        new_text: text.to_string(),
+        utf16: true,
+    };
+    vec![
+        edit(30, 30, "\n"),
+        edit(30, 30, "  "),
+        edit(32, 32, " "),
+        edit(34, 34, " "),
+        edit(35, 35, " "),
+        edit(37, 37, " "),
+        edit(38, 38, "\n"),
+        edit(38, 38, "    "),
+        edit(44, 46, " "),
+    ]
+}
+
+/// #1633: format on type indents the lines it breaks and leaves the caret
+/// right after the `;` that was typed, on the line the text moved to.
+#[test]
+fn format_on_type_keeps_the_caret_after_the_typed_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ts = tmp.path().join("fmt2.ts");
+    std::fs::write(
+        &ts,
+        "export function f(a: number) {if(a>1){return  0;\n  return a;\n}\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&ts).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 48;
+    assert!(app.apply_on_type_edits(&ts, &vtsls_on_type_reply()));
+    assert_eq!(
+        app.editor.lines[..4],
+        [
+            "export function f(a: number) {",
+            "  if (a > 1) {",
+            "    return 0;",
+            "  return a;"
+        ]
+        .map(String::from)
+    );
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 13));
+}
+
+/// #1633 negative: edits that all sit after the caret leave it where it is,
+/// and an edit on the caret's line before it moves it by the text added.
+#[test]
+fn format_on_type_moves_the_caret_only_for_edits_before_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ts = tmp.path().join("a.ts");
+    std::fs::write(&ts, "let a=1;\nlet  b = 2;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&ts).unwrap();
+    app.focus_pane(Pane::Editor);
+    let edit =
+        |row: usize, col: usize, end: usize, text: &str| crate::widgets::editor::TextSpanEdit {
+            start: (row, col),
+            end: (row, end),
+            new_text: text.to_string(),
+            utf16: true,
+        };
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 3;
+    assert!(app.apply_on_type_edits(&ts, &[edit(1, 3, 5, " ")]));
+    assert_eq!(app.editor.lines[1], "let b = 2;");
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 3));
+    app.editor.cursor_col = 8;
+    assert!(app.apply_on_type_edits(&ts, &[edit(0, 5, 5, " "), edit(0, 6, 6, " ")]));
+    assert_eq!(app.editor.lines[0], "let a = 1;");
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 10));
+}
+
 #[test]
 fn a_document_link_refuses_a_non_web_scheme_and_records_nav_history() {
     use crate::lsp::manager::DocumentLinkItem;
