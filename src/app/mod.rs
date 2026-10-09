@@ -17222,6 +17222,9 @@ impl App {
         }
         if self.multiline_paste_needs_confirm(payload) {
             self.pending_terminal_paste = Some(payload.to_vec());
+            // An armed Cmd+K chord would take the popup's next key (Cmd+K I
+            // turning broadcast on behind it), so the popup disarms it.
+            self.cmd_k_leader = None;
             return;
         }
         self.paste_terminal_input_now(payload);

@@ -77940,6 +77940,21 @@ fn a_multiline_paste_into_a_plain_shell_waits_for_confirmation() {
     assert!(app.pending_terminal_paste.is_none());
 }
 
+/// The confirm popup disarms a pending Cmd+K chord: its next key answers the
+/// popup, it does not finish the chord (Cmd+K I is the broadcast toggle).
+#[test]
+fn a_multiline_paste_confirm_disarms_a_pending_cmd_k_chord() {
+    let (mut app, _tmp) = plain_paste_app();
+    app.cmd_k_leader = Some(std::time::Instant::now());
+    app.handle_paste(TWO_LINES);
+    assert!(app.pending_terminal_paste.is_some());
+    assert!(app.cmd_k_leader.is_none(), "the chord is disarmed");
+    app.handle_key(key(KeyCode::Char('i'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.pending_broadcast_enable, "no broadcast prompt");
+    assert!(!app.broadcast_input);
+}
+
 #[test]
 fn a_multiline_paste_can_go_in_as_one_line() {
     let (mut app, _tmp) = plain_paste_app();
