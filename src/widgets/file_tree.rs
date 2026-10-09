@@ -1321,6 +1321,18 @@ pub fn is_descendant_or_same(target: &Path, source: &Path) -> bool {
     canon_target == canon_source || canon_target.starts_with(&canon_source)
 }
 
+/// Whether `source` already sits directly in `dir`, so moving it there moves
+/// nothing (#1174). A source that no longer exists (deleted or renamed since
+/// it was cut) is not in place: it takes the ordinary path, which reports it
+/// missing. A dangling symlink still exists, as the link itself.
+pub fn is_directly_in(dir: &Path, source: &Path) -> bool {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    source.symlink_metadata().is_ok()
+        && source
+            .parent()
+            .is_some_and(|parent| canon(parent) == canon(dir))
+}
+
 /// Move `source` to a fresh path inside `dest_dir`. Falls back to
 /// copy-then-remove when the source and destination live on different
 /// filesystems and `std::fs::rename` returns `EXDEV`. Returns the final
@@ -1331,6 +1343,10 @@ pub fn move_into(dest_dir: &Path, source: &Path) -> std::io::Result<PathBuf> {
             std::io::ErrorKind::InvalidInput,
             format!("cannot move {} into itself", source.display()),
         ));
+    }
+    // Already there: a fresh name would rename it to "<name> copy" (#1174).
+    if is_directly_in(dest_dir, source) {
+        return Ok(source.to_path_buf());
     }
     let dest = unique_destination_in(dest_dir, source);
     if std::fs::rename(source, &dest).is_ok() {
@@ -3373,6 +3389,42 @@ mod tests {
             std::fs::read_to_string(dst_dir.join("a.txt")).unwrap(),
             "preexisting"
         );
+    }
+
+    /// #1174: moving an item into the folder it is already in moves
+    /// nothing, where it used to rename it to "<name> copy".
+    #[test]
+    fn move_into_its_own_folder_leaves_it_where_it_is() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("a.txt");
+        std::fs::write(&src, "x").unwrap();
+        let dir = tmp.path().join("src");
+        std::fs::create_dir(&dir).unwrap();
+        assert_eq!(move_into(tmp.path(), &src).unwrap(), src);
+        assert_eq!(move_into(tmp.path(), &dir).unwrap(), dir);
+        let mut names: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a.txt", "src"]);
+        assert_eq!(std::fs::read_to_string(&src).unwrap(), "x");
+    }
+
+    /// #1174 negative: a cut file deleted before the paste is not "already
+    /// in this folder"; the move fails as missing.
+    #[test]
+    fn move_into_its_own_folder_of_a_missing_file_fails() {
+        let tmp = TempDir::new().unwrap();
+        let gone = tmp.path().join("gone.txt");
+        assert!(!is_directly_in(tmp.path(), &gone));
+        assert!(move_into(tmp.path(), &gone).is_err());
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("dangling");
+            std::os::unix::fs::symlink(tmp.path().join("nowhere"), &link).unwrap();
+            assert!(is_directly_in(tmp.path(), &link), "the link itself exists");
+        }
     }
 
     #[test]

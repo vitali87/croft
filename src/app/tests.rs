@@ -10948,6 +10948,83 @@ fn tree_context_menu_on_subfolder_offers_new_file_new_folder_then_cut_copy_renam
     );
 }
 
+/// #1174: Cut then Paste with the selection still in the cut file's folder
+/// leaves the file alone and keeps the cut, so pasting on the folder it was
+/// meant for still moves it there.
+#[test]
+fn cut_then_paste_in_the_same_folder_leaves_the_file_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("notes.txt"), "notes\n").unwrap();
+    std::fs::create_dir(tmp.path().join("sub")).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Explorer);
+    app.focus_pane(Pane::Tree);
+    let select = |app: &mut App, name: &str| {
+        app.tree.selected = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.path.file_name().is_some_and(|f| f == name))
+            .unwrap_or_else(|| panic!("{name} in the tree"));
+    };
+    select(&mut app, "notes.txt");
+    let notes = app.tree.nodes[app.tree.selected].path.clone();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::CONTROL))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(notes.exists(), "the file keeps its name");
+    assert!(!notes.with_file_name("notes copy.txt").exists());
+    assert_eq!(app.status, "Already in this folder: nothing to move");
+    assert!(app.tree_clipboard.is_some(), "the cut is kept");
+
+    select(&mut app, "sub");
+    let sub = app.tree.nodes[app.tree.selected].path.clone();
+    app.handle_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(sub.join("notes.txt").exists(), "{}", app.status);
+    assert!(!notes.exists());
+    assert!(app.tree_clipboard.is_none());
+}
+
+/// Negative (#1174): a cut pasted into another folder still moves the
+/// file there, and a copy pasted into its own folder still makes
+/// "<name> copy", as before.
+#[test]
+fn cut_to_another_folder_moves_and_copy_in_place_still_duplicates() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("notes.txt"), "notes\n").unwrap();
+    std::fs::write(tmp.path().join("todo.txt"), "todo\n").unwrap();
+    std::fs::create_dir(tmp.path().join("sub")).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Explorer);
+    app.focus_pane(Pane::Tree);
+    let select = |app: &mut App, name: &str| {
+        app.tree.selected = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.path.file_name().is_some_and(|f| f == name))
+            .unwrap_or_else(|| panic!("{name} in the tree"));
+    };
+    select(&mut app, "notes.txt");
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::CONTROL))
+        .unwrap();
+    select(&mut app, "sub");
+    app.handle_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(tmp.path().join("sub/notes.txt").exists(), "{}", app.status);
+    assert!(!tmp.path().join("notes.txt").exists());
+    assert!(app.tree_clipboard.is_none(), "a done move clears the cut");
+    select(&mut app, "todo.txt");
+    app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(tmp.path().join("todo copy.txt").exists(), "{}", app.status);
+    assert!(tmp.path().join("todo.txt").exists());
+}
+
 #[test]
 fn tree_context_menu_with_clipboard_offers_paste_on_directory() {
     let tmp = tempfile::tempdir().unwrap();

@@ -66182,8 +66182,10 @@ impl App {
             self.status = String::from("Explorer clipboard is empty");
             return;
         };
-        self.move_or_copy_in_explorer(&dest_dir, &clip.paths, clip.mode);
-        if matches!(clip.mode, ExplorerClipMode::Cut) {
+        let moved = self.move_or_copy_in_explorer(&dest_dir, &clip.paths, clip.mode);
+        // A cut pasted back where it already is moved nothing, so it stays
+        // on the clipboard for the paste into the folder it was meant for.
+        if moved && matches!(clip.mode, ExplorerClipMode::Cut) {
             self.tree_clipboard = None;
         }
     }
@@ -66196,10 +66198,22 @@ impl App {
         dest_dir: &Path,
         paths: &[PathBuf],
         mode: ExplorerClipMode,
-    ) {
+    ) -> bool {
         if matches!(mode, ExplorerClipMode::Copy) {
             let _ = self.apply_paste_or_drop(dest_dir, paths, mode);
-            return;
+            return true;
+        }
+        // An item already in `dest_dir` stays as it is: moving it there is
+        // no move, and a fresh name for it renamed the file to "<name> copy"
+        // on disk, retargeting its tabs and the servers' imports (#1174).
+        let paths: Vec<PathBuf> = paths
+            .iter()
+            .filter(|p| !crate::widgets::file_tree::is_directly_in(dest_dir, p))
+            .cloned()
+            .collect();
+        if paths.is_empty() {
+            self.status = String::from("Already in this folder: nothing to move");
+            return false;
         }
         let renames = paths
             .iter()
@@ -66211,9 +66225,10 @@ impl App {
             .collect();
         let op = FileMove::Paste {
             dest_dir: dest_dir.to_path_buf(),
-            paths: paths.to_vec(),
+            paths,
         };
         self.start_file_move(op, renames);
+        true
     }
 
     /// Ask the servers about `renames`, then run `op` once they answer (or
