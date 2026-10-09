@@ -44967,14 +44967,20 @@ impl App {
     /// claiming a copy landed would be a claim croft cannot make.
     fn deliver_copied_text(&mut self, text: &str) {
         let n = text.chars().count();
+        self.status = self.copy_where_pasted(text).status(&format!("{n} chars"));
+    }
+
+    /// The copy `deliver_copied_text` makes, without the status line, for a
+    /// caller that words its own. Every terminal copy goes this way (#1667):
+    /// Copy Output, copy mode, quick select and copy on select all wrote
+    /// the remote box's clipboard on a relay session.
+    fn copy_where_pasted(&mut self, text: &str) -> CopyLanding {
         if self.is_relay_session && self.push_clipboard_via_relay(text) {
-            self.status = format!("Copied {n} chars to the local clipboard");
-            return;
-        }
-        if copy_to_clipboard(text) {
-            self.status = format!("Copied {n} chars to clipboard");
+            CopyLanding::Local
+        } else if copy_to_clipboard(text) {
+            CopyLanding::Clipboard
         } else {
-            self.status = format!("Copied {n} chars via OSC 52 (the host terminal decides)");
+            CopyLanding::Osc52
         }
     }
 
@@ -46961,12 +46967,12 @@ impl App {
             return;
         }
         let lines = text.lines().count();
-        copy_to_clipboard(&text);
-        self.status = if lines == 1 {
-            String::from("Copied command output (1 line)")
+        let what = if lines == 1 {
+            String::from("command output (1 line)")
         } else {
-            format!("Copied command output ({lines} lines)")
+            format!("command output ({lines} lines)")
         };
+        self.status = self.copy_where_pasted(&text).status(&what);
     }
 
     fn select_command_output(
@@ -52658,8 +52664,7 @@ impl App {
                     self.status =
                         String::from("Copy mode: nothing selected (v/V/^V starts a selection)");
                 } else {
-                    copy_to_clipboard(&text);
-                    self.status = format!("Copied {} chars to clipboard", text.chars().count());
+                    self.deliver_copied_text(&text);
                 }
                 return;
             }
@@ -52847,15 +52852,14 @@ impl App {
                     // number); the clipboard rule applies here too (#360).
                     let text = self.terminal_text_for_copy(hit.text.clone());
                     self.close_terminal_quick_select();
-                    copy_to_clipboard(&text);
+                    let copied = self
+                        .copy_where_pasted(&text)
+                        .status(&format!("{} chars", text.chars().count()));
                     if shifted {
                         self.terminal_mut().paste_input(text.as_bytes());
-                        self.status = format!(
-                            "Copied {} chars to clipboard and pasted into the shell",
-                            text.chars().count()
-                        );
+                        self.status = format!("{copied} and pasted into the shell");
                     } else {
-                        self.status = format!("Copied {} chars to clipboard", text.chars().count());
+                        self.status = copied;
                     }
                 } else if state.hints.iter().any(|h| h.label.starts_with(&candidate)) {
                     let Some(state) = self.terminal_quick_select.as_mut() else {
@@ -56706,7 +56710,7 @@ impl App {
                                 let text = self
                                     .terminal_text_for_copy(self.terminals[idx].selection_text());
                                 if !text.is_empty() {
-                                    copy_to_clipboard(&text);
+                                    self.copy_where_pasted(&text);
                                 }
                             }
                         }
@@ -56731,7 +56735,7 @@ impl App {
                 {
                     let text = self.terminal_text_for_copy(self.terminal().selection_text());
                     if !text.is_empty() {
-                        copy_to_clipboard(&text);
+                        self.copy_where_pasted(&text);
                     }
                 }
                 // A plain click on a redacted span shows the real value in
@@ -68742,6 +68746,30 @@ fn copy_to_clipboard(text: &str) -> bool {
     let _ = out.write_all(&bytes);
     let _ = out.flush();
     false
+}
+
+/// Where `App::copy_where_pasted` put a copy.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CopyLanding {
+    /// Queued home over the drop relay, to the machine the user types at.
+    /// The relay sends no word back on whether that clipboard took it, so
+    /// the status says it was sent, not that it landed.
+    Local,
+    /// This machine's clipboard.
+    Clipboard,
+    /// Only an OSC 52 sequence, which the host terminal may ignore.
+    Osc52,
+}
+
+impl CopyLanding {
+    /// The status line for copying `what`, saying honestly where it went.
+    fn status(self, what: &str) -> String {
+        match self {
+            CopyLanding::Local => format!("Sent {what} to the local clipboard"),
+            CopyLanding::Clipboard => format!("Copied {what} to clipboard"),
+            CopyLanding::Osc52 => format!("Copied {what} via OSC 52 (the host terminal decides)"),
+        }
+    }
 }
 
 /// Returns true if the given key event should copy the editor's current
