@@ -520,38 +520,88 @@ fn cargo_tasks(root: &Path) -> Vec<Task> {
 }
 
 fn pyproject_tasks(root: &Path) -> Vec<Task> {
+    let uv_on_path = std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|p| p.join("uv").is_file()));
+    pyproject_tasks_on(root, uv_on_path)
+}
+
+/// Tasks for a `pyproject.toml`: its scripts and, when it mentions pytest,
+/// pytest, run the way the project runs things (#1296). The runner comes
+/// from what the project has, as `package_json_tasks` picks one from the
+/// lockfile: `uv.lock` means uv, Poetry's lock or table means Poetry, PDM's
+/// means PDM, then a project venv, then uv only when it is installed. A
+/// Poetry project under `uv run` fails with "No `project` table found", and
+/// a machine without uv fails every task.
+fn pyproject_tasks_on(root: &Path, uv_on_path: bool) -> Vec<Task> {
     let Some(text) = read_first(root, &["pyproject.toml"]) else {
         return Vec::new();
     };
-    let mut out = Vec::new();
-    if let Ok(v) = text.parse::<toml::Table>()
-        && let Some(scripts) = v
-            .get("project")
-            .and_then(|p| p.get("scripts"))
-            .and_then(|s| s.as_table())
+    let table = text.parse::<toml::Table>().unwrap_or_default();
+    let tool = |name: &str| table.get("tool").and_then(|t| t.get(name));
+    let venv = [".venv", "venv"]
+        .into_iter()
+        .find(|v| root.join(v).join("bin/python").is_file());
+    // (prefix for a script, the pytest command)
+    let (script_prefix, pytest) = if root.join("uv.lock").exists() {
+        (String::from("uv run "), String::from("uv run pytest"))
+    } else if root.join("poetry.lock").exists() || tool("poetry").is_some() {
+        (
+            String::from("poetry run "),
+            String::from("poetry run pytest"),
+        )
+    } else if root.join("pdm.lock").exists() || tool("pdm").is_some() {
+        (String::from("pdm run "), String::from("pdm run pytest"))
+    } else if let Some(venv) = venv {
+        (
+            format!("{venv}/bin/"),
+            format!("{venv}/bin/python -m pytest"),
+        )
+    } else if uv_on_path {
+        (String::from("uv run "), String::from("uv run pytest"))
+    } else {
+        (String::new(), String::from("python3 -m pytest"))
+    };
+    let script_tables = [
+        table.get("project").and_then(|p| p.get("scripts")),
+        tool("poetry").and_then(|p| p.get("scripts")),
+        tool("pdm").and_then(|p| p.get("scripts")),
+    ];
+    let mut names: Vec<&String> = Vec::new();
+    for scripts in script_tables
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.as_table())
     {
         for name in scripts.keys() {
-            out.push(Task {
-                label: format!("uv run {name}"),
-                command: format!("uv run {name}"),
-                source: "pyproject.toml".to_string(),
-                is_build: false,
-                is_default: false,
-                problem_matcher: None,
-                vscode: None,
-            });
+            if !names.contains(&name) {
+                names.push(name);
+            }
         }
     }
+    let task = |command: String| Task {
+        label: command.clone(),
+        command,
+        source: "pyproject.toml".to_string(),
+        is_build: false,
+        is_default: false,
+        problem_matcher: None,
+        vscode: None,
+    };
+    let mut out: Vec<Task> = names
+        .into_iter()
+        .map(|name| {
+            // A quoted TOML key can hold shell syntax; the terminal runs this
+            // line, so the name goes in as one word.
+            let word = if needs_quote(name) {
+                quote_word(name)
+            } else {
+                name.clone()
+            };
+            task(format!("{script_prefix}{word}"))
+        })
+        .collect();
     if text.contains("pytest") {
-        out.push(Task {
-            label: "uv run pytest".to_string(),
-            command: "uv run pytest".to_string(),
-            source: "pyproject.toml".to_string(),
-            is_build: false,
-            is_default: false,
-            problem_matcher: None,
-            vscode: None,
-        });
+        out.push(task(pytest));
     }
     out
 }
@@ -1015,9 +1065,124 @@ mod tests {
             "[project]\nname = \"x\"\nversion = \"0\"\ndependencies = [\"pytest\"]\n\n[project.scripts]\nserve = \"x.main:run\"\n",
         )
         .unwrap();
-        let cmds = commands(tmp.path());
-        assert!(cmds.contains(&"uv run serve".to_string()), "{cmds:?}");
-        assert!(cmds.contains(&"uv run pytest".to_string()), "{cmds:?}");
+        let cmds = py_commands(tmp.path(), true);
+        assert_eq!(cmds, ["uv run serve", "uv run pytest"]);
+        // A uv.lock means uv whether or not this PATH has it.
+        std::fs::write(tmp.path().join("uv.lock"), "").unwrap();
+        assert_eq!(
+            py_commands(tmp.path(), false),
+            ["uv run serve", "uv run pytest"]
+        );
+    }
+
+    fn py_commands(root: &Path, uv_on_path: bool) -> Vec<String> {
+        pyproject_tasks_on(root, uv_on_path)
+            .into_iter()
+            .map(|t| {
+                assert_eq!(t.label, t.command);
+                t.command
+            })
+            .collect()
+    }
+
+    /// A script key with shell syntax in it runs as one quoted word, never
+    /// as a second command.
+    #[test]
+    fn a_script_name_with_shell_syntax_is_quoted() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\n\n[project.scripts]\n\"a; touch pwned\" = \"x:a\"\nserve = \"x:run\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            py_commands(tmp.path(), true),
+            ["uv run 'a; touch pwned'", "uv run serve"]
+        );
+    }
+
+    const POETRY_PYPROJECT: &str = "[tool.poetry]\nname = \"calc\"\nversion = \"0.1.0\"\n\n[tool.poetry.group.dev.dependencies]\npytest = \"^8\"\n\n[tool.poetry.scripts]\ncalc = \"calc:main\"\n";
+
+    /// A Poetry project runs its tasks through Poetry, and its
+    /// `[tool.poetry.scripts]` are listed (#1296).
+    #[test]
+    fn a_poetry_project_runs_tasks_through_poetry() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("pyproject.toml"), POETRY_PYPROJECT).unwrap();
+        assert_eq!(
+            py_commands(tmp.path(), true),
+            ["poetry run calc", "poetry run pytest"]
+        );
+        // A poetry.lock says the same for a PEP 621 `[project]` table.
+        let pep621 = tempfile::tempdir().unwrap();
+        std::fs::write(
+            pep621.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\n\n[project.scripts]\nserve = \"x:run\"\n\n[dependency-groups]\ndev = [\"pytest\"]\n",
+        )
+        .unwrap();
+        std::fs::write(pep621.path().join("poetry.lock"), "").unwrap();
+        assert_eq!(
+            py_commands(pep621.path(), true),
+            ["poetry run serve", "poetry run pytest"]
+        );
+    }
+
+    #[test]
+    fn a_pdm_project_runs_tasks_through_pdm() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\n\n[tool.pdm.scripts]\nlint = \"ruff check .\"\n\n[tool.pdm.dev-dependencies]\ntest = [\"pytest\"]\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("pdm.lock"), "").unwrap();
+        assert_eq!(
+            py_commands(tmp.path(), true),
+            ["pdm run lint", "pdm run pytest"]
+        );
+    }
+
+    /// With no lockfile, a project venv runs pytest and the scripts it
+    /// installed, the way the Testing view already runs pytest.
+    #[test]
+    fn a_plain_venv_project_runs_tasks_through_its_venv() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            POETRY_PYPROJECT
+                .replace("[tool.poetry]", "[tool.other]")
+                .replace("tool.poetry.", "project."),
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join(".venv/bin")).unwrap();
+        std::fs::write(tmp.path().join(".venv/bin/python"), "").unwrap();
+        assert_eq!(
+            py_commands(tmp.path(), true),
+            [".venv/bin/calc", ".venv/bin/python -m pytest"]
+        );
+    }
+
+    /// Negative: with no lockfile, no venv and no uv on PATH, nothing says
+    /// `uv`, which would only fail with "uv: command not found".
+    #[test]
+    fn without_a_runner_or_uv_python_tasks_do_not_use_uv() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\ndependencies = [\"pytest\"]\n\n[project.scripts]\nserve = \"x:run\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            py_commands(tmp.path(), false),
+            ["serve", "python3 -m pytest"]
+        );
+        // And a project that never mentions pytest gets no pytest task.
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\n",
+        )
+        .unwrap();
+        assert!(py_commands(tmp.path(), true).is_empty());
     }
 
     #[test]

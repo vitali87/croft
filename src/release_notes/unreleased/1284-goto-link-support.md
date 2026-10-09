@@ -1,0 +1,1 @@
+fix: Go to Definition, Declaration, Type Definition and Implementations land on the symbol's name instead of the first character of its declaration: croft now declares `linkSupport`, so TypeScript/JavaScript servers send the name's position (F12 on a destructured export no longer jumps lines above it).

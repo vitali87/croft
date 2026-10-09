@@ -121,3 +121,29 @@ impl InstallSession {
         self.adopted.take()
     }
 }
+
+#[cfg(test)]
+impl InstallSession {
+    /// A session whose installer has already reported `events` and runs
+    /// nothing, so a test can drive the App's handling of them without ssh.
+    pub fn with_events(
+        host: &str,
+        path: Option<String>,
+        adopted: Option<AdoptedMaster>,
+        events: Vec<InstallEvent>,
+    ) -> Self {
+        let (tx, events_rx) = channel();
+        for ev in events {
+            let _ = tx.send(ev);
+        }
+        let (fallback_answer_tx, _) = channel();
+        Self {
+            host: host.to_string(),
+            path,
+            adopted,
+            events_rx,
+            fallback_answer_tx,
+            _handle: None,
+        }
+    }
+}

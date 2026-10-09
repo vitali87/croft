@@ -27,7 +27,6 @@ A handful of chords have no `Ctrl` form, or one a legacy terminal cannot send, b
 | `Cmd`+`C` / `Cmd`+`W` copy the selection / close the active terminal, in the terminal pane | `Ctrl`+`C` and `Ctrl`+`W` go to the shell (interrupt, delete a word) | `Ctrl`+`Shift`+`C` / `Ctrl`+`Shift`+`W` |
 | `Cmd`+`T` split terminal | `Ctrl`+`T` belongs to the shell and the editor | `Ctrl`+`Shift`+`T` |
 | `Cmd`+`F12` go to implementations | `Ctrl`+`F12` is Go to Type Definition | Command Palette "Go to Implementations" |
-| `Cmd`+`Z` jump to a directory with zoxide, in the Explorer | `Ctrl`+`Z` is the terminal's suspend key, kept out of the Explorer | Command Palette "Explorer: Jump to Directory (zoxide)" |
 | `Cmd`+`Enter` run the Markdown code block under the caret | `Ctrl`+`Enter` runs it too where the terminal reports it (the kitty keyboard protocol, tmux `extended-keys`), but a legacy terminal sends it as a bare `Enter` | Command Palette "Markdown: Run Code Block at Cursor" |
 | `Cmd`+`A` select all, in the editor | `Ctrl`+`A` is line start there, as in the shell | Command Palette "Select All" |
 | `Cmd`+`E` toggle vim mode | `Ctrl`+`E` is end of line, in the editor as in the shell | Command Palette "Toggle Vim Mode" |
