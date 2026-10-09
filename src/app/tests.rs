@@ -26438,6 +26438,27 @@ fn a_test_run_saves_the_unsaved_buffer_first() {
     assert_eq!(app.status, "Running test parse::run");
 }
 
+/// #1639: a rust-analyzer "Run Test" code lens is a task too, and saves
+/// first: cargo builds the file on disk.
+#[test]
+fn a_code_lens_test_run_saves_the_unsaved_buffer_first() {
+    let (tmp, mut app, file) = app_with_unsaved_pinned_file("lib.rs");
+    let mut lens = lens_at(0, "new", "Run Test", "rust-analyzer.runSingle");
+    lens.arguments = vec![serde_json::json!({
+        "label": "test tests::it_works",
+        "kind": "cargo",
+        "args": {
+            "cwd": tmp.path().canonicalize().unwrap(),
+            "cargoArgs": ["test", "--lib"],
+            "executableArgs": ["tests::it_works", "--exact"]
+        }
+    })];
+    app.editor.code_lenses = vec![lens];
+    app.run_code_lens(0);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    assert_eq!(app.status, "Running test tests::it_works");
+}
+
 /// #1639 negative: with nothing unsaved, a task writes nothing and says
 /// nothing about saving; a workspace with no test runner saves nothing.
 #[test]
@@ -63929,6 +63950,56 @@ fn a_run_asked_for_mid_run_does_not_take_over_the_first_runs_outcome() {
         "{}",
         s.app.status
     );
+}
+
+/// #1639: a test run started with saving turned off shows the unsaved
+/// file's warning in front of its "Running …" status, and its outcome
+/// still replaces that status when it ends.
+#[cfg(unix)]
+#[test]
+fn a_test_run_started_with_the_unsaved_warning_still_reports_its_outcome() {
+    let mut s = CodeqlStandIn::new();
+    s.will(STAND_IN_PASS, 0);
+    let file = PathBuf::from(&s.root).join("test/Find/Find.ql");
+    std::fs::write(&file, "old\n").unwrap();
+    s.app.editor.open_pinned(&file).unwrap();
+    s.app.editor.insert_str("new\n");
+    s.app.save_before_debug = false;
+    s.app.run_named_test(String::from("Find.qlref"));
+    assert_eq!(
+        s.app.status,
+        "Find.ql has unsaved changes: the test run uses the file on disk - Running test test/Find::Find.qlref"
+    );
+    s.finish();
+    assert!(
+        s.app.status.starts_with("Find.qlref passed ("),
+        "{}",
+        s.app.status
+    );
+}
+
+/// #1639: with a watched scope, the save a test run makes before it
+/// starts schedules no second, watched run after it.
+#[cfg(unix)]
+#[test]
+fn the_save_before_a_test_run_schedules_no_watched_rerun() {
+    let mut s = CodeqlStandIn::new();
+    s.will(STAND_IN_PASS, 0);
+    s.app
+        .testing
+        .watch
+        .toggle(crate::testing::watch::WatchScope::All);
+    let file = PathBuf::from(&s.root).join("test/Find/Find.ql");
+    assert!(file.starts_with(&s.app.active_test_root));
+    std::fs::write(&file, "old\n").unwrap();
+    s.app.editor.open_pinned(&file).unwrap();
+    s.app.editor.insert_str("new\n");
+    s.app.run_named_test(String::from("Find.qlref"));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    assert_eq!(s.app.testing.watch.due_at(), None);
+    s.finish();
+    assert!(!s.app.testing.is_busy());
+    assert_eq!(s.app.testing.watch.due_at(), None);
 }
 
 /// #856 guard: a coverage run that never ran (CodeQL tests have no source

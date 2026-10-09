@@ -24029,7 +24029,7 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
-        self.run_with_unsaved_saved("the test run", |app| {
+        self.test_run_with_unsaved_saved(|app| {
             app.test_worker.run_coverage();
             app.set_sidebar_view(SidebarView::Testing);
             app.status = String::from("Running tests with coverage");
@@ -24439,7 +24439,7 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
-        self.run_with_unsaved_saved("the test run", |app| {
+        self.test_run_with_unsaved_saved(|app| {
             app.test_worker.run_all();
             app.set_sidebar_view(SidebarView::Testing);
         });
@@ -24451,7 +24451,7 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
-        self.run_with_unsaved_saved("the test run", |app| {
+        self.test_run_with_unsaved_saved(|app| {
             app.testing.start_single(&name);
             app.test_worker.run_one(name);
             app.set_sidebar_view(SidebarView::Testing);
@@ -24479,7 +24479,7 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
-        self.run_with_unsaved_saved("the test run", |app| {
+        self.test_run_with_unsaved_saved(|app| {
             app.testing
                 .start_filter(&crate::testing::suite_pattern(&suite));
             app.test_worker.run_suite(suite);
@@ -24508,7 +24508,7 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
-        self.run_with_unsaved_saved("the test run", |app| app.run_named_test_now(name));
+        self.test_run_with_unsaved_saved(|app| app.run_named_test_now(name));
     }
 
     fn run_named_test_now(&mut self, name: String) {
@@ -24588,9 +24588,7 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
-        self.run_with_unsaved_saved("the test run", |app| {
-            app.run_test_at_cursor_with_coverage_now(name)
-        });
+        self.test_run_with_unsaved_saved(|app| app.run_test_at_cursor_with_coverage_now(name));
     }
 
     fn run_test_at_cursor_with_coverage_now(&mut self, name: String) {
@@ -24621,9 +24619,7 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
-        self.run_with_unsaved_saved("the test run", |app| {
-            app.run_scope_with_coverage_now(name, suite)
-        });
+        self.test_run_with_unsaved_saved(|app| app.run_scope_with_coverage_now(name, suite));
     }
 
     fn run_scope_with_coverage_now(&mut self, name: String, suite: bool) {
@@ -31063,11 +31059,35 @@ impl App {
             [] => unreachable!("checked above"),
         };
         let warning = format!("{names} {verb} unsaved changes: {what} uses the file on disk");
-        self.status = if self.status.is_empty() {
+        let running = std::mem::take(&mut self.status);
+        self.status = if running.is_empty() {
             warning
         } else {
-            format!("{warning} - {}", self.status)
+            format!("{warning} - {running}")
         };
+        // The run registered its "Running …" status for its outcome to
+        // replace; that status now carries the warning, so the tracked text
+        // follows it, or the outcome would never land.
+        let tracked = self
+            .test_run_status
+            .iter_mut()
+            .chain(self.pane_run_statuses.iter_mut().map(|(_, run)| run));
+        for run in tracked {
+            if run.shown == running {
+                run.shown = self.status.clone();
+            }
+        }
+    }
+
+    /// [`Self::run_with_unsaved_saved`] for a Testing run: the saves it
+    /// makes are for this run, so a watched scope does not also hear
+    /// about them and rerun after it.
+    fn test_run_with_unsaved_saved(&mut self, launch: impl FnOnce(&mut Self)) {
+        let due = self.testing.watch.due_at();
+        self.run_with_unsaved_saved("the test run", |app| {
+            app.testing.watch.set_due_at(due);
+            launch(app);
+        });
     }
 
     /// File names of the editors with unsaved edits, deduped, the active
@@ -58428,7 +58448,7 @@ impl App {
                 }
             }
             crate::code_lens::LensAction::RunInTerminal { label, command } => {
-                self.run_project_task(crate::tasks::Task {
+                self.start_project_task(crate::tasks::Task {
                     label,
                     command,
                     source: String::from("code lens"),
