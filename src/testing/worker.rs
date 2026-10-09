@@ -284,6 +284,11 @@ impl TestWorker {
             self.root = root.clone();
         }
         self.expected_epoch += 1;
+        // Every request a pending cancel covers was sent before this
+        // re-root, so its end carries the old epoch and is dropped below:
+        // the cancel must not outlive it and swallow the new root's next
+        // verdict.
+        self.cancel_pending = false;
         self.send(TestRequest::SetRoot(root));
     }
 
@@ -313,6 +318,9 @@ impl TestWorker {
                 }
                 TestResponse::Finished { ok } => panel.on_finished(ok),
                 TestResponse::Refused => panel.on_refused(),
+                // A cancelled coverage run's killed child wrote no report:
+                // that error is not news, and would overwrite the cancel.
+                TestResponse::Coverage(_) if self.cancel_pending => continue,
                 TestResponse::Coverage(result) => panel.on_coverage(result),
             }
             changed = true;
@@ -1998,6 +2006,43 @@ mod tests {
         .unwrap();
         assert!(w.drain(&mut panel));
         assert!(!panel.is_empty());
+    }
+
+    /// #1534: a cancel whose run's end is dropped as stale by a re-root
+    /// does not carry over to the new root's next run.
+    #[test]
+    fn a_cancel_dropped_by_a_re_root_does_not_cancel_the_next_run() {
+        let (mut w, tx) = TestWorker::for_test();
+        let mut panel = TestingPanel::new();
+        w.cancel();
+        w.set_root(PathBuf::from("/new"));
+        tx.send((0, TestResponse::Finished { ok: None })).unwrap();
+        tx.send((1, TestResponse::Started(Activity::Running)))
+            .unwrap();
+        tx.send((1, TestResponse::Finished { ok: Some(true) }))
+            .unwrap();
+        w.drain(&mut panel);
+        assert!(!panel.take_cancelled(), "the new run is not cancelled");
+        assert_eq!(panel.take_finished(), Some(Some(true)));
+    }
+
+    /// #1534: a cancelled coverage run's missing report does not replace
+    /// the cancel with a coverage error.
+    #[test]
+    fn a_cancelled_coverage_run_reports_no_coverage_error() {
+        let (mut w, tx) = TestWorker::for_test();
+        let mut panel = TestingPanel::new();
+        tx.send((0, TestResponse::Started(Activity::Running)))
+            .unwrap();
+        w.drain(&mut panel);
+        w.cancel();
+        tx.send((0, TestResponse::Coverage(Err(CoverageError::NoReport))))
+            .unwrap();
+        tx.send((0, TestResponse::Finished { ok: Some(false) }))
+            .unwrap();
+        w.drain(&mut panel);
+        assert!(panel.take_cancelled());
+        assert!(panel.take_coverage_error().is_none());
     }
 
     #[test]
