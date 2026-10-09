@@ -239,6 +239,8 @@ pub struct SnippetSet {
     /// What could not be loaded: the file itself, or one entry by name. The
     /// rest still loads (#1483).
     warnings: Vec<String>,
+    /// The file did not parse at all, so nothing was loaded from it (#1191).
+    broken: bool,
 }
 
 /// The on-disk value shape: `prefix` is a string or an array of them (VS Code
@@ -303,24 +305,37 @@ impl SnippetSet {
         Self::from_json(&json)
     }
 
-    /// Entry by entry, so one snippet croft cannot read is skipped and named
-    /// in [`warnings`](Self::warnings) instead of taking every other snippet
-    /// with it (#1483).
     pub fn from_json(json: &str) -> Self {
-        let stripped = crate::keymap::strip_line_comments(json);
+        Self::parse(json).0
+    }
+
+    /// The snippets in `json`, read as JSONC like VS Code's snippet files
+    /// and croft's settings (comments and trailing commas, #1191), entry by
+    /// entry, so one snippet croft cannot read is skipped and named in
+    /// [`warnings`](Self::warnings) instead of taking every other snippet
+    /// with it (#1483). The second half is why none were loaded when the
+    /// file does not parse at all; it is in the warnings too.
+    pub fn parse(json: &str) -> (Self, Option<String>) {
+        let stripped = crate::tasks::strip_jsonc(json);
         if stripped.trim().is_empty() {
-            return Self::default();
+            return (Self::default(), None);
         }
-        let entries: serde_json::Map<String, serde_json::Value> =
-            match serde_json::from_str(&stripped) {
-                Ok(entries) => entries,
-                Err(e) => {
-                    return Self {
-                        snippets: Vec::new(),
-                        warnings: vec![format!("snippets.json could not be read: {e}")],
-                    };
-                }
-            };
+        let entries: serde_json::Map<String, serde_json::Value> = match serde_json::from_str(
+            &stripped,
+        ) {
+            Ok(entries) => entries,
+            Err(e) => {
+                let why = format!(
+                    "snippets.json could not be read: the file does not parse ({e}); NO snippets were loaded from it"
+                );
+                let set = Self {
+                    snippets: Vec::new(),
+                    warnings: vec![why.clone()],
+                    broken: true,
+                };
+                return (set, Some(why));
+            }
+        };
         let mut snippets = Vec::new();
         let mut warnings = Vec::new();
         for (name, value) in entries {
@@ -352,7 +367,12 @@ impl SnippetSet {
                 });
             }
         }
-        Self { snippets, warnings }
+        let set = Self {
+            snippets,
+            warnings,
+            broken: false,
+        };
+        (set, None)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -362,6 +382,11 @@ impl SnippetSet {
     /// What could not be loaded, one line each, for OUTPUT · Snippets.
     pub fn warnings(&self) -> &[String] {
         &self.warnings
+    }
+
+    /// Whether the file did not parse at all, so nothing was loaded (#1191).
+    pub fn is_broken(&self) -> bool {
+        self.broken
     }
 
     /// Snippets in `language` whose prefix begins with `word` (case-sensitive,
@@ -413,6 +438,42 @@ pub const TEMPLATE: &str = r#"// croft user snippets. Keyed by name; each has a 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snippets_with_a_trailing_comma_or_block_comment_still_load() {
+        // #1191: VS Code's snippet files are JSONC, and a pasted one has both.
+        let set = SnippetSet::from_json(
+            "{\n  /* logging */\n  \"log\": { \"prefix\": \"log\", \"body\": \"console.log($1);\" },\n  \"todo\": { \"prefix\": \"todo\", \"body\": [\"// TODO: $1\",], },\n}\n",
+        );
+        assert_eq!(set.matching("log", "javascript").len(), 1);
+        let todo = set.matching("todo", "javascript");
+        assert_eq!(todo.len(), 1);
+        assert_eq!(
+            todo[0].body, "// TODO: $1",
+            "a comment marker inside a string stays"
+        );
+    }
+
+    #[test]
+    fn snippet_bodies_keep_what_only_looks_like_jsonc() {
+        // Negative: commas before a brace and comment markers inside strings
+        // are the snippet's text, not JSONC to strip.
+        let set =
+            SnippetSet::from_json(r#"{"c": {"prefix": "cm", "body": "/* $1 */ f(a, }) // end"}}"#);
+        assert_eq!(set.matching("cm", "c")[0].body, "/* $1 */ f(a, }) // end");
+    }
+
+    #[test]
+    fn a_snippets_file_that_does_not_parse_says_so() {
+        // A file that is broken (not merely JSONC) loads nothing, as before,
+        // but no longer silently: the reason comes back for OUTPUT.
+        let (set, warning) = SnippetSet::parse(r#"{"log": {"prefix": "log" "body": "x"}}"#);
+        assert!(set.matching("log", "javascript").is_empty());
+        let warning = warning.expect("a warning");
+        assert!(warning.contains("does not parse"), "{warning}");
+        let (_, none) = SnippetSet::parse("{}");
+        assert_eq!(none, None, "an empty file is fine");
+    }
 
     #[test]
     fn lsp_snippets_keep_backslashes_nest_placeholders_and_pick_a_choice() {

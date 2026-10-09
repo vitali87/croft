@@ -1,0 +1,1 @@
+fix: A trailing comma or /* */ comment in snippets.json or keybindings.json no longer silently drops every snippet or binding: both files are read as JSONC, and a snippets.json that still does not parse says so in OUTPUT · Snippets.

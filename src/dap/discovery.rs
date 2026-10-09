@@ -18,8 +18,8 @@ use super::remote_attach::{PyVersion, is_python_process};
 /// `--version` flag, understood by every CPython.
 const VERSION_FLAG: &str = "--version";
 /// Cap on the command-line summary shown in the picker so one long argv can't
-/// blow out the row width.
-const CMD_SUMMARY_MAX: usize = 80;
+/// blow out the row width. The picker cuts it again to fit its popup.
+const CMD_SUMMARY_MAX: usize = 160;
 
 /// A running CPython process that can be attached to (>= 3.14).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,18 +111,40 @@ fn interpreter_version(exe: &Path) -> Option<PyVersion> {
 }
 
 /// Collapse a process argv into a single bounded line for display.
+///
+/// The interpreter shows by its file name (#1283): a uv, pyenv or venv path
+/// filled the whole line, so every row read ".../bin/python" and the
+/// arguments that tell processes apart never showed. The row's version
+/// column says which interpreter it is, and [`PyTarget::exe`] keeps the full
+/// path. A line still over the cap loses its middle, marked with `…`, so
+/// the script and its arguments at the end stay.
 fn summarize_cmd(cmd: &[OsString]) -> String {
     let joined = cmd
         .iter()
-        .map(|s| s.to_string_lossy())
+        .enumerate()
+        .map(|(i, s)| match Path::new(s).file_name() {
+            Some(name) if i == 0 => name.to_string_lossy(),
+            _ => s.to_string_lossy(),
+        })
         .collect::<Vec<_>>()
         .join(" ");
-    if joined.chars().count() > CMD_SUMMARY_MAX {
-        // Cut to the cap with no trailing ellipsis marker.
-        joined.chars().take(CMD_SUMMARY_MAX).collect()
-    } else {
-        joined
+    elide_middle(&joined, CMD_SUMMARY_MAX)
+}
+
+/// `s` cut to at most `max` chars by dropping its middle for one `…`,
+/// keeping a third of what fits from the start and the rest from the end.
+pub fn elide_middle(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
     }
+    let keep = max.saturating_sub(1);
+    let head = keep / 3;
+    let tail = keep - head;
+    let mut out: String = chars[..head].iter().collect();
+    out.push('…');
+    out.extend(&chars[chars.len() - tail..]);
+    out
 }
 
 /// Whether `cmd` is a `python -m pdb -p <pid>` attach client, the process an
@@ -237,15 +259,42 @@ mod tests {
         assert_eq!(summarize_cmd(&cmd), "python3.14 app.py --port=8000");
     }
 
+    /// #1283: a uv, pyenv or venv interpreter path alone filled the whole
+    /// summary, so every row read ".../bin/python" and nothing after. The
+    /// interpreter shows by its file name (the version column already says
+    /// which one it is) and the arguments that tell processes apart show.
     #[test]
-    fn summarize_truncates_overlong_argv_plainly() {
-        let long = "x".repeat(200);
-        let cmd = vec![OsString::from(long)];
+    fn summarize_names_the_interpreter_by_file_name_and_keeps_the_arguments() {
+        let cmd = argv(&[
+            "/root/.local/share/uv/python/cpython-3.14.0-linux-x86_64-gnu/bin/python3.14",
+            "-m",
+            "http.server",
+            "8766",
+        ]);
+        assert_eq!(summarize_cmd(&cmd), "python3.14 -m http.server 8766");
+    }
+
+    /// #1283: an argv still too long for the cap loses its middle, marked
+    /// with an ellipsis, and keeps its end, where the script and its
+    /// arguments are.
+    #[test]
+    fn summarize_cuts_an_overlong_argv_in_the_middle_and_keeps_its_end() {
+        let long = "x".repeat(300);
+        let cmd = argv(&["python3", "worker.py", &long, "--queue", "emails"]);
         let out = summarize_cmd(&cmd);
-        // Cut to the cap with no trailing ellipsis marker.
-        assert!(out.chars().count() <= CMD_SUMMARY_MAX);
-        assert!(!out.contains('…'));
-        assert!(out.chars().all(|c| c == 'x'));
+        assert_eq!(out.chars().count(), CMD_SUMMARY_MAX);
+        assert!(out.starts_with("python3 worker.py x"), "{out}");
+        assert!(out.ends_with("x --queue emails"), "{out}");
+        assert_eq!(out.matches('…').count(), 1, "{out}");
+    }
+
+    /// #1283 negative: a short command shows unchanged, with no ellipsis,
+    /// and a bare interpreter name is left alone.
+    #[test]
+    fn summarize_leaves_a_short_command_whole() {
+        let cmd = argv(&["python3", "manage.py", "runserver"]);
+        assert_eq!(summarize_cmd(&cmd), "python3 manage.py runserver");
+        assert_eq!(summarize_cmd(&argv(&["python3.14"])), "python3.14");
     }
 
     #[test]
