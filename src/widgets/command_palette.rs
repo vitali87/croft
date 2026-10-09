@@ -58,9 +58,14 @@ pub enum Command {
     DebugClearWatch,
     PeekDefinition,
     PeekReferences,
+    GoToDefinition,
+    GoToReferences,
+    GoToDeclaration,
+    GoToTypeDefinition,
     /// Go to Implementations (#843): Cmd+F12, which has no `Ctrl` form
     /// (`Ctrl+F12` is Go to Type Definition).
     GoToImplementations,
+    RenameSymbol,
     MouseAddCursorAtClick,
     MouseGoToDefinitionAtClick,
     MouseOpenLinkAtClick,
@@ -68,6 +73,9 @@ pub enum Command {
     StageHunk,
     UnstageHunk,
     RevertHunk,
+    /// Git: Undo Last Commit (#1350): `reset --soft HEAD~1`, its message
+    /// back in the Source Control box.
+    GitUndoLastCommit,
     AddCursorAbove,
     AddCursorBelow,
     AddSelectionToNextMatch,
@@ -317,6 +325,9 @@ pub enum Command {
     ProblemsToggleScope,
     DiffToggleIgnoreWhitespace,
     NewTerminal,
+    /// Terminal: Run Selected Text in Active Terminal (#1292): the
+    /// editor's selection, or the caret's line, run in the active pane.
+    RunSelectedText,
     /// Terminal: Focus Next / Previous Terminal (#843): Cmd+] / Cmd+[, which
     /// have no `Ctrl` form (`Ctrl+[` is `Esc`).
     FocusNextTerminal,
@@ -347,6 +358,9 @@ pub enum Command {
     OpenSearchEditor,
     RerunSearchEditor,
     RebaseAbort,
+    GitContinueOperation,
+    GitSkipOperation,
+    GitAbortOperation,
     ToggleTerminalSuggestions,
     ToggleScreenReader,
     OpenKeyboardShortcuts,
@@ -503,7 +517,12 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::DebugClearWatch,
     Command::PeekDefinition,
     Command::PeekReferences,
+    Command::GoToDefinition,
+    Command::GoToReferences,
+    Command::GoToDeclaration,
+    Command::GoToTypeDefinition,
     Command::GoToImplementations,
+    Command::RenameSymbol,
     Command::MouseAddCursorAtClick,
     Command::MouseGoToDefinitionAtClick,
     Command::MouseOpenLinkAtClick,
@@ -511,6 +530,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::StageHunk,
     Command::UnstageHunk,
     Command::RevertHunk,
+    Command::GitUndoLastCommit,
     Command::AddCursorAbove,
     Command::AddCursorBelow,
     Command::AddSelectionToNextMatch,
@@ -723,6 +743,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ProblemsToggleScope,
     Command::DiffToggleIgnoreWhitespace,
     Command::NewTerminal,
+    Command::RunSelectedText,
     Command::FocusNextTerminal,
     Command::FocusPreviousTerminal,
     Command::StartDebugging,
@@ -750,6 +771,9 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::OpenSearchEditor,
     Command::RerunSearchEditor,
     Command::RebaseAbort,
+    Command::GitContinueOperation,
+    Command::GitSkipOperation,
+    Command::GitAbortOperation,
     Command::ToggleTerminalSuggestions,
     Command::ToggleScreenReader,
     Command::OpenKeyboardShortcuts,
@@ -886,7 +910,12 @@ impl Command {
             Command::DebugClearWatch => "Debug: Remove All Watch Expressions",
             Command::PeekDefinition => "Peek Definition",
             Command::PeekReferences => "Peek References",
+            Command::GoToDefinition => "Go to Definition",
+            Command::GoToReferences => "Go to References",
+            Command::GoToDeclaration => "Go to Declaration",
+            Command::GoToTypeDefinition => "Go to Type Definition",
             Command::GoToImplementations => "Go to Implementations",
+            Command::RenameSymbol => "Rename Symbol",
             Command::MouseAddCursorAtClick => "Mouse: Add Cursor at Click",
             Command::MouseGoToDefinitionAtClick => "Mouse: Go to Definition at Click",
             Command::MouseOpenLinkAtClick => "Mouse: Open Link at Click",
@@ -894,6 +923,7 @@ impl Command {
             Command::StageHunk => "Git: Stage Hunk",
             Command::UnstageHunk => "Git: Unstage Hunk",
             Command::RevertHunk => "Git: Revert Hunk",
+            Command::GitUndoLastCommit => "Git: Undo Last Commit",
             Command::AddCursorAbove => "Add Cursor Above",
             Command::AddCursorBelow => "Add Cursor Below",
             Command::AddSelectionToNextMatch => "Add Selection to Next Find Match",
@@ -1110,6 +1140,7 @@ impl Command {
             Command::ProblemsToggleScope => "Problems: Toggle Scope (Open Files / Whole Project)",
             Command::DiffToggleIgnoreWhitespace => "Diff: Toggle Ignore Whitespace",
             Command::NewTerminal => "Terminal: Create New Terminal",
+            Command::RunSelectedText => "Terminal: Run Selected Text in Active Terminal",
             Command::FocusNextTerminal => "Terminal: Focus Next Terminal",
             Command::FocusPreviousTerminal => "Terminal: Focus Previous Terminal",
             Command::StartDebugging => "Debug: Start Debugging",
@@ -1137,6 +1168,9 @@ impl Command {
             Command::OpenSearchEditor => "Search: Open Results in Editor",
             Command::RerunSearchEditor => "Search Editor: Rerun",
             Command::RebaseAbort => "Rebase: Abort",
+            Command::GitContinueOperation => "Git: Continue Rebase, Cherry-Pick or Revert",
+            Command::GitSkipOperation => "Git: Skip Commit (Rebase, Cherry-Pick or Revert)",
+            Command::GitAbortOperation => "Git: Abort Merge, Rebase, Cherry-Pick, Revert or Bisect",
             Command::ToggleTerminalSuggestions => "Terminal: Toggle Command Suggestions",
             Command::ToggleScreenReader => "Accessibility: Toggle Screen Reader Mode",
             Command::OpenKeyboardShortcuts => "Preferences: Open Keyboard Shortcuts",
@@ -1280,7 +1314,12 @@ impl Command {
             Command::DebugClearWatch => "",
             Command::PeekDefinition => "Alt+F12",
             Command::PeekReferences => "Alt+Shift+F12",
+            Command::GoToDefinition => "F12",
+            Command::GoToReferences => "Shift+F12",
+            Command::GoToDeclaration => "Ctrl+Shift+F12",
+            Command::GoToTypeDefinition => "Ctrl+F12",
             Command::GoToImplementations => "Cmd+F12",
+            Command::RenameSymbol => "F2",
             Command::MouseAddCursorAtClick => "",
             Command::MouseGoToDefinitionAtClick => "",
             Command::MouseOpenLinkAtClick => "",
@@ -1288,6 +1327,7 @@ impl Command {
             Command::StageHunk => "S in diff",
             Command::UnstageHunk => "U in diff",
             Command::RevertHunk => "R in diff",
+            Command::GitUndoLastCommit => "",
             Command::AddCursorAbove => "Cmd+Opt+↑",
             Command::AddCursorBelow => "Cmd+Opt+↓",
             Command::AddSelectionToNextMatch => "Cmd+D",
@@ -1498,6 +1538,7 @@ impl Command {
             Command::ProblemsToggleScope => "",
             Command::DiffToggleIgnoreWhitespace => "",
             Command::NewTerminal => "Cmd+T",
+            Command::RunSelectedText => "",
             Command::FocusNextTerminal => "Cmd+]",
             Command::FocusPreviousTerminal => "Cmd+[",
             Command::KeyboardShortcuts => "F1",
@@ -1528,6 +1569,9 @@ impl Command {
             Command::OpenSearchEditor => "Cmd+K Shift+F",
             Command::RerunSearchEditor => "Cmd+K Shift+R",
             Command::RebaseAbort => "",
+            Command::GitContinueOperation => "",
+            Command::GitSkipOperation => "",
+            Command::GitAbortOperation => "",
             Command::ToggleTerminalSuggestions => "",
             Command::ToggleScreenReader => "",
             Command::OpenKeyboardShortcuts => "Cmd+K Cmd+S",
@@ -1652,7 +1696,12 @@ impl Command {
             Command::DebugClearWatch => "debug_clear_watch",
             Command::PeekDefinition => "peek_definition",
             Command::PeekReferences => "peek_references",
+            Command::GoToDefinition => "go_to_definition",
+            Command::GoToReferences => "go_to_references",
+            Command::GoToDeclaration => "go_to_declaration",
+            Command::GoToTypeDefinition => "go_to_type_definition",
             Command::GoToImplementations => "go_to_implementations",
+            Command::RenameSymbol => "rename_symbol",
             Command::MouseAddCursorAtClick => "mouse_add_cursor_at_click",
             Command::MouseGoToDefinitionAtClick => "mouse_go_to_definition_at_click",
             Command::MouseOpenLinkAtClick => "mouse_open_link_at_click",
@@ -1660,6 +1709,7 @@ impl Command {
             Command::StageHunk => "stage_hunk",
             Command::UnstageHunk => "unstage_hunk",
             Command::RevertHunk => "revert_hunk",
+            Command::GitUndoLastCommit => "git_undo_last_commit",
             Command::AddCursorAbove => "add_cursor_above",
             Command::AddCursorBelow => "add_cursor_below",
             Command::AddSelectionToNextMatch => "add_selection_to_next_match",
@@ -1872,6 +1922,7 @@ impl Command {
             Command::ProblemsToggleScope => "problems_toggle_scope",
             Command::DiffToggleIgnoreWhitespace => "diff_toggle_ignore_whitespace",
             Command::NewTerminal => "new_terminal",
+            Command::RunSelectedText => "run_selected_text",
             Command::FocusNextTerminal => "focus_next_terminal",
             Command::FocusPreviousTerminal => "focus_previous_terminal",
             Command::StartDebugging => "start_debugging",
@@ -1899,6 +1950,9 @@ impl Command {
             Command::OpenSearchEditor => "open_search_editor",
             Command::RerunSearchEditor => "rerun_search_editor",
             Command::RebaseAbort => "rebase_abort",
+            Command::GitContinueOperation => "git_continue_operation",
+            Command::GitSkipOperation => "git_skip_operation",
+            Command::GitAbortOperation => "git_abort_operation",
             Command::ToggleTerminalSuggestions => "toggle_terminal_suggestions",
             Command::ToggleScreenReader => "toggle_screen_reader",
             Command::OpenKeyboardShortcuts => "open_keyboard_shortcuts",
@@ -2470,6 +2524,77 @@ mod tests {
         let palette = CommandPalette::new();
         assert_eq!(palette.results.len(), ALL_COMMANDS.len());
         assert_eq!(palette.results.first(), Some(&builtin(Command::MoveLineUp)));
+    }
+
+    /// #1212: the caret-driven LSP actions were F-key checks only, so the
+    /// palette could not find them and keybindings.json could not name them.
+    #[test]
+    fn lsp_navigation_and_rename_are_palette_commands() {
+        for (query, title, id, hint) in [
+            (
+                "go to definition",
+                "Go to Definition",
+                "go_to_definition",
+                "F12",
+            ),
+            (
+                "go to references",
+                "Go to References",
+                "go_to_references",
+                "Shift+F12",
+            ),
+            (
+                "go to declaration",
+                "Go to Declaration",
+                "go_to_declaration",
+                "Ctrl+Shift+F12",
+            ),
+            (
+                "type definition",
+                "Go to Type Definition",
+                "go_to_type_definition",
+                "Ctrl+F12",
+            ),
+            (
+                "implementation",
+                "Go to Implementations",
+                "go_to_implementations",
+                "Cmd+F12",
+            ),
+            ("rename symbol", "Rename Symbol", "rename_symbol", "F2"),
+        ] {
+            let mut palette = CommandPalette::new();
+            palette.set_query(query);
+            let found = palette.results.iter().find(|item| item.title() == title);
+            assert!(found.is_some(), "{query:?} should list {title:?}");
+            assert_eq!(found.unwrap().keybinding_hint(), hint, "{title}");
+            let cmd = Command::from_id(id);
+            assert!(cmd.is_some(), "{id:?} should be a command id");
+            assert_eq!(cmd.unwrap().title(), title);
+        }
+    }
+
+    /// The peek and pointer-driven forms keep their own ids and titles; the
+    /// new caret commands sit beside them rather than replacing them.
+    #[test]
+    fn peek_and_mouse_definition_commands_are_unchanged() {
+        for (id, title) in [
+            ("peek_definition", "Peek Definition"),
+            ("peek_references", "Peek References"),
+            (
+                "mouse_go_to_definition_at_click",
+                "Mouse: Go to Definition at Click",
+            ),
+        ] {
+            assert_eq!(Command::from_id(id).map(Command::title), Some(title));
+        }
+        let mut palette = CommandPalette::new();
+        palette.set_query("go to definition");
+        assert!(
+            palette
+                .results
+                .contains(&builtin(Command::MouseGoToDefinitionAtClick))
+        );
     }
 
     #[test]
