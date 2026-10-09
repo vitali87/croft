@@ -43236,8 +43236,8 @@ impl App {
                 KeyCode::Right if alt => self.editor.move_word_right(),
                 KeyCode::Left => self.editor.move_left(),
                 KeyCode::Right => self.editor.move_right(),
-                KeyCode::Home => self.editor.home_line(),
-                KeyCode::End => self.editor.end_line(),
+                KeyCode::Home => self.editor.home_key(),
+                KeyCode::End => self.editor.end_key(),
                 KeyCode::PageUp => self.editor.page_up_one_screen(),
                 KeyCode::PageDown => self.editor.page_down_one_screen(),
                 _ => {}
@@ -43260,8 +43260,8 @@ impl App {
             KeyCode::Right => self.editor.move_right(),
             KeyCode::PageUp => self.editor.page_up_one_screen(),
             KeyCode::PageDown => self.editor.page_down_one_screen(),
-            KeyCode::Home => self.editor.home_line(),
-            KeyCode::End => self.editor.end_line(),
+            KeyCode::Home => self.editor.home_key(),
+            KeyCode::End => self.editor.end_key(),
             KeyCode::Backspace => {
                 self.editor.backspace();
                 self.note_incomplete_completion_edit();

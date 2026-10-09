@@ -11930,14 +11930,60 @@ impl Editor {
         self.last_edit_kind = None;
     }
 
+    /// Start of the logical line (`Ctrl+A`, and Home's second step).
     pub fn home_line(&mut self) {
         self.cursor_col = 0;
         self.last_edit_kind = None;
     }
 
+    /// End of the logical line (`Ctrl+E`, and End's second step).
     pub fn end_line(&mut self) {
         self.cursor_col = self.line_char_len(self.cursor_row);
         self.last_edit_kind = None;
+    }
+
+    /// The Home key. With wrap on (#1569) it first goes to the start of the
+    /// wrapped row the caret is on, as VS Code does, and to the line's start
+    /// from there.
+    pub fn home_key(&mut self) {
+        self.cursor_col = match self.wrapped_row_of_cursor() {
+            // A row can start on a combining mark (the wrap breaks after the
+            // space it sits on), so step back to its cluster's start.
+            Some((start, _)) => match floor_grapheme_col(&self.lines[self.cursor_row], start) {
+                row_start if self.cursor_col > row_start => row_start,
+                _ => 0,
+            },
+            None => 0,
+        };
+        self.last_edit_kind = None;
+    }
+
+    /// The End key. With wrap on (#1569) it first goes to the end of the
+    /// wrapped row the caret is on, before the character the row breaks at
+    /// (the space, usually), since the column after it is drawn on the next
+    /// row; from there, to the line's end.
+    pub fn end_key(&mut self) {
+        let len = self.line_char_len(self.cursor_row);
+        self.cursor_col = match self.wrapped_row_of_cursor() {
+            Some((_, end)) if end < len => {
+                let last = floor_grapheme_col(&self.lines[self.cursor_row], end - 1);
+                if self.cursor_col < last { last } else { len }
+            }
+            _ => len,
+        };
+        self.last_edit_kind = None;
+    }
+
+    /// The `(start, end)` columns of the wrapped row holding the caret, or
+    /// `None` with wrap off.
+    fn wrapped_row_of_cursor(&self) -> Option<(usize, usize)> {
+        if !self.wrap_enabled() {
+            return None;
+        }
+        let width = self.visible_text_width().max(1);
+        let segs = self.line_segments(self.cursor_row, width);
+        let idx = self.segment_index_of_col(self.cursor_row, self.cursor_col, width);
+        segs.get(idx).copied()
     }
 
     /// Scroll an open spreadsheet preview by `rows` (negative scrolls up).
@@ -24272,6 +24318,116 @@ mod tests {
         assert_eq!(e.cursor_col, 0);
         e.end_line();
         assert_eq!(e.cursor_col, 11);
+    }
+
+    /// The issue's paragraph, `Notes: word0 … word59`, wrapped in a 60-column
+    /// pane, with its wrap rows as `(start, end)` columns.
+    fn wrapped_paragraph(wrap: bool) -> (Editor, Vec<(usize, usize)>) {
+        let words: Vec<String> = (0..60).map(|i| format!("word{i}")).collect();
+        let mut e = editor_with(&format!("Notes: {}", words.join(" ")));
+        e.wrap_override = Some(wrap);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 20,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        let segs = e.line_segments(0, e.visible_text_width().max(1));
+        assert!(segs.len() >= 4, "the paragraph wraps: {segs:?}");
+        (e, segs)
+    }
+
+    /// #1569: with wrap on, End went to the end of the whole line from any of
+    /// its rows. Like VS Code it now stops at the end of the caret's row (on
+    /// the space the row broke at), and a second End goes to the line's end.
+    #[test]
+    fn end_in_a_wrapped_line_stops_at_the_end_of_the_row_first() {
+        let (mut e, segs) = wrapped_paragraph(true);
+        let len = e.line_char_len(0);
+        e.cursor_col = segs[1].0;
+        e.end_key();
+        assert_eq!(e.cursor_col, segs[1].1 - 1, "the end of row 2: {segs:?}");
+        assert_eq!(e.lines[0].chars().nth(e.cursor_col), Some(' '));
+        let width = e.visible_text_width();
+        assert_eq!(
+            e.segment_index_of_col(0, e.cursor_col, width),
+            1,
+            "still on row 2"
+        );
+        e.end_key();
+        assert_eq!(
+            e.cursor_col, len,
+            "a second End goes to the end of the line"
+        );
+        e.end_key();
+        assert_eq!(e.cursor_col, len);
+    }
+
+    /// #1569: Home from inside a wrapped row stops at that row's start first.
+    #[test]
+    fn home_in_a_wrapped_line_stops_at_the_start_of_the_row_first() {
+        let (mut e, segs) = wrapped_paragraph(true);
+        e.cursor_col = segs[2].0 + 5;
+        e.home_key();
+        assert_eq!(e.cursor_col, segs[2].0, "the start of row 3: {segs:?}");
+        e.home_key();
+        assert_eq!(
+            e.cursor_col, 0,
+            "a second Home goes to the start of the line"
+        );
+    }
+
+    /// #1569: a wrapped row can begin on a combining mark (the row before
+    /// broke after the space it combines with); Home must not leave the caret
+    /// inside that cluster.
+    #[test]
+    fn home_in_a_wrapped_line_stays_on_a_grapheme_boundary() {
+        let (probe, _) = wrapped_paragraph(true);
+        let width = probe.visible_text_width();
+        let text = format!("{} \u{301}{}", "x".repeat(width - 1), "y".repeat(width + 5));
+        let mut e = editor_with(&text);
+        e.wrap_override = Some(true);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 20,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        let segs = e.line_segments(0, e.visible_text_width().max(1));
+        assert_eq!(segs[1].0, width, "row 2 starts on the mark: {segs:?}");
+        e.cursor_col = width + 3;
+        e.home_key();
+        assert_eq!(e.cursor_col, width - 1, "the space the mark sits on");
+    }
+
+    /// #1569: on the first and last rows the row's ends are the line's.
+    #[test]
+    fn home_and_end_on_the_outer_rows_of_a_wrapped_line_reach_the_line_ends() {
+        let (mut e, segs) = wrapped_paragraph(true);
+        let len = e.line_char_len(0);
+        e.cursor_col = segs.last().unwrap().0 + 1;
+        e.end_key();
+        assert_eq!(e.cursor_col, len);
+        e.cursor_col = 3;
+        e.home_key();
+        assert_eq!(e.cursor_col, 0);
+    }
+
+    /// #1569 negative: with wrap off, Home and End go to the line's ends.
+    #[test]
+    fn home_and_end_without_wrap_go_to_the_line_ends() {
+        let (mut e, segs) = wrapped_paragraph(false);
+        let len = e.line_char_len(0);
+        e.cursor_col = segs[1].0;
+        e.end_key();
+        assert_eq!(e.cursor_col, len);
+        e.cursor_col = segs[2].0 + 5;
+        e.home_key();
+        assert_eq!(e.cursor_col, 0);
     }
 
     #[test]
