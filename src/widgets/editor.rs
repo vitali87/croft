@@ -5566,7 +5566,8 @@ impl Editor {
     /// by extension.
     fn install_sheet_view(&mut self, path: &Path, view: crate::sheet::SheetView) {
         self.path = Some(path.to_path_buf());
-        self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_stamp =
+            Self::disk_stamp_with_wal(path, view.kind == crate::sheet::SheetKind::Sqlite);
         self.disk_conflict = false;
         // A whole-buffer swap: whatever the previous contents could not be
         // encoded as is no longer this tab's problem.
@@ -9490,10 +9491,49 @@ impl Editor {
         Some((meta.modified().ok()?, meta.len()))
     }
 
+    /// [`Self::disk_stamp_of`], with a SQLite database's write-ahead log
+    /// folded in when `sqlite` (#1643): in WAL mode a commit lands in
+    /// `<db>-wal` and leaves the database file alone until a checkpoint,
+    /// which can wait until the writing app exits. The log is part of what a
+    /// reader sees, so a commit moves the stamp and the tab reloads. Only a
+    /// SQLite view counts it: a plain file with a `<name>-wal` sibling keeps
+    /// its own stamp, untouched by whatever that sibling is.
+    fn disk_stamp_with_wal(path: &Path, sqlite: bool) -> Option<(SystemTime, u64)> {
+        let stamp = Self::disk_stamp_of(path)?;
+        if !sqlite {
+            return Some(stamp);
+        }
+        Some(
+            match sqlite_wal_path(path).and_then(|w| std::fs::metadata(w).ok()) {
+                Some(wal) => (
+                    wal.modified().map_or(stamp.0, |m| m.max(stamp.0)),
+                    stamp.1 + wal.len(),
+                ),
+                None => stamp,
+            },
+        )
+    }
+
+    /// True when this tab is a SQLite browser, whose stamp covers the log.
+    fn is_sqlite_view(&self) -> bool {
+        self.sheet
+            .as_ref()
+            .is_some_and(|s| s.kind == crate::sheet::SheetKind::Sqlite)
+    }
+
+    /// This tab's stamp of `path` now: [`Self::disk_stamp_with_wal`] for
+    /// whatever view the tab is.
+    fn current_disk_stamp(&self, path: &Path) -> Option<(SystemTime, u64)> {
+        Self::disk_stamp_with_wal(path, self.is_sqlite_view())
+    }
+
     /// Record that this buffer is now in sync with disk. Called at open and
     /// after a successful save so the next external write is detected.
     fn mark_synced_with_disk(&mut self) {
-        self.disk_stamp = self.path.as_deref().and_then(Self::disk_stamp_of);
+        self.disk_stamp = self
+            .path
+            .as_deref()
+            .and_then(|p| self.current_disk_stamp(p));
         self.disk_conflict = false;
         // A new buffer<->disk sync point; undo snapshots from before it
         // restore as dirty (see `restore_snapshot`).
@@ -9509,7 +9549,7 @@ impl Editor {
             return false;
         };
         match self.disk_stamp {
-            Some(known) => Self::disk_stamp_of(path) != Some(known),
+            Some(known) => self.current_disk_stamp(path) != Some(known),
             None => false,
         }
     }
@@ -9546,6 +9586,9 @@ impl Editor {
         // A SARIF viewer keeps the reader's place, and the logs added to
         // it, across a rewrite of its log (#577).
         let old_sarif = self.sarif.take();
+        // A SQLite tab keeps its table, page, cell and scroll across a
+        // reload, which a WAL-mode app's every commit now triggers (#1643).
+        let sqlite_place = self.sqlite_place();
         // `open` starts a text tab's history afresh. A reload keeps it
         // (#1357): the text from before an agent's or formatter's rewrite is
         // one undo away, with everything typed before that behind it.
@@ -9564,6 +9607,9 @@ impl Editor {
         if let (Some(old), Some(view)) = (old_sarif.as_ref(), self.sarif.as_mut()) {
             view.carry_from(old);
         }
+        if let (Some(place), true) = (sqlite_place, result.is_ok()) {
+            self.restore_sqlite_place(&path, place);
+        }
         // Cleared even when the open bailed before reaching `open_pdf`, so
         // the request can never leak into an unrelated later open.
         self.pdf_restore_page = None;
@@ -9573,6 +9619,74 @@ impl Editor {
         self.cursor_col = prev_col.min(self.line_char_len(self.cursor_row));
         self.scroll = prev_scroll.min(self.lines.len().saturating_sub(1));
         result
+    }
+
+    /// Where the reader is in a SQLite tab, for [`Self::reload_from_disk`]
+    /// to put back on the rebuilt view.
+    fn sqlite_place(&self) -> Option<SqlitePlace> {
+        let view = self.sheet.as_ref().filter(|_| self.is_sqlite_view())?;
+        let data = view.sheets.get(view.current_sheet)?;
+        let (table, page) = view.sqlite_pages.get(view.current_sheet)?.clone();
+        Some(SqlitePlace {
+            sheet: view.current_sheet,
+            table,
+            page,
+            cell: (data.cur_row, data.cur_col),
+            scroll: (data.scroll_row, data.scroll_col),
+        })
+    }
+
+    /// Put a reloaded SQLite view back where [`Self::sqlite_place`] found
+    /// the reader: the same table (found by name, else the same position
+    /// clamped), the same page while the table still reaches it (else its
+    /// last), and the cell and scroll clamped to what that page now holds.
+    fn restore_sqlite_place(&mut self, path: &Path, place: SqlitePlace) {
+        if !self.is_sqlite_view() {
+            return;
+        }
+        let Some(view) = self.sheet.as_mut() else {
+            return;
+        };
+        let Some(last) = view.sheets.len().checked_sub(1) else {
+            return;
+        };
+        let idx = view
+            .sqlite_pages
+            .iter()
+            .position(|(t, _)| *t == place.table)
+            .unwrap_or(place.sheet.min(last));
+        view.current_sheet = idx;
+        let table = view.sqlite_pages[idx].0.clone();
+        let same_table = table == place.table;
+        if same_table && place.page > 0 {
+            // The page as it was; when the table has shrunk short of it, its
+            // last page instead (counting only then, as Ctrl+End does).
+            let fetch = |page| crate::sqlite_view::table_page(path, &table, page).ok();
+            let found = match fetch(place.page) {
+                Some(got) if !got.1.is_empty() => Some((place.page, got)),
+                _ => crate::sqlite_view::last_page(path, &table)
+                    .ok()
+                    .filter(|&l| l > 0 && l < place.page)
+                    .and_then(|l| fetch(l).map(|got| (l, got))),
+            };
+            if let Some((page, (headers, rows, more))) = found {
+                let label = crate::sqlite_view::page_label(&table, page, rows.len(), more);
+                let mut data = crate::sheet::sheet_data_from_parts(label, headers, rows);
+                data.row_base = page * crate::sqlite_view::ROW_CAP;
+                view.sheets[idx] = data;
+                view.sqlite_pages[idx].1 = page;
+            }
+        }
+        if !same_table {
+            return;
+        }
+        let data = &mut view.sheets[idx];
+        let rows = data.row_count().saturating_sub(1);
+        let cols = data.col_count().saturating_sub(1);
+        data.cur_row = place.cell.0.min(rows);
+        data.cur_col = place.cell.1.min(cols);
+        data.scroll_row = place.scroll.0.min(data.cur_row);
+        data.scroll_col = place.scroll.1.min(data.cur_col);
     }
 
     /// Put back the history [`Self::reload_from_disk`] took aside, with the
@@ -16980,6 +17094,26 @@ pub struct Crumb {
 /// A rendered breadcrumb crumb's hit-test span: `(x_start, width, jump target)`.
 type BreadcrumbRange = (u16, u16, Option<(u32, u32)>);
 
+/// A reader's place in a SQLite tab, carried across a reload (#1643).
+struct SqlitePlace {
+    sheet: usize,
+    table: String,
+    page: usize,
+    cell: (usize, usize),
+    scroll: (usize, usize),
+}
+
+/// Where SQLite keeps `path`'s write-ahead log, if `path` were a database
+/// in WAL mode: the same name with `-wal` after it (#1643).
+///
+/// SQLite keeps the log beside the real database file, so a database opened
+/// through a symlink has its log beside the link's target, not the link.
+pub fn sqlite_wal_path(path: &Path) -> Option<PathBuf> {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut name = path.file_name()?.to_os_string();
+    name.push("-wal");
+    Some(path.with_file_name(name))
+}
 pub struct EditorTabs {
     /// The active editor's rect below the tab strip and breadcrumbs, from
     /// the last frame: where a view standing in for it (the history
