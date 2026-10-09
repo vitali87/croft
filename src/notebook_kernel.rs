@@ -679,4 +679,252 @@ mod tests {
         fresh.fold(NB);
         assert_eq!(fresh.running_indices(), vec![1]);
     }
+
+    /// A stand-in for `jupyter_client` (#1477): it records which threads
+    /// touch the kernel client, and with `FAKE_RESTART_FAIL` set fails the
+    /// restart's `wait_for_ready` the way a socket race does. A code cell
+    /// containing `hang` never finishes, like a runaway loop.
+    const FAKE_JUPYTER: &str = r#"# A stand-in for jupyter_client that records which threads touch the
+# kernel's sockets, and can fail a restart the way a socket race does.
+import json, os, queue, threading, time
+
+touched = set()
+
+
+class Spec:
+    display_name = "Fake"
+
+
+class Client:
+    def __init__(self):
+        self.n = 0
+        self.idle = []
+        self.up = False
+        self.restarted = False
+
+    def mark(self):
+        if self.up:
+            touched.add(threading.current_thread().name)
+
+    def start_channels(self):
+        pass
+
+    def wait_for_ready(self, timeout=None):
+        self.mark()
+        if self.restarted and os.environ.get("FAKE_RESTART_FAIL"):
+            raise RuntimeError("Invalid Signature")
+        self.up = True
+
+    def execute(self, code, store_history=True):
+        self.mark()
+        self.n += 1
+        mid = "m%d" % self.n
+        if "hang" not in code:
+            self.idle.append(mid)
+        return mid
+
+    def get_iopub_msg(self, timeout=None):
+        self.mark()
+        if self.idle:
+            mid = self.idle.pop(0)
+            return {"parent_header": {"msg_id": mid}, "msg_type": "status",
+                    "content": {"execution_state": "idle"}}
+        time.sleep(min(timeout or 0, 0.02))
+        raise queue.Empty
+
+    def get_shell_msg(self, timeout=None):
+        self.mark()
+        time.sleep(min(timeout or 0, 0.02))
+        raise queue.Empty
+
+    def stop_channels(self):
+        with open(os.environ["FAKE_TOUCHED"], "w") as f:
+            json.dump(sorted(touched), f)
+
+
+class KernelManager:
+    def __init__(self, kernel_name=None):
+        self.kernel_spec = Spec()
+        self.c = Client()
+
+    def start_kernel(self, cwd=None):
+        pass
+
+    def client(self):
+        return self.c
+
+    def restart_kernel(self, now=False):
+        self.c.mark()
+        self.c.restarted = True
+
+    def interrupt_kernel(self):
+        pass
+
+    def shutdown_kernel(self, now=False):
+        pass
+"#;
+
+    /// Runs the real bridge against the fake kernel with `requests` as its
+    /// stdin; returns what it emitted and the threads that used the client.
+    fn bridge_against_fake(requests: &[&str], restart_fails: bool) -> (Vec<Event>, Vec<String>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("jupyter_client");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("__init__.py"), "").unwrap();
+        std::fs::write(pkg.join("manager.py"), FAKE_JUPYTER).unwrap();
+        let touched = tmp.path().join("touched.json");
+        let mut cmd = std::process::Command::new("python3");
+        cmd.arg("-c")
+            .arg(BRIDGE)
+            .arg("python3")
+            .arg(tmp.path())
+            .env("PYTHONPATH", tmp.path())
+            .env("FAKE_TOUCHED", &touched)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        if restart_fails {
+            cmd.env("FAKE_RESTART_FAIL", "1");
+        }
+        let mut child = cmd.spawn().unwrap();
+        {
+            use std::io::Write;
+            let mut stdin = child.stdin.take().unwrap();
+            for r in requests {
+                writeln!(stdin, "{r}").unwrap();
+            }
+            // Let the bridge work through them before it is told to stop.
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            writeln!(stdin, r#"{{"op":"shutdown"}}"#).unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        let events = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let touched: Vec<String> = std::fs::read_to_string(&touched)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        (events, touched)
+    }
+
+    const RUN_HANG_RESTART_RUN: [&str; 4] = [
+        r#"{"op":"execute","id":"a","code":"x = 1"}"#,
+        r#"{"op":"execute","id":"h","code":"hang"}"#,
+        r#"{"op":"restart"}"#,
+        r#"{"op":"execute","id":"b","code":"print('after')"}"#,
+    ];
+
+    fn done_status(events: &[Event], cell: &str) -> Option<String> {
+        events.iter().find_map(|e| match e {
+            Event::Done { id, status, .. } if id == cell => Some(status.clone()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn one_thread_owns_the_kernel_sockets_across_a_restart() {
+        if !crate::lsp::manager::is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let (events, touched) = bridge_against_fake(&RUN_HANG_RESTART_RUN, false);
+        // zmq sockets are not thread-safe: a second reader is what lost the
+        // restart's reply and left cells at In [*].
+        assert_eq!(
+            touched.len(),
+            1,
+            "threads that used the client: {touched:?}"
+        );
+        let readies = events
+            .iter()
+            .filter(|e| matches!(e, Event::Ready { .. }))
+            .count();
+        assert_eq!(
+            readies, 2,
+            "the restart must announce the new kernel: {events:?}"
+        );
+        assert_eq!(
+            done_status(&events, "b").as_deref(),
+            Some("ok"),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_restart_still_settles_the_cells_it_lost() {
+        if !crate::lsp::manager::is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let (events, _) = bridge_against_fake(&RUN_HANG_RESTART_RUN, true);
+        assert_eq!(
+            done_status(&events, "h").as_deref(),
+            Some("error"),
+            "the runaway cell must not stay at In [*]: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::Error { message } if message.starts_with("restart:")
+            )),
+            "the failure is reported: {events:?}"
+        );
+        // The bridge keeps serving after it.
+        assert_eq!(
+            done_status(&events, "b").as_deref(),
+            Some("ok"),
+            "{events:?}"
+        );
+    }
+
+    /// Negative: without a restart, a finished cell is reported once, as ok,
+    /// and nothing is settled as failed.
+    #[test]
+    fn cells_without_a_restart_finish_ok() {
+        if !crate::lsp::manager::is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let (events, _) = bridge_against_fake(
+            &[
+                r#"{"op":"execute","id":"a","code":"x = 1"}"#,
+                r#"{"op":"execute","id":"b","code":"y = 2"}"#,
+            ],
+            false,
+        );
+        assert_eq!(done_status(&events, "a").as_deref(), Some("ok"));
+        assert_eq!(done_status(&events, "b").as_deref(), Some("ok"));
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Error { .. })),
+            "{events:?}"
+        );
+    }
+
+    /// A long Run All behind a silent cell: the bridge must not wait on
+    /// iopub between queued requests, or each one costs the poll timeout
+    /// and an Interrupt or Restart queued after them is held back.
+    #[test]
+    fn queued_requests_do_not_each_wait_on_a_silent_kernel() {
+        if !crate::lsp::manager::is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let mut requests: Vec<String> = (0..250)
+            .map(|i| format!(r#"{{"op":"execute","id":"h{i}","code":"hang"}}"#))
+            .collect();
+        requests.push(r#"{"op":"execute","id":"a","code":"x = 1"}"#.into());
+        let requests: Vec<&str> = requests.iter().map(String::as_str).collect();
+        let start = std::time::Instant::now();
+        let (events, _) = bridge_against_fake(&requests, false);
+        let took = start.elapsed();
+        assert_eq!(done_status(&events, "a").as_deref(), Some("ok"));
+        // Waiting per queued cell would add 250 polls (5s) on top of the
+        // helper's 0.8s pause.
+        assert!(
+            took < std::time::Duration::from_secs(3),
+            "queued requests were slowed by iopub polls: {took:?}"
+        );
+    }
 }

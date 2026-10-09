@@ -85,11 +85,34 @@ fn build_matcher(query: &str, opts: SearchOpts) -> Option<RegexMatcher> {
     if query.is_empty() {
         return None;
     }
+    compile_matcher(query, opts).ok()
+}
+
+fn compile_matcher(query: &str, opts: SearchOpts) -> Result<RegexMatcher, grep_regex::Error> {
     let mut b = RegexMatcherBuilder::new();
     b.case_insensitive(!opts.case_sensitive);
     b.word(opts.whole_word);
     b.fixed_strings(!opts.use_regex);
-    b.build(query).ok()
+    b.build(query)
+}
+
+/// Why the query can't run, for the sidebar to show where the result count
+/// would be (#1496): every search path drops a pattern that fails to compile,
+/// so without this an unclosed `(` or a look-ahead read as "0 results".
+/// `None` for an empty query or one that compiles. The parser's multi-line
+/// report (pattern, caret, `error: ...`) is cut to its `error:` line.
+pub fn query_error(query: &str, opts: SearchOpts) -> Option<String> {
+    let q = as_typed(query);
+    if q.is_empty() {
+        return None;
+    }
+    let err = compile_matcher(q, opts).err()?.to_string();
+    let reason = err
+        .lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix("error: "))
+        .unwrap_or_else(|| err.lines().next().unwrap_or("").trim());
+    Some(format!("Invalid regex: {reason}"))
 }
 
 fn build_searcher() -> Searcher {
@@ -134,6 +157,15 @@ fn split_globs(raw: &str) -> impl Iterator<Item = &str> {
 }
 
 fn compile_glob(pat: &str) -> Option<Glob> {
+    // A leading `/` anchors the pattern to the root, as in .gitignore: the
+    // form a VS Code exclude setting's bare `build` arrives in (#1479). Its
+    // `*` stays within one folder, so `/*.log` is the root's logs only.
+    if let Some(anchored) = pat.strip_prefix('/') {
+        return globset::GlobBuilder::new(anchored)
+            .literal_separator(true)
+            .build()
+            .ok();
+    }
     // VS Code convention: a pattern without a path separator matches at
     // any depth, so `*.rs` finds Rust files in every subdirectory.
     let expanded = if pat.contains('/') {
@@ -853,10 +885,10 @@ fn replace_in_line(
                             .filter(|c| c.get(0).is_some_and(|m| m.range() == (0..end - start)))
                     })
             });
-            match caps {
-                Some(caps) if opts.use_regex => {
+            match caps.zip(full) {
+                Some((caps, re)) if opts.use_regex => {
                     let mut expanded = String::new();
-                    caps.expand(&brace_group_refs(replacement), &mut expanded);
+                    caps.expand(&brace_group_refs(replacement, re), &mut expanded);
                     out.push_str(&expanded);
                 }
                 _ => out.push_str(replacement),
@@ -909,34 +941,54 @@ fn trim_leading_context(lead: &str, avail: usize, need: usize) -> Option<String>
     Some(lead[start..].to_string())
 }
 
-/// `replacement` with each numbered capture reference braced (`$1_old` to
-/// `${1}_old`). The regex crate reads `$1_old` as a group NAMED `1_old`,
-/// which expands to nothing and deletes the match; VS Code reads group 1
-/// then `_old`. `$$` stays a literal dollar.
-pub fn brace_group_refs(replacement: &str) -> String {
+/// `replacement` made safe for `Captures::expand` against `re`, read the way
+/// VS Code reads it. A numbered reference is braced (`$1_old` to
+/// `${1}_old`): the regex crate reads `$1_old` as a group NAMED `1_old`,
+/// which expands to nothing and deletes the match, where VS Code reads group
+/// 1 then `_old`. `$&` is the whole match and `$$` a literal dollar. A
+/// `$NAME` or `${NAME}` expands only when `re` has a group of that name;
+/// any other `$` is text (#1399), so a shell, PHP or Perl variable such as
+/// `$PREFIX` survives instead of expanding to nothing.
+pub fn brace_group_refs(replacement: &str, re: &regex::Regex) -> String {
+    let is_group = |name: &str| re.capture_names().flatten().any(|n| n == name);
+    let is_name = |c: &char| c.is_ascii_alphanumeric() || *c == '_';
     let mut out = String::with_capacity(replacement.len());
-    let mut chars = replacement.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '$' {
-            out.push(c);
-            continue;
-        }
-        if chars.peek() == Some(&'$') {
-            chars.next();
-            out.push_str("$$");
-            continue;
-        }
-        let mut digits = String::new();
-        while let Some(&d) = chars.peek().filter(|d| d.is_ascii_digit()) {
-            digits.push(d);
-            chars.next();
-        }
-        if digits.is_empty() {
-            out.push('$');
+    let mut rest = replacement;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        let digits = after.len() - after.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        let name_len = after
+            .chars()
+            .take_while(is_name)
+            .map(char::len_utf8)
+            .sum::<usize>();
+        let braced = after
+            .strip_prefix('{')
+            .and_then(|b| b.find('}').map(|end| &b[..end]));
+        let (expansion, used) = if after.starts_with('$') {
+            (String::from("$$"), 1)
+        } else if after.starts_with('&') {
+            (String::from("${0}"), 1)
+        } else if digits > 0 {
+            (format!("${{{}}}", &after[..digits]), digits)
+        } else if let Some(name) = braced {
+            let group =
+                name.chars().all(|c| c.is_ascii_digit()) && !name.is_empty() || is_group(name);
+            if group {
+                (format!("${{{name}}}"), name.len() + 2)
+            } else {
+                (String::from("$$"), 0)
+            }
+        } else if name_len > 0 && is_group(&after[..name_len]) {
+            (format!("${{{}}}", &after[..name_len]), name_len)
         } else {
-            out.push_str(&format!("${{{digits}}}"));
-        }
+            (String::from("$$"), 0)
+        };
+        out.push_str(&expansion);
+        rest = &after[used..];
     }
+    out.push_str(rest);
     out
 }
 
@@ -994,7 +1046,7 @@ pub fn expand_replacement(
         return replacement.to_string();
     };
     if opts.use_regex {
-        re.replace(matched, brace_group_refs(replacement).as_str())
+        re.replace(matched, brace_group_refs(replacement, &re).as_str())
             .into_owned()
     } else {
         replacement.to_string()
@@ -1064,6 +1116,9 @@ pub struct SearchPanel {
     /// name when more than one folder is open.
     pub roots: Vec<PathBuf>,
     pub opts: SearchOpts,
+    /// `(query, opts, error)` behind `query_error`, so the caption doesn't
+    /// rebuild the regex every frame.
+    query_error_memo: Option<(String, SearchOpts, Option<String>)>,
     /// Per-toggle absolute screen column captured by the most recent render.
     /// Used by `App::handle_mouse` to map clicks on `Aa`, `ab`, `.*` into
     /// flag flips. Zero means the row was too narrow to render that toggle.
@@ -1175,6 +1230,7 @@ impl SearchPanel {
             last_area: Rect::default(),
             root,
             opts: SearchOpts::default(),
+            query_error_memo: None,
             toggle_case_x: 0,
             toggle_word_x: 0,
             toggle_regex_x: 0,
@@ -1724,6 +1780,20 @@ impl SearchPanel {
         }
         merged.extend(new);
         self.hits = merged;
+    }
+
+    /// `query_error` for the current query and toggles, compiled once per
+    /// change rather than on every frame.
+    pub fn query_error(&mut self) -> Option<String> {
+        let fresh = matches!(&self.query_error_memo,
+            Some((q, o, _)) if *q == self.query && *o == self.opts);
+        if !fresh {
+            let error = query_error(&self.query, self.opts);
+            self.query_error_memo = Some((self.query.clone(), self.opts, error));
+        }
+        self.query_error_memo
+            .as_ref()
+            .and_then(|(_, _, e)| e.clone())
     }
 
     /// Run the current query, store the results, and reset selection.
@@ -2454,24 +2524,40 @@ impl Widget for &mut SearchPanel {
             }
         }
         let caption_y = separator_y + 1;
-        let results_start_y = caption_y + 1;
+        let mut results_start_y = caption_y + 1;
+        if caption_y < inner.y + inner.height && !as_typed(&self.query).is_empty() {
+            if let Some(error) = self.query_error() {
+                // Wrapped, not cut off: the sidebar is narrow and the
+                // reason sits at the end of the message.
+                let style = Style::default().fg(self.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c)));
+                let rows = crate::sarif::render::wrap(&error, inner.width.max(1) as usize);
+                let mut y = caption_y;
+                for row in rows {
+                    if y >= inner.y + inner.height {
+                        break;
+                    }
+                    buf.set_stringn(inner.x, y, &row, inner.width as usize, style);
+                    y += 1;
+                }
+                results_start_y = y.max(caption_y + 1);
+            } else {
+                let (results, files) = self.result_counts();
+                let header = format!(
+                    "{results} result{} in {files} file{}",
+                    if results == 1 { "" } else { "s" },
+                    if files == 1 { "" } else { "s" }
+                );
+                let caption = Line::from(Span::styled(
+                    header,
+                    Style::default()
+                        .fg(self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)))
+                        .add_modifier(Modifier::ITALIC),
+                ));
+                buf.set_line(inner.x, caption_y, &caption, inner.width);
+            }
+        }
         // Record where results begin so scrolling / click mapping stay aligned.
         self.results_start_offset = results_start_y.saturating_sub(inner.y);
-        if caption_y < inner.y + inner.height && !as_typed(&self.query).is_empty() {
-            let (results, files) = self.result_counts();
-            let header = format!(
-                "{results} result{} in {files} file{}",
-                if results == 1 { "" } else { "s" },
-                if files == 1 { "" } else { "s" }
-            );
-            let caption = Line::from(Span::styled(
-                header,
-                Style::default()
-                    .fg(self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)))
-                    .add_modifier(Modifier::ITALIC),
-            ));
-            buf.set_line(inner.x, caption_y, &caption, inner.width);
-        }
 
         // Results
         self.last_scrollbar = Rect::default();
@@ -3652,6 +3738,121 @@ mod tests {
         );
     }
 
+    /// #1496: a regex that won't compile is an error, not "no matches".
+    /// Typos and the look-around / backreference syntax VS Code runs
+    /// through PCRE2 each name what is wrong.
+    #[test]
+    fn a_regex_that_will_not_compile_names_the_problem() {
+        let re = SearchOpts {
+            use_regex: true,
+            ..SearchOpts::default()
+        };
+        assert_eq!(
+            query_error("foo(", re).as_deref(),
+            Some("Invalid regex: unclosed group")
+        );
+        let look_ahead = query_error(r"foo(?=\()", re).unwrap();
+        assert!(
+            look_ahead.starts_with("Invalid regex: look-around"),
+            "{look_ahead}"
+        );
+        let backref = query_error(r"(a)\1", re).unwrap();
+        assert!(
+            backref.starts_with("Invalid regex: backreferences"),
+            "{backref}"
+        );
+    }
+
+    /// #1496 negative: valid patterns, literal mode and an empty box carry
+    /// no error, so the count header still shows.
+    #[test]
+    fn valid_and_literal_queries_have_no_regex_error() {
+        let re = SearchOpts {
+            use_regex: true,
+            ..SearchOpts::default()
+        };
+        assert_eq!(query_error(r"foo\(", re), None);
+        assert_eq!(query_error(r"get_(user_\w+)", re), None);
+        assert_eq!(query_error("", re), None);
+        // The same `foo(` is a plain literal with the regex chip off.
+        assert_eq!(query_error("foo(", SearchOpts::default()), None);
+        let whole_word = SearchOpts {
+            whole_word: true,
+            ..re
+        };
+        assert_eq!(query_error("foo", whole_word), None);
+    }
+
+    /// #1496: the sidebar shows the error where the count would be, not
+    /// "0 results in 0 files" over a search that never ran.
+    #[test]
+    fn the_sidebar_shows_the_regex_error_in_place_of_the_count() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp.path().join("a.py"), "def foo(x):\n    return foo(1)\n");
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.opts.use_regex = true;
+        panel.query = "foo(".into();
+        panel.run_query();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 14,
+        };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let text = buffer_to_string(&buf);
+        assert!(text.contains("Invalid regex: unclosed group"), "{text}");
+        assert!(!text.contains("0 results"), "{text}");
+        // Fixing the pattern brings the count back.
+        panel.query = r"foo\(".into();
+        panel.run_query();
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let text = buffer_to_string(&buf);
+        assert!(text.contains("2 results in 1 file"), "{text}");
+        assert!(!text.contains("Invalid regex"), "{text}");
+    }
+
+    /// #1496: the sidebar is narrow, so a long error (look-around's runs to
+    /// 70 columns) wraps onto the rows below instead of being cut off, and
+    /// the result list starts under its last line.
+    #[test]
+    fn a_long_regex_error_wraps_in_a_narrow_sidebar() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp.path().join("a.py"), "foo(1)\n");
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.opts.use_regex = true;
+        panel.query = r"foo(?=\()".into();
+        panel.run_query();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 32,
+            height: 14,
+        };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let text = buffer_to_string(&buf);
+        let flat: String = text
+            .lines()
+            .map(|l| l.trim_matches(|c: char| c == '│' || c.is_whitespace()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(flat.contains("is not supported"), "{text}");
+        let error_rows = text
+            .lines()
+            .filter(|l| l.contains("look-") || l.contains("supported"))
+            .count();
+        assert!(error_rows >= 2, "{text}");
+        let header = panel.last_inner.y + panel.results_start_offset;
+        let last_error_row = text.lines().position(|l| l.contains("supported")).unwrap() as u16;
+        assert!(
+            header > last_error_row,
+            "results start under the error\n{text}"
+        );
+    }
+
     #[test]
     fn toggle_at_maps_a_click_on_each_glyph_to_the_right_kind() {
         use ratatui::buffer::Buffer;
@@ -4120,6 +4321,36 @@ mod tests {
         assert!(text.contains("files to exclude\u{20}"), "{text}");
     }
 
+    /// #1479: a leading `/` anchors a glob to the root (gitignore's rule):
+    /// `/build` is the root's `build` folder, not `scripts/build`.
+    #[test]
+    fn a_leading_slash_anchors_an_exclude_glob_to_the_root() {
+        let root = Path::new("/r");
+        let f = PathFilter::excluding(&[String::from("/build")]);
+        assert!(f.excludes(root, Path::new("/r/build/out.js")));
+        assert!(f.excludes(root, Path::new("/r/build")));
+        assert!(!f.excludes(root, Path::new("/r/scripts/build/release.py")));
+        assert!(!f.excludes(root, Path::new("/r/rebuild/x")));
+        let f = PathFilter::excluding(&[String::from("/*.log")]);
+        assert!(f.excludes(root, Path::new("/r/app.log")));
+        assert!(!f.excludes(root, Path::new("/r/logs/app.log")));
+    }
+
+    /// #1479 negative: croft's own bare glob still matches at any depth, as
+    /// documented, and `**/` still does.
+    #[test]
+    fn a_bare_or_starred_exclude_glob_still_matches_at_any_depth() {
+        let root = Path::new("/r");
+        for glob in ["build", "**/build"] {
+            let f = PathFilter::excluding(&[String::from(glob)]);
+            assert!(f.excludes(root, Path::new("/r/build/out.js")), "{glob}");
+            assert!(
+                f.excludes(root, Path::new("/r/scripts/build/release.py")),
+                "{glob}"
+            );
+        }
+    }
+
     /// #1345: the project's exclusions show under the exclude box as a
     /// checkbox, clickable, and stay out of the box's own text; with none
     /// the row is not drawn.
@@ -4465,6 +4696,46 @@ mod tests {
         let (out, n) = replace_in_text("a1 b2 c3", r"([a-z])(\d)", "$2$1", opts).unwrap();
         assert_eq!(n, 3);
         assert_eq!(out, "1a 2b 3c");
+    }
+
+    /// #1399: a `$NAME` that is no group of the pattern is text, as in VS
+    /// Code: a shell, PHP or Perl variable in the replacement survives.
+    #[test]
+    fn a_dollar_name_that_is_no_group_stays_literal() {
+        let opts = SearchOpts {
+            use_regex: true,
+            ..Default::default()
+        };
+        let replace =
+            |text: &str, find: &str, with: &str| replace_in_text(text, find, with, opts).unwrap().0;
+        assert_eq!(
+            replace("cp a /opt/app\n", r"/opt/(\S+)", "$PREFIX/$1"),
+            "cp a $PREFIX/app\n"
+        );
+        assert_eq!(replace("x", "x", "${HOME}/x"), "${HOME}/x");
+        assert_eq!(replace("x", "x", "cost $"), "cost $");
+        assert_eq!(replace("x", "x", "$_ and $@"), "$_ and $@");
+        // VS Code's `$&` is the whole match.
+        assert_eq!(replace("abc", "b", "[$&]"), "a[b]c");
+        // The preview row shows the same text Replace All writes.
+        assert_eq!(
+            expand_replacement("/opt/app", r"/opt/(\S+)", "$PREFIX/$1", opts),
+            "$PREFIX/app"
+        );
+    }
+
+    /// #1399 negative: real references keep their meaning.
+    #[test]
+    fn real_capture_references_still_expand() {
+        let opts = SearchOpts {
+            use_regex: true,
+            ..Default::default()
+        };
+        let replace =
+            |text: &str, find: &str, with: &str| replace_in_text(text, find, with, opts).unwrap().0;
+        assert_eq!(replace("ab", "(a)(b)", "$2$1 $0 ${1} $$"), "ba ab a $");
+        assert_eq!(replace("foo", "(foo)", "$1_old"), "foo_old");
+        assert_eq!(replace("cat", r"(?P<HOME>\w+)", "${HOME}/$HOME"), "cat/cat");
     }
 
     #[test]
