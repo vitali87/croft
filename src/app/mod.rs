@@ -34128,7 +34128,7 @@ impl App {
         // Before `add -A`, which would mark a conflict resolved with its
         // markers still in it (#989).
         if let Err(err) = crate::git::refuse_unmerged(&self.scm_root()) {
-            self.run_scm_op("add -A", Err(err), "Stage all");
+            self.run_scm_op("add -A", Err(err), "Stage all", "Stage all");
             return;
         }
 
