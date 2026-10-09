@@ -42553,11 +42553,11 @@ fn terminal_find_navigation_survives_streaming_output() {
         app.handle_terminal_key(key(KeyCode::Char(c), KeyModifiers::NONE));
     }
     let anchored_line = |app: &App| -> String {
-        let (lines, top, now) = app.terminals[0].grid_lines_and_clock();
+        let (lines, now) = app.terminals[0].find_lines_and_clock();
         let (clock, abs, _c, _l) = app.terminal_find_match.expect("an anchored match");
         let abs = abs - (now - clock) as i32;
-        let row = (abs - top).clamp(0, lines.len() as i32 - 1) as usize;
-        lines[row].clone()
+        let row = lines.iter().rposition(|l| l.start <= abs).unwrap_or(0);
+        lines[row].text.clone()
     };
     assert!(
         anchored_line(&app).contains("match-three"),
@@ -78337,6 +78337,86 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     let _ = render_buf(&mut app);
     assert!(app.source_control.nested_repos.is_empty());
     assert!(app.source_control.last_init_repo_button_area.width > 0);
+}
+
+/// A quiet 30-column pane holding `text`, with the find bar open on it.
+fn wrapped_find_app(text: &str) -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sleep",
+        &[String::from("60")],
+        tmp.path(),
+    )
+    .unwrap();
+    app.terminals[0].resize(30, 10);
+    app.terminals[0].feed_bytes_for_test(format!("\x1b[2J\x1b[H{text}").as_bytes());
+    app.focus_pane(Pane::Terminal);
+    app.open_terminal_find();
+    (tmp, app)
+}
+
+fn terminal_find_count(app: &mut App, query: &str) -> usize {
+    app.terminal_find_set_query(query.to_string());
+    app.terminal_find.as_ref().unwrap().match_count
+}
+
+/// The background the pane paints at `col` of the `row`th screen row of
+/// the fed text (the pane's run-label header may sit above it).
+fn terminal_cell_bg(app: &mut App, row: u16, col: u16) -> ratatui::style::Color {
+    let area = ratatui::layout::Rect::new(0, 0, 32, 12);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    ratatui::widgets::Widget::render(&mut app.terminals[0], area, &mut buf);
+    let first = (1..area.height - 1)
+        .find(|&y| buf[(1, y)].symbol() == "x")
+        .expect("the fed text is on screen");
+    buf[(col + 1, first + row)].bg
+}
+
+/// A match the pane's soft wrap cut in two is found once, and both halves
+/// are painted as the active match (#1275).
+#[test]
+fn terminal_find_matches_across_a_soft_wrap() {
+    let line = format!("{}connection-refused port 5432\r\n", "x".repeat(24));
+    let (_tmp, mut app) = wrapped_find_app(&line);
+    assert_eq!(terminal_find_count(&mut app, "connection-refused"), 1);
+    assert_eq!(
+        app.terminal_find.as_ref().unwrap().match_index,
+        Some(1),
+        "1 of 1"
+    );
+    let reset = ratatui::style::Color::Reset;
+    // `connec` ends row 0; `tion-refused` starts row 1.
+    let first_half = terminal_cell_bg(&mut app, 0, 26);
+    let second_half = terminal_cell_bg(&mut app, 1, 8);
+    assert_ne!(first_half, reset, "the half before the wrap is painted");
+    assert_eq!(first_half, second_half, "both halves are the active match");
+    assert_eq!(terminal_cell_bg(&mut app, 0, 10), reset, "the x run is not");
+    assert_eq!(terminal_cell_bg(&mut app, 1, 14), reset, "nor is `port`");
+}
+
+/// Negative: rows that merely sit next to each other, with no soft wrap
+/// between them, never match across their boundary, and a word that ends
+/// exactly at the wrap is counted once.
+#[test]
+fn terminal_find_never_joins_rows_without_a_wrap_and_counts_an_edge_match_once() {
+    let text = format!("{}connec\r\ntion-refused\r\n", "x".repeat(24));
+    let (_tmp, mut app) = wrapped_find_app(&text);
+    assert_eq!(terminal_find_count(&mut app, "connection-refused"), 0);
+    assert_eq!(
+        terminal_cell_bg(&mut app, 0, 26),
+        ratatui::style::Color::Reset
+    );
+    assert_eq!(terminal_find_count(&mut app, "connec"), 1);
+
+    let edge = format!("{}abcdef{}\r\n", "x".repeat(24), "y".repeat(10));
+    let (_tmp, mut app) = wrapped_find_app(&edge);
+    assert_eq!(terminal_find_count(&mut app, "abcdef"), 1);
+    assert_eq!(
+        terminal_find_count(&mut app, "fyy"),
+        1,
+        "and across the edge"
+    );
 }
 
 /// An App over `tmp` whose user config lives in `cfg`, never the real one.
