@@ -2202,6 +2202,11 @@ struct Snapshot {
     /// with it, so a cycle never credits lines to whoever wrote a different
     /// buffer.
     provenance: crate::provenance::Provenance,
+    /// The server's fold spans as they stood over this text, with the line
+    /// count they were checked against: a line move rewrites them, so an
+    /// undo must bring back the ones that described the restored text.
+    lsp_folds: Option<Vec<crate::lsp::manager::FoldingRangeItem>>,
+    lsp_folds_lines: usize,
     /// The text this step holds, each line's `String` header included,
     /// measured once when it is taken (see [`UNDO_BYTES_LIMIT`]).
     bytes: usize,
@@ -9313,6 +9318,8 @@ impl Editor {
             dirty: self.dirty,
             save_seq: self.save_seq,
             provenance: self.provenance.clone(),
+            lsp_folds: self.lsp_folds.clone(),
+            lsp_folds_lines: self.lsp_folds_lines,
         }
     }
 
@@ -9415,6 +9422,8 @@ impl Editor {
             self.lines.push(String::new());
         }
         self.provenance.truncate(self.lines.len());
+        self.lsp_folds = snap.lsp_folds;
+        self.lsp_folds_lines = snap.lsp_folds_lines;
         self.cursor_row = snap.cursor_row.min(self.lines.len().saturating_sub(1));
         self.cursor_col = snap.cursor_col.min(self.line_char_len(self.cursor_row));
         self.selection = snap.selection;
@@ -29864,6 +29873,34 @@ mod tests {
         paint(&mut e);
         assert_eq!(folded_rows(&e), vec![3]);
         assert!(e.is_line_hidden(4) && e.is_line_hidden(5));
+    }
+
+    /// #1611: a fold from the language server stays closed over its text
+    /// through a Move Line and its undo: the undo brings back the spans that
+    /// described the restored text, not the ones the move rewrote.
+    #[test]
+    fn undoing_a_move_keeps_a_server_fold_closed() {
+        use crate::lsp::manager::{FoldRangeKind, FoldingRangeItem};
+        let mut e = editor_with("a\nb {\nc\nd\n}\ne");
+        e.set_lsp_folds(vec![FoldingRangeItem {
+            start_line: 1,
+            end_line: 3,
+            kind: FoldRangeKind::Other,
+        }]);
+        e.toggle_fold(1);
+        assert!(e.is_line_hidden(2) && e.is_line_hidden(3));
+        (e.cursor_row, e.cursor_col) = (1, 0);
+        e.move_lines_down();
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![2], "{:?}", e.lines);
+        assert!(e.undo());
+        paint(&mut e);
+        assert_eq!(e.lines[1], "b {");
+        assert_eq!(folded_rows(&e), vec![1]);
+        assert!(
+            e.is_line_hidden(2) && e.is_line_hidden(3),
+            "the server's fold is closed again over its rows"
+        );
     }
 
     /// #1611: Copy Line Down on a folded header copies the whole function.
