@@ -133,6 +133,12 @@ use clap::Parser;
 use cli::Cli;
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Ok(cwd) = std::env::current_dir()
+        && let Some(err) = cli::misspelled_subcommand(&args, &cwd)
+    {
+        err.exit();
+    }
+    let cli = Cli::parse_from(args);
     cli.run()
 }
