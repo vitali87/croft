@@ -11042,20 +11042,45 @@ impl Editor {
         self.lines.get(row)?.chars().nth(col)
     }
 
+    /// Which string or comment each bracket lies in (#1634), from the last
+    /// highlight pass. `None` while the pass is stale or the buffer has no
+    /// grammar: every bracket then counts, as before.
+    fn bracket_zones(&self) -> Option<BracketZones<'_>> {
+        if !self.protected_current || self.protected_ranges.is_empty() {
+            return None;
+        }
+        let mut starts = Vec::with_capacity(self.lines.len());
+        let mut at = 0;
+        for line in &self.lines {
+            starts.push(at);
+            at += line.len() + 1;
+        }
+        Some(BracketZones {
+            lines: &self.lines,
+            starts,
+            ranges: &self.protected_ranges,
+        })
+    }
+
     /// Forward-scan from the opening bracket at `open` to its matching close,
     /// counting nesting of the SAME pair type. Returns the `(row, col)` of the
-    /// closing bracket, or None when unbalanced.
-    fn match_bracket_forward(&self, open: BPos) -> Option<BPos> {
+    /// closing bracket, or None when unbalanced. Only brackets in the same
+    /// place as `open` count (#1634): from code, the brackets in strings and
+    /// comments are text; from inside a string, only that string's own.
+    fn match_bracket_forward(&self, open: BPos, zones: Option<&BracketZones>) -> Option<BPos> {
         let oc = self.char_at(open.0, open.1)?;
         let cc = matching_close(oc)?;
+        let home = zones.and_then(|z| z.zone(open));
         let mut depth = 0i32;
         let (mut row, mut col) = open;
         loop {
             match self.char_at(row, col) {
                 Some(ch) => {
-                    if ch == oc {
+                    let counts =
+                        (ch == oc || ch == cc) && zones.is_none_or(|z| z.zone((row, col)) == home);
+                    if counts && ch == oc {
                         depth += 1;
-                    } else if ch == cc {
+                    } else if counts && ch == cc {
                         depth -= 1;
                         if depth == 0 {
                             return Some((row, col));
@@ -11074,10 +11099,13 @@ impl Editor {
         }
     }
 
-    /// Backward-scan from the closing bracket at `close` to its matching open.
-    fn match_bracket_backward(&self, close: BPos) -> Option<BPos> {
+    /// Backward-scan from the closing bracket at `close` to its matching open,
+    /// counting only brackets in the same place, as
+    /// [`Self::match_bracket_forward`] does.
+    fn match_bracket_backward(&self, close: BPos, zones: Option<&BracketZones>) -> Option<BPos> {
         let cc = self.char_at(close.0, close.1)?;
         let oc = matching_open(cc)?;
+        let home = zones.and_then(|z| z.zone(close));
         let mut depth = 0i32;
         let mut row = close.0;
         let mut col = close.1 as isize;
@@ -11091,9 +11119,11 @@ impl Editor {
                 continue;
             }
             let ch = self.char_at(row, col as usize)?;
-            if ch == cc {
+            let counts =
+                (ch == oc || ch == cc) && zones.is_none_or(|z| z.zone((row, col as usize)) == home);
+            if counts && ch == cc {
                 depth += 1;
-            } else if ch == oc {
+            } else if counts && ch == oc {
                 depth -= 1;
                 if depth == 0 {
                     return Some((row, col as usize));
@@ -11105,8 +11135,10 @@ impl Editor {
 
     /// The innermost bracket pair enclosing the cursor, found by walking
     /// backwards for the first unmatched opening bracket and matching it
-    /// forwards. Mirrors VS Code's `findEnclosingBrackets`.
-    fn enclosing_brackets(&self) -> Option<(BPos, BPos)> {
+    /// forwards. Mirrors VS Code's `findEnclosingBrackets`. Brackets in
+    /// strings and comments are passed over, so from inside a string this
+    /// finds the pair in code around it.
+    fn enclosing_brackets(&self, zones: Option<&BracketZones>) -> Option<(BPos, BPos)> {
         let mut row = self.cursor_row;
         let mut col = self.cursor_col as isize - 1;
         let mut expected: Vec<char> = Vec::new();
@@ -11120,17 +11152,18 @@ impl Editor {
                 continue;
             }
             let ch = self.char_at(row, col as usize)?;
-            if is_close_bracket(ch) {
+            let pos = (row, col as usize);
+            let in_code = || zones.is_none_or(|z| z.zone(pos).is_none());
+            if is_close_bracket(ch) && in_code() {
                 expected.push(matching_open(ch)?);
-            } else if is_open_bracket(ch) {
+            } else if is_open_bracket(ch) && in_code() {
                 match expected.last() {
                     Some(&want) if want == ch => {
                         expected.pop();
                     }
                     _ => {
-                        let open = (row, col as usize);
-                        let close = self.match_bracket_forward(open)?;
-                        return Some((open, close));
+                        let close = self.match_bracket_forward(pos, zones)?;
+                        return Some((pos, close));
                     }
                 }
             }
@@ -11138,19 +11171,23 @@ impl Editor {
         }
     }
 
-    /// The first bracket pair at or after the cursor (`findNextBracket`).
-    fn next_bracket_pair(&self) -> Option<(BPos, BPos)> {
+    /// The first bracket pair at or after the cursor (`findNextBracket`),
+    /// passing over brackets in strings and comments.
+    fn next_bracket_pair(&self, zones: Option<&BracketZones>) -> Option<(BPos, BPos)> {
         let mut row = self.cursor_row;
         let mut col = self.cursor_col;
         loop {
+            let in_code = zones.is_none_or(|z| z.zone((row, col)).is_none());
             match self.char_at(row, col) {
-                Some(ch) if is_open_bracket(ch) => {
+                Some(ch) if is_open_bracket(ch) && in_code => {
                     let open = (row, col);
-                    return self.match_bracket_forward(open).map(|c| (open, c));
+                    return self.match_bracket_forward(open, zones).map(|c| (open, c));
                 }
-                Some(ch) if is_close_bracket(ch) => {
+                Some(ch) if is_close_bracket(ch) && in_code => {
                     let close = (row, col);
-                    return self.match_bracket_backward(close).map(|o| (o, close));
+                    return self
+                        .match_bracket_backward(close, zones)
+                        .map(|o| (o, close));
                 }
                 Some(_) => col += 1,
                 None => {
@@ -11172,40 +11209,51 @@ impl Editor {
     /// left, then a close to the right; failing all four it falls back to the
     /// enclosing pair, then the next bracket forward.
     fn find_bracket_pair(&self) -> Option<(BPos, BPos, bool)> {
-        if let Some(pair) = self.adjacent_bracket_pair() {
+        let zones = self.bracket_zones();
+        if let Some(pair) = self.adjacent_bracket_pair(zones.as_ref()) {
             return Some(pair);
         }
-        if let Some((open, close)) = self.enclosing_brackets() {
+        if let Some((open, close)) = self.enclosing_brackets(zones.as_ref()) {
             return Some((open, close, false));
         }
-        self.next_bracket_pair().map(|(o, c)| (o, c, false))
+        self.next_bracket_pair(zones.as_ref())
+            .map(|(o, c)| (o, c, false))
     }
 
     /// The bracket pair whose bracket sits immediately to the left or right of
     /// the caret, as `(open, close, anchored_on_close)`. `None` when the caret
     /// touches no bracket. Adjacency priority mirrors VS Code's `matchBracket`:
     /// a close to the left wins, then an open to the right, then an open to the
-    /// left, then a close to the right.
-    fn adjacent_bracket_pair(&self) -> Option<(BPos, BPos, bool)> {
+    /// left, then a close to the right. A bracket in a string or comment
+    /// pairs only with one in the same string or comment.
+    fn adjacent_bracket_pair(&self, zones: Option<&BracketZones>) -> Option<(BPos, BPos, bool)> {
         let row = self.cursor_row;
         let col = self.cursor_col;
         let left = col.checked_sub(1).and_then(|c| self.char_at(row, c));
         let right = self.char_at(row, col);
         if left.is_some_and(is_close_bracket) {
             let close = (row, col - 1);
-            return self.match_bracket_backward(close).map(|o| (o, close, true));
+            return self
+                .match_bracket_backward(close, zones)
+                .map(|o| (o, close, true));
         }
         if right.is_some_and(is_open_bracket) {
             let open = (row, col);
-            return self.match_bracket_forward(open).map(|c| (open, c, false));
+            return self
+                .match_bracket_forward(open, zones)
+                .map(|c| (open, c, false));
         }
         if left.is_some_and(is_open_bracket) {
             let open = (row, col - 1);
-            return self.match_bracket_forward(open).map(|c| (open, c, false));
+            return self
+                .match_bracket_forward(open, zones)
+                .map(|c| (open, c, false));
         }
         if right.is_some_and(is_close_bracket) {
             let close = (row, col);
-            return self.match_bracket_backward(close).map(|o| (o, close, true));
+            return self
+                .match_bracket_backward(close, zones)
+                .map(|o| (o, close, true));
         }
         None
     }
@@ -11215,7 +11263,9 @@ impl Editor {
     /// [`Self::find_bracket_pair`] it never falls back to the enclosing or next
     /// pair, so the highlight appears only when the caret is beside a bracket.
     pub fn bracket_match_pair(&self) -> Option<(BPos, BPos)> {
-        self.adjacent_bracket_pair().map(|(o, c, _)| (o, c))
+        let zones = self.bracket_zones();
+        self.adjacent_bracket_pair(zones.as_ref())
+            .map(|(o, c, _)| (o, c))
     }
 
     /// VS Code "Go to Bracket" (`editor.action.jumpToBracket`, Cmd+Shift+\):
@@ -12654,6 +12704,27 @@ impl Editor {
             }
         }
         None
+    }
+}
+
+/// The string and comment byte ranges of a buffer, with each line's start
+/// offset, so a bracket scan can tell code from text (#1634).
+struct BracketZones<'a> {
+    lines: &'a [String],
+    starts: Vec<usize>,
+    ranges: &'a [(usize, usize)],
+}
+
+impl BracketZones<'_> {
+    /// The string or comment `(row, char col)` lies in, as an index into
+    /// the ranges; `None` in code.
+    fn zone(&self, (row, col): BPos) -> Option<usize> {
+        let byte = self.starts.get(row)? + char_byte(self.lines.get(row)?, col);
+        let i = self.ranges.partition_point(|&(_, end)| end <= byte);
+        self.ranges
+            .get(i)
+            .filter(|&&(start, _)| start <= byte)
+            .map(|_| i)
     }
 }
 
@@ -30299,6 +30370,72 @@ mod tests {
         e.cursor_col = 7; // before the '{'
         assert!(e.jump_to_matching_bracket());
         assert_eq!((e.cursor_row, e.cursor_col), (2, 0)); // the '}'
+    }
+
+    /// #1634's `br.rs`, highlighted as Rust so strings and comments are
+    /// known.
+    fn bracket_sample() -> Editor {
+        let mut e = editor_with(
+            "fn main() {\n    let re = Regex::new(\"\\\\(\").unwrap();\n    let n = count(\")\", s) + 1;\n    // closes the block: }\n    println!(\"{}\", n);\n}\n",
+        );
+        e.set_language(Some(LangKind::Rust));
+        e
+    }
+
+    /// #1634: a bracket inside a string or a comment is text, so the
+    /// highlight, Go to Bracket and Select to Bracket pair the code's own
+    /// brackets.
+    #[test]
+    fn brackets_in_strings_and_comments_are_skipped_when_matching() {
+        let mut e = bracket_sample();
+        // The `(` after `Regex::new` pairs with the `)` before `.unwrap`.
+        (e.cursor_row, e.cursor_col) = (1, 23);
+        assert_eq!(e.bracket_match_pair(), Some(((1, 23), (1, 29))));
+        assert!(e.jump_to_matching_bracket());
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 29));
+        // `count(")", s)`: the string's `)` is skipped.
+        (e.cursor_row, e.cursor_col) = (2, 17);
+        assert_eq!(e.bracket_match_pair(), Some(((2, 17), (2, 24))));
+        // The `{` of `fn main` pairs with line 6's `}`, not the comment's.
+        (e.cursor_row, e.cursor_col) = (0, 10);
+        assert_eq!(e.bracket_match_pair(), Some(((0, 10), (5, 0))));
+        assert!(e.select_to_matching_bracket());
+        assert_eq!(
+            e.selection,
+            Some(EditorSelection {
+                anchor: (0, 10),
+                head: (5, 1)
+            })
+        );
+        // And back from the `}`.
+        (e.cursor_row, e.cursor_col) = (5, 1);
+        assert_eq!(e.bracket_match_pair(), Some(((0, 10), (5, 0))));
+    }
+
+    /// #1634: from inside a string, Go to Bracket goes to the enclosing
+    /// pair in code, and a bracket inside a string pairs with nothing.
+    #[test]
+    fn a_caret_inside_a_string_uses_the_enclosing_code_brackets() {
+        let mut e = bracket_sample();
+        (e.cursor_row, e.cursor_col) = (2, 19);
+        assert!(e.jump_to_matching_bracket());
+        assert_eq!((e.cursor_row, e.cursor_col), (2, 24));
+        (e.cursor_row, e.cursor_col) = (2, 20);
+        assert_eq!(e.bracket_match_pair(), None, "the string's `)` is text");
+    }
+
+    /// #1634 negative: brackets in code match as before, across lines and
+    /// nested, and a buffer with no grammar still counts every bracket.
+    #[test]
+    fn brackets_in_code_match_as_before() {
+        let mut e = bracket_sample();
+        (e.cursor_row, e.cursor_col) = (0, 7);
+        assert_eq!(e.bracket_match_pair(), Some(((0, 7), (0, 8))));
+        (e.cursor_row, e.cursor_col) = (4, 12);
+        assert_eq!(e.bracket_match_pair(), Some(((4, 12), (4, 20))));
+        let mut plain = editor_with("f(\")\")\n");
+        (plain.cursor_row, plain.cursor_col) = (0, 1);
+        assert_eq!(plain.bracket_match_pair(), Some(((0, 1), (0, 3))));
     }
 
     #[test]
