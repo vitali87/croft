@@ -4060,6 +4060,13 @@ pub struct App {
     /// requested: the server's edit ranges describe the line then, and the
     /// accept shifts them by what was typed or deleted since.
     completion_origin: Option<(usize, usize)>,
+    /// The pending completion's last reply was marked `isIncomplete` (#1529):
+    /// each word edit re-asks the server, whether or not any of its old items
+    /// are still on screen. Lives only while `completion_request_id` does.
+    completion_incomplete: bool,
+    /// A word edit in an incomplete session is waiting to re-ask the server;
+    /// sent after `sync_lsp` so the request follows the edit's `didChange`.
+    completion_reask_due: bool,
     /// Signature Help (parameter hints) popup, anchored to the caret while the
     /// user is inside a call. Populated by `drain_lsp_signature_help`.
     pub signature_help_popup: Option<crate::widgets::signature_help_popup::SignatureHelpPopup>,
@@ -5667,7 +5674,7 @@ impl App {
                 // machine (#262): applied on arrival like the files above.
                 crate::config_layers::synced_config_path(),
             ]),
-            snippets: crate::snippets::SnippetSet::load(&crate::snippets::snippets_path()),
+            snippets: load_snippets(&crate::snippets::snippets_path()),
             format_on_save: loaded_prefs.format_on_save,
             copy_on_select: loaded_prefs.copy_on_select,
             files_exclude: Vec::new(),
@@ -6213,6 +6220,8 @@ impl App {
             file_finder_index_dirty: false,
             completion_request_id: None,
             completion_origin: None,
+            completion_incomplete: false,
+            completion_reask_due: false,
             signature_help_popup: None,
             signature_help_request_id: None,
             signature_help_anchor: None,
@@ -9041,6 +9050,7 @@ impl App {
             self.completion_request_id = None;
             return false;
         }
+        self.completion_incomplete = result.is_incomplete;
         let Some((cx, cy)) = self.editor.cursor_screen_pos() else {
             return false;
         };
@@ -9152,6 +9162,8 @@ impl App {
         let id = lsp.request_completion(path, line, character);
         self.completion_request_id = Some(id);
         self.completion_origin = Some((self.editor.cursor_row, self.editor.cursor_col));
+        self.completion_incomplete = false;
+        self.completion_reask_due = false;
     }
 
     /// Ask the server for parameter hints at the caret (typing `(` or `,`).
@@ -14850,14 +14862,61 @@ impl App {
 
     fn refresh_completion_prefix(&mut self) {
         let prefix = self.editor.word_before_cursor();
+        let incomplete = self.note_incomplete_completion_edit();
         let Some(popup) = self.completion_popup.as_mut() else {
             return;
         };
         popup.set_prefix(prefix);
-        if popup.visible_is_empty() {
-            self.completion_popup = None;
+        if !popup.visible_is_empty() {
+            return;
+        }
+        self.completion_popup = None;
+        // A capped list (`isIncomplete`) only holds what matched the word
+        // as it was (#1529): with none of it left, the session still waits
+        // on the re-ask for the word as it is.
+        if !incomplete {
             self.completion_request_id = None;
         }
+    }
+
+    /// A word edit while the pending completion is an incomplete list
+    /// (#1529): mark a re-ask due, popup shown or not. Returns whether the
+    /// session is incomplete.
+    fn note_incomplete_completion_edit(&mut self) -> bool {
+        let live = self.completion_incomplete && self.completion_request_id.is_some();
+        if live {
+            self.completion_reask_due = true;
+        }
+        live
+    }
+
+    /// Send the re-ask a word edit left due (#1529). Runs after `sync_lsp`,
+    /// so the server has the edit's `didChange` before the request; keeps
+    /// the session's origin so the reply opens while the caret stays in the
+    /// word, and ends the session once the caret has left it.
+    fn send_due_completion_reask(&mut self) {
+        if !std::mem::take(&mut self.completion_reask_due) {
+            return;
+        }
+        if !self.completion_incomplete || self.completion_request_id.is_none() {
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        if self.editor.has_non_text_view() || !self.completion_origin_covers_caret(&path) {
+            self.completion_incomplete = false;
+            self.completion_request_id = None;
+            return;
+        }
+        let (line, character) = self
+            .editor
+            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
+        let Some(lsp) = self.lsp.as_mut() else {
+            return;
+        };
+        let id = lsp.request_completion_for_incomplete(path, line, character);
+        self.completion_request_id = Some(id);
     }
 
     fn drain_fs_events(&mut self) -> bool {
@@ -42798,7 +42857,10 @@ impl App {
             KeyCode::PageDown => self.editor.page_down_one_screen(),
             KeyCode::Home => self.editor.home_line(),
             KeyCode::End => self.editor.end_line(),
-            KeyCode::Backspace => self.editor.backspace(),
+            KeyCode::Backspace => {
+                self.editor.backspace();
+                self.note_incomplete_completion_edit();
+            }
             KeyCode::Delete => self.editor.delete_forward(),
             KeyCode::Enter => self.editor.insert_newline(),
             // Tab advances a live snippet, else expands a snippet whose prefix
@@ -42814,6 +42876,9 @@ impl App {
                     && !key.modifiers.contains(KeyModifiers::SUPER) =>
             {
                 self.editor.insert_char(c);
+                // With an incomplete list pending but none of it on screen,
+                // typing on still re-asks (#1529).
+                self.note_incomplete_completion_edit();
                 // `.` is the canonical LSP trigger character for member
                 // access in Python / TS / Rust. Fire a completion request
                 // immediately so the popup pops without a Ctrl+Space.
@@ -56694,7 +56759,7 @@ impl App {
         }
         let (map, _) = crate::keymap::Keymap::load_with_warnings(&self.keybindings_file);
         self.keymap = map;
-        self.snippets = crate::snippets::SnippetSet::load(&crate::snippets::snippets_path());
+        self.snippets = load_snippets(&crate::snippets::snippets_path());
         self.status = format!(
             "Profile: {}; keybindings and snippets applied, settings apply at the next launch",
             name.as_deref().unwrap_or("Default")
@@ -58291,9 +58356,9 @@ impl App {
             }
             self.status = keybindings_reload_status(&warns);
         } else if path == crate::snippets::snippets_path() {
-            let (set, warning) = crate::snippets::SnippetSet::load_with_warning(path);
-            self.snippets = set;
-            self.status = snippets_reload_status(warning.is_some());
+            self.snippets = load_snippets(path);
+            self.status =
+                snippets_reload_status(self.snippets.is_broken(), self.snippets.warnings());
         } else if path == crate::agents::agents_path() {
             self.agents = crate::agents::AgentTable::load(path);
             let dropped = self.agents.dropped_patterns();
@@ -66178,13 +66243,31 @@ fn is_cmd_shift_letter(key: KeyEvent, letter: char) -> bool {
     has_shift && has_ctrl_or_super
 }
 
-/// The status after snippets.json is saved: a file that loaded nothing
-/// says so, with the detail in OUTPUT (#1191), as keybindings.json does.
-fn snippets_reload_status(broken: bool) -> String {
+/// Load the snippets file, writing what could not be read to OUTPUT ·
+/// Snippets: one bad entry used to empty the whole set without a word (#1483).
+fn load_snippets(path: &std::path::Path) -> crate::snippets::SnippetSet {
+    let set = crate::snippets::SnippetSet::load(path);
+    for w in set.warnings() {
+        crate::output::push("Snippets", crate::output::OutputLevel::Warn, w);
+    }
+    set
+}
+
+/// The status line shown after a snippets reload, tested the same way. A
+/// file that loaded nothing says so, with the detail in OUTPUT (#1191), as
+/// keybindings.json does; skipped entries are counted (#1483).
+fn snippets_reload_status(broken: bool, warns: &[String]) -> String {
     if broken {
-        String::from("Snippets not loaded: the file does not parse — see OUTPUT · Snippets")
-    } else {
-        String::from("Snippets reloaded")
+        return String::from(
+            "Snippets not loaded: the file does not parse — see OUTPUT · Snippets",
+        );
+    }
+    match warns.len() {
+        0 => String::from("Snippets reloaded"),
+        n => format!(
+            "Snippets reloaded with {n} warning{} — see OUTPUT · Snippets",
+            if n == 1 { "" } else { "s" }
+        ),
     }
 }
 
@@ -70033,6 +70116,13 @@ pub fn run(
     // Snapshot the terminal panel for the next launch (cwds are read live
     // here, so plain `cd`s during the session are captured at quit).
     app.save_terminal_session();
+    // Quitting mid-debug ends the program as Stop Debugging does (#1536):
+    // nothing sent `disconnect` here, and the debuggee outlived croft.
+    // The teardowns run while the terminal is restored and are joined
+    // below, before any exit path.
+    if !app.debug_sessions.is_empty() {
+        app.debug_stop();
+    }
 
     disable_raw_mode().ok();
     {
@@ -70072,6 +70162,7 @@ pub fn run(
     // disabled, pilot death): those threads race process exit, and a thread
     // that dies mid-grace-kill leaves the claude child running.
     crate::pair_host::join_teardowns();
+    crate::dap::transport::join_teardowns();
 
     result?;
     if app.drop_to_local {
@@ -70621,6 +70712,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let http_changed = app.drain_http_responses();
         let reveal_changed = app.tick_redaction_reveal();
         app.sync_lsp();
+        app.send_due_completion_reask();
         let markdown_lint_changed = app.sync_markdown_lint();
         let sarif_diagnostics_changed = app.sync_sarif_diagnostics();
         app.sync_sarif_selection_to_cursor();
