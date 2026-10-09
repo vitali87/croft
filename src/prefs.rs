@@ -364,6 +364,12 @@ pub struct Prefs {
     /// opens a plain shell. User layers only: it names a command to run.
     #[serde(default)]
     pub lane_agent: Option<String>,
+    /// The colour depth croft draws for (#1433): "truecolor", "256" or
+    /// "16". Unset, it is read from the terminal's environment; set it for
+    /// a terminal that draws 24-bit colour without saying so (often over
+    /// SSH, where `COLORTERM` is not passed on). Read at startup.
+    #[serde(default)]
+    pub color_depth: Option<String>,
     /// Scrollback lines kept per terminal pane (VS Code's
     /// `terminal.integrated.scrollback`). 0 — the default for older configs —
     /// means the built-in 5000. Applies to panes opened after the change.

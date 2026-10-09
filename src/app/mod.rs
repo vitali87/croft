@@ -3653,6 +3653,10 @@ pub struct App {
     /// The `agents.json` row a new worktree lane starts in its pane (#348);
     /// `None` opens a plain shell. From `lane_agent` in settings.json.
     lane_agent: Option<String>,
+    /// The colour depth each frame is fitted to before it is written
+    /// (#1433): the `color_depth` setting, else what the terminal's
+    /// environment advertises.
+    pub(crate) color_depth: crate::color_depth::ColorDepth,
     /// Which panes are worktree lanes' (#348), by pane uid: saved with the
     /// terminal session so a relaunch seats the agent again, and consulted
     /// when a lane closes so its pane goes with it.
@@ -5985,6 +5989,13 @@ impl App {
                 std::time::SystemTime::now(),
             ),
             lane_agent: loaded_prefs.lane_agent.clone(),
+            color_depth: loaded_prefs
+                .color_depth
+                .as_deref()
+                .and_then(crate::color_depth::ColorDepth::from_setting)
+                .unwrap_or_else(|| {
+                    crate::color_depth::ColorDepth::detect(|name| std::env::var(name).ok())
+                }),
             lane_panes: std::collections::BTreeMap::new(),
             tree_clipboard: None,
             tree_typeahead: None,
@@ -18788,6 +18799,13 @@ impl App {
                 false
             }
         }
+    }
+
+    /// Render the frame the terminal is sent: [`Self::render`], with every
+    /// colour fitted to the terminal's depth (#1433).
+    fn render_for_terminal(&mut self, frame: &mut ratatui::Frame) {
+        self.render(frame);
+        self.color_depth.fit_buffer(frame.buffer_mut());
     }
 
     fn render(&mut self, frame: &mut ratatui::Frame) {
@@ -72317,9 +72335,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 app.forget_sent_images();
             }
             let draw_start = std::time::Instant::now();
-            let drawn = terminal.draw(|f| {
-                app.render(f);
-            })?;
+            let drawn = terminal.draw(|f| app.render_for_terminal(f))?;
             let mut underlays = app.image_underlays(drawn.buffer);
             app.drawn_buffer = Some(drawn.buffer.clone());
             // Record render+flush time and the bytes ratatui shipped this
@@ -72335,9 +72351,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 app.overlays.welcome.mark_dirty();
                 app.overlays.hero.mark_dirty();
                 app.forget_sent_images();
-                let drawn = terminal.draw(|f| {
-                    app.render(f);
-                })?;
+                let drawn = terminal.draw(|f| app.render_for_terminal(f))?;
                 underlays = app.image_underlays(drawn.buffer);
                 app.drawn_buffer = Some(drawn.buffer.clone());
             }

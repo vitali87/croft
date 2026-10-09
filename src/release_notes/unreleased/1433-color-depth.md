@@ -1,0 +1,1 @@
+fix: On a terminal without 24-bit colour, such as the macOS Terminal app or a plain `xterm-256color`, croft now draws every colour as the nearest one the terminal supports instead of sending 24-bit codes it cannot show; set `"color_depth"` to `"truecolor"`, `"256"` or `"16"` to override the guess.
