@@ -68751,7 +68751,9 @@ fn copy_to_clipboard(text: &str) -> bool {
 /// Where `App::copy_where_pasted` put a copy.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CopyLanding {
-    /// Home over the drop relay, to the machine the user types at.
+    /// Queued home over the drop relay, to the machine the user types at.
+    /// The relay sends no word back on whether that clipboard took it, so
+    /// the status says it was sent, not that it landed.
     Local,
     /// This machine's clipboard.
     Clipboard,
@@ -68763,7 +68765,7 @@ impl CopyLanding {
     /// The status line for copying `what`, saying honestly where it went.
     fn status(self, what: &str) -> String {
         match self {
-            CopyLanding::Local => format!("Copied {what} to the local clipboard"),
+            CopyLanding::Local => format!("Sent {what} to the local clipboard"),
             CopyLanding::Clipboard => format!("Copied {what} to clipboard"),
             CopyLanding::Osc52 => format!("Copied {what} via OSC 52 (the host terminal decides)"),
         }

@@ -24161,7 +24161,7 @@ fn copy_output_on_a_relay_session_reaches_the_local_clipboard() {
     assert_eq!(sent.as_deref().map(str::trim_end), Some("out-1667"));
     assert_eq!(
         app.status,
-        "Copied command output (1 line) to the local clipboard"
+        "Sent command output (1 line) to the local clipboard"
     );
 }
 
