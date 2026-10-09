@@ -12384,7 +12384,7 @@ fn floor_grapheme_col(line: &str, col: usize) -> usize {
     start
 }
 
-fn is_word_char(c: char) -> bool {
+pub(crate) fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
