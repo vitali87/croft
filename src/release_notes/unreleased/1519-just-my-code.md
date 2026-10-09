@@ -1,0 +1,1 @@
+fix: Python debugging steps only through your own code by default (justMyCode on, as in VS Code), so F11 over a library call no longer walks into the standard library; a launch.json "justMyCode": false still steps into libraries.
