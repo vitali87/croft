@@ -1006,7 +1006,7 @@ The proactive-look detector, pure text-in and row-out. Tree-sitter judges whethe
 
 Per-tool output parsers. All node IDs are normalised to `::` separators so one panel tree serves every runner.
 
-**The runners covered.** libtest (`parse_test_line` for run lines, `parse_list_line` for discovery), pytest (`-v` result lines, `--collect-only` node IDs), vitest (`parse_vitest_list_line` for `vitest list`, `parse_vitest_tap_line` for the streaming `--reporter=tap-flat` run lines, whose `file > describe > test` IDs are complete per line), and jest (`parse_jest_json`).
+**The runners covered.** libtest (`parse_test_line` for run lines, `parse_list_line` for discovery), pytest (`<id> PASSED` result lines at `--verbosity=1`, `--collect-only` node IDs at `--verbosity=-1`, both set outright so a project's `addopts` `-q` cannot shift them), vitest (`parse_vitest_list_line` for `vitest list`, `parse_vitest_tap_line` for the streaming `--reporter=tap-flat` run lines, whose `file > describe > test` IDs are complete per line), and jest (`parse_jest_json`).
 
 **Why jest is different.** jest prints one `--json` document to stdout at run end, with human output going to stderr, yielding every assertion with its describe chain and treating `pending`/`todo` as the skip family.
 

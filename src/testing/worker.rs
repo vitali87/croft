@@ -412,6 +412,17 @@ fn pytest_script(path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     None
 }
 
+/// pytest's verbosity for a run: `<id> PASSED` lines are printed from 1
+/// up. Set outright, not with `-v`, which counts on from the project's
+/// `addopts`: with the common `-q` there, `-v` lands on 0 and the run
+/// prints only dots, so no result is read (#1502).
+const PYTEST_RUN_VERBOSITY: &str = "--verbosity=1";
+
+/// pytest's verbosity for `--collect-only`: one node id per line is level
+/// -1 exactly. `-q` would stack on an `addopts` `-q` to -2, which prints a
+/// count per file instead (#1502).
+const PYTEST_COLLECT_VERBOSITY: &str = "--verbosity=-1";
+
 /// `pytest <args>` rooted at the workspace, launched as [`pytest_launch`]
 /// says, with piped stdio. Discovery, runs and coverage all come through
 /// here, so they always agree on the interpreter.
@@ -963,7 +974,7 @@ fn run_all(root: &Path, tx: &EpochTx) {
     tx.send(TestResponse::Started(Activity::Running));
     let ok = match runner {
         Runner::Pytest => {
-            let cmd = pytest_cmd(root, &["-v", "--color=no"]);
+            let cmd = pytest_cmd(root, &[PYTEST_RUN_VERBOSITY, "--color=no"]);
             run_streaming(tx, cmd, one(parse_pytest_line))
         }
         Runner::Vitest => {
@@ -1084,7 +1095,12 @@ fn coverage_args(runner: Runner, dir: &Path) -> Vec<String> {
     let v = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
     match runner {
         Runner::Pytest => {
-            let mut a = v(&["-v", "--color=no", "--cov=.", "--cov-branch"]);
+            let mut a = v(&[
+                PYTEST_RUN_VERBOSITY,
+                "--color=no",
+                "--cov=.",
+                "--cov-branch",
+            ]);
             a.push(format!("--cov-report=lcov:{report}"));
             a
         }
@@ -1269,7 +1285,7 @@ fn run_one(root: &Path, tx: &EpochTx, name: &str) {
     };
     let ok = match runner {
         Runner::Pytest => {
-            let cmd = pytest_cmd(root, &["-v", "--color=no", name]);
+            let cmd = pytest_cmd(root, &[PYTEST_RUN_VERBOSITY, "--color=no", name]);
             run_streaming(tx, cmd, one(parse_pytest_line))
         }
         Runner::Vitest => {
@@ -1313,9 +1329,9 @@ fn run_filter(root: &Path, tx: &EpochTx, pattern: &str, suite: bool) {
             // A suite is always a node-ID prefix; the `.py` sniff keeps a
             // node-ID handed to a plain filter run positional too.
             let cmd = if suite || pattern.contains(".py") {
-                pytest_cmd(root, &["-v", "--color=no", pattern])
+                pytest_cmd(root, &[PYTEST_RUN_VERBOSITY, "--color=no", pattern])
             } else {
-                pytest_cmd(root, &["-v", "--color=no", "-k", pattern])
+                pytest_cmd(root, &[PYTEST_RUN_VERBOSITY, "--color=no", "-k", pattern])
             };
             run_streaming(tx, cmd, one(parse_pytest_line))
         }
@@ -1366,7 +1382,7 @@ fn discover(root: &Path, tx: &EpochTx) {
     };
     let ok = match runner {
         Runner::Pytest => {
-            let cmd = pytest_cmd(root, &["--collect-only", "-q", "--color=no"]);
+            let cmd = pytest_cmd(root, &["--collect-only", PYTEST_COLLECT_VERBOSITY, "--color=no"]);
             let show = |line: &str| Some(line.to_string());
             run_streaming_exit(tx, cmd, show, |line| {
                 parse_pytest_collect_line(line)
@@ -2028,7 +2044,10 @@ mod tests {
             py.contains(&"--cov-report=lcov:/t/cov/lcov.info".to_string()),
             "{py:?}"
         );
-        assert!(py.contains(&"--cov-branch".to_string()) && py.contains(&"-v".to_string()));
+        assert!(
+            py.contains(&"--cov-branch".to_string())
+                && py.contains(&PYTEST_RUN_VERBOSITY.to_string())
+        );
         let vi = coverage_args(Runner::Vitest, dir);
         assert!(vi.contains(&"--reporter=tap-flat".to_string()));
         assert!(
@@ -2165,6 +2184,122 @@ mod tests {
             let p = bin.join(name);
             std::fs::write(&p, format!("#!/bin/sh\n{text}\n")).unwrap();
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// A project whose pytest `addopts` is `addopts`, with a venv python
+    /// that answers the way pytest does for the verbosity it ends up at:
+    /// `addopts` comes first, `-v` / `-q` (and `-qq`) count up and down
+    /// from there, and `--verbosity=N` sets the level outright. Collection
+    /// prints node ids only at -1; a run prints `<id> PASSED` lines only
+    /// from 1 up, and dots below that.
+    #[cfg(unix)]
+    fn pytest_project_with_addopts(root: &Path, addopts: &str) {
+        std::fs::write(
+            root.join("pyproject.toml"),
+            format!("[tool.pytest.ini_options]\naddopts = \"{addopts}\"\n"),
+        )
+        .unwrap();
+        let body = format!(
+            r#"shift 2
+v=0
+collect=0
+for a in {addopts} "$@"; do
+  case "$a" in
+    -v) v=$((v+1)) ;;
+    -vv) v=$((v+2)) ;;
+    -q) v=$((v-1)) ;;
+    -qq) v=$((v-2)) ;;
+    --verbosity=*) v="${{a#--verbosity=}}" ;;
+    --collect-only) collect=1 ;;
+  esac
+done
+if [ "$collect" = 1 ]; then
+  if [ "$v" -le -2 ]; then echo "tests/test_x.py: 2"
+  elif [ "$v" -eq -1 ]; then echo "tests/test_x.py::test_a"; echo "tests/test_x.py::test_b"
+  else echo "<Module tests/test_x.py>"; echo "  <Function test_a>"; echo "  <Function test_b>"
+  fi
+  echo "2 tests collected in 0.01s"
+  exit 0
+fi
+if [ "$v" -ge 1 ]; then
+  echo "tests/test_x.py::test_a PASSED"
+  echo "tests/test_x.py::test_b FAILED"
+else
+  echo "tests/test_x.py .F"
+fi
+echo "1 failed, 1 passed in 0.01s"
+exit 1"#
+        );
+        fake_venv(root, ".venv", &body);
+    }
+
+    /// What `f` sends: the cases by name and status, and the run's verdict.
+    fn collect_responses(
+        root: &Path,
+        f: impl Fn(&Path, &EpochTx),
+    ) -> (Vec<(String, TestStatus)>, Option<Option<bool>>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let etx = EpochTx {
+            tx: &tx,
+            epoch: 0,
+            codeql: Path::new("codeql"),
+        };
+        f(root, &etx);
+        let mut cases = Vec::new();
+        let mut finished = None;
+        for (_, r) in rx.try_iter() {
+            match r {
+                TestResponse::Case(c) => cases.push((c.name, c.status)),
+                TestResponse::Finished { ok } => finished = Some(ok),
+                _ => {}
+            }
+        }
+        (cases, finished)
+    }
+
+    /// #1502: a project with `-q` in its pytest `addopts` (the pytest docs'
+    /// own `-ra -q` example) listed no tests: croft's `-q` stacked on it and
+    /// collection printed per-file counts instead of node ids. Discovery now
+    /// sets the verbosity outright.
+    #[cfg(unix)]
+    #[test]
+    fn discovery_lists_pytest_tests_under_a_quiet_addopts() {
+        for addopts in ["-ra -q", "-qq", "", "-v"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            pytest_project_with_addopts(root, addopts);
+            let (cases, finished) = collect_responses(root, discover);
+            assert_eq!(
+                cases,
+                vec![
+                    (String::from("tests/test_x.py::test_a"), TestStatus::NotRun),
+                    (String::from("tests/test_x.py::test_b"), TestStatus::NotRun),
+                ],
+                "addopts {addopts:?}"
+            );
+            assert_eq!(finished, Some(Some(true)), "addopts {addopts:?}");
+        }
+    }
+
+    /// #1502: with `-q` in `addopts`, croft's `-v` cancelled out, the run
+    /// printed dots, no result was parsed and the view said "Run failed".
+    /// Runs now ask for verbosity 1 outright, whatever `addopts` holds.
+    #[cfg(unix)]
+    #[test]
+    fn a_pytest_run_reports_results_under_a_quiet_addopts() {
+        for addopts in ["-ra -q", "-qq", "", "-v"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            pytest_project_with_addopts(root, addopts);
+            let expected = vec![
+                (String::from("tests/test_x.py::test_a"), TestStatus::Passed),
+                (String::from("tests/test_x.py::test_b"), TestStatus::Failed),
+            ];
+            let (cases, _) = collect_responses(root, run_all);
+            assert_eq!(cases, expected, "run all, addopts {addopts:?}");
+            let (cases, _) = collect_responses(root, |r, t| run_one(r, t, "tests/test_x.py"));
+            assert_eq!(cases, expected, "run one, addopts {addopts:?}");
         }
     }
 
