@@ -1,0 +1,1 @@
+fix: With word wrap on, End and Home now go to the end and start of the wrapped row the caret is on, and to the ends of the whole line on a second press, so Shift+End selects one row instead of the rest of the paragraph.

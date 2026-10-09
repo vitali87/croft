@@ -78971,3 +78971,37 @@ fn save_all_does_not_report_a_file_waiting_on_its_formatter_as_saved() {
         "Saved 1 editor"
     );
 }
+
+/// #1569: Shift+End in a wrapped paragraph selects to the end of the row the
+/// caret is on, not the rest of the paragraph; a second Shift+End extends it
+/// to the line's end.
+#[test]
+fn shift_end_in_a_wrapped_paragraph_selects_to_the_end_of_the_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("long.txt");
+    let words: Vec<String> = (0..60).map(|i| format!("word{i}")).collect();
+    std::fs::write(&f, format!("Notes: {}\n", words.join(" "))).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.editor.toggle_wrap();
+    assert!(app.editor.wrap_enabled());
+    app.focus_pane(Pane::Editor);
+    draw(&mut app, 100, 30);
+    app.handle_editor_key(key(KeyCode::Down, KeyModifiers::NONE));
+    let row_start = app.editor.cursor_col;
+    assert!(row_start > 0, "Down moved onto row 2 of line 1");
+    app.handle_editor_key(key(KeyCode::End, KeyModifiers::SHIFT));
+    let selected = app.editor.selection_text();
+    assert!(
+        !selected.is_empty() && selected.len() < 60,
+        "one row, not the paragraph: {selected:?}"
+    );
+    assert_eq!(
+        app.editor.lines[0].chars().nth(app.editor.cursor_col),
+        Some(' '),
+        "up to the space the row breaks at: {selected:?}"
+    );
+    app.handle_editor_key(key(KeyCode::End, KeyModifiers::SHIFT));
+    let selected = app.editor.selection_text();
+    assert!(selected.ends_with("word59"), "{selected:?}");
+}
