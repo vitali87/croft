@@ -542,7 +542,18 @@ const MAX_SPANNED_CELLS: usize = 100_000;
 /// A `colspan` / `rowspan` attribute's value, 1 when absent or unreadable.
 fn span_attr(tag: &str, attr: &str) -> usize {
     let lower = tag.to_ascii_lowercase();
-    let Some(at) = lower.find(attr) else {
+    // The attribute by its whole name: `data-colspan` and `aria-colspan`
+    // are metadata, not a span.
+    let Some(at) = lower.match_indices(attr).map(|(i, _)| i).find(|&i| {
+        lower[..i]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace)
+            && !lower[i + attr.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    }) else {
         return 1;
     };
     let value = lower[at + attr.len()..]
@@ -572,7 +583,17 @@ fn fenced_pre(inner: &str) -> String {
     let mut rest = inner;
     while let Some(lt) = rest.find('<') {
         raw.push_str(&rest[..lt]);
-        rest = rest[lt..].find('>').map_or("", |gt| &rest[lt + gt + 1..]);
+        let Some(gt) = rest[lt..].find('>') else {
+            rest = "";
+            break;
+        };
+        // A `<br>` is a line break of the output; other tags just go.
+        let tag = rest[lt + 1..lt + gt].trim_end_matches('/');
+        let name = tag.split_whitespace().next().unwrap_or("");
+        if name.eq_ignore_ascii_case("br") {
+            raw.push('\n');
+        }
+        rest = &rest[lt + gt + 1..];
     }
     raw.push_str(rest);
     let text = decode_entities(&raw);
@@ -1122,6 +1143,11 @@ mod tests {
         assert!(text.contains("   1  0.912"), "{text}");
         assert!(text.contains("<0.640>"), "entities decoded: {text}");
         assert!(!text.contains("loss 1"), "not joined onto one line: {text}");
+        // A `<br>` inside it is a line break too.
+        assert_eq!(
+            html_to_markdown("<pre>a<br>b<br/>c<BR class=\"x\">d</pre>"),
+            "```\na\nb\nc\nd\n```"
+        );
     }
 
     /// Negative: a table without spans and inline HTML are unchanged, and a
@@ -1156,6 +1182,13 @@ mod tests {
         );
         assert_eq!(span_attr("td colspan=\"0\"", "colspan"), 1);
         assert_eq!(span_attr("td colspan='3'", "colspan"), 3);
+        // Only the attribute by its whole name is a span.
+        assert_eq!(span_attr("td data-colspan=\"2\"", "colspan"), 1);
+        assert_eq!(span_attr("td aria-colspan=\"2\"", "colspan"), 1);
+        assert_eq!(
+            span_attr("td data-colspan=\"2\" colspan=\"3\"", "colspan"),
+            3
+        );
         assert_eq!(span_attr("td ROWSPAN=2", "rowspan"), 2);
         assert_eq!(span_attr("td", "rowspan"), 1);
     }
