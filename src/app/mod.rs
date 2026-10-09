@@ -3491,6 +3491,14 @@ pub struct App {
     /// it went (a folder's summary file or a gist's URL), how many
     /// repositories it holds, and those whose results failed.
     codeql_variant_export: Option<std::sync::mpsc::Receiver<Result<VariantExport, String>>>,
+    /// The walk for the workspace's queries in flight (#840): opening the
+    /// CodeQL view starts it off the UI thread and the packs land here. It is
+    /// tagged with the root it walks, so a root the workspace has left since
+    /// never lists its queries.
+    codeql_queries_job: Option<(
+        PathBuf,
+        std::sync::mpsc::Receiver<Vec<crate::codeql_query::QueryPack>>,
+    )>,
     /// True when the in-flight refresh was triggered by the user (the ⟳ button),
     /// so its completion reports a status line; the silent startup refresh
     /// doesn't, to avoid clobbering more useful startup messages.
@@ -5935,6 +5943,7 @@ impl App {
             codeql_variant_polled: None,
             codeql_variant_results: None,
             codeql_variant_export: None,
+            codeql_queries_job: None,
             ext_index_manual_refresh: false,
             search_query_tx,
             search_results_rx,
@@ -9026,7 +9035,9 @@ impl App {
                 .and_then(|(_, repo)| repo.clone())
                 .or_else(|| path.parent().and_then(crate::git::repo_toplevel))
         };
-        let mut fetched: std::collections::HashMap<PathBuf, Option<Vec<String>>> =
+        // Keyed by encoding too: the same file open in two tabs under two
+        // encodings needs HEAD decoded each tab's way (#1242).
+        let mut fetched: std::collections::HashMap<(PathBuf, &str), Option<Vec<String>>> =
             std::collections::HashMap::new();
         let groups =
             std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut());
@@ -9040,14 +9051,16 @@ impl App {
             // Untracked files / non-repo dirs yield Err here, so the gutter
             // simply shows nothing; the baseline-for marker still updates so we
             // don't re-shell every tick.
+            let enc = ed.encoding;
             let head = fetched
-                .entry(path.clone())
+                .entry((path.clone(), enc.name()))
                 .or_insert_with(|| {
                     let root = repo_for(&path)?;
                     path.strip_prefix(&root)
                         .ok()
                         .and_then(|rel| rel.to_str())
-                        .and_then(|rel| crate::git::read_file_at_head(&root, rel).ok())
+                        .and_then(|rel| crate::git::read_bytes_at_head(&root, rel).ok())
+                        .and_then(|bytes| crate::widgets::editor::decode_blob(&bytes, enc))
                         .map(|text| text.lines().map(str::to_string).collect())
                 })
                 .clone();
@@ -24867,6 +24880,9 @@ impl App {
 
     /// Reveal the CodeQL view (#578): the QL icon and the palette. Refused,
     /// with the reason, while the built-in CodeQL extension is disabled.
+    /// The saved lists it shows are small files read here; the workspace's
+    /// queries take a walk of the tree, which runs off the UI thread so the
+    /// view opens at once (#840).
     fn open_codeql_view(&mut self) {
         if !self.is_extension_enabled("codeql") {
             self.status = String::from(
@@ -24877,7 +24893,7 @@ impl App {
         self.show_tree = true;
         self.refresh_codeql_databases();
         self.refresh_codeql_history();
-        self.refresh_codeql_queries();
+        self.discover_codeql_queries();
         self.refresh_codeql_variant();
         self.set_sidebar_view(SidebarView::CodeQL);
     }
@@ -27371,10 +27387,67 @@ impl App {
         }
     }
 
-    /// Find the workspace's queries for the side bar's Queries section.
-    /// Called when the view opens, not every frame: it walks the tree.
+    /// Find the workspace's queries for the side bar's Queries section now,
+    /// for a caller that needs the list at once (a query just created, Run
+    /// All Queries). It walks the tree, so opening the view does this off
+    /// the UI thread instead. A walk still in flight is dropped: it may
+    /// predate what this one finds.
     fn refresh_codeql_queries(&mut self) {
+        self.codeql_queries_job = None;
+        self.codeql.discovering_queries = false;
         self.codeql.queries = crate::codeql_query::discover(self.workspace_root());
+    }
+
+    /// Find the workspace's queries on a worker thread (#840): the walk can
+    /// take seconds on a large tree, and switching to the CodeQL view must
+    /// not wait for it. [`Self::drain_codeql_queries`] lists what it finds;
+    /// until then the section keeps its last list, or says it is looking.
+    /// A walk of this root already in flight is left to finish rather than
+    /// doubled; one of a root the workspace has since left is replaced.
+    fn discover_codeql_queries(&mut self) {
+        let root = self.workspace_root().to_path_buf();
+        if self
+            .codeql_queries_job
+            .as_ref()
+            .is_some_and(|(walked, _)| *walked == root)
+        {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let walk = root.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::codeql_query::discover(&walk));
+        });
+        self.codeql_queries_job = Some((root, rx));
+        self.codeql.discovering_queries = true;
+    }
+
+    /// List the queries a discovery found, once it lands (#840). True when
+    /// the side bar changed. A walk of a root the workspace has left since
+    /// is dropped unread, landed or not, and the view, if showing, walks
+    /// the root it shows now.
+    pub fn drain_codeql_queries(&mut self) -> bool {
+        let Some((walked, rx)) = self.codeql_queries_job.as_ref() else {
+            return false;
+        };
+        if walked.as_path() != self.workspace_root() {
+            self.codeql_queries_job = None;
+            self.codeql.discovering_queries = false;
+            if self.sidebar_view == SidebarView::CodeQL {
+                self.discover_codeql_queries();
+            }
+            return true;
+        }
+        match rx.try_recv() {
+            Ok(queries) => self.codeql.set_queries(queries),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            // The walk died: stop saying it is looking.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.codeql.discovering_queries = false;
+            }
+        }
+        self.codeql_queries_job = None;
+        true
     }
 
     /// Ask for the name of a new query (#578, VS Code's "CodeQL: Create
@@ -33207,13 +33280,27 @@ impl App {
                 }
             }
             ChangeKind::Modified | ChangeKind::StagedModified => {
-                match crate::git::read_file_at_head(&scm_root, &entry.path) {
-                    Ok(head_text) => {
+                // Both sides decoded the way the file's open tab decodes it,
+                // so a windows-1252 or UTF-16 file diffs too (#1242).
+                let enc = self.open_tab_encoding(&abs);
+                let texts =
+                    crate::git::read_bytes_at_head(&scm_root, &entry.path).and_then(|head| {
+                        let working = std::fs::read(&abs).map_err(|e| e.to_string())?;
+                        let decode = |b: &[u8]| crate::widgets::editor::decode_blob(b, enc);
+                        decode(&head)
+                            .zip(decode(&working))
+                            .ok_or_else(|| format!("{} is not {}", entry.path, enc.name()))
+                    });
+                match texts {
+                    Ok((head_text, working_text)) => {
                         let label = std::path::PathBuf::from(format!("{} (HEAD)", entry.path));
-                        match self
-                            .editor
-                            .open_head_diff_with_text(label, &head_text, &abs, true)
-                        {
+                        match self.editor.open_head_diff_with_texts(
+                            label,
+                            &head_text,
+                            &working_text,
+                            &abs,
+                            true,
+                        ) {
                             Ok(()) => {
                                 self.tag_open_diff(
                                     crate::widgets::diff::DiffSource::HeadVsWorking {
@@ -33221,6 +33308,9 @@ impl App {
                                         rel: entry.path.clone(),
                                     },
                                 );
+                                if let Some(diff) = self.editor.diff.as_mut() {
+                                    diff.text_encoding = enc;
+                                }
                                 true
                             }
                             Err(e) => {
@@ -38102,14 +38192,20 @@ impl App {
     /// active tab isn't a working-tree diff or no hunk is at the cursor.
     fn diff_hunk_patch_at_caret(&mut self) -> Option<(String, String)> {
         let built = match self.editor.diff.as_ref() {
-            None => self.editor_hunk_patch_at_caret(),
+            None => self.editor_hunk_patch_at_caret().map_err(str::to_string),
             Some(diff) if !diff.left_is_git_head => {
-                Err("Hunk actions need a working-tree diff from Source Control")
+                Err("Hunk actions need a working-tree diff from Source Control".to_string())
             }
+            // The patch is built from the decoded text, which would put UTF-8
+            // bytes into a blob stored in another encoding (#1242).
+            Some(diff) if diff.text_encoding != encoding_rs::UTF_8 => Err(format!(
+                "Hunk actions work on UTF-8 files only; this diff is {}: stage the whole file",
+                diff.text_encoding.name()
+            )),
             Some(diff) => match self.repo_relative_path(&diff.right_path) {
-                None => Err("File is outside the repository"),
+                None => Err("File is outside the repository".to_string()),
                 Some(rel) => match diff.hunk_range_at(diff.action_row()) {
-                    None => Err("No change hunk at the cursor"),
+                    None => Err("No change hunk at the cursor".to_string()),
                     Some(range) => {
                         let patch = diff.hunk_patch(&rel, range);
                         Ok((rel, patch))
@@ -38185,7 +38281,8 @@ impl App {
     /// caller falls back to the whole-hunk action.
     fn diff_selected_lines_patch(&self) -> Option<(String, String)> {
         let diff = self.editor.diff.as_ref()?;
-        if !diff.left_is_git_head {
+        // Not UTF-8: left to the hunk path, which refuses it with a reason.
+        if !diff.left_is_git_head || diff.text_encoding != encoding_rs::UTF_8 {
             return None;
         }
         let sel = diff.selection?;
@@ -46628,9 +46725,8 @@ impl App {
             }
             // Always drain so completions never pile up unseen.
             for f in t.drain_finished_commands() {
-                if !f.output.is_empty() {
-                    build_scans.push((t.uid(), f.cwd.clone(), f.cmd.clone(), f.output.clone()));
-                }
+                // Empty output included (#1488): see the scan loop below.
+                build_scans.push((t.uid(), f.cwd.clone(), f.cmd.clone(), f.output.clone()));
                 // Durable command history: every finished command with a
                 // known text is recorded (cwd, exit, duration, timestamp)
                 // for the Ctrl+Shift+R cross-session search.
@@ -46761,6 +46857,16 @@ impl App {
             build_changed |= self.install_build_diags(pane, cwd.as_deref(), diags);
         }
         for (pane, cwd, cmd, output) in build_scans {
+            // A command that printed nothing (`cd`, `clear`) says nothing
+            // about the build, so the pane's problems stay. It still ends
+            // the pane's command, so it uses up a watcher's one-shot skip:
+            // a watcher that clears the screen erases its own output, and
+            // with the skip left armed the next build was the one skipped,
+            // leaving the watcher's stale problems in place (#1488).
+            if output.is_empty() {
+                self.watch_published_panes.remove(&pane);
+                continue;
+            }
             build_changed |= self.apply_build_scan(pane, cwd.as_deref(), &cmd, &output);
         }
         // Captures collect silently (iTerm2's model: the panel is the
@@ -65894,6 +66000,18 @@ impl App {
         );
     }
 
+    /// The encoding `path`'s open tab decodes it with, in any group; UTF-8
+    /// when it isn't open, which is what opening it would pick: a BOM still
+    /// wins in `decode_blob`, and bytes that are not UTF-8 get the plain
+    /// open rather than an editable diff of replacement characters.
+    fn open_tab_encoding(&self, path: &Path) -> &'static encoding_rs::Encoding {
+        std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .find(|e| e.diff.is_none() && e.path.as_deref() == Some(path))
+            .map_or(encoding_rs::UTF_8, |e| e.encoding)
+    }
+
     /// Re-point the tabs of a renamed or moved path in every editor group,
     /// not just the focused one: a tab in the other split kept the old path,
     /// raised a disk conflict, and a save brought the old file back.
@@ -69791,8 +69909,11 @@ fn rebuild_diff_view(
             if !head_moved && !written(&old.right_path) && !old.sides_moved_on_disk() {
                 return None;
             }
-            let head = crate::git::read_file_at_head(root, rel).ok()?;
-            let right = std::fs::read_to_string(&old.right_path).ok()?;
+            let enc = old.text_encoding;
+            let head = crate::git::read_bytes_at_head(root, rel).ok()?;
+            let head = crate::widgets::editor::decode_blob(&head, enc)?;
+            let right = std::fs::read(&old.right_path).ok()?;
+            let right = crate::widgets::editor::decode_blob(&right, enc)?;
             two_sided(&head, &right)
         }
         DiffSource::FixedLeft { left_text } => {
@@ -69830,6 +69951,7 @@ fn rebuild_diff_view(
     };
     fresh.source = old.source.clone();
     fresh.left_is_real_file = old.left_is_real_file;
+    fresh.text_encoding = old.text_encoding;
     fresh.stamp_sides();
     Some(fresh)
 }
@@ -72049,7 +72171,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             | app.drain_codeql_variant_submit()
             | app.poll_codeql_variant_runs()
             | app.drain_codeql_variant_results()
-            | app.drain_codeql_variant_export();
+            | app.drain_codeql_variant_export()
+            | app.drain_codeql_queries();
         let search_changed = app.drain_search_results();
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
