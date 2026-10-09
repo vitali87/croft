@@ -13475,13 +13475,6 @@ fn every_cmd_chord_is_ctrl_off_macos_unless_linux_md_lists_it() {
             how: NoCtrl::Refused,
         },
         Row {
-            doc: "`Cmd`+`Z` jump to a directory with zoxide, in the Explorer",
-            pred: "is_tree_zoxide_jump_key",
-            code: &[KeyCode::Char('z')],
-            mods: any,
-            how: NoCtrl::Refused,
-        },
-        Row {
             doc: "`Cmd`+`Enter` run the Markdown code block under the caret",
             pred: "is_run_fence_key",
             code: &[KeyCode::Enter],
@@ -13674,19 +13667,17 @@ fn the_palette_opens_the_zoxide_jump_from_any_pane() {
     assert!(app.zoxide_jump.is_some());
 }
 
-/// Guard (#843): `Ctrl`+`Z` in the Explorer still opens nothing (LINUX.md
-/// lists the zoxide jump as having no `Ctrl` form), while Cmd+Z does.
+/// #1294: `Ctrl`+`Z` in the Explorer opens the zoxide jump, as Cmd+Z does,
+/// so a terminal that never sends Super reaches it.
 #[test]
-fn ctrl_z_in_the_explorer_does_not_open_the_zoxide_jump() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.focus_pane(Pane::Tree);
-    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL))
-        .unwrap();
-    assert!(app.zoxide_jump.is_none());
-    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::SUPER))
-        .unwrap();
-    assert!(app.zoxide_jump.is_some(), "Cmd+Z still opens it");
+fn ctrl_z_in_the_explorer_opens_the_zoxide_jump_like_cmd_z() {
+    for mods in [KeyModifiers::CONTROL, KeyModifiers::SUPER] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.focus_pane(Pane::Tree);
+        app.handle_key(key(KeyCode::Char('z'), mods)).unwrap();
+        assert!(app.zoxide_jump.is_some(), "{mods:?}+Z opens it");
+    }
 }
 
 /// Guard (#843): "Go to Implementations" with no file open sends nothing,
@@ -27312,11 +27303,12 @@ fn relative_clipboard_text_is_relative_inside_root_and_absolute_outside() {
 }
 
 #[test]
-fn zoxide_jump_key_is_cmd_z_only_and_never_ctrl_z_or_redo() {
-    // Cmd+Z (SUPER) opens the Explorer jump popup. Ctrl+Z must NOT — it
-    // is the shell suspend in the terminal, and the editor's undo lives on
-    // Ctrl/Cmd+Z in its own (editor-focused) path. Cmd+Shift+Z is the
-    // reserved redo chord. Cmd+J stays free for terminal manipulation.
+fn zoxide_jump_key_is_cmd_or_ctrl_z_and_never_redo() {
+    // Cmd+Z and Ctrl+Z open the Explorer jump popup (#1294): most Linux
+    // terminals never deliver Super, and this predicate runs only while the
+    // Explorer is focused, where Ctrl+Z is no shell suspend or editor undo.
+    // Cmd+Shift+Z is the reserved redo chord. Cmd+J stays free for terminal
+    // manipulation.
     assert!(is_tree_zoxide_jump_key(key(
         KeyCode::Char('z'),
         KeyModifiers::SUPER
@@ -27326,20 +27318,86 @@ fn zoxide_jump_key_is_cmd_z_only_and_never_ctrl_z_or_redo() {
         "letter match must be case-insensitive"
     );
     assert!(
-        !is_tree_zoxide_jump_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL)),
-        "Ctrl+Z must not open the popup; it is shell suspend / editor undo"
+        is_tree_zoxide_jump_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL)),
+        "Ctrl+Z is the jump on terminals that never send Super"
     );
-    assert!(
-        !is_tree_zoxide_jump_key(key(
-            KeyCode::Char('z'),
-            KeyModifiers::SUPER | KeyModifiers::SHIFT
-        )),
-        "Cmd+Shift+Z is reserved for redo and must not open the popup"
-    );
+    for (mods, why) in [
+        (
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+            "Cmd+Shift+Z is redo",
+        ),
+        (
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            "Ctrl+Shift+Z is redo",
+        ),
+        (KeyModifiers::ALT, "Alt+Z is not the jump"),
+        (
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            "Ctrl+Alt+Z is not the jump",
+        ),
+        (KeyModifiers::NONE, "a bare z is type-to-find"),
+    ] {
+        assert!(
+            !is_tree_zoxide_jump_key(key(KeyCode::Char('z'), mods)),
+            "{why}"
+        );
+    }
     assert!(
         !is_tree_zoxide_jump_key(key(KeyCode::Char('j'), KeyModifiers::SUPER)),
         "Cmd+J must stay free for terminal manipulation"
     );
+}
+
+/// On a terminal that never sends Super, Ctrl+Z with the Explorer focused
+/// opens the jump through the real key path (#1294).
+#[test]
+fn ctrl_z_in_the_explorer_opens_the_zoxide_jump() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Tree;
+    app.sidebar_view = SidebarView::Explorer;
+    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.zoxide_jump.is_some(), "status: {}", app.status);
+}
+
+/// Negative: with the editor focused, Ctrl+Z is still undo and never the
+/// jump.
+#[test]
+fn ctrl_z_in_the_editor_still_undoes_and_opens_no_jump() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.txt");
+    std::fs::write(&file, "one\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_at(&file, 0, 0).unwrap();
+    app.focus = Pane::Editor;
+    app.editor.cursor_col = 3;
+    app.editor.insert_char('!');
+    assert_eq!(app.editor.lines[0], "one!");
+    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.zoxide_jump.is_none());
+    assert_eq!(app.editor.lines[0], "one", "Ctrl+Z undid the edit");
+}
+
+/// The jump is reachable from the palette with any pane focused, so a
+/// terminal without Super still has a way in (#1294).
+#[test]
+fn the_palette_has_a_zoxide_jump_command_that_works_from_any_pane() {
+    use crate::widgets::command_palette::ALL_COMMANDS;
+    let cmd = ALL_COMMANDS
+        .iter()
+        .copied()
+        .find(|c| c.title().to_lowercase().contains("zoxide"))
+        .expect("a palette command for the zoxide jump");
+    assert_eq!(cmd.title(), "Explorer: Jump to Directory (zoxide)");
+    for pane in [Pane::Editor, Pane::Terminal, Pane::Tree] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.focus = pane;
+        app.run_command(cmd);
+        assert!(app.zoxide_jump.is_some(), "{}", app.status);
+    }
 }
 
 #[test]
@@ -77725,6 +77783,120 @@ fn commit_all_refuses_while_merge_conflicts_are_unresolved() {
     );
 }
 
+/// #910: `tax.py` open with an unsaved function, rewritten on disk behind
+/// it (a `git checkout`, a restore, an agent), and the sweep that notices.
+fn app_with_a_disk_conflict(tmp: &std::path::Path) -> (App, std::path::PathBuf) {
+    let f = tmp.join("tax.py");
+    std::fs::write(&f, "RATE = 0.1\n").unwrap();
+    let mut app = App::new(tmp.to_path_buf()).unwrap();
+    app.history_root = tmp.join(".history");
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = "RATE = 0.1".len();
+    app.editor
+        .insert_str("\ndef tax(amount):\n    return amount * RATE");
+    assert!(app.editor.dirty);
+    std::fs::write(&f, "RATE = 0.2  # from the other branch\n").unwrap();
+    app.reload_open_file_after_external_change();
+    assert!(
+        matches!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(crate::widgets::input_prompt::InputPurpose::ReloadConflict { .. })
+        ),
+        "the conflict prompt opens"
+    );
+    (app, f)
+}
+
+fn type_keys(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+#[test]
+fn typing_on_into_the_disk_conflict_prompt_keeps_the_edits() {
+    // The prompt opens mid-typing and takes the keys; Enter on whatever was
+    // typed used to reload and throw the unsaved function away.
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_a_disk_conflict(tmp.path());
+    type_keys(&mut app, "    print(tax(100))");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.input_prompt.is_none(), "the prompt is dismissed");
+    assert!(
+        app.editor.lines.join("\n").contains("def tax(amount):"),
+        "the unsaved edits were discarded: {:?}",
+        app.editor.lines
+    );
+    assert!(app.editor.dirty);
+    assert!(
+        app.status.contains("Kept your unsaved edits"),
+        "{}",
+        app.status
+    );
+}
+
+#[test]
+fn the_disk_conflict_prompt_starts_empty_and_says_what_reload_costs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_a_disk_conflict(tmp.path());
+    let prompt = app.input_prompt.as_ref().unwrap();
+    assert_eq!(
+        prompt.value, "",
+        "nothing pre-filled for a stray Enter to confirm"
+    );
+    assert!(prompt.title.starts_with("tax.py "), "{}", prompt.title);
+    let said = format!(
+        "{} {}",
+        prompt.placeholder,
+        prompt.hint.clone().unwrap_or_default()
+    );
+    assert!(said.contains("discard"), "{said}");
+    // Negative: Enter on the empty field does nothing at all.
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.input_prompt.is_some());
+    assert!(app.editor.dirty);
+}
+
+#[test]
+fn reloading_over_unsaved_edits_keeps_them_in_local_history() {
+    // Typing `reload` is the explicit consent; what it discards stays
+    // recoverable from TIMELINE.
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, f) = app_with_a_disk_conflict(tmp.path());
+    type_keys(&mut app, "reload");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "RATE = 0.2  # from the other branch"
+    );
+    assert!(!app.editor.dirty);
+    let held: Vec<String> = crate::history::entries_in(&app.history_root, &f)
+        .iter()
+        .map(|s| std::fs::read_to_string(&s.file).unwrap())
+        .collect();
+    assert!(
+        held.iter().any(|h| h.contains("def tax(amount):")),
+        "the discarded buffer is in Local History: {held:?}"
+    );
+}
+
+#[test]
+fn escape_on_the_disk_conflict_prompt_keeps_the_edits() {
+    // Negative: the other way out still keeps them.
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_a_disk_conflict(tmp.path());
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.input_prompt.is_none());
+    assert!(app.editor.lines.join("\n").contains("def tax(amount):"));
+}
+
 // ---- Find bar seeding selects the word under the caret (#1278) ----
 
 /// orders.py from the issue, open and focused, caret at `(row, col)`.
@@ -77984,6 +78156,114 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     let _ = render_buf(&mut app);
     assert!(app.source_control.nested_repos.is_empty());
     assert!(app.source_control.last_init_repo_button_area.width > 0);
+}
+
+// ---- An empty Go to Definition / Declaration / Type Definition reply (#1302) ----
+
+/// `m.py` open with the caret on `undefined_name`, as in the issue.
+fn jump_app(dir: &std::path::Path) -> App {
+    std::fs::write(
+        dir.join("m.py"),
+        "total = 42\nprint(total + undefined_name)\n",
+    )
+    .unwrap();
+    let mut app = App::new(dir.to_path_buf()).unwrap();
+    app.editor.open_pinned(&dir.join("m.py")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 16;
+    app.status = String::from("Jumped to m.py line 2");
+    app
+}
+
+#[test]
+fn an_empty_jump_reply_says_nothing_was_found_and_clears_the_request() {
+    use crate::lsp::manager::{DeclarationResult, DefinitionResult, TypeDefinitionResult};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = jump_app(tmp.path());
+    let path = app.editor.path.clone().unwrap();
+
+    app.request_definition_at_cursor();
+    let id = app.definition_request_id.expect("F12 sent a request");
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_definition_for_test(DefinitionResult {
+            request_id: id,
+            path: path.clone(),
+            target: None,
+        });
+    let redrew = app.drain_lsp_definition();
+    assert_eq!(app.status, "No definition found");
+    assert!(redrew, "the empty reply redraws");
+    assert_eq!(app.definition_request_id, None);
+
+    app.request_declaration_at_cursor();
+    let id = app.declaration_request_id.expect("a declaration request");
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_declaration_for_test(DeclarationResult {
+            request_id: id,
+            path: path.clone(),
+            target: None,
+            unsupported: false,
+        });
+    assert!(app.drain_lsp_declaration());
+    assert_eq!(app.status, "No declaration found");
+    assert_eq!(app.declaration_request_id, None);
+
+    app.request_type_definition_at_cursor();
+    let id = app
+        .type_definition_request_id
+        .expect("a type definition request");
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_type_definition_for_test(TypeDefinitionResult {
+            request_id: id,
+            path,
+            target: None,
+            unsupported: false,
+        });
+    assert!(app.drain_lsp_type_definition());
+    assert_eq!(app.status, "No type definition found");
+    assert_eq!(app.type_definition_request_id, None);
+}
+
+#[test]
+fn a_stale_jump_reply_changes_nothing_and_a_found_target_still_jumps() {
+    // Negative: only the outstanding request's reply speaks, and a reply
+    // with a target jumps as before instead of reporting "not found".
+    use crate::lsp::manager::DefinitionResult;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = jump_app(tmp.path());
+    let path = app.editor.path.clone().unwrap();
+    app.request_definition_at_cursor();
+    let id = app.definition_request_id.expect("F12 sent a request");
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_definition_for_test(DefinitionResult {
+            request_id: id + 1000,
+            path: path.clone(),
+            target: None,
+        });
+    assert!(!app.drain_lsp_definition(), "a stale reply is dropped");
+    assert_eq!(app.status, "Jumped to m.py line 2");
+    assert_eq!(app.definition_request_id, Some(id), "still waiting");
+
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_definition_for_test(DefinitionResult {
+            request_id: id,
+            path: path.clone(),
+            target: Some((path, 0, 0)),
+        });
+    assert!(app.drain_lsp_definition());
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
+    assert_ne!(app.status, "No definition found");
 }
 
 // ── #1483: one snippet croft cannot read no longer empties the whole set ──

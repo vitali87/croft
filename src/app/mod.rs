@@ -7801,20 +7801,17 @@ impl App {
     /// already owns the modal slot, so we never stomp an in-progress input.
     fn prompt_disk_conflict(&mut self, paths: Vec<PathBuf>) {
         use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
-        let (title, placeholder) = match paths.as_slice() {
-            [one] => (
-                format!(
-                    "{} changed on disk and you have unsaved edits.",
-                    one.display()
-                ),
-                "Enter to reload (discard your edits) · Esc to keep editing",
+        // It opens mid-typing and takes the keys, so nothing a stray Enter
+        // or a typed line can confirm discards the edits: only the word
+        // `reload` does, and the box says so (#910).
+        let title = match paths.as_slice() {
+            [one] => format!(
+                "{} changed on disk and you have unsaved edits.",
+                self.status_path(one)
             ),
-            many => (
-                format!(
-                    "{} open files changed on disk with unsaved edits.",
-                    many.len()
-                ),
-                "Enter to reload all (discard your edits) · Esc to keep editing",
+            many => format!(
+                "{} open files changed on disk with unsaved edits.",
+                many.len()
             ),
         };
         if self.input_prompt.is_some() {
@@ -7822,8 +7819,12 @@ impl App {
             return;
         }
         self.open_input_prompt(
-            InputPrompt::new(InputPurpose::ReloadConflict { paths }, title, placeholder)
-                .with_value("reload"),
+            InputPrompt::new(
+                InputPurpose::ReloadConflict { paths },
+                title,
+                "type reload to discard your unsaved edits",
+            )
+            .with_hint("reload + Enter discards your edits · anything else keeps them"),
         );
     }
 
@@ -11508,11 +11509,13 @@ impl App {
     pub fn drain_lsp_definition(&mut self) -> bool {
         let mut target = None;
         let mut peek = None;
+        let mut empty_reply = false;
         {
             let Some(lsp) = self.lsp.as_ref() else {
                 return false;
             };
             let mut peek_replied = false;
+            let mut replied = false;
             while let Some(result) = lsp.drain_definition() {
                 if Some(result.request_id) == self.peek_definition_request_id {
                     peek_replied = true;
@@ -11522,6 +11525,7 @@ impl App {
                 if Some(result.request_id) != self.definition_request_id {
                     continue;
                 }
+                replied = true;
                 target = result.target;
             }
             if peek_replied && peek.is_none() {
@@ -11530,8 +11534,17 @@ impl App {
                 self.peek_definition_request_id = None;
                 self.status = String::from("No definition found");
             }
+            if replied {
+                self.definition_request_id = None;
+                // An empty F12 reply said nothing (#1302): a slow server, a
+                // missing one and "nothing here" all looked alike.
+                if target.is_none() {
+                    self.status = String::from("No definition found");
+                    empty_reply = true;
+                }
+            }
         }
-        let mut changed = false;
+        let mut changed = empty_reply;
         if let Some((path, line, col)) = peek {
             self.peek_definition_request_id = None;
             self.open_peek_popup(path, line, col);
@@ -11654,6 +11667,7 @@ impl App {
     pub fn drain_lsp_declaration(&mut self) -> bool {
         let mut target = None;
         let mut unsupported = false;
+        let mut replied = false;
         {
             let Some(lsp) = self.lsp.as_ref() else {
                 return false;
@@ -11662,9 +11676,13 @@ impl App {
                 if Some(result.request_id) != self.declaration_request_id {
                     continue;
                 }
+                replied = true;
                 target = result.target;
                 unsupported = result.unsupported;
             }
+        }
+        if replied {
+            self.declaration_request_id = None;
         }
         match target {
             // The jump itself is identical to definition: open the target file,
@@ -11681,6 +11699,10 @@ impl App {
                     String::from("Go to Declaration: not supported by this file's language server");
                 true
             }
+            None if replied => {
+                self.status = String::from("No declaration found");
+                true
+            }
             None => false,
         }
     }
@@ -11688,6 +11710,7 @@ impl App {
     pub fn drain_lsp_type_definition(&mut self) -> bool {
         let mut target = None;
         let mut unsupported = false;
+        let mut replied = false;
         {
             let Some(lsp) = self.lsp.as_ref() else {
                 return false;
@@ -11696,9 +11719,13 @@ impl App {
                 if Some(result.request_id) != self.type_definition_request_id {
                     continue;
                 }
+                replied = true;
                 target = result.target;
                 unsupported = result.unsupported;
             }
+        }
+        if replied {
+            self.type_definition_request_id = None;
         }
         match target {
             // The jump itself is identical to definition: open the target file,
@@ -11711,6 +11738,10 @@ impl App {
                 self.status = String::from(
                     "Go to Type Definition: not supported by this file's language server",
                 );
+                true
+            }
+            None if replied => {
+                self.status = String::from("No type definition found");
                 true
             }
             None => false,
@@ -34827,6 +34858,15 @@ impl App {
             }
             InputPurpose::ReloadConflict { paths } => {
                 self.close_input_prompt();
+                if !value.eq_ignore_ascii_case("reload") {
+                    self.status = String::from(
+                        "Kept your unsaved edits; saving asks before overwriting the disk version",
+                    );
+                    return;
+                }
+                // Recoverable from TIMELINE: no answer, however deliberate,
+                // makes typed work unrecoverable (#910).
+                let kept = self.keep_unsaved_buffers_in_history(&paths);
                 // Every group: the prompt lists conflicts from the other
                 // splits too, and reverting only the focused one left theirs
                 // unreloaded with the prompt never coming back.
@@ -34848,6 +34888,10 @@ impl App {
                     (n, 0) => format!("Reloaded {n} files from disk"),
                     (n, f) => format!("Reloaded {n} files; {f} failed and kept their edits"),
                 };
+                if kept > 0 && !reverted.is_empty() {
+                    self.status
+                        .push_str("; the discarded edits are in Local History (TIMELINE)");
+                }
             }
             InputPurpose::AskNavigator {
                 file,
@@ -59087,6 +59131,32 @@ impl App {
         }
     }
 
+    /// Record each dirty tab of `paths` (any group) in Local History as a
+    /// kept snapshot, before a reload throws its edits away (#910). The
+    /// number recorded.
+    fn keep_unsaved_buffers_in_history(&mut self, paths: &[PathBuf]) -> usize {
+        let millis = now_millis();
+        let mut buffers: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
+        for tab in groups.flat_map(|g| g.iter_tabs()) {
+            let Some(path) = tab.path.as_ref().filter(|p| paths.contains(p)) else {
+                continue;
+            };
+            if tab.dirty
+                && !buffers.iter().any(|(p, _)| p == path)
+                && let Some(bytes) = tab.bytes_for_disk()
+            {
+                buffers.push((path.clone(), bytes));
+            }
+        }
+        buffers
+            .iter()
+            .filter(|(path, bytes)| {
+                crate::history::record_kept_in(&self.history_root, path, bytes, millis).is_ok()
+            })
+            .count()
+    }
+
     /// [`Self::record_history_snapshot_of`] as a kept snapshot (a restore).
     fn record_history_snapshot_of_kept(
         &mut self,
@@ -66939,14 +67009,13 @@ fn is_toggle_wrap_key(key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
-/// Explorer-pane shortcut: `Cmd+Z` — open the zoxide jump popup. `z` for
-/// **z**oxide; the user's shell still uses `j` for the same jump. Requires
-/// SUPER (iTerm2 already forwards Cmd+Z as `Char('z') + SUPER` for the
-/// editor's undo via the `CMD_Z` GlobalKeyMap entry). Off Termux it rejects
-/// CONTROL so a terminal `Ctrl+Z` suspend never reaches it and it stays
-/// distinct from the Ctrl-based terminal-toggle chords on `j`; on Termux,
-/// where Ctrl is the Cmd surrogate, `Ctrl+Z` opens the popup (this predicate
-/// only runs while the Explorer is focused, so there is no suspend to clash).
+/// Explorer-pane shortcut: `Cmd+Z` / `Ctrl+Z` — open the zoxide jump popup.
+/// `z` for **z**oxide; the user's shell still uses `j` for the same jump.
+/// `Ctrl+Z` counts on every platform, as the Make Root chords do (#1294):
+/// xterm, GNOME Terminal, Konsole and tmux never deliver Super, and this
+/// predicate only runs while the Explorer is focused, so a `Ctrl+Z` here is
+/// never a shell's suspend or the editor's undo. The Explorer has no undo
+/// of its own to clash with.
 /// SHIFT is rejected because `Cmd+Shift+Z` is the reserved redo chord.
 /// Editor-pane `Cmd+Z` is untouched: this predicate is only consulted from
 /// `handle_explorer_shortcut`, which runs solely when the Explorer is
@@ -66961,10 +67030,7 @@ fn is_tree_zoxide_jump_key(key: KeyEvent) -> bool {
     if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
-    // `has_cmd` is SUPER-only off Termux (so a terminal `Ctrl+Z` suspend is
-    // never swallowed); on Termux Ctrl is the command key, and this predicate
-    // only runs while the Explorer is focused, so there is no suspend to clash.
-    has_cmd(key.modifiers)
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
 /// Explorer-pane shortcut: `Cmd+F` / `Ctrl+F` (no Shift, no Alt) - "New File".
