@@ -543,7 +543,11 @@ impl Prefs {
         std::fs::rename(&tmp, path).with_context(|| {
             let _ = std::fs::remove_file(&tmp);
             format!("replacing {}", path.display())
-        })
+        })?;
+        // croft's own write, already applied: the settings watch must not
+        // re-merge it as if it came from outside (#1435).
+        crate::config_sync::note_own_write(path);
+        Ok(())
     }
 
     /// What [`Prefs::save`] writes: the loaded file with only the settings

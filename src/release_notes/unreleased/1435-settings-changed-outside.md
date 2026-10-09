@@ -1,0 +1,1 @@
+fix: Settings files changed outside croft now apply within about two seconds, as a save from inside croft does: `config.json`, `config.local.json`, a workspace's `.croft/config.json`, `.croft/config.local.json` and `.vscode/settings.json`, and their `extends` targets, whether changed by a `git pull`, an edit in croft's terminal, a dotfiles sync or another croft window.

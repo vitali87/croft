@@ -5556,6 +5556,29 @@ fn plan_port_open(entry: &crate::widgets::ports::PortEntry, relay_active: bool) 
     }
 }
 
+/// The config files the [`crate::config_sync::ConfigWatch`] checks for
+/// changes made outside croft: the fixed ones, then every file of the
+/// settings chain (#1435), so a `git pull` of `.croft/config.json`, an edit
+/// in vim, or a dotfiles sync applies like a save from inside croft.
+fn config_watch_paths(settings_chain: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths = vec![
+        crate::keymap::keybindings_path(),
+        crate::snippets::snippets_path(),
+        crate::triggers::triggers_path(),
+        crate::problem_matchers::matchers_path(),
+        crate::macros::macros_path(),
+        // The settings layer config sync brings from the connecting
+        // machine (#262): applied on arrival like the files above.
+        crate::config_layers::synced_config_path(),
+    ];
+    for path in settings_chain {
+        if !paths.contains(path) {
+            paths.push(path.clone());
+        }
+    }
+    paths
+}
+
 impl App {
     pub fn new(root: PathBuf) -> Result<Self> {
         // Reap any js-debug adapter tree a previous croft left orphaned (a
@@ -5749,16 +5772,9 @@ impl App {
             macro_registers: crate::macros::load(&crate::macros::macros_path()),
             macro_replaying: false,
             macros_path: crate::macros::macros_path(),
-            config_watch: crate::config_sync::ConfigWatch::new(vec![
-                crate::keymap::keybindings_path(),
-                crate::snippets::snippets_path(),
-                crate::triggers::triggers_path(),
-                crate::problem_matchers::matchers_path(),
-                crate::macros::macros_path(),
-                // The settings layer config sync brings from the connecting
-                // machine (#262): applied on arrival like the files above.
-                crate::config_layers::synced_config_path(),
-            ]),
+            config_watch: crate::config_sync::ConfigWatch::new(config_watch_paths(
+                &merged_settings.chain,
+            )),
             snippets: load_snippets(&crate::snippets::snippets_path()),
             format_on_save: loaded_prefs.format_on_save,
             copy_on_select: loaded_prefs.copy_on_select,
@@ -48678,6 +48694,8 @@ impl App {
             self.status = format!("{}: {e}", path.display());
             return;
         }
+        // Applied just below, so the settings watch must not apply it again.
+        self.config_watch.note(&path);
         let merged = self.merged_settings_here();
         for w in &merged.warnings {
             crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
@@ -59162,7 +59180,8 @@ impl App {
 
     /// Re-run the layered settings merge (#251) and apply everything that can
     /// apply live: theme, editor toggles, save behavior, host accents. Called
-    /// when any file of the chain is saved in the editor; layout and other
+    /// when any file of the chain is saved in the editor or changes on disk
+    /// outside croft (#1435); layout and other
     /// startup-read settings still say "next launch".
     fn remerge_settings(&mut self) {
         let merged = crate::config_layers::load_merged(Some(self.roots.primary()));
@@ -59170,6 +59189,10 @@ impl App {
             crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
         }
         self.settings_chain = merged.chain;
+        // The chain follows the primary root and the `extends` targets, so
+        // the watch follows the chain (#1435).
+        self.config_watch
+            .set_paths(config_watch_paths(&self.settings_chain));
         self.settings_provenance = merged.provenance;
         self.apply_merged_settings(&merged.prefs);
         self.status = if merged.warnings.is_empty() {

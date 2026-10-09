@@ -72589,6 +72589,146 @@ fn a_macros_file_written_outside_croft_is_reloaded_live() {
     assert!(!app.tick_config_watch_at(t0 + crate::config_sync::ConfigWatch::INTERVAL * 4));
 }
 
+/// One check of the config watch after `t0`, past its interval.
+fn tick_after(app: &mut App, t0: std::time::Instant, n: u32) -> bool {
+    app.tick_config_watch_at(t0 + crate::config_sync::ConfigWatch::INTERVAL * n)
+}
+
+/// #1435: `.croft/config.json` written from croft's own terminal (or by a
+/// `git pull`) applies within the watch interval, the way a save from
+/// inside croft does, and only once.
+#[test]
+fn a_workspace_settings_file_written_outside_croft_applies_live() {
+    use crate::widgets::editor::WhitespaceMode;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert_eq!(app.whitespace_mode, WhitespaceMode::Selection);
+    let t0 = std::time::Instant::now();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/config.json"),
+        r#"{ "render_whitespace": "all" }"#,
+    )
+    .unwrap();
+    assert!(tick_after(&mut app, t0, 2));
+    assert_eq!(app.whitespace_mode, WhitespaceMode::All);
+    assert_eq!(app.editor.whitespace_mode, WhitespaceMode::All);
+    assert_eq!(app.status, "Settings reloaded");
+    assert!(!tick_after(&mut app, t0, 4), "applied once");
+}
+
+/// #1435: an `extends` target is part of the chain too, watched even
+/// before it exists, so creating it applies its settings.
+#[test]
+fn an_extends_target_written_outside_croft_applies_live() {
+    use crate::widgets::editor::WhitespaceMode;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/config.json"),
+        r#"{ "extends": "team.json" }"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let t0 = std::time::Instant::now();
+    std::fs::write(
+        tmp.path().join(".croft/team.json"),
+        r#"{ "render_whitespace": "none" }"#,
+    )
+    .unwrap();
+    assert!(tick_after(&mut app, t0, 2));
+    assert_eq!(app.whitespace_mode, WhitespaceMode::None);
+    assert_eq!(app.status, "Settings reloaded");
+}
+
+/// #1435: a settings file saved from inside croft reloads on the save, and
+/// the watch does not reload it a second time.
+#[test]
+fn a_settings_file_saved_in_croft_reloads_once() {
+    use crate::widgets::editor::WhitespaceMode;
+    let tmp = tempfile::tempdir().unwrap();
+    let layer = crate::config_layers::workspace_config_path(tmp.path());
+    std::fs::create_dir_all(layer.parent().unwrap()).unwrap();
+    std::fs::write(&layer, "{}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let t0 = std::time::Instant::now();
+    app.editor.open(&layer).unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 1;
+    app.editor.insert_str(r#" "render_whitespace": "all" "#);
+    app.save();
+    assert_eq!(app.whitespace_mode, WhitespaceMode::All);
+    assert_eq!(app.status, "Settings reloaded");
+    app.status = String::from("after the save");
+    assert!(!tick_after(&mut app, t0, 2), "the save already applied it");
+    assert_eq!(app.status, "after the save");
+}
+
+/// #1435: the Settings editor writes its layer and applies it itself, so
+/// the watch leaves that write alone and the editor's own message stays.
+#[test]
+fn a_settings_editor_write_is_not_reloaded_again_by_the_watch() {
+    use crate::widgets::editor::WhitespaceMode;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let t0 = std::time::Instant::now();
+    app.open_settings_editor();
+    app.settings_editor.as_mut().unwrap().target = crate::config_layers::LayerKind::Workspace;
+    app.write_setting("render_whitespace", serde_json::json!("all"));
+    assert_eq!(app.whitespace_mode, WhitespaceMode::All);
+    let saved = app.status.clone();
+    assert!(saved.starts_with("render_whitespace saved to"), "{saved}");
+    assert!(!tick_after(&mut app, t0, 2));
+    assert_eq!(app.status, saved);
+}
+
+/// #1435: after a re-root the new root's settings are watched and the old
+/// root's are not: editing the repo croft has left changes nothing.
+#[test]
+fn after_a_re_root_only_the_new_roots_settings_are_watched() {
+    use crate::widgets::editor::WhitespaceMode;
+    let old = tempfile::tempdir().unwrap();
+    let new = tempfile::tempdir().unwrap();
+    for root in [old.path(), new.path()] {
+        std::fs::create_dir_all(root.join(".croft")).unwrap();
+    }
+    let mut app = App::new(old.path().to_path_buf()).unwrap();
+    app.change_workspace_root(new.path().to_path_buf());
+    let old_layer = crate::config_layers::workspace_config_path(old.path());
+    let new_layer = crate::config_layers::workspace_config_path(new.path());
+    assert!(app.config_watch.watches(&new_layer));
+    assert!(!app.config_watch.watches(&old_layer));
+    let t0 = std::time::Instant::now();
+    std::fs::write(&old_layer, r#"{ "render_whitespace": "all" }"#).unwrap();
+    assert!(!tick_after(&mut app, t0, 2), "the old root is not watched");
+    assert_eq!(app.whitespace_mode, WhitespaceMode::Selection);
+    std::fs::write(&new_layer, r#"{ "render_whitespace": "all" }"#).unwrap();
+    assert!(tick_after(&mut app, t0, 4));
+    assert_eq!(app.whitespace_mode, WhitespaceMode::All);
+}
+
+/// #1435: the user's own settings layers are watched from startup, the
+/// files croft already watched still are, and a file that is no settings
+/// layer is not.
+#[test]
+fn the_config_watch_covers_every_settings_layer_and_only_those() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    for layer in &app.settings_chain {
+        assert!(app.config_watch.watches(layer), "{}", layer.display());
+    }
+    assert!(app.config_watch.watches(&crate::keymap::keybindings_path()));
+    assert!(
+        app.config_watch
+            .watches(&crate::config_layers::synced_config_path())
+    );
+    assert!(!app.config_watch.watches(&tmp.path().join("notes.json")));
+    assert!(
+        !app.config_watch
+            .watches(&tmp.path().join(".croft/tasks.json"))
+    );
+}
+
 /// #577: export to a `.sarif` name writes the visible results as SARIF,
 /// each run kept with its tool and rules, filtered results left out and a
 /// run with nothing left dropped; any other name still gets CSV.

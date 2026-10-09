@@ -161,7 +161,9 @@ impl ConfigWatch {
             let current = stamp(path);
             if current != *seen {
                 *seen = current;
-                changed.push(path.clone());
+                if !is_own_write(path, current) {
+                    changed.push(path.clone());
+                }
             }
         }
         changed
@@ -174,6 +176,62 @@ impl ConfigWatch {
             *seen = stamp(path);
         }
     }
+
+    /// Watch `paths` from now on (#1435): the settings chain follows the
+    /// primary root and its `extends` targets, so the list changes after a
+    /// re-merge. A path already watched keeps what was last seen of it, so a
+    /// change it had before the switch is still reported; a new one is taken
+    /// as already applied, like the paths given to [`Self::new`].
+    pub fn set_paths(&mut self, paths: Vec<PathBuf>) {
+        let mut known = std::mem::take(&mut self.files);
+        self.files = paths
+            .into_iter()
+            .map(|p| match known.iter().position(|(q, _)| *q == p) {
+                Some(i) => known.swap_remove(i),
+                None => {
+                    let s = stamp(&p);
+                    (p, s)
+                }
+            })
+            .collect();
+    }
+
+    /// Whether `path` is one of the watched files.
+    #[cfg(test)]
+    pub fn watches(&self, path: &std::path::Path) -> bool {
+        self.files.iter().any(|(p, _)| p == path)
+    }
+}
+
+/// What croft itself last wrote to each settings file, so the poll can
+/// tell its own writes (a theme pick, the saved layout) from a change made
+/// outside croft (#1435). The settings files are now watched, and croft
+/// writes `config.json` far more often than a person does: without this,
+/// every one of those writes would re-merge and re-apply every setting two
+/// seconds later and replace the status bar's message with "Settings
+/// reloaded".
+static OWN_WRITES: std::sync::Mutex<Vec<(PathBuf, Stamp)>> = std::sync::Mutex::new(Vec::new());
+
+/// Record that croft has just written `path` itself, so a [`ConfigWatch`]
+/// poll that sees it in exactly this state does not report it.
+pub fn note_own_write(path: &std::path::Path) {
+    let Some(s) = stamp(path) else {
+        return;
+    };
+    let mut own = OWN_WRITES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match own.iter_mut().find(|(p, _)| p == path) {
+        Some((_, seen)) => *seen = s,
+        None => own.push((path.to_path_buf(), s)),
+    }
+}
+
+fn is_own_write(path: &std::path::Path, current: Option<Stamp>) -> bool {
+    let own = OWN_WRITES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    current.is_some_and(|c| own.iter().any(|(p, s)| p == path && *s == c))
 }
 
 /// Local paths of the syncable files that actually exist.
@@ -628,6 +686,49 @@ mod tests {
         watch.note(&file);
         let later = std::time::Instant::now() + ConfigWatch::INTERVAL * 2;
         assert!(watch.poll(later).is_empty());
+    }
+
+    /// #1435: re-seating the list keeps a known file's last-seen state (a
+    /// change it had is still reported), takes a new file as applied, and
+    /// stops reporting a dropped one.
+    #[test]
+    fn set_paths_keeps_what_it_knew_and_drops_what_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let kept = dir.path().join("config.json");
+        let old_root = dir.path().join("old.json");
+        let new_root = dir.path().join("new.json");
+        for f in [&kept, &old_root, &new_root] {
+            std::fs::write(f, "{}").unwrap();
+        }
+        let mut watch = ConfigWatch::new(vec![kept.clone(), old_root.clone()]);
+        std::fs::write(&kept, r#"{ "theme": "dark" }"#).unwrap();
+        watch.set_paths(vec![kept.clone(), new_root.clone()]);
+        assert!(watch.watches(&new_root) && !watch.watches(&old_root));
+        std::fs::write(&old_root, r#"{ "theme": "light" }"#).unwrap();
+        let later = std::time::Instant::now() + ConfigWatch::INTERVAL * 2;
+        assert_eq!(
+            watch.poll(later),
+            vec![kept],
+            "the new file was not changed"
+        );
+    }
+
+    /// #1435: a settings file croft saved itself (a theme pick, the layout)
+    /// is not reported as changed outside croft; one more write by someone
+    /// else after it is.
+    #[test]
+    fn croft_s_own_settings_save_is_not_reported_but_a_later_edit_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.json");
+        std::fs::write(&file, "{}").unwrap();
+        let mut watch = ConfigWatch::new(vec![file.clone()]);
+        let mut prefs = crate::prefs::Prefs::load_for_update(&file).unwrap();
+        prefs.osk_split = true;
+        prefs.save(&file).unwrap();
+        let t0 = std::time::Instant::now();
+        assert!(watch.poll(t0 + ConfigWatch::INTERVAL * 2).is_empty());
+        std::fs::write(&file, r#"{ "render_whitespace": "all" }"#).unwrap();
+        assert_eq!(watch.poll(t0 + ConfigWatch::INTERVAL * 4), vec![file]);
     }
 
     /// #262: the per-host opt-out, case-insensitive like the other lists.
