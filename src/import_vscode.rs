@@ -287,6 +287,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "focus_right_editor_group",
     ),
     ("workbench.action.terminal.focus", "focus_terminal"),
+    (
+        "workbench.action.terminal.runSelectedText",
+        "run_selected_text",
+    ),
     ("workbench.actions.view.problems", "show_problems"),
     ("workbench.action.toggleZenMode", "toggle_zen_mode"),
     (
@@ -1815,6 +1819,24 @@ mod tests {
             vec![(String::from("ctrl+s"), String::from("save_file"))]
         );
         assert_eq!(report.snippets["Test"]["scope"], json!("rust"));
+    }
+
+    /// #1292: VS Code's Run Selected Text keybinding imports instead of
+    /// being dropped.
+    #[test]
+    fn run_selected_text_keybinding_imports() {
+        let mut report = Report::default();
+        convert_keybindings(
+            &json!([{ "key": "ctrl+alt+enter", "command": "workbench.action.terminal.runSelectedText" }]),
+            &mut report,
+        );
+        assert_eq!(
+            report.keybindings,
+            vec![(
+                String::from("ctrl+alt+enter"),
+                String::from("run_selected_text")
+            )]
+        );
     }
 
     /// #1286: VSCodeVim installed in the profile's product turns croft's

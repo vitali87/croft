@@ -4305,6 +4305,85 @@ fn ctrl_f_reaches_the_terminal_child_on_macos() {
     );
 }
 
+/// Run Terminal: Run Selected Text in Active Terminal the way the palette
+/// does, and return what the active pane was sent.
+fn run_selected_text(app: &mut App) -> String {
+    let cmd = crate::widgets::command_palette::Command::from_id("run_selected_text")
+        .expect("there is a Run Selected Text command");
+    let before = app.terminals[app.active_terminal]
+        .written_bytes_for_test()
+        .len();
+    app.run_command(cmd);
+    let written = app.terminals[app.active_terminal].written_bytes_for_test();
+    String::from_utf8_lossy(&written[before..]).into_owned()
+}
+
+/// What a pane was sent, without bracketed-paste marks: the test pane's
+/// shell turns bracketed paste on by itself, at a time the test can't pin.
+fn unbracketed(sent: &str) -> String {
+    sent.replace("\x1b[200~", "").replace("\x1b[201~", "")
+}
+
+/// #1292: the selection goes to the terminal with Enter after it, and
+/// focus stays in the editor so the next line can be picked.
+#[test]
+fn run_selected_text_sends_the_selection_and_enter_to_the_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(
+        tmp.path(),
+        "explore.py",
+        "import csv\nrows = [1, 2]\ntotal = sum(rows)\nprint(total)\n",
+    );
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (2, 0),
+        head: (3, 12),
+    });
+    assert_eq!(
+        unbracketed(&run_selected_text(&mut app)),
+        "total = sum(rows)\nprint(total)\r"
+    );
+    assert!(app.focus == Pane::Editor, "focus stays in the editor");
+    assert!(app.show_terminal, "the terminal is shown");
+}
+
+/// #1292: a multi-line block arrives as one bracketed paste when the
+/// program in the pane asked for it, and Enter follows outside it.
+#[test]
+fn run_selected_text_brackets_the_block_when_the_pane_asked_for_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "a = 1\nb = 2\n");
+    app.terminals[app.active_terminal].feed_bytes_for_test(b"\x1b[?2004h");
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 0),
+        head: (1, 5),
+    });
+    assert_eq!(
+        run_selected_text(&mut app),
+        "\x1b[200~a = 1\nb = 2\x1b[201~\r"
+    );
+}
+
+/// #1292: with no selection the caret's line is sent and the caret steps
+/// to the next non-blank line, so repeated runs walk through a script.
+#[test]
+fn run_selected_text_without_a_selection_sends_the_line_and_steps_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "a = 1\n\n\nb = 2\n");
+    assert_eq!(unbracketed(&run_selected_text(&mut app)), "a = 1\r");
+    assert_eq!(app.editor.cursor_row, 3, "blank lines are stepped over");
+    assert_eq!(unbracketed(&run_selected_text(&mut app)), "b = 2\r");
+}
+
+/// #1292 negative: with nothing to send (a blank line at the end of the
+/// file) the terminal gets nothing, not even a bare Enter.
+#[test]
+fn run_selected_text_sends_nothing_for_a_blank_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "a = 1\n");
+    app.editor.cursor_row = 1;
+    assert_eq!(unbracketed(&run_selected_text(&mut app)), "");
+}
+
 #[test]
 fn cmd_opt_up_parks_the_previous_prompt_mark_at_the_viewport_top() {
     let tmp = tempfile::tempdir().unwrap();

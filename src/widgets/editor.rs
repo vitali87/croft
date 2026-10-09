@@ -1181,6 +1181,51 @@ fn clip_pad_cells(text: &str, skip: usize, width: usize) -> String {
     out
 }
 
+/// Paint the changed characters `range` (char indices) of a diff line
+/// drawn at `text_x` from char `skip`, `width` cells wide, in `bg` (#1351).
+/// Cells follow display width, so a wide character before the change does
+/// not shift the mark (#1248). A range wholly past either edge puts a `›`
+/// or `‹` on that edge in `bg` instead, so a change off-screen still shows.
+#[allow(clippy::too_many_arguments)]
+fn paint_intraline_range(
+    buf: &mut Buffer,
+    text_x: u16,
+    y: u16,
+    width: u16,
+    text: &str,
+    skip: usize,
+    (start, end): (usize, usize),
+    bg: Color,
+    fg: Color,
+) {
+    if start >= end || width == 0 {
+        return;
+    }
+    let edge = Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
+    if end <= skip {
+        buf.set_string(text_x, y, "\u{2039}", edge);
+        return;
+    }
+    let mut cell = 0u16;
+    let mut painted = false;
+    for (i, c) in text.chars().enumerate().skip(skip) {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as u16;
+        if cell + w > width {
+            break;
+        }
+        if (start..end).contains(&i) {
+            for dx in 0..w {
+                buf[(text_x + cell + dx, y)].set_bg(bg);
+            }
+            painted = true;
+        }
+        cell += w;
+    }
+    if !painted {
+        buf.set_string(text_x + width - 1, y, "\u{203a}", edge);
+    }
+}
+
 /// Returns the hit-test rects of the prev / next change arrows painted
 /// in the diff header (in that order). Both are `Rect::default()` when
 /// the header was too narrow to allocate them.
@@ -1407,6 +1452,25 @@ fn render_diff(
                 })
                 .bg(l_cell_bg),
         );
+        // The changed characters of a replaced line (#1351), on both sides.
+        let intraline = match row {
+            DiffRow::Replaced { .. } => crate::widgets::diff::changed_char_ranges(&l_text, &r_text),
+            _ => None,
+        };
+        if let Some((range, _)) = intraline {
+            let (r, g, b) = crate::widgets::diff::INTRALINE_REMOVED_BG;
+            paint_intraline_range(
+                buf,
+                l_text_x,
+                y,
+                l_text_w,
+                &l_text,
+                diff.scroll_x,
+                range,
+                theme.ui(Color::Rgb(r, g, b)),
+                removed_fg,
+            );
+        }
 
         // Right column.
         let r_right_idx = match row {
@@ -1474,6 +1538,20 @@ fn render_diff(
                 })
                 .bg(r_cell_bg),
         );
+        if let Some((_, range)) = intraline {
+            let (r, g, b) = crate::widgets::diff::INTRALINE_ADDED_BG;
+            paint_intraline_range(
+                buf,
+                r_text_x,
+                y,
+                r_text_w,
+                &r_text,
+                diff.scroll_x,
+                range,
+                theme.ui(Color::Rgb(r, g, b)),
+                added_fg,
+            );
+        }
 
         // Inline-find highlight: overpaint every occurrence of the needle
         // on top of the text just laid down, lighting the active match in
@@ -26571,6 +26649,108 @@ mod tests {
 
     fn row_text(buf: &ratatui::buffer::Buffer, y: u16, from: u16, to: u16) -> String {
         (from..to).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    /// The x of the left text column and the row showing `left_text` in a
+    /// diff rendered by [`render_wide_diff`].
+    fn left_text_at(
+        buf: &ratatui::buffer::Buffer,
+        inner: Rect,
+        lines: usize,
+        left_text: &str,
+    ) -> (u16, u16) {
+        let l_text_x = inner.x + (lines + 1).to_string().len() as u16 + 1 + 2;
+        let y = (inner.y..inner.bottom())
+            .find(|&y| row_text(buf, y, l_text_x, inner.x + inner.width / 2).starts_with(left_text))
+            .expect("the changed row is drawn");
+        (l_text_x, y)
+    }
+
+    fn intraline(rgb: (u8, u8, u8)) -> Color {
+        Color::Rgb(rgb.0, rgb.1, rgb.2)
+    }
+
+    /// #1351: a one-character edit marks just that character on each side,
+    /// in a stronger tint than the rest of the changed line.
+    #[test]
+    fn a_one_character_change_is_marked_within_the_line() {
+        use crate::widgets::diff::{INTRALINE_ADDED_BG, INTRALINE_REMOVED_BG};
+        let (buf, inner, r_text_x) = render_wide_diff("x\nbackoff=1.5\n", "x\nbackoff=2.5\n");
+        let (l_text_x, y) = left_text_at(&buf, inner, 2, "backoff=1.5");
+        assert_eq!(buf[(l_text_x + 8, y)].symbol(), "1");
+        assert_eq!(buf[(l_text_x + 8, y)].bg, intraline(INTRALINE_REMOVED_BG));
+        assert_eq!(buf[(r_text_x + 8, y)].symbol(), "2");
+        assert_eq!(buf[(r_text_x + 8, y)].bg, intraline(INTRALINE_ADDED_BG));
+        for col in [0u16, 7, 9, 10] {
+            assert_ne!(
+                buf[(l_text_x + col, y)].bg,
+                intraline(INTRALINE_REMOVED_BG),
+                "col {col}"
+            );
+            assert_ne!(
+                buf[(r_text_x + col, y)].bg,
+                intraline(INTRALINE_ADDED_BG),
+                "col {col}"
+            );
+        }
+    }
+
+    /// #1351 negative: a line rewritten from scratch gets no character
+    /// marks, so it does not turn into confetti.
+    #[test]
+    fn a_rewritten_line_gets_no_character_marks() {
+        use crate::widgets::diff::{INTRALINE_ADDED_BG, INTRALINE_REMOVED_BG};
+        let (buf, inner, _) = render_wide_diff("x\nalpha beta gamma\n", "x\nquite other words\n");
+        let marked = (inner.y..inner.bottom())
+            .flat_map(|y| (inner.x..inner.right()).map(move |x| (x, y)))
+            .filter(|&p| {
+                let bg = buf[p].bg;
+                bg == intraline(INTRALINE_REMOVED_BG) || bg == intraline(INTRALINE_ADDED_BG)
+            })
+            .count();
+        assert_eq!(marked, 0);
+    }
+
+    /// #1351: a change past the right edge of a side is flagged with `›` at
+    /// that edge, so two lines that look the same on screen say they differ.
+    #[test]
+    fn a_change_past_the_right_edge_is_flagged_at_the_edge() {
+        use crate::widgets::diff::INTRALINE_ADDED_BG;
+        let line = |v: &str| {
+            format!(
+                "TIMEOUT_SECONDS = compute_timeout(base=30, retries=3, backoff={v}, jitter=True)"
+            )
+        };
+        let (buf, inner, r_text_x) = render_wide_diff(
+            &format!("x\n{}\n", line("1.5")),
+            &format!("x\n{}\n", line("2.5")),
+        );
+        let (_, y) = left_text_at(&buf, inner, 2, "TIMEOUT_SECONDS");
+        let edge = inner.right() - 1;
+        assert!(
+            r_text_x + 64 > edge,
+            "precondition: the change is off-screen"
+        );
+        assert_eq!(buf[(edge, y)].symbol(), "\u{203a}");
+        assert_eq!(buf[(edge, y)].bg, intraline(INTRALINE_ADDED_BG));
+    }
+
+    /// #1351: wide characters before the change keep the mark on the right
+    /// cells (#1248): `語` takes two cells, so `b` is at cell 6.
+    #[test]
+    fn the_mark_stays_aligned_after_wide_characters() {
+        use crate::widgets::diff::INTRALINE_ADDED_BG;
+        let (buf, inner, r_text_x) = render_wide_diff("x\n日本語a\n", "x\n日本語b\n");
+        let (_, y) = left_text_at(&buf, inner, 2, "日");
+        assert_eq!(buf[(r_text_x + 6, y)].symbol(), "b");
+        assert_eq!(buf[(r_text_x + 6, y)].bg, intraline(INTRALINE_ADDED_BG));
+        for col in 0..6u16 {
+            assert_ne!(
+                buf[(r_text_x + col, y)].bg,
+                intraline(INTRALINE_ADDED_BG),
+                "col {col}"
+            );
+        }
     }
 
     /// Wide (CJK) characters take two cells: each side is clipped to its
