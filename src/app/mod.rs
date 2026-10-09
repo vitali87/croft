@@ -42833,9 +42833,13 @@ impl App {
         // reachable from the Command Palette, which guarantees parity on
         // terminals that don't deliver the Alt+letter chords.
         if is_toggle_line_comment_key(key) {
-            // The palette's message too: a key that does nothing must say so
-            // (#1181).
-            if self.editor_is_text() && !self.editor.toggle_line_comment() {
+            // The palette's message too: a key that does nothing because the
+            // language has no comment must say so (#1181); a blank line in
+            // one that has does nothing quietly.
+            if self.editor_is_text()
+                && !self.editor.toggle_line_comment()
+                && !self.editor.has_line_comment_syntax()
+            {
                 self.status = String::from("Toggle Line Comment: no comment for this language");
             }
             return;
@@ -50295,7 +50299,7 @@ impl App {
             Cmd::MoveLineUp => self.editor.move_lines_up(),
             Cmd::MoveLineDown => self.editor.move_lines_down(),
             Cmd::ToggleLineComment => {
-                if !self.editor.toggle_line_comment() {
+                if !self.editor.toggle_line_comment() && !self.editor.has_line_comment_syntax() {
                     self.status = String::from("Toggle Line Comment: no comment for this language");
                 }
             }

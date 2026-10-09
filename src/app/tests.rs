@@ -32604,6 +32604,25 @@ fn ctrl_slash_reports_a_file_with_no_comment_and_comments_one_by_extension() {
     assert!(app.status.is_empty(), "{}", app.status);
 }
 
+/// #1181 negative: Ctrl+/ on a blank line of a language that has a comment
+/// does nothing, without claiming the language has no comment.
+#[test]
+fn ctrl_slash_on_a_blank_line_does_not_report_no_comment() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (name, text) in [("main.rs", "   \n"), ("index.html", "\n")] {
+        let path = tmp.path().join(name);
+        std::fs::write(&path, text).unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open_pinned(&path).unwrap();
+        app.focus_pane(Pane::Editor);
+        app.status.clear();
+        app.handle_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(app.editor.lines[0], text.trim_end_matches('\n'), "{name}");
+        assert!(app.status.is_empty(), "{name}: {}", app.status);
+    }
+}
+
 #[test]
 fn toggle_line_comment_key_is_cmd_or_ctrl_slash() {
     assert!(is_toggle_line_comment_key(key(

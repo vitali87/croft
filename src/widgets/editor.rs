@@ -10593,7 +10593,7 @@ impl Editor {
         self.push_undo(EditKind::ToggleComment);
         let all_commented = non_blank
             .iter()
-            .all(|&r| self.lines[r].trim_start().starts_with(token));
+            .all(|&r| line_comment_prefix_len(self.lines[r].trim_start(), token).is_some());
         // Each changed row with the char column of its edit and the chars it
         // added (negative: removed), to carry the carets on it along.
         let mut edits: Vec<(usize, usize, isize)> = Vec::with_capacity(non_blank.len());
@@ -10602,8 +10602,9 @@ impl Editor {
                 let line = self.lines[r].clone();
                 let off = line.len() - line.trim_start().len();
                 let mut rest = line[off..].to_string();
-                rest.drain(..token.len());
-                let mut removed = token.chars().count();
+                let len = line_comment_prefix_len(&rest, token).unwrap_or(0);
+                let mut removed = rest[..len].chars().count();
+                rest.drain(..len);
                 if rest.starts_with(' ') {
                     rest.drain(..1);
                     removed += 1;
@@ -10651,9 +10652,19 @@ impl Editor {
     /// (#1181).
     fn line_comment_marker(&self) -> Option<&'static str> {
         match self.lang {
+            // SCSS and Sass share the CSS grammar but, unlike CSS, have a
+            // `//` line comment, so the file's extension decides.
+            Some(LangKind::Css) | None => {
+                self.path.as_deref().and_then(line_comment_token_for_path)
+            }
             Some(_) => line_comment_token(self.lang),
-            None => self.path.as_deref().and_then(line_comment_token_for_path),
         }
+    }
+
+    /// Whether Toggle Line Comment has any comment to use in this buffer: a
+    /// line comment, or a block comment to wrap the lines in.
+    pub fn has_line_comment_syntax(&self) -> bool {
+        self.line_comment_marker().is_some() || block_comment_tokens(self.lang).is_some()
     }
 
     /// Toggle Line Comment where the language has only block comments: each
@@ -12923,7 +12934,8 @@ fn line_comment_token_for_path(path: &Path) -> Option<&'static str> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     match ext.as_str() {
         "kt" | "kts" | "swift" | "scala" | "sc" | "dart" | "php" | "groovy" | "gradle"
-        | "jsonc" | "json5" | "proto" | "zig" | "v" | "sv" | "fs" | "fsx" => Some("//"),
+        | "jsonc" | "json5" | "proto" | "zig" | "v" | "sv" | "fs" | "fsx" | "scss" | "sass"
+        | "less" => Some("//"),
         "pl" | "pm" | "r" | "ps1" | "psm1" | "mk" | "conf" | "cfg" | "properties" | "env"
         | "tf" | "hcl" | "nix" | "jl" | "ex" | "exs" | "cmake" | "gitignore" | "zsh" | "fish"
         | "awk" | "tcl" | "nim" | "cr" | "graphql" | "gql" => Some("#"),
@@ -12931,9 +12943,31 @@ fn line_comment_token_for_path(path: &Path) -> Option<&'static str> {
         "ini" | "clj" | "cljs" | "edn" | "lisp" | "el" | "scm" | "rkt" | "asm" => Some(";"),
         "tex" | "sty" | "erl" | "hrl" => Some("%"),
         "vim" => Some("\""),
-        "bat" | "cmd" => Some("REM"),
+        "bat" | "cmd" => Some("@REM"),
         _ => None,
     }
+}
+
+/// The byte length of the line comment `token` that `text` (a line with its
+/// indentation trimmed) starts with, or `None` when it is not commented. A
+/// word token (batch's `@REM`) must end at whitespace or the line's end, so
+/// `REMOTE.EXE` is not a comment, and batch's plain `REM` counts too.
+fn line_comment_prefix_len(text: &str, token: &str) -> Option<usize> {
+    let word = |t: &str| {
+        text.starts_with(t)
+            && text[t.len()..]
+                .chars()
+                .next()
+                .is_none_or(char::is_whitespace)
+    };
+    if !token.ends_with(|c: char| c.is_ascii_alphabetic()) {
+        return text.starts_with(token).then_some(token.len());
+    }
+    if word(token) {
+        return Some(token.len());
+    }
+    let plain = token.trim_start_matches('@');
+    (plain != token && word(plain)).then_some(plain.len())
 }
 
 /// The block-comment delimiters for a language (VS Code `blockComment`), or
@@ -29306,6 +29340,59 @@ mod tests {
             assert_eq!(e.lines, vec![commented], "{name}");
             assert!(e.toggle_line_comment(), "{name}");
             assert_eq!(e.lines, vec![text], "{name} uncomments");
+        }
+    }
+
+    /// #1181: SCSS, Sass and Less comment with `//`, though SCSS and Sass
+    /// share the CSS grammar, which still wraps in `/* */`.
+    #[test]
+    fn toggle_line_comment_uses_slashes_in_scss_sass_and_less() {
+        for (name, lang) in [
+            ("a.scss", Some(LangKind::Css)),
+            ("a.sass", Some(LangKind::Css)),
+            ("a.less", None),
+        ] {
+            let mut e = editor_with("  color: red;");
+            e.lang = lang;
+            e.path = Some(PathBuf::from("/tmp/x").join(name));
+            assert!(e.toggle_line_comment(), "{name}");
+            assert_eq!(e.lines, vec!["  // color: red;"], "{name}");
+            assert!(e.toggle_line_comment(), "{name}");
+            assert_eq!(e.lines, vec!["  color: red;"], "{name} uncomments");
+        }
+        let mut e = editor_with("body {");
+        e.lang = Some(LangKind::Css);
+        e.path = Some(PathBuf::from("/tmp/x/a.css"));
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["/* body { */"]);
+    }
+
+    /// #1181: batch files comment with `@REM`, as VS Code does, and
+    /// uncomment `@REM` or `REM` only as a whole word, so `REMOTE.EXE` is
+    /// a command, not a comment.
+    #[test]
+    fn toggle_line_comment_in_batch_files_uses_at_rem_as_a_word() {
+        let bat = |text: &str| {
+            let mut e = editor_with(text);
+            e.lang = None;
+            e.path = Some(PathBuf::from("/tmp/x/run.bat"));
+            e
+        };
+        let mut e = bat("echo hi");
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["@REM echo hi"]);
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["echo hi"]);
+        let mut e = bat("REM note");
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["note"], "plain REM uncomments");
+        let mut e = bat("REM");
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec![""]);
+        for text in ["REMOTE.EXE --sync", "@REMOTE.EXE --sync"] {
+            let mut e = bat(text);
+            assert!(e.toggle_line_comment());
+            assert_eq!(e.lines, vec![format!("@REM {text}")], "{text}");
         }
     }
 
