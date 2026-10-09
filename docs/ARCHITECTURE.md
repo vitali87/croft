@@ -40,6 +40,7 @@ src/
 ├── asciicast.rs          writing a session as an asciicast v2 recording, behind "Session: Record Terminal as Asciicast"; payloads go through `serde_json`, backwards timestamps are clamped
 ├── archive.rs            archive browser core: zip/jar/whl and tar/tar.gz member listing without payload reads, size-gated before the parse; extract_member writes one member under a strictly lexical containment check; the tab is read-only
 ├── highlight.rs          tree-sitter highlight registry per language; every span, captured or not, styles from the active theme's `SyntaxPalette`, snapshotted once per pass rather than a hardcoded Base16 literal; Markdown alone resolves injections (the inline grammar, fenced code by its language, front matter), each with its children included since the block grammar leaves delimiter hints inside the ranges it hands off
+├── hot_exit.rs           hot exit (#862): the workspace's unsaved buffers backed up while unsaved under `~/.cache/croft/hot-exit/<workspace digest>/<pid>.json`, one file per running croft; a launch restores only the files of crofts that are gone, as unsaved tabs, and a clean quit removes its own
 ├── history.rs            local history: per-save snapshots under `~/.config/croft/history` (raw bytes, deduped, capped, 10s merge window), merged into the Explorer timeline, backing snapshot diff/restore plus a per-line `.seats` authorship sidecar
 ├── icons.rs             Codicon and file-type Nerd Font glyphs and per-language colors
 ├── install_session.rs   streams install-progress events while a remote host builds / installs the croft binary
@@ -112,7 +113,7 @@ src/
 │   └── tests.rs         unit / integration tests
 ├── dap/                 debugger stack: Debug Adapter Protocol client. debugpy (Python: the adapter on a private 3.14+ venv, the program on the project's own interpreter, #864) is the verified mechanism; Rust/C/C++ route to lldb-dap; JS/TS route to vscode-js-debug; Go routes to delve (`dlv dap` over TCP, single-session, #264). Which file types each handles is a data-driven extension axis (see registry.rs)
 │   ├── mod.rs
-│   ├── transport.rs     DAP wire framing (Content-Length + seq envelope, not JSON-RPC, so async-lsp can't be reused); spawns the adapter detached via setsid (so the debuggee can't tcsetpgrp-background and SIGTTIN-suspend croft, and so teardown can killpg the whole group), blocking reader thread frames stdout into an mpsc channel; Drop/kill signals the process group and reaps the child
+│   ├── transport.rs     DAP wire framing (Content-Length + seq envelope, not JSON-RPC, so async-lsp can't be reused); spawns the adapter detached via setsid (so the debuggee can't tcsetpgrp-background and SIGTTIN-suspend croft, and so teardown can killpg the whole group), blocking reader thread frames stdout into an mpsc channel; Drop signals the process group and reaps the child, except after a `disconnect` (#1536): then a detached teardown thread gives the adapter up to 2 s to answer and end the debuggee, kills the group, and SIGKILLs the debuggee pid from the `process` event if a launched program is still running (debugpy's launcher puts it in its own group, out of `killpg`'s reach); quit stops every session and joins these teardowns
 │   ├── session.rs            one debug launch session: the initialize → setBreakpoints → configurationDone → stopped state machine, event classifier, the stackTrace → scopes → variables chain, evaluate, breakpoints and logpoints, over one adapter-agnostic launch_with
 │   ├── registry.rs           data-driven debug-adapter registry: maps a file extension to an AdapterKind from the `[[debug_adapters]]` blocks in bundled + user manifests, skipping adapters whose extension is disabled in the Extensions panel
 │   ├── log.rs           optional DAP wire log at ~/.croft/dap.log (gated by CROFT_DAP_LOG), mirroring lsp/log_file.rs
@@ -154,7 +155,7 @@ src/
     ├── mod.rs
     ├── command_palette.rs   VS Code Command Palette (Cmd/Ctrl+Shift+P): a static command registry + fuzzy-filtered picker; the App's run_command dispatches each entry
     ├── commit_graph.rs       the Source Control COMMITS section: a repo-wide commit graph with box-drawing lane rails; `layout_graph` is the pure lane algorithm, run on the fetch thread
-    ├── completion_popup.rs  LSP completion popup (anchored at the cursor, filterable; `area_for` clamps to the editor pane on all four edges — a popup wider than a narrow pane used to be pushed left past the pane's own edge and paint over the Explorer)
+    ├── completion_popup.rs  LSP completion popup (anchored at the cursor, filterable; a list the server marked `isIncomplete` re-asks it on each keystroke with trigger kind 3, keeping the old matches up until the reply replaces them (#1529); `area_for` clamps to the editor pane on all four edges — a popup wider than a narrow pane used to be pushed left past the pane's own edge and paint over the Explorer)
     ├── signature_help_popup.rs  LSP signature help / parameter hints: a one-line popup above the caret with the active parameter bolded, auto-triggered on `(`/`,` and dismissed on `)`/Esc (manager `RequestSignatureHelp` + `normalise_signature_help`)
     ├── connect_dialog.rs    remote SSH connect modal (host + auth prompt phases)
     ├── dependencies.rs       collapsible, language-aware DEPENDENCIES section: detects the workspace's package ecosystems from root manifests (Cargo.toml, pyproject.toml, package.json, go.mod), resolves packages off-thread; display-only, gated on detection
@@ -1290,7 +1291,7 @@ Durable user preferences — color theme, Customize Layout chrome, format-on-sav
 
 ### snippets.rs
 
-User snippets loaded from `~/.config/croft/snippets.json` in VS Code format: prefix, body as a string or array, and an optional language scope. It reloads on save.
+User snippets loaded from `~/.config/croft/snippets.json` in VS Code format: prefix as a string or array, body as a string or array, and an optional language scope. Entries load one by one, so a malformed one is skipped and reported instead of emptying the set. It reloads on save.
 
 **`parse_body` turns tab-stop syntax into stops the editor drives.** A body's `$1`/`$0`/`${1:placeholder}` syntax becomes insert text plus ordered stops that the editor walks on Tab.
 
