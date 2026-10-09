@@ -252,8 +252,13 @@ pub fn resolve_managed(
     // server; a later request re-probes once the install lands.
     ensure_in_background(config, provision);
     if log_skip {
+        // Name what was looked for, so the log says why a download started.
+        let tried = match provision {
+            Provision::Binary { bin, .. } => format!(" (no `{bin}` or `{bin}-NN` on PATH)"),
+            _ => String::new(),
+        };
         log_file::log(&format!(
-            "lsp[{}] not installed; starting croft-managed install",
+            "lsp[{}] not installed{tried}; starting croft-managed install",
             config.name
         ));
     }
@@ -440,12 +445,58 @@ fn managed_binary_path_in(
     servers.join(name).join(bin_path.unwrap_or(bin))
 }
 
+/// The newest `bin-NN` executable on `path` (`clangd-18`, `clangd-20.1`),
+/// the name Debian/Ubuntu and apt.llvm.org install LLVM tools under, often
+/// with no unversioned symlink (#1211). The version is dot-separated
+/// numbers, compared numerically; at an equal version the earlier PATH entry
+/// wins. `None` when there is none.
+fn versioned_on_path(bin: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    let mut best: Option<(Vec<u64>, PathBuf)> = None;
+    for dir in std::env::split_paths(path) {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(version) = name
+                .to_str()
+                .and_then(|n| n.strip_prefix(bin))
+                .and_then(|rest| rest.strip_prefix('-'))
+            else {
+                continue;
+            };
+            let Some(key) = version
+                .split('.')
+                .map(|part| part.parse::<u64>().ok())
+                .collect::<Option<Vec<u64>>>()
+            else {
+                continue;
+            };
+            // A relative PATH entry resolves against croft's cwd now; the
+            // server is spawned from the workspace root, so hand it an
+            // absolute path.
+            let Ok(full) = std::path::absolute(entry.path()) else {
+                continue;
+            };
+            if crate::lsp::manager::is_executable_file(&full)
+                && best.as_ref().is_none_or(|(k, _)| key > *k)
+            {
+                best = Some((key, full));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
 /// Resolve an invocable command for a binary-provisioned server. PATH-first
 /// (mirrors Zed: a user's own clangd/taplo, matching their toolchain, wins),
 /// then croft's managed copy. `None` when neither exists yet.
 fn binary_command(name: &str, bin: &str, bin_path: Option<&str>) -> Option<String> {
     if crate::lsp::manager::is_on_path(bin) {
         return Some(bin.to_string());
+    }
+    if let Some(p) = std::env::var_os("PATH").and_then(|path| versioned_on_path(bin, &path)) {
+        return Some(p.to_string_lossy().into_owned());
     }
     if let Some(p) = managed_binary_path(name, bin, bin_path)
         && p.is_file()
@@ -2061,6 +2112,77 @@ mod tests {
             "@vtsls/language-server",
             "no pin installs latest"
         );
+    }
+
+    /// An executable at `dir/name`.
+    fn put_exe(dir: &Path, name: &str, exec: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, "#!/bin/sh\n").unwrap();
+        let mode = if exec { 0o755 } else { 0o644 };
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Ubuntu's `apt install clangd-18` leaves only `/usr/bin/clangd-18`; the
+    /// newest such executable on PATH is the toolchain copy croft uses
+    /// (#1211).
+    #[test]
+    fn a_versioned_binary_on_path_is_found_newest_first() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        put_exe(a.path(), "clangd-15", true);
+        put_exe(a.path(), "clangd-18", true);
+        put_exe(b.path(), "clangd-19", false);
+        put_exe(b.path(), "clangd-9", true);
+        let path = std::env::join_paths([a.path(), b.path()]).unwrap();
+        assert_eq!(
+            versioned_on_path("clangd", &path),
+            Some(a.path().join("clangd-18"))
+        );
+        put_exe(b.path(), "clangd-18.1", true);
+        assert_eq!(
+            versioned_on_path("clangd", &path),
+            Some(b.path().join("clangd-18.1"))
+        );
+    }
+
+    /// A relative PATH entry still yields an absolute path, so the server
+    /// launches from the workspace root, not croft's cwd.
+    #[test]
+    fn a_versioned_binary_on_a_relative_path_entry_is_returned_absolute() {
+        let a = tempfile::tempdir().unwrap();
+        put_exe(a.path(), "clangd-18", true);
+        let cwd = std::env::current_dir().unwrap();
+        let mut rel = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            rel.push("..");
+        }
+        rel.push(a.path().strip_prefix("/").unwrap());
+        assert!(rel.is_relative());
+        let found = versioned_on_path("clangd", rel.as_os_str()).unwrap();
+        assert!(found.is_absolute(), "{found:?}");
+        assert!(found.ends_with("clangd-18"), "{found:?}");
+    }
+
+    /// Negative: a different tool that shares the prefix (`clangd-tidy`,
+    /// `clangd-indexer`), a bare `clangd-`, a fused `clangd18` and a
+    /// non-executable `clangd-20` are never taken for clangd.
+    #[test]
+    fn only_a_numbered_executable_counts_as_a_versioned_binary() {
+        let a = tempfile::tempdir().unwrap();
+        for name in [
+            "clangd-tidy",
+            "clangd-indexer",
+            "clangd-",
+            "clangd18",
+            "clangd-18x",
+        ] {
+            put_exe(a.path(), name, true);
+        }
+        put_exe(a.path(), "clangd-20", false);
+        let path = std::env::join_paths([a.path()]).unwrap();
+        assert_eq!(versioned_on_path("clangd", &path), None);
+        assert_eq!(versioned_on_path("taplo", &path), None);
     }
 
     /// A managed uv tool installed under an older pin is stale, so croft
