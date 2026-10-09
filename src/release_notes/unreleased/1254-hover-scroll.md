@@ -1,0 +1,1 @@
+fix: A hover too long for its box scrolls with the mouse wheel instead of closing, its border counts the lines above and below, and on a tall screen it uses up to half the height instead of stopping at 16 rows.

@@ -78114,6 +78114,77 @@ fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
     assert_eq!(app.status, "Tab is already kept open");
 }
 
+// --- #1254: long hovers scroll ---------------------------------------------------
+
+fn app_with_long_hover() -> (
+    App,
+    tempfile::TempDir,
+    ratatui::Terminal<ratatui::backend::TestBackend>,
+) {
+    let (mut app, tmp, col, row) = app_with_open_file_and_editor_cell();
+    let doc = (1..=40)
+        .map(|i| format!("doc line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+        doc,
+        (col, row),
+    ));
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    (app, tmp, term)
+}
+
+#[test]
+fn the_wheel_over_a_hover_popup_scrolls_it_instead_of_closing_it() {
+    use crossterm::event::MouseEventKind;
+    let (mut app, _tmp, mut term) = app_with_long_hover();
+    let area = app.hover_popup.as_ref().unwrap().last_area;
+    assert!(area.height > 2, "the popup painted");
+    let (x, y) = (area.x + 3, area.y + 2);
+    app.handle_mouse(mouse(MouseEventKind::ScrollDown, x, y));
+    let popup = app
+        .hover_popup
+        .as_ref()
+        .expect("the wheel keeps the popup open");
+    assert!(popup.scroll > 0, "and scrolls it");
+    let after_down = popup.scroll;
+    app.handle_mouse(mouse(MouseEventKind::ScrollUp, x, y));
+    assert!(app.hover_popup.as_ref().unwrap().scroll < after_down);
+    term.draw(|frame| app.render(frame)).unwrap();
+    assert!(app.hover_popup.is_some());
+}
+
+#[test]
+fn moving_the_pointer_onto_the_hover_popup_keeps_it_open() {
+    use crossterm::event::MouseEventKind;
+    let (mut app, _tmp, _term) = app_with_long_hover();
+    let area = app.hover_popup.as_ref().unwrap().last_area;
+    app.handle_mouse(mouse(MouseEventKind::Moved, area.x + 3, area.y + 2));
+    assert!(
+        app.hover_popup.is_some(),
+        "the pointer has to cross onto the popup to scroll it"
+    );
+}
+
+#[test]
+fn the_wheel_away_from_the_hover_popup_still_closes_it() {
+    use crossterm::event::MouseEventKind;
+    let (mut app, _tmp, _term) = app_with_long_hover();
+    let area = app.hover_popup.as_ref().unwrap().last_area;
+    let x = if area.x > 2 {
+        area.x - 2
+    } else {
+        area.right() + 2
+    };
+    app.handle_mouse(mouse(MouseEventKind::ScrollDown, x, area.y + 1));
+    assert!(
+        app.hover_popup.is_none(),
+        "scrolling the editor dismisses the hover"
+    );
+}
+
 // ---- Git diffs of files that aren't UTF-8 (#1242) ----
 
 /// A repo with `name` committed as `head` bytes, then `head + added` on disk.
