@@ -14028,6 +14028,116 @@ fn discard_all_requires_confirmation_and_then_reverts_tracked_changes() {
     );
 }
 
+/// `git -C dir <args>` for app tests, asserting success; stdout trimmed.
+fn git_checked(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// #1350: Undo Last Commit (⋯ → Commit) takes the commit back: HEAD is
+/// the parent, its changes are staged, and its message is in the box.
+#[test]
+fn undo_last_commit_via_the_menu_puts_the_message_back_in_the_box() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = make_committed_repo();
+    let parent = git_checked(tmp.path(), &["rev-parse", "HEAD"]);
+    std::fs::write(tmp.path().join("b.txt"), "b\n").unwrap();
+    git_checked(tmp.path(), &["add", "b.txt"]);
+    git_checked(tmp.path(), &["commit", "-q", "-m", "Add b too early"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.dispatch_scm_action(ScmAction::UndoLastCommit);
+    assert_eq!(git_checked(tmp.path(), &["rev-parse", "HEAD"]), parent);
+    assert_eq!(app.source_control.message, "Add b too early");
+    assert_eq!(
+        git_checked(tmp.path(), &["diff", "--cached", "--name-only"]),
+        "b.txt"
+    );
+    assert!(
+        !app.source_control.commit_feedback_is_error,
+        "{:?}",
+        app.source_control.commit_feedback
+    );
+}
+
+/// #1350: the palette has it too.
+#[test]
+fn undo_last_commit_is_in_the_palette() {
+    let cmd = crate::widgets::command_palette::Command::from_id("git_undo_last_commit")
+        .expect("there is an Undo Last Commit command");
+    assert_eq!(cmd.title(), "Git: Undo Last Commit");
+    let tmp = make_committed_repo();
+    std::fs::write(tmp.path().join("b.txt"), "b\n").unwrap();
+    git_checked(tmp.path(), &["add", "b.txt"]);
+    git_checked(tmp.path(), &["commit", "-q", "-m", "second"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(cmd);
+    assert_eq!(app.source_control.message, "second");
+}
+
+/// #1350 negative: a commit already on the upstream is not undone on the
+/// first ask; it warns that undoing it means a force push, and a second
+/// ask goes ahead.
+#[test]
+fn undo_last_commit_warns_before_undoing_a_pushed_commit() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = make_committed_repo();
+    let remote = tempfile::tempdir().unwrap();
+    git_checked(remote.path(), &["init", "-q", "--bare"]);
+    git_checked(
+        tmp.path(),
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+    );
+    git_checked(tmp.path(), &["push", "-q", "-u", "origin", "main"]);
+    let head = git_checked(tmp.path(), &["rev-parse", "HEAD"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.dispatch_scm_action(ScmAction::UndoLastCommit);
+    assert_eq!(
+        git_checked(tmp.path(), &["rev-parse", "HEAD"]),
+        head,
+        "not yet"
+    );
+    let warning = app
+        .source_control
+        .commit_feedback
+        .clone()
+        .unwrap_or_default();
+    assert!(warning.contains("force push"), "{warning}");
+    app.dispatch_scm_action(ScmAction::UndoLastCommit);
+    assert_eq!(
+        app.source_control.message, "init",
+        "the second ask undoes it"
+    );
+}
+
+/// #1350 negative: with a typed message in the box the undo keeps it
+/// rather than overwriting the user's text.
+#[test]
+fn undo_last_commit_keeps_a_message_the_user_typed() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = make_committed_repo();
+    std::fs::write(tmp.path().join("b.txt"), "b\n").unwrap();
+    git_checked(tmp.path(), &["add", "b.txt"]);
+    git_checked(tmp.path(), &["commit", "-q", "-m", "second"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.source_control.insert_str("my draft");
+    app.dispatch_scm_action(ScmAction::UndoLastCommit);
+    assert_eq!(app.source_control.message, "my draft");
+    assert_eq!(
+        git_checked(tmp.path(), &["log", "-1", "--format=%s"]),
+        "init"
+    );
+}
+
 /// The issue's repo (#1352): `value_1`..`value_20` committed, then line 5
 /// changed to `value_FIVE` and line 9 deleted, open in an editor tab with
 /// its change bars computed.
@@ -14932,6 +15042,7 @@ fn a_late_completion_reply_opens_only_while_the_caret_is_in_its_word() {
     app.focus_pane(Pane::Editor);
     let reply = |request_id| CompletionResult {
         request_id,
+        is_incomplete: false,
         path: path.clone(),
         items: vec![crate::lsp::CompletionItem {
             label: String::from("load"),
@@ -15022,6 +15133,7 @@ fn optional_members_survive_the_first_typed_letter() {
     };
     assert!(app.apply_completion_result(CompletionResult {
         request_id: 1,
+        is_incomplete: false,
         path: path.clone(),
         items: vec![member("email"), member("name")],
     }));
@@ -15079,6 +15191,184 @@ fn completion_reply_app() -> (
     (tmp, path, app, tx)
 }
 
+/// #1529: a reply the server marked incomplete, offering `labels`.
+fn incomplete_reply(
+    request_id: u64,
+    path: &Path,
+    labels: &[&str],
+) -> crate::lsp::manager::CompletionResult {
+    crate::lsp::manager::CompletionResult {
+        is_incomplete: true,
+        ..completion_reply(request_id, path, labels)
+    }
+}
+
+/// #1529: clangd caps its list at 100 and marks it incomplete. Typing on
+/// past the first list's names must ask the server again, not close the
+/// popup: `lo` gave `load` only, `lox` has to reach the server's `loxodrome`.
+#[test]
+fn typing_into_an_incomplete_list_asks_the_server_again() {
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.trigger_completion();
+    let first = app.completion_request_id.expect("the ask went out");
+    draw(&mut app, 100, 30);
+    tx.send(incomplete_reply(first, &path, &["load"])).unwrap();
+    assert!(app.drain_lsp_completion());
+    assert!(app.completion_popup.is_some());
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    sync_then_reask(&mut app);
+    let again = app
+        .completion_request_id
+        .expect("an incomplete list keeps a request in flight");
+    assert_ne!(again, first, "typing into an incomplete list re-asks");
+    draw(&mut app, 100, 30);
+    tx.send(incomplete_reply(again, &path, &["loxodrome"]))
+        .unwrap();
+    assert!(app.drain_lsp_completion());
+    let popup = app.completion_popup.as_ref().expect("the new list opens");
+    assert_eq!(popup.prefix, "lox");
+    let labels: Vec<&str> = popup
+        .visible_indices()
+        .into_iter()
+        .map(|i| popup.items[i].label.as_str())
+        .collect();
+    assert_eq!(labels, ["loxodrome"]);
+}
+
+/// #1529: while the re-ask is out, the old list's matches stay on screen,
+/// and a stale reply to the first ask can't replace the newer one.
+#[test]
+fn an_incomplete_list_keeps_its_matches_until_the_new_reply_lands() {
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.trigger_completion();
+    let first = app.completion_request_id.unwrap();
+    draw(&mut app, 100, 30);
+    tx.send(incomplete_reply(first, &path, &["load", "local"]))
+        .unwrap();
+    app.drain_lsp_completion();
+    app.handle_key(key(KeyCode::Char('c'), KeyModifiers::NONE))
+        .unwrap();
+    let popup = app
+        .completion_popup
+        .as_ref()
+        .expect("`local` still matches");
+    assert_eq!(popup.visible_indices().len(), 1);
+    sync_then_reask(&mut app);
+    // The first ask answering late is dropped by id.
+    tx.send(incomplete_reply(first, &path, &["stale"])).unwrap();
+    assert!(!app.drain_lsp_completion());
+    let again = app.completion_request_id.unwrap();
+    assert_ne!(again, first);
+}
+
+/// #1529 negative: a complete list is only filtered. No second request
+/// goes out, and when nothing matches the popup closes, as before.
+#[test]
+fn typing_into_a_complete_list_only_filters_it() {
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.trigger_completion();
+    let first = app.completion_request_id.unwrap();
+    draw(&mut app, 100, 30);
+    tx.send(completion_reply(first, &path, &["load", "local"]))
+        .unwrap();
+    app.drain_lsp_completion();
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE))
+        .unwrap();
+    sync_then_reask(&mut app);
+    assert_eq!(app.completion_request_id, Some(first), "no re-ask");
+    assert!(app.completion_popup.is_some());
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.completion_popup.is_none(), "nothing matches `loax`");
+    assert_eq!(app.completion_request_id, None);
+}
+
+/// #1529 negative: leaving the word (a space) ends an incomplete list's
+/// session too; no re-ask follows the caret out of the word.
+#[test]
+fn leaving_the_word_ends_an_incomplete_list() {
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.trigger_completion();
+    let first = app.completion_request_id.unwrap();
+    draw(&mut app, 100, 30);
+    tx.send(incomplete_reply(first, &path, &["load"])).unwrap();
+    app.drain_lsp_completion();
+    app.handle_key(key(KeyCode::Char(' '), KeyModifiers::NONE))
+        .unwrap();
+    sync_then_reask(&mut app);
+    assert!(app.completion_popup.is_none());
+    assert_eq!(app.completion_request_id, None);
+}
+
+/// One event-loop tick's LSP steps: the edit's `didChange`, then the re-ask
+/// an incomplete list left due (#1529).
+fn sync_then_reask(app: &mut App) {
+    app.sync_lsp();
+    app.send_due_completion_reask();
+}
+
+/// #1529: when a keystroke filters out every item of an incomplete list,
+/// the popup closes but the session stays: the next keystroke, typed before
+/// the re-ask answers, asks again for the newer word.
+#[test]
+fn an_emptied_incomplete_list_still_re_asks_on_the_next_keystroke() {
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.trigger_completion();
+    let first = app.completion_request_id.unwrap();
+    draw(&mut app, 100, 30);
+    tx.send(incomplete_reply(first, &path, &["load", "local"]))
+        .unwrap();
+    app.drain_lsp_completion();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.completion_popup.is_none(), "nothing matches `lox`");
+    sync_then_reask(&mut app);
+    let second = app.completion_request_id.expect("re-asked for `lox`");
+    assert_ne!(second, first);
+    app.handle_key(key(KeyCode::Char('o'), KeyModifiers::NONE))
+        .unwrap();
+    sync_then_reask(&mut app);
+    let third = app.completion_request_id.expect("re-asked for `loxo`");
+    assert_ne!(third, second, "a keystroke with no popup still re-asks");
+    draw(&mut app, 100, 30);
+    tx.send(incomplete_reply(third, &path, &["loxodrome"]))
+        .unwrap();
+    assert!(app.drain_lsp_completion());
+    let popup = app.completion_popup.as_ref().expect("the new list opens");
+    assert_eq!(popup.prefix, "loxo");
+}
+
+/// #1529: the re-ask waits for the tick's `sync_lsp`, so the server has the
+/// edit's `didChange` before it is asked about the new caret position.
+#[test]
+fn an_incomplete_re_ask_waits_until_the_edit_is_synced() {
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.trigger_completion();
+    let first = app.completion_request_id.unwrap();
+    draw(&mut app, 100, 30);
+    tx.send(incomplete_reply(first, &path, &["load"])).unwrap();
+    app.drain_lsp_completion();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('o'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.completion_request_id,
+        Some(first),
+        "no request goes out from the key handler"
+    );
+    app.send_due_completion_reask();
+    let again = app.completion_request_id.unwrap();
+    assert_ne!(again, first, "one re-ask covers both keystrokes");
+    app.send_due_completion_reask();
+    assert_eq!(
+        app.completion_request_id,
+        Some(again),
+        "nothing more is due"
+    );
+}
+
 /// One completion reply for `path`, offering each of `labels`.
 fn completion_reply(
     request_id: u64,
@@ -15087,6 +15377,7 @@ fn completion_reply(
 ) -> crate::lsp::manager::CompletionResult {
     crate::lsp::manager::CompletionResult {
         request_id,
+        is_incomplete: false,
         path: path.to_path_buf(),
         items: labels
             .iter()
@@ -42067,6 +42358,96 @@ fn refresh_run_debug_syncs_the_config_row() {
     app.refresh_run_debug();
     assert_eq!(app.run_debug.config_count, 1);
     assert_eq!(app.run_debug.selected_config.as_deref(), Some("One"));
+}
+
+/// A Rust buffer with the caret inside `value`, and the given keybindings.
+fn lsp_nav_app(keymap: &str) -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("lib.rs"),
+        "fn main() {\n    let value = 1;\n}\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("lib.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 9;
+    app.keymap = crate::keymap::Keymap::from_json(keymap);
+    (app, tmp)
+}
+
+#[test]
+fn a_rebound_chord_runs_go_to_definition_and_rename_symbol() {
+    // #1212: keybindings.json rows naming the caret-driven LSP actions were
+    // rejected as unknown ids, so the only way in was the F-key.
+    let (mut app, _tmp) = lsp_nav_app(
+        r#"[
+            { "key": "ctrl+alt+d", "command": "go_to_definition" },
+            { "key": "ctrl+alt+r", "command": "rename_symbol" },
+            { "key": "ctrl+alt+u", "command": "go_to_references" },
+            { "key": "ctrl+alt+t", "command": "go_to_type_definition" },
+            { "key": "ctrl+alt+i", "command": "go_to_implementations" },
+            { "key": "ctrl+alt+l", "command": "go_to_declaration" }
+        ]"#,
+    );
+    let chord = |c| key(KeyCode::Char(c), KeyModifiers::CONTROL | KeyModifiers::ALT);
+
+    app.handle_key(chord('d')).unwrap();
+    assert!(
+        app.definition_request_id.is_some(),
+        "the bound chord sends the definition request at the caret"
+    );
+    app.handle_key(chord('u')).unwrap();
+    assert!(app.references_request_id.is_some(), "references");
+    app.handle_key(chord('t')).unwrap();
+    assert!(app.type_definition_request_id.is_some(), "type definition");
+    app.handle_key(chord('i')).unwrap();
+    assert!(app.implementation_request_id.is_some(), "implementations");
+    app.handle_key(chord('l')).unwrap();
+    assert!(app.declaration_request_id.is_some(), "declaration");
+    app.handle_key(chord('r')).unwrap();
+    assert!(
+        app.prepare_rename_request.is_some(),
+        "the bound chord starts a rename at the caret"
+    );
+    assert_eq!(app.status, "Preparing rename…");
+}
+
+#[test]
+fn the_f_keys_still_go_to_definition_and_rename_without_a_keymap() {
+    let (mut app, _tmp) = lsp_nav_app("[]");
+    app.handle_key(key(KeyCode::F(12), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.definition_request_id.is_some(), "F12");
+    app.handle_key(key(KeyCode::F(12), KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(app.references_request_id.is_some(), "Shift+F12");
+    app.handle_key(key(KeyCode::F(2), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.prepare_rename_request.is_some(), "F2");
+}
+
+#[test]
+fn a_rebound_go_to_definition_on_a_non_text_view_says_so_and_sends_nothing() {
+    let (mut app, tmp) = lsp_nav_app(
+        r#"[
+            { "key": "ctrl+alt+d", "command": "go_to_definition" },
+            { "key": "ctrl+alt+r", "command": "rename_symbol" }
+        ]"#,
+    );
+    let bin = tmp.path().join("a.bin");
+    std::fs::write(&bin, [0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+    app.editor.hex = Some(crate::hex::HexView::open(&bin).unwrap());
+    assert!(app.editor.has_non_text_view(), "precondition");
+    let chord = |c| key(KeyCode::Char(c), KeyModifiers::CONTROL | KeyModifiers::ALT);
+
+    app.handle_key(chord('d')).unwrap();
+    assert!(app.definition_request_id.is_none());
+    assert_eq!(app.status, "Go to Definition needs a text file");
+    app.handle_key(chord('r')).unwrap();
+    assert!(app.prepare_rename_request.is_none());
+    assert_eq!(app.status, "Rename Symbol needs a text file");
 }
 
 #[test]
@@ -72635,10 +73016,13 @@ fn the_synced_settings_layer_is_in_the_reload_chain() {
 fn a_snippets_file_that_loads_nothing_says_where_to_look() {
     // #1191: a broken snippets.json used to reload as "Snippets reloaded"
     // with nothing loaded.
-    let status = super::snippets_reload_status(true);
+    let status = super::snippets_reload_status(true, &[]);
     assert!(status.contains("not loaded"), "{status}");
     assert!(status.contains("OUTPUT · Snippets"), "{status}");
-    assert_eq!(super::snippets_reload_status(false), "Snippets reloaded");
+    assert_eq!(
+        super::snippets_reload_status(false, &[]),
+        "Snippets reloaded"
+    );
 }
 
 /// Every cell of a drawn frame, row after row.
@@ -74937,6 +75321,69 @@ fn a_click_on_the_secondary_outline_header_or_blank_rows_moves_nothing() {
     assert!(
         find_painted(&term, "sym_000", right).is_some(),
         "the header click did not fold the secondary Outline away"
+    );
+}
+
+// ── #1483: one snippet croft cannot read no longer empties the whole set ──
+
+/// A Python buffer holding `typed`, with a snippet set that mixes a plain
+/// prefix and an array one; returns the first line after Tab.
+fn expand_with_array_prefix_snippets(typed: &str) -> String {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("loop.py");
+    std::fs::write(&f, "").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.snippets = crate::snippets::SnippetSet::from_json(
+        r#"{
+            "Python main guard": { "prefix": "main", "body": "if __name__ == '__main__':", "scope": "python" },
+            "For loop": { "prefix": ["for", "fori"], "body": ["for ${1:i} in range(${2:10}):", "    $0"], "scope": "python" }
+        }"#,
+    );
+    app.editor.insert_str(typed);
+    app.handle_editor_tab();
+    app.editor.lines[0].clone()
+}
+
+#[test]
+fn tab_expands_each_word_of_an_array_prefix() {
+    assert_eq!(
+        expand_with_array_prefix_snippets("fori"),
+        "for i in range(10):"
+    );
+    assert_eq!(
+        expand_with_array_prefix_snippets("for"),
+        "for i in range(10):"
+    );
+    // The snippet beside it still expands too.
+    assert_eq!(
+        expand_with_array_prefix_snippets("main"),
+        "if __name__ == '__main__':"
+    );
+}
+
+#[test]
+fn a_snippet_reload_with_a_skipped_entry_says_so() {
+    // Built in memory: writing the real snippets.json would leak into every
+    // concurrently running test that builds an `App`.
+    let set = crate::snippets::SnippetSet::from_json(
+        r#"{ "Broken": { "prefix": 42, "body": "x" }, "Log": { "prefix": "log", "body": "y" } }"#,
+    );
+    let status = super::snippets_reload_status(set.is_broken(), set.warnings());
+    assert!(
+        status.contains("1 warning") && status.contains("OUTPUT · Snippets"),
+        "{status:?}"
+    );
+}
+
+/// Negative: a clean reload says nothing about warnings.
+#[test]
+fn a_clean_snippet_reload_has_no_warning() {
+    let set =
+        crate::snippets::SnippetSet::from_json(r#"{ "Log": { "prefix": "log", "body": "y" } }"#);
+    assert_eq!(
+        super::snippets_reload_status(set.is_broken(), set.warnings()),
+        "Snippets reloaded"
     );
 }
 
