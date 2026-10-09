@@ -71109,8 +71109,8 @@ fn the_scrubber_opens_a_commits_version_here_or_diffs_it_to_the_working_tree() {
     assert_eq!(diff.left_lines, vec!["v1", "v2"]);
     assert_eq!(
         diff.right_lines,
-        vec!["v1", "v2", "v3", "v4"],
-        "the file on disk"
+        vec!["v1", "v2", "v3", "v4", "unsaved"],
+        "the working copy as the user has it, unsaved edit included (#1572)"
     );
 
     // With no scrubbed commit, the commands say so rather than guess.
@@ -78970,4 +78970,187 @@ fn save_all_does_not_report_a_file_waiting_on_its_formatter_as_saved() {
         save_all_summary(1, 0, None, String::new()),
         "Saved 1 editor"
     );
+}
+
+/// A modified file whose tab has unsaved edits, opened from Source Control
+/// (#1572): `seed.txt` is `a = 2` on disk against `a = 1` at HEAD, and its
+/// open tab reads `# a = 2`.
+fn scm_app_with_an_unsaved_modified_file() -> (tempfile::TempDir, std::path::PathBuf, App, usize) {
+    let (tmp, f) = repo_with_seed("a = 1\n");
+    std::fs::write(&f, "a = 2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    type_str(&mut app, "# ");
+    assert!(
+        app.editor.dirty,
+        "staging: the file's tab has unsaved edits"
+    );
+    assert!(wait_for_changes(&mut app, |a| {
+        a.source_control
+            .entries
+            .iter()
+            .any(|e| e.path == "seed.txt")
+    }));
+    let idx = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "seed.txt")
+        .unwrap();
+    (tmp, f, app, idx)
+}
+
+fn diff_tab_count(app: &App) -> usize {
+    app.editor.iter_tabs().filter(|e| e.diff.is_some()).count()
+}
+
+#[test]
+fn reopening_the_source_control_diff_of_an_unsaved_file_reuses_its_diff_tab() {
+    let (_tmp, _f, mut app, idx) = scm_app_with_an_unsaved_modified_file();
+    app.open_source_control_entry(idx);
+    app.open_source_control_entry(idx);
+    app.open_source_control_entry(idx);
+    assert_eq!(
+        diff_tab_count(&app),
+        1,
+        "every click on the row must land on the one diff tab"
+    );
+    assert_eq!(app.editor.tab_count(), 2, "the file's tab and its diff");
+}
+
+#[test]
+fn the_source_control_diff_of_an_unsaved_file_shows_the_unsaved_text() {
+    let (_tmp, _f, mut app, idx) = scm_app_with_an_unsaved_modified_file();
+    app.open_source_control_entry(idx);
+    let diff = app.editor.diff.as_ref().expect("a diff view is open");
+    assert_eq!(
+        diff.left_lines,
+        vec!["a = 1".to_string()],
+        "HEAD on the left"
+    );
+    assert_eq!(
+        diff.right_lines,
+        vec!["# a = 2".to_string()],
+        "the right side is the buffer the user is editing, not the disk"
+    );
+}
+
+#[test]
+fn the_source_control_diff_leaves_the_unsaved_tab_alone() {
+    let (_tmp, f, mut app, idx) = scm_app_with_an_unsaved_modified_file();
+    app.open_source_control_entry(idx);
+    app.open_source_control_entry(idx);
+    let tab = app
+        .editor
+        .iter_tabs()
+        .find(|e| e.diff.is_none() && e.path.as_deref() == Some(f.as_path()))
+        .expect("the file's own tab is still open");
+    assert!(tab.dirty, "its unsaved edits are kept");
+    assert_eq!(tab.lines[0], "# a = 2");
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        "a = 2\n",
+        "nothing saved"
+    );
+}
+
+#[test]
+fn the_source_control_diff_of_a_clean_file_reuses_its_tab_and_reads_the_disk() {
+    let (tmp, f) = repo_with_seed("a = 1\n");
+    std::fs::write(&f, "a = 2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    assert!(wait_for_changes(&mut app, |a| {
+        a.source_control
+            .entries
+            .iter()
+            .any(|e| e.path == "seed.txt")
+    }));
+    let idx = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "seed.txt")
+        .unwrap();
+    app.open_source_control_entry(idx);
+    app.open_source_control_entry(idx);
+    assert_eq!(app.editor.tab_count(), 1, "the clean tab becomes the diff");
+    let diff = app.editor.diff.as_ref().expect("a diff view is open");
+    assert_eq!(diff.right_lines, vec!["a = 2".to_string()]);
+}
+
+#[test]
+fn compare_with_selected_diffs_an_unsaved_buffer_as_it_stands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "x\n").unwrap();
+    std::fs::write(&b, "y\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    type_str(&mut app, "z");
+    app.dispatch_menu_action(
+        MenuAction::CompareWithSelected {
+            anchor: a.clone(),
+            other: b.clone(),
+        },
+        tmp.path().to_path_buf(),
+    );
+    let diff = app.editor.diff.as_ref().expect("a diff view is open");
+    assert_eq!(
+        diff.left_lines,
+        vec!["zx".to_string()],
+        "the unsaved buffer, not the disk"
+    );
+    assert_eq!(
+        diff.right_lines,
+        vec!["y".to_string()],
+        "a closed file reads the disk"
+    );
+}
+
+#[test]
+fn hunk_actions_refuse_a_source_control_diff_of_unsaved_text() {
+    let (tmp, _f, mut app, idx) = scm_app_with_an_unsaved_modified_file();
+    app.open_source_control_entry(idx);
+    app.stage_hunk_at_caret();
+    assert_eq!(
+        app.status,
+        "Save the file first: hunk actions apply to the file on disk"
+    );
+    let staged = std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp.path())
+        .args(["diff", "--cached", "--name-only"])
+        .output()
+        .unwrap();
+    assert!(
+        staged.stdout.is_empty(),
+        "unsaved text must never reach the index: {}",
+        String::from_utf8_lossy(&staged.stdout)
+    );
+}
+
+#[test]
+fn hunk_actions_still_stage_from_a_source_control_diff_of_a_saved_file() {
+    let (tmp, f) = repo_with_seed("a = 1\n");
+    std::fs::write(&f, "a = 2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(wait_for_changes(&mut app, |a| {
+        a.source_control
+            .entries
+            .iter()
+            .any(|e| e.path == "seed.txt")
+    }));
+    let idx = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "seed.txt")
+        .unwrap();
+    app.open_source_control_entry(idx);
+    app.stage_hunk_at_caret();
+    assert_eq!(app.status, "Staged hunk in seed.txt");
 }

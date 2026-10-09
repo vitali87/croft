@@ -176,6 +176,11 @@ pub struct DiffData {
     /// against. Gates stage/unstage/revert: a Timeline snapshot diff is
     /// built by the same opener and must not reach the git index.
     pub left_is_git_head: bool,
+    /// True when the right side is an open tab's unsaved text rather than
+    /// the file on disk (#1572). Hunk actions patch the saved file, so they
+    /// refuse this view until a save (whose disk write rebuilds it) lines the
+    /// two up again.
+    pub right_is_unsaved: bool,
     /// Per-line CRLF flags and final-newline facts for byte-exact hunk
     /// patches: the display lines are `str::lines()`-cleaned, which erases
     /// both. Empty/false when raw text was not supplied (hunk actions are
@@ -402,6 +407,7 @@ impl DiffData {
             find: DiffFindState::default(),
             nav_anchor: None,
             left_is_git_head: false,
+            right_is_unsaved: false,
             left_crlf,
             right_crlf,
             left_no_final_nl,
@@ -441,6 +447,7 @@ impl DiffData {
             find: DiffFindState::default(),
             nav_anchor: None,
             left_is_git_head: false,
+            right_is_unsaved: false,
             left_crlf: Vec::new(),
             right_crlf: Vec::new(),
             left_no_final_nl: false,
@@ -499,6 +506,7 @@ impl DiffData {
                 find: DiffFindState::default(),
                 nav_anchor: None,
                 left_is_git_head: false,
+                right_is_unsaved: false,
                 left_crlf: Vec::new(),
                 right_crlf: Vec::new(),
                 left_no_final_nl: false,
@@ -602,6 +610,7 @@ impl DiffData {
             find: DiffFindState::default(),
             nav_anchor: None,
             left_is_git_head: false,
+            right_is_unsaved: false,
             left_crlf: Vec::new(),
             right_crlf: Vec::new(),
             left_no_final_nl: false,

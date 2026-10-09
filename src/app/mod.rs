@@ -38105,6 +38105,9 @@ impl App {
             Some(diff) if !diff.left_is_git_head => {
                 Err("Hunk actions need a working-tree diff from Source Control")
             }
+            Some(diff) if diff.right_is_unsaved => {
+                Err("Save the file first: hunk actions apply to the file on disk")
+            }
             Some(diff) => match self.repo_relative_path(&diff.right_path) {
                 None => Err("File is outside the repository"),
                 Some(rel) => match diff.hunk_range_at(diff.action_row()) {
@@ -38184,7 +38187,7 @@ impl App {
     /// caller falls back to the whole-hunk action.
     fn diff_selected_lines_patch(&self) -> Option<(String, String)> {
         let diff = self.editor.diff.as_ref()?;
-        if !diff.left_is_git_head {
+        if !diff.left_is_git_head || diff.right_is_unsaved {
             return None;
         }
         let sel = diff.selection?;
@@ -38251,6 +38254,11 @@ impl App {
         if !diff.left_is_git_head {
             self.status =
                 String::from("Group by seat applies to a Source Control diff of the working tree");
+            return;
+        }
+        if diff.right_is_unsaved {
+            // The seat map is keyed on the saved file's lines (#1572).
+            self.status = String::from("Save the file first: group by seat reads the saved file");
             return;
         }
         diff.group_by_seat = !diff.group_by_seat;
@@ -40747,7 +40755,8 @@ impl App {
     }
 
     /// **Diff to working tree** (#371): the scrubbed version against the
-    /// file on disk, in the side-by-side diff.
+    /// working copy (its open tab's unsaved edits, else the file on disk),
+    /// in the side-by-side diff.
     fn scrub_diff_to_working_tree(&mut self) {
         let Some((path, rel, commit, text)) = self.scrubbed_file() else {
             return;
