@@ -4799,7 +4799,15 @@ pub struct App {
     watch_baseline_pending: bool,
     /// Debug console log: program stdout/stderr (DAP output events) plus REPL
     /// echoes and results. Capped; the tail is shown in the Run & Debug panel.
-    pub debug_console: Vec<String>,
+    /// Each line is escape-free text with the colour spans its SGR sequences
+    /// set (#1501), so search and copy see `FAILED`, not `[31mFAILED[0m`.
+    pub debug_console: Vec<crate::ansi_text::AnsiLine>,
+    /// The SGR state program output left in force, carried into its next
+    /// line the way a terminal carries it (#1501).
+    debug_console_style: crate::ansi_text::AnsiStyle,
+    /// An escape sequence cut off at the end of an output event, held until
+    /// the next event completes it: adapters chunk output arbitrarily.
+    debug_console_cut: String,
     /// True once the current/just-ended debug session stopped at least once
     /// (breakpoint / step / exception). Drives the "exited without hitting a
     /// breakpoint" end message. Reset when a new session starts.
@@ -6256,6 +6264,8 @@ impl App {
             watch_prev: std::collections::HashMap::new(),
             watch_baseline_pending: false,
             debug_console: Vec::new(),
+            debug_console_style: crate::ansi_text::AnsiStyle::default(),
+            debug_console_cut: String::new(),
             debug_ever_stopped: false,
             zoxide_jump: None,
             zoxide_add_folder: false,
@@ -30253,7 +30263,7 @@ impl App {
         // while in the background.
         let mut events = self.debug_sessions.take_focused_backlog();
         let mut background_ended: Vec<usize> = Vec::new();
-        let mut background_output: Vec<String> = Vec::new();
+        let mut background_output: Vec<(String, String)> = Vec::new();
         // By index, not name: a compound can list one configuration twice,
         // so two members can share a name.
         let mut background_stopped: Option<usize> = None;
@@ -30277,11 +30287,7 @@ impl App {
                     DapEvent::Output { category, text }
                         if crate::dap::session::output_is_user_visible(&category) =>
                     {
-                        background_output.extend(
-                            text.split('\n')
-                                .filter(|l| !l.is_empty())
-                                .map(|l| format!("[{}] {l}", named.name)),
-                        );
+                        background_output.push((named.name.clone(), text));
                     }
                     DapEvent::Output { .. } => {}
                     other => {
@@ -30297,8 +30303,8 @@ impl App {
                 }
             }
         }
-        for line in background_output {
-            self.debug_console_push(line);
+        for (name, text) in background_output {
+            self.debug_console_push_output(&text, Some(&name));
         }
         // Highest index first, so removing one does not move the next.
         let mut ended_names = Vec::new();
@@ -30363,11 +30369,7 @@ impl App {
                 DapEvent::Output { category, text }
                     if crate::dap::session::output_is_user_visible(&category) =>
                 {
-                    for line in text.split('\n') {
-                        if !line.is_empty() {
-                            self.debug_console_push(line.to_string());
-                        }
-                    }
+                    self.debug_console_push_output(&text, None);
                 }
                 // REPL submissions echo "❯ expr" then the result; watch/hover
                 // results are consumed elsewhere.
@@ -30774,11 +30776,37 @@ impl App {
     /// "Debug Console" channel (#867), where it reads at full width and can
     /// be searched and copied; that channel keeps its own cap.
     fn debug_console_push(&mut self, line: String) {
+        self.debug_console_push_line(crate::ansi_text::AnsiLine::plain(line));
+    }
+
+    /// Append a program's output event to the debug console, one line per
+    /// embedded newline, with its colour sequences turned into spans and every
+    /// other escape dropped (#1501). `from` names a background session, whose
+    /// lines carry a `[name]` prefix. A sequence the event ends in the middle
+    /// of waits for the next event rather than leaking its tail as text.
+    fn debug_console_push_output(&mut self, text: &str, from: Option<&str>) {
+        let mut raw = std::mem::take(&mut self.debug_console_cut);
+        raw.push_str(text);
+        let whole = raw.len() - crate::ansi_text::unfinished_escape_len(&raw);
+        self.debug_console_cut = raw[whole..].to_string();
+        for part in raw[..whole].split('\n') {
+            let mut line = crate::ansi_text::parse_line(part, &mut self.debug_console_style);
+            if line.text.is_empty() {
+                continue;
+            }
+            if let Some(name) = from {
+                line.prefix(&format!("[{name}] "));
+            }
+            self.debug_console_push_line(line);
+        }
+    }
+
+    fn debug_console_push_line(&mut self, line: crate::ansi_text::AnsiLine) {
         const CAP: usize = 1000;
         crate::output::push(
             crate::output::CHANNEL_DEBUG_CONSOLE,
             crate::output::OutputLevel::Info,
-            &line,
+            &line.text,
         );
         self.debug_console.push(line);
         if self.debug_console.len() > CAP {
@@ -30906,6 +30934,8 @@ impl App {
         // tracking so the "exited without hitting a breakpoint" hint and the
         // console reflect only this run.
         self.debug_console.clear();
+        self.debug_console_style = crate::ansi_text::AnsiStyle::default();
+        self.debug_console_cut.clear();
         self.debug_ever_stopped = false;
         self.run_debug.session_ended = false;
         self.show_tree = true;
@@ -32820,9 +32850,7 @@ impl App {
                 DapEvent::Output { category, text }
                     if crate::dap::session::output_is_user_visible(&category) =>
                 {
-                    for line in text.split('\n').filter(|l| !l.is_empty()) {
-                        self.debug_console_push(line.to_string());
-                    }
+                    self.debug_console_push_output(&text, None);
                 }
                 DapEvent::Output { .. } => {}
                 other => keep.push(other),

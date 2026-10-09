@@ -61,6 +61,67 @@ pub struct AnsiLine {
     pub spans: Vec<AnsiSpan>,
 }
 
+impl AnsiLine {
+    /// A line with no escapes in it: its text in the default style.
+    pub fn plain(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let spans = if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![AnsiSpan {
+                start: 0,
+                end: text.len(),
+                style: AnsiStyle::default(),
+            }]
+        };
+        Self { text, spans }
+    }
+
+    /// Put `lead` in front of the line, in the default style, moving the
+    /// spans along with the text they colour.
+    pub fn prefix(&mut self, lead: &str) {
+        if lead.is_empty() {
+            return;
+        }
+        let n = lead.len();
+        for span in &mut self.spans {
+            span.start += n;
+            span.end += n;
+        }
+        self.spans.insert(
+            0,
+            AnsiSpan {
+                start: 0,
+                end: n,
+                style: AnsiStyle::default(),
+            },
+        );
+        self.text.insert_str(0, lead);
+    }
+}
+
+/// How many bytes at the end of `raw` are an escape sequence that has not
+/// finished yet: a stream cut mid-sequence (a debug adapter's output event,
+/// #1501) holds these back until the next chunk completes them, where
+/// [`parse_line`] would drop a truncated CSI and print a lone ESC. Only the
+/// last line counts, since a newline ends any line the parser reads.
+pub fn unfinished_escape_len(raw: &str) -> usize {
+    let line = raw.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let bytes = &raw.as_bytes()[line..];
+    let Some(esc) = bytes.iter().rposition(|&b| b == 0x1b) else {
+        return 0;
+    };
+    let tail = &bytes[esc..];
+    let unfinished = match tail.get(1) {
+        None => true,
+        Some(b'[') => !tail[2..].iter().any(|b| (0x40..=0x7e).contains(b)),
+        Some(b']' | b'P' | b'X' | b'^' | b'_') => !tail[2..].contains(&0x07),
+        Some(b'(' | b')' | b'*' | b'+' | b'#') => tail.len() < 3,
+        Some(_) => false,
+    };
+    if unfinished { tail.len() } else { 0 }
+}
+
 /// Parse one line, carrying `style` in and out so colours persist across
 /// lines the way a terminal does (a log that sets red on one line and resets
 /// three lines later paints all three red).
@@ -503,5 +564,45 @@ mod tests {
         assert_eq!(parse("\u{1b}\u{1F642} tail").text, "\u{1b}\u{1F642} tail");
         // A real two-byte escape still disappears.
         assert_eq!(parse("\u{1b}7saved").text, "saved");
+    }
+
+    /// #1501: a debug adapter cuts output anywhere, so the console holds back
+    /// a sequence the chunk ends inside of, and only that.
+    #[test]
+    fn an_unfinished_escape_at_the_end_is_measured() {
+        assert_eq!(unfinished_escape_len("ok \u{1b}[3"), 3);
+        assert_eq!(unfinished_escape_len("ok \u{1b}["), 2);
+        assert_eq!(unfinished_escape_len("ok \u{1b}"), 1);
+        assert_eq!(unfinished_escape_len("\u{1b}]0;title"), 9);
+        assert_eq!(unfinished_escape_len("a\n\u{1b}[1;3"), 5);
+    }
+
+    #[test]
+    fn a_finished_escape_or_plain_text_holds_nothing_back() {
+        assert_eq!(unfinished_escape_len(""), 0);
+        assert_eq!(unfinished_escape_len("plain [31m text"), 0);
+        assert_eq!(unfinished_escape_len("\u{1b}[31mred\u{1b}[0m"), 0);
+        assert_eq!(unfinished_escape_len("\u{1b}]0;title\u{7}after"), 0);
+        assert_eq!(unfinished_escape_len("\u{1b}]8;;x\u{1b}\\"), 0);
+        // A newline ends the line the cut sequence was on.
+        assert_eq!(unfinished_escape_len("\u{1b}[3\nnext"), 0);
+    }
+
+    #[test]
+    fn a_prefix_moves_the_spans_with_their_text() {
+        let mut style = AnsiStyle::default();
+        let mut line = parse_line("\u{1b}[31mred\u{1b}[0m done", &mut style);
+        line.prefix("[A] ");
+        assert_eq!(line.text, "[A] red done");
+        let red: Vec<&str> = line
+            .spans
+            .iter()
+            .filter(|s| s.style.fg == Some(AnsiColor::Indexed(1)))
+            .map(|s| &line.text[s.start..s.end])
+            .collect();
+        assert_eq!(red, vec!["red"]);
+        assert_eq!(line.spans[0].style, AnsiStyle::default());
+        assert_eq!(AnsiLine::plain("").spans, Vec::new());
+        assert_eq!(AnsiLine::plain("x").text, "x");
     }
 }

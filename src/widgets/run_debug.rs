@@ -57,25 +57,45 @@ fn with_bg(style: Style, bg: Option<Color>) -> Style {
     }
 }
 
+/// One wrapped console row: runs of text, each in the style its program
+/// output set (#1501).
+type ConsoleRow = Vec<(String, crate::ansi_text::AnsiStyle)>;
+
 /// Soft-wrap one console line into rows at most `width` display columns
 /// wide, the way a terminal wraps (#867): whitespace is kept, so a
 /// traceback's indentation survives, a wide glyph never straddles two rows,
-/// and a tab is four spaces. An empty line is one empty row.
+/// and a tab is four spaces. An empty line is one empty row. Each character
+/// keeps the colour its span gives it, so a coloured word wrapped across two
+/// rows is coloured on both (#1501).
 ///
 /// Only the last `keep` rows are returned, oldest first, and only they are
 /// built: a row that scrolls out of the kept tail lends its buffer to the
 /// next, so a program printing one enormous line costs a scan of it per
 /// frame but never a string per row (#867 review).
-fn wrap_console_line_tail(line: &str, width: usize, keep: usize) -> Vec<String> {
+fn wrap_console_line_tail(
+    line: &crate::ansi_text::AnsiLine,
+    width: usize,
+    keep: usize,
+) -> Vec<ConsoleRow> {
     use unicode_width::UnicodeWidthChar;
     if keep == 0 {
         return Vec::new();
     }
     let width = width.max(1);
-    let mut rows: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-    let mut row = String::new();
+    let mut rows: std::collections::VecDeque<ConsoleRow> = std::collections::VecDeque::new();
+    let mut row = ConsoleRow::new();
     let mut used = 0;
-    for c in line.chars() {
+    let mut span = 0;
+    for (at, c) in line.text.char_indices() {
+        while line.spans.get(span).is_some_and(|s| s.end <= at) {
+            span += 1;
+        }
+        let style = line
+            .spans
+            .get(span)
+            .filter(|s| s.start <= at)
+            .map(|s| s.style)
+            .unwrap_or_default();
         // A tab is four spaces.
         let (c, n) = if c == '\t' { (' ', 4) } else { (c, 1) };
         let w = c.width().unwrap_or(0);
@@ -91,12 +111,46 @@ fn wrap_console_line_tail(line: &str, width: usize, keep: usize) -> Vec<String> 
                 }
                 used = 0;
             }
-            row.push(c);
+            match row.last_mut() {
+                Some((text, st)) if *st == style => text.push(c),
+                _ => row.push((c.to_string(), style)),
+            }
             used += w;
         }
     }
     rows.push_back(row);
     rows.into()
+}
+
+/// The style a console run paints in: `base` (the line's own colour), with
+/// whatever the program's colour sequences set on top (#1501). Inverse is
+/// left to the terminal, which knows the pair it swaps.
+fn console_run_style(
+    base: Style,
+    st: crate::ansi_text::AnsiStyle,
+    theme: crate::theme::Theme,
+) -> Style {
+    use crate::widgets::editor::ansi_color_to_tui;
+    let mut style = base;
+    if let Some(c) = st.fg {
+        style = style.fg(ansi_color_to_tui(c, theme));
+    }
+    if let Some(c) = st.bg {
+        style = style.bg(ansi_color_to_tui(c, theme));
+    }
+    for (on, m) in [
+        (st.bold, Modifier::BOLD),
+        (st.dim, Modifier::DIM),
+        (st.italic, Modifier::ITALIC),
+        (st.underline, Modifier::UNDERLINED),
+        (st.inverse, Modifier::REVERSED),
+        (st.strikeout, Modifier::CROSSED_OUT),
+    ] {
+        if on {
+            style = style.add_modifier(m);
+        }
+    }
+    style
 }
 
 /// Colour a Python value by its `type_name` (PyCharm/Darcula-ish): strings and
@@ -254,7 +308,7 @@ pub struct RunDebugPanel {
     pub last_debug_rows_shown: usize,
     /// Tail of the debug console (program output + REPL echoes/results), set by
     /// the app each refresh; rendered below the variables tree.
-    pub console_tail: Vec<String>,
+    pub console_tail: Vec<crate::ansi_text::AnsiLine>,
     /// Current REPL input line, rendered as a `❯` prompt at the panel bottom.
     pub repl_input: String,
     /// Top-left cell of the OSC-1337 icon overlay block. The post-draw
@@ -437,10 +491,10 @@ impl RunDebugPanel {
     /// to `width` columns (#867), oldest first so they paint top-down with
     /// the newest last. Each row says whether its line is a REPL echo
     /// (`❯ expr`), drawn in the accent colour down all its rows.
-    fn console_rows(&self, width: usize, max_rows: usize) -> Vec<(String, bool)> {
+    fn console_rows(&self, width: usize, max_rows: usize) -> Vec<(ConsoleRow, bool)> {
         let mut rows = Vec::new();
         for line in self.console_tail.iter().rev() {
-            let echo = line.starts_with('❯');
+            let echo = line.text.starts_with('❯');
             let keep = max_rows.saturating_sub(rows.len());
             for row in wrap_console_line_tail(line, width, keep).into_iter().rev() {
                 if rows.len() == max_rows {
@@ -452,6 +506,29 @@ impl RunDebugPanel {
         }
         rows.reverse();
         rows
+    }
+
+    /// Paint one wrapped console row at (`x`, `y`), at most `width` columns,
+    /// each run in `base` overlaid with its own colours.
+    fn put_console_row(
+        &self,
+        buf: &mut Buffer,
+        x: u16,
+        y: u16,
+        row: &ConsoleRow,
+        width: u16,
+        base: Style,
+    ) {
+        let right = x.saturating_add(width);
+        let mut at = x;
+        for (text, st) in row {
+            if at >= right {
+                break;
+            }
+            let style = console_run_style(base, *st, self.theme);
+            let (end, _) = buf.set_stringn(at, y, text, (right - at) as usize, style);
+            at = end;
+        }
     }
 
     /// Render the paused-state tree (Variant A / Darcula): a status pill, the
@@ -777,11 +854,12 @@ impl RunDebugPanel {
             } else {
                 Style::default().fg(self.theme.ui(DBG_LOC))
             };
-            buf.set_stringn(
+            self.put_console_row(
+                buf,
                 inner.x + 1,
                 console_y0 + i as u16,
                 row,
-                console_w as usize,
+                console_w,
                 style,
             );
         }
@@ -1154,7 +1232,7 @@ impl Widget for &mut RunDebugPanel {
             let max_w = inner.width.saturating_sub(2) as usize;
             let line_style = Style::default().fg(self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)));
             for (row, _) in self.console_rows(max_w, avail) {
-                buf.set_stringn(inner.x + 1, next_y, &row, max_w, line_style);
+                self.put_console_row(buf, inner.x + 1, next_y, &row, max_w as u16, line_style);
                 next_y = next_y.saturating_add(1);
             }
         }
@@ -1165,10 +1243,24 @@ impl Widget for &mut RunDebugPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ansi_text::AnsiLine;
 
     /// Every row of `line` wrapped to `width`.
     fn wrap_console_line(line: &str, width: usize) -> Vec<String> {
-        wrap_console_line_tail(line, width, usize::MAX)
+        wrap_console_line_tail(&AnsiLine::plain(line), width, usize::MAX)
+            .iter()
+            .map(row_text)
+            .collect()
+    }
+
+    /// A wrapped row's text, its runs joined.
+    fn row_text(row: &ConsoleRow) -> String {
+        row.iter().map(|(t, _)| t.as_str()).collect()
+    }
+
+    /// Console lines with no colour in them.
+    fn plain_lines<S: Into<String>>(lines: impl IntoIterator<Item = S>) -> Vec<AnsiLine> {
+        lines.into_iter().map(AnsiLine::plain).collect()
     }
 
     #[test]
@@ -1274,7 +1366,10 @@ mod tests {
                 for keep in 0..=whole.len() + 2 {
                     let tail = &whole[whole.len().saturating_sub(keep)..];
                     assert_eq!(
-                        wrap_console_line_tail(line, width, keep),
+                        wrap_console_line_tail(&AnsiLine::plain(line.as_str()), width, keep)
+                            .iter()
+                            .map(row_text)
+                            .collect::<Vec<_>>(),
                         tail,
                         "{line:?} at {width} keeping {keep}"
                     );
@@ -1289,11 +1384,11 @@ mod tests {
     fn a_huge_console_line_shows_its_last_rows() {
         let mut panel = RunDebugPanel::default();
         let huge = "a".repeat(2_000_000) + "THE END";
-        panel.console_tail = vec![String::from("before"), huge];
+        panel.console_tail = plain_lines([String::from("before"), huge]);
         let rows = panel.console_rows(10, 3);
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[2].0, "THE END");
-        assert_eq!(rows[1].0, "a".repeat(10));
+        assert_eq!(row_text(&rows[2].0), "THE END");
+        assert_eq!(row_text(&rows[1].0), "a".repeat(10));
     }
 
     #[test]
@@ -1307,7 +1402,7 @@ mod tests {
                 title: "CALL STACK".into(),
             },
         }];
-        panel.console_tail = vec!["hello from program".into(), "42".into()];
+        panel.console_tail = plain_lines(["hello from program", "42"]);
         panel.repl_input = String::from("x + 1");
         let area = Rect {
             x: 0,
@@ -1344,6 +1439,57 @@ mod tests {
         );
     }
 
+    /// #1501: the console paints the colours a program's SGR sequences set,
+    /// over the console's own colour, and a wrapped run keeps its colour on
+    /// both rows.
+    #[test]
+    fn console_rows_paint_program_colours() {
+        let mut panel = RunDebugPanel::new();
+        panel.debug_active = true;
+        panel.debug_status = String::from("Paused");
+        let mut style = crate::ansi_text::AnsiStyle::default();
+        panel.console_tail = vec![crate::ansi_text::parse_line(
+            "\x1b[31mFAILED\x1b[0m ok \x1b[32mgreen-run-that-is-too-long-for-the-panel-TAIL\x1b[0m",
+            &mut style,
+        )];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 24,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let find = |text: &str| {
+            (0..area.height)
+                .find_map(|y| {
+                    let row: String = (0..area.width).map(|x| buf[(x, y)].symbol()).collect();
+                    row.find(text).map(|i| (row[..i].chars().count() as u16, y))
+                })
+                .unwrap_or_else(|| panic!("{text:?} on screen:\n{}", buffer_to_string(&buf)))
+        };
+        let ansi = |i: usize| {
+            let (r, g, b) = panel.theme.ansi()[i];
+            Color::Rgb(r, g, b)
+        };
+        let (x, y) = find("FAILED");
+        assert_eq!(buf[(x, y)].fg, ansi(1), "red");
+        assert_eq!(
+            buf[(x + 7, y)].fg,
+            panel.theme.ui(DBG_LOC),
+            "back to the console's own"
+        );
+        let (x, y) = find("green");
+        assert_eq!(buf[(x, y)].fg, ansi(2));
+        let (x2, y2) = find("TAIL");
+        assert!(y2 > y, "the green run wrapped");
+        assert_eq!(
+            buf[(x2, y2)].fg,
+            ansi(2),
+            "and is green on its next row too"
+        );
+    }
+
     /// #867: program output wider than the sidebar was cut at its edge, with
     /// no wrap and no scroll. A long line now wraps onto the rows above the
     /// label, every character of it on screen, still anchored to the label.
@@ -1360,7 +1506,7 @@ mod tests {
                 title: "CALL STACK".into(),
             },
         }];
-        panel.console_tail = vec!["short".into(), long.into()];
+        panel.console_tail = plain_lines(["short", long]);
         let area = Rect {
             x: 0,
             y: 0,
@@ -1393,7 +1539,7 @@ mod tests {
         let long = "x".repeat(60) + "END";
         let mut panel = RunDebugPanel::new();
         panel.session_ended = true;
-        panel.console_tail = vec![long.clone()];
+        panel.console_tail = plain_lines([long.clone()]);
         let area = Rect {
             x: 0,
             y: 0,
@@ -1452,14 +1598,20 @@ mod tests {
     #[test]
     fn wrapped_console_rows_keep_the_newest_within_the_cap() {
         let mut panel = RunDebugPanel::new();
-        panel.console_tail = vec![String::from("older"), "y".repeat(30) + "END"];
+        panel.console_tail = plain_lines([String::from("older"), "y".repeat(30) + "END"]);
         let rows = panel.console_rows(10, 3);
         assert_eq!(rows.len(), 3, "{rows:?}");
         // 33 columns at width 10: three full rows of `y`, then `END`.
-        assert_eq!(rows.last().map(|(r, _)| r.as_str()), Some("END"));
-        assert!(!rows.iter().any(|(r, _)| r.contains("older")), "{rows:?}");
+        assert_eq!(
+            rows.last().map(|(r, _)| row_text(r)),
+            Some(String::from("END"))
+        );
+        assert!(
+            !rows.iter().any(|(r, _)| row_text(r).contains("older")),
+            "{rows:?}"
+        );
         // A REPL echo keeps its accent on every one of its rows.
-        panel.console_tail = vec![format!("❯ {}", "e".repeat(20))];
+        panel.console_tail = plain_lines([format!("❯ {}", "e".repeat(20))]);
         let rows = panel.console_rows(10, 6);
         assert!(
             rows.len() > 1 && rows.iter().all(|(_, echo)| *echo),

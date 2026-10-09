@@ -1068,7 +1068,7 @@ Hand-curated "IN THIS RELEASE" highlights (feature or fix, glyph plus summary) s
 
 ### run_debug.rs
 
-The Run and Debug sidebar widget: an empty-state Run [filename] button, and when a session is live the paused-state tree (call stack, expandable variables, WATCH), a debug console of program output (soft-wrapped to the panel width by display columns, #867), and a `❯` REPL prompt. Every console line is also mirrored to the OUTPUT bus's "Debug Console" channel. The App builds the rows and maps clicks back to frames and variables.
+The Run and Debug sidebar widget: an empty-state Run [filename] button, and when a session is live the paused-state tree (call stack, expandable variables, WATCH), a debug console of program output (soft-wrapped to the panel width by display columns, #867, and coloured by the program's own SGR sequences, which `ansi_text` turns into spans; other escapes are dropped, #1501), and a `❯` REPL prompt. Every console line is also mirrored, as plain text, to the OUTPUT bus's "Debug Console" channel. The App builds the rows and maps clicks back to frames and variables.
 
 **WATCH is frame-relative.** Session-scoped expressions are re-evaluated on every stop via DAP `evaluate` with context `watch`, against the SELECTED frame. The stop selects the top frame, and clicking a call-stack frame re-evaluates every watch against that frame.
 
