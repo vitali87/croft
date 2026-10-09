@@ -276,28 +276,31 @@ fn transcript_commands(text: &str, root: bool) -> String {
     let mut out = String::new();
     // The command read so far, while one is being read.
     let mut command: Option<String> = None;
-    // The word that ends the heredoc the command opened.
-    let mut heredoc: Option<String> = None;
+    // The heredoc the command opened, while its body is being read.
+    let mut heredoc: Option<Heredoc> = None;
     for line in text.lines() {
-        if let Some(word) = &heredoc {
-            if let Some(body) = ps2_body(line) {
-                out.push_str(body);
-                out.push('\n');
-                if body.trim() == word {
-                    heredoc = None;
-                }
-                continue;
+        if let Some(doc) = &heredoc {
+            // Every line up to the delimiter is the heredoc's body, with
+            // or without its `> `.
+            let body = ps2_body(line).unwrap_or(line);
+            out.push_str(body);
+            out.push('\n');
+            if doc.ends_at(body) {
+                heredoc = None;
             }
-            heredoc = None;
+            continue;
         }
         if let Some(sofar) = command.as_mut() {
             if command_is_open(sofar) {
                 let body = ps2_body(line).unwrap_or(line);
                 sofar.push('\n');
+                let from = sofar.len();
                 sofar.push_str(body);
                 out.push_str(body);
                 out.push('\n');
-                heredoc = heredoc_word(body);
+                // Read in the whole command's context: a `<<` inside a
+                // quote opened on an earlier line opens nothing.
+                heredoc = heredoc_word(sofar, from);
                 continue;
             }
             command = None;
@@ -305,7 +308,7 @@ fn transcript_commands(text: &str, root: bool) -> String {
         if let Some(cmd) = prompt_command(line, root).filter(|c| !c.trim().is_empty()) {
             out.push_str(cmd);
             out.push('\n');
-            heredoc = heredoc_word(cmd);
+            heredoc = heredoc_word(cmd, 0);
             command = Some(cmd.to_string());
         }
     }
@@ -340,23 +343,92 @@ fn command_is_open(cmd: &str) -> bool {
     escaped || single || double || tail.ends_with('|') || tail.ends_with("&&")
 }
 
-/// The word a heredoc opened on this line ends at (`<<EOF`, `<<-'EOF'`),
-/// or None. A here-string (`<<<`) opens nothing.
-fn heredoc_word(line: &str) -> Option<String> {
-    let at = line.find("<<")?;
-    let rest = &line[at + 2..];
-    if rest.starts_with('<') {
-        return None;
+/// A heredoc a command opened: the word that ends it, and whether `<<-`
+/// lets that word be indented with tabs.
+struct Heredoc {
+    word: String,
+    tabs: bool,
+}
+
+impl Heredoc {
+    /// This body line is the one that closes the heredoc.
+    fn ends_at(&self, line: &str) -> bool {
+        let line = if self.tabs {
+            line.trim_start_matches('\t')
+        } else {
+            line
+        };
+        line.trim_end() == self.word
     }
-    let rest = rest
-        .trim_start_matches('-')
-        .trim_start()
-        .trim_start_matches(['\'', '"', '\\']);
-    let word: String = rest
-        .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
-        .collect();
-    (!word.is_empty()).then_some(word)
+}
+
+/// The heredoc a command opens (`<<EOF`, `<<-'EOF'`) at or after byte
+/// `from`, or None. Only a `<<` the shell would read counts: not one
+/// quoted, escaped or in a `#` comment, and not a here-string (`<<<`).
+fn heredoc_word(line: &str, from: usize) -> Option<Heredoc> {
+    let b = line.as_bytes();
+    let (mut single, mut double) = (false, false);
+    let mut word_start = true;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if single {
+            single = c != b'\'';
+            i += 1;
+            word_start = false;
+            continue;
+        }
+        match c {
+            b'\\' => {
+                // The next character is literal, `<` included.
+                i += 2;
+                word_start = false;
+                continue;
+            }
+            b'\'' if !double => single = true,
+            b'"' => double = !double,
+            // A comment runs to the end of its line.
+            b'#' if !double && word_start => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'<' if !double && b.get(i + 1) == Some(&b'<') => {
+                if b.get(i + 2) == Some(&b'<') {
+                    // A here-string: skip all of `<<<`.
+                    i += 3;
+                    word_start = false;
+                    continue;
+                }
+                if i >= from {
+                    return heredoc_at(&line[i + 2..]);
+                }
+                i += 2;
+                word_start = false;
+                continue;
+            }
+            _ => {}
+        }
+        word_start = c.is_ascii_whitespace() || matches!(c, b';' | b'&' | b'|' | b'(');
+        i += 1;
+    }
+    None
+}
+
+/// The heredoc whose operator `<<` came just before `rest`.
+fn heredoc_at(rest: &str) -> Option<Heredoc> {
+    let tabs = rest.starts_with('-');
+    let rest = rest.strip_prefix('-').unwrap_or(rest).trim_start();
+    let word: String = match rest.chars().next()? {
+        q @ ('\'' | '"') => rest[1..].chars().take_while(|&c| c != q).collect(),
+        _ => rest
+            .trim_start_matches('\\')
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect(),
+    };
+    (!word.is_empty()).then_some(Heredoc { word, tabs })
 }
 
 /// One captured run of a fence, shown under it in the preview.
@@ -2062,6 +2134,43 @@ mod tests {
     fn output_starting_with_a_ps2_mark_after_a_finished_command_is_output() {
         let md = "```console\n$ npm run build\n\n> demo@1.0.0 build\n> tsc\n\n$ npm test\n```\n";
         assert_eq!(run_codes(md), vec!["npm run build\nnpm test\n"]);
+    }
+
+    /// #1473 negative: a `<<` the shell would not read (quoted, escaped,
+    /// in a comment, or a `<<<` here-string) opens no heredoc, so `> `
+    /// sample output after it never runs.
+    #[test]
+    fn a_quoted_or_commented_heredoc_marker_does_not_run_the_output() {
+        for cmd in [
+            "printf '%s\\n' '<<EOF'",
+            "echo \"<<EOF\"",
+            "echo \\<<EOF",
+            "ls # <<EOF",
+            "cat <<< EOF",
+        ] {
+            let md = format!("```console\n$ {cmd}\n> touch /tmp/x\n> EOF\n```\n");
+            assert_eq!(run_codes(&md), vec![format!("{cmd}\n")], "{cmd}");
+        }
+        // A `<<` inside a quote a previous line opened is quoted too.
+        let md = "```console\n$ echo 'a\n> <<EOF'\n> touch /tmp/x\n```\n";
+        assert_eq!(run_codes(md), vec!["echo 'a\n<<EOF'\n"]);
+    }
+
+    /// #1473: a heredoc body written without `> ` is kept, raw, up to its
+    /// delimiter; `<<-` lets the delimiter be tab-indented and a quoted
+    /// delimiter is the word inside the quotes.
+    #[test]
+    fn a_heredoc_body_without_continuation_prompts_is_kept() {
+        let md = "```console\n$ cat <<EOF\nhello\n$ not-a-prompt\nEOF\n$ ls\nout\n```\n";
+        assert_eq!(
+            run_codes(md),
+            vec!["cat <<EOF\nhello\n$ not-a-prompt\nEOF\nls\n"]
+        );
+        let tabs = "```console\n$ cat <<-'END'\n\thi\n\tEND\nout\n```\n";
+        assert_eq!(run_codes(tabs), vec!["cat <<-'END'\n\thi\n\tEND\n"]);
+        // Without `-` a tab-indented word is body, not the delimiter.
+        let plain = "```console\n$ cat <<\"END\"\n\tEND\nEND\nout\n```\n";
+        assert_eq!(run_codes(plain), vec!["cat <<\"END\"\n\tEND\nEND\n"]);
     }
 
     /// #1473: a shell fence written as a transcript (it opens with a
