@@ -79380,6 +79380,138 @@ fn save_all_does_not_report_a_file_waiting_on_its_formatter_as_saved() {
     );
 }
 
+/// `a.py` reading `value = 1`, open in the editor, then `00` typed at the
+/// end of the line and saved: the issue's (#1568) setup.
+fn app_with_a_saved_edit() -> (tempfile::TempDir, std::path::PathBuf, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.py");
+    std::fs::write(&a, "value = 1\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_editor_key(key(KeyCode::End, KeyModifiers::NONE));
+    type_str(&mut app, "00");
+    app.handle_key(ctrl('s')).unwrap();
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "value = 100\n");
+    assert!(!app.editor.dirty);
+    (tmp, a, app)
+}
+
+/// #1568: closing a tab threw its undo history away, so after Reopen Closed
+/// Editor Ctrl+Z said "Nothing to undo". The history now comes back with
+/// the file, and undoing past the save leaves the buffer modified.
+#[test]
+fn reopen_closed_editor_brings_back_the_undo_history() {
+    let (_tmp, _a, mut app) = app_with_a_saved_edit();
+    app.run_command(crate::widgets::command_palette::Command::CloseEditor);
+    assert!(app.editor.path.is_none(), "the tab closed");
+    app.run_command(crate::widgets::command_palette::Command::ReopenClosedEditor);
+    assert_eq!(app.editor.lines[0], "value = 100");
+    app.handle_key(ctrl('z')).unwrap();
+    assert_eq!(app.status, "Undo");
+    assert_eq!(app.editor.lines[0], "value = 1");
+    assert!(app.editor.dirty, "the undone text is not what is on disk");
+    app.handle_key(key(
+        KeyCode::Char('z'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert_eq!(app.editor.lines[0], "value = 100", "and redo still works");
+}
+
+/// #1568: opening the file again from the Explorer (a new tab, not Reopen
+/// Closed Editor) finds the history too.
+#[test]
+fn opening_a_closed_file_again_brings_back_the_undo_history() {
+    let (_tmp, a, mut app) = app_with_a_saved_edit();
+    app.run_command(crate::widgets::command_palette::Command::CloseEditor);
+    app.editor.open_preview(&a).unwrap();
+    assert!(app.editor.undo());
+    assert_eq!(app.editor.lines[0], "value = 1");
+}
+
+/// #1568 negative: a file changed on disk after its tab closed opens with
+/// no history, which describes text the file no longer has.
+#[test]
+fn a_file_changed_after_its_tab_closed_reopens_with_no_history() {
+    let (_tmp, a, mut app) = app_with_a_saved_edit();
+    app.run_command(crate::widgets::command_palette::Command::CloseEditor);
+    std::fs::write(&a, "value = 2\n").unwrap();
+    app.run_command(crate::widgets::command_palette::Command::ReopenClosedEditor);
+    assert_eq!(app.editor.lines[0], "value = 2");
+    app.handle_key(ctrl('z')).unwrap();
+    assert_eq!(app.status, "Nothing to undo");
+    assert_eq!(app.editor.lines[0], "value = 2");
+}
+
+/// #1568 negative: edits discarded at close ("Don't Save") are not on disk,
+/// so their history does not apply to the file that reopens.
+#[test]
+fn discarded_edits_leave_no_history_behind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.py");
+    std::fs::write(&a, "value = 1\n").unwrap();
+    let mut tabs = crate::widgets::editor::EditorTabs::new();
+    tabs.open_pinned(&a).unwrap();
+    tabs.end_line();
+    tabs.insert_str("00");
+    assert!(tabs.dirty);
+    tabs.close_tab(tabs.active_index());
+    tabs.open_pinned(&a).unwrap();
+    assert_eq!(tabs.lines[0], "value = 1");
+    assert!(!tabs.undo(), "nothing to undo in the file as it is on disk");
+}
+
+/// #1568: a tab moving on to another file (a reused preview slot, or any
+/// open into the same tab) keeps the history of the file it leaves, which
+/// comes back when that file opens there again.
+#[test]
+fn a_tab_keeps_the_history_of_the_file_it_moves_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.py");
+    let b = tmp.path().join("b.py");
+    std::fs::write(&a, "value = 1\n").unwrap();
+    std::fs::write(&b, "other\n").unwrap();
+    let mut e = crate::widgets::editor::Editor::new();
+    e.open(&a).unwrap();
+    e.end_line();
+    e.insert_str("00");
+    e.save_to_disk().unwrap();
+    e.open(&b).unwrap();
+    assert!(!e.undo(), "b.py has no history of its own");
+    e.open(&a).unwrap();
+    assert!(e.undo());
+    assert_eq!(e.lines[0], "value = 1");
+}
+
+/// #1568: the kept histories are capped; past the cap the oldest closed
+/// file's goes first and the newest stay.
+#[test]
+fn closed_tab_histories_are_capped_oldest_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let files: Vec<_> = (0..31)
+        .map(|i| {
+            let f = tmp.path().join(format!("f{i}.txt"));
+            std::fs::write(&f, "x\n").unwrap();
+            f
+        })
+        .collect();
+    for f in &files {
+        let mut e = crate::widgets::editor::Editor::new();
+        e.open(f).unwrap();
+        e.insert_str("y");
+        e.save_to_disk().unwrap();
+    }
+    let undoes = |f: &std::path::Path| {
+        let mut e = crate::widgets::editor::Editor::new();
+        e.open(f).unwrap();
+        e.undo()
+    };
+    assert!(!undoes(&files[0]), "the oldest of 31 is dropped");
+    assert!(undoes(&files[1]));
+    assert!(undoes(&files[30]));
+}
+
 /// #1488: a watcher that clears the screen (`tsc --watch`, `cargo watch -c`)
 /// erases its own output mark, so its finish reports no output. That finish
 /// never reached the build scan, the one-shot skip meant for it stayed set,
