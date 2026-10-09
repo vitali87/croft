@@ -160,7 +160,7 @@ pub const TABLE: &[Mapping] = &[
         vscode: "esbenp.prettier-vscode",
         croft: "format_on_save",
         status: Status::Builtin,
-        note: "formatting runs through each language server's formatter on save",
+        note: "Format Document and format on save run the project's Prettier (node_modules/.bin/prettier) when it has a Prettier config",
     },
     Mapping {
         vscode: "orta.vscode-jest",

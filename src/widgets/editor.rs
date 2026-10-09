@@ -9797,6 +9797,21 @@ impl Editor {
         out
     }
 
+    /// The buffer as `\n`-joined text with the final newline the file has,
+    /// for an external formatter that reads the whole file (#1255).
+    pub fn text_for_formatter(&self) -> String {
+        let mut text = self.lines.join("\n");
+        if self.final_newline && !text.is_empty() {
+            text.push('\n');
+        }
+        text
+    }
+
+    /// Whether the buffer's last line ends in a line break on disk.
+    pub fn has_final_newline(&self) -> bool {
+        self.final_newline
+    }
+
     /// The text a save writes: the lines joined with the file's EOL, and
     /// the final newline the file had. An emptied buffer writes nothing.
     fn content_for_disk(&self) -> String {
