@@ -2684,6 +2684,49 @@ struct PendingRevertHunk {
     patch: String,
 }
 
+/// What an unsaved-changes prompt (#862) goes on to do once it is answered.
+/// Everything that would drop a dirty buffer asks first: a quit that goes
+/// ahead removes the hot-exit backup, so the prompt is the last chance to
+/// save.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum UnsavedExit {
+    /// Quit croft (Ctrl+Q, vim `:qa`).
+    Quit,
+    /// Hand a remote croft back to the local one (Cmd+Shift+L), which
+    /// ends this process as a quit does.
+    DropToLocal,
+    /// Leave this croft for a workspace on `host`: the local session ends
+    /// and a later return starts a fresh one.
+    RemoteLaunch { host: String, path: Option<String> },
+    /// The croft on `host` is ready and this one is about to hand it the
+    /// terminal, ending here. Asked about edits made since the connect was
+    /// asked for, which can be minutes earlier (an install ran between).
+    RemoteHandoff { host: String },
+    /// Close the focused group's tab at `idx`. `path` is the file it showed
+    /// when asked, so an answer never lands on a tab that moved into its
+    /// place meanwhile.
+    CloseTab { idx: usize, path: Option<PathBuf> },
+}
+
+impl UnsavedExit {
+    /// The prompt's name for going on: "Save all and quit", "Did not quit".
+    fn verb(&self) -> &'static str {
+        match self {
+            Self::Quit => "quit",
+            Self::DropToLocal => "return to local",
+            Self::RemoteLaunch { .. } | Self::RemoteHandoff { .. } => "connect",
+            Self::CloseTab { .. } => "close",
+        }
+    }
+}
+
+/// Whether closing `ed` would lose text only it holds (#862): unsaved
+/// changes to a file, or an untitled buffer that was typed into and still
+/// holds something.
+fn holds_unsaved(ed: &Editor) -> bool {
+    ed.dirty && (ed.path.is_some() || ed.lines.iter().any(|l| !l.is_empty()))
+}
+
 /// Why the branch picker is open, deciding what its Enter does. `Checkout`
 /// is the default (click the branch name / "Checkout to"); the others are
 /// reached from the Branch submenu and act on the highlighted *existing*
@@ -3721,6 +3764,38 @@ pub struct App {
     /// Armed by R in a Source-Control diff; reverting a hunk destroys
     /// uncommitted work, so the confirm modal always runs first.
     pending_revert_hunk: Option<PendingRevertHunk>,
+    /// An unsaved-changes prompt (#862) waiting on S / D / Esc, holding what
+    /// it goes on to do. While `Some`, the modal eats every key and click.
+    pending_unsaved: Option<UnsavedExit>,
+    /// The unsaved state (see [`App::unsaved_stamp`]) the user chose to
+    /// leave behind when asked about a remote connect (#862): the handoff
+    /// that ends this croft later goes without asking again only while
+    /// nothing has changed since.
+    remote_handoff_ok: Option<u64>,
+    /// Hot exit (#862): the directory this croft backs its unsaved buffers
+    /// up under (`~/.cache/croft/hot-exit`). `None` keeps no backups, as
+    /// under test unless a test points it at a tempdir.
+    pub hot_exit_dir: Option<PathBuf>,
+    /// The [`App::unsaved_stamp`] this croft's backup on disk was written
+    /// at, `None` while it has none: the tick writes only when they differ.
+    /// A write that fails leaves it alone, so a later tick tries again.
+    hot_exit_written: Option<u64>,
+    /// When a failed hot-exit write may be tried again (#862): a full disk
+    /// is retried every [`App::HOT_EXIT_DELAY`], not every frame. `None`
+    /// once a write lands.
+    hot_exit_retry_at: Option<std::time::Instant>,
+    /// Backups of crofts that are gone whose text this croft restored
+    /// (#862). Removed once its own backup holds that text, so a write that
+    /// fails never leaves the text in memory only.
+    hot_exit_consumed: Vec<PathBuf>,
+    /// Consumed backups that could not be removed once this croft's own
+    /// backup landed (#862 review). They may still hold text, so the quit
+    /// tries them again and says which are left.
+    hot_exit_unremoved: Vec<PathBuf>,
+    /// Lines for stderr once the terminal is the shell's again, about what
+    /// the user must still hear after croft has gone: a hot-exit backup a
+    /// quit could not remove (#862).
+    exit_notes: Vec<String>,
     /// The tasks backing the open Run Task picker; the picker row `id`
     /// indexes into this list.
     run_tasks: Vec<crate::tasks::Task>,
@@ -4064,6 +4139,13 @@ pub struct App {
     /// requested: the server's edit ranges describe the line then, and the
     /// accept shifts them by what was typed or deleted since.
     completion_origin: Option<(usize, usize)>,
+    /// The pending completion's last reply was marked `isIncomplete` (#1529):
+    /// each word edit re-asks the server, whether or not any of its old items
+    /// are still on screen. Lives only while `completion_request_id` does.
+    completion_incomplete: bool,
+    /// A word edit in an incomplete session is waiting to re-ask the server;
+    /// sent after `sync_lsp` so the request follows the edit's `didChange`.
+    completion_reask_due: bool,
     /// Signature Help (parameter hints) popup, anchored to the caret while the
     /// user is inside a call. Populated by `drain_lsp_signature_help`.
     pub signature_help_popup: Option<crate::widgets::signature_help_popup::SignatureHelpPopup>,
@@ -4891,6 +4973,9 @@ pub struct App {
     /// pane's next scanned command replaces its previous run's diagnostics
     /// (VS Code clears a task's problems when the task re-runs).
     build_diag_files_by_pane: std::collections::HashMap<u64, Vec<PathBuf>>,
+    /// The HEAD a warned Undo Last Commit (#1350) is armed for: a commit
+    /// already on its upstream is undone on the second ask at that HEAD.
+    undo_pushed_commit_armed: Option<String>,
     /// True while the "Discard All Changes" confirmation modal is up.
     pub pending_discard_all: bool,
     /// The Replace All confirmation (#123): `(occurrences, files, dirty
@@ -5668,7 +5753,7 @@ impl App {
                 // machine (#262): applied on arrival like the files above.
                 crate::config_layers::synced_config_path(),
             ]),
-            snippets: crate::snippets::SnippetSet::load(&crate::snippets::snippets_path()),
+            snippets: load_snippets(&crate::snippets::snippets_path()),
             format_on_save: loaded_prefs.format_on_save,
             copy_on_select: loaded_prefs.copy_on_select,
             files_exclude: Vec::new(),
@@ -5932,6 +6017,18 @@ impl App {
             scm_unsaved_cleared: false,
             scm_after_format_save: None,
             pending_revert_hunk: None,
+            pending_unsaved: None,
+            remote_handoff_ok: None,
+            hot_exit_dir: if cfg!(test) {
+                None
+            } else {
+                Some(croft_cache_dir().join("hot-exit"))
+            },
+            hot_exit_written: None,
+            hot_exit_retry_at: None,
+            hot_exit_consumed: Vec::new(),
+            hot_exit_unremoved: Vec::new(),
+            exit_notes: Vec::new(),
             run_tasks: Vec::new(),
             last_task: None,
             pending_terminal_warning: false,
@@ -6208,6 +6305,7 @@ impl App {
             git_output_log: Vec::new(),
             build_diagnostics: std::collections::HashMap::new(),
             build_diag_files_by_pane: std::collections::HashMap::new(),
+            undo_pushed_commit_armed: None,
             pending_discard_all: false,
             pending_replace_all: None,
             file_finder_index: None,
@@ -6215,6 +6313,8 @@ impl App {
             file_finder_index_dirty: false,
             completion_request_id: None,
             completion_origin: None,
+            completion_incomplete: false,
+            completion_reask_due: false,
             signature_help_popup: None,
             signature_help_request_id: None,
             signature_help_anchor: None,
@@ -7707,20 +7807,17 @@ impl App {
     /// already owns the modal slot, so we never stomp an in-progress input.
     fn prompt_disk_conflict(&mut self, paths: Vec<PathBuf>) {
         use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
-        let (title, placeholder) = match paths.as_slice() {
-            [one] => (
-                format!(
-                    "{} changed on disk and you have unsaved edits.",
-                    one.display()
-                ),
-                "Enter to reload (discard your edits) · Esc to keep editing",
+        // It opens mid-typing and takes the keys, so nothing a stray Enter
+        // or a typed line can confirm discards the edits: only the word
+        // `reload` does, and the box says so (#910).
+        let title = match paths.as_slice() {
+            [one] => format!(
+                "{} changed on disk and you have unsaved edits.",
+                self.status_path(one)
             ),
-            many => (
-                format!(
-                    "{} open files changed on disk with unsaved edits.",
-                    many.len()
-                ),
-                "Enter to reload all (discard your edits) · Esc to keep editing",
+            many => format!(
+                "{} open files changed on disk with unsaved edits.",
+                many.len()
             ),
         };
         if self.input_prompt.is_some() {
@@ -7728,8 +7825,12 @@ impl App {
             return;
         }
         self.open_input_prompt(
-            InputPrompt::new(InputPurpose::ReloadConflict { paths }, title, placeholder)
-                .with_value("reload"),
+            InputPrompt::new(
+                InputPurpose::ReloadConflict { paths },
+                title,
+                "type reload to discard your unsaved edits",
+            )
+            .with_hint("reload + Enter discards your edits · anything else keeps them"),
         );
     }
 
@@ -9043,6 +9144,7 @@ impl App {
             self.completion_request_id = None;
             return false;
         }
+        self.completion_incomplete = result.is_incomplete;
         let Some((cx, cy)) = self.editor.cursor_screen_pos() else {
             return false;
         };
@@ -9154,6 +9256,8 @@ impl App {
         let id = lsp.request_completion(path, line, character);
         self.completion_request_id = Some(id);
         self.completion_origin = Some((self.editor.cursor_row, self.editor.cursor_col));
+        self.completion_incomplete = false;
+        self.completion_reask_due = false;
     }
 
     /// Ask the server for parameter hints at the caret (typing `(` or `,`).
@@ -11411,11 +11515,13 @@ impl App {
     pub fn drain_lsp_definition(&mut self) -> bool {
         let mut target = None;
         let mut peek = None;
+        let mut empty_reply = false;
         {
             let Some(lsp) = self.lsp.as_ref() else {
                 return false;
             };
             let mut peek_replied = false;
+            let mut replied = false;
             while let Some(result) = lsp.drain_definition() {
                 if Some(result.request_id) == self.peek_definition_request_id {
                     peek_replied = true;
@@ -11425,6 +11531,7 @@ impl App {
                 if Some(result.request_id) != self.definition_request_id {
                     continue;
                 }
+                replied = true;
                 target = result.target;
             }
             if peek_replied && peek.is_none() {
@@ -11433,8 +11540,17 @@ impl App {
                 self.peek_definition_request_id = None;
                 self.status = String::from("No definition found");
             }
+            if replied {
+                self.definition_request_id = None;
+                // An empty F12 reply said nothing (#1302): a slow server, a
+                // missing one and "nothing here" all looked alike.
+                if target.is_none() {
+                    self.status = String::from("No definition found");
+                    empty_reply = true;
+                }
+            }
         }
-        let mut changed = false;
+        let mut changed = empty_reply;
         if let Some((path, line, col)) = peek {
             self.peek_definition_request_id = None;
             self.open_peek_popup(path, line, col);
@@ -11557,6 +11673,7 @@ impl App {
     pub fn drain_lsp_declaration(&mut self) -> bool {
         let mut target = None;
         let mut unsupported = false;
+        let mut replied = false;
         {
             let Some(lsp) = self.lsp.as_ref() else {
                 return false;
@@ -11565,9 +11682,13 @@ impl App {
                 if Some(result.request_id) != self.declaration_request_id {
                     continue;
                 }
+                replied = true;
                 target = result.target;
                 unsupported = result.unsupported;
             }
+        }
+        if replied {
+            self.declaration_request_id = None;
         }
         match target {
             // The jump itself is identical to definition: open the target file,
@@ -11584,6 +11705,10 @@ impl App {
                     String::from("Go to Declaration: not supported by this file's language server");
                 true
             }
+            None if replied => {
+                self.status = String::from("No declaration found");
+                true
+            }
             None => false,
         }
     }
@@ -11591,6 +11716,7 @@ impl App {
     pub fn drain_lsp_type_definition(&mut self) -> bool {
         let mut target = None;
         let mut unsupported = false;
+        let mut replied = false;
         {
             let Some(lsp) = self.lsp.as_ref() else {
                 return false;
@@ -11599,9 +11725,13 @@ impl App {
                 if Some(result.request_id) != self.type_definition_request_id {
                     continue;
                 }
+                replied = true;
                 target = result.target;
                 unsupported = result.unsupported;
             }
+        }
+        if replied {
+            self.type_definition_request_id = None;
         }
         match target {
             // The jump itself is identical to definition: open the target file,
@@ -11614,6 +11744,10 @@ impl App {
                 self.status = String::from(
                     "Go to Type Definition: not supported by this file's language server",
                 );
+                true
+            }
+            None if replied => {
+                self.status = String::from("No type definition found");
                 true
             }
             None => false,
@@ -14257,7 +14391,10 @@ impl App {
                 self.refresh_source_control();
                 self.status = format!("Merge complete: staged {rel}");
             }
-            Err(e) => self.status = format!("Stage failed: {e}"),
+            Err(e) => {
+                let why = self.git_error_line("add", &e);
+                self.status = format!("Stage failed: {why}");
+            }
         }
     }
 
@@ -14911,14 +15048,61 @@ impl App {
 
     fn refresh_completion_prefix(&mut self) {
         let prefix = self.editor.word_before_cursor();
+        let incomplete = self.note_incomplete_completion_edit();
         let Some(popup) = self.completion_popup.as_mut() else {
             return;
         };
         popup.set_prefix(prefix);
-        if popup.visible_is_empty() {
-            self.completion_popup = None;
+        if !popup.visible_is_empty() {
+            return;
+        }
+        self.completion_popup = None;
+        // A capped list (`isIncomplete`) only holds what matched the word
+        // as it was (#1529): with none of it left, the session still waits
+        // on the re-ask for the word as it is.
+        if !incomplete {
             self.completion_request_id = None;
         }
+    }
+
+    /// A word edit while the pending completion is an incomplete list
+    /// (#1529): mark a re-ask due, popup shown or not. Returns whether the
+    /// session is incomplete.
+    fn note_incomplete_completion_edit(&mut self) -> bool {
+        let live = self.completion_incomplete && self.completion_request_id.is_some();
+        if live {
+            self.completion_reask_due = true;
+        }
+        live
+    }
+
+    /// Send the re-ask a word edit left due (#1529). Runs after `sync_lsp`,
+    /// so the server has the edit's `didChange` before the request; keeps
+    /// the session's origin so the reply opens while the caret stays in the
+    /// word, and ends the session once the caret has left it.
+    fn send_due_completion_reask(&mut self) {
+        if !std::mem::take(&mut self.completion_reask_due) {
+            return;
+        }
+        if !self.completion_incomplete || self.completion_request_id.is_none() {
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        if self.editor.has_non_text_view() || !self.completion_origin_covers_caret(&path) {
+            self.completion_incomplete = false;
+            self.completion_request_id = None;
+            return;
+        }
+        let (line, character) = self
+            .editor
+            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
+        let Some(lsp) = self.lsp.as_mut() else {
+            return;
+        };
+        let id = lsp.request_completion_for_incomplete(path, line, character);
+        self.completion_request_id = Some(id);
     }
 
     fn drain_fs_events(&mut self) -> bool {
@@ -16850,14 +17034,15 @@ impl App {
 
     /// Record every tab the bulk closes (Close Others / Close to the Right)
     /// are about to drop: the unpinned, file-backed ones `pred` selects, in
-    /// tab order so the reopen stack pops most-recent-first.
+    /// tab order so the reopen stack pops most-recent-first. A tab with
+    /// unsaved changes is never one: the bulk closes keep those open (#862).
     fn record_closed_tabs_where(&mut self, pred: impl Fn(usize, &Editor) -> bool) {
         let picks: Vec<usize> = self
             .editor
             .editors
             .iter()
             .enumerate()
-            .filter(|(i, ed)| pred(*i, ed))
+            .filter(|(i, ed)| !ed.dirty && pred(*i, ed))
             .map(|(i, _)| i)
             .collect();
         for i in picks {
@@ -18622,6 +18807,12 @@ impl App {
     /// same workspace with the file open), then close the tab here — the file
     /// has moved to the new window. The current window is otherwise untouched.
     fn move_into_new_window(&mut self, idx: usize) {
+        // The new window reads the file from disk, so unsaved edits would
+        // stay behind in the tab this closes (#862).
+        if self.editor.editors.get(idx).is_some_and(|e| e.dirty) {
+            self.status = String::from("New Window: save the file first");
+            return;
+        }
         if !self.open_tab_in_new_window(idx) {
             return;
         }
@@ -20295,6 +20486,7 @@ impl App {
         self.render_replace_all_confirm(frame);
         self.render_broadcast_confirm(frame);
         self.render_run_block_confirm(frame);
+        self.render_unsaved_confirm(frame);
         // Terminal-pane inline image: sync after the panes have painted so
         // last_inner and the scroll offset are this frame's (all gating —
         // hidden panel, alt screen, off-screen anchor — is inside).
@@ -20787,6 +20979,91 @@ impl App {
                         .add_modifier(Modifier::BOLD),
                 ),
                 ratatui::text::Span::raw("o / Esc"),
+            ]),
+        ]);
+        frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+    }
+
+    /// The unsaved-changes prompt (#862): what would be lost and the three
+    /// ways out. Amber like Replace All's rather than red, since its default
+    /// (S / Enter) keeps the edits and only D throws anything away.
+    fn render_unsaved_confirm(&self, frame: &mut ratatui::Frame) {
+        let Some(exit) = self.pending_unsaved.as_ref() else {
+            return;
+        };
+        let (headline, names, save, discard) = match exit {
+            UnsavedExit::CloseTab { idx, .. } => (
+                String::from("This tab has unsaved changes:"),
+                self.editor.tab_display_label(*idx),
+                String::from("ave and close"),
+                String::from("on't save"),
+            ),
+            other => {
+                let files = self.unsaved_files();
+                let verb = other.verb();
+                (
+                    if files.len() == 1 {
+                        String::from("1 file has unsaved changes:")
+                    } else {
+                        format!("{} files have unsaved changes:", files.len())
+                    },
+                    files.join(", "),
+                    format!("ave all and {verb}"),
+                    format!("iscard and {verb}"),
+                )
+            }
+        };
+        let area = frame.area();
+        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
+        let height: u16 = 8;
+        let rect = Rect {
+            x: (area.width.saturating_sub(width)) / 2 + area.x,
+            y: (area.height.saturating_sub(height)) / 2 + area.y,
+            width,
+            height,
+        };
+        let rect = rect.intersection(area);
+        let warn = self.theme.ui(Color::Rgb(0xe7, 0xa7, 0x3c));
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(warn))
+            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
+            .title(ratatui::text::Span::styled(
+                " UNSAVED CHANGES ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(warn)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(block, rect);
+        let inner = Rect {
+            x: rect.x + 2,
+            y: rect.y + 1,
+            width: rect.width.saturating_sub(4),
+            height: rect.height.saturating_sub(2),
+        };
+        let key = |k: &'static str, color: Color| {
+            Span::styled(k, Style::default().fg(color).add_modifier(Modifier::BOLD))
+        };
+        let body = ratatui::text::Text::from(vec![
+            Line::from(Span::styled(
+                headline,
+                Style::default().fg(self.theme.ui(Color::White)),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                truncate_for_display(&names, inner.width as usize),
+                Style::default().fg(self.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b))),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                key("[S]", Color::Green),
+                Span::raw(format!("{save}   ")),
+                key("[D]", Color::Red),
+                Span::raw(format!("{discard}   ")),
+                key("[Esc]", self.theme.ui(Color::White)),
+                Span::raw(" cancel"),
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
@@ -22519,6 +22796,23 @@ impl App {
             self.handle_list_picker_key(key);
             return Ok(());
         }
+        // The unsaved-changes prompt (#862): S or Enter saves, D goes on
+        // without saving, N or Esc cancels. N is a cancel, not "don't save":
+        // every other croft confirm reads N as "stop", and a reflex N must
+        // not throw edits away. Letters count only unmodified, so a stray
+        // Ctrl+D (add next match) cannot discard either.
+        if self.pending_unsaved.is_some() {
+            let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
+            match key.code {
+                KeyCode::Char('s' | 'S') if plain => self.answer_unsaved(true),
+                KeyCode::Enter => self.answer_unsaved(true),
+                KeyCode::Char('d' | 'D') if plain => self.answer_unsaved(false),
+                KeyCode::Char('n' | 'N') if plain => self.cancel_unsaved(),
+                KeyCode::Esc => self.cancel_unsaved(),
+                _ => {}
+            }
+            return Ok(());
+        }
         if self.pending_replace_all.is_some() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
@@ -22964,8 +23258,7 @@ impl App {
             return Ok(());
         }
         if self.is_remote && is_drop_to_local_key(key) {
-            self.drop_to_local = true;
-            self.quit = true;
+            self.guard_unsaved(UnsavedExit::DropToLocal);
             return Ok(());
         }
         if self.sidebar_view == SidebarView::Search
@@ -23011,7 +23304,7 @@ impl App {
         }
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), KeyModifiers::CONTROL) if !terminal_owns_ctrl => {
-                self.quit = true;
+                self.guard_unsaved(UnsavedExit::Quit);
                 return Ok(());
             }
             (KeyCode::F(6), _) => {
@@ -23401,6 +23694,16 @@ impl App {
             }
             KeyCode::Right => {
                 self.source_control.move_cursor_right();
+                self.poke_cursor();
+            }
+            // Home/End stay on the caret's line; with Ctrl they take the
+            // whole message (#1334).
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.source_control.message_start();
+                self.poke_cursor();
+            }
+            KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.source_control.message_end();
                 self.poke_cursor();
             }
             KeyCode::Home => {
@@ -32994,7 +33297,8 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        self.status = format!("git show HEAD failed: {e}");
+                        let why = self.git_error_line("show HEAD", &e);
+                        self.status = format!("git show HEAD failed: {why}");
                         // Fall back to plain open so the user still sees
                         // something rather than nothing.
                         if abs.is_file() {
@@ -33022,7 +33326,8 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        self.status = format!("git show HEAD failed: {e}");
+                        let why = self.git_error_line("show HEAD", &e);
+                        self.status = format!("git show HEAD failed: {why}");
                         false
                     }
                 }
@@ -33086,7 +33391,8 @@ impl App {
             }
             Ok(out) => {
                 let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                self.status = format!("git init failed: {err}");
+                let why = self.git_error_line("init", &err);
+                self.status = format!("git init failed: {why}");
             }
             Err(e) => {
                 self.status = format!("git init failed: {e}");
@@ -33134,8 +33440,9 @@ impl App {
                 };
             }
             Err(err) => {
-                self.status = format!("Stage failed: {err}");
-                self.source_control.commit_feedback = Some(err);
+                let why = self.git_error_line("add", &err);
+                self.status = format!("Stage failed: {why}");
+                self.source_control.commit_feedback = Some(why);
                 self.source_control.commit_feedback_is_error = true;
             }
         }
@@ -33156,7 +33463,14 @@ impl App {
         });
     }
 
+    /// Report a finished push on one line (#858): git's ref update, or its
+    /// error, from [`crate::git::summary_line`]; the Git Output log keeps the
+    /// `remote:` chatter and the rest.
     fn finish_push(&mut self, result: Result<String, String>) {
+        self.log_git("push", &result);
+        let result = result
+            .map(|out| crate::git::summary_line(&out))
+            .map_err(|err| crate::git::error_line(&err));
         match result {
             Ok(summary) => {
                 self.source_control.commit_feedback = Some(if summary.is_empty() {
@@ -33165,7 +33479,11 @@ impl App {
                     format!("pushed: {summary}")
                 });
                 self.source_control.commit_feedback_is_error = false;
-                self.status = format!("Pushed: {summary}");
+                self.status = if summary.is_empty() {
+                    String::from("Pushed")
+                } else {
+                    format!("Pushed: {summary}")
+                };
             }
             Err(err) => {
                 self.source_control.commit_feedback = Some(format!("push failed: {err}"));
@@ -33187,21 +33505,32 @@ impl App {
         });
     }
 
+    /// Report a finished pull. One that stopped on conflicts names them, and
+    /// a failure names git's `error:` or `fatal:` line, on one line (#858);
+    /// the Git Output log keeps git's whole text.
     fn finish_pull(&mut self, result: Result<String, String>) {
+        self.log_git("pull", &result);
         match result {
             Ok(summary) => {
+                // git's result ("Fast-forward", "Already up to date."), not
+                // the `From <url>` / `Updating a..b` lines before it (#858).
+                let summary = crate::git::result_line(&summary);
                 self.source_control.commit_feedback = Some(if summary.is_empty() {
                     "pulled".to_string()
                 } else {
                     format!("pulled: {summary}")
                 });
                 self.source_control.commit_feedback_is_error = false;
-                self.status = format!("Pulled: {summary}");
+                self.status = if summary.is_empty() {
+                    String::from("Pulled")
+                } else {
+                    format!("Pulled: {summary}")
+                };
             }
             Err(err) => {
-                self.source_control.commit_feedback = Some(format!("pull failed: {err}"));
+                self.source_control.commit_feedback = Some(crate::git::failure_line("pull", &err));
                 self.source_control.commit_feedback_is_error = true;
-                self.status = format!("Pull failed: {err}");
+                self.status = crate::git::failure_line("Pull", &err);
             }
         }
         self.active_git_bypass_debounce();
@@ -33226,31 +33555,52 @@ impl App {
         });
     }
 
+    /// Report a finished Sync on one line (#858): what the pull did and the
+    /// push's ref update ("Synced: pulled: Fast-forward | pushed: a..b main
+    /// -> main"), or why either half failed; the Git Output log keeps both
+    /// of git's texts.
     fn finish_sync(&mut self, pull: Result<String, String>, push: Option<Result<String, String>>) {
+        self.log_git("pull", &pull);
         let pull_summary = match pull {
-            Ok(s) => s,
+            Ok(s) => crate::git::result_line(&s),
             Err(err) => {
-                self.source_control.commit_feedback = Some(format!("sync: pull failed: {err}"));
+                // One line (#858): the conflicts the pull stopped on, or
+                // git's error line; the Git Output log has the rest.
+                let why = crate::git::error_line(&err);
+                self.source_control.commit_feedback = Some(format!("sync: pull failed: {why}"));
                 self.source_control.commit_feedback_is_error = true;
-                self.status = format!("Sync failed on pull: {err}");
+                self.status = format!("Sync failed on pull: {why}");
                 self.active_git_bypass_debounce();
                 self.refresh_git_status_debounced();
                 self.refresh_source_control();
                 return;
             }
         };
-        match push.unwrap_or_else(|| Err(String::from("push did not run"))) {
+        let push = push.unwrap_or_else(|| Err(String::from("push did not run")));
+        self.log_git("push", &push);
+        match push {
             Ok(push_summary) => {
-                self.source_control.commit_feedback = Some(format!(
-                    "synced (pulled: {pull_summary} | pushed: {push_summary})"
-                ));
+                let push_summary = crate::git::summary_line(&push_summary);
+                let combined = [("pulled", pull_summary), ("pushed", push_summary)]
+                    .into_iter()
+                    .filter(|(_, summary)| !summary.is_empty())
+                    .map(|(half, summary)| format!("{half}: {summary}"))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let (feedback, status) = if combined.is_empty() {
+                    (String::from("synced"), String::from("Synced"))
+                } else {
+                    (format!("synced: {combined}"), format!("Synced: {combined}"))
+                };
+                self.source_control.commit_feedback = Some(feedback);
                 self.source_control.commit_feedback_is_error = false;
-                self.status = String::from("Synced");
+                self.status = status;
             }
             Err(err) => {
-                self.source_control.commit_feedback = Some(format!("pull ok; push failed: {err}"));
+                let why = crate::git::error_line(&err);
+                self.source_control.commit_feedback = Some(format!("pull ok; push failed: {why}"));
                 self.source_control.commit_feedback_is_error = true;
-                self.status = format!("Sync: pull ok; push failed: {err}");
+                self.status = format!("Sync: pull ok; push failed: {why}");
             }
         }
         self.active_git_bypass_debounce();
@@ -33259,21 +33609,30 @@ impl App {
     }
 
     /// Stash the working tree (`git stash push`). Reached from the commit
-    /// dropdown's "Stash" item.
+    /// dropdown's "Stash" item. Reported on one line (#858); the Git Output
+    /// log keeps git's text.
     pub fn stash_source_control(&mut self) {
         if self.hold_for_unsaved(ScmWrite::Stash) {
             return;
         }
-        match crate::git::stash_push(&self.scm_root()) {
+        let stashed = crate::git::stash_push(&self.scm_root());
+        self.log_git("stash push", &stashed);
+        match stashed {
             Ok(summary) => {
-                self.source_control.commit_feedback = Some(format!("stashed: {summary}"));
+                let summary = crate::git::result_line(&summary);
+                let (feedback, status) = if summary.is_empty() {
+                    (String::from("stashed"), String::from("Stashed"))
+                } else {
+                    (format!("stashed: {summary}"), format!("Stashed: {summary}"))
+                };
+                self.source_control.commit_feedback = Some(feedback);
                 self.source_control.commit_feedback_is_error = false;
-                self.status = format!("Stashed: {summary}");
+                self.status = status;
             }
             Err(err) => {
-                self.source_control.commit_feedback = Some(format!("stash failed: {err}"));
+                self.source_control.commit_feedback = Some(crate::git::failure_line("stash", &err));
                 self.source_control.commit_feedback_is_error = true;
-                self.status = format!("Stash failed: {err}");
+                self.status = crate::git::failure_line("Stash", &err);
             }
         }
         self.active_git_bypass_debounce();
@@ -33281,19 +33640,33 @@ impl App {
         self.refresh_source_control();
     }
 
-    /// Restore the most recent stash (`git stash pop`). A pop conflict is
-    /// surfaced verbatim so the user can resolve it.
+    /// Restore the most recent stash (`git stash pop`). A pop that stops on
+    /// conflicts names them on one line (#858), so the user can resolve
+    /// them; the Git Output log keeps git's whole text.
     pub fn stash_pop_source_control(&mut self) {
-        match crate::git::stash_pop(&self.scm_root()) {
+        let popped = crate::git::stash_pop(&self.scm_root());
+        self.log_git("stash pop", &popped);
+        match popped {
             Ok(summary) => {
-                self.source_control.commit_feedback = Some(format!("popped: {summary}"));
+                // The stash it dropped, not the `git status` dump before it.
+                let summary = crate::git::result_line(&summary);
+                let (feedback, status) = if summary.is_empty() {
+                    (String::from("popped"), String::from("Stash popped"))
+                } else {
+                    (
+                        format!("popped: {summary}"),
+                        format!("Stash popped: {summary}"),
+                    )
+                };
+                self.source_control.commit_feedback = Some(feedback);
                 self.source_control.commit_feedback_is_error = false;
-                self.status = format!("Stash popped: {summary}");
+                self.status = status;
             }
             Err(err) => {
-                self.source_control.commit_feedback = Some(format!("stash pop failed: {err}"));
+                self.source_control.commit_feedback =
+                    Some(crate::git::failure_line("stash pop", &err));
                 self.source_control.commit_feedback_is_error = true;
-                self.status = format!("Stash pop failed: {err}");
+                self.status = crate::git::failure_line("Stash pop", &err);
             }
         }
         self.active_git_bypass_debounce();
@@ -33318,8 +33691,9 @@ impl App {
                 self.refresh_source_control();
             }
             Err(err) => {
-                self.status = format!("Unstage failed: {err}");
-                self.source_control.commit_feedback = Some(err);
+                let why = self.git_error_line("reset -q HEAD --", &err);
+                self.status = format!("Unstage failed: {why}");
+                self.source_control.commit_feedback = Some(why);
                 self.source_control.commit_feedback_is_error = true;
             }
         }
@@ -33342,6 +33716,14 @@ impl App {
             let excess = self.git_output_log.len() - CAP;
             self.git_output_log.drain(0..excess);
         }
+    }
+
+    /// Git's error `err` on the one line the status bar and the Source
+    /// Control panel show ([`crate::git::error_line`]), its whole text sent
+    /// to the Git Output log under `label` (#858).
+    fn git_error_line(&mut self, label: &str, err: &str) -> String {
+        self.log_git(label, &Err(err.to_string()));
+        crate::git::error_line(err)
     }
 
     /// The repository's operation in progress (#1356), read fresh, or
@@ -33369,7 +33751,7 @@ impl App {
             crate::git::RepoOp::Bisect => String::from("Bisect reset"),
             _ => format!("Aborted the {}", op.command()),
         };
-        self.run_scm_op(op.command(), r, &done);
+        self.run_scm_op(op.command(), r, &done, &format!("Git {}", op.command()));
     }
 
     /// Continue the rebase, cherry-pick or revert in progress once its
@@ -33404,7 +33786,12 @@ impl App {
             return;
         }
         let r = crate::git::bisect_mark(&self.scm_root(), good);
-        self.run_scm_op("bisect", r, if good { "Marked good" } else { "Marked bad" });
+        self.run_scm_op(
+            "bisect",
+            r,
+            if good { "Marked good" } else { "Marked bad" },
+            "Bisect",
+        );
     }
 
     /// Report a Continue or Skip, saying where the operation stands now:
@@ -33420,7 +33807,7 @@ impl App {
             None => format!("{verb} the {}, which is done", op.command()),
             Some(next) => format!("{verb} the {}, now {}", op.command(), next.label()),
         };
-        self.run_scm_op(op.command(), r, &done);
+        self.run_scm_op(op.command(), r, &done, &format!("Git {}", op.command()));
     }
 
     /// After a commit made from Source Control mid-rebase (#1356, the #989
@@ -33440,23 +33827,36 @@ impl App {
     /// Run an immediate git operation: log it, surface its summary or error
     /// in the commit-feedback line, and refresh the panel. The single path
     /// every "⋯"-menu leaf that acts now (vs. opening a modal) flows through.
-    fn run_scm_op(&mut self, label: &str, outcome: Result<String, String>, ok_prefix: &str) {
+    /// `ok_prefix` heads a success ("Merged: …"); `noun` names the operation
+    /// when it fails ("Merge failed: …", "Merge: 1 conflict (pricing.py)"),
+    /// on one line from [`crate::git::failure_line`] (#858).
+    fn run_scm_op(
+        &mut self,
+        label: &str,
+        outcome: Result<String, String>,
+        ok_prefix: &str,
+        noun: &str,
+    ) {
         self.log_git(label, &outcome);
         match outcome {
             Ok(summary) => {
-                let said = if summary.is_empty() {
+                // git's result line, past a fetch's `From <url>`, a push's
+                // `To <url>` and the like (#858).
+                let summary = crate::git::result_line(&summary);
+                let line = if summary.is_empty() {
                     ok_prefix.to_string()
                 } else {
                     format!("{ok_prefix}: {summary}")
                 };
-                self.source_control.commit_feedback = Some(said.clone());
+                self.source_control.commit_feedback = Some(line.clone());
                 self.source_control.commit_feedback_is_error = false;
-                self.status = said;
+                self.status = line;
             }
             Err(err) => {
-                self.source_control.commit_feedback = Some(format!("{ok_prefix} failed: {err}"));
+                let line = crate::git::failure_line(noun, &err);
+                self.source_control.commit_feedback = Some(line.clone());
                 self.source_control.commit_feedback_is_error = true;
-                self.status = format!("{ok_prefix} failed: {err}");
+                self.status = line;
             }
         }
         self.active_git_bypass_debounce();
@@ -33540,12 +33940,13 @@ impl App {
         &mut self,
         label: &'static str,
         ok_prefix: &'static str,
+        noun: &'static str,
         op: impl FnOnce(&Path) -> Result<String, String> + Send + 'static,
     ) {
         let root = self.scm_root();
         self.spawn_git_net(label, move || {
             let r = op(&root);
-            Box::new(move |app: &mut App| app.run_scm_op(label, r, ok_prefix))
+            Box::new(move |app: &mut App| app.run_scm_op(label, r, ok_prefix, noun))
         });
     }
 
@@ -33562,10 +33963,10 @@ impl App {
                 }
             }
             Err(err) => {
-                self.log_git("clone", &Err(err.clone()));
-                self.source_control.commit_feedback = Some(format!("clone failed: {err}"));
+                let why = self.git_error_line("clone", &err);
+                self.source_control.commit_feedback = Some(format!("clone failed: {why}"));
                 self.source_control.commit_feedback_is_error = true;
-                self.status = format!("Clone failed: {err}");
+                self.status = format!("Clone failed: {why}");
             }
         }
     }
@@ -33592,12 +33993,12 @@ impl App {
 
     pub fn stage_all_source_control(&mut self) {
         let r = crate::git::stage_all(&self.scm_root());
-        self.run_scm_op("add -A", r, "Staged all");
+        self.run_scm_op("add -A", r, "Staged all", "Stage all");
     }
 
     pub fn unstage_all_source_control(&mut self) {
         let r = crate::git::unstage_all(&self.scm_root());
-        self.run_scm_op("reset HEAD", r, "Unstaged all");
+        self.run_scm_op("reset HEAD", r, "Unstaged all", "Unstage all");
     }
 
     /// Arm the Discard All confirmation. Destructive (reverts every tracked
@@ -33616,7 +34017,12 @@ impl App {
         }
         self.pending_discard_all = false;
         let r = crate::git::discard_all_tracked(&self.scm_root());
-        self.run_scm_op("checkout -- .", r, "Discarded all changes");
+        self.run_scm_op(
+            "checkout -- .",
+            r,
+            "Discarded all changes",
+            "Discard all changes",
+        );
     }
 
     /// `git stash push -u` from the commit dropdown.
@@ -33625,7 +34031,12 @@ impl App {
             return;
         }
         let r = crate::git::stash_push_untracked(&self.scm_root());
-        self.run_scm_op("stash push -u", r, "Stashed (incl. untracked)");
+        self.run_scm_op(
+            "stash push -u",
+            r,
+            "Stashed (incl. untracked)",
+            "Stash (incl. untracked)",
+        );
     }
 
     /// `git stash push --staged` from the commit dropdown.
@@ -33634,7 +34045,7 @@ impl App {
             return;
         }
         let r = crate::git::stash_push_staged(&self.scm_root());
-        self.run_scm_op("stash push --staged", r, "Stashed staged");
+        self.run_scm_op("stash push --staged", r, "Stashed staged", "Stash staged");
     }
 
     /// The files of tabs with unsaved edits under the repository, each
@@ -33822,7 +34233,7 @@ impl App {
             move || crate::git::commit_staged(&root, &committed),
             |app, r| {
                 let committed = r.is_ok();
-                app.run_scm_op("commit -m", r, "Committed staged");
+                app.run_scm_op("commit -m", r, "Committed staged", "Commit staged");
                 if committed {
                     app.continue_rebase_after_commit();
                 }
@@ -33847,7 +34258,7 @@ impl App {
             },
             |app, r| {
                 let committed = r.is_ok();
-                app.run_scm_op("commit (all)", r, "Committed all");
+                app.run_scm_op("commit (all)", r, "Committed all", "Commit all");
                 if committed {
                     app.continue_rebase_after_commit();
                 }
@@ -33873,7 +34284,44 @@ impl App {
                     crate::git::commit_amend(&root, &committed)
                 }
             },
-            |app, r| app.run_scm_op("commit --amend", r, "Amended commit"),
+            |app, r| app.run_scm_op("commit --amend", r, "Amended commit", "Amend commit"),
+        );
+    }
+
+    /// Undo Last Commit (#1350): the last commit goes back to Staged and
+    /// its message back into an empty box, so a reword or a re-pick of the
+    /// files is one step away. A commit already on the upstream is undone
+    /// only on a second ask, after a warning that it means a force push.
+    fn undo_last_commit_source_control(&mut self) {
+        let root = self.scm_root();
+        let head = crate::git::query(&root).head_oid;
+        if head.is_some()
+            && crate::git::head_is_on_upstream(&root)
+            && self.undo_pushed_commit_armed != head
+        {
+            self.undo_pushed_commit_armed = head;
+            let warning = String::from(
+                "The last commit is already pushed: undoing it means a force push later. Undo Last Commit again to undo it anyway",
+            );
+            self.source_control.commit_feedback = Some(warning.clone());
+            self.source_control.commit_feedback_is_error = true;
+            self.status = warning;
+            return;
+        }
+        self.undo_pushed_commit_armed = None;
+        let outcome = crate::git::undo_last_commit(&root);
+        if let Ok(message) = &outcome
+            && self.source_control.message.trim().is_empty()
+        {
+            self.source_control.clear_message();
+            self.source_control.insert_str(message.trim());
+        }
+        let summary = outcome.map(|m| m.lines().next().unwrap_or("").trim().to_string());
+        self.run_scm_op(
+            "reset --soft HEAD~1",
+            summary,
+            "Undid last commit",
+            "Undo last commit",
         );
     }
 
@@ -33895,9 +34343,7 @@ impl App {
             |app, commit| {
                 app.log_git("commit -am", &commit);
                 if let Err(err) = commit {
-                    app.source_control.commit_feedback = Some(err.clone());
-                    app.source_control.commit_feedback_is_error = true;
-                    app.status = format!("Commit failed: {err}");
+                    app.report_commit_failure(&err);
                     return;
                 }
                 // Mid-rebase, sync only once the rebase is back on its branch.
@@ -33916,7 +34362,7 @@ impl App {
             self.source_control.commit_feedback_is_error = true;
             return;
         };
-        self.spawn_scm_op("push -u", "Published", move |root| {
+        self.spawn_scm_op("push -u", "Published", "Publish branch", move |root| {
             crate::git::publish_branch(root, &branch)
         });
     }
@@ -34013,7 +34459,12 @@ impl App {
             )),
             ScmAction::CheckoutTo => self.open_branch_picker_for(BranchPurpose::Checkout),
             ScmAction::Fetch => {
-                self.spawn_scm_op("fetch --all --prune", "Fetched", crate::git::fetch_all);
+                self.spawn_scm_op(
+                    "fetch --all --prune",
+                    "Fetched",
+                    "Fetch",
+                    crate::git::fetch_all,
+                );
             }
             ScmAction::ShowGitOutput => self.show_git_output(),
             ScmAction::ContinueOperation => self.continue_git_operation(),
@@ -34025,6 +34476,7 @@ impl App {
             ScmAction::CommitStaged => self.commit_staged_source_control(),
             ScmAction::CommitAll => self.commit_all_source_control(),
             ScmAction::CommitAmend => self.commit_amend_source_control(),
+            ScmAction::UndoLastCommit => self.undo_last_commit_source_control(),
             ScmAction::CommitAndPush => self.commit_and_push_source_control(),
             ScmAction::CommitAndSync => self.commit_and_sync_source_control(),
             ScmAction::StageAll => self.stage_all_source_control(),
@@ -34032,13 +34484,19 @@ impl App {
             ScmAction::DiscardAll => self.request_discard_all_source_control(),
             ScmAction::Sync => self.sync_source_control(),
             ScmAction::PullRebase => {
-                self.spawn_scm_op("pull --rebase", "Pulled (rebase)", crate::git::pull_rebase);
+                self.spawn_scm_op(
+                    "pull --rebase",
+                    "Pulled (rebase)",
+                    "Pull (rebase)",
+                    crate::git::pull_rebase,
+                );
             }
             ScmAction::PushTo => self.open_push_to_remote_picker(),
             ScmAction::PushForce => {
                 self.spawn_scm_op(
                     "push --force-with-lease",
                     "Force-pushed",
+                    "Force push",
                     crate::git::push_force,
                 );
             }
@@ -34396,12 +34854,12 @@ impl App {
             InputPurpose::RenameBranch => {
                 self.close_input_prompt();
                 let r = crate::git::rename_branch(&self.scm_root(), &value);
-                self.run_scm_op("branch -m", r, "Renamed branch");
+                self.run_scm_op("branch -m", r, "Renamed branch", "Rename branch");
             }
             InputPurpose::CreateBranchFrom { base } => {
                 self.close_input_prompt();
                 let r = crate::git::create_branch_from(&self.scm_root(), &value, &base);
-                self.run_scm_op("switch -c (from)", r, "Created branch");
+                self.run_scm_op("switch -c (from)", r, "Created branch", "Create branch");
             }
             InputPurpose::DebugConfigField { field } => {
                 self.close_input_prompt();
@@ -34419,12 +34877,12 @@ impl App {
             InputPurpose::AddRemoteUrl { name } => {
                 self.close_input_prompt();
                 let r = crate::git::add_remote(&self.scm_root(), &name, &value);
-                self.run_scm_op("remote add", r, "Added remote");
+                self.run_scm_op("remote add", r, "Added remote", "Add remote");
             }
             InputPurpose::CreateTag => {
                 self.close_input_prompt();
                 let r = crate::git::create_tag(&self.scm_root(), &value);
-                self.run_scm_op("tag", r, "Created tag");
+                self.run_scm_op("tag", r, "Created tag", "Create tag");
             }
             InputPurpose::ViewerConsent { key, path } => {
                 // The user allowed the viewer's extension; record it and
@@ -34482,6 +34940,15 @@ impl App {
             }
             InputPurpose::ReloadConflict { paths } => {
                 self.close_input_prompt();
+                if !value.eq_ignore_ascii_case("reload") {
+                    self.status = String::from(
+                        "Kept your unsaved edits; saving asks before overwriting the disk version",
+                    );
+                    return;
+                }
+                // Recoverable from TIMELINE: no answer, however deliberate,
+                // makes typed work unrecoverable (#910).
+                let kept = self.keep_unsaved_buffers_in_history(&paths);
                 // Every group: the prompt lists conflicts from the other
                 // splits too, and reverting only the focused one left theirs
                 // unreloaded with the prompt never coming back.
@@ -34503,6 +34970,10 @@ impl App {
                     (n, 0) => format!("Reloaded {n} files from disk"),
                     (n, f) => format!("Reloaded {n} files; {f} failed and kept their edits"),
                 };
+                if kept > 0 && !reverted.is_empty() {
+                    self.status
+                        .push_str("; the discarded edits are in Local History (TIMELINE)");
+                }
             }
             InputPurpose::AskNavigator {
                 file,
@@ -36648,27 +37119,27 @@ impl App {
             }
             ListPurpose::StashApply => {
                 let r = crate::git::stash_apply(&self.scm_root(), index);
-                self.run_scm_op("stash apply", r, "Applied stash");
+                self.run_scm_op("stash apply", r, "Applied stash", "Apply stash");
             }
             ListPurpose::StashPop => {
                 let r = crate::git::stash_pop_at(&self.scm_root(), index);
-                self.run_scm_op("stash pop", r, "Popped stash");
+                self.run_scm_op("stash pop", r, "Popped stash", "Pop stash");
             }
             ListPurpose::StashDrop => {
                 let r = crate::git::stash_drop(&self.scm_root(), index);
-                self.run_scm_op("stash drop", r, "Dropped stash");
+                self.run_scm_op("stash drop", r, "Dropped stash", "Drop stash");
             }
             ListPurpose::RemoveRemote => {
                 let r = crate::git::remove_remote(&self.scm_root(), &row.id);
-                self.run_scm_op("remote remove", r, "Removed remote");
+                self.run_scm_op("remote remove", r, "Removed remote", "Remove remote");
             }
             ListPurpose::DeleteTag => {
                 let r = crate::git::delete_tag(&self.scm_root(), &row.id);
-                self.run_scm_op("tag -d", r, "Deleted tag");
+                self.run_scm_op("tag -d", r, "Deleted tag", "Delete tag");
             }
             ListPurpose::PushToRemote => {
                 let remote = row.id.clone();
-                self.spawn_scm_op("push", "Pushed", move |root| {
+                self.spawn_scm_op("push", "Pushed", "Push", move |root| {
                     crate::git::push_to_remote(root, &remote)
                 });
             }
@@ -37440,7 +37911,7 @@ impl App {
                 };
                 self.close_branch_picker();
                 let r = crate::git::delete_branch(&self.scm_root(), &name);
-                self.run_scm_op("branch -d", r, "Deleted branch");
+                self.run_scm_op("branch -d", r, "Deleted branch", "Delete branch");
             }
             BranchPurpose::Merge => {
                 let Some(name) = picker.selected_existing_branch() else {
@@ -37448,7 +37919,7 @@ impl App {
                 };
                 self.close_branch_picker();
                 let r = crate::git::merge_branch(&self.scm_root(), &name);
-                self.run_scm_op("merge", r, "Merged");
+                self.run_scm_op("merge", r, "Merged", "Merge");
             }
             BranchPurpose::Rebase => {
                 let Some(name) = picker.selected_existing_branch() else {
@@ -37456,7 +37927,7 @@ impl App {
                 };
                 self.close_branch_picker();
                 let r = crate::git::rebase_branch(&self.scm_root(), &name);
-                self.run_scm_op("rebase", r, "Rebased");
+                self.run_scm_op("rebase", r, "Rebased", "Rebase");
             }
         }
     }
@@ -37469,9 +37940,10 @@ impl App {
         let raw = match crate::git::diff_staged(&self.scm_root()) {
             Ok(r) => r,
             Err(err) => {
-                self.source_control.commit_feedback = Some(format!("diff failed: {err}"));
+                let why = self.git_error_line("diff --staged", &err);
+                self.source_control.commit_feedback = Some(format!("diff failed: {why}"));
                 self.source_control.commit_feedback_is_error = true;
-                self.status = format!("View Staged Changes failed: {err}");
+                self.status = format!("View Staged Changes failed: {why}");
                 return;
             }
         };
@@ -37509,9 +37981,10 @@ impl App {
         let raw = match crate::git::diff_against_branch(&self.scm_root(), &branch) {
             Ok(r) => r,
             Err(err) => {
-                self.source_control.commit_feedback = Some(format!("diff failed: {err}"));
+                let why = self.git_error_line(&format!("diff {branch}"), &err);
+                self.source_control.commit_feedback = Some(format!("diff failed: {why}"));
                 self.source_control.commit_feedback_is_error = true;
-                self.status = format!("View Changes vs {branch} failed: {err}");
+                self.status = format!("View Changes vs {branch} failed: {why}");
                 return;
             }
         };
@@ -37557,9 +38030,10 @@ impl App {
         let raw = match crate::git::diff_previous_commit(&self.scm_root()) {
             Ok(r) => r,
             Err(err) => {
-                self.source_control.commit_feedback = Some(format!("diff failed: {err}"));
+                let why = self.git_error_line("diff HEAD~1", &err);
+                self.source_control.commit_feedback = Some(format!("diff failed: {why}"));
                 self.source_control.commit_feedback_is_error = true;
-                self.status = format!("View Changes vs previous failed: {err}");
+                self.status = format!("View Changes vs previous failed: {why}");
                 return;
             }
         };
@@ -37600,12 +38074,11 @@ impl App {
             message,
             move || crate::git::commit_all_tracked(&root, &committed),
             |app, r| {
+                app.log_git("commit -am", &r);
                 let commit_summary = match r {
-                    Ok(s) => s,
+                    Ok(s) => crate::git::headline(&s).to_string(),
                     Err(err) => {
-                        app.source_control.commit_feedback = Some(err.clone());
-                        app.source_control.commit_feedback_is_error = true;
-                        app.status = format!("Commit failed: {err}");
+                        app.report_commit_failure(&err);
                         return;
                     }
                 };
@@ -37626,7 +38099,14 @@ impl App {
         );
     }
 
+    /// Report Commit & Push on one line (#858): the commit's headline and
+    /// the push's ref update, or why the push failed; the Git Output log
+    /// keeps git push's whole text.
     fn finish_commit_and_push(&mut self, commit_summary: String, push: Result<String, String>) {
+        self.log_git("push", &push);
+        let push = push
+            .map(|out| crate::git::summary_line(&out))
+            .map_err(|err| crate::git::error_line(&err));
         match push {
             Ok(push_summary) => {
                 let combined = if push_summary.is_empty() {
@@ -37665,8 +38145,9 @@ impl App {
                 self.refresh_source_control();
             }
             Err(err) => {
-                self.status = format!("Stage failed: {err}");
-                self.source_control.commit_feedback = Some(err);
+                let why = self.git_error_line("add", &err);
+                self.status = format!("Stage failed: {why}");
+                self.source_control.commit_feedback = Some(why);
                 self.source_control.commit_feedback_is_error = true;
             }
         }
@@ -38153,8 +38634,9 @@ impl App {
                 self.refresh_source_control();
             }
             Err(err) => {
-                self.status = format!("Discard failed: {err}");
-                self.source_control.commit_feedback = Some(err);
+                let why = self.git_error_line("checkout -- (discard)", &err);
+                self.status = format!("Discard failed: {why}");
+                self.source_control.commit_feedback = Some(why);
                 self.source_control.commit_feedback_is_error = true;
             }
         }
@@ -38205,20 +38687,20 @@ impl App {
         self.spawn_commit(
             message,
             move || crate::git::commit_all_tracked(&root, &committed),
-            |app, r| match r {
-                Ok(summary) => {
-                    app.source_control.commit_feedback = Some(summary.clone());
-                    app.source_control.commit_feedback_is_error = false;
-                    app.status = format!("Committed: {summary}");
-                    app.active_git_bypass_debounce();
-                    app.refresh_git_status_debounced();
-                    app.refresh_source_control();
-                    app.continue_rebase_after_commit();
-                }
-                Err(err) => {
-                    app.source_control.commit_feedback = Some(err.clone());
-                    app.source_control.commit_feedback_is_error = true;
-                    app.status = format!("Commit failed: {err}");
+            |app, r| {
+                app.log_git("commit -am", &r);
+                match r {
+                    Ok(summary) => {
+                        let headline = crate::git::headline(&summary);
+                        app.source_control.commit_feedback = Some(headline.to_string());
+                        app.source_control.commit_feedback_is_error = false;
+                        app.status = format!("Committed: {headline}");
+                        app.active_git_bypass_debounce();
+                        app.refresh_git_status_debounced();
+                        app.refresh_source_control();
+                        app.continue_rebase_after_commit();
+                    }
+                    Err(err) => app.report_commit_failure(&err),
                 }
             },
         );
@@ -38252,6 +38734,16 @@ impl App {
         self.source_control.commit_feedback = Some(running.clone());
         self.source_control.commit_feedback_is_error = false;
         self.status = running;
+    }
+
+    /// A refused `git commit` (#858): the panel and the status bar name why
+    /// on one line ("nothing to commit, working tree clean", not the "On
+    /// branch main" git prints first); the Git Output log has the rest.
+    fn report_commit_failure(&mut self, err: &str) {
+        let why = crate::git::error_line(err);
+        self.source_control.commit_feedback = Some(why.clone());
+        self.source_control.commit_feedback_is_error = true;
+        self.status = format!("Commit failed: {why}");
     }
 
     /// Housekeeping for the ssh-pane offer (#364), from the top of `render`
@@ -38411,6 +38903,11 @@ impl App {
     }
 
     fn request_remote_launch(&mut self, host: String, path: Option<String>) {
+        // The launch ends this croft once the remote one is up (#862).
+        self.guard_unsaved(UnsavedExit::RemoteLaunch { host, path });
+    }
+
+    fn start_remote_launch(&mut self, host: String, path: Option<String>) {
         self.status = format!("Connecting to {host}");
         match crate::remote_connect::SshAuth::start(&host) {
             Ok(auth) => {
@@ -40823,17 +41320,12 @@ impl App {
             if let Some(session) = self.install_session.as_mut()
                 && let Some(adopted) = session.take_adopted()
             {
-                let host = session.host.clone();
-                let path = session.path.clone();
-                self.note_provisioning_succeeded(&host);
-                self.remote_launch = Some(RemoteLaunch {
-                    host: host.clone(),
-                    path,
+                let launch = RemoteLaunch {
+                    host: session.host.clone(),
+                    path: session.path.clone(),
                     adopted: Some(adopted),
-                });
-                self.status = format!("Launching croft on {host}");
-                self.connect_dialog = None;
-                self.quit = true;
+                };
+                self.hand_off_to_remote(launch);
             }
             return true;
         }
@@ -40855,21 +41347,39 @@ impl App {
             if let Some(mut session) = self.install_session.take()
                 && let Some(adopted) = session.take_adopted()
             {
-                let host = session.host.clone();
-                let path = session.path.clone();
-                self.note_provisioning_succeeded(&host);
-                self.remote_launch = Some(RemoteLaunch {
-                    host: host.clone(),
-                    path,
+                let launch = RemoteLaunch {
+                    host: session.host.clone(),
+                    path: session.path.clone(),
                     adopted: Some(adopted),
-                });
-                self.status = format!("Launching croft on {host}");
-                self.connect_dialog = None;
-                self.quit = true;
+                };
+                self.hand_off_to_remote(launch);
             }
             changed = true;
         }
         changed
+    }
+
+    /// The croft on the remote is ready: quit so the terminal goes to it
+    /// (the main loop launches `launch` once this one has let go). The quit
+    /// ends this croft, so edits made since the connect was asked for are
+    /// asked about first (#862); what the user already chose to leave then
+    /// goes without asking again.
+    fn hand_off_to_remote(&mut self, launch: RemoteLaunch) {
+        let host = launch.host.clone();
+        self.note_provisioning_succeeded(&host);
+        self.remote_launch = Some(launch);
+        self.status = format!("Launching croft on {host}");
+        self.connect_dialog = None;
+        let handoff = UnsavedExit::RemoteHandoff { host };
+        let left_as_agreed = self
+            .remote_handoff_ok
+            .take()
+            .is_some_and(|ok| Some(ok) == self.unsaved_stamp());
+        if left_as_agreed {
+            self.finish_unsaved_exit(handoff);
+        } else {
+            self.guard_unsaved(handoff);
+        }
     }
 
     /// Start the background self-update watcher on a remote-launched croft.
@@ -41455,45 +41965,7 @@ impl App {
 
     fn apply_session_state(&mut self, state: &crate::session_state::SessionState) {
         for tab in &state.tabs {
-            let unsaved = tab.unsaved_text.as_deref().filter(|_| tab.dirty);
-            let opened = tab
-                .path
-                .as_deref()
-                .is_some_and(|p| self.editor.open_pinned(p).is_ok());
-            let ed = if opened {
-                let path = tab.path.as_deref();
-                self.editor
-                    .editors
-                    .iter_mut()
-                    .find(|e| e.path.as_deref() == path)
-            } else if unsaved.is_some() {
-                // An untitled buffer, or a file that can no longer be read
-                // (deleted, permissions changed while the update ran): the
-                // unsaved text is the only copy, so it comes back (below) as a
-                // dirty tab rather than being dropped.
-                Some(self.editor.open_unreadable_tab(tab.path.clone()))
-            } else {
-                None
-            };
-            let Some(ed) = ed else {
-                continue;
-            };
-            if let Some(text) = unsaved {
-                ed.lines = text.split('\n').map(str::to_string).collect();
-                if ed.lines.is_empty() {
-                    ed.lines.push(String::new());
-                }
-                ed.dirty = true;
-                // Make the restored unsaved content eligible for auto save:
-                // due() keys on last_edit_at, which a fresh Editor lacks.
-                ed.last_edit_at = Some(std::time::Instant::now());
-            }
-            let max_row = ed.lines.len().saturating_sub(1);
-            ed.cursor_row = tab.cursor_row.min(max_row);
-            let max_col = ed.lines.get(ed.cursor_row).map_or(0, |l| l.chars().count());
-            ed.cursor_col = tab.cursor_col.min(max_col);
-            ed.scroll = tab.scroll;
-            ed.scroll_col = tab.scroll_col;
+            self.restore_open_tab(tab);
         }
         if state.active_tab < self.editor.tab_count() {
             self.editor.select(state.active_tab);
@@ -41514,6 +41986,49 @@ impl App {
         };
     }
 
+    /// Reopen one captured tab, the update relaunch's or hot exit's (#862):
+    /// its file at the saved cursor and scroll, with its unsaved text over
+    /// what the file holds now. Returns the tab, or `None` when there was
+    /// nothing to bring back.
+    fn restore_open_tab(
+        &mut self,
+        tab: &crate::session_state::OpenTabState,
+    ) -> Option<&mut Editor> {
+        let unsaved = tab.unsaved_text.as_deref().filter(|_| tab.dirty);
+        let opened = tab
+            .path
+            .as_deref()
+            .is_some_and(|p| self.editor.open_pinned(p).is_ok());
+        let ed = if opened {
+            let path = tab.path.as_deref();
+            self.editor
+                .editors
+                .iter_mut()
+                .find(|e| e.path.as_deref() == path)?
+        } else if unsaved.is_some() {
+            // An untitled buffer, or a file that can no longer be read
+            // (deleted, permissions changed while the update ran): the
+            // unsaved text is the only copy, so it comes back (below) as a
+            // dirty tab rather than being dropped.
+            self.editor.open_unreadable_tab(tab.path.clone())
+        } else {
+            return None;
+        };
+        if let Some(text) = unsaved {
+            // As an edit, not a bare assignment: the text is re-highlighted
+            // (it kept the disk file's colours) and the LSP and the rest
+            // resync to it. It also stamps the edit time auto save keys on.
+            ed.restore_unsaved_text(text);
+        }
+        let max_row = ed.lines.len().saturating_sub(1);
+        ed.cursor_row = tab.cursor_row.min(max_row);
+        let max_col = ed.lines.get(ed.cursor_row).map_or(0, |l| l.chars().count());
+        ed.cursor_col = tab.cursor_col.min(max_col);
+        ed.scroll = tab.scroll;
+        ed.scroll_col = tab.scroll_col;
+        Some(ed)
+    }
+
     fn tear_down_connect_auth(&mut self) {
         if let Some(mut auth) = self.connect_auth.take() {
             auth.cancel();
@@ -41521,6 +42036,7 @@ impl App {
         self.install_session = None;
         self.pending_remote_launch_host = None;
         self.pending_remote_launch_path = None;
+        self.remote_handoff_ok = None;
     }
 
     pub fn handle_connect_dialog_key(&mut self, key: KeyEvent) {
@@ -42555,16 +43071,7 @@ impl App {
         // so without this hoist Cmd+W is silently swallowed on a diff, sheet,
         // or image tab and the tab can never be closed from the keyboard.
         if is_close_tab_key(key) {
-            self.record_closed_tab_at(self.editor.active_index());
-            if self.editor.close_active() {
-                self.sync_open_file_poll_mtime();
-                self.status = String::from("Closed tab");
-                // Closing the focused group's last tab while split closes
-                // the group: collapse back to the surviving column.
-                self.collapse_split_if_empty();
-            } else {
-                self.status = String::from("Cannot close last tab");
-            }
+            self.request_close_tab(self.editor.active_index());
             return;
         }
         if self.editor.diff.is_some() {
@@ -42812,7 +43319,10 @@ impl App {
             KeyCode::PageDown => self.editor.page_down_one_screen(),
             KeyCode::Home => self.editor.home_line(),
             KeyCode::End => self.editor.end_line(),
-            KeyCode::Backspace => self.editor.backspace(),
+            KeyCode::Backspace => {
+                self.editor.backspace();
+                self.note_incomplete_completion_edit();
+            }
             KeyCode::Delete => self.editor.delete_forward(),
             KeyCode::Enter => self.editor.insert_newline(),
             // Tab advances a live snippet, else expands a snippet whose prefix
@@ -42828,6 +43338,9 @@ impl App {
                     && !key.modifiers.contains(KeyModifiers::SUPER) =>
             {
                 self.editor.insert_char(c);
+                // With an incomplete list pending but none of it on screen,
+                // typing on still re-asks (#1529).
+                self.note_incomplete_completion_edit();
                 // `.` is the canonical LSP trigger character for member
                 // access in Python / TS / Rust. Fire a completion request
                 // immediately so the popup pops without a Ctrl+Space.
@@ -43530,23 +44043,21 @@ impl App {
         }
         match cmd {
             "w" | "write" => self.save(),
-            "q" | "q!" | "quit" => {
-                self.record_closed_tab_at(self.editor.active_index());
-                if self.editor.close_active() {
-                    self.sync_open_file_poll_mtime();
-                    self.status = String::from("Closed tab");
-                } else {
-                    self.quit = true;
-                }
+            "q" | "quit" => self.request_close_tab(self.editor.active_index()),
+            // vim's `!` is the answer to "discard the changes?" given up
+            // front, so these two never ask (#862).
+            "q!" => self.close_tab_now(self.editor.active_index()),
+            "qa!" => {
+                self.clear_hot_exit();
+                self.quit = true;
             }
             "wq" | "x" | "wq!" => {
                 self.save();
-                self.record_closed_tab_at(self.editor.active_index());
-                if !self.editor.close_active() {
-                    self.quit = true;
-                }
+                // A save that did not land (a disk conflict, a format still
+                // running) leaves the tab dirty, and the close asks.
+                self.request_close_tab(self.editor.active_index());
             }
-            "qa" | "qa!" | "quitall" => self.quit = true,
+            "qa" | "quitall" => self.guard_unsaved(UnsavedExit::Quit),
             other => self.status = format!("Unknown command: {other}"),
         }
     }
@@ -47395,16 +47906,46 @@ impl App {
     }
 
     /// Populate and run the Search panel from a parsed terminal search
-    /// command line. Returns false when `input` isn't a recognisable search.
+    /// command line, scoped to the paths it searched from the focused pane's
+    /// directory. Returns false when `input` isn't a recognisable search.
     fn seed_search_from_command(&mut self, input: &str) -> bool {
+        let cwd = self
+            .terminals
+            .get(self.active_terminal)
+            .and_then(|t| t.pid())
+            .and_then(cwd_of_pid)
+            .filter(|p| p.is_dir());
+        let Some(cwd) = cwd else {
+            // Guessing the workspace root would widen `rg foo` run from a
+            // subdirectory to every file (#1201).
+            if crate::quickfix::parse_search_command(input).is_none() {
+                return false;
+            }
+            self.status = String::from(
+                "Search not seeded: can't tell which directory the terminal searched from",
+            );
+            return true;
+        };
+        self.seed_search_from_command_in(input, &cwd)
+    }
+
+    /// [`Self::seed_search_from_command`] for a command run in `cwd`. A
+    /// search whose scope can't be reproduced exactly is refused with the
+    /// reason in the status bar and leaves the panel alone (still true:
+    /// the input was a search), so Replace All never widens past it (#1201).
+    fn seed_search_from_command_in(&mut self, input: &str, cwd: &Path) -> bool {
         let Some(sc) = crate::quickfix::parse_search_command(input) else {
             return false;
         };
-        self.search.seed(
-            sc.pattern.clone(),
-            sc.include.unwrap_or_default(),
-            sc.exclude.unwrap_or_default(),
-        );
+        let (include, exclude) =
+            match crate::quickfix::scope_filters(&sc, cwd, self.workspace_root()) {
+                Ok(filters) => filters,
+                Err(why) => {
+                    self.status = format!("Search not seeded: {why}");
+                    return true;
+                }
+            };
+        self.search.seed(sc.pattern.clone(), include, exclude);
         self.search.opts.case_sensitive = sc.case_sensitive;
         self.search.opts.whole_word = sc.whole_word;
         self.search.opts.use_regex = sc.use_regex;
@@ -49719,15 +50260,25 @@ impl App {
             Cmd::DebugAddWatch => self.open_add_watch_prompt(),
             Cmd::PeekDefinition => self.peek_definition_at_cursor(),
             Cmd::PeekReferences => self.peek_references_at_cursor(),
-            // Cmd+F12's request (#843), which has no `Ctrl` form.
-            Cmd::GoToImplementations => {
-                if self.editor.diff.is_none()
-                    && self.editor.sheet.is_none()
-                    && self.editor.image.is_none()
-                {
-                    self.request_implementation_at_cursor();
-                }
+            // The caret-driven LSP actions (#1212), the same calls the F-key
+            // chords make. A palette run or a rebound chord on a non-text
+            // view says why nothing happened instead of staying silent.
+            Cmd::GoToDefinition
+            | Cmd::GoToReferences
+            | Cmd::GoToDeclaration
+            | Cmd::GoToTypeDefinition
+            | Cmd::GoToImplementations
+            | Cmd::RenameSymbol
+                if self.editor.has_non_text_view() =>
+            {
+                self.status = format!("{} needs a text file", cmd.title());
             }
+            Cmd::GoToDefinition => self.request_definition_at_cursor(),
+            Cmd::GoToReferences => self.request_references_at_cursor(),
+            Cmd::GoToDeclaration => self.request_declaration_at_cursor(),
+            Cmd::GoToTypeDefinition => self.request_type_definition_at_cursor(),
+            Cmd::GoToImplementations => self.request_implementation_at_cursor(),
+            Cmd::RenameSymbol => self.start_rename_symbol(),
             // Position-carrying commands (#259). They read the click the
             // dispatcher set, and do nothing from the keyboard: invoked from
             // the palette there is no click to act on, and guessing the
@@ -49850,6 +50401,9 @@ impl App {
             Cmd::StageHunk => self.stage_hunk_at_caret(),
             Cmd::UnstageHunk => self.unstage_hunk_at_caret(),
             Cmd::RevertHunk => self.request_revert_hunk_at_caret(),
+            Cmd::GitUndoLastCommit => {
+                self.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::UndoLastCommit)
+            }
             Cmd::ToggleFold => {
                 let row = self.editor.cursor_row;
                 self.editor.toggle_fold(row);
@@ -49917,14 +50471,7 @@ impl App {
                     self.editor.selection_text().chars().count()
                 );
             }
-            Cmd::CloseEditor => {
-                self.record_closed_tab_at(self.editor.active_index());
-                if self.editor.close_active() {
-                    self.sync_open_file_poll_mtime();
-                    self.collapse_split_if_empty();
-                    self.status = String::from("Closed tab");
-                }
-            }
+            Cmd::CloseEditor => self.request_close_tab(self.editor.active_index()),
             Cmd::ReopenClosedEditor => self.reopen_closed_tab(),
             // The Explorer's Cmd+Z (#843), which has no `Ctrl` form.
             Cmd::ZoxideJump => self.open_zoxide_jump(),
@@ -51101,29 +51648,46 @@ impl App {
     /// feedback line so the user can amend the name.
     fn apply_branch_action(&mut self, action: crate::widgets::branch_picker::BranchAction) {
         use crate::widgets::branch_picker::BranchAction;
-        let (result, verb) = match &action {
+        let (result, verb, label, name) = match &action {
             BranchAction::Checkout(name) => (
                 crate::git::checkout_branch(&self.scm_root(), name),
                 "Switched to",
+                "switch",
+                name,
             ),
-            BranchAction::Create(name) => {
-                (crate::git::create_branch(&self.scm_root(), name), "Created")
-            }
+            BranchAction::Create(name) => (
+                crate::git::create_branch(&self.scm_root(), name),
+                "Created",
+                "switch -c",
+                name,
+            ),
         };
+        self.log_git(label, &result);
         match result {
             Ok(summary) => {
+                // One line (#858): git's result, or, when git said only which
+                // edits it carried over (`M\tpath`) or how the branch stands
+                // against its upstream, where the switch went.
+                let summary = crate::git::result_line(&summary);
+                let (feedback, status) = if summary.is_empty() {
+                    let line = format!("{verb} {name}");
+                    (line.clone(), line)
+                } else {
+                    (summary.clone(), format!("{verb}: {summary}"))
+                };
                 self.close_branch_picker();
-                self.source_control.commit_feedback = Some(summary.clone());
+                self.source_control.commit_feedback = Some(feedback);
                 self.source_control.commit_feedback_is_error = false;
-                self.status = format!("{verb}: {summary}");
+                self.status = status;
                 self.active_git_bypass_debounce();
                 self.refresh_git_status_debounced();
                 self.refresh_source_control();
             }
             Err(err) => {
-                self.source_control.commit_feedback = Some(format!("branch: {err}"));
+                let why = crate::git::error_line(&err);
+                self.source_control.commit_feedback = Some(format!("branch: {why}"));
                 self.source_control.commit_feedback_is_error = true;
-                self.status = format!("Branch: {err}");
+                self.status = format!("Branch: {why}");
             }
         }
     }
@@ -53082,6 +53646,11 @@ impl App {
         }
         // The approval popup takes no clicks, and none reach what it covers.
         if self.approval_ui.is_some() {
+            return;
+        }
+        // Nor does the unsaved-changes prompt (#862): a click behind it must
+        // not close or move the tabs it is asking about.
+        if self.pending_unsaved.is_some() {
             return;
         }
         // The history scrubber's slider (#371): a press on the track seeks
@@ -55261,13 +55830,7 @@ impl App {
                             self.status = String::from("Unpinned tab");
                             self.poke_cursor();
                         } else {
-                            self.record_closed_tab_at(idx);
-                            if self.editor.close_tab(idx) {
-                                self.sync_open_file_poll_mtime();
-                                self.status = String::from("Closed tab");
-                                self.poke_cursor();
-                                self.collapse_split_if_empty();
-                            }
+                            self.request_close_tab(idx);
                         }
                     } else if let Some(idx) = self.editor.tab_at(m.column, m.row) {
                         self.focus_pane(Pane::Editor);
@@ -56681,7 +57244,7 @@ impl App {
         }
         let (map, _) = crate::keymap::Keymap::load_with_warnings(&self.keybindings_file);
         self.keymap = map;
-        self.snippets = crate::snippets::SnippetSet::load(&crate::snippets::snippets_path());
+        self.snippets = load_snippets(&crate::snippets::snippets_path());
         self.status = format!(
             "Profile: {}; keybindings and snippets applied, settings apply at the next launch",
             name.as_deref().unwrap_or("Default")
@@ -58285,9 +58848,9 @@ impl App {
             }
             self.status = keybindings_reload_status(&warns);
         } else if path == crate::snippets::snippets_path() {
-            let (set, warning) = crate::snippets::SnippetSet::load_with_warning(path);
-            self.snippets = set;
-            self.status = snippets_reload_status(warning.is_some());
+            self.snippets = load_snippets(path);
+            self.status =
+                snippets_reload_status(self.snippets.is_broken(), self.snippets.warnings());
         } else if path == crate::agents::agents_path() {
             self.agents = crate::agents::AgentTable::load(path);
             let dropped = self.agents.dropped_patterns();
@@ -58685,6 +59248,32 @@ impl App {
         for session in self.debug_sessions.iter_mut() {
             session.update_breakpoints(path, &specs);
         }
+    }
+
+    /// Record each dirty tab of `paths` (any group) in Local History as a
+    /// kept snapshot, before a reload throws its edits away (#910). The
+    /// number recorded.
+    fn keep_unsaved_buffers_in_history(&mut self, paths: &[PathBuf]) -> usize {
+        let millis = now_millis();
+        let mut buffers: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
+        for tab in groups.flat_map(|g| g.iter_tabs()) {
+            let Some(path) = tab.path.as_ref().filter(|p| paths.contains(p)) else {
+                continue;
+            };
+            if tab.dirty
+                && !buffers.iter().any(|(p, _)| p == path)
+                && let Some(bytes) = tab.bytes_for_disk()
+            {
+                buffers.push((path.clone(), bytes));
+            }
+        }
+        buffers
+            .iter()
+            .filter(|(path, bytes)| {
+                crate::history::record_kept_in(&self.history_root, path, bytes, millis).is_ok()
+            })
+            .count()
     }
 
     /// [`Self::record_history_snapshot_of`] as a kept snapshot (a restore).
@@ -59289,6 +59878,10 @@ impl App {
                 shell_synced = false;
             }
         }
+        // The hot-exit backup is keyed by the workspace: this croft's goes
+        // with it to the new root at the next tick, rather than staying
+        // where the old workspace's next launch would restore it (#862).
+        self.remove_own_hot_exit();
         self.roots.replace_primary(new_root.clone());
         // A panel the user never touched — the startup default, one unnamed
         // shell with no input ever typed and no launched program — is swapped
@@ -59688,15 +60281,7 @@ impl App {
             MenuAction::CopyTabPath(path) => self.copy_path_to_clipboard(path),
             MenuAction::CopyTabRelativePath(path) => self.copy_relative_path_to_clipboard(path),
             MenuAction::RevealInExplorer(path) => self.reveal_in_explorer(path),
-            MenuAction::CloseTab(idx) => {
-                self.record_closed_tab_at(idx);
-                if self.editor.close_tab(idx) {
-                    self.sync_open_file_poll_mtime();
-                    self.status = String::from("Closed tab");
-                    self.poke_cursor();
-                    self.collapse_split_if_empty();
-                }
-            }
+            MenuAction::CloseTab(idx) => self.request_close_tab(idx),
             MenuAction::CloseOtherTabs(keep_idx) => self.close_other_tabs(keep_idx),
             MenuAction::CloseTabsToRight(from_idx) => self.close_tabs_to_right(from_idx),
             MenuAction::CloseAllTabs => self.close_all_tabs(),
@@ -60066,16 +60651,34 @@ impl App {
     /// layout (e.g. `cgr duplicates` diffs) would otherwise only empty the
     /// clicked group and look like a single close once the blank group
     /// collapsed away.
+    ///
+    /// Tabs with unsaved changes stay open, in whichever group holds them
+    /// (#862): a sweep must not decide to throw edits away, and Cmd+W on one
+    /// of them asks. Only the groups left with nothing fold away then.
     fn close_all_tabs(&mut self) {
         let mut removed = self.editor.close_all();
+        let mut kept = self.editor.editors.iter().filter(|e| e.dirty).count();
         if self.editor_layout.is_split() {
-            removed += self
+            let mut emptied = Vec::new();
+            for (g, group) in self
                 .editor_layout
-                .inactive_groups()
-                .iter()
-                .map(|g| g.editors.len())
-                .sum::<usize>();
-            self.editor_layout = editor_layout::EditorLayout::single();
+                .inactive_groups_mut()
+                .into_iter()
+                .enumerate()
+            {
+                removed += group.close_all();
+                let dirty = group.editors.iter().filter(|e| e.dirty).count();
+                if dirty == 0 {
+                    emptied.push(g);
+                }
+                kept += dirty;
+            }
+            if kept == 0 {
+                self.editor_layout = editor_layout::EditorLayout::single();
+            } else {
+                self.editor_layout.prune_inactive_at(&emptied);
+                self.collapse_split_if_empty();
+            }
             self.editor_seams.clear();
             self.disable_editor_image(1);
             self.sync_focus_flags();
@@ -60086,6 +60689,10 @@ impl App {
         } else {
             format!("Closed {removed} tabs")
         };
+        if kept > 0 {
+            self.status
+                .push_str(&format!("; kept {kept} with unsaved changes open"));
+        }
         self.poke_cursor();
     }
 
@@ -60107,6 +60714,738 @@ impl App {
         };
         self.poke_cursor();
         self.collapse_split_if_empty();
+    }
+
+    /// Go on with `exit`, unless it would drop unsaved changes (#862): then
+    /// raise the prompt that asks whether to save them first. Every quit and
+    /// every single-tab close comes through here. The update relaunch alone
+    /// does not: its session handoff carries unsaved text across the re-exec.
+    fn guard_unsaved(&mut self, exit: UnsavedExit) {
+        let at_stake = match &exit {
+            UnsavedExit::CloseTab { idx, .. } => self.tab_would_lose_edits(*idx),
+            _ => !self.unsaved_files().is_empty(),
+        };
+        if at_stake {
+            self.pending_unsaved = Some(exit);
+        } else {
+            self.finish_unsaved_exit(exit);
+        }
+    }
+
+    /// Close the focused group's tab at `idx`: at once when it holds nothing
+    /// unsaved, through the prompt when it does.
+    fn request_close_tab(&mut self, idx: usize) {
+        let path = self.editor.tab_path(idx);
+        self.guard_unsaved(UnsavedExit::CloseTab { idx, path });
+    }
+
+    /// Carry `exit` out, with nothing left to ask.
+    fn finish_unsaved_exit(&mut self, exit: UnsavedExit) {
+        match exit {
+            // A quit that goes ahead kept every edit or was told to drop
+            // them, so the hot-exit backup goes with it.
+            UnsavedExit::Quit => {
+                self.clear_hot_exit();
+                self.quit = true;
+            }
+            UnsavedExit::DropToLocal => {
+                self.clear_hot_exit();
+                self.drop_to_local = true;
+                self.quit = true;
+            }
+            UnsavedExit::RemoteLaunch { host, path } => {
+                // What the answer left unsaved (D) goes without a second
+                // question at the handoff; anything edited after it does not.
+                self.remote_handoff_ok = self.unsaved_stamp();
+                self.start_remote_launch(host, path);
+            }
+            UnsavedExit::RemoteHandoff { .. } => {
+                self.clear_hot_exit();
+                self.quit = true;
+            }
+            UnsavedExit::CloseTab { idx, .. } => self.close_tab_now(idx),
+        }
+    }
+
+    /// Answer the unsaved-changes prompt (#862). `save` writes the buffers
+    /// first and goes on only once every one of them is on disk: a file left
+    /// unsaved keeps croft (or the tab) open and is named in the status
+    /// line. Otherwise it goes on without saving.
+    fn answer_unsaved(&mut self, save: bool) {
+        let Some(exit) = self.pending_unsaved.take() else {
+            return;
+        };
+        if let UnsavedExit::CloseTab { idx, path } = &exit
+            && self.editor.tab_path(*idx) != *path
+        {
+            self.status = String::from("The tab moved while croft was asking; nothing was closed");
+            return;
+        }
+        if save {
+            let only = match &exit {
+                UnsavedExit::CloseTab { idx, .. } => Some(*idx),
+                _ => None,
+            };
+            let left = self.save_tabs_for_exit(only);
+            if !left.is_empty() {
+                self.drop_unsaved_exit(&exit);
+                self.status = format!(
+                    "Did not {}: still unsaved - {}",
+                    exit.verb(),
+                    left.join(", ")
+                );
+                return;
+            }
+        }
+        let closing = matches!(exit, UnsavedExit::CloseTab { .. });
+        self.finish_unsaved_exit(exit);
+        if closing {
+            self.status = String::from(if save {
+                "Saved and closed tab"
+            } else {
+                "Closed tab without saving"
+            });
+        }
+    }
+
+    fn cancel_unsaved(&mut self) {
+        if let Some(exit) = self.pending_unsaved.take() {
+            self.drop_unsaved_exit(&exit);
+            self.status = format!("Cancelled: did not {}", exit.verb());
+        }
+    }
+
+    /// Let go of `exit` when the prompt ends without it going ahead. A
+    /// remote handoff is already armed (the launch waits for the quit), and
+    /// left armed it would go ahead at the next, unrelated quit.
+    fn drop_unsaved_exit(&mut self, exit: &UnsavedExit) {
+        if matches!(exit, UnsavedExit::RemoteHandoff { .. }) {
+            self.remote_launch = None;
+            self.tear_down_connect_auth();
+        }
+    }
+
+    /// Close the focused group's tab at `idx` without asking: the shared end
+    /// of every single-tab close (Cmd+W, the tab's close button and context
+    /// menu, View: Close Editor, vim `:q`). The tab is recorded for Reopen
+    /// Closed Editor first, while it is still in place.
+    fn close_tab_now(&mut self, idx: usize) {
+        self.record_closed_tab_at(idx);
+        if self.editor.close_tab(idx) {
+            self.sync_open_file_poll_mtime();
+            self.status = String::from("Closed tab");
+            self.poke_cursor();
+            // Closing the focused group's last tab while split closes the
+            // group: collapse back to the surviving column.
+            self.collapse_split_if_empty();
+            // A tab closed without saving takes its text out of the
+            // hot-exit backup now (#862 review), not at a later tick: a
+            // crash in between would bring back what was discarded.
+            if self.hot_exit_written.is_some() && self.unsaved_stamp() != self.hot_exit_written {
+                self.write_hot_exit();
+            }
+        }
+    }
+
+    /// Whether closing the focused group's tab at `idx` throws unsaved edits
+    /// away (#862). Not when another open tab holds the very same unsaved
+    /// text: a symbol tab and its file's tab mirror one buffer (#369), so
+    /// closing either keeps the edits in the other.
+    fn tab_would_lose_edits(&self, idx: usize) -> bool {
+        let Some(ed) = self.editor.editors.get(idx).filter(|e| holds_unsaved(e)) else {
+            return false;
+        };
+        !std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .any(|other| {
+                !std::ptr::eq(other, ed)
+                    && other.dirty
+                    && other.path.is_some()
+                    && other.path == ed.path
+                    && other.lines == ed.lines
+            })
+    }
+
+    /// Every file a quit would lose (#862), one label each: the dirty tabs of
+    /// every editor group, a file open in several tabs (a split, a symbol
+    /// tab) counted once, and each untitled buffer holding text on its own.
+    fn unsaved_files(&self) -> Vec<String> {
+        let mut seen: Vec<&Path> = Vec::new();
+        let mut labels = Vec::new();
+        for ed in std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .filter(|e| holds_unsaved(e))
+        {
+            match ed.path.as_deref() {
+                Some(p) if seen.contains(&p) => {}
+                Some(p) => {
+                    seen.push(p);
+                    labels.push(self.status_path(p));
+                }
+                None => labels.push(String::from("untitled")),
+            }
+        }
+        labels
+    }
+
+    /// A fingerprint of every unsaved buffer as it stands (#862): which tabs
+    /// hold unsaved text and how far each has been edited, so any edit, save
+    /// or close changes it. `None` when nothing is unsaved. Cheap enough for
+    /// every tick: it hashes paths and edit counters, never text.
+    fn unsaved_stamp(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut any = false;
+        for ed in std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .filter(|e| holds_unsaved(e))
+        {
+            any = true;
+            ed.path.hash(&mut h);
+            ed.edit_seq.hash(&mut h);
+        }
+        any.then(|| h.finish())
+    }
+
+    /// Hot exit's pause after the newest unsaved edit before it backs the
+    /// buffers up (#862): typing never waits on a write, and a crash loses
+    /// seconds of it.
+    const HOT_EXIT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Keep the hot-exit backup (#862) in step with the unsaved buffers.
+    /// Runs every tick, but writes only once they changed since the last
+    /// backup and [`Self::HOT_EXIT_DELAY`] has passed since the newest edit,
+    /// and removes the backup once nothing is unsaved.
+    pub fn tick_hot_exit(&mut self, now: std::time::Instant) {
+        if self.hot_exit_dir.is_none() {
+            return;
+        }
+        let stamp = self.unsaved_stamp();
+        if stamp == self.hot_exit_written && self.hot_exit_consumed.is_empty() {
+            return;
+        }
+        if self.hot_exit_retry_at.is_some_and(|at| now < at) {
+            return;
+        }
+        let settling = stamp.is_some()
+            && self
+                .newest_unsaved_edit()
+                .is_some_and(|t| now.saturating_duration_since(t) < Self::HOT_EXIT_DELAY);
+        if !settling {
+            self.write_hot_exit();
+        }
+    }
+
+    /// When the most recently edited unsaved buffer last changed.
+    fn newest_unsaved_edit(&self) -> Option<std::time::Instant> {
+        std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .filter(|e| holds_unsaved(e))
+            .filter_map(|e| e.last_edit_at)
+            .max()
+    }
+
+    /// This croft's hot-exit backup file for its workspace, when it keeps
+    /// backups at all.
+    fn hot_exit_path(&self) -> Option<PathBuf> {
+        let dir = self.hot_exit_dir.as_deref()?;
+        Some(crate::hot_exit::own_path(dir, self.workspace_root()))
+    }
+
+    /// Write the hot-exit backup now (#862): every unsaved text buffer of
+    /// every editor group, or no backup at all once there is none. Once it
+    /// lands, the backups this croft restored from go (never its own file,
+    /// which may carry the same name). A write that fails says so once, is
+    /// not counted as written, and is tried again by a later tick. Returns
+    /// whether it landed.
+    fn write_hot_exit(&mut self) -> bool {
+        let Some(path) = self.hot_exit_path() else {
+            return false;
+        };
+        let root = self.workspace_root().to_path_buf();
+        let stamp = self.unsaved_stamp();
+        let backup = self.capture_hot_exit();
+        let result = if backup.buffers.is_empty() {
+            crate::hot_exit::remove(&path, &root).map_err(|e| {
+                format!(
+                    "Could not remove the hot-exit backup {} ({e})",
+                    path.display()
+                )
+            })
+        } else {
+            backup
+                .save(&path)
+                .map_err(|e| format!("Could not back up unsaved changes ({e:#})"))
+        };
+        match result {
+            Ok(()) => {
+                self.hot_exit_written = stamp;
+                self.hot_exit_retry_at = None;
+                let mut left = Vec::new();
+                for consumed in std::mem::take(&mut self.hot_exit_consumed) {
+                    if consumed == path {
+                        continue;
+                    }
+                    if let Err(e) = crate::hot_exit::remove(&consumed, &root) {
+                        left.push(format!("{} ({e})", consumed.display()));
+                        self.hot_exit_unremoved.push(consumed);
+                    }
+                }
+                if !left.is_empty() {
+                    self.status = format!(
+                        "Could not remove the hot-exit backup {}: it may still hold unsaved text; delete it by hand",
+                        left.join(", ")
+                    );
+                }
+                true
+            }
+            Err(note) => {
+                if self.hot_exit_retry_at.is_none() {
+                    self.status = note;
+                }
+                self.hot_exit_retry_at = Some(std::time::Instant::now() + Self::HOT_EXIT_DELAY);
+                false
+            }
+        }
+    }
+
+    /// What a hot-exit backup holds (#862): each unsaved tab as the update
+    /// relaunch captures it (every group, a file once, untitled buffers
+    /// that hold text), with the file's stamp from when the buffer last
+    /// matched it. Hex and sheet tabs carry no text and are left out, as
+    /// from the relaunch.
+    fn capture_hot_exit(&self) -> crate::hot_exit::Backup {
+        let editors: Vec<&Editor> = std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .collect();
+        let buffers = self
+            .capture_session_state()
+            .tabs
+            .into_iter()
+            .filter(|t| {
+                t.dirty
+                    && t.unsaved_text
+                        .as_deref()
+                        .is_some_and(|text| t.path.is_some() || !text.is_empty())
+            })
+            .map(|tab| {
+                let disk_stamp = tab.path.as_deref().and_then(|p| {
+                    editors
+                        .iter()
+                        .find(|e| e.dirty && e.path.as_deref() == Some(p))
+                        .and_then(|e| e.disk_stamp())
+                });
+                crate::hot_exit::Buffer { tab, disk_stamp }
+            })
+            .collect();
+        crate::hot_exit::Backup {
+            workspace_root: self.workspace_root().to_path_buf(),
+            buffers,
+        }
+    }
+
+    /// Remove this croft's hot-exit backup and the ones it restored from
+    /// (#862): the quit ending it kept every unsaved edit on disk, or was
+    /// told to drop them. One that cannot be removed is said, in the status
+    /// line and on stderr after the quit, since it may still hold text the
+    /// user chose to discard.
+    fn clear_hot_exit(&mut self) {
+        let root = self.workspace_root().to_path_buf();
+        let mut left = Vec::new();
+        let consumed = std::mem::take(&mut self.hot_exit_consumed);
+        let unremoved = std::mem::take(&mut self.hot_exit_unremoved);
+        for path in self
+            .hot_exit_path()
+            .into_iter()
+            .chain(consumed)
+            .chain(unremoved)
+        {
+            if let Err(e) = crate::hot_exit::remove(&path, &root) {
+                left.push(format!("{} ({e})", path.display()));
+            }
+        }
+        self.hot_exit_written = None;
+        self.hot_exit_retry_at = None;
+        if !left.is_empty() {
+            let note = format!(
+                "Could not remove the hot-exit backup {}: it may still hold the unsaved text; delete it by hand",
+                left.join(", ")
+            );
+            self.status = note.clone();
+            self.exit_notes.push(note);
+        }
+    }
+
+    /// Remove this croft's own hot-exit backup, keyed by the workspace it
+    /// was written for (#862): a re-root writes it again under the new one
+    /// at the next tick, and what it restored from stays until then.
+    fn remove_own_hot_exit(&mut self) {
+        if let Some(path) = self.hot_exit_path() {
+            let _ = crate::hot_exit::remove(&path, self.workspace_root());
+        }
+        self.hot_exit_written = None;
+    }
+
+    /// Bring back what hot exit kept of this workspace's unsaved buffers
+    /// (#862) when croft last ended without a clean quit: a kill, a crash,
+    /// an OOM kill. Each comes back as an unsaved tab with its text and
+    /// cursor and nothing is written to its file. A file changed on disk
+    /// since is named in the status line and keeps the stamp its edits were
+    /// made against, so its first save asks before overwriting the change;
+    /// a deleted one comes back as a tab for its path. This croft writes its
+    /// own backup of them at once and removes the consumed ones only after
+    /// that lands, so a crash straight after the launch, or a write that
+    /// fails, cannot lose them either. Backups come newest first, and an
+    /// older one of a file already restored (two crofts on the workspace,
+    /// both killed) is not restored over the newer: that copy stays in its
+    /// backup for a later launch.
+    /// A backup that cannot be read is kept and said so, until it is older
+    /// than
+    /// [`crate::hot_exit::UNREADABLE_KEPT_FOR`]. Called once, at a normal
+    /// launch.
+    pub fn restore_hot_exit(&mut self) {
+        let Some(dir) = self.hot_exit_dir.clone() else {
+            return;
+        };
+        let root = self.workspace_root().to_path_buf();
+        let mut restored = 0usize;
+        let mut changed: Vec<PathBuf> = Vec::new();
+        let mut gone: Vec<PathBuf> = Vec::new();
+        let mut unreadable: Vec<String> = Vec::new();
+        let mut expired = 0usize;
+        // The files this launch has filled a tab for. Another backup of one
+        // of them, older since the newest come first, is a second croft's
+        // unsaved copy (two crofts on the workspace, both killed), and
+        // restoring it into that tab would overwrite the newer text. It
+        // stays in its backup instead, held for a later launch once the
+        // newer copy is saved or closed.
+        let mut filled: Vec<PathBuf> = Vec::new();
+        let mut doubled: Vec<PathBuf> = Vec::new();
+        let mut trimmed: Vec<(PathBuf, crate::hot_exit::Backup)> = Vec::new();
+        // A dead croft's backup at this croft's own path (the start time
+        // could not be read, so the name is the recycled pid alone) would be
+        // restored from, written over by this croft's backup and cut down,
+        // all as one file. It is moved aside first; one that cannot be is
+        // left alone, and this croft keeps no backup rather than write over
+        // it.
+        let own = self.hot_exit_path();
+        let mut orphans = crate::hot_exit::orphaned(&dir, &root);
+        if let Some(own) = own.as_ref().filter(|own| orphans.contains(own)) {
+            match crate::hot_exit::move_aside(own) {
+                Some(aside) => {
+                    for file in orphans.iter_mut().filter(|f| *f == own) {
+                        *file = aside.clone();
+                    }
+                }
+                None => {
+                    self.hot_exit_dir = None;
+                    self.status = format!(
+                        "Hot exit is off for this session: a backup is at its own path, {}, and could not be moved aside",
+                        own.display()
+                    );
+                    return;
+                }
+            }
+        }
+        for file in orphans {
+            let backup = match crate::hot_exit::Backup::load(&file) {
+                Ok(backup) if backup.is_of(&root) => backup,
+                // Another workspace's, under a colliding digest.
+                Ok(_) => continue,
+                // Reported for a week already: past recovery by hand.
+                Err(_) if crate::hot_exit::is_expired(&file) => {
+                    if crate::hot_exit::remove(&file, &root).is_ok() {
+                        expired += 1;
+                    }
+                    continue;
+                }
+                Err(_) => {
+                    unreadable.push(file.display().to_string());
+                    continue;
+                }
+            };
+            let before = restored;
+            let mut held: Vec<crate::hot_exit::Buffer> = Vec::new();
+            for buffer in &backup.buffers {
+                if let Some(path) = buffer.tab.path.as_ref().filter(|p| filled.contains(p)) {
+                    doubled.push(path.clone());
+                    held.push(buffer.clone());
+                    continue;
+                }
+                let Some(ed) = self.restore_open_tab(&buffer.tab) else {
+                    continue;
+                };
+                restored += 1;
+                let Some(path) = buffer.tab.path.clone() else {
+                    continue;
+                };
+                filled.push(path.clone());
+                match ed.disk_stamp() {
+                    // Kept at the stamp its edits were made against, so a
+                    // file made at the path since is not written over
+                    // without asking.
+                    None => {
+                        ed.set_disk_stamp(buffer.disk_stamp);
+                        gone.push(path);
+                    }
+                    Some(now) if buffer.disk_stamp.is_some_and(|then| then != now) => {
+                        ed.set_disk_stamp(buffer.disk_stamp);
+                        changed.push(path);
+                    }
+                    Some(_) => {}
+                }
+            }
+            if !held.is_empty() {
+                // Not consumed. Once this croft's own backup holds what was
+                // restored from it, it is cut down to the held copies, so
+                // those do not come back a second time.
+                if restored > before {
+                    trimmed.push((
+                        file,
+                        crate::hot_exit::Backup {
+                            workspace_root: backup.workspace_root,
+                            buffers: held,
+                        },
+                    ));
+                }
+            } else if restored == before {
+                // Nothing in it to keep (an emptied backup, left by a
+                // removal that failed): no write to wait on.
+                let _ = crate::hot_exit::remove(&file, &root);
+            } else {
+                self.hot_exit_consumed.push(file);
+            }
+        }
+        let mut notes = Vec::new();
+        if restored > 0 {
+            notes.push(format!(
+                "Hot exit: restored {restored} unsaved tab{}",
+                if restored == 1 { "" } else { "s" }
+            ));
+            let names = |paths: &[PathBuf]| {
+                paths
+                    .iter()
+                    .map(|p| self.status_path(p))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            if !changed.is_empty() {
+                notes.push(format!("{} changed on disk since", names(&changed)));
+            }
+            if !gone.is_empty() {
+                notes.push(format!("{} no longer on disk", names(&gone)));
+            }
+            if !doubled.is_empty() {
+                notes.push(format!(
+                    "{} {} kept in {} backup for a later launch",
+                    names(&doubled),
+                    if doubled.len() == 1 {
+                        "has a second unsaved copy,"
+                    } else {
+                        "have second unsaved copies,"
+                    },
+                    if doubled.len() == 1 { "its" } else { "their" },
+                ));
+            }
+            let unremoved = self.hot_exit_unremoved.len();
+            if self.write_hot_exit() {
+                if self.hot_exit_unremoved.len() > unremoved {
+                    notes.push(std::mem::take(&mut self.status));
+                }
+                // A trim that fails leaves the whole backup, so its other
+                // files come back again later rather than the held copy
+                // going.
+                for (file, held) in trimmed {
+                    let _ = held.save(&file);
+                }
+            } else {
+                notes.push(format!(
+                    "{}; the backup they came from is kept until it can",
+                    std::mem::take(&mut self.status)
+                ));
+            }
+        }
+        if expired > 0 {
+            notes.push(format!(
+                "Hot exit: removed {expired} unreadable backup{} older than a week",
+                if expired == 1 { "" } else { "s" }
+            ));
+        }
+        if !unreadable.is_empty() {
+            notes.push(format!(
+                "Hot exit: could not read {} (kept for a week)",
+                unreadable.join(", ")
+            ));
+        }
+        if !notes.is_empty() {
+            self.status = notes.join("; ");
+        }
+    }
+
+    /// Write what an unsaved-changes prompt (#862) asked about: the focused
+    /// group's tab at `only`, or every unsaved tab in every group.
+    ///
+    /// Each write is the explicit save's, done now and unformatted (the tab
+    /// is about to go, and a formatter's reply would land after it), and it
+    /// refuses what a first Cmd+S refuses: a file changed on disk, text its
+    /// encoding cannot hold. A merge with conflicts still open is not written
+    /// blind either, and an untitled buffer has no file to go to. Returns a
+    /// line per file still unsaved; empty means everything is on disk.
+    fn save_tabs_for_exit(&mut self, only: Option<usize>) -> Vec<String> {
+        use crate::widgets::editor::SaveOutcome;
+        // The tabs of a file with a symbol tab mirror one text (#369): the
+        // first write saves them all, and writing a second would read the
+        // first as a change on disk. The sync afterwards marks them clean.
+        let mirrored: Vec<PathBuf> = self
+            .symbol_view_paths()
+            .into_iter()
+            .filter(|p| !self.symbol_path_is_live(p))
+            .collect();
+        // A collab guest never writes a shared file, and loses nothing by
+        // leaving it: its edits are already live with the owner, who saves.
+        let guest = self.is_collab_guest();
+        let root = self.tree.root.clone();
+        let collab = &self.collab;
+        let owner_saves = |p: &Path| {
+            guest
+                && collab_file_key(&root, p)
+                    .is_some_and(|f| collab.as_ref().is_some_and(|s| !s.is_local_only(&f)))
+        };
+        // A file open in more than one editor group is a buffer per group.
+        // The same unsaved text in each is written once and the other copies
+        // marked saved: a second write would read the first as a change on
+        // disk. Different texts are not settled by writing whichever group
+        // comes first, so neither is written. Each path with more than one
+        // unsaved copy, with how many and whether they hold one text.
+        let mut copies: Vec<(PathBuf, usize, bool)> = Vec::new();
+        if only.is_none() {
+            let mut seen: Vec<(PathBuf, &Editor)> = Vec::new();
+            for ed in std::iter::once(&self.editor)
+                .chain(self.editor_layout.inactive_groups())
+                .flat_map(|g| g.editors.iter())
+                .filter(|e| holds_unsaved(e) && e.hex.is_none() && e.sheet.is_none())
+            {
+                let Some(path) = ed.path.clone() else {
+                    continue;
+                };
+                match seen.iter().find(|(p, _)| *p == path) {
+                    Some((_, first)) => {
+                        let same = first.lines == ed.lines
+                            && first.bytes_for_disk() == ed.bytes_for_disk();
+                        match copies.iter_mut().find(|(p, ..)| *p == path) {
+                            Some((_, n, one_text)) => {
+                                *n += 1;
+                                *one_text &= same;
+                            }
+                            None => copies.push((path, 2, same)),
+                        }
+                    }
+                    None => seen.push((path, ed)),
+                }
+            }
+        }
+        let mut saved: Vec<(PathBuf, crate::provenance::Provenance, Option<Vec<u8>>)> = Vec::new();
+        // The saved text of each, for the language server's didSave (#854).
+        let mut saved_texts: Vec<String> = Vec::new();
+        let mut left: Vec<(Option<PathBuf>, String)> = Vec::new();
+        let mut save = |ed: &mut Editor| {
+            if !holds_unsaved(ed) {
+                return;
+            }
+            let Some(path) = ed.path.clone() else {
+                left.push((None, String::from("no file to save to")));
+                return;
+            };
+            if owner_saves(&path)
+                || (mirrored.contains(&path) && saved.iter().any(|(q, ..)| *q == path))
+            {
+                return;
+            }
+            let reported = left.iter().any(|(q, _)| q.as_ref() == Some(&path));
+            match copies.iter().find(|(p, ..)| *p == path) {
+                Some((_, n, false)) => {
+                    if !reported {
+                        left.push((
+                            Some(path),
+                            format!("open in {n} editor groups with different unsaved text"),
+                        ));
+                    }
+                    return;
+                }
+                Some((_, _, true)) if saved.iter().any(|(q, ..)| *q == path) => {
+                    ed.mark_clean_like_sibling();
+                    return;
+                }
+                // The first copy's save was refused; this one would be too.
+                Some((_, _, true)) if reported => return,
+                _ => {}
+            }
+            if ed.merge.as_ref().is_some_and(|m| m.unresolved_count() > 0) {
+                left.push((Some(path), String::from("merge conflicts left")));
+                return;
+            }
+            let outcome = if ed.hex.is_some() {
+                ed.hex_save(false)
+            } else if ed.sheet.is_some() {
+                ed.sheet_save(false, false)
+            } else {
+                ed.save_to_disk()
+            };
+            let why = match outcome {
+                Ok(SaveOutcome::Saved) if !ed.dirty => {
+                    saved.push((path, ed.provenance_to_record(), ed.bytes_for_disk()));
+                    saved_texts.push(ed.lines.join("\n"));
+                    return;
+                }
+                // A workbook save that held formula cells back names them.
+                Ok(SaveOutcome::Saved) => ed.status.clone(),
+                Ok(SaveOutcome::DiskConflict) => String::from("changed on disk"),
+                Ok(SaveOutcome::EncodingLoss) => {
+                    format!("{} cannot hold every character", ed.encoding.name())
+                }
+                Err(e) => e.to_string(),
+            };
+            left.push((Some(path), why));
+        };
+        match only {
+            Some(idx) => {
+                if let Some(ed) = self.editor.editors.get_mut(idx) {
+                    save(ed);
+                }
+            }
+            None => {
+                self.editor.editors.iter_mut().for_each(&mut save);
+                for group in self.editor_layout.inactive_groups_mut() {
+                    group.editors.iter_mut().for_each(&mut save);
+                }
+            }
+        }
+        if only.is_none() && !saved.is_empty() {
+            self.sync_symbol_views();
+        }
+        // The same follow-ups as every other save path.
+        for (path, ..) in &saved {
+            self.reload_config_for_path(path);
+        }
+        if let Some(lsp) = self.lsp.as_ref() {
+            for ((path, ..), text) in saved.iter().zip(saved_texts) {
+                lsp.save_doc(path.clone(), text);
+            }
+        }
+        for (path, seats, described) in saved {
+            self.record_history_snapshot_of(&path, seats, described);
+        }
+        left.into_iter()
+            .map(|(path, why)| match path {
+                Some(p) => format!("{} ({why})", self.status_path(&p)),
+                None => format!("untitled ({why})"),
+            })
+            .collect()
     }
 
     /// Copy `path` (an editor tab's absolute path) to the system clipboard via
@@ -65789,14 +67128,13 @@ fn is_toggle_wrap_key(key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
-/// Explorer-pane shortcut: `Cmd+Z` — open the zoxide jump popup. `z` for
-/// **z**oxide; the user's shell still uses `j` for the same jump. Requires
-/// SUPER (iTerm2 already forwards Cmd+Z as `Char('z') + SUPER` for the
-/// editor's undo via the `CMD_Z` GlobalKeyMap entry). Off Termux it rejects
-/// CONTROL so a terminal `Ctrl+Z` suspend never reaches it and it stays
-/// distinct from the Ctrl-based terminal-toggle chords on `j`; on Termux,
-/// where Ctrl is the Cmd surrogate, `Ctrl+Z` opens the popup (this predicate
-/// only runs while the Explorer is focused, so there is no suspend to clash).
+/// Explorer-pane shortcut: `Cmd+Z` / `Ctrl+Z` — open the zoxide jump popup.
+/// `z` for **z**oxide; the user's shell still uses `j` for the same jump.
+/// `Ctrl+Z` counts on every platform, as the Make Root chords do (#1294):
+/// xterm, GNOME Terminal, Konsole and tmux never deliver Super, and this
+/// predicate only runs while the Explorer is focused, so a `Ctrl+Z` here is
+/// never a shell's suspend or the editor's undo. The Explorer has no undo
+/// of its own to clash with.
 /// SHIFT is rejected because `Cmd+Shift+Z` is the reserved redo chord.
 /// Editor-pane `Cmd+Z` is untouched: this predicate is only consulted from
 /// `handle_explorer_shortcut`, which runs solely when the Explorer is
@@ -65811,10 +67149,7 @@ fn is_tree_zoxide_jump_key(key: KeyEvent) -> bool {
     if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
         return false;
     }
-    // `has_cmd` is SUPER-only off Termux (so a terminal `Ctrl+Z` suspend is
-    // never swallowed); on Termux Ctrl is the command key, and this predicate
-    // only runs while the Explorer is focused, so there is no suspend to clash.
-    has_cmd(key.modifiers)
+    key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
 /// Explorer-pane shortcut: `Cmd+F` / `Ctrl+F` (no Shift, no Alt) - "New File".
@@ -66172,13 +67507,31 @@ fn is_cmd_shift_letter(key: KeyEvent, letter: char) -> bool {
     has_shift && has_ctrl_or_super
 }
 
-/// The status after snippets.json is saved: a file that loaded nothing
-/// says so, with the detail in OUTPUT (#1191), as keybindings.json does.
-fn snippets_reload_status(broken: bool) -> String {
+/// Load the snippets file, writing what could not be read to OUTPUT ·
+/// Snippets: one bad entry used to empty the whole set without a word (#1483).
+fn load_snippets(path: &std::path::Path) -> crate::snippets::SnippetSet {
+    let set = crate::snippets::SnippetSet::load(path);
+    for w in set.warnings() {
+        crate::output::push("Snippets", crate::output::OutputLevel::Warn, w);
+    }
+    set
+}
+
+/// The status line shown after a snippets reload, tested the same way. A
+/// file that loaded nothing says so, with the detail in OUTPUT (#1191), as
+/// keybindings.json does; skipped entries are counted (#1483).
+fn snippets_reload_status(broken: bool, warns: &[String]) -> String {
     if broken {
-        String::from("Snippets not loaded: the file does not parse — see OUTPUT · Snippets")
-    } else {
-        String::from("Snippets reloaded")
+        return String::from(
+            "Snippets not loaded: the file does not parse — see OUTPUT · Snippets",
+        );
+    }
+    match warns.len() {
+        0 => String::from("Snippets reloaded"),
+        n => format!(
+            "Snippets reloaded with {n} warning{} — see OUTPUT · Snippets",
+            if n == 1 { "" } else { "s" }
+        ),
     }
 }
 
@@ -69890,6 +71243,9 @@ pub fn run(
             Ok(state) => {
                 app.apply_session_state(&state);
                 let _ = std::fs::remove_file(session_path);
+                // The hot-exit backup follows what the relaunch brought
+                // back (#862), at once rather than after the first edit.
+                let _ = app.write_hot_exit();
             }
             // Kept: it may hold the only copy of unsaved text.
             Err(e) => {
@@ -69899,6 +71255,10 @@ pub fn run(
                 );
             }
         }
+    } else {
+        // A normal launch brings back what hot exit kept of this workspace
+        // when croft last ended without a clean quit (#862).
+        app.restore_hot_exit();
     }
     // `--zen`: hide the Explorer sidebar and terminal so the editor fills the
     // window. "Move/Copy into New Window" launches the new window this way so it
@@ -70027,6 +71387,13 @@ pub fn run(
     // Snapshot the terminal panel for the next launch (cwds are read live
     // here, so plain `cd`s during the session are captured at quit).
     app.save_terminal_session();
+    // Quitting mid-debug ends the program as Stop Debugging does (#1536):
+    // nothing sent `disconnect` here, and the debuggee outlived croft.
+    // The teardowns run while the terminal is restored and are joined
+    // below, before any exit path.
+    if !app.debug_sessions.is_empty() {
+        app.debug_stop();
+    }
 
     disable_raw_mode().ok();
     {
@@ -70066,7 +71433,13 @@ pub fn run(
     // disabled, pilot death): those threads race process exit, and a thread
     // that dies mid-grace-kill leaves the claude child running.
     crate::pair_host::join_teardowns();
+    crate::dap::transport::join_teardowns();
 
+    // What croft could not do on the way out, said once the shell is the
+    // user's again (#862).
+    for note in app.exit_notes.drain(..) {
+        eprintln!("croft: {note}");
+    }
     result?;
     if app.drop_to_local {
         std::process::exit(crate::remote::DROP_TO_LOCAL_EXIT_CODE);
@@ -70600,6 +71973,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.refresh_terminal_labels() | app.drain_agent_events() | app.drain_fleet_results();
         app.flush_terminal_session();
         let auto_save_changed = app.tick_auto_save();
+        app.tick_hot_exit(std::time::Instant::now());
         let highlights_changed = app.poll_highlights();
         let live_run_changed =
             app.tick_live_run() | app.sync_markdown_scroll() | app.tick_minimap();
@@ -70615,6 +71989,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let http_changed = app.drain_http_responses();
         let reveal_changed = app.tick_redaction_reveal();
         app.sync_lsp();
+        app.send_due_completion_reask();
         let markdown_lint_changed = app.sync_markdown_lint();
         let sarif_diagnostics_changed = app.sync_sarif_diagnostics();
         app.sync_sarif_selection_to_cursor();
