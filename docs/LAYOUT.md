@@ -22,7 +22,7 @@ Each section is individually collapsible, grows to at most half the region, and 
 
 ![Search: find TODO across the workspace and open a hit at its line](images/search.gif)
 
-`Cmd`/`Ctrl`+`Shift`+`F` opens Search in the sidebar: find in files on the ripgrep engine as you type, with match case, whole word and regex toggles (`Aa`, `ab`, `.*`), "files to include" / "files to exclude" globs behind the `⋯`, and Replace All. A regex that won't compile, such as an unclosed `(` or a look-ahead, shows its error (`Invalid regex: unclosed group`) where the result count would be. Click a hit to open the file at that line.
+`Cmd`/`Ctrl`+`Shift`+`F` opens Search in the sidebar: find in files on the ripgrep engine as you type, with match case, whole word and regex toggles (`Aa`, `ab`, `.*`), "files to include" / "files to exclude" globs behind the `⋯`, and Replace All. A regex that won't compile, such as an unclosed `(` or a look-ahead, shows its error (`Invalid regex: unclosed group`) where the result count would be. Click a hit to open the file at that line. Dotfiles and dot-directories such as `.env` and `.github/workflows` are searched unless gitignored; the `.git` store never is.
 
 ### Activity bar
 

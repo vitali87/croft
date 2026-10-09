@@ -382,9 +382,15 @@ pub fn search_workspace_streaming_filtered<F>(
     let Some(matcher) = build_matcher(q, opts) else {
         return;
     };
+    // Dotfiles are searched (#1648): `.env`, `.github/workflows` and lint
+    // configs are among the files most searched, and Quick Open already
+    // lists them. `hidden(true)` skipped every dot-entry, whole `.github`
+    // tree included. A repository's own store stays out, as VS Code's
+    // default `files.exclude` keeps it out.
     let walker = WalkBuilder::new(root)
         .git_ignore(true)
-        .hidden(true)
+        .hidden(false)
+        .filter_entry(|entry| entry.depth() == 0 || !is_vcs_store(entry.file_name()))
         .build_parallel();
     let root = root.to_path_buf();
     walker.run(|| {
@@ -433,6 +439,16 @@ pub fn search_workspace_streaming_filtered<F>(
             WalkState::Continue
         })
     });
+}
+
+/// A version-control store (`.git`, `.hg`, `.svn`, `.bzr`, `CVS`): never
+/// searched, as VS Code's default `files.exclude` keeps it out. `.git` can be
+/// a worktree's gitlink file as well as a directory.
+fn is_vcs_store(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some(".git" | ".hg" | ".svn" | ".bzr" | "CVS")
+    )
 }
 
 /// Aggregating wrapper around `search_workspace_streaming`. Returns every
@@ -2905,6 +2921,76 @@ mod tests {
             .collect();
         assert!(names.contains(&"a.txt".to_string()));
         assert!(names.contains(&"b.rs".to_string()));
+    }
+
+    /// #1648's repro: a git repo with `SECRET_TOKEN` in a source file, in
+    /// dotfiles and under a dot-directory, and in gitignored copies.
+    fn dotfile_repo() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        fs::create_dir_all(root.join("node_modules/x")).unwrap();
+        write(&root.join(".gitignore"), "node_modules/\n*.log\n");
+        write(&root.join("src/app.js"), "const SECRET_TOKEN = 1;\n");
+        write(&root.join(".env"), "SECRET_TOKEN=abc\n");
+        write(&root.join(".github/workflows/ci.yml"), "SECRET_TOKEN\n");
+        write(&root.join("node_modules/x/index.js"), "SECRET_TOKEN\n");
+        write(&root.join("debug.log"), "SECRET_TOKEN\n");
+        write(&root.join(".git/SECRET_TOKEN_NOTE"), "SECRET_TOKEN\n");
+        tmp
+    }
+
+    fn hit_paths(root: &Path, query: &str) -> Vec<String> {
+        let mut paths: Vec<String> = search_workspace(root, query, SearchOpts::default())
+            .into_iter()
+            .map(|h| {
+                h.path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// #1648: dotfiles and dot-directories that are not gitignored are
+    /// searched, as in VS Code and as Quick Open already lists them.
+    #[test]
+    fn search_finds_matches_in_dotfiles_and_dot_directories() {
+        let tmp = dotfile_repo();
+        assert_eq!(
+            hit_paths(tmp.path(), "SECRET_TOKEN"),
+            [".env", ".github/workflows/ci.yml", "src/app.js"]
+        );
+    }
+
+    /// #1648 negative: gitignored files and the VCS's own directory stay
+    /// out of the results.
+    #[test]
+    fn search_still_skips_gitignored_files_and_vcs_internals() {
+        let tmp = dotfile_repo();
+        for vcs in [".hg", ".svn"] {
+            fs::create_dir_all(tmp.path().join(vcs)).unwrap();
+            write(&tmp.path().join(vcs).join("store"), "SECRET_TOKEN\n");
+        }
+        let paths = hit_paths(tmp.path(), "SECRET_TOKEN");
+        for skipped in ["node_modules", "debug.log", ".git/", ".hg/", ".svn/"] {
+            assert!(
+                paths.iter().all(|p| !p.starts_with(skipped)),
+                "{skipped} must not be searched: {paths:?}"
+            );
+        }
+        assert!(hit_paths(tmp.path(), "core.bare").is_empty());
     }
 
     #[test]
