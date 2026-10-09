@@ -49,6 +49,21 @@ impl Default for LayoutPrefs {
     }
 }
 
+/// When a paste of more than one line into a terminal asks first (#1274),
+/// VS Code's `terminal.integrated.enableMultiLinePasteWarning`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MultilinePasteWarning {
+    /// Only when the program in the pane has not turned on bracketed paste,
+    /// so each line would run the moment it lands.
+    #[default]
+    Auto,
+    /// Before every multi-line paste.
+    Always,
+    /// Never.
+    Never,
+}
+
 /// Which of the Explorer's stacked sub-views are shown, toggled from the
 /// "Views and More Actions" (⋯) menu on the EXPLORER header. Mirrors VS Code's
 /// defaults: Open Editors hidden, every other view shown. Each field carries
@@ -382,6 +397,13 @@ pub struct Prefs {
     /// macOS; off by default. Applies to panes opened after the change.
     #[serde(default)]
     pub terminal_persistent_panes: bool,
+    /// Whether a multi-line paste into a terminal asks before it is written
+    /// (#1274): `auto` (the default) asks only when the pane's program has
+    /// not turned on bracketed paste, `always` asks for every multi-line
+    /// paste, `never` never asks. User layers only: a cloned repo must not
+    /// switch the guard off.
+    #[serde(default)]
+    pub terminal_multiline_paste_warning: MultilinePasteWarning,
     /// What exported navigator comments start with (#368), marking them as
     /// AI-authored on GitHub. Unset means `[AI, croft navigator] `; an
     /// empty string turns the marker off.

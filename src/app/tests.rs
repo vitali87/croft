@@ -4346,6 +4346,21 @@ fn run_selected_text_sends_the_selection_and_enter_to_the_terminal() {
     assert!(app.show_terminal, "the terminal is shown");
 }
 
+/// #1274: Run Selected Text is not a paste to confirm, even with the
+/// multi-line warning always on; the lines and their Enter go together.
+#[test]
+fn run_selected_text_skips_the_multiline_paste_confirm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "explore.py", "a = 1\nb = 2\n");
+    app.multiline_paste_warning = crate::prefs::MultilinePasteWarning::Always;
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 0),
+        head: (1, 5),
+    });
+    assert_eq!(unbracketed(&run_selected_text(&mut app)), "a = 1\nb = 2\r");
+    assert!(app.pending_terminal_paste.is_none(), "nothing held");
+}
+
 /// #1292: a multi-line block arrives as one bracketed paste when the
 /// program in the pane asked for it, and Enter follows outside it.
 #[test]
@@ -78112,6 +78127,207 @@ fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
     );
     assert_eq!(tab_names_852(&app.editor), ["c.rs", "a.rs", "b.rs"]);
     assert_eq!(app.status, "Tab is already kept open");
+}
+
+// ---- Multi-line paste into a terminal without bracketed paste (#1274) ----
+
+/// An app whose active pane runs a program that never turns on bracketed
+/// paste (`sh` reading a line), focused, with nothing written yet.
+fn plain_paste_app() -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from("sleep 30")],
+        tmp.path(),
+    )
+    .unwrap();
+    app.active_terminal = 0;
+    app.focus_pane(Pane::Terminal);
+    (app, tmp)
+}
+
+fn pasted(app: &App) -> String {
+    String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()).into_owned()
+}
+
+const TWO_LINES: &str = "echo first-line\ntouch pasted-ran\n";
+
+#[test]
+fn a_multiline_paste_into_a_plain_shell_waits_for_confirmation() {
+    let (mut app, _tmp) = plain_paste_app();
+    app.handle_paste(TWO_LINES);
+    assert_eq!(pasted(&app), "", "nothing runs before the user agrees");
+    assert!(app.pending_terminal_paste.is_some());
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(pasted(&app), TWO_LINES);
+    assert!(app.pending_terminal_paste.is_none());
+}
+
+/// The confirm popup disarms a pending Cmd+K chord: its next key answers the
+/// popup, it does not finish the chord (Cmd+K I is the broadcast toggle).
+#[test]
+fn a_multiline_paste_confirm_disarms_a_pending_cmd_k_chord() {
+    let (mut app, _tmp) = plain_paste_app();
+    app.cmd_k_leader = Some(std::time::Instant::now());
+    app.handle_paste(TWO_LINES);
+    assert!(app.pending_terminal_paste.is_some());
+    assert!(app.cmd_k_leader.is_none(), "the chord is disarmed");
+    app.handle_key(key(KeyCode::Char('i'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.pending_broadcast_enable, "no broadcast prompt");
+    assert!(!app.broadcast_input);
+}
+
+#[test]
+fn a_multiline_paste_can_go_in_as_one_line() {
+    let (mut app, _tmp) = plain_paste_app();
+    app.handle_paste("echo a\r\n  echo b\r\n\r\n");
+    app.handle_key(key(KeyCode::Char('l'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(pasted(&app), "echo a   echo b");
+}
+
+#[test]
+fn a_cancelled_multiline_paste_writes_nothing() {
+    let (mut app, _tmp) = plain_paste_app();
+    app.handle_paste(TWO_LINES);
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(pasted(&app), "");
+    assert!(app.pending_terminal_paste.is_none());
+    // The next key is typing again, not an answer to the popup.
+    app.handle_key(key(KeyCode::Char('l'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(pasted(&app), "l");
+}
+
+#[test]
+fn the_confirmation_says_how_many_lines_will_run() {
+    let (mut app, _tmp) = plain_paste_app();
+    app.handle_paste(TWO_LINES);
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(screen.contains("PASTE 2 LINES"), "{screen}");
+}
+
+#[test]
+fn a_bracketed_paste_or_a_single_line_goes_straight_in() {
+    // Negative: a shell that brackets pastes runs nothing until Enter, and
+    // one line with no line break runs nothing either.
+    let (mut app, _tmp) = plain_paste_app();
+    app.handle_paste("echo one-line");
+    assert_eq!(pasted(&app), "echo one-line");
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?2004h");
+    app.handle_paste(TWO_LINES);
+    assert!(app.pending_terminal_paste.is_none());
+    assert!(
+        pasted(&app).ends_with(&format!("\x1b[200~{TWO_LINES}\x1b[201~")),
+        "{:?}",
+        pasted(&app)
+    );
+}
+
+#[test]
+fn the_multiline_paste_warning_follows_its_setting() {
+    use crate::prefs::MultilinePasteWarning;
+    let (mut app, _tmp) = plain_paste_app();
+    app.multiline_paste_warning = MultilinePasteWarning::Never;
+    app.handle_paste(TWO_LINES);
+    assert_eq!(pasted(&app), TWO_LINES, "never: straight in");
+    let (mut app, _tmp) = plain_paste_app();
+    app.multiline_paste_warning = MultilinePasteWarning::Always;
+    app.terminals[0].feed_bytes_for_test(b"\x1b[?2004h");
+    app.handle_paste(TWO_LINES);
+    assert!(
+        app.pending_terminal_paste.is_some(),
+        "always: asks even when bracketed"
+    );
+    assert_eq!(pasted(&app), "");
+}
+
+#[test]
+fn a_second_paste_while_asking_is_refused_and_the_first_still_waits() {
+    // The popup holds the first paste; a later one, multi-line or not,
+    // neither replaces it nor slips into the shell behind the popup.
+    let (mut app, _tmp) = plain_paste_app();
+    app.handle_paste(TWO_LINES);
+    app.handle_paste("rm -rf build\nls\n");
+    app.handle_paste("echo sneaked");
+    assert_eq!(pasted(&app), "", "nothing reaches the shell");
+    assert_eq!(app.status, "Resolve the pending paste before pasting again");
+    assert_eq!(
+        app.pending_terminal_paste.as_deref(),
+        Some(TWO_LINES.as_bytes()),
+        "the first paste is the one still asked about"
+    );
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(pasted(&app), TWO_LINES);
+}
+
+/// Two panes, the first active and maximized so each has a rail row,
+/// drawn once so the rows are laid out.
+fn two_pane_paste_app() -> (App, tempfile::TempDir) {
+    let (mut app, tmp) = plain_paste_app();
+    app.split_terminal().unwrap();
+    app.active_terminal = 0;
+    app.focus_pane(Pane::Terminal);
+    app.terminal_pane_maximized = true;
+    draw(&mut app, 180, 40);
+    (app, tmp)
+}
+
+#[test]
+fn a_click_while_asking_cannot_move_the_paste_to_another_pane() {
+    // The paste was checked against the active pane; a click on another
+    // pane's rail row must not send it there instead.
+    let (mut app, _tmp) = two_pane_paste_app();
+    app.handle_paste(TWO_LINES);
+    let other = app.terminal_rail_rects[1];
+    left_click(&mut app, other.x + 1, other.y);
+    assert_eq!(app.active_terminal, 0, "the click is ignored while asking");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(pasted(&app), TWO_LINES, "the checked pane gets the paste");
+}
+
+#[test]
+fn once_the_paste_is_answered_clicks_and_pastes_work_again() {
+    // Negative: the guards last only while the popup is up.
+    let (mut app, _tmp) = two_pane_paste_app();
+    app.handle_paste(TWO_LINES);
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_paste("echo again");
+    assert_eq!(pasted(&app), "echo again");
+    let other = app.terminal_rail_rects[1];
+    left_click(&mut app, other.x + 1, other.y);
+    assert_eq!(app.active_terminal, 1, "the rail row switches panes again");
+}
+
+#[test]
+fn the_multiline_paste_warning_setting_parses() {
+    use crate::prefs::{MultilinePasteWarning, Prefs};
+    let p: Prefs = serde_json::from_str(r#"{"terminal_multiline_paste_warning":"never"}"#).unwrap();
+    assert_eq!(
+        p.terminal_multiline_paste_warning,
+        MultilinePasteWarning::Never
+    );
+    let p: Prefs = serde_json::from_str("{}").unwrap();
+    assert_eq!(
+        p.terminal_multiline_paste_warning,
+        MultilinePasteWarning::Auto
+    );
 }
 
 // ---- Git diffs of files that aren't UTF-8 (#1242) ----
