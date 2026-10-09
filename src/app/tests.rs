@@ -78114,6 +78114,115 @@ fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
     assert_eq!(app.status, "Tab is already kept open");
 }
 
+// --- #1215: keys that move the caret sideways scroll the view to it -----------
+
+fn wide_line_app(tmp: &std::path::Path) -> (App, ratatui::Terminal<ratatui::backend::TestBackend>) {
+    let line = format!(
+        "start {} END",
+        (0..120)
+            .map(|i| format!("w{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let mut app = app_with_open_file(tmp, "h300.txt", &format!("{line}\nshort\n"));
+    app.focus_pane(Pane::Editor);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    (app, term)
+}
+
+fn caret_on_screen(app: &App) -> bool {
+    let bar = usize::from(app.editor.last_scrollbar.width > 0);
+    let width = (app.editor.last_inner.width as usize)
+        .saturating_sub(app.editor.last_gutter_width as usize + 2 + bar);
+    app.editor.cursor_col >= app.editor.scroll_col
+        && app.editor.cursor_col < app.editor.scroll_col + width
+}
+
+#[test]
+fn end_on_a_wide_line_scrolls_the_caret_into_view() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _term) = wide_line_app(tmp.path());
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.cursor_col, 609);
+    assert!(app.editor.scroll_col > 0, "the view follows the caret");
+    assert!(
+        caret_on_screen(&app),
+        "scroll_col {}",
+        app.editor.scroll_col
+    );
+}
+
+#[test]
+fn typing_past_the_right_edge_keeps_the_caret_in_view() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _term) = wide_line_app(tmp.path());
+    app.editor.cursor_col = 60;
+    for _ in 0..40 {
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(app.editor.cursor_col, 100);
+    assert!(
+        caret_on_screen(&app),
+        "scroll_col {}",
+        app.editor.scroll_col
+    );
+}
+
+#[test]
+fn home_after_scrolling_right_brings_the_view_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _term) = wide_line_app(tmp.path());
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    app.editor.scroll_col = 500;
+    app.editor.cursor_col = 600;
+    app.handle_key(key(KeyCode::Home, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.cursor_col, 0);
+    assert_eq!(app.editor.scroll_col, 0);
+}
+
+#[test]
+fn shift_end_extends_the_selection_and_follows_the_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _term) = wide_line_app(tmp.path());
+    app.handle_key(key(KeyCode::End, KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(app.editor.selection.is_some());
+    assert!(
+        caret_on_screen(&app),
+        "scroll_col {}",
+        app.editor.scroll_col
+    );
+}
+
+#[test]
+fn enter_at_the_end_of_a_wide_line_scrolls_back_to_column_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _term) = wide_line_app(tmp.path());
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    app.editor.scroll_col = 560;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 0));
+    assert_eq!(app.editor.scroll_col, 0);
+}
+
+#[test]
+fn end_on_a_short_line_leaves_the_view_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _term) = wide_line_app(tmp.path());
+    app.editor.cursor_row = 1;
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.cursor_col, 5);
+    assert_eq!(app.editor.scroll_col, 0);
+}
+
 // ---- Git diffs of files that aren't UTF-8 (#1242) ----
 
 /// A repo with `name` committed as `head` bytes, then `head + added` on disk.

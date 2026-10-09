@@ -43340,6 +43340,7 @@ impl App {
                 _ => {}
             }
             self.editor.extend_selection_to_cursor();
+            self.editor.ensure_cursor_col_visible();
             return;
         }
         if is_motion {
@@ -43399,6 +43400,10 @@ impl App {
             }
             _ => {}
         }
+        // Home, End, typing, Backspace, Delete and Enter move the caret
+        // sideways too; only ←/→ pulled the view along, so End on a wide
+        // line or typing past the edge left the caret off-screen (#1215).
+        self.editor.ensure_cursor_col_visible();
     }
 
     /// Vim-style chord layer for the editor: `cmd+gg` jumps to top, `cmd+G`
