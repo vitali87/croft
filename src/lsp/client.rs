@@ -499,8 +499,16 @@ impl LspClient {
             exited_for_loop.store(true, Ordering::Release);
         });
 
+        // `rootUri` and `rootPath` are deprecated for `workspaceFolders` but
+        // still sent, as VS Code and Neovim do: `rootUri` is a required
+        // field, null there means "no folder is open", and a server that
+        // reads it (lua-language-server) then never loads the workspace and
+        // answers nothing (#1517).
+        #[allow(deprecated)]
         let params = serde_json::to_value(InitializeParams {
             process_id: Some(std::process::id()),
+            root_path: Some(workspace_root.display().to_string()),
+            root_uri: Some(workspace_folders[0].uri.clone()),
             capabilities: client_capabilities,
             initialization_options: config.initialization_options.clone(),
             workspace_folders: Some(workspace_folders),

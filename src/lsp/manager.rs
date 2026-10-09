@@ -10493,6 +10493,130 @@ while True:
         handle.block_on(state.shutdown_all());
     }
 
+    /// The `initialize` params a language server is sent for a workspace at
+    /// `dir_name` under a temp dir, as JSON, with that workspace's path.
+    fn initialize_params_for_workspace(dir_name: &str) -> (serde_json::Value, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp
+            .path()
+            .canonicalize()
+            .expect("canonicalize")
+            .join(dir_name);
+        std::fs::create_dir_all(&root).expect("workspace");
+        let script = tmp.path().join("fake_lsp.py");
+        let params = tmp.path().join("initialize.json");
+        // The recorder's message plumbing, with a loop that saves the
+        // initialize params instead of logging methods.
+        let head = FAKE_LSP_RECORDER
+            .split("\nwhile True:")
+            .next()
+            .expect("recorder head");
+        std::fs::write(
+            &script,
+            format!(
+                "{head}\n\
+                 while True:\n    msg = read_msg()\n    if msg is None:\n        break\n\
+                 \x20   if msg.get('method') == 'exit':\n        break\n\
+                 \x20   if msg.get('method') == 'initialize':\n\
+                 \x20       open(sys.argv[2], 'w').write(json.dumps(msg['params']))\n\
+                 \x20       send({{'jsonrpc': '2.0', 'id': msg['id'], 'result': {{'capabilities': {{}}}}}})\n\
+                 \x20   elif 'id' in msg:\n\
+                 \x20       send({{'jsonrpc': '2.0', 'id': msg['id'], 'result': None}})\n"
+            ),
+        )
+        .expect("write fake server");
+        let mut registry = ServerRegistry::new();
+        registry.register(
+            Language::PYTHON,
+            ServerConfig {
+                name: "fake-initialize",
+                command: "python3".into(),
+                args: vec![
+                    script.display().to_string(),
+                    tmp.path().join("methods.log").display().to_string(),
+                    params.display().to_string(),
+                ],
+                language: Language::PYTHON,
+                initialization_options: None,
+                provision: None,
+            },
+        );
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut state = WorkerState {
+            workspace_root: root.clone(),
+            extra_roots: Vec::new(),
+            registry,
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+            restarts: ServerRestarts::default(),
+        };
+        let runtime = LspRuntime::new().expect("runtime");
+        let py = root.join("main.py");
+        std::fs::write(&py, "x = 1\n").expect("write py");
+        runtime
+            .handle()
+            .clone()
+            .block_on(state.open_doc(py, String::from("x = 1\n")));
+        crate::test_budget::await_spawned(
+            Duration::from_secs(5),
+            "the fake server to receive initialize",
+            || params.is_file(),
+        );
+        runtime.handle().clone().block_on(state.shutdown_all());
+        let json = std::fs::read_to_string(&params).expect("initialize params");
+        (serde_json::from_str(&json).expect("json"), root)
+    }
+
+    /// #1517: `initialize` sent `rootUri: null` beside `workspaceFolders`.
+    /// `rootUri` is deprecated but still required, and null means "no folder
+    /// is open": lua-language-server then never loads the workspace and
+    /// answers nothing. It now names the workspace, as VS Code and Neovim
+    /// do, with `rootPath` for servers older still.
+    #[test]
+    fn initialize_names_the_workspace_as_root_uri_and_root_path() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let (params, root) = initialize_params_for_workspace("lp");
+        let folder = &params["workspaceFolders"][0]["uri"];
+        assert!(
+            folder.is_string(),
+            "workspaceFolders is still sent: {params}"
+        );
+        assert_eq!(
+            &params["rootUri"], folder,
+            "rootUri is the workspace folder"
+        );
+        assert_eq!(params["rootPath"], root.display().to_string());
+    }
+
+    /// Negative: a workspace path that needs escaping gives `rootUri` the
+    /// same percent-encoded URI as its workspace folder, and `rootPath`
+    /// the plain path, not the URI.
+    #[test]
+    fn root_uri_matches_the_workspace_folder_for_a_path_with_spaces() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let (params, root) = initialize_params_for_workspace("my lua project");
+        let uri = params["rootUri"].as_str().expect("rootUri is set");
+        assert!(
+            uri.starts_with("file:///") && uri.ends_with("my%20lua%20project"),
+            "{uri}"
+        );
+        assert_eq!(&params["rootUri"], &params["workspaceFolders"][0]["uri"]);
+        assert_eq!(params["rootPath"], root.display().to_string());
+    }
+
     /// Open, save and close one document against [`FAKE_LSP_RECORDER`]
     /// advertising `capabilities` (a Python literal), and return the method
     /// log once the close has arrived (#854).
