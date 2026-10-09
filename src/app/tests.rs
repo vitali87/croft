@@ -79535,15 +79535,21 @@ fn discard_and_replace_all_confirmations_are_announced() {
     app.pending_replace_all = Some((3, 2, 1));
     let snap = app.a11y_snapshot();
     assert_eq!(snap.focus, "Replace all?");
-    assert_eq!(
-        snap.item.as_deref(),
-        Some(
+    // Longer than an announcement holds: the middle is cut, not the keys.
+    let item = snap.item.unwrap_or_default();
+    assert!(
+        item.starts_with(
             "Replace 3 occurrence(s) across 2 file(s) with \"total\"? \
              Files are rewritten on disk. \
-             1 open file(s) with unsaved changes will be skipped. \
-             Enter or Y, replace. Escape, cancel"
-        )
+             1 open file(s) with unsaved changes"
+        ),
+        "{item}"
     );
+    assert!(
+        item.ends_with("… Enter or Y, replace. Escape, cancel"),
+        "{item}"
+    );
+    assert!(item.chars().count() <= crate::a11y::MAX_LINE, "{item}");
 }
 
 /// #1584 (comment): the Settings editor reads its target layer and the
@@ -79580,10 +79586,101 @@ fn the_settings_editor_and_an_input_prompt_are_announced() {
     assert_eq!(before.focus, "Review Pull Request");
     assert_eq!(
         before.item.as_deref(),
-        Some("Enter to confirm, Escape to cancel")
+        Some("number or URL. Enter to confirm, Escape to cancel")
     );
     app.input_prompt.as_mut().unwrap().value = String::from("12");
     assert_eq!(app.a11y_snapshot(), before, "typing is not re-read");
+}
+
+/// #1584 (comment): Add Remote asks for the name, then replaces that
+/// prompt with one for the URL under the same title and keys. The field's
+/// instruction tells the two apart, so the second step is announced; the
+/// typed name is not part of either.
+#[test]
+fn a_prompt_replaced_by_the_next_step_under_the_same_title_is_announced() {
+    use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.screen_reader = true;
+    app.open_input_prompt(InputPrompt::new(
+        InputPurpose::AddRemoteName,
+        "Add Remote",
+        "Remote name (e.g. origin)",
+    ));
+    draw_and_cursor(&mut app);
+    let first = app.announcer.line.clone();
+    assert!(first.contains("Remote name (e.g. origin)"), "{first}");
+    app.input_prompt.as_mut().unwrap().value = String::from("upstream");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let p = app.input_prompt.as_ref().expect("the URL step opened");
+    assert_eq!(p.title, "Add Remote");
+    let snap = app.a11y_snapshot();
+    assert_eq!(
+        snap.item.as_deref(),
+        Some("Remote URL. Enter to confirm, Escape to cancel")
+    );
+    draw_and_cursor(&mut app);
+    let second = app.announcer.line.clone();
+    assert_ne!(second, first);
+    assert!(second.contains("Remote URL"), "{second}");
+    assert!(!second.contains("upstream"), "the typed value is not read");
+}
+
+/// #1584 (comment): a long command, path or file list is cut so the keys
+/// at the end of a confirmation still fit the announcement.
+#[test]
+fn a_long_confirmation_still_announces_its_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.screen_reader = true;
+    app.pending_discard = Some(PendingDiscard {
+        rel_path: format!("src/{}/seed.txt", "deeply/nested".repeat(30)),
+        untracked: false,
+        staged: false,
+    });
+    draw_and_cursor(&mut app);
+    let said = app.announcer.line.clone();
+    assert!(said.starts_with("Discard changes?"), "{said}");
+    assert!(
+        said.contains("… Y, yes, discard. N or Escape, no"),
+        "the keys survive: {said}"
+    );
+    assert!(said.contains('…'), "the path is what was cut: {said}");
+    app.pending_discard = None;
+    app.search.replace = "x".repeat(400);
+    app.pending_replace_all = Some((3, 2, 0));
+    let item = app.a11y_snapshot().item.unwrap_or_default();
+    assert!(item.chars().count() <= crate::a11y::MAX_LINE, "{item}");
+    assert!(
+        item.ends_with("Enter or Y, replace. Escape, cancel"),
+        "{item}"
+    );
+}
+
+/// #1584 (comment): an agent's edit proposal takes every key, so screen
+/// reader mode reads it, not the editor behind it: who wants to change
+/// which file, and the popup's keys in its current state.
+#[test]
+fn an_incoming_approval_is_announced_with_its_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.rs");
+    std::fs::write(&file, "let x = 1;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let _hook = queue_edit_proposal(&mut app, tmp.path(), &file, "1", "2");
+    assert!(app.approval_ui.is_some(), "setup: the popup opened");
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "claude-code wants to edit a.rs");
+    assert_eq!(snap.line, None, "not the editor under the popup");
+    let item = snap.item.unwrap_or_default();
+    for part in ["Enter, approve", "Escape, deny", "R, deny with a reason"] {
+        assert!(item.contains(part), "{part:?} missing from {item:?}");
+    }
+    app.approval_ui.as_mut().unwrap().reason = Some(String::from("no"));
+    assert_eq!(
+        app.a11y_snapshot().item.as_deref(),
+        Some("Type the reason. Enter, send. Escape, back")
+    );
 }
 
 /// Negative (#1584): with no dialog open the snapshot is the focused

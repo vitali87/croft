@@ -57838,7 +57838,7 @@ impl App {
         let tr = |s: &str| crate::i18n::tr(s).into_owned();
         // The title, and its sentences joined for speech: a full stop
         // between them unless one already ends in a question mark.
-        let said = |title: &str, parts: &[String]| -> (String, String) {
+        let join = |parts: &[String]| -> String {
             let mut item = String::new();
             for part in parts.iter().map(|p| p.trim().trim_end_matches('.')) {
                 if part.is_empty() {
@@ -57849,26 +57849,74 @@ impl App {
                 }
                 item.push_str(part);
             }
+            item
+        };
+        // What it says, then which key does what. The announcement is cut
+        // at `a11y::MAX_LINE`, so a long path, command or file list is cut
+        // here instead: the keys at the end are always read.
+        let said = |title: &str, body: &[String], actions: &[String]| -> (String, String) {
+            let actions = join(actions);
+            let mut item = join(body);
+            let room = crate::a11y::MAX_LINE.saturating_sub(actions.chars().count() + 2);
+            if item.chars().count() > room {
+                item = if room < 2 {
+                    String::new()
+                } else {
+                    let mut cut: String = item.chars().take(room - 1).collect();
+                    cut.truncate(cut.trim_end().len());
+                    cut.push('…');
+                    cut
+                };
+            }
+            if !item.is_empty() && !actions.is_empty() {
+                item.push_str(if item.ends_with('?') || item.ends_with('…') {
+                    " "
+                } else {
+                    ". "
+                });
+            }
+            item.push_str(&actions);
             (tr(title), item)
         };
         let yes_no = |yes: &str| format!("{}. {}", tr(yes), tr("N or Escape, no"));
         if self.pending_terminal_warning {
             return Some(said(
                 "Unsupported terminal",
-                &[
-                    tr(
-                        "Croft's icons and images need an inline-image protocol this terminal does not support",
-                    ),
-                    tr("Any key dismisses. D, don't show again"),
-                ],
+                &[tr(
+                    "Croft's icons and images need an inline-image protocol this terminal does not support",
+                )],
+                &[tr("Any key dismisses. D, don't show again")],
             ));
         }
+        // An agent's edit proposal takes every key while it is up, so it is
+        // read before anything it covers: who wants to change which file,
+        // and the keys the popup's footer offers in its current state.
+        if let (Some(ui), Some(head)) = (&self.approval_ui, self.approvals.front()) {
+            let title = crate::widgets::approval_popup::title(
+                head,
+                self.approvals.len(),
+                self.workspace_root(),
+            )
+            .trim()
+            .replace(" · ", ", ");
+            let actions = if ui.reason.is_some() {
+                "Type the reason. Enter, send. Escape, back"
+            } else if ui.target_dirty {
+                "Unsaved edits here. Enter, merge them with the agent's. Escape, deny. R, deny with a reason"
+            } else {
+                "Enter, approve. Escape, deny. A, approve all from this agent for 10 minutes. R, deny with a reason. E, edit, then approve"
+            };
+            return Some((title, tr(actions)));
+        }
+        // The field's own instruction ("Remote URL") is read with the keys,
+        // so a prompt replaced by the next step under the same title is
+        // still heard; what is typed is left to the reader's echo.
         if let Some(p) = &self.input_prompt {
             let hint = p
                 .hint
                 .clone()
                 .unwrap_or_else(|| String::from("Enter to confirm, Escape to cancel"));
-            return Some(said(&p.title, &[tr(&hint)]));
+            return Some(said(&p.title, &[tr(&p.placeholder)], &[tr(&hint)]));
         }
         if let Some(ed) = &self.settings_editor {
             let target = if ed.target == crate::config_layers::LayerKind::Workspace {
@@ -57896,8 +57944,8 @@ impl App {
             let names = names.replace("● ", "");
             return Some(said(
                 "Unsaved changes",
+                &[format!("{} {names}", tr(&headline))],
                 &[
-                    format!("{} {names}", tr(&headline)),
                     format!("S, {}", tr(&format!("S{save}"))),
                     format!("D, {}", tr(&format!("D{discard}"))),
                     tr("Escape, cancel"),
@@ -57921,8 +57969,8 @@ impl App {
                         block.cwd.display()
                     ),
                     block.code.lines().collect::<Vec<_>>().join("; "),
-                    yes_no("Y, yes, run"),
                 ],
+                &[yes_no("Y, yes, run")],
             ));
         }
         if self.pending_broadcast_enable {
@@ -57934,14 +57982,12 @@ impl App {
                 .max(1);
             return Some(said(
                 "Broadcast input to all panes?",
-                &[
-                    format!(
-                        "{} {receiving} {}",
-                        tr("Every keystroke and paste will go to"),
-                        tr("terminal panes at once")
-                    ),
-                    yes_no("Y, yes, broadcast"),
-                ],
+                &[format!(
+                    "{} {receiving} {}",
+                    tr("Every keystroke and paste will go to"),
+                    tr("terminal panes at once")
+                )],
+                &[yes_no("Y, yes, broadcast")],
             ));
         }
         if let Some((occurrences, files, skipped)) = self.pending_replace_all {
@@ -57957,8 +58003,11 @@ impl App {
                     "{skipped} open file(s) with unsaved changes will be skipped"
                 ));
             }
-            parts.push(tr("Enter or Y, replace. Escape, cancel"));
-            return Some(said("Replace all?", &parts));
+            return Some(said(
+                "Replace all?",
+                &parts,
+                &[tr("Enter or Y, replace. Escape, cancel")],
+            ));
         }
         if let Some(pending) = &self.pending_unsaved_scm {
             let verb = pending.op.verb();
@@ -57975,13 +58024,13 @@ impl App {
             let n = names.len();
             return Some(said(
                 "Unsaved changes",
+                &[format!(
+                    "{n} file{} {} unsaved changes: {}",
+                    if n == 1 { "" } else { "s" },
+                    if n == 1 { "has" } else { "have" },
+                    names.join(", ")
+                )],
                 &[
-                    format!(
-                        "{n} file{} {} unsaved changes: {}",
-                        if n == 1 { "" } else { "s" },
-                        if n == 1 { "has" } else { "have" },
-                        names.join(", ")
-                    ),
                     format!("S, Save All & {verb}"),
                     format!("C, {verb} Anyway"),
                     tr("Escape, cancel"),
@@ -57991,10 +58040,10 @@ impl App {
         if self.pending_discard_all {
             return Some(said(
                 "Discard all changes?",
-                &[
-                    tr("This reverts every tracked file to HEAD. Untracked files are kept."),
-                    yes_no("Y, yes, discard all"),
-                ],
+                &[tr(
+                    "This reverts every tracked file to HEAD. Untracked files are kept.",
+                )],
+                &[yes_no("Y, yes, discard all")],
             ));
         }
         if let Some(pr) = &self.pending_revert_hunk {
@@ -58003,8 +58052,8 @@ impl App {
                 &[
                     tr("This will undo the change hunk under the cursor on disk."),
                     pr.rel_path.clone(),
-                    yes_no("Y, yes, revert"),
                 ],
+                &[yes_no("Y, yes, revert")],
             ));
         }
         if let Some(pd) = &self.pending_discard {
@@ -58015,7 +58064,8 @@ impl App {
             };
             return Some(said(
                 "Discard changes?",
-                &[tr(warn), pd.rel_path.clone(), yes_no("Y, yes, discard")],
+                &[tr(warn), pd.rel_path.clone()],
+                &[yes_no("Y, yes, discard")],
             ));
         }
         if let Some(url) = &self.pending_local_open {
@@ -58024,12 +58074,12 @@ impl App {
                 &[
                     tr("This URL will open in YOUR LOCAL MAC's browser via the croft relay."),
                     url.clone(),
-                    format!(
-                        "{}. {}",
-                        tr("Y, yes once. A, always for this session"),
-                        tr("N or Escape, no")
-                    ),
                 ],
+                &[format!(
+                    "{}. {}",
+                    tr("Y, yes once. A, always for this session"),
+                    tr("N or Escape, no")
+                )],
             ));
         }
         None
