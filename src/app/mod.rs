@@ -13294,18 +13294,31 @@ impl App {
     /// user left (#1635): Go Back knew only the jumps that recorded
     /// themselves, so the usual way of changing file left nothing to go
     /// back to. A gesture that recorded or walked the history (Go to
-    /// Definition, Go Back itself) is left as it did it.
+    /// Definition, Go Back itself) is left as it did it, and so is one that
+    /// moved focus to another editor group: a history entry holds no group,
+    /// so Go Back would reopen that group's file in the focused one.
     fn recording_file_switches<R>(&mut self, gesture: impl FnOnce(&mut Self) -> R) -> R {
         let left = self.current_nav_loc();
         let changes = self.nav.changes();
+        let group = self.editor_group_identity();
         let result = gesture(self);
         if let Some(left) = left
             && self.nav.changes() == changes
+            && self.editor_group_identity() == group
             && self.editor.path.as_ref() != Some(&left.path)
         {
             self.nav.record(left);
         }
         result
+    }
+
+    /// Which editor group has focus, as the split's leaf count and the
+    /// focused leaf's position: a change in either is a group change.
+    fn editor_group_identity(&self) -> (usize, usize) {
+        (
+            self.editor_layout.leaf_count(),
+            self.editor_layout.active_dfs_index(),
+        )
     }
 
     fn nav_back(&mut self) {

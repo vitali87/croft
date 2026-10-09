@@ -4244,6 +4244,27 @@ fn go_back_returns_to_the_file_left_by_any_open() {
     assert_eq!(at(&app), (Some(a), 39), "{}", app.status);
 }
 
+/// #1635 negative: moving focus to another editor group showing another
+/// file is not a file switch. A history entry holds no group, so Go Back
+/// would reopen the left group's file in the focused one.
+#[test]
+fn focusing_another_editor_group_records_no_go_back_location() {
+    let (_tmp, mut app, a, b) = nav_switch_fixture();
+    app.split_editor(); // right group (focused) duplicates a.txt
+    app.editor.open_pinned(&b).unwrap();
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()));
+    let changes = app.nav.changes();
+    app.handle_key(key(KeyCode::Left, KeyModifiers::SUPER | KeyModifiers::ALT))
+        .unwrap();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(a.as_path()),
+        "{}",
+        app.status
+    );
+    assert_eq!(app.nav.changes(), changes, "no history entry recorded");
+}
+
 /// #1635: Go to Line, then Quick Open, then Back twice visits the line the
 /// file was left on, then the line before the Go to Line; Forward returns.
 #[test]
