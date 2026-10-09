@@ -1290,6 +1290,7 @@ pub fn commit_all_tracked(root: &Path, message: &str) -> Result<String, String> 
     if message.trim().is_empty() {
         return Err("Commit message is empty".to_string());
     }
+    refuse_unmerged(root)?;
     let path_str = root
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
@@ -2798,6 +2799,51 @@ pub fn clone_into(parent: &Path, url: &str) -> Result<PathBuf, String> {
 }
 
 // --- Commit variants -----------------------------------------------------
+
+/// Paths git still holds as unmerged (`UU`, `AA`, `DU`, …): the MERGE
+/// CONFLICTS group, read straight from the index.
+pub fn unmerged_paths(root: &Path) -> Vec<String> {
+    let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        // `--no-relative`: with `diff.relative` set, a subdirectory root
+        // would hide the conflicts outside it, and `git add -A` stages them.
+        .args(["diff", "--no-relative", "--name-only", "--diff-filter=U", "-z"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let mut paths: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(String::from)
+        .collect();
+    paths.dedup();
+    paths
+}
+
+/// Refuse to commit while a merge still has unresolved conflicts (#989).
+/// `git commit -a` and `git add -A` stage an unmerged file as it is, so the
+/// commit would record its `<<<<<<<` markers; a plain `git commit` refuses
+/// here by itself, and this says the same thing up front for the paths that
+/// stage on the user's behalf.
+pub fn refuse_unmerged(root: &Path) -> Result<(), String> {
+    let paths = unmerged_paths(root);
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut named = paths.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+    if paths.len() > 3 {
+        named.push_str(", …");
+    }
+    let (n, them) = match paths.len() {
+        1 => (String::from("1 merge conflict"), "it"),
+        n => (format!("{n} merge conflicts"), "them"),
+    };
+    Err(format!(
+        "Resolve {n} ({named}) and stage {them} before committing"
+    ))
+}
 
 /// Commit only what is already staged (`git commit -m`), leaving unstaged
 /// changes in the working tree. The mirror of `commit_all_tracked`, which
@@ -6189,6 +6235,123 @@ filename seed.txt
             summary.to_lowercase().contains("up to date") || summary.is_empty(),
             "an up-to-date pull reports no new work (got: {summary:?})"
         );
+    }
+
+    /// #989: the issue's repro, a merge stopped on a conflict in README.md.
+    fn repo_in_a_conflicted_merge() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let script = r#"set -e
+git init -q -b main && git config user.email a@b && git config user.name a
+printf '# Orders\n\nRun `python pricing.py`.\n' > README.md && git add . && git commit -qm init
+git checkout -qb hotfix && sed 's/python pricing.py/python -m pricing/' README.md > README.tmp && mv README.tmp README.md && git commit -qam fix
+git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' README.md > README.tmp && mv README.tmp README.md && git commit -qam uv
+! git merge -q hotfix >/dev/null 2>&1"#;
+        let out = Command::new("sh")
+            .args(["-c", script])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        tmp
+    }
+
+    fn head_of(p: &Path) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(p)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn commit_all_tracked_refuses_while_a_merge_has_unresolved_conflicts() {
+        // `git commit -a` stages an unmerged file as it is, so the merge
+        // commit recorded the conflict markers.
+        let tmp = repo_in_a_conflicted_merge();
+        let p = tmp.path();
+        let before = head_of(p);
+        let err = commit_all_tracked(p, "Merge hotfix").expect_err("the commit must be refused");
+        assert!(
+            err.contains("Resolve 1 merge conflict (README.md)"),
+            "{err}"
+        );
+        assert_eq!(head_of(p), before, "no commit was made");
+        assert_eq!(unmerged_paths(p), vec![String::from("README.md")]);
+        assert!(
+            p.join(".git/MERGE_HEAD").exists(),
+            "the merge is still open"
+        );
+    }
+
+    #[test]
+    fn a_merge_whose_conflicts_are_resolved_and_staged_still_commits() {
+        // Negative: the guard only holds back unresolved paths.
+        let tmp = repo_in_a_conflicted_merge();
+        let p = tmp.path();
+        std::fs::write(
+            p.join("README.md"),
+            "# Orders\n\nRun `uv run -m pricing`.\n",
+        )
+        .unwrap();
+        run_mutation(p, &["add", "README.md"]).unwrap();
+        assert!(unmerged_paths(p).is_empty());
+        commit_all_tracked(p, "Merge hotfix").expect("a resolved merge commits");
+        let parents = Command::new("git")
+            .arg("-C")
+            .arg(p)
+            .args(["rev-list", "--parents", "-n1", "HEAD"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&parents.stdout)
+                .split_whitespace()
+                .count(),
+            3,
+            "a merge commit with two parents"
+        );
+    }
+
+    #[test]
+    fn the_commits_that_do_not_stage_are_refused_by_git_itself() {
+        // Negative: Commit Staged and Amend run a plain `git commit`, which
+        // refuses an unmerged index on its own, so they need no guard.
+        let tmp = repo_in_a_conflicted_merge();
+        let p = tmp.path();
+        let before = head_of(p);
+        assert!(commit_staged(p, "Merge hotfix").is_err());
+        assert!(commit_amend(p, "amended").is_err());
+        assert!(commit_amend_no_edit(p).is_err());
+        assert_eq!(head_of(p), before);
+    }
+
+    #[test]
+    fn a_subdirectory_root_with_diff_relative_still_sees_the_conflicts() {
+        // `diff.relative` scoped the check to the subdirectory, so a
+        // conflict outside it slipped past the guard.
+        let tmp = repo_in_a_conflicted_merge();
+        let p = tmp.path();
+        run_mutation(p, &["config", "diff.relative", "true"]).unwrap();
+        let sub = p.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        assert_eq!(unmerged_paths(&sub), vec![String::from("README.md")]);
+        assert!(refuse_unmerged(&sub).is_err());
+    }
+
+    #[test]
+    fn a_repo_with_no_merge_in_progress_has_no_unmerged_paths() {
+        // Negative: ordinary edits are not conflicts.
+        let tmp = repo_in_a_conflicted_merge();
+        let p = tmp.path();
+        run_mutation(p, &["merge", "--abort"]).unwrap();
+        std::fs::write(p.join("README.md"), "edited\n").unwrap();
+        assert!(unmerged_paths(p).is_empty());
+        commit_all_tracked(p, "edit").expect("an ordinary commit goes through");
     }
 
     /// A repo whose `*.txt` files go through a rot13 clean/smudge filter: the
