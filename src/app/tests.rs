@@ -78971,3 +78971,132 @@ fn save_all_does_not_report_a_file_waiting_on_its_formatter_as_saved() {
         "Saved 1 editor"
     );
 }
+
+/// The issue's fork setup (#1445): `up` with `main` and `feat`, cloned to
+/// `clone` (so `origin`, with its `origin/HEAD`), plus `upstream` pointing
+/// at `up` too, and `my/fork`, a remote whose name holds a `/`, carrying a
+/// `solo` branch no other remote has.
+fn clone_with_two_remotes() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let up = tmp.path().join("up");
+    std::fs::create_dir(&up).unwrap();
+    git_checked(&up, &["init", "-q", "-b", "main"]);
+    git_checked(
+        &up,
+        &[
+            "-c",
+            "user.name=a",
+            "-c",
+            "user.email=a@b",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "i",
+        ],
+    );
+    git_checked(&up, &["branch", "feat"]);
+    let fork = tmp.path().join("fork");
+    git_checked(tmp.path(), &["clone", "-q", "up", "fork"]);
+    git_checked(&fork, &["branch", "solo"]);
+    git_checked(tmp.path(), &["clone", "-q", "up", "clone"]);
+    let clone = tmp.path().join("clone");
+    git_checked(&clone, &["remote", "add", "upstream", "../up"]);
+    git_checked(&clone, &["remote", "add", "my/fork", "../fork"]);
+    git_checked(&clone, &["fetch", "-q", "--all"]);
+    (tmp, clone)
+}
+
+/// Open the Checkout picker on `clone`, type `query` and press Enter.
+fn pick_branch(clone: &std::path::Path, query: &str) -> App {
+    let mut app = App::new(clone.to_path_buf()).unwrap();
+    app.open_branch_picker();
+    for c in query.chars() {
+        app.handle_branch_picker_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    app.handle_branch_picker_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    app
+}
+
+/// #1445: a clone's `origin/HEAD`, which git shortens to plain `origin`,
+/// is a pointer, not a branch: the picker lists no `origin` row.
+#[test]
+fn the_branch_picker_lists_no_remote_head_in_a_clone() {
+    let (_tmp, clone) = clone_with_two_remotes();
+    let mut app = App::new(clone.clone()).unwrap();
+    app.open_branch_picker();
+    let shown: Vec<String> = app
+        .branch_picker
+        .as_ref()
+        .expect("the picker opens")
+        .branches
+        .iter()
+        .map(|b| b.display.clone())
+        .collect();
+    assert!(
+        !shown.iter().any(|d| d == "origin" || d.ends_with("/HEAD")),
+        "{shown:?}"
+    );
+    // Both remotes' copies of `feat` are listed: the pick decides which.
+    assert!(shown.contains(&"origin/feat".to_string()), "{shown:?}");
+    assert!(shown.contains(&"upstream/feat".to_string()), "{shown:?}");
+}
+
+/// #1445: picking a branch that two remotes carry checks it out tracking
+/// the remote picked, where `git switch feat` refused the ambiguous name.
+#[test]
+fn picking_a_branch_on_two_remotes_tracks_the_remote_picked() {
+    let (_tmp, clone) = clone_with_two_remotes();
+    let app = pick_branch(&clone, "upstream/feat");
+    assert!(
+        app.branch_picker.is_none(),
+        "the switch worked: {}",
+        app.status
+    );
+    assert_eq!(git_checked(&clone, &["branch", "--show-current"]), "feat");
+    assert_eq!(
+        git_checked(&clone, &["rev-parse", "--abbrev-ref", "feat@{upstream}"]),
+        "upstream/feat"
+    );
+}
+
+/// #1445: a remote whose name holds a `/` is split by the remote list, not
+/// at the first `/`, so its branch checks out as itself.
+#[test]
+fn a_remote_named_with_a_slash_checks_out_its_branch() {
+    let (_tmp, clone) = clone_with_two_remotes();
+    let app = pick_branch(&clone, "my/fork/solo");
+    assert!(
+        app.branch_picker.is_none(),
+        "the switch worked: {}",
+        app.status
+    );
+    assert_eq!(git_checked(&clone, &["branch", "--show-current"]), "solo");
+    assert_eq!(
+        git_checked(&clone, &["rev-parse", "--abbrev-ref", "solo@{upstream}"]),
+        "my/fork/solo"
+    );
+}
+
+/// #1445 negative: a local branch still hides the remote ones of the same
+/// name, and picking a local branch is a plain switch.
+#[test]
+fn a_local_branch_hides_its_remotes_and_switches_plainly() {
+    let (_tmp, clone) = clone_with_two_remotes();
+    git_checked(&clone, &["switch", "-q", "-c", "side"]);
+    let mut app = App::new(clone.clone()).unwrap();
+    app.open_branch_picker();
+    let shown: Vec<String> = app
+        .branch_picker
+        .as_ref()
+        .unwrap()
+        .branches
+        .iter()
+        .map(|b| b.display.clone())
+        .collect();
+    assert!(!shown.iter().any(|d| d.ends_with("/main")), "{shown:?}");
+    drop(app);
+    let app = pick_branch(&clone, "main");
+    assert!(app.branch_picker.is_none(), "{}", app.status);
+    assert_eq!(git_checked(&clone, &["branch", "--show-current"]), "main");
+}
