@@ -142,8 +142,12 @@ impl Teardown {
             .and_then(Value::as_str);
         match (kind, name) {
             (Some("event"), Some("process")) => {
+                // A remote target's pid names no local process: signalling
+                // it could hit an unrelated one that shares the number.
+                let local = msg["body"]["isLocalProcess"].as_bool() != Some(false);
                 self.debuggee = msg["body"]["systemProcessId"]
                     .as_i64()
+                    .filter(|_| local)
                     .and_then(|p| i32::try_from(p).ok())
                     .filter(|p| *p > 0);
             }
@@ -486,14 +490,29 @@ impl Drop for DapTransport {
             return;
         }
         // Off the UI thread: Stop Debugging stays instant on screen.
+        // The child rides in a shared slot so a failed spawn, which drops
+        // the closure, still leaves it here to kill rather than orphan.
         let teardown = self.teardown.clone();
+        let slot = Arc::new(Mutex::new(Some(child)));
+        let moved = slot.clone();
         let spawned = std::thread::Builder::new()
             .name("dap-teardown".into())
-            .spawn(move || finish_teardown(child, &teardown, DISCONNECT_GRACE));
-        if let Ok(handle) = spawned {
-            let mut reg = TEARDOWNS.lock().unwrap();
-            reg.retain(|h| !h.is_finished());
-            reg.push(handle);
+            .spawn(move || {
+                if let Some(child) = moved.lock().unwrap().take() {
+                    finish_teardown(child, &teardown, DISCONNECT_GRACE);
+                }
+            });
+        match spawned {
+            Ok(handle) => {
+                let mut reg = TEARDOWNS.lock().unwrap();
+                reg.retain(|h| !h.is_finished());
+                reg.push(handle);
+            }
+            Err(_) => {
+                if let Some(mut child) = slot.lock().unwrap().take() {
+                    kill_tree(&mut child);
+                }
+            }
         }
     }
 }
@@ -761,6 +780,24 @@ while True:
         let ok = ends_soon(pid);
         end(pid);
         assert!(ok, "the reported debuggee survived the teardown");
+    }
+
+    /// #1536: a `process` event for a remote target carries a pid that
+    /// names no local process, so the teardown must never signal it.
+    #[test]
+    fn a_remote_process_pid_is_not_recorded() {
+        let event = |body: Value| json!({"type": "event", "event": "process", "body": body});
+        let mut seen = Teardown::default();
+        seen.observe(&event(
+            json!({"systemProcessId": 4242, "isLocalProcess": false}),
+        ));
+        assert_eq!(seen.debuggee, None, "a remote pid was kept");
+        seen.observe(&event(
+            json!({"systemProcessId": 4242, "isLocalProcess": true}),
+        ));
+        assert_eq!(seen.debuggee, Some(4242));
+        seen.observe(&event(json!({"systemProcessId": 77})));
+        assert_eq!(seen.debuggee, Some(77), "an unmarked pid is local");
     }
 
     /// #1536 negative: an attach session disconnects with
