@@ -45804,7 +45804,36 @@ impl App {
         self.status = format!("Pasted {} chars", s.chars().count());
     }
 
+    /// A terminal paste. While a macro records, a paste into the editor is a
+    /// step of it, on the same terms `handle_key` records a key: not while
+    /// replaying, and only when the editor had focus before and after
+    /// (#1464). Before, the replay silently left the pasted text out.
     fn handle_paste(&mut self, s: &str) {
+        let capture =
+            self.macro_recording.is_some() && !self.macro_replaying && self.focus == Pane::Editor;
+        self.handle_paste_inner(s);
+        if self.macro_recording.is_none() || self.macro_replaying {
+            return;
+        }
+        if capture && self.focus == Pane::Editor {
+            if let Some(rec) = self.macro_recording.as_mut() {
+                rec.recorded.push_paste(s);
+            }
+        } else if !s.is_empty() {
+            // Logged as skipped keys are, by size only: a paste into a
+            // terminal can be a password.
+            crate::output::push(
+                "Macros",
+                crate::output::OutputLevel::Info,
+                &format!(
+                    "skipped a paste of {} chars: recording captures the editor pane only",
+                    s.chars().count()
+                ),
+            );
+        }
+    }
+
+    fn handle_paste_inner(&mut self, s: &str) {
         // Modal overlays own paste entirely while open — paste lands in
         // the modal's input field, never in the editor / tree / terminal
         // behind it. Without this, hitting Cmd+V right after Cmd+P pastes
@@ -50218,10 +50247,10 @@ impl App {
             return;
         }
         let count = count.max(1);
-        // Budget the keys actually fed, not the recorded step count:
-        // `key_events` drops steps this build cannot replay, so `len()` is an
-        // upper bound rather than the real total.
-        let keys = mac.key_events();
+        // Budget the steps actually fed, not the recorded step count:
+        // `replay_steps` drops steps this build cannot replay, so `len()` is
+        // an upper bound rather than the real total.
+        let keys = mac.replay_steps();
         if keys.is_empty() {
             // Every step was one this build cannot replay (a macro from a
             // newer croft). Say so rather than reporting a successful run
@@ -50229,7 +50258,16 @@ impl App {
             self.status = String::from("Macro has no steps this version can replay");
             return;
         }
-        let total = keys.len().saturating_mul(count);
+        // A paste is one step but inserts all of its text, so its characters
+        // count against the budget like typed ones.
+        let per_run: usize = keys
+            .iter()
+            .map(|step| match step {
+                crate::macros::Replay::Key(_) => 1,
+                crate::macros::Replay::Paste(text) => text.chars().count().max(1),
+            })
+            .sum();
+        let total = per_run.saturating_mul(count);
         if total > MAX_REPLAY_KEYS {
             self.status =
                 format!("Macro would run {total} keys (limit {MAX_REPLAY_KEYS}) — refused");
@@ -50247,10 +50285,16 @@ impl App {
             // one-step-per-iteration guarantee needs an undo-group API the
             // editor does not have (its undo is whole-buffer snapshots).
             self.editor.break_undo_coalescing();
-            for k in &keys {
-                if let Err(e) = self.handle_key(*k) {
-                    aborted = Some((iteration + 1, e.to_string()));
-                    break 'outer;
+            for step in &keys {
+                match step {
+                    crate::macros::Replay::Key(k) => {
+                        if let Err(e) = self.handle_key(*k) {
+                            aborted = Some((iteration + 1, e.to_string()));
+                            break 'outer;
+                        }
+                    }
+                    // Pasted, not typed, as it was recorded (#1464).
+                    crate::macros::Replay::Paste(text) => self.handle_paste(text),
                 }
             }
             done = iteration + 1;

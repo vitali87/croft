@@ -79380,6 +79380,120 @@ fn save_all_does_not_report_a_file_waiting_on_its_formatter_as_saved() {
     );
 }
 
+/// Record the issue's macro on line one of `lines`: End, `: `, a terminal
+/// paste of `paste`, ` ok`, Down. Then replay it once on the next line.
+fn record_and_replay_a_macro_with_a_paste(lines: &[&str], paste: &str) -> App {
+    use crate::widgets::command_palette::Command;
+    let mut app = editor_app_with_lines(lines);
+    app.run_command(Command::MacroStartStopRecording);
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    type_str(&mut app, ": ");
+    app.handle_paste(paste);
+    type_str(&mut app, " ok");
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    app.run_command(Command::MacroStartStopRecording);
+    app.run_command(Command::MacroReplayLast);
+    app
+}
+
+/// #1464: a terminal paste made while recording is part of the macro, and
+/// replay pastes the same text at the new caret.
+#[test]
+fn a_paste_while_recording_a_macro_replays_at_the_new_caret() {
+    let app = record_and_replay_a_macro_with_a_paste(&["alpha", "beta", "gamma"], "PASTED");
+    assert_eq!(app.editor.lines[0], "alpha: PASTED ok");
+    assert_eq!(
+        app.editor.lines[1], "beta: PASTED ok",
+        "the replay pastes too"
+    );
+    assert_eq!(app.editor.lines[2], "gamma");
+}
+
+/// #1464: a multi-line paste replays as pasted. Typed back key by key, its
+/// newlines would pick up the editor's auto-indent line by line.
+#[test]
+fn a_multi_line_paste_in_a_macro_replays_with_its_indentation() {
+    let paste = "{\n  x: 1,\n}";
+    let app = record_and_replay_a_macro_with_a_paste(&["  a", "  b", "  c"], paste);
+    let first: Vec<&str> = app.editor.lines[0..3].iter().map(String::as_str).collect();
+    assert_eq!(
+        first,
+        ["  a: {", "  x: 1,", "} ok"],
+        "the recording pasted as is"
+    );
+    let replayed: Vec<&str> = app.editor.lines[3..6].iter().map(String::as_str).collect();
+    assert_eq!(
+        replayed,
+        ["  b: {", "  x: 1,", "} ok"],
+        "and so does the replay"
+    );
+}
+
+/// #1464: the paste is one step of its own, between the typing around it.
+#[test]
+fn a_paste_is_recorded_as_one_step_of_its_own() {
+    use crate::macros::Step;
+    use crate::widgets::command_palette::Command;
+    let mut app = editor_app_with_lines(&["alpha"]);
+    app.run_command(Command::MacroStartStopRecording);
+    type_str(&mut app, "ab");
+    app.handle_paste("P\nQ");
+    type_str(&mut app, "c");
+    app.run_command(Command::MacroStartStopRecording);
+    let steps = app.macro_last.as_ref().expect("recorded").steps.clone();
+    assert_eq!(
+        steps,
+        vec![
+            Step::Text { text: "ab".into() },
+            Step::Paste {
+                text: "P\nQ".into()
+            },
+            Step::Text { text: "c".into() },
+        ]
+    );
+}
+
+/// #1464 negative: a paste into another pane while recording is not part
+/// of the macro, which captures the editor only, and the Macros channel
+/// says it was skipped, as it does for keys: by size, never its text.
+#[test]
+fn a_paste_into_another_pane_while_recording_is_skipped_and_logged() {
+    use crate::widgets::command_palette::Command;
+    let mut app = editor_app_with_lines(&["alpha"]);
+    app.run_command(Command::MacroStartStopRecording);
+    type_str(&mut app, "x");
+    app.focus_pane(Pane::Tree);
+    app.handle_paste("SKIPPED-PASTE-1464");
+    app.focus_pane(Pane::Editor);
+    app.run_command(Command::MacroStartStopRecording);
+    let steps = app.macro_last.as_ref().expect("recorded").steps.clone();
+    assert_eq!(steps, vec![crate::macros::Step::Text { text: "x".into() }]);
+    let logged = crate::output::snapshot("Macros").unwrap_or_default();
+    assert!(
+        logged
+            .iter()
+            .any(|l| l.text.contains("skipped a paste of 18 chars")),
+        "{logged:?}"
+    );
+    assert!(
+        !logged.iter().any(|l| l.text.contains("SKIPPED-PASTE-1464")),
+        "the pasted text itself stays out of the log"
+    );
+}
+
+/// #1464 negative: a replayed paste is not recorded again into the macro
+/// replaying it, and pasting with no recording records nothing.
+#[test]
+fn a_replayed_paste_is_never_recorded_again() {
+    let mut app = record_and_replay_a_macro_with_a_paste(&["a", "b"], "P");
+    let len = app.macro_last.as_ref().unwrap().steps.len();
+    app.handle_paste("Z");
+    assert_eq!(app.macro_last.as_ref().unwrap().steps.len(), len);
+    assert!(app.macro_recording.is_none());
+}
+
 /// #1488: a watcher that clears the screen (`tsc --watch`, `cargo watch -c`)
 /// erases its own output mark, so its finish reports no output. That finish
 /// never reached the build scan, the one-shot skip meant for it stayed set,
@@ -79434,4 +79548,24 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     app.watch_published_panes.insert(pane);
     assert!(!app.apply_build_scan(pane, Some(&cwd), "tsc --watch", "a.c:1:1: error: old\n"));
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
+}
+
+/// #1464: a paste is one macro step but inserts all of its text, so its
+/// characters count against the replay budget: a 10 KB paste times 100 is
+/// refused, not a megabyte typed into the buffer.
+#[test]
+fn a_macro_paste_counts_its_characters_against_the_replay_budget() {
+    let (mut app, tmp) = vim_app("one\n");
+    app.macros_path = tmp.path().join("macros.json");
+    let mut big = crate::macros::Macro::default();
+    big.push_paste(&"x".repeat(10_000));
+    app.macro_registers.insert("z".into(), big);
+    let before = app.editor.lines[0].clone();
+    vim_feed_str(&mut app, "100@z");
+    assert!(
+        app.status.contains("refused"),
+        "a replay past the budget is refused visibly, got {:?}",
+        app.status
+    );
+    assert_eq!(app.editor.lines[0], before, "and nothing ran");
 }
