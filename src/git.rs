@@ -43,6 +43,144 @@ pub struct GitStatus {
     /// `merge --squash` writes `SQUASH_MSG`. Comment lines are dropped, as
     /// `commit.cleanup=strip` would. `None` when neither file is there.
     pub prepared_message: Option<String>,
+    /// The merge, rebase, cherry-pick, revert or bisect the repository is
+    /// in the middle of (#1356), from [`repo_operation`].
+    pub operation: Option<RepoOp>,
+}
+
+/// An operation git stopped half-way through (#1356): what the status bar
+/// names next to the branch, and what Abort / Continue / Skip act on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepoOp {
+    Merge,
+    /// `step` of `total` commits, as git counts them.
+    Rebase {
+        step: usize,
+        total: usize,
+    },
+    CherryPick,
+    Revert,
+    Bisect,
+}
+
+impl RepoOp {
+    /// The status-bar tag: `MERGING`, `REBASING 2/5`, `CHERRY-PICKING`,
+    /// `REVERTING`, `BISECTING`.
+    pub fn label(self) -> String {
+        match self {
+            RepoOp::Merge => String::from("MERGING"),
+            RepoOp::Rebase { step, total } => format!("REBASING {step}/{total}"),
+            RepoOp::CherryPick => String::from("CHERRY-PICKING"),
+            RepoOp::Revert => String::from("REVERTING"),
+            RepoOp::Bisect => String::from("BISECTING"),
+        }
+    }
+
+    /// The git command it belongs to, also its name in messages.
+    pub fn command(self) -> &'static str {
+        match self {
+            RepoOp::Merge => "merge",
+            RepoOp::Rebase { .. } => "rebase",
+            RepoOp::CherryPick => "cherry-pick",
+            RepoOp::Revert => "revert",
+            RepoOp::Bisect => "bisect",
+        }
+    }
+}
+
+/// The operation `root`'s repository is in the middle of (#1356), read
+/// from the state files git leaves in its directory: `rebase-merge/` or
+/// `rebase-apply/` (with the step counters), `MERGE_HEAD`,
+/// `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `BISECT_LOG`. Found through
+/// `--git-path`, so a worktree reads its own. A `git am` (an
+/// `rebase-apply/applying` marker) is not one of these and reads as none.
+pub fn repo_operation(root: &Path) -> Option<RepoOp> {
+    const NAMES: [&str; 6] = [
+        "rebase-merge",
+        "rebase-apply",
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "BISECT_LOG",
+    ];
+    let mut args = vec!["rev-parse"];
+    for name in NAMES {
+        args.extend(["--git-path", name]);
+    }
+    let out = run_git(root, &args).ok()?;
+    let paths: Vec<PathBuf> = out.lines().map(|l| root.join(l.trim())).collect();
+    if paths.len() != NAMES.len() {
+        return None;
+    }
+    let counter = |dir: &Path, name: &str| -> usize {
+        std::fs::read_to_string(dir.join(name))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    if paths[0].is_dir() {
+        return Some(RepoOp::Rebase {
+            step: counter(&paths[0], "msgnum"),
+            total: counter(&paths[0], "end"),
+        });
+    }
+    if paths[1].is_dir() && !paths[1].join("applying").exists() {
+        return Some(RepoOp::Rebase {
+            step: counter(&paths[1], "next"),
+            total: counter(&paths[1], "last"),
+        });
+    }
+    let op = [
+        RepoOp::Merge,
+        RepoOp::CherryPick,
+        RepoOp::Revert,
+        RepoOp::Bisect,
+    ]
+    .into_iter()
+    .zip(&paths[2..])
+    .find(|(_, p)| p.is_file())?;
+    Some(op.0)
+}
+
+/// Abort `op` (#1356): `merge --abort`, `rebase --abort`,
+/// `cherry-pick --abort`, `revert --abort`, or `bisect reset` for a bisect.
+pub fn abort_operation(root: &Path, op: RepoOp) -> Result<String, String> {
+    match op {
+        RepoOp::Bisect => run_mutation(root, &["bisect", "reset"]),
+        _ => run_mutation(root, &[op.command(), "--abort"]),
+    }
+}
+
+/// Continue `op` once its conflicts are resolved and staged (#1356),
+/// keeping each commit's own message: git's editor is `true`, so it never
+/// waits for one. A merge is concluded by a commit, and a bisect has no
+/// continue; both are refused.
+pub fn continue_operation(root: &Path, op: RepoOp) -> Result<String, String> {
+    match op {
+        RepoOp::Merge => Err(String::from("Commit to conclude the merge, or abort it")),
+        RepoOp::Bisect => Err(String::from(
+            "Mark the commit good or bad to go on with the bisect",
+        )),
+        _ => run_mutation_with_env(
+            root,
+            &[op.command(), "--continue"],
+            &[("GIT_EDITOR", "true")],
+        ),
+    }
+}
+
+/// Skip the commit `op` stopped on (#1356): `rebase --skip`,
+/// `cherry-pick --skip`, `revert --skip`. Refused for a merge or bisect.
+pub fn skip_operation(root: &Path, op: RepoOp) -> Result<String, String> {
+    match op {
+        RepoOp::Merge | RepoOp::Bisect => Err(format!("A {} has no skip", op.command())),
+        _ => run_mutation_with_env(root, &[op.command(), "--skip"], &[("GIT_EDITOR", "true")]),
+    }
+}
+
+/// Mark the commit a bisect checked out good or bad (#1356).
+pub fn bisect_mark(root: &Path, good: bool) -> Result<String, String> {
+    run_mutation(root, &["bisect", if good { "good" } else { "bad" }])
 }
 
 pub fn query(root: &Path) -> GitStatus {
@@ -89,6 +227,7 @@ pub fn query(root: &Path) -> GitStatus {
         repo_root: Some(repo_root),
         changed_count,
         prepared_message: prepared_message(root),
+        operation: repo_operation(root),
     }
 }
 
@@ -331,6 +470,15 @@ fn detach_from_tty(cmd: &mut Command) {
 /// surface whichever stream carries the message verbatim, so the panel
 /// shows the host's exact reason (e.g. "fatal: 'x' is not a commit").
 fn run_mutation(root: &Path, args: &[&str]) -> Result<String, String> {
+    run_mutation_with_env(root, args, &[])
+}
+
+/// [`run_mutation`] with extra environment variables for git.
+fn run_mutation_with_env(
+    root: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Result<String, String> {
     let path_str = root
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
@@ -344,6 +492,7 @@ fn run_mutation(root: &Path, args: &[&str]) -> Result<String, String> {
     );
     let mut cmd = Command::new("git");
     cmd.args(["-C", path_str]).args(args);
+    cmd.envs(envs.iter().copied());
     never_prompt(&mut cmd);
     let output = cmd
         .output()
@@ -1160,12 +1309,27 @@ pub fn diff_staged(root: &Path) -> Result<String, String> {
     diff_text(root, &["diff", "--staged"])
 }
 
-/// Raw `git diff <branch>` text — working-tree state versus the tip of
-/// `branch`. Used by the Source Control dropdown's "View Changes vs
-/// <default>" so users can preview every uncommitted-plus-committed change
-/// on the current branch in one view.
+/// The commit HEAD and `branch` last had in common (`git merge-base`), or
+/// None when they share no history or `branch` does not resolve.
+pub fn merge_base(root: &Path, branch: &str) -> Option<String> {
+    diff_text(root, &["merge-base", "HEAD", branch])
+        .ok()
+        .map(|out| out.trim().to_string())
+        .filter(|sha| !sha.is_empty())
+}
+
+/// The working tree against the point the current branch left `branch`
+/// (its merge base), as a pull request diff shows it: every committed and
+/// uncommitted change on this branch, and nothing `branch` gained since
+/// (#1444). Diffing against `branch`'s tip listed that later work as this
+/// branch deleting or reverting it. With no shared history it falls back
+/// to the tip. Used by the Source Control dropdown's "View Changes vs
+/// <default>" and that tab's refresh.
 pub fn diff_against_branch(root: &Path, branch: &str) -> Result<String, String> {
-    diff_text(root, &["diff", branch])
+    match merge_base(root, branch) {
+        Some(base) => diff_text(root, &["diff", &base]),
+        None => diff_text(root, &["diff", branch]),
+    }
 }
 
 /// Raw `git diff HEAD~1` text — working-tree state versus the commit
@@ -1183,7 +1347,21 @@ fn diff_text(root: &Path, args: &[&str]) -> Result<String, String> {
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
     let mut cmd = Command::new("git");
-    cmd.args(["-C", path_str]).args(args);
+    cmd.args(["-C", path_str]);
+    match args.split_first() {
+        // The patch croft parses, never the user's display settings
+        // (#1447): `color.ui = always` wrapped every line in escape codes,
+        // and a `diff.external` tool (difftastic) printed its own view in
+        // place of the patch.
+        Some((sub, rest)) if matches!(*sub, "diff" | "show") => {
+            cmd.arg(sub)
+                .args(["--no-color", "--no-ext-diff"])
+                .args(rest);
+        }
+        _ => {
+            cmd.args(args);
+        }
+    }
     let output = cmd
         .output()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
@@ -4621,6 +4799,80 @@ mod tests {
         assert_eq!(b, "main", "freshly init -b main repo must resolve to main");
     }
 
+    /// #1447 fixture: a repo with `app.py` committed and an edit staged.
+    fn repo_with_a_staged_edit() -> (TempDir, String) {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        let head = sh_git(p, &["rev-parse", "HEAD"]);
+        std::fs::write(p.join("seed.txt"), "one\nTWO\n").unwrap();
+        sh_git(p, &["add", "seed.txt"]);
+        (tmp, head.trim().to_string())
+    }
+
+    /// #1447: `color.ui = always` (here in the repo's own config, which
+    /// git reads the same way as `~/.gitconfig`) never reaches the text
+    /// croft parses as a patch.
+    #[test]
+    fn git_diff_views_ignore_a_color_always_config() {
+        let (tmp, head) = repo_with_a_staged_edit();
+        let p = tmp.path();
+        sh_git(p, &["config", "color.ui", "always"]);
+        sh_git(p, &["config", "color.diff", "always"]);
+        let coloured = sh_git(p, &["diff", "--staged"]);
+        assert!(
+            coloured.contains('\x1b'),
+            "the config colours git's own output: {coloured:?}"
+        );
+        let staged = diff_staged(p).unwrap();
+        assert!(staged.starts_with("diff --git"), "{staged:?}");
+        assert!(!staged.contains('\x1b'), "{staged:?}");
+        assert!(staged.contains("\n+TWO\n"), "{staged:?}");
+        let previous = diff_against_branch(p, &head).unwrap();
+        assert!(!previous.contains('\x1b'), "{previous:?}");
+        sh_git(p, &["commit", "-qm", "two"]);
+        let commit = show_commit(p, "HEAD").unwrap();
+        assert!(commit.starts_with("commit "), "{commit:?}");
+        assert!(!commit.contains('\x1b'), "{commit:?}");
+        let file = show_commit_file_diff(p, "HEAD", "seed.txt").unwrap();
+        assert!(!file.contains('\x1b'), "{file:?}");
+        assert!(!diff_previous_commit(p).unwrap().contains('\x1b'));
+    }
+
+    /// #1447: a `diff.external` tool (difftastic's recommended setup) does
+    /// not replace the patch with its own output.
+    #[test]
+    fn git_diff_views_ignore_an_external_diff_tool() {
+        let (tmp, _) = repo_with_a_staged_edit();
+        let p = tmp.path();
+        let tool = p.join("external-diff.sh");
+        std::fs::write(&tool, "#!/bin/sh\necho EXTERNAL\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        sh_git(p, &["config", "diff.external", tool.to_str().unwrap()]);
+        assert!(sh_git(p, &["diff", "--staged"]).contains("EXTERNAL"));
+        let staged = diff_staged(p).unwrap();
+        assert!(staged.starts_with("diff --git"), "{staged:?}");
+        assert!(!staged.contains("EXTERNAL"), "{staged:?}");
+    }
+
+    /// #1447 negative: with git's default colour settings the text is
+    /// exactly what plain `git diff` / `git show` print.
+    #[test]
+    fn git_diff_views_are_unchanged_without_colour_config() {
+        let (tmp, _) = repo_with_a_staged_edit();
+        let p = tmp.path();
+        assert_eq!(diff_staged(p).unwrap(), sh_git(p, &["diff", "--staged"]));
+        sh_git(p, &["commit", "-qm", "two"]);
+        assert_eq!(
+            show_commit(p, "HEAD").unwrap(),
+            sh_git(p, &["show", "--stat", "--patch", "HEAD"])
+        );
+    }
+
     #[test]
     fn diff_against_branch_shows_working_tree_versus_branch() {
         let tmp = TempDir::new().unwrap();
@@ -4632,6 +4884,128 @@ mod tests {
             out.contains("+three"),
             "diff vs branch must include the new +three line: {out}"
         );
+    }
+
+    /// #1444 fixture: `feature` branched from `main` and added
+    /// `feature.py`; `main` then got a teammate's `teammate.py` and an
+    /// `app.py` change. HEAD is `feature`.
+    fn branch_behind_a_moved_main() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        let git = |args: &[&str]| {
+            let o = Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "a@b"]);
+        git(&["config", "user.name", "a"]);
+        std::fs::write(p.join("app.py"), "def a():\n    return 1\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        git(&["checkout", "-qb", "feature"]);
+        std::fs::write(p.join("feature.py"), "def feature():\n    return 2\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "add feature"]);
+        git(&["checkout", "-q", "main"]);
+        std::fs::write(p.join("teammate.py"), "def teammate():\n    return 3\n").unwrap();
+        std::fs::write(p.join("app.py"), "def a():\n    return 10\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "teammate work"]);
+        git(&["checkout", "-q", "feature"]);
+        tmp
+    }
+
+    /// #1444: the view holds the branch's own changes only, as a pull
+    /// request diff does, not main's later work shown in reverse.
+    #[test]
+    fn diff_against_branch_starts_from_the_merge_base() {
+        let tmp = branch_behind_a_moved_main();
+        let out = diff_against_branch(tmp.path(), "main").unwrap();
+        assert!(out.contains("+++ b/feature.py"), "{out}");
+        assert!(!out.contains("teammate.py"), "{out}");
+        assert!(!out.contains("app.py"), "{out}");
+    }
+
+    /// #1444: uncommitted work on the branch is still in the view.
+    #[test]
+    fn diff_against_branch_keeps_uncommitted_edits() {
+        let tmp = branch_behind_a_moved_main();
+        std::fs::write(
+            tmp.path().join("feature.py"),
+            "def feature():\n    return 22\n",
+        )
+        .unwrap();
+        let out = diff_against_branch(tmp.path(), "main").unwrap();
+        assert!(out.contains("+    return 22"), "{out}");
+        assert!(!out.contains("teammate.py"), "{out}");
+    }
+
+    /// #1444 negative: when main has not moved, the view is exactly
+    /// `git diff main`, as before.
+    #[test]
+    fn diff_against_an_unmoved_branch_is_the_plain_diff() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["checkout", "-qb", "feature"]);
+        std::fs::write(p.join("seed.txt"), "one\ntwo\nthree\n").unwrap();
+        git(&["commit", "-qam", "three"]);
+        std::fs::write(p.join("new.txt"), "x\n").unwrap();
+        git(&["add", "new.txt"]);
+        let plain = String::from_utf8(git(&["diff", "main"]).stdout).unwrap();
+        assert!(plain.contains("+three"), "{plain}");
+        assert_eq!(diff_against_branch(p, "main").unwrap(), plain);
+    }
+
+    /// #1444 negative: with no shared history there is no merge base, and
+    /// the view falls back to the tip diff instead of failing.
+    #[test]
+    fn diff_against_an_unrelated_branch_falls_back_to_its_tip() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["checkout", "-q", "--orphan", "other"]);
+        git(&["rm", "-rfq", "."]);
+        std::fs::write(p.join("other.txt"), "other\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "other root"]);
+        assert_eq!(merge_base(p, "main"), None);
+        let plain = String::from_utf8(git(&["diff", "main"]).stdout).unwrap();
+        assert!(plain.contains("seed.txt"), "{plain}");
+        assert_eq!(diff_against_branch(p, "main").unwrap(), plain);
+    }
+
+    /// #1444 negative: a branch git does not know still errors, as before.
+    #[test]
+    fn diff_against_an_unknown_branch_still_errors() {
+        let tmp = TempDir::new().unwrap();
+        init_repo_with_commit(tmp.path());
+        assert!(diff_against_branch(tmp.path(), "no-such-branch").is_err());
     }
 
     #[test]

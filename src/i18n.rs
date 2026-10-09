@@ -206,6 +206,7 @@ pub const TRANSLATABLE: &[&str] = &[
     "New File",
     "New Folder",
     "Open Symbol in Its Own Tab",
+    "Output",
     "Panel Alignment",
     "Paste",
     "Pin",
