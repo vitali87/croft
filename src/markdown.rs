@@ -166,7 +166,8 @@ pub struct MdRunnable {
     /// included: what `Cmd+Enter` uses to find the block under the caret,
     /// from the parser's own offsets rather than a second fence scanner.
     pub lines: (usize, usize),
-    /// The block's text, as written.
+    /// What the block runs: its text as written, or for a shell-session
+    /// transcript its commands without their prompts (#1473).
     pub code: String,
     /// The interpreter: `sh` (typed at the shell as-is), `python3` or `node`
     /// (fed through a heredoc).
@@ -213,11 +214,149 @@ pub fn runnable_interpreter(info: &str) -> Option<&'static str> {
         return None;
     }
     match lang.to_ascii_lowercase().as_str() {
-        "sh" | "bash" | "zsh" | "fish" | "shell" | "console" => Some("sh"),
+        "sh" | "bash" | "zsh" | "fish" | "shell" => Some("sh"),
+        // Shell-session transcripts: only their prompt lines run (#1473).
+        "console" | "shell-session" | "sh-session" | "shellsession" | "bash-session" => Some("sh"),
         "python" | "py" | "python3" => interpreter_on_path("python3").then_some("python3"),
         "node" | "javascript" | "js" => interpreter_on_path("node").then_some("node"),
         _ => None,
     }
+}
+
+/// What a runnable fence types (#1473). A shell-session transcript, a
+/// `console` / `shell-session` fence or a shell fence that opens with a
+/// `$ ` prompt (which no script does), runs its prompt lines without the
+/// prompt; its sample output never runs. Any other fence runs as written.
+/// None for a transcript with no command in it: it is all output.
+pub fn fence_code(info: &str, text: &str) -> Option<String> {
+    let (lang, _) = split_info(info);
+    let lang = lang.to_ascii_lowercase();
+    let declared = matches!(
+        lang.as_str(),
+        "console" | "shell-session" | "sh-session" | "shellsession" | "bash-session"
+    );
+    let shell = matches!(lang.as_str(), "sh" | "bash" | "zsh" | "fish" | "shell");
+    let opens_with_prompt = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|l| prompt_command(l, false).is_some());
+    if !declared && !(shell && opens_with_prompt) {
+        return Some(text.to_string());
+    }
+    // `# ` is a root prompt only where the fence says it is a transcript:
+    // in a shell fence it is a comment.
+    let commands = transcript_commands(text, declared);
+    (!commands.trim().is_empty()).then_some(commands)
+}
+
+/// The command on a transcript's prompt line: `$ cmd`, or `# cmd` for a
+/// root prompt when `root` allows it. A bare prompt is an empty command.
+fn prompt_command(line: &str, root: bool) -> Option<&str> {
+    let line = line.trim_end();
+    if line == "$" || (root && line == "#") {
+        return Some("");
+    }
+    line.strip_prefix("$ ")
+        .or_else(|| root.then(|| line.strip_prefix("# ")).flatten())
+}
+
+/// A line under the shell's continuation prompt (PS2, `> `): its text.
+fn ps2_body(line: &str) -> Option<&str> {
+    line.strip_prefix("> ")
+        .or_else(|| (line.trim_end() == ">").then_some(""))
+}
+
+/// The commands of a shell-session transcript, one per line, prompts
+/// stripped. A command whose line leaves it open (a trailing `\`, `|`,
+/// `&&`, an unclosed quote, a heredoc) takes the lines that continue it,
+/// with or without their `> `. Every other line is output, dropped: a
+/// `> ` line after a finished command is output too (npm prints
+/// `> pkg@1.0.0 build`).
+fn transcript_commands(text: &str, root: bool) -> String {
+    let mut out = String::new();
+    // The command read so far, while one is being read.
+    let mut command: Option<String> = None;
+    // The word that ends the heredoc the command opened.
+    let mut heredoc: Option<String> = None;
+    for line in text.lines() {
+        if let Some(word) = &heredoc {
+            if let Some(body) = ps2_body(line) {
+                out.push_str(body);
+                out.push('\n');
+                if body.trim() == word {
+                    heredoc = None;
+                }
+                continue;
+            }
+            heredoc = None;
+        }
+        if let Some(sofar) = command.as_mut() {
+            if command_is_open(sofar) {
+                let body = ps2_body(line).unwrap_or(line);
+                sofar.push('\n');
+                sofar.push_str(body);
+                out.push_str(body);
+                out.push('\n');
+                heredoc = heredoc_word(body);
+                continue;
+            }
+            command = None;
+        }
+        if let Some(cmd) = prompt_command(line, root).filter(|c| !c.trim().is_empty()) {
+            out.push_str(cmd);
+            out.push('\n');
+            heredoc = heredoc_word(cmd);
+            command = Some(cmd.to_string());
+        }
+    }
+    out
+}
+
+/// The command does not end where its line does: a trailing `\`, `|`,
+/// `||` or `&&`, or a quote still open. A `#` comment does not count.
+fn command_is_open(cmd: &str) -> bool {
+    let (mut single, mut double, mut escaped) = (false, false, false);
+    let mut word_start = true;
+    let mut end = cmd.len();
+    for (i, c) in cmd.char_indices() {
+        if escaped {
+            escaped = false;
+            word_start = false;
+            continue;
+        }
+        match c {
+            '\\' if !single => escaped = true,
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '#' if !single && !double && word_start => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+        word_start = c.is_whitespace();
+    }
+    let tail = cmd[..end].trim_end();
+    escaped || single || double || tail.ends_with('|') || tail.ends_with("&&")
+}
+
+/// The word a heredoc opened on this line ends at (`<<EOF`, `<<-'EOF'`),
+/// or None. A here-string (`<<<`) opens nothing.
+fn heredoc_word(line: &str) -> Option<String> {
+    let at = line.find("<<")?;
+    let rest = &line[at + 2..];
+    if rest.starts_with('<') {
+        return None;
+    }
+    let rest = rest
+        .trim_start_matches('-')
+        .trim_start()
+        .trim_start_matches(['\'', '"', '\\']);
+    let word: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    (!word.is_empty()).then_some(word)
 }
 
 /// One captured run of a fence, shown under it in the preview.
@@ -885,21 +1024,24 @@ impl Renderer<'_> {
         let info = std::mem::take(&mut self.code_info);
         let runnable = runnable_interpreter(&info)
             .filter(|_| !has_control_chars(&text) && !text.trim().is_empty())
-            .map(|interpreter| {
+            .and_then(|interpreter| {
                 let (_, attrs) = split_info(&info);
-                MdRunnable {
+                // A transcript runs its commands only (#1473), and they
+                // are what the destructive check reads.
+                let code = fence_code(&info, &text)?;
+                Some(MdRunnable {
                     first_line: self.out.len(),
                     lines: self.code_lines,
-                    code: text.clone(),
+                    destructive: attrs.contains(&"confirm") || looks_destructive(&code),
+                    code,
                     interpreter,
-                    destructive: attrs.contains(&"confirm") || looks_destructive(&text),
                     cwd_root: attrs.contains(&"cwd=root"),
                     persist: attrs.contains(&"persist"),
                     capture_timeout: attrs
                         .iter()
                         .find_map(|a| a.strip_prefix("timeout=").and_then(|v| v.parse().ok())),
                     kernel_cell: None,
-                }
+                })
             });
         let bar = Span::styled("\u{258e} ", Style::default().fg(self.theme.accent()));
         // The play glyph replaces the first line's bar (#353): the same
@@ -1864,6 +2006,117 @@ mod tests {
         let (_, _, runs) =
             render_markdown_full(blank, Theme::default(), &mut reg, None, BlockOutputs::new());
         assert!(runs.is_empty());
+    }
+
+    /// The commands a fence would run, by fence, in order.
+    fn run_codes(md: &str) -> Vec<String> {
+        let mut reg = crate::highlight::LangRegistry::new();
+        let (_, _, runs) =
+            render_markdown_full(md, Theme::default(), &mut reg, None, BlockOutputs::new());
+        runs.into_iter().map(|r| r.code).collect()
+    }
+
+    /// #1473: a `console` fence is a shell-session transcript. Only its
+    /// prompt lines run, without the `$ `; its sample output never does.
+    #[test]
+    fn a_console_fence_runs_its_prompt_lines_and_not_its_output() {
+        let md = "```console\n$ echo installed-ok\ninstalled-ok\n$ ls -1 /tmp/rd\nREADME.md\n```\n";
+        assert_eq!(run_codes(md), vec!["echo installed-ok\nls -1 /tmp/rd\n"]);
+        // The other transcript names, and a root `# ` prompt.
+        for lang in [
+            "shell-session",
+            "sh-session",
+            "shellsession",
+            "bash-session",
+        ] {
+            let md = format!("```{lang}\n$ make\nok\n```\n");
+            assert_eq!(run_codes(&md), vec!["make\n"], "{lang}");
+        }
+        let root = "```console\n# apt-get install -y jq\nReading package lists...\n```\n";
+        assert_eq!(run_codes(root), vec!["apt-get install -y jq\n"]);
+        // A bare `$` prompt line is an empty command, not `$`.
+        let bare = "```console\n$\n$ pwd\n/home/me\n```\n";
+        assert_eq!(run_codes(bare), vec!["pwd\n"]);
+    }
+
+    /// #1473: a command continued onto the next lines keeps them, whether
+    /// the transcript shows the shell's `> ` continuation prompt or not.
+    #[test]
+    fn a_console_fence_keeps_a_command_continued_over_several_lines() {
+        let slash = "```console\n$ cargo build \\\n    --release\n   Compiling x\n```\n";
+        assert_eq!(run_codes(slash), vec!["cargo build \\\n    --release\n"]);
+        let ps2 = "```console\n$ echo 'one\n> two'\none\ntwo\n```\n";
+        assert_eq!(run_codes(ps2), vec!["echo 'one\ntwo'\n"]);
+        let pipe = "```console\n$ ls |\n> wc -l\n3\n```\n";
+        assert_eq!(run_codes(pipe), vec!["ls |\nwc -l\n"]);
+        let heredoc = "```console\n$ cat <<EOF > a.txt\n> hi\n> EOF\n$ cat a.txt\nhi\n```\n";
+        assert_eq!(
+            run_codes(heredoc),
+            vec!["cat <<EOF > a.txt\nhi\nEOF\ncat a.txt\n"]
+        );
+    }
+
+    /// #1473 negative: output that starts with `> ` after a finished
+    /// command is output (npm prints `> pkg@1.0.0 build`), not more command.
+    #[test]
+    fn output_starting_with_a_ps2_mark_after_a_finished_command_is_output() {
+        let md = "```console\n$ npm run build\n\n> demo@1.0.0 build\n> tsc\n\n$ npm test\n```\n";
+        assert_eq!(run_codes(md), vec!["npm run build\nnpm test\n"]);
+    }
+
+    /// #1473: a shell fence written as a transcript (it opens with a
+    /// `$ ` prompt, which no real script does) runs the same way.
+    #[test]
+    fn a_shell_fence_written_as_a_transcript_runs_its_prompt_lines() {
+        let md = "```bash\n$ npm install\nadded 1 package\n$ npm start\n```\n";
+        assert_eq!(run_codes(md), vec!["npm install\nnpm start\n"]);
+        let sh = "```sh\n\n$ make test\n```\n";
+        assert_eq!(run_codes(sh), vec!["make test\n"]);
+    }
+
+    /// #1473 negative: an ordinary shell script is typed as written: a
+    /// `# ` comment is not a root prompt, `$HOME` and `$(...)` are not
+    /// prompts, and nothing is dropped.
+    #[test]
+    fn an_ordinary_shell_fence_is_unchanged() {
+        let md = "```bash\n# install deps\nnpm install\necho done\n```\n";
+        assert_eq!(
+            run_codes(md),
+            vec!["# install deps\nnpm install\necho done\n"]
+        );
+        let var = "```sh\n$HOME/bin/tool --flag\n$(which ls) -1\n```\n";
+        assert_eq!(
+            run_codes(var),
+            vec!["$HOME/bin/tool --flag\n$(which ls) -1\n"]
+        );
+        // A prompt-looking line that is not the first one is the script's.
+        let later = "```bash\nset -e\n$ not-a-prompt\n```\n";
+        assert_eq!(run_codes(later), vec!["set -e\n$ not-a-prompt\n"]);
+    }
+
+    /// #1473 negative: a `console` fence with no prompt line has nothing
+    /// to run (it is all output), so it wears no play glyph.
+    #[test]
+    fn a_console_fence_with_no_prompt_is_not_runnable() {
+        let md = "```console\nREADME.md\nsrc\n```\n";
+        assert!(run_codes(md).is_empty());
+        let empty = "```console\n$\n```\n";
+        assert!(run_codes(empty).is_empty());
+    }
+
+    /// #1473: the destructive check reads the commands, not the output,
+    /// so sample output can neither raise nor hide the red warning.
+    #[test]
+    fn a_console_fence_is_judged_destructive_by_its_commands() {
+        let mut reg = crate::highlight::LangRegistry::new();
+        let quiet = "```console\n$ ls\nrm -rf /tmp/x\n```\n";
+        let (_, _, runs) =
+            render_markdown_full(quiet, Theme::default(), &mut reg, None, BlockOutputs::new());
+        assert!(!runs[0].destructive, "output that mentions rm is not run");
+        let loud = "```console\n$ sudo rm -rf /tmp/x\n```\n";
+        let (_, _, runs) =
+            render_markdown_full(loud, Theme::default(), &mut reg, None, BlockOutputs::new());
+        assert!(runs[0].destructive);
     }
 
     /// #354's first acceptance criterion: a run that printed `hi` and
