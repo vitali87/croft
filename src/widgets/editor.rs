@@ -11064,20 +11064,22 @@ impl Editor {
 
     /// Forward-scan from the opening bracket at `open` to its matching close,
     /// counting nesting of the SAME pair type. Returns the `(row, col)` of the
-    /// closing bracket, or None when unbalanced. Only brackets in the same
-    /// place as `open` count (#1634): from code, the brackets in strings and
-    /// comments are text; from inside a string, only that string's own.
+    /// closing bracket, or None when unbalanced. Brackets in strings and
+    /// comments are text (#1634): they are passed over, and one of them as
+    /// `open` matches nothing, even a balanced `"()"`.
     fn match_bracket_forward(&self, open: BPos, zones: Option<&BracketZones>) -> Option<BPos> {
         let oc = self.char_at(open.0, open.1)?;
         let cc = matching_close(oc)?;
-        let home = zones.and_then(|z| z.zone(open));
+        if zones.is_some_and(|z| z.zone(open).is_some()) {
+            return None;
+        }
         let mut depth = 0i32;
         let (mut row, mut col) = open;
         loop {
             match self.char_at(row, col) {
                 Some(ch) => {
-                    let counts =
-                        (ch == oc || ch == cc) && zones.is_none_or(|z| z.zone((row, col)) == home);
+                    let counts = (ch == oc || ch == cc)
+                        && zones.is_none_or(|z| z.zone((row, col)).is_none());
                     if counts && ch == oc {
                         depth += 1;
                     } else if counts && ch == cc {
@@ -11100,12 +11102,14 @@ impl Editor {
     }
 
     /// Backward-scan from the closing bracket at `close` to its matching open,
-    /// counting only brackets in the same place, as
+    /// passing over brackets in strings and comments, as
     /// [`Self::match_bracket_forward`] does.
     fn match_bracket_backward(&self, close: BPos, zones: Option<&BracketZones>) -> Option<BPos> {
         let cc = self.char_at(close.0, close.1)?;
         let oc = matching_open(cc)?;
-        let home = zones.and_then(|z| z.zone(close));
+        if zones.is_some_and(|z| z.zone(close).is_some()) {
+            return None;
+        }
         let mut depth = 0i32;
         let mut row = close.0;
         let mut col = close.1 as isize;
@@ -11119,8 +11123,8 @@ impl Editor {
                 continue;
             }
             let ch = self.char_at(row, col as usize)?;
-            let counts =
-                (ch == oc || ch == cc) && zones.is_none_or(|z| z.zone((row, col as usize)) == home);
+            let counts = (ch == oc || ch == cc)
+                && zones.is_none_or(|z| z.zone((row, col as usize)).is_none());
             if counts && ch == cc {
                 depth += 1;
             } else if counts && ch == oc {
@@ -11225,7 +11229,7 @@ impl Editor {
     /// touches no bracket. Adjacency priority mirrors VS Code's `matchBracket`:
     /// a close to the left wins, then an open to the right, then an open to the
     /// left, then a close to the right. A bracket in a string or comment
-    /// pairs only with one in the same string or comment.
+    /// pairs with nothing.
     fn adjacent_bracket_pair(&self, zones: Option<&BracketZones>) -> Option<(BPos, BPos, bool)> {
         let row = self.cursor_row;
         let col = self.cursor_col;
@@ -30422,6 +30426,10 @@ mod tests {
         assert_eq!((e.cursor_row, e.cursor_col), (2, 24));
         (e.cursor_row, e.cursor_col) = (2, 20);
         assert_eq!(e.bracket_match_pair(), None, "the string's `)` is text");
+        // A balanced pair inside a string is text too: `"{}"` on line 5.
+        assert_eq!(&e.lines[4][13..17], "\"{}\"");
+        (e.cursor_row, e.cursor_col) = (4, 15);
+        assert_eq!(e.bracket_match_pair(), None, "the string's `{{}}` is text");
     }
 
     /// #1634 negative: brackets in code match as before, across lines and
