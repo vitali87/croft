@@ -167,7 +167,7 @@ All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macO
 | Command | Opens | Notes |
 |---------|-------|-------|
 | Preferences: Open Settings | a searchable settings hub | Fuzzy-search the toggleable settings; `Enter` flips a toggle and keeps the hub open. Also routes to the Color Theme picker and the JSON files below |
-| Preferences: Open Settings (JSON) | `config.json` | The full preferences document; edits apply on the next launch |
+| Preferences: Open Settings (JSON) | `config.json` | Your settings: only the keys you set, every other setting at its default (a new file starts empty); edits apply on the next launch |
 | Preferences: Open Keyboard Shortcuts (JSON) | `keybindings.json` | Rebind any palette command; **applies on save** |
 | Preferences: Configure User Snippets | `snippets.json` | Define snippets; **applies on save** |
 

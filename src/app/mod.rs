@@ -51543,10 +51543,7 @@ impl App {
                 let _ = std::fs::create_dir_all(parent);
             }
             let contents = match seed {
-                ConfigFileSeed::Settings => {
-                    let prefs = crate::prefs::Prefs::load_or_default();
-                    serde_json::to_string_pretty(&prefs).unwrap_or_else(|_| String::from("{}\n"))
-                }
+                ConfigFileSeed::Settings => SETTINGS_TEMPLATE.to_string(),
                 ConfigFileSeed::SettingsLayer => SETTINGS_LAYER_TEMPLATE.to_string(),
                 ConfigFileSeed::Keybindings => crate::keymap::TEMPLATE.to_string(),
                 ConfigFileSeed::Snippets => crate::snippets::TEMPLATE.to_string(),
@@ -68421,6 +68418,17 @@ const SETTINGS_LAYER_TEMPLATE: &str = r#"{
   // blocks). Workspace files may set appearance and editor/terminal
   // behavior keys only; trust-related settings are user-config only and
   // warn in OUTPUT · Settings.
+}
+"#;
+
+/// What Open Settings (JSON) creates when there is no `config.json` yet: an
+/// object with no keys, like VS Code's settings.json. Seeding every default
+/// made each one a user setting, over an `extends` base and over defaults a
+/// later release changes (#1617).
+const SETTINGS_TEMPLATE: &str = r#"{
+  // Your croft settings: add only the keys you want to change, and every
+  // other setting keeps its default. docs/SETTINGS.md lists the keys and
+  // explains "extends" and platform blocks.
 }
 "#;
 

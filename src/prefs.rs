@@ -550,11 +550,15 @@ impl Prefs {
     /// that changed since it was read replaced, so keys this struct does not
     /// model survive. A value is compared against the file's own typed view,
     /// so an untouched setting is left exactly as the user wrote it.
+    ///
+    /// With no file read, the file is an empty object, whose typed view is
+    /// every default: the first save writes only the settings that differ
+    /// from them (#1617). Writing them all pinned every default as a user
+    /// setting, over an `extends` base and over any default a later release
+    /// changes.
     fn document(&self) -> Result<serde_json::Value> {
         let current = serde_json::to_value(self).context("serializing prefs")?;
-        let Some(mut doc) = self.source.0.clone() else {
-            return Ok(current);
-        };
+        let mut doc = self.source.0.clone().unwrap_or_default();
         let loaded: Self = serde_json::from_value(serde_json::Value::Object(doc.clone()))
             .context("re-reading prefs")?;
         let loaded = serde_json::to_value(&loaded).context("serializing prefs")?;
@@ -1237,6 +1241,87 @@ mod tests {
         );
     }
     use super::*;
+
+    /// The keys of the `config.json` in `dir`.
+    fn saved_keys(dir: &Path) -> Vec<String> {
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let mut keys: Vec<String> = doc.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    /// #1617: the first save on a fresh install writes the one setting that
+    /// changed, not every default.
+    #[test]
+    fn the_first_save_writes_only_the_setting_that_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        save_tour_done_in(dir.path()).unwrap();
+        assert_eq!(saved_keys(dir.path()), vec!["tour_done"]);
+        let other = tempfile::tempdir().unwrap();
+        let mut prefs = Prefs::load_for_update(&other.path().join("config.json")).unwrap();
+        prefs.vim_mode = true;
+        prefs.suppress_terminal_warning = true;
+        prefs.save(&other.path().join("config.json")).unwrap();
+        assert_eq!(
+            saved_keys(other.path()),
+            vec!["suppress_terminal_warning", "vim_mode"]
+        );
+        let loaded = Prefs::load(&other.path().join("config.json")).unwrap();
+        assert!(loaded.vim_mode && loaded.suppress_terminal_warning);
+        assert_eq!(
+            loaded,
+            Prefs {
+                vim_mode: true,
+                suppress_terminal_warning: true,
+                ..Prefs::default()
+            },
+            "every other setting reads back as its default"
+        );
+    }
+
+    /// #1617: an `extends` base added after the first save is not overridden
+    /// by defaults that save pinned.
+    #[test]
+    fn an_extends_base_still_applies_after_the_first_save() {
+        let dir = tempfile::tempdir().unwrap();
+        save_tour_done_in(dir.path()).unwrap();
+        let base = dir.path().join("base.json");
+        std::fs::write(&base, r#"{ "vim_mode": true }"#).unwrap();
+        let path = dir.path().join("config.json");
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        doc["extends"] = serde_json::Value::String(base.display().to_string());
+        std::fs::write(&path, doc.to_string()).unwrap();
+        let merged = crate::config_layers::load_merged_from(dir.path(), None, "linux");
+        assert!(merged.prefs.vim_mode, "{:?}", merged.warnings);
+        assert!(merged.prefs.tour_done);
+        assert_eq!(
+            crate::config_layers::layer_of(&merged.provenance, "format_on_save"),
+            crate::config_layers::LayerKind::Default,
+            "a setting nobody set is not a user setting"
+        );
+    }
+
+    /// #1617 negative: in a file that already exists, a key the user wrote
+    /// stays even when it holds the default, and the one that changed is
+    /// written.
+    #[test]
+    fn an_existing_file_keeps_its_keys_when_another_setting_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"vim_mode": false, "theme": "dark"}"#).unwrap();
+        save_tour_done_in(dir.path()).unwrap();
+        assert_eq!(
+            saved_keys(dir.path()),
+            vec!["theme", "tour_done", "vim_mode"]
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["vim_mode"], false);
+        assert_eq!(doc["theme"], "dark");
+    }
 
     #[test]
     fn saving_keeps_unknown_keys_nested_in_a_changed_object_and_drops_removed_entries() {

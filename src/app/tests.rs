@@ -16685,6 +16685,42 @@ fn opening_a_config_file_keeps_the_active_tabs_unsaved_edits() {
     assert_eq!(kept.lines, vec![String::from("unsaved")]);
 }
 
+/// #1617: Open Settings (JSON) on a fresh install creates a `config.json`
+/// with no settings in it. Seeding every default made each one a user
+/// setting, over an `extends` base and over later default changes.
+#[test]
+fn open_settings_json_seeds_a_config_with_no_settings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let path = tmp.path().join("user").join("config.json");
+    app.open_config_file_in_editor(path.clone(), ConfigFileSeed::Settings);
+    assert_eq!(app.editor.path.as_deref(), Some(path.as_path()));
+    let written = std::fs::read_to_string(&path).unwrap();
+    let doc: serde_json::Value =
+        serde_json::from_str(&crate::tasks::strip_jsonc(&written)).unwrap();
+    assert_eq!(doc, serde_json::json!({}), "{written}");
+    assert!(written.contains("docs/SETTINGS.md"), "{written}");
+    assert_eq!(
+        crate::prefs::Prefs::load(&path).unwrap(),
+        crate::prefs::Prefs::default()
+    );
+}
+
+/// #1617 negative: an existing `config.json` opens as it is.
+#[test]
+fn open_settings_json_leaves_an_existing_config_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, "{ \"vim_mode\": true }\n").unwrap();
+    app.open_config_file_in_editor(path.clone(), ConfigFileSeed::Settings);
+    assert_eq!(app.editor.path.as_deref(), Some(path.as_path()));
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "{ \"vim_mode\": true }\n"
+    );
+}
+
 #[test]
 fn bounded_output_gives_up_on_a_command_that_hangs() {
     let started = std::time::Instant::now();

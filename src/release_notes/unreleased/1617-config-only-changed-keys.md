@@ -1,0 +1,1 @@
+fix: The first setting croft saves on a fresh install, and Open Settings (JSON) with no config yet, no longer write every default into config.json, so an extends base and later default changes apply. A config.json already written this way keeps its keys: delete the ones you never set.
