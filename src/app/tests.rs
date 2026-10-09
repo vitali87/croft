@@ -10437,6 +10437,67 @@ fn xlsx_grid_editing_saves_cells_and_holds_formulas_for_consent() {
     assert_eq!(ws3.cell((2u32, 3u32)).unwrap().value(), "8");
 }
 
+/// #1618: F2 is the spreadsheet "edit this cell" key, caret at the end, as
+/// docs/KEYBINDINGS.md says. Rename Symbol used to swallow it, so the next
+/// characters replaced the value instead of appending to it.
+#[test]
+fn f2_in_the_sheet_grid_edits_the_cell_with_the_caret_at_the_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("people.csv");
+    std::fs::write(&p, "id,name\n1,Smith\n2,Lee\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    app.handle_editor_key(key(KeyCode::Down, KeyModifiers::NONE));
+    app.handle_editor_key(key(KeyCode::Right, KeyModifiers::NONE));
+    app.handle_editor_key(key(KeyCode::F(2), KeyModifiers::NONE));
+    let editing = app.editor.sheet.as_ref().unwrap().editing.as_ref();
+    assert_eq!(
+        editing.map(|e| (e.value.as_str(), e.cursor)),
+        Some(("Lee", 3)),
+        "F2 opens the cell editor on the value, caret at the end"
+    );
+    for c in "son".chars() {
+        app.handle_editor_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    app.handle_editor_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    let view = app.editor.sheet.as_ref().unwrap();
+    assert_eq!(
+        view.sheets[0].cell(1, 1),
+        "Leeson",
+        "F2 appends, like Enter"
+    );
+    app.save();
+    assert_eq!(
+        std::fs::read_to_string(&p).unwrap(),
+        "id,name\n1,Smith\n2,Leeson\n"
+    );
+}
+
+/// #1618 negative: in a text buffer F2 is still Rename Symbol, and
+/// Ctrl+F2 in the grid still does not open the cell editor.
+#[test]
+fn f2_outside_the_grid_is_still_rename_symbol() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.txt", "Lee\n");
+    app.status.clear();
+    app.handle_editor_key(key(KeyCode::F(2), KeyModifiers::NONE));
+    assert!(
+        app.status == "No language server for this file" || app.status == "Preparing rename…",
+        "F2 went to Rename Symbol: {:?}",
+        app.status
+    );
+    assert_eq!(app.editor.lines[0], "Lee");
+
+    let p = tmp.path().join("people.csv");
+    std::fs::write(&p, "id,name\n2,Lee\n").unwrap();
+    app.editor.open(&p).unwrap();
+    app.handle_editor_key(key(KeyCode::F(2), KeyModifiers::CONTROL));
+    assert!(
+        app.editor.sheet.as_ref().unwrap().editing.is_none(),
+        "Ctrl+F2 is not the grid's edit key"
+    );
+}
+
 /// #1375 end-to-end: one cell typed into a fully quoted CSV and saved
 /// changes that line only, still fully quoted.
 #[test]
