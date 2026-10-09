@@ -1,0 +1,1 @@
+fix: Starting the debugger, Debug Test or Run now saves unsaved editors first, so breakpoints and the paused line match the code that runs. Set `"debug.saveBeforeStart": "none"` (or `disable_save_before_debug`) to launch without saving.
