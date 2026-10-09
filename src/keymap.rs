@@ -338,46 +338,6 @@ fn parse_key(tok: &str) -> Option<KeyCode> {
     })
 }
 
-/// Strip `//` line comments so the JSONC config (and the seeded template) parse
-/// through `serde_json`, which rejects comments. Tracks string state so a `//`
-/// inside a quoted value survives. ponytail: only `//` line comments, no `/* */`
-/// blocks — the config has never needed them; add if a user asks.
-pub(crate) fn strip_line_comments(src: &str) -> String {
-    let mut out = String::with_capacity(src.len());
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut chars = src.chars().peekable();
-    while let Some(c) = chars.next() {
-        if in_string {
-            out.push(c);
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match c {
-            '"' => {
-                in_string = true;
-                out.push(c);
-            }
-            '/' if chars.peek() == Some(&'/') => {
-                for skipped in chars.by_ref() {
-                    if skipped == '\n' {
-                        out.push('\n');
-                        break;
-                    }
-                }
-            }
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
 /// A mouse gesture bindable in `keybindings.json` (#259).
 ///
 /// Deliberately NOT expressed as a [`Chord`]: a chord is a `KeyCode` plus
@@ -617,12 +577,13 @@ impl Keymap {
     pub(crate) fn resolve(json: &str) -> (Self, Vec<String>) {
         let mut warnings = Vec::new();
         // A malformed file is the worst of the silent cases and the likeliest:
-        // this is hand-edited JSON with no schema, and one trailing comma cost
-        // the user EVERY binding with nothing anywhere to say so. Reported
+        // this is hand-edited JSON with no schema. It is read as JSONC, as VS
+        // Code reads it, so comments and trailing commas are fine (#1191);
+        // anything else costs the user EVERY binding, so it is reported
         // rather than swallowed - an empty file legitimately means no
         // bindings, but a broken one means bindings the user wrote that
         // vanished, and the two must not look alike.
-        let rows: Vec<Binding> = match serde_json::from_str(&strip_line_comments(json)) {
+        let rows: Vec<Binding> = match serde_json::from_str(&crate::tasks::strip_jsonc(json)) {
             Ok(rows) => rows,
             Err(e) => {
                 warnings.push(format!(
@@ -814,13 +775,13 @@ pub fn rebind_text(src: Option<&str>, command: &str, chord: &str) -> Option<Stri
     let kept: Vec<&str> = src.lines().filter(|l| !names_command(l)).collect();
     let mut text = kept.join("\n");
     let parsed_ok = |t: &str| {
-        serde_json::from_str::<serde_json::Value>(&strip_line_comments(t))
+        serde_json::from_str::<serde_json::Value>(&crate::tasks::strip_jsonc(t))
             .is_ok_and(|v| v.is_array())
     };
     if let Some(close) = text.rfind(']') {
         // What precedes the new entry decides the comma: an element needs
         // one, an opening bracket or a trailing comma does not.
-        let before = strip_line_comments(&text[..close]);
+        let before = crate::tasks::strip_jsonc(&text[..close]);
         let needs_comma = before.trim_end().ends_with('}');
         let insert = format!("{}  {entry}\n", if needs_comma { ",\n" } else { "\n" });
         let head = text[..close].trim_end().to_string();
@@ -833,7 +794,8 @@ pub fn rebind_text(src: Option<&str>, command: &str, chord: &str) -> Option<Stri
         }
     }
     // Structured fallback: comments are lost, the bindings are not.
-    let mut rows: Vec<serde_json::Value> = serde_json::from_str(&strip_line_comments(src)).ok()?;
+    let mut rows: Vec<serde_json::Value> =
+        serde_json::from_str(&crate::tasks::strip_jsonc(src)).ok()?;
     rows.retain(|r| r.get("command").and_then(|c| c.as_str()) != Some(command));
     rows.push(serde_json::json!({ "key": chord, "command": command }));
     Some(serde_json::to_string_pretty(&rows).ok()? + "\n")
@@ -897,8 +859,49 @@ mod tests {
     #[test]
     fn rebinding_refuses_a_file_that_does_not_parse() {
         use super::*;
-        let src = "/* mine */\n[{\"key\":\"ctrl+a\",\"command\":\"save_file\"}]\n";
+        // A missing comma between two keys: no JSONC reading fixes that.
+        let src = "[{\"key\":\"ctrl+a\" \"command\":\"save_file\"}]\n";
         assert_eq!(rebind_text(Some(src), "close_tab", "ctrl+w"), None);
+    }
+
+    /// keybindings.json the way VS Code users write it (#1191): a block
+    /// comment and trailing commas.
+    const JSONC_BINDINGS: &str = "/* mine */\n[\n  { \"key\": \"ctrl+alt+q\", \"command\": \"quick_open\" },\n  { \"key\": \"f7\", \"command\": \"toggle_word_wrap\", /* wrap */ },\n]\n";
+
+    #[test]
+    fn keybindings_with_a_trailing_comma_or_block_comment_still_load() {
+        use super::*;
+        let (map, warnings) = Keymap::resolve(JSONC_BINDINGS);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let key = |spec: &str| {
+            let c = Chord::parse(spec).unwrap();
+            KeyEvent::new(c.code, c.mods)
+        };
+        assert_eq!(map.command_for(key("ctrl+alt+q")), Some(Command::QuickOpen));
+        assert_eq!(map.command_for(key("f7")), Some(Command::ToggleWordWrap));
+    }
+
+    #[test]
+    fn rebinding_a_jsonc_file_keeps_its_comments_and_bindings() {
+        use super::*;
+        let out = rebind_text(Some(JSONC_BINDINGS), "toggle_live_run", "f8").unwrap();
+        assert!(out.contains("/* mine */"), "{out}");
+        let (map, warnings) = Keymap::resolve(&out);
+        assert!(warnings.is_empty(), "{warnings:?}\n{out}");
+        assert_eq!(map.chord_for(Command::ToggleLiveRun).as_deref(), Some("f8"));
+        assert_eq!(
+            map.chord_for(Command::QuickOpen).as_deref(),
+            Some("ctrl+alt+q")
+        );
+    }
+
+    #[test]
+    fn keybindings_that_really_do_not_parse_still_say_so() {
+        // Negative: the JSONC reading must not swallow a broken file.
+        use super::*;
+        let (_, warnings) = Keymap::resolve("[{\"key\": \"f7\" \"command\": \"save_file\"},]");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("does not parse"), "{warnings:?}");
     }
 
     #[test]
@@ -1306,8 +1309,9 @@ mod tests {
 
     #[test]
     fn strips_line_comments_but_keeps_slashes_in_strings() {
-        let stripped =
-            strip_line_comments("// lead\n[{ \"key\": \"a//b\", \"command\": \"x\" }] // trailing");
+        let stripped = crate::tasks::strip_jsonc(
+            "// lead\n[{ \"key\": \"a//b\", \"command\": \"x\" }] // trailing",
+        );
         assert!(!stripped.contains("lead"));
         assert!(!stripped.contains("trailing"));
         assert!(
@@ -1328,9 +1332,11 @@ mod tests {
     // gone". The test above passing made this look covered when it was not.
     #[test]
     fn a_file_that_does_not_parse_says_so_instead_of_dropping_every_binding() {
-        // One trailing comma, the classic hand-edit.
+        // A missing comma between two rows, the classic hand-edit. (A
+        // trailing comma is JSONC and parses, #1191.)
         let broken = r#"[
-            { "key": "cmd+1", "command": "save_file" },
+            { "key": "cmd+1", "command": "save_file" }
+            { "key": "cmd+2", "command": "save_file" }
         ]"#;
         let (map, warnings) = Keymap::resolve(broken);
         assert!(map.is_empty(), "a broken file binds nothing");

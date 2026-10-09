@@ -1,0 +1,1 @@
+fix: Debug: Attach to Python Process shows each process's arguments again: the interpreter is named by its file name instead of its full uv, pyenv or venv path, a command too long to fit loses its middle (marked with …) rather than its end, and the picker grows with the terminal instead of stopping at 110 columns.
