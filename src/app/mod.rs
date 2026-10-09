@@ -51871,6 +51871,12 @@ impl App {
                 "switch",
                 name,
             ),
+            BranchAction::Track { remote_ref, name } => (
+                crate::git::track_remote_branch(&self.scm_root(), remote_ref, name),
+                "Switched to",
+                "switch --track",
+                name,
+            ),
             BranchAction::Create(name) => (
                 crate::git::create_branch(&self.scm_root(), name),
                 "Created",
