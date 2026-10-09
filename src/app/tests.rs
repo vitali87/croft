@@ -78114,6 +78114,44 @@ fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
     assert_eq!(app.status, "Tab is already kept open");
 }
 
+// --- #1218: a multi-line paste keeps its shape under the caret ----------------
+
+fn shop_app(tmp: &std::path::Path) -> App {
+    let mut app = app_with_open_file(
+        tmp,
+        "shop.py",
+        "class Shop:\n    def total(self, items):\n        if items:\n            n = 0\n            \n        return 0\n",
+    );
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 12;
+    app
+}
+
+#[test]
+fn a_bracketed_paste_into_a_nested_block_keeps_the_block_shape() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = shop_app(tmp.path());
+    app.handle_paste("for x in items:\n    if x:\n        print(x)");
+    assert_eq!(
+        &app.editor.lines[4..7],
+        &[
+            "            for x in items:",
+            "                if x:",
+            "                    print(x)",
+        ]
+    );
+}
+
+#[test]
+fn with_paste_reindent_off_a_paste_is_verbatim() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = shop_app(tmp.path());
+    app.paste_reindent = false;
+    app.handle_paste("for x in items:\n    if x:\n        print(x)");
+    assert_eq!(app.editor.lines[5], "    if x:");
+}
+
 // ---- Git diffs of files that aren't UTF-8 (#1242) ----
 
 /// A repo with `name` committed as `head` bytes, then `head + added` on disk.

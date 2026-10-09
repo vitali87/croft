@@ -3177,6 +3177,9 @@ pub struct App {
     /// Auto-closing pairs (#121), persisted; synced onto the active editor
     /// beside the blame flag.
     auto_close_pairs: bool,
+    /// Re-indent a multi-line paste under the caret line (#1218), on unless
+    /// `disable_paste_reindent` is set.
+    paste_reindent: bool,
     /// LSP inlay hints (inline type / parameter annotations), on by default
     /// like VS Code's `editor.inlayHints.enabled`; toggled from the palette
     /// and persisted as `disable_inlay_hints` in config.json.
@@ -5823,6 +5826,7 @@ impl App {
             inline_values_enabled: !loaded_prefs.disable_inline_values,
             save_before_debug: !loaded_prefs.disable_save_before_debug,
             auto_close_pairs: !loaded_prefs.disable_auto_close_pairs,
+            paste_reindent: !loaded_prefs.disable_paste_reindent,
             inlay_hints_enabled: !loaded_prefs.disable_inlay_hints,
             // Keep the suite off the user's real ~/.config/croft/history: a
             // per-process temp root in test builds, the real dir otherwise.
@@ -45800,7 +45804,7 @@ impl App {
             self.status = String::from("Cmd+V: clipboard is empty");
             return;
         }
-        self.editor.insert_str(s);
+        self.editor.paste_str(s, self.paste_reindent);
         self.status = format!("Pasted {} chars", s.chars().count());
     }
 
@@ -45969,7 +45973,7 @@ impl App {
         }
         match self.focus {
             Pane::Editor => {
-                self.editor.insert_str(s);
+                self.editor.paste_str(s, self.paste_reindent);
                 self.status = format!("Pasted {} chars", s.chars().count());
             }
             Pane::Terminal => {
@@ -59265,6 +59269,8 @@ impl App {
         }
         self.auto_close_pairs = !p.disable_auto_close_pairs;
         self.editor.auto_close_pairs = self.auto_close_pairs;
+        self.paste_reindent = !p.disable_paste_reindent;
+
         self.follow_vim_mode_pref(p.vim_mode);
         if !p.disable_inline_blame && !self.inline_blame_enabled {
             // Re-enabling refetches, like toggle_inline_blame.

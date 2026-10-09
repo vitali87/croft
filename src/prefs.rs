@@ -242,6 +242,10 @@ pub struct Prefs {
     /// (a default-false field keeps old configs valid, like inline blame).
     #[serde(default)]
     pub disable_auto_close_pairs: bool,
+    /// A multi-line paste is re-indented under the caret line (#1218); this
+    /// stores the opt-out for people who want the clipboard verbatim.
+    #[serde(default)]
+    pub disable_paste_reindent: bool,
     /// Opt-out for debugger inline values (#135), on by default like VS
     /// Code's `debug.inlineValues: "auto"`. Stored as the disable flag so
     /// the derived `Default` and an older config both mean "values shown".

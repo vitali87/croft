@@ -94,7 +94,7 @@ never change what croft trusts or executes. They are limited to an explicit
 allowlist — appearance and editor/terminal behavior:
 
 `theme`, `format_on_save`, `format_on_type`, `auto_save`, `auto_save_on_focus_change`,
-`render_whitespace`, `disable_inline_blame`, `disable_auto_close_pairs`,
+`render_whitespace`, `disable_inline_blame`, `disable_auto_close_pairs`, `disable_paste_reindent`,
 `disable_inline_values`, `disable_save_before_debug`, `disable_bracket_colors`, `disable_indent_guides`,
 `disable_inlay_hints`, `copy_on_select`, `disable_secret_redaction`, `disable_log_highlight`, `explorer_views`,
 `files_exclude`, `search_exclude`.
