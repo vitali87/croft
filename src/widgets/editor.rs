@@ -11497,9 +11497,20 @@ impl Editor {
         // already done is pinned from its line's end.
         let mut order: Vec<usize> = (0..all.len()).collect();
         order.sort_by(|&a, &b| all[b].head.cmp(&all[a].head));
+        // Two carets whose swaps share a character (`ab` with carets after
+        // `a` and after `b`) would each act on text the other already moved:
+        // the second of them, in this order, stays where it is instead.
+        let mut taken: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
         let mut pinned = vec![(0, 0); all.len()];
         for i in order {
-            let at = self.transpose_at(all[i].head);
+            let head = all[i].head;
+            let cells = self.transpose_cells(head);
+            if cells.iter().any(|c| taken.contains(c)) {
+                pinned[i] = self.pin_from_end(head);
+                continue;
+            }
+            taken.extend(cells);
+            let at = self.transpose_at(head);
             pinned[i] = self.pin_from_end(at);
         }
         let moved: Vec<EditorSelection> = pinned
@@ -11515,6 +11526,24 @@ impl Editor {
             self.recompute_highlights();
         }
         self.ensure_cursor_col_visible();
+    }
+
+    /// The `(row, char col)` cells one caret's Transpose Characters
+    /// changes, in the buffer as it is: the two chars it swaps, or a line's
+    /// last char and the line break it moves across (col = the line's
+    /// length). Empty when it only steps the caret.
+    fn transpose_cells(&self, (row, col): (usize, usize)) -> Vec<(usize, usize)> {
+        let len = self.line_char_len(row);
+        if col >= len {
+            if row + 1 >= self.lines.len() || len == 0 {
+                return Vec::new();
+            }
+            return vec![(row, len - 1), (row, len)];
+        }
+        if col == 0 {
+            return Vec::new();
+        }
+        vec![(row, col - 1), (row, col)]
     }
 
     /// One caret's Transpose Characters, returning where that caret goes.
@@ -29516,6 +29545,22 @@ mod tests {
         assert!(e.undo());
         assert_eq!(e.lines[0], "let foo = 1;");
         assert_eq!(e.lines[2], "let baz = foo * 3;");
+    }
+
+    /// #1637: two carets whose swaps share a character do not act on text
+    /// the other already moved: `ab` with carets after `a` and after `b`
+    /// moves `b` to the next line once, and leaves `a` where it was.
+    #[test]
+    fn overlapping_transpose_carets_do_not_compound() {
+        let mut e = editor_with("ab\nx");
+        carets_at(&mut e, &[(0, 1), (0, 2)]);
+        e.transpose_chars();
+        assert_eq!(e.lines, vec!["a", "bx"]);
+        // Two carets with disjoint swaps on one line both still swap.
+        let mut e = editor_with("abcd");
+        carets_at(&mut e, &[(0, 1), (0, 3)]);
+        e.transpose_chars();
+        assert_eq!(e.lines, vec!["badc"]);
     }
 
     /// #1637 negative: one caret bumps and transposes as before, and a line
