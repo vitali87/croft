@@ -883,6 +883,7 @@ fn unsaved_edits_survive_a_kill_and_come_back_on_the_next_launch() {
             .env("HOME", dir)
             .env("TERM", "xterm-256color")
             .env_remove("TERM_PROGRAM")
+            .env_remove("XDG_STATE_HOME")
             .stdin(slave.try_clone().unwrap())
             .stdout(slave.try_clone().unwrap())
             .stderr(slave.try_clone().unwrap());
@@ -947,7 +948,8 @@ fn unsaved_edits_survive_a_kill_and_come_back_on_the_next_launch() {
     let home = tempfile::tempdir().unwrap();
     let file = home.path().join("a.txt");
     std::fs::write(&file, "alpha\n").unwrap();
-    let backups = home.path().join(".cache/croft/hot-exit");
+    // In the state directory, not the cache that cleaners delete (#1578).
+    let backups = home.path().join(".local/state/croft/hot-exit");
     let (mut child, mut pty) = spawn(home.path(), &["a.txt"]);
     let started = read_until(&mut pty, limit, |out| out.contains("alpha"));
     assert!(

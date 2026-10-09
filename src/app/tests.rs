@@ -12005,6 +12005,53 @@ fn hot_exit_backs_up_an_unsaved_buffer_once_it_settles() {
     assert!(!app.quit);
 }
 
+/// #1578: hot-exit backups lived under `~/.cache/croft`, which cache
+/// cleaners delete, taking the only copy of unsaved edits with them. They
+/// now live in the state directory; a backup an earlier croft left in the
+/// cache moves there on launch and is restored from it, and so do sticky
+/// notes.
+#[test]
+fn a_backup_left_in_the_cache_is_restored_from_the_state_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, &cache.path().join("hot-exit"));
+    settle_hot_exit(&mut app);
+    drop(app);
+    let notes = cache.path().join("notes").join("0123456789abcdef.json");
+    std::fs::create_dir_all(notes.parent().unwrap()).unwrap();
+    std::fs::write(&notes, "[]").unwrap();
+
+    let data = user_data_dir(cache.path(), state.path());
+    assert_eq!(data, state.path());
+    assert!(
+        !cache.path().join("hot-exit").exists(),
+        "nothing is left in the cache"
+    );
+    assert!(
+        state
+            .path()
+            .join("notes")
+            .join("0123456789abcdef.json")
+            .is_file()
+    );
+
+    let mut next = with_hot_exit(
+        App::new(tmp.path().to_path_buf()).unwrap(),
+        &data.join("hot-exit"),
+    );
+    next.restore_hot_exit();
+    let ed = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .expect("the unsaved tab is back");
+    assert!(ed.dirty);
+    assert_eq!(ed.lines[0], "xalpha");
+}
+
 /// #862 hot exit: croft killed with an unsaved buffer (no quit ran, the
 /// App is simply dropped) comes back on the next launch of the workspace:
 /// the tab returns unsaved, with its text and cursor, the file untouched,
