@@ -4887,6 +4887,9 @@ pub struct App {
     /// pane's next scanned command replaces its previous run's diagnostics
     /// (VS Code clears a task's problems when the task re-runs).
     build_diag_files_by_pane: std::collections::HashMap<u64, Vec<PathBuf>>,
+    /// The HEAD a warned Undo Last Commit (#1350) is armed for: a commit
+    /// already on its upstream is undone on the second ask at that HEAD.
+    undo_pushed_commit_armed: Option<String>,
     /// True while the "Discard All Changes" confirmation modal is up.
     pub pending_discard_all: bool,
     /// The Replace All confirmation (#123): `(occurrences, files, dirty
@@ -6202,6 +6205,7 @@ impl App {
             git_output_log: Vec::new(),
             build_diagnostics: std::collections::HashMap::new(),
             build_diag_files_by_pane: std::collections::HashMap::new(),
+            undo_pushed_commit_armed: None,
             pending_discard_all: false,
             pending_replace_all: None,
             file_finder_index: None,
@@ -33909,6 +33913,38 @@ impl App {
         );
     }
 
+    /// Undo Last Commit (#1350): the last commit goes back to Staged and
+    /// its message back into an empty box, so a reword or a re-pick of the
+    /// files is one step away. A commit already on the upstream is undone
+    /// only on a second ask, after a warning that it means a force push.
+    fn undo_last_commit_source_control(&mut self) {
+        let root = self.scm_root();
+        let head = crate::git::query(&root).head_oid;
+        if head.is_some()
+            && crate::git::head_is_on_upstream(&root)
+            && self.undo_pushed_commit_armed != head
+        {
+            self.undo_pushed_commit_armed = head;
+            let warning = String::from(
+                "The last commit is already pushed: undoing it means a force push later. Undo Last Commit again to undo it anyway",
+            );
+            self.source_control.commit_feedback = Some(warning.clone());
+            self.source_control.commit_feedback_is_error = true;
+            self.status = warning;
+            return;
+        }
+        self.undo_pushed_commit_armed = None;
+        let outcome = crate::git::undo_last_commit(&root);
+        if let Ok(message) = &outcome
+            && self.source_control.message.trim().is_empty()
+        {
+            self.source_control.clear_message();
+            self.source_control.insert_str(message.trim());
+        }
+        let summary = outcome.map(|m| m.lines().next().unwrap_or("").trim().to_string());
+        self.run_scm_op("reset --soft HEAD~1", summary, "Undid last commit");
+    }
+
     fn commit_and_sync_source_control(&mut self) {
         if self.git_net_busy() {
             return;
@@ -34060,6 +34096,7 @@ impl App {
             ScmAction::CommitStaged => self.commit_staged_source_control(),
             ScmAction::CommitAll => self.commit_all_source_control(),
             ScmAction::CommitAmend => self.commit_amend_source_control(),
+            ScmAction::UndoLastCommit => self.undo_last_commit_source_control(),
             ScmAction::CommitAndPush => self.commit_and_push_source_control(),
             ScmAction::CommitAndSync => self.commit_and_sync_source_control(),
             ScmAction::StageAll => self.stage_all_source_control(),
@@ -49781,15 +49818,25 @@ impl App {
             Cmd::DebugAddWatch => self.open_add_watch_prompt(),
             Cmd::PeekDefinition => self.peek_definition_at_cursor(),
             Cmd::PeekReferences => self.peek_references_at_cursor(),
-            // Cmd+F12's request (#843), which has no `Ctrl` form.
-            Cmd::GoToImplementations => {
-                if self.editor.diff.is_none()
-                    && self.editor.sheet.is_none()
-                    && self.editor.image.is_none()
-                {
-                    self.request_implementation_at_cursor();
-                }
+            // The caret-driven LSP actions (#1212), the same calls the F-key
+            // chords make. A palette run or a rebound chord on a non-text
+            // view says why nothing happened instead of staying silent.
+            Cmd::GoToDefinition
+            | Cmd::GoToReferences
+            | Cmd::GoToDeclaration
+            | Cmd::GoToTypeDefinition
+            | Cmd::GoToImplementations
+            | Cmd::RenameSymbol
+                if self.editor.has_non_text_view() =>
+            {
+                self.status = format!("{} needs a text file", cmd.title());
             }
+            Cmd::GoToDefinition => self.request_definition_at_cursor(),
+            Cmd::GoToReferences => self.request_references_at_cursor(),
+            Cmd::GoToDeclaration => self.request_declaration_at_cursor(),
+            Cmd::GoToTypeDefinition => self.request_type_definition_at_cursor(),
+            Cmd::GoToImplementations => self.request_implementation_at_cursor(),
+            Cmd::RenameSymbol => self.start_rename_symbol(),
             // Position-carrying commands (#259). They read the click the
             // dispatcher set, and do nothing from the keyboard: invoked from
             // the palette there is no click to act on, and guessing the
@@ -49912,6 +49959,9 @@ impl App {
             Cmd::StageHunk => self.stage_hunk_at_caret(),
             Cmd::UnstageHunk => self.unstage_hunk_at_caret(),
             Cmd::RevertHunk => self.request_revert_hunk_at_caret(),
+            Cmd::GitUndoLastCommit => {
+                self.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::UndoLastCommit)
+            }
             Cmd::ToggleFold => {
                 let row = self.editor.cursor_row;
                 self.editor.toggle_fold(row);
