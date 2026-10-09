@@ -53055,9 +53055,17 @@ impl App {
             return false;
         }
         let changed = log.poll_index();
-        if log.indexing() {
+        let indexing = log.indexing();
+        // A reload's kept place may lie past what was indexed so far.
+        if changed {
+            self.editor.settle_log_reload();
+        }
+        if indexing {
             return changed;
         }
+        let Some(log) = self.editor.log.as_ref() else {
+            return true;
+        };
         if let Some(state) = self.editor_find.as_ref()
             && !state.query.is_empty()
         {
@@ -53119,6 +53127,9 @@ impl App {
             return;
         };
         self.editor.active_search_match = Some((m.row, m.col_chars, m.len_chars));
+        // The match is the reader's place now; a reload still settling its
+        // own place must not scroll it away on the next index batch.
+        self.editor.cancel_log_reload();
         // The log body starts one row below the header.
         let rows = (self.editor.last_inner.height as usize).saturating_sub(1);
         if rows == 0 {

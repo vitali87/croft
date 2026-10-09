@@ -393,7 +393,7 @@ Image tabs (`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp`) are read-only; eve
 
 | Keys | Action |
 |------|--------|
-| `Up` / `Down`, `PageUp` / `PageDown`, `Home` / `End` (also with `Ctrl`) | Scroll the log a line, a screen, or to the top / the tail. The tab is read-only, so typed keys change nothing |
+| `Up` / `Down`, `PageUp` / `PageDown`, `Home` / `End` (also with `Ctrl`) | Scroll the log a line, a screen, or to the top / the tail. The tab is read-only, so typed keys change nothing. When the file changes on disk the view reloads where it was, and a view at the tail follows it, so lines a program appends come into view as they are written (a truncated log clamps to what is left) |
 | Highlighting (palette toggle) | Plain lines in the rendered log are coloured by [tailspin](https://github.com/bensadeh/tailspin): dates, durations, numbers, UUIDs, IPs, URLs, paths, quotes, severity keywords (ERROR/WARN/INFO/DEBUG), booleans and null, and HTTP methods. Lines that already carry their own colours are left as printed. The rendered view still opens only for a file carrying ANSI colour in its first 8 KiB (an uncoloured `.log` stays an ordinary editable file), so this colours the plain lines of a log that is coloured elsewhere: a build log, pytest output, a structured logger's file. "Log: Toggle Highlighting (tailspin)" switches it for every open log and for logs opened later, persisted as `disable_log_highlight` in `config.json` (also a row in Settings) |
 
 **PDF (`.pdf`)**
