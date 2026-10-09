@@ -17699,15 +17699,52 @@ impl EditorTabs {
         Ok(())
     }
 
+    /// The text a diff should show for `path` (#1572): an open tab's unsaved
+    /// edits, as a save would write them, since that is the version the user
+    /// is looking at; the file on disk when no tab has unsaved edits to it.
+    fn text_to_diff(unsaved: Option<String>, path: &Path) -> Result<String> {
+        match unsaved {
+            Some(text) => Ok(text),
+            None => {
+                std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
+            }
+        }
+    }
+
+    /// The text a save of `path`'s open tab would write, when that tab has
+    /// unsaved edits; `None` otherwise. Searches this group only: the app
+    /// resolves it across every split group before calling the `_resolved`
+    /// openers.
+    pub fn unsaved_text_of(&self, path: &Path) -> Option<String> {
+        let idx = self.find_tab_matching(path, |e| {
+            e.dirty && e.symbol_view.is_none() && !e.has_non_text_view()
+        })?;
+        Some(self.editors[idx].content_for_disk())
+    }
+
     /// Open a side-by-side diff of two files in a fresh pinned tab next
-    /// to the active one. The new tab is read-only: edits, save, and the
+    /// to the active one, each side read the way [`Self::text_to_diff`]
+    /// says. The new tab is read-only: edits, save, and the
     /// text-rendering path are all bypassed via the `diff: Some(...)` flag
     /// on the underlying Editor.
+    #[cfg(test)]
     pub fn open_diff(&mut self, left: &Path, right: &Path) -> Result<()> {
-        let left_text =
-            std::fs::read_to_string(left).with_context(|| format!("reading {}", left.display()))?;
-        let right_text = std::fs::read_to_string(right)
-            .with_context(|| format!("reading {}", right.display()))?;
+        let left_unsaved = self.unsaved_text_of(left);
+        let right_unsaved = self.unsaved_text_of(right);
+        self.open_diff_resolved(left, right, left_unsaved, right_unsaved)
+    }
+
+    /// [`Self::open_diff`] with each side's unsaved text already resolved by
+    /// the caller (across every split group); `None` reads the disk.
+    pub fn open_diff_resolved(
+        &mut self,
+        left: &Path,
+        right: &Path,
+        left_unsaved: Option<String>,
+        right_unsaved: Option<String>,
+    ) -> Result<()> {
+        let left_text = Self::text_to_diff(left_unsaved, left)?;
+        let right_text = Self::text_to_diff(right_unsaved, right)?;
         let left_lines: Vec<String> = left_text.lines().map(str::to_string).collect();
         let right_lines: Vec<String> = right_text.lines().map(str::to_string).collect();
         let mut data = crate::widgets::diff::DiffData::build(
@@ -17742,10 +17779,12 @@ impl EditorTabs {
     }
 
     /// Open a side-by-side diff between an in-memory `left_text` (e.g.
-    /// the HEAD version of a file) and the working-tree file at `right`.
-    /// The left "path" is purely a label; nothing reads from it on disk.
+    /// the HEAD version of a file) and `right` as the user sees it: its open
+    /// tab's unsaved edits, else the file on disk. The left "path" is purely
+    /// a label; nothing reads from it on disk.
     /// Used by the Source Control panel to show working-tree-vs-HEAD
     /// diffs when the user clicks a Modified entry.
+    #[cfg(test)]
     pub fn open_head_diff_with_text(
         &mut self,
         left_label: PathBuf,
@@ -17753,13 +17792,46 @@ impl EditorTabs {
         right: &Path,
         left_is_git_head: bool,
     ) -> Result<()> {
-        let right_text = std::fs::read_to_string(right)
-            .with_context(|| format!("reading {}", right.display()))?;
-        self.open_head_diff_with_texts(left_label, left_text, &right_text, right, left_is_git_head)
+        let unsaved = self.unsaved_text_of(right);
+        self.open_head_diff_with_text_resolved(
+            left_label,
+            left_text,
+            right,
+            left_is_git_head,
+            unsaved,
+        )
+    }
+
+    /// [`Self::open_head_diff_with_text`] with `right`'s unsaved text already
+    /// resolved by the caller (across every split group); `None` reads the
+    /// disk.
+    pub fn open_head_diff_with_text_resolved(
+        &mut self,
+        left_label: PathBuf,
+        left_text: &str,
+        right: &Path,
+        left_is_git_head: bool,
+        unsaved: Option<String>,
+    ) -> Result<()> {
+        let right_is_unsaved = unsaved.is_some();
+        let right_text = match unsaved {
+            Some(text) => text,
+            None => std::fs::read_to_string(right)
+                .with_context(|| format!("reading {}", right.display()))?,
+        };
+        self.open_head_diff_with_texts(
+            left_label,
+            left_text,
+            &right_text,
+            right,
+            left_is_git_head,
+            right_is_unsaved,
+        )
     }
 
     /// [`Self::open_head_diff_with_text`] with the working side already read
-    /// and decoded, for a file that isn't UTF-8 (#1242).
+    /// and decoded, for a file that isn't UTF-8 (#1242). `right_is_unsaved`
+    /// says `right_text` is the open tab's unsaved buffer, not the disk.
     pub fn open_head_diff_with_texts(
         &mut self,
         left_label: PathBuf,
@@ -17767,6 +17839,7 @@ impl EditorTabs {
         right_text: &str,
         right: &Path,
         left_is_git_head: bool,
+        right_is_unsaved: bool,
     ) -> Result<()> {
         let left_lines: Vec<String> = left_text.lines().map(str::to_string).collect();
         let right_lines: Vec<String> = right_text.lines().map(str::to_string).collect();
@@ -17786,6 +17859,7 @@ impl EditorTabs {
             data.scroll_to_row(row);
         }
         data.left_is_git_head = left_is_git_head;
+        data.right_is_unsaved = right_is_unsaved;
         let mut e = Editor::new();
         e.focused = self.editors[self.active].focused;
         e.preview = false;
@@ -17798,8 +17872,12 @@ impl EditorTabs {
         // If a tab is already showing this path (as a plain file or a
         // diff), reuse it so we don't pile up duplicate tabs as the
         // user clicks through the change list — unless it holds unsaved
-        // edits, which replacing wholesale would silently destroy.
-        if let Some(idx) = self.find_tab_with_path(right)
+        // edits, which replacing wholesale would silently destroy. A diff
+        // tab of the path comes first: with the file's own tab dirty, it
+        // is the only one to reuse (#1572).
+        if let Some(idx) = self
+            .find_tab_matching(right, |e| e.diff.is_some())
+            .or_else(|| self.find_tab_with_path(right))
             && !self.editors[idx].dirty
         {
             self.editors[idx] = e;

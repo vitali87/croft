@@ -241,7 +241,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Home` / `End` | Start / end of the caret's line in the commit message; with `Ctrl`, the start / end of the whole message |
 | `Enter` | Commit all tracked changes with the message. The commit runs in the background, so croft keeps responding while the repository's hooks run; the message stays in the box until the commit lands, and a hook's rejection shows below it. If a tab under the repository has unsaved edits, every commit and stash variant first asks, as VS Code does: `S`/`Enter` Save All & Commit (or Stash), which saves the tabs and goes ahead only once all of them are saved; `C` Commit (or Stash) Anyway, with the files as they are on disk; `Esc` cancels |
 | Click ✓ Commit | Same as `Enter` |
-| Click a change row | Open that file's diff against HEAD in a read-only editor tab |
+| Click a change row | Open that file's diff against HEAD in a read-only editor tab, reused on the next click. With unsaved edits the diff shows them; hunk actions then ask for a save first |
 | `S` in a diff tab | Stage only the change hunk under the cursor (click a row or `F7` to pick the hunk). With a selection dragged across rows, stages only the SELECTED lines instead (VS Code's Stage Selected Ranges): unselected additions stay out of the index and unselected deletions stay in it |
 | `U` in a diff tab | Unstage only the change hunk under the cursor, or only the selected lines when a selection spans rows |
 | `R` in a diff tab | Revert only the change hunk under the cursor after a `Y`/`N` confirm modal |
