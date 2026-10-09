@@ -30943,11 +30943,29 @@ impl App {
         if self.editor.hex.is_none() {
             return;
         }
-        self.open_input_prompt(InputPrompt::new(
-            InputPurpose::HexFind,
-            "Find in Hex",
-            "hex bytes (de ad be ef) or text",
-        ));
+        // Which reading a hex-shaped query gets depends on the column the
+        // search starts from (#1644), so the title says it.
+        let text_side = self.editor.hex.as_ref().is_some_and(|v| v.ascii_focus);
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::HexFind,
+                if text_side {
+                    "Find in Hex (text)"
+                } else {
+                    "Find in Hex"
+                },
+                if text_side {
+                    "text"
+                } else {
+                    "hex bytes (de ad be ef) or text"
+                },
+            )
+            .with_hint(if text_side {
+                "Enter finds this text · Esc cancels"
+            } else {
+                "\"1234\" finds hex-looking text · Enter · Esc cancels"
+            }),
+        );
     }
 
     /// The "+ Add Expression" affordance (panel row or palette): a single-line
@@ -34837,11 +34855,12 @@ impl App {
             }
             InputPurpose::HexFind => {
                 self.close_input_prompt();
-                match crate::hex::HexView::parse_find_query(&value) {
-                    Some(needle) => {
+                let text_side = self.editor.hex.as_ref().is_some_and(|v| v.ascii_focus);
+                match crate::hex::HexView::parse_find_query(&value, text_side) {
+                    Some(query) => {
                         let from = match self.editor.hex.as_mut() {
                             Some(view) => {
-                                view.last_find = Some(needle);
+                                view.last_find = Some(query);
                                 // The submit searches from the cursor
                                 // INCLUSIVE so a match under it is
                                 // found; F3 then steps past it.
@@ -65833,22 +65852,26 @@ impl App {
         let Some(view) = self.editor.hex.as_mut() else {
             return;
         };
-        let Some(needle) = view.last_find.clone() else {
+        let Some(query) = view.last_find.clone() else {
             return;
         };
+        let needle = &query.needle;
+        // Which reading the query got (#1644): "1234" as bytes 12 34 and as
+        // text are different searches, and the line says which one ran.
+        let what = query.describe();
         let rows = (view.layout.data_rows as usize).max(1);
-        match view.find_forward(&needle, from) {
+        match view.find_forward(needle, from) {
             Ok(crate::hex::FindOutcome::Found(off)) => {
                 view.set_cursor(off, false, rows);
                 view.sel_anchor = Some(off + needle.len() as u64 - 1);
-                self.status = format!("Found at 0x{off:X}");
+                self.status = format!("Found {what} at 0x{off:X}");
             }
             Ok(crate::hex::FindOutcome::NotFound) => {
-                self.status = String::from("Not found");
+                self.status = format!("Not found: {what}");
             }
             Ok(crate::hex::FindOutcome::Capped) => {
                 self.status = format!(
-                    "Not found in the first {} MB scanned",
+                    "Not found in the first {} MB scanned: {what}",
                     crate::hex::FIND_SCAN_CAP / (1024 * 1024)
                 );
             }

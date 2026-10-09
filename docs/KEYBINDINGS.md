@@ -435,7 +435,7 @@ Binary files open here automatically instead of erroring; the file is read in wi
 | `↑` / `↓` | One row up / down (`Shift` extends) |
 | `PageUp` / `PageDown` | One viewport up / down (`Shift` extends) |
 | `Home` / `End` | Start / end of the row; with `Cmd`/`Ctrl`: start / end of the file |
-| `Cmd+F` (`Ctrl+F`) | Find bytes: hex pairs (`de ad be ef`) or literal text |
+| `Cmd+F` (`Ctrl+F`) | Find bytes: hex pairs (`de ad be ef`) or literal text. Text that looks like hex (`1234`, `cafe`) is found as text in double quotes (`"1234"`) or when searching from the text column (`Tab`); the status line says which was searched for |
 | `F3` | Find next match (wraps; selects the match) |
 | `0-9 a-f` (hex grid) / any character (ASCII gutter) | Overwrite the byte under the cursor; two hex digits complete a byte and advance. Pending edits tint amber until saved |
 | `Tab` | Switch typing between the hex grid and the ASCII gutter |
