@@ -10869,6 +10869,7 @@ impl App {
     }
 
     fn go_to_definition(&mut self, path: PathBuf, line: u32, col: u32) {
+        let pinned = self.keep_preview_open_for_navigation_to(&path);
         if let Some(from) = self.editor.path.clone() {
             self.nav.record(NavLoc {
                 path: from,
@@ -10881,7 +10882,10 @@ impl App {
             Ok(()) => {
                 self.status = format!("Jumped to {} line {}", self.status_path(&path), line + 1)
             }
-            Err(e) => self.status = format!("Go to definition failed: {e}"),
+            Err(e) => {
+                self.restore_preview_after_failed_navigation(pinned);
+                self.status = format!("Go to definition failed: {e}")
+            }
         }
     }
 
@@ -13275,18 +13279,58 @@ impl App {
         })
     }
 
+    /// A code navigation that leaves the active tab for another file keeps
+    /// that tab open (#1561), as VS Code does by default
+    /// (`enablePreviewFromCodeNavigation` off): were it the preview, the
+    /// target would take its slot and close the file being read, and Go
+    /// Back would swap them again. A jump within the same file replaces
+    /// nothing, so the tab stays a preview.
+    ///
+    /// The target counts as the same file under the editor's own path
+    /// matching (canonicalized), so a symlinked tab and the canonical path
+    /// a language server answers with are one file. Returns whether the tab
+    /// was promoted, for [`Self::restore_preview_after_failed_navigation`].
+    fn keep_preview_open_for_navigation_to(&mut self, target: &Path) -> bool {
+        let same_file = self.editor.path.as_deref().is_some_and(|p| {
+            p == target
+                || matches!(
+                    (p.canonicalize(), target.canonicalize()),
+                    (Ok(a), Ok(b)) if a == b
+                )
+        });
+        if !same_file && self.editor.is_preview(self.editor.active_index()) {
+            self.editor.pin_active();
+            return true;
+        }
+        false
+    }
+
+    /// A navigation whose target failed to open (a stale language-server
+    /// answer, a file deleted since it entered the history) left the user
+    /// on the tab it started from, so that tab goes back to being the
+    /// preview it was before [`Self::keep_preview_open_for_navigation_to`].
+    fn restore_preview_after_failed_navigation(&mut self, pinned: bool) {
+        if pinned {
+            self.editor.preview = true;
+        }
+    }
+
     fn nav_back(&mut self) {
         let current = self.current_nav_loc();
         let Some(loc) = self.nav.back(current) else {
             self.status = "No previous location".to_string();
             return;
         };
+        let pinned = self.keep_preview_open_for_navigation_to(&loc.path);
         let line = loc.row;
         match self.open_at(&loc.path, loc.row, loc.col) {
             Ok(()) => {
                 self.status = format!("Back to {} line {}", self.status_path(&loc.path), line + 1)
             }
-            Err(e) => self.status = format!("Go back failed: {e}"),
+            Err(e) => {
+                self.restore_preview_after_failed_navigation(pinned);
+                self.status = format!("Go back failed: {e}")
+            }
         }
     }
 
@@ -13298,6 +13342,7 @@ impl App {
             self.status = "No forward location".to_string();
             return;
         };
+        let pinned = self.keep_preview_open_for_navigation_to(&loc.path);
         let line = loc.row;
         match self.open_at(&loc.path, loc.row, loc.col) {
             Ok(()) => {
@@ -13307,7 +13352,10 @@ impl App {
                     line + 1
                 )
             }
-            Err(e) => self.status = format!("Go forward failed: {e}"),
+            Err(e) => {
+                self.restore_preview_after_failed_navigation(pinned);
+                self.status = format!("Go forward failed: {e}")
+            }
         }
     }
 
