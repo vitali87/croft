@@ -4131,6 +4131,58 @@ fn go_forward_after_go_back_keeps_both_files_open() {
     assert_eq!(open_tab_paths(&app), vec![mc, main, mh]);
 }
 
+/// A definition whose target cannot be opened (a stale language-server
+/// answer) leaves the user where they were, so the tab the jump started
+/// from stays the preview it was rather than being pinned for nothing.
+#[test]
+fn a_failed_definition_jump_leaves_the_preview_tab_a_preview() {
+    let (tmp, mut app, mc, main, _mh) = preview_nav_fixture();
+    app.editor.open_preview(&main).unwrap();
+    let gone = tmp.path().join("gone_dir");
+    std::fs::create_dir(&gone).unwrap();
+    app.go_to_definition(gone, 0, 0);
+    assert_eq!(app.editor.path.as_deref(), Some(main.as_path()));
+    assert_eq!(open_tab_paths(&app), vec![mc, main]);
+    assert!(
+        app.editor.is_preview(app.editor.active_index()),
+        "no navigation happened, so the tab is still the preview"
+    );
+}
+
+/// Go Back to a location whose file has since become unopenable keeps the
+/// preview tab a preview too.
+#[test]
+fn a_failed_go_back_leaves_the_preview_tab_a_preview() {
+    let (tmp, mut app, _mc, main, _mh) = preview_nav_fixture();
+    let doomed = tmp.path().join("doomed");
+    std::fs::create_dir(&doomed).unwrap();
+    app.nav.record(NavLoc {
+        path: doomed,
+        row: 0,
+        col: 0,
+    });
+    app.editor.open_preview(&main).unwrap();
+    app.nav_back();
+    assert_eq!(app.editor.path.as_deref(), Some(main.as_path()));
+    assert!(app.editor.is_preview(app.editor.active_index()));
+}
+
+/// A tab opened through a symlink and a language server's canonical path
+/// for the same file are one file: the jump stays inside the tab, so it
+/// stays a preview.
+#[cfg(unix)]
+#[test]
+fn a_definition_at_the_canonical_path_of_a_symlinked_preview_stays_a_preview() {
+    let (tmp, mut app, mc, main, _mh) = preview_nav_fixture();
+    let link = tmp.path().join("link.c");
+    std::os::unix::fs::symlink(&main, &link).unwrap();
+    app.editor.open_preview(&link).unwrap();
+    app.go_to_definition(main.canonicalize().unwrap(), 1, 0);
+    assert_eq!(app.editor.cursor_row, 1);
+    assert_eq!(open_tab_paths(&app), vec![mc, link]);
+    assert!(app.editor.is_preview(app.editor.active_index()));
+}
+
 /// Negative: a jump inside the same file (an outline entry, a local
 /// definition) moves the caret without promoting the preview tab, so the
 /// next single-click open still replaces it.
@@ -51918,7 +51970,7 @@ fn alt_enter_on_a_symlinked_symbol_still_opens_its_tab() {
     let root = std::fs::canonicalize(tmp.path()).unwrap();
     let file = root.join("two.rs");
     std::fs::write(&file, "fn a() {\n    1\n}\nfn b() {\n    2\n}").unwrap();
-    let link = root.join("link.rs");
+    let link = root.join("link.c");
     std::os::unix::fs::symlink(&file, &link).unwrap();
     let mut app = App::new(root.clone()).unwrap();
     app.editor.open_pinned(&file).unwrap();
