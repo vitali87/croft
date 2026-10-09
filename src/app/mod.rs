@@ -10869,6 +10869,7 @@ impl App {
     }
 
     fn go_to_definition(&mut self, path: PathBuf, line: u32, col: u32) {
+        self.keep_preview_open_for_navigation_to(&path);
         if let Some(from) = self.editor.path.clone() {
             self.nav.record(NavLoc {
                 path: from,
@@ -13275,12 +13276,27 @@ impl App {
         })
     }
 
+    /// A code navigation that leaves the active tab for another file keeps
+    /// that tab open (#1561), as VS Code does by default
+    /// (`enablePreviewFromCodeNavigation` off): were it the preview, the
+    /// target would take its slot and close the file being read, and Go
+    /// Back would swap them again. A jump within the same file replaces
+    /// nothing, so the tab stays a preview.
+    fn keep_preview_open_for_navigation_to(&mut self, target: &Path) {
+        if self.editor.path.as_deref() != Some(target)
+            && self.editor.is_preview(self.editor.active_index())
+        {
+            self.editor.pin_active();
+        }
+    }
+
     fn nav_back(&mut self) {
         let current = self.current_nav_loc();
         let Some(loc) = self.nav.back(current) else {
             self.status = "No previous location".to_string();
             return;
         };
+        self.keep_preview_open_for_navigation_to(&loc.path);
         let line = loc.row;
         match self.open_at(&loc.path, loc.row, loc.col) {
             Ok(()) => {
@@ -13298,6 +13314,7 @@ impl App {
             self.status = "No forward location".to_string();
             return;
         };
+        self.keep_preview_open_for_navigation_to(&loc.path);
         let line = loc.row;
         match self.open_at(&loc.path, loc.row, loc.col) {
             Ok(()) => {
