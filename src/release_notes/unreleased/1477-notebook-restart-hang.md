@@ -1,0 +1,1 @@
+fix: Notebook: Restart Kernel no longer leaves the notebook dead with cells stuck at In [*]: one thread now owns the kernel's sockets, and a restart that fails still settles the cells it lost and says why.

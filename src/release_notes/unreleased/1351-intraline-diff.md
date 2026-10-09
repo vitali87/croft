@@ -1,0 +1,1 @@
+fix: Side-by-side diffs mark the characters that changed within a modified line in a stronger tint (a one-character edit like 1.5 to 2.5 is easy to spot), flag a change past a side's edge with › or ‹, and leave fully rewritten lines plainly tinted.
