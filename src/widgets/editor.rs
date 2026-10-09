@@ -7600,10 +7600,32 @@ impl Editor {
             .unwrap_or_default();
         let indent_len = indent.chars().count();
         let parsed = crate::snippets::parse_body(body);
+        // A body's leading `\t` is one indent level, VS Code's convention
+        // (#1554): it becomes this buffer's indent unit, so a space-indented
+        // file gets no tab after its spaces. Tabs past the indentation are
+        // text and stay.
+        let unit = self.indent_unit();
+        let grow = unit.chars().count().saturating_sub(1);
+        let body_lines: Vec<&str> = parsed.text.split('\n').collect();
+        let leading_tabs = |line: &str, upto: usize| {
+            line.chars()
+                .take(upto)
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .filter(|c| *c == '\t')
+                .count()
+        };
+        let text = body_lines
+            .iter()
+            .map(|line| {
+                let lead = line.len() - line.trim_start_matches([' ', '\t']).len();
+                format!("{}{}", line[..lead].replace('\t', &unit), &line[lead..])
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         let inserted = if indent.is_empty() {
-            parsed.text.clone()
+            text
         } else {
-            parsed.text.replace('\n', &format!("\n{indent}"))
+            text.replace('\n', &format!("\n{indent}"))
         };
         // A snippet body is text the user chose, not text they wrote (#349).
         self.insert_str_as(&inserted, crate::provenance::Seat::Generated);
@@ -7613,6 +7635,7 @@ impl Editor {
             .iter()
             .map(|s| {
                 let (ld, col) = crate::snippets::offset_to_line_col(&parsed.text, s.offset);
+                let col = col + grow * leading_tabs(body_lines[ld], col);
                 let row = start.0 + ld;
                 let c = if ld == 0 {
                     start.1 + col
@@ -18755,6 +18778,75 @@ mod tests {
             e.lines[1], "        ",
             "continuation line keeps the 4-space block indent plus its own"
         );
+    }
+
+    /// #1554: a snippet body's `\t` is one indent level (VS Code's
+    /// convention) and was inserted as a literal tab, leaving a tab after
+    /// spaces in a space-indented file (ruff W191 / E101). It becomes the
+    /// buffer's indent unit, and the tab stop on that line moves with it.
+    #[test]
+    fn a_snippet_tab_becomes_the_buffers_indent_unit() {
+        let mut e = editor_with("def run():\n    ");
+        e.lang = Some(LangKind::Python);
+        e.cursor_row = 1;
+        e.cursor_col = 4;
+        e.expand_snippet("if __name__ == \"__main__\":\n\t${1:main()}", 0);
+        assert_eq!(e.lines[1], "    if __name__ == \"__main__\":");
+        assert_eq!(
+            e.lines[2], "        main()",
+            "four spaces of block indent, four for the tab"
+        );
+        assert_eq!((e.cursor_row, e.cursor_col), (2, 14));
+        assert_eq!(
+            e.selection_text(),
+            "main()",
+            "the stop still selects its placeholder"
+        );
+    }
+
+    /// #1554: nested levels (`\t\t`) each become a unit, and a stop past
+    /// the indentation on such a line lands on its text.
+    #[test]
+    fn nested_snippet_tabs_each_become_an_indent_unit() {
+        let mut e = editor_with("");
+        e.lang = Some(LangKind::Python);
+        e.expand_snippet(
+            "try:\n\tfor x in xs:\n\t\t${1:pass}\nexcept ${2:E}:\n\t${0}",
+            0,
+        );
+        assert_eq!(
+            e.lines,
+            vec![
+                "try:",
+                "    for x in xs:",
+                "        pass",
+                "except E:",
+                "    "
+            ]
+        );
+        assert_eq!(e.selection_text(), "pass");
+    }
+
+    /// Negative: a tab-indented buffer keeps the body's tabs, and a tab
+    /// inside a line (not leading) is left alone in any buffer.
+    #[test]
+    fn snippet_tabs_stay_tabs_in_a_tab_indented_buffer_and_mid_line() {
+        let mut e = editor_with("func f() {\n\t\n}");
+        e.set_indent_style(IndentStyle {
+            width: 4,
+            use_spaces: false,
+        });
+        e.cursor_row = 1;
+        e.cursor_col = 1;
+        e.expand_snippet("if x {\n\t${1:y}\n}", 0);
+        assert_eq!(e.lines[1], "\tif x {");
+        assert_eq!(e.lines[2], "\t\ty");
+        assert_eq!(e.selection_text(), "y");
+
+        let mut e = editor_with("");
+        e.lang = Some(LangKind::Python);
+        e.expand_snippet("a\tb\n\tc\td", 0);
+        assert_eq!(e.lines, vec!["a\tb", "    c\td"]);
     }
 
     #[test]
