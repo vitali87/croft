@@ -46662,9 +46662,8 @@ impl App {
             }
             // Always drain so completions never pile up unseen.
             for f in t.drain_finished_commands() {
-                if !f.output.is_empty() {
-                    build_scans.push((t.uid(), f.cwd.clone(), f.cmd.clone(), f.output.clone()));
-                }
+                // Empty output included (#1488): see the scan loop below.
+                build_scans.push((t.uid(), f.cwd.clone(), f.cmd.clone(), f.output.clone()));
                 // Durable command history: every finished command with a
                 // known text is recorded (cwd, exit, duration, timestamp)
                 // for the Ctrl+Shift+R cross-session search.
@@ -46795,6 +46794,16 @@ impl App {
             build_changed |= self.install_build_diags(pane, cwd.as_deref(), diags);
         }
         for (pane, cwd, cmd, output) in build_scans {
+            // A command that printed nothing (`cd`, `clear`) says nothing
+            // about the build, so the pane's problems stay. It still ends
+            // the pane's command, so it uses up a watcher's one-shot skip:
+            // a watcher that clears the screen erases its own output, and
+            // with the skip left armed the next build was the one skipped,
+            // leaving the watcher's stale problems in place (#1488).
+            if output.is_empty() {
+                self.watch_published_panes.remove(&pane);
+                continue;
+            }
             build_changed |= self.apply_build_scan(pane, cwd.as_deref(), &cmd, &output);
         }
         // Captures collect silently (iTerm2's model: the panel is the
