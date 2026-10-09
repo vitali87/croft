@@ -309,7 +309,9 @@ pub fn pytest_debug_launch_request(python: &Path, cwd: &Path, name: &str) -> Val
             "cwd": cwd.to_string_lossy(),
             "console": "internalConsole",
             "stopOnEntry": false,
-            "justMyCode": false
+            // Only the user's code, as VS Code and debugpy default (#1519):
+            // a step over a library call does not walk into the library.
+            "justMyCode": true
         }
     })
 }
@@ -325,7 +327,8 @@ pub fn launch_request(program: &Path, interpreter: &Path, stop_on_entry: bool) -
             "python": [interpreter.to_string_lossy()],
             "console": "internalConsole",
             "stopOnEntry": stop_on_entry,
-            "justMyCode": false
+            // See `pytest_debug_launch_request` (#1519).
+            "justMyCode": true
         }
     })
 }
@@ -3690,7 +3693,22 @@ def stopped():"#,
         assert_eq!(args[2], "test_addition");
         assert_eq!(req["arguments"]["python"][0], "/proj/.venv/bin/python");
         assert_eq!(req["arguments"]["cwd"], "/proj");
-        assert_eq!(req["arguments"]["justMyCode"], false);
+    }
+
+    /// #1519: every Python session croft started sent `justMyCode: false`,
+    /// so F11 on `json.dumps(...)` stepped into the standard library and the
+    /// call stack filled with `runpy` frames. VS Code and debugpy default to
+    /// stepping only through the user's own code; F5 and Debug Test now do.
+    #[test]
+    fn python_launches_step_through_the_users_code_only() {
+        let f5 = launch_request(Path::new("/w/main.py"), Path::new("/v/bin/python"), false);
+        assert_eq!(f5["arguments"]["justMyCode"], true, "F5 on the active file");
+        let test = pytest_debug_launch_request(
+            Path::new("/proj/.venv/bin/python"),
+            Path::new("/proj"),
+            "test_addition",
+        );
+        assert_eq!(test["arguments"]["justMyCode"], true, "Debug Test");
     }
 
     #[test]
