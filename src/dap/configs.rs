@@ -917,8 +917,10 @@ pub fn debugpy_request(rc: &ResolvedConfig, project_python: &Path) -> Value {
                 args.insert("python".into(), json!([project_python.to_string_lossy()]));
             }
             args.insert("console".into(), json!("internalConsole"));
+            // debugpy's and VS Code's default (#1519): step through the
+            // user's own code only. A config that sets it keeps its value.
             if !args.contains_key("justMyCode") {
-                args.insert("justMyCode".into(), json!(false));
+                args.insert("justMyCode".into(), json!(true));
             }
             request_value("launch", args)
         }
@@ -1678,6 +1680,29 @@ mod tests {
         assert!(err.contains("/nope/.env"), "{err}");
     }
 
+    /// #1519: a launch.json configuration that does not set `justMyCode`
+    /// steps only through the user's code, debugpy's and VS Code's default,
+    /// instead of croft forcing it off.
+    #[test]
+    fn a_debugpy_config_without_just_my_code_steps_through_user_code_only() {
+        let cfg = config(r#"[{ "name": "API", "type": "python", "program": "/p/api.py" }]"#);
+        let rc = resolve(&cfg, &ctx()).unwrap();
+        let req = debugpy_request(&rc, Path::new("/venv/bin/python"));
+        assert_eq!(req["arguments"]["justMyCode"], true);
+    }
+
+    /// Negative: a configuration that turns `justMyCode` off (to step into
+    /// a library) keeps it off.
+    #[test]
+    fn a_debugpy_config_can_still_step_into_libraries() {
+        let cfg = config(
+            r#"[{ "name": "API", "type": "python", "program": "/p/api.py", "justMyCode": false }]"#,
+        );
+        let rc = resolve(&cfg, &ctx()).unwrap();
+        let req = debugpy_request(&rc, Path::new("/venv/bin/python"));
+        assert_eq!(req["arguments"]["justMyCode"], false);
+    }
+
     #[test]
     fn debugpy_launch_request_carries_env_args_and_forces_internal_console() {
         let cfg = config(
@@ -1694,7 +1719,6 @@ mod tests {
         assert_eq!(req["arguments"]["args"][0], "--serve");
         assert_eq!(req["arguments"]["env"]["MODE"], "dev");
         assert_eq!(req["arguments"]["python"][0], "/venv/bin/python");
-        assert_eq!(req["arguments"]["justMyCode"], false);
         // integratedTerminal would hang on the declined runInTerminal.
         assert_eq!(req["arguments"]["console"], "internalConsole");
     }

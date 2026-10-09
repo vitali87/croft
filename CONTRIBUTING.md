@@ -1,323 +1,99 @@
 # Contributing to croft
 
-Thanks for hacking on croft. Build, run, and platform setup live in the
-[README](README.md) and the [platform guides](docs/). Project internals are in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). This guide covers the day to day
-developer workflow that does not belong in any of those.
+Thanks for helping. This page covers what you need to land a change. For
+building and running croft see the [README](README.md); for how the code is laid
+out see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). AI agents follow this page
+too.
 
-Everything here applies to AI agents too, including the three sections below on
-coordinating work, on verifying that a review happened, and on verifying that
-the checks actually ran. Agents often also keep a `CLAUDE.md` at the root for
-their own preferences, but it is deliberately untracked and clone-local: a
-fresh checkout will not have one, and nothing here depends on it.
+Every change is weighed against the [tenets](README.md#tenets): speed and low
+latency first, the same behaviour locally and over SSH, a shortcut for every
+action, and bugs fixed at the root rather than worked around.
 
-## Coordinating work, so concurrent sessions do not collide
-
-Several agent sessions work this repo at once. There is no lock or claim
-label: an open PR against an issue is the only signal that the work is taken.
-Check before starting — `gh pr list --search "<issue number>"` is one call, and
-skipping it is how the same issue gets solved twice.
-
-**A PR holds the work only while someone is behind it.** If nothing has moved,
-it is not a reservation:
-
-1. Age the work by its **last commit**, not `updatedAt` — a comment bumps
-   `updatedAt`, so a stale branch can look active:
-   `gh pr view <n> --json commits -q '.commits | last | .committedDate'`
-2. Ask the sessions that are actually live, naming the specific PRs. One
-   message is cheap; discovering ownership after merging is not.
-3. Silence plus a stale commit date means it is free to take.
-
-When you take something over, say so on the PR with your reasons, and leave the
-branch untouched and reopenable — no force-push, no rewriting someone else's
-history.
-
-## Verifying a review actually happened
-
-A green checks column is not evidence that anyone reviewed the change. Before
-merging, confirm an actual review body exists — `gh pr view <n> --json
-reviews,comments` — and that every finding in it is fixed or refuted with a
-reason. Two specific traps:
-
-* A review bot's check can report **pass** while annotated "review rate
-  limited", which means no review ran at all.
-* `mergeStateStatus: CLEAN` answers "is a branch rule blocking this", not "has
-  this been reviewed". A PR with no review at all reports CLEAN.
-
-Re-fetch comments immediately before merging rather than trusting what you read
-earlier: bot replies land asynchronously while checks are still running.
-
-## Verifying the CHECKS actually ran
-
-A short, all-green `gh pr checks` is not evidence that CI ran, and a green
-merge gate is not evidence that anything is resolved. Every item below was hit
-for real on this repo in a single day, and they share one shape: **the thing
-that would have told you was absent rather than wrong.** A check that cannot
-fail in the case you need it for is not a check.
-
-Where this section and an untracked `/CLAUDE.md` disagree, **this file wins**:
-`/CLAUDE.md` is gitignored, so a fresh clone never sees it and it drifts
-per-machine.
-
-**An all-green check list can mean CI never started.** Faster CI makes this
-more dangerous, not less: a check-settled test that polls until nothing is
-pending passes instantly against an empty list, because the run has not been
-created yet. Count the jobs and require all of them for the SHA you are about
-to merge. "Nothing is failing" and "nothing has run" are the same reading.
+## Set up
 
 ```bash
-head=$(gh pr view <n> --json headRefOid --jq .headRefOid)
-gh run list --commit "$head" --json databaseId --jq 'length'   # 0 = nothing ran
+git clone https://github.com/vitali87/croft.git && cd croft
+cargo run -- .        # rustup installs the pinned toolchain (rust-toolchain.toml)
 ```
 
-Count **runs**, not checks. A check is not a run: a rate-limited review bot
-posts a status context with no workflow behind it, so a PR here returned `1`
-from `gh pr checks --json name --jq 'length'` while having zero runs for its
-head. The reader who most needs this item — the one whose CI never started — is
-exactly the one that count misleads.
+The full test suite also needs `zsh` at `/bin/zsh` and `pdftoppm` (poppler-utils)
+on `PATH`, plus `python3` for the scripts in `scripts/`. On macOS, set up a
+`.noindex` build directory first, or Spotlight will index it and spin your fans:
+see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
 
-**A `CONFLICTING` pull request gets no workflow runs at all.** GitHub cannot
-compute the merge commit, so it never creates them. Four pushes over an hour
-produced zero runs while `gh pr checks` showed one row the whole time — a
-review bot's no-op — which reads exactly like a healthy PR early in its cycle.
-The tell is the pair:
+## Pick something to work on
 
-```bash
-head=$(gh pr view <n> --json headRefOid --jq .headRefOid)
-gh pr view <n> --json mergeable    # CONFLICTING
-gh run list --commit "$head"       # empty: no run exists for this commit
-```
+1. Start from an issue. Issues labelled `ready`, or opened by the maintainer, are
+   vetted and fair game. For anything new, open an issue first.
+2. Check that no open PR already references it. There is no claim label: an open
+   PR is the claim.
 
-`--commit`, not `--branch`: a branch filter happily returns an older run and
-answers a question you did not ask.
+## Make the change
 
-Either alone is ambiguous; together they are conclusive. This is worse than the
-empty-list case above, because a single green row survives a glance that an
-empty list would not.
-
-**A job that never got a runner reports `pending`, exactly like one that is
-running.** `gh run view <id> --json jobs` is the right command, but read
-`status`, not `completedAt`. That field is Go's zero `time.Time`
-(`0001-01-01T00:00:00Z`) for every unfinished job, `in_progress` and `queued`
-alike, so it separates finished from unfinished — which is not the question.
-`startedAt` is populated on queued jobs too. What distinguishes them is a job
-still `queued` while its siblings in the same run have moved to `in_progress`
-or `completed`.
-
-**Threads can appear after everything is green, and an earlier read of them
-expires.** The trap above — a bot whose check says pass while no review ran —
-has a second direction, and it nearly landed a major bug: a bot that has been
-genuinely silent can start producing findings at any moment, and its check row
-looks identical before and after. One PR was eight-of-eight green — one of the
-eight being the review bot's own `pass`, annotated "Review rate limited" — when
-a pre-merge re-fetch turned up five inline threads, one of them a command
-running in a directory other than the one its confirm popup named.
-
-Read them with the GraphQL `reviewThreads` query rather than
-`pulls/<n>/comments`: the REST payload carries no resolution state at all, and
-resolution is what the ruleset below gates on.
-
-```bash
-gh api graphql -F owner=OWNER -F repo=REPO -F number=N -f query='
-query($owner:String!, $repo:String!, $number:Int!, $after:String) {
-  repository(owner:$owner, name:$repo) { pullRequest(number:$number) {
-    reviewThreads(first:100, after:$after) {
-      pageInfo { hasNextPage endCursor }
-      nodes { isResolved isOutdated path }
-    } } } }'
-```
-
-Variables, not literals spliced into the query: `number:N` is not an `Int!` and
-the call fails outright, which is at least loud. **Page it.** `first:` is a cap,
-not a promise, and a PR with more threads than the page size returns a short
-list — this section's own failure mode wearing a page size. Follow `endCursor`
-while `hasNextPage` is true.
-
-`isOutdated` earns its place beside `isResolved`: a thread on a file your branch
-no longer owns appears there, and no code change will ever resolve it.
-
-**`mergeStateStatus: BLOCKED` names no reason, and the obvious endpoint lies.**
-Classic branch protection can report zero required checks and zero required
-approvals while a **ruleset** is what is actually enforcing. Rulesets live
-somewhere else entirely:
-
-```bash
-gh api repos/<repo>/rules/branches/main
-```
-
-That is where this repo's `required_review_thread_resolution` lives, which is
-why a PR with every check green and every finding fixed in code still refuses
-to merge until the threads themselves are resolved. Fixing the code does not
-resolve a thread: reply saying where the point was addressed, then resolve it.
-
-**A merge commit can have the right tree and the wrong parents.** If a merge
-is committed before it is completed, the tree carries main's *changes* while
-the commit does not carry main's *history* — and every check that looks at
-files agrees it worked. `git status` is clean, the diff against main is what
-you expect, the suite passes. GitHub keeps computing a conflict against a
-merge that looks done, and the branch reads as inexplicably `DIRTY`.
-
-**The trigger is "DIRTY at a tree I have just verified is right"**, not "I
-suspect my merge failed" — because you will not suspect that. The natural
-response to an unexplained `DIRTY` is to resolve the conflict again, which
-produces another single-parent commit and the identical result. The evidence
-does not survive either: redoing the merge on top makes the broken commit
-two-parent, so `git log -1 --format=%p` prints two afterwards and nothing in
-the tree records that anything was wrong. It is diagnosable only in the moment.
-
-Only the parent list tells you, so ask about the parents:
-
-```bash
-git merge-base --is-ancestor origin/main HEAD && echo ok || echo "main is NOT merged"
-git log -1 --format=%p            # a merge has two parents; one means it is not one
-```
-
-Run it in the same breath as the final `gh pr checks`: it answers "is this
-branch really current with main", which is not visible in a diff.
-
+* **Keep PRs small.** The PR Split Score check flags anything over about 400
+  changed lines. Split bigger work into stacked PRs.
+* **Tests** go beside the code in a `#[cfg(test)]` module. Whole-app behaviour is
+  tested in `src/app/tests.rs`, and the CLI in `tests/`.
+* **Commits** are one imperative sentence saying what changed for the user, for
+  example `Keep folds collapsed when lines are added or deleted`. No prefixes.
+* **Keep your branch current by merging `main` into it.** Don't rebase or
+  force-push a branch someone else is working on.
+* **Insert new items after a complete item, never just above a `///` block.**
+  Rust attaches a doc comment to whatever follows it, so inserting there gives
+  the old item's docs to the new one, and nothing fails. The
+  `doc comments stay with their function` CI job catches it. If you are removing
+  a doc on purpose, add `doc-removal: src/path/to/file.rs::name` to a commit
+  message. The CI error tells you the exact key to use.
+* **New or changed module?** Update its entry in
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). CI fails if you shorten a
+  module's description without moving its reasoning into a `### <module>`
+  section.
 
 ## Every shipped change carries release notes
 
-A PR that changes anything compiled into the binary (`src/`, `assets/`,
-`build.rs`, `Cargo.toml`, `Cargo.lock`) adds one file to
-`src/release_notes/unreleased/`, named for the change and starting with its
-issue number so no two PRs pick the same name, for example `862-hot-exit.md`.
-It holds the change's highlights, one per line, each prefixed `feature:` or
-`fix:`, which selects the card's glyph and tint. Blank lines and `#` headings
-are ignored:
+If your PR changes `src/`, `assets/`, `build.rs`, `Cargo.toml` or `Cargo.lock`,
+add one file named `src/release_notes/unreleased/<issue>-<slug>.md`, for example
+`862-hot-exit.md`. Put one user-facing highlight on each line:
 
 ```text
-feature: Cmd+F now searches a rendered colour log.
-fix: A copy larger than the cap no longer splits a character.
+feature: Unsaved edits survive a kill and come back on the next launch.
+fix: Ctrl+Q asks before throwing away unsaved edits.
 ```
 
-A PR **never** changes `version` in `Cargo.toml` and never writes
-`src/release_notes/<version>.md`. The version is assigned after the merge
-(below), so there is nothing to keep current with main: no PR edits the same
-line as another, and none has to move its number when another merges first.
+**Never** change `version` in `Cargo.toml`, and never edit
+`src/release_notes/<version>.md`. After your PR merges, CI assigns the version,
+folds in the notes, and publishes the release. You don't need a fragment for
+docs, CI or test-only changes. A diff confined to `#[cfg(test)]`,
+`src/app/tests.rs` or `tests/` counts as test-only.
 
-A build carries the pending notes when there are any: its welcome card heads
-them "IN THIS BUILD (vX.Y.Z+)", since they are changes on top of that release.
-With none pending it shows its own version's notes under "IN THIS RELEASE".
-A build with neither is a **build** error, not an empty panel, so a binary
-always describes itself.
+## Show it
 
-Every `chore: release` commit that bumps the version on `main` is then tagged `v<version>` by
-`.github/workflows/tag.yml`, which also starts `release.yml` for that tag, so a
-merged version is a published release without anyone cutting it by hand. A
-merge that ships nothing keeps the previous version, whose tag already exists,
-and is left untagged.
+If a user can see the change (a view, modal, command, status message,
+keybinding, layout or colour), the PR description needs a recording of it. Use a
+**GIF** for interaction and a **screenshot** for a still. Record the real binary
+built from your branch. Show the feature working and the edge case a reviewer
+will ask about, such as an error or an empty state. Aim for 30 seconds or less
+and under 1 MB. If nothing visible changed, replace the template's Demo section
+with one line saying why.
 
+To record, use vhs, asciinema with agg, or any screen recorder, then drag the
+file into the PR description.
 
-CI enforces it (the `release notes` job, `scripts/release.py check`): a shipped
-change must add a fragment that says something, and no PR may change the
-version or any version's notes. Docs, CI, and test-only PRs are exempt:
-`src/app/tests.rs` and `tests/` by path, and a `.rs` file whose diff touches
-nothing outside a `#[cfg(test)]` module, since most of croft's unit tests sit
-beside the code they cover and a change confined to them produces a
-byte-identical binary. Anything that filter is unsure about counts as shipped,
-so an unexpected request for notes is the failure it prefers over a waived one.
-Fixing a typo in a pending fragment changes no code and owes no fragment of its
-own. A fragment pending on main may be edited, or moved to another name, but
-not deleted: the next release would leave it out.
+<details>
+<summary>Recording without a browser (agents, headless machines)</summary>
 
-Why fragments: notes in one shared file put every open PR on the others'
-rebase path (#399), and then a version bump in every PR put every open PR in
-conflict on the version lines of `Cargo.toml` and `Cargo.lock` whenever any of
-them merged. Each PR's notes in a file only it names never conflict.
-
-### Releases are cut after merge
-
-On every push to main, `.github/workflows/version-bump.yml` runs
-`scripts/release.py cut`: it folds every pending fragment, in file-name order,
-into `src/release_notes/<next>.md`, removes the fragments, bumps `version` in
-`Cargo.toml` and croft's entry in `Cargo.lock`, and pushes one
-`chore: release <next>` commit. A merge that shipped nothing leaves no fragment
-and releases nothing. Runs are serialized and queued, so two merges close
-together never take the same number, a release asked for by hand waits its
-turn rather than being replaced, and merges that land while one run is going
-are released together by the next. A run whose push loses the race to a merge cuts again on
-the new main. A version's notes, once written, describe that release and are
-never edited.
-
-The workflow pushes past main's pull-request rule with a deploy key, as
-code-graph-rag's version bump does: a deploy key with **write** access, whose
-private key is the repository secret `VERSION_BUMP_SSH_KEY`. Without that
-secret the job fails and says so, and the notes stay pending until it is set.
-
-The bump is a patch. For a minor or major release, run the workflow by hand
-(Actions → version bump → Run workflow) on main and pick the component.
-Publishing is unchanged: pushing a `v<version>` tag runs `release.yml`, whose
-release body is `src/release_notes/<version>.md`.
-
-### crates.io publishes every 50 bumps
-
-Every merge is a version, but crates.io does not need one per merge.
-`.github/workflows/publish-crate.yml` runs on each push to `main`, counts the
-versions `main` has carried since the newest one crates.io already lists
-(`scripts/publish_cadence.py`, anchored on the crates.io index rather than a
-counter kept here), and when the count reaches 50 it publishes the head with
-crates.io Trusted Publishing, tags it `v<version>`, and dispatches
-`release.yml` on that tag for the prebuilt archives, the GitHub release and
-the Homebrew formula. To publish the current head ahead of the cadence, run
-the workflow by hand with `force` ticked (`gh workflow run publish-crate.yml
--f force=true`). Nothing needs a token in the repo: the job exchanges its OIDC
-identity for a short-lived crates.io token, which the crate's Trusted
-Publishing settings on crates.io must allow for this repository, this
-workflow file and the `crates-io` environment.
-
-### Version numbers count like an odometer
-
-`MINOR` and `PATCH` each stay below 1000, the same rule code-graph-rag's
-version bump uses. A bump that would take one to 1000 carries into the next
-component and resets the lower ones to 0: `0.1.999` is followed by `0.2.0`,
-never `0.1.1000`, and `0.999.999` by `1.0.0`. A version already past the cap
-carries on its next bump the same way, which is why the release after
-`0.1.1244` is `0.2.0`. `scripts/release.py cut` takes the next number from
-`scripts/next_version.py`, which holds the rule:
-
-```bash
-python3 scripts/next_version.py 0.2.999          # 0.3.0
-python3 scripts/next_version.py 0.2.7 minor      # 0.3.0
-```
-
-## Show it: a visible change comes with a recording
-
-A PR that changes anything a user can see must show it in the PR description.
-That covers a new view, modal, command, status message, keybinding, layout or
-colour. Use a **GIF** when there is interaction and a **screenshot** when a still
-says it all. Tests prove the code does what the tests say. Only a recording
-shows what a user actually gets. Recording #675 found that its value prompt was
-drawn *under* the Settings editor, so users typed blind, and every unit test
-still passed.
-
-* **Record the real binary** built from the PR's head, not a mockup. If a later
-  push changes what the recording shows, record it again.
-* **Show the feature doing its job, and the edge a reviewer will ask about**:
-  the refusal, the error, the empty state. Aim for 30 seconds or less and under
-  1 MB.
-* **Stacked PRs**: put the recording on the PR that makes the feature
-  reachable, and link to it from the others.
-* **Nothing to show?** Replace the template's Demo section with one line saying
-  why, e.g. "No UI change: parser only."
-
-**By hand**, record your terminal with vhs, asciinema plus agg, or any screen
-recorder. Then drag the file into the PR description on GitHub, which hosts it.
-
-**From an agent session**, which has no browser to drag into, use
-`scripts/demo/tui_demo.py`. It drives the real binary in a sized tmux session
-with a throwaway `HOME`, renders each frame with a Nerd Font so croft's icons
-draw, and writes the GIF. `scripts/demo/examples/settings_editor.py` is a
-complete scenario to copy from:
+`scripts/demo/tui_demo.py` drives the real binary in tmux and writes a GIF. It
+needs tmux, node, Pillow and Chromium. Copy the scenario in
+`scripts/demo/examples/`:
 
 ```bash
 cargo build
 python3 scripts/demo/examples/settings_editor.py target/debug/croft out.gif
 ```
 
-Put the file on the `pr-media` branch, at `<pr number>/<name>.gif`. That branch
-is never merged, so binaries stay out of `main`'s history. Then embed it with
-a URL pinned to the commit, so the image reviewers saw survives later pushes:
+If you have push access, commit the GIF to the never-merged `pr-media` branch at
+`<pr>/<name>.gif`. Then embed it with a URL pinned to that commit's SHA, so the
+image stays the same after later pushes:
 
 ```bash
 git fetch origin pr-media && git worktree add ../pr-media origin/pr-media
@@ -330,270 +106,69 @@ git -C ../pr-media push origin HEAD:pr-media && git -C ../pr-media rev-parse HEA
 ![what it shows](https://raw.githubusercontent.com/vitali87/croft/<sha>/<pr>/<name>.gif)
 ```
 
-## Insert new items AFTER a complete item, never above a doc block
+</details>
 
-Rust attaches a `///` block to whatever item **follows** it. Insert anything
-between an existing item and its doc comment and that prose silently becomes
-the newcomer's: no compiler error, no failing test, no clippy lint. The build
-stays green and the rendered rustdoc is *confidently wrong* rather than
-absent, which is worse - absent docs send a reader to the code, wrong docs
-stop them looking.
+## Check before you push
 
-The habit that avoids it is positional: add a new item after a complete item,
-not directly above a `///` block. Where that is not possible, confirm the doc
-block above the **next** item still describes that next item.
-
-This is not only about functions. A `const` inserted above another `const`'s
-doc captures it exactly the same way, and did so twice in one day before the
-gate could see it.
-
-CI catches what the habit misses (the `doc comments stay with their function`
-job): an item that had a doc comment at the merge base and has none at your
-head is the fingerprint this insertion leaves. It covers `fn`, `const`,
-`static`, `struct`, `enum`, `union`, `trait`, `type` and `macro_rules!`, and
-for a file your branch ADDS it compares your commits pairwise, since a file
-with no base version has no merge-base history to lose documentation against.
-
-Two further passes cover captures that fingerprint does not leave:
-
-* **Head-only.** Reports a `///` block with nothing under it for a doc to
-  attach to — what an insertion strands when the newcomer has no doc of its own.
-* **Doc-changed-owner.** Compares what each doc line sat above earlier with what
-  it sits above now, at the merge base and at every non-merge commit on your
-  branch that touched the file, so a capture made and left in place mid-branch
-  is seen even though the merge base predates both items. It exists because an
-  item inserted directly above a documented enum variant takes its prose while
-  stranding nothing at all, and that shape shipped once with the gate green. It
-  reports only when the old item is still there and now has no documentation,
-  and when the line the prose landed on is new, so moving a doc back onto its
-  rightful item stays green. Merges are skipped because a merge's first parent
-  is your branch tip, so comparing across one replays whatever you merged IN as
-  your own work; the cost is that a capture made by a merge resolution, where
-  the thief is a line the other side already had, is not reported.
-
-If a removal is deliberate, say so in a commit message on the branch:
-
-```text
-doc-removal: src/path/to/file.rs::some_function_name
-doc-removal: src/path/to/file.rs::SomeType::method_name
-```
-
-The key after the path is the one the gate's own error names: a bare name for a
-free item, or the enclosing `impl` header for a method (`Foo::new`, `Display for
-Foo::fmt`), so a declared removal of one `new` cannot excuse another. It covers
-the two passes that name an item: the merge-base loss check and the
-doc-changed-owner check. For a victim the gate does not model as an item, an
-enum variant being the common case, the key is the leading name on the line
-itself (`E::A` is declared as `a.rs::A`), and the error prints the exact
-declaration to write.
-
-The head-only pass has no declaration, because what it reports is prose with
-nothing under it and there is no item to name. Give the block an item, or move
-the inserted one above it.
-
-The file qualifier matters: an exemption keyed on the bare name would excuse
-every function of that name in every changed file, so a deliberate removal of
-one `new` would quietly cover an accidental loss of another.
-
-Run it yourself with `python3 scripts/check_doc_ownership.py origin/main HEAD`.
-
-## Managing the `target/` directory
-
-croft is a large workspace with a deep dependency tree, so rebuilds are
-frequent. Cargo trades disk for build speed, keeping the incremental
-compilation cache (`target/debug/incremental/`) plus a compiled copy of every
-crate in the tree. The catch is that Cargo **does not garbage collect the per
-project `target/` directory**: old incremental snapshots from previous branches
-and toolchains accumulate and are never reclaimed. On a busy croft checkout the
-directory can reach hundreds of gigabytes, mostly stale incremental cache.
-
-Neither obvious answer works:
-
-* Cargo's automatic cache cleanup (stable since 1.88) only prunes the **global**
-  cache under `~/.cargo` (downloaded registry and git sources). It never touches
-  a project's `target/`, so it does nothing for the directory that grows.
-* `cargo clean` wipes `target/` entirely, reclaiming everything but forcing a
-  full cold rebuild next time. Fine in an emergency, painful as a routine.
-
-### The recommended fix: scheduled `cargo-sweep`
-
-[`cargo-sweep`](https://github.com/holmgr/cargo-sweep) deletes only the build
-artifacts unused for N days, so your active branch stays warm and rebuilds fast
-while stale snapshots get reclaimed.
+CI runs all of these. Running them locally first saves a round trip:
 
 ```bash
-cargo install cargo-sweep
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+RUST_TEST_THREADS=4 cargo test --locked
+python3 -m unittest discover -s scripts/tests
+
+base=$(git merge-base origin/main HEAD)
+python3 scripts/release.py check "$base" HEAD           # release notes
+python3 scripts/check_doc_ownership.py "$base" HEAD     # doc comments
 ```
 
-Run it by hand, recursively across all your Rust projects:
+CI also cross-builds the static musl binaries that `croft remote` ships, and an
+Android build. If you bump `rust-toolchain.toml`, add the cross targets
+(`rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl`) and
+make sure those jobs stay green.
 
-```bash
-# Preview first (no deletions)
-cargo sweep -r --dry-run --time 15 ~/path/to/projects
+### Flaky tests
 
-# Reclaim artifacts unused for 15+ days
-cargo sweep -r --time 15 ~/path/to/projects
-```
+The suite spawns real PTYs and shells, so terminal, clipboard and pairing tests
+can fail on a busy machine. Cap the thread count at about half your cores, as
+above. To set it permanently, use the gitignored `/.cargo/config.toml` (build
+jobs) and `/.config/nextest.toml` (nextest threads). Before you blame your
+change, run the same tests on an untouched `main` under the same load. If they
+fail there too, your diff is not the cause.
 
-`--time 15` keeps anything touched in the last 15 days. Lower it if you switch
-branches a lot and the cache still grows faster than you would like.
+One wall-clock test is `#[ignore]`d and runs on its own:
+`cargo test --bin croft fs_sync_reflects -- --ignored --test-threads=1`.
 
-### Automate it (recommended)
+### Waiting on a spawned process in a test
 
-Run the sweep weekly so it stays hands off.
-
-**macOS (launchd).** Save as
-`~/Library/LaunchAgents/com.user.cargo-sweep.plist`, adjusting the project path:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.user.cargo-sweep</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/zsh</string>
-        <string>-lc</string>
-        <string>cargo sweep -r --time 15 "$HOME/path/to/projects"</string>
-    </array>
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Weekday</key><integer>0</integer>
-        <key>Hour</key><integer>3</integer>
-        <key>Minute</key><integer>0</integer>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>/Users/YOU/Library/Logs/cargo-sweep.log</string>
-    <key>StandardErrorPath</key>
-    <string>/Users/YOU/Library/Logs/cargo-sweep.log</string>
-</dict>
-</plist>
-```
-
-Then load it:
-
-```bash
-launchctl load ~/Library/LaunchAgents/com.user.cargo-sweep.plist
-launchctl list | grep cargo-sweep   # confirm it registered
-```
-
-Invoking through `zsh -lc` matters: launchd runs with a bare environment, and a
-login shell puts `cargo` (via rustup) on `PATH`. Missed runs (machine asleep at
-03:00) fire on the next wake.
-
-**Linux (cron).** Add a weekly entry with `crontab -e`:
-
-```cron
-0 3 * * 0 $HOME/.cargo/bin/cargo-sweep -r --time 15 "$HOME/path/to/projects" >> "$HOME/.cache/cargo-sweep.log" 2>&1
-```
-
-Or, if you prefer systemd, a user `cargo-sweep.timer` paired with a
-`cargo-sweep.service` running the same command achieves the same thing.
-
-### Why not turn off incremental compilation?
-
-Setting `incremental = false` would stop the cache from growing, but it slows
-the edit, build, run loop you rely on while developing croft. Keep incremental
-on and let `cargo-sweep` reclaim the stale parts instead.
-
-### macOS: keep the build directory out of Spotlight
-
-Disk is not the only cost of the build directory on macOS. Spotlight indexes the
-constant `.fingerprint/` and `incremental/` churn, which pins a CPU core and
-spins your fans up while you build. The fix is to build into a directory whose
-name ends in `.noindex`, which Spotlight ignores. See
-[docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory) for the
-one line setup. With it applied your build directory is `target.noindex/` rather
-than `target/`.
-
-## Running the suite: cap your thread count
-
-The suite spawns PTYs and real shells, so a slice of it is timing-sensitive and
-starves under contention. Run it flat out on a many-core machine and you get
-failures that have nothing to do with your change — terminal, clipboard and
-pairing tests that pass fine on an idle box. CI pins `RUST_TEST_THREADS: 4` for
-this reason.
-
-Half your cores is a reasonable default:
-
-```bash
-RUST_TEST_THREADS=$(( ($(getconf _NPROCESSORS_ONLN) + 1) / 2 )) cargo test
-```
-
-One test is `#[ignore]`d for the same reason and runs separately: the 200 ms
-fs-sync invariant (an external file change reaches the Explorer within 200 ms)
-is a wall-clock claim, and a parallel suite is itself the load, so the suite
-carries it as a count of drain ticks and the wall-clock version runs alone. CI
-runs it serially after the suite; locally:
-
-```bash
-cargo test --bin croft fs_sync_reflects -- --ignored --test-threads=1
-```
-
-To make it permanent, the right number is per-machine, so both files are
-gitignored rather than committed: `/.cargo/config.toml` caps build jobs
-(`[build] jobs = N`), and `/.config/nextest.toml` caps nextest's threads —
-nextest reads them from there, not from `RUST_TEST_THREADS`.
-
-Before you blame your change for a terminal or clipboard failure, re-run it
-against an untouched `origin/main` checkout. These flake under load, and
-baselining is faster than bisecting.
-
-## Waiting on a spawned process in a test
-
-A test that spawns a real process and waits a **fixed** wall-clock budget will
-flake on a loaded machine, and the budget looks generous right up until it
-isn't. The number is not knowable from inside the test: what blows it is not the
-operation but contention from every other test spawning at the same moment, plus
-whatever else owns the machine.
-
-So do not pick a fresh constant. Use the shared helper, which scales a quiet
-machine baseline by the load actually present:
+A fixed timeout will eventually flake on a loaded machine. Use the shared helper,
+which scales a quiet-machine baseline by the current load:
 
 ```rust
 crate::test_budget::await_spawned(
-    Duration::from_millis(500),          // what it costs on a quiet machine
+    Duration::from_millis(500),           // cost on a quiet machine
     "the shell to paint the linked cell", // what you are waiting for
     || linked_cell(&app).is_some(),
 );
 ```
 
-For a wait that hands its deadline to something else (a `recv_timeout`, a
-probe's own timeout) use `test_budget::spawn_budget(base)` for the `Duration`.
+To get a `Duration` you can pass on, such as to `recv_timeout`, use
+`test_budget::spawn_budget(base)`.
 
-The teeth are unchanged: a genuinely broken behaviour never satisfies the
-condition and still fails, just later. That trade - a slow true failure over a
-fast false one - is the point.
+## Review and merge
 
-**When one of these does fail, the cheap first move is the merge-base
-comparison:** run the full suite on the unmodified merge base under the same
-load. If it fails there too, your diff is innocent. Isolation runs cannot tell
-you this, because an isolated run cannot reproduce a contention failure however
-many times you repeat it.
+Bots (CodeRabbit, Greptile and Copilot) review every PR. They are tuned to flag
+only bugs, security issues and data loss. Fix each thread or reply saying why you didn't, then **resolve** it. Merge
+is blocked until every thread is resolved. PRs are merged with a merge commit.
 
-## Bumping the Rust toolchain
+## Keep `target/` from filling your disk
 
-`rust-toolchain.toml` is the single source of truth for the channel, and
-**rustup targets belong to one toolchain**. Bumping the pin orphans every
-cross target, which silently turns `croft <host>` from "ship a prebuilt static
-binary" into "compile the whole crate graph on the user's box". A 1.95.0 to
-1.97.1 bump did exactly that for four days.
-
-A toolchain bump is not finished until this passes, run **from inside the
-checkout** so the pin applies:
+Cargo never cleans a project's `target/`, so it can grow to hundreds of GB.
+[`cargo-sweep`](https://github.com/holmgr/cargo-sweep) deletes only artifacts
+you haven't used recently. Run it weekly from cron or launchd:
 
 ```bash
-rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-cargo zigbuild --profile remote-fast --locked --bin croft \
-  --target x86_64-unknown-linux-musl
+cargo install cargo-sweep
+cargo sweep -r --time 15 ~/path/to/projects   # drop artifacts unused for 15+ days
 ```
-
-The binary has to exist at the end. `remote::tests::the_pinned_toolchain_has_every_cross_target`
-fails the suite when a target is missing, and `.github/workflows/ci.yml` runs
-the real ship-path build for both musl triples plus an Android NDK build on
-every pull request.
-
-When a remote update feels slow, read `~/.cache/croft/install.log` first: it
-records the exact reason the fast path was skipped.
