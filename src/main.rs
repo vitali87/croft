@@ -42,6 +42,7 @@ mod gui_path;
 mod hex;
 mod highlight;
 mod history;
+mod hot_exit;
 mod http_file;
 mod i18n;
 mod icons;

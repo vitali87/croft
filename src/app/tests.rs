@@ -11318,6 +11318,1755 @@ fn close_all_closes_every_split_group() {
     assert_eq!(app.status, format!("Closed {total} tabs"));
 }
 
+/// Type `text` into the focused editor, which leaves its buffer dirty.
+fn type_into_editor(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+fn press_ctrl_q(app: &mut App) {
+    app.handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL))
+        .unwrap();
+}
+
+/// An app with `a.txt` open, edited and unsaved, and the file's path (#862).
+fn app_with_unsaved_file(tmp: &std::path::Path) -> (App, PathBuf) {
+    let mut app = app_with_open_file(tmp, "a.txt", "alpha\n");
+    type_into_editor(&mut app, "x");
+    assert!(app.editor.dirty, "setup: typing leaves the buffer dirty");
+    (app, tmp.join("a.txt"))
+}
+
+/// #862: a quit with nothing unsaved is immediate, as it always was.
+#[test]
+fn ctrl_q_with_nothing_unsaved_quits_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha\n");
+    press_ctrl_q(&mut app);
+    assert!(app.quit);
+    assert_eq!(app.pending_unsaved, None, "nothing to ask about");
+}
+
+/// #862: Ctrl+Q with an unsaved buffer used to exit on the spot and lose
+/// it. It asks now, naming the file, and does not quit until answered.
+#[test]
+fn ctrl_q_with_an_unsaved_tab_asks_before_quitting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    press_ctrl_q(&mut app);
+    assert!(!app.quit, "an unsaved buffer must not be dropped by Ctrl+Q");
+    assert_eq!(app.pending_unsaved, Some(UnsavedExit::Quit));
+    let screen = draw_screen(&mut app);
+    assert!(screen.contains("UNSAVED CHANGES"), "{screen}");
+    assert!(screen.contains("1 file has unsaved changes"), "{screen}");
+    assert!(
+        screen.contains("a.txt"),
+        "the prompt names the file:\n{screen}"
+    );
+    // The prompt owns the keyboard: typing does not reach the buffer, and a
+    // second Ctrl+Q does not force the quit.
+    let before = app.editor.lines.clone();
+    type_into_editor(&mut app, "zz");
+    press_ctrl_q(&mut app);
+    assert_eq!(app.editor.lines, before);
+    assert!(!app.quit);
+}
+
+/// #862: S saves every unsaved buffer, in every split, and then quits.
+#[test]
+fn s_at_the_quit_prompt_saves_every_split_and_quits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    app.split_editor();
+    app.editor.open_pinned(&b).unwrap();
+    type_into_editor(&mut app, "y");
+    assert!(app.editor_layout.is_split(), "setup: two groups");
+    press_ctrl_q(&mut app);
+    assert!(!app.quit);
+    let screen = draw_screen(&mut app);
+    assert!(screen.contains("2 files have unsaved changes"), "{screen}");
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.quit, "saved everything, so it quits: {}", app.status);
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "xalpha\n");
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), "ybravo\n");
+}
+
+/// #862: D quits without writing anything.
+#[test]
+fn d_at_the_quit_prompt_quits_without_saving() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    press_ctrl_q(&mut app);
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.quit);
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
+}
+
+/// #862: Esc (or N, which never means "don't save") cancels: croft stays,
+/// the edits stay, and the disk is untouched. A modified D does not discard.
+#[test]
+fn esc_or_n_at_the_quit_prompt_cancels() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    for cancel in [
+        key(KeyCode::Esc, KeyModifiers::NONE),
+        key(KeyCode::Char('n'), KeyModifiers::NONE),
+    ] {
+        press_ctrl_q(&mut app);
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(!app.quit, "Ctrl+D is not the D answer");
+        app.handle_key(cancel).unwrap();
+        assert!(!app.quit);
+        assert_eq!(app.pending_unsaved, None, "the prompt closed");
+        assert!(app.editor.dirty, "the edits are still there");
+        assert_eq!(app.editor.lines[0], "xalpha");
+    }
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
+}
+
+/// #862: an untitled buffer has no file to save to, so S cannot keep its
+/// text and does not quit; D is the explicit way out.
+#[test]
+fn save_all_does_not_quit_while_an_untitled_buffer_holds_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    type_into_editor(&mut app, "note");
+    assert!(app.editor.path.is_none() && app.editor.dirty, "setup");
+    press_ctrl_q(&mut app);
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.quit, "the untitled text would be lost");
+    assert!(app.status.contains("untitled"), "{}", app.status);
+    assert_eq!(app.editor.lines, vec![String::from("note")]);
+    press_ctrl_q(&mut app);
+    app.handle_key(key(KeyCode::Char('D'), KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(app.quit);
+}
+
+/// #862: an untitled buffer that holds nothing is not worth a prompt.
+#[test]
+fn an_emptied_untitled_buffer_does_not_hold_up_a_quit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    type_into_editor(&mut app, "x");
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines, vec![String::new()], "setup");
+    press_ctrl_q(&mut app);
+    assert!(app.quit);
+}
+
+/// #862: a save that fails keeps croft open. Here the file changed on disk
+/// under the edits: Save All must neither overwrite that nor quit.
+#[test]
+fn save_all_does_not_quit_when_a_save_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    std::fs::write(&a, "changed elsewhere\n").unwrap();
+    press_ctrl_q(&mut app);
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.quit);
+    assert!(
+        app.status.contains("a.txt (changed on disk)"),
+        "{}",
+        app.status
+    );
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "changed elsewhere\n",
+        "the other writer's change is not overwritten"
+    );
+    assert!(app.editor.dirty, "the edits are still in the buffer");
+}
+
+/// #862 review: a file open in two editor groups is two buffers. With the
+/// same unsaved text in both, Save All writes it once and quits: before,
+/// the second write read the first as a change on disk, refused, and kept
+/// croft open over a file that already held the edits.
+#[test]
+fn save_all_writes_a_file_open_in_two_groups_with_the_same_edits_once_and_quits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    let edited = app.editor.lines.clone();
+    app.split_editor();
+    app.editor.lines = edited.clone();
+    app.editor.dirty = true;
+    press_ctrl_q(&mut app);
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.quit, "{}", app.status);
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "xalpha\n");
+}
+
+/// #862 review, the guard: two groups holding different unsaved text for
+/// one file are not settled by writing whichever comes first. Neither is
+/// written, both stay, and croft stays open naming the file.
+#[test]
+fn save_all_writes_neither_of_two_different_unsaved_copies_of_a_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    app.split_editor();
+    app.editor.lines = vec![String::from("yalpha"), String::new()];
+    app.editor.dirty = true;
+    press_ctrl_q(&mut app);
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.quit);
+    assert!(
+        app.status
+            .contains("a.txt (open in 2 editor groups with different unsaved text)"),
+        "{}",
+        app.status
+    );
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
+    let mut texts: Vec<String> = std::iter::once(&app.editor)
+        .chain(app.editor_layout.inactive_groups())
+        .flat_map(|g| g.editors.iter())
+        .filter(|e| e.path.as_deref() == Some(a.as_path()))
+        .inspect(|e| assert!(e.dirty, "both copies stay unsaved"))
+        .map(|e| e.lines[0].clone())
+        .collect();
+    texts.sort();
+    assert_eq!(texts, ["xalpha", "yalpha"]);
+}
+
+/// #862: Cmd+W on an unsaved tab used to close it, and Reopen Closed
+/// Editor brought back only the file on disk. It asks now; Esc keeps it.
+#[test]
+fn closing_an_unsaved_tab_asks_rather_than_dropping_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.editor.select(0);
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.editor.tab_count(), 2, "nothing closed yet");
+    assert!(matches!(
+        app.pending_unsaved,
+        Some(UnsavedExit::CloseTab { idx: 0, .. })
+    ));
+    assert_ne!(app.status, "Closed tab");
+    let screen = draw_screen(&mut app);
+    assert!(screen.contains("This tab has unsaved changes"), "{screen}");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.tab_count(), 2);
+    assert_eq!(app.editor.lines[0], "xalpha", "the edits are kept");
+}
+
+/// #862: S at the close prompt writes the tab, then closes it.
+#[test]
+fn s_at_the_close_prompt_saves_then_closes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "xalpha\n");
+    assert_eq!(app.editor.path, None, "the tab closed");
+    assert_eq!(app.status, "Saved and closed tab");
+    assert!(!app.quit, "closing a tab never quits");
+}
+
+/// #862: D at the close prompt closes without writing, and the tab can
+/// still be reopened from disk.
+#[test]
+fn d_at_the_close_prompt_closes_without_saving() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    app.run_command(crate::widgets::command_palette::Command::CloseEditor);
+    assert!(app.pending_unsaved.is_some(), "View: Close Editor asks too");
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.path, None, "the tab closed");
+    assert_eq!(app.status, "Closed tab without saving");
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
+    app.reopen_closed_tab();
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    assert_eq!(app.editor.lines[0], "alpha", "reopened from disk");
+}
+
+/// #862: a clean tab closes at once, exactly as before.
+#[test]
+fn closing_a_clean_tab_does_not_ask() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha\n");
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.pending_unsaved, None);
+    assert_eq!(app.editor.path, None);
+    assert_eq!(app.status, "Closed tab");
+}
+
+/// #862: the tab context menu's Close asks about an unsaved tab, and its
+/// Close Others / Close All keep one open rather than dropping it.
+#[test]
+fn tab_menu_closes_keep_unsaved_tabs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    let root = tmp.path().to_path_buf();
+
+    app.dispatch_menu_action(MenuAction::CloseTab(0), root.clone());
+    assert!(
+        app.pending_unsaved.is_some(),
+        "Close on the unsaved tab asks"
+    );
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+
+    app.dispatch_menu_action(MenuAction::CloseOtherTabs(1), root.clone());
+    assert_eq!(
+        app.editor.tab_count(),
+        2,
+        "Close Others keeps the unsaved a.txt"
+    );
+
+    app.dispatch_menu_action(MenuAction::CloseAllTabs, root);
+    assert_eq!(app.editor.tab_count(), 1);
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    assert!(app.editor.dirty);
+    assert_eq!(app.status, "Closed 1 tab; kept 1 with unsaved changes open");
+}
+
+/// #862: Close All keeps a split whose other group holds unsaved edits, and
+/// folds away only the groups it emptied.
+#[test]
+fn close_all_keeps_the_split_group_holding_unsaved_edits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    app.split_editor();
+    assert!(app.editor_layout.is_split(), "setup: two groups");
+    app.dispatch_menu_action(MenuAction::CloseAllTabs, tmp.path().to_path_buf());
+    assert!(
+        !app.editor_layout.is_split(),
+        "the emptied focused group folded away"
+    );
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    assert!(app.editor.dirty, "the unsaved group survives, promoted");
+}
+
+/// #862: a tab whose unsaved text another open tab holds too (a symbol tab
+/// and its file's tab mirror one buffer) closes without asking: nothing is
+/// lost while the other keeps it.
+#[test]
+fn a_tab_whose_edits_another_tab_holds_closes_without_asking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    let edited = app.editor.lines.clone();
+    app.split_editor();
+    app.editor.lines = edited.clone();
+    app.editor.dirty = true;
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.pending_unsaved, None, "no prompt");
+    assert!(!app.editor_layout.is_split(), "the tab closed");
+    assert_eq!(app.editor.lines, edited, "the other copy kept the edits");
+    assert!(app.editor.dirty);
+}
+
+/// #862: vim's `:q` and `:qa` ask like Cmd+W and Ctrl+Q; the `!` forms are
+/// the answer given up front and discard without asking.
+#[test]
+fn vim_quits_ask_unless_forced() {
+    let (mut app, tmp) = vim_app("one\n");
+    let f = tmp.path().join("buf.txt");
+    app.editor.lines[0] = String::from("edited");
+    app.editor.dirty = true;
+    app.vim_run_ex("qa");
+    assert!(!app.quit);
+    assert_eq!(app.pending_unsaved, Some(UnsavedExit::Quit));
+    app.cancel_unsaved();
+    app.vim_run_ex("q");
+    assert!(matches!(
+        app.pending_unsaved,
+        Some(UnsavedExit::CloseTab { .. })
+    ));
+    app.cancel_unsaved();
+    app.vim_run_ex("qa!");
+    assert!(app.quit, ":qa! quits without asking");
+    app.quit = false;
+    app.vim_run_ex("q!");
+    assert_eq!(app.pending_unsaved, None);
+    assert_eq!(app.editor.path, None, ":q! closed the tab");
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "one\n");
+}
+
+/// #862: leaving a remote croft for the local one ends this process like a
+/// quit, so it asks the same way.
+#[test]
+fn drop_to_local_with_unsaved_edits_asks_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    app.is_remote = true;
+    let drop_key = key(
+        KeyCode::Char('l'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    );
+    app.handle_key(drop_key).unwrap();
+    assert!(!app.quit && !app.drop_to_local);
+    assert_eq!(app.pending_unsaved, Some(UnsavedExit::DropToLocal));
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.drop_to_local && app.quit);
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "xalpha\n");
+}
+
+/// #862 negative: S at a close prompt writes the tab it asked about and no
+/// other; a second unsaved tab stays unsaved and open.
+#[test]
+fn s_at_the_close_prompt_saves_only_that_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    type_into_editor(&mut app, "y");
+    app.editor.select(0);
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "xalpha\n");
+    assert_eq!(
+        std::fs::read_to_string(&b).unwrap(),
+        "bravo\n",
+        "the other unsaved tab is not written"
+    );
+    assert_eq!(app.editor.tab_count(), 1);
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()));
+    assert!(app.editor.dirty, "and keeps its edits");
+}
+
+/// #862 negative: an answer never lands on a tab other than the one asked
+/// about. When the tab at that index is another file by the time the answer
+/// comes, D closes nothing and discards nothing.
+#[test]
+fn an_answer_for_a_tab_that_moved_closes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.editor.select(0);
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(matches!(
+        app.pending_unsaved,
+        Some(UnsavedExit::CloseTab { idx: 0, .. })
+    ));
+    // Something other than the user reorders the tabs meanwhile.
+    app.editor.editors.swap(0, 1);
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.tab_count(), 2, "nothing closed");
+    assert!(app.status.contains("moved"), "{}", app.status);
+    let a_tab = app
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .unwrap();
+    assert!(a_tab.dirty && a_tab.lines[0] == "xalpha", "edits kept");
+}
+
+/// #862 negative: while the prompt is up a click behind it does nothing,
+/// even on another tab's close button, which closes that tab once the
+/// prompt is gone.
+#[test]
+fn a_click_behind_the_unsaved_prompt_closes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.editor.select(0);
+    draw_screen(&mut app);
+    let row = app.editor.tab_strip_y_for_test();
+    let col = app.editor.close_screen_x(1).expect("b.txt's close button");
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    draw_screen(&mut app);
+    left_click(&mut app, col, row);
+    assert_eq!(app.editor.tab_count(), 2, "the click went nowhere");
+    assert!(app.pending_unsaved.is_some(), "the prompt is still asking");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    draw_screen(&mut app);
+    left_click(&mut app, col, row);
+    assert_eq!(app.editor.tab_count(), 1, "with no prompt it closes b.txt");
+}
+
+/// A remote connect whose install just reported `event`: the croft on the
+/// host is ready to take this terminal over (no ssh is run).
+fn ready_to_hand_off(app: &mut App, event: crate::install_session::InstallEvent) {
+    let adopted = crate::remote::AdoptedMaster {
+        host: String::from("devbox"),
+        socket_dir: PathBuf::from("/nonexistent/croft-test-ctl"),
+        socket_path: PathBuf::from("/nonexistent/croft-test-ctl/ctl"),
+    };
+    app.install_session = Some(crate::install_session::InstallSession::with_events(
+        "devbox",
+        None,
+        Some(adopted),
+        vec![event],
+    ));
+}
+
+/// The two install outcomes that hand this terminal to the remote croft:
+/// one was already there (it launches while the reinstall runs on), or the
+/// install just finished.
+fn handoff_events() -> [crate::install_session::InstallEvent; 2] {
+    use crate::install_session::InstallEvent;
+    [InstallEvent::CanLaunch, InstallEvent::Done(Ok(()))]
+}
+
+/// #862: connecting to a remote croft ends this one once the remote side is
+/// ready, which can be minutes after the connect was asked for. An edit
+/// made meanwhile went with it: the handoff set `quit` without asking. It
+/// asks now, and S saves before handing off.
+#[test]
+fn a_remote_handoff_asks_about_edits_made_during_the_install() {
+    for event in handoff_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha\n");
+        // Nothing was unsaved when the connect was asked for; the edit
+        // comes while the install runs.
+        type_into_editor(&mut app, "x");
+        ready_to_hand_off(&mut app, event);
+        app.poll_install_session();
+        assert!(!app.quit, "the unsaved a.txt must not go with the handoff");
+        assert!(app.pending_unsaved.is_some(), "it asks");
+        let screen = draw_screen(&mut app);
+        assert!(screen.contains("ave all and connect"), "{screen}");
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.quit, "saved, so it hands off: {}", app.status);
+        assert!(app.remote_launch.is_some(), "to the remote croft");
+        let a = tmp.path().join("a.txt");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "xalpha\n");
+    }
+}
+
+/// #862 negative: with nothing unsaved the handoff goes at once, as before.
+#[test]
+fn a_remote_handoff_with_nothing_unsaved_goes_at_once() {
+    for event in handoff_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha\n");
+        ready_to_hand_off(&mut app, event);
+        app.poll_install_session();
+        assert!(app.quit);
+        assert!(app.pending_unsaved.is_none(), "nothing to ask about");
+        assert!(app.remote_launch.is_some());
+    }
+}
+
+/// #862: Esc at the handoff prompt keeps this croft and the edits, and
+/// drops the launch rather than leaving it armed for a later quit.
+#[test]
+fn cancelling_the_remote_handoff_stays_here_with_the_edits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    ready_to_hand_off(&mut app, crate::install_session::InstallEvent::CanLaunch);
+    app.poll_install_session();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.quit);
+    assert!(app.remote_launch.is_none(), "the launch is dropped");
+    assert!(app.install_session.is_none());
+    assert!(app.editor.dirty && app.editor.lines[0] == "xalpha");
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
+    assert!(app.status.contains("did not connect"), "{}", app.status);
+}
+
+/// #862 negative: edits the user already chose to leave behind at the
+/// connect prompt (D records them; the answer itself would start a real
+/// ssh here) go with the handoff without a second question. One more edit
+/// after that answer is asked about.
+#[test]
+fn edits_left_at_the_connect_prompt_are_not_asked_about_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    app.remote_handoff_ok = app.unsaved_stamp();
+    ready_to_hand_off(&mut app, crate::install_session::InstallEvent::CanLaunch);
+    app.poll_install_session();
+    assert!(app.quit, "already answered: {}", app.status);
+    assert!(app.pending_unsaved.is_none());
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    app.remote_handoff_ok = app.unsaved_stamp();
+    type_into_editor(&mut app, "y");
+    ready_to_hand_off(&mut app, crate::install_session::InstallEvent::CanLaunch);
+    app.poll_install_session();
+    assert!(!app.quit, "the later edit was never agreed to");
+    assert!(app.pending_unsaved.is_some());
+}
+
+/// #862 negative: S at the handoff prompt whose save is refused (the file
+/// changed on disk) stays here, and drops the launch: left armed, the next
+/// ordinary Ctrl+Q would have connected instead of quitting.
+#[test]
+fn a_refused_save_at_the_remote_handoff_drops_the_launch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    std::fs::write(&a, "changed elsewhere\n").unwrap();
+    ready_to_hand_off(&mut app, crate::install_session::InstallEvent::CanLaunch);
+    app.poll_install_session();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.quit);
+    assert!(app.status.contains("Did not connect"), "{}", app.status);
+    assert!(app.remote_launch.is_none(), "not left armed");
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "changed elsewhere\n");
+}
+
+/// Hot exit (#862) on for `app`, backing up under `cache` instead of the
+/// real `~/.cache/croft`.
+fn with_hot_exit(mut app: App, cache: &std::path::Path) -> App {
+    app.hot_exit_dir = Some(cache.to_path_buf());
+    app
+}
+
+/// A hot-exit tick long after the last edit, so the buffers count as settled.
+fn settle_hot_exit(app: &mut App) {
+    app.tick_hot_exit(std::time::Instant::now() + std::time::Duration::from_secs(60));
+}
+
+/// The hot-exit backup files for the workspace `root` under `cache`.
+fn hot_exit_files(cache: &std::path::Path, root: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(crate::hot_exit::workspace_dir(cache, root)) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    files.sort();
+    files
+}
+
+/// What the one hot-exit backup of `root` holds.
+fn the_hot_exit_backup(cache: &std::path::Path, root: &std::path::Path) -> crate::hot_exit::Backup {
+    let files = hot_exit_files(cache, root);
+    assert_eq!(files.len(), 1, "one backup: {files:?}");
+    crate::hot_exit::Backup::load(&files[0]).unwrap()
+}
+
+/// #862 hot exit: an unsaved buffer is backed up (path, text, cursor) once
+/// its edits settle, owner-only, and never while the edit is fresh, so
+/// typing never waits on a write. The file itself is not touched.
+#[test]
+fn hot_exit_backs_up_an_unsaved_buffer_once_it_settles() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    app.tick_hot_exit(std::time::Instant::now());
+    assert!(
+        hot_exit_files(cache.path(), tmp.path()).is_empty(),
+        "not while the edit is fresh"
+    );
+    settle_hot_exit(&mut app);
+    let backup = the_hot_exit_backup(cache.path(), tmp.path());
+    assert_eq!(backup.buffers.len(), 1);
+    let tab = &backup.buffers[0].tab;
+    assert_eq!(tab.path.as_deref(), Some(a.as_path()));
+    assert!(tab.dirty);
+    assert_eq!(
+        tab.unsaved_text.as_deref().unwrap().lines().next(),
+        Some("xalpha")
+    );
+    assert_eq!((tab.cursor_row, tab.cursor_col), (0, 1));
+    use std::os::unix::fs::PermissionsExt;
+    let file = &hot_exit_files(cache.path(), tmp.path())[0];
+    let mode = std::fs::metadata(file).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600, "it holds unsaved text: owner-only");
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
+    assert!(!app.quit);
+}
+
+/// #862 hot exit: croft killed with an unsaved buffer (no quit ran, the
+/// App is simply dropped) comes back on the next launch of the workspace:
+/// the tab returns unsaved, with its text and cursor, the file untouched,
+/// and the backup is the new croft's own at once, so a crash straight
+/// after the launch cannot lose the text either.
+#[test]
+fn hot_exit_restores_the_unsaved_tab_in_the_next_croft_on_the_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    let ed = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .expect("the unsaved tab is back");
+    assert!(ed.dirty, "restored as unsaved");
+    assert_eq!(ed.lines[0], "xalpha");
+    assert_eq!((ed.cursor_row, ed.cursor_col), (0, 1));
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "alpha\n",
+        "nothing is written to the file"
+    );
+    assert!(
+        next.status.contains("restored 1 unsaved tab"),
+        "{}",
+        next.status
+    );
+    let kept = the_hot_exit_backup(cache.path(), tmp.path());
+    assert_eq!(kept.buffers[0].tab.path.as_deref(), Some(a.as_path()));
+}
+
+/// #862 hot exit: every quit that keeps or knowingly drops the edits
+/// removes the backup: a clean quit (all saved), S once the saves land, D,
+/// and vim's `:qa!`.
+#[test]
+fn hot_exit_backup_goes_with_a_clean_quit_save_all_or_discard() {
+    type Quit = fn(&mut App);
+    let quits: [(&str, Quit); 4] = [
+        ("clean quit", |app| {
+            app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL))
+                .unwrap();
+            press_ctrl_q(app);
+        }),
+        ("S", |app| {
+            press_ctrl_q(app);
+            app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+                .unwrap();
+        }),
+        ("D", |app| {
+            press_ctrl_q(app);
+            app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+                .unwrap();
+        }),
+        (":qa!", |app| app.vim_run_ex("qa!")),
+    ];
+    for (name, quit) in quits {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let (app, _) = app_with_unsaved_file(tmp.path());
+        let mut app = with_hot_exit(app, cache.path());
+        settle_hot_exit(&mut app);
+        assert_eq!(hot_exit_files(cache.path(), tmp.path()).len(), 1, "setup");
+        quit(&mut app);
+        assert!(app.quit, "{name}: {}", app.status);
+        assert!(
+            hot_exit_files(cache.path(), tmp.path()).is_empty(),
+            "{name} removes the backup"
+        );
+    }
+}
+
+/// #862 hot exit negative: what is not a clean quit leaves the backup:
+/// cancelling the quit prompt, and the update relaunch (its handoff carries
+/// the same text across the exec, and the next croft backs it up again).
+#[test]
+fn hot_exit_backup_stays_when_croft_does_not_quit_cleanly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    press_ctrl_q(&mut app);
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(hot_exit_files(cache.path(), tmp.path()).len(), 1, "Esc");
+    app.update_status = UpdateStatus::Ready;
+    app.handle_key(key(
+        KeyCode::F(9),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert!(app.pending_reexec && app.quit, "setup: the relaunch armed");
+    assert_eq!(
+        hot_exit_files(cache.path(), tmp.path()).len(),
+        1,
+        "relaunch"
+    );
+}
+
+/// #862 hot exit: a file changed on disk after the backup still comes back
+/// unsaved with the backed-up text, the status line says it changed, and
+/// the first save refuses to overwrite the other change.
+#[test]
+fn hot_exit_restores_over_a_file_changed_since_and_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    std::fs::write(&a, "changed elsewhere after the backup\n").unwrap();
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    next.focus_pane(Pane::Editor);
+    assert_eq!(next.editor.path.as_deref(), Some(a.as_path()));
+    assert!(next.editor.dirty);
+    assert_eq!(next.editor.lines[0], "xalpha");
+    assert!(
+        next.status.contains("a.txt changed on disk"),
+        "{}",
+        next.status
+    );
+    next.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "changed elsewhere after the backup\n",
+        "the first save does not clobber the other change"
+    );
+}
+
+/// #862 hot exit: a backed-up file deleted since comes back as an unsaved
+/// tab for that path (a save recreates it), and an untitled buffer holding
+/// text comes back untitled.
+#[test]
+fn hot_exit_restores_deleted_and_untitled_buffers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    let untitled = app.editor.open_unreadable_tab(None);
+    untitled.lines = vec![String::from("scratch note")];
+    untitled.dirty = true;
+    settle_hot_exit(&mut app);
+    assert_eq!(
+        the_hot_exit_backup(cache.path(), tmp.path()).buffers.len(),
+        2
+    );
+    drop(app);
+    std::fs::remove_file(&a).unwrap();
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    let deleted = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .expect("the deleted file's tab is back");
+    assert!(deleted.dirty && deleted.lines[0] == "xalpha");
+    assert!(!a.exists(), "not recreated until saved");
+    let scratch = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.is_none() && e.dirty)
+        .expect("the untitled buffer is back");
+    assert_eq!(scratch.lines, vec![String::from("scratch note")]);
+}
+
+/// #862 review (CodeRabbit): a tab restored for a file deleted since keeps
+/// the stamp its edits were made against. It came back with none, so once
+/// something made the file again, the first save wrote over that without
+/// asking, as it would not for a file merely changed since.
+#[test]
+fn a_restored_tab_of_a_deleted_file_does_not_overwrite_one_made_since() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    std::fs::remove_file(&a).unwrap();
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert!(next.status.contains("no longer on disk"), "{}", next.status);
+    assert_eq!(next.editor.path.as_deref(), Some(a.as_path()), "setup");
+    std::fs::write(&a, "made elsewhere\n").unwrap();
+    next.focus_pane(Pane::Editor);
+    next.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "made elsewhere\n");
+    assert!(next.status.contains("changed on disk"), "{}", next.status);
+    assert!(next.editor.dirty, "the restored text is still there");
+}
+
+/// #862 review, the guard: a deleted file's restored tab can still be
+/// saved. The first save asks, as for any file changed since; the second
+/// writes it.
+#[test]
+fn a_restored_tab_of_a_deleted_file_is_saved_when_asked_twice() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    std::fs::remove_file(&a).unwrap();
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    next.focus_pane(Pane::Editor);
+    for _ in 0..2 {
+        next.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
+            .unwrap();
+    }
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap().lines().next(),
+        Some("xalpha")
+    );
+    assert!(!next.editor.dirty);
+}
+
+/// #862 review (CodeRabbit): a consumed backup that cannot be removed once
+/// this croft's own backup lands is not forgotten. It was dropped without a
+/// word, so text the user later discarded could come back at a launch. It
+/// is said, and the quit tries it again and says so too.
+#[test]
+fn a_consumed_backup_that_cannot_be_removed_is_reported_and_tried_at_quit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    let old = as_a_dead_crofts_backup(cache.path(), tmp.path());
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    let own = block_hot_exit_path(&next);
+    next.restore_hot_exit();
+    assert!(old.exists(), "setup: kept while its own write fails");
+    // Neither emptied nor unlinked: a non-empty directory in its place.
+    std::fs::remove_file(&old).unwrap();
+    std::fs::create_dir_all(old.join("blocked")).unwrap();
+    std::fs::remove_dir_all(&own).unwrap();
+    settle_hot_exit(&mut next);
+    assert!(own.is_file(), "setup: its own backup landed");
+    let old_name = old.display().to_string();
+    assert!(
+        next.status.contains("Could not remove") && next.status.contains(&old_name),
+        "{}",
+        next.status
+    );
+    press_ctrl_q(&mut next);
+    next.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(next.quit);
+    assert!(
+        next.exit_notes.iter().any(|n| n.contains(&old_name)),
+        "{:?}",
+        next.exit_notes
+    );
+}
+
+/// #862 review (CodeRabbit): a dead croft's backup can sit at this croft's
+/// own backup path, where the process start time cannot be read (the name
+/// is then `<pid>.json`) and the pid was recycled. Restoring from it, then
+/// writing this croft's own backup, then cutting it down to a held copy
+/// all hit one file: the cut wrote over the backup of what was restored.
+/// It is moved aside before anything is restored from it.
+#[test]
+fn a_backup_at_this_crofts_own_path_is_moved_aside_before_restoring() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    let b_buffer = crate::hot_exit::Buffer {
+        tab: crate::session_state::OpenTabState {
+            path: Some(b.clone()),
+            dirty: true,
+            cursor_row: 0,
+            cursor_col: 0,
+            scroll: 0,
+            scroll_col: 0,
+            unsaved_text: Some(String::from("zbravo\n")),
+        },
+        disk_stamp: None,
+    };
+    two_dead_backups_of_a(
+        tmp.path(),
+        cache.path(),
+        ["first\n", "second\n"],
+        vec![b_buffer],
+    );
+    // The older backup, holding a.txt and b.txt, sits at this croft's own
+    // path; its write time comes with it.
+    let older = hot_exit_files(cache.path(), tmp.path())
+        .into_iter()
+        .find(|f| f.ends_with("1-1.json"))
+        .unwrap();
+    let own = crate::hot_exit::own_path(cache.path(), tmp.path());
+    std::fs::rename(&older, &own).unwrap();
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert!(
+        next.status.contains("restored 2 unsaved tabs"),
+        "{}",
+        next.status
+    );
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &b),
+        ["zbravo\n"],
+        "b.txt's restored text is backed up"
+    );
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &a),
+        ["first\n", "second\n"],
+        "and so are both copies of a.txt"
+    );
+}
+
+/// #862 review (CodeRabbit, security): a tab closed without saving had its
+/// text left in the hot-exit backup until a later tick rewrote it, so a
+/// crash in between brought back text the user had chosen to discard. The
+/// close rewrites the backup at once.
+#[test]
+fn discarding_a_tab_takes_its_text_out_of_the_backup_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &a).len(),
+        1,
+        "setup: backed up"
+    );
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.status.contains("without saving"), "{}", app.status);
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &a),
+        Vec::<String>::new(),
+        "no tick has run, and the discarded text is gone from disk"
+    );
+}
+
+/// #862 review, the guard: discarding one tab leaves the others' unsaved
+/// text in the backup.
+#[test]
+fn discarding_a_tab_keeps_the_other_unsaved_tabs_backed_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    type_into_editor(&mut app, "z");
+    settle_hot_exit(&mut app);
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()), "setup");
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &b),
+        Vec::<String>::new()
+    );
+    assert_eq!(hot_exit_texts_of(cache.path(), tmp.path(), &a).len(), 1);
+}
+
+/// #862 hot exit negative: only the launched workspace's backup comes back;
+/// another workspace's stays where it is for that workspace's next launch.
+#[test]
+fn hot_exit_does_not_restore_another_workspaces_backup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+
+    let mut elsewhere = with_hot_exit(App::new(other.path().to_path_buf()).unwrap(), cache.path());
+    elsewhere.restore_hot_exit();
+    assert!(
+        elsewhere.editor.editors.iter().all(|e| !e.dirty),
+        "nothing restored into the other workspace"
+    );
+    assert_eq!(hot_exit_files(cache.path(), tmp.path()).len(), 1, "kept");
+}
+
+/// #862 hot exit negative: a backup another running croft owns (a second
+/// window on the workspace) is neither restored nor removed by this one.
+/// This one is named by its pid alone, as backups were before hot exit
+/// recorded start times: a live pid is then taken to be its croft.
+#[test]
+fn hot_exit_leaves_a_running_crofts_backup_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    let mine = hot_exit_files(cache.path(), tmp.path()).remove(0);
+    // pid 1 is always running.
+    let live = mine.with_file_name("1.json");
+    std::fs::rename(&mine, &live).unwrap();
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert!(
+        next.editor.editors.iter().all(|e| !e.dirty),
+        "not taken over"
+    );
+    assert!(live.exists(), "and not removed");
+}
+
+/// This test's hot-exit backup of `root`, renamed as a croft that is gone
+/// left it (a pid that does not exist, in the pid-only name): a backup at a
+/// path other than the restoring croft's own.
+fn as_a_dead_crofts_backup(cache: &std::path::Path, root: &std::path::Path) -> PathBuf {
+    let mine = hot_exit_files(cache, root).remove(0);
+    let dead = mine.with_file_name("999999999.json");
+    std::fs::rename(&mine, &dead).unwrap();
+    dead
+}
+
+/// Put a non-empty directory where `app`'s own hot-exit backup goes, so
+/// writing it fails even for root (a rename cannot replace a directory
+/// that holds something). Returns the path, to clear the way again.
+fn block_hot_exit_path(app: &App) -> PathBuf {
+    let own = app.hot_exit_path().unwrap();
+    std::fs::create_dir_all(own.join("blocked")).unwrap();
+    own
+}
+
+/// #862 hot exit (review): the backup a restore consumed stays on disk
+/// until this croft's own backup of the restored tabs is written. The
+/// restore removed it first, so a failed write (a full disk) left the text
+/// in memory only; the next tick then writes it and lets the old one go.
+#[test]
+fn a_failed_rewrite_after_a_restore_keeps_the_old_backup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    let old = as_a_dead_crofts_backup(cache.path(), tmp.path());
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    let own = block_hot_exit_path(&next);
+    next.restore_hot_exit();
+    assert!(
+        next.editor.dirty && next.editor.lines[0] == "xalpha",
+        "setup: restored"
+    );
+    assert!(
+        old.exists(),
+        "the old backup stays while it is the only copy on disk"
+    );
+    assert!(next.status.contains("Could not back up"), "{}", next.status);
+    std::fs::remove_dir_all(&own).unwrap();
+    settle_hot_exit(&mut next);
+    assert!(own.is_file(), "a later tick writes it");
+    assert!(!old.exists(), "and only then the old backup goes");
+}
+
+/// #862 hot exit (review): a backup write that failed is tried again by a
+/// later tick, with no further edit. It counted as written, so nothing was
+/// backed up until the user typed again.
+#[test]
+fn a_failed_hot_exit_write_is_retried_by_a_later_tick() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    let own = block_hot_exit_path(&app);
+    settle_hot_exit(&mut app);
+    assert!(!own.is_file(), "setup: the write failed");
+    std::fs::remove_dir_all(&own).unwrap();
+    settle_hot_exit(&mut app);
+    assert!(own.is_file(), "retried with no new edit");
+    let backup = crate::hot_exit::Backup::load(&own).unwrap();
+    assert_eq!(backup.buffers.len(), 1);
+}
+
+/// #862 hot exit negative: a restore whose rewrite lands removes the backup
+/// it consumed; this croft's own backup is never removed, even when the
+/// consumed file carries its name (a dead croft whose pid it reuses).
+#[test]
+fn a_restore_replaces_the_old_backup_and_keeps_its_own() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    let old = as_a_dead_crofts_backup(cache.path(), tmp.path());
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert!(!old.exists(), "the consumed backup goes");
+    let own = next.hot_exit_path().unwrap();
+    assert!(own.is_file(), "its own holds the text now");
+    drop(next);
+
+    // The consumed file is this croft's own name: it is rewritten, never
+    // removed.
+    let mut again = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    again.restore_hot_exit();
+    assert!(again.editor.dirty, "setup: restored again");
+    assert!(own.is_file(), "its own backup is kept");
+    let backup = crate::hot_exit::Backup::load(&own).unwrap();
+    assert!(
+        backup.buffers[0]
+            .tab
+            .unsaved_text
+            .as_deref()
+            .unwrap()
+            .starts_with("xalpha")
+    );
+}
+
+/// #862 hot exit negative: a consumed backup that restores nothing (no
+/// buffers in it) is removed at once; there is no text to wait on a write
+/// for, and no backup of this croft's is written.
+#[test]
+fn a_backup_that_restores_nothing_is_removed_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let dir = crate::hot_exit::workspace_dir(cache.path(), tmp.path());
+    let empty = dir.join("999999999.json");
+    crate::hot_exit::Backup {
+        workspace_root: tmp.path().to_path_buf(),
+        buffers: Vec::new(),
+    }
+    .save(&empty)
+    .unwrap();
+    let mut app = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    app.restore_hot_exit();
+    assert!(!empty.exists());
+    assert!(hot_exit_files(cache.path(), tmp.path()).is_empty());
+}
+
+/// #862 hot exit (review): a backup whose pid is alive again, but as a
+/// process that started at another time than the croft that wrote it, is
+/// from a croft that is gone: its pid was recycled. It is restored. Judged
+/// by the pid alone it stayed untouched as long as the newcomer ran.
+#[test]
+fn hot_exit_restores_a_backup_whose_pid_was_recycled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    let mine = hot_exit_files(cache.path(), tmp.path()).remove(0);
+    // pid 1 is always running, and did not start one second into 1970.
+    let recycled = mine.with_file_name("1-1.json");
+    std::fs::rename(&mine, &recycled).unwrap();
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    let ed = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .expect("restored");
+    assert!(ed.dirty && ed.lines[0] == "xalpha");
+    assert!(!recycled.exists(), "consumed");
+}
+
+/// The texts hot-exit backups under `cache` hold for `file`, sorted.
+fn hot_exit_texts_of(
+    cache: &std::path::Path,
+    root: &std::path::Path,
+    file: &std::path::Path,
+) -> Vec<String> {
+    let mut texts: Vec<String> = hot_exit_files(cache, root)
+        .iter()
+        .flat_map(|f| crate::hot_exit::Backup::load(f).unwrap().buffers)
+        .filter(|b| b.tab.path.as_deref() == Some(file))
+        .filter_map(|b| b.tab.unsaved_text)
+        .collect();
+    texts.sort();
+    texts
+}
+
+/// Two dead crofts' backups (`1-1.json`, `1-2.json`: pid 1 never started
+/// in 1970), each holding `a.txt` with the unsaved text `texts` gives it,
+/// the second written later, and `extra` buffers added to the first.
+fn two_dead_backups_of_a(
+    tmp: &std::path::Path,
+    cache: &std::path::Path,
+    texts: [&str; 2],
+    extra: Vec<crate::hot_exit::Buffer>,
+) {
+    let (app, _) = app_with_unsaved_file(tmp);
+    let mut app = with_hot_exit(app, cache);
+    settle_hot_exit(&mut app);
+    drop(app);
+    let mine = hot_exit_files(cache, tmp).remove(0);
+    let mut backup = crate::hot_exit::Backup::load(&mine).unwrap();
+    std::fs::remove_file(&mine).unwrap();
+    for (i, text) in texts.iter().enumerate() {
+        backup.buffers.truncate(1);
+        backup.buffers[0].tab.unsaved_text = Some((*text).to_string());
+        if i == 0 {
+            backup.buffers.extend(extra.iter().cloned());
+        }
+        let file = mine.with_file_name(format!("1-{}.json", i + 1));
+        backup.save(&file).unwrap();
+        let written =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(60 - 30 * i as u64);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(written)
+            .unwrap();
+    }
+}
+
+/// #862 review: two crofts on one workspace, both killed holding unsaved
+/// edits to one file. Restoring the second backup into the tab the first
+/// filled overwrote that text, and both backups were then deleted, so one
+/// set of edits was gone while the status line counted two tabs restored.
+/// The second copy now stays in its backup, and comes back once the first
+/// has been saved or closed.
+#[test]
+fn hot_exit_keeps_a_second_backup_of_a_file_it_already_restored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    two_dead_backups_of_a(
+        tmp.path(),
+        cache.path(),
+        ["first\n", "second\n"],
+        Vec::new(),
+    );
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert!(
+        next.status.contains("restored 1 unsaved tab"),
+        "{}",
+        next.status
+    );
+    assert!(
+        next.status.contains("a.txt has a second unsaved copy"),
+        "{}",
+        next.status
+    );
+    let shown = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .expect("restored");
+    assert_eq!(shown.lines[0], "second", "the newer copy fills the tab");
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &a),
+        ["first\n", "second\n"],
+        "both texts are still on disk"
+    );
+
+    // Once this croft's copy is gone (a clean quit that discards it), the
+    // next launch brings back the other one.
+    next.clear_hot_exit();
+    drop(next);
+    let mut third = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    third.restore_hot_exit();
+    let other = third
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .expect("the second copy is restored");
+    assert!(other.dirty);
+    assert_eq!(
+        other.lines[0], "first",
+        "the copy the first launch held back"
+    );
+}
+
+/// #862 review, the guard: the backup that held the second copy keeps only
+/// that copy. Its other file is restored and not left in it to come back a
+/// second time.
+#[test]
+fn hot_exit_restores_the_rest_of_a_backup_that_also_held_a_second_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    let b_buffer = crate::hot_exit::Buffer {
+        tab: crate::session_state::OpenTabState {
+            path: Some(b.clone()),
+            dirty: true,
+            cursor_row: 0,
+            cursor_col: 0,
+            scroll: 0,
+            scroll_col: 0,
+            unsaved_text: Some(String::from("zbravo\n")),
+        },
+        disk_stamp: None,
+    };
+    two_dead_backups_of_a(
+        tmp.path(),
+        cache.path(),
+        ["first\n", "second\n"],
+        vec![b_buffer],
+    );
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert!(
+        next.status.contains("restored 2 unsaved tabs"),
+        "{}",
+        next.status
+    );
+    let bed = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(b.as_path()))
+        .expect("b.txt restored");
+    assert!(bed.dirty && bed.lines[0] == "zbravo");
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &b),
+        ["zbravo\n"],
+        "b.txt is in this croft's backup alone"
+    );
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &a),
+        ["first\n", "second\n"]
+    );
+}
+
+/// #862 hot exit negative: a backup whose pid and start time are both
+/// those of a running process is that croft's live copy: neither restored
+/// nor removed.
+#[test]
+fn hot_exit_leaves_the_backup_of_a_process_still_running_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    let mine = hot_exit_files(cache.path(), tmp.path()).remove(0);
+    let init = crate::hot_exit::start_time_of(1).expect("pid 1 runs");
+    let live = mine.with_file_name(format!("1-{init}.json"));
+    std::fs::rename(&mine, &live).unwrap();
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert!(
+        next.editor.editors.iter().all(|e| !e.dirty),
+        "not taken over"
+    );
+    assert!(live.exists(), "and not removed");
+}
+
+/// #862 hot exit (review): a backup the quit could not remove is not
+/// dropped silently. It holds text the user chose to discard (D), so the
+/// failure is said, with the path, rather than left to be restored as
+/// unsaved at the next launch without a word.
+#[test]
+fn a_backup_a_quit_cannot_remove_is_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    // A directory where the backup goes: neither written nor removable.
+    let own = block_hot_exit_path(&app);
+    press_ctrl_q(&mut app);
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.quit, "the quit still goes ahead");
+    assert!(
+        app.status.contains("Could not remove") && app.status.contains(&own.display().to_string()),
+        "{}",
+        app.status
+    );
+    assert_eq!(
+        app.exit_notes,
+        vec![app.status.clone()],
+        "and it is said again on stderr once croft has gone"
+    );
+}
+
+/// #862 hot exit (review): a backup that could not be read is not kept
+/// forever. Reported and kept for a week, in case it can be recovered by
+/// hand, it is removed once it is older than that.
+#[test]
+fn an_unreadable_backup_older_than_a_week_is_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let dir = crate::hot_exit::workspace_dir(cache.path(), tmp.path());
+    std::fs::create_dir_all(&dir).unwrap();
+    let corrupt = dir.join("999999999.json");
+    std::fs::write(&corrupt, "{\"workspace_root\": \"/tm").unwrap();
+    let eight_days = std::time::Duration::from_secs(8 * 24 * 60 * 60);
+    std::fs::File::options()
+        .write(true)
+        .open(&corrupt)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - eight_days)
+        .unwrap();
+    let mut app = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    app.restore_hot_exit();
+    assert!(!corrupt.exists(), "expired");
+    assert!(app.editor.editors.iter().all(|e| !e.dirty));
+    assert!(app.status.contains("removed"), "{}", app.status);
+}
+
+/// #862 hot exit negative: clean buffers are never backed up, and once the
+/// last unsaved edit is saved the backup goes.
+#[test]
+fn hot_exit_does_not_back_up_clean_buffers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let app = app_with_open_file(tmp.path(), "a.txt", "alpha\n");
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    assert!(hot_exit_files(cache.path(), tmp.path()).is_empty());
+    assert!(
+        !crate::hot_exit::workspace_dir(cache.path(), tmp.path()).exists(),
+        "not even the directory"
+    );
+    type_into_editor(&mut app, "x");
+    settle_hot_exit(&mut app);
+    assert_eq!(hot_exit_files(cache.path(), tmp.path()).len(), 1, "setup");
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        .unwrap();
+    settle_hot_exit(&mut app);
+    assert!(hot_exit_files(cache.path(), tmp.path()).is_empty(), "saved");
+}
+
+/// #862 hot exit negative: an unsaved buffer that has not changed since
+/// the last backup is not written again, however often the tick runs or
+/// the caret moves; the next edit is.
+#[test]
+fn hot_exit_does_not_rewrite_an_unchanged_backup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    let file = hot_exit_files(cache.path(), tmp.path()).remove(0);
+    std::fs::write(&file, "sentinel").unwrap();
+    settle_hot_exit(&mut app);
+    app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+        .unwrap();
+    settle_hot_exit(&mut app);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "sentinel",
+        "not rewritten"
+    );
+    type_into_editor(&mut app, "y");
+    settle_hot_exit(&mut app);
+    let backup = crate::hot_exit::Backup::load(&file).unwrap();
+    assert!(
+        backup.buffers[0]
+            .tab
+            .unsaved_text
+            .as_deref()
+            .unwrap()
+            .contains("xaylpha")
+    );
+}
+
+/// #862 hot exit: re-rooting the workspace takes this croft's backup along
+/// to the new root. Left under the old one, the old workspace's next launch
+/// would restore buffers this croft still holds and later saves.
+#[test]
+fn hot_exit_backup_follows_a_change_of_workspace_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    assert_eq!(hot_exit_files(cache.path(), tmp.path()).len(), 1, "setup");
+    app.change_workspace_root(other.path().to_path_buf());
+    settle_hot_exit(&mut app);
+    assert!(
+        hot_exit_files(cache.path(), tmp.path()).is_empty(),
+        "nothing left under the old root"
+    );
+    assert_eq!(hot_exit_files(cache.path(), other.path()).len(), 1);
+}
+
+/// #862 hot exit negative: a backup that cannot be read (truncated, not
+/// JSON) restores nothing and does not panic; it is kept, since it may be
+/// the only copy of the text, and the status line says so.
+#[test]
+fn hot_exit_ignores_a_corrupt_backup_without_a_panic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let dir = crate::hot_exit::workspace_dir(cache.path(), tmp.path());
+    std::fs::create_dir_all(&dir).unwrap();
+    let corrupt = dir.join("999999999.json");
+    std::fs::write(&corrupt, "{\"workspace_root\": \"/tm").unwrap();
+    let mut app = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    app.restore_hot_exit();
+    assert!(app.editor.editors.iter().all(|e| !e.dirty));
+    assert!(corrupt.exists(), "kept");
+    assert!(app.status.contains("could not read"), "{}", app.status);
+}
+
+/// A comment longer than the line on disk it replaces (#862): a restore
+/// that kept the disk file's syntax spans would colour only the first few
+/// characters of it, or none.
+const RESTORED_COMMENT: &str = "# a comment that is longer than the disk line";
+
+/// The syntax spans `text` gets as line 0 of a `.py` file opened from disk,
+/// the reference a restored buffer holding the same text must match.
+fn spans_of_python_line_opened_from_disk(text: &str) -> Vec<(usize, usize, ratatui::style::Style)> {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app_with_open_file(tmp.path(), "ref.py", &format!("{text}\n"));
+    app.editor.line_spans_for_test(0)
+}
+
+/// #862 hot exit: a restored buffer is highlighted as the text it holds,
+/// not as the file on disk it was opened over. It kept the disk text's
+/// spans: here the restored comment was coloured only for the length of
+/// the disk line `x = 1`, and the rest stayed plain until the next edit.
+/// The edit counter moves too, so the LSP and everything else that follows
+/// it resync to the restored text.
+#[test]
+fn hot_exit_restored_text_is_highlighted_as_itself() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let mut app = with_hot_exit(
+        app_with_open_file(tmp.path(), "a.py", "x = 1\n"),
+        cache.path(),
+    );
+    app.editor.lines = vec![String::from(RESTORED_COMMENT), String::new()];
+    app.editor.dirty = true;
+    settle_hot_exit(&mut app);
+    drop(app);
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert_eq!(next.editor.lines[0], RESTORED_COMMENT, "setup: restored");
+    let want = spans_of_python_line_opened_from_disk(RESTORED_COMMENT);
+    assert!(
+        want.iter()
+            .any(|&(s, e, _)| s == 0 && e == RESTORED_COMMENT.len()),
+        "setup: the comment is one span over the whole line: {want:?}"
+    );
+    assert_eq!(
+        next.editor.line_spans_for_test(0),
+        want,
+        "the whole restored comment carries the comment style"
+    );
+    let mut opened = crate::widgets::editor::Editor::new();
+    opened.open(&tmp.path().join("a.py")).unwrap();
+    assert_ne!(
+        next.editor.edit_seq, opened.edit_seq,
+        "the edit counter moved past the disk text's"
+    );
+}
+
+/// #862: the update relaunch restores through the same path and had the
+/// same gap: its unsaved text kept the disk file's syntax spans.
+#[test]
+fn relaunch_restored_text_is_highlighted_as_itself() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "x = 1\n");
+    app.editor.lines = vec![String::from(RESTORED_COMMENT), String::new()];
+    app.editor.dirty = true;
+    let state = app.capture_session_state();
+
+    let mut next = App::new(tmp.path().to_path_buf()).unwrap();
+    next.apply_session_state(&state);
+    let a = tmp.path().join("a.py");
+    let ed = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .unwrap();
+    assert_eq!(ed.lines[0], RESTORED_COMMENT, "setup: restored");
+    assert_eq!(
+        ed.line_spans_for_test(0),
+        spans_of_python_line_opened_from_disk(RESTORED_COMMENT)
+    );
+}
+
+/// #862 negative: an untitled buffer has no language, so its restored text
+/// gets no syntax spans at all (and no panic); a clean tab open beside the
+/// restored ones keeps its spans, its text and its edit counter.
+#[test]
+fn restoring_leaves_untitled_text_plain_and_clean_tabs_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let mut app = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    let scratch = app.editor.open_unreadable_tab(None);
+    scratch.lines = vec![String::from(RESTORED_COMMENT)];
+    scratch.dirty = true;
+    settle_hot_exit(&mut app);
+    drop(app);
+
+    let clean = tmp.path().join("clean.py");
+    std::fs::write(&clean, "def f():\n    return 1\n").unwrap();
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.editor.open_pinned(&clean).unwrap();
+    let before = (
+        next.editor.line_spans_for_test(0),
+        next.editor.lines.clone(),
+        next.editor.edit_seq,
+    );
+    assert!(!before.0.is_empty(), "setup: the clean tab is highlighted");
+    next.restore_hot_exit();
+    let untitled = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.is_none() && e.dirty)
+        .expect("the untitled buffer is back");
+    assert_eq!(untitled.lines, vec![String::from(RESTORED_COMMENT)]);
+    assert!(
+        untitled.line_spans_for_test(0).is_empty(),
+        "no language, no spans: {:?}",
+        untitled.line_spans_for_test(0)
+    );
+    let kept = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(clean.as_path()))
+        .unwrap();
+    assert!(!kept.dirty);
+    assert_eq!(
+        (
+            kept.line_spans_for_test(0),
+            kept.lines.clone(),
+            kept.edit_seq
+        ),
+        before,
+        "the clean tab is untouched"
+    );
+}
+
 #[test]
 fn cmd_k_arms_leader_then_unmatched_second_key_clears_it() {
     let tmp = tempfile::tempdir().unwrap();
