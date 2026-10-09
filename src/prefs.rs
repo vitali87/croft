@@ -451,6 +451,21 @@ fn merge_changed(
         if before == Some(value) {
             continue;
         }
+        // A nested object the file does not have yet (the first `layout`
+        // change in a new config.json) gets only its changed keys too, so its
+        // untouched siblings keep following the defaults and any `extends`
+        // base.
+        if let (Some(b @ Value::Object(_)), Value::Object(_)) = (before, value)
+            && !doc.contains_key(key)
+            && !SERDE_ALIASES
+                .iter()
+                .any(|(canonical, legacy)| key == canonical && doc.contains_key(*legacy))
+        {
+            let mut inner = serde_json::Map::new();
+            merge_changed(&mut inner, b, value);
+            doc.insert(key.clone(), Value::Object(inner));
+            continue;
+        }
         match (doc.get_mut(key), before, value) {
             (Some(Value::Object(inner)), Some(b @ Value::Object(_)), Value::Object(_)) => {
                 merge_changed(inner, b, value);
@@ -1279,6 +1294,22 @@ mod tests {
             },
             "every other setting reads back as its default"
         );
+    }
+
+    /// #1617: the first save of a nested setting writes only that field of
+    /// it, so its siblings keep following the defaults.
+    #[test]
+    fn the_first_save_of_a_nested_setting_writes_only_its_changed_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut prefs = Prefs::load_for_update(&path).unwrap();
+        prefs.layout.status_bar = !prefs.layout.status_bar;
+        prefs.save(&path).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let layout: Vec<&String> = doc["layout"].as_object().unwrap().keys().collect();
+        assert_eq!(layout, vec!["status_bar"], "{doc}");
+        assert_eq!(Prefs::load(&path).unwrap(), prefs);
     }
 
     /// #1617: an `extends` base added after the first save is not overridden
