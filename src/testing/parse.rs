@@ -91,16 +91,34 @@ fn parse_xdist_line(line: &str) -> Option<TestCase> {
         Some(progress) => progress.split_once("] ")?.1,
         None => rest,
     };
-    let (word, rest) = rest.split_once(' ')?;
+    let (mut word, mut rest) = rest.split_once(' ')?;
+    // `console_output_style = times` puts the test's duration before the
+    // outcome (`[gw0] 1.234ms PASSED …`).
+    if word.starts_with(|c: char| c.is_ascii_digit()) {
+        (word, rest) = rest.split_once(' ')?;
+    }
     let status = PYTEST_OUTCOMES
         .iter()
         .find(|(w, _)| w.trim_start() == word)?
         .1;
-    let name = rest.split_whitespace().next()?;
+    let name = xdist_node_id(rest.trim_start())?;
     name.contains("::").then(|| TestCase {
         name: name.to_string(),
         status,
     })
+}
+
+/// The node ID at the start of `rest`: up to the first whitespace, unless a
+/// parametrize ID (`test_a[hello world]`) is still open there, in which case
+/// it runs to that bracket's close.
+fn xdist_node_id(rest: &str) -> Option<&str> {
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let head = &rest[..end];
+    let end = match head.find('[') {
+        Some(open) if !head[open..].contains(']') => open + rest[open..].find(']')? + 1,
+        _ => end,
+    };
+    Some(&rest[..end]).filter(|n| !n.is_empty())
 }
 
 /// Parse a single line of `pytest --collect-only -q` output into a discovered
@@ -403,6 +421,18 @@ mod tests {
                 "[gw0] PASSED tests/test_x.py::test_a",
                 "tests/test_x.py::test_a",
                 TestStatus::Passed,
+            ),
+            // `console_output_style = times` prints the duration first.
+            (
+                "[gw0] 1.234ms PASSED tests/test_x.py::test_a ",
+                "tests/test_x.py::test_a",
+                TestStatus::Passed,
+            ),
+            // A parametrize ID keeps its whitespace.
+            (
+                "[gw1] [ 50%] FAILED tests/test_x.py::test_g[hello world] ",
+                "tests/test_x.py::test_g[hello world]",
+                TestStatus::Failed,
             ),
         ];
         for (line, name, status) in cases {
