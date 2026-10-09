@@ -77650,6 +77650,120 @@ fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
     assert_eq!(app.status, "Tab is already kept open");
 }
 
+/// #910: `tax.py` open with an unsaved function, rewritten on disk behind
+/// it (a `git checkout`, a restore, an agent), and the sweep that notices.
+fn app_with_a_disk_conflict(tmp: &std::path::Path) -> (App, std::path::PathBuf) {
+    let f = tmp.join("tax.py");
+    std::fs::write(&f, "RATE = 0.1\n").unwrap();
+    let mut app = App::new(tmp.to_path_buf()).unwrap();
+    app.history_root = tmp.join(".history");
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = "RATE = 0.1".len();
+    app.editor
+        .insert_str("\ndef tax(amount):\n    return amount * RATE");
+    assert!(app.editor.dirty);
+    std::fs::write(&f, "RATE = 0.2  # from the other branch\n").unwrap();
+    app.reload_open_file_after_external_change();
+    assert!(
+        matches!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(crate::widgets::input_prompt::InputPurpose::ReloadConflict { .. })
+        ),
+        "the conflict prompt opens"
+    );
+    (app, f)
+}
+
+fn type_keys(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+#[test]
+fn typing_on_into_the_disk_conflict_prompt_keeps_the_edits() {
+    // The prompt opens mid-typing and takes the keys; Enter on whatever was
+    // typed used to reload and throw the unsaved function away.
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_a_disk_conflict(tmp.path());
+    type_keys(&mut app, "    print(tax(100))");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.input_prompt.is_none(), "the prompt is dismissed");
+    assert!(
+        app.editor.lines.join("\n").contains("def tax(amount):"),
+        "the unsaved edits were discarded: {:?}",
+        app.editor.lines
+    );
+    assert!(app.editor.dirty);
+    assert!(
+        app.status.contains("Kept your unsaved edits"),
+        "{}",
+        app.status
+    );
+}
+
+#[test]
+fn the_disk_conflict_prompt_starts_empty_and_says_what_reload_costs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_a_disk_conflict(tmp.path());
+    let prompt = app.input_prompt.as_ref().unwrap();
+    assert_eq!(
+        prompt.value, "",
+        "nothing pre-filled for a stray Enter to confirm"
+    );
+    assert!(prompt.title.starts_with("tax.py "), "{}", prompt.title);
+    let said = format!(
+        "{} {}",
+        prompt.placeholder,
+        prompt.hint.clone().unwrap_or_default()
+    );
+    assert!(said.contains("discard"), "{said}");
+    // Negative: Enter on the empty field does nothing at all.
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.input_prompt.is_some());
+    assert!(app.editor.dirty);
+}
+
+#[test]
+fn reloading_over_unsaved_edits_keeps_them_in_local_history() {
+    // Typing `reload` is the explicit consent; what it discards stays
+    // recoverable from TIMELINE.
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, f) = app_with_a_disk_conflict(tmp.path());
+    type_keys(&mut app, "reload");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "RATE = 0.2  # from the other branch"
+    );
+    assert!(!app.editor.dirty);
+    let held: Vec<String> = crate::history::entries_in(&app.history_root, &f)
+        .iter()
+        .map(|s| std::fs::read_to_string(&s.file).unwrap())
+        .collect();
+    assert!(
+        held.iter().any(|h| h.contains("def tax(amount):")),
+        "the discarded buffer is in Local History: {held:?}"
+    );
+}
+
+#[test]
+fn escape_on_the_disk_conflict_prompt_keeps_the_edits() {
+    // Negative: the other way out still keeps them.
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_a_disk_conflict(tmp.path());
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.input_prompt.is_none());
+    assert!(app.editor.lines.join("\n").contains("def tax(amount):"));
+}
+
 // ---- Find bar seeding selects the word under the caret (#1278) ----
 
 /// orders.py from the issue, open and focused, caret at `(row, col)`.
