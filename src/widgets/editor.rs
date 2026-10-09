@@ -6918,9 +6918,14 @@ impl Editor {
             decode_semantic_tokens(&self.semantic_data, legend, bytes, &line_starts);
     }
 
-    /// Number of logical lines in the buffer (the inlay-hint request range).
-    pub fn line_count(&self) -> usize {
-        self.lines.len()
+    /// Where the buffer ends, as an LSP position: the end of an inlay-hint
+    /// request range, which a strict server rejects past it (#1490).
+    pub fn document_end(&self) -> lsp_types::Position {
+        let last = self.lines.last().map_or("", String::as_str);
+        lsp_types::Position::new(
+            self.lines.len().saturating_sub(1) as u32,
+            last.encode_utf16().count() as u32,
+        )
     }
 
     /// Markdown: Toggle Preview (Cmd/Ctrl+Shift+V). Returns false when the

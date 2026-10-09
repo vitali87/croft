@@ -78339,6 +78339,46 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     assert!(app.source_control.last_init_repo_button_area.width > 0);
 }
 
+// ── #1490: inlay hints are asked for up to the document's real end ──
+
+#[test]
+fn inlay_hints_are_requested_up_to_the_last_line_not_one_past_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app_with_open_file(
+        tmp.path(),
+        "main.rs",
+        "fn main() {\n    let v = 40 + 2;\n}\n",
+    );
+    let targets = app.inlay_hint_targets();
+    assert_eq!(targets.len(), 1);
+    // The server holds the buffer's lines joined by newlines; its last
+    // position is the end of the closing brace's line, not a line past it.
+    assert_eq!(targets[0].1, lsp_types::Position::new(2, 1));
+    assert_eq!(
+        targets[0].1,
+        crate::lsp::manager::document_end(&app.editor.lines.join("\n"))
+    );
+}
+
+#[test]
+fn inlay_hints_end_after_the_last_line_in_utf16_units() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app_with_open_file(tmp.path(), "main.py", "x = 1\ns = \"é😀\"");
+    // `s = "é😀"` is 9 UTF-16 units: `é` is one and `😀` is two.
+    assert_eq!(
+        app.inlay_hint_targets()[0].1,
+        lsp_types::Position::new(1, 9)
+    );
+}
+
+/// Negative: an editor with no file asks nothing.
+#[test]
+fn inlay_hints_target_no_file_when_none_is_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.inlay_hint_targets().is_empty());
+}
+
 /// An App over `tmp` whose user config lives in `cfg`, never the real one.
 fn settings_editor_app(cfg: &std::path::Path, tmp: &std::path::Path) -> App {
     let mut app = App::new(tmp.to_path_buf()).unwrap();

@@ -8452,7 +8452,7 @@ impl App {
                     // stable through the first nudge of the scroll wheel
                     // before the full-document reply lands.
                     let start = tab.scroll as u32;
-                    let end = (tab.scroll + tab.page_size() + 16).min(tab.lines.len()) as u32;
+                    let end = (tab.scroll + tab.page_size() + 16) as u32;
                     let text = tab.lines.join("\n");
                     // Paint the last-known semantic colours instantly from the
                     // disk cache, so an import-heavy file does not flash grey
@@ -8475,7 +8475,9 @@ impl App {
             None => return,
         };
         for (is_open, path, text, seq, viewport) in to_send {
-            let line_count = text.lines().count() as u32 + 1;
+            let doc_end = crate::lsp::manager::document_end(&text);
+            let viewport =
+                viewport.map(|(start, end)| (start, crate::lsp::manager::rows_end(&text, end)));
             if is_open {
                 lsp.open_doc(path.clone(), text);
                 // Paint the visible lines first: ty answers a viewport range
@@ -8496,7 +8498,7 @@ impl App {
             // Same cadence for inlay hints; the reply carries `seq` so a
             // stale batch (computed against older text) is dropped on drain.
             if self.inlay_hints_enabled {
-                lsp.request_inlay_hints(path.clone(), line_count, seq);
+                lsp.request_inlay_hints(path.clone(), doc_end, seq);
             }
             // Document links ride the same cadence (#254); silent when no
             // server advertises a documentLinkProvider, so Ctrl+click
@@ -10832,20 +10834,26 @@ impl App {
         let Some(lsp) = self.lsp.as_ref() else {
             return;
         };
-        let mut targets: Vec<(PathBuf, u32)> = Vec::new();
+        for (p, end) in self.inlay_hint_targets() {
+            if let Some(&seq) = self.lsp_last_seen.get(&p) {
+                lsp.request_inlay_hints(p, end, seq);
+            }
+        }
+    }
+
+    /// Every visible editor's file with where its buffer ends: the range an
+    /// inlay-hint request covers (#1490).
+    fn inlay_hint_targets(&self) -> Vec<(PathBuf, lsp_types::Position)> {
+        let mut targets = Vec::new();
         if let Some(p) = self.editor.path.clone() {
-            targets.push((p, self.editor.line_count() as u32 + 1));
+            targets.push((p, self.editor.document_end()));
         }
         for group in self.editor_layout.inactive_groups() {
             if let Some(p) = group.path.clone() {
-                targets.push((p, group.line_count() as u32 + 1));
+                targets.push((p, group.document_end()));
             }
         }
-        for (p, line_count) in targets {
-            if let Some(&seq) = self.lsp_last_seen.get(&p) {
-                lsp.request_inlay_hints(p, line_count, seq);
-            }
-        }
+        targets
     }
 
     /// Editor: Toggle Inlay Hints — flips the hint display live and persists
