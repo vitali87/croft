@@ -7365,7 +7365,7 @@ pub(crate) fn is_on_path(cmd: &str) -> bool {
 
 /// True when `path` is a regular file with at least one execute bit set. On
 /// non-unix any existing file counts (no mode bits to inspect).
-fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     if !path.is_file() {
         return false;
     }
