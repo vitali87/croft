@@ -13288,6 +13288,39 @@ impl App {
         })
     }
 
+    /// Run one key or mouse gesture, and when it moved the editor to
+    /// another file without going through the navigation history itself
+    /// (Quick Open, a Search result, the Explorer, a tab), record where the
+    /// user left (#1635): Go Back knew only the jumps that recorded
+    /// themselves, so the usual way of changing file left nothing to go
+    /// back to. A gesture that recorded or walked the history (Go to
+    /// Definition, Go Back itself) is left as it did it, and so is one that
+    /// moved focus to another editor group: a history entry holds no group,
+    /// so Go Back would reopen that group's file in the focused one.
+    fn recording_file_switches<R>(&mut self, gesture: impl FnOnce(&mut Self) -> R) -> R {
+        let left = self.current_nav_loc();
+        let changes = self.nav.changes();
+        let group = self.editor_group_identity();
+        let result = gesture(self);
+        if let Some(left) = left
+            && self.nav.changes() == changes
+            && self.editor_group_identity() == group
+            && self.editor.path.as_ref() != Some(&left.path)
+        {
+            self.nav.record(left);
+        }
+        result
+    }
+
+    /// Which editor group has focus, as the split's leaf count and the
+    /// focused leaf's position: a change in either is a group change.
+    fn editor_group_identity(&self) -> (usize, usize) {
+        (
+            self.editor_layout.leaf_count(),
+            self.editor_layout.active_dfs_index(),
+        )
+    }
+
     fn nav_back(&mut self) {
         let current = self.current_nav_loc();
         let Some(loc) = self.nav.back(current) else {
@@ -22571,7 +22604,7 @@ impl App {
         }
         let capture =
             self.macro_recording.is_some() && !self.macro_replaying && self.focus == Pane::Editor;
-        let result = self.handle_key_inner(key);
+        let result = self.recording_file_switches(|app| app.handle_key_inner(key));
         // Focus is re-checked after dispatch too: a key that hands focus to
         // the terminal would otherwise be recorded while everything after it
         // is dropped, producing a macro that replays a focus change and then
@@ -53835,6 +53868,10 @@ impl App {
     }
 
     fn handle_mouse(&mut self, m: MouseEvent) {
+        self.recording_file_switches(|app| app.handle_mouse_inner(m));
+    }
+
+    fn handle_mouse_inner(&mut self, m: MouseEvent) {
         // A click means the user moved on from a pending shortcut prompt.
         if matches!(m.kind, MouseEventKind::Down(_)) && self.recording_shortcut.take().is_some() {
             self.status = String::from("Shortcut unchanged");

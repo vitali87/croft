@@ -4177,6 +4177,146 @@ fn ctrl_minus_and_the_palette_both_navigate_back() {
     );
 }
 
+/// #1635 fixture: `a.txt` (120 lines) open with the caret on line 40, and
+/// `b.txt` (60 lines, then `needle here`) beside it.
+fn nav_switch_fixture() -> (tempfile::TempDir, App, PathBuf, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let a = root.join("a.txt");
+    let b = root.join("b.txt");
+    let lines = |name: &str, n: usize| -> String {
+        (1..=n).map(|i| format!("{name} line {i}\n")).collect()
+    };
+    std::fs::write(&a, lines("alpha", 120)).unwrap();
+    std::fs::write(&b, lines("beta", 60) + "needle here\n").unwrap();
+    let mut app = App::new(root).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 39;
+    (tmp, app, a, b)
+}
+
+/// Go Back, as Ctrl+- types it.
+fn press_go_back(app: &mut App) {
+    app.handle_key(key(KeyCode::Char('-'), KeyModifiers::CONTROL))
+        .unwrap();
+}
+
+/// #1635: a file opened from Quick Open, a Search result or the Explorer
+/// records where the user left, so Go Back returns there.
+#[test]
+fn go_back_returns_to_the_file_left_by_any_open() {
+    let at = |app: &App| (app.editor.path.clone(), app.editor.cursor_row);
+    // Quick Open.
+    let (_tmp, mut app, a, b) = nav_switch_fixture();
+    quick_open_typing(&mut app, "b.txt");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()));
+    press_go_back(&mut app);
+    assert_eq!(at(&app), (Some(a.clone()), 39), "{}", app.status);
+
+    // A Search result.
+    let (_tmp, mut app, a, b) = nav_switch_fixture();
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.query = String::from("needle");
+    app.search.run_query();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()));
+    press_go_back(&mut app);
+    assert_eq!(at(&app), (Some(a.clone()), 39), "{}", app.status);
+
+    // The Explorer.
+    let (_tmp, mut app, a, b) = nav_switch_fixture();
+    app.set_sidebar_view(SidebarView::Explorer);
+    app.focus_pane(Pane::Tree);
+    app.tree.selected = app
+        .tree
+        .nodes
+        .iter()
+        .position(|n| n.path == b)
+        .expect("b.txt is listed");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()));
+    press_go_back(&mut app);
+    assert_eq!(at(&app), (Some(a), 39), "{}", app.status);
+}
+
+/// #1635 negative: moving focus to another editor group showing another
+/// file is not a file switch. A history entry holds no group, so Go Back
+/// would reopen the left group's file in the focused one.
+#[test]
+fn focusing_another_editor_group_records_no_go_back_location() {
+    let (_tmp, mut app, a, b) = nav_switch_fixture();
+    app.split_editor(); // right group (focused) duplicates a.txt
+    app.editor.open_pinned(&b).unwrap();
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()));
+    let changes = app.nav.changes();
+    app.handle_key(key(KeyCode::Left, KeyModifiers::SUPER | KeyModifiers::ALT))
+        .unwrap();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(a.as_path()),
+        "{}",
+        app.status
+    );
+    assert_eq!(app.nav.changes(), changes, "no history entry recorded");
+}
+
+/// #1635: Go to Line, then Quick Open, then Back twice visits the line the
+/// file was left on, then the line before the Go to Line; Forward returns.
+#[test]
+fn go_back_walks_a_go_to_line_then_a_file_switch_in_order() {
+    let (_tmp, mut app, a, b) = nav_switch_fixture();
+    quick_open_typing(&mut app, ":80");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.cursor_row, 79, "{}", app.status);
+    quick_open_typing(&mut app, "b.txt");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    press_go_back(&mut app);
+    assert_eq!(
+        (app.editor.path.clone(), app.editor.cursor_row),
+        (Some(a.clone()), 79)
+    );
+    press_go_back(&mut app);
+    assert_eq!(
+        (app.editor.path.clone(), app.editor.cursor_row),
+        (Some(a), 39)
+    );
+    app.run_command(crate::widgets::command_palette::Command::NavigateForward);
+    app.run_command(crate::widgets::command_palette::Command::NavigateForward);
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(b.as_path()),
+        "{}",
+        app.status
+    );
+}
+
+/// #1635 negative: moving through a file with the keys records nothing,
+/// and Go Back itself is not recorded as a switch.
+#[test]
+fn moving_within_a_file_records_no_go_back_location() {
+    let (_tmp, mut app, a, _b) = nav_switch_fixture();
+    for code in [
+        KeyCode::PageDown,
+        KeyCode::PageDown,
+        KeyCode::Down,
+        KeyCode::Up,
+    ] {
+        app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
+    }
+    app.handle_key(key(KeyCode::End, KeyModifiers::CONTROL))
+        .unwrap();
+    press_go_back(&mut app);
+    assert_eq!(app.status, "No previous location");
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+}
+
 #[test]
 fn go_back_with_empty_history_stays_put() {
     let tmp = tempfile::tempdir().unwrap();

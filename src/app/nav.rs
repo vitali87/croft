@@ -17,10 +17,20 @@ pub struct NavLoc {
 pub struct NavHistory {
     back: Vec<NavLoc>,
     forward: Vec<NavLoc>,
+    /// Bumped by every record and every step back or forward, so a caller
+    /// can tell whether a gesture already went through the history.
+    changes: u64,
 }
 
 impl NavHistory {
+    /// How many times the history has been recorded into or walked: equal
+    /// before and after a gesture when the gesture left it alone (#1635).
+    pub fn changes(&self) -> u64 {
+        self.changes
+    }
+
     pub fn record(&mut self, loc: NavLoc) {
+        self.changes += 1;
         if self.back.last() == Some(&loc) {
             return;
         }
@@ -38,6 +48,7 @@ impl NavHistory {
     /// file position (the welcome screen); the step still happens.
     pub fn back(&mut self, current: Option<NavLoc>) -> Option<NavLoc> {
         let loc = self.back.pop()?;
+        self.changes += 1;
         if let Some(cur) = current
             && self.forward.last() != Some(&cur)
         {
@@ -52,6 +63,7 @@ impl NavHistory {
     /// Step forward after a Go Back, mirroring [`Self::back`].
     pub fn forward(&mut self, current: Option<NavLoc>) -> Option<NavLoc> {
         let loc = self.forward.pop()?;
+        self.changes += 1;
         if let Some(cur) = current
             && self.back.last() != Some(&cur)
         {
