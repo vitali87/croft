@@ -844,6 +844,158 @@ fn typing_with_images_on_does_not_stream_images_per_keystroke() {
     );
 }
 
+/// #862 hot exit end to end, on the real binary: croft killed (SIGKILL, so
+/// no quit runs, as in an OOM kill) a few seconds after an edit it never
+/// saved brings the edit back on the next launch of the workspace, as an
+/// unsaved tab, and the file itself is untouched. Before hot exit the text
+/// was gone.
+#[cfg(unix)]
+#[test]
+fn unsaved_edits_survive_a_kill_and_come_back_on_the_next_launch() {
+    use std::io::{Read, Write};
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+
+    /// croft on a fresh pty in `dir` (also its HOME), and the pty's master.
+    fn spawn(dir: &std::path::Path, args: &[&str]) -> (std::process::Child, std::fs::File) {
+        let (mut master, mut slave) = (0, 0);
+        let ws = libc::winsize {
+            ws_row: 40,
+            ws_col: 140,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &ws,
+            )
+        };
+        assert_eq!(opened, 0);
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("croft"));
+        cmd.args(args)
+            .current_dir(dir)
+            .env("HOME", dir)
+            .env("TERM", "xterm-256color")
+            .env_remove("TERM_PROGRAM")
+            .stdin(slave.try_clone().unwrap())
+            .stdout(slave.try_clone().unwrap())
+            .stderr(slave.try_clone().unwrap());
+        // A child that cannot take the pty as its controlling terminal
+        // fails to spawn here, rather than running detached from it.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = cmd.spawn().unwrap();
+        drop(slave);
+        unsafe {
+            let flags = libc::fcntl(master, libc::F_GETFL);
+            libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        (child, unsafe { std::fs::File::from_raw_fd(master) })
+    }
+    /// What croft writes until `done` holds on everything read so far, or
+    /// until `limit` (a bound for a slow machine, not a wait). The end of
+    /// the terminal (croft exited) stops the read; any other read error
+    /// fails the test rather than passing for the end.
+    fn read_until(
+        pty: &mut std::fs::File,
+        limit: Duration,
+        mut done: impl FnMut(&str) -> bool,
+    ) -> String {
+        let mut out = String::new();
+        let mut buf = [0u8; 1 << 16];
+        let end = Instant::now() + limit;
+        while !done(&out) && Instant::now() < end {
+            match pty.read(&mut buf) {
+                Ok(0) => break,
+                Ok(k) => out.push_str(&String::from_utf8_lossy(&buf[..k])),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                // Linux reports the slave side closing as EIO.
+                Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+                Err(e) => panic!("reading croft's terminal: {e}"),
+            }
+        }
+        out
+    }
+    /// Whether a hot-exit backup under `dir` holds `text`.
+    fn a_backup_holds(dir: &std::path::Path, text: &str) -> bool {
+        let Ok(workspaces) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        workspaces
+            .flatten()
+            .filter_map(|ws| std::fs::read_dir(ws.path()).ok())
+            .flat_map(|files| files.flatten())
+            .filter(|f| f.path().extension().is_some_and(|x| x == "json"))
+            .any(|f| std::fs::read_to_string(f.path()).is_ok_and(|t| t.contains(text)))
+    }
+    let limit = Duration::from_secs(20);
+
+    let home = tempfile::tempdir().unwrap();
+    let file = home.path().join("a.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let backups = home.path().join(".cache/croft/hot-exit");
+    let (mut child, mut pty) = spawn(home.path(), &["a.txt"]);
+    let started = read_until(&mut pty, limit, |out| out.contains("alpha"));
+    assert!(
+        started.contains("alpha"),
+        "croft never drew a.txt: {started:?}"
+    );
+    // Dismiss anything a first launch shows over the editor. A terminal
+    // reads ESC as Escape only when nothing follows it at once, so this
+    // pause is the protocol's, not a guess at how long croft takes.
+    pty.write_all(b"\x1b").unwrap();
+    read_until(&mut pty, Duration::from_millis(300), |_| false);
+    pty.write_all(b"HOTEXIT").unwrap();
+    // The backup lands 5 s after the last edit; croft is killed outright
+    // once it has. The terminal is read meanwhile, so croft never blocks
+    // on a full one.
+    let end = Instant::now() + limit;
+    while !a_backup_holds(&backups, "HOTEXIT") && Instant::now() < end {
+        read_until(&mut pty, Duration::from_millis(100), |_| false);
+    }
+    assert!(
+        a_backup_holds(&backups, "HOTEXIT"),
+        "a backup holds the edit"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "alpha\n",
+        "never saved"
+    );
+
+    let (mut child, mut pty) = spawn(home.path(), &[]);
+    let drawn = read_until(&mut pty, limit, |out| {
+        out.contains("HOTEXITalpha") && out.contains("restored 1 unsaved tab")
+    });
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        drawn.contains("HOTEXITalpha"),
+        "the unsaved edit is back on the next launch"
+    );
+    assert!(
+        drawn.contains("restored 1 unsaved tab"),
+        "and croft says so"
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\n");
+}
+
 /// #621: a locale as `$LANG` spells it (`de_DE.UTF-8`) seeds the template
 /// from the German catalog and names the file croft will load.
 #[test]
@@ -1340,5 +1492,227 @@ fn ctrl_shift_s_as_tmux_sends_it_does_not_save_while_ctrl_s_does() {
     assert!(
         drawn.contains("SOURCE CONTROL"),
         "Ctrl+Shift+S opens Source Control"
+    );
+}
+
+/// `croft edit --sequence-editor`, as git runs it from `GIT_SEQUENCE_EDITOR`,
+/// with git's own editor set to `editor` and no git config in the way.
+fn sequence_editor_command(dir: &std::path::Path, editor: &str) -> Command {
+    let no_config = dir.join("empty.gitconfig");
+    std::fs::write(&no_config, "").unwrap();
+    let mut cmd = Command::cargo_bin("croft").unwrap();
+    cmd.env("GIT_EDITOR", editor)
+        .env("GIT_CONFIG_GLOBAL", &no_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .current_dir(dir);
+    cmd
+}
+
+/// #1452: a shell that outlived its croft (a tmux server started from a
+/// croft pane) keeps `GIT_SEQUENCE_EDITOR` and `CROFT_VIEW_SOCK`. Every
+/// `git rebase -i` there failed with "the croft that opened this pane is
+/// gone". As the sequence editor, croft now hands the plan to git's own
+/// editor instead.
+#[test]
+fn the_sequence_editor_falls_back_to_gits_editor_when_its_croft_is_gone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = tmp.path().join("git-rebase-todo");
+    std::fs::write(&plan, "pick 1234567 one\n").unwrap();
+    let out = sequence_editor_command(tmp.path(), "echo edited >>")
+        .env("CROFT_VIEW_SOCK", tmp.path().join("nobody.sock"))
+        .args(["edit", "--wait", "--sequence-editor", "git-rebase-todo"])
+        .assert();
+    let out = out.success();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("croft is not running; using echo edited >>"),
+        "says which editor it used, was: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&plan).unwrap(),
+        "pick 1234567 one\nedited\n",
+        "git's editor ran on the plan"
+    );
+}
+
+/// #1452: the same with no socket at all (the variable was dropped but
+/// `GIT_SEQUENCE_EDITOR` kept).
+#[test]
+fn the_sequence_editor_falls_back_when_no_croft_socket_is_set() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = tmp.path().join("git-rebase-todo");
+    std::fs::write(&plan, "pick 1234567 one\n").unwrap();
+    sequence_editor_command(tmp.path(), "echo edited >>")
+        .env_remove("CROFT_VIEW_SOCK")
+        .args(["edit", "--wait", "--sequence-editor", "git-rebase-todo"])
+        .assert()
+        .success();
+    assert!(
+        std::fs::read_to_string(&plan)
+            .unwrap()
+            .ends_with("edited\n")
+    );
+}
+
+/// #1452: the fallback editor's own failure is git's to see: its exit code
+/// comes back, so git aborts the rebase as it would without croft.
+#[test]
+fn a_failing_fallback_editor_fails_the_sequence_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("git-rebase-todo"), "pick 1234567 one\n").unwrap();
+    let out = sequence_editor_command(tmp.path(), "exit 3;")
+        .env("CROFT_VIEW_SOCK", tmp.path().join("nobody.sock"))
+        .args(["edit", "--wait", "--sequence-editor", "git-rebase-todo"])
+        .assert();
+    let out = out.failure().code(3);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("using exit 3;"), "stderr was: {stderr}");
+}
+
+/// #1452 negative: a plain `croft edit` asked for croft by name, so a gone
+/// croft is still an error there and no other editor runs.
+#[test]
+fn a_plain_edit_against_a_gone_croft_still_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = tmp.path().join("notes.txt");
+    std::fs::write(&plan, "keep\n").unwrap();
+    let out = sequence_editor_command(tmp.path(), "echo edited >>")
+        .env("CROFT_VIEW_SOCK", tmp.path().join("nobody.sock"))
+        .args(["edit", "--wait", "notes.txt"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("the croft that opened this pane is gone"),
+        "stderr was: {stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(&plan).unwrap(), "keep\n");
+}
+
+/// #1452 negative: a croft that is running but refuses the file is not a
+/// gone croft. Its refusal stands, and git's editor does not run.
+#[test]
+fn a_croft_that_refuses_the_plan_is_not_replaced_by_gits_editor() {
+    use std::io::{BufRead, BufReader, Write};
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = tmp.path().join("git-rebase-todo");
+    std::fs::write(&plan, "pick 1234567 one\n").unwrap();
+    let sock = tmp.path().join("v.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        stream
+            .write_all(b"{\"status\":\"err\",\"message\":\"cannot open that here\"}\n")
+            .unwrap();
+    });
+    let out = sequence_editor_command(tmp.path(), "echo edited >>")
+        .env("CROFT_VIEW_SOCK", &sock)
+        .args(["edit", "--wait", "--sequence-editor", "git-rebase-todo"])
+        .assert();
+    server.join().unwrap();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("cannot open that here"),
+        "stderr was: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&plan).unwrap(),
+        "pick 1234567 one\n"
+    );
+}
+
+/// #1452 negative: a croft that took the plan and closed without a reply may
+/// have opened it, so git's editor must not open the same plan a second time.
+#[test]
+fn a_croft_that_closes_without_replying_is_not_replaced_by_gits_editor() {
+    use std::io::{BufRead, BufReader};
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = tmp.path().join("git-rebase-todo");
+    std::fs::write(&plan, "pick 1234567 one\n").unwrap();
+    let sock = tmp.path().join("v.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+    });
+    let out = sequence_editor_command(tmp.path(), "echo edited >>")
+        .env("CROFT_VIEW_SOCK", &sock)
+        .args(["edit", "--wait", "--sequence-editor", "git-rebase-todo"])
+        .assert();
+    server.join().unwrap();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(!stderr.contains("not running"), "stderr was: {stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&plan).unwrap(),
+        "pick 1234567 one\n"
+    );
+}
+
+/// #1452 negative: where git itself names no editor (a dumb terminal with
+/// none set), the fallback fails as git would rather than inventing `vi`.
+#[test]
+fn the_sequence_editor_fails_when_git_names_no_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = tmp.path().join("git-rebase-todo");
+    std::fs::write(&plan, "pick 1234567 one\n").unwrap();
+    let out = sequence_editor_command(tmp.path(), "unused")
+        .env_remove("GIT_EDITOR")
+        .env_remove("VISUAL")
+        .env_remove("EDITOR")
+        .env("TERM", "dumb")
+        .env("CROFT_VIEW_SOCK", tmp.path().join("nobody.sock"))
+        .args(["edit", "--wait", "--sequence-editor", "git-rebase-todo"])
+        .assert();
+    let out = out.failure().code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(!stderr.contains("using"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains("the croft that opened this pane is gone"),
+        "stderr was: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&plan).unwrap(),
+        "pick 1234567 one\n"
+    );
+}
+
+/// #1452 negative: with its croft alive the plan opens there, exactly as
+/// before, and git's editor never runs.
+#[test]
+fn a_live_croft_still_gets_the_plan() {
+    use std::io::{BufRead, BufReader, Write};
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = tmp.path().join("git-rebase-todo");
+    std::fs::write(&plan, "pick 1234567 one\n").unwrap();
+    let sock = tmp.path().join("v.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let server = std::thread::spawn(move || {
+        let replies: [&[u8]; 2] = [
+            b"{\"status\":\"ok\"}\n",
+            b"{\"status\":\"err\",\"message\":\"closed\"}\n",
+        ];
+        for reply in replies {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            stream.write_all(reply).unwrap();
+        }
+    });
+    let out = sequence_editor_command(tmp.path(), "echo edited >>")
+        .env("CROFT_VIEW_SOCK", &sock)
+        .args(["edit", "--wait", "--sequence-editor", "git-rebase-todo"])
+        .assert();
+    server.join().unwrap();
+    let out = out.success();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(!stderr.contains("not running"), "stderr was: {stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&plan).unwrap(),
+        "pick 1234567 one\n"
     );
 }

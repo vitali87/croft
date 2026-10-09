@@ -398,7 +398,8 @@ pub enum CliCommand {
         #[arg(long, default_value_t = false)]
         wait: bool,
         /// Running as git's sequence editor: defer to `sequence.editor`
-        /// when the repository's git config names one.
+        /// when the repository's git config names one, and to git's own
+        /// editor when no croft is there to open the plan.
         #[arg(long, default_value_t = false, hide = true)]
         sequence_editor: bool,
     },
@@ -791,20 +792,30 @@ impl Cli {
                 sequence_editor,
             }) => {
                 if sequence_editor && let Some(configured) = configured_sequence_editor() {
-                    // Exactly how git itself runs an editor value.
-                    let status = std::process::Command::new("sh")
-                        .arg("-c")
-                        .arg(format!("{configured} \"$@\""))
-                        .arg(configured.as_str())
-                        .arg(&path)
-                        .status();
-                    std::process::exit(status.ok().and_then(|s| s.code()).unwrap_or(1));
+                    std::process::exit(run_git_editor(&configured, &path));
                 }
-                if let Err(e) = crate::view_ipc::edit(&path, wait, &crate::app::croft_cache_dir()) {
-                    eprintln!("{e}");
-                    std::process::exit(1);
+                match crate::view_ipc::edit(&path, wait, &crate::app::croft_cache_dir()) {
+                    Ok(()) => Ok(()),
+                    // A shell that outlived its croft (a tmux server started
+                    // from a pane) keeps GIT_SEQUENCE_EDITOR: git's rebase
+                    // then needs an editor, not croft (#1452). A plain
+                    // `croft edit` asked for croft, so it still fails.
+                    Err(e)
+                        if sequence_editor
+                            && e.downcast_ref::<crate::view_ipc::NoCroft>().is_some() =>
+                    {
+                        let Some(editor) = git_editor() else {
+                            eprintln!("{e}");
+                            std::process::exit(1);
+                        };
+                        eprintln!("croft is not running; using {editor}");
+                        std::process::exit(run_git_editor(&editor, &path));
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
                 }
-                Ok(())
             }
             Some(CliCommand::Hook { action }) => {
                 // Printed and exited, like `view`: a one-line reason, never
@@ -1059,6 +1070,33 @@ fn configured_sequence_editor() -> Option<String> {
         .ok()?;
     let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !value.is_empty()).then_some(value)
+}
+
+/// The editor git itself would run: `GIT_EDITOR`, `core.editor`, `VISUAL`,
+/// `EDITOR`, then git's built-in default, as `git var GIT_EDITOR` reports.
+/// `None` when git names none (a dumb terminal with no editor set): git
+/// fails there, so no editor is invented. git's own reason reaches stderr.
+fn git_editor() -> Option<String> {
+    std::process::Command::new("git")
+        .args(["var", "GIT_EDITOR"])
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|editor| !editor.is_empty())
+}
+
+/// Run the editor value `editor` on `path` exactly as git itself runs one,
+/// and return its exit code.
+fn run_git_editor(editor: &str, path: &std::ffi::OsStr) -> i32 {
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$@\""))
+        .arg(editor)
+        .arg(path)
+        .status();
+    status.ok().and_then(|s| s.code()).unwrap_or(1)
 }
 
 /// `croft open-link` (#359): check the link, then become the `croft remote`
@@ -1890,6 +1928,86 @@ fn setup_ghostty(yes: bool) -> Result<()> {
     Ok(())
 }
 
+/// A clap usage error when the word clap bound to `PATH` is a misspelled
+/// subcommand rather than a folder: `croft atach`, `croft sync-confg devbox`.
+/// clap tries a word as a subcommand only on an exact match, so without this
+/// the typo surfaces as a missing workspace, or as an "unrecognized
+/// subcommand" aimed at the next word. `base` is the folder a relative
+/// `PATH` resolves against.
+pub fn misspelled_subcommand(args: &[std::ffi::OsString], base: &Path) -> Option<clap::Error> {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    let takes_value = |flag: &str| {
+        cmd.get_arguments().any(|a| {
+            !a.is_positional()
+                && a.get_action().takes_values()
+                && match flag.strip_prefix("--") {
+                    Some(long) => a.get_long() == Some(long),
+                    None => flag.chars().nth(1) == a.get_short(),
+                }
+        })
+    };
+    let mut rest = args.iter().skip(1);
+    let word = loop {
+        let arg = rest.next()?.to_str()?;
+        // After `--` the word is a path by the user's own say-so.
+        if arg == "--" {
+            return None;
+        }
+        if arg.len() > 1 && arg.starts_with('-') {
+            if !arg.contains('=') && takes_value(arg) {
+                rest.next();
+            }
+            continue;
+        }
+        break arg;
+    };
+    let is_subcommand = |w: &str| {
+        cmd.get_subcommands()
+            .any(|s| s.get_name() == w || s.get_all_aliases().any(|a| a == w))
+    };
+    if is_subcommand(word)
+        || word.contains('/')
+        || word.contains(std::path::MAIN_SEPARATOR)
+        || base.join(word).symlink_metadata().is_ok()
+    {
+        return None;
+    }
+    let suggestion = cmd
+        .get_subcommands()
+        .filter(|s| !s.is_hide_set())
+        .map(|s| (edit_distance(word, s.get_name()), s.get_name().to_string()))
+        // One slip in a short name, two in a longer one: `croft app` is a
+        // folder that is not there, not a stab at `pr`.
+        .filter(|(d, name)| *d <= if name.chars().count() <= 4 { 1 } else { 2 })
+        .min_by_key(|(d, _)| *d)?
+        .1;
+    Some(cmd.error(
+        clap::error::ErrorKind::InvalidSubcommand,
+        format!(
+            "'{word}' is not a croft command or an existing path\n\n  tip: a similar subcommand exists: '{suggestion}'"
+        ),
+    ))
+}
+
+/// Levenshtein distance, counted in chars.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diag = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = (diag + usize::from(ca != *cb))
+                .min(above + 1)
+                .min(row[j] + 1);
+            diag = above;
+        }
+    }
+    row[b.len()]
+}
+
 /// Split the `PATH` argument into the workspace root and the file to open in
 /// the editor. Handing croft a *file* roots the workspace at its parent and
 /// opens the file, so `croft pitch_deck.tex` works and the macOS launcher can
@@ -1928,7 +2046,7 @@ fn resolve_workspace_from(
     let path = cwd
         .join(path)
         .canonicalize()
-        .context("resolving workspace path")?;
+        .with_context(|| format!("resolving workspace path {}", path.display()))?;
     if path.is_dir() {
         let open_file = open_file.map(|f| resolve_open_file(f, &path, cwd));
         return Ok((path, open_file, Vec::new()));
@@ -2313,6 +2431,80 @@ mod tests {
         let cli = Cli::try_parse_from(["croft", "--build-info", "demo"]).unwrap();
         assert!(cli.build_info);
         assert!(matches!(cli.command, Some(CliCommand::Demo { tour: None })));
+    }
+
+    fn typo_error(args: &[&str], base: &Path) -> Option<String> {
+        let args: Vec<std::ffi::OsString> = args.iter().map(Into::into).collect();
+        misspelled_subcommand(&args, base).map(|e| {
+            assert_eq!(e.exit_code(), 2, "a usage error, like clap's own");
+            e.to_string()
+        })
+    }
+
+    #[test]
+    fn a_misspelled_subcommand_is_suggested_not_opened_as_a_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let msg = typo_error(&["croft", "atach"], dir.path()).expect("a typo error");
+        assert!(
+            msg.contains("'atach' is not a croft command or an existing path"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("a similar subcommand exists: 'attach'"),
+            "{msg}"
+        );
+        let msg = typo_error(&["croft", "locale-templat", "fr"], dir.path()).expect("a typo error");
+        assert!(msg.contains("'locale-template'"), "{msg}");
+    }
+
+    #[test]
+    fn the_suggestion_is_for_the_misspelled_word_not_the_one_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let msg = typo_error(&["croft", "sync-confg", "devbox"], dir.path()).expect("a typo error");
+        assert!(msg.contains("'sync-config'"), "{msg}");
+        assert!(!msg.contains("'demo'"), "{msg}");
+        // Flags before the word, and a flag's value, are not the word.
+        let msg = typo_error(
+            &["croft", "--zen", "--open-file", "x.rs", "atach"],
+            dir.path(),
+        )
+        .expect("a typo error");
+        assert!(msg.contains("'attach'"), "{msg}");
+    }
+
+    #[test]
+    fn an_existing_folder_named_like_a_typo_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("atach")).unwrap();
+        assert_eq!(typo_error(&["croft", "atach"], dir.path()), None);
+    }
+
+    #[test]
+    fn words_that_are_not_near_a_subcommand_are_left_to_clap() {
+        let dir = tempfile::tempdir().unwrap();
+        for args in [
+            &["croft"][..],
+            &["croft", "attach"],
+            &["croft", "sync-config", "devbox"],
+            &["croft", "--open-file", "atach"],
+            &["croft", "app"],
+            &["croft", "my-project"],
+            &["croft", "sub/atach"],
+            &["croft", "--", "atach"],
+        ] {
+            assert_eq!(typo_error(args, dir.path()), None, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn a_missing_workspace_path_is_named_in_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-dir");
+        let err = resolve_workspace(&missing, None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains(&missing.display().to_string()),
+            "{err:#}"
+        );
     }
 
     #[test]
