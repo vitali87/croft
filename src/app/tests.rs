@@ -26220,7 +26220,7 @@ fn run_active_file_with_python_file_spawns_a_new_terminal_and_focuses_it() {
 
 /// #1400 fixture: `name` holds "old\n" on disk and "new\nold\n" in its
 /// open, unsaved tab.
-fn app_with_unsaved_file(name: &str) -> (tempfile::TempDir, App, PathBuf) {
+fn app_with_unsaved_pinned_file(name: &str) -> (tempfile::TempDir, App, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let file = root.join(name);
@@ -26236,7 +26236,7 @@ fn app_with_unsaved_file(name: &str) -> (tempfile::TempDir, App, PathBuf) {
 /// runs the text the breakpoints were set against.
 #[test]
 fn f5_saves_the_unsaved_buffer_before_launching() {
-    let (_tmp, mut app, file) = app_with_unsaved_file("notes.txt");
+    let (_tmp, mut app, file) = app_with_unsaved_pinned_file("notes.txt");
     app.debug_start_or_continue();
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
     assert!(!app.editor.dirty);
@@ -26251,7 +26251,7 @@ fn f5_saves_the_unsaved_buffer_before_launching() {
 /// debuggee imports the others.
 #[test]
 fn f5_saves_every_unsaved_tab_not_only_the_active_one() {
-    let (tmp, mut app, helper) = app_with_unsaved_file("helper.txt");
+    let (tmp, mut app, helper) = app_with_unsaved_pinned_file("helper.txt");
     let main = tmp.path().canonicalize().unwrap().join("main.txt");
     std::fs::write(&main, "main\n").unwrap();
     app.editor.open_pinned(&main).unwrap();
@@ -26263,7 +26263,7 @@ fn f5_saves_every_unsaved_tab_not_only_the_active_one() {
 /// #1400: Run writes the unsaved tab before the run command starts.
 #[test]
 fn run_saves_the_unsaved_buffer_before_running() {
-    let (_tmp, mut app, file) = app_with_unsaved_file("hello.py");
+    let (_tmp, mut app, file) = app_with_unsaved_pinned_file("hello.py");
     app.run_active_file();
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
     assert!(!app.editor.dirty);
@@ -26272,7 +26272,7 @@ fn run_saves_the_unsaved_buffer_before_running() {
 /// #1400: Debug Test saves too: the test runs from the files on disk.
 #[test]
 fn debug_test_saves_the_unsaved_buffer_before_launching() {
-    let (_tmp, mut app, file) = app_with_unsaved_file("test_x.txt");
+    let (_tmp, mut app, file) = app_with_unsaved_pinned_file("test_x.txt");
     app.debug_named_test(String::from("test_x"));
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
     assert_eq!(app.status, "No test runner detected in this workspace");
@@ -26282,7 +26282,7 @@ fn debug_test_saves_the_unsaved_buffer_before_launching() {
 /// is left alone, and the status says the debuggee runs the saved file.
 #[test]
 fn with_save_before_debug_off_f5_leaves_the_disk_and_warns() {
-    let (_tmp, mut app, file) = app_with_unsaved_file("notes.txt");
+    let (_tmp, mut app, file) = app_with_unsaved_pinned_file("notes.txt");
     app.save_before_debug = false;
     app.debug_start_or_continue();
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
@@ -26304,7 +26304,7 @@ fn with_save_before_debug_off_f5_leaves_the_disk_and_warns() {
 /// blind to start a launch; it stays unsaved and the status says so.
 #[test]
 fn f5_never_overwrites_a_file_changed_on_disk() {
-    let (_tmp, mut app, file) = app_with_unsaved_file("notes.txt");
+    let (_tmp, mut app, file) = app_with_unsaved_pinned_file("notes.txt");
     std::thread::sleep(std::time::Duration::from_millis(20));
     std::fs::write(&file, "theirs, changed elsewhere\n").unwrap();
     app.debug_start_or_continue();
