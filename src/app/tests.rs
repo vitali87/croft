@@ -4305,6 +4305,85 @@ fn ctrl_f_reaches_the_terminal_child_on_macos() {
     );
 }
 
+/// Run Terminal: Run Selected Text in Active Terminal the way the palette
+/// does, and return what the active pane was sent.
+fn run_selected_text(app: &mut App) -> String {
+    let cmd = crate::widgets::command_palette::Command::from_id("run_selected_text")
+        .expect("there is a Run Selected Text command");
+    let before = app.terminals[app.active_terminal]
+        .written_bytes_for_test()
+        .len();
+    app.run_command(cmd);
+    let written = app.terminals[app.active_terminal].written_bytes_for_test();
+    String::from_utf8_lossy(&written[before..]).into_owned()
+}
+
+/// What a pane was sent, without bracketed-paste marks: the test pane's
+/// shell turns bracketed paste on by itself, at a time the test can't pin.
+fn unbracketed(sent: &str) -> String {
+    sent.replace("\x1b[200~", "").replace("\x1b[201~", "")
+}
+
+/// #1292: the selection goes to the terminal with Enter after it, and
+/// focus stays in the editor so the next line can be picked.
+#[test]
+fn run_selected_text_sends_the_selection_and_enter_to_the_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(
+        tmp.path(),
+        "explore.py",
+        "import csv\nrows = [1, 2]\ntotal = sum(rows)\nprint(total)\n",
+    );
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (2, 0),
+        head: (3, 12),
+    });
+    assert_eq!(
+        unbracketed(&run_selected_text(&mut app)),
+        "total = sum(rows)\nprint(total)\r"
+    );
+    assert!(app.focus == Pane::Editor, "focus stays in the editor");
+    assert!(app.show_terminal, "the terminal is shown");
+}
+
+/// #1292: a multi-line block arrives as one bracketed paste when the
+/// program in the pane asked for it, and Enter follows outside it.
+#[test]
+fn run_selected_text_brackets_the_block_when_the_pane_asked_for_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "a = 1\nb = 2\n");
+    app.terminals[app.active_terminal].feed_bytes_for_test(b"\x1b[?2004h");
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 0),
+        head: (1, 5),
+    });
+    assert_eq!(
+        run_selected_text(&mut app),
+        "\x1b[200~a = 1\nb = 2\x1b[201~\r"
+    );
+}
+
+/// #1292: with no selection the caret's line is sent and the caret steps
+/// to the next non-blank line, so repeated runs walk through a script.
+#[test]
+fn run_selected_text_without_a_selection_sends_the_line_and_steps_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "a = 1\n\n\nb = 2\n");
+    assert_eq!(unbracketed(&run_selected_text(&mut app)), "a = 1\r");
+    assert_eq!(app.editor.cursor_row, 3, "blank lines are stepped over");
+    assert_eq!(unbracketed(&run_selected_text(&mut app)), "b = 2\r");
+}
+
+/// #1292 negative: with nothing to send (a blank line at the end of the
+/// file) the terminal gets nothing, not even a bare Enter.
+#[test]
+fn run_selected_text_sends_nothing_for_a_blank_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "a = 1\n");
+    app.editor.cursor_row = 1;
+    assert_eq!(unbracketed(&run_selected_text(&mut app)), "");
+}
+
 #[test]
 fn cmd_opt_up_parks_the_previous_prompt_mark_at_the_viewport_top() {
     let tmp = tempfile::tempdir().unwrap();
@@ -7031,6 +7110,7 @@ fn git_status_spans_clean_branch_is_green() {
         repo_root: None,
         changed_count: 0,
         prepared_message: None,
+        operation: None,
     };
     let spans = git_status_spans(&st);
     let main_span = spans
@@ -7056,6 +7136,7 @@ fn git_status_spans_dirty_branch_is_yellow_not_red() {
         repo_root: None,
         changed_count: 0,
         prepared_message: None,
+        operation: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -7084,6 +7165,7 @@ fn git_status_spans_renders_detached_hash_when_no_branch() {
         repo_root: None,
         changed_count: 0,
         prepared_message: None,
+        operation: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -7104,6 +7186,7 @@ fn git_status_spans_renders_ahead_behind_counts() {
         repo_root: None,
         changed_count: 0,
         prepared_message: None,
+        operation: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -14323,6 +14406,236 @@ fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// The issue's repo (#1356): `main` and `feat` both change `f` from
+/// `base`, so merging, rebasing or cherry-picking one onto the other stops
+/// on a conflict.
+fn diverged_repo() -> tempfile::TempDir {
+    let tmp = make_committed_repo();
+    let p = tmp.path();
+    let f = p.join("f");
+    std::fs::write(&f, "base\n").unwrap();
+    assert!(git_succeeds(p, &["add", "f"]) && git_succeeds(p, &["commit", "-qm", "base"]));
+    assert!(git_succeeds(p, &["checkout", "-qb", "feat"]));
+    std::fs::write(&f, "feat\n").unwrap();
+    assert!(git_succeeds(p, &["commit", "-qam", "feat"]));
+    assert!(git_succeeds(p, &["checkout", "-q", "main"]));
+    std::fs::write(&f, "mainline\n").unwrap();
+    assert!(git_succeeds(p, &["commit", "-qam", "main"]));
+    tmp
+}
+
+/// Run git in `dir` without an editor; true when it succeeded.
+fn git_succeeds(dir: &std::path::Path, args: &[&str]) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_EDITOR", "true")
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+/// #1356: a conflicted merge is reported as one, and Abort Merge from
+/// the Source Control menu puts HEAD and the tree back as they were.
+#[test]
+fn abort_merge_restores_the_pre_merge_head() {
+    use crate::git::RepoOp;
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    let before = git_stdout(p, &["rev-parse", "HEAD"]);
+    assert!(
+        !git_succeeds(p, &["merge", "feat"]),
+        "the merge must conflict"
+    );
+    assert_eq!(crate::git::repo_operation(p), Some(RepoOp::Merge));
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::AbortOperation);
+    assert_eq!(crate::git::repo_operation(p), None, "{}", app.status);
+    assert_eq!(git_stdout(p, &["rev-parse", "HEAD"]), before);
+    assert_eq!(git_stdout(p, &["status", "--porcelain"]), "");
+}
+
+/// #1356: Continue on a rebase whose conflict is resolved and staged
+/// finishes it on the branch, with the resolution on top of `main`.
+#[test]
+fn continue_rebase_finishes_it_on_the_branch() {
+    use crate::git::RepoOp;
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    assert!(git_succeeds(p, &["checkout", "-q", "feat"]));
+    assert!(
+        !git_succeeds(p, &["rebase", "main"]),
+        "the rebase must conflict"
+    );
+    assert_eq!(
+        crate::git::repo_operation(p),
+        Some(RepoOp::Rebase { step: 1, total: 1 })
+    );
+    std::fs::write(p.join("f"), "resolved\n").unwrap();
+    assert!(git_succeeds(p, &["add", "f"]));
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::GitContinueOperation);
+    assert_eq!(crate::git::repo_operation(p), None, "{}", app.status);
+    assert_eq!(git_stdout(p, &["symbolic-ref", "--short", "HEAD"]), "feat");
+    assert_eq!(
+        git_stdout(p, &["log", "--format=%s", "-2"]),
+        "feat\nmain",
+        "feat replays on top of main"
+    );
+}
+
+/// #1356 (the #989 path): committing from Source Control mid-rebase
+/// carries on with the rebase instead of leaving HEAD detached.
+#[test]
+fn committing_mid_rebase_continues_the_rebase() {
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    assert!(git_succeeds(p, &["checkout", "-q", "feat"]));
+    assert!(!git_succeeds(p, &["rebase", "main"]));
+    std::fs::write(p.join("f"), "resolved\n").unwrap();
+    assert!(git_succeeds(p, &["add", "f"]));
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.source_control.message = String::from("feat");
+    app.commit_source_control();
+    wait_for_git_net(&mut app);
+    assert_eq!(crate::git::repo_operation(p), None, "{}", app.status);
+    assert_eq!(git_stdout(p, &["symbolic-ref", "--short", "HEAD"]), "feat");
+}
+
+/// #1356: Commit & Push mid-rebase continues the rebase before pushing,
+/// so the push is never made from the rebase's detached HEAD.
+#[test]
+fn commit_and_push_mid_rebase_continues_the_rebase_first() {
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    assert!(git_succeeds(p, &["checkout", "-q", "feat"]));
+    assert!(!git_succeeds(p, &["rebase", "main"]));
+    std::fs::write(p.join("f"), "resolved\n").unwrap();
+    assert!(git_succeeds(p, &["add", "f"]));
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.source_control.message = String::from("feat");
+    app.commit_and_push_source_control();
+    wait_for_git_net(&mut app);
+    assert_eq!(crate::git::repo_operation(p), None, "{}", app.status);
+    assert_eq!(git_stdout(p, &["symbolic-ref", "--short", "HEAD"]), "feat");
+}
+
+/// #1356: Skip drops the conflicting commit and finishes the rebase.
+#[test]
+fn skip_drops_the_conflicting_rebase_commit() {
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    assert!(git_succeeds(p, &["checkout", "-q", "feat"]));
+    assert!(!git_succeeds(p, &["rebase", "main"]));
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::GitSkipOperation);
+    assert_eq!(crate::git::repo_operation(p), None, "{}", app.status);
+    assert_eq!(std::fs::read_to_string(p.join("f")).unwrap(), "mainline\n");
+}
+
+/// #1356: a conflicted cherry-pick is reported, offered Continue and
+/// Abort in the menu, and Abort ends it.
+#[test]
+fn a_conflicted_cherry_pick_can_be_aborted() {
+    use crate::git::RepoOp;
+    use crate::widgets::scm_menu::{Node, ScmAction};
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    assert!(!git_succeeds(p, &["cherry-pick", "feat"]));
+    assert_eq!(crate::git::repo_operation(p), Some(RepoOp::CherryPick));
+    let actions: Vec<ScmAction> = crate::widgets::scm_menu::menu_for(Some(RepoOp::CherryPick))
+        .iter()
+        .filter_map(|n| match n {
+            Node::Item(l) => Some(l.action),
+            _ => None,
+        })
+        .collect();
+    assert!(actions.contains(&ScmAction::ContinueOperation));
+    assert!(actions.contains(&ScmAction::AbortOperation));
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::GitAbortOperation);
+    assert_eq!(crate::git::repo_operation(p), None, "{}", app.status);
+    assert_eq!(git_stdout(p, &["status", "--porcelain"]), "");
+}
+
+/// #1356: the status bar and the git status name the operation and, for
+/// a rebase, the step.
+#[test]
+fn the_status_bar_names_the_operation_in_progress() {
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    assert!(!git_succeeds(p, &["merge", "feat"]));
+    let status = crate::git::query(p);
+    let text: String = git_status_spans(&status)
+        .iter()
+        .map(|s| s.content.to_string())
+        .collect();
+    assert!(text.contains("main") && text.contains("MERGING"), "{text}");
+    assert!(git_succeeds(p, &["merge", "--abort"]));
+    assert!(git_succeeds(p, &["checkout", "-q", "feat"]));
+    assert!(!git_succeeds(p, &["rebase", "main"]));
+    let status = crate::git::query(p);
+    let text: String = git_status_spans(&status)
+        .iter()
+        .map(|s| s.content.to_string())
+        .collect();
+    assert!(text.contains("REBASING 1/1"), "{text}");
+}
+
+/// #1356: bisect shows as BISECTING, and Abort is Bisect Reset.
+#[test]
+fn bisect_is_reported_and_reset() {
+    use crate::git::RepoOp;
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    assert!(git_succeeds(p, &["bisect", "start", "main", "feat~1"]));
+    assert_eq!(crate::git::repo_operation(p), Some(RepoOp::Bisect));
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::GitAbortOperation);
+    assert_eq!(crate::git::repo_operation(p), None, "{}", app.status);
+}
+
+/// #1356 negative: with nothing in progress the commands refuse and say
+/// so, HEAD stays put, and the menu offers no abort.
+#[test]
+fn with_nothing_in_progress_abort_and_continue_refuse() {
+    use crate::widgets::scm_menu::{Node, ScmAction};
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    let before = git_stdout(p, &["rev-parse", "HEAD"]);
+    assert_eq!(crate::git::repo_operation(p), None);
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::GitAbortOperation);
+    assert!(app.status.contains("No merge"), "{}", app.status);
+    app.run_command(crate::widgets::command_palette::Command::GitContinueOperation);
+    assert!(app.status.contains("No "), "{}", app.status);
+    assert_eq!(git_stdout(p, &["rev-parse", "HEAD"]), before);
+    assert!(
+        !crate::widgets::scm_menu::menu_for(None)
+            .iter()
+            .any(|n| matches!(
+                n,
+                Node::Item(l) if l.action == ScmAction::AbortOperation
+            ))
+    );
+}
+
+/// #1356 negative: Continue refuses a merge (a commit concludes one) and
+/// leaves it in progress.
+#[test]
+fn continue_does_not_conclude_a_merge() {
+    use crate::git::RepoOp;
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    assert!(!git_succeeds(p, &["merge", "feat"]));
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::GitContinueOperation);
+    assert_eq!(crate::git::repo_operation(p), Some(RepoOp::Merge));
+    assert!(app.status.contains("Commit"), "{}", app.status);
+}
+
 /// A committed repo whose `main` tracks `<remote>/main` in a bare repo, for
 /// each named remote, then a local branch `topic` with one more commit and
 /// no upstream (#1245).
@@ -19846,8 +20159,12 @@ fn editor_find_pre_fills_the_query_from_word_under_cursor_on_open() {
         .unwrap();
     assert_eq!(
         app.editor_find.as_ref().unwrap().query,
-        "alpha",
-        "opening Cmd+F with the cursor mid-word must pre-fill the query with the identifier chars to the left of the cursor, matching VS Code"
+        "alphabet",
+        "opening Cmd+F with the cursor mid-word pre-fills the whole word under it, as VS Code does (#1278)"
+    );
+    assert!(
+        app.editor_find.as_ref().unwrap().query_selected,
+        "and selects it, so typing replaces it"
     );
 }
 
@@ -23788,6 +24105,125 @@ fn run_active_file_with_python_file_spawns_a_new_terminal_and_focuses_it() {
     assert!(app.show_terminal, "terminal pane must become visible");
     assert!(matches!(app.focus, Pane::Terminal));
     assert!(!app.run_debug.feedback_is_error);
+}
+
+/// #1400 fixture: `name` holds "old\n" on disk and "new\nold\n" in its
+/// open, unsaved tab.
+fn app_with_unsaved_file(name: &str) -> (tempfile::TempDir, App, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let file = root.join(name);
+    std::fs::write(&file, "old\n").unwrap();
+    let mut app = App::new(root).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.editor.insert_str("new\n");
+    assert!(app.editor.dirty);
+    (tmp, app, file)
+}
+
+/// #1400: F5 writes the unsaved tab before the launch, so the debuggee
+/// runs the text the breakpoints were set against.
+#[test]
+fn f5_saves_the_unsaved_buffer_before_launching() {
+    let (_tmp, mut app, file) = app_with_unsaved_file("notes.txt");
+    app.debug_start_or_continue();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    assert!(!app.editor.dirty);
+    assert!(
+        app.status.starts_with("No debugger for .txt files"),
+        "the launch itself still runs and reports: {}",
+        app.status
+    );
+}
+
+/// #1400: every dirty tab is saved, not only the one being debugged: the
+/// debuggee imports the others.
+#[test]
+fn f5_saves_every_unsaved_tab_not_only_the_active_one() {
+    let (tmp, mut app, helper) = app_with_unsaved_file("helper.txt");
+    let main = tmp.path().canonicalize().unwrap().join("main.txt");
+    std::fs::write(&main, "main\n").unwrap();
+    app.editor.open_pinned(&main).unwrap();
+    app.debug_start_or_continue();
+    assert_eq!(std::fs::read_to_string(&helper).unwrap(), "new\nold\n");
+    assert_eq!(app.unsaved_count(), 0);
+}
+
+/// #1400: Run writes the unsaved tab before the run command starts.
+#[test]
+fn run_saves_the_unsaved_buffer_before_running() {
+    let (_tmp, mut app, file) = app_with_unsaved_file("hello.py");
+    app.run_active_file();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    assert!(!app.editor.dirty);
+}
+
+/// #1400: Debug Test saves too: the test runs from the files on disk.
+#[test]
+fn debug_test_saves_the_unsaved_buffer_before_launching() {
+    let (_tmp, mut app, file) = app_with_unsaved_file("test_x.txt");
+    app.debug_named_test(String::from("test_x"));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    assert_eq!(app.status, "No test runner detected in this workspace");
+}
+
+/// #1400 negative: with `debug.saveBeforeStart: "none"` the file on disk
+/// is left alone, and the status says the debuggee runs the saved file.
+#[test]
+fn with_save_before_debug_off_f5_leaves_the_disk_and_warns() {
+    let (_tmp, mut app, file) = app_with_unsaved_file("notes.txt");
+    app.save_before_debug = false;
+    app.debug_start_or_continue();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+    assert!(app.editor.dirty);
+    assert!(
+        app.status
+            .starts_with("notes.txt has unsaved changes: the launch uses the file on disk"),
+        "{}",
+        app.status
+    );
+    assert!(
+        app.status.contains("No debugger for .txt files"),
+        "{}",
+        app.status
+    );
+}
+
+/// #1400 negative: a tab whose file changed on disk is never overwritten
+/// blind to start a launch; it stays unsaved and the status says so.
+#[test]
+fn f5_never_overwrites_a_file_changed_on_disk() {
+    let (_tmp, mut app, file) = app_with_unsaved_file("notes.txt");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&file, "theirs, changed elsewhere\n").unwrap();
+    app.debug_start_or_continue();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "theirs, changed elsewhere\n"
+    );
+    assert!(app.editor.dirty);
+    assert!(
+        app.status.contains("notes.txt has unsaved changes"),
+        "{}",
+        app.status
+    );
+}
+
+/// #1400 negative: with nothing unsaved, a launch writes nothing and says
+/// nothing about saving.
+#[test]
+fn f5_with_nothing_unsaved_writes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let file = root.join("notes.txt");
+    std::fs::write(&file, "old\n").unwrap();
+    let stamp = std::fs::metadata(&file).unwrap().modified().unwrap();
+    let mut app = App::new(root).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    app.debug_start_or_continue();
+    assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), stamp);
+    assert!(!app.status.contains("unsaved"), "{}", app.status);
 }
 
 /// #1444: View Changes vs main on a branch behind a moved main shows the
@@ -31569,7 +32005,9 @@ fn replace_chord_toggles_the_replace_row_on_an_open_find_bar() {
 fn tab_switches_focus_between_the_find_and_replace_fields() {
     use crate::widgets::editor_find::FindField;
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha beta");
+    // The caret opens off any word, so nothing is seeded and focus starts
+    // in the query row (a seeded query would start in the replace row).
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "- alpha beta");
     app.handle_key(replace_chord()).unwrap();
     for c in "alpha".chars() {
         app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
@@ -31606,7 +32044,9 @@ fn tab_switches_focus_between_the_find_and_replace_fields() {
 #[test]
 fn enter_in_the_replace_field_replaces_the_current_match_and_advances() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha beta\ngamma alpha");
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "- alpha beta\ngamma alpha");
+    // The caret opens off any word, so nothing is seeded (#1278) and the
+    // query is typed.
     app.handle_key(replace_chord()).unwrap();
     for c in "alpha".chars() {
         app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
@@ -31619,7 +32059,7 @@ fn enter_in_the_replace_field_replaces_the_current_match_and_advances() {
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert_eq!(
-        app.editor.lines[0], "x beta",
+        app.editor.lines[0], "- x beta",
         "the current match is replaced"
     );
     assert_eq!(
@@ -31632,13 +32072,15 @@ fn enter_in_the_replace_field_replaces_the_current_match_and_advances() {
     );
     assert!(app.editor.dirty, "a replace dirties the buffer");
     assert!(app.editor.undo(), "the replace is undoable");
-    assert_eq!(app.editor.lines[0], "alpha beta");
+    assert_eq!(app.editor.lines[0], "- alpha beta");
 }
 
 #[test]
 fn replace_all_chord_replaces_every_match_in_one_undo_step() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha beta\ngamma alpha");
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "- alpha beta\ngamma alpha");
+    // The caret opens off any word, so nothing is seeded (#1278) and the
+    // query is typed.
     app.handle_key(replace_chord()).unwrap();
     for c in "alpha".chars() {
         app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
@@ -31650,11 +32092,11 @@ fn replace_all_chord_replaces_every_match_in_one_undo_step() {
         .unwrap();
     app.handle_key(key(KeyCode::Enter, KeyModifiers::ALT | KeyModifiers::SUPER))
         .unwrap();
-    assert_eq!(app.editor.lines[0], "x beta");
+    assert_eq!(app.editor.lines[0], "- x beta");
     assert_eq!(app.editor.lines[1], "gamma x");
     assert!(app.editor.dirty, "replace all dirties the buffer");
     assert!(app.editor.undo(), "replace all is one undo step");
-    assert_eq!(app.editor.lines[0], "alpha beta");
+    assert_eq!(app.editor.lines[0], "- alpha beta");
     assert_eq!(app.editor.lines[1], "gamma alpha");
 }
 
@@ -72189,6 +72631,16 @@ fn the_synced_settings_layer_is_in_the_reload_chain() {
     );
 }
 
+#[test]
+fn a_snippets_file_that_loads_nothing_says_where_to_look() {
+    // #1191: a broken snippets.json used to reload as "Snippets reloaded"
+    // with nothing loaded.
+    let status = super::snippets_reload_status(true);
+    assert!(status.contains("not loaded"), "{status}");
+    assert!(status.contains("OUTPUT · Snippets"), "{status}");
+    assert_eq!(super::snippets_reload_status(false), "Snippets reloaded");
+}
+
 /// Every cell of a drawn frame, row after row.
 fn screen_text_863(app: &mut App, w: u16, h: u16) -> String {
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
@@ -74146,6 +74598,103 @@ fn commit_all_refuses_while_merge_conflicts_are_unresolved() {
     );
 }
 
+// ---- Find bar seeding selects the word under the caret (#1278) ----
+
+/// orders.py from the issue, open and focused, caret at `(row, col)`.
+fn find_seed_app(row: usize, col: usize) -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("orders.py");
+    std::fs::write(
+        &f,
+        "def loadOrders(path):\n    return readRows(path)\n\n\ndef saveOrders(path, rows):\n    writeRows(path, rows)\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = row;
+    app.editor.cursor_col = col;
+    (app, tmp)
+}
+
+fn ctrl(c: char) -> KeyEvent {
+    key(KeyCode::Char(c), KeyModifiers::CONTROL)
+}
+
+fn type_str(app: &mut App, s: &str) {
+    for c in s.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+fn find_query(app: &App) -> String {
+    app.editor_find.as_ref().map(|s| s.query.clone()).unwrap()
+}
+
+#[test]
+fn find_seeds_the_whole_word_and_typing_replaces_it() {
+    // Caret after `def loadOr`, mid-word.
+    let (mut app, _tmp) = find_seed_app(0, 10);
+    app.handle_key(ctrl('f')).unwrap();
+    assert_eq!(find_query(&app), "loadOrders");
+    type_str(&mut app, "save");
+    assert_eq!(find_query(&app), "save");
+    assert!(app.editor_find.as_ref().unwrap().match_count >= 1);
+}
+
+#[test]
+fn find_seeds_the_word_the_caret_just_left() {
+    // Caret right after `loadOrders`, where it sits after typing a word.
+    let (mut app, _tmp) = find_seed_app(0, 14);
+    app.handle_key(ctrl('f')).unwrap();
+    assert_eq!(find_query(&app), "loadOrders");
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(find_query(&app), "", "Backspace clears a selected seed");
+}
+
+#[test]
+fn ctrl_a_selects_the_query_and_ctrl_backspace_deletes_a_word() {
+    let (mut app, _tmp) = find_seed_app(2, 0);
+    app.handle_key(ctrl('f')).unwrap();
+    type_str(&mut app, "write rows");
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(find_query(&app), "write ");
+    app.handle_key(ctrl('a')).unwrap();
+    type_str(&mut app, "read");
+    assert_eq!(find_query(&app), "read");
+}
+
+#[test]
+fn ctrl_f_on_an_open_bar_selects_its_query_again() {
+    let (mut app, _tmp) = find_seed_app(0, 10);
+    app.handle_key(ctrl('f')).unwrap();
+    type_str(&mut app, "save");
+    app.handle_key(ctrl('f')).unwrap();
+    type_str(&mut app, "write");
+    assert_eq!(find_query(&app), "write");
+}
+
+#[test]
+fn an_unseeded_or_deselected_query_still_appends() {
+    // Negative: with nothing to seed, typing appends as before; after a
+    // caret key the seed is no longer selected and typing extends it.
+    let (mut app, _tmp) = find_seed_app(2, 0);
+    app.handle_key(ctrl('f')).unwrap();
+    assert_eq!(find_query(&app), "");
+    type_str(&mut app, "sa");
+    type_str(&mut app, "ve");
+    assert_eq!(find_query(&app), "save");
+    let (mut app, _tmp) = find_seed_app(0, 10);
+    app.handle_key(ctrl('f')).unwrap();
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    type_str(&mut app, "X");
+    assert_eq!(find_query(&app), "loadOrdersX");
+}
+
 /// A stand-in `codeql` still open for writing, the way a test's freshly
 /// written script is while another test thread forks: exec fails with
 /// "Text file busy" until the writer lets go. The handle is dropped after
@@ -74308,6 +74857,183 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     let _ = render_buf(&mut app);
     assert!(app.source_control.nested_repos.is_empty());
     assert!(app.source_control.last_init_repo_button_area.width > 0);
+}
+
+/// A diagnostic for the Problems panel, as a language server reports it.
+fn problem(
+    line: u32,
+    severity: crate::lsp::manager::DiagnosticSeverity,
+    message: &str,
+) -> crate::widgets::problems::ProblemItem {
+    crate::widgets::problems::ProblemItem {
+        line,
+        col: 0,
+        col_utf16: true,
+        severity,
+        message: message.into(),
+        source: "ruff".into(),
+    }
+}
+
+#[test]
+fn the_problems_tab_is_announced_with_its_counts_and_top_entry() {
+    use crate::lsp::manager::DiagnosticSeverity::{Error, Warning};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Terminal;
+    app.bottom_panel_tab = BottomPanelTab::Problems;
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Problems, no problems");
+    assert_eq!(snap.item, None);
+    app.problems
+        .set_groups(vec![crate::widgets::problems::ProblemGroup {
+            path: tmp.path().join("app.py"),
+            name: "app.py".into(),
+            rel_dir: String::new(),
+            items: vec![
+                problem(3, Error, "Undefined name `totl`"),
+                problem(4, Error, "Type mismatch"),
+                problem(4, Warning, "Unused variable"),
+            ],
+        }]);
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Problems, 2 errors, 1 warning");
+    assert_eq!(
+        snap.item.as_deref(),
+        Some("app.py line 4: Undefined name `totl` (ruff)")
+    );
+}
+
+#[test]
+fn the_terminal_tab_is_still_announced_as_its_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Terminal;
+    app.bottom_panel_tab = BottomPanelTab::Terminal;
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Terminal 1");
+    assert_eq!(snap.item, None);
+}
+
+#[test]
+fn the_output_ports_and_captures_tabs_are_announced_by_name_and_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Terminal;
+
+    let channel = "a11y-1295-channel";
+    crate::output::push(channel, crate::output::OutputLevel::Info, "hello");
+    app.output.sync();
+    assert!(app.output.select_by_name(channel));
+    app.bottom_panel_tab = BottomPanelTab::Output;
+    assert_eq!(app.a11y_snapshot().focus, format!("Output, {channel}"));
+
+    app.bottom_panel_tab = BottomPanelTab::Ports;
+    let snap = app.a11y_snapshot();
+    assert_eq!((snap.focus.as_str(), snap.item), ("Ports, none", None));
+    app.ports.upsert(
+        3000,
+        Some("http://localhost:3000".into()),
+        Some("node".into()),
+        crate::widgets::ports::PortOrigin::Local,
+    );
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Ports, 1 port");
+    assert_eq!(
+        snap.item.as_deref(),
+        Some("Port 3000, node, http://localhost:3000")
+    );
+
+    app.bottom_panel_tab = BottomPanelTab::Captures;
+    assert_eq!(app.a11y_snapshot().focus, "Captures, none");
+    app.captures.push(crate::widgets::captures::CapturedLine {
+        pane: "zsh".into(),
+        shell_pid: None,
+        message: "Build failed".into(),
+        line: "error: build failed".into(),
+    });
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Captures, 1 capture");
+    assert_eq!(snap.item.as_deref(), Some("Build failed, from zsh"));
+}
+
+#[test]
+fn search_results_are_announced_with_the_count_and_the_selected_match() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Tree;
+    app.sidebar_view = SidebarView::Search;
+    assert_eq!(app.a11y_snapshot().focus, "Search");
+    assert_eq!(
+        app.a11y_snapshot().item,
+        None,
+        "no results, nothing selected"
+    );
+    let hit = |file: &str, line_no: usize, text: &str| crate::widgets::search::SearchHit {
+        path: tmp.path().join(file),
+        line_no,
+        line_text: text.into(),
+        matches: 1,
+    };
+    app.search.hits = vec![
+        hit("app.py", 1, "def total(xs):"),
+        hit("b.py", 1, "total = 0"),
+        hit("b.py", 3, "total += i"),
+    ];
+    app.search.selected = 2;
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Search, 3 matches in 2 files");
+    assert_eq!(snap.item.as_deref(), Some("b.py line 3: total += i"));
+}
+
+/// #1295: the announced total counts matches, not matching lines, the same
+/// as the Search header: a line with two matches is two.
+#[test]
+fn search_announces_every_match_on_a_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Tree;
+    app.sidebar_view = SidebarView::Search;
+    app.search.hits = vec![crate::widgets::search::SearchHit {
+        path: tmp.path().join("b.py"),
+        line_no: 3,
+        line_text: "total += total".into(),
+        matches: 2,
+    }];
+    assert_eq!(app.a11y_snapshot().focus, "Search, 2 matches in 1 file");
+}
+
+#[test]
+fn the_selected_source_control_change_is_announced() {
+    use crate::git::{ChangeEntry, ChangeKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Tree;
+    app.sidebar_view = SidebarView::SourceControl;
+    let change = |path: &str, kind| ChangeEntry {
+        path: path.into(),
+        kind,
+        additions: 1,
+        deletions: 0,
+    };
+    app.source_control.entries = vec![
+        change("app.py", ChangeKind::Modified),
+        change("new.py", ChangeKind::StagedAdded),
+    ];
+    app.source_control.selected_change = None;
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Source Control, 2 changes");
+    assert_eq!(snap.item, None, "nothing selected, nothing read");
+    app.source_control.selected_change = Some(1);
+    assert_eq!(
+        app.a11y_snapshot().item.as_deref(),
+        Some("new.py, added, staged")
+    );
+    app.source_control.selected_change = Some(0);
+    assert_eq!(
+        app.a11y_snapshot().item.as_deref(),
+        Some("app.py, modified")
+    );
 }
 
 /// A format-on-save in flight for `m.py`, with `x` typed and not yet on

@@ -104,6 +104,10 @@ fn never_means_disabled(v: &Value) -> Option<Value> {
     v.as_str().map(|s| Value::from(s == "never"))
 }
 
+fn none_means_disabled(v: &Value) -> Option<Value> {
+    v.as_str().map(|s| Value::from(s == "none"))
+}
+
 fn as_whitespace_mode(v: &Value) -> Option<Value> {
     // VS Code has five whitespace modes; croft has three (WhitespaceMode:
     // none, selection, all). Only ids croft can actually represent are
@@ -193,6 +197,11 @@ const SETTINGS: &[SettingMap] = &[
         vscode: "debug.inlineValues",
         croft: "disable_inline_values",
         convert: off_means_disabled,
+    },
+    SettingMap {
+        vscode: "debug.saveBeforeStart",
+        croft: "disable_save_before_debug",
+        convert: none_means_disabled,
     },
     SettingMap {
         vscode: "editor.renderWhitespace",
@@ -287,6 +296,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "focus_right_editor_group",
     ),
     ("workbench.action.terminal.focus", "focus_terminal"),
+    (
+        "workbench.action.terminal.runSelectedText",
+        "run_selected_text",
+    ),
     ("workbench.actions.view.problems", "show_problems"),
     ("workbench.action.toggleZenMode", "toggle_zen_mode"),
     (
@@ -1439,6 +1452,23 @@ mod tests {
         }
     }
 
+    /// #1400: `debug.saveBeforeStart: "none"` is the one value that turns
+    /// off saving before a launch; VS Code's other values all save.
+    #[test]
+    fn debug_save_before_start_none_disables_saving_before_a_launch() {
+        let none = json!({ "debug.saveBeforeStart": "none" });
+        let (mapped, _, _) = map_settings(none.as_object().unwrap());
+        assert_eq!(mapped["disable_save_before_debug"], json!(true));
+        for value in ["allEditorsInActiveGroup", "nonUntitledEditorsInActiveGroup"] {
+            let saves = json!({ "debug.saveBeforeStart": value });
+            let (mapped, _, _) = map_settings(saves.as_object().unwrap());
+            assert_eq!(mapped["disable_save_before_debug"], json!(false), "{value}");
+        }
+        let junk = json!({ "debug.saveBeforeStart": 3 });
+        let (mapped, _, _) = map_settings(junk.as_object().unwrap());
+        assert!(!mapped.contains_key("disable_save_before_debug"));
+    }
+
     /// The workspace layer and this importer must read a VS Code settings
     /// file the SAME way. They had a table each, and the tables had already
     /// drifted: `files.autoSave: "onWindowChange"` was a save-on-focus-change
@@ -1815,6 +1845,24 @@ mod tests {
             vec![(String::from("ctrl+s"), String::from("save_file"))]
         );
         assert_eq!(report.snippets["Test"]["scope"], json!("rust"));
+    }
+
+    /// #1292: VS Code's Run Selected Text keybinding imports instead of
+    /// being dropped.
+    #[test]
+    fn run_selected_text_keybinding_imports() {
+        let mut report = Report::default();
+        convert_keybindings(
+            &json!([{ "key": "ctrl+alt+enter", "command": "workbench.action.terminal.runSelectedText" }]),
+            &mut report,
+        );
+        assert_eq!(
+            report.keybindings,
+            vec![(
+                String::from("ctrl+alt+enter"),
+                String::from("run_selected_text")
+            )]
+        );
     }
 
     /// #1286: VSCodeVim installed in the profile's product turns croft's

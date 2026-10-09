@@ -95,7 +95,7 @@ allowlist — appearance and editor/terminal behavior:
 
 `theme`, `format_on_save`, `format_on_type`, `auto_save`, `auto_save_on_focus_change`,
 `render_whitespace`, `disable_inline_blame`, `disable_auto_close_pairs`,
-`disable_inline_values`, `disable_bracket_colors`, `disable_indent_guides`,
+`disable_inline_values`, `disable_save_before_debug`, `disable_bracket_colors`, `disable_indent_guides`,
 `disable_inlay_hints`, `copy_on_select`, `disable_secret_redaction`, `disable_log_highlight`, `explorer_views`,
 `files_exclude`, `search_exclude`.
 
@@ -124,6 +124,7 @@ means the same thing whichever path reads it.
 | `editor.guides.indentation` | `disable_indent_guides` (negated) |
 | `editor.inlayHints.enabled` | `disable_inlay_hints` (negated) |
 | `editor.autoClosingBrackets: "never"` | `disable_auto_close_pairs` |
+| `debug.saveBeforeStart: "none"` | `disable_save_before_debug` (every other value saves before a launch) |
 | `terminal.integrated.copyOnSelection` | `copy_on_select` |
 | `files.exclude` | `files_exclude` (the globs set to `true`; `false` entries and `when` clauses are left out). VS Code reads a bare glob such as `build` from the workspace root, so it arrives anchored, as `/build`, and `scripts/build/` stays visible |
 | `search.exclude` | `search_exclude` (same) |

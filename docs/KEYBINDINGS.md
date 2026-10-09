@@ -170,7 +170,7 @@ All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macO
 | Preferences: Open Keyboard Shortcuts (JSON) | `keybindings.json` | Rebind any palette command; **applies on save** |
 | Preferences: Configure User Snippets | `snippets.json` | Define snippets; **applies on save** |
 
-**Custom keybindings.** `keybindings.json` is a JSON (with `//` comments) array of `{ "key": …, "command": … }`:
+**Custom keybindings.** `keybindings.json` is a JSONC (`//` and `/* */` comments and trailing commas are fine, as in VS Code) array of `{ "key": …, "command": … }`:
 
 * `key` is a chord like `ctrl+shift+p`, `cmd+,`, `alt+up`, or `f2`. Modifiers are `ctrl`, `alt`/`opt`, `shift`, `cmd`/`super`, and `mod` (Cmd on macOS, Ctrl elsewhere).
 * `command` is a palette command id (see the ids in `Preferences: Open Settings`, e.g. `save_file`, `quick_open`, `toggle_terminal`).
@@ -180,7 +180,7 @@ These restrictions cover KEYBOARD chords only. They apply while any pane except 
 
 In iTerm2, reserved `Cmd` chords must be forwarded first (`croft setup-iterm2`); `Ctrl`/`Alt`/function-key bindings always reach croft, and Ghostty forwards everything after `croft setup-ghostty`.
 
-**User snippets.** `snippets.json` mirrors VS Code's global snippets file: an object keyed by a name, each with a `prefix`, a `body` (a string or an array of lines), and an optional `scope` (comma-separated language ids; omit for every language). Type a snippet's prefix and press `Tab` to expand it, or pick it from the completion popup, where it appears alongside language-server suggestions and is accepted with `Enter`/`Tab`.
+**User snippets.** `snippets.json` mirrors VS Code's global snippets file: an object keyed by a name, each with a `prefix`, a `body` (a string or an array of lines), and an optional `scope` (comma-separated language ids; omit for every language). Type a snippet's prefix and press `Tab` to expand it, or pick it from the completion popup, where it appears alongside language-server suggestions and is accepted with `Enter`/`Tab`. Like VS Code's, the file is JSONC: comments and trailing commas are fine. A file that still does not parse loads no snippets and says why in OUTPUT · Snippets.
 
 The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in order with `Tab`, `$0` is the final caret, and `${1:name}` seeds a stop with selected placeholder text. Continuation lines are re-indented to the caret. Language-server completions that arrive as snippets (rust-analyzer's `println!` and the like) expand the same way.
 
@@ -224,7 +224,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | Click the header refresh icon | Re-run the current query |
 | Click the header clear icon | Clear the search query and results |
 | Click the left chevron (`▸`/`▾`), or `Ctrl`/`Cmd`+`Shift`+`H` from anywhere | Expand / collapse the Replace row (expanding focuses it; the chord, "Search: Replace in Files" in the palette, only ever opens it); while a replacement is typed, every result row previews the match crossed out with the expanded replacement beside it |
-| Type in Replace, then `Enter` or click the replace-all icon | Raise the Replace All confirmation — "Replace N occurrence(s) across M file(s)?" — then `Enter`/`Y` rewrites on disk, `Esc` cancels (regex mode honours `$1` capture references); files open with unsaved changes are skipped and named, and the search re-runs afterward |
+| Type in Replace, then `Enter` or click the replace-all icon | Raise the Replace All confirmation — "Replace N occurrence(s) across M file(s)?" — then `Enter`/`Y` rewrites on disk, `Esc` cancels (regex mode honours `$1` capture references, `$&` for the whole match and `$$` for a dollar; any other `$NAME` that names no group in the pattern stays as typed); files open with unsaved changes are skipped and named, and the search re-runs afterward |
 | Click the `...` icon, or `Alt`+`D` in a Search input | Expand / collapse the "files to include" and "files to exclude" glob inputs (also the palette's "Search: Toggle Search Details"; VS Code's `Ctrl+Shift+J` is croft's maximize-terminal) |
 | Type globs into include / exclude | Restrict the search to / from matching files (comma-separated, VS Code style; a bare `*.rs` matches at any depth, and brace alternates like `*.{ts,tsx}` are one glob). A glob that doesn't compile shows as `invalid glob: …` in red above its box, and an include box with no valid glob matches nothing. Editing re-runs the search live |
 | `Tab` | Cycle focus through the visible inputs (search → replace → include → exclude) |
@@ -489,6 +489,8 @@ Mapped fields: `name`, `type` (`python`/`debugpy`, `lldb`/`cppdbg`, `node`/`pwa-
 
 "Debug: Add Configuration…" writes a new entry for you ([#250](https://github.com/vitali87/croft/issues/250)). It goes to `.croft/launch.json`, which croft rewrites whole. A `.croft/launch.json` with comments or trailing commas would lose them, so it is left alone and the entry is shown for you to paste in, and a `.vscode/launch.json` is never touched. Pick a configuration with "Debug: Select and Start Debugging" or the config row under the Run and Debug panel's button. The pick is what `F5` and restart launch until changed, and an edited launch.json re-reads on the next `F5`.
 
+Every launch (`F5`, restart, a picked configuration or compound, Debug Test, and the Run button) first saves the unsaved editors, as VS Code's `debug.saveBeforeStart` does ([#1400](https://github.com/vitali87/croft/issues/1400)): the debuggee reads its files from disk, while breakpoints follow the buffer. They are written as typed, without format on save, whose edits could move lines after the breakpoints were sent. A file changed on disk since it was opened is never overwritten to start a launch; it stays unsaved and the status line names it. Set `"disable_save_before_debug": true` (or VS Code's `"debug.saveBeforeStart": "none"`) to launch without saving; the status line then names the unsaved files the launch runs without.
+
 | Keys | Action |
 |------|--------|
 | `F5` | Start debugging (the selected `launch.json` configuration, or the active file when none is selected), or resume when paused at a breakpoint |
@@ -555,6 +557,7 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 |------|--------|
 | Any key croft does not bind | Forwarded to the shell PTY (arrows, most `Ctrl+letter`, `Alt+x`, function keys translated to VT escapes) |
 | A chord croft binds | **Claimed by croft, whatever pane has focus** - the shell never sees it. Measured by driving every letter through the real key path and watching which ones reach the PTY:<br>`Ctrl` + **F J P S**, and `Ctrl+Shift` + **B C D E F H J L M O P R S T U V W X Y**<br>`Cmd` + **B C E F K P S T V W**, and `Cmd+Shift` + **B C D E F H L M O P R S T U V W X**<br>Everything else is forwarded, so the chords a shell leans on - `Ctrl+A` `C` `D` `E` `K` `L` `R` `U` `W` `Z` - all reach the app, and so do `Ctrl+B`, `Ctrl+Q` and `Ctrl+V` while the terminal pane is focused (#304, #1290), which is what lets Claude Code background a running command and vim enter visual block; `Cmd+B` still reaches croft from anywhere |
+| Command Palette: `Terminal: Run Selected Text in Active Terminal` | Run the editor's selection in the active terminal pane, then Enter: a block goes as one paste (bracketed when the program asked for it), so a `python3`, `psql` or `node` REPL gets it whole. With no selection it runs the caret's line and moves the caret to the next non-blank line, so repeated runs step through a script. Focus stays in the editor. Bind `run_selected_text` in keybindings.json for a key |
 | Bare `F5` / `F9` / `F10` / `F11` | Forwarded while the terminal is focused and no debug session is live, so process-compose's `F10` and htop's `F9` work. Modified, they keep their debug meaning everywhere |
 | Mouse drag | Select text, pinned to the scrollback content; drag past an edge to auto-scroll through history. Inside a full-screen app that scrolls by repainting (Claude Code, a pager), the highlight follows its text across the app's own scrolling. Rows covered by the app's chrome (an input box, a floating pill) drop out, while a row with an overlay in its middle keeps both intact ends; the surviving rows stay highlighted, the selection hides entirely only when none remain (copy still yields the whole selection), and it reappears as the text scrolls back. A drag held past an edge forwards wheel ticks, so the app scrolls under the drag |
 | `Shift`+click | Extend the existing selection to the clicked cell instead of starting a new one |

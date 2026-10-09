@@ -843,6 +843,15 @@ fn git_status_spans<'a>(status: &'a crate::git::GitStatus) -> Vec<Span<'a>> {
         label,
         Style::default().fg(pill_color).add_modifier(Modifier::BOLD),
     ));
+    // The operation git stopped in (#1356), as `main | MERGING`.
+    if let Some(op) = status.operation {
+        spans.push(Span::styled(
+            format!(" | {}", op.label()),
+            Style::default()
+                .fg(GIT_DIRTY_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if status.ahead > 0 {
         spans.push(Span::styled(
             format!(" \u{2191}{}", status.ahead),
@@ -3118,6 +3127,10 @@ pub struct App {
     /// Debugger inline values (#135): on by default; rebuilt on every
     /// `InspectionUpdated`, cleared wherever the stop arrow clears.
     inline_values_enabled: bool,
+    /// Save unsaved editors before every debug or run launch (#1400), so
+    /// the debuggee runs the text its breakpoints were set against. Off
+    /// only by `disable_save_before_debug` (`debug.saveBeforeStart: none`).
+    save_before_debug: bool,
     /// Auto-closing pairs (#121), persisted; synced onto the active editor
     /// beside the blame flag.
     auto_close_pairs: bool,
@@ -5713,6 +5726,7 @@ impl App {
                 &loaded_prefs.diff_ignore_whitespace,
             ),
             inline_values_enabled: !loaded_prefs.disable_inline_values,
+            save_before_debug: !loaded_prefs.disable_save_before_debug,
             auto_close_pairs: !loaded_prefs.disable_auto_close_pairs,
             inlay_hints_enabled: !loaded_prefs.disable_inlay_hints,
             // Keep the suite off the user's real ~/.config/croft/history: a
@@ -16945,6 +16959,56 @@ impl App {
         };
     }
 
+    /// Terminal: Run Selected Text in Active Terminal (#1292): send the
+    /// editor's selection, or with none the caret's line, to the active
+    /// pane, then Enter. A block goes as one paste, bracketed when the
+    /// program in the pane asked for it, and Enter follows outside the
+    /// brackets so it runs. Without a selection the caret steps to the next
+    /// non-blank line, so repeated runs walk through a script. Focus stays
+    /// in the editor.
+    fn run_selected_text_in_terminal(&mut self) {
+        if !self.editor_is_text() {
+            self.status = String::from("Run Selected Text works on text tabs");
+            return;
+        }
+        let selected = self.editor.selection_text();
+        let stepping = selected.is_empty();
+        let text = if stepping {
+            self.editor
+                .lines
+                .get(self.editor.cursor_row)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            selected
+        };
+        let text = text.trim_end_matches(['\n', '\r']);
+        if stepping {
+            let next = (self.editor.cursor_row + 1..self.editor.lines.len())
+                .find(|&r| !self.editor.lines[r].trim().is_empty());
+            if let Some(row) = next {
+                self.editor.cursor_row = row;
+                self.editor.cursor_col = 0;
+            }
+        }
+        if text.trim().is_empty() {
+            self.status = String::from("Nothing to run on this line");
+            return;
+        }
+        let lines = text.lines().count();
+        let text = text.to_string();
+        self.show_terminal = true;
+        self.bottom_panel_tab = BottomPanelTab::Terminal;
+        self.reveal_terminal_pane(self.active_terminal);
+        self.paste_terminal_input(text.as_bytes());
+        self.write_terminal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        self.status = format!(
+            "Ran {lines} line{} in {}",
+            if lines == 1 { "" } else { "s" },
+            self.terminal().label()
+        );
+    }
+
     /// Paste counterpart of [`Self::write_terminal_key`] (bracketed-paste
     /// aware per pane): normally just the active pane, mirrored to every
     /// non-excluded pane while broadcast is on (the focused pane always
@@ -24253,11 +24317,15 @@ impl App {
     /// binary launches under lldb-dap with the name as its libtest filter.
     /// Shared by debug-at-cursor and Alt+click on the gutter play glyph.
     fn debug_named_test(&mut self, name: String) {
-        use std::collections::BTreeMap;
         if !self.debug_sessions.is_empty() {
             self.status = String::from("A debug session is already running (Shift+F5 stops it)");
             return;
         }
+        self.launch_with_unsaved_saved(|app| app.debug_named_test_now(name));
+    }
+
+    fn debug_named_test_now(&mut self, name: String) {
+        use std::collections::BTreeMap;
         let root = self.tree.root.clone();
         // #373: if the last run of this test failed and named a place in
         // the user's own code, break there — the whole point of "debug this
@@ -30547,6 +30615,68 @@ impl App {
         self.status = msg;
     }
 
+    /// Run `launch` with every unsaved editor written first (#1400), as VS
+    /// Code's `debug.saveBeforeStart` does: the debuggee reads its files
+    /// from disk, while breakpoints and the stop arrow follow the buffer,
+    /// so launching over unsaved edits pauses on the wrong lines.
+    ///
+    /// The tabs are written as typed, through the auto-save sweep: a
+    /// format-on-save reply lands later and could move lines the launch
+    /// already sent breakpoints for. The sweep never overwrites a file that
+    /// changed on disk (or writes a lossy encoding, a hex or sheet edit, an
+    /// unresolved merge); whatever is still unsaved after it, or everything
+    /// with `disable_save_before_debug`, is named in front of the launch's
+    /// own status.
+    fn launch_with_unsaved_saved(&mut self, launch: impl FnOnce(&mut Self)) {
+        if self.save_before_debug && self.unsaved_count() > 0 {
+            self.sweep_dirty_buffers(false, false);
+        }
+        let unsaved = self.unsaved_editor_names();
+        launch(self);
+        if unsaved.is_empty() {
+            return;
+        }
+        let (names, verb) = match unsaved.as_slice() {
+            [one] => (one.clone(), "has"),
+            [first, second] => (format!("{first} and {second}"), "have"),
+            [first, rest @ ..] => (format!("{first} and {} more", rest.len()), "have"),
+            [] => unreachable!("checked above"),
+        };
+        let warning = format!("{names} {verb} unsaved changes: the launch uses the file on disk");
+        self.status = if self.status.is_empty() {
+            warning
+        } else {
+            format!("{warning} - {}", self.status)
+        };
+    }
+
+    /// File names of the editors with unsaved edits, deduped, the active
+    /// tab first: what [`Self::launch_with_unsaved_saved`] warns about.
+    fn unsaved_editor_names(&self) -> Vec<String> {
+        let mut seen: Vec<&std::path::Path> = Vec::new();
+        let mut names = Vec::new();
+        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
+        let active = self.editor.editors.get(self.editor.active_index());
+        let tabs = active
+            .into_iter()
+            .chain(groups.flat_map(|g| g.editors.iter()));
+        for ed in tabs.filter(|e| e.dirty) {
+            let Some(path) = ed.path.as_deref() else {
+                continue;
+            };
+            if seen.contains(&path) {
+                continue;
+            }
+            seen.push(path);
+            names.push(
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string()),
+            );
+        }
+        names
+    }
+
     /// F5: start debugging the active file, or resume if already paused.
     pub fn debug_start_or_continue(&mut self) {
         use crate::dap::session::SessionPhase;
@@ -30566,6 +30696,10 @@ impl App {
     /// Configs are re-read here so an edited launch.json applies on the next
     /// F5 without reopening the picker.
     fn start_selected_debug(&mut self) {
+        self.launch_with_unsaved_saved(Self::start_selected_debug_now);
+    }
+
+    fn start_selected_debug_now(&mut self) {
         if let Some(name) = self.selected_debug_compound.clone() {
             let root = self.active_workspace_root();
             self.debug_compounds = crate::dap::configs::discover_compounds(&root);
@@ -32654,9 +32788,16 @@ impl App {
     }
 
     pub fn run_active_file(&mut self) {
-        let Some(path) = self.editor.path.clone() else {
+        if self.editor.path.is_none() {
             self.run_debug.feedback = Some(String::from("Open a file first"));
             self.run_debug.feedback_is_error = true;
+            return;
+        }
+        self.launch_with_unsaved_saved(Self::run_active_file_now);
+    }
+
+    fn run_active_file_now(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
             return;
         };
         let run_root = self
@@ -33124,6 +33265,99 @@ impl App {
         }
     }
 
+    /// The repository's operation in progress (#1356), read fresh, or
+    /// `None` with a status saying there is none.
+    fn git_operation_or_say(&mut self) -> Option<crate::git::RepoOp> {
+        let op = crate::git::repo_operation(&self.scm_root());
+        if op.is_none() {
+            self.status =
+                String::from("No merge, rebase, cherry-pick, revert or bisect in progress");
+        }
+        op
+    }
+
+    /// Abort the merge, rebase, cherry-pick or revert in progress, or reset
+    /// a bisect (#1356; VS Code's Abort Merge / Abort Rebase).
+    fn abort_git_operation(&mut self) {
+        if self.repo_git_busy() {
+            return;
+        }
+        let Some(op) = self.git_operation_or_say() else {
+            return;
+        };
+        let r = crate::git::abort_operation(&self.scm_root(), op);
+        let done = match op {
+            crate::git::RepoOp::Bisect => String::from("Bisect reset"),
+            _ => format!("Aborted the {}", op.command()),
+        };
+        self.run_scm_op(op.command(), r, &done);
+    }
+
+    /// Continue the rebase, cherry-pick or revert in progress once its
+    /// conflicts are resolved and staged (#1356; VS Code's Continue Rebase).
+    fn continue_git_operation(&mut self) {
+        if self.repo_git_busy() {
+            return;
+        }
+        let Some(op) = self.git_operation_or_say() else {
+            return;
+        };
+        let r = crate::git::continue_operation(&self.scm_root(), op);
+        self.report_git_operation_step(op, r, "Continued");
+    }
+
+    /// Skip the commit the rebase, cherry-pick or revert stopped on
+    /// (#1356).
+    fn skip_git_operation(&mut self) {
+        if self.repo_git_busy() {
+            return;
+        }
+        let Some(op) = self.git_operation_or_say() else {
+            return;
+        };
+        let r = crate::git::skip_operation(&self.scm_root(), op);
+        self.report_git_operation_step(op, r, "Skipped a commit of");
+    }
+
+    /// Mark the commit a bisect is on good or bad (#1356).
+    fn bisect_mark_source_control(&mut self, good: bool) {
+        if self.repo_git_busy() {
+            return;
+        }
+        let r = crate::git::bisect_mark(&self.scm_root(), good);
+        self.run_scm_op("bisect", r, if good { "Marked good" } else { "Marked bad" });
+    }
+
+    /// Report a Continue or Skip, saying where the operation stands now:
+    /// finished, or stopped again (the next conflict, with its step).
+    fn report_git_operation_step(
+        &mut self,
+        op: crate::git::RepoOp,
+        r: Result<String, String>,
+        verb: &str,
+    ) {
+        let now = crate::git::repo_operation(&self.scm_root());
+        let done = match now {
+            None => format!("{verb} the {}, which is done", op.command()),
+            Some(next) => format!("{verb} the {}, now {}", op.command(), next.label()),
+        };
+        self.run_scm_op(op.command(), r, &done);
+    }
+
+    /// After a commit made from Source Control mid-rebase (#1356, the #989
+    /// path): carry on with the rebase, as VS Code's Commit button does
+    /// there, instead of leaving HEAD detached with the rest unapplied.
+    fn continue_rebase_after_commit(&mut self) -> bool {
+        let root = self.scm_root();
+        let Some(op @ crate::git::RepoOp::Rebase { .. }) = crate::git::repo_operation(&root) else {
+            return true;
+        };
+        let r = crate::git::continue_operation(&root, op);
+        let continued = r.is_ok();
+        self.report_git_operation_step(op, r, "Committed and continued");
+        continued
+    }
+
     /// Run an immediate git operation: log it, surface its summary or error
     /// in the commit-feedback line, and refresh the panel. The single path
     /// every "⋯"-menu leaf that acts now (vs. opening a modal) flows through.
@@ -33131,13 +33365,14 @@ impl App {
         self.log_git(label, &outcome);
         match outcome {
             Ok(summary) => {
-                self.source_control.commit_feedback = Some(if summary.is_empty() {
+                let said = if summary.is_empty() {
                     ok_prefix.to_string()
                 } else {
                     format!("{ok_prefix}: {summary}")
-                });
+                };
+                self.source_control.commit_feedback = Some(said.clone());
                 self.source_control.commit_feedback_is_error = false;
-                self.status = format!("{ok_prefix}: {summary}");
+                self.status = said;
             }
             Err(err) => {
                 self.source_control.commit_feedback = Some(format!("{ok_prefix} failed: {err}"));
@@ -33506,7 +33741,13 @@ impl App {
         self.spawn_commit(
             message,
             move || crate::git::commit_staged(&root, &committed),
-            |app, r| app.run_scm_op("commit -m", r, "Committed staged"),
+            |app, r| {
+                let committed = r.is_ok();
+                app.run_scm_op("commit -m", r, "Committed staged");
+                if committed {
+                    app.continue_rebase_after_commit();
+                }
+            },
         );
     }
 
@@ -33532,7 +33773,13 @@ impl App {
                 crate::git::stage_all(&root).map_err(|err| format!("stage all failed: {err}"))?;
                 crate::git::commit_staged(&root, &committed)
             },
-            |app, r| app.run_scm_op("commit (all)", r, "Committed all"),
+            |app, r| {
+                let committed = r.is_ok();
+                app.run_scm_op("commit (all)", r, "Committed all");
+                if committed {
+                    app.continue_rebase_after_commit();
+                }
+            },
         );
     }
 
@@ -33579,6 +33826,10 @@ impl App {
                     app.source_control.commit_feedback = Some(err.clone());
                     app.source_control.commit_feedback_is_error = true;
                     app.status = format!("Commit failed: {err}");
+                    return;
+                }
+                // Mid-rebase, sync only once the rebase is back on its branch.
+                if !app.continue_rebase_after_commit() {
                     return;
                 }
                 app.sync_source_control();
@@ -33693,6 +33944,11 @@ impl App {
                 self.spawn_scm_op("fetch --all --prune", "Fetched", crate::git::fetch_all);
             }
             ScmAction::ShowGitOutput => self.show_git_output(),
+            ScmAction::ContinueOperation => self.continue_git_operation(),
+            ScmAction::SkipOperation => self.skip_git_operation(),
+            ScmAction::AbortOperation => self.abort_git_operation(),
+            ScmAction::BisectGood => self.bisect_mark_source_control(true),
+            ScmAction::BisectBad => self.bisect_mark_source_control(false),
             ScmAction::Commit => self.commit_source_control(),
             ScmAction::CommitStaged => self.commit_staged_source_control(),
             ScmAction::CommitAll => self.commit_all_source_control(),
@@ -36508,7 +36764,7 @@ impl App {
                         self.selected_debug_config = None;
                         self.selected_debug_compound = Some(compound.name.clone());
                         self.run_debug.selected_config = Some(compound.name.clone());
-                        self.launch_compound(&compound);
+                        self.launch_with_unsaved_saved(|app| app.launch_compound(&compound));
                     }
                 } else if row.id == "add" {
                     self.open_add_debug_config();
@@ -36527,7 +36783,7 @@ impl App {
                     self.selected_debug_config = Some(cfg.name.clone());
                     self.selected_debug_compound = None;
                     self.run_debug.selected_config = Some(cfg.name.clone());
-                    self.launch_debug_config(&cfg);
+                    self.launch_with_unsaved_saved(|app| app.launch_debug_config(&cfg));
                 }
             }
             ListPurpose::SessionParticipant => {
@@ -37281,6 +37537,11 @@ impl App {
                         return;
                     }
                 };
+                // Mid-rebase, push only once the rebase is back on its
+                // branch, never from the detached HEAD it works on.
+                if !app.continue_rebase_after_commit() {
+                    return;
+                }
                 let root = app.scm_root();
                 app.spawn_git_net("push", move || {
                     let r = crate::git::push_or_publish(&root);
@@ -37880,6 +38141,7 @@ impl App {
                     app.active_git_bypass_debounce();
                     app.refresh_git_status_debounced();
                     app.refresh_source_control();
+                    app.continue_rebase_after_commit();
                 }
                 Err(err) => {
                     app.source_control.commit_feedback = Some(err.clone());
@@ -50179,6 +50441,7 @@ impl App {
                 self.status = format!("Problems: {}", self.problems.scope.label());
             }
             Cmd::DiffToggleIgnoreWhitespace => self.diff_cycle_whitespace_mode(),
+            Cmd::RunSelectedText => self.run_selected_text_in_terminal(),
             // Cmd+] / Cmd+[ (#843), which have no `Ctrl` form. The chords
             // work in the terminal pane; from the palette the commands bring
             // it up and focus it first, as VS Code's do.
@@ -50216,6 +50479,9 @@ impl App {
             Cmd::ToggleCodeLens => self.toggle_code_lens(),
             Cmd::OpenSearchEditor => self.open_search_editor(),
             Cmd::RebaseAbort => self.abort_rebase_todo(),
+            Cmd::GitContinueOperation => self.continue_git_operation(),
+            Cmd::GitSkipOperation => self.skip_git_operation(),
+            Cmd::GitAbortOperation => self.abort_git_operation(),
             Cmd::ToggleTerminalSuggestions => self.toggle_terminal_suggestions(),
             Cmd::ToggleScreenReader => self.toggle_screen_reader(),
             Cmd::OpenKeyboardShortcuts => self.open_keyboard_shortcuts(),
@@ -51036,6 +51302,7 @@ impl App {
             return;
         }
         if self.editor_find.is_some() {
+            self.reselect_editor_find();
             return;
         }
         let opts = self.search.opts;
@@ -51058,14 +51325,10 @@ impl App {
                 String::from("Find: type to search, Enter next, Shift+Enter prev, Esc close");
             return;
         }
-        let initial = if !self.editor.selection_text().is_empty()
-            && !self.editor.selection_text().contains('\n')
-        {
-            self.editor.selection_text()
-        } else {
-            self.editor.word_before_cursor()
-        };
+        let initial = self.editor_find_seed();
         let mut state = crate::widgets::editor_find::EditorFind::new(initial.clone(), opts);
+        // Selected, so what the user types next replaces the seed (#1278).
+        state.query_selected = !initial.is_empty();
         if !initial.is_empty() {
             state.set_match_count(
                 crate::widgets::editor_find::count_matches(&self.editor.lines, &initial, opts),
@@ -52203,9 +52466,112 @@ impl App {
         self.editor_find_set_query(new_q);
     }
 
+    /// What Ctrl+F puts in the find bar: a one-line selection, else the
+    /// whole word under the caret or just left of it (#1278; the half of
+    /// the word before the caret made typing build `loadOrsave`).
+    fn editor_find_seed(&self) -> String {
+        let selection = self.editor.selection_text();
+        if !selection.is_empty() && !selection.contains('\n') {
+            return selection;
+        }
+        let (row, col) = (self.editor.cursor_row, self.editor.cursor_col);
+        self.editor
+            .word_string_at(row, col)
+            .or_else(|| {
+                col.checked_sub(1)
+                    .and_then(|c| self.editor.word_string_at(row, c))
+            })
+            .unwrap_or_default()
+    }
+
+    /// Ctrl+F on an open find bar, as in VS Code: take a one-line selection
+    /// if there is one, focus the query and select it, so typing replaces it.
+    fn reselect_editor_find(&mut self) {
+        let selection = self.editor.selection_text();
+        if self.editor.diff.is_none() && !selection.is_empty() && !selection.contains('\n') {
+            self.editor_find_set_query(selection);
+        }
+        if let Some(s) = self.editor_find.as_mut() {
+            s.focus = crate::widgets::editor_find::FindField::Query;
+            s.query_selected = !s.query.is_empty();
+        }
+    }
+
     fn handle_editor_find_key(&mut self, key: KeyEvent) {
         if is_editor_replace_key(key) {
             self.open_editor_replace();
+            return;
+        }
+        if is_editor_find_key(key) {
+            self.reselect_editor_find();
+            return;
+        }
+        // A selected query (#1278) is replaced by what is typed or pasted
+        // and cleared by Backspace / Delete; any other editing or caret key
+        // drops the selection and then acts as usual.
+        let selected = !self.editor_find_replace_focused()
+            && self.editor_find.as_ref().is_some_and(|s| s.query_selected);
+        if selected {
+            let plain_char = matches!(key.code, KeyCode::Char(_))
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER);
+            let paste = matches!(key.code, KeyCode::Char('v'))
+                && key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER);
+            let keeps = matches!(
+                key.code,
+                KeyCode::Enter | KeyCode::F(3) | KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc
+            ) || (matches!(key.code, KeyCode::Char('a'))
+                && key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER));
+            if let Some(s) = self.editor_find.as_mut()
+                && !keeps
+            {
+                s.query_selected = false;
+            }
+            if plain_char || paste || matches!(key.code, KeyCode::Backspace | KeyCode::Delete) {
+                self.editor_find_set_query(String::new());
+                if matches!(key.code, KeyCode::Backspace | KeyCode::Delete) {
+                    return;
+                }
+            }
+        }
+        let word_delete = key.code == KeyCode::Backspace
+            && key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if word_delete {
+            // The word before the end, with any spaces after it, as in a
+            // text field; a lone punctuation mark goes on its own.
+            self.editor_find_edit_focused(|s| {
+                let kept = s.trim_end().len();
+                let word_start = s[..kept]
+                    .char_indices()
+                    .rev()
+                    .find(|&(_, c)| !crate::widgets::editor::is_word_char(c))
+                    .map_or(0, |(i, c)| i + c.len_utf8());
+                let cut = if word_start == kept {
+                    s[..kept].char_indices().next_back().map_or(0, |(i, _)| i)
+                } else {
+                    word_start
+                };
+                s.truncate(cut);
+            });
+            return;
+        }
+        if matches!(key.code, KeyCode::Char('a'))
+            && key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        {
+            if let Some(s) = self.editor_find.as_mut()
+                && s.focus == crate::widgets::editor_find::FindField::Query
+            {
+                s.query_selected = !s.query.is_empty();
+            }
             return;
         }
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -54448,6 +54814,9 @@ impl App {
                     if self.source_control.click_more(m.column, m.row) {
                         self.commit_menu_open = false;
                         self.scm_menu.open = !self.scm_menu.open;
+                        if self.scm_menu.open {
+                            self.scm_menu.operation = crate::git::repo_operation(&self.scm_root());
+                        }
                         if !self.scm_menu.open {
                             self.scm_menu.close();
                         }
@@ -56557,11 +56926,15 @@ impl App {
                     status,
                 }
             }
-            Pane::Terminal => Snapshot {
-                focus: format!("{} {}", tr("Terminal"), self.active_terminal + 1),
-                status,
-                ..Default::default()
-            },
+            Pane::Terminal => {
+                let (focus, item) = self.bottom_panel_a11y();
+                Snapshot {
+                    focus,
+                    item,
+                    status,
+                    ..Default::default()
+                }
+            }
             Pane::Tree => {
                 let (focus, item) = match self.sidebar_view {
                     SidebarView::Explorer => (
@@ -56571,8 +56944,8 @@ impl App {
                             .and_then(|p| p.file_name())
                             .map(|n| n.to_string_lossy().into_owned()),
                     ),
-                    SidebarView::Search => (tr("Search"), None),
-                    SidebarView::SourceControl => (tr("Source Control"), None),
+                    SidebarView::Search => self.search_a11y(),
+                    SidebarView::SourceControl => self.source_control_a11y(),
                     SidebarView::Remote => (tr("Remote"), None),
                     SidebarView::RunDebug => (tr("Run and Debug"), None),
                     SidebarView::Extensions => (tr("Extensions"), None),
@@ -56587,6 +56960,146 @@ impl App {
                 }
             }
         }
+    }
+
+    /// What screen reader mode says for the bottom panel's front tab
+    /// (#1295): the tab's name with what it holds, and its row in focus.
+    /// The panel is one `Pane` whichever tab is in front, so the tab, not
+    /// the pane, decides.
+    fn bottom_panel_a11y(&self) -> (String, Option<String>) {
+        let tr = |s: &str| crate::i18n::tr(s).into_owned();
+        let with = |name: &str, what: String| format!("{}, {what}", tr(name));
+        match self.bottom_panel_tab {
+            BottomPanelTab::Terminal => (
+                format!("{} {}", tr("Terminal"), self.active_terminal + 1),
+                None,
+            ),
+            BottomPanelTab::Problems => {
+                let errors = self.problems.error_count();
+                let warnings = self.problems.warning_count();
+                let others = self.problems.total_count() - errors - warnings;
+                let counts: Vec<String> = [
+                    (errors, "error", "errors"),
+                    (warnings, "warning", "warnings"),
+                    (others, "info", "infos"),
+                ]
+                .into_iter()
+                .filter(|(n, ..)| *n > 0)
+                .map(|(n, one, many)| a11y_count(n, one, many))
+                .collect();
+                let counts = if counts.is_empty() {
+                    String::from("no problems")
+                } else {
+                    counts.join(", ")
+                };
+                let item = self.problems.top_diagnostic().map(|(group, it)| {
+                    let source = if it.source.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", it.source)
+                    };
+                    format!(
+                        "{} line {}: {}{source}",
+                        group.name,
+                        it.line + 1,
+                        it.message
+                    )
+                });
+                (with("Problems", counts), item)
+            }
+            BottomPanelTab::Output => (
+                match self.output.selected_name() {
+                    Some(channel) => with("Output", channel),
+                    None => tr("Output"),
+                },
+                None,
+            ),
+            BottomPanelTab::Ports => {
+                let n = self.ports.len();
+                let item = self.ports.selected().map(|p| {
+                    let mut said = format!("Port {}", p.port);
+                    for part in [&p.process, &p.url].into_iter().flatten() {
+                        said.push_str(", ");
+                        said.push_str(part);
+                    }
+                    said
+                });
+                let count = if n == 0 {
+                    String::from("none")
+                } else {
+                    a11y_count(n, "port", "ports")
+                };
+                (with("Ports", count), item)
+            }
+            BottomPanelTab::Captures => {
+                let n = self.captures.len();
+                let item = self
+                    .captures
+                    .selected_entry()
+                    .map(|c| format!("{}, from {}", c.message, c.pane));
+                let count = if n == 0 {
+                    String::from("none")
+                } else {
+                    a11y_count(n, "capture", "captures")
+                };
+                (with("Captures", count), item)
+            }
+        }
+    }
+
+    /// The Search sidebar for screen reader mode (#1295): how many matches
+    /// in how many files, and the selected match as `file line N: text`.
+    fn search_a11y(&self) -> (String, Option<String>) {
+        let name = crate::i18n::tr("Search").into_owned();
+        let hits = &self.search.hits;
+        if hits.is_empty() {
+            return (name, None);
+        }
+        // The Search header's own totals: a line with two matches counts two.
+        let (matches, files) = self.search.result_counts();
+        let focus = format!(
+            "{name}, {} in {}",
+            a11y_count(matches, "match", "matches"),
+            a11y_count(files, "file", "files")
+        );
+        let item = self.search.selected_hit().map(|h| {
+            let rel = h
+                .path
+                .strip_prefix(self.workspace_root())
+                .unwrap_or(&h.path);
+            format!("{} line {}: {}", rel.display(), h.line_no, h.line_text)
+        });
+        (focus, item)
+    }
+
+    /// The Source Control sidebar for screen reader mode (#1295): how many
+    /// changes, and the selected one as `path, what happened to it`.
+    fn source_control_a11y(&self) -> (String, Option<String>) {
+        use crate::git::ChangeKind;
+        let name = crate::i18n::tr("Source Control").into_owned();
+        let entries = &self.source_control.entries;
+        if entries.is_empty() {
+            return (name, None);
+        }
+        let focus = format!("{name}, {}", a11y_count(entries.len(), "change", "changes"));
+        let item = self
+            .source_control
+            .selected_change
+            .and_then(|i| entries.get(i))
+            .map(|e| {
+                let what = match e.kind {
+                    ChangeKind::StagedAdded => "added, staged",
+                    ChangeKind::StagedModified => "modified, staged",
+                    ChangeKind::StagedDeleted => "deleted, staged",
+                    ChangeKind::StagedRenamed => "renamed, staged",
+                    ChangeKind::Modified => "modified",
+                    ChangeKind::Deleted => "deleted",
+                    ChangeKind::Untracked => "untracked",
+                    ChangeKind::Conflicted => "conflicted",
+                };
+                format!("{}, {what}", e.path)
+            });
+        (focus, item)
     }
 
     /// Feed this frame's snapshot to the announcer (#621).
@@ -56800,6 +57313,15 @@ impl App {
             .as_deref()
             .is_some_and(crate::rebase_todo::is_todo)
         {
+            // Outside the plan tab, a rebase stopped on a conflict is the
+            // one this means (#1356).
+            if matches!(
+                crate::git::repo_operation(&self.scm_root()),
+                Some(crate::git::RepoOp::Rebase { .. })
+            ) {
+                self.abort_git_operation();
+                return;
+            }
             self.status = String::from("Rebase: Abort works in a git-rebase-todo tab");
             return;
         }
@@ -57684,8 +58206,9 @@ impl App {
             }
             self.status = keybindings_reload_status(&warns);
         } else if path == crate::snippets::snippets_path() {
-            self.snippets = crate::snippets::SnippetSet::load(path);
-            self.status = String::from("Snippets reloaded");
+            let (set, warning) = crate::snippets::SnippetSet::load_with_warning(path);
+            self.snippets = set;
+            self.status = snippets_reload_status(warning.is_some());
         } else if path == crate::agents::agents_path() {
             self.agents = crate::agents::AgentTable::load(path);
             let dropped = self.agents.dropped_patterns();
@@ -57922,6 +58445,7 @@ impl App {
             self.inline_values_enabled = true;
             self.refresh_inline_values();
         }
+        self.save_before_debug = !p.disable_save_before_debug;
         self.explorer_views = ExplorerViewVisibility::from_prefs(p.explorer_views);
         self.set_host_accents(&p.host_accents);
     }
@@ -65569,6 +66093,16 @@ fn is_cmd_shift_letter(key: KeyEvent, letter: char) -> bool {
     has_shift && has_ctrl_or_super
 }
 
+/// The status after snippets.json is saved: a file that loaded nothing
+/// says so, with the detail in OUTPUT (#1191), as keybindings.json does.
+fn snippets_reload_status(broken: bool) -> String {
+    if broken {
+        String::from("Snippets not loaded: the file does not parse — see OUTPUT · Snippets")
+    } else {
+        String::from("Snippets reloaded")
+    }
+}
+
 /// The status line shown after a keybindings reload.
 ///
 /// Split out of `reload_config_for_path` so it can be tested against a keymap
@@ -65611,6 +66145,12 @@ fn is_sidebar_toggle_key(key: KeyEvent) -> bool {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// `n` with the word for one or for many, as screen reader mode reads a
+/// count: "1 error", "3 matches".
+fn a11y_count(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 /// `⌥⌘B` (macOS) / `Ctrl+Alt+B` (Linux): toggle the secondary side bar (the
