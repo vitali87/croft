@@ -9034,7 +9034,9 @@ impl App {
                 .and_then(|(_, repo)| repo.clone())
                 .or_else(|| path.parent().and_then(crate::git::repo_toplevel))
         };
-        let mut fetched: std::collections::HashMap<PathBuf, Option<Vec<String>>> =
+        // Keyed by encoding too: the same file open in two tabs under two
+        // encodings needs HEAD decoded each tab's way (#1242).
+        let mut fetched: std::collections::HashMap<(PathBuf, &str), Option<Vec<String>>> =
             std::collections::HashMap::new();
         let groups =
             std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut());
@@ -9048,14 +9050,16 @@ impl App {
             // Untracked files / non-repo dirs yield Err here, so the gutter
             // simply shows nothing; the baseline-for marker still updates so we
             // don't re-shell every tick.
+            let enc = ed.encoding;
             let head = fetched
-                .entry(path.clone())
+                .entry((path.clone(), enc.name()))
                 .or_insert_with(|| {
                     let root = repo_for(&path)?;
                     path.strip_prefix(&root)
                         .ok()
                         .and_then(|rel| rel.to_str())
-                        .and_then(|rel| crate::git::read_file_at_head(&root, rel).ok())
+                        .and_then(|rel| crate::git::read_bytes_at_head(&root, rel).ok())
+                        .and_then(|bytes| crate::widgets::editor::decode_blob(&bytes, enc))
                         .map(|text| text.lines().map(str::to_string).collect())
                 })
                 .clone();
@@ -33275,13 +33279,27 @@ impl App {
                 }
             }
             ChangeKind::Modified | ChangeKind::StagedModified => {
-                match crate::git::read_file_at_head(&scm_root, &entry.path) {
-                    Ok(head_text) => {
+                // Both sides decoded the way the file's open tab decodes it,
+                // so a windows-1252 or UTF-16 file diffs too (#1242).
+                let enc = self.open_tab_encoding(&abs);
+                let texts =
+                    crate::git::read_bytes_at_head(&scm_root, &entry.path).and_then(|head| {
+                        let working = std::fs::read(&abs).map_err(|e| e.to_string())?;
+                        let decode = |b: &[u8]| crate::widgets::editor::decode_blob(b, enc);
+                        decode(&head)
+                            .zip(decode(&working))
+                            .ok_or_else(|| format!("{} is not {}", entry.path, enc.name()))
+                    });
+                match texts {
+                    Ok((head_text, working_text)) => {
                         let label = std::path::PathBuf::from(format!("{} (HEAD)", entry.path));
-                        match self
-                            .editor
-                            .open_head_diff_with_text(label, &head_text, &abs, true)
-                        {
+                        match self.editor.open_head_diff_with_texts(
+                            label,
+                            &head_text,
+                            &working_text,
+                            &abs,
+                            true,
+                        ) {
                             Ok(()) => {
                                 self.tag_open_diff(
                                     crate::widgets::diff::DiffSource::HeadVsWorking {
@@ -33289,6 +33307,9 @@ impl App {
                                         rel: entry.path.clone(),
                                     },
                                 );
+                                if let Some(diff) = self.editor.diff.as_mut() {
+                                    diff.text_encoding = enc;
+                                }
                                 true
                             }
                             Err(e) => {
@@ -38170,14 +38191,20 @@ impl App {
     /// active tab isn't a working-tree diff or no hunk is at the cursor.
     fn diff_hunk_patch_at_caret(&mut self) -> Option<(String, String)> {
         let built = match self.editor.diff.as_ref() {
-            None => self.editor_hunk_patch_at_caret(),
+            None => self.editor_hunk_patch_at_caret().map_err(str::to_string),
             Some(diff) if !diff.left_is_git_head => {
-                Err("Hunk actions need a working-tree diff from Source Control")
+                Err("Hunk actions need a working-tree diff from Source Control".to_string())
             }
+            // The patch is built from the decoded text, which would put UTF-8
+            // bytes into a blob stored in another encoding (#1242).
+            Some(diff) if diff.text_encoding != encoding_rs::UTF_8 => Err(format!(
+                "Hunk actions work on UTF-8 files only; this diff is {}: stage the whole file",
+                diff.text_encoding.name()
+            )),
             Some(diff) => match self.repo_relative_path(&diff.right_path) {
-                None => Err("File is outside the repository"),
+                None => Err("File is outside the repository".to_string()),
                 Some(rel) => match diff.hunk_range_at(diff.action_row()) {
-                    None => Err("No change hunk at the cursor"),
+                    None => Err("No change hunk at the cursor".to_string()),
                     Some(range) => {
                         let patch = diff.hunk_patch(&rel, range);
                         Ok((rel, patch))
@@ -38253,7 +38280,8 @@ impl App {
     /// caller falls back to the whole-hunk action.
     fn diff_selected_lines_patch(&self) -> Option<(String, String)> {
         let diff = self.editor.diff.as_ref()?;
-        if !diff.left_is_git_head {
+        // Not UTF-8: left to the hunk path, which refuses it with a reason.
+        if !diff.left_is_git_head || diff.text_encoding != encoding_rs::UTF_8 {
             return None;
         }
         let sel = diff.selection?;
@@ -65971,6 +65999,18 @@ impl App {
         );
     }
 
+    /// The encoding `path`'s open tab decodes it with, in any group; UTF-8
+    /// when it isn't open, which is what opening it would pick: a BOM still
+    /// wins in `decode_blob`, and bytes that are not UTF-8 get the plain
+    /// open rather than an editable diff of replacement characters.
+    fn open_tab_encoding(&self, path: &Path) -> &'static encoding_rs::Encoding {
+        std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .find(|e| e.diff.is_none() && e.path.as_deref() == Some(path))
+            .map_or(encoding_rs::UTF_8, |e| e.encoding)
+    }
+
     /// Re-point the tabs of a renamed or moved path in every editor group,
     /// not just the focused one: a tab in the other split kept the old path,
     /// raised a disk conflict, and a save brought the old file back.
@@ -69868,8 +69908,11 @@ fn rebuild_diff_view(
             if !head_moved && !written(&old.right_path) && !old.sides_moved_on_disk() {
                 return None;
             }
-            let head = crate::git::read_file_at_head(root, rel).ok()?;
-            let right = std::fs::read_to_string(&old.right_path).ok()?;
+            let enc = old.text_encoding;
+            let head = crate::git::read_bytes_at_head(root, rel).ok()?;
+            let head = crate::widgets::editor::decode_blob(&head, enc)?;
+            let right = std::fs::read(&old.right_path).ok()?;
+            let right = crate::widgets::editor::decode_blob(&right, enc)?;
             two_sided(&head, &right)
         }
         DiffSource::FixedLeft { left_text } => {
@@ -69907,6 +69950,7 @@ fn rebuild_diff_view(
     };
     fresh.source = old.source.clone();
     fresh.left_is_real_file = old.left_is_real_file;
+    fresh.text_encoding = old.text_encoding;
     fresh.stamp_sides();
     Some(fresh)
 }

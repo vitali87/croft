@@ -78114,6 +78114,189 @@ fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
     assert_eq!(app.status, "Tab is already kept open");
 }
 
+// ---- Git diffs of files that aren't UTF-8 (#1242) ----
+
+/// A repo with `name` committed as `head` bytes, then `head + added` on disk.
+fn encoded_repo(name: &str, head: &[u8], added: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = make_committed_repo();
+    let f = tmp.path().join(name);
+    std::fs::write(&f, head).unwrap();
+    git_stdout_in(tmp.path(), &["add", name]);
+    git_stdout_in(tmp.path(), &["commit", "-qm", "encoded"]);
+    std::fs::write(&f, [head, added].concat()).unwrap();
+    (tmp, f)
+}
+
+const LATIN1_HEAD: &[u8] = b"name;city\nM\xfcller;K\xf6ln\nJos\xe9;M\xe1laga\n";
+const LATIN1_ADDED: &[u8] = b"Zo\xeb;Z\xfcrich\n";
+
+/// After Reopen with Encoding, the gutter baseline is HEAD decoded the same
+/// way, so the added line gets its bar and the old lines none.
+#[test]
+fn a_windows_1252_file_gets_gutter_marks_after_reopen_with_encoding() {
+    let (tmp, f) = encoded_repo("latin1.txt", LATIN1_HEAD, LATIN1_ADDED);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.sync_git_gutters();
+    app.editor
+        .reopen_with_encoding(encoding_rs::WINDOWS_1252)
+        .unwrap();
+    app.sync_git_gutters();
+    assert_eq!(
+        app.editor.git_head_lines.as_deref(),
+        Some(&["name;city", "Müller;Köln", "José;Málaga"].map(String::from)[..])
+    );
+    draw(&mut app, 100, 30);
+    assert_eq!(
+        app.editor.git_mark_at(3),
+        Some(crate::widgets::editor::GitMark::Added)
+    );
+    assert_eq!(app.editor.git_mark_at(1), None);
+}
+
+/// A UTF-16LE file with a BOM is decoded as UTF-16 on both sides.
+#[test]
+fn a_utf16_file_gets_gutter_marks() {
+    let utf16 = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+    let head = [&[0xff, 0xfe][..], &utf16("one\ntwo\n")].concat();
+    let (tmp, f) = encoded_repo("app.rc", &head, &utf16("three\n"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.sync_git_gutters();
+    assert_eq!(
+        app.editor.git_head_lines.as_deref(),
+        Some(&["one", "two"].map(String::from)[..])
+    );
+    draw(&mut app, 100, 30);
+    assert_eq!(
+        app.editor.git_mark_at(2),
+        Some(crate::widgets::editor::GitMark::Added)
+    );
+}
+
+/// Clicking the file in Source Control opens its HEAD diff, decoded with the
+/// encoding its tab uses, instead of failing with "not UTF-8".
+#[test]
+fn a_windows_1252_file_opens_its_source_control_diff() {
+    let (tmp, f) = encoded_repo("latin1.txt", LATIN1_HEAD, LATIN1_ADDED);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.editor
+        .reopen_with_encoding(encoding_rs::WINDOWS_1252)
+        .unwrap();
+    wait_for_changes(&mut app, |a| {
+        a.source_control
+            .entries
+            .iter()
+            .any(|e| e.path == "latin1.txt")
+    });
+    let idx = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "latin1.txt")
+        .unwrap();
+    app.open_source_control_entry(idx);
+    let diff = app
+        .editor
+        .diff
+        .as_ref()
+        .unwrap_or_else(|| panic!("no diff opened: {}", app.status));
+    assert_eq!(diff.left_lines[1], "Müller;Köln");
+    assert_eq!(
+        diff.right_lines.last().map(String::as_str),
+        Some("Zoë;Zürich")
+    );
+    let changed = diff
+        .rows
+        .iter()
+        .filter(|r| !matches!(r, crate::widgets::diff::DiffRow::Equal { .. }))
+        .count();
+    assert_eq!(changed, 1, "only the added line differs");
+}
+
+/// With no tab open, the file is decoded the way opening it would: a BOM
+/// names its encoding, so a closed UTF-16 file still opens its diff.
+#[test]
+fn a_closed_utf16_file_opens_its_source_control_diff() {
+    let utf16 = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+    let head = [&[0xff, 0xfe][..], &utf16("one\ntwo\n")].concat();
+    let (tmp, _) = encoded_repo("app.rc", &head, &utf16("three\n"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    wait_for_changes(&mut app, |a| {
+        a.source_control.entries.iter().any(|e| e.path == "app.rc")
+    });
+    let idx = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "app.rc")
+        .unwrap();
+    app.open_source_control_entry(idx);
+    let diff = app
+        .editor
+        .diff
+        .as_ref()
+        .unwrap_or_else(|| panic!("no diff opened: {}", app.status));
+    assert_eq!(diff.left_lines, ["one", "two"]);
+    assert_eq!(diff.right_lines.last().map(String::as_str), Some("three"));
+}
+
+/// Staging a hunk writes the diff's decoded text back as a patch, which for
+/// a non-UTF-8 file would put UTF-8 bytes into a windows-1252 blob: refused,
+/// and the index is left alone.
+#[test]
+fn staging_a_hunk_in_a_non_utf8_diff_is_refused() {
+    let (tmp, f) = encoded_repo("latin1.txt", LATIN1_HEAD, LATIN1_ADDED);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.editor
+        .reopen_with_encoding(encoding_rs::WINDOWS_1252)
+        .unwrap();
+    wait_for_changes(&mut app, |a| {
+        a.source_control
+            .entries
+            .iter()
+            .any(|e| e.path == "latin1.txt")
+    });
+    let idx = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "latin1.txt")
+        .unwrap();
+    app.open_source_control_entry(idx);
+    assert!(app.editor.diff.is_some(), "{}", app.status);
+    app.stage_hunk_at_caret();
+    assert!(app.status.contains("windows-1252"), "{}", app.status);
+    assert_eq!(
+        git_stdout_in(tmp.path(), &["diff", "--cached", "--name-only"]),
+        ""
+    );
+}
+
+/// A binary (not UTF-8, no tab picking an encoding) file still opens
+/// without a diff, as before.
+#[test]
+fn a_modified_binary_file_still_opens_without_a_diff() {
+    let (tmp, _) = encoded_repo("blob.bin", b"\x00\xff\x01bin\n", b"\x00\xfemore\n");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    wait_for_changes(&mut app, |a| {
+        a.source_control
+            .entries
+            .iter()
+            .any(|e| e.path == "blob.bin")
+    });
+    let idx = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "blob.bin")
+        .unwrap();
+    app.open_source_control_entry(idx);
+    assert!(app.editor.diff.is_none());
+}
+
 /// #989: an App on the issue's repro, a merge stopped on a conflict.
 fn app_in_a_conflicted_merge() -> (App, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
