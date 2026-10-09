@@ -5811,6 +5811,45 @@ impl Editor {
         self.disk_stamp
     }
 
+    /// Put `text` in the buffer as unsaved edits over the file it was opened
+    /// from: the copy hot exit or the update relaunch kept of them (#862).
+    /// A whole-buffer swap, so everything measured against the opened text
+    /// is redone as an edit redoes it: syntax spans, bracket colours and the
+    /// string and comment ranges they skip, and the edit counter the LSP,
+    /// git gutter, fold tables and previews resync on. Folds and server fold
+    /// spans were line numbers into the old text and go; so does the undo
+    /// history, which would put the file's text back under the restored
+    /// edits, and the authorship map, which described the file's lines.
+    pub fn restore_unsaved_text(&mut self, text: &str) {
+        self.lines = text.split('\n').map(str::to_string).collect();
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.selection = None;
+        self.provenance = crate::provenance::Provenance::new();
+        self.folded.clear();
+        self.hidden_ranges.clear();
+        self.fold_epoch_lines = 0;
+        self.lsp_folds = None;
+        self.lsp_folds_lines = 0;
+        // Dirty, stamped as edited now (auto save's delay keys on it), and
+        // the edit counter moves.
+        self.mark_buffer_changed();
+        // Nothing was edited at a place in this session to go back to.
+        self.last_edit_pos = None;
+        self.recompute_highlights();
+    }
+
+    /// Anchor the disk stamp at `stamp`, the file as this buffer's edits
+    /// last matched it, for a buffer rebuilt from a copy of its unsaved text
+    /// (hot exit, #862): a file that changed since then reads as changed
+    /// externally, so a save asks before overwriting that change.
+    pub fn set_disk_stamp(&mut self, stamp: Option<(SystemTime, u64)>) {
+        self.disk_stamp = stamp;
+    }
+
     /// Open `path` in the SARIF results viewer (#577). Fails with the
     /// loader's explanation (position of a JSON error, an unsupported
     /// version) so the caller can fall back to text and say why.
@@ -6733,6 +6772,16 @@ impl Editor {
     #[cfg(test)]
     pub fn inlay_spans_for_test(&self, line: usize) -> &[(usize, String, Option<Color>)] {
         self.row_inlay_spans(line)
+    }
+
+    /// Line `line`'s syntax spans as `(start, end, style)`, for tests
+    /// outside this module (#862).
+    #[cfg(test)]
+    pub fn line_spans_for_test(&self, line: usize) -> Vec<(usize, usize, Style)> {
+        self.highlights
+            .get(line)
+            .map(|spans| spans.iter().map(|s| (s.start, s.end, s.style)).collect())
+            .unwrap_or_default()
     }
 
     /// The buffer text to key a semantic-token cache entry on, but only when
@@ -17257,7 +17306,8 @@ impl EditorTabs {
     }
 
     /// Close every tab whose index ≠ `keep_idx`, except pinned tabs, which
-    /// always survive (VS Code "Close Others" never closes a pinned tab). The
+    /// always survive (VS Code "Close Others" never closes a pinned tab), and
+    /// tabs with unsaved changes, which a sweep never drops (#862). The
     /// kept tab stays active. Returns how many tabs were actually removed (0
     /// when `keep_idx` is out of range or nothing else is closeable). Mirrors
     /// VS Code's "Close Others" context-menu action.
@@ -17272,7 +17322,7 @@ impl EditorTabs {
             if i == keep_idx {
                 new_active = kept.len();
                 kept.push(ed);
-            } else if ed.pinned {
+            } else if ed.pinned || ed.dirty {
                 kept.push(ed);
             }
         }
@@ -17287,9 +17337,9 @@ impl EditorTabs {
 
     /// Close every tab whose index > `from_idx`, except pinned tabs, which
     /// always survive (VS Code "Close to the Right" never closes a pinned
-    /// tab). The tab at `from_idx` stays active; tabs to the left are
-    /// untouched. Returns the number of tabs removed. Matches VS Code's
-    /// "Close to the Right".
+    /// tab), and tabs with unsaved changes (#862). The tab at `from_idx`
+    /// stays active; tabs to the left are untouched. Returns the number of
+    /// tabs removed. Matches VS Code's "Close to the Right".
     pub fn close_to_right(&mut self, from_idx: usize) -> usize {
         if from_idx >= self.editors.len() {
             return 0;
@@ -17300,7 +17350,7 @@ impl EditorTabs {
         let mut pivot_pos = 0;
         let mut kept: Vec<Editor> = Vec::with_capacity(before);
         for (i, ed) in std::mem::take(&mut self.editors).into_iter().enumerate() {
-            if i <= from_idx || ed.pinned {
+            if i <= from_idx || ed.pinned || ed.dirty {
                 if i == from_idx {
                     pivot_pos = kept.len();
                 }
@@ -17324,15 +17374,12 @@ impl EditorTabs {
     /// Close every tab, resetting the editor pane to the single blank
     /// just-launched state — mirrors `close_tab` on the last remaining
     /// tab. Returns how many tabs were collapsed away (always ≥ 1 when
-    /// the editor had any content). Matches VS Code's "Close All".
+    /// the editor had any content). Matches VS Code's "Close All", except
+    /// that tabs with unsaved changes stay open (#862): VS Code asks about
+    /// each, croft leaves them for a Cmd+W that asks. That makes it the
+    /// same sweep as [`Self::close_saved`], pinned tabs going in both.
     pub fn close_all(&mut self) -> usize {
-        let n = self.editors.len();
-        let was_focused = self.editors[self.active].focused;
-        let mut fresh = Editor::new();
-        fresh.focused = was_focused;
-        self.editors = vec![fresh];
-        self.active = 0;
-        n
+        self.close_saved()
     }
 
     /// Close every saved (non-dirty) tab, keeping any with unsaved changes.
@@ -28583,6 +28630,38 @@ mod tests {
         let removed = t.close_saved();
         assert_eq!(removed, 0, "nothing saved means nothing to close");
         assert_eq!(t.tab_count(), 2, "both dirty tabs stay open");
+    }
+
+    /// #862: the bulk closes never drop unsaved edits: Close Others, Close
+    /// to the Right and Close All each leave a dirty tab open.
+    #[test]
+    fn bulk_closes_keep_tabs_with_unsaved_changes() {
+        let tabs = || {
+            let mut t = EditorTabs::new();
+            t.editors[0].path = Some(std::path::PathBuf::from("/a"));
+            t.add_tab_with_path(std::path::PathBuf::from("/b"));
+            t.add_tab_with_path(std::path::PathBuf::from("/c"));
+            t.editors[2].dirty = true;
+            t
+        };
+        let paths = |t: &EditorTabs| -> Vec<Option<std::path::PathBuf>> {
+            t.editors.iter().map(|e| e.path.clone()).collect()
+        };
+        let path = |p: &str| Some(std::path::PathBuf::from(p));
+
+        let mut t = tabs();
+        assert_eq!(t.close_others(0), 1, "only the clean /b goes");
+        assert_eq!(paths(&t), vec![path("/a"), path("/c")]);
+        assert_eq!(t.active_index(), 0, "the kept tab stays active");
+
+        let mut t = tabs();
+        assert_eq!(t.close_to_right(0), 1, "only the clean /b goes");
+        assert_eq!(paths(&t), vec![path("/a"), path("/c")]);
+
+        let mut t = tabs();
+        assert_eq!(t.close_all(), 2);
+        assert_eq!(paths(&t), vec![path("/c")], "the dirty tab survives");
+        assert!(t.editors[0].dirty);
     }
 
     #[test]

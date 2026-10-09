@@ -470,7 +470,22 @@ fn detach_from_tty(cmd: &mut Command) {
 /// surface whichever stream carries the message verbatim, so the panel
 /// shows the host's exact reason (e.g. "fatal: 'x' is not a commit").
 fn run_mutation(root: &Path, args: &[&str]) -> Result<String, String> {
-    run_mutation_with_env(root, args, &[])
+    run_mutation_with(root, args, false)
+}
+
+/// [`run_mutation`] for an operation that can stop on conflicts: merge,
+/// rebase, pull, stash apply and pop. Git names the conflicts on stdout
+/// (`CONFLICT (content): Merge conflict in pricing.py`) and, for a rebase,
+/// the failure on stderr (`error: could not apply …`); keeping stderr alone
+/// lost the conflicts (#858), so a failure here carries both, stdout first.
+fn run_mutation_keeping_conflicts(root: &Path, args: &[&str]) -> Result<String, String> {
+    run_mutation_with(root, args, true)
+}
+
+/// [`run_mutation`]'s body; `both_streams` makes a failure report stdout
+/// and stderr together when git wrote to both.
+fn run_mutation_with(root: &Path, args: &[&str], both_streams: bool) -> Result<String, String> {
+    run_mutation_inner(root, args, &[], both_streams)
 }
 
 /// [`run_mutation`] with extra environment variables for git.
@@ -478,6 +493,16 @@ fn run_mutation_with_env(
     root: &Path,
     args: &[&str],
     envs: &[(&str, &str)],
+) -> Result<String, String> {
+    run_mutation_inner(root, args, envs, false)
+}
+
+/// The body shared by [`run_mutation_with`] and [`run_mutation_with_env`].
+fn run_mutation_inner(
+    root: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    both_streams: bool,
 ) -> Result<String, String> {
     let path_str = root
         .to_str()
@@ -510,7 +535,19 @@ fn run_mutation_with_env(
         }
         Ok(msg)
     } else {
-        let msg = if !stderr.is_empty() { stderr } else { stdout };
+        let msg = if both_streams && !stdout.is_empty() && !stderr.is_empty() {
+            // Appended to stdout's own buffer rather than formatted into a
+            // new one, however long git's text is.
+            let mut both = stdout;
+            both.reserve(1 + stderr.len());
+            both.push('\n');
+            both.push_str(&stderr);
+            both
+        } else if !stderr.is_empty() {
+            stderr
+        } else {
+            stdout
+        };
         let err = if msg.is_empty() {
             let verb = args.first().copied().unwrap_or("git");
             format!("git {verb} failed with code {:?}", output.status.code())
@@ -1276,6 +1313,222 @@ pub fn commit_all_tracked(root: &Path, message: &str) -> Result<String, String> 
         } else {
             msg
         })
+    }
+}
+
+/// The note git prints for each file a merge, rebase or stash pop merged
+/// (`Auto-merging pricing.py`), before the line that says how that went.
+const AUTO_MERGING: &str = "Auto-merging ";
+
+/// What git's conflict line says before the file (`CONFLICT (content):
+/// Merge conflict in pricing.py`).
+const MERGE_CONFLICT_IN: &str = "Merge conflict in ";
+
+/// `line` as a terminal shows it. Git redraws a progress line (`Rebasing
+/// (1/1)`) by returning the carriage and, on a capable terminal, erasing
+/// the line (`ESC [K`) before the next text, so what is left on screen is
+/// the last redraw that says something (#858).
+fn shown(line: &str) -> &str {
+    line.rsplit('\r')
+        .map(|part| part.trim_start_matches("\u{1b}[K"))
+        .find(|part| !part.trim().is_empty())
+        .unwrap_or_default()
+}
+
+/// `line` with its runs of whitespace collapsed to one space.
+fn squash(line: &str) -> String {
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The first line of git's `output` (for a commit, `[branch sha] subject`):
+/// what the Source Control panel and the status bar report. The rest, a
+/// commit's diffstat and one `create mode` row per new file, ran on past
+/// both (#858); the Git Output log keeps it whole. A merge's `Auto-merging`
+/// notes give way to the result after them ("Merge made by the 'ort'
+/// strategy."), and a line git redrew reads as [`shown`] ("Successfully
+/// rebased …", not "Rebasing (1/1)"); a text of nothing but those notes is
+/// its first one, never an empty line.
+pub fn headline(output: &str) -> &str {
+    let said = || {
+        output
+            .lines()
+            .map(shown)
+            .filter(|line| !line.trim().is_empty())
+    };
+    said()
+        .find(|line| !line.starts_with(AUTO_MERGING))
+        .or_else(|| said().next())
+        .unwrap_or_default()
+        .trim_end()
+}
+
+/// The one line of git's `output` the status bar and the Source Control
+/// panel report (#858); the Git Output log keeps the whole text. For a push
+/// that is its ref update (`5a6cd5c..9f1e2d3 main -> main`, `[new branch]
+/// main -> main`, `[rejected] main -> main (fetch first)`), otherwise the
+/// first line that is not `remote:` chatter, a `hint:`, the `To <url>`
+/// destination, the `On branch` / `Your branch` preamble git prints before
+/// "nothing to commit" or an `Auto-merging` note. Lines read as [`shown`],
+/// and runs of spaces collapse to one. Empty when nothing is left, as for a
+/// push that printed only `remote:` lines.
+pub fn summary_line(output: &str) -> String {
+    const NOISE: [&str; 6] = [
+        "remote:",
+        "hint:",
+        "To ",
+        "On branch ",
+        "Your branch ",
+        AUTO_MERGING,
+    ];
+    let lines = || {
+        output
+            .lines()
+            .map(|l| shown(l).trim())
+            .filter(|l| !l.is_empty() && !NOISE.iter().any(|n| l.starts_with(n)))
+    };
+    let Some(line) = lines()
+        .find(|l| l.contains(" -> "))
+        .or_else(|| lines().next())
+    else {
+        return String::new();
+    };
+    let mut words = line.split_whitespace().peekable();
+    // A ref update leads with git's one-character flag (`*`, `+`, `-`, `!`,
+    // `=`, or a space, which trimming already took).
+    if words
+        .peek()
+        .is_some_and(|w| matches!(*w, "*" | "+" | "-" | "!" | "="))
+    {
+        words.next();
+    }
+    words.collect::<Vec<_>>().join(" ")
+}
+
+/// The one line a git operation that succeeded reports in the status bar
+/// and the Source Control panel (#858): git's result ("Already up to
+/// date.", "Fast-forward", "Merge made by the 'ort' strategy.",
+/// "Successfully rebased and updated refs/heads/main.", "Dropped
+/// refs/stash@{0} (…)", "[main 5a6cd5c] subject"). Passed over on the way:
+/// the fetch's `From <url>` and the push's `To <url>`, `remote:` chatter,
+/// `hint:`s, `Updating a..b`, `Fetching <remote>`, `Auto-merging` notes,
+/// the `warning:` / `error:` / `fatal:` asides a success can still carry
+/// (a failed push negotiation), the `git status` dump a stash or a switch
+/// prints, the `M\tpath` rows a switch lists, and every indented line (ref
+/// updates, the diffstat, file lists). Lines read as [`shown`]. When
+/// nothing else is left, the ref update if there is one ([`summary_line`]),
+/// else empty, and the caller's own word ("Pulled", "Applied stash") says
+/// it; the Git Output log keeps git's whole text.
+pub fn result_line(output: &str) -> String {
+    const NOISE: [&str; 18] = [
+        "From ",
+        "To ",
+        "remote:",
+        "hint:",
+        "Updating ",
+        "Fetching ",
+        AUTO_MERGING,
+        "warning:",
+        "error:",
+        "fatal:",
+        "On branch ",
+        "Your branch ",
+        "Changes not staged for commit:",
+        "Changes to be committed:",
+        "Untracked files:",
+        "Unmerged paths:",
+        "no changes added to commit",
+        "nothing added to commit",
+    ];
+    // `M\tpath`: a file `git switch` carried over.
+    let file_row = |line: &str| {
+        let bytes = line.as_bytes();
+        bytes.len() > 1 && bytes[0].is_ascii_uppercase() && bytes[1] == b'\t'
+    };
+    let result = output.lines().map(shown).find(|line| {
+        !line.trim().is_empty()
+            && !line.starts_with(char::is_whitespace)
+            && !file_row(line)
+            && !NOISE.iter().any(|n| line.starts_with(n))
+    });
+    match result {
+        Some(line) => line.trim_end().to_string(),
+        None if output.contains(" -> ") => summary_line(output),
+        None => String::new(),
+    }
+}
+
+/// The conflicts git stopped on, from the `CONFLICT …` lines of its
+/// `output` (#858): "1 conflict (pricing.py)", "2 conflicts (a.py, b.py)",
+/// naming three files at most before "…". A lone conflict git words
+/// without "Merge conflict in <file>" (`CONFLICT (modify/delete): …`) is
+/// git's own line. `None` when git reported no conflict.
+pub fn conflict_summary(output: &str) -> Option<String> {
+    const NAMED: usize = 3;
+    let conflicts: Vec<&str> = output
+        .lines()
+        .map(|l| shown(l).trim())
+        .filter(|l| l.starts_with("CONFLICT ("))
+        .collect();
+    match conflicts.as_slice() {
+        [] => return None,
+        [only] if !only.contains(MERGE_CONFLICT_IN) => return Some(squash(only)),
+        _ => {}
+    }
+    let mut files: Vec<&str> = Vec::new();
+    let mut unnamed = 0;
+    for line in &conflicts {
+        match line.split_once(MERGE_CONFLICT_IN) {
+            Some((_, file)) if !files.contains(&file.trim()) => files.push(file.trim()),
+            Some(_) => {}
+            None => unnamed += 1,
+        }
+    }
+    let count = files.len() + unnamed;
+    let noun = if count == 1 { "conflict" } else { "conflicts" };
+    if files.is_empty() {
+        return Some(format!("{count} {noun}"));
+    }
+    let mut names = files[..files.len().min(NAMED)].join(", ");
+    if count > NAMED.min(files.len()) {
+        names.push_str(", \u{2026}");
+    }
+    Some(format!("{count} {noun} ({names})"))
+}
+
+/// The one line of git's error text `err` the status bar and the Source
+/// Control panel report (#858); the Git Output log keeps the whole text.
+/// First the conflicts git stopped on ([`conflict_summary`]), then a
+/// rejected ref update (`[rejected] main -> main (fetch first)`), then
+/// git's first `error:` or `fatal:` line, then [`summary_line`]. Failing
+/// all of those, the first line, so a refusal always says something.
+pub fn error_line(err: &str) -> String {
+    if let Some(conflicts) = conflict_summary(err) {
+        return conflicts;
+    }
+    let lines = || err.lines().map(|l| shown(l).trim());
+    if let Some(rejected) = lines().find_map(|l| l.strip_prefix('!').filter(|_| l.contains(" -> ")))
+    {
+        return squash(rejected);
+    }
+    if let Some(line) = lines().find(|l| l.starts_with("error:") || l.starts_with("fatal:")) {
+        return squash(line);
+    }
+    let line = summary_line(err);
+    if line.is_empty() {
+        headline(err).to_string()
+    } else {
+        line
+    }
+}
+
+/// A failed git operation's one line (#858), `noun` naming the operation
+/// ("Merge", "Pop stash"): "Merge: 1 conflict (pricing.py)" when git
+/// stopped on conflicts, which wait on the user to resolve them, otherwise
+/// "Merge failed: " and git's [`error_line`].
+pub fn failure_line(noun: &str, err: &str) -> String {
+    match conflict_summary(err) {
+        Some(conflicts) => format!("{noun}: {conflicts}"),
+        None => format!("{noun} failed: {}", error_line(err)),
     }
 }
 
@@ -2403,7 +2656,7 @@ pub fn discard_path(
 /// and used by `sync` below. Returns git's verbatim summary ("Already
 /// up to date." / the fast-forward range) so the panel can echo it.
 pub fn pull_current_branch(root: &Path) -> Result<String, String> {
-    run_mutation(root, &["pull"])
+    run_mutation_keeping_conflicts(root, &["pull"])
 }
 
 /// A single branch the Checkout/Create picker can offer.
@@ -2508,7 +2761,7 @@ pub fn stash_push(root: &Path) -> Result<String, String> {
 /// Restore and drop the most recent stash (`git stash pop`). A pop
 /// conflict surfaces git's verbatim message so the user can resolve it.
 pub fn stash_pop(root: &Path) -> Result<String, String> {
-    run_mutation(root, &["stash", "pop"])
+    run_mutation_keeping_conflicts(root, &["stash", "pop"])
 }
 
 // --- Fetch / Clone -------------------------------------------------------
@@ -2572,6 +2825,93 @@ pub fn commit_amend_no_edit(root: &Path) -> Result<String, String> {
     run_mutation(root, &["commit", "--amend", "--no-edit"])
 }
 
+/// Undo Last Commit (#1350), as VS Code does it: `git reset --soft HEAD~1`,
+/// so HEAD moves to the parent and the commit's changes stay staged, or
+/// on the root commit `git update-ref -d HEAD`, which leaves the branch
+/// unborn with every file staged. Returns the undone commit's message, for
+/// the message box. Refused while a merge, rebase, cherry-pick or revert
+/// is in progress: moving HEAD under one of those breaks it.
+pub fn undo_last_commit(root: &Path) -> Result<String, String> {
+    if let Some(op) = operation_in_progress(root) {
+        return Err(format!(
+            "a {op} is in progress; finish or abort it before undoing a commit"
+        ));
+    }
+    let message = run_git(root, &["log", "-1", "--format=%B", "HEAD"])
+        .map_err(|_| String::from("there is no commit to undo"))?;
+    if run_git(root, &["rev-parse", "--verify", "-q", "HEAD~1"]).is_ok() {
+        run_mutation(root, &["reset", "--soft", "HEAD~1"])?;
+    } else {
+        // A shallow checkout cuts history at a commit that still has a
+        // parent: deleting the ref there would drop the branch tip.
+        let raw = run_git(root, &["cat-file", "commit", "HEAD"])
+            .map_err(|_| String::from("cannot read the last commit"))?;
+        if raw
+            .lines()
+            .take_while(|l| !l.is_empty())
+            .any(|l| l.starts_with("parent "))
+        {
+            return Err(String::from(
+                "the parent commit is not in this shallow checkout; deepen it before undoing a commit",
+            ));
+        }
+        // On a detached HEAD, `update-ref -d HEAD` deletes `.git/HEAD`
+        // itself and the repository stops being one.
+        if run_git(root, &["symbolic-ref", "-q", "HEAD"]).is_err() {
+            return Err(String::from(
+                "HEAD is detached; check out a branch before undoing its root commit",
+            ));
+        }
+        run_mutation(root, &["update-ref", "-d", "HEAD"])?;
+    }
+    Ok(message)
+}
+
+/// The git operation in progress in `root`'s repository, by the state
+/// file git keeps for it, or `None`.
+fn operation_in_progress(root: &Path) -> Option<&'static str> {
+    const STATES: [(&str, &str); 5] = [
+        ("MERGE_HEAD", "merge"),
+        ("rebase-merge", "rebase"),
+        ("rebase-apply", "rebase"),
+        ("CHERRY_PICK_HEAD", "cherry-pick"),
+        ("REVERT_HEAD", "revert"),
+    ];
+    let mut args = vec!["rev-parse"];
+    for (file, _) in STATES {
+        args.extend(["--git-path", file]);
+    }
+    let paths = run_git(root, &args).ok()?;
+    paths
+        .lines()
+        .zip(STATES)
+        .find(|(path, _)| root.join(path.trim()).exists())
+        .map(|(_, (_, op))| op)
+}
+
+/// Whether HEAD is already on its upstream (`HEAD` is an ancestor of
+/// `@{u}`), so undoing it rewrites published history and needs a force
+/// push later (#1350). No upstream is not pushed; an upstream that is
+/// configured but cannot be checked (its tracking ref missing) counts as
+/// pushed, so the warning errs on the side of showing.
+pub fn head_is_on_upstream(root: &Path) -> bool {
+    let code = Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .arg("-C")
+        .arg(root)
+        .args(["merge-base", "--is-ancestor", "HEAD", "@{u}"])
+        .output()
+        .ok()
+        .and_then(|o| o.status.code());
+    match code {
+        Some(0) => true,
+        Some(1) => false,
+        _ => run_git(root, &["symbolic-ref", "-q", "HEAD"])
+            .and_then(|branch| run_git(root, &["for-each-ref", "--format=%(upstream)", &branch]))
+            .is_ok_and(|upstream| !upstream.is_empty()),
+    }
+}
+
 // --- Bulk staging --------------------------------------------------------
 
 /// Stage every change, tracked and untracked (`git add -A`).
@@ -2596,7 +2936,7 @@ pub fn discard_all_tracked(root: &Path) -> Result<String, String> {
 
 /// Pull with rebase instead of merge (`git pull --rebase`).
 pub fn pull_rebase(root: &Path) -> Result<String, String> {
-    run_mutation(root, &["pull", "--rebase"])
+    run_mutation_keeping_conflicts(root, &["pull", "--rebase"])
 }
 
 /// Force-push the current branch, but only if the remote hasn't advanced
@@ -2688,12 +3028,12 @@ pub fn delete_branch(root: &Path, name: &str) -> Result<String, String> {
 
 /// Merge `branch` into the current branch (`git merge <branch>`).
 pub fn merge_branch(root: &Path, branch: &str) -> Result<String, String> {
-    run_mutation(root, &["merge", branch])
+    run_mutation_keeping_conflicts(root, &["merge", branch])
 }
 
 /// Rebase the current branch onto `branch` (`git rebase <branch>`).
 pub fn rebase_branch(root: &Path, branch: &str) -> Result<String, String> {
-    run_mutation(root, &["rebase", branch])
+    run_mutation_keeping_conflicts(root, &["rebase", branch])
 }
 
 // --- Remotes -------------------------------------------------------------
@@ -2781,12 +3121,12 @@ pub fn list_stashes(root: &Path) -> Result<Vec<StashInfo>, String> {
 
 /// Apply a stash without dropping it (`git stash apply stash@{N}`).
 pub fn stash_apply(root: &Path, index: usize) -> Result<String, String> {
-    run_mutation(root, &["stash", "apply", &format!("stash@{{{index}}}")])
+    run_mutation_keeping_conflicts(root, &["stash", "apply", &format!("stash@{{{index}}}")])
 }
 
 /// Apply and drop a specific stash (`git stash pop stash@{N}`).
 pub fn stash_pop_at(root: &Path, index: usize) -> Result<String, String> {
-    run_mutation(root, &["stash", "pop", &format!("stash@{{{index}}}")])
+    run_mutation_keeping_conflicts(root, &["stash", "pop", &format!("stash@{{{index}}}")])
 }
 
 /// Drop a stash without applying it (`git stash drop stash@{N}`).
@@ -2957,6 +3297,264 @@ pub fn git_worker_loop(
 
 #[cfg(test)]
 mod tests {
+
+    /// #858: the one line reported for git's output. A new branch's ref
+    /// update loses git's `*` flag but keeps its `[new branch]` tag; a
+    /// message with no ref update is its first line past the noise; git's
+    /// text of only noise is empty, and `error_line` then falls back to the
+    /// first line rather than saying nothing.
+    #[test]
+    fn summary_line_picks_the_ref_update_or_the_first_meaningful_line() {
+        assert_eq!(
+            summary_line("To /tmp/r.git\n * [new branch]      main -> main"),
+            "[new branch] main -> main"
+        );
+        assert_eq!(
+            summary_line("Everything up-to-date"),
+            "Everything up-to-date"
+        );
+        assert_eq!(
+            summary_line("On branch main\nYour branch is up to date.\n\nnothing to commit"),
+            "nothing to commit"
+        );
+        assert_eq!(summary_line("remote: a\nremote: b\nhint: c"), "");
+        assert_eq!(error_line("hint: only a hint"), "hint: only a hint");
+    }
+
+    /// Git 2.43's text for a `git merge feature` that stopped on a conflict
+    /// (all of it on stdout).
+    const MERGE_CONFLICT_858: &str = "Auto-merging pricing.py\nCONFLICT (content): Merge conflict in pricing.py\nAutomatic merge failed; fix conflicts and then commit the result.";
+    /// The same merge with three conflicted files.
+    const MERGE_CONFLICTS_858: &str = "Auto-merging a.py\nCONFLICT (content): Merge conflict in a.py\nAuto-merging b.py\nCONFLICT (content): Merge conflict in b.py\nAuto-merging pricing.py\nCONFLICT (content): Merge conflict in pricing.py\nAutomatic merge failed; fix conflicts and then commit the result.";
+    /// `git rebase feature` stopped on a conflict: stdout (the conflict),
+    /// then stderr, whose first line git redrew over its `Rebasing (1/1)`
+    /// progress with a carriage return.
+    const REBASE_CONFLICT_858: &str = "Auto-merging pricing.py\nCONFLICT (content): Merge conflict in pricing.py\nRebasing (1/1)\rerror: could not apply ffb4d23... main: raise free shipping\nhint: Resolve all conflicts manually, mark them as resolved with\nhint: \"git add/rm <conflicted_files>\", then run \"git rebase --continue\".\nhint: You can instead skip this commit: run \"git rebase --skip\".\nhint: To abort and get back to the state before \"git rebase\", run \"git rebase --abort\".\nCould not apply ffb4d23... main: raise free shipping";
+    /// A `git pull` that fetched, then stopped merging on a conflict:
+    /// stdout, then the fetch's ref updates from stderr.
+    const PULL_CONFLICT_858: &str = "Auto-merging pricing.py\nCONFLICT (content): Merge conflict in pricing.py\nAutomatic merge failed; fix conflicts and then commit the result.\nFrom github.com:o/r\n   5a6cd5c..9f1e2d3  main       -> origin/main";
+    /// `git stash pop` onto a conflicting commit.
+    const STASH_POP_CONFLICT_858: &str = "Auto-merging pricing.py\nCONFLICT (content): Merge conflict in pricing.py\nOn branch main\nUnmerged paths:\n  (use \"git restore --staged <file>...\" to unstage)\n  (use \"git add <file>...\" to mark resolution)\n\tboth modified:   pricing.py\n\nno changes added to commit (use \"git add\" and/or \"git commit -a\")\nThe stash entry is kept in case you need it again.";
+
+    /// #858: a merge, rebase, pull or stash pop that stopped on conflicts
+    /// is reported by its conflicts, not by git's first line, which is
+    /// `Auto-merging pricing.py` and reads like a step that went fine.
+    #[test]
+    fn error_line_names_the_conflicts_git_stopped_on() {
+        assert_eq!(error_line(MERGE_CONFLICT_858), "1 conflict (pricing.py)");
+        assert_eq!(
+            error_line(MERGE_CONFLICTS_858),
+            "3 conflicts (a.py, b.py, pricing.py)"
+        );
+        assert_eq!(error_line(REBASE_CONFLICT_858), "1 conflict (pricing.py)");
+        assert_eq!(
+            error_line(PULL_CONFLICT_858),
+            "1 conflict (pricing.py)",
+            "the conflict, not the fetch's ref update"
+        );
+        assert_eq!(
+            error_line(STASH_POP_CONFLICT_858),
+            "1 conflict (pricing.py)"
+        );
+    }
+
+    /// #858: with no conflict to name, git's `error:` or `fatal:` line wins
+    /// over a progress line or a fetched ref update printed before it, and
+    /// a line git redrew with a carriage return reads as its last redraw.
+    #[test]
+    fn error_line_prefers_git_s_error_and_fatal_lines() {
+        let rebase_stderr = "Rebasing (1/1)\rerror: could not apply ffb4d23... main: raise free shipping\nhint: Resolve all conflicts manually, mark them as resolved with\nCould not apply ffb4d23... main: raise free shipping";
+        assert_eq!(
+            error_line(rebase_stderr),
+            "error: could not apply ffb4d23... main: raise free shipping"
+        );
+        let pull = "From github.com:o/r\n * branch            main       -> FETCH_HEAD\nhint: Diverging branches can't be fast-forwarded.\nfatal: Not possible to fast-forward, aborting.";
+        assert_eq!(
+            error_line(pull),
+            "fatal: Not possible to fast-forward, aborting."
+        );
+    }
+
+    /// #858: git's result line, not the `Auto-merging` note printed before
+    /// it or the `Rebasing (1/1)` progress it redrew with a carriage return
+    /// and an erase-line sequence.
+    #[test]
+    fn headline_skips_auto_merging_and_reads_a_redrawn_line_as_shown() {
+        assert_eq!(
+            headline(
+                "Auto-merging pricing.py\nMerge made by the 'ort' strategy.\n pricing.py | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)"
+            ),
+            "Merge made by the 'ort' strategy."
+        );
+        assert_eq!(
+            headline("Rebasing (1/1)\r\u{1b}[KSuccessfully rebased and updated refs/heads/rb."),
+            "Successfully rebased and updated refs/heads/rb."
+        );
+    }
+
+    /// #858 negative: a text of only `Auto-merging` notes still reports
+    /// something, never an empty line.
+    #[test]
+    fn error_line_of_only_auto_merging_notes_is_never_empty() {
+        assert_eq!(
+            error_line("Auto-merging pricing.py"),
+            "Auto-merging pricing.py"
+        );
+        let two = error_line("Auto-merging a.py\nAuto-merging b.py");
+        assert!(!two.is_empty(), "{two:?}");
+        assert!(!headline("Auto-merging pricing.py").is_empty());
+    }
+
+    /// #858 negative: the lines the push and commit reports already picked
+    /// are unchanged: a rejected ref update over git's `error:` line after
+    /// it, the first `fatal:` line, and "nothing to commit" past the
+    /// `On branch` preamble.
+    #[test]
+    fn error_line_keeps_the_push_and_commit_lines_it_already_picked() {
+        let rejected = "To github.com:o/r.git\n ! [rejected]        main -> main (fetch first)\nerror: failed to push some refs to 'github.com:o/r.git'\nhint: Updates were rejected because the remote contains work that you do";
+        assert_eq!(
+            error_line(rejected),
+            "[rejected] main -> main (fetch first)"
+        );
+        let fatal = "fatal: 'origin' does not appear to be a git repository\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights";
+        assert_eq!(
+            error_line(fatal),
+            "fatal: 'origin' does not appear to be a git repository"
+        );
+        assert_eq!(
+            error_line(
+                "On branch main\nYour branch is up to date with 'origin/main'.\n\nnothing to commit, working tree clean"
+            ),
+            "nothing to commit, working tree clean"
+        );
+        assert_eq!(
+            headline("[main 5a6cd5c] fix: one line\n 1 file changed, 1 insertion(+)"),
+            "[main 5a6cd5c] fix: one line"
+        );
+    }
+    /// #858: the conflicts are counted per file and named, three at most;
+    /// a lone conflict git words without a file is git's own line; a text
+    /// with no `CONFLICT` line has no conflict summary.
+    #[test]
+    fn conflict_summary_counts_and_names_the_conflicted_files() {
+        assert_eq!(
+            conflict_summary(MERGE_CONFLICT_858).as_deref(),
+            Some("1 conflict (pricing.py)")
+        );
+        let five = (1..=5)
+            .map(|i| format!("Auto-merging f{i}.py\nCONFLICT (content): Merge conflict in f{i}.py"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            conflict_summary(&five).as_deref(),
+            Some("5 conflicts (f1.py, f2.py, f3.py, \u{2026})")
+        );
+        let twice = "CONFLICT (add/add): Merge conflict in a.py\nCONFLICT (content): Merge conflict in a.py";
+        assert_eq!(
+            conflict_summary(twice).as_deref(),
+            Some("1 conflict (a.py)")
+        );
+        let modify_delete = "CONFLICT (modify/delete): report.py deleted in feature and modified in HEAD.  Version HEAD of report.py left in tree.\nAutomatic merge failed; fix conflicts and then commit the result.";
+        assert_eq!(
+            conflict_summary(modify_delete).as_deref(),
+            Some(
+                "CONFLICT (modify/delete): report.py deleted in feature and modified in HEAD. Version HEAD of report.py left in tree."
+            )
+        );
+        let mixed = format!("{modify_delete}\n{MERGE_CONFLICT_858}");
+        assert_eq!(
+            conflict_summary(&mixed).as_deref(),
+            Some("2 conflicts (pricing.py, \u{2026})")
+        );
+        assert_eq!(conflict_summary("Auto-merging pricing.py"), None);
+        assert_eq!(
+            conflict_summary("error: cannot rebase: You have unstaged changes."),
+            None
+        );
+    }
+
+    /// #858: a failure names the operation ("Merge failed", never the
+    /// "Merged failed" its success prefix made of it); one that stopped on
+    /// conflicts names them after the operation.
+    #[test]
+    fn failure_line_names_the_operation_and_why() {
+        assert_eq!(
+            failure_line("Merge", MERGE_CONFLICT_858),
+            "Merge: 1 conflict (pricing.py)"
+        );
+        assert_eq!(
+            failure_line("Rebase", REBASE_CONFLICT_858),
+            "Rebase: 1 conflict (pricing.py)"
+        );
+        assert_eq!(
+            failure_line(
+                "Rebase",
+                "error: cannot rebase: You have unstaged changes.\nerror: Please commit or stash them."
+            ),
+            "Rebase failed: error: cannot rebase: You have unstaged changes."
+        );
+        assert_eq!(
+            failure_line("Merge", "merge: nosuch - not something we can merge"),
+            "Merge failed: merge: nosuch - not something we can merge"
+        );
+        assert_eq!(
+            failure_line("Merge", "Auto-merging pricing.py"),
+            "Merge failed: Auto-merging pricing.py",
+            "only noise: still says something, and still that the merge failed"
+        );
+    }
+    /// #858: the line a successful pull, fetch, push, stash or switch
+    /// reports, from git's own texts (2.43): its result, past the fetch and
+    /// push chatter, the range, the diffstat and `git status` dumps.
+    #[test]
+    fn result_line_names_what_git_did() {
+        let fast_forward = "Updating 5d25c91..f79a881\nFast-forward\n f.txt | 1 +\n 1 file changed, 1 insertion(+)";
+        assert_eq!(result_line(fast_forward), "Fast-forward");
+        let rebased = "From /tmp/r\n   5d25c91..f79a881  main       -> origin/main\nRebasing (1/2)\rRebasing (2/2)\r\r\u{1b}[KSuccessfully rebased and updated refs/heads/main.";
+        assert_eq!(
+            result_line(rebased),
+            "Successfully rebased and updated refs/heads/main."
+        );
+        assert_eq!(
+            result_line("Auto-merging f.txt\nMerge made by the 'ort' strategy.\n f.txt | 1 +"),
+            "Merge made by the 'ort' strategy."
+        );
+        let popped = "On branch main\nChanges not staged for commit:\n  (use \"git add <file>...\" to update what will be committed)\n\tmodified:   g.txt\n\nno changes added to commit (use \"git add\" and/or \"git commit -a\")\nDropped refs/stash@{0} (4f2e1d0)";
+        assert_eq!(result_line(popped), "Dropped refs/stash@{0} (4f2e1d0)");
+        assert_eq!(
+            result_line("[main 5a6cd5c] fix: a -> b  twice\n 1 file changed"),
+            "[main 5a6cd5c] fix: a -> b  twice",
+            "a commit's subject is kept as written"
+        );
+        let fetched = "From /tmp/r\n   a3fecf9..117b94a  main       -> origin/main";
+        assert_eq!(result_line(fetched), "a3fecf9..117b94a main -> origin/main");
+        let negotiated = "fatal: expected 'acknowledgments', received 'packfile'\nwarning: push negotiation failed; proceeding anyway with push\nTo /tmp/r.git\n + 915bd5e...74d526d main -> main (forced update)";
+        assert_eq!(
+            result_line(negotiated),
+            "915bd5e...74d526d main -> main (forced update)"
+        );
+    }
+
+    /// #858 negative: a one-line result is kept whole, and a text with
+    /// nothing but noise and no ref update is empty, for the caller's own
+    /// word, never a stray `M\tpath` or `Your branch` line.
+    #[test]
+    fn result_line_keeps_a_lone_result_and_is_empty_for_pure_noise() {
+        assert_eq!(result_line("Already up to date."), "Already up to date.");
+        assert_eq!(
+            result_line("Everything up-to-date"),
+            "Everything up-to-date"
+        );
+        assert_eq!(
+            result_line("branch 'newb' set up to track 'origin/newb'."),
+            "branch 'newb' set up to track 'origin/newb'."
+        );
+        assert_eq!(
+            result_line("M\tseed.txt\nYour branch is up to date with 'origin/main'."),
+            ""
+        );
+        assert_eq!(result_line(""), "");
+    }
     use super::*;
     use tempfile::TempDir;
 
@@ -4171,6 +4769,147 @@ mod tests {
             .arg(p)
             .args(["commit", "-m", "init", "--quiet"])
             .status();
+    }
+
+    /// `git -C p <args>`, asserting it succeeded; its stdout, trimmed.
+    fn git_in(p: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(p)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// #1350: Undo Last Commit is `reset --soft HEAD~1`: HEAD goes back to
+    /// the parent, the commit's changes are staged, and its message comes
+    /// back for the box.
+    #[test]
+    fn undo_last_commit_moves_head_back_and_keeps_the_changes_staged() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        let parent = git_in(p, &["rev-parse", "HEAD"]);
+        std::fs::write(p.join("b.txt"), "b\n").unwrap();
+        git_in(p, &["add", "b.txt"]);
+        git_in(p, &["commit", "-q", "-m", "Add b\n\nWith a body."]);
+        assert_eq!(undo_last_commit(p).as_deref(), Ok("Add b\n\nWith a body."));
+        assert_eq!(git_in(p, &["rev-parse", "HEAD"]), parent);
+        assert_eq!(git_in(p, &["diff", "--cached", "--name-only"]), "b.txt");
+        assert_eq!(std::fs::read_to_string(p.join("b.txt")).unwrap(), "b\n");
+    }
+
+    /// #1350: undoing the root commit leaves the branch unborn with every
+    /// file staged, as VS Code does with `update-ref -d HEAD`.
+    #[test]
+    fn undo_last_commit_on_the_root_commit_leaves_an_unborn_branch_staged() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        assert_eq!(undo_last_commit(p).as_deref(), Ok("init"));
+        let head = Command::new("git")
+            .arg("-C")
+            .arg(p)
+            .args(["rev-parse", "--verify", "-q", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(!head.status.success(), "the branch is unborn");
+        assert_eq!(git_in(p, &["symbolic-ref", "--short", "HEAD"]), "main");
+        assert_eq!(git_in(p, &["diff", "--cached", "--name-only"]), "seed.txt");
+    }
+
+    /// #1350 negative: in the middle of a merge, rebase, cherry-pick or
+    /// revert the undo is refused, says why, and leaves HEAD alone.
+    #[test]
+    fn undo_last_commit_refuses_during_a_merge() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        let head = git_in(p, &["rev-parse", "HEAD"]);
+        std::fs::write(p.join(".git/MERGE_HEAD"), format!("{head}\n")).unwrap();
+        let err = undo_last_commit(p).unwrap_err();
+        assert!(err.contains("merge"), "{err}");
+        assert_eq!(git_in(p, &["rev-parse", "HEAD"]), head);
+    }
+
+    /// #1350 negative: a repository with no commit has nothing to undo.
+    #[test]
+    fn undo_last_commit_with_no_commit_says_so() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        git_in(p, &["init", "-q", "-b", "main"]);
+        let err = undo_last_commit(p).unwrap_err();
+        assert!(err.contains("no commit"), "{err}");
+    }
+
+    /// #1350: whether HEAD is already on its upstream, so the app can warn
+    /// that undoing it means a force push later. No upstream is not pushed.
+    #[test]
+    fn head_on_upstream_follows_the_tracking_branch() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        assert!(!head_is_on_upstream(p), "no upstream yet");
+        let remote = TempDir::new().unwrap();
+        git_in(remote.path(), &["init", "-q", "--bare"]);
+        git_in(
+            p,
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        );
+        git_in(p, &["push", "-q", "-u", "origin", "main"]);
+        assert!(head_is_on_upstream(p), "pushed");
+        std::fs::write(p.join("c.txt"), "c\n").unwrap();
+        git_in(p, &["add", "c.txt"]);
+        git_in(p, &["commit", "-q", "-m", "local only"]);
+        assert!(!head_is_on_upstream(p), "a local commit is not pushed");
+        git_in(p, &["update-ref", "-d", "refs/remotes/origin/main"]);
+        assert!(
+            head_is_on_upstream(p),
+            "an upstream whose tracking ref is missing cannot be ruled out"
+        );
+    }
+
+    /// #1350 negative: in a shallow checkout HEAD~1 is missing but the
+    /// commit has a parent; deleting the ref would drop the branch tip.
+    #[test]
+    fn undo_last_commit_refuses_at_a_shallow_boundary() {
+        let src = TempDir::new().unwrap();
+        init_repo_with_commit(src.path());
+        std::fs::write(src.path().join("b.txt"), "b\n").unwrap();
+        git_in(src.path(), &["add", "b.txt"]);
+        git_in(src.path(), &["commit", "-q", "-m", "Add b"]);
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("shallow");
+        let url = format!("file://{}", src.path().display());
+        git_in(
+            tmp.path(),
+            &["clone", "-q", "--depth=1", &url, p.to_str().unwrap()],
+        );
+        let head = git_in(&p, &["rev-parse", "HEAD"]);
+        let err = undo_last_commit(&p).unwrap_err();
+        assert!(err.contains("shallow"), "{err}");
+        assert_eq!(git_in(&p, &["rev-parse", "HEAD"]), head);
+    }
+
+    /// #1350 negative: a detached HEAD on a root commit is refused, since
+    /// `update-ref -d HEAD` would delete `.git/HEAD` itself.
+    #[test]
+    fn undo_last_commit_refuses_a_detached_root_commit() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        git_in(p, &["checkout", "-q", "--detach"]);
+        let head = git_in(p, &["rev-parse", "HEAD"]);
+        let err = undo_last_commit(p).unwrap_err();
+        assert!(err.contains("detached"), "{err}");
+        assert!(p.join(".git/HEAD").exists());
+        assert_eq!(git_in(p, &["rev-parse", "HEAD"]), head);
     }
 
     #[test]

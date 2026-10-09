@@ -1,0 +1,1 @@
+fix: The completion list keeps up as you type when the language server sent only part of it (clangd caps lists at 100): croft asks the server again instead of closing the list, so `strr` now finds `strrchr`.
