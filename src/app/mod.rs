@@ -53127,6 +53127,9 @@ impl App {
             return;
         };
         self.editor.active_search_match = Some((m.row, m.col_chars, m.len_chars));
+        // The match is the reader's place now; a reload still settling its
+        // own place must not scroll it away on the next index batch.
+        self.editor.cancel_log_reload();
         // The log body starts one row below the header.
         let rows = (self.editor.last_inner.height as usize).saturating_sub(1);
         if rows == 0 {

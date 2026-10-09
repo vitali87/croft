@@ -49608,6 +49608,63 @@ fn the_loop_brings_a_reloaded_large_log_to_its_new_end() {
     );
 }
 
+/// #1538: a find-bar jump while a reloaded large log is still indexing is
+/// the reader's place; the next index batch does not snap the view back to
+/// the place the reload was settling.
+#[test]
+fn a_log_search_jump_during_a_reload_index_is_not_undone() {
+    use ratatui::widgets::Widget as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("huge.log");
+    let mut body = Vec::new();
+    body.extend_from_slice(b"\x1b[32mINFO\x1b[0m head\n");
+    let mut lines = 1usize;
+    while (body.len() as u64) < crate::log_view::HEAD_INDEX_BYTES + 1024 * 1024 {
+        body.extend_from_slice(format!("line{lines} some padding text\n").as_bytes());
+        lines += 1;
+    }
+    std::fs::write(&p, &body).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    let area = Rect::new(0, 0, 80, 12);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    (&mut *app.editor).render(area, &mut buf);
+    app.editor.log.as_mut().unwrap().finish_index();
+    app.editor.scroll_down(5);
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        writeln!(f, "\x1b[31mERROR\x1b[0m disk full").unwrap();
+    }
+    app.editor.reload_or_flag_conflict();
+    assert!(app.editor.log.as_ref().unwrap().indexing());
+
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    for ch in "line400 ".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor.active_search_match.map(|(row, ..)| row),
+        Some(400),
+        "the search lands on its match"
+    );
+    let scroll = app.editor.scroll;
+    assert!(scroll > 5 && scroll <= 400, "and the view moved to it");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the background log index",
+        || {
+            app.poll_log_index();
+            !app.editor.log.as_ref().unwrap().indexing()
+        },
+    );
+    assert_eq!(app.editor.scroll, scroll, "the index did not move the view");
+}
+
 /// #374: Fix with Navigator from PROBLEMS. With no navigator seated the
 /// action lands on the diagnostic and says the navigator is not active
 /// rather than doing nothing; the caret-side entry points resolve the

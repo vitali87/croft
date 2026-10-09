@@ -9551,11 +9551,19 @@ impl Editor {
         // it, across a rewrite of its log (#577).
         let old_sarif = self.sarif.take();
         // A rendered log keeps its place too, and one viewed at its end
-        // follows it, since a log grows while it is read (#1538).
+        // follows it, since a log grows while it is read (#1538). A place
+        // an earlier reload is still settling is the one to keep: the scroll
+        // was clamped to that reload's partial index, so it says nothing
+        // about where the reader is, and it would drop the end marker.
+        let pending_top = self.log_reload_top;
         let log_place = self.log.as_ref().map(|log| {
             let rows = (self.last_inner.height as usize).saturating_sub(1).max(1);
             let at_end = !log.indexing() && prev_scroll + rows >= log.len();
-            let top = if at_end { usize::MAX } else { prev_scroll };
+            let top = match pending_top {
+                Some(top) => top,
+                None if at_end => usize::MAX,
+                None => prev_scroll,
+            };
             (top, log.highlight(), log.selection, log.last_body)
         });
         // `open` starts a text tab's history afresh. A reload keeps it
@@ -12369,6 +12377,13 @@ impl Editor {
         if self.log.as_ref().is_some_and(|log| log.indexing()) {
             self.log_reload_top = Some(top);
         }
+    }
+
+    /// Drop the place a log reload is still settling (#1538): the reader
+    /// moved the view some other way, such as a find-bar jump, and the next
+    /// index batch must not take it back.
+    pub fn cancel_log_reload(&mut self) {
+        self.log_reload_top = None;
     }
 
     fn scroll_view_to(&mut self, top: usize) {
@@ -20806,6 +20821,32 @@ mod tests {
         e.log.as_mut().unwrap().finish_index();
         e.settle_log_reload();
         assert_eq!(e.scroll, 10, "the reader's own scroll wins");
+    }
+
+    /// #1538: a second change to a large log while the first reload is still
+    /// indexing keeps following the end, rather than pinning the view to the
+    /// scroll the first reload's partial index clamped it to.
+    #[test]
+    fn a_second_reload_during_indexing_keeps_following_the_end() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lines = (crate::log_view::HEAD_INDEX_BYTES as usize) / 9 + 50_000;
+        let (mut e, p, _) = open_rendered_log(tmp.path(), lines);
+        e.log.as_mut().unwrap().finish_index();
+        e.scroll_down(usize::MAX / 2);
+        let rows = log_body_rows(&e);
+        append_log_lines(&p, lines + 1, lines + 3);
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert!(e.log.as_ref().unwrap().indexing());
+        append_log_lines(&p, lines + 4, lines + 6);
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert!(e.log.as_ref().unwrap().indexing());
+        e.log.as_mut().unwrap().finish_index();
+        e.settle_log_reload();
+        assert_eq!(
+            e.scroll + rows,
+            lines + 7,
+            "the view lands on the newest end"
+        );
     }
 
     /// Negative: a log truncated under the view (rotation, `> app.log`)
