@@ -13475,13 +13475,6 @@ fn every_cmd_chord_is_ctrl_off_macos_unless_linux_md_lists_it() {
             how: NoCtrl::Refused,
         },
         Row {
-            doc: "`Cmd`+`Z` jump to a directory with zoxide, in the Explorer",
-            pred: "is_tree_zoxide_jump_key",
-            code: &[KeyCode::Char('z')],
-            mods: any,
-            how: NoCtrl::Refused,
-        },
-        Row {
             doc: "`Cmd`+`Enter` run the Markdown code block under the caret",
             pred: "is_run_fence_key",
             code: &[KeyCode::Enter],
@@ -13674,19 +13667,17 @@ fn the_palette_opens_the_zoxide_jump_from_any_pane() {
     assert!(app.zoxide_jump.is_some());
 }
 
-/// Guard (#843): `Ctrl`+`Z` in the Explorer still opens nothing (LINUX.md
-/// lists the zoxide jump as having no `Ctrl` form), while Cmd+Z does.
+/// #1294: `Ctrl`+`Z` in the Explorer opens the zoxide jump, as Cmd+Z does,
+/// so a terminal that never sends Super reaches it.
 #[test]
-fn ctrl_z_in_the_explorer_does_not_open_the_zoxide_jump() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.focus_pane(Pane::Tree);
-    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL))
-        .unwrap();
-    assert!(app.zoxide_jump.is_none());
-    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::SUPER))
-        .unwrap();
-    assert!(app.zoxide_jump.is_some(), "Cmd+Z still opens it");
+fn ctrl_z_in_the_explorer_opens_the_zoxide_jump_like_cmd_z() {
+    for mods in [KeyModifiers::CONTROL, KeyModifiers::SUPER] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.focus_pane(Pane::Tree);
+        app.handle_key(key(KeyCode::Char('z'), mods)).unwrap();
+        assert!(app.zoxide_jump.is_some(), "{mods:?}+Z opens it");
+    }
 }
 
 /// Guard (#843): "Go to Implementations" with no file open sends nothing,
@@ -18069,6 +18060,34 @@ fn a_pasted_multi_line_message_commits_with_its_body() {
     assert_eq!(
         last_commit_message(tmp.path()),
         "Fix rounding\n\nTotals were floats\nFixes #42\n\n"
+    );
+}
+
+/// #1334: in the Source Control box Home/End work on the caret's line and
+/// Ctrl+Home/Ctrl+End on the whole message.
+#[test]
+fn scm_home_end_follow_the_carets_line_and_ctrl_takes_the_whole_message() {
+    let (_tmp, mut app) = scm_ready_to_commit();
+    app.handle_paste("Add rounding\n\nRounds to cents.\nFixes 42");
+    let press = |app: &mut App, code: KeyCode, mods: KeyModifiers| {
+        app.handle_source_control_key(key(code, mods));
+    };
+    press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Home, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
+    press(&mut app, KeyCode::End, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+    assert_eq!(
+        app.source_control.message,
+        "Add rounding\n\n[Rounds to cents.]\nFixes 42"
+    );
+    press(&mut app, KeyCode::Home, KeyModifiers::CONTROL);
+    press(&mut app, KeyCode::Char('>'), KeyModifiers::NONE);
+    press(&mut app, KeyCode::End, KeyModifiers::CONTROL);
+    press(&mut app, KeyCode::Char('.'), KeyModifiers::NONE);
+    assert_eq!(
+        app.source_control.message,
+        ">Add rounding\n\n[Rounds to cents.]\nFixes 42."
     );
 }
 
@@ -27312,11 +27331,12 @@ fn relative_clipboard_text_is_relative_inside_root_and_absolute_outside() {
 }
 
 #[test]
-fn zoxide_jump_key_is_cmd_z_only_and_never_ctrl_z_or_redo() {
-    // Cmd+Z (SUPER) opens the Explorer jump popup. Ctrl+Z must NOT — it
-    // is the shell suspend in the terminal, and the editor's undo lives on
-    // Ctrl/Cmd+Z in its own (editor-focused) path. Cmd+Shift+Z is the
-    // reserved redo chord. Cmd+J stays free for terminal manipulation.
+fn zoxide_jump_key_is_cmd_or_ctrl_z_and_never_redo() {
+    // Cmd+Z and Ctrl+Z open the Explorer jump popup (#1294): most Linux
+    // terminals never deliver Super, and this predicate runs only while the
+    // Explorer is focused, where Ctrl+Z is no shell suspend or editor undo.
+    // Cmd+Shift+Z is the reserved redo chord. Cmd+J stays free for terminal
+    // manipulation.
     assert!(is_tree_zoxide_jump_key(key(
         KeyCode::Char('z'),
         KeyModifiers::SUPER
@@ -27326,20 +27346,86 @@ fn zoxide_jump_key_is_cmd_z_only_and_never_ctrl_z_or_redo() {
         "letter match must be case-insensitive"
     );
     assert!(
-        !is_tree_zoxide_jump_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL)),
-        "Ctrl+Z must not open the popup; it is shell suspend / editor undo"
+        is_tree_zoxide_jump_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL)),
+        "Ctrl+Z is the jump on terminals that never send Super"
     );
-    assert!(
-        !is_tree_zoxide_jump_key(key(
-            KeyCode::Char('z'),
-            KeyModifiers::SUPER | KeyModifiers::SHIFT
-        )),
-        "Cmd+Shift+Z is reserved for redo and must not open the popup"
-    );
+    for (mods, why) in [
+        (
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+            "Cmd+Shift+Z is redo",
+        ),
+        (
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            "Ctrl+Shift+Z is redo",
+        ),
+        (KeyModifiers::ALT, "Alt+Z is not the jump"),
+        (
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            "Ctrl+Alt+Z is not the jump",
+        ),
+        (KeyModifiers::NONE, "a bare z is type-to-find"),
+    ] {
+        assert!(
+            !is_tree_zoxide_jump_key(key(KeyCode::Char('z'), mods)),
+            "{why}"
+        );
+    }
     assert!(
         !is_tree_zoxide_jump_key(key(KeyCode::Char('j'), KeyModifiers::SUPER)),
         "Cmd+J must stay free for terminal manipulation"
     );
+}
+
+/// On a terminal that never sends Super, Ctrl+Z with the Explorer focused
+/// opens the jump through the real key path (#1294).
+#[test]
+fn ctrl_z_in_the_explorer_opens_the_zoxide_jump() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Tree;
+    app.sidebar_view = SidebarView::Explorer;
+    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.zoxide_jump.is_some(), "status: {}", app.status);
+}
+
+/// Negative: with the editor focused, Ctrl+Z is still undo and never the
+/// jump.
+#[test]
+fn ctrl_z_in_the_editor_still_undoes_and_opens_no_jump() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.txt");
+    std::fs::write(&file, "one\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_at(&file, 0, 0).unwrap();
+    app.focus = Pane::Editor;
+    app.editor.cursor_col = 3;
+    app.editor.insert_char('!');
+    assert_eq!(app.editor.lines[0], "one!");
+    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.zoxide_jump.is_none());
+    assert_eq!(app.editor.lines[0], "one", "Ctrl+Z undid the edit");
+}
+
+/// The jump is reachable from the palette with any pane focused, so a
+/// terminal without Super still has a way in (#1294).
+#[test]
+fn the_palette_has_a_zoxide_jump_command_that_works_from_any_pane() {
+    use crate::widgets::command_palette::ALL_COMMANDS;
+    let cmd = ALL_COMMANDS
+        .iter()
+        .copied()
+        .find(|c| c.title().to_lowercase().contains("zoxide"))
+        .expect("a palette command for the zoxide jump");
+    assert_eq!(cmd.title(), "Explorer: Jump to Directory (zoxide)");
+    for pane in [Pane::Editor, Pane::Terminal, Pane::Tree] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.focus = pane;
+        app.run_command(cmd);
+        assert!(app.zoxide_jump.is_some(), "{}", app.status);
+    }
 }
 
 #[test]
@@ -28547,15 +28633,168 @@ fn seeding_search_replaces_stale_include_and_exclude_filters() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.search.include = String::from("*.md");
     app.search.exclude = String::from("vendor");
-    assert!(app.seed_search_from_command("rg TODO"));
+    assert!(seed_at_root(&mut app, "rg TODO"));
     assert_eq!(
         app.search.include, "",
         "a bare rg scanned everything; a stale include must not filter the seeded search"
     );
     assert_eq!(app.search.exclude, "");
-    assert!(app.seed_search_from_command("rg -g '*.rs' -g '!target' TODO"));
+    assert!(seed_at_root(&mut app, "rg -g '*.rs' -g '!target' TODO"));
     assert_eq!(app.search.include, "*.rs");
     assert_eq!(app.search.exclude, "target");
+}
+
+/// Seed Search as if the terminal ran `input` at the workspace root.
+fn seed_at_root(app: &mut App, input: &str) -> bool {
+    let root = app.workspace_root().to_path_buf();
+    app.seed_search_from_command_in(input, &root)
+}
+
+/// Negative: with no terminal whose directory croft can read, a search is
+/// refused rather than guessed to have run at the workspace root, which
+/// would widen `rg color` run from src/ to every file (#1201).
+#[test]
+fn a_search_with_no_known_terminal_directory_is_not_seeded() {
+    let (_tmp, mut app) = grep_scope_app();
+    // No pane to read a directory from: the app's own shell would answer
+    // with the workspace root.
+    app.active_terminal = app.terminals.len();
+    app.search.query = String::from("untouched");
+    assert!(app.seed_search_from_command("rg color"), "still a search");
+    assert_eq!(app.search.query, "untouched");
+    assert!(app.status.contains("Search not seeded"), "{}", app.status);
+    assert!(!app.seed_search_from_command("ls -la"), "not a search");
+}
+
+/// The workspace of #1201: one `color` in src/, one in docs/ and one in a
+/// vendored file that must never be rewritten.
+fn grep_scope_app() -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    for (rel, body) in [
+        ("src/style.py", "color = \"red\"\n"),
+        ("docs/guide.md", "Set the color in style.py.\n"),
+        (
+            "vendor/lib.py",
+            "color = \"keep\"  # third-party, do not touch\n",
+        ),
+    ] {
+        let f = tmp.path().join(rel);
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, body).unwrap();
+    }
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    (tmp, app)
+}
+
+/// The files of [`grep_scope_app`] the seeded Search (and so Replace All)
+/// would cover.
+fn seeded_scope(app: &App, root: &std::path::Path) -> Vec<&'static str> {
+    let filter = crate::widgets::search::PathFilter::new(&app.search.include, &app.search.exclude);
+    ["docs/guide.md", "src/style.py", "vendor/lib.py"]
+        .into_iter()
+        .filter(|rel| filter.allows(root, &root.join(rel)))
+        .collect()
+}
+
+/// `rg -n color src/` searched one directory; the seeded Search must too,
+/// or Replace All rewrites docs/ and the vendored file (#1201).
+#[test]
+fn seeded_search_covers_only_the_paths_the_grep_searched() {
+    let (tmp, mut app) = grep_scope_app();
+    let root = tmp.path();
+    assert!(seed_at_root(&mut app, "rg -n color src/"));
+    assert_eq!(app.search.query, "color");
+    assert_eq!(
+        seeded_scope(&app, root),
+        ["src/style.py"],
+        "include: {:?}",
+        app.search.include
+    );
+    assert!(seed_at_root(&mut app, "grep -rn color src/style.py docs"));
+    assert_eq!(seeded_scope(&app, root), ["docs/guide.md", "src/style.py"]);
+}
+
+/// `rg -t py` searched Python files only, so the markdown guide stays out.
+#[test]
+fn seeded_search_keeps_the_rg_type_filter() {
+    let (tmp, mut app) = grep_scope_app();
+    let root = tmp.path();
+    assert!(seed_at_root(&mut app, "rg -t py color"));
+    assert_eq!(
+        seeded_scope(&app, root),
+        ["src/style.py", "vendor/lib.py"],
+        "include: {:?}",
+        app.search.include
+    );
+    assert!(seed_at_root(&mut app, "rg --type-not py color"));
+    assert_eq!(seeded_scope(&app, root), ["docs/guide.md"]);
+    assert!(seed_at_root(&mut app, "rg -t py color src"));
+    assert_eq!(seeded_scope(&app, root), ["src/style.py"]);
+}
+
+/// After `cd src`, a bare `rg color` searched src/ only.
+#[test]
+fn seeded_search_runs_from_the_panes_directory() {
+    let (tmp, mut app) = grep_scope_app();
+    let root = tmp.path();
+    assert!(app.seed_search_from_command_in("rg color", &root.join("src")));
+    assert_eq!(seeded_scope(&app, root), ["src/style.py"]);
+    assert!(app.seed_search_from_command_in("rg color ../vendor", &root.join("src")));
+    assert_eq!(seeded_scope(&app, root), ["vendor/lib.py"]);
+}
+
+/// A scope croft can't reproduce is refused with the reason, leaving the
+/// panel untouched, instead of seeding a wider search: an inverted match
+/// (`-v` lists the lines that don't match), an unknown rg type, a path
+/// outside the workspace or one that doesn't exist.
+#[test]
+fn a_grep_whose_scope_cant_be_reproduced_refuses_to_seed() {
+    let (tmp, mut app) = grep_scope_app();
+    let root = tmp.path();
+    for cmd in [
+        "rg -v color src/",
+        "grep -rL color .",
+        "rg -t nosuchtype color",
+        "rg color ../",
+        "rg color missing/",
+    ] {
+        app.status.clear();
+        assert!(
+            app.seed_search_from_command_in(cmd, root),
+            "{cmd} is a search"
+        );
+        assert!(
+            app.status.starts_with("Search not seeded: "),
+            "{cmd}: status {:?}",
+            app.status
+        );
+        assert_eq!(app.search.query, "", "{cmd} must not seed the panel");
+    }
+}
+
+/// Negative: a search that covered the whole workspace still seeds the
+/// whole workspace, and an rg `-L` (follow symlinks) is not an inversion.
+#[test]
+fn a_grep_over_the_whole_workspace_still_seeds_every_file() {
+    let (tmp, mut app) = grep_scope_app();
+    let root = tmp.path();
+    for cmd in [
+        "rg color",
+        "grep -rn color .",
+        "rg -L color",
+        "git grep color -- .",
+    ] {
+        assert!(app.seed_search_from_command_in(cmd, root));
+        assert_eq!(app.search.query, "color", "{cmd}");
+        assert_eq!(
+            seeded_scope(&app, root),
+            ["docs/guide.md", "src/style.py", "vendor/lib.py"],
+            "{cmd}: include {:?}",
+            app.search.include
+        );
+    }
+    assert!(app.seed_search_from_command_in("rg -g '*.md' color", root));
+    assert_eq!(app.search.include, "*.md");
 }
 
 /// A byte-range selection made in the Include field before the seed must not
@@ -28569,7 +28808,7 @@ fn seeding_search_cannot_leave_a_stale_field_selection() {
     app.search.include = String::from("**/*.rs,**/*.toml");
     app.search.focus_field(SearchField::Include);
     app.search.select_all_active();
-    assert!(app.seed_search_from_command("rg -g '*.md' TODO"));
+    assert!(seed_at_root(&mut app, "rg -g '*.md' TODO"));
     assert_eq!(
         app.search.field,
         SearchField::Query,
@@ -77650,6 +77889,81 @@ fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
     assert_eq!(app.status, "Tab is already kept open");
 }
 
+/// #989: an App on the issue's repro, a merge stopped on a conflict.
+fn app_in_a_conflicted_merge() -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = r#"set -e
+git init -q -b main && git config user.email a@b && git config user.name a
+printf '# Orders\n\nRun `python pricing.py`.\n' > README.md && git add . && git commit -qm init
+git checkout -qb hotfix && sed 's/python pricing.py/python -m pricing/' README.md > README.tmp && mv README.tmp README.md && git commit -qam fix
+git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' README.md > README.tmp && mv README.tmp README.md && git commit -qam uv
+! git merge -q hotfix >/dev/null 2>&1"#;
+    let out = std::process::Command::new("sh")
+        .args(["-c", script])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.source_control.message = String::from("Merge hotfix");
+    (app, tmp)
+}
+
+fn committed_readme(root: &std::path::Path) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["show", "HEAD:README.md"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn commit_refuses_while_merge_conflicts_are_unresolved() {
+    let (mut app, tmp) = app_in_a_conflicted_merge();
+    app.commit_source_control();
+    wait_for_git_net(&mut app);
+    assert!(
+        !committed_readme(tmp.path()).contains("<<<<<<<"),
+        "the conflict markers were committed"
+    );
+    let feedback = app
+        .source_control
+        .commit_feedback
+        .clone()
+        .unwrap_or_default();
+    assert!(feedback.contains("Resolve 1 merge conflict"), "{feedback}");
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.source_control.message, "Merge hotfix",
+        "the message is kept"
+    );
+}
+
+#[test]
+fn commit_all_refuses_while_merge_conflicts_are_unresolved() {
+    // Commit All stages everything first, and `git add -A` marks a conflict
+    // resolved with its markers in it.
+    let (mut app, tmp) = app_in_a_conflicted_merge();
+    app.commit_all_source_control();
+    assert!(!committed_readme(tmp.path()).contains("<<<<<<<"));
+    assert_eq!(
+        crate::git::unmerged_paths(tmp.path()),
+        vec![String::from("README.md")],
+        "nothing was staged"
+    );
+    assert!(
+        app.status.contains("Resolve 1 merge conflict"),
+        "{}",
+        app.status
+    );
+}
+
 /// #910: `tax.py` open with an unsaved function, rewritten on disk behind
 /// it (a `git checkout`, a restore, an agent), and the sweep that notices.
 fn app_with_a_disk_conflict(tmp: &std::path::Path) -> (App, std::path::PathBuf) {
@@ -78023,6 +78337,270 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     let _ = render_buf(&mut app);
     assert!(app.source_control.nested_repos.is_empty());
     assert!(app.source_control.last_init_repo_button_area.width > 0);
+}
+
+/// An App over `tmp` whose user config lives in `cfg`, never the real one.
+fn settings_editor_app(cfg: &std::path::Path, tmp: &std::path::Path) -> App {
+    let mut app = App::new(tmp.to_path_buf()).unwrap();
+    app.config_dir = cfg.to_path_buf();
+    app.run_command(crate::widgets::command_palette::Command::OpenSettingsEditor);
+    assert!(app.settings_editor.is_some(), "the editor opens");
+    app
+}
+
+fn type_query(app: &mut App, q: &str) {
+    for c in q.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+#[test]
+fn the_settings_editor_flips_a_setting_into_the_user_layer_and_applies_it() {
+    // #612: search a setting, Enter edits it in place, the file and the live
+    // session both change, and the row names the layer that set it.
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        cfg.path().join("config.json"),
+        "{\n  \"auto_save\": false\n}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/config.json"),
+        "{ \"copy_on_select\": true }",
+    )
+    .unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    let copy = app
+        .settings_editor
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .find(|r| r.key == "copy_on_select")
+        .cloned()
+        .unwrap();
+    assert_eq!(copy.layer, crate::config_layers::LayerKind::Workspace);
+    type_query(&mut app, "auto save");
+    let row = app
+        .settings_editor
+        .as_ref()
+        .unwrap()
+        .selected_row()
+        .cloned()
+        .unwrap();
+    assert_eq!(row.key, "auto_save");
+    assert_eq!(row.value, serde_json::json!(false));
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cfg.path().join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(written["auto_save"], serde_json::json!(true));
+    assert!(app.auto_save, "applied to the live session");
+    let row = app
+        .settings_editor
+        .as_ref()
+        .unwrap()
+        .selected_row()
+        .cloned()
+        .unwrap();
+    assert_eq!(row.value, serde_json::json!(true));
+    assert_eq!(row.layer, crate::config_layers::LayerKind::User);
+}
+
+#[test]
+fn the_settings_editor_writes_the_workspace_layer_only_for_allowed_keys() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.settings_editor.as_ref().unwrap().target,
+        crate::config_layers::LayerKind::Workspace
+    );
+    type_query(&mut app, "format on save");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let ws: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".croft/config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ws["format_on_save"], serde_json::json!(true));
+    assert!(
+        !cfg.path().join("config.json").exists(),
+        "the user layer is untouched"
+    );
+    // A key only the user may set is refused for the workspace.
+    for _ in 0.."format on save".len() {
+        app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+            .unwrap();
+    }
+    type_query(&mut app, "sidebar auto hide");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.status.contains("user"), "{}", app.status);
+    let ws = std::fs::read_to_string(tmp.path().join(".croft/config.json")).unwrap();
+    assert!(!ws.contains("sidebar_auto_hide"), "{ws}");
+}
+
+#[test]
+fn the_settings_editor_asks_for_a_number_and_refuses_one_that_is_not() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "terminal scrollback");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(matches!(
+        app.input_prompt.as_ref().map(|p| &p.purpose),
+        Some(crate::widgets::input_prompt::InputPurpose::SettingValue { key }) if key == "terminal_scrollback"
+    ));
+    app.close_input_prompt();
+    app.submit_setting_value("terminal_scrollback", "lots");
+    assert!(app.status.contains("number"), "{}", app.status);
+    assert!(!cfg.path().join("config.json").exists());
+    app.submit_setting_value("terminal_scrollback", " 5000 ");
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cfg.path().join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(written["terminal_scrollback"], serde_json::json!(5000));
+}
+
+#[test]
+fn the_settings_editor_draws_its_value_prompt_on_top() {
+    // The prompt Enter opens for a number sits over the editor. Drawn under
+    // it, the user typed blind.
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "terminal scrollback");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.input_prompt.is_some(), "Enter asks for the number");
+    type_query(&mut app, "424242");
+    let backend = ratatui::backend::TestBackend::new(120, 36);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let screen: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(screen.contains("424242"), "the typed value is visible");
+}
+
+// ---- An empty Go to Definition / Declaration / Type Definition reply (#1302) ----
+
+/// `m.py` open with the caret on `undefined_name`, as in the issue.
+fn jump_app(dir: &std::path::Path) -> App {
+    std::fs::write(
+        dir.join("m.py"),
+        "total = 42\nprint(total + undefined_name)\n",
+    )
+    .unwrap();
+    let mut app = App::new(dir.to_path_buf()).unwrap();
+    app.editor.open_pinned(&dir.join("m.py")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 16;
+    app.status = String::from("Jumped to m.py line 2");
+    app
+}
+
+#[test]
+fn an_empty_jump_reply_says_nothing_was_found_and_clears_the_request() {
+    use crate::lsp::manager::{DeclarationResult, DefinitionResult, TypeDefinitionResult};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = jump_app(tmp.path());
+    let path = app.editor.path.clone().unwrap();
+
+    app.request_definition_at_cursor();
+    let id = app.definition_request_id.expect("F12 sent a request");
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_definition_for_test(DefinitionResult {
+            request_id: id,
+            path: path.clone(),
+            target: None,
+        });
+    let redrew = app.drain_lsp_definition();
+    assert_eq!(app.status, "No definition found");
+    assert!(redrew, "the empty reply redraws");
+    assert_eq!(app.definition_request_id, None);
+
+    app.request_declaration_at_cursor();
+    let id = app.declaration_request_id.expect("a declaration request");
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_declaration_for_test(DeclarationResult {
+            request_id: id,
+            path: path.clone(),
+            target: None,
+            unsupported: false,
+        });
+    assert!(app.drain_lsp_declaration());
+    assert_eq!(app.status, "No declaration found");
+    assert_eq!(app.declaration_request_id, None);
+
+    app.request_type_definition_at_cursor();
+    let id = app
+        .type_definition_request_id
+        .expect("a type definition request");
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_type_definition_for_test(TypeDefinitionResult {
+            request_id: id,
+            path,
+            target: None,
+            unsupported: false,
+        });
+    assert!(app.drain_lsp_type_definition());
+    assert_eq!(app.status, "No type definition found");
+    assert_eq!(app.type_definition_request_id, None);
+}
+
+#[test]
+fn a_stale_jump_reply_changes_nothing_and_a_found_target_still_jumps() {
+    // Negative: only the outstanding request's reply speaks, and a reply
+    // with a target jumps as before instead of reporting "not found".
+    use crate::lsp::manager::DefinitionResult;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = jump_app(tmp.path());
+    let path = app.editor.path.clone().unwrap();
+    app.request_definition_at_cursor();
+    let id = app.definition_request_id.expect("F12 sent a request");
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_definition_for_test(DefinitionResult {
+            request_id: id + 1000,
+            path: path.clone(),
+            target: None,
+        });
+    assert!(!app.drain_lsp_definition(), "a stale reply is dropped");
+    assert_eq!(app.status, "Jumped to m.py line 2");
+    assert_eq!(app.definition_request_id, Some(id), "still waiting");
+
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_definition_for_test(DefinitionResult {
+            request_id: id,
+            path: path.clone(),
+            target: Some((path, 0, 0)),
+        });
+    assert!(app.drain_lsp_definition());
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
+    assert_ne!(app.status, "No definition found");
 }
 
 // ── #1483: one snippet croft cannot read no longer empties the whole set ──

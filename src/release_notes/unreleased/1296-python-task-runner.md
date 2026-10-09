@@ -1,0 +1,1 @@
+fix: Tasks: Run Task picks the Python runner the project uses (uv.lock → uv, Poetry → poetry run, PDM → pdm run, then the project venv, then uv only when installed) and lists `[tool.poetry.scripts]` and `[tool.pdm.scripts]`, so a Poetry project's pytest task no longer fails with "No `project` table found".
