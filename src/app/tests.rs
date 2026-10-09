@@ -79103,3 +79103,59 @@ fn closed_tab_histories_are_capped_oldest_first() {
     assert!(undoes(&files[1]));
     assert!(undoes(&files[30]));
 }
+
+/// #1488: a watcher that clears the screen (`tsc --watch`, `cargo watch -c`)
+/// erases its own output mark, so its finish reports no output. That finish
+/// never reached the build scan, the one-shot skip meant for it stayed set,
+/// and it swallowed the NEXT command's scan instead: PROBLEMS kept the
+/// watcher's stale cycle and dropped the new build's errors.
+#[test]
+fn a_build_after_a_screen_clearing_watcher_reaches_problems() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let pane = app.run_project_task(long_task("tsc --watch")).unwrap();
+    let cwd = tmp.path().to_path_buf();
+    let stale = "main.ts(1,7): error TS2322: Type 'string' is not assignable to type 'number'.\n";
+    let fresh = "main.ts(2,7): error TS2322: Type 'number' is not assignable to type 'string'.\n";
+    // The watcher's last cycle, published mid-run.
+    assert!(app.apply_build_scan(pane, Some(&cwd), "tsc --watch", stale));
+    app.watch_published_panes.insert(pane);
+    // Ctrl+C: the watcher's own finish, its output erased by the clears.
+    finish_pane_command(&mut app, pane, Some(130), 5_000);
+    // The next build in the same pane.
+    assert!(
+        app.apply_build_scan(pane, Some(&cwd), "tsc", fresh),
+        "the build after the watcher is scanned"
+    );
+    let groups = app.problems.groups().to_vec();
+    assert_eq!(groups.len(), 1, "{groups:?}");
+    let lines: Vec<u32> = groups[0].items.iter().map(|d| d.line).collect();
+    assert_eq!(
+        lines,
+        vec![1],
+        "the build's line 2 error (0-based 1), not the watcher's line 1"
+    );
+}
+
+/// #1488 negative: a command that prints nothing (`clear`, `cd`) leaves the
+/// pane's problems as they were; only a scan of real output replaces them.
+#[test]
+fn a_command_with_no_output_keeps_the_panes_problems() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let pane = app.run_project_task(long_task("make")).unwrap();
+    let cwd = tmp.path().to_path_buf();
+    assert!(app.apply_build_scan(
+        pane,
+        Some(&cwd),
+        "make",
+        "main.c:7:3: error: expected ';'\n"
+    ));
+    finish_pane_command(&mut app, pane, Some(0), 10);
+    assert_eq!(app.problems.groups().len(), 1, "still listed");
+    // And the skip still covers the watcher's own finish when it does
+    // report output.
+    app.watch_published_panes.insert(pane);
+    assert!(!app.apply_build_scan(pane, Some(&cwd), "tsc --watch", "a.c:1:1: error: old\n"));
+    assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
+}
