@@ -51,6 +51,11 @@ impl Scrubber {
         }
     }
 
+    /// The commits the scrubber walks, newest first.
+    pub fn commits(&self) -> &[crate::git::GraphCommit] {
+        &self.commits
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn position(&self) -> Position {
         self.position
@@ -215,6 +220,33 @@ impl Scrubber {
     }
 }
 
+/// The name the file had at each of `commits` (newest first), given its
+/// `--follow` walk `touched` (newest first, from [`crate::git::follow_names`])
+/// (#1304). The name changes only in a commit that touched the file, so a
+/// commit the walk skips has the name of the nearest older one it lists.
+/// Commits older than the walk's oldest entry are left out: the file did not
+/// exist there under any name the walk knows.
+pub fn names_by_commit(
+    commits: &[crate::git::GraphCommit],
+    touched: &[(String, String)],
+) -> std::collections::HashMap<String, String> {
+    let touched: std::collections::HashMap<&str, &str> = touched
+        .iter()
+        .map(|(hash, path)| (hash.as_str(), path.as_str()))
+        .collect();
+    let mut name: Option<&str> = None;
+    let mut out = std::collections::HashMap::new();
+    for c in commits.iter().rev() {
+        if let Some(path) = touched.get(c.hash.as_str()) {
+            name = Some(path);
+        }
+        if let Some(name) = name {
+            out.insert(c.hash.clone(), name.to_string());
+        }
+    }
+    out
+}
+
 /// One file at one commit, to be built into a read-only view.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ViewKey {
@@ -234,6 +266,10 @@ pub struct ViewJob {
     pub path: std::path::PathBuf,
     /// git's abbreviation of the commit, for the "did not exist" note.
     pub short: String,
+    /// The file's name at the commit and at its parent, which differ from
+    /// `key.rel` before a rename (#1304).
+    pub read_rel: String,
+    pub parent_rel: String,
     /// The commit's first parent, whose version of the file the gutter
     /// marks are drawn against.
     pub parent: Option<String>,
@@ -328,19 +364,19 @@ impl ViewBuilder {
                     pending = next;
                 }
             };
-            let read = |known: Option<Option<std::sync::Arc<str>>>, rev: &str| {
+            let read = |known: Option<Option<std::sync::Arc<str>>>, rev: &str, rel: &str| {
                 known.unwrap_or_else(|| {
-                    crate::git::read_file_at_rev(root, rev, &job.key.rel)
+                    crate::git::read_file_at_rev(root, rev, rel)
                         .ok()
                         .map(std::sync::Arc::from)
                 })
             };
-            let text = read(job.text.clone(), &job.key.hash);
+            let text = read(job.text.clone(), &job.key.hash, &job.read_rel);
             let built = if full {
                 let parent_text = job
                     .parent
                     .as_ref()
-                    .map(|p| (p.clone(), read(job.parent_text.clone(), p)));
+                    .map(|p| (p.clone(), read(job.parent_text.clone(), p, &job.parent_rel)));
                 let baseline = parent_text
                     .as_ref()
                     .and_then(|(_, t)| t.as_deref())
@@ -497,6 +533,36 @@ mod tests {
             author: String::from("t"),
             age_secs: 0,
         }
+    }
+
+    #[test]
+    fn a_commit_the_follow_walk_skips_has_the_name_of_the_nearest_older_one() {
+        // Newest first: c0 edits new.py, c1 touches something else, c2
+        // renames old.py to new.py, c3 and c4 edit old.py, c5 predates it.
+        let commits: Vec<_> = (0..6).map(commit).collect();
+        let touched = [
+            ("c0", "new.py"),
+            ("c2", "new.py"),
+            ("c3", "old.py"),
+            ("side", "elsewhere.py"),
+            ("c4", "old.py"),
+        ]
+        .map(|(h, p)| (h.to_string(), p.to_string()));
+        let names = names_by_commit(&commits, &touched);
+        let name = |h: &str| names.get(h).map(String::as_str);
+        assert_eq!(name("c0"), Some("new.py"));
+        assert_eq!(name("c1"), Some("new.py"), "skipped, so the rename's name");
+        assert_eq!(name("c2"), Some("new.py"));
+        assert_eq!(name("c3"), Some("old.py"));
+        assert_eq!(name("c4"), Some("old.py"));
+        assert_eq!(name("c5"), None, "older than the file: no name");
+        assert_eq!(name("side"), None, "only the walked commits are named");
+    }
+
+    #[test]
+    fn an_empty_follow_walk_names_nothing() {
+        let commits: Vec<_> = (0..3).map(commit).collect();
+        assert!(names_by_commit(&commits, &[]).is_empty());
     }
 
     fn scrubber(n: usize) -> Scrubber {
