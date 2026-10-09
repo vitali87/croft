@@ -1,0 +1,1 @@
+fix: Go to Definition, Go to References, Go to Declaration, Go to Type Definition, Go to Implementations and Rename Symbol are now Command Palette commands, can be rebound in keybindings.json (`go_to_definition`, `rename_symbol`, ...), and import-vscode carries their remapped VS Code chords.
