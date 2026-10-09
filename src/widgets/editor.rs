@@ -11947,8 +11947,13 @@ impl Editor {
     /// from there.
     pub fn home_key(&mut self) {
         self.cursor_col = match self.wrapped_row_of_cursor() {
-            Some((start, _)) if self.cursor_col > start => start,
-            _ => 0,
+            // A row can start on a combining mark (the wrap breaks after the
+            // space it sits on), so step back to its cluster's start.
+            Some((start, _)) => match floor_grapheme_col(&self.lines[self.cursor_row], start) {
+                row_start if self.cursor_col > row_start => row_start,
+                _ => 0,
+            },
+            None => 0,
         };
         self.last_edit_kind = None;
     }
@@ -24372,6 +24377,31 @@ mod tests {
             e.cursor_col, 0,
             "a second Home goes to the start of the line"
         );
+    }
+
+    /// #1569: a wrapped row can begin on a combining mark (the row before
+    /// broke after the space it combines with); Home must not leave the caret
+    /// inside that cluster.
+    #[test]
+    fn home_in_a_wrapped_line_stays_on_a_grapheme_boundary() {
+        let (probe, _) = wrapped_paragraph(true);
+        let width = probe.visible_text_width();
+        let text = format!("{} \u{301}{}", "x".repeat(width - 1), "y".repeat(width + 5));
+        let mut e = editor_with(&text);
+        e.wrap_override = Some(true);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 20,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        let segs = e.line_segments(0, e.visible_text_width().max(1));
+        assert_eq!(segs[1].0, width, "row 2 starts on the mark: {segs:?}");
+        e.cursor_col = width + 3;
+        e.home_key();
+        assert_eq!(e.cursor_col, width - 1, "the space the mark sits on");
     }
 
     /// #1569: on the first and last rows the row's ends are the line's.
