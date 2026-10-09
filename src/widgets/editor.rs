@@ -7466,6 +7466,9 @@ impl Editor {
         // whose new encoding covers the buffer fine.
         self.encoding_loss = false;
         self.lossy_save_armed = false;
+        // The git-gutter baseline was decoded with the old encoding: drop it
+        // so the next sweep refetches HEAD decoded the new way (#1242).
+        self.git_baseline_for = None;
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.sync_bookmarks_to_buffer();
         self.recompute_highlights();
@@ -13996,6 +13999,23 @@ fn read_file_head(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(head)
 }
 
+/// Decode a file's bytes (a git blob or the working copy) the way its tab
+/// decodes them, for a diff or gutter baseline against that tab (#1242). A
+/// byte-order mark wins, as on open. Under UTF-8 only valid UTF-8 decodes,
+/// as before; under an encoding the user picked, everything but binary does.
+pub fn decode_blob(bytes: &[u8], enc: &'static encoding_rs::Encoding) -> Option<String> {
+    if let Some((bom_enc, _)) = encoding_rs::Encoding::for_bom(bytes) {
+        return Some(bom_enc.decode(bytes).0.into_owned());
+    }
+    if enc == encoding_rs::UTF_8 {
+        return String::from_utf8(bytes.to_vec()).ok();
+    }
+    if is_binary(bytes) {
+        return None;
+    }
+    Some(enc.decode(bytes).0.into_owned())
+}
+
 fn is_binary(data: &[u8]) -> bool {
     let sample = &data[..data.len().min(4096)];
     if sample.contains(&0) {
@@ -17799,6 +17819,28 @@ impl EditorTabs {
             None => std::fs::read_to_string(right)
                 .with_context(|| format!("reading {}", right.display()))?,
         };
+        self.open_head_diff_with_texts(
+            left_label,
+            left_text,
+            &right_text,
+            right,
+            left_is_git_head,
+            right_is_unsaved,
+        )
+    }
+
+    /// [`Self::open_head_diff_with_text`] with the working side already read
+    /// and decoded, for a file that isn't UTF-8 (#1242). `right_is_unsaved`
+    /// says `right_text` is the open tab's unsaved buffer, not the disk.
+    pub fn open_head_diff_with_texts(
+        &mut self,
+        left_label: PathBuf,
+        left_text: &str,
+        right_text: &str,
+        right: &Path,
+        left_is_git_head: bool,
+        right_is_unsaved: bool,
+    ) -> Result<()> {
         let left_lines: Vec<String> = left_text.lines().map(str::to_string).collect();
         let right_lines: Vec<String> = right_text.lines().map(str::to_string).collect();
         let mut data = crate::widgets::diff::DiffData::build_with_byte_check(
@@ -17807,7 +17849,7 @@ impl EditorTabs {
             left_lines,
             right_lines,
             Some(left_text),
-            Some(&right_text),
+            Some(right_text),
         );
         data.set_whitespace_mode(self.diff_ws_default);
         // Park the viewport on the first change hunk so the user lands on
