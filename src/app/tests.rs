@@ -18063,6 +18063,34 @@ fn a_pasted_multi_line_message_commits_with_its_body() {
     );
 }
 
+/// #1334: in the Source Control box Home/End work on the caret's line and
+/// Ctrl+Home/Ctrl+End on the whole message.
+#[test]
+fn scm_home_end_follow_the_carets_line_and_ctrl_takes_the_whole_message() {
+    let (_tmp, mut app) = scm_ready_to_commit();
+    app.handle_paste("Add rounding\n\nRounds to cents.\nFixes 42");
+    let press = |app: &mut App, code: KeyCode, mods: KeyModifiers| {
+        app.handle_source_control_key(key(code, mods));
+    };
+    press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Home, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
+    press(&mut app, KeyCode::End, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+    assert_eq!(
+        app.source_control.message,
+        "Add rounding\n\n[Rounds to cents.]\nFixes 42"
+    );
+    press(&mut app, KeyCode::Home, KeyModifiers::CONTROL);
+    press(&mut app, KeyCode::Char('>'), KeyModifiers::NONE);
+    press(&mut app, KeyCode::End, KeyModifiers::CONTROL);
+    press(&mut app, KeyCode::Char('.'), KeyModifiers::NONE);
+    assert_eq!(
+        app.source_control.message,
+        ">Add rounding\n\n[Rounds to cents.]\nFixes 42."
+    );
+}
+
 /// #1336: finishing a conflicted `git revert` from Source Control commits
 /// git's whole message, "This reverts commit <sha>." included, as
 /// `git revert --continue` would.
@@ -26211,7 +26239,7 @@ fn run_active_file_with_python_file_spawns_a_new_terminal_and_focuses_it() {
 
 /// #1400 fixture: `name` holds "old\n" on disk and "new\nold\n" in its
 /// open, unsaved tab.
-fn app_with_unsaved_file(name: &str) -> (tempfile::TempDir, App, PathBuf) {
+fn app_with_unsaved_pinned_file(name: &str) -> (tempfile::TempDir, App, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let file = root.join(name);
@@ -26227,7 +26255,7 @@ fn app_with_unsaved_file(name: &str) -> (tempfile::TempDir, App, PathBuf) {
 /// runs the text the breakpoints were set against.
 #[test]
 fn f5_saves_the_unsaved_buffer_before_launching() {
-    let (_tmp, mut app, file) = app_with_unsaved_file("notes.txt");
+    let (_tmp, mut app, file) = app_with_unsaved_pinned_file("notes.txt");
     app.debug_start_or_continue();
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
     assert!(!app.editor.dirty);
@@ -26242,7 +26270,7 @@ fn f5_saves_the_unsaved_buffer_before_launching() {
 /// debuggee imports the others.
 #[test]
 fn f5_saves_every_unsaved_tab_not_only_the_active_one() {
-    let (tmp, mut app, helper) = app_with_unsaved_file("helper.txt");
+    let (tmp, mut app, helper) = app_with_unsaved_pinned_file("helper.txt");
     let main = tmp.path().canonicalize().unwrap().join("main.txt");
     std::fs::write(&main, "main\n").unwrap();
     app.editor.open_pinned(&main).unwrap();
@@ -26254,7 +26282,7 @@ fn f5_saves_every_unsaved_tab_not_only_the_active_one() {
 /// #1400: Run writes the unsaved tab before the run command starts.
 #[test]
 fn run_saves_the_unsaved_buffer_before_running() {
-    let (_tmp, mut app, file) = app_with_unsaved_file("hello.py");
+    let (_tmp, mut app, file) = app_with_unsaved_pinned_file("hello.py");
     app.run_active_file();
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
     assert!(!app.editor.dirty);
@@ -26263,7 +26291,7 @@ fn run_saves_the_unsaved_buffer_before_running() {
 /// #1400: Debug Test saves too: the test runs from the files on disk.
 #[test]
 fn debug_test_saves_the_unsaved_buffer_before_launching() {
-    let (_tmp, mut app, file) = app_with_unsaved_file("test_x.txt");
+    let (_tmp, mut app, file) = app_with_unsaved_pinned_file("test_x.txt");
     app.debug_named_test(String::from("test_x"));
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
     assert_eq!(app.status, "No test runner detected in this workspace");
@@ -26273,7 +26301,7 @@ fn debug_test_saves_the_unsaved_buffer_before_launching() {
 /// is left alone, and the status says the debuggee runs the saved file.
 #[test]
 fn with_save_before_debug_off_f5_leaves_the_disk_and_warns() {
-    let (_tmp, mut app, file) = app_with_unsaved_file("notes.txt");
+    let (_tmp, mut app, file) = app_with_unsaved_pinned_file("notes.txt");
     app.save_before_debug = false;
     app.debug_start_or_continue();
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
@@ -26295,7 +26323,7 @@ fn with_save_before_debug_off_f5_leaves_the_disk_and_warns() {
 /// blind to start a launch; it stays unsaved and the status says so.
 #[test]
 fn f5_never_overwrites_a_file_changed_on_disk() {
-    let (_tmp, mut app, file) = app_with_unsaved_file("notes.txt");
+    let (_tmp, mut app, file) = app_with_unsaved_pinned_file("notes.txt");
     std::thread::sleep(std::time::Duration::from_millis(20));
     std::fs::write(&file, "theirs, changed elsewhere\n").unwrap();
     app.debug_start_or_continue();
@@ -28605,15 +28633,168 @@ fn seeding_search_replaces_stale_include_and_exclude_filters() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.search.include = String::from("*.md");
     app.search.exclude = String::from("vendor");
-    assert!(app.seed_search_from_command("rg TODO"));
+    assert!(seed_at_root(&mut app, "rg TODO"));
     assert_eq!(
         app.search.include, "",
         "a bare rg scanned everything; a stale include must not filter the seeded search"
     );
     assert_eq!(app.search.exclude, "");
-    assert!(app.seed_search_from_command("rg -g '*.rs' -g '!target' TODO"));
+    assert!(seed_at_root(&mut app, "rg -g '*.rs' -g '!target' TODO"));
     assert_eq!(app.search.include, "*.rs");
     assert_eq!(app.search.exclude, "target");
+}
+
+/// Seed Search as if the terminal ran `input` at the workspace root.
+fn seed_at_root(app: &mut App, input: &str) -> bool {
+    let root = app.workspace_root().to_path_buf();
+    app.seed_search_from_command_in(input, &root)
+}
+
+/// Negative: with no terminal whose directory croft can read, a search is
+/// refused rather than guessed to have run at the workspace root, which
+/// would widen `rg color` run from src/ to every file (#1201).
+#[test]
+fn a_search_with_no_known_terminal_directory_is_not_seeded() {
+    let (_tmp, mut app) = grep_scope_app();
+    // No pane to read a directory from: the app's own shell would answer
+    // with the workspace root.
+    app.active_terminal = app.terminals.len();
+    app.search.query = String::from("untouched");
+    assert!(app.seed_search_from_command("rg color"), "still a search");
+    assert_eq!(app.search.query, "untouched");
+    assert!(app.status.contains("Search not seeded"), "{}", app.status);
+    assert!(!app.seed_search_from_command("ls -la"), "not a search");
+}
+
+/// The workspace of #1201: one `color` in src/, one in docs/ and one in a
+/// vendored file that must never be rewritten.
+fn grep_scope_app() -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    for (rel, body) in [
+        ("src/style.py", "color = \"red\"\n"),
+        ("docs/guide.md", "Set the color in style.py.\n"),
+        (
+            "vendor/lib.py",
+            "color = \"keep\"  # third-party, do not touch\n",
+        ),
+    ] {
+        let f = tmp.path().join(rel);
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, body).unwrap();
+    }
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    (tmp, app)
+}
+
+/// The files of [`grep_scope_app`] the seeded Search (and so Replace All)
+/// would cover.
+fn seeded_scope(app: &App, root: &std::path::Path) -> Vec<&'static str> {
+    let filter = crate::widgets::search::PathFilter::new(&app.search.include, &app.search.exclude);
+    ["docs/guide.md", "src/style.py", "vendor/lib.py"]
+        .into_iter()
+        .filter(|rel| filter.allows(root, &root.join(rel)))
+        .collect()
+}
+
+/// `rg -n color src/` searched one directory; the seeded Search must too,
+/// or Replace All rewrites docs/ and the vendored file (#1201).
+#[test]
+fn seeded_search_covers_only_the_paths_the_grep_searched() {
+    let (tmp, mut app) = grep_scope_app();
+    let root = tmp.path();
+    assert!(seed_at_root(&mut app, "rg -n color src/"));
+    assert_eq!(app.search.query, "color");
+    assert_eq!(
+        seeded_scope(&app, root),
+        ["src/style.py"],
+        "include: {:?}",
+        app.search.include
+    );
+    assert!(seed_at_root(&mut app, "grep -rn color src/style.py docs"));
+    assert_eq!(seeded_scope(&app, root), ["docs/guide.md", "src/style.py"]);
+}
+
+/// `rg -t py` searched Python files only, so the markdown guide stays out.
+#[test]
+fn seeded_search_keeps_the_rg_type_filter() {
+    let (tmp, mut app) = grep_scope_app();
+    let root = tmp.path();
+    assert!(seed_at_root(&mut app, "rg -t py color"));
+    assert_eq!(
+        seeded_scope(&app, root),
+        ["src/style.py", "vendor/lib.py"],
+        "include: {:?}",
+        app.search.include
+    );
+    assert!(seed_at_root(&mut app, "rg --type-not py color"));
+    assert_eq!(seeded_scope(&app, root), ["docs/guide.md"]);
+    assert!(seed_at_root(&mut app, "rg -t py color src"));
+    assert_eq!(seeded_scope(&app, root), ["src/style.py"]);
+}
+
+/// After `cd src`, a bare `rg color` searched src/ only.
+#[test]
+fn seeded_search_runs_from_the_panes_directory() {
+    let (tmp, mut app) = grep_scope_app();
+    let root = tmp.path();
+    assert!(app.seed_search_from_command_in("rg color", &root.join("src")));
+    assert_eq!(seeded_scope(&app, root), ["src/style.py"]);
+    assert!(app.seed_search_from_command_in("rg color ../vendor", &root.join("src")));
+    assert_eq!(seeded_scope(&app, root), ["vendor/lib.py"]);
+}
+
+/// A scope croft can't reproduce is refused with the reason, leaving the
+/// panel untouched, instead of seeding a wider search: an inverted match
+/// (`-v` lists the lines that don't match), an unknown rg type, a path
+/// outside the workspace or one that doesn't exist.
+#[test]
+fn a_grep_whose_scope_cant_be_reproduced_refuses_to_seed() {
+    let (tmp, mut app) = grep_scope_app();
+    let root = tmp.path();
+    for cmd in [
+        "rg -v color src/",
+        "grep -rL color .",
+        "rg -t nosuchtype color",
+        "rg color ../",
+        "rg color missing/",
+    ] {
+        app.status.clear();
+        assert!(
+            app.seed_search_from_command_in(cmd, root),
+            "{cmd} is a search"
+        );
+        assert!(
+            app.status.starts_with("Search not seeded: "),
+            "{cmd}: status {:?}",
+            app.status
+        );
+        assert_eq!(app.search.query, "", "{cmd} must not seed the panel");
+    }
+}
+
+/// Negative: a search that covered the whole workspace still seeds the
+/// whole workspace, and an rg `-L` (follow symlinks) is not an inversion.
+#[test]
+fn a_grep_over_the_whole_workspace_still_seeds_every_file() {
+    let (tmp, mut app) = grep_scope_app();
+    let root = tmp.path();
+    for cmd in [
+        "rg color",
+        "grep -rn color .",
+        "rg -L color",
+        "git grep color -- .",
+    ] {
+        assert!(app.seed_search_from_command_in(cmd, root));
+        assert_eq!(app.search.query, "color", "{cmd}");
+        assert_eq!(
+            seeded_scope(&app, root),
+            ["docs/guide.md", "src/style.py", "vendor/lib.py"],
+            "{cmd}: include {:?}",
+            app.search.include
+        );
+    }
+    assert!(app.seed_search_from_command_in("rg -g '*.md' color", root));
+    assert_eq!(app.search.include, "*.md");
 }
 
 /// A byte-range selection made in the Include field before the seed must not
@@ -28627,7 +28808,7 @@ fn seeding_search_cannot_leave_a_stale_field_selection() {
     app.search.include = String::from("**/*.rs,**/*.toml");
     app.search.focus_field(SearchField::Include);
     app.search.select_all_active();
-    assert!(app.seed_search_from_command("rg -g '*.md' TODO"));
+    assert!(seed_at_root(&mut app, "rg -g '*.md' TODO"));
     assert_eq!(
         app.search.field,
         SearchField::Query,
@@ -77708,6 +77889,81 @@ fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
     assert_eq!(app.status, "Tab is already kept open");
 }
 
+/// #989: an App on the issue's repro, a merge stopped on a conflict.
+fn app_in_a_conflicted_merge() -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = r#"set -e
+git init -q -b main && git config user.email a@b && git config user.name a
+printf '# Orders\n\nRun `python pricing.py`.\n' > README.md && git add . && git commit -qm init
+git checkout -qb hotfix && sed 's/python pricing.py/python -m pricing/' README.md > README.tmp && mv README.tmp README.md && git commit -qam fix
+git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' README.md > README.tmp && mv README.tmp README.md && git commit -qam uv
+! git merge -q hotfix >/dev/null 2>&1"#;
+    let out = std::process::Command::new("sh")
+        .args(["-c", script])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.source_control.message = String::from("Merge hotfix");
+    (app, tmp)
+}
+
+fn committed_readme(root: &std::path::Path) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["show", "HEAD:README.md"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn commit_refuses_while_merge_conflicts_are_unresolved() {
+    let (mut app, tmp) = app_in_a_conflicted_merge();
+    app.commit_source_control();
+    wait_for_git_net(&mut app);
+    assert!(
+        !committed_readme(tmp.path()).contains("<<<<<<<"),
+        "the conflict markers were committed"
+    );
+    let feedback = app
+        .source_control
+        .commit_feedback
+        .clone()
+        .unwrap_or_default();
+    assert!(feedback.contains("Resolve 1 merge conflict"), "{feedback}");
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.source_control.message, "Merge hotfix",
+        "the message is kept"
+    );
+}
+
+#[test]
+fn commit_all_refuses_while_merge_conflicts_are_unresolved() {
+    // Commit All stages everything first, and `git add -A` marks a conflict
+    // resolved with its markers in it.
+    let (mut app, tmp) = app_in_a_conflicted_merge();
+    app.commit_all_source_control();
+    assert!(!committed_readme(tmp.path()).contains("<<<<<<<"));
+    assert_eq!(
+        crate::git::unmerged_paths(tmp.path()),
+        vec![String::from("README.md")],
+        "nothing was staged"
+    );
+    assert!(
+        app.status.contains("Resolve 1 merge conflict"),
+        "{}",
+        app.status
+    );
+}
+
 /// #910: `tax.py` open with an unsaved function, rewritten on disk behind
 /// it (a `git checkout`, a restore, an agent), and the sweep that notices.
 fn app_with_a_disk_conflict(tmp: &std::path::Path) -> (App, std::path::PathBuf) {
@@ -78081,6 +78337,162 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     let _ = render_buf(&mut app);
     assert!(app.source_control.nested_repos.is_empty());
     assert!(app.source_control.last_init_repo_button_area.width > 0);
+}
+
+/// An App over `tmp` whose user config lives in `cfg`, never the real one.
+fn settings_editor_app(cfg: &std::path::Path, tmp: &std::path::Path) -> App {
+    let mut app = App::new(tmp.to_path_buf()).unwrap();
+    app.config_dir = cfg.to_path_buf();
+    app.run_command(crate::widgets::command_palette::Command::OpenSettingsEditor);
+    assert!(app.settings_editor.is_some(), "the editor opens");
+    app
+}
+
+fn type_query(app: &mut App, q: &str) {
+    for c in q.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+#[test]
+fn the_settings_editor_flips_a_setting_into_the_user_layer_and_applies_it() {
+    // #612: search a setting, Enter edits it in place, the file and the live
+    // session both change, and the row names the layer that set it.
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        cfg.path().join("config.json"),
+        "{\n  \"auto_save\": false\n}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/config.json"),
+        "{ \"copy_on_select\": true }",
+    )
+    .unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    let copy = app
+        .settings_editor
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .find(|r| r.key == "copy_on_select")
+        .cloned()
+        .unwrap();
+    assert_eq!(copy.layer, crate::config_layers::LayerKind::Workspace);
+    type_query(&mut app, "auto save");
+    let row = app
+        .settings_editor
+        .as_ref()
+        .unwrap()
+        .selected_row()
+        .cloned()
+        .unwrap();
+    assert_eq!(row.key, "auto_save");
+    assert_eq!(row.value, serde_json::json!(false));
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cfg.path().join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(written["auto_save"], serde_json::json!(true));
+    assert!(app.auto_save, "applied to the live session");
+    let row = app
+        .settings_editor
+        .as_ref()
+        .unwrap()
+        .selected_row()
+        .cloned()
+        .unwrap();
+    assert_eq!(row.value, serde_json::json!(true));
+    assert_eq!(row.layer, crate::config_layers::LayerKind::User);
+}
+
+#[test]
+fn the_settings_editor_writes_the_workspace_layer_only_for_allowed_keys() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.settings_editor.as_ref().unwrap().target,
+        crate::config_layers::LayerKind::Workspace
+    );
+    type_query(&mut app, "format on save");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let ws: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".croft/config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ws["format_on_save"], serde_json::json!(true));
+    assert!(
+        !cfg.path().join("config.json").exists(),
+        "the user layer is untouched"
+    );
+    // A key only the user may set is refused for the workspace.
+    for _ in 0.."format on save".len() {
+        app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+            .unwrap();
+    }
+    type_query(&mut app, "sidebar auto hide");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.status.contains("user"), "{}", app.status);
+    let ws = std::fs::read_to_string(tmp.path().join(".croft/config.json")).unwrap();
+    assert!(!ws.contains("sidebar_auto_hide"), "{ws}");
+}
+
+#[test]
+fn the_settings_editor_asks_for_a_number_and_refuses_one_that_is_not() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "terminal scrollback");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(matches!(
+        app.input_prompt.as_ref().map(|p| &p.purpose),
+        Some(crate::widgets::input_prompt::InputPurpose::SettingValue { key }) if key == "terminal_scrollback"
+    ));
+    app.close_input_prompt();
+    app.submit_setting_value("terminal_scrollback", "lots");
+    assert!(app.status.contains("number"), "{}", app.status);
+    assert!(!cfg.path().join("config.json").exists());
+    app.submit_setting_value("terminal_scrollback", " 5000 ");
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cfg.path().join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(written["terminal_scrollback"], serde_json::json!(5000));
+}
+
+#[test]
+fn the_settings_editor_draws_its_value_prompt_on_top() {
+    // The prompt Enter opens for a number sits over the editor. Drawn under
+    // it, the user typed blind.
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "terminal scrollback");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.input_prompt.is_some(), "Enter asks for the number");
+    type_query(&mut app, "424242");
+    let backend = ratatui::backend::TestBackend::new(120, 36);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let screen: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(screen.contains("424242"), "the typed value is visible");
 }
 
 // ---- An empty Go to Definition / Declaration / Type Definition reply (#1302) ----
