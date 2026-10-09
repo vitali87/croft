@@ -14835,7 +14835,11 @@ fn sync_on_a_branch_with_no_upstream_publishes_without_pulling() {
         "{:?}",
         app.source_control.commit_feedback
     );
-    assert_eq!(app.status, "Synced");
+    // One line naming what each half did (#858).
+    assert_eq!(
+        app.status,
+        "Synced: pulled: nothing, branch not published yet | pushed: published topic to origin"
+    );
     assert_eq!(
         git_stdout(tmp.path(), &["rev-parse", "--abbrev-ref", "topic@{u}"]),
         "origin/topic"
@@ -14903,9 +14907,10 @@ fn sync_on_a_tracked_branch_still_pulls_first() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.sync_source_control();
     wait_for_git_net(&mut app);
-    assert_eq!(
-        app.status, "Synced",
-        "{:?}",
+    assert!(
+        app.status.starts_with("Synced: pulled: Fast-forward"),
+        "{}: {:?}",
+        app.status,
         app.source_control.commit_feedback
     );
     assert!(tmp.path().join("theirs.txt").exists());
@@ -16392,6 +16397,72 @@ fn plain_enter_still_commits_a_one_line_message() {
     wait_for_git_net(&mut app);
     assert_eq!(last_commit_message(tmp.path()), "one line\n\n");
     assert_eq!(app.source_control.message, "");
+}
+
+#[test]
+fn a_commit_reports_only_git_s_first_line_in_the_panel_and_status_bar() {
+    // #858: `git commit` prints `[branch sha] subject`, then a diffstat and
+    // one `create mode` row per new file; the whole of it was the feedback.
+    let tmp = make_committed_repo();
+    std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    wait_for_changes(&mut app, |a| {
+        a.source_control
+            .entries
+            .iter()
+            .any(|e| e.path == "seed.txt")
+    });
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.source_control.message = "fix: one line".to_string();
+    app.source_control.message_cursor = app.source_control.message.chars().count();
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_git_net(&mut app);
+    let feedback = app
+        .source_control
+        .commit_feedback
+        .clone()
+        .unwrap_or_default();
+    assert!(
+        feedback.starts_with("[main ") && feedback.ends_with("] fix: one line"),
+        "the feedback is git's first line: {feedback:?}"
+    );
+    assert_eq!(app.status, format!("Committed: {feedback}"));
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(
+        logged.contains("1 file changed"),
+        "the Git Output log keeps the rest: {logged:?}"
+    );
+}
+
+/// #858 negative: a refused commit (nothing to commit) is still reported
+/// as an error, on one line that names why, in the panel and the status
+/// bar; git's full text is in the Git Output log.
+#[test]
+fn a_refused_commit_names_the_reason_on_one_line() {
+    let tmp = make_committed_repo();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.source_control.message = "fix: nothing here".to_string();
+    app.source_control.message_cursor = app.source_control.message.chars().count();
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_git_net(&mut app);
+    assert!(app.source_control.commit_feedback_is_error);
+    let feedback = app
+        .source_control
+        .commit_feedback
+        .clone()
+        .unwrap_or_default();
+    let shown = crate::git::headline(&feedback);
+    assert!(
+        shown.contains("nothing to commit"),
+        "the panel's line names the reason: {shown:?} (feedback {feedback:?})"
+    );
+    assert!(
+        !app.status.contains('\n'),
+        "one status line: {:?}",
+        app.status
+    );
+    assert!(app.status.contains("nothing to commit"), "{:?}", app.status);
 }
 
 #[test]
@@ -73010,6 +73081,929 @@ fn the_synced_settings_layer_is_in_the_reload_chain() {
         "{synced:?} in {:?}",
         app.settings_chain
     );
+}
+
+/// What `git push` writes to stderr for a push to GitHub: `remote:`
+/// chatter, the destination, then the ref update.
+const PUSH_OUTPUT_858: &str = "remote: \nremote: Create a pull request for 'main' on GitHub by visiting:\nremote:      https://github.com/o/r/pull/new/main\nremote: \nTo github.com:o/r.git\n   5a6cd5c..9f1e2d3  main -> main";
+
+/// #858: after Commit & Push the status bar said "Committed & pushed:"
+/// followed by git push's whole multi-line stderr, squashed into the one
+/// status row, which is what the issue asked to stop. Status and panel now
+/// carry one line (the commit's headline and the ref update); the push's
+/// full text is in the Git Output log.
+#[test]
+fn commit_and_push_reports_one_line_and_logs_the_push() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.finish_commit_and_push(
+        String::from("[main 9f1e2d3] fix: one line"),
+        Ok(String::from(PUSH_OUTPUT_858)),
+    );
+    let feedback = app.source_control.commit_feedback.clone().unwrap();
+    for text in [&app.status, &feedback] {
+        assert!(!text.contains('\n'), "one line: {text:?}");
+        assert!(!text.contains("remote:"), "no remote chatter: {text:?}");
+        assert!(text.contains("[main 9f1e2d3] fix: one line"), "{text:?}");
+        assert!(text.contains("main -> main"), "{text:?}");
+    }
+    assert!(!app.source_control.commit_feedback_is_error);
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(
+        logged.contains("Create a pull request"),
+        "the Git Output log keeps the whole push: {logged:?}"
+    );
+}
+
+/// #858: Push (the commit menu's) reported `Pushed: ` and the same
+/// multi-line stderr; it now reports the ref update alone.
+#[test]
+fn push_reports_its_ref_update_on_one_line_and_logs_the_rest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.finish_push(Ok(String::from(PUSH_OUTPUT_858)));
+    assert_eq!(app.status, "Pushed: 5a6cd5c..9f1e2d3 main -> main");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("pushed: 5a6cd5c..9f1e2d3 main -> main")
+    );
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(
+        logged.contains("github.com/o/r/pull/new/main"),
+        "{logged:?}"
+    );
+}
+
+/// #858 negative: a push whose output is only `remote:` chatter reports
+/// that it pushed and nothing of the chatter, never a stray `remote:`.
+#[test]
+fn a_push_with_only_remote_chatter_reports_just_pushed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let chatter = "remote: Resolving deltas: 100% (2/2)\nremote: \nremote: Done";
+    app.finish_push(Ok(String::from(chatter)));
+    assert_eq!(app.status, "Pushed");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("pushed")
+    );
+    app.finish_commit_and_push(
+        String::from("[main 9f1e2d3] fix: one line"),
+        Ok(String::from(chatter)),
+    );
+    assert_eq!(
+        app.status,
+        "Committed & pushed: [main 9f1e2d3] fix: one line"
+    );
+    // A one-line push result is kept as git wrote it.
+    app.finish_push(Ok(String::from("Everything up-to-date")));
+    assert_eq!(app.status, "Pushed: Everything up-to-date");
+}
+
+/// #858 negative: a failed push still names the error, on one line: the
+/// rejected ref update with git's reason, or git's `fatal:` line, never the
+/// `To` destination or a `hint:`. It stays an error.
+#[test]
+fn a_failed_push_still_names_the_error_on_one_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let rejected = "To github.com:o/r.git\n ! [rejected]        main -> main (fetch first)\nerror: failed to push some refs to 'github.com:o/r.git'\nhint: Updates were rejected because the remote contains work that you do\nhint: not have locally.";
+    app.finish_commit_and_push(
+        String::from("[main 9f1e2d3] fix: one line"),
+        Err(String::from(rejected)),
+    );
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        "Commit ok; push failed: [rejected] main -> main (fetch first)"
+    );
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("commit ok; push failed: [rejected] main -> main (fetch first)")
+    );
+    let fatal = "fatal: 'origin' does not appear to be a git repository\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.";
+    app.finish_push(Err(String::from(fatal)));
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        "Push failed: fatal: 'origin' does not appear to be a git repository"
+    );
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(logged.contains("correct access rights"), "{logged:?}");
+}
+
+/// pricing.py as `main` and `feature` both start from it (#858).
+const PRICING_858: &str = "TAX_RATE = 0.21\nFREE_SHIPPING_OVER = 50\n\n\ndef shipping(total):\n    if total >= FREE_SHIPPING_OVER:\n        return 0\n    return 3.99\n";
+
+/// A repo on `main` whose `feature` branch writes `feature_pricing` to
+/// pricing.py (and adds feature.txt) while `main` raises FREE_SHIPPING_OVER
+/// to 75 (#858). With `feature` lowering it to 40, merging or rebasing
+/// stops on a conflict in pricing.py; with [`PRICING_858`] unchanged it is
+/// clean.
+fn pricing_repo_858(feature_pricing: &str) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().to_path_buf();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&p)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git setup step failed: {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    for (key, value) in [
+        ("user.email", "a@b"),
+        ("user.name", "a"),
+        ("commit.gpgsign", "false"),
+        ("merge.autoStash", "false"),
+        ("rebase.autoStash", "false"),
+    ] {
+        git(&["config", key, value]);
+    }
+    std::fs::write(p.join("pricing.py"), PRICING_858).unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "base"]);
+    git(&["checkout", "-q", "-b", "feature"]);
+    std::fs::write(p.join("pricing.py"), feature_pricing).unwrap();
+    std::fs::write(p.join("feature.txt"), "feature\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "feature: lower free shipping"]);
+    git(&["checkout", "-q", "main"]);
+    std::fs::write(
+        p.join("pricing.py"),
+        PRICING_858.replace("OVER = 50", "OVER = 75"),
+    )
+    .unwrap();
+    git(&["commit", "-qam", "main: raise free shipping"]);
+    tmp
+}
+
+/// [`pricing_repo_858`] whose merge or rebase stops on a conflict.
+fn conflicting_pricing_repo_858() -> tempfile::TempDir {
+    pricing_repo_858(&PRICING_858.replace("OVER = 50", "OVER = 40"))
+}
+
+/// A Branch submenu verb (Merge, Rebase, Delete Branch) on `branch`, the
+/// way a user runs it: the SCM menu opens the branch picker, the name is
+/// typed, Enter.
+fn pick_branch_858(app: &mut App, action: crate::widgets::scm_menu::ScmAction, branch: &str) {
+    app.dispatch_scm_action(action);
+    assert!(app.branch_picker.is_some(), "{action:?} opens the picker");
+    for c in branch.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+}
+
+/// #858: SCM ⋯ → Branch → Merge onto a conflicting branch. Git's text
+/// starts with `Auto-merging pricing.py`, and the panel and the status bar
+/// said "Merged failed: Auto-merging pricing.py", which reads like a step
+/// that went fine and leaves the conflict out. They now name the conflict,
+/// on one line; the Git Output log keeps git's whole text.
+#[test]
+fn a_merge_stopped_on_a_conflict_names_the_conflict_not_auto_merging() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = conflicting_pricing_repo_858();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::Merge, "feature");
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("Merge: 1 conflict (pricing.py)")
+    );
+    assert_eq!(app.status, "Merge: 1 conflict (pricing.py)");
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(logged.starts_with("$ git merge"), "{logged:?}");
+    assert!(
+        logged.contains("Auto-merging pricing.py")
+            && logged.contains("CONFLICT (content): Merge conflict in pricing.py"),
+        "the Git Output log keeps git's whole text: {logged:?}"
+    );
+}
+
+/// #858: SCM ⋯ → Branch → Rebase that stops on a conflict. Git names the
+/// conflict on stdout and `error: could not apply …` on stderr, after a
+/// `Rebasing (1/1)` progress line it redraws with a carriage return; only
+/// stderr was kept, so the conflict never reached the panel, which said
+/// "Rebased failed: Rebasing (1/1)…". It now names the conflict.
+#[test]
+fn a_rebase_stopped_on_a_conflict_names_the_conflict() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = conflicting_pricing_repo_858();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::Rebase, "feature");
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("Rebase: 1 conflict (pricing.py)")
+    );
+    assert_eq!(app.status, "Rebase: 1 conflict (pricing.py)");
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(
+        logged.contains("CONFLICT (content): Merge conflict in pricing.py")
+            && logged.contains("could not apply"),
+        "the Git Output log has both of git's streams: {logged:?}"
+    );
+}
+
+/// #858: a failed op names the operation, "Merge failed" or "Rebase
+/// failed", not the past tense its success uses ("Merged failed",
+/// "Rebased failed"), and a failure with no conflict names git's `error:`
+/// or `fatal:` line. Covers the branch picker, an input prompt and a
+/// worker op.
+#[test]
+fn a_failed_scm_op_names_the_operation_and_git_s_error_line() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = conflicting_pricing_repo_858();
+    // A local edit the merge would overwrite, and that rebase refuses.
+    std::fs::write(tmp.path().join("pricing.py"), "TAX_RATE = 0.2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    let one_line = |app: &App| {
+        assert!(app.source_control.commit_feedback_is_error);
+        assert_eq!(
+            app.source_control.commit_feedback.as_deref(),
+            Some(app.status.as_str())
+        );
+        assert!(!app.status.contains('\n'), "{:?}", app.status);
+    };
+
+    pick_branch_858(&mut app, ScmAction::Merge, "feature");
+    assert_eq!(
+        app.status,
+        "Merge failed: error: Your local changes to the following files would be overwritten by merge:"
+    );
+    one_line(&app);
+
+    pick_branch_858(&mut app, ScmAction::Rebase, "feature");
+    assert_eq!(
+        app.status,
+        "Rebase failed: error: cannot rebase: You have unstaged changes."
+    );
+    one_line(&app);
+
+    pick_branch_858(&mut app, ScmAction::DeleteBranch, "main");
+    assert!(
+        app.status
+            .starts_with("Delete branch failed: error: cannot delete branch 'main'"),
+        "{:?}",
+        app.status
+    );
+    one_line(&app);
+
+    crate::git::create_tag(tmp.path(), "v1").unwrap();
+    app.dispatch_scm_action(ScmAction::CreateTag);
+    for c in "v1".chars() {
+        app.input_prompt.as_mut().unwrap().push_char(c);
+    }
+    app.submit_input_prompt();
+    assert_eq!(
+        app.status,
+        "Create tag failed: fatal: tag 'v1' already exists"
+    );
+    one_line(&app);
+
+    // No upstream: a worker op, reported when it lands.
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp.path())
+        .args(["checkout", "-q", "--", "."])
+        .status()
+        .unwrap();
+    app.dispatch_scm_action(ScmAction::PullRebase);
+    wait_for_git_net(&mut app);
+    assert_eq!(
+        app.status,
+        "Pull (rebase) failed: There is no tracking information for the current branch."
+    );
+    one_line(&app);
+}
+
+/// #858: Pull, Sync and Pop Stash stop on conflicts the same way a merge
+/// does, `Auto-merging …` first; they name the conflict too, and the Git
+/// Output log keeps git's text.
+#[test]
+fn a_pull_sync_or_stash_pop_stopped_on_a_conflict_names_the_conflict() {
+    let tmp = make_committed_repo();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    };
+    std::fs::write(tmp.path().join("seed.txt"), "stashed\n").unwrap();
+    git(&["stash", "-q"]);
+    std::fs::write(tmp.path().join("seed.txt"), "committed\n").unwrap();
+    git(&["commit", "-qam", "conflicting"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.stash_pop_source_control();
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(app.status, "Stash pop: 1 conflict (seed.txt)");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("stash pop: 1 conflict (seed.txt)")
+    );
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(logged.contains("Auto-merging seed.txt"), "{logged:?}");
+
+    // Git's text for a pull that fetched, then stopped merging.
+    let pull = "Auto-merging pricing.py\nCONFLICT (content): Merge conflict in pricing.py\nAutomatic merge failed; fix conflicts and then commit the result.\nFrom github.com:o/r\n   5a6cd5c..9f1e2d3  main       -> origin/main";
+    app.finish_pull(Err(String::from(pull)));
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(app.status, "Pull: 1 conflict (pricing.py)");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("pull: 1 conflict (pricing.py)")
+    );
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(logged.contains("5a6cd5c..9f1e2d3"), "{logged:?}");
+
+    app.finish_sync(Err(String::from(pull)), None);
+    assert_eq!(app.status, "Sync failed on pull: 1 conflict (pricing.py)");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("sync: pull failed: 1 conflict (pricing.py)")
+    );
+}
+
+/// #858: a clean merge that auto-merged a file, and a clean rebase, report
+/// git's result line, not the `Auto-merging` note before it or the
+/// `Rebasing (1/1)` progress git redrew over.
+#[test]
+fn a_clean_merge_or_rebase_reports_git_s_result_line_not_its_progress() {
+    use crate::widgets::scm_menu::ScmAction;
+    // `feature` changes another line of pricing.py: git auto-merges it.
+    let tmp = pricing_repo_858(&PRICING_858.replace("3.99", "4.99"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::Merge, "feature");
+    assert!(!app.source_control.commit_feedback_is_error);
+    assert_eq!(app.status, "Merged: Merge made by the 'ort' strategy.");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("Merged: Merge made by the 'ort' strategy.")
+    );
+
+    let tmp = pricing_repo_858(&PRICING_858.replace("3.99", "4.99"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::Rebase, "feature");
+    assert!(!app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        "Rebased: Successfully rebased and updated refs/heads/main."
+    );
+}
+
+/// #858 negative: a clean merge of another file still reports its normal
+/// one-line success, as a success.
+#[test]
+fn a_clean_merge_still_reports_its_one_line_success() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = pricing_repo_858(PRICING_858);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::Merge, "feature");
+    assert!(!app.source_control.commit_feedback_is_error);
+    assert_eq!(app.status, "Merged: Merge made by the 'ort' strategy.");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("Merged: Merge made by the 'ort' strategy.")
+    );
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(logged.contains("feature.txt"), "{logged:?}");
+}
+
+/// Draw the whole app and return the frame (#858).
+fn draw_858(
+    term: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+    app: &mut App,
+) -> ratatui::buffer::Buffer {
+    term.draw(|f| app.render(f)).unwrap();
+    term.backend().buffer().clone()
+}
+
+/// Assert that `feedback`, shown in the Source Control panel, changes no
+/// cell of its row from the panel's right border to the screen's edge,
+/// over whatever the editor shows there, and return that row (#858). Only
+/// that row is compared: the feedback is one line, and the editor's other
+/// rows may change between frames as the git worker reports.
+fn assert_feedback_stays_in_the_panel_858(
+    term: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+    app: &mut App,
+    feedback: &str,
+) -> u16 {
+    app.source_control.commit_feedback = None;
+    draw_858(term, app);
+    let bare = draw_858(term, app);
+    app.source_control.commit_feedback = Some(feedback.to_string());
+    let shown = draw_858(term, app);
+    let panel = app.source_control.last_area;
+    let width = shown.area.width;
+    assert!(
+        panel.width > 0 && panel.right() < width,
+        "the panel sits left of the editor: {panel:?}"
+    );
+    let head: String = feedback.chars().take(12).collect();
+    let row = (panel.top()..panel.bottom())
+        .find(|&y| {
+            (panel.left()..panel.right())
+                .map(|x| shown[(x, y)].symbol())
+                .collect::<String>()
+                .contains(&head)
+        })
+        .unwrap_or_else(|| panic!("the panel shows {head:?}"));
+    for x in panel.right() - 1..width {
+        assert_eq!(
+            shown[(x, row)].symbol(),
+            bare[(x, row)].symbol(),
+            "cell ({x}, {row}) from the Source Control panel's right border on changed with feedback {feedback:?}"
+        );
+    }
+    row
+}
+
+/// Assert that `row` crosses the merge editor's source panes below their
+/// titles, where the panes paint only their text and the cells between
+/// show whatever was drawn there first, as in the issue's frames (#858).
+fn assert_row_crosses_the_merge_panes_858(app: &App, row: u16) {
+    let panes = app
+        .editor
+        .merge
+        .as_ref()
+        .expect("the merge editor is up")
+        .last_panes_area;
+    assert!(
+        row > panes.y + 1 && row + 1 < panes.bottom(),
+        "the feedback row {row} crosses the source panes {panes:?}"
+    );
+}
+
+/// #858, the issue's frames: with the merge editor open, the Source
+/// Control feedback, first the merge's conflict and then, once it is
+/// resolved, a merge commit's long subject, paints nothing past the panel.
+/// The merge editor paints only its text cells, so feedback drawn past the
+/// panel showed through between them.
+#[test]
+fn scm_feedback_paints_nothing_over_the_merge_editor() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = conflicting_pricing_repo_858();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::Merge, "feature");
+    let conflict = app
+        .source_control
+        .commit_feedback
+        .clone()
+        .expect("the merge reports");
+    let idx = wait_for_conflicted_entry(&mut app);
+    app.open_source_control_entry(idx);
+    assert!(app.editor.merge.is_some(), "the merge editor is up");
+    // Tall enough that the feedback row crosses the source panes rather
+    // than the RESULT bar, which the merge editor paints edge to edge.
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(150, 60)).unwrap();
+    let row = assert_feedback_stays_in_the_panel_858(&mut term, &mut app, &conflict);
+    assert_row_crosses_the_merge_panes_858(&app, row);
+
+    // Resolve, stage, and commit the merge with a subject longer than the
+    // panel.
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptAllIncoming);
+    app.complete_merge();
+    assert!(app.status.contains("Merge complete"), "{:?}", app.status);
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.source_control.message =
+        "Merge branch 'feature': keep the lower free-shipping threshold for EU customers"
+            .to_string();
+    app.source_control.message_cursor = app.source_control.message.chars().count();
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_git_net(&mut app);
+    let subject = app
+        .source_control
+        .commit_feedback
+        .clone()
+        .unwrap_or_default();
+    assert!(
+        subject.starts_with("[main ") && subject.ends_with("for EU customers"),
+        "the commit's first line: {subject:?}"
+    );
+    assert!(app.editor.merge.is_some(), "the merge editor is still up");
+    let row = assert_feedback_stays_in_the_panel_858(&mut term, &mut app, &subject);
+    assert_row_crosses_the_merge_panes_858(&app, row);
+}
+
+/// Run git in `dir` for a #858 fixture, asserting it succeeded.
+fn git_858(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Local settings for a #858 fixture repo: an identity, no signing and
+/// no push negotiation from the user's global config, and how `git pull`
+/// reconciles (`pull.rebase`).
+fn configure_858(dir: &std::path::Path, pull_rebase: &str) {
+    for (key, value) in [
+        ("user.email", "a@b"),
+        ("user.name", "a"),
+        ("commit.gpgsign", "false"),
+        ("push.negotiate", "false"),
+        ("pull.rebase", pull_rebase),
+    ] {
+        git_858(dir, &["config", key, value]);
+    }
+}
+
+/// A bare remote on `main`; `theirs`, a clone that pushes to it; and
+/// `mine`, the clone the app opens (#858).
+struct Remote858 {
+    _dir: tempfile::TempDir,
+    bare: std::path::PathBuf,
+    theirs: std::path::PathBuf,
+    mine: std::path::PathBuf,
+}
+
+/// [`Remote858`] with f.txt ("one") on `main` in all three; `mine` pulls
+/// the way `pull_rebase` says.
+fn remote_858(pull_rebase: &str) -> Remote858 {
+    let dir = tempfile::tempdir().unwrap();
+    let bare = dir.path().join("remote.git");
+    let theirs = dir.path().join("theirs");
+    let mine = dir.path().join("mine");
+    std::fs::create_dir(&theirs).unwrap();
+    git_858(
+        dir.path(),
+        &["init", "-q", "--bare", "-b", "main", "remote.git"],
+    );
+    git_858(&theirs, &["init", "-q", "-b", "main"]);
+    configure_858(&theirs, "false");
+    std::fs::write(theirs.join("f.txt"), "one\n").unwrap();
+    git_858(&theirs, &["add", "-A"]);
+    git_858(&theirs, &["commit", "-qm", "one"]);
+    git_858(
+        &theirs,
+        &["remote", "add", "origin", bare.to_str().unwrap()],
+    );
+    git_858(&theirs, &["push", "-q", "-u", "origin", "main"]);
+    git_858(dir.path(), &["clone", "-q", bare.to_str().unwrap(), "mine"]);
+    configure_858(&mine, pull_rebase);
+    Remote858 {
+        _dir: dir,
+        bare,
+        theirs,
+        mine,
+    }
+}
+
+/// Commit `text` to `file` in `repo`.
+fn commit_858(repo: &std::path::Path, file: &str, text: &str) {
+    std::fs::write(repo.join(file), text).unwrap();
+    git_858(repo, &["add", "-A"]);
+    git_858(repo, &["commit", "-qm", file]);
+}
+
+/// Assert the status bar and the Source Control panel each carry one line.
+fn assert_one_line_858(app: &App) {
+    let feedback = app
+        .source_control
+        .commit_feedback
+        .clone()
+        .unwrap_or_default();
+    for text in [&app.status, &feedback] {
+        assert!(!text.contains('\n'), "one line: {text:?}");
+        assert!(!text.contains("From "), "no fetch source: {text:?}");
+        assert!(!text.contains("To "), "no push destination: {text:?}");
+    }
+}
+
+/// #858: Pull reported git's whole text, "Pulled: Updating a..b\n
+/// Fast-forward\n f.txt | 1 +\n 1 file changed…", squashed into the status
+/// row. It now reports git's result line; the Git Output log keeps the
+/// rest.
+#[test]
+fn a_fast_forward_pull_reports_fast_forward_on_one_line() {
+    let r = remote_858("false");
+    commit_858(&r.theirs, "f.txt", "one\ntwo\n");
+    git_858(&r.theirs, &["push", "-q"]);
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.pull_source_control();
+    wait_for_git_net(&mut app);
+    assert_eq!(app.status, "Pulled: Fast-forward");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("pulled: Fast-forward")
+    );
+    assert!(!app.source_control.commit_feedback_is_error);
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(
+        logged.starts_with("$ git pull")
+            && logged.contains("Updating ")
+            && logged.contains("f.txt"),
+        "the Git Output log keeps git's whole text: {logged:?}"
+    );
+}
+
+/// #858: a pull that rebases prints only to stderr: the fetch's `From
+/// <url>` and ref update, then `Rebasing (1/1)` redrawn into "Successfully
+/// rebased …". It reported "Pulled: From /…" and the rest; now the result.
+#[test]
+fn a_rebasing_pull_reports_the_rebase_not_the_fetch() {
+    let r = remote_858("true");
+    commit_858(&r.theirs, "f.txt", "one\ntwo\n");
+    git_858(&r.theirs, &["push", "-q"]);
+    commit_858(&r.mine, "g.txt", "mine\n");
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.pull_source_control();
+    wait_for_git_net(&mut app);
+    assert_eq!(
+        app.status,
+        "Pulled: Successfully rebased and updated refs/heads/main."
+    );
+    assert_one_line_858(&app);
+}
+
+/// #858 negative: a pull with nothing to bring in still says so, rather
+/// than an empty "Pulled".
+#[test]
+fn a_pull_that_is_already_up_to_date_still_says_so() {
+    let r = remote_858("false");
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.pull_source_control();
+    wait_for_git_net(&mut app);
+    assert_eq!(app.status, "Pulled: Already up to date.");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("pulled: Already up to date.")
+    );
+}
+
+/// #858 negative: a pull that fails still says it failed, with git's
+/// `fatal:` line, and one stopped on conflicts still names them.
+#[test]
+fn a_failed_or_conflicted_pull_still_says_why() {
+    let r = remote_858("false");
+    git_858(&r.mine, &["config", "pull.ff", "only"]);
+    commit_858(&r.theirs, "f.txt", "one\ntheirs\n");
+    git_858(&r.theirs, &["push", "-q"]);
+    commit_858(&r.mine, "f.txt", "one\nmine\n");
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.pull_source_control();
+    wait_for_git_net(&mut app);
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        "Pull failed: fatal: Not possible to fast-forward, aborting."
+    );
+    assert_one_line_858(&app);
+
+    git_858(&r.mine, &["config", "pull.ff", "false"]);
+    app.pull_source_control();
+    wait_for_git_net(&mut app);
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(app.status, "Pull: 1 conflict (f.txt)");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("pull: 1 conflict (f.txt)")
+    );
+}
+
+/// #858: Sync reported "Synced" in the status bar and, in the panel,
+/// "synced (pulled: <git pull's text> | pushed: <git push's text>)" with
+/// every line of both. It now names both halves on one line, the way
+/// Commit & Push does; the Git Output log keeps git's text.
+#[test]
+fn a_sync_reports_both_halves_on_one_line() {
+    let r = remote_858("false");
+    commit_858(&r.theirs, "f.txt", "one\ntwo\n");
+    git_858(&r.theirs, &["push", "-q"]);
+    commit_858(&r.mine, "g.txt", "mine\n");
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.sync_source_control();
+    wait_for_git_net(&mut app);
+    assert!(!app.source_control.commit_feedback_is_error);
+    assert!(
+        app.status
+            .starts_with("Synced: pulled: Merge made by the 'ort' strategy. | pushed: ")
+            && app.status.ends_with(" main -> main"),
+        "{:?}",
+        app.status
+    );
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some(app.status.replacen("Synced", "synced", 1).as_str())
+    );
+    assert_one_line_858(&app);
+    let log = app.git_output_log.join("\n");
+    assert!(
+        log.contains("$ git pull") && log.contains("$ git push") && log.contains("To "),
+        "{log:?}"
+    );
+}
+
+/// #858 negative: a sync with nothing to move still reports both halves,
+/// never an empty "Synced".
+#[test]
+fn a_sync_with_nothing_to_move_still_reports_both_halves() {
+    let r = remote_858("false");
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.sync_source_control();
+    wait_for_git_net(&mut app);
+    assert_eq!(
+        app.status,
+        "Synced: pulled: Already up to date. | pushed: Everything up-to-date"
+    );
+}
+
+/// #858: a sync whose push the remote refuses reported "pull ok; push
+/// failed: " and git push's whole stderr (`remote:` lines, `To <url>`,
+/// the rejected ref, `error:`). It now names the rejected ref.
+#[test]
+fn a_sync_whose_push_is_refused_names_the_rejected_ref() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = remote_858("false");
+    let hook = r.bare.join("hooks").join("pre-receive");
+    std::fs::write(&hook, "#!/bin/sh\necho 'no pushes today' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    commit_858(&r.mine, "g.txt", "mine\n");
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.sync_source_control();
+    wait_for_git_net(&mut app);
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        "Sync: pull ok; push failed: [remote rejected] main -> main (pre-receive hook declined)"
+    );
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("pull ok; push failed: [remote rejected] main -> main (pre-receive hook declined)")
+    );
+    let log = app.git_output_log.join("\n");
+    assert!(log.contains("no pushes today"), "{log:?}");
+}
+
+/// #858: Fetch and Push (Force) reported git's first line, the fetch's
+/// `From <url>` or the push's `To <url>`; they now report the ref update,
+/// as Push does.
+#[test]
+fn fetch_and_force_push_report_the_ref_update_not_the_url() {
+    use crate::widgets::scm_menu::ScmAction;
+    let r = remote_858("false");
+    commit_858(&r.theirs, "f.txt", "one\ntwo\n");
+    git_858(&r.theirs, &["push", "-q"]);
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.dispatch_scm_action(ScmAction::Fetch);
+    wait_for_git_net(&mut app);
+    assert!(
+        app.status.starts_with("Fetched: ") && app.status.ends_with(" main -> origin/main"),
+        "{:?}",
+        app.status
+    );
+    assert_one_line_858(&app);
+
+    git_858(&r.mine, &["merge", "-q", "--ff-only", "origin/main"]);
+    commit_858(&r.mine, "g.txt", "mine\n");
+    git_858(&r.mine, &["push", "-q"]);
+    git_858(
+        &r.mine,
+        &["commit", "-q", "--amend", "-m", "g.txt, reworded"],
+    );
+    app.dispatch_scm_action(ScmAction::PushForce);
+    wait_for_git_net(&mut app);
+    assert!(
+        app.status.starts_with("Force-pushed: ")
+            && app.status.ends_with(" main -> main (forced update)"),
+        "{:?}",
+        app.status
+    );
+    assert_one_line_858(&app);
+}
+
+/// #858: switching branch with a local edit reported git's stdout, the
+/// `M\tseed.txt` list of carried-over changes, as "Switched to: M…"; a
+/// refused switch reported git's whole error. Both are one line now.
+#[test]
+fn switching_branch_reports_one_line() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = make_committed_repo();
+    configure_858(tmp.path(), "false");
+    git_858(tmp.path(), &["branch", "feature"]);
+    std::fs::write(tmp.path().join("seed.txt"), "edited\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::CheckoutTo, "feature");
+    assert!(!app.source_control.commit_feedback_is_error);
+    assert_eq!(app.status, "Switched to feature");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("Switched to feature")
+    );
+
+    // `main` moves on under the edit: switching back would overwrite it.
+    git_858(tmp.path(), &["stash", "-q"]);
+    git_858(tmp.path(), &["checkout", "-q", "main"]);
+    commit_858(tmp.path(), "seed.txt", "main moved\n");
+    git_858(tmp.path(), &["checkout", "-q", "feature"]);
+    git_858(tmp.path(), &["stash", "pop", "-q"]);
+    pick_branch_858(&mut app, ScmAction::CheckoutTo, "main");
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        "Branch: error: Your local changes to the following files would be overwritten by checkout:"
+    );
+    assert_one_line_858(&app);
+}
+
+/// #858: popping the latest stash reported git's `git status` dump
+/// ("Stash popped: On branch main\nChanges not staged…"); it now reports
+/// the stash it dropped.
+#[test]
+fn popping_a_stash_reports_the_dropped_entry_on_one_line() {
+    let tmp = make_committed_repo();
+    std::fs::write(tmp.path().join("seed.txt"), "stashed\n").unwrap();
+    git_858(tmp.path(), &["stash", "-q"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.stash_pop_source_control();
+    assert!(!app.source_control.commit_feedback_is_error);
+    assert!(
+        app.status
+            .starts_with("Stash popped: Dropped refs/stash@{0} ("),
+        "{:?}",
+        app.status
+    );
+    assert!(
+        app.source_control
+            .commit_feedback
+            .as_deref()
+            .is_some_and(|f| f.starts_with("popped: Dropped refs/stash@{0} (")),
+        "{:?}",
+        app.source_control.commit_feedback
+    );
+    assert_one_line_858(&app);
+}
+
+/// #858: View Changes vs previous on a one-commit repository reported git's
+/// three-line error; it now reports its `fatal:` line.
+#[test]
+fn a_failed_diff_view_names_git_s_fatal_line() {
+    let tmp = make_committed_repo();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.view_previous_commit_diff_source_control();
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        "View Changes vs previous failed: fatal: ambiguous argument 'HEAD~1': unknown revision or path not in the working tree."
+    );
+    assert_one_line_858(&app);
+}
+
+/// #858: a failed clone reported "Clone failed: Cloning into 'notrepo'...\n
+/// fatal: …\nfatal: …\n\nPlease make sure…"; it now reports git's first
+/// `fatal:` line.
+#[test]
+fn a_failed_clone_names_git_s_fatal_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    let not_a_repo = tmp.path().join("elsewhere").join("notrepo");
+    std::fs::create_dir(&ws).unwrap();
+    std::fs::create_dir_all(&not_a_repo).unwrap();
+    let url = format!("file://{}", not_a_repo.display());
+    let mut app = App::new(ws).unwrap();
+    let err = crate::git::clone_into(tmp.path(), &url)
+        .map(|_| ())
+        .expect_err("nothing to clone");
+    assert!(err.contains('\n'), "git's text runs to lines: {err:?}");
+    app.finish_clone(Err(err), tmp.path());
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        format!(
+            "Clone failed: fatal: '{}' does not appear to be a git repository",
+            not_a_repo.display()
+        )
+    );
+    assert_one_line_858(&app);
 }
 
 #[test]
