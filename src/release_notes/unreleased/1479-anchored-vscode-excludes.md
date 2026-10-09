@@ -1,0 +1,1 @@
+fix: A VS Code `files.exclude` or `search.exclude` glob without a folder, such as `"build": true`, now hides only the top-level folder as VS Code does, instead of every folder with that name, so `scripts/build/` stays in the Explorer, Search and Go to File. In croft settings, a leading `/` anchors a glob to the workspace root.
