@@ -66167,6 +66167,7 @@ fn codeql_pack_commands_install_dependencies_and_download_packs() {
         let mut app = codeql_query_fixture(tmp.path(), "select 1");
         app.codeql_program = fake_codeql(bin.path(), "", 0, "");
         app.open_codeql_view();
+        wait_for_codeql_queries(&mut app);
         app.run_command(Command::CodeqlInstallPackDependencies);
         assert_eq!(
             app.status,
@@ -66427,6 +66428,19 @@ fn wait_for_codeql(app: &mut App) {
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+/// Drain until the walk for the workspace's queries lands (#840): opening
+/// the CodeQL view starts it off the UI thread.
+fn wait_for_codeql_queries(app: &mut App) {
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the CodeQL query discovery to land",
+        || {
+            app.drain_codeql_queries();
+            app.codeql_queries_job.is_none()
+        },
+    );
 }
 
 #[cfg(unix)]
@@ -68674,6 +68688,7 @@ fn a_query_row_in_the_side_bar_runs_that_file_and_records_it() {
         let mut app = codeql_query_fixture(tmp.path(), "select 1");
         app.codeql_program = fake_codeql(bin.path(), r#"{"version":"2.1.0","runs":[]}"#, 0, "");
         app.open_codeql_view();
+        wait_for_codeql_queries(&mut app);
         let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["acme/rust", crate::codeql_query::NO_PACK]);
         let row = app
@@ -68736,6 +68751,7 @@ fn codeql_pack_fixture(tmp: &std::path::Path, bin: &std::path::Path) -> App {
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
     app.codeql_program = program;
     app.open_codeql_view();
+    wait_for_codeql_queries(&mut app);
     app.focus = Pane::Tree;
     let row = app
         .codeql
@@ -69856,6 +69872,7 @@ fn creating_a_codeql_query_writes_opens_and_lists_it_in_the_selected_pack() {
         std::fs::write(pack.join("a.ql"), "select 1").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.open_codeql_view();
+        wait_for_codeql_queries(&mut app);
         app.focus = Pane::Tree;
         let row = app
             .codeql
@@ -69904,6 +69921,7 @@ fn creating_a_codeql_query_writes_opens_and_lists_it_in_the_selected_pack() {
         let empty = tempfile::tempdir().unwrap();
         let mut app = App::new(empty.path().to_path_buf()).unwrap();
         app.open_codeql_view();
+        wait_for_codeql_queries(&mut app);
         app.focus = Pane::Tree;
         app.codeql.language = Some(6);
         app.codeql.collapsed.insert(Section::Databases);
@@ -69952,6 +69970,54 @@ fn creating_a_codeql_query_writes_opens_and_lists_it_in_the_selected_pack() {
             Some(Command::CodeqlCreateQuery)
         );
         assert_eq!(Command::CodeqlCreateQuery.title(), "CodeQL: Create Query");
+    });
+}
+
+#[test]
+fn opening_the_codeql_view_does_not_wait_for_the_query_walk() {
+    // #840: the QL icon walked the whole workspace for queries before the
+    // view switched. It switches at once and the queries land on a later
+    // tick; a query created meanwhile is listed at once all the same.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    use crate::widgets::codeql::Line;
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let pack = tmp.path().join("pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join("qlpack.yml"), "name: acme/go\nextractor: go\n").unwrap();
+        std::fs::write(pack.join("a.ql"), "select 1").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        assert_eq!(app.sidebar_view, SidebarView::CodeQL);
+        assert!(
+            app.codeql_queries_job.is_some(),
+            "the walk is off the UI thread"
+        );
+        assert!(app.codeql.queries.is_empty());
+        assert!(
+            app.codeql
+                .lines()
+                .contains(&Line::Text("Discovering queries\u{2026}"))
+        );
+        wait_for_codeql_queries(&mut app);
+        let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["acme/go"]);
+
+        app.open_codeql_view();
+        assert!(app.codeql_queries_job.is_some());
+        assert_eq!(app.codeql.queries[0].queries, vec![pack.join("a.ql")]);
+        app.submit_create_codeql_query(&pack, Some("go"), "later");
+        let created = pack.join("later.ql");
+        assert!(
+            app.codeql.queries[0].queries.contains(&created),
+            "{:?}",
+            app.codeql.queries
+        );
+        assert!(
+            !app.drain_codeql_queries(),
+            "the older walk is dropped, never listed over the new query"
+        );
     });
 }
 
@@ -75071,6 +75137,165 @@ fn the_synced_settings_layer_is_in_the_reload_chain() {
     );
 }
 
+/// #840 regression, through base APIs only: clicking the QL icon walked the
+/// whole workspace for queries on the UI thread before the view switched,
+/// so the list was already filled when `open_codeql_view` returned. The
+/// view now switches at once and the walk's packs land on a later tick.
+#[test]
+fn opening_the_codeql_view_returns_before_the_query_walk_lands() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let pack = tmp.path().join("pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join("qlpack.yml"), "name: acme/go\nextractor: go\n").unwrap();
+        std::fs::write(pack.join("a.ql"), "select 1").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        assert_eq!(app.sidebar_view, SidebarView::CodeQL);
+        let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
+        assert!(
+            names.is_empty(),
+            "the walk ran on the UI thread before the view opened: {names:?}"
+        );
+    });
+}
+
+/// #840 negative: reopening the view while a walk is in flight keeps that
+/// walk rather than starting a second over the same tree: what it sends is
+/// what lands.
+#[test]
+fn reopening_the_codeql_view_keeps_the_walk_in_flight() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.codeql_queries_job = Some((app.workspace_root().to_path_buf(), rx));
+        app.open_codeql_view();
+        let pack = crate::codeql_query::QueryPack {
+            name: String::from("acme/in-flight"),
+            language: None,
+            dir: tmp.path().to_path_buf(),
+            queries: Vec::new(),
+        };
+        tx.send(vec![pack]).unwrap();
+        assert!(app.drain_codeql_queries());
+        let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["acme/in-flight"]);
+    });
+}
+
+/// #840 negative: a walk whose thread died without sending stops the
+/// "Discovering queries" line and leaves the list alone; with no walk in
+/// flight a drain changes nothing.
+#[test]
+fn a_query_walk_that_dies_stops_saying_it_is_discovering() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        assert!(
+            !app.drain_codeql_queries(),
+            "nothing in flight, nothing changes"
+        );
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<crate::codeql_query::QueryPack>>();
+        drop(tx);
+        app.codeql_queries_job = Some((app.workspace_root().to_path_buf(), rx));
+        app.codeql.discovering_queries = true;
+        assert!(app.drain_codeql_queries());
+        assert!(!app.codeql.discovering_queries);
+        assert!(app.codeql_queries_job.is_none());
+        assert!(app.codeql.queries.is_empty());
+    });
+}
+
+/// A workspace folder holding one CodeQL pack named `name`.
+fn codeql_pack_workspace_840(name: &str) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let pack = tmp.path().join("pack");
+    std::fs::create_dir_all(&pack).unwrap();
+    std::fs::write(
+        pack.join("qlpack.yml"),
+        format!("name: {name}\nextractor: go\n"),
+    )
+    .unwrap();
+    std::fs::write(pack.join("a.ql"), "select 1").unwrap();
+    tmp
+}
+
+/// #840: the walk runs off the UI thread, so the workspace can move to
+/// another root before it lands. Its packs are the old root's: they must
+/// not be listed for the new one, and the view walks the new root.
+#[test]
+fn a_query_walk_of_a_root_the_workspace_left_never_lands() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let a = codeql_pack_workspace_840("acme/a");
+        let b = codeql_pack_workspace_840("acme/b");
+        let mut app = App::new(a.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        assert!(
+            app.codeql_queries_job.is_some(),
+            "fixture: a's walk in flight"
+        );
+        app.change_workspace_root(b.path().to_path_buf());
+        wait_for_codeql_queries(&mut app);
+        let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
+        assert!(
+            !names.contains(&"acme/a"),
+            "a's queries landed on b: {names:?}"
+        );
+        app.open_codeql_view();
+        wait_for_codeql_queries(&mut app);
+        let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["acme/b"]);
+    });
+}
+
+/// #840: reopening the view after a workspace switch, with the old root's
+/// walk still in flight, walks the new root instead of waiting on the old.
+#[test]
+fn reopening_codeql_after_a_workspace_switch_walks_the_new_root() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let a = codeql_pack_workspace_840("acme/a");
+        let b = codeql_pack_workspace_840("acme/b");
+        let mut app = App::new(a.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        app.change_workspace_root(b.path().to_path_buf());
+        // Undrained, a's walk is still in flight here, landed or not.
+        app.open_codeql_view();
+        wait_for_codeql_queries(&mut app);
+        let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["acme/b"]);
+    });
+}
+
+/// #840 negative: a walk of the root the workspace still has lands as
+/// before, and one the test holds for that root keeps its place when the
+/// view is reopened (no second walk of the same tree).
+#[test]
+fn a_query_walk_of_the_current_root_still_lands() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let a = codeql_pack_workspace_840("acme/a");
+        let mut app = App::new(a.path().to_path_buf()).unwrap();
+        app.open_codeql_view();
+        app.open_codeql_view();
+        wait_for_codeql_queries(&mut app);
+        let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["acme/a"]);
+        assert!(!app.codeql.discovering_queries);
+    });
+}
+
 /// What `git push` writes to stderr for a push to GitHub: `remote:`
 /// chatter, the destination, then the ref update.
 const PUSH_OUTPUT_858: &str = "remote: \nremote: Create a pull request for 'main' on GitHub by visiting:\nremote:      https://github.com/o/r/pull/new/main\nremote: \nTo github.com:o/r.git\n   5a6cd5c..9f1e2d3  main -> main";
@@ -78061,6 +78286,189 @@ fn a_final_newline_prettier_adds_reaches_the_disk() {
     );
 }
 
+// ---- Git diffs of files that aren't UTF-8 (#1242) ----
+
+/// A repo with `name` committed as `head` bytes, then `head + added` on disk.
+fn encoded_repo(name: &str, head: &[u8], added: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = make_committed_repo();
+    let f = tmp.path().join(name);
+    std::fs::write(&f, head).unwrap();
+    git_stdout_in(tmp.path(), &["add", name]);
+    git_stdout_in(tmp.path(), &["commit", "-qm", "encoded"]);
+    std::fs::write(&f, [head, added].concat()).unwrap();
+    (tmp, f)
+}
+
+const LATIN1_HEAD: &[u8] = b"name;city\nM\xfcller;K\xf6ln\nJos\xe9;M\xe1laga\n";
+const LATIN1_ADDED: &[u8] = b"Zo\xeb;Z\xfcrich\n";
+
+/// After Reopen with Encoding, the gutter baseline is HEAD decoded the same
+/// way, so the added line gets its bar and the old lines none.
+#[test]
+fn a_windows_1252_file_gets_gutter_marks_after_reopen_with_encoding() {
+    let (tmp, f) = encoded_repo("latin1.txt", LATIN1_HEAD, LATIN1_ADDED);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.sync_git_gutters();
+    app.editor
+        .reopen_with_encoding(encoding_rs::WINDOWS_1252)
+        .unwrap();
+    app.sync_git_gutters();
+    assert_eq!(
+        app.editor.git_head_lines.as_deref(),
+        Some(&["name;city", "Müller;Köln", "José;Málaga"].map(String::from)[..])
+    );
+    draw(&mut app, 100, 30);
+    assert_eq!(
+        app.editor.git_mark_at(3),
+        Some(crate::widgets::editor::GitMark::Added)
+    );
+    assert_eq!(app.editor.git_mark_at(1), None);
+}
+
+/// A UTF-16LE file with a BOM is decoded as UTF-16 on both sides.
+#[test]
+fn a_utf16_file_gets_gutter_marks() {
+    let utf16 = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+    let head = [&[0xff, 0xfe][..], &utf16("one\ntwo\n")].concat();
+    let (tmp, f) = encoded_repo("app.rc", &head, &utf16("three\n"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.sync_git_gutters();
+    assert_eq!(
+        app.editor.git_head_lines.as_deref(),
+        Some(&["one", "two"].map(String::from)[..])
+    );
+    draw(&mut app, 100, 30);
+    assert_eq!(
+        app.editor.git_mark_at(2),
+        Some(crate::widgets::editor::GitMark::Added)
+    );
+}
+
+/// Clicking the file in Source Control opens its HEAD diff, decoded with the
+/// encoding its tab uses, instead of failing with "not UTF-8".
+#[test]
+fn a_windows_1252_file_opens_its_source_control_diff() {
+    let (tmp, f) = encoded_repo("latin1.txt", LATIN1_HEAD, LATIN1_ADDED);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.editor
+        .reopen_with_encoding(encoding_rs::WINDOWS_1252)
+        .unwrap();
+    wait_for_changes(&mut app, |a| {
+        a.source_control
+            .entries
+            .iter()
+            .any(|e| e.path == "latin1.txt")
+    });
+    let idx = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "latin1.txt")
+        .unwrap();
+    app.open_source_control_entry(idx);
+    let diff = app
+        .editor
+        .diff
+        .as_ref()
+        .unwrap_or_else(|| panic!("no diff opened: {}", app.status));
+    assert_eq!(diff.left_lines[1], "Müller;Köln");
+    assert_eq!(
+        diff.right_lines.last().map(String::as_str),
+        Some("Zoë;Zürich")
+    );
+    let changed = diff
+        .rows
+        .iter()
+        .filter(|r| !matches!(r, crate::widgets::diff::DiffRow::Equal { .. }))
+        .count();
+    assert_eq!(changed, 1, "only the added line differs");
+}
+
+/// With no tab open, the file is decoded the way opening it would: a BOM
+/// names its encoding, so a closed UTF-16 file still opens its diff.
+#[test]
+fn a_closed_utf16_file_opens_its_source_control_diff() {
+    let utf16 = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+    let head = [&[0xff, 0xfe][..], &utf16("one\ntwo\n")].concat();
+    let (tmp, _) = encoded_repo("app.rc", &head, &utf16("three\n"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    wait_for_changes(&mut app, |a| {
+        a.source_control.entries.iter().any(|e| e.path == "app.rc")
+    });
+    let idx = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "app.rc")
+        .unwrap();
+    app.open_source_control_entry(idx);
+    let diff = app
+        .editor
+        .diff
+        .as_ref()
+        .unwrap_or_else(|| panic!("no diff opened: {}", app.status));
+    assert_eq!(diff.left_lines, ["one", "two"]);
+    assert_eq!(diff.right_lines.last().map(String::as_str), Some("three"));
+}
+
+/// Staging a hunk writes the diff's decoded text back as a patch, which for
+/// a non-UTF-8 file would put UTF-8 bytes into a windows-1252 blob: refused,
+/// and the index is left alone.
+#[test]
+fn staging_a_hunk_in_a_non_utf8_diff_is_refused() {
+    let (tmp, f) = encoded_repo("latin1.txt", LATIN1_HEAD, LATIN1_ADDED);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.editor
+        .reopen_with_encoding(encoding_rs::WINDOWS_1252)
+        .unwrap();
+    wait_for_changes(&mut app, |a| {
+        a.source_control
+            .entries
+            .iter()
+            .any(|e| e.path == "latin1.txt")
+    });
+    let idx = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "latin1.txt")
+        .unwrap();
+    app.open_source_control_entry(idx);
+    assert!(app.editor.diff.is_some(), "{}", app.status);
+    app.stage_hunk_at_caret();
+    assert!(app.status.contains("windows-1252"), "{}", app.status);
+    assert_eq!(
+        git_stdout_in(tmp.path(), &["diff", "--cached", "--name-only"]),
+        ""
+    );
+}
+
+/// A binary (not UTF-8, no tab picking an encoding) file still opens
+/// without a diff, as before.
+#[test]
+fn a_modified_binary_file_still_opens_without_a_diff() {
+    let (tmp, _) = encoded_repo("blob.bin", b"\x00\xff\x01bin\n", b"\x00\xfemore\n");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    wait_for_changes(&mut app, |a| {
+        a.source_control
+            .entries
+            .iter()
+            .any(|e| e.path == "blob.bin")
+    });
+    let idx = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "blob.bin")
+        .unwrap();
+    app.open_source_control_entry(idx);
+    assert!(app.editor.diff.is_none());
+}
+
 /// #989: an App on the issue's repro, a merge stopped on a conflict.
 fn app_in_a_conflicted_merge() -> (App, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
@@ -79142,4 +79550,60 @@ fn save_all_does_not_report_a_file_waiting_on_its_formatter_as_saved() {
         save_all_summary(1, 0, None, String::new()),
         "Saved 1 editor"
     );
+}
+
+/// #1488: a watcher that clears the screen (`tsc --watch`, `cargo watch -c`)
+/// erases its own output mark, so its finish reports no output. That finish
+/// never reached the build scan, the one-shot skip meant for it stayed set,
+/// and it swallowed the NEXT command's scan instead: PROBLEMS kept the
+/// watcher's stale cycle and dropped the new build's errors.
+#[test]
+fn a_build_after_a_screen_clearing_watcher_reaches_problems() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let pane = app.run_project_task(long_task("tsc --watch")).unwrap();
+    let cwd = tmp.path().to_path_buf();
+    let stale = "main.ts(1,7): error TS2322: Type 'string' is not assignable to type 'number'.\n";
+    let fresh = "main.ts(2,7): error TS2322: Type 'number' is not assignable to type 'string'.\n";
+    // The watcher's last cycle, published mid-run.
+    assert!(app.apply_build_scan(pane, Some(&cwd), "tsc --watch", stale));
+    app.watch_published_panes.insert(pane);
+    // Ctrl+C: the watcher's own finish, its output erased by the clears.
+    finish_pane_command(&mut app, pane, Some(130), 5_000);
+    // The next build in the same pane.
+    assert!(
+        app.apply_build_scan(pane, Some(&cwd), "tsc", fresh),
+        "the build after the watcher is scanned"
+    );
+    let groups = app.problems.groups().to_vec();
+    assert_eq!(groups.len(), 1, "{groups:?}");
+    let lines: Vec<u32> = groups[0].items.iter().map(|d| d.line).collect();
+    assert_eq!(
+        lines,
+        vec![1],
+        "the build's line 2 error (0-based 1), not the watcher's line 1"
+    );
+}
+
+/// #1488 negative: a command that prints nothing (`clear`, `cd`) leaves the
+/// pane's problems as they were; only a scan of real output replaces them.
+#[test]
+fn a_command_with_no_output_keeps_the_panes_problems() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let pane = app.run_project_task(long_task("make")).unwrap();
+    let cwd = tmp.path().to_path_buf();
+    assert!(app.apply_build_scan(
+        pane,
+        Some(&cwd),
+        "make",
+        "main.c:7:3: error: expected ';'\n"
+    ));
+    finish_pane_command(&mut app, pane, Some(0), 10);
+    assert_eq!(app.problems.groups().len(), 1, "still listed");
+    // And the skip still covers the watcher's own finish when it does
+    // report output.
+    app.watch_published_panes.insert(pane);
+    assert!(!app.apply_build_scan(pane, Some(&cwd), "tsc --watch", "a.c:1:1: error: old\n"));
+    assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
 }
