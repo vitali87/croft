@@ -24921,6 +24921,91 @@ mod tests {
         );
     }
 
+    /// Make the save path's copy aside fail as a full disk does, for the
+    /// rest of this thread.
+    #[cfg(target_os = "linux")]
+    fn fill_the_disk_for_copies() {
+        crate::prefs::test_hooks::ASIDE_OUT_OF_SPACE.set(true);
+    }
+
+    /// #1614: with no room for a second copy of the file, a save writes the
+    /// file in place instead of failing with "No space left on device".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_save_with_no_room_for_a_copy_writes_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("notes.md");
+        let original: String = (0..2000)
+            .map(|i| format!("line {i} of the notes\n"))
+            .collect();
+        std::fs::write(&f, &original).unwrap();
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.insert_str("X");
+        fill_the_disk_for_copies();
+        let saved = e.save_to_disk();
+        crate::prefs::test_hooks::ASIDE_OUT_OF_SPACE.set(false);
+        assert_eq!(saved.unwrap(), SaveOutcome::Saved);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), format!("X{original}"));
+        assert!(!e.dirty);
+        assert!(!e.disk_changed_externally());
+        let stray: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "notes.md")
+            .collect();
+        assert!(stray.is_empty(), "temp files left behind: {stray:?}");
+    }
+
+    /// #1614 negative: when the new contents don't fit in place either, the
+    /// save fails and the file is left whole (#1124).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_save_that_fits_neither_aside_nor_in_place_leaves_the_file_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("notes.md");
+        let original: String = (0..400).map(|i| format!("- entry {i:04}\n")).collect();
+        std::fs::write(&f, &original).unwrap();
+        run_with_file_size_limit(
+            "widgets::editor::tests::child_saves_in_place_under_a_file_size_limit",
+            &f,
+            4096,
+        );
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            original,
+            "the failed save cut the file short"
+        );
+        let stray: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "notes.md")
+            .collect();
+        assert!(stray.is_empty(), "temp files left behind: {stray:?}");
+    }
+
+    /// The child half of the test above; a no-op unless run by it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_saves_in_place_under_a_file_size_limit() {
+        let Some(f) = std::env::var_os("CROFT_TEST_FSIZE_FILE") else {
+            return;
+        };
+        let mut e = Editor::new();
+        e.open(std::path::Path::new(&f)).unwrap();
+        e.insert_str("# A new entry at the top\n");
+        fill_the_disk_for_copies();
+        assert!(
+            e.save_to_disk().is_err(),
+            "the write must fail past the limit"
+        );
+        assert!(e.dirty, "the edits are still only in the buffer");
+        assert!(
+            !e.disk_changed_externally(),
+            "croft's own failed write must not read as an external change"
+        );
+    }
+
     #[test]
     fn saving_keeps_the_mode_and_writes_through_a_symlink() {
         // Negative: writing aside and renaming in must not change what a

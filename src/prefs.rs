@@ -667,6 +667,12 @@ impl From<ReplaceError> for std::io::Error {
 /// be given; and it is impossible where the directory refuses the temp file.
 /// Those are written in place, with the space for the new contents reserved
 /// before the first byte changes.
+///
+/// So is a file with room for its new contents but not for a second copy of
+/// them (#1614): on a nearly full disk, a one-character edit to a file bigger
+/// than the free space could never be saved. That fallback is Linux only,
+/// where the reservation is made, and only when the space is reserved, so
+/// a write that doesn't fit still fails with the file whole.
 pub(crate) fn replace_file_contents(path: &Path, bytes: &[u8]) -> Result<(), ReplaceError> {
     let untouched = |error| ReplaceError {
         error,
@@ -694,11 +700,31 @@ pub(crate) fn replace_file_contents(path: &Path, bytes: &[u8]) -> Result<(), Rep
                     untouched(e)
                 });
             }
+            #[cfg(target_os = "linux")]
+            Err(Aside::Failed(e)) if is_out_of_space(&e) => {
+                return write_in_place(&target, bytes, true).map_err(|r| {
+                    // Nothing changed: the save failed for the reason the
+                    // copy aside did, and that is what the user can act on.
+                    if r.touched { r } else { untouched(e) }
+                });
+            }
             Err(Aside::Failed(e)) => return Err(untouched(e)),
             Err(Aside::InPlace) => {}
         }
     }
-    write_in_place(&target, bytes)
+    write_in_place(&target, bytes, false)
+}
+
+/// `statfs` magic numbers of the filesystems that copy every overwritten
+/// block, where reserving space does not make an overwrite safe: Btrfs, ZFS
+/// and bcachefs.
+#[cfg(target_os = "linux")]
+const COPY_ON_WRITE_FS_MAGIC: [u32; 3] = [0x9123_683E, 0x2FC1_2FC1, 0xCA45_1A4E];
+
+/// The disk or the user's quota is full.
+#[cfg(target_os = "linux")]
+fn is_out_of_space(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT))
 }
 
 /// Why [`write_aside`] gave up: the write failed (a full disk), or the
@@ -749,6 +775,10 @@ fn write_aside(target: &Path, meta: &std::fs::Metadata, bytes: &[u8]) -> Result<
         let _ = std::fs::remove_file(tmp);
         Aside::Failed(e)
     };
+    #[cfg(test)]
+    if test_hooks::ASIDE_OUT_OF_SPACE.get() {
+        return Err(fail(&tmp, std::io::Error::from_raw_os_error(libc::ENOSPC)));
+    }
     if let Err(e) = file.write_all(bytes).and_then(|()| file.flush()) {
         return Err(fail(&tmp, e));
     }
@@ -840,9 +870,15 @@ fn copy_xattrs(_fd: libc::c_int, _target: &Path) -> bool {
 
 /// Overwrite `target` with `bytes` without truncating it first. On Linux
 /// the space a longer file needs is reserved before the first byte changes,
-/// so running out of it fails with the file untouched.
-fn write_in_place(target: &Path, bytes: &[u8]) -> Result<(), ReplaceError> {
+/// so running out of it fails with the file untouched. With `must_reserve`,
+/// the whole output is reserved even when it is not longer (a sparse or
+/// copy-on-write file can need new blocks to overwrite), and a filesystem
+/// that can't reserve space fails the write too, untouched, instead of
+/// writing on unguarded.
+fn write_in_place(target: &Path, bytes: &[u8], must_reserve: bool) -> Result<(), ReplaceError> {
     use std::io::{Seek as _, Write as _};
+    #[cfg(not(target_os = "linux"))]
+    let _ = must_reserve;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .open(target)
@@ -857,11 +893,53 @@ fn write_in_place(target: &Path, bytes: &[u8]) -> Result<(), ReplaceError> {
     let before = file.metadata().ok();
     #[cfg(target_os = "linux")]
     let old_len = before.as_ref().map_or(0, |m| m.len());
+    // Reserving space does not hold on a filesystem that writes every
+    // overwritten block somewhere new (Btrfs, ZFS, bcachefs): an overwrite
+    // can still run out halfway through the old contents, so the mandatory
+    // fallback refuses there, untouched. XFS shares reflinked extents the
+    // same way but can unshare them up front, which leaves nothing to copy
+    // on write.
     #[cfg(target_os = "linux")]
-    if new_len > old_len {
+    if must_reserve {
+        use std::os::unix::io::AsRawFd as _;
+        let fd = file.as_raw_fd();
+        let refuse = |err: i32| ReplaceError {
+            error: std::io::Error::from_raw_os_error(err),
+            touched: false,
+        };
+        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatfs(fd, &mut st) } != 0 {
+            return Err(refuse(libc::EOPNOTSUPP));
+        }
+        if COPY_ON_WRITE_FS_MAGIC.contains(&(st.f_type as u32)) {
+            return Err(refuse(libc::EOPNOTSUPP));
+        }
+        if old_len > 0 {
+            let err = unsafe {
+                libc::fallocate(fd, libc::FALLOC_FL_UNSHARE_RANGE, 0, old_len as libc::off_t)
+            };
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if err != 0 && errno != libc::EOPNOTSUPP && errno != libc::EINVAL {
+                return Err(refuse(errno));
+            }
+        }
+    }
+    // A mandatory reservation covers the whole output even when it is no
+    // longer than the file: overwriting a sparse file's holes, or any block
+    // on a copy-on-write filesystem, can still need new blocks and fail
+    // halfway through the old contents.
+    #[cfg(target_os = "linux")]
+    if new_len > old_len || (must_reserve && new_len > 0) {
         use std::os::unix::io::AsRawFd as _;
         let err = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, new_len as libc::off_t) };
-        if err != 0 && err != libc::EOPNOTSUPP && err != libc::EINVAL {
+        let unsupported = err == libc::EOPNOTSUPP || err == libc::EINVAL;
+        if unsupported && must_reserve {
+            return Err(ReplaceError {
+                error: std::io::Error::from_raw_os_error(err),
+                touched: false,
+            });
+        }
+        if err != 0 && !unsupported {
             // A reservation that failed partway may have grown the file: cut
             // it back. The contents are as they were, but the attempt can
             // still have moved the file's timestamp (ext4 marks it modified
@@ -886,6 +964,16 @@ fn write_in_place(target: &Path, bytes: &[u8]) -> Result<(), ReplaceError> {
             error,
             touched: true,
         })
+}
+
+/// Faults a test can inject into the save path.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    thread_local! {
+        /// Fail the copy aside the way a full disk does (#1614).
+        pub(crate) static ASIDE_OUT_OF_SPACE: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
 }
 
 /// The settings file under `config_dir`. The real config dir means the
