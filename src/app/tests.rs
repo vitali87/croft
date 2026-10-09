@@ -32576,6 +32576,53 @@ fn open_line_above_relocated_from_cmd_shift_o_to_cmd_shift_enter() {
     )));
 }
 
+/// #1181: Ctrl+/ in a file with no comment syntax says so, as the palette
+/// command does, instead of doing nothing silently; in a file croft has no
+/// grammar for but knows the comment of, it comments.
+#[test]
+fn ctrl_slash_reports_a_file_with_no_comment_and_comments_one_by_extension() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("notes.unknownext");
+    std::fs::write(&plain, "hello\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&plain).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "hello");
+    assert_eq!(
+        app.status,
+        "Toggle Line Comment: no comment for this language"
+    );
+    let kt = tmp.path().join("App.kt");
+    std::fs::write(&kt, "class App\n").unwrap();
+    app.editor.open_pinned(&kt).unwrap();
+    app.status.clear();
+    app.handle_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "// class App");
+    assert!(app.status.is_empty(), "{}", app.status);
+}
+
+/// #1181 negative: Ctrl+/ on a blank line of a language that has a comment
+/// does nothing, without claiming the language has no comment.
+#[test]
+fn ctrl_slash_on_a_blank_line_does_not_report_no_comment() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (name, text) in [("main.rs", "   \n"), ("index.html", "\n")] {
+        let path = tmp.path().join(name);
+        std::fs::write(&path, text).unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open_pinned(&path).unwrap();
+        app.focus_pane(Pane::Editor);
+        app.status.clear();
+        app.handle_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(app.editor.lines[0], text.trim_end_matches('\n'), "{name}");
+        assert!(app.status.is_empty(), "{name}: {}", app.status);
+    }
+}
+
 #[test]
 fn toggle_line_comment_key_is_cmd_or_ctrl_slash() {
     assert!(is_toggle_line_comment_key(key(

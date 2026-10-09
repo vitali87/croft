@@ -10573,8 +10573,13 @@ impl Editor {
     /// what it did. Returns false (a no-op) for languages with no line
     /// comment.
     pub fn toggle_line_comment(&mut self) -> bool {
-        let Some(token) = line_comment_token(self.lang) else {
-            return false;
+        let Some(token) = self.line_comment_marker() else {
+            // VS Code's fallback for a language with only block comments
+            // (HTML, CSS, Markdown, XML): wrap the lines in one (#1181).
+            return match block_comment_tokens(self.lang) {
+                Some((open, close)) => self.toggle_lines_in_block_comment(open, close),
+                None => false,
+            };
         };
         let blocks = self.selected_row_blocks();
         let non_blank: Vec<usize> = blocks
@@ -10588,7 +10593,7 @@ impl Editor {
         self.push_undo(EditKind::ToggleComment);
         let all_commented = non_blank
             .iter()
-            .all(|&r| self.lines[r].trim_start().starts_with(token));
+            .all(|&r| line_comment_prefix_len(self.lines[r].trim_start(), token).is_some());
         // Each changed row with the char column of its edit and the chars it
         // added (negative: removed), to carry the carets on it along.
         let mut edits: Vec<(usize, usize, isize)> = Vec::with_capacity(non_blank.len());
@@ -10597,8 +10602,9 @@ impl Editor {
                 let line = self.lines[r].clone();
                 let off = line.len() - line.trim_start().len();
                 let mut rest = line[off..].to_string();
-                rest.drain(..token.len());
-                let mut removed = token.chars().count();
+                let len = line_comment_prefix_len(&rest, token).unwrap_or(0);
+                let mut removed = rest[..len].chars().count();
+                rest.drain(..len);
                 if rest.starts_with(' ') {
                     rest.drain(..1);
                     removed += 1;
@@ -10634,6 +10640,104 @@ impl Editor {
         self.remap_carets(|(r, c)| match edits.iter().find(|e| e.0 == r) {
             Some(&(_, at, delta)) => (r, shift_col(c, at, delta)),
             None => (r, c),
+        });
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        self.ensure_cursor_col_visible();
+        true
+    }
+
+    /// This buffer's line-comment marker: its language's, or for a file
+    /// croft has no grammar for, the one its name or extension uses
+    /// (#1181).
+    fn line_comment_marker(&self) -> Option<&'static str> {
+        match self.lang {
+            // SCSS and Sass share the CSS grammar but, unlike CSS, have a
+            // `//` line comment, so the file's extension decides.
+            Some(LangKind::Css) | None => {
+                self.path.as_deref().and_then(line_comment_token_for_path)
+            }
+            Some(_) => line_comment_token(self.lang),
+        }
+    }
+
+    /// Whether Toggle Line Comment has any comment to use in this buffer: a
+    /// line comment, or a block comment to wrap the lines in.
+    pub fn has_line_comment_syntax(&self) -> bool {
+        self.line_comment_marker().is_some() || block_comment_tokens(self.lang).is_some()
+    }
+
+    /// Toggle Line Comment where the language has only block comments: each
+    /// block of lines is wrapped in one `open … close` pair, from its first
+    /// non-blank character to its last, or unwrapped when every block
+    /// already is one, as VS Code does (#1181).
+    fn toggle_lines_in_block_comment(&mut self, open: &str, close: &str) -> bool {
+        // Each block's first and last non-blank rows.
+        let spans: Vec<(usize, usize)> = self
+            .selected_row_blocks()
+            .into_iter()
+            .filter_map(|(start, end)| {
+                let blank = |r: &usize| self.lines[*r].trim().is_empty();
+                let first = (start..=end).find(|r| !blank(r))?;
+                let last = (start..=end).rev().find(|r| !blank(r))?;
+                Some((first, last))
+            })
+            .collect();
+        if spans.is_empty() {
+            return false;
+        }
+        let commented = spans.iter().all(|&(first, last)| {
+            let (head, tail) = (self.lines[first].trim_start(), self.lines[last].trim_end());
+            head.starts_with(open)
+                && tail.ends_with(close)
+                && (first != last || head.len() >= open.len() + close.len())
+        });
+        self.push_undo(EditKind::ToggleComment);
+        // Each edit as (row, char column, chars added or, negative, removed),
+        // in the order made: a row's closing edit comes before its opening
+        // one, so each column is still true when its edit is applied.
+        let mut edits: Vec<(usize, usize, isize)> = Vec::with_capacity(spans.len() * 2);
+        for &(first, last) in &spans {
+            let line = &self.lines[last];
+            let end = line.trim_end().len();
+            if commented {
+                let mut cut = end - close.len();
+                if line[..cut].ends_with(' ') {
+                    cut -= 1;
+                }
+                let at = line[..cut].chars().count();
+                let removed = line[cut..end].chars().count();
+                self.lines[last].replace_range(cut..end, "");
+                edits.push((last, at, -(removed as isize)));
+            } else {
+                let at = line[..end].chars().count();
+                let marker = format!(" {close}");
+                self.lines[last].insert_str(end, &marker);
+                edits.push((last, at, marker.chars().count() as isize));
+            }
+            let line = &self.lines[first];
+            let indent = line.len() - line.trim_start().len();
+            let at = line[..indent].chars().count();
+            if commented {
+                let mut cut = indent + open.len();
+                if line[cut..].starts_with(' ') {
+                    cut += 1;
+                }
+                let removed = line[indent..cut].chars().count();
+                self.lines[first].replace_range(indent..cut, "");
+                edits.push((first, at, -(removed as isize)));
+            } else {
+                let marker = format!("{open} ");
+                self.lines[first].insert_str(indent, &marker);
+                edits.push((first, at, marker.chars().count() as isize));
+            }
+        }
+        self.remap_carets(|(r, c)| {
+            let c = edits
+                .iter()
+                .filter(|e| e.0 == r)
+                .fold(c, |c, &(_, at, delta)| shift_col(c, at, delta));
+            (r, c)
         });
         self.mark_buffer_changed();
         self.recompute_highlights();
@@ -12802,8 +12906,68 @@ fn line_comment_token(lang: Option<LangKind>) -> Option<&'static str> {
         | Some(LangKind::Dockerfile) => Some("#"),
         Some(LangKind::Java) | Some(LangKind::CSharp) => Some("//"),
         Some(LangKind::Lua) | Some(LangKind::Sql) => Some("--"),
+        // JSONC, which croft's and VS Code's own settings files are: VS
+        // Code's JSON language comments with `//` too.
+        Some(LangKind::Json) => Some("//"),
         _ => None,
     }
+}
+
+/// The line comment of a file croft has no grammar for, by its file name or
+/// extension, as VS Code's language configurations give them (#1181).
+fn line_comment_token_for_path(path: &Path) -> Option<&'static str> {
+    let name = path.file_name()?.to_str()?;
+    if name.starts_with(".env")
+        || matches!(
+            name,
+            ".gitignore"
+                | ".dockerignore"
+                | ".npmignore"
+                | ".prettierignore"
+                | ".gitattributes"
+                | ".editorconfig"
+                | "CODEOWNERS"
+        )
+    {
+        return Some("#");
+    }
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "kt" | "kts" | "swift" | "scala" | "sc" | "dart" | "php" | "groovy" | "gradle"
+        | "jsonc" | "json5" | "proto" | "zig" | "v" | "sv" | "fs" | "fsx" | "scss" | "sass"
+        | "less" => Some("//"),
+        "pl" | "pm" | "r" | "ps1" | "psm1" | "mk" | "conf" | "cfg" | "properties" | "env"
+        | "tf" | "hcl" | "nix" | "jl" | "ex" | "exs" | "cmake" | "gitignore" | "zsh" | "fish"
+        | "awk" | "tcl" | "nim" | "cr" | "graphql" | "gql" => Some("#"),
+        "hs" | "elm" | "ada" | "adb" | "ads" | "vhd" | "vhdl" => Some("--"),
+        "ini" | "clj" | "cljs" | "edn" | "lisp" | "el" | "scm" | "rkt" | "asm" => Some(";"),
+        "tex" | "sty" | "erl" | "hrl" => Some("%"),
+        "vim" => Some("\""),
+        "bat" | "cmd" => Some("@REM"),
+        _ => None,
+    }
+}
+
+/// The byte length of the line comment `token` that `text` (a line with its
+/// indentation trimmed) starts with, or `None` when it is not commented. A
+/// word token (batch's `@REM`) must end at whitespace or the line's end, so
+/// `REMOTE.EXE` is not a comment, and batch's plain `REM` counts too.
+fn line_comment_prefix_len(text: &str, token: &str) -> Option<usize> {
+    let word = |t: &str| {
+        text.starts_with(t)
+            && text[t.len()..]
+                .chars()
+                .next()
+                .is_none_or(char::is_whitespace)
+    };
+    if !token.ends_with(|c: char| c.is_ascii_alphabetic()) {
+        return text.starts_with(token).then_some(token.len());
+    }
+    if word(token) {
+        return Some(token.len());
+    }
+    let plain = token.trim_start_matches('@');
+    (plain != token && word(plain)).then_some(plain.len())
 }
 
 /// The block-comment delimiters for a language (VS Code `blockComment`), or
@@ -12822,7 +12986,9 @@ fn block_comment_tokens(lang: Option<LangKind>) -> Option<(&'static str, &'stati
         | Some(LangKind::Css)
         | Some(LangKind::Ql)
         | Some(LangKind::Dbscheme) => Some(("/*", "*/")),
-        Some(LangKind::Html) | Some(LangKind::Markdown) => Some(("<!--", "-->")),
+        Some(LangKind::Html) | Some(LangKind::Markdown) | Some(LangKind::Xml) => {
+            Some(("<!--", "-->"))
+        }
         Some(LangKind::Lua) => Some(("--[[", "]]")),
         Some(LangKind::Java) | Some(LangKind::CSharp) | Some(LangKind::Sql) => Some(("/*", "*/")),
         // Python has no true block comment; VS Code's language config maps
@@ -29111,6 +29277,142 @@ mod tests {
         e.lang = None;
         assert!(!e.toggle_line_comment());
         assert_eq!(e.lines, vec!["x = 1"]);
+    }
+
+    /// #1181: where the language has only block comments, Toggle Line
+    /// Comment wraps the lines in one, as VS Code does, and unwraps them.
+    #[test]
+    fn toggle_line_comment_wraps_lines_in_a_block_comment_where_there_is_no_line_comment() {
+        for (lang, text, commented) in [
+            (LangKind::Html, "  <ul>", "  <!-- <ul> -->"),
+            (LangKind::Css, "body {", "/* body { */"),
+            (LangKind::Markdown, "# Title", "<!-- # Title -->"),
+            (LangKind::Xml, "<a/>", "<!-- <a/> -->"),
+        ] {
+            let mut e = editor_with(text);
+            e.lang = Some(lang);
+            e.cursor_col = text.chars().count() - 1;
+            assert!(e.toggle_line_comment(), "{lang:?}");
+            assert_eq!(e.lines, vec![commented], "{lang:?}");
+            assert!(e.toggle_line_comment(), "{lang:?}");
+            assert_eq!(e.lines, vec![text], "{lang:?} unwraps");
+            assert_eq!(e.cursor_col, text.chars().count() - 1, "{lang:?} caret");
+        }
+        // A selection of lines gets one pair, from the first line's text to
+        // the last one's, and blank lines around it are left out.
+        let mut e = editor_with("<ul>\n  <li>one</li>\n</ul>\n\n");
+        e.lang = Some(LangKind::Html);
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (3, 0),
+        });
+        assert!(e.toggle_line_comment());
+        assert_eq!(
+            e.lines,
+            vec!["<!-- <ul>", "  <li>one</li>", "</ul> -->", ""]
+        );
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["<ul>", "  <li>one</li>", "</ul>", ""]);
+    }
+
+    /// #1181: JSON(C) comments with `//`, and a file croft has no grammar
+    /// for comments by its name or extension.
+    #[test]
+    fn toggle_line_comment_covers_json_and_files_without_a_grammar() {
+        let mut e = editor_with("  \"a\": 1,");
+        e.lang = Some(LangKind::Json);
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["  // \"a\": 1,"]);
+        for (name, text, commented) in [
+            ("App.kt", "class App {", "// class App {"),
+            ("main.swift", "let x = 1", "// let x = 1"),
+            (".gitignore", "target/", "# target/"),
+            (".env.local", "KEY=1", "# KEY=1"),
+            ("run.ps1", "Write-Host hi", "# Write-Host hi"),
+            ("Main.hs", "main = pure ()", "-- main = pure ()"),
+            ("setup.ini", "[core]", "; [core]"),
+            ("paper.tex", "\\section{A}", "% \\section{A}"),
+        ] {
+            let mut e = editor_with(text);
+            e.lang = None;
+            e.path = Some(PathBuf::from("/tmp/x").join(name));
+            assert!(e.toggle_line_comment(), "{name}");
+            assert_eq!(e.lines, vec![commented], "{name}");
+            assert!(e.toggle_line_comment(), "{name}");
+            assert_eq!(e.lines, vec![text], "{name} uncomments");
+        }
+    }
+
+    /// #1181: SCSS, Sass and Less comment with `//`, though SCSS and Sass
+    /// share the CSS grammar, which still wraps in `/* */`.
+    #[test]
+    fn toggle_line_comment_uses_slashes_in_scss_sass_and_less() {
+        for (name, lang) in [
+            ("a.scss", Some(LangKind::Css)),
+            ("a.sass", Some(LangKind::Css)),
+            ("a.less", None),
+        ] {
+            let mut e = editor_with("  color: red;");
+            e.lang = lang;
+            e.path = Some(PathBuf::from("/tmp/x").join(name));
+            assert!(e.toggle_line_comment(), "{name}");
+            assert_eq!(e.lines, vec!["  // color: red;"], "{name}");
+            assert!(e.toggle_line_comment(), "{name}");
+            assert_eq!(e.lines, vec!["  color: red;"], "{name} uncomments");
+        }
+        let mut e = editor_with("body {");
+        e.lang = Some(LangKind::Css);
+        e.path = Some(PathBuf::from("/tmp/x/a.css"));
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["/* body { */"]);
+    }
+
+    /// #1181: batch files comment with `@REM`, as VS Code does, and
+    /// uncomment `@REM` or `REM` only as a whole word, so `REMOTE.EXE` is
+    /// a command, not a comment.
+    #[test]
+    fn toggle_line_comment_in_batch_files_uses_at_rem_as_a_word() {
+        let bat = |text: &str| {
+            let mut e = editor_with(text);
+            e.lang = None;
+            e.path = Some(PathBuf::from("/tmp/x/run.bat"));
+            e
+        };
+        let mut e = bat("echo hi");
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["@REM echo hi"]);
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["echo hi"]);
+        let mut e = bat("REM note");
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["note"], "plain REM uncomments");
+        let mut e = bat("REM");
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec![""]);
+        for text in ["REMOTE.EXE --sync", "@REMOTE.EXE --sync"] {
+            let mut e = bat(text);
+            assert!(e.toggle_line_comment());
+            assert_eq!(e.lines, vec![format!("@REM {text}")], "{text}");
+        }
+    }
+
+    /// #1181 negative: a file of an unknown kind, or a language with no
+    /// comment of either kind, is still left alone, as are blank lines.
+    #[test]
+    fn toggle_line_comment_still_skips_what_has_no_comment() {
+        let mut e = editor_with("x = 1");
+        e.lang = None;
+        e.path = Some(PathBuf::from("/tmp/x/notes.unknownext"));
+        assert!(!e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["x = 1"]);
+        let mut e = editor_with("   ");
+        e.lang = Some(LangKind::Html);
+        assert!(!e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["   "]);
+        let mut e = editor_with("x: 1");
+        e.lang = Some(LangKind::Yaml);
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["# x: 1"], "a line comment still wins");
     }
 
     // ---- Toggle Block Comment (Shift+Alt+A) ----
