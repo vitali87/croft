@@ -316,6 +316,9 @@ pub enum Command {
     ProblemsToggleScope,
     DiffToggleIgnoreWhitespace,
     NewTerminal,
+    /// Terminal: Run Selected Text in Active Terminal (#1292): the
+    /// editor's selection, or the caret's line, run in the active pane.
+    RunSelectedText,
     /// Terminal: Focus Next / Previous Terminal (#843): Cmd+] / Cmd+[, which
     /// have no `Ctrl` form (`Ctrl+[` is `Esc`).
     FocusNextTerminal,
@@ -724,6 +727,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ProblemsToggleScope,
     Command::DiffToggleIgnoreWhitespace,
     Command::NewTerminal,
+    Command::RunSelectedText,
     Command::FocusNextTerminal,
     Command::FocusPreviousTerminal,
     Command::StartDebugging,
@@ -1113,6 +1117,7 @@ impl Command {
             Command::ProblemsToggleScope => "Problems: Toggle Scope (Open Files / Whole Project)",
             Command::DiffToggleIgnoreWhitespace => "Diff: Toggle Ignore Whitespace",
             Command::NewTerminal => "Terminal: Create New Terminal",
+            Command::RunSelectedText => "Terminal: Run Selected Text in Active Terminal",
             Command::FocusNextTerminal => "Terminal: Focus Next Terminal",
             Command::FocusPreviousTerminal => "Terminal: Focus Previous Terminal",
             Command::StartDebugging => "Debug: Start Debugging",
@@ -1503,6 +1508,7 @@ impl Command {
             Command::ProblemsToggleScope => "",
             Command::DiffToggleIgnoreWhitespace => "",
             Command::NewTerminal => "Cmd+T",
+            Command::RunSelectedText => "",
             Command::FocusNextTerminal => "Cmd+]",
             Command::FocusPreviousTerminal => "Cmd+[",
             Command::KeyboardShortcuts => "F1",
@@ -1879,6 +1885,7 @@ impl Command {
             Command::ProblemsToggleScope => "problems_toggle_scope",
             Command::DiffToggleIgnoreWhitespace => "diff_toggle_ignore_whitespace",
             Command::NewTerminal => "new_terminal",
+            Command::RunSelectedText => "run_selected_text",
             Command::FocusNextTerminal => "focus_next_terminal",
             Command::FocusPreviousTerminal => "focus_previous_terminal",
             Command::StartDebugging => "start_debugging",
