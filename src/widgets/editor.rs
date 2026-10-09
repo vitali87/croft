@@ -9897,6 +9897,7 @@ impl Editor {
         self.move_up();
         if (self.cursor_row, self.cursor_col) == before {
             self.cursor_col = 0;
+            self.ensure_cursor_col_visible();
         }
     }
 
@@ -9908,6 +9909,7 @@ impl Editor {
         self.move_down();
         if (self.cursor_row, self.cursor_col) == before {
             self.cursor_col = self.line_char_len(self.cursor_row);
+            self.ensure_cursor_col_visible();
         }
     }
 
@@ -27540,6 +27542,41 @@ mod tests {
             long.last_inner.y + long.last_inner.height - 1,
             "the horizontal scrollbar sits on the bottom inner row"
         );
+    }
+
+    /// #1563: the edge arrows' line-end and line-start landings scroll the
+    /// view sideways to keep the caret on screen in a narrow pane.
+    #[test]
+    fn edge_arrows_keep_the_caret_horizontally_visible() {
+        let mut e = editor_with(&format!("short\n{}", "b".repeat(200)));
+        e.focused = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 6,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        e.cursor_row = 1;
+        e.cursor_col = 0;
+        e.arrow_down();
+        assert_eq!(e.cursor_col, 200);
+        assert!(
+            e.scroll_col > 0,
+            "the view follows the caret to the line end"
+        );
+        let width = e.visible_text_width();
+        assert!(
+            e.cursor_col < e.scroll_col + width,
+            "the caret is on screen"
+        );
+        e.cursor_row = 0;
+        e.cursor_col = 3;
+        e.scroll_col = 100;
+        e.arrow_up();
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 0));
+        assert_eq!(e.scroll_col, 0, "the view comes back to the line start");
     }
 
     #[test]
