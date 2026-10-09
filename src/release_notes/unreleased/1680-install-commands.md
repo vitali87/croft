@@ -1,0 +1,1 @@
+fix: Each release now publishes croft-software to crates.io (once a CARGO_REGISTRY_TOKEN secret is set), so `cargo binstall croft-software` installs the newest release instead of an old version that has no release archives, and the README gives a curl one-liner that installs the latest release with nothing else needed.

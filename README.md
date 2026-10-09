@@ -74,6 +74,18 @@ or a prebuilt from [its releases](https://github.com/cargo-bins/cargo-binstall#i
 That downloads the tagged release for your platform (macOS arm64/x86_64, Linux
 musl arm64/x86_64) and puts `croft` on `PATH` in seconds.
 
+Or straight from the latest release, with nothing but `curl` and `tar`:
+
+```bash
+os=$([ "$(uname -s)" = Darwin ] && echo apple-darwin || echo unknown-linux-musl)
+arch=$(uname -m | sed 's/arm64/aarch64/')
+curl -fsSL "https://github.com/vitali87/croft/releases/latest/download/croft-$arch-$os.tar.gz" | tar xz
+sudo mv "croft-$arch-$os/croft" /usr/local/bin/
+```
+
+On Android in Termux there is no `sudo` and no `/usr/local/bin`: move it to
+`"$PREFIX/bin/"` instead.
+
 Every release also carries a `SHA256SUMS` covering all four archives, so a
 download can be verified independently. It lists every archive, so check only
 the one you fetched rather than running it whole:
