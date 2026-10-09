@@ -1,0 +1,1 @@
+fix: Regex Replace keeps a `$NAME` or `${NAME}` that names no group in the pattern as typed, so shell, PHP and Perl variables are no longer deleted from the replacement; `$&` inserts the whole match as in VS Code (#1399)
