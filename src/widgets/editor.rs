@@ -3157,6 +3157,11 @@ pub struct Editor {
     /// [`crate::hex`], so a multi-gigabyte log opens instantly. Read-only;
     /// "Reopen as Text" (`force_text`) shows the raw bytes.
     pub log: Option<crate::log_view::LogView>,
+    /// The top line a reload of the log is restoring (#1538), `usize::MAX`
+    /// for "the end", while the reloaded view is still indexing: the line
+    /// may lie past what the head pass reached, so it is settled again as
+    /// the index grows. Dropped when the reader scrolls.
+    log_reload_top: Option<usize>,
     /// Archive browser (#179): the member list of a zip/jar/whl/tar
     /// archive; Enter extracts one member to scratch and opens it
     /// through the normal dispatch. Read-only.
@@ -3383,6 +3388,7 @@ impl Editor {
             diff: None,
             hex: None,
             log: None,
+            log_reload_top: None,
             archive: None,
             pr_review: None,
             fleet: None,
@@ -5801,6 +5807,7 @@ impl Editor {
         self.sarif = None;
         self.hex = None;
         self.log = Some(view);
+        self.log_reload_top = None;
         self.status = format!("Opened {} as a rendered log", path.display());
         Ok(())
     }
@@ -9543,6 +9550,14 @@ impl Editor {
         // A SARIF viewer keeps the reader's place, and the logs added to
         // it, across a rewrite of its log (#577).
         let old_sarif = self.sarif.take();
+        // A rendered log keeps its place too, and one viewed at its end
+        // follows it, since a log grows while it is read (#1538).
+        let log_place = self.log.as_ref().map(|log| {
+            let rows = (self.last_inner.height as usize).saturating_sub(1).max(1);
+            let at_end = !log.indexing() && prev_scroll + rows >= log.len();
+            let top = if at_end { usize::MAX } else { prev_scroll };
+            (top, log.highlight(), log.selection, log.last_body)
+        });
         // `open` starts a text tab's history afresh. A reload keeps it
         // (#1357): the text from before an agent's or formatter's rewrite is
         // one undo away, with everything typed before that behind it.
@@ -9569,6 +9584,19 @@ impl Editor {
         self.cursor_row = prev_row.min(self.lines.len().saturating_sub(1));
         self.cursor_col = prev_col.min(self.line_char_len(self.cursor_row));
         self.scroll = prev_scroll.min(self.lines.len().saturating_sub(1));
+        if let Some((top, highlight, selection, last_body)) = log_place
+            && let Some(log) = self.log.as_mut()
+        {
+            log.set_highlight(highlight);
+            let (len, indexing) = (log.len(), log.indexing());
+            log.selection = selection.filter(|&(a, b)| indexing || a.0.max(b.0) < len);
+            log.last_body = last_body;
+            if !indexing && self.active_search_match.is_some_and(|(row, ..)| row >= len) {
+                self.active_search_match = None;
+            }
+            self.log_reload_top = Some(top);
+            self.settle_log_reload();
+        }
         result
     }
 
@@ -12327,6 +12355,22 @@ impl Editor {
         self.last_edit_kind = None;
     }
 
+    /// Scroll a reloaded log to the place its reload kept (#1538), clamped
+    /// to what is indexed so far, and keep the request while the index is
+    /// still growing so the place is reached once it covers it.
+    pub fn settle_log_reload(&mut self) {
+        let Some(top) = self.log_reload_top.take() else {
+            return;
+        };
+        if self.log.is_none() {
+            return;
+        }
+        self.scroll_view_to(top);
+        if self.log.as_ref().is_some_and(|log| log.indexing()) {
+            self.log_reload_top = Some(top);
+        }
+    }
+
     fn scroll_view_to(&mut self, top: usize) {
         let viewport = self.last_inner.height as usize;
         // A rendered log's text side is a one-line stub, so clamping against
@@ -12336,6 +12380,9 @@ impl Editor {
         if let Some(log) = self.log.as_ref() {
             let rows = viewport.saturating_sub(1).max(1);
             self.scroll = top.min(log.len().saturating_sub(rows));
+            // Any scroll is the reader's own place now, which a reload still
+            // settling must not take back.
+            self.log_reload_top = None;
             return;
         }
         if viewport == 0 || self.lines.is_empty() {
@@ -20651,6 +20698,164 @@ mod tests {
         assert!(e.scroll < total, "scroll stays inside the file");
         e.scroll_up(usize::MAX / 2);
         assert_eq!(e.scroll, 0, "and back to the top");
+    }
+
+    /// A rendered log of `n` lines (`line1` .. `line{n}`) behind a colour
+    /// escape, so it routes to the log view, opened and painted once.
+    fn open_rendered_log(dir: &Path, n: usize) -> (Editor, PathBuf, Rect) {
+        let p = dir.join("app.log");
+        let mut body = String::from("\u{1b}[32mINFO\u{1b}[0m start\n");
+        for i in 1..=n {
+            body.push_str(&format!("line{i}\n"));
+        }
+        std::fs::write(&p, body).unwrap();
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+        assert!(e.log.is_some(), "the fixture opens as a rendered log");
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        e.render(area, &mut buf);
+        (e, p, area)
+    }
+
+    fn append_log_lines(p: &Path, from: usize, to: usize) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(p).unwrap();
+        for i in from..=to {
+            writeln!(f, "line{i}").unwrap();
+        }
+    }
+
+    /// The rows the log body shows under its header.
+    fn log_body_rows(e: &Editor) -> usize {
+        (e.last_inner.height as usize).saturating_sub(1).max(1)
+    }
+
+    /// #1538: a log that grew on disk reloaded with the view back on line 1,
+    /// so a reader at line 240 lost their place on every append.
+    #[test]
+    fn a_grown_log_keeps_its_scroll_through_an_external_reload() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut e, p, _) = open_rendered_log(tmp.path(), 2_000);
+        e.scroll_down(240);
+        assert_eq!(e.scroll, 240);
+        append_log_lines(&p, 2_001, 2_010);
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert_eq!(
+            e.log.as_ref().unwrap().len(),
+            2_011,
+            "the reload saw the append"
+        );
+        assert_eq!(e.scroll, 240, "the reader stays where they were");
+    }
+
+    /// #1538: a view at the end of the log follows it, so new lines come into
+    /// view on each reload the way `tail -f` shows them.
+    #[test]
+    fn a_log_viewed_at_its_end_follows_new_lines_on_reload() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut e, p, area) = open_rendered_log(tmp.path(), 2_000);
+        e.scroll_down(usize::MAX / 2);
+        let rows = log_body_rows(&e);
+        assert_eq!(e.scroll + rows, 2_001, "the view is on the last line");
+        append_log_lines(&p, 2_001, 2_005);
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert_eq!(e.scroll + rows, 2_006, "the new last line is in view");
+        let mut buf = Buffer::empty(area);
+        e.render(area, &mut buf);
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("line2005"), "and painted");
+    }
+
+    /// #1538: a log too large to index on open (past the synchronous head)
+    /// still follows its end: the place is settled again as the background
+    /// index catches up, rather than clamped to the head's line count.
+    #[test]
+    fn a_large_log_viewed_at_its_end_follows_it_once_the_index_catches_up() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lines = (crate::log_view::HEAD_INDEX_BYTES as usize) / 9 + 50_000;
+        let (mut e, p, _) = open_rendered_log(tmp.path(), lines);
+        e.log.as_mut().unwrap().finish_index();
+        e.scroll_down(usize::MAX / 2);
+        let rows = log_body_rows(&e);
+        assert_eq!(e.scroll + rows, lines + 1);
+        append_log_lines(&p, lines + 1, lines + 3);
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert!(
+            e.log.as_ref().unwrap().indexing(),
+            "the tail indexes in the background"
+        );
+        e.log.as_mut().unwrap().finish_index();
+        e.settle_log_reload();
+        assert_eq!(e.scroll + rows, lines + 4, "the view lands on the new end");
+    }
+
+    /// Negative: a reader who scrolls while the reload's index is still
+    /// running keeps the place they scrolled to; the settle does not drag
+    /// them back to where the reload left them.
+    #[test]
+    fn scrolling_during_a_reload_index_cancels_the_pending_place() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lines = (crate::log_view::HEAD_INDEX_BYTES as usize) / 9 + 50_000;
+        let (mut e, p, _) = open_rendered_log(tmp.path(), lines);
+        e.log.as_mut().unwrap().finish_index();
+        e.scroll_down(usize::MAX / 2);
+        append_log_lines(&p, lines + 1, lines + 3);
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        e.scroll_view_to(10);
+        e.log.as_mut().unwrap().finish_index();
+        e.settle_log_reload();
+        assert_eq!(e.scroll, 10, "the reader's own scroll wins");
+    }
+
+    /// Negative: a log truncated under the view (rotation, `> app.log`)
+    /// clamps to what is left instead of scrolling into blank rows, and one
+    /// shorter than a screen goes back to the top.
+    #[test]
+    fn a_truncated_log_clamps_its_scroll_on_reload() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut e, p, _) = open_rendered_log(tmp.path(), 2_000);
+        let rows = log_body_rows(&e);
+        e.scroll_down(1_500);
+        let mut body = String::from("\u{1b}[32mINFO\u{1b}[0m start\n");
+        for i in 1..=99 {
+            body.push_str(&format!("line{i}\n"));
+        }
+        std::fs::write(&p, &body).unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert_eq!(e.log.as_ref().unwrap().len(), 100);
+        assert_eq!(e.scroll, 100 - rows, "clamped to the last screen");
+
+        std::fs::write(&p, "\u{1b}[32mINFO\u{1b}[0m rotated\n").unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert_eq!(
+            e.scroll, 0,
+            "a log shorter than a screen shows from the top"
+        );
+    }
+
+    /// A reload keeps the reader's selection and colour toggle, and drops a
+    /// selection that no longer points into the file.
+    #[test]
+    fn a_log_reload_keeps_the_selection_and_highlight_toggle() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut e, p, _) = open_rendered_log(tmp.path(), 2_000);
+        let flipped = !e.log.as_ref().unwrap().highlight();
+        {
+            let log = e.log.as_mut().unwrap();
+            log.set_highlight(flipped);
+            log.selection = Some(((10, 0), (12, 3)));
+        }
+        append_log_lines(&p, 2_001, 2_002);
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        let log = e.log.as_ref().unwrap();
+        assert_eq!(log.highlight(), flipped);
+        assert_eq!(log.selection, Some(((10, 0), (12, 3))));
+
+        e.log.as_mut().unwrap().selection = Some(((1_900, 0), (1_950, 2)));
+        std::fs::write(&p, "\u{1b}[32mINFO\u{1b}[0m rotated\nline1\n").unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert_eq!(e.log.as_ref().unwrap().selection, None, "past the new end");
     }
 
     /// Colours resolve through the ACTIVE theme's ANSI palette, so a rendered

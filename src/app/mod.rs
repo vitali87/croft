@@ -52796,9 +52796,17 @@ impl App {
             return false;
         }
         let changed = log.poll_index();
-        if log.indexing() {
+        let indexing = log.indexing();
+        // A reload's kept place may lie past what was indexed so far.
+        if changed {
+            self.editor.settle_log_reload();
+        }
+        if indexing {
             return changed;
         }
+        let Some(log) = self.editor.log.as_ref() else {
+            return true;
+        };
         if let Some(state) = self.editor_find.as_ref()
             && !state.query.is_empty()
         {
