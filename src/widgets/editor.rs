@@ -10340,7 +10340,7 @@ impl Editor {
     /// `EditKind::DuplicateLines`.
     pub fn duplicate_lines_down(&mut self) {
         self.push_undo(EditKind::DuplicateLines);
-        let blocks = self.selected_row_blocks();
+        let blocks = self.selected_row_blocks_over_folds();
         for &(start, end) in blocks.iter().rev() {
             let block: Vec<String> = self.lines[start..=end].to_vec();
             self.lines.splice(end + 1..end + 1, block);
@@ -10359,7 +10359,7 @@ impl Editor {
     /// it started at (the original is pushed down by `block_len`).
     pub fn duplicate_lines_up(&mut self) {
         self.push_undo(EditKind::DuplicateLines);
-        let blocks = self.selected_row_blocks();
+        let blocks = self.selected_row_blocks_over_folds();
         for &(start, end) in blocks.iter().rev() {
             let block: Vec<String> = self.lines[start..=end].to_vec();
             self.lines.splice(start..start, block);
@@ -10407,6 +10407,59 @@ impl Editor {
             })
             .collect();
         merge_row_blocks(rows, true)
+    }
+
+    /// [`Self::selected_row_blocks`], with a block that ends on a folded
+    /// header widened over the lines the fold hides, so Move Line and Copy
+    /// Line take a folded region whole instead of its header alone (#1611).
+    fn selected_row_blocks_over_folds(&self) -> Vec<(usize, usize)> {
+        let rows = self
+            .selected_row_blocks()
+            .into_iter()
+            .map(|(start, end)| (start, self.folded_end(end).unwrap_or(end)))
+            .collect();
+        merge_row_blocks(rows, true)
+    }
+
+    /// The last line `row`'s fold hides, when `row` is a folded header.
+    fn folded_end(&self, row: usize) -> Option<usize> {
+        self.hidden_ranges
+            .iter()
+            .find(|&&(header, _)| header == row)
+            .map(|&(_, end)| end)
+    }
+
+    /// The header of the fold hiding `row`, when a fold hides it.
+    fn folded_header_hiding(&self, row: usize) -> Option<usize> {
+        self.hidden_ranges
+            .iter()
+            .find(|&&(header, end)| header < row && row <= end)
+            .map(|&(header, _)| header)
+    }
+
+    /// Carry the folds through a line move that sent each row `r` to
+    /// `map(r)`: a moved fold stays folded over the same text. `before` is
+    /// the fold set ahead of the move. It replaces what the edit's own fold
+    /// sync made of the move, which follows a header by its text and so
+    /// loses one whose text repeats. The server's spans move too, since a
+    /// move keeps the line count they are checked against; one the move
+    /// split apart is dropped until the next reply.
+    fn move_folds(
+        &mut self,
+        before: std::collections::BTreeSet<usize>,
+        map: impl Fn(usize) -> usize,
+    ) {
+        self.folded = before.into_iter().map(&map).collect();
+        if let Some(spans) = self.lsp_folds.as_mut() {
+            for span in spans.iter_mut() {
+                span.start_line = map(span.start_line);
+                span.end_line = map(span.end_line);
+            }
+            spans.retain(|span| span.start_line < span.end_line);
+        }
+        // The marker and comment table is rebuilt from the moved text.
+        self.refresh_fold_tables();
+        self.rebuild_hidden_ranges();
     }
 
     /// Move the primary caret and selection and every extra caret through
@@ -10511,55 +10564,99 @@ impl Editor {
     /// block with the line below it, carrying the cursor and selection along.
     /// With several carets every caret's block moves. No-op when a block
     /// already touches the last line: all of them move or none does.
+    ///
+    /// A folded region moves as one line and stays folded (#1611): a block
+    /// on a folded header takes the hidden lines with it, and a block above
+    /// a folded header moves below its whole region, never into its body.
     pub fn move_lines_down(&mut self) {
-        let blocks = self.selected_row_blocks();
+        let blocks = self.selected_row_blocks_over_folds();
+        // What each block swaps with: the line below it, or all of a folded
+        // region that starts there.
+        let below: Vec<(usize, usize)> = blocks
+            .iter()
+            .map(|&(_, end)| (end + 1, self.folded_end(end + 1).unwrap_or(end + 1)))
+            .collect();
         // A symbol tab's block stops at the symbol's last line.
         let limit = self.symbol_clip().map_or(self.lines.len(), |(_, e)| e);
-        if blocks.last().is_none_or(|&(_, end)| end + 1 >= limit) {
+        if below.last().is_none_or(|&(_, last)| last >= limit)
+            || below
+                .iter()
+                .zip(blocks.iter().skip(1))
+                .any(|(b, next)| b.1 >= next.0)
+        {
             return;
         }
         self.push_undo(EditKind::MoveLines);
-        for &(start, end) in blocks.iter().rev() {
-            self.forget_folds_in(start, end + 1);
-            self.lines[start..=end + 1].rotate_right(1);
+        let folds = self.folded.clone();
+        for (&(start, end), &(_, last)) in blocks.iter().zip(&below).rev() {
+            self.lines[start..=last].rotate_right(last - end);
         }
-        self.remap_carets(|(r, c)| {
-            let row = match blocks.iter().find(|b| b.0 <= r && r <= b.1 + 1) {
-                // The line below a block swaps up over it.
-                Some(&(start, end)) if r == end + 1 => start,
-                Some(_) => r + 1,
-                None => r,
-            };
-            (row, c)
-        });
+        let map = |r: usize| {
+            for (&(start, end), &(first, last)) in blocks.iter().zip(&below) {
+                if (start..=end).contains(&r) {
+                    return r + (last - end);
+                }
+                // The lines below a block swap up over it.
+                if (first..=last).contains(&r) {
+                    return r - (end - start + 1);
+                }
+            }
+            r
+        };
+        self.remap_carets(|(r, c)| (map(r), c));
         self.mark_buffer_changed();
+        self.move_folds(folds, map);
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
     }
 
     /// VS Code "Move Line Up" (Alt+Up): mirror of `move_lines_down`. No-op
-    /// when a block already touches the first line.
+    /// when a block already touches the first line. A block below a folded
+    /// region moves above all of it (#1611).
     pub fn move_lines_up(&mut self) {
-        let blocks = self.selected_row_blocks();
+        let blocks = self.selected_row_blocks_over_folds();
         let first = self.symbol_clip().map_or(0, |(first, _)| first);
         if blocks.first().is_none_or(|&(start, _)| start <= first) {
             return;
         }
-        self.push_undo(EditKind::MoveLines);
-        for &(start, end) in &blocks {
-            self.forget_folds_in(start - 1, end);
-            self.lines[start - 1..=end].rotate_left(1);
+        // What each block swaps with: the line above it, or all of the
+        // folded region whose hidden lines end there.
+        let above: Vec<(usize, usize)> = blocks
+            .iter()
+            .map(|&(start, _)| {
+                let row = start - 1;
+                (self.folded_header_hiding(row).unwrap_or(row), row)
+            })
+            .collect();
+        if above.first().is_some_and(|&(top, _)| top < first)
+            || above
+                .iter()
+                .skip(1)
+                .zip(&blocks)
+                .any(|(a, prev)| a.0 <= prev.1)
+        {
+            return;
         }
-        self.remap_carets(|(r, c)| {
-            let row = match blocks.iter().find(|b| b.0 <= r + 1 && r <= b.1) {
-                // The line above a block swaps down under it.
-                Some(&(start, end)) if r + 1 == start => end,
-                Some(_) => r - 1,
-                None => r,
-            };
-            (row, c)
-        });
+        self.push_undo(EditKind::MoveLines);
+        let folds = self.folded.clone();
+        for (&(start, end), &(top, _)) in blocks.iter().zip(&above) {
+            self.lines[top..=end].rotate_left(start - top);
+        }
+        let map = |r: usize| {
+            for (&(start, end), &(top, bottom)) in blocks.iter().zip(&above) {
+                if (start..=end).contains(&r) {
+                    return r - (start - top);
+                }
+                // The lines above a block swap down under it.
+                if (top..=bottom).contains(&r) {
+                    return r + (end - start + 1);
+                }
+            }
+            r
+        };
+        self.remap_carets(|(r, c)| (map(r), c));
         self.mark_buffer_changed();
+        self.move_folds(folds, map);
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
     }
@@ -29709,6 +29806,104 @@ mod tests {
         assert_eq!(folded_rows(&e), vec![2, 8]);
         assert_eq!(e.lines[2], "def alpha():");
         assert!(e.is_line_hidden(3) && !e.is_line_hidden(2));
+    }
+
+    /// The #1611 file, with `def b()` (row 4, body rows 5-6) folded.
+    fn folded_b() -> Editor {
+        let mut e =
+            editor_with("def a():\n    return 1\n\n\ndef b():\n    x = 1\n    return x\nlast = 3");
+        e.toggle_fold(4);
+        assert_eq!(folded_rows(&e), vec![4]);
+        assert!(e.is_line_hidden(5) && e.is_line_hidden(6));
+        e
+    }
+
+    /// #1611: Move Line Up below a folded function moves the line above the
+    /// whole function, not into its hidden body, and the fold stays closed.
+    #[test]
+    fn move_line_up_below_a_folded_function_moves_above_it() {
+        let mut e = folded_b();
+        (e.cursor_row, e.cursor_col) = (7, 0);
+        e.move_lines_up();
+        assert_eq!(
+            e.lines[3..],
+            ["", "last = 3", "def b():", "    x = 1", "    return x"]
+        );
+        assert_eq!(e.cursor_row, 4);
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![5], "the fold moved with its text");
+        assert!(e.is_line_hidden(6) && e.is_line_hidden(7));
+        assert!(e.undo());
+        assert_eq!(e.lines[7], "last = 3");
+    }
+
+    /// #1611: Move Line Down on a folded header moves the header and its
+    /// body together, and a line above a fold moves below all of it.
+    #[test]
+    fn move_line_down_moves_a_folded_function_whole() {
+        let mut e = folded_b();
+        (e.cursor_row, e.cursor_col) = (4, 0);
+        e.move_lines_down();
+        assert_eq!(
+            e.lines[3..],
+            ["", "last = 3", "def b():", "    x = 1", "    return x"]
+        );
+        assert_eq!(e.cursor_row, 5, "the caret stays on the header");
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![5]);
+        assert!(e.is_line_hidden(6) && e.is_line_hidden(7));
+
+        let mut e = folded_b();
+        (e.cursor_row, e.cursor_col) = (3, 0);
+        e.move_lines_down();
+        assert_eq!(
+            e.lines[3..],
+            ["def b():", "    x = 1", "    return x", "", "last = 3"]
+        );
+        assert_eq!(e.cursor_row, 6);
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![3]);
+        assert!(e.is_line_hidden(4) && e.is_line_hidden(5));
+    }
+
+    /// #1611: Copy Line Down on a folded header copies the whole function.
+    #[test]
+    fn copy_line_down_on_a_folded_header_copies_its_body_too() {
+        let mut e = folded_b();
+        (e.cursor_row, e.cursor_col) = (4, 0);
+        e.duplicate_lines_down();
+        assert_eq!(
+            e.lines[4..],
+            [
+                "def b():",
+                "    x = 1",
+                "    return x",
+                "def b():",
+                "    x = 1",
+                "    return x",
+                "last = 3"
+            ]
+        );
+        assert_eq!(e.cursor_row, 7, "the caret is on the copy's header");
+    }
+
+    /// #1611 negative: with no fold, or with the fold open, Move Line swaps
+    /// one line as before.
+    #[test]
+    fn move_line_without_a_closed_fold_swaps_one_line() {
+        let mut e =
+            editor_with("def a():\n    return 1\n\n\ndef b():\n    x = 1\n    return x\nlast = 3");
+        (e.cursor_row, e.cursor_col) = (7, 0);
+        e.move_lines_up();
+        assert_eq!(e.lines[6..], ["last = 3", "    return x"]);
+        let mut e = folded_b();
+        e.toggle_fold(4);
+        assert!(e.folded.is_empty());
+        (e.cursor_row, e.cursor_col) = (4, 0);
+        e.move_lines_down();
+        assert_eq!(e.lines[4..6], ["    x = 1", "def b():"]);
+        e.duplicate_lines_down();
+        assert_eq!(e.lines[5..7], ["def b():", "def b():"]);
     }
 
     /// An untitled buffer has no path, and its folds follow edits too.
