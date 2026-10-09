@@ -7111,6 +7111,7 @@ fn git_status_spans_clean_branch_is_green() {
         changed_count: 0,
         prepared_message: None,
         operation: None,
+        rebasing_branch: None,
     };
     let spans = git_status_spans(&st);
     let main_span = spans
@@ -7137,6 +7138,7 @@ fn git_status_spans_dirty_branch_is_yellow_not_red() {
         changed_count: 0,
         prepared_message: None,
         operation: None,
+        rebasing_branch: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -7166,6 +7168,7 @@ fn git_status_spans_renders_detached_hash_when_no_branch() {
         changed_count: 0,
         prepared_message: None,
         operation: None,
+        rebasing_branch: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -7187,6 +7190,7 @@ fn git_status_spans_renders_ahead_behind_counts() {
         changed_count: 0,
         prepared_message: None,
         operation: None,
+        rebasing_branch: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -16334,6 +16338,57 @@ fn continue_rebase_finishes_it_on_the_branch() {
         "feat\nmain",
         "feat replays on top of main"
     );
+}
+
+/// #1647: mid-rebase HEAD is detached on the commit being replayed onto,
+/// yet the status bar and Source Control name the branch being rebased,
+/// for a merge-backend and an apply-backend rebase alike.
+#[test]
+fn a_rebase_names_the_branch_being_rebased() {
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    assert!(git_succeeds(p, &["checkout", "-q", "feat"]));
+    for rebase in [&["rebase", "main"][..], &["rebase", "--apply", "main"][..]] {
+        assert!(!git_succeeds(p, rebase), "the rebase must conflict");
+        let st = crate::git::query(p);
+        assert_eq!(st.head_label(), "feat", "{rebase:?}");
+        let pill: String = git_status_spans(&st)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(pill.contains("feat | REBASING 1/1"), "{rebase:?}: {pill}");
+        let mut panel = crate::widgets::source_control::SourceControlPanel::new();
+        panel.set_status(st, Vec::new());
+        let area = ratatui::layout::Rect::new(0, 0, 60, 12);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let panel_text: String = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .map(|xy| buf[xy].symbol())
+            .collect();
+        assert!(panel_text.contains("feat"), "{rebase:?}: {panel_text}");
+        assert!(git_succeeds(p, &["rebase", "--abort"]));
+    }
+}
+
+/// #1647 negative: a plain detached checkout, and a rebase of a detached
+/// HEAD (git's `head-name` is then "detached HEAD"), still show the hash.
+#[test]
+fn a_detached_head_still_shows_its_hash() {
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    assert!(git_succeeds(p, &["checkout", "-q", "--detach", "feat"]));
+    let short = git_stdout(p, &["rev-parse", "--short", "HEAD"]);
+    assert_eq!(crate::git::query(p).head_label(), short);
+    assert!(
+        !git_succeeds(p, &["rebase", "main"]),
+        "the rebase must conflict"
+    );
+    let onto = git_stdout(p, &["rev-parse", "--short", "HEAD"]);
+    assert_eq!(crate::git::query(p).head_label(), onto);
+    assert!(git_succeeds(p, &["rebase", "--abort"]));
+    assert!(git_succeeds(p, &["checkout", "-q", "main"]));
+    assert_eq!(crate::git::query(p).head_label(), "main");
 }
 
 /// #1356 (the #989 path): committing from Source Control mid-rebase

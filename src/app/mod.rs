@@ -834,11 +834,7 @@ fn git_status_spans<'a>(status: &'a crate::git::GitStatus) -> Vec<Span<'a>> {
     // activity-bar Source Control icon, so the status-bar branch indicator
     // and the SCM panel share the same visual mark.
     spans.push(Span::styled("\u{ea68} ", Style::default().fg(pill_color)));
-    let label: &str = match (&status.branch, &status.detached_hash) {
-        (Some(b), _) => b.as_str(),
-        (None, Some(h)) => h.as_str(),
-        (None, None) => "(no head)",
-    };
+    let label = status.head_label();
     spans.push(Span::styled(
         label,
         Style::default().fg(pill_color).add_modifier(Modifier::BOLD),
