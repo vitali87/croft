@@ -14028,6 +14028,116 @@ fn discard_all_requires_confirmation_and_then_reverts_tracked_changes() {
     );
 }
 
+/// `git -C dir <args>` for app tests, asserting success; stdout trimmed.
+fn git_checked(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// #1350: Undo Last Commit (⋯ → Commit) takes the commit back: HEAD is
+/// the parent, its changes are staged, and its message is in the box.
+#[test]
+fn undo_last_commit_via_the_menu_puts_the_message_back_in_the_box() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = make_committed_repo();
+    let parent = git_checked(tmp.path(), &["rev-parse", "HEAD"]);
+    std::fs::write(tmp.path().join("b.txt"), "b\n").unwrap();
+    git_checked(tmp.path(), &["add", "b.txt"]);
+    git_checked(tmp.path(), &["commit", "-q", "-m", "Add b too early"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.dispatch_scm_action(ScmAction::UndoLastCommit);
+    assert_eq!(git_checked(tmp.path(), &["rev-parse", "HEAD"]), parent);
+    assert_eq!(app.source_control.message, "Add b too early");
+    assert_eq!(
+        git_checked(tmp.path(), &["diff", "--cached", "--name-only"]),
+        "b.txt"
+    );
+    assert!(
+        !app.source_control.commit_feedback_is_error,
+        "{:?}",
+        app.source_control.commit_feedback
+    );
+}
+
+/// #1350: the palette has it too.
+#[test]
+fn undo_last_commit_is_in_the_palette() {
+    let cmd = crate::widgets::command_palette::Command::from_id("git_undo_last_commit")
+        .expect("there is an Undo Last Commit command");
+    assert_eq!(cmd.title(), "Git: Undo Last Commit");
+    let tmp = make_committed_repo();
+    std::fs::write(tmp.path().join("b.txt"), "b\n").unwrap();
+    git_checked(tmp.path(), &["add", "b.txt"]);
+    git_checked(tmp.path(), &["commit", "-q", "-m", "second"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(cmd);
+    assert_eq!(app.source_control.message, "second");
+}
+
+/// #1350 negative: a commit already on the upstream is not undone on the
+/// first ask; it warns that undoing it means a force push, and a second
+/// ask goes ahead.
+#[test]
+fn undo_last_commit_warns_before_undoing_a_pushed_commit() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = make_committed_repo();
+    let remote = tempfile::tempdir().unwrap();
+    git_checked(remote.path(), &["init", "-q", "--bare"]);
+    git_checked(
+        tmp.path(),
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+    );
+    git_checked(tmp.path(), &["push", "-q", "-u", "origin", "main"]);
+    let head = git_checked(tmp.path(), &["rev-parse", "HEAD"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.dispatch_scm_action(ScmAction::UndoLastCommit);
+    assert_eq!(
+        git_checked(tmp.path(), &["rev-parse", "HEAD"]),
+        head,
+        "not yet"
+    );
+    let warning = app
+        .source_control
+        .commit_feedback
+        .clone()
+        .unwrap_or_default();
+    assert!(warning.contains("force push"), "{warning}");
+    app.dispatch_scm_action(ScmAction::UndoLastCommit);
+    assert_eq!(
+        app.source_control.message, "init",
+        "the second ask undoes it"
+    );
+}
+
+/// #1350 negative: with a typed message in the box the undo keeps it
+/// rather than overwriting the user's text.
+#[test]
+fn undo_last_commit_keeps_a_message_the_user_typed() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = make_committed_repo();
+    std::fs::write(tmp.path().join("b.txt"), "b\n").unwrap();
+    git_checked(tmp.path(), &["add", "b.txt"]);
+    git_checked(tmp.path(), &["commit", "-q", "-m", "second"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.source_control.insert_str("my draft");
+    app.dispatch_scm_action(ScmAction::UndoLastCommit);
+    assert_eq!(app.source_control.message, "my draft");
+    assert_eq!(
+        git_checked(tmp.path(), &["log", "-1", "--format=%s"]),
+        "init"
+    );
+}
+
 /// The issue's repo (#1352): `value_1`..`value_20` committed, then line 5
 /// changed to `value_FIVE` and line 9 deleted, open in an editor tab with
 /// its change bars computed.
