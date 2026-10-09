@@ -74,6 +74,51 @@ pub struct OutlinePanel {
     /// the current scroll), so wheel-scroll can clamp to the last row without
     /// knowing the layout at input time.
     viewport_rows: u16,
+    /// The `current` this view last scrolled into sight. Each host keeps its
+    /// own, so a host that was swapped out when the caret moved still follows
+    /// it the next time it is swapped in.
+    followed: Option<usize>,
+    /// Bumped whenever the panel switches to another file (or clears), so a
+    /// swapped-out view can tell its scroll belongs to the old file.
+    file_generation: u64,
+    /// The `file_generation` this view's scroll was taken against.
+    view_generation: u64,
+}
+
+/// One host's view of the outline: its scroll and the rects its last render
+/// left for hit-testing. The Explorer's OUTLINE section and the secondary
+/// side bar list the same symbols but scroll on their own (#1326), so the app
+/// keeps the second host's view and swaps it in around that host's render and
+/// mouse handling with [`OutlinePanel::swap_view`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutlineView {
+    scroll: usize,
+    followed: Option<usize>,
+    generation: u64,
+    last_area: Rect,
+    last_scrollbar: Rect,
+    last_header_row: u16,
+    last_header_x: u16,
+    last_header_w: u16,
+    first_row_y: u16,
+    visible_rows: u16,
+    viewport_rows: u16,
+}
+
+impl OutlineView {
+    /// The rect this view was last painted into; empty before its first
+    /// render and after [`forget_area`](Self::forget_area).
+    pub fn area(&self) -> Rect {
+        self.last_area
+    }
+
+    /// Drop the hit rects (the host is no longer on screen), so a click where
+    /// it used to be cannot reach it.
+    pub fn forget_area(&mut self) {
+        self.last_area = Rect::default();
+        self.last_scrollbar = Rect::default();
+        self.visible_rows = 0;
+    }
 }
 
 impl OutlinePanel {
@@ -97,7 +142,71 @@ impl OutlinePanel {
             first_row_y: 0,
             visible_rows: 0,
             viewport_rows: 0,
+            followed: None,
+            file_generation: 0,
+            view_generation: 0,
         }
+    }
+
+    /// Exchange this panel's view (scroll and hit rects) with `view`. Call it
+    /// in pairs around another host's render or mouse handling. A view taken
+    /// against an earlier file starts again from the top, and a view that
+    /// missed a caret move scrolls to the caret's symbol now.
+    pub fn swap_view(&mut self, view: &mut OutlineView) {
+        let mine = OutlineView {
+            scroll: self.scroll,
+            followed: self.followed,
+            generation: self.view_generation,
+            last_area: self.last_area,
+            last_scrollbar: self.last_scrollbar,
+            last_header_row: self.last_header_row,
+            last_header_x: self.last_header_x,
+            last_header_w: self.last_header_w,
+            first_row_y: self.first_row_y,
+            visible_rows: self.visible_rows,
+            viewport_rows: self.viewport_rows,
+        };
+        let theirs = std::mem::replace(view, mine);
+        self.scroll = theirs.scroll;
+        self.followed = theirs.followed;
+        self.view_generation = theirs.generation;
+        self.last_area = theirs.last_area;
+        self.last_scrollbar = theirs.last_scrollbar;
+        self.last_header_row = theirs.last_header_row;
+        self.last_header_x = theirs.last_header_x;
+        self.last_header_w = theirs.last_header_w;
+        self.first_row_y = theirs.first_row_y;
+        self.visible_rows = theirs.visible_rows;
+        self.viewport_rows = theirs.viewport_rows;
+        if self.view_generation != self.file_generation {
+            self.view_generation = self.file_generation;
+            self.scroll = 0;
+            self.followed = None;
+        }
+        self.catch_up_with_caret();
+    }
+
+    /// Scroll the caret's symbol into view if it changed since this view last
+    /// did so. Only on a change: follow-cursor runs every frame, and pulling
+    /// the view back each tick would fight a manual wheel-scroll.
+    fn catch_up_with_caret(&mut self) {
+        if self.followed != self.current {
+            if let Some(i) = self.current {
+                self.ensure_visible(i);
+            }
+            self.followed = self.current;
+        }
+    }
+
+    /// The panel moved to another file or was cleared: every view's scroll
+    /// is stale. This view starts from the top now; swapped-out views do when
+    /// they are next swapped in.
+    fn new_file_generation(&mut self) {
+        self.file_generation += 1;
+        self.view_generation = self.file_generation;
+        self.scroll = 0;
+        self.current = None;
+        self.followed = None;
     }
 
     /// Replace the outline with an authoritative language-server reply for
@@ -145,8 +254,7 @@ impl OutlinePanel {
         self.path = Some(path);
         self.symbols = symbols;
         if !same_file {
-            self.scroll = 0;
-            self.current = None;
+            self.new_file_generation();
         } else if self.current.is_some_and(|i| i >= self.symbols.len()) {
             self.current = None;
         }
@@ -156,8 +264,7 @@ impl OutlinePanel {
     pub fn clear(&mut self) {
         self.path = None;
         self.symbols.clear();
-        self.current = None;
-        self.scroll = 0;
+        self.new_file_generation();
         self.loaded = false;
     }
 
@@ -193,12 +300,7 @@ impl OutlinePanel {
         }
         let changed = best != self.current;
         self.current = best;
-        // Only pull the view to the caret's symbol when that symbol actually
-        // changes; otherwise follow-cursor (which runs every frame) would fight
-        // a manual wheel-scroll, yanking the view back each tick.
-        if changed && let Some(i) = best {
-            self.ensure_visible(i);
-        }
+        self.catch_up_with_caret();
         changed
     }
 
@@ -580,6 +682,61 @@ mod tests {
         assert!(p.follow_caret(2));
         assert_eq!(p.current, Some(0), "only the class encloses line 2");
         assert!(!p.follow_caret(2), "no change returns false");
+    }
+
+    /// Render `p` into a `height`-row area at the origin.
+    fn render_rows(p: &mut OutlinePanel, height: u16) {
+        let area = Rect::new(0, 0, 30, height);
+        let mut buf = Buffer::empty(area);
+        p.render(area, &mut buf);
+    }
+
+    #[test]
+    fn a_swapped_in_view_keeps_its_own_scroll() {
+        let mut p = OutlinePanel::new();
+        p.toggle_collapse();
+        p.set_symbols("a.rs".into(), many(50));
+        render_rows(&mut p, 10);
+        let mut other = OutlineView::default();
+        p.swap_view(&mut other);
+        render_rows(&mut p, 10);
+        p.scroll_down(7);
+        p.swap_view(&mut other);
+        assert_eq!(p.scroll, 0, "the first view did not move");
+        p.swap_view(&mut other);
+        assert_eq!(p.scroll, 7, "the second view kept its offset");
+    }
+
+    #[test]
+    fn a_swapped_out_view_follows_the_caret_and_the_file_when_swapped_back() {
+        let mut p = OutlinePanel::new();
+        p.toggle_collapse();
+        p.set_symbols("a.rs".into(), many(50));
+        render_rows(&mut p, 10);
+        let mut other = OutlineView::default();
+        p.swap_view(&mut other);
+        render_rows(&mut p, 10);
+        p.swap_view(&mut other);
+        // The caret moves to symbol 30 while the other view is swapped out.
+        assert!(p.follow_caret(30));
+        assert!(p.scroll > 0, "the active view followed");
+        p.swap_view(&mut other);
+        assert!(
+            p.row_at(p.first_row_y).is_some_and(|i| i <= 30)
+                && 30 < p.scroll + p.visible_rows as usize,
+            "the other view scrolls symbol 30 into sight when swapped in"
+        );
+        p.scroll_up(1000);
+        p.swap_view(&mut other);
+        // A file switch while it is swapped out puts it back at the top, but
+        // a wheel-scroll since its last catch-up is not undone.
+        p.set_symbols("b.rs".into(), many(50));
+        p.swap_view(&mut other);
+        assert_eq!(p.scroll, 0, "a view from the old file starts at the top");
+        p.scroll_down(5);
+        p.swap_view(&mut other);
+        p.swap_view(&mut other);
+        assert_eq!(p.scroll, 5, "no caret move, so no pull back");
     }
 
     #[test]
