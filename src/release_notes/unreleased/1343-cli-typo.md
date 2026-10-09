@@ -1,0 +1,1 @@
+fix: A mistyped subcommand such as `croft atach` or `croft sync-confg devbox` now exits with "'atach' is not a croft command or an existing path" and suggests the subcommand you meant, instead of failing to open a workspace or suggesting a match for the next word; a missing workspace path is named in its error.

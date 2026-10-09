@@ -59,6 +59,9 @@ pub struct CompletionResult {
     pub request_id: u64,
     pub path: PathBuf,
     pub items: Vec<CompletionItem>,
+    /// The server capped the list (`isIncomplete`): typing on must ask it
+    /// again rather than only filter these items (#1529).
+    pub is_incomplete: bool,
 }
 
 #[derive(Debug)]
@@ -756,6 +759,8 @@ enum Cmd {
         path: PathBuf,
         line: u32,
         character: u32,
+        /// Re-asking because the last list was incomplete (#1529).
+        incomplete: bool,
     },
     RequestSignatureHelp {
         request_id: u64,
@@ -949,6 +954,15 @@ pub struct LspManager {
     signature_help_rx: std_mpsc::Receiver<SignatureHelpResult>,
     hover_rx: std_mpsc::Receiver<HoverResult>,
     def_rx: std_mpsc::Receiver<DefinitionResult>,
+    /// Test hooks: senders into the three jump channels, so app tests can
+    /// answer a definition, declaration or type definition request
+    /// without a server.
+    #[cfg(test)]
+    jump_test_tx: (
+        std_mpsc::Sender<DefinitionResult>,
+        std_mpsc::Sender<DeclarationResult>,
+        std_mpsc::Sender<TypeDefinitionResult>,
+    ),
     doc_symbols_rx: std_mpsc::Receiver<DocumentSymbolsResult>,
     decl_rx: std_mpsc::Receiver<DeclarationResult>,
     type_def_rx: std_mpsc::Receiver<TypeDefinitionResult>,
@@ -1017,6 +1031,8 @@ impl LspManager {
         let (doc_symbols_tx, doc_symbols_rx) = std_mpsc::channel();
         let (decl_tx, decl_rx) = std_mpsc::channel();
         let (type_def_tx, type_def_rx) = std_mpsc::channel();
+        #[cfg(test)]
+        let jump_test_tx = (def_tx.clone(), decl_tx.clone(), type_def_tx.clone());
         let (impl_tx, impl_rx) = std_mpsc::channel();
         let (ref_tx, ref_rx) = std_mpsc::channel();
         let (doc_highlights_tx, doc_highlights_rx) = std_mpsc::channel();
@@ -1112,6 +1128,8 @@ impl LspManager {
             signature_help_rx,
             hover_rx,
             def_rx,
+            #[cfg(test)]
+            jump_test_tx,
             doc_symbols_rx,
             decl_rx,
             type_def_rx,
@@ -1199,6 +1217,28 @@ impl LspManager {
     }
 
     pub fn request_completion(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
+        self.send_completion_request(path, line, character, false)
+    }
+
+    /// Ask again as the user types into a list the server marked
+    /// incomplete, with `triggerKind: TriggerForIncompleteCompletions`
+    /// (#1529).
+    pub fn request_completion_for_incomplete(
+        &mut self,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+    ) -> u64 {
+        self.send_completion_request(path, line, character, true)
+    }
+
+    fn send_completion_request(
+        &mut self,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+        incomplete: bool,
+    ) -> u64 {
         let id = self.next_request_id;
         self.next_request_id += 1;
         let _ = self.cmd_tx.send(Cmd::RequestCompletion {
@@ -1206,6 +1246,7 @@ impl LspManager {
             path,
             line,
             character,
+            incomplete,
         });
         id
     }
@@ -1448,6 +1489,25 @@ impl LspManager {
 
     pub fn drain_definition(&self) -> Option<DefinitionResult> {
         self.def_rx.try_recv().ok()
+    }
+
+    /// Test hook: deliver a definition reply as if a server had answered.
+    #[cfg(test)]
+    pub fn push_definition_for_test(&self, result: DefinitionResult) {
+        let _ = self.jump_test_tx.0.send(result);
+    }
+
+    /// Test hook: deliver a declaration reply as if a server had answered.
+    #[cfg(test)]
+    pub fn push_declaration_for_test(&self, result: DeclarationResult) {
+        let _ = self.jump_test_tx.1.send(result);
+    }
+
+    /// Test hook: deliver a type definition reply as if a server had
+    /// answered.
+    #[cfg(test)]
+    pub fn push_type_definition_for_test(&self, result: TypeDefinitionResult) {
+        let _ = self.jump_test_tx.2.send(result);
     }
 
     /// Ask the server for the document's symbol tree (the Outline). Fire on
@@ -2397,9 +2457,17 @@ async fn worker_loop(
                 path,
                 line,
                 character,
+                incomplete,
             } => {
                 state
-                    .request_completion(request_id, path, line, character, &tx.completion)
+                    .request_completion(
+                        request_id,
+                        path,
+                        line,
+                        character,
+                        incomplete,
+                        &tx.completion,
+                    )
                     .await
             }
             Cmd::RequestSignatureHelp {
@@ -3312,6 +3380,7 @@ impl WorkerState {
         path: PathBuf,
         line: u32,
         character: u32,
+        incomplete: bool,
         tx: &std_mpsc::Sender<CompletionResult>,
     ) {
         let Some(doc) = self.docs.get(&path) else {
@@ -3338,6 +3407,7 @@ impl WorkerState {
                 request_id,
                 path,
                 items: Vec::new(),
+                is_incomplete: false,
             });
             return;
         };
@@ -3347,12 +3417,12 @@ impl WorkerState {
         let tx = tx.clone();
         let path_clone = path.clone();
         log_file::log(&format!(
-            "completion request id={request_id} server={server_name} path={} line={line} char={character}",
+            "completion request id={request_id} server={server_name} path={} line={line} char={character} incomplete={incomplete}",
             path.display()
         ));
         tokio::spawn(async move {
             let mut client = client_arc.lock().await.requests();
-            let resp = client.completion(uri, line, character).await;
+            let resp = client.completion(uri, line, character, incomplete).await;
             drop(client);
             let (is_incomplete, items): (Option<bool>, Vec<CompletionItem>) = match resp {
                 Ok(Some(CompletionResponse::Array(items))) => {
@@ -3393,6 +3463,7 @@ impl WorkerState {
                 request_id,
                 path: path_clone,
                 items,
+                is_incomplete: is_incomplete == Some(true),
             });
         });
     }
@@ -6990,8 +7061,24 @@ fn standard_semantic_token_modifiers() -> Vec<SemanticTokenModifier> {
 }
 
 fn build_client_capabilities() -> ClientCapabilities {
+    // `linkSupport` on every goto: without it a server flattens each
+    // `LocationLink` into a `Location` over the whole declaration, and the
+    // jump lands on its first character instead of the name, lines above it
+    // in a multi-line declaration (#1284). `def_location` reads a link's
+    // `targetSelectionRange`.
+    let goto = || {
+        Some(lsp_types::GotoCapability {
+            dynamic_registration: Some(false),
+            link_support: Some(true),
+        })
+    };
     ClientCapabilities {
         text_document: Some(TextDocumentClientCapabilities {
+            definition: goto(),
+            declaration: goto(),
+            type_definition: goto(),
+            implementation: goto(),
+
             // croft sends didSave, and only to a server that advertised
             // `save` (#854). No dynamic registration: croft answers no
             // `client/registerCapability`, and rust-analyzer registers didSave
@@ -7365,7 +7452,7 @@ pub(crate) fn is_on_path(cmd: &str) -> bool {
 
 /// True when `path` is a regular file with at least one execute bit set. On
 /// non-unix any existing file counts (no mode bits to inspect).
-fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     if !path.is_file() {
         return false;
     }
@@ -7669,6 +7756,58 @@ mod tests {
         let caps = build_client_capabilities();
         let window = caps.window.expect("window capabilities must be set");
         assert_eq!(window.work_done_progress, Some(true));
+    }
+
+    /// Without `linkSupport` a server turns each `LocationLink` into a
+    /// `Location` spanning the whole declaration, so F12 lands on its first
+    /// character, lines above a name in a multi-line declaration (#1284).
+    #[test]
+    fn client_capabilities_ask_for_location_links_on_every_goto() {
+        let caps = build_client_capabilities();
+        let td = caps.text_document.expect("text document capabilities");
+        for (name, goto) in [
+            ("definition", td.definition),
+            ("declaration", td.declaration),
+            ("typeDefinition", td.type_definition),
+            ("implementation", td.implementation),
+        ] {
+            let goto = goto.unwrap_or_else(|| panic!("{name} capability must be declared"));
+            assert_eq!(goto.link_support, Some(true), "{name}.linkSupport");
+            assert_eq!(goto.dynamic_registration, Some(false), "{name}");
+        }
+    }
+
+    /// Negative: a server that still answers with a plain `Location`
+    /// jumps to its start, and a link whose declaration starts lines above
+    /// its name lands on the name, not the declaration.
+    #[test]
+    fn a_plain_location_still_jumps_to_its_start_and_a_link_to_its_name() {
+        let uri = Url::from_file_path("/tmp/config.ts").unwrap();
+        let plain = GotoDefinitionResponse::Array(vec![Location {
+            uri: uri.clone(),
+            range: lsp_types::Range::new(Position::new(7, 0), Position::new(11, 10)),
+        }]);
+        assert_eq!(
+            def_location(&plain),
+            Some((PathBuf::from("/tmp/config.ts"), 7, 0))
+        );
+        let link = GotoDefinitionResponse::Link(vec![LocationLink {
+            origin_selection_range: None,
+            target_uri: uri,
+            target_range: lsp_types::Range::new(Position::new(7, 0), Position::new(11, 10)),
+            target_selection_range: lsp_types::Range::new(
+                Position::new(10, 2),
+                Position::new(10, 7),
+            ),
+        }]);
+        assert_eq!(
+            def_location(&link),
+            Some((PathBuf::from("/tmp/config.ts"), 10, 2))
+        );
+        assert_eq!(
+            def_locations(&link),
+            vec![(PathBuf::from("/tmp/config.ts"), 10, 2)]
+        );
     }
 
     #[test]
@@ -10842,6 +10981,124 @@ while True:
             ],
             "WRITE maps to write=true; an absent kind defaults to a read tint"
         );
+    }
+
+    /// A fake server whose completion list is marked `isIncomplete` and
+    /// names the `triggerKind` it was asked with (#1529).
+    const FAKE_LSP_INCOMPLETE: &str = r#"
+import json, sys
+
+def read_msg():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    if length is None:
+        return None
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(msg):
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+while True:
+    msg = read_msg()
+    if msg is None:
+        break
+    method = msg.get("method", "")
+    if "id" in msg:
+        if method == "initialize":
+            send({"jsonrpc": "2.0", "id": msg["id"],
+                  "result": {"capabilities": {"completionProvider": {}}}})
+        elif method == "textDocument/completion":
+            kind = msg["params"].get("context", {}).get("triggerKind")
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": {
+                "isIncomplete": True,
+                "items": [{"label": "kind%s" % kind}]}})
+        else:
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+    if method == "exit":
+        break
+"#;
+
+    /// #1529: an `isIncomplete` list reaches the app as such, and the
+    /// re-ask goes out as `TriggerForIncompleteCompletions` (3); a first
+    /// ask stays `Invoked` (1).
+    #[test]
+    fn an_incomplete_completion_list_is_reported_and_re_asked_with_kind_3() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let file = root.join("demo.py");
+        std::fs::write(&file, "lo\n").expect("write demo");
+        let script = root.join("fake_incomplete_lsp.py");
+        std::fs::write(&script, FAKE_LSP_INCOMPLETE).expect("write fake server");
+        let mut registry = ServerRegistry::new();
+        registry.register(
+            Language::PYTHON,
+            ServerConfig {
+                name: "fake-incomplete",
+                command: "python3".into(),
+                args: vec![script.display().to_string()],
+                language: Language::PYTHON,
+                initialization_options: None,
+                provision: None,
+            },
+        );
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut state = WorkerState {
+            workspace_root: root.clone(),
+            extra_roots: Vec::new(),
+            registry,
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+            restarts: ServerRestarts::default(),
+        };
+        let (tx, rx) = std_mpsc::channel();
+        let runtime = LspRuntime::new().expect("runtime");
+        runtime.handle().clone().block_on(async {
+            state.open_doc(file.clone(), String::from("lo\n")).await;
+            state
+                .request_completion(1, file.clone(), 0, 2, false, &tx)
+                .await;
+        });
+        let first = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("first reply");
+        runtime.handle().clone().block_on(async {
+            state
+                .request_completion(2, file.clone(), 0, 2, true, &tx)
+                .await;
+        });
+        let again = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("second reply");
+        assert!(first.is_incomplete, "isIncomplete reaches the app");
+        assert_eq!(first.items[0].label, "kind1", "a first ask is Invoked");
+        assert_eq!(again.request_id, 2);
+        assert_eq!(
+            again.items[0].label, "kind3",
+            "the re-ask is TriggerForIncompleteCompletions"
+        );
+        runtime.handle().clone().block_on(state.shutdown_all());
     }
 
     /// A fake server that advertises `documentHighlightProvider` and answers

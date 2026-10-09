@@ -40,36 +40,8 @@ pub struct SessionState {
 
 impl SessionState {
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
         let json = serde_json::to_string(self).context("serializing session state")?;
-        // Owner-only and written aside: the file carries every dirty
-        // buffer's unsaved text, and a crash mid-write must not leave half.
-        use std::io::Write;
-        #[cfg(unix)]
-        use std::os::unix::fs::OpenOptionsExt;
-        let tmp = path.with_extension(format!(
-            "json.{}.{:?}.tmp",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_file(&tmp);
-        let write = || -> std::io::Result<()> {
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create_new(true);
-            #[cfg(unix)]
-            opts.mode(0o600);
-            let mut f = opts.open(&tmp)?;
-            f.write_all(json.as_bytes())?;
-            f.sync_all()?;
-            std::fs::rename(&tmp, path)
-        };
-        write().map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            anyhow::Error::new(e).context(format!("writing {}", path.display()))
-        })
+        write_private_atomically(path, json.as_bytes())
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -77,6 +49,40 @@ impl SessionState {
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         serde_json::from_str(&json).context("parsing session state")
     }
+}
+
+/// Write `bytes` to `path` owner-only and written aside, then renamed over:
+/// the files that go through here (the relaunch handoff, the hot-exit
+/// backup) carry unsaved text, and a crash mid-write must not leave half.
+/// Creates `path`'s directory as needed.
+pub(crate) fn write_private_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension(format!(
+        "json.{}.{:?}.tmp",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_file(&tmp);
+    let write = || -> std::io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut f = opts.open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::Error::new(e).context(format!("writing {}", path.display()))
+    })
 }
 
 /// Per-pid scratch path for the session handoff file. Pid-scoping keeps
