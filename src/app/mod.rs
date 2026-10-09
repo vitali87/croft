@@ -1021,8 +1021,9 @@ struct PendingRunBlock {
     pane_name: String,
     cwd: PathBuf,
     command: String,
-    /// The block as written, shown whole in the popup (the fence was
-    /// refused if it carried control characters, so it renders as typed).
+    /// What the block runs, shown whole in the popup: the block as written,
+    /// or a transcript's commands without their prompts (#1473). The fence
+    /// was refused if it carried control characters, so it renders as typed.
     code: String,
     /// Turns the popup red: the block looks destructive or said `{confirm}`.
     destructive: bool,

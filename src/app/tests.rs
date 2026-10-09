@@ -79380,6 +79380,22 @@ fn save_all_does_not_report_a_file_waiting_on_its_formatter_as_saved() {
     );
 }
 
+/// #1473: "Markdown: Run Code Block at Cursor" on a README's `console`
+/// fence parks only its commands behind the confirm box: no `$ ` prompt is
+/// typed, and no line of the sample output runs as a command.
+#[test]
+fn running_a_console_fence_types_only_its_commands() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let readme = "```console\n$ echo installed-ok\ninstalled-ok\n$ ls -1 /tmp/rd\nREADME.md\n```\n";
+    let mut app = app_with_open_file(tmp.path(), "README.md", readme);
+    app.editor.cursor_row = 5;
+    app.run_command(Command::RunCodeBlockAtCursor);
+    let pending = app.pending_run_block.as_ref().expect("the fence runs");
+    assert_eq!(pending.code, "echo installed-ok\nls -1 /tmp/rd\n");
+    assert_eq!(pending.command, "echo installed-ok\nls -1 /tmp/rd\r");
+}
+
 /// #1488: a watcher that clears the screen (`tsc --watch`, `cargo watch -c`)
 /// erases its own output mark, so its finish reports no output. That finish
 /// never reached the build scan, the one-shot skip meant for it stayed set,
