@@ -46,6 +46,24 @@ pub struct GitStatus {
     /// The merge, rebase, cherry-pick, revert or bisect the repository is
     /// in the middle of (#1356), from [`repo_operation`].
     pub operation: Option<RepoOp>,
+    /// The branch a rebase is rewriting (#1647). HEAD is detached on the
+    /// commit being replayed onto throughout, so `branch` is `None`; git
+    /// keeps the branch's name in the rebase's `head-name` file. `None`
+    /// outside a rebase, and for a rebase of a detached HEAD.
+    pub rebasing_branch: Option<String>,
+}
+
+impl GitStatus {
+    /// What HEAD is called in the status bar and the Source Control header:
+    /// the branch, the branch a rebase is rewriting (#1647), else the short
+    /// hash of a detached HEAD.
+    pub fn head_label(&self) -> &str {
+        match (&self.branch, &self.rebasing_branch, &self.detached_hash) {
+            (Some(b), _, _) | (None, Some(b), _) => b,
+            (None, None, Some(h)) => h,
+            (None, None, None) => "(no head)",
+        }
+    }
 }
 
 /// An operation git stopped half-way through (#1356): what the status bar
@@ -215,9 +233,9 @@ pub fn query(root: &Path) -> GitStatus {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let operation = repo_operation(root);
     GitStatus {
         in_repo: true,
-        branch,
         detached_hash,
         dirty,
         ahead,
@@ -227,8 +245,39 @@ pub fn query(root: &Path) -> GitStatus {
         repo_root: Some(repo_root),
         changed_count,
         prepared_message: prepared_message(root),
-        operation: repo_operation(root),
+        rebasing_branch: match (&branch, operation) {
+            (None, Some(RepoOp::Rebase { .. })) => rebasing_branch(root),
+            _ => None,
+        },
+        branch,
+        operation,
     }
+}
+
+/// The branch the rebase in progress is rewriting (#1647), from the
+/// `head-name` git writes in `rebase-merge/` or `rebase-apply/`
+/// (`refs/heads/feature`). A rebase of a detached HEAD writes `detached
+/// HEAD` there, which names no branch.
+fn rebasing_branch(root: &Path) -> Option<String> {
+    let out = run_git(
+        root,
+        &[
+            "rev-parse",
+            "--git-path",
+            "rebase-merge/head-name",
+            "--git-path",
+            "rebase-apply/head-name",
+        ],
+    )
+    .ok()?;
+    out.lines()
+        .find_map(|l| std::fs::read_to_string(root.join(l.trim())).ok())
+        .and_then(|name| {
+            name.trim()
+                .strip_prefix("refs/heads/")
+                .filter(|b| !b.is_empty())
+                .map(String::from)
+        })
 }
 
 /// git's prepared message for the commit in progress (#1282): `MERGE_MSG`
