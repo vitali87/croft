@@ -1,0 +1,1 @@
+fix: Move Line Up/Down (Alt+Up/Down) and Copy Line Up/Down treat a folded region as one line: a line next to a folded function moves past all of it instead of into its hidden body, a folded header moves or copies with its body, and the fold stays closed.
