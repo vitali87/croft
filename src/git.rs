@@ -964,6 +964,13 @@ fn filter_driver_configured(root: &Path, name: &str) -> bool {
 /// non-UTF8 content (binary file) is reported as an error so the caller
 /// can fall back to opening the file directly.
 pub fn read_file_at_head(root: &Path, rel_path: &str) -> Result<String, String> {
+    let bytes = read_bytes_at_head(root, rel_path)?;
+    String::from_utf8(bytes).map_err(|_| format!("{rel_path} at HEAD is not UTF-8"))
+}
+
+/// The raw bytes of `rel_path` at HEAD (`git show HEAD:<rel_path>`), for a
+/// caller that decodes them itself, with the encoding the file's tab uses.
+pub fn read_bytes_at_head(root: &Path, rel_path: &str) -> Result<Vec<u8>, String> {
     let path_str = root
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
@@ -982,7 +989,7 @@ pub fn read_file_at_head(root: &Path, rel_path: &str) -> Result<String, String> 
             stderr
         });
     }
-    String::from_utf8(output.stdout).map_err(|_| format!("{rel_path} at HEAD is not UTF-8"))
+    Ok(output.stdout)
 }
 
 /// The `git` command that prints the blob `spec` names, for `rel_path`.
