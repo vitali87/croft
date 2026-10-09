@@ -5974,13 +5974,24 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
             waited += 20;
         }
-        let (lines, top) = term.grid_lines();
-        let expect_line = top
-            + lines
-                .iter()
-                .position(|l| l.starts_with("note-worthy-line"))
-                .unwrap() as i32;
-        let cur = term.annotations_current();
+        // The reader thread can still be scrolling (the newline after
+        // `fill-29`) between reading the grid and reading the anchors, so
+        // compare the two only once they come from the same screen.
+        let mut waited = 0u32;
+        let (expect_line, cur) = loop {
+            let (lines, top) = term.grid_lines();
+            let expect_line = top
+                + lines
+                    .iter()
+                    .position(|l| l.starts_with("note-worthy-line"))
+                    .unwrap() as i32;
+            let cur = term.annotations_current();
+            if (cur.len() == 1 && cur[0].0 == expect_line) || waited >= 2000 {
+                break (expect_line, cur);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        };
         assert_eq!(cur.len(), 1);
         assert_eq!(
             cur[0].0, expect_line,
