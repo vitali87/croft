@@ -3769,7 +3769,8 @@ pub struct App {
     /// nothing has changed since.
     remote_handoff_ok: Option<u64>,
     /// Hot exit (#862): the directory this croft backs its unsaved buffers
-    /// up under (`~/.cache/croft/hot-exit`). `None` keeps no backups, as
+    /// up under (`~/.local/state/croft/hot-exit`, see [`user_data_dir`]).
+    /// `None` keeps no backups, as
     /// under test unless a test points it at a tempdir.
     pub hot_exit_dir: Option<PathBuf>,
     /// The [`App::unsaved_stamp`] this croft's backup on disk was written
@@ -5587,8 +5588,11 @@ impl App {
         }
         let loaded_prefs = merged_settings.prefs.clone();
         let (review_tx, review_rx) = std::sync::mpsc::channel();
-        let notes_path = (!cfg!(test))
-            .then(|| crate::sticky_notes::Notes::store_path(&croft_cache_dir(), &root));
+        let data_dir =
+            (!cfg!(test)).then(|| user_data_dir(&croft_cache_dir(), &crate::prefs::state_dir()));
+        let notes_path = data_dir
+            .as_deref()
+            .map(|dir| crate::sticky_notes::Notes::store_path(dir, &root));
         if !cfg!(test) {
             crate::i18n::init(loaded_prefs.locale.as_deref());
         }
@@ -6015,11 +6019,7 @@ impl App {
             pending_revert_hunk: None,
             pending_unsaved: None,
             remote_handoff_ok: None,
-            hot_exit_dir: if cfg!(test) {
-                None
-            } else {
-                Some(croft_cache_dir().join("hot-exit"))
-            },
+            hot_exit_dir: data_dir.as_deref().map(|dir| dir.join("hot-exit")),
             hot_exit_written: None,
             hot_exit_retry_at: None,
             hot_exit_consumed: Vec::new(),
@@ -70553,6 +70553,17 @@ type CodeqlCodeSearch = (
     String,
     std::sync::mpsc::Receiver<Result<(Vec<String>, Option<String>), String>>,
 );
+
+/// The directory this croft keeps hot-exit backups and sticky notes under
+/// (#1578): `state`, after moving in what an earlier croft kept under
+/// `cache`, which cache cleaners are free to delete. Run at every launch,
+/// so a backup an older croft still writes to the cache is taken over too.
+pub(crate) fn user_data_dir(cache: &Path, state: &Path) -> PathBuf {
+    for kind in ["hot-exit", "notes"] {
+        crate::hot_exit::move_tree(&cache.join(kind), &state.join(kind));
+    }
+    state.to_path_buf()
+}
 
 pub(crate) fn croft_cache_dir() -> PathBuf {
     #[cfg(test)]

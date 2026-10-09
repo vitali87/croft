@@ -1,0 +1,1 @@
+fix: Hot-exit backups of unsaved edits and sticky notes are kept in ~/.local/state/croft ($XDG_STATE_HOME) instead of ~/.cache/croft, which cache cleaners delete; backups left in the old place move over at launch.

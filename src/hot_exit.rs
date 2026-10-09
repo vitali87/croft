@@ -253,6 +253,46 @@ fn is_gone(pid: u32) -> bool {
         && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
+/// Move everything under `old` into `new`, keeping the layout (#1578): how
+/// a launch takes over the backups and notes an earlier croft kept under
+/// the cache directory. A file already at its new path (an older croft
+/// still writing to the cache) keeps whichever copy is newer. A rename
+/// that cannot cross filesystems is a copy, which keeps the owner-only
+/// mode, then a removal. Emptied old directories go. Best-effort: what
+/// cannot be moved stays where it is, for the next launch to try again.
+pub fn move_tree(old: &Path, new: &Path) {
+    let Ok(entries) = std::fs::read_dir(old) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let from = entry.path();
+        let to = new.join(entry.file_name());
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            move_tree(&from, &to);
+            continue;
+        }
+        if !kind.is_file() {
+            continue;
+        }
+        let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        if to.exists() {
+            if modified(&to) >= modified(&from) {
+                let _ = std::fs::remove_file(&from);
+                continue;
+            }
+        } else if std::fs::create_dir_all(new).is_err() {
+            return;
+        }
+        if std::fs::rename(&from, &to).is_err() && std::fs::copy(&from, &to).is_ok() {
+            let _ = std::fs::remove_file(&from);
+        }
+    }
+    let _ = std::fs::remove_dir(old);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,5 +504,67 @@ mod tests {
         let path = own_path(dir.path(), root.path());
         std::fs::create_dir_all(path.join("inside")).unwrap();
         assert!(remove(&path, root.path()).is_err());
+    }
+
+    /// #1578: what an earlier croft left under the cache moves into the
+    /// state directory, nested directories and owner-only modes included,
+    /// and the emptied old directories go.
+    #[cfg(unix)]
+    #[test]
+    fn move_tree_moves_backups_and_removes_the_old_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let cache = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let old = cache.path().join("hot-exit");
+        let new = state.path().join("hot-exit");
+        let file = old.join("0123456789abcdef").join("42-7.json");
+        crate::session_state::write_private_atomically(&file, b"{\"unsaved\":1}").unwrap();
+
+        move_tree(&old, &new);
+        let moved = new.join("0123456789abcdef").join("42-7.json");
+        assert_eq!(std::fs::read_to_string(&moved).unwrap(), "{\"unsaved\":1}");
+        let mode = std::fs::metadata(&moved).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "still owner-only");
+        assert!(!old.exists(), "the emptied cache directories go");
+    }
+
+    /// Negative: a file in both places (an older croft kept writing to the
+    /// cache) keeps the newer copy; a missing old directory moves nothing
+    /// and creates nothing.
+    #[test]
+    fn move_tree_keeps_the_newer_copy_and_does_nothing_without_an_old_tree() {
+        let cache = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let old = cache.path().join("hot-exit");
+        let new = state.path().join("hot-exit");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        let set_age = |p: &Path, secs_ago: u64| {
+            let f = std::fs::File::options().write(true).open(p).unwrap();
+            f.set_modified(SystemTime::now() - Duration::from_secs(secs_ago))
+                .unwrap();
+        };
+        std::fs::write(old.join("a.json"), "old-newer").unwrap();
+        std::fs::write(new.join("a.json"), "new-older").unwrap();
+        set_age(&old.join("a.json"), 10);
+        set_age(&new.join("a.json"), 100);
+        std::fs::write(old.join("b.json"), "old-older").unwrap();
+        std::fs::write(new.join("b.json"), "new-newer").unwrap();
+        set_age(&old.join("b.json"), 100);
+        set_age(&new.join("b.json"), 10);
+        move_tree(&old, &new);
+        assert_eq!(
+            std::fs::read_to_string(new.join("a.json")).unwrap(),
+            "old-newer"
+        );
+        assert_eq!(
+            std::fs::read_to_string(new.join("b.json")).unwrap(),
+            "new-newer"
+        );
+        assert!(!old.exists());
+
+        let nowhere = state.path().join("never");
+        move_tree(&cache.path().join("missing"), &nowhere);
+        assert!(!nowhere.exists());
     }
 }
