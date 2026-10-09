@@ -42781,8 +42781,9 @@ impl App {
         }
         // Rename Symbol (F2) and Change All Occurrences (Cmd/Ctrl+F2) are only
         // meaningful on a text buffer, so they sit above the read-only diff /
-        // sheet / image guards below.
-        if is_rename_symbol_key(key) {
+        // sheet / image guards below. The sheet grid is editable and F2 is its
+        // own "edit this cell" key (#1618), so there F2 falls through to it.
+        if is_rename_symbol_key(key) && self.editor.sheet.is_none() {
             self.start_rename_symbol();
             return;
         }
