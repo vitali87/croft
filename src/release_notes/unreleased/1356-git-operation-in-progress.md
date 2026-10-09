@@ -1,0 +1,1 @@
+fix: a merge, rebase, cherry-pick, revert or bisect in progress shows in the status bar and Source Control, with Continue, Skip and Abort in the ⋯ menu and palette; committing mid-rebase continues it (#1356)
