@@ -1,0 +1,1 @@
+fix: The "changed on disk and you have unsaved edits" prompt no longer throws your edits away on any Enter: only typing reload does, the box says so, and the discarded version is kept in Local History.

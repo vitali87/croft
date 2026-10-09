@@ -483,11 +483,26 @@ impl SourceControlPanel {
         }
     }
 
+    /// Caret to the start of its line (#1334): a message has a subject and
+    /// a body, and Home works within the line as in the editor.
     pub fn home(&mut self) {
+        let (line, _) = self.caret_line_col();
+        self.set_caret_line_col(line, 0);
+    }
+
+    /// Caret to the end of its line (#1334).
+    pub fn end(&mut self) {
+        let (line, _) = self.caret_line_col();
+        self.set_caret_line_col(line, usize::MAX);
+    }
+
+    /// Caret to the start of the whole message (Ctrl+Home).
+    pub fn message_start(&mut self) {
         self.message_cursor = 0;
     }
 
-    pub fn end(&mut self) {
+    /// Caret to the end of the whole message (Ctrl+End).
+    pub fn message_end(&mut self) {
         self.message_cursor = self.message.chars().count();
     }
 
@@ -1191,10 +1206,11 @@ impl Widget for &mut SourceControlPanel {
         }
 
         // Row 0: SOURCE CONTROL header (light grey bold), inside the panel.
-        buf.set_string(
+        buf.set_stringn(
             inner.x,
             inner.y,
             "SOURCE CONTROL",
+            inner.width as usize,
             Style::default()
                 .fg(self.theme.ui(Color::Rgb(0xb0, 0xb8, 0xc8)))
                 .add_modifier(Modifier::BOLD),
@@ -1482,7 +1498,9 @@ impl Widget for &mut SourceControlPanel {
         }
         y += 3 + 1; // button + 1-row gap
 
-        // Optional feedback line.
+        // Optional feedback line: its first line only, cut at the panel's
+        // edge. Git's output runs to several lines and past any sidebar, and
+        // an uncapped `set_string` painted it across the editor (#858).
         if let Some(msg) = self.commit_feedback.as_ref()
             && y < inner.y + inner.height
         {
@@ -1491,7 +1509,8 @@ impl Widget for &mut SourceControlPanel {
             } else {
                 Style::default().fg(self.theme.ui(Color::Rgb(0xa3, 0xbe, 0x8c)))
             };
-            buf.set_string(inner.x, y, msg.as_str(), style);
+            let line = crate::git::headline(msg);
+            buf.set_stringn(inner.x, y, line, inner.width as usize, style);
             y += 2;
         }
 
@@ -1542,10 +1561,11 @@ impl Widget for &mut SourceControlPanel {
             .saturating_sub(u16::from(scrollbar_metrics.is_some()));
 
         if total == 0 {
-            buf.set_string(
+            buf.set_stringn(
                 list_area.x,
                 list_area.y,
                 "No changes",
+                list_area.width as usize,
                 Style::default().fg(Color::DarkGray),
             );
             return;
@@ -2053,6 +2073,95 @@ mod tests {
     }
 
     #[test]
+    fn commit_feedback_shows_its_first_line_and_stays_inside_the_panel() {
+        // #858: git's commit output (subject, diffstat, one `create mode`
+        // row per new file) was drawn uncapped and ran on into the editor.
+        use ratatui::buffer::Buffer;
+        let mut p = SourceControlPanel::new();
+        p.set_status(dummy_status_with_branch("main"), Vec::new());
+        p.commit_feedback = Some(
+            "[main 5a6cd5c] Add per-category report with a subject longer than the panel\n \
+             3 files changed, 38 insertions(+)\n create mode 100644 report.py"
+                .to_string(),
+        );
+        let panel_area = Rect {
+            x: 0,
+            y: 0,
+            width: 28,
+            height: 30,
+        };
+        let buf_area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 30,
+        };
+        let mut buf = Buffer::empty(buf_area);
+        ratatui::widgets::Widget::render(&mut p, panel_area, &mut buf);
+        for y in buf_area.top()..buf_area.bottom() {
+            for x in panel_area.right()..buf_area.right() {
+                let sym = buf[(x, y)].symbol();
+                assert!(
+                    sym == " " || sym.is_empty(),
+                    "cell ({x}, {y}) past the panel's right edge carries {sym:?}"
+                );
+            }
+        }
+        let panel_text: String = (panel_area.top()..panel_area.bottom())
+            .flat_map(|y| (panel_area.left()..panel_area.right()).map(move |x| (x, y)))
+            .map(|pos| buf[pos].symbol().to_string())
+            .collect();
+        assert!(panel_text.contains("[main 5a6cd5c] Add"), "{panel_text:?}");
+        assert!(
+            !panel_text.contains("changed") && !panel_text.contains("create mode"),
+            "only git's first line belongs in the panel: {panel_text:?}"
+        );
+    }
+
+    /// #858 negative: a one-line feedback that fits is drawn whole, and an
+    /// error one is clipped at the panel's edge like a success.
+    #[test]
+    fn a_short_feedback_is_drawn_whole_and_an_error_stays_inside_the_panel() {
+        use ratatui::buffer::Buffer;
+        let draw = |feedback: &str, is_error: bool| -> (Buffer, Rect) {
+            let mut p = SourceControlPanel::new();
+            p.set_status(dummy_status_with_branch("main"), Vec::new());
+            p.commit_feedback = Some(feedback.to_string());
+            p.commit_feedback_is_error = is_error;
+            let panel_area = Rect::new(0, 0, 28, 30);
+            let mut buf = Buffer::empty(Rect::new(0, 0, 80, 30));
+            ratatui::widgets::Widget::render(&mut p, panel_area, &mut buf);
+            (buf, panel_area)
+        };
+        let text = |buf: &Buffer, area: Rect| -> String {
+            (area.top()..area.bottom())
+                .map(|y| {
+                    (area.left()..area.right())
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let (buf, area) = draw("Empty commit message", true);
+        assert!(text(&buf, area).contains("Empty commit message"));
+        let (buf, area) = draw(
+            "error: pathspec 'a-very-long-file-name-that-runs-on.rs' did not match",
+            true,
+        );
+        for y in 0..30 {
+            for x in area.right()..80 {
+                let sym = buf[(x, y)].symbol();
+                assert!(
+                    sym == " " || sym.is_empty(),
+                    "cell ({x}, {y}) past the panel carries {sym:?}"
+                );
+            }
+        }
+        assert!(text(&buf, area).contains("error: pathspec"));
+    }
+
+    #[test]
     fn long_commit_message_keeps_the_caret_visible_and_scrolls_to_show_the_tail() {
         use ratatui::buffer::Buffer;
         let mut p = SourceControlPanel::new();
@@ -2082,6 +2191,49 @@ mod tests {
             rendered.contains("croft"),
             "the box must scroll horizontally to reveal the tail near the cursor; rendered window was {rendered:?}"
         );
+    }
+
+    /// #1334: Home and End stay on the caret's line of a multi-line
+    /// message, as in the editor.
+    #[test]
+    fn home_and_end_move_within_the_carets_line() {
+        let mut p = SourceControlPanel::new();
+        p.insert_str("Add rounding\n\nRounds to cents.\nFixes 42");
+        assert!(p.move_cursor_up());
+        p.home();
+        p.insert_char('[');
+        p.end();
+        p.insert_char(']');
+        assert_eq!(p.message, "Add rounding\n\n[Rounds to cents.]\nFixes 42");
+        // The empty line between subject and body: both stay on it.
+        let mut p = SourceControlPanel::new();
+        p.insert_str("a\n\nbody");
+        assert!(p.move_cursor_up());
+        p.end();
+        assert_eq!(p.message_cursor, 2);
+        p.home();
+        assert_eq!(p.message_cursor, 2);
+    }
+
+    /// Negative (#1334): on a one-line message Home and End reach its start
+    /// and end as before, and the whole-message moves still reach index 0
+    /// and the end from any line.
+    #[test]
+    fn single_line_home_end_and_whole_message_moves_are_unchanged() {
+        let mut p = SourceControlPanel::new();
+        p.insert_str("one line");
+        p.home();
+        assert_eq!(p.message_cursor, 0);
+        p.end();
+        assert_eq!(p.message_cursor, 8);
+        let mut p = SourceControlPanel::new();
+        p.insert_str("subject\n\nbody\nlast");
+        assert!(p.move_cursor_up());
+        p.message_start();
+        assert_eq!(p.message_cursor, 0);
+        assert!(p.move_cursor_down());
+        p.message_end();
+        assert_eq!(p.message_cursor, p.message.chars().count());
     }
 
     #[test]
