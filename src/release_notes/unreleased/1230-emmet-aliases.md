@@ -1,0 +1,1 @@
+fix: Emmet expands its HTML aliases (`input:email`, `btn:s`, `link:css`, `a:mail`, ...) and `lorem`/`loremN` placeholder text instead of writing made-up tags, and refuses an unknown colon name in HTML (#1230)

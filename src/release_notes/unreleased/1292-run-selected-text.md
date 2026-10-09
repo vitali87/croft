@@ -1,0 +1,1 @@
+fix: Terminal: Run Selected Text in Active Terminal sends the editor's selection, or the caret's line, to the active terminal pane and runs it, stepping the caret to the next line, and croft import-vscode keeps VS Code's binding for it.
