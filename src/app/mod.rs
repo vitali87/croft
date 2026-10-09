@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-        MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -57125,6 +57125,18 @@ impl App {
         changed
     }
 
+    /// The terminal window croft runs in lost focus (#1622): alt-tab to the
+    /// browser, another tmux window. With auto save "onWindowChange" (or
+    /// `onFocusChange`) every dirty buffer is written now, the one being
+    /// edited included, since the whole window is what lost focus; VS Code
+    /// does the same. Returns true when anything changed on screen.
+    pub fn on_window_focus_lost(&mut self) -> bool {
+        if !self.auto_save_on_focus_change {
+            return false;
+        }
+        self.sweep_dirty_buffers(false, false)
+    }
+
     /// Sample the current focus (pane, active tab, active path) and report
     /// whether it moved since the last sample. The first sample never
     /// counts as a change, so launching croft writes nothing on its own.
@@ -66822,6 +66834,10 @@ fn takeover_mode_seq() -> Vec<u8> {
         EnterAlternateScreen,
         EnableMouseCapture,
         EnableBracketedPaste,
+        // Focus in/out reports (#1622): auto save "onWindowChange" saves
+        // when the croft window loses focus, which croft only learns from
+        // the terminal.
+        EnableFocusChange,
         crossterm::cursor::SetCursorStyle::SteadyBar,
     );
     seq
@@ -71643,6 +71659,7 @@ pub fn run(
         LeaveAlternateScreen,
         DisableMouseCapture,
         DisableBracketedPaste,
+        DisableFocusChange,
     )
     .ok();
     terminal.show_cursor().ok();
@@ -71738,15 +71755,15 @@ fn restore_host_terminal_state() {
 
 // Disable every mouse-tracking mode crossterm knows about (1000/1002/1003
 // normal+button+any-motion, 1015/1006 urxvt+SGR encodings), bracketed
-// paste (2004), exit any leftover alt-screen (1049l), reset the cursor
-// style, and reset the host's default fg/bg (OSC 110/111, undoing the
-// theme's dynamic colors). Written as raw bytes because the callers that
+// paste (2004) and focus reports (1004), exit any leftover alt-screen
+// (1049l), reset the cursor style, and reset the host's default fg/bg
+// (OSC 110/111, undoing the theme's dynamic colors). Written as raw bytes because the callers that
 // need it (the panic hook, the post-remote-ssh restore) no longer hold a
 // crossterm Backend handle for `execute!`. Both callers are done with the
 // tty (a return from remote re-enters `run`, which re-applies the theme's
 // host colors), so the color reset can't strand a live session.
 const TERMINAL_RESTORE_SEQ: &[u8] =
-    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1049l\x1b[ q\x1b]110\x07\x1b]111\x07";
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[ q\x1b]110\x07\x1b]111\x07";
 
 fn install_terminal_restore_panic_hook() {
     static HOOK: std::sync::Once = std::sync::Once::new();
@@ -71825,6 +71842,7 @@ fn run_pending_scp_uploads(app: &mut App, terminal: &mut CroftTerminal) -> Resul
         LeaveAlternateScreen,
         DisableMouseCapture,
         DisableBracketedPaste,
+        DisableFocusChange,
         crossterm::cursor::SetCursorStyle::DefaultUserShape,
     )
     .ok();
@@ -72666,6 +72684,9 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                     }
                     Event::Mouse(m) => app.handle_mouse(m),
                     Event::Paste(s) => app.handle_paste(&s),
+                    Event::FocusLost => {
+                        app.on_window_focus_lost();
+                    }
                     Event::Resize(_, _) => {
                         // Alt-screen reflow blanks the activity bar's SGR cells
                         // but iTerm2's OSC-1337 image layer survives, so a plain
