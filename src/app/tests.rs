@@ -79549,3 +79549,23 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     assert!(!app.apply_build_scan(pane, Some(&cwd), "tsc --watch", "a.c:1:1: error: old\n"));
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
 }
+
+/// #1464: a paste is one macro step but inserts all of its text, so its
+/// characters count against the replay budget: a 10 KB paste times 100 is
+/// refused, not a megabyte typed into the buffer.
+#[test]
+fn a_macro_paste_counts_its_characters_against_the_replay_budget() {
+    let (mut app, tmp) = vim_app("one\n");
+    app.macros_path = tmp.path().join("macros.json");
+    let mut big = crate::macros::Macro::default();
+    big.push_paste(&"x".repeat(10_000));
+    app.macro_registers.insert("z".into(), big);
+    let before = app.editor.lines[0].clone();
+    vim_feed_str(&mut app, "100@z");
+    assert!(
+        app.status.contains("refused"),
+        "a replay past the budget is refused visibly, got {:?}",
+        app.status
+    );
+    assert_eq!(app.editor.lines[0], before, "and nothing ran");
+}

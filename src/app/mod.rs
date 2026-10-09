@@ -50258,7 +50258,16 @@ impl App {
             self.status = String::from("Macro has no steps this version can replay");
             return;
         }
-        let total = keys.len().saturating_mul(count);
+        // A paste is one step but inserts all of its text, so its characters
+        // count against the budget like typed ones.
+        let per_run: usize = keys
+            .iter()
+            .map(|step| match step {
+                crate::macros::Replay::Key(_) => 1,
+                crate::macros::Replay::Paste(text) => text.chars().count().max(1),
+            })
+            .sum();
+        let total = per_run.saturating_mul(count);
         if total > MAX_REPLAY_KEYS {
             self.status =
                 format!("Macro would run {total} keys (limit {MAX_REPLAY_KEYS}) — refused");

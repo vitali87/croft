@@ -271,8 +271,8 @@ impl Macro {
         self.steps
             .iter()
             .map(|s| match s {
-                Step::Text { text } => text.chars().count(),
-                Step::Key { .. } | Step::Paste { .. } => 1,
+                Step::Text { text } | Step::Paste { text } => text.chars().count().max(1),
+                Step::Key { .. } => 1,
                 Step::Unknown(_) => 0,
             })
             .sum()
@@ -615,7 +615,7 @@ mod tests {
         let path = dir.path().join("macros.json");
         save_register(&path, "p", m.clone()).unwrap();
         assert_eq!(load(&path).get("p"), Some(&m));
-        assert_eq!(m.len(), 3, "the paste counts as one step of the replay");
+        assert_eq!(m.len(), 7, "the budget counts the paste's characters too");
     }
 
     /// #1464 negative: a `Paste` that lost its text is a corrupt store, not
