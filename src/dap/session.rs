@@ -845,6 +845,9 @@ pub struct NamedSession<S = DapSession> {
     /// dropping a background member's `stopped` left a breakpoint hit that
     /// nothing showed, so the member looked hung. Replayed in order on focus.
     pub backlog: Vec<DapEvent>,
+    /// This session's Debug Console parser state (#1501), its own so a
+    /// sibling's colour or cut escape never runs into its output.
+    pub console_ansi: crate::ansi_text::AnsiStream,
 }
 
 /// The debug sessions in flight, one of them FOCUSED (#310).
@@ -916,6 +919,7 @@ impl<S> DebugSessions<S> {
             name: name.into(),
             session,
             backlog: Vec::new(),
+            console_ansi: crate::ansi_text::AnsiStream::default(),
         });
         self.focused = 0;
     }
@@ -931,6 +935,7 @@ impl<S> DebugSessions<S> {
             name: name.into(),
             session,
             backlog: Vec::new(),
+            console_ansi: crate::ansi_text::AnsiStream::default(),
         });
         self.focused = self.sessions.len() - 1;
     }

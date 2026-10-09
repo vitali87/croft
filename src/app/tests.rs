@@ -32684,13 +32684,16 @@ fn debug_end_message_flags_a_program_that_exited_without_hitting_a_breakpoint() 
 fn debug_console_is_retained_after_the_session_ends() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.debug_console = vec![String::from("hello from program"), String::from("all done")];
+    app.debug_console = vec![
+        crate::ansi_text::AnsiLine::plain("hello from program"),
+        crate::ansi_text::AnsiLine::plain("all done"),
+    ];
     app.run_debug.session_ended = true;
     app.refresh_debug_panel();
     assert!(
         app.run_debug
             .console_tail
-            .contains(&String::from("all done")),
+            .contains(&crate::ansi_text::AnsiLine::plain("all done")),
         "the ended session's console output must stay visible"
     );
 
@@ -59330,10 +59333,14 @@ fn a_background_members_output_reaches_the_console_with_its_name() {
     app.debug_sessions.push("B", stub_member(false));
     app.debug_sessions.focus(1);
     poll_until(&mut app, |a| {
-        a.debug_console.iter().any(|l| l.contains("hello from A"))
+        a.debug_console
+            .iter()
+            .any(|l| l.text.contains("hello from A"))
     });
     assert!(
-        app.debug_console.iter().any(|l| l == "[A] hello from A"),
+        app.debug_console
+            .iter()
+            .any(|l| l.text == "[A] hello from A"),
         "console: {:?}",
         app.debug_console
     );
@@ -59578,7 +59585,7 @@ fn the_debug_console_mirror_skips_telemetry_and_copies_each_line_once() {
         app.poll_dap();
     }
     let channel = crate::output::snapshot(crate::output::CHANNEL_DEBUG_CONSOLE).unwrap_or_default();
-    let in_panel = app.debug_console.iter().filter(|l| **l == line).count();
+    let in_panel = app.debug_console.iter().filter(|l| l.text == line).count();
     app.debug_stop();
     assert_eq!(count(&line), 1, "once");
     assert!(
@@ -59699,7 +59706,7 @@ fn an_exception_answer_after_continue_does_not_say_paused() {
         "the late answer and the marker after it",
         || {
             app.poll_dap();
-            app.debug_console.iter().any(|l| l == "MARKER")
+            app.debug_console.iter().any(|l| l.text == "MARKER")
         },
     );
     let status = app.status.clone();
@@ -74834,7 +74841,11 @@ fn f5_names_a_project_python_older_than_3_14() {
         status.contains("F10 step over"),
         "the key hints stay: {status}"
     );
-    assert_eq!(console.first(), Some(&want), "{console:?}");
+    assert_eq!(
+        console.first().map(|l| l.text.as_str()),
+        Some(want.as_str()),
+        "{console:?}"
+    );
 }
 
 /// #864 against a real debugpy: Debug Test at Cursor runs pytest under
@@ -79377,6 +79388,196 @@ fn save_all_does_not_report_a_file_waiting_on_its_formatter_as_saved() {
     assert_eq!(
         save_all_summary(1, 0, None, String::new()),
         "Saved 1 editor"
+    );
+}
+
+/// Feed `events` (DAP `output` bodies' `output` strings, JSON-escaped) to a
+/// stub debug session and poll until `done` holds for the Debug Console.
+fn debug_console_after(outputs: &[&str], done: impl Fn(&App) -> bool) -> App {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let events: Vec<String> = outputs
+        .iter()
+        .enumerate()
+        .map(|(i, out)| {
+            format!(
+                r#"{{"seq":{},"type":"event","event":"output","body":{{"category":"stdout","output":"{out}"}}}}"#,
+                i + 1
+            )
+        })
+        .collect();
+    let refs: Vec<&str> = events.iter().map(String::as_str).collect();
+    app.debug_sessions.push("P", stub_emitting(&refs));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the program's output to reach the Debug Console",
+        || {
+            app.poll_dap();
+            done(&app)
+        },
+    );
+    app.debug_stop();
+    app
+}
+
+fn console_line<'a>(app: &'a App, text: &str) -> &'a crate::ansi_text::AnsiLine {
+    app.debug_console
+        .iter()
+        .find(|l| l.text == text)
+        .unwrap_or_else(|| panic!("no {text:?} in {:?}", app.debug_console))
+}
+
+/// The colour at byte `at` of a console line.
+fn console_fg(line: &crate::ansi_text::AnsiLine, at: usize) -> Option<crate::ansi_text::AnsiColor> {
+    line.spans
+        .iter()
+        .find(|s| s.start <= at && at < s.end)
+        .and_then(|s| s.style.fg)
+}
+
+/// #1501: pytest `--color=yes`, chalk and coloured logging printed their SGR
+/// sequences into the Debug Console as `[31mFAILED[0m`. The console keeps the
+/// colours as spans over the plain text, and OUTPUT's channel gets the text.
+#[test]
+fn the_debug_console_shows_colour_codes_as_colours() {
+    let tag = format!("ansi-{}", std::process::id());
+    let printed = format!("FAILED tests/test_a.py::test_x - {tag}");
+    let app = debug_console_after(
+        &[&format!(
+            r"\u001b[31mFAILED\u001b[0m tests/test_a.py::\u001b[1mtest_x\u001b[0m - {tag}\n"
+        )],
+        |a| a.debug_console.iter().any(|l| l.text.contains(&tag)),
+    );
+    let line = console_line(&app, &printed);
+    use crate::ansi_text::AnsiColor;
+    assert_eq!(
+        console_fg(line, 0),
+        Some(AnsiColor::Indexed(1)),
+        "FAILED is red"
+    );
+    assert_eq!(console_fg(line, 7), None, "the reset ends it");
+    let bold = line
+        .spans
+        .iter()
+        .find(|s| &line.text[s.start..s.end] == "test_x")
+        .expect("test_x is its own run");
+    assert!(bold.style.bold, "{:?}", line.spans);
+    assert!(
+        crate::output::snapshot(crate::output::CHANNEL_DEBUG_CONSOLE)
+            .unwrap_or_default()
+            .iter()
+            .any(|l| l.text == printed),
+        "OUTPUT's Debug Console channel gets the plain text"
+    );
+}
+
+/// #1501: a colour set on one line stays on until reset, as in a terminal,
+/// and a sequence cut between two output events is joined, not printed.
+#[test]
+fn debug_console_colour_carries_across_lines_and_cut_events() {
+    let tag = format!("carry-{}", std::process::id());
+    let app = debug_console_after(
+        &[r"\u001b[3", &format!(r"2m{tag} ok\nstill\u001b[0m plain\n")],
+        |a| a.debug_console.iter().any(|l| l.text.contains("plain")),
+    );
+    use crate::ansi_text::AnsiColor;
+    let first = console_line(&app, &format!("{tag} ok"));
+    assert_eq!(console_fg(first, 0), Some(AnsiColor::Indexed(2)));
+    let second = console_line(&app, "still plain");
+    assert_eq!(
+        console_fg(second, 0),
+        Some(AnsiColor::Indexed(2)),
+        "carried"
+    );
+    assert_eq!(console_fg(second, 6), None, "until the reset");
+    assert!(
+        !app.debug_console
+            .iter()
+            .any(|l| l.text.contains('\u{1b}') || l.text.contains("[3")),
+        "{:?}",
+        app.debug_console
+    );
+}
+
+/// #1501 negative: text without escapes is untouched, brackets included, and
+/// croft's own console lines never inherit a colour the program left on.
+#[test]
+fn debug_console_plain_output_and_croft_lines_stay_plain() {
+    use crate::dap::session::DapEvent;
+    let tag = format!("plain-{}", std::process::id());
+    let mut app = debug_console_after(
+        &[&format!(r"[31m is just text {tag}\n\u001b[35mleft on\n")],
+        |a| a.debug_console.iter().any(|l| l.text.ends_with("left on")),
+    );
+    let plain = console_line(&app, &format!("[31m is just text {tag}"));
+    assert_eq!(
+        plain.spans.iter().map(|s| s.style).collect::<Vec<_>>(),
+        vec![crate::ansi_text::AnsiStyle::default()]
+    );
+    app.debug_sessions.push("Q", stub_emitting(&[]));
+    let (_, q) = app
+        .debug_sessions
+        .iter_named_mut_indexed()
+        .find(|(i, _)| *i == 0)
+        .unwrap();
+    q.backlog.push(DapEvent::Evaluated {
+        context: String::from("repl"),
+        expression: String::from("1 + 1"),
+        result: String::from("2"),
+        success: true,
+    });
+    app.poll_dap();
+    app.debug_stop();
+    let echo = console_line(&app, "❯ 1 + 1");
+    assert_eq!(console_fg(echo, 0), None, "{:?}", echo.spans);
+    assert_eq!(console_fg(console_line(&app, "2"), 0), None);
+}
+
+/// #1501: each debug session's output is its own ANSI stream. In a compound,
+/// session A ends an event mid-escape (`ESC[3`) with red left on; session B's
+/// next line must neither lose its first letter to A's escape nor turn red.
+#[test]
+fn debug_console_sessions_keep_their_own_colour_and_cut_escape() {
+    let tag = format!("streams-{}", std::process::id());
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let a_event = format!(
+        r#"{{"seq":1,"type":"event","event":"output","body":{{"category":"stdout","output":"\u001b[31mred from A {tag}\n\u001b[3"}}}}"#
+    );
+    app.debug_sessions.push("A", stub_emitting(&[&a_event]));
+    let a_line = format!("red from A {tag}");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "session A's output to reach the Debug Console",
+        || {
+            app.poll_dap();
+            app.debug_console.iter().any(|l| l.text == a_line)
+        },
+    );
+    // A is now in the background with red on and `ESC[3` held back.
+    let b_event = format!(
+        r#"{{"seq":1,"type":"event","event":"output","body":{{"category":"stdout","output":"hello from B {tag}\n"}}}}"#
+    );
+    app.debug_sessions.push("B", stub_emitting(&[&b_event]));
+    let b_line = format!("hello from B {tag}");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "session B's output to reach the Debug Console",
+        || {
+            app.poll_dap();
+            app.debug_console
+                .iter()
+                .any(|l| l.text.contains(&format!("from B {tag}")))
+        },
+    );
+    app.debug_stop();
+    let b = console_line(&app, &b_line);
+    assert_eq!(console_fg(b, 0), None, "A's red stays in A: {:?}", b.spans);
+    use crate::ansi_text::AnsiColor;
+    assert_eq!(
+        console_fg(console_line(&app, &a_line), 0),
+        Some(AnsiColor::Indexed(1)),
+        "A's own line is red"
     );
 }
 
