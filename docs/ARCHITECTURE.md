@@ -129,7 +129,7 @@ src/
 │   ├── locate.rs             test-name → source location: `find_test_source` walks the workspace grepping `fn <leaf>` and ranks by module path, while pytest and JS node IDs grep just their own file; run on a background thread so a big workspace cannot freeze the render loop
 │   ├── model.rs         TestStatus (NotRun/Running/Passed/Failed/Skipped) + TestCase; suite_and_leaf splits a `module::name` path for the tree
 │   ├── registry.rs           data-driven test-runner registry: maps a workspace root to a Runner from the `[[test_runners]]` blocks in bundled + user manifests, skipping runners whose extension is disabled in the Extensions panel
-│   ├── parse.rs              per-tool output parsers — libtest, pytest, vitest, jest — with all node IDs normalised to `::` separators so one panel tree serves every runner
+│   ├── parse.rs              per-tool output parsers — libtest, pytest (plain `-v` lines and pytest-xdist's outcome-first `[gwN]` lines), vitest, jest — with all node IDs normalised to `::` separators so one panel tree serves every runner
 │   └── worker.rs             the test-runner command layer: RunAll / RunOne / RunFilter / RunSuite / Discover per runner, building each tool's argv and streaming cases over an mpsc channel
 ├── mcp/                 MCP sidecar host (Tier-1 extensions): croft is a DETERMINISTIC MCP host — a human invokes a contributed palette command and croft calls one pre-known tool on one vetted local server (no LLM picks tools), which removes MCP's whole prompt-injection/tool-poisoning attack family
 │   ├── mod.rs           module overview + McpOutcome (the off-thread worker's result)

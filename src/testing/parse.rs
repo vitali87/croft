@@ -55,7 +55,12 @@ const PYTEST_OUTCOMES: [(&str, TestStatus); 6] = [
 /// short-summary lines). A result line is `<node-id> <OUTCOME>` optionally
 /// followed by a reason and the `[ NN%]` progress: the node ID must contain
 /// `::` and no whitespace, which excludes prose that happens to name a test.
+/// Under pytest-xdist the line is `[gwN] [ NN%] <OUTCOME> <node-id>` instead
+/// (#1503); see [`parse_xdist_line`].
 pub fn parse_pytest_line(line: &str) -> Option<TestCase> {
+    if let Some(case) = parse_xdist_line(line) {
+        return Some(case);
+    }
     for (word, status) in PYTEST_OUTCOMES {
         if let Some((name, rest)) = line.split_once(word)
             && name.contains("::")
@@ -69,6 +74,33 @@ pub fn parse_pytest_line(line: &str) -> Option<TestCase> {
         }
     }
     None
+}
+
+/// A pytest-xdist `-v` result (#1503): pytest's terminal reporter writes a
+/// worker's report as `[gwN]`, the `[ NN%]` progress unless
+/// `console_output_style = classic` turned it off, the outcome, then the node
+/// ID. Anything after the node ID (a skip reason) is ignored, and a node ID
+/// is still required to hold `::`, so xdist's own `[gwN] …` chrome is not a
+/// result.
+fn parse_xdist_line(line: &str) -> Option<TestCase> {
+    let (worker, rest) = line.strip_prefix("[gw")?.split_once("] ")?;
+    if worker.is_empty() || !worker.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let rest = match rest.strip_prefix('[') {
+        Some(progress) => progress.split_once("] ")?.1,
+        None => rest,
+    };
+    let (word, rest) = rest.split_once(' ')?;
+    let status = PYTEST_OUTCOMES
+        .iter()
+        .find(|(w, _)| w.trim_start() == word)?
+        .1;
+    let name = rest.split_whitespace().next()?;
+    name.contains("::").then(|| TestCase {
+        name: name.to_string(),
+        status,
+    })
 }
 
 /// Parse a single line of `pytest --collect-only -q` output into a discovered
@@ -327,6 +359,76 @@ mod tests {
         assert!(parse_pytest_line("tests/test_sample.py:7: AssertionError").is_none());
         assert!(parse_pytest_line("collecting ... collected 7 items").is_none());
         assert!(parse_pytest_line("").is_none());
+    }
+
+    /// #1503: under pytest-xdist (`-n auto` in addopts) `pytest -v` prints
+    /// the worker and the outcome BEFORE the node ID, so no result was read
+    /// and Run All reported a failed run. Lines as pytest 9 + xdist 3 print
+    /// them, progress on and off.
+    #[test]
+    fn pytest_xdist_verbose_lines_parse_outcome_first() {
+        let cases = [
+            (
+                "[gw0] [ 50%] PASSED tests/test_x.py::test_a ",
+                "tests/test_x.py::test_a",
+                TestStatus::Passed,
+            ),
+            (
+                "[gw1] [100%] FAILED tests/test_x.py::test_b ",
+                "tests/test_x.py::test_b",
+                TestStatus::Failed,
+            ),
+            (
+                "[gw3] [ 25%] SKIPPED tests/test_x.py::test_c ",
+                "tests/test_x.py::test_c",
+                TestStatus::Skipped,
+            ),
+            (
+                "[gw0] [ 75%] ERROR tests/test_x.py::test_d ",
+                "tests/test_x.py::test_d",
+                TestStatus::Failed,
+            ),
+            (
+                "[gw12] [ 10%] XFAIL tests/test_x.py::TestGroup::test_e ",
+                "tests/test_x.py::TestGroup::test_e",
+                TestStatus::Skipped,
+            ),
+            (
+                "[gw2] [ 90%] XPASS tests/test_x.py::test_f[1-2] ",
+                "tests/test_x.py::test_f[1-2]",
+                TestStatus::Passed,
+            ),
+            // `console_output_style = classic` drops the progress.
+            (
+                "[gw0] PASSED tests/test_x.py::test_a",
+                "tests/test_x.py::test_a",
+                TestStatus::Passed,
+            ),
+        ];
+        for (line, name, status) in cases {
+            let c = parse_pytest_line(line).unwrap_or_else(|| panic!("{line:?}"));
+            assert_eq!((c.name.as_str(), c.status), (name, status), "{line:?}");
+        }
+    }
+
+    /// #1503 negative: xdist's own chrome names workers but is no result.
+    #[test]
+    fn pytest_xdist_chrome_is_not_a_result() {
+        for line in [
+            "created: 2/2 workers",
+            "2 workers [2 items]",
+            "scheduling tests via LoadScheduling",
+            "[gw0] linux Python 3.11.2 cwd: /tmp/ptq",
+            "[gw0] Python 3.11.2 (main, Mar 13 2023, 12:18:29) [GCC 12.2.0]",
+            "[gw1] node down: Not properly terminated",
+            "[gw0] [ 50%] PASSED",
+            "[gw0] [ 50%] PASSED see tests/test_x.py",
+            "[gwX] [ 50%] PASSED tests/test_x.py::test_a",
+            "replacing crashed worker gw0",
+            "FAILED tests/test_x.py::test_b - assert False",
+        ] {
+            assert!(parse_pytest_line(line).is_none(), "{line:?}");
+        }
     }
 
     #[test]
