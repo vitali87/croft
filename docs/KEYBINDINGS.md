@@ -158,7 +158,7 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | View: Pin Editor / View: Unpin Editor | `Cmd`+`K` `P` | The tab menu's **Pin** / **Unpin** on the active tab. As in VS Code, the palette lists only the one that applies; bound in `keybindings.json`, each leaves a tab already in its state alone |
 | View: Keep Editor | `Cmd`+`K` `Shift`+`P` | The tab menu's **Keep Open**: the italic preview tab stays when the next file opens (the palette also finds it as "keep open") |
 
-**Terminal: Search & Replace from Last grep/rg** (palette-only) reads the last `grep`/`rg`/`git grep` command run in the focused terminal, seeds the Search sidebar with its pattern and matching flags (`-i`, `-w`, `-F`/`-E`, `-g`), and runs it. The terminal search becomes the Search panel's results list, so its replace-all covers every match at once (`:cdo`-style).
+**Terminal: Search & Replace from Last grep/rg** (palette-only) reads the last `grep`/`rg`/`git grep` command run in the focused terminal, seeds the Search sidebar with its pattern and matching flags (`-i`, `-w`, `-F`/`-E`, `-g`), scopes it to the paths and rg `-t`/`-T` types the command searched (resolved from the pane's directory), and runs it. A command whose scope can't be reproduced exactly (`-v`, `-L`, an unknown type, a path outside the workspace) is refused with the reason rather than seeded wider. The terminal search becomes the Search panel's results list, so its replace-all covers every match at once (`:cdo`-style).
 
 ## Settings, custom keybindings & snippets
 

@@ -47817,16 +47817,46 @@ impl App {
     }
 
     /// Populate and run the Search panel from a parsed terminal search
-    /// command line. Returns false when `input` isn't a recognisable search.
+    /// command line, scoped to the paths it searched from the focused pane's
+    /// directory. Returns false when `input` isn't a recognisable search.
     fn seed_search_from_command(&mut self, input: &str) -> bool {
+        let cwd = self
+            .terminals
+            .get(self.active_terminal)
+            .and_then(|t| t.pid())
+            .and_then(cwd_of_pid)
+            .filter(|p| p.is_dir());
+        let Some(cwd) = cwd else {
+            // Guessing the workspace root would widen `rg foo` run from a
+            // subdirectory to every file (#1201).
+            if crate::quickfix::parse_search_command(input).is_none() {
+                return false;
+            }
+            self.status = String::from(
+                "Search not seeded: can't tell which directory the terminal searched from",
+            );
+            return true;
+        };
+        self.seed_search_from_command_in(input, &cwd)
+    }
+
+    /// [`Self::seed_search_from_command`] for a command run in `cwd`. A
+    /// search whose scope can't be reproduced exactly is refused with the
+    /// reason in the status bar and leaves the panel alone (still true:
+    /// the input was a search), so Replace All never widens past it (#1201).
+    fn seed_search_from_command_in(&mut self, input: &str, cwd: &Path) -> bool {
         let Some(sc) = crate::quickfix::parse_search_command(input) else {
             return false;
         };
-        self.search.seed(
-            sc.pattern.clone(),
-            sc.include.unwrap_or_default(),
-            sc.exclude.unwrap_or_default(),
-        );
+        let (include, exclude) =
+            match crate::quickfix::scope_filters(&sc, cwd, self.workspace_root()) {
+                Ok(filters) => filters,
+                Err(why) => {
+                    self.status = format!("Search not seeded: {why}");
+                    return true;
+                }
+            };
+        self.search.seed(sc.pattern.clone(), include, exclude);
         self.search.opts.case_sensitive = sc.case_sensitive;
         self.search.opts.whole_word = sc.whole_word;
         self.search.opts.use_regex = sc.use_regex;

@@ -1,0 +1,1 @@
+fix: Terminal: Search & Replace from Last grep/rg now covers only the paths, rg types and directory the grep searched, so Replace All no longer rewrites files outside it; a `-v`/`-L` search or a scope it cannot reproduce is refused with the reason.
