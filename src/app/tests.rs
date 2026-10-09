@@ -11318,6 +11318,1755 @@ fn close_all_closes_every_split_group() {
     assert_eq!(app.status, format!("Closed {total} tabs"));
 }
 
+/// Type `text` into the focused editor, which leaves its buffer dirty.
+fn type_into_editor(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+fn press_ctrl_q(app: &mut App) {
+    app.handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL))
+        .unwrap();
+}
+
+/// An app with `a.txt` open, edited and unsaved, and the file's path (#862).
+fn app_with_unsaved_file(tmp: &std::path::Path) -> (App, PathBuf) {
+    let mut app = app_with_open_file(tmp, "a.txt", "alpha\n");
+    type_into_editor(&mut app, "x");
+    assert!(app.editor.dirty, "setup: typing leaves the buffer dirty");
+    (app, tmp.join("a.txt"))
+}
+
+/// #862: a quit with nothing unsaved is immediate, as it always was.
+#[test]
+fn ctrl_q_with_nothing_unsaved_quits_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha\n");
+    press_ctrl_q(&mut app);
+    assert!(app.quit);
+    assert_eq!(app.pending_unsaved, None, "nothing to ask about");
+}
+
+/// #862: Ctrl+Q with an unsaved buffer used to exit on the spot and lose
+/// it. It asks now, naming the file, and does not quit until answered.
+#[test]
+fn ctrl_q_with_an_unsaved_tab_asks_before_quitting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    press_ctrl_q(&mut app);
+    assert!(!app.quit, "an unsaved buffer must not be dropped by Ctrl+Q");
+    assert_eq!(app.pending_unsaved, Some(UnsavedExit::Quit));
+    let screen = draw_screen(&mut app);
+    assert!(screen.contains("UNSAVED CHANGES"), "{screen}");
+    assert!(screen.contains("1 file has unsaved changes"), "{screen}");
+    assert!(
+        screen.contains("a.txt"),
+        "the prompt names the file:\n{screen}"
+    );
+    // The prompt owns the keyboard: typing does not reach the buffer, and a
+    // second Ctrl+Q does not force the quit.
+    let before = app.editor.lines.clone();
+    type_into_editor(&mut app, "zz");
+    press_ctrl_q(&mut app);
+    assert_eq!(app.editor.lines, before);
+    assert!(!app.quit);
+}
+
+/// #862: S saves every unsaved buffer, in every split, and then quits.
+#[test]
+fn s_at_the_quit_prompt_saves_every_split_and_quits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    app.split_editor();
+    app.editor.open_pinned(&b).unwrap();
+    type_into_editor(&mut app, "y");
+    assert!(app.editor_layout.is_split(), "setup: two groups");
+    press_ctrl_q(&mut app);
+    assert!(!app.quit);
+    let screen = draw_screen(&mut app);
+    assert!(screen.contains("2 files have unsaved changes"), "{screen}");
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.quit, "saved everything, so it quits: {}", app.status);
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "xalpha\n");
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), "ybravo\n");
+}
+
+/// #862: D quits without writing anything.
+#[test]
+fn d_at_the_quit_prompt_quits_without_saving() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    press_ctrl_q(&mut app);
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.quit);
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
+}
+
+/// #862: Esc (or N, which never means "don't save") cancels: croft stays,
+/// the edits stay, and the disk is untouched. A modified D does not discard.
+#[test]
+fn esc_or_n_at_the_quit_prompt_cancels() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    for cancel in [
+        key(KeyCode::Esc, KeyModifiers::NONE),
+        key(KeyCode::Char('n'), KeyModifiers::NONE),
+    ] {
+        press_ctrl_q(&mut app);
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(!app.quit, "Ctrl+D is not the D answer");
+        app.handle_key(cancel).unwrap();
+        assert!(!app.quit);
+        assert_eq!(app.pending_unsaved, None, "the prompt closed");
+        assert!(app.editor.dirty, "the edits are still there");
+        assert_eq!(app.editor.lines[0], "xalpha");
+    }
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
+}
+
+/// #862: an untitled buffer has no file to save to, so S cannot keep its
+/// text and does not quit; D is the explicit way out.
+#[test]
+fn save_all_does_not_quit_while_an_untitled_buffer_holds_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    type_into_editor(&mut app, "note");
+    assert!(app.editor.path.is_none() && app.editor.dirty, "setup");
+    press_ctrl_q(&mut app);
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.quit, "the untitled text would be lost");
+    assert!(app.status.contains("untitled"), "{}", app.status);
+    assert_eq!(app.editor.lines, vec![String::from("note")]);
+    press_ctrl_q(&mut app);
+    app.handle_key(key(KeyCode::Char('D'), KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(app.quit);
+}
+
+/// #862: an untitled buffer that holds nothing is not worth a prompt.
+#[test]
+fn an_emptied_untitled_buffer_does_not_hold_up_a_quit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    type_into_editor(&mut app, "x");
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines, vec![String::new()], "setup");
+    press_ctrl_q(&mut app);
+    assert!(app.quit);
+}
+
+/// #862: a save that fails keeps croft open. Here the file changed on disk
+/// under the edits: Save All must neither overwrite that nor quit.
+#[test]
+fn save_all_does_not_quit_when_a_save_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    std::fs::write(&a, "changed elsewhere\n").unwrap();
+    press_ctrl_q(&mut app);
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.quit);
+    assert!(
+        app.status.contains("a.txt (changed on disk)"),
+        "{}",
+        app.status
+    );
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "changed elsewhere\n",
+        "the other writer's change is not overwritten"
+    );
+    assert!(app.editor.dirty, "the edits are still in the buffer");
+}
+
+/// #862 review: a file open in two editor groups is two buffers. With the
+/// same unsaved text in both, Save All writes it once and quits: before,
+/// the second write read the first as a change on disk, refused, and kept
+/// croft open over a file that already held the edits.
+#[test]
+fn save_all_writes_a_file_open_in_two_groups_with_the_same_edits_once_and_quits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    let edited = app.editor.lines.clone();
+    app.split_editor();
+    app.editor.lines = edited.clone();
+    app.editor.dirty = true;
+    press_ctrl_q(&mut app);
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.quit, "{}", app.status);
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "xalpha\n");
+}
+
+/// #862 review, the guard: two groups holding different unsaved text for
+/// one file are not settled by writing whichever comes first. Neither is
+/// written, both stay, and croft stays open naming the file.
+#[test]
+fn save_all_writes_neither_of_two_different_unsaved_copies_of_a_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    app.split_editor();
+    app.editor.lines = vec![String::from("yalpha"), String::new()];
+    app.editor.dirty = true;
+    press_ctrl_q(&mut app);
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.quit);
+    assert!(
+        app.status
+            .contains("a.txt (open in 2 editor groups with different unsaved text)"),
+        "{}",
+        app.status
+    );
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
+    let mut texts: Vec<String> = std::iter::once(&app.editor)
+        .chain(app.editor_layout.inactive_groups())
+        .flat_map(|g| g.editors.iter())
+        .filter(|e| e.path.as_deref() == Some(a.as_path()))
+        .inspect(|e| assert!(e.dirty, "both copies stay unsaved"))
+        .map(|e| e.lines[0].clone())
+        .collect();
+    texts.sort();
+    assert_eq!(texts, ["xalpha", "yalpha"]);
+}
+
+/// #862: Cmd+W on an unsaved tab used to close it, and Reopen Closed
+/// Editor brought back only the file on disk. It asks now; Esc keeps it.
+#[test]
+fn closing_an_unsaved_tab_asks_rather_than_dropping_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.editor.select(0);
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.editor.tab_count(), 2, "nothing closed yet");
+    assert!(matches!(
+        app.pending_unsaved,
+        Some(UnsavedExit::CloseTab { idx: 0, .. })
+    ));
+    assert_ne!(app.status, "Closed tab");
+    let screen = draw_screen(&mut app);
+    assert!(screen.contains("This tab has unsaved changes"), "{screen}");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.tab_count(), 2);
+    assert_eq!(app.editor.lines[0], "xalpha", "the edits are kept");
+}
+
+/// #862: S at the close prompt writes the tab, then closes it.
+#[test]
+fn s_at_the_close_prompt_saves_then_closes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "xalpha\n");
+    assert_eq!(app.editor.path, None, "the tab closed");
+    assert_eq!(app.status, "Saved and closed tab");
+    assert!(!app.quit, "closing a tab never quits");
+}
+
+/// #862: D at the close prompt closes without writing, and the tab can
+/// still be reopened from disk.
+#[test]
+fn d_at_the_close_prompt_closes_without_saving() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    app.run_command(crate::widgets::command_palette::Command::CloseEditor);
+    assert!(app.pending_unsaved.is_some(), "View: Close Editor asks too");
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.path, None, "the tab closed");
+    assert_eq!(app.status, "Closed tab without saving");
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
+    app.reopen_closed_tab();
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    assert_eq!(app.editor.lines[0], "alpha", "reopened from disk");
+}
+
+/// #862: a clean tab closes at once, exactly as before.
+#[test]
+fn closing_a_clean_tab_does_not_ask() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha\n");
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.pending_unsaved, None);
+    assert_eq!(app.editor.path, None);
+    assert_eq!(app.status, "Closed tab");
+}
+
+/// #862: the tab context menu's Close asks about an unsaved tab, and its
+/// Close Others / Close All keep one open rather than dropping it.
+#[test]
+fn tab_menu_closes_keep_unsaved_tabs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    let root = tmp.path().to_path_buf();
+
+    app.dispatch_menu_action(MenuAction::CloseTab(0), root.clone());
+    assert!(
+        app.pending_unsaved.is_some(),
+        "Close on the unsaved tab asks"
+    );
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+
+    app.dispatch_menu_action(MenuAction::CloseOtherTabs(1), root.clone());
+    assert_eq!(
+        app.editor.tab_count(),
+        2,
+        "Close Others keeps the unsaved a.txt"
+    );
+
+    app.dispatch_menu_action(MenuAction::CloseAllTabs, root);
+    assert_eq!(app.editor.tab_count(), 1);
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    assert!(app.editor.dirty);
+    assert_eq!(app.status, "Closed 1 tab; kept 1 with unsaved changes open");
+}
+
+/// #862: Close All keeps a split whose other group holds unsaved edits, and
+/// folds away only the groups it emptied.
+#[test]
+fn close_all_keeps_the_split_group_holding_unsaved_edits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    app.split_editor();
+    assert!(app.editor_layout.is_split(), "setup: two groups");
+    app.dispatch_menu_action(MenuAction::CloseAllTabs, tmp.path().to_path_buf());
+    assert!(
+        !app.editor_layout.is_split(),
+        "the emptied focused group folded away"
+    );
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    assert!(app.editor.dirty, "the unsaved group survives, promoted");
+}
+
+/// #862: a tab whose unsaved text another open tab holds too (a symbol tab
+/// and its file's tab mirror one buffer) closes without asking: nothing is
+/// lost while the other keeps it.
+#[test]
+fn a_tab_whose_edits_another_tab_holds_closes_without_asking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    let edited = app.editor.lines.clone();
+    app.split_editor();
+    app.editor.lines = edited.clone();
+    app.editor.dirty = true;
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.pending_unsaved, None, "no prompt");
+    assert!(!app.editor_layout.is_split(), "the tab closed");
+    assert_eq!(app.editor.lines, edited, "the other copy kept the edits");
+    assert!(app.editor.dirty);
+}
+
+/// #862: vim's `:q` and `:qa` ask like Cmd+W and Ctrl+Q; the `!` forms are
+/// the answer given up front and discard without asking.
+#[test]
+fn vim_quits_ask_unless_forced() {
+    let (mut app, tmp) = vim_app("one\n");
+    let f = tmp.path().join("buf.txt");
+    app.editor.lines[0] = String::from("edited");
+    app.editor.dirty = true;
+    app.vim_run_ex("qa");
+    assert!(!app.quit);
+    assert_eq!(app.pending_unsaved, Some(UnsavedExit::Quit));
+    app.cancel_unsaved();
+    app.vim_run_ex("q");
+    assert!(matches!(
+        app.pending_unsaved,
+        Some(UnsavedExit::CloseTab { .. })
+    ));
+    app.cancel_unsaved();
+    app.vim_run_ex("qa!");
+    assert!(app.quit, ":qa! quits without asking");
+    app.quit = false;
+    app.vim_run_ex("q!");
+    assert_eq!(app.pending_unsaved, None);
+    assert_eq!(app.editor.path, None, ":q! closed the tab");
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "one\n");
+}
+
+/// #862: leaving a remote croft for the local one ends this process like a
+/// quit, so it asks the same way.
+#[test]
+fn drop_to_local_with_unsaved_edits_asks_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    app.is_remote = true;
+    let drop_key = key(
+        KeyCode::Char('l'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    );
+    app.handle_key(drop_key).unwrap();
+    assert!(!app.quit && !app.drop_to_local);
+    assert_eq!(app.pending_unsaved, Some(UnsavedExit::DropToLocal));
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.drop_to_local && app.quit);
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "xalpha\n");
+}
+
+/// #862 negative: S at a close prompt writes the tab it asked about and no
+/// other; a second unsaved tab stays unsaved and open.
+#[test]
+fn s_at_the_close_prompt_saves_only_that_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    type_into_editor(&mut app, "y");
+    app.editor.select(0);
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "xalpha\n");
+    assert_eq!(
+        std::fs::read_to_string(&b).unwrap(),
+        "bravo\n",
+        "the other unsaved tab is not written"
+    );
+    assert_eq!(app.editor.tab_count(), 1);
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()));
+    assert!(app.editor.dirty, "and keeps its edits");
+}
+
+/// #862 negative: an answer never lands on a tab other than the one asked
+/// about. When the tab at that index is another file by the time the answer
+/// comes, D closes nothing and discards nothing.
+#[test]
+fn an_answer_for_a_tab_that_moved_closes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.editor.select(0);
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(matches!(
+        app.pending_unsaved,
+        Some(UnsavedExit::CloseTab { idx: 0, .. })
+    ));
+    // Something other than the user reorders the tabs meanwhile.
+    app.editor.editors.swap(0, 1);
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.tab_count(), 2, "nothing closed");
+    assert!(app.status.contains("moved"), "{}", app.status);
+    let a_tab = app
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .unwrap();
+    assert!(a_tab.dirty && a_tab.lines[0] == "xalpha", "edits kept");
+}
+
+/// #862 negative: while the prompt is up a click behind it does nothing,
+/// even on another tab's close button, which closes that tab once the
+/// prompt is gone.
+#[test]
+fn a_click_behind_the_unsaved_prompt_closes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.editor.select(0);
+    draw_screen(&mut app);
+    let row = app.editor.tab_strip_y_for_test();
+    let col = app.editor.close_screen_x(1).expect("b.txt's close button");
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    draw_screen(&mut app);
+    left_click(&mut app, col, row);
+    assert_eq!(app.editor.tab_count(), 2, "the click went nowhere");
+    assert!(app.pending_unsaved.is_some(), "the prompt is still asking");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    draw_screen(&mut app);
+    left_click(&mut app, col, row);
+    assert_eq!(app.editor.tab_count(), 1, "with no prompt it closes b.txt");
+}
+
+/// A remote connect whose install just reported `event`: the croft on the
+/// host is ready to take this terminal over (no ssh is run).
+fn ready_to_hand_off(app: &mut App, event: crate::install_session::InstallEvent) {
+    let adopted = crate::remote::AdoptedMaster {
+        host: String::from("devbox"),
+        socket_dir: PathBuf::from("/nonexistent/croft-test-ctl"),
+        socket_path: PathBuf::from("/nonexistent/croft-test-ctl/ctl"),
+    };
+    app.install_session = Some(crate::install_session::InstallSession::with_events(
+        "devbox",
+        None,
+        Some(adopted),
+        vec![event],
+    ));
+}
+
+/// The two install outcomes that hand this terminal to the remote croft:
+/// one was already there (it launches while the reinstall runs on), or the
+/// install just finished.
+fn handoff_events() -> [crate::install_session::InstallEvent; 2] {
+    use crate::install_session::InstallEvent;
+    [InstallEvent::CanLaunch, InstallEvent::Done(Ok(()))]
+}
+
+/// #862: connecting to a remote croft ends this one once the remote side is
+/// ready, which can be minutes after the connect was asked for. An edit
+/// made meanwhile went with it: the handoff set `quit` without asking. It
+/// asks now, and S saves before handing off.
+#[test]
+fn a_remote_handoff_asks_about_edits_made_during_the_install() {
+    for event in handoff_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha\n");
+        // Nothing was unsaved when the connect was asked for; the edit
+        // comes while the install runs.
+        type_into_editor(&mut app, "x");
+        ready_to_hand_off(&mut app, event);
+        app.poll_install_session();
+        assert!(!app.quit, "the unsaved a.txt must not go with the handoff");
+        assert!(app.pending_unsaved.is_some(), "it asks");
+        let screen = draw_screen(&mut app);
+        assert!(screen.contains("ave all and connect"), "{screen}");
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.quit, "saved, so it hands off: {}", app.status);
+        assert!(app.remote_launch.is_some(), "to the remote croft");
+        let a = tmp.path().join("a.txt");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "xalpha\n");
+    }
+}
+
+/// #862 negative: with nothing unsaved the handoff goes at once, as before.
+#[test]
+fn a_remote_handoff_with_nothing_unsaved_goes_at_once() {
+    for event in handoff_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha\n");
+        ready_to_hand_off(&mut app, event);
+        app.poll_install_session();
+        assert!(app.quit);
+        assert!(app.pending_unsaved.is_none(), "nothing to ask about");
+        assert!(app.remote_launch.is_some());
+    }
+}
+
+/// #862: Esc at the handoff prompt keeps this croft and the edits, and
+/// drops the launch rather than leaving it armed for a later quit.
+#[test]
+fn cancelling_the_remote_handoff_stays_here_with_the_edits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    ready_to_hand_off(&mut app, crate::install_session::InstallEvent::CanLaunch);
+    app.poll_install_session();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.quit);
+    assert!(app.remote_launch.is_none(), "the launch is dropped");
+    assert!(app.install_session.is_none());
+    assert!(app.editor.dirty && app.editor.lines[0] == "xalpha");
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
+    assert!(app.status.contains("did not connect"), "{}", app.status);
+}
+
+/// #862 negative: edits the user already chose to leave behind at the
+/// connect prompt (D records them; the answer itself would start a real
+/// ssh here) go with the handoff without a second question. One more edit
+/// after that answer is asked about.
+#[test]
+fn edits_left_at_the_connect_prompt_are_not_asked_about_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    app.remote_handoff_ok = app.unsaved_stamp();
+    ready_to_hand_off(&mut app, crate::install_session::InstallEvent::CanLaunch);
+    app.poll_install_session();
+    assert!(app.quit, "already answered: {}", app.status);
+    assert!(app.pending_unsaved.is_none());
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    app.remote_handoff_ok = app.unsaved_stamp();
+    type_into_editor(&mut app, "y");
+    ready_to_hand_off(&mut app, crate::install_session::InstallEvent::CanLaunch);
+    app.poll_install_session();
+    assert!(!app.quit, "the later edit was never agreed to");
+    assert!(app.pending_unsaved.is_some());
+}
+
+/// #862 negative: S at the handoff prompt whose save is refused (the file
+/// changed on disk) stays here, and drops the launch: left armed, the next
+/// ordinary Ctrl+Q would have connected instead of quitting.
+#[test]
+fn a_refused_save_at_the_remote_handoff_drops_the_launch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, a) = app_with_unsaved_file(tmp.path());
+    std::fs::write(&a, "changed elsewhere\n").unwrap();
+    ready_to_hand_off(&mut app, crate::install_session::InstallEvent::CanLaunch);
+    app.poll_install_session();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.quit);
+    assert!(app.status.contains("Did not connect"), "{}", app.status);
+    assert!(app.remote_launch.is_none(), "not left armed");
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "changed elsewhere\n");
+}
+
+/// Hot exit (#862) on for `app`, backing up under `cache` instead of the
+/// real `~/.cache/croft`.
+fn with_hot_exit(mut app: App, cache: &std::path::Path) -> App {
+    app.hot_exit_dir = Some(cache.to_path_buf());
+    app
+}
+
+/// A hot-exit tick long after the last edit, so the buffers count as settled.
+fn settle_hot_exit(app: &mut App) {
+    app.tick_hot_exit(std::time::Instant::now() + std::time::Duration::from_secs(60));
+}
+
+/// The hot-exit backup files for the workspace `root` under `cache`.
+fn hot_exit_files(cache: &std::path::Path, root: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(crate::hot_exit::workspace_dir(cache, root)) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    files.sort();
+    files
+}
+
+/// What the one hot-exit backup of `root` holds.
+fn the_hot_exit_backup(cache: &std::path::Path, root: &std::path::Path) -> crate::hot_exit::Backup {
+    let files = hot_exit_files(cache, root);
+    assert_eq!(files.len(), 1, "one backup: {files:?}");
+    crate::hot_exit::Backup::load(&files[0]).unwrap()
+}
+
+/// #862 hot exit: an unsaved buffer is backed up (path, text, cursor) once
+/// its edits settle, owner-only, and never while the edit is fresh, so
+/// typing never waits on a write. The file itself is not touched.
+#[test]
+fn hot_exit_backs_up_an_unsaved_buffer_once_it_settles() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    app.tick_hot_exit(std::time::Instant::now());
+    assert!(
+        hot_exit_files(cache.path(), tmp.path()).is_empty(),
+        "not while the edit is fresh"
+    );
+    settle_hot_exit(&mut app);
+    let backup = the_hot_exit_backup(cache.path(), tmp.path());
+    assert_eq!(backup.buffers.len(), 1);
+    let tab = &backup.buffers[0].tab;
+    assert_eq!(tab.path.as_deref(), Some(a.as_path()));
+    assert!(tab.dirty);
+    assert_eq!(
+        tab.unsaved_text.as_deref().unwrap().lines().next(),
+        Some("xalpha")
+    );
+    assert_eq!((tab.cursor_row, tab.cursor_col), (0, 1));
+    use std::os::unix::fs::PermissionsExt;
+    let file = &hot_exit_files(cache.path(), tmp.path())[0];
+    let mode = std::fs::metadata(file).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600, "it holds unsaved text: owner-only");
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
+    assert!(!app.quit);
+}
+
+/// #862 hot exit: croft killed with an unsaved buffer (no quit ran, the
+/// App is simply dropped) comes back on the next launch of the workspace:
+/// the tab returns unsaved, with its text and cursor, the file untouched,
+/// and the backup is the new croft's own at once, so a crash straight
+/// after the launch cannot lose the text either.
+#[test]
+fn hot_exit_restores_the_unsaved_tab_in_the_next_croft_on_the_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    let ed = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .expect("the unsaved tab is back");
+    assert!(ed.dirty, "restored as unsaved");
+    assert_eq!(ed.lines[0], "xalpha");
+    assert_eq!((ed.cursor_row, ed.cursor_col), (0, 1));
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "alpha\n",
+        "nothing is written to the file"
+    );
+    assert!(
+        next.status.contains("restored 1 unsaved tab"),
+        "{}",
+        next.status
+    );
+    let kept = the_hot_exit_backup(cache.path(), tmp.path());
+    assert_eq!(kept.buffers[0].tab.path.as_deref(), Some(a.as_path()));
+}
+
+/// #862 hot exit: every quit that keeps or knowingly drops the edits
+/// removes the backup: a clean quit (all saved), S once the saves land, D,
+/// and vim's `:qa!`.
+#[test]
+fn hot_exit_backup_goes_with_a_clean_quit_save_all_or_discard() {
+    type Quit = fn(&mut App);
+    let quits: [(&str, Quit); 4] = [
+        ("clean quit", |app| {
+            app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL))
+                .unwrap();
+            press_ctrl_q(app);
+        }),
+        ("S", |app| {
+            press_ctrl_q(app);
+            app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+                .unwrap();
+        }),
+        ("D", |app| {
+            press_ctrl_q(app);
+            app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+                .unwrap();
+        }),
+        (":qa!", |app| app.vim_run_ex("qa!")),
+    ];
+    for (name, quit) in quits {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let (app, _) = app_with_unsaved_file(tmp.path());
+        let mut app = with_hot_exit(app, cache.path());
+        settle_hot_exit(&mut app);
+        assert_eq!(hot_exit_files(cache.path(), tmp.path()).len(), 1, "setup");
+        quit(&mut app);
+        assert!(app.quit, "{name}: {}", app.status);
+        assert!(
+            hot_exit_files(cache.path(), tmp.path()).is_empty(),
+            "{name} removes the backup"
+        );
+    }
+}
+
+/// #862 hot exit negative: what is not a clean quit leaves the backup:
+/// cancelling the quit prompt, and the update relaunch (its handoff carries
+/// the same text across the exec, and the next croft backs it up again).
+#[test]
+fn hot_exit_backup_stays_when_croft_does_not_quit_cleanly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    press_ctrl_q(&mut app);
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(hot_exit_files(cache.path(), tmp.path()).len(), 1, "Esc");
+    app.update_status = UpdateStatus::Ready;
+    app.handle_key(key(
+        KeyCode::F(9),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert!(app.pending_reexec && app.quit, "setup: the relaunch armed");
+    assert_eq!(
+        hot_exit_files(cache.path(), tmp.path()).len(),
+        1,
+        "relaunch"
+    );
+}
+
+/// #862 hot exit: a file changed on disk after the backup still comes back
+/// unsaved with the backed-up text, the status line says it changed, and
+/// the first save refuses to overwrite the other change.
+#[test]
+fn hot_exit_restores_over_a_file_changed_since_and_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    std::fs::write(&a, "changed elsewhere after the backup\n").unwrap();
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    next.focus_pane(Pane::Editor);
+    assert_eq!(next.editor.path.as_deref(), Some(a.as_path()));
+    assert!(next.editor.dirty);
+    assert_eq!(next.editor.lines[0], "xalpha");
+    assert!(
+        next.status.contains("a.txt changed on disk"),
+        "{}",
+        next.status
+    );
+    next.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "changed elsewhere after the backup\n",
+        "the first save does not clobber the other change"
+    );
+}
+
+/// #862 hot exit: a backed-up file deleted since comes back as an unsaved
+/// tab for that path (a save recreates it), and an untitled buffer holding
+/// text comes back untitled.
+#[test]
+fn hot_exit_restores_deleted_and_untitled_buffers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    let untitled = app.editor.open_unreadable_tab(None);
+    untitled.lines = vec![String::from("scratch note")];
+    untitled.dirty = true;
+    settle_hot_exit(&mut app);
+    assert_eq!(
+        the_hot_exit_backup(cache.path(), tmp.path()).buffers.len(),
+        2
+    );
+    drop(app);
+    std::fs::remove_file(&a).unwrap();
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    let deleted = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .expect("the deleted file's tab is back");
+    assert!(deleted.dirty && deleted.lines[0] == "xalpha");
+    assert!(!a.exists(), "not recreated until saved");
+    let scratch = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.is_none() && e.dirty)
+        .expect("the untitled buffer is back");
+    assert_eq!(scratch.lines, vec![String::from("scratch note")]);
+}
+
+/// #862 review (CodeRabbit): a tab restored for a file deleted since keeps
+/// the stamp its edits were made against. It came back with none, so once
+/// something made the file again, the first save wrote over that without
+/// asking, as it would not for a file merely changed since.
+#[test]
+fn a_restored_tab_of_a_deleted_file_does_not_overwrite_one_made_since() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    std::fs::remove_file(&a).unwrap();
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert!(next.status.contains("no longer on disk"), "{}", next.status);
+    assert_eq!(next.editor.path.as_deref(), Some(a.as_path()), "setup");
+    std::fs::write(&a, "made elsewhere\n").unwrap();
+    next.focus_pane(Pane::Editor);
+    next.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "made elsewhere\n");
+    assert!(next.status.contains("changed on disk"), "{}", next.status);
+    assert!(next.editor.dirty, "the restored text is still there");
+}
+
+/// #862 review, the guard: a deleted file's restored tab can still be
+/// saved. The first save asks, as for any file changed since; the second
+/// writes it.
+#[test]
+fn a_restored_tab_of_a_deleted_file_is_saved_when_asked_twice() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    std::fs::remove_file(&a).unwrap();
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    next.focus_pane(Pane::Editor);
+    for _ in 0..2 {
+        next.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
+            .unwrap();
+    }
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap().lines().next(),
+        Some("xalpha")
+    );
+    assert!(!next.editor.dirty);
+}
+
+/// #862 review (CodeRabbit): a consumed backup that cannot be removed once
+/// this croft's own backup lands is not forgotten. It was dropped without a
+/// word, so text the user later discarded could come back at a launch. It
+/// is said, and the quit tries it again and says so too.
+#[test]
+fn a_consumed_backup_that_cannot_be_removed_is_reported_and_tried_at_quit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    let old = as_a_dead_crofts_backup(cache.path(), tmp.path());
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    let own = block_hot_exit_path(&next);
+    next.restore_hot_exit();
+    assert!(old.exists(), "setup: kept while its own write fails");
+    // Neither emptied nor unlinked: a non-empty directory in its place.
+    std::fs::remove_file(&old).unwrap();
+    std::fs::create_dir_all(old.join("blocked")).unwrap();
+    std::fs::remove_dir_all(&own).unwrap();
+    settle_hot_exit(&mut next);
+    assert!(own.is_file(), "setup: its own backup landed");
+    let old_name = old.display().to_string();
+    assert!(
+        next.status.contains("Could not remove") && next.status.contains(&old_name),
+        "{}",
+        next.status
+    );
+    press_ctrl_q(&mut next);
+    next.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(next.quit);
+    assert!(
+        next.exit_notes.iter().any(|n| n.contains(&old_name)),
+        "{:?}",
+        next.exit_notes
+    );
+}
+
+/// #862 review (CodeRabbit): a dead croft's backup can sit at this croft's
+/// own backup path, where the process start time cannot be read (the name
+/// is then `<pid>.json`) and the pid was recycled. Restoring from it, then
+/// writing this croft's own backup, then cutting it down to a held copy
+/// all hit one file: the cut wrote over the backup of what was restored.
+/// It is moved aside before anything is restored from it.
+#[test]
+fn a_backup_at_this_crofts_own_path_is_moved_aside_before_restoring() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    let b_buffer = crate::hot_exit::Buffer {
+        tab: crate::session_state::OpenTabState {
+            path: Some(b.clone()),
+            dirty: true,
+            cursor_row: 0,
+            cursor_col: 0,
+            scroll: 0,
+            scroll_col: 0,
+            unsaved_text: Some(String::from("zbravo\n")),
+        },
+        disk_stamp: None,
+    };
+    two_dead_backups_of_a(
+        tmp.path(),
+        cache.path(),
+        ["first\n", "second\n"],
+        vec![b_buffer],
+    );
+    // The older backup, holding a.txt and b.txt, sits at this croft's own
+    // path; its write time comes with it.
+    let older = hot_exit_files(cache.path(), tmp.path())
+        .into_iter()
+        .find(|f| f.ends_with("1-1.json"))
+        .unwrap();
+    let own = crate::hot_exit::own_path(cache.path(), tmp.path());
+    std::fs::rename(&older, &own).unwrap();
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert!(
+        next.status.contains("restored 2 unsaved tabs"),
+        "{}",
+        next.status
+    );
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &b),
+        ["zbravo\n"],
+        "b.txt's restored text is backed up"
+    );
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &a),
+        ["first\n", "second\n"],
+        "and so are both copies of a.txt"
+    );
+}
+
+/// #862 review (CodeRabbit, security): a tab closed without saving had its
+/// text left in the hot-exit backup until a later tick rewrote it, so a
+/// crash in between brought back text the user had chosen to discard. The
+/// close rewrites the backup at once.
+#[test]
+fn discarding_a_tab_takes_its_text_out_of_the_backup_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &a).len(),
+        1,
+        "setup: backed up"
+    );
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.status.contains("without saving"), "{}", app.status);
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &a),
+        Vec::<String>::new(),
+        "no tick has run, and the discarded text is gone from disk"
+    );
+}
+
+/// #862 review, the guard: discarding one tab leaves the others' unsaved
+/// text in the backup.
+#[test]
+fn discarding_a_tab_keeps_the_other_unsaved_tabs_backed_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    type_into_editor(&mut app, "z");
+    settle_hot_exit(&mut app);
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()), "setup");
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &b),
+        Vec::<String>::new()
+    );
+    assert_eq!(hot_exit_texts_of(cache.path(), tmp.path(), &a).len(), 1);
+}
+
+/// #862 hot exit negative: only the launched workspace's backup comes back;
+/// another workspace's stays where it is for that workspace's next launch.
+#[test]
+fn hot_exit_does_not_restore_another_workspaces_backup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+
+    let mut elsewhere = with_hot_exit(App::new(other.path().to_path_buf()).unwrap(), cache.path());
+    elsewhere.restore_hot_exit();
+    assert!(
+        elsewhere.editor.editors.iter().all(|e| !e.dirty),
+        "nothing restored into the other workspace"
+    );
+    assert_eq!(hot_exit_files(cache.path(), tmp.path()).len(), 1, "kept");
+}
+
+/// #862 hot exit negative: a backup another running croft owns (a second
+/// window on the workspace) is neither restored nor removed by this one.
+/// This one is named by its pid alone, as backups were before hot exit
+/// recorded start times: a live pid is then taken to be its croft.
+#[test]
+fn hot_exit_leaves_a_running_crofts_backup_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    let mine = hot_exit_files(cache.path(), tmp.path()).remove(0);
+    // pid 1 is always running.
+    let live = mine.with_file_name("1.json");
+    std::fs::rename(&mine, &live).unwrap();
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert!(
+        next.editor.editors.iter().all(|e| !e.dirty),
+        "not taken over"
+    );
+    assert!(live.exists(), "and not removed");
+}
+
+/// This test's hot-exit backup of `root`, renamed as a croft that is gone
+/// left it (a pid that does not exist, in the pid-only name): a backup at a
+/// path other than the restoring croft's own.
+fn as_a_dead_crofts_backup(cache: &std::path::Path, root: &std::path::Path) -> PathBuf {
+    let mine = hot_exit_files(cache, root).remove(0);
+    let dead = mine.with_file_name("999999999.json");
+    std::fs::rename(&mine, &dead).unwrap();
+    dead
+}
+
+/// Put a non-empty directory where `app`'s own hot-exit backup goes, so
+/// writing it fails even for root (a rename cannot replace a directory
+/// that holds something). Returns the path, to clear the way again.
+fn block_hot_exit_path(app: &App) -> PathBuf {
+    let own = app.hot_exit_path().unwrap();
+    std::fs::create_dir_all(own.join("blocked")).unwrap();
+    own
+}
+
+/// #862 hot exit (review): the backup a restore consumed stays on disk
+/// until this croft's own backup of the restored tabs is written. The
+/// restore removed it first, so a failed write (a full disk) left the text
+/// in memory only; the next tick then writes it and lets the old one go.
+#[test]
+fn a_failed_rewrite_after_a_restore_keeps_the_old_backup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    let old = as_a_dead_crofts_backup(cache.path(), tmp.path());
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    let own = block_hot_exit_path(&next);
+    next.restore_hot_exit();
+    assert!(
+        next.editor.dirty && next.editor.lines[0] == "xalpha",
+        "setup: restored"
+    );
+    assert!(
+        old.exists(),
+        "the old backup stays while it is the only copy on disk"
+    );
+    assert!(next.status.contains("Could not back up"), "{}", next.status);
+    std::fs::remove_dir_all(&own).unwrap();
+    settle_hot_exit(&mut next);
+    assert!(own.is_file(), "a later tick writes it");
+    assert!(!old.exists(), "and only then the old backup goes");
+}
+
+/// #862 hot exit (review): a backup write that failed is tried again by a
+/// later tick, with no further edit. It counted as written, so nothing was
+/// backed up until the user typed again.
+#[test]
+fn a_failed_hot_exit_write_is_retried_by_a_later_tick() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    let own = block_hot_exit_path(&app);
+    settle_hot_exit(&mut app);
+    assert!(!own.is_file(), "setup: the write failed");
+    std::fs::remove_dir_all(&own).unwrap();
+    settle_hot_exit(&mut app);
+    assert!(own.is_file(), "retried with no new edit");
+    let backup = crate::hot_exit::Backup::load(&own).unwrap();
+    assert_eq!(backup.buffers.len(), 1);
+}
+
+/// #862 hot exit negative: a restore whose rewrite lands removes the backup
+/// it consumed; this croft's own backup is never removed, even when the
+/// consumed file carries its name (a dead croft whose pid it reuses).
+#[test]
+fn a_restore_replaces_the_old_backup_and_keeps_its_own() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    let old = as_a_dead_crofts_backup(cache.path(), tmp.path());
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert!(!old.exists(), "the consumed backup goes");
+    let own = next.hot_exit_path().unwrap();
+    assert!(own.is_file(), "its own holds the text now");
+    drop(next);
+
+    // The consumed file is this croft's own name: it is rewritten, never
+    // removed.
+    let mut again = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    again.restore_hot_exit();
+    assert!(again.editor.dirty, "setup: restored again");
+    assert!(own.is_file(), "its own backup is kept");
+    let backup = crate::hot_exit::Backup::load(&own).unwrap();
+    assert!(
+        backup.buffers[0]
+            .tab
+            .unsaved_text
+            .as_deref()
+            .unwrap()
+            .starts_with("xalpha")
+    );
+}
+
+/// #862 hot exit negative: a consumed backup that restores nothing (no
+/// buffers in it) is removed at once; there is no text to wait on a write
+/// for, and no backup of this croft's is written.
+#[test]
+fn a_backup_that_restores_nothing_is_removed_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let dir = crate::hot_exit::workspace_dir(cache.path(), tmp.path());
+    let empty = dir.join("999999999.json");
+    crate::hot_exit::Backup {
+        workspace_root: tmp.path().to_path_buf(),
+        buffers: Vec::new(),
+    }
+    .save(&empty)
+    .unwrap();
+    let mut app = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    app.restore_hot_exit();
+    assert!(!empty.exists());
+    assert!(hot_exit_files(cache.path(), tmp.path()).is_empty());
+}
+
+/// #862 hot exit (review): a backup whose pid is alive again, but as a
+/// process that started at another time than the croft that wrote it, is
+/// from a croft that is gone: its pid was recycled. It is restored. Judged
+/// by the pid alone it stayed untouched as long as the newcomer ran.
+#[test]
+fn hot_exit_restores_a_backup_whose_pid_was_recycled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    let mine = hot_exit_files(cache.path(), tmp.path()).remove(0);
+    // pid 1 is always running, and did not start one second into 1970.
+    let recycled = mine.with_file_name("1-1.json");
+    std::fs::rename(&mine, &recycled).unwrap();
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    let ed = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .expect("restored");
+    assert!(ed.dirty && ed.lines[0] == "xalpha");
+    assert!(!recycled.exists(), "consumed");
+}
+
+/// The texts hot-exit backups under `cache` hold for `file`, sorted.
+fn hot_exit_texts_of(
+    cache: &std::path::Path,
+    root: &std::path::Path,
+    file: &std::path::Path,
+) -> Vec<String> {
+    let mut texts: Vec<String> = hot_exit_files(cache, root)
+        .iter()
+        .flat_map(|f| crate::hot_exit::Backup::load(f).unwrap().buffers)
+        .filter(|b| b.tab.path.as_deref() == Some(file))
+        .filter_map(|b| b.tab.unsaved_text)
+        .collect();
+    texts.sort();
+    texts
+}
+
+/// Two dead crofts' backups (`1-1.json`, `1-2.json`: pid 1 never started
+/// in 1970), each holding `a.txt` with the unsaved text `texts` gives it,
+/// the second written later, and `extra` buffers added to the first.
+fn two_dead_backups_of_a(
+    tmp: &std::path::Path,
+    cache: &std::path::Path,
+    texts: [&str; 2],
+    extra: Vec<crate::hot_exit::Buffer>,
+) {
+    let (app, _) = app_with_unsaved_file(tmp);
+    let mut app = with_hot_exit(app, cache);
+    settle_hot_exit(&mut app);
+    drop(app);
+    let mine = hot_exit_files(cache, tmp).remove(0);
+    let mut backup = crate::hot_exit::Backup::load(&mine).unwrap();
+    std::fs::remove_file(&mine).unwrap();
+    for (i, text) in texts.iter().enumerate() {
+        backup.buffers.truncate(1);
+        backup.buffers[0].tab.unsaved_text = Some((*text).to_string());
+        if i == 0 {
+            backup.buffers.extend(extra.iter().cloned());
+        }
+        let file = mine.with_file_name(format!("1-{}.json", i + 1));
+        backup.save(&file).unwrap();
+        let written =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(60 - 30 * i as u64);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(written)
+            .unwrap();
+    }
+}
+
+/// #862 review: two crofts on one workspace, both killed holding unsaved
+/// edits to one file. Restoring the second backup into the tab the first
+/// filled overwrote that text, and both backups were then deleted, so one
+/// set of edits was gone while the status line counted two tabs restored.
+/// The second copy now stays in its backup, and comes back once the first
+/// has been saved or closed.
+#[test]
+fn hot_exit_keeps_a_second_backup_of_a_file_it_already_restored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    two_dead_backups_of_a(
+        tmp.path(),
+        cache.path(),
+        ["first\n", "second\n"],
+        Vec::new(),
+    );
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert!(
+        next.status.contains("restored 1 unsaved tab"),
+        "{}",
+        next.status
+    );
+    assert!(
+        next.status.contains("a.txt has a second unsaved copy"),
+        "{}",
+        next.status
+    );
+    let shown = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .expect("restored");
+    assert_eq!(shown.lines[0], "second", "the newer copy fills the tab");
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &a),
+        ["first\n", "second\n"],
+        "both texts are still on disk"
+    );
+
+    // Once this croft's copy is gone (a clean quit that discards it), the
+    // next launch brings back the other one.
+    next.clear_hot_exit();
+    drop(next);
+    let mut third = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    third.restore_hot_exit();
+    let other = third
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .expect("the second copy is restored");
+    assert!(other.dirty);
+    assert_eq!(
+        other.lines[0], "first",
+        "the copy the first launch held back"
+    );
+}
+
+/// #862 review, the guard: the backup that held the second copy keeps only
+/// that copy. Its other file is restored and not left in it to come back a
+/// second time.
+#[test]
+fn hot_exit_restores_the_rest_of_a_backup_that_also_held_a_second_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&b, "bravo\n").unwrap();
+    let b_buffer = crate::hot_exit::Buffer {
+        tab: crate::session_state::OpenTabState {
+            path: Some(b.clone()),
+            dirty: true,
+            cursor_row: 0,
+            cursor_col: 0,
+            scroll: 0,
+            scroll_col: 0,
+            unsaved_text: Some(String::from("zbravo\n")),
+        },
+        disk_stamp: None,
+    };
+    two_dead_backups_of_a(
+        tmp.path(),
+        cache.path(),
+        ["first\n", "second\n"],
+        vec![b_buffer],
+    );
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert!(
+        next.status.contains("restored 2 unsaved tabs"),
+        "{}",
+        next.status
+    );
+    let bed = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(b.as_path()))
+        .expect("b.txt restored");
+    assert!(bed.dirty && bed.lines[0] == "zbravo");
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &b),
+        ["zbravo\n"],
+        "b.txt is in this croft's backup alone"
+    );
+    assert_eq!(
+        hot_exit_texts_of(cache.path(), tmp.path(), &a),
+        ["first\n", "second\n"]
+    );
+}
+
+/// #862 hot exit negative: a backup whose pid and start time are both
+/// those of a running process is that croft's live copy: neither restored
+/// nor removed.
+#[test]
+fn hot_exit_leaves_the_backup_of_a_process_still_running_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    drop(app);
+    let mine = hot_exit_files(cache.path(), tmp.path()).remove(0);
+    let init = crate::hot_exit::start_time_of(1).expect("pid 1 runs");
+    let live = mine.with_file_name(format!("1-{init}.json"));
+    std::fs::rename(&mine, &live).unwrap();
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert!(
+        next.editor.editors.iter().all(|e| !e.dirty),
+        "not taken over"
+    );
+    assert!(live.exists(), "and not removed");
+}
+
+/// #862 hot exit (review): a backup the quit could not remove is not
+/// dropped silently. It holds text the user chose to discard (D), so the
+/// failure is said, with the path, rather than left to be restored as
+/// unsaved at the next launch without a word.
+#[test]
+fn a_backup_a_quit_cannot_remove_is_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    // A directory where the backup goes: neither written nor removable.
+    let own = block_hot_exit_path(&app);
+    press_ctrl_q(&mut app);
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.quit, "the quit still goes ahead");
+    assert!(
+        app.status.contains("Could not remove") && app.status.contains(&own.display().to_string()),
+        "{}",
+        app.status
+    );
+    assert_eq!(
+        app.exit_notes,
+        vec![app.status.clone()],
+        "and it is said again on stderr once croft has gone"
+    );
+}
+
+/// #862 hot exit (review): a backup that could not be read is not kept
+/// forever. Reported and kept for a week, in case it can be recovered by
+/// hand, it is removed once it is older than that.
+#[test]
+fn an_unreadable_backup_older_than_a_week_is_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let dir = crate::hot_exit::workspace_dir(cache.path(), tmp.path());
+    std::fs::create_dir_all(&dir).unwrap();
+    let corrupt = dir.join("999999999.json");
+    std::fs::write(&corrupt, "{\"workspace_root\": \"/tm").unwrap();
+    let eight_days = std::time::Duration::from_secs(8 * 24 * 60 * 60);
+    std::fs::File::options()
+        .write(true)
+        .open(&corrupt)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - eight_days)
+        .unwrap();
+    let mut app = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    app.restore_hot_exit();
+    assert!(!corrupt.exists(), "expired");
+    assert!(app.editor.editors.iter().all(|e| !e.dirty));
+    assert!(app.status.contains("removed"), "{}", app.status);
+}
+
+/// #862 hot exit negative: clean buffers are never backed up, and once the
+/// last unsaved edit is saved the backup goes.
+#[test]
+fn hot_exit_does_not_back_up_clean_buffers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let app = app_with_open_file(tmp.path(), "a.txt", "alpha\n");
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    assert!(hot_exit_files(cache.path(), tmp.path()).is_empty());
+    assert!(
+        !crate::hot_exit::workspace_dir(cache.path(), tmp.path()).exists(),
+        "not even the directory"
+    );
+    type_into_editor(&mut app, "x");
+    settle_hot_exit(&mut app);
+    assert_eq!(hot_exit_files(cache.path(), tmp.path()).len(), 1, "setup");
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        .unwrap();
+    settle_hot_exit(&mut app);
+    assert!(hot_exit_files(cache.path(), tmp.path()).is_empty(), "saved");
+}
+
+/// #862 hot exit negative: an unsaved buffer that has not changed since
+/// the last backup is not written again, however often the tick runs or
+/// the caret moves; the next edit is.
+#[test]
+fn hot_exit_does_not_rewrite_an_unchanged_backup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    let file = hot_exit_files(cache.path(), tmp.path()).remove(0);
+    std::fs::write(&file, "sentinel").unwrap();
+    settle_hot_exit(&mut app);
+    app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+        .unwrap();
+    settle_hot_exit(&mut app);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "sentinel",
+        "not rewritten"
+    );
+    type_into_editor(&mut app, "y");
+    settle_hot_exit(&mut app);
+    let backup = crate::hot_exit::Backup::load(&file).unwrap();
+    assert!(
+        backup.buffers[0]
+            .tab
+            .unsaved_text
+            .as_deref()
+            .unwrap()
+            .contains("xaylpha")
+    );
+}
+
+/// #862 hot exit: re-rooting the workspace takes this croft's backup along
+/// to the new root. Left under the old one, the old workspace's next launch
+/// would restore buffers this croft still holds and later saves.
+#[test]
+fn hot_exit_backup_follows_a_change_of_workspace_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    assert_eq!(hot_exit_files(cache.path(), tmp.path()).len(), 1, "setup");
+    app.change_workspace_root(other.path().to_path_buf());
+    settle_hot_exit(&mut app);
+    assert!(
+        hot_exit_files(cache.path(), tmp.path()).is_empty(),
+        "nothing left under the old root"
+    );
+    assert_eq!(hot_exit_files(cache.path(), other.path()).len(), 1);
+}
+
+/// #862 hot exit negative: a backup that cannot be read (truncated, not
+/// JSON) restores nothing and does not panic; it is kept, since it may be
+/// the only copy of the text, and the status line says so.
+#[test]
+fn hot_exit_ignores_a_corrupt_backup_without_a_panic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let dir = crate::hot_exit::workspace_dir(cache.path(), tmp.path());
+    std::fs::create_dir_all(&dir).unwrap();
+    let corrupt = dir.join("999999999.json");
+    std::fs::write(&corrupt, "{\"workspace_root\": \"/tm").unwrap();
+    let mut app = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    app.restore_hot_exit();
+    assert!(app.editor.editors.iter().all(|e| !e.dirty));
+    assert!(corrupt.exists(), "kept");
+    assert!(app.status.contains("could not read"), "{}", app.status);
+}
+
+/// A comment longer than the line on disk it replaces (#862): a restore
+/// that kept the disk file's syntax spans would colour only the first few
+/// characters of it, or none.
+const RESTORED_COMMENT: &str = "# a comment that is longer than the disk line";
+
+/// The syntax spans `text` gets as line 0 of a `.py` file opened from disk,
+/// the reference a restored buffer holding the same text must match.
+fn spans_of_python_line_opened_from_disk(text: &str) -> Vec<(usize, usize, ratatui::style::Style)> {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app_with_open_file(tmp.path(), "ref.py", &format!("{text}\n"));
+    app.editor.line_spans_for_test(0)
+}
+
+/// #862 hot exit: a restored buffer is highlighted as the text it holds,
+/// not as the file on disk it was opened over. It kept the disk text's
+/// spans: here the restored comment was coloured only for the length of
+/// the disk line `x = 1`, and the rest stayed plain until the next edit.
+/// The edit counter moves too, so the LSP and everything else that follows
+/// it resync to the restored text.
+#[test]
+fn hot_exit_restored_text_is_highlighted_as_itself() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let mut app = with_hot_exit(
+        app_with_open_file(tmp.path(), "a.py", "x = 1\n"),
+        cache.path(),
+    );
+    app.editor.lines = vec![String::from(RESTORED_COMMENT), String::new()];
+    app.editor.dirty = true;
+    settle_hot_exit(&mut app);
+    drop(app);
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert_eq!(next.editor.lines[0], RESTORED_COMMENT, "setup: restored");
+    let want = spans_of_python_line_opened_from_disk(RESTORED_COMMENT);
+    assert!(
+        want.iter()
+            .any(|&(s, e, _)| s == 0 && e == RESTORED_COMMENT.len()),
+        "setup: the comment is one span over the whole line: {want:?}"
+    );
+    assert_eq!(
+        next.editor.line_spans_for_test(0),
+        want,
+        "the whole restored comment carries the comment style"
+    );
+    let mut opened = crate::widgets::editor::Editor::new();
+    opened.open(&tmp.path().join("a.py")).unwrap();
+    assert_ne!(
+        next.editor.edit_seq, opened.edit_seq,
+        "the edit counter moved past the disk text's"
+    );
+}
+
+/// #862: the update relaunch restores through the same path and had the
+/// same gap: its unsaved text kept the disk file's syntax spans.
+#[test]
+fn relaunch_restored_text_is_highlighted_as_itself() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "x = 1\n");
+    app.editor.lines = vec![String::from(RESTORED_COMMENT), String::new()];
+    app.editor.dirty = true;
+    let state = app.capture_session_state();
+
+    let mut next = App::new(tmp.path().to_path_buf()).unwrap();
+    next.apply_session_state(&state);
+    let a = tmp.path().join("a.py");
+    let ed = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .unwrap();
+    assert_eq!(ed.lines[0], RESTORED_COMMENT, "setup: restored");
+    assert_eq!(
+        ed.line_spans_for_test(0),
+        spans_of_python_line_opened_from_disk(RESTORED_COMMENT)
+    );
+}
+
+/// #862 negative: an untitled buffer has no language, so its restored text
+/// gets no syntax spans at all (and no panic); a clean tab open beside the
+/// restored ones keeps its spans, its text and its edit counter.
+#[test]
+fn restoring_leaves_untitled_text_plain_and_clean_tabs_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let mut app = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    let scratch = app.editor.open_unreadable_tab(None);
+    scratch.lines = vec![String::from(RESTORED_COMMENT)];
+    scratch.dirty = true;
+    settle_hot_exit(&mut app);
+    drop(app);
+
+    let clean = tmp.path().join("clean.py");
+    std::fs::write(&clean, "def f():\n    return 1\n").unwrap();
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.editor.open_pinned(&clean).unwrap();
+    let before = (
+        next.editor.line_spans_for_test(0),
+        next.editor.lines.clone(),
+        next.editor.edit_seq,
+    );
+    assert!(!before.0.is_empty(), "setup: the clean tab is highlighted");
+    next.restore_hot_exit();
+    let untitled = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.is_none() && e.dirty)
+        .expect("the untitled buffer is back");
+    assert_eq!(untitled.lines, vec![String::from(RESTORED_COMMENT)]);
+    assert!(
+        untitled.line_spans_for_test(0).is_empty(),
+        "no language, no spans: {:?}",
+        untitled.line_spans_for_test(0)
+    );
+    let kept = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(clean.as_path()))
+        .unwrap();
+    assert!(!kept.dirty);
+    assert_eq!(
+        (
+            kept.line_spans_for_test(0),
+            kept.lines.clone(),
+            kept.edit_seq
+        ),
+        before,
+        "the clean tab is untouched"
+    );
+}
+
 #[test]
 fn cmd_k_arms_leader_then_unmatched_second_key_clears_it() {
     let tmp = tempfile::tempdir().unwrap();
@@ -11726,13 +13475,6 @@ fn every_cmd_chord_is_ctrl_off_macos_unless_linux_md_lists_it() {
             how: NoCtrl::Refused,
         },
         Row {
-            doc: "`Cmd`+`Z` jump to a directory with zoxide, in the Explorer",
-            pred: "is_tree_zoxide_jump_key",
-            code: &[KeyCode::Char('z')],
-            mods: any,
-            how: NoCtrl::Refused,
-        },
-        Row {
             doc: "`Cmd`+`Enter` run the Markdown code block under the caret",
             pred: "is_run_fence_key",
             code: &[KeyCode::Enter],
@@ -11925,19 +13667,17 @@ fn the_palette_opens_the_zoxide_jump_from_any_pane() {
     assert!(app.zoxide_jump.is_some());
 }
 
-/// Guard (#843): `Ctrl`+`Z` in the Explorer still opens nothing (LINUX.md
-/// lists the zoxide jump as having no `Ctrl` form), while Cmd+Z does.
+/// #1294: `Ctrl`+`Z` in the Explorer opens the zoxide jump, as Cmd+Z does,
+/// so a terminal that never sends Super reaches it.
 #[test]
-fn ctrl_z_in_the_explorer_does_not_open_the_zoxide_jump() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.focus_pane(Pane::Tree);
-    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL))
-        .unwrap();
-    assert!(app.zoxide_jump.is_none());
-    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::SUPER))
-        .unwrap();
-    assert!(app.zoxide_jump.is_some(), "Cmd+Z still opens it");
+fn ctrl_z_in_the_explorer_opens_the_zoxide_jump_like_cmd_z() {
+    for mods in [KeyModifiers::CONTROL, KeyModifiers::SUPER] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.focus_pane(Pane::Tree);
+        app.handle_key(key(KeyCode::Char('z'), mods)).unwrap();
+        assert!(app.zoxide_jump.is_some(), "{mods:?}+Z opens it");
+    }
 }
 
 /// Guard (#843): "Go to Implementations" with no file open sends nothing,
@@ -14028,6 +15768,116 @@ fn discard_all_requires_confirmation_and_then_reverts_tracked_changes() {
     );
 }
 
+/// `git -C dir <args>` for app tests, asserting success; stdout trimmed.
+fn git_checked(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// #1350: Undo Last Commit (⋯ → Commit) takes the commit back: HEAD is
+/// the parent, its changes are staged, and its message is in the box.
+#[test]
+fn undo_last_commit_via_the_menu_puts_the_message_back_in_the_box() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = make_committed_repo();
+    let parent = git_checked(tmp.path(), &["rev-parse", "HEAD"]);
+    std::fs::write(tmp.path().join("b.txt"), "b\n").unwrap();
+    git_checked(tmp.path(), &["add", "b.txt"]);
+    git_checked(tmp.path(), &["commit", "-q", "-m", "Add b too early"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.dispatch_scm_action(ScmAction::UndoLastCommit);
+    assert_eq!(git_checked(tmp.path(), &["rev-parse", "HEAD"]), parent);
+    assert_eq!(app.source_control.message, "Add b too early");
+    assert_eq!(
+        git_checked(tmp.path(), &["diff", "--cached", "--name-only"]),
+        "b.txt"
+    );
+    assert!(
+        !app.source_control.commit_feedback_is_error,
+        "{:?}",
+        app.source_control.commit_feedback
+    );
+}
+
+/// #1350: the palette has it too.
+#[test]
+fn undo_last_commit_is_in_the_palette() {
+    let cmd = crate::widgets::command_palette::Command::from_id("git_undo_last_commit")
+        .expect("there is an Undo Last Commit command");
+    assert_eq!(cmd.title(), "Git: Undo Last Commit");
+    let tmp = make_committed_repo();
+    std::fs::write(tmp.path().join("b.txt"), "b\n").unwrap();
+    git_checked(tmp.path(), &["add", "b.txt"]);
+    git_checked(tmp.path(), &["commit", "-q", "-m", "second"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(cmd);
+    assert_eq!(app.source_control.message, "second");
+}
+
+/// #1350 negative: a commit already on the upstream is not undone on the
+/// first ask; it warns that undoing it means a force push, and a second
+/// ask goes ahead.
+#[test]
+fn undo_last_commit_warns_before_undoing_a_pushed_commit() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = make_committed_repo();
+    let remote = tempfile::tempdir().unwrap();
+    git_checked(remote.path(), &["init", "-q", "--bare"]);
+    git_checked(
+        tmp.path(),
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+    );
+    git_checked(tmp.path(), &["push", "-q", "-u", "origin", "main"]);
+    let head = git_checked(tmp.path(), &["rev-parse", "HEAD"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.dispatch_scm_action(ScmAction::UndoLastCommit);
+    assert_eq!(
+        git_checked(tmp.path(), &["rev-parse", "HEAD"]),
+        head,
+        "not yet"
+    );
+    let warning = app
+        .source_control
+        .commit_feedback
+        .clone()
+        .unwrap_or_default();
+    assert!(warning.contains("force push"), "{warning}");
+    app.dispatch_scm_action(ScmAction::UndoLastCommit);
+    assert_eq!(
+        app.source_control.message, "init",
+        "the second ask undoes it"
+    );
+}
+
+/// #1350 negative: with a typed message in the box the undo keeps it
+/// rather than overwriting the user's text.
+#[test]
+fn undo_last_commit_keeps_a_message_the_user_typed() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = make_committed_repo();
+    std::fs::write(tmp.path().join("b.txt"), "b\n").unwrap();
+    git_checked(tmp.path(), &["add", "b.txt"]);
+    git_checked(tmp.path(), &["commit", "-q", "-m", "second"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.source_control.insert_str("my draft");
+    app.dispatch_scm_action(ScmAction::UndoLastCommit);
+    assert_eq!(app.source_control.message, "my draft");
+    assert_eq!(
+        git_checked(tmp.path(), &["log", "-1", "--format=%s"]),
+        "init"
+    );
+}
+
 /// The issue's repo (#1352): `value_1`..`value_20` committed, then line 5
 /// changed to `value_FIVE` and line 9 deleted, open in an editor tab with
 /// its change bars computed.
@@ -14725,7 +16575,11 @@ fn sync_on_a_branch_with_no_upstream_publishes_without_pulling() {
         "{:?}",
         app.source_control.commit_feedback
     );
-    assert_eq!(app.status, "Synced");
+    // One line naming what each half did (#858).
+    assert_eq!(
+        app.status,
+        "Synced: pulled: nothing, branch not published yet | pushed: published topic to origin"
+    );
     assert_eq!(
         git_stdout(tmp.path(), &["rev-parse", "--abbrev-ref", "topic@{u}"]),
         "origin/topic"
@@ -14793,9 +16647,10 @@ fn sync_on_a_tracked_branch_still_pulls_first() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.sync_source_control();
     wait_for_git_net(&mut app);
-    assert_eq!(
-        app.status, "Synced",
-        "{:?}",
+    assert!(
+        app.status.starts_with("Synced: pulled: Fast-forward"),
+        "{}: {:?}",
+        app.status,
         app.source_control.commit_feedback
     );
     assert!(tmp.path().join("theirs.txt").exists());
@@ -14932,6 +16787,7 @@ fn a_late_completion_reply_opens_only_while_the_caret_is_in_its_word() {
     app.focus_pane(Pane::Editor);
     let reply = |request_id| CompletionResult {
         request_id,
+        is_incomplete: false,
         path: path.clone(),
         items: vec![crate::lsp::CompletionItem {
             label: String::from("load"),
@@ -15022,6 +16878,7 @@ fn optional_members_survive_the_first_typed_letter() {
     };
     assert!(app.apply_completion_result(CompletionResult {
         request_id: 1,
+        is_incomplete: false,
         path: path.clone(),
         items: vec![member("email"), member("name")],
     }));
@@ -15079,6 +16936,184 @@ fn completion_reply_app() -> (
     (tmp, path, app, tx)
 }
 
+/// #1529: a reply the server marked incomplete, offering `labels`.
+fn incomplete_reply(
+    request_id: u64,
+    path: &Path,
+    labels: &[&str],
+) -> crate::lsp::manager::CompletionResult {
+    crate::lsp::manager::CompletionResult {
+        is_incomplete: true,
+        ..completion_reply(request_id, path, labels)
+    }
+}
+
+/// #1529: clangd caps its list at 100 and marks it incomplete. Typing on
+/// past the first list's names must ask the server again, not close the
+/// popup: `lo` gave `load` only, `lox` has to reach the server's `loxodrome`.
+#[test]
+fn typing_into_an_incomplete_list_asks_the_server_again() {
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.trigger_completion();
+    let first = app.completion_request_id.expect("the ask went out");
+    draw(&mut app, 100, 30);
+    tx.send(incomplete_reply(first, &path, &["load"])).unwrap();
+    assert!(app.drain_lsp_completion());
+    assert!(app.completion_popup.is_some());
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    sync_then_reask(&mut app);
+    let again = app
+        .completion_request_id
+        .expect("an incomplete list keeps a request in flight");
+    assert_ne!(again, first, "typing into an incomplete list re-asks");
+    draw(&mut app, 100, 30);
+    tx.send(incomplete_reply(again, &path, &["loxodrome"]))
+        .unwrap();
+    assert!(app.drain_lsp_completion());
+    let popup = app.completion_popup.as_ref().expect("the new list opens");
+    assert_eq!(popup.prefix, "lox");
+    let labels: Vec<&str> = popup
+        .visible_indices()
+        .into_iter()
+        .map(|i| popup.items[i].label.as_str())
+        .collect();
+    assert_eq!(labels, ["loxodrome"]);
+}
+
+/// #1529: while the re-ask is out, the old list's matches stay on screen,
+/// and a stale reply to the first ask can't replace the newer one.
+#[test]
+fn an_incomplete_list_keeps_its_matches_until_the_new_reply_lands() {
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.trigger_completion();
+    let first = app.completion_request_id.unwrap();
+    draw(&mut app, 100, 30);
+    tx.send(incomplete_reply(first, &path, &["load", "local"]))
+        .unwrap();
+    app.drain_lsp_completion();
+    app.handle_key(key(KeyCode::Char('c'), KeyModifiers::NONE))
+        .unwrap();
+    let popup = app
+        .completion_popup
+        .as_ref()
+        .expect("`local` still matches");
+    assert_eq!(popup.visible_indices().len(), 1);
+    sync_then_reask(&mut app);
+    // The first ask answering late is dropped by id.
+    tx.send(incomplete_reply(first, &path, &["stale"])).unwrap();
+    assert!(!app.drain_lsp_completion());
+    let again = app.completion_request_id.unwrap();
+    assert_ne!(again, first);
+}
+
+/// #1529 negative: a complete list is only filtered. No second request
+/// goes out, and when nothing matches the popup closes, as before.
+#[test]
+fn typing_into_a_complete_list_only_filters_it() {
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.trigger_completion();
+    let first = app.completion_request_id.unwrap();
+    draw(&mut app, 100, 30);
+    tx.send(completion_reply(first, &path, &["load", "local"]))
+        .unwrap();
+    app.drain_lsp_completion();
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE))
+        .unwrap();
+    sync_then_reask(&mut app);
+    assert_eq!(app.completion_request_id, Some(first), "no re-ask");
+    assert!(app.completion_popup.is_some());
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.completion_popup.is_none(), "nothing matches `loax`");
+    assert_eq!(app.completion_request_id, None);
+}
+
+/// #1529 negative: leaving the word (a space) ends an incomplete list's
+/// session too; no re-ask follows the caret out of the word.
+#[test]
+fn leaving_the_word_ends_an_incomplete_list() {
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.trigger_completion();
+    let first = app.completion_request_id.unwrap();
+    draw(&mut app, 100, 30);
+    tx.send(incomplete_reply(first, &path, &["load"])).unwrap();
+    app.drain_lsp_completion();
+    app.handle_key(key(KeyCode::Char(' '), KeyModifiers::NONE))
+        .unwrap();
+    sync_then_reask(&mut app);
+    assert!(app.completion_popup.is_none());
+    assert_eq!(app.completion_request_id, None);
+}
+
+/// One event-loop tick's LSP steps: the edit's `didChange`, then the re-ask
+/// an incomplete list left due (#1529).
+fn sync_then_reask(app: &mut App) {
+    app.sync_lsp();
+    app.send_due_completion_reask();
+}
+
+/// #1529: when a keystroke filters out every item of an incomplete list,
+/// the popup closes but the session stays: the next keystroke, typed before
+/// the re-ask answers, asks again for the newer word.
+#[test]
+fn an_emptied_incomplete_list_still_re_asks_on_the_next_keystroke() {
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.trigger_completion();
+    let first = app.completion_request_id.unwrap();
+    draw(&mut app, 100, 30);
+    tx.send(incomplete_reply(first, &path, &["load", "local"]))
+        .unwrap();
+    app.drain_lsp_completion();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.completion_popup.is_none(), "nothing matches `lox`");
+    sync_then_reask(&mut app);
+    let second = app.completion_request_id.expect("re-asked for `lox`");
+    assert_ne!(second, first);
+    app.handle_key(key(KeyCode::Char('o'), KeyModifiers::NONE))
+        .unwrap();
+    sync_then_reask(&mut app);
+    let third = app.completion_request_id.expect("re-asked for `loxo`");
+    assert_ne!(third, second, "a keystroke with no popup still re-asks");
+    draw(&mut app, 100, 30);
+    tx.send(incomplete_reply(third, &path, &["loxodrome"]))
+        .unwrap();
+    assert!(app.drain_lsp_completion());
+    let popup = app.completion_popup.as_ref().expect("the new list opens");
+    assert_eq!(popup.prefix, "loxo");
+}
+
+/// #1529: the re-ask waits for the tick's `sync_lsp`, so the server has the
+/// edit's `didChange` before it is asked about the new caret position.
+#[test]
+fn an_incomplete_re_ask_waits_until_the_edit_is_synced() {
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.trigger_completion();
+    let first = app.completion_request_id.unwrap();
+    draw(&mut app, 100, 30);
+    tx.send(incomplete_reply(first, &path, &["load"])).unwrap();
+    app.drain_lsp_completion();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('o'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.completion_request_id,
+        Some(first),
+        "no request goes out from the key handler"
+    );
+    app.send_due_completion_reask();
+    let again = app.completion_request_id.unwrap();
+    assert_ne!(again, first, "one re-ask covers both keystrokes");
+    app.send_due_completion_reask();
+    assert_eq!(
+        app.completion_request_id,
+        Some(again),
+        "nothing more is due"
+    );
+}
+
 /// One completion reply for `path`, offering each of `labels`.
 fn completion_reply(
     request_id: u64,
@@ -15087,6 +17122,7 @@ fn completion_reply(
 ) -> crate::lsp::manager::CompletionResult {
     crate::lsp::manager::CompletionResult {
         request_id,
+        is_incomplete: false,
         path: path.to_path_buf(),
         items: labels
             .iter()
@@ -16027,6 +18063,34 @@ fn a_pasted_multi_line_message_commits_with_its_body() {
     );
 }
 
+/// #1334: in the Source Control box Home/End work on the caret's line and
+/// Ctrl+Home/Ctrl+End on the whole message.
+#[test]
+fn scm_home_end_follow_the_carets_line_and_ctrl_takes_the_whole_message() {
+    let (_tmp, mut app) = scm_ready_to_commit();
+    app.handle_paste("Add rounding\n\nRounds to cents.\nFixes 42");
+    let press = |app: &mut App, code: KeyCode, mods: KeyModifiers| {
+        app.handle_source_control_key(key(code, mods));
+    };
+    press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Home, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
+    press(&mut app, KeyCode::End, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+    assert_eq!(
+        app.source_control.message,
+        "Add rounding\n\n[Rounds to cents.]\nFixes 42"
+    );
+    press(&mut app, KeyCode::Home, KeyModifiers::CONTROL);
+    press(&mut app, KeyCode::Char('>'), KeyModifiers::NONE);
+    press(&mut app, KeyCode::End, KeyModifiers::CONTROL);
+    press(&mut app, KeyCode::Char('.'), KeyModifiers::NONE);
+    assert_eq!(
+        app.source_control.message,
+        ">Add rounding\n\n[Rounds to cents.]\nFixes 42."
+    );
+}
+
 /// #1336: finishing a conflicted `git revert` from Source Control commits
 /// git's whole message, "This reverts commit <sha>." included, as
 /// `git revert --continue` would.
@@ -16101,6 +18165,72 @@ fn plain_enter_still_commits_a_one_line_message() {
     wait_for_git_net(&mut app);
     assert_eq!(last_commit_message(tmp.path()), "one line\n\n");
     assert_eq!(app.source_control.message, "");
+}
+
+#[test]
+fn a_commit_reports_only_git_s_first_line_in_the_panel_and_status_bar() {
+    // #858: `git commit` prints `[branch sha] subject`, then a diffstat and
+    // one `create mode` row per new file; the whole of it was the feedback.
+    let tmp = make_committed_repo();
+    std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    wait_for_changes(&mut app, |a| {
+        a.source_control
+            .entries
+            .iter()
+            .any(|e| e.path == "seed.txt")
+    });
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.source_control.message = "fix: one line".to_string();
+    app.source_control.message_cursor = app.source_control.message.chars().count();
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_git_net(&mut app);
+    let feedback = app
+        .source_control
+        .commit_feedback
+        .clone()
+        .unwrap_or_default();
+    assert!(
+        feedback.starts_with("[main ") && feedback.ends_with("] fix: one line"),
+        "the feedback is git's first line: {feedback:?}"
+    );
+    assert_eq!(app.status, format!("Committed: {feedback}"));
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(
+        logged.contains("1 file changed"),
+        "the Git Output log keeps the rest: {logged:?}"
+    );
+}
+
+/// #858 negative: a refused commit (nothing to commit) is still reported
+/// as an error, on one line that names why, in the panel and the status
+/// bar; git's full text is in the Git Output log.
+#[test]
+fn a_refused_commit_names_the_reason_on_one_line() {
+    let tmp = make_committed_repo();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.source_control.message = "fix: nothing here".to_string();
+    app.source_control.message_cursor = app.source_control.message.chars().count();
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_git_net(&mut app);
+    assert!(app.source_control.commit_feedback_is_error);
+    let feedback = app
+        .source_control
+        .commit_feedback
+        .clone()
+        .unwrap_or_default();
+    let shown = crate::git::headline(&feedback);
+    assert!(
+        shown.contains("nothing to commit"),
+        "the panel's line names the reason: {shown:?} (feedback {feedback:?})"
+    );
+    assert!(
+        !app.status.contains('\n'),
+        "one status line: {:?}",
+        app.status
+    );
+    assert!(app.status.contains("nothing to commit"), "{:?}", app.status);
 }
 
 #[test]
@@ -20159,8 +22289,12 @@ fn editor_find_pre_fills_the_query_from_word_under_cursor_on_open() {
         .unwrap();
     assert_eq!(
         app.editor_find.as_ref().unwrap().query,
-        "alpha",
-        "opening Cmd+F with the cursor mid-word must pre-fill the query with the identifier chars to the left of the cursor, matching VS Code"
+        "alphabet",
+        "opening Cmd+F with the cursor mid-word pre-fills the whole word under it, as VS Code does (#1278)"
+    );
+    assert!(
+        app.editor_find.as_ref().unwrap().query_selected,
+        "and selects it, so typing replaces it"
     );
 }
 
@@ -24103,6 +26237,125 @@ fn run_active_file_with_python_file_spawns_a_new_terminal_and_focuses_it() {
     assert!(!app.run_debug.feedback_is_error);
 }
 
+/// #1400 fixture: `name` holds "old\n" on disk and "new\nold\n" in its
+/// open, unsaved tab.
+fn app_with_unsaved_pinned_file(name: &str) -> (tempfile::TempDir, App, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let file = root.join(name);
+    std::fs::write(&file, "old\n").unwrap();
+    let mut app = App::new(root).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.editor.insert_str("new\n");
+    assert!(app.editor.dirty);
+    (tmp, app, file)
+}
+
+/// #1400: F5 writes the unsaved tab before the launch, so the debuggee
+/// runs the text the breakpoints were set against.
+#[test]
+fn f5_saves_the_unsaved_buffer_before_launching() {
+    let (_tmp, mut app, file) = app_with_unsaved_pinned_file("notes.txt");
+    app.debug_start_or_continue();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    assert!(!app.editor.dirty);
+    assert!(
+        app.status.starts_with("No debugger for .txt files"),
+        "the launch itself still runs and reports: {}",
+        app.status
+    );
+}
+
+/// #1400: every dirty tab is saved, not only the one being debugged: the
+/// debuggee imports the others.
+#[test]
+fn f5_saves_every_unsaved_tab_not_only_the_active_one() {
+    let (tmp, mut app, helper) = app_with_unsaved_pinned_file("helper.txt");
+    let main = tmp.path().canonicalize().unwrap().join("main.txt");
+    std::fs::write(&main, "main\n").unwrap();
+    app.editor.open_pinned(&main).unwrap();
+    app.debug_start_or_continue();
+    assert_eq!(std::fs::read_to_string(&helper).unwrap(), "new\nold\n");
+    assert_eq!(app.unsaved_count(), 0);
+}
+
+/// #1400: Run writes the unsaved tab before the run command starts.
+#[test]
+fn run_saves_the_unsaved_buffer_before_running() {
+    let (_tmp, mut app, file) = app_with_unsaved_pinned_file("hello.py");
+    app.run_active_file();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    assert!(!app.editor.dirty);
+}
+
+/// #1400: Debug Test saves too: the test runs from the files on disk.
+#[test]
+fn debug_test_saves_the_unsaved_buffer_before_launching() {
+    let (_tmp, mut app, file) = app_with_unsaved_pinned_file("test_x.txt");
+    app.debug_named_test(String::from("test_x"));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    assert_eq!(app.status, "No test runner detected in this workspace");
+}
+
+/// #1400 negative: with `debug.saveBeforeStart: "none"` the file on disk
+/// is left alone, and the status says the debuggee runs the saved file.
+#[test]
+fn with_save_before_debug_off_f5_leaves_the_disk_and_warns() {
+    let (_tmp, mut app, file) = app_with_unsaved_pinned_file("notes.txt");
+    app.save_before_debug = false;
+    app.debug_start_or_continue();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+    assert!(app.editor.dirty);
+    assert!(
+        app.status
+            .starts_with("notes.txt has unsaved changes: the launch uses the file on disk"),
+        "{}",
+        app.status
+    );
+    assert!(
+        app.status.contains("No debugger for .txt files"),
+        "{}",
+        app.status
+    );
+}
+
+/// #1400 negative: a tab whose file changed on disk is never overwritten
+/// blind to start a launch; it stays unsaved and the status says so.
+#[test]
+fn f5_never_overwrites_a_file_changed_on_disk() {
+    let (_tmp, mut app, file) = app_with_unsaved_pinned_file("notes.txt");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&file, "theirs, changed elsewhere\n").unwrap();
+    app.debug_start_or_continue();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "theirs, changed elsewhere\n"
+    );
+    assert!(app.editor.dirty);
+    assert!(
+        app.status.contains("notes.txt has unsaved changes"),
+        "{}",
+        app.status
+    );
+}
+
+/// #1400 negative: with nothing unsaved, a launch writes nothing and says
+/// nothing about saving.
+#[test]
+fn f5_with_nothing_unsaved_writes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let file = root.join("notes.txt");
+    std::fs::write(&file, "old\n").unwrap();
+    let stamp = std::fs::metadata(&file).unwrap().modified().unwrap();
+    let mut app = App::new(root).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    app.debug_start_or_continue();
+    assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), stamp);
+    assert!(!app.status.contains("unsaved"), "{}", app.status);
+}
+
 /// #1444: View Changes vs main on a branch behind a moved main shows the
 /// branch's own work and names the merge base it starts from.
 #[test]
@@ -25078,11 +27331,12 @@ fn relative_clipboard_text_is_relative_inside_root_and_absolute_outside() {
 }
 
 #[test]
-fn zoxide_jump_key_is_cmd_z_only_and_never_ctrl_z_or_redo() {
-    // Cmd+Z (SUPER) opens the Explorer jump popup. Ctrl+Z must NOT — it
-    // is the shell suspend in the terminal, and the editor's undo lives on
-    // Ctrl/Cmd+Z in its own (editor-focused) path. Cmd+Shift+Z is the
-    // reserved redo chord. Cmd+J stays free for terminal manipulation.
+fn zoxide_jump_key_is_cmd_or_ctrl_z_and_never_redo() {
+    // Cmd+Z and Ctrl+Z open the Explorer jump popup (#1294): most Linux
+    // terminals never deliver Super, and this predicate runs only while the
+    // Explorer is focused, where Ctrl+Z is no shell suspend or editor undo.
+    // Cmd+Shift+Z is the reserved redo chord. Cmd+J stays free for terminal
+    // manipulation.
     assert!(is_tree_zoxide_jump_key(key(
         KeyCode::Char('z'),
         KeyModifiers::SUPER
@@ -25092,20 +27346,86 @@ fn zoxide_jump_key_is_cmd_z_only_and_never_ctrl_z_or_redo() {
         "letter match must be case-insensitive"
     );
     assert!(
-        !is_tree_zoxide_jump_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL)),
-        "Ctrl+Z must not open the popup; it is shell suspend / editor undo"
+        is_tree_zoxide_jump_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL)),
+        "Ctrl+Z is the jump on terminals that never send Super"
     );
-    assert!(
-        !is_tree_zoxide_jump_key(key(
-            KeyCode::Char('z'),
-            KeyModifiers::SUPER | KeyModifiers::SHIFT
-        )),
-        "Cmd+Shift+Z is reserved for redo and must not open the popup"
-    );
+    for (mods, why) in [
+        (
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+            "Cmd+Shift+Z is redo",
+        ),
+        (
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            "Ctrl+Shift+Z is redo",
+        ),
+        (KeyModifiers::ALT, "Alt+Z is not the jump"),
+        (
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            "Ctrl+Alt+Z is not the jump",
+        ),
+        (KeyModifiers::NONE, "a bare z is type-to-find"),
+    ] {
+        assert!(
+            !is_tree_zoxide_jump_key(key(KeyCode::Char('z'), mods)),
+            "{why}"
+        );
+    }
     assert!(
         !is_tree_zoxide_jump_key(key(KeyCode::Char('j'), KeyModifiers::SUPER)),
         "Cmd+J must stay free for terminal manipulation"
     );
+}
+
+/// On a terminal that never sends Super, Ctrl+Z with the Explorer focused
+/// opens the jump through the real key path (#1294).
+#[test]
+fn ctrl_z_in_the_explorer_opens_the_zoxide_jump() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Tree;
+    app.sidebar_view = SidebarView::Explorer;
+    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.zoxide_jump.is_some(), "status: {}", app.status);
+}
+
+/// Negative: with the editor focused, Ctrl+Z is still undo and never the
+/// jump.
+#[test]
+fn ctrl_z_in_the_editor_still_undoes_and_opens_no_jump() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.txt");
+    std::fs::write(&file, "one\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_at(&file, 0, 0).unwrap();
+    app.focus = Pane::Editor;
+    app.editor.cursor_col = 3;
+    app.editor.insert_char('!');
+    assert_eq!(app.editor.lines[0], "one!");
+    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.zoxide_jump.is_none());
+    assert_eq!(app.editor.lines[0], "one", "Ctrl+Z undid the edit");
+}
+
+/// The jump is reachable from the palette with any pane focused, so a
+/// terminal without Super still has a way in (#1294).
+#[test]
+fn the_palette_has_a_zoxide_jump_command_that_works_from_any_pane() {
+    use crate::widgets::command_palette::ALL_COMMANDS;
+    let cmd = ALL_COMMANDS
+        .iter()
+        .copied()
+        .find(|c| c.title().to_lowercase().contains("zoxide"))
+        .expect("a palette command for the zoxide jump");
+    assert_eq!(cmd.title(), "Explorer: Jump to Directory (zoxide)");
+    for pane in [Pane::Editor, Pane::Terminal, Pane::Tree] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.focus = pane;
+        app.run_command(cmd);
+        assert!(app.zoxide_jump.is_some(), "{}", app.status);
+    }
 }
 
 #[test]
@@ -26313,15 +28633,168 @@ fn seeding_search_replaces_stale_include_and_exclude_filters() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.search.include = String::from("*.md");
     app.search.exclude = String::from("vendor");
-    assert!(app.seed_search_from_command("rg TODO"));
+    assert!(seed_at_root(&mut app, "rg TODO"));
     assert_eq!(
         app.search.include, "",
         "a bare rg scanned everything; a stale include must not filter the seeded search"
     );
     assert_eq!(app.search.exclude, "");
-    assert!(app.seed_search_from_command("rg -g '*.rs' -g '!target' TODO"));
+    assert!(seed_at_root(&mut app, "rg -g '*.rs' -g '!target' TODO"));
     assert_eq!(app.search.include, "*.rs");
     assert_eq!(app.search.exclude, "target");
+}
+
+/// Seed Search as if the terminal ran `input` at the workspace root.
+fn seed_at_root(app: &mut App, input: &str) -> bool {
+    let root = app.workspace_root().to_path_buf();
+    app.seed_search_from_command_in(input, &root)
+}
+
+/// Negative: with no terminal whose directory croft can read, a search is
+/// refused rather than guessed to have run at the workspace root, which
+/// would widen `rg color` run from src/ to every file (#1201).
+#[test]
+fn a_search_with_no_known_terminal_directory_is_not_seeded() {
+    let (_tmp, mut app) = grep_scope_app();
+    // No pane to read a directory from: the app's own shell would answer
+    // with the workspace root.
+    app.active_terminal = app.terminals.len();
+    app.search.query = String::from("untouched");
+    assert!(app.seed_search_from_command("rg color"), "still a search");
+    assert_eq!(app.search.query, "untouched");
+    assert!(app.status.contains("Search not seeded"), "{}", app.status);
+    assert!(!app.seed_search_from_command("ls -la"), "not a search");
+}
+
+/// The workspace of #1201: one `color` in src/, one in docs/ and one in a
+/// vendored file that must never be rewritten.
+fn grep_scope_app() -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    for (rel, body) in [
+        ("src/style.py", "color = \"red\"\n"),
+        ("docs/guide.md", "Set the color in style.py.\n"),
+        (
+            "vendor/lib.py",
+            "color = \"keep\"  # third-party, do not touch\n",
+        ),
+    ] {
+        let f = tmp.path().join(rel);
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, body).unwrap();
+    }
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    (tmp, app)
+}
+
+/// The files of [`grep_scope_app`] the seeded Search (and so Replace All)
+/// would cover.
+fn seeded_scope(app: &App, root: &std::path::Path) -> Vec<&'static str> {
+    let filter = crate::widgets::search::PathFilter::new(&app.search.include, &app.search.exclude);
+    ["docs/guide.md", "src/style.py", "vendor/lib.py"]
+        .into_iter()
+        .filter(|rel| filter.allows(root, &root.join(rel)))
+        .collect()
+}
+
+/// `rg -n color src/` searched one directory; the seeded Search must too,
+/// or Replace All rewrites docs/ and the vendored file (#1201).
+#[test]
+fn seeded_search_covers_only_the_paths_the_grep_searched() {
+    let (tmp, mut app) = grep_scope_app();
+    let root = tmp.path();
+    assert!(seed_at_root(&mut app, "rg -n color src/"));
+    assert_eq!(app.search.query, "color");
+    assert_eq!(
+        seeded_scope(&app, root),
+        ["src/style.py"],
+        "include: {:?}",
+        app.search.include
+    );
+    assert!(seed_at_root(&mut app, "grep -rn color src/style.py docs"));
+    assert_eq!(seeded_scope(&app, root), ["docs/guide.md", "src/style.py"]);
+}
+
+/// `rg -t py` searched Python files only, so the markdown guide stays out.
+#[test]
+fn seeded_search_keeps_the_rg_type_filter() {
+    let (tmp, mut app) = grep_scope_app();
+    let root = tmp.path();
+    assert!(seed_at_root(&mut app, "rg -t py color"));
+    assert_eq!(
+        seeded_scope(&app, root),
+        ["src/style.py", "vendor/lib.py"],
+        "include: {:?}",
+        app.search.include
+    );
+    assert!(seed_at_root(&mut app, "rg --type-not py color"));
+    assert_eq!(seeded_scope(&app, root), ["docs/guide.md"]);
+    assert!(seed_at_root(&mut app, "rg -t py color src"));
+    assert_eq!(seeded_scope(&app, root), ["src/style.py"]);
+}
+
+/// After `cd src`, a bare `rg color` searched src/ only.
+#[test]
+fn seeded_search_runs_from_the_panes_directory() {
+    let (tmp, mut app) = grep_scope_app();
+    let root = tmp.path();
+    assert!(app.seed_search_from_command_in("rg color", &root.join("src")));
+    assert_eq!(seeded_scope(&app, root), ["src/style.py"]);
+    assert!(app.seed_search_from_command_in("rg color ../vendor", &root.join("src")));
+    assert_eq!(seeded_scope(&app, root), ["vendor/lib.py"]);
+}
+
+/// A scope croft can't reproduce is refused with the reason, leaving the
+/// panel untouched, instead of seeding a wider search: an inverted match
+/// (`-v` lists the lines that don't match), an unknown rg type, a path
+/// outside the workspace or one that doesn't exist.
+#[test]
+fn a_grep_whose_scope_cant_be_reproduced_refuses_to_seed() {
+    let (tmp, mut app) = grep_scope_app();
+    let root = tmp.path();
+    for cmd in [
+        "rg -v color src/",
+        "grep -rL color .",
+        "rg -t nosuchtype color",
+        "rg color ../",
+        "rg color missing/",
+    ] {
+        app.status.clear();
+        assert!(
+            app.seed_search_from_command_in(cmd, root),
+            "{cmd} is a search"
+        );
+        assert!(
+            app.status.starts_with("Search not seeded: "),
+            "{cmd}: status {:?}",
+            app.status
+        );
+        assert_eq!(app.search.query, "", "{cmd} must not seed the panel");
+    }
+}
+
+/// Negative: a search that covered the whole workspace still seeds the
+/// whole workspace, and an rg `-L` (follow symlinks) is not an inversion.
+#[test]
+fn a_grep_over_the_whole_workspace_still_seeds_every_file() {
+    let (tmp, mut app) = grep_scope_app();
+    let root = tmp.path();
+    for cmd in [
+        "rg color",
+        "grep -rn color .",
+        "rg -L color",
+        "git grep color -- .",
+    ] {
+        assert!(app.seed_search_from_command_in(cmd, root));
+        assert_eq!(app.search.query, "color", "{cmd}");
+        assert_eq!(
+            seeded_scope(&app, root),
+            ["docs/guide.md", "src/style.py", "vendor/lib.py"],
+            "{cmd}: include {:?}",
+            app.search.include
+        );
+    }
+    assert!(app.seed_search_from_command_in("rg -g '*.md' color", root));
+    assert_eq!(app.search.include, "*.md");
 }
 
 /// A byte-range selection made in the Include field before the seed must not
@@ -26335,7 +28808,7 @@ fn seeding_search_cannot_leave_a_stale_field_selection() {
     app.search.include = String::from("**/*.rs,**/*.toml");
     app.search.focus_field(SearchField::Include);
     app.search.select_all_active();
-    assert!(app.seed_search_from_command("rg -g '*.md' TODO"));
+    assert!(seed_at_root(&mut app, "rg -g '*.md' TODO"));
     assert_eq!(
         app.search.field,
         SearchField::Query,
@@ -31882,7 +34355,9 @@ fn replace_chord_toggles_the_replace_row_on_an_open_find_bar() {
 fn tab_switches_focus_between_the_find_and_replace_fields() {
     use crate::widgets::editor_find::FindField;
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha beta");
+    // The caret opens off any word, so nothing is seeded and focus starts
+    // in the query row (a seeded query would start in the replace row).
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "- alpha beta");
     app.handle_key(replace_chord()).unwrap();
     for c in "alpha".chars() {
         app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
@@ -31919,7 +34394,9 @@ fn tab_switches_focus_between_the_find_and_replace_fields() {
 #[test]
 fn enter_in_the_replace_field_replaces_the_current_match_and_advances() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha beta\ngamma alpha");
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "- alpha beta\ngamma alpha");
+    // The caret opens off any word, so nothing is seeded (#1278) and the
+    // query is typed.
     app.handle_key(replace_chord()).unwrap();
     for c in "alpha".chars() {
         app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
@@ -31932,7 +34409,7 @@ fn enter_in_the_replace_field_replaces_the_current_match_and_advances() {
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert_eq!(
-        app.editor.lines[0], "x beta",
+        app.editor.lines[0], "- x beta",
         "the current match is replaced"
     );
     assert_eq!(
@@ -31945,13 +34422,15 @@ fn enter_in_the_replace_field_replaces_the_current_match_and_advances() {
     );
     assert!(app.editor.dirty, "a replace dirties the buffer");
     assert!(app.editor.undo(), "the replace is undoable");
-    assert_eq!(app.editor.lines[0], "alpha beta");
+    assert_eq!(app.editor.lines[0], "- alpha beta");
 }
 
 #[test]
 fn replace_all_chord_replaces_every_match_in_one_undo_step() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha beta\ngamma alpha");
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "- alpha beta\ngamma alpha");
+    // The caret opens off any word, so nothing is seeded (#1278) and the
+    // query is typed.
     app.handle_key(replace_chord()).unwrap();
     for c in "alpha".chars() {
         app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
@@ -31963,11 +34442,11 @@ fn replace_all_chord_replaces_every_match_in_one_undo_step() {
         .unwrap();
     app.handle_key(key(KeyCode::Enter, KeyModifiers::ALT | KeyModifiers::SUPER))
         .unwrap();
-    assert_eq!(app.editor.lines[0], "x beta");
+    assert_eq!(app.editor.lines[0], "- x beta");
     assert_eq!(app.editor.lines[1], "gamma x");
     assert!(app.editor.dirty, "replace all dirties the buffer");
     assert!(app.editor.undo(), "replace all is one undo step");
-    assert_eq!(app.editor.lines[0], "alpha beta");
+    assert_eq!(app.editor.lines[0], "- alpha beta");
     assert_eq!(app.editor.lines[1], "gamma alpha");
 }
 
@@ -41938,6 +44417,96 @@ fn refresh_run_debug_syncs_the_config_row() {
     app.refresh_run_debug();
     assert_eq!(app.run_debug.config_count, 1);
     assert_eq!(app.run_debug.selected_config.as_deref(), Some("One"));
+}
+
+/// A Rust buffer with the caret inside `value`, and the given keybindings.
+fn lsp_nav_app(keymap: &str) -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("lib.rs"),
+        "fn main() {\n    let value = 1;\n}\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("lib.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 9;
+    app.keymap = crate::keymap::Keymap::from_json(keymap);
+    (app, tmp)
+}
+
+#[test]
+fn a_rebound_chord_runs_go_to_definition_and_rename_symbol() {
+    // #1212: keybindings.json rows naming the caret-driven LSP actions were
+    // rejected as unknown ids, so the only way in was the F-key.
+    let (mut app, _tmp) = lsp_nav_app(
+        r#"[
+            { "key": "ctrl+alt+d", "command": "go_to_definition" },
+            { "key": "ctrl+alt+r", "command": "rename_symbol" },
+            { "key": "ctrl+alt+u", "command": "go_to_references" },
+            { "key": "ctrl+alt+t", "command": "go_to_type_definition" },
+            { "key": "ctrl+alt+i", "command": "go_to_implementations" },
+            { "key": "ctrl+alt+l", "command": "go_to_declaration" }
+        ]"#,
+    );
+    let chord = |c| key(KeyCode::Char(c), KeyModifiers::CONTROL | KeyModifiers::ALT);
+
+    app.handle_key(chord('d')).unwrap();
+    assert!(
+        app.definition_request_id.is_some(),
+        "the bound chord sends the definition request at the caret"
+    );
+    app.handle_key(chord('u')).unwrap();
+    assert!(app.references_request_id.is_some(), "references");
+    app.handle_key(chord('t')).unwrap();
+    assert!(app.type_definition_request_id.is_some(), "type definition");
+    app.handle_key(chord('i')).unwrap();
+    assert!(app.implementation_request_id.is_some(), "implementations");
+    app.handle_key(chord('l')).unwrap();
+    assert!(app.declaration_request_id.is_some(), "declaration");
+    app.handle_key(chord('r')).unwrap();
+    assert!(
+        app.prepare_rename_request.is_some(),
+        "the bound chord starts a rename at the caret"
+    );
+    assert_eq!(app.status, "Preparing rename…");
+}
+
+#[test]
+fn the_f_keys_still_go_to_definition_and_rename_without_a_keymap() {
+    let (mut app, _tmp) = lsp_nav_app("[]");
+    app.handle_key(key(KeyCode::F(12), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.definition_request_id.is_some(), "F12");
+    app.handle_key(key(KeyCode::F(12), KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(app.references_request_id.is_some(), "Shift+F12");
+    app.handle_key(key(KeyCode::F(2), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.prepare_rename_request.is_some(), "F2");
+}
+
+#[test]
+fn a_rebound_go_to_definition_on_a_non_text_view_says_so_and_sends_nothing() {
+    let (mut app, tmp) = lsp_nav_app(
+        r#"[
+            { "key": "ctrl+alt+d", "command": "go_to_definition" },
+            { "key": "ctrl+alt+r", "command": "rename_symbol" }
+        ]"#,
+    );
+    let bin = tmp.path().join("a.bin");
+    std::fs::write(&bin, [0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+    app.editor.hex = Some(crate::hex::HexView::open(&bin).unwrap());
+    assert!(app.editor.has_non_text_view(), "precondition");
+    let chord = |c| key(KeyCode::Char(c), KeyModifiers::CONTROL | KeyModifiers::ALT);
+
+    app.handle_key(chord('d')).unwrap();
+    assert!(app.definition_request_id.is_none());
+    assert_eq!(app.status, "Go to Definition needs a text file");
+    app.handle_key(chord('r')).unwrap();
+    assert!(app.prepare_rename_request.is_none());
+    assert_eq!(app.status, "Rename Symbol needs a text file");
 }
 
 #[test]
@@ -72502,6 +75071,942 @@ fn the_synced_settings_layer_is_in_the_reload_chain() {
     );
 }
 
+/// What `git push` writes to stderr for a push to GitHub: `remote:`
+/// chatter, the destination, then the ref update.
+const PUSH_OUTPUT_858: &str = "remote: \nremote: Create a pull request for 'main' on GitHub by visiting:\nremote:      https://github.com/o/r/pull/new/main\nremote: \nTo github.com:o/r.git\n   5a6cd5c..9f1e2d3  main -> main";
+
+/// #858: after Commit & Push the status bar said "Committed & pushed:"
+/// followed by git push's whole multi-line stderr, squashed into the one
+/// status row, which is what the issue asked to stop. Status and panel now
+/// carry one line (the commit's headline and the ref update); the push's
+/// full text is in the Git Output log.
+#[test]
+fn commit_and_push_reports_one_line_and_logs_the_push() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.finish_commit_and_push(
+        String::from("[main 9f1e2d3] fix: one line"),
+        Ok(String::from(PUSH_OUTPUT_858)),
+    );
+    let feedback = app.source_control.commit_feedback.clone().unwrap();
+    for text in [&app.status, &feedback] {
+        assert!(!text.contains('\n'), "one line: {text:?}");
+        assert!(!text.contains("remote:"), "no remote chatter: {text:?}");
+        assert!(text.contains("[main 9f1e2d3] fix: one line"), "{text:?}");
+        assert!(text.contains("main -> main"), "{text:?}");
+    }
+    assert!(!app.source_control.commit_feedback_is_error);
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(
+        logged.contains("Create a pull request"),
+        "the Git Output log keeps the whole push: {logged:?}"
+    );
+}
+
+/// #858: Push (the commit menu's) reported `Pushed: ` and the same
+/// multi-line stderr; it now reports the ref update alone.
+#[test]
+fn push_reports_its_ref_update_on_one_line_and_logs_the_rest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.finish_push(Ok(String::from(PUSH_OUTPUT_858)));
+    assert_eq!(app.status, "Pushed: 5a6cd5c..9f1e2d3 main -> main");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("pushed: 5a6cd5c..9f1e2d3 main -> main")
+    );
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(
+        logged.contains("github.com/o/r/pull/new/main"),
+        "{logged:?}"
+    );
+}
+
+/// #858 negative: a push whose output is only `remote:` chatter reports
+/// that it pushed and nothing of the chatter, never a stray `remote:`.
+#[test]
+fn a_push_with_only_remote_chatter_reports_just_pushed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let chatter = "remote: Resolving deltas: 100% (2/2)\nremote: \nremote: Done";
+    app.finish_push(Ok(String::from(chatter)));
+    assert_eq!(app.status, "Pushed");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("pushed")
+    );
+    app.finish_commit_and_push(
+        String::from("[main 9f1e2d3] fix: one line"),
+        Ok(String::from(chatter)),
+    );
+    assert_eq!(
+        app.status,
+        "Committed & pushed: [main 9f1e2d3] fix: one line"
+    );
+    // A one-line push result is kept as git wrote it.
+    app.finish_push(Ok(String::from("Everything up-to-date")));
+    assert_eq!(app.status, "Pushed: Everything up-to-date");
+}
+
+/// #858 negative: a failed push still names the error, on one line: the
+/// rejected ref update with git's reason, or git's `fatal:` line, never the
+/// `To` destination or a `hint:`. It stays an error.
+#[test]
+fn a_failed_push_still_names_the_error_on_one_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let rejected = "To github.com:o/r.git\n ! [rejected]        main -> main (fetch first)\nerror: failed to push some refs to 'github.com:o/r.git'\nhint: Updates were rejected because the remote contains work that you do\nhint: not have locally.";
+    app.finish_commit_and_push(
+        String::from("[main 9f1e2d3] fix: one line"),
+        Err(String::from(rejected)),
+    );
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        "Commit ok; push failed: [rejected] main -> main (fetch first)"
+    );
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("commit ok; push failed: [rejected] main -> main (fetch first)")
+    );
+    let fatal = "fatal: 'origin' does not appear to be a git repository\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.";
+    app.finish_push(Err(String::from(fatal)));
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        "Push failed: fatal: 'origin' does not appear to be a git repository"
+    );
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(logged.contains("correct access rights"), "{logged:?}");
+}
+
+/// pricing.py as `main` and `feature` both start from it (#858).
+const PRICING_858: &str = "TAX_RATE = 0.21\nFREE_SHIPPING_OVER = 50\n\n\ndef shipping(total):\n    if total >= FREE_SHIPPING_OVER:\n        return 0\n    return 3.99\n";
+
+/// A repo on `main` whose `feature` branch writes `feature_pricing` to
+/// pricing.py (and adds feature.txt) while `main` raises FREE_SHIPPING_OVER
+/// to 75 (#858). With `feature` lowering it to 40, merging or rebasing
+/// stops on a conflict in pricing.py; with [`PRICING_858`] unchanged it is
+/// clean.
+fn pricing_repo_858(feature_pricing: &str) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().to_path_buf();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&p)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git setup step failed: {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    for (key, value) in [
+        ("user.email", "a@b"),
+        ("user.name", "a"),
+        ("commit.gpgsign", "false"),
+        ("merge.autoStash", "false"),
+        ("rebase.autoStash", "false"),
+    ] {
+        git(&["config", key, value]);
+    }
+    std::fs::write(p.join("pricing.py"), PRICING_858).unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "base"]);
+    git(&["checkout", "-q", "-b", "feature"]);
+    std::fs::write(p.join("pricing.py"), feature_pricing).unwrap();
+    std::fs::write(p.join("feature.txt"), "feature\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "feature: lower free shipping"]);
+    git(&["checkout", "-q", "main"]);
+    std::fs::write(
+        p.join("pricing.py"),
+        PRICING_858.replace("OVER = 50", "OVER = 75"),
+    )
+    .unwrap();
+    git(&["commit", "-qam", "main: raise free shipping"]);
+    tmp
+}
+
+/// [`pricing_repo_858`] whose merge or rebase stops on a conflict.
+fn conflicting_pricing_repo_858() -> tempfile::TempDir {
+    pricing_repo_858(&PRICING_858.replace("OVER = 50", "OVER = 40"))
+}
+
+/// A Branch submenu verb (Merge, Rebase, Delete Branch) on `branch`, the
+/// way a user runs it: the SCM menu opens the branch picker, the name is
+/// typed, Enter.
+fn pick_branch_858(app: &mut App, action: crate::widgets::scm_menu::ScmAction, branch: &str) {
+    app.dispatch_scm_action(action);
+    assert!(app.branch_picker.is_some(), "{action:?} opens the picker");
+    for c in branch.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+}
+
+/// #858: SCM ⋯ → Branch → Merge onto a conflicting branch. Git's text
+/// starts with `Auto-merging pricing.py`, and the panel and the status bar
+/// said "Merged failed: Auto-merging pricing.py", which reads like a step
+/// that went fine and leaves the conflict out. They now name the conflict,
+/// on one line; the Git Output log keeps git's whole text.
+#[test]
+fn a_merge_stopped_on_a_conflict_names_the_conflict_not_auto_merging() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = conflicting_pricing_repo_858();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::Merge, "feature");
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("Merge: 1 conflict (pricing.py)")
+    );
+    assert_eq!(app.status, "Merge: 1 conflict (pricing.py)");
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(logged.starts_with("$ git merge"), "{logged:?}");
+    assert!(
+        logged.contains("Auto-merging pricing.py")
+            && logged.contains("CONFLICT (content): Merge conflict in pricing.py"),
+        "the Git Output log keeps git's whole text: {logged:?}"
+    );
+}
+
+/// #858: SCM ⋯ → Branch → Rebase that stops on a conflict. Git names the
+/// conflict on stdout and `error: could not apply …` on stderr, after a
+/// `Rebasing (1/1)` progress line it redraws with a carriage return; only
+/// stderr was kept, so the conflict never reached the panel, which said
+/// "Rebased failed: Rebasing (1/1)…". It now names the conflict.
+#[test]
+fn a_rebase_stopped_on_a_conflict_names_the_conflict() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = conflicting_pricing_repo_858();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::Rebase, "feature");
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("Rebase: 1 conflict (pricing.py)")
+    );
+    assert_eq!(app.status, "Rebase: 1 conflict (pricing.py)");
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(
+        logged.contains("CONFLICT (content): Merge conflict in pricing.py")
+            && logged.contains("could not apply"),
+        "the Git Output log has both of git's streams: {logged:?}"
+    );
+}
+
+/// #858: a failed op names the operation, "Merge failed" or "Rebase
+/// failed", not the past tense its success uses ("Merged failed",
+/// "Rebased failed"), and a failure with no conflict names git's `error:`
+/// or `fatal:` line. Covers the branch picker, an input prompt and a
+/// worker op.
+#[test]
+fn a_failed_scm_op_names_the_operation_and_git_s_error_line() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = conflicting_pricing_repo_858();
+    // A local edit the merge would overwrite, and that rebase refuses.
+    std::fs::write(tmp.path().join("pricing.py"), "TAX_RATE = 0.2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    let one_line = |app: &App| {
+        assert!(app.source_control.commit_feedback_is_error);
+        assert_eq!(
+            app.source_control.commit_feedback.as_deref(),
+            Some(app.status.as_str())
+        );
+        assert!(!app.status.contains('\n'), "{:?}", app.status);
+    };
+
+    pick_branch_858(&mut app, ScmAction::Merge, "feature");
+    assert_eq!(
+        app.status,
+        "Merge failed: error: Your local changes to the following files would be overwritten by merge:"
+    );
+    one_line(&app);
+
+    pick_branch_858(&mut app, ScmAction::Rebase, "feature");
+    assert_eq!(
+        app.status,
+        "Rebase failed: error: cannot rebase: You have unstaged changes."
+    );
+    one_line(&app);
+
+    pick_branch_858(&mut app, ScmAction::DeleteBranch, "main");
+    assert!(
+        app.status
+            .starts_with("Delete branch failed: error: cannot delete branch 'main'"),
+        "{:?}",
+        app.status
+    );
+    one_line(&app);
+
+    crate::git::create_tag(tmp.path(), "v1").unwrap();
+    app.dispatch_scm_action(ScmAction::CreateTag);
+    for c in "v1".chars() {
+        app.input_prompt.as_mut().unwrap().push_char(c);
+    }
+    app.submit_input_prompt();
+    assert_eq!(
+        app.status,
+        "Create tag failed: fatal: tag 'v1' already exists"
+    );
+    one_line(&app);
+
+    // No upstream: a worker op, reported when it lands.
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp.path())
+        .args(["checkout", "-q", "--", "."])
+        .status()
+        .unwrap();
+    app.dispatch_scm_action(ScmAction::PullRebase);
+    wait_for_git_net(&mut app);
+    assert_eq!(
+        app.status,
+        "Pull (rebase) failed: There is no tracking information for the current branch."
+    );
+    one_line(&app);
+}
+
+/// #858: Pull, Sync and Pop Stash stop on conflicts the same way a merge
+/// does, `Auto-merging …` first; they name the conflict too, and the Git
+/// Output log keeps git's text.
+#[test]
+fn a_pull_sync_or_stash_pop_stopped_on_a_conflict_names_the_conflict() {
+    let tmp = make_committed_repo();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    };
+    std::fs::write(tmp.path().join("seed.txt"), "stashed\n").unwrap();
+    git(&["stash", "-q"]);
+    std::fs::write(tmp.path().join("seed.txt"), "committed\n").unwrap();
+    git(&["commit", "-qam", "conflicting"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.stash_pop_source_control();
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(app.status, "Stash pop: 1 conflict (seed.txt)");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("stash pop: 1 conflict (seed.txt)")
+    );
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(logged.contains("Auto-merging seed.txt"), "{logged:?}");
+
+    // Git's text for a pull that fetched, then stopped merging.
+    let pull = "Auto-merging pricing.py\nCONFLICT (content): Merge conflict in pricing.py\nAutomatic merge failed; fix conflicts and then commit the result.\nFrom github.com:o/r\n   5a6cd5c..9f1e2d3  main       -> origin/main";
+    app.finish_pull(Err(String::from(pull)));
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(app.status, "Pull: 1 conflict (pricing.py)");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("pull: 1 conflict (pricing.py)")
+    );
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(logged.contains("5a6cd5c..9f1e2d3"), "{logged:?}");
+
+    app.finish_sync(Err(String::from(pull)), None);
+    assert_eq!(app.status, "Sync failed on pull: 1 conflict (pricing.py)");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("sync: pull failed: 1 conflict (pricing.py)")
+    );
+}
+
+/// #858: a clean merge that auto-merged a file, and a clean rebase, report
+/// git's result line, not the `Auto-merging` note before it or the
+/// `Rebasing (1/1)` progress git redrew over.
+#[test]
+fn a_clean_merge_or_rebase_reports_git_s_result_line_not_its_progress() {
+    use crate::widgets::scm_menu::ScmAction;
+    // `feature` changes another line of pricing.py: git auto-merges it.
+    let tmp = pricing_repo_858(&PRICING_858.replace("3.99", "4.99"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::Merge, "feature");
+    assert!(!app.source_control.commit_feedback_is_error);
+    assert_eq!(app.status, "Merged: Merge made by the 'ort' strategy.");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("Merged: Merge made by the 'ort' strategy.")
+    );
+
+    let tmp = pricing_repo_858(&PRICING_858.replace("3.99", "4.99"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::Rebase, "feature");
+    assert!(!app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        "Rebased: Successfully rebased and updated refs/heads/main."
+    );
+}
+
+/// #858 negative: a clean merge of another file still reports its normal
+/// one-line success, as a success.
+#[test]
+fn a_clean_merge_still_reports_its_one_line_success() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = pricing_repo_858(PRICING_858);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::Merge, "feature");
+    assert!(!app.source_control.commit_feedback_is_error);
+    assert_eq!(app.status, "Merged: Merge made by the 'ort' strategy.");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("Merged: Merge made by the 'ort' strategy.")
+    );
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(logged.contains("feature.txt"), "{logged:?}");
+}
+
+/// Draw the whole app and return the frame (#858).
+fn draw_858(
+    term: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+    app: &mut App,
+) -> ratatui::buffer::Buffer {
+    term.draw(|f| app.render(f)).unwrap();
+    term.backend().buffer().clone()
+}
+
+/// Assert that `feedback`, shown in the Source Control panel, changes no
+/// cell of its row from the panel's right border to the screen's edge,
+/// over whatever the editor shows there, and return that row (#858). Only
+/// that row is compared: the feedback is one line, and the editor's other
+/// rows may change between frames as the git worker reports.
+fn assert_feedback_stays_in_the_panel_858(
+    term: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+    app: &mut App,
+    feedback: &str,
+) -> u16 {
+    app.source_control.commit_feedback = None;
+    draw_858(term, app);
+    let bare = draw_858(term, app);
+    app.source_control.commit_feedback = Some(feedback.to_string());
+    let shown = draw_858(term, app);
+    let panel = app.source_control.last_area;
+    let width = shown.area.width;
+    assert!(
+        panel.width > 0 && panel.right() < width,
+        "the panel sits left of the editor: {panel:?}"
+    );
+    let head: String = feedback.chars().take(12).collect();
+    let row = (panel.top()..panel.bottom())
+        .find(|&y| {
+            (panel.left()..panel.right())
+                .map(|x| shown[(x, y)].symbol())
+                .collect::<String>()
+                .contains(&head)
+        })
+        .unwrap_or_else(|| panic!("the panel shows {head:?}"));
+    for x in panel.right() - 1..width {
+        assert_eq!(
+            shown[(x, row)].symbol(),
+            bare[(x, row)].symbol(),
+            "cell ({x}, {row}) from the Source Control panel's right border on changed with feedback {feedback:?}"
+        );
+    }
+    row
+}
+
+/// Assert that `row` crosses the merge editor's source panes below their
+/// titles, where the panes paint only their text and the cells between
+/// show whatever was drawn there first, as in the issue's frames (#858).
+fn assert_row_crosses_the_merge_panes_858(app: &App, row: u16) {
+    let panes = app
+        .editor
+        .merge
+        .as_ref()
+        .expect("the merge editor is up")
+        .last_panes_area;
+    assert!(
+        row > panes.y + 1 && row + 1 < panes.bottom(),
+        "the feedback row {row} crosses the source panes {panes:?}"
+    );
+}
+
+/// #858, the issue's frames: with the merge editor open, the Source
+/// Control feedback, first the merge's conflict and then, once it is
+/// resolved, a merge commit's long subject, paints nothing past the panel.
+/// The merge editor paints only its text cells, so feedback drawn past the
+/// panel showed through between them.
+#[test]
+fn scm_feedback_paints_nothing_over_the_merge_editor() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = conflicting_pricing_repo_858();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::Merge, "feature");
+    let conflict = app
+        .source_control
+        .commit_feedback
+        .clone()
+        .expect("the merge reports");
+    let idx = wait_for_conflicted_entry(&mut app);
+    app.open_source_control_entry(idx);
+    assert!(app.editor.merge.is_some(), "the merge editor is up");
+    // Tall enough that the feedback row crosses the source panes rather
+    // than the RESULT bar, which the merge editor paints edge to edge.
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(150, 60)).unwrap();
+    let row = assert_feedback_stays_in_the_panel_858(&mut term, &mut app, &conflict);
+    assert_row_crosses_the_merge_panes_858(&app, row);
+
+    // Resolve, stage, and commit the merge with a subject longer than the
+    // panel.
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptAllIncoming);
+    app.complete_merge();
+    assert!(app.status.contains("Merge complete"), "{:?}", app.status);
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.source_control.message =
+        "Merge branch 'feature': keep the lower free-shipping threshold for EU customers"
+            .to_string();
+    app.source_control.message_cursor = app.source_control.message.chars().count();
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_git_net(&mut app);
+    let subject = app
+        .source_control
+        .commit_feedback
+        .clone()
+        .unwrap_or_default();
+    assert!(
+        subject.starts_with("[main ") && subject.ends_with("for EU customers"),
+        "the commit's first line: {subject:?}"
+    );
+    assert!(app.editor.merge.is_some(), "the merge editor is still up");
+    let row = assert_feedback_stays_in_the_panel_858(&mut term, &mut app, &subject);
+    assert_row_crosses_the_merge_panes_858(&app, row);
+}
+
+/// Run git in `dir` for a #858 fixture, asserting it succeeded.
+fn git_858(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Local settings for a #858 fixture repo: an identity, no signing and
+/// no push negotiation from the user's global config, and how `git pull`
+/// reconciles (`pull.rebase`).
+fn configure_858(dir: &std::path::Path, pull_rebase: &str) {
+    for (key, value) in [
+        ("user.email", "a@b"),
+        ("user.name", "a"),
+        ("commit.gpgsign", "false"),
+        ("push.negotiate", "false"),
+        ("pull.rebase", pull_rebase),
+    ] {
+        git_858(dir, &["config", key, value]);
+    }
+}
+
+/// A bare remote on `main`; `theirs`, a clone that pushes to it; and
+/// `mine`, the clone the app opens (#858).
+struct Remote858 {
+    _dir: tempfile::TempDir,
+    bare: std::path::PathBuf,
+    theirs: std::path::PathBuf,
+    mine: std::path::PathBuf,
+}
+
+/// [`Remote858`] with f.txt ("one") on `main` in all three; `mine` pulls
+/// the way `pull_rebase` says.
+fn remote_858(pull_rebase: &str) -> Remote858 {
+    let dir = tempfile::tempdir().unwrap();
+    let bare = dir.path().join("remote.git");
+    let theirs = dir.path().join("theirs");
+    let mine = dir.path().join("mine");
+    std::fs::create_dir(&theirs).unwrap();
+    git_858(
+        dir.path(),
+        &["init", "-q", "--bare", "-b", "main", "remote.git"],
+    );
+    git_858(&theirs, &["init", "-q", "-b", "main"]);
+    configure_858(&theirs, "false");
+    std::fs::write(theirs.join("f.txt"), "one\n").unwrap();
+    git_858(&theirs, &["add", "-A"]);
+    git_858(&theirs, &["commit", "-qm", "one"]);
+    git_858(
+        &theirs,
+        &["remote", "add", "origin", bare.to_str().unwrap()],
+    );
+    git_858(&theirs, &["push", "-q", "-u", "origin", "main"]);
+    git_858(dir.path(), &["clone", "-q", bare.to_str().unwrap(), "mine"]);
+    configure_858(&mine, pull_rebase);
+    Remote858 {
+        _dir: dir,
+        bare,
+        theirs,
+        mine,
+    }
+}
+
+/// Commit `text` to `file` in `repo`.
+fn commit_858(repo: &std::path::Path, file: &str, text: &str) {
+    std::fs::write(repo.join(file), text).unwrap();
+    git_858(repo, &["add", "-A"]);
+    git_858(repo, &["commit", "-qm", file]);
+}
+
+/// Assert the status bar and the Source Control panel each carry one line.
+fn assert_one_line_858(app: &App) {
+    let feedback = app
+        .source_control
+        .commit_feedback
+        .clone()
+        .unwrap_or_default();
+    for text in [&app.status, &feedback] {
+        assert!(!text.contains('\n'), "one line: {text:?}");
+        assert!(!text.contains("From "), "no fetch source: {text:?}");
+        assert!(!text.contains("To "), "no push destination: {text:?}");
+    }
+}
+
+/// #858: Pull reported git's whole text, "Pulled: Updating a..b\n
+/// Fast-forward\n f.txt | 1 +\n 1 file changed…", squashed into the status
+/// row. It now reports git's result line; the Git Output log keeps the
+/// rest.
+#[test]
+fn a_fast_forward_pull_reports_fast_forward_on_one_line() {
+    let r = remote_858("false");
+    commit_858(&r.theirs, "f.txt", "one\ntwo\n");
+    git_858(&r.theirs, &["push", "-q"]);
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.pull_source_control();
+    wait_for_git_net(&mut app);
+    assert_eq!(app.status, "Pulled: Fast-forward");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("pulled: Fast-forward")
+    );
+    assert!(!app.source_control.commit_feedback_is_error);
+    let logged = app.git_output_log.last().cloned().unwrap_or_default();
+    assert!(
+        logged.starts_with("$ git pull")
+            && logged.contains("Updating ")
+            && logged.contains("f.txt"),
+        "the Git Output log keeps git's whole text: {logged:?}"
+    );
+}
+
+/// #858: a pull that rebases prints only to stderr: the fetch's `From
+/// <url>` and ref update, then `Rebasing (1/1)` redrawn into "Successfully
+/// rebased …". It reported "Pulled: From /…" and the rest; now the result.
+#[test]
+fn a_rebasing_pull_reports_the_rebase_not_the_fetch() {
+    let r = remote_858("true");
+    commit_858(&r.theirs, "f.txt", "one\ntwo\n");
+    git_858(&r.theirs, &["push", "-q"]);
+    commit_858(&r.mine, "g.txt", "mine\n");
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.pull_source_control();
+    wait_for_git_net(&mut app);
+    assert_eq!(
+        app.status,
+        "Pulled: Successfully rebased and updated refs/heads/main."
+    );
+    assert_one_line_858(&app);
+}
+
+/// #858 negative: a pull with nothing to bring in still says so, rather
+/// than an empty "Pulled".
+#[test]
+fn a_pull_that_is_already_up_to_date_still_says_so() {
+    let r = remote_858("false");
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.pull_source_control();
+    wait_for_git_net(&mut app);
+    assert_eq!(app.status, "Pulled: Already up to date.");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("pulled: Already up to date.")
+    );
+}
+
+/// #858 negative: a pull that fails still says it failed, with git's
+/// `fatal:` line, and one stopped on conflicts still names them.
+#[test]
+fn a_failed_or_conflicted_pull_still_says_why() {
+    let r = remote_858("false");
+    git_858(&r.mine, &["config", "pull.ff", "only"]);
+    commit_858(&r.theirs, "f.txt", "one\ntheirs\n");
+    git_858(&r.theirs, &["push", "-q"]);
+    commit_858(&r.mine, "f.txt", "one\nmine\n");
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.pull_source_control();
+    wait_for_git_net(&mut app);
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        "Pull failed: fatal: Not possible to fast-forward, aborting."
+    );
+    assert_one_line_858(&app);
+
+    git_858(&r.mine, &["config", "pull.ff", "false"]);
+    app.pull_source_control();
+    wait_for_git_net(&mut app);
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(app.status, "Pull: 1 conflict (f.txt)");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("pull: 1 conflict (f.txt)")
+    );
+}
+
+/// #858: Sync reported "Synced" in the status bar and, in the panel,
+/// "synced (pulled: <git pull's text> | pushed: <git push's text>)" with
+/// every line of both. It now names both halves on one line, the way
+/// Commit & Push does; the Git Output log keeps git's text.
+#[test]
+fn a_sync_reports_both_halves_on_one_line() {
+    let r = remote_858("false");
+    commit_858(&r.theirs, "f.txt", "one\ntwo\n");
+    git_858(&r.theirs, &["push", "-q"]);
+    commit_858(&r.mine, "g.txt", "mine\n");
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.sync_source_control();
+    wait_for_git_net(&mut app);
+    assert!(!app.source_control.commit_feedback_is_error);
+    assert!(
+        app.status
+            .starts_with("Synced: pulled: Merge made by the 'ort' strategy. | pushed: ")
+            && app.status.ends_with(" main -> main"),
+        "{:?}",
+        app.status
+    );
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some(app.status.replacen("Synced", "synced", 1).as_str())
+    );
+    assert_one_line_858(&app);
+    let log = app.git_output_log.join("\n");
+    assert!(
+        log.contains("$ git pull") && log.contains("$ git push") && log.contains("To "),
+        "{log:?}"
+    );
+}
+
+/// #858 negative: a sync with nothing to move still reports both halves,
+/// never an empty "Synced".
+#[test]
+fn a_sync_with_nothing_to_move_still_reports_both_halves() {
+    let r = remote_858("false");
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.sync_source_control();
+    wait_for_git_net(&mut app);
+    assert_eq!(
+        app.status,
+        "Synced: pulled: Already up to date. | pushed: Everything up-to-date"
+    );
+}
+
+/// #858: a sync whose push the remote refuses reported "pull ok; push
+/// failed: " and git push's whole stderr (`remote:` lines, `To <url>`,
+/// the rejected ref, `error:`). It now names the rejected ref.
+#[test]
+fn a_sync_whose_push_is_refused_names_the_rejected_ref() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = remote_858("false");
+    let hook = r.bare.join("hooks").join("pre-receive");
+    std::fs::write(&hook, "#!/bin/sh\necho 'no pushes today' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    commit_858(&r.mine, "g.txt", "mine\n");
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.sync_source_control();
+    wait_for_git_net(&mut app);
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        "Sync: pull ok; push failed: [remote rejected] main -> main (pre-receive hook declined)"
+    );
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("pull ok; push failed: [remote rejected] main -> main (pre-receive hook declined)")
+    );
+    let log = app.git_output_log.join("\n");
+    assert!(log.contains("no pushes today"), "{log:?}");
+}
+
+/// #858: Fetch and Push (Force) reported git's first line, the fetch's
+/// `From <url>` or the push's `To <url>`; they now report the ref update,
+/// as Push does.
+#[test]
+fn fetch_and_force_push_report_the_ref_update_not_the_url() {
+    use crate::widgets::scm_menu::ScmAction;
+    let r = remote_858("false");
+    commit_858(&r.theirs, "f.txt", "one\ntwo\n");
+    git_858(&r.theirs, &["push", "-q"]);
+    let mut app = App::new(r.mine.clone()).unwrap();
+    app.dispatch_scm_action(ScmAction::Fetch);
+    wait_for_git_net(&mut app);
+    assert!(
+        app.status.starts_with("Fetched: ") && app.status.ends_with(" main -> origin/main"),
+        "{:?}",
+        app.status
+    );
+    assert_one_line_858(&app);
+
+    git_858(&r.mine, &["merge", "-q", "--ff-only", "origin/main"]);
+    commit_858(&r.mine, "g.txt", "mine\n");
+    git_858(&r.mine, &["push", "-q"]);
+    git_858(
+        &r.mine,
+        &["commit", "-q", "--amend", "-m", "g.txt, reworded"],
+    );
+    app.dispatch_scm_action(ScmAction::PushForce);
+    wait_for_git_net(&mut app);
+    assert!(
+        app.status.starts_with("Force-pushed: ")
+            && app.status.ends_with(" main -> main (forced update)"),
+        "{:?}",
+        app.status
+    );
+    assert_one_line_858(&app);
+}
+
+/// #858: switching branch with a local edit reported git's stdout, the
+/// `M\tseed.txt` list of carried-over changes, as "Switched to: M…"; a
+/// refused switch reported git's whole error. Both are one line now.
+#[test]
+fn switching_branch_reports_one_line() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = make_committed_repo();
+    configure_858(tmp.path(), "false");
+    git_858(tmp.path(), &["branch", "feature"]);
+    std::fs::write(tmp.path().join("seed.txt"), "edited\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::CheckoutTo, "feature");
+    assert!(!app.source_control.commit_feedback_is_error);
+    assert_eq!(app.status, "Switched to feature");
+    assert_eq!(
+        app.source_control.commit_feedback.as_deref(),
+        Some("Switched to feature")
+    );
+
+    // `main` moves on under the edit: switching back would overwrite it.
+    git_858(tmp.path(), &["stash", "-q"]);
+    git_858(tmp.path(), &["checkout", "-q", "main"]);
+    commit_858(tmp.path(), "seed.txt", "main moved\n");
+    git_858(tmp.path(), &["checkout", "-q", "feature"]);
+    git_858(tmp.path(), &["stash", "pop", "-q"]);
+    pick_branch_858(&mut app, ScmAction::CheckoutTo, "main");
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        "Branch: error: Your local changes to the following files would be overwritten by checkout:"
+    );
+    assert_one_line_858(&app);
+}
+
+/// #858: popping the latest stash reported git's `git status` dump
+/// ("Stash popped: On branch main\nChanges not staged…"); it now reports
+/// the stash it dropped.
+#[test]
+fn popping_a_stash_reports_the_dropped_entry_on_one_line() {
+    let tmp = make_committed_repo();
+    std::fs::write(tmp.path().join("seed.txt"), "stashed\n").unwrap();
+    git_858(tmp.path(), &["stash", "-q"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.stash_pop_source_control();
+    assert!(!app.source_control.commit_feedback_is_error);
+    assert!(
+        app.status
+            .starts_with("Stash popped: Dropped refs/stash@{0} ("),
+        "{:?}",
+        app.status
+    );
+    assert!(
+        app.source_control
+            .commit_feedback
+            .as_deref()
+            .is_some_and(|f| f.starts_with("popped: Dropped refs/stash@{0} (")),
+        "{:?}",
+        app.source_control.commit_feedback
+    );
+    assert_one_line_858(&app);
+}
+
+/// #858: View Changes vs previous on a one-commit repository reported git's
+/// three-line error; it now reports its `fatal:` line.
+#[test]
+fn a_failed_diff_view_names_git_s_fatal_line() {
+    let tmp = make_committed_repo();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.view_previous_commit_diff_source_control();
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        "View Changes vs previous failed: fatal: ambiguous argument 'HEAD~1': unknown revision or path not in the working tree."
+    );
+    assert_one_line_858(&app);
+}
+
+/// #858: a failed clone reported "Clone failed: Cloning into 'notrepo'...\n
+/// fatal: …\nfatal: …\n\nPlease make sure…"; it now reports git's first
+/// `fatal:` line.
+#[test]
+fn a_failed_clone_names_git_s_fatal_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    let not_a_repo = tmp.path().join("elsewhere").join("notrepo");
+    std::fs::create_dir(&ws).unwrap();
+    std::fs::create_dir_all(&not_a_repo).unwrap();
+    let url = format!("file://{}", not_a_repo.display());
+    let mut app = App::new(ws).unwrap();
+    let err = crate::git::clone_into(tmp.path(), &url)
+        .map(|_| ())
+        .expect_err("nothing to clone");
+    assert!(err.contains('\n'), "git's text runs to lines: {err:?}");
+    app.finish_clone(Err(err), tmp.path());
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.status,
+        format!(
+            "Clone failed: fatal: '{}' does not appear to be a git repository",
+            not_a_repo.display()
+        )
+    );
+    assert_one_line_858(&app);
+}
+
+#[test]
+fn a_snippets_file_that_loads_nothing_says_where_to_look() {
+    // #1191: a broken snippets.json used to reload as "Snippets reloaded"
+    // with nothing loaded.
+    let status = super::snippets_reload_status(true, &[]);
+    assert!(status.contains("not loaded"), "{status}");
+    assert!(status.contains("OUTPUT · Snippets"), "{status}");
+    assert_eq!(
+        super::snippets_reload_status(false, &[]),
+        "Snippets reloaded"
+    );
+}
+
 /// Every cell of a drawn frame, row after row.
 fn screen_text_863(app: &mut App, w: u16, h: u16) -> String {
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
@@ -74467,6 +77972,292 @@ fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
     assert_eq!(app.status, "Tab is already kept open");
 }
 
+/// #989: an App on the issue's repro, a merge stopped on a conflict.
+fn app_in_a_conflicted_merge() -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = r#"set -e
+git init -q -b main && git config user.email a@b && git config user.name a
+printf '# Orders\n\nRun `python pricing.py`.\n' > README.md && git add . && git commit -qm init
+git checkout -qb hotfix && sed 's/python pricing.py/python -m pricing/' README.md > README.tmp && mv README.tmp README.md && git commit -qam fix
+git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' README.md > README.tmp && mv README.tmp README.md && git commit -qam uv
+! git merge -q hotfix >/dev/null 2>&1"#;
+    let out = std::process::Command::new("sh")
+        .args(["-c", script])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.source_control.message = String::from("Merge hotfix");
+    (app, tmp)
+}
+
+fn committed_readme(root: &std::path::Path) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["show", "HEAD:README.md"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn commit_refuses_while_merge_conflicts_are_unresolved() {
+    let (mut app, tmp) = app_in_a_conflicted_merge();
+    app.commit_source_control();
+    wait_for_git_net(&mut app);
+    assert!(
+        !committed_readme(tmp.path()).contains("<<<<<<<"),
+        "the conflict markers were committed"
+    );
+    let feedback = app
+        .source_control
+        .commit_feedback
+        .clone()
+        .unwrap_or_default();
+    assert!(feedback.contains("Resolve 1 merge conflict"), "{feedback}");
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.source_control.message, "Merge hotfix",
+        "the message is kept"
+    );
+}
+
+#[test]
+fn commit_all_refuses_while_merge_conflicts_are_unresolved() {
+    // Commit All stages everything first, and `git add -A` marks a conflict
+    // resolved with its markers in it.
+    let (mut app, tmp) = app_in_a_conflicted_merge();
+    app.commit_all_source_control();
+    assert!(!committed_readme(tmp.path()).contains("<<<<<<<"));
+    assert_eq!(
+        crate::git::unmerged_paths(tmp.path()),
+        vec![String::from("README.md")],
+        "nothing was staged"
+    );
+    assert!(
+        app.status.contains("Resolve 1 merge conflict"),
+        "{}",
+        app.status
+    );
+}
+
+/// #910: `tax.py` open with an unsaved function, rewritten on disk behind
+/// it (a `git checkout`, a restore, an agent), and the sweep that notices.
+fn app_with_a_disk_conflict(tmp: &std::path::Path) -> (App, std::path::PathBuf) {
+    let f = tmp.join("tax.py");
+    std::fs::write(&f, "RATE = 0.1\n").unwrap();
+    let mut app = App::new(tmp.to_path_buf()).unwrap();
+    app.history_root = tmp.join(".history");
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = "RATE = 0.1".len();
+    app.editor
+        .insert_str("\ndef tax(amount):\n    return amount * RATE");
+    assert!(app.editor.dirty);
+    std::fs::write(&f, "RATE = 0.2  # from the other branch\n").unwrap();
+    app.reload_open_file_after_external_change();
+    assert!(
+        matches!(
+            app.input_prompt.as_ref().map(|p| &p.purpose),
+            Some(crate::widgets::input_prompt::InputPurpose::ReloadConflict { .. })
+        ),
+        "the conflict prompt opens"
+    );
+    (app, f)
+}
+
+fn type_keys(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+#[test]
+fn typing_on_into_the_disk_conflict_prompt_keeps_the_edits() {
+    // The prompt opens mid-typing and takes the keys; Enter on whatever was
+    // typed used to reload and throw the unsaved function away.
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_a_disk_conflict(tmp.path());
+    type_keys(&mut app, "    print(tax(100))");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.input_prompt.is_none(), "the prompt is dismissed");
+    assert!(
+        app.editor.lines.join("\n").contains("def tax(amount):"),
+        "the unsaved edits were discarded: {:?}",
+        app.editor.lines
+    );
+    assert!(app.editor.dirty);
+    assert!(
+        app.status.contains("Kept your unsaved edits"),
+        "{}",
+        app.status
+    );
+}
+
+#[test]
+fn the_disk_conflict_prompt_starts_empty_and_says_what_reload_costs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_a_disk_conflict(tmp.path());
+    let prompt = app.input_prompt.as_ref().unwrap();
+    assert_eq!(
+        prompt.value, "",
+        "nothing pre-filled for a stray Enter to confirm"
+    );
+    assert!(prompt.title.starts_with("tax.py "), "{}", prompt.title);
+    let said = format!(
+        "{} {}",
+        prompt.placeholder,
+        prompt.hint.clone().unwrap_or_default()
+    );
+    assert!(said.contains("discard"), "{said}");
+    // Negative: Enter on the empty field does nothing at all.
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.input_prompt.is_some());
+    assert!(app.editor.dirty);
+}
+
+#[test]
+fn reloading_over_unsaved_edits_keeps_them_in_local_history() {
+    // Typing `reload` is the explicit consent; what it discards stays
+    // recoverable from TIMELINE.
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, f) = app_with_a_disk_conflict(tmp.path());
+    type_keys(&mut app, "reload");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "RATE = 0.2  # from the other branch"
+    );
+    assert!(!app.editor.dirty);
+    let held: Vec<String> = crate::history::entries_in(&app.history_root, &f)
+        .iter()
+        .map(|s| std::fs::read_to_string(&s.file).unwrap())
+        .collect();
+    assert!(
+        held.iter().any(|h| h.contains("def tax(amount):")),
+        "the discarded buffer is in Local History: {held:?}"
+    );
+}
+
+#[test]
+fn escape_on_the_disk_conflict_prompt_keeps_the_edits() {
+    // Negative: the other way out still keeps them.
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_a_disk_conflict(tmp.path());
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.input_prompt.is_none());
+    assert!(app.editor.lines.join("\n").contains("def tax(amount):"));
+}
+
+// ---- Find bar seeding selects the word under the caret (#1278) ----
+
+/// orders.py from the issue, open and focused, caret at `(row, col)`.
+fn find_seed_app(row: usize, col: usize) -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("orders.py");
+    std::fs::write(
+        &f,
+        "def loadOrders(path):\n    return readRows(path)\n\n\ndef saveOrders(path, rows):\n    writeRows(path, rows)\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = row;
+    app.editor.cursor_col = col;
+    (app, tmp)
+}
+
+fn ctrl(c: char) -> KeyEvent {
+    key(KeyCode::Char(c), KeyModifiers::CONTROL)
+}
+
+fn type_str(app: &mut App, s: &str) {
+    for c in s.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+fn find_query(app: &App) -> String {
+    app.editor_find.as_ref().map(|s| s.query.clone()).unwrap()
+}
+
+#[test]
+fn find_seeds_the_whole_word_and_typing_replaces_it() {
+    // Caret after `def loadOr`, mid-word.
+    let (mut app, _tmp) = find_seed_app(0, 10);
+    app.handle_key(ctrl('f')).unwrap();
+    assert_eq!(find_query(&app), "loadOrders");
+    type_str(&mut app, "save");
+    assert_eq!(find_query(&app), "save");
+    assert!(app.editor_find.as_ref().unwrap().match_count >= 1);
+}
+
+#[test]
+fn find_seeds_the_word_the_caret_just_left() {
+    // Caret right after `loadOrders`, where it sits after typing a word.
+    let (mut app, _tmp) = find_seed_app(0, 14);
+    app.handle_key(ctrl('f')).unwrap();
+    assert_eq!(find_query(&app), "loadOrders");
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(find_query(&app), "", "Backspace clears a selected seed");
+}
+
+#[test]
+fn ctrl_a_selects_the_query_and_ctrl_backspace_deletes_a_word() {
+    let (mut app, _tmp) = find_seed_app(2, 0);
+    app.handle_key(ctrl('f')).unwrap();
+    type_str(&mut app, "write rows");
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(find_query(&app), "write ");
+    app.handle_key(ctrl('a')).unwrap();
+    type_str(&mut app, "read");
+    assert_eq!(find_query(&app), "read");
+}
+
+#[test]
+fn ctrl_f_on_an_open_bar_selects_its_query_again() {
+    let (mut app, _tmp) = find_seed_app(0, 10);
+    app.handle_key(ctrl('f')).unwrap();
+    type_str(&mut app, "save");
+    app.handle_key(ctrl('f')).unwrap();
+    type_str(&mut app, "write");
+    assert_eq!(find_query(&app), "write");
+}
+
+#[test]
+fn an_unseeded_or_deselected_query_still_appends() {
+    // Negative: with nothing to seed, typing appends as before; after a
+    // caret key the seed is no longer selected and typing extends it.
+    let (mut app, _tmp) = find_seed_app(2, 0);
+    app.handle_key(ctrl('f')).unwrap();
+    assert_eq!(find_query(&app), "");
+    type_str(&mut app, "sa");
+    type_str(&mut app, "ve");
+    assert_eq!(find_query(&app), "save");
+    let (mut app, _tmp) = find_seed_app(0, 10);
+    app.handle_key(ctrl('f')).unwrap();
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    type_str(&mut app, "X");
+    assert_eq!(find_query(&app), "loadOrdersX");
+}
+
 /// A stand-in `codeql` still open for writing, the way a test's freshly
 /// written script is while another test thread forks: exec fails with
 /// "Text file busy" until the writer lets go. The handle is dropped after
@@ -74629,6 +78420,510 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     let _ = render_buf(&mut app);
     assert!(app.source_control.nested_repos.is_empty());
     assert!(app.source_control.last_init_repo_button_area.width > 0);
+}
+
+/// An App over `tmp` whose user config lives in `cfg`, never the real one.
+fn settings_editor_app(cfg: &std::path::Path, tmp: &std::path::Path) -> App {
+    let mut app = App::new(tmp.to_path_buf()).unwrap();
+    app.config_dir = cfg.to_path_buf();
+    app.run_command(crate::widgets::command_palette::Command::OpenSettingsEditor);
+    assert!(app.settings_editor.is_some(), "the editor opens");
+    app
+}
+
+fn type_query(app: &mut App, q: &str) {
+    for c in q.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+#[test]
+fn the_settings_editor_flips_a_setting_into_the_user_layer_and_applies_it() {
+    // #612: search a setting, Enter edits it in place, the file and the live
+    // session both change, and the row names the layer that set it.
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        cfg.path().join("config.json"),
+        "{\n  \"auto_save\": false\n}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/config.json"),
+        "{ \"copy_on_select\": true }",
+    )
+    .unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    let copy = app
+        .settings_editor
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .find(|r| r.key == "copy_on_select")
+        .cloned()
+        .unwrap();
+    assert_eq!(copy.layer, crate::config_layers::LayerKind::Workspace);
+    type_query(&mut app, "auto save");
+    let row = app
+        .settings_editor
+        .as_ref()
+        .unwrap()
+        .selected_row()
+        .cloned()
+        .unwrap();
+    assert_eq!(row.key, "auto_save");
+    assert_eq!(row.value, serde_json::json!(false));
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cfg.path().join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(written["auto_save"], serde_json::json!(true));
+    assert!(app.auto_save, "applied to the live session");
+    let row = app
+        .settings_editor
+        .as_ref()
+        .unwrap()
+        .selected_row()
+        .cloned()
+        .unwrap();
+    assert_eq!(row.value, serde_json::json!(true));
+    assert_eq!(row.layer, crate::config_layers::LayerKind::User);
+}
+
+#[test]
+fn the_settings_editor_writes_the_workspace_layer_only_for_allowed_keys() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.settings_editor.as_ref().unwrap().target,
+        crate::config_layers::LayerKind::Workspace
+    );
+    type_query(&mut app, "format on save");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let ws: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".croft/config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ws["format_on_save"], serde_json::json!(true));
+    assert!(
+        !cfg.path().join("config.json").exists(),
+        "the user layer is untouched"
+    );
+    // A key only the user may set is refused for the workspace.
+    for _ in 0.."format on save".len() {
+        app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+            .unwrap();
+    }
+    type_query(&mut app, "sidebar auto hide");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.status.contains("user"), "{}", app.status);
+    let ws = std::fs::read_to_string(tmp.path().join(".croft/config.json")).unwrap();
+    assert!(!ws.contains("sidebar_auto_hide"), "{ws}");
+}
+
+#[test]
+fn the_settings_editor_asks_for_a_number_and_refuses_one_that_is_not() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "terminal scrollback");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(matches!(
+        app.input_prompt.as_ref().map(|p| &p.purpose),
+        Some(crate::widgets::input_prompt::InputPurpose::SettingValue { key }) if key == "terminal_scrollback"
+    ));
+    app.close_input_prompt();
+    app.submit_setting_value("terminal_scrollback", "lots");
+    assert!(app.status.contains("number"), "{}", app.status);
+    assert!(!cfg.path().join("config.json").exists());
+    app.submit_setting_value("terminal_scrollback", " 5000 ");
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cfg.path().join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(written["terminal_scrollback"], serde_json::json!(5000));
+}
+
+#[test]
+fn the_settings_editor_draws_its_value_prompt_on_top() {
+    // The prompt Enter opens for a number sits over the editor. Drawn under
+    // it, the user typed blind.
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "terminal scrollback");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.input_prompt.is_some(), "Enter asks for the number");
+    type_query(&mut app, "424242");
+    let backend = ratatui::backend::TestBackend::new(120, 36);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let screen: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(screen.contains("424242"), "the typed value is visible");
+}
+
+// ---- An empty Go to Definition / Declaration / Type Definition reply (#1302) ----
+
+/// `m.py` open with the caret on `undefined_name`, as in the issue.
+fn jump_app(dir: &std::path::Path) -> App {
+    std::fs::write(
+        dir.join("m.py"),
+        "total = 42\nprint(total + undefined_name)\n",
+    )
+    .unwrap();
+    let mut app = App::new(dir.to_path_buf()).unwrap();
+    app.editor.open_pinned(&dir.join("m.py")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 16;
+    app.status = String::from("Jumped to m.py line 2");
+    app
+}
+
+#[test]
+fn an_empty_jump_reply_says_nothing_was_found_and_clears_the_request() {
+    use crate::lsp::manager::{DeclarationResult, DefinitionResult, TypeDefinitionResult};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = jump_app(tmp.path());
+    let path = app.editor.path.clone().unwrap();
+
+    app.request_definition_at_cursor();
+    let id = app.definition_request_id.expect("F12 sent a request");
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_definition_for_test(DefinitionResult {
+            request_id: id,
+            path: path.clone(),
+            target: None,
+        });
+    let redrew = app.drain_lsp_definition();
+    assert_eq!(app.status, "No definition found");
+    assert!(redrew, "the empty reply redraws");
+    assert_eq!(app.definition_request_id, None);
+
+    app.request_declaration_at_cursor();
+    let id = app.declaration_request_id.expect("a declaration request");
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_declaration_for_test(DeclarationResult {
+            request_id: id,
+            path: path.clone(),
+            target: None,
+            unsupported: false,
+        });
+    assert!(app.drain_lsp_declaration());
+    assert_eq!(app.status, "No declaration found");
+    assert_eq!(app.declaration_request_id, None);
+
+    app.request_type_definition_at_cursor();
+    let id = app
+        .type_definition_request_id
+        .expect("a type definition request");
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_type_definition_for_test(TypeDefinitionResult {
+            request_id: id,
+            path,
+            target: None,
+            unsupported: false,
+        });
+    assert!(app.drain_lsp_type_definition());
+    assert_eq!(app.status, "No type definition found");
+    assert_eq!(app.type_definition_request_id, None);
+}
+
+#[test]
+fn a_stale_jump_reply_changes_nothing_and_a_found_target_still_jumps() {
+    // Negative: only the outstanding request's reply speaks, and a reply
+    // with a target jumps as before instead of reporting "not found".
+    use crate::lsp::manager::DefinitionResult;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = jump_app(tmp.path());
+    let path = app.editor.path.clone().unwrap();
+    app.request_definition_at_cursor();
+    let id = app.definition_request_id.expect("F12 sent a request");
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_definition_for_test(DefinitionResult {
+            request_id: id + 1000,
+            path: path.clone(),
+            target: None,
+        });
+    assert!(!app.drain_lsp_definition(), "a stale reply is dropped");
+    assert_eq!(app.status, "Jumped to m.py line 2");
+    assert_eq!(app.definition_request_id, Some(id), "still waiting");
+
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_definition_for_test(DefinitionResult {
+            request_id: id,
+            path: path.clone(),
+            target: Some((path, 0, 0)),
+        });
+    assert!(app.drain_lsp_definition());
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
+    assert_ne!(app.status, "No definition found");
+}
+
+// ── #1483: one snippet croft cannot read no longer empties the whole set ──
+
+/// A Python buffer holding `typed`, with a snippet set that mixes a plain
+/// prefix and an array one; returns the first line after Tab.
+fn expand_with_array_prefix_snippets(typed: &str) -> String {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("loop.py");
+    std::fs::write(&f, "").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.snippets = crate::snippets::SnippetSet::from_json(
+        r#"{
+            "Python main guard": { "prefix": "main", "body": "if __name__ == '__main__':", "scope": "python" },
+            "For loop": { "prefix": ["for", "fori"], "body": ["for ${1:i} in range(${2:10}):", "    $0"], "scope": "python" }
+        }"#,
+    );
+    app.editor.insert_str(typed);
+    app.handle_editor_tab();
+    app.editor.lines[0].clone()
+}
+
+#[test]
+fn tab_expands_each_word_of_an_array_prefix() {
+    assert_eq!(
+        expand_with_array_prefix_snippets("fori"),
+        "for i in range(10):"
+    );
+    assert_eq!(
+        expand_with_array_prefix_snippets("for"),
+        "for i in range(10):"
+    );
+    // The snippet beside it still expands too.
+    assert_eq!(
+        expand_with_array_prefix_snippets("main"),
+        "if __name__ == '__main__':"
+    );
+}
+
+#[test]
+fn a_snippet_reload_with_a_skipped_entry_says_so() {
+    // Built in memory: writing the real snippets.json would leak into every
+    // concurrently running test that builds an `App`.
+    let set = crate::snippets::SnippetSet::from_json(
+        r#"{ "Broken": { "prefix": 42, "body": "x" }, "Log": { "prefix": "log", "body": "y" } }"#,
+    );
+    let status = super::snippets_reload_status(set.is_broken(), set.warnings());
+    assert!(
+        status.contains("1 warning") && status.contains("OUTPUT · Snippets"),
+        "{status:?}"
+    );
+}
+
+/// Negative: a clean reload says nothing about warnings.
+#[test]
+fn a_clean_snippet_reload_has_no_warning() {
+    let set =
+        crate::snippets::SnippetSet::from_json(r#"{ "Log": { "prefix": "log", "body": "y" } }"#);
+    assert_eq!(
+        super::snippets_reload_status(set.is_broken(), set.warnings()),
+        "Snippets reloaded"
+    );
+}
+
+/// A diagnostic for the Problems panel, as a language server reports it.
+fn problem(
+    line: u32,
+    severity: crate::lsp::manager::DiagnosticSeverity,
+    message: &str,
+) -> crate::widgets::problems::ProblemItem {
+    crate::widgets::problems::ProblemItem {
+        line,
+        col: 0,
+        col_utf16: true,
+        severity,
+        message: message.into(),
+        source: "ruff".into(),
+    }
+}
+
+#[test]
+fn the_problems_tab_is_announced_with_its_counts_and_top_entry() {
+    use crate::lsp::manager::DiagnosticSeverity::{Error, Warning};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Terminal;
+    app.bottom_panel_tab = BottomPanelTab::Problems;
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Problems, no problems");
+    assert_eq!(snap.item, None);
+    app.problems
+        .set_groups(vec![crate::widgets::problems::ProblemGroup {
+            path: tmp.path().join("app.py"),
+            name: "app.py".into(),
+            rel_dir: String::new(),
+            items: vec![
+                problem(3, Error, "Undefined name `totl`"),
+                problem(4, Error, "Type mismatch"),
+                problem(4, Warning, "Unused variable"),
+            ],
+        }]);
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Problems, 2 errors, 1 warning");
+    assert_eq!(
+        snap.item.as_deref(),
+        Some("app.py line 4: Undefined name `totl` (ruff)")
+    );
+}
+
+#[test]
+fn the_terminal_tab_is_still_announced_as_its_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Terminal;
+    app.bottom_panel_tab = BottomPanelTab::Terminal;
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Terminal 1");
+    assert_eq!(snap.item, None);
+}
+
+#[test]
+fn the_output_ports_and_captures_tabs_are_announced_by_name_and_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Terminal;
+
+    let channel = "a11y-1295-channel";
+    crate::output::push(channel, crate::output::OutputLevel::Info, "hello");
+    app.output.sync();
+    assert!(app.output.select_by_name(channel));
+    app.bottom_panel_tab = BottomPanelTab::Output;
+    assert_eq!(app.a11y_snapshot().focus, format!("Output, {channel}"));
+
+    app.bottom_panel_tab = BottomPanelTab::Ports;
+    let snap = app.a11y_snapshot();
+    assert_eq!((snap.focus.as_str(), snap.item), ("Ports, none", None));
+    app.ports.upsert(
+        3000,
+        Some("http://localhost:3000".into()),
+        Some("node".into()),
+        crate::widgets::ports::PortOrigin::Local,
+    );
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Ports, 1 port");
+    assert_eq!(
+        snap.item.as_deref(),
+        Some("Port 3000, node, http://localhost:3000")
+    );
+
+    app.bottom_panel_tab = BottomPanelTab::Captures;
+    assert_eq!(app.a11y_snapshot().focus, "Captures, none");
+    app.captures.push(crate::widgets::captures::CapturedLine {
+        pane: "zsh".into(),
+        shell_pid: None,
+        message: "Build failed".into(),
+        line: "error: build failed".into(),
+    });
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Captures, 1 capture");
+    assert_eq!(snap.item.as_deref(), Some("Build failed, from zsh"));
+}
+
+#[test]
+fn search_results_are_announced_with_the_count_and_the_selected_match() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Tree;
+    app.sidebar_view = SidebarView::Search;
+    assert_eq!(app.a11y_snapshot().focus, "Search");
+    assert_eq!(
+        app.a11y_snapshot().item,
+        None,
+        "no results, nothing selected"
+    );
+    let hit = |file: &str, line_no: usize, text: &str| crate::widgets::search::SearchHit {
+        path: tmp.path().join(file),
+        line_no,
+        line_text: text.into(),
+        matches: 1,
+    };
+    app.search.hits = vec![
+        hit("app.py", 1, "def total(xs):"),
+        hit("b.py", 1, "total = 0"),
+        hit("b.py", 3, "total += i"),
+    ];
+    app.search.selected = 2;
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Search, 3 matches in 2 files");
+    assert_eq!(snap.item.as_deref(), Some("b.py line 3: total += i"));
+}
+
+/// #1295: the announced total counts matches, not matching lines, the same
+/// as the Search header: a line with two matches is two.
+#[test]
+fn search_announces_every_match_on_a_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Tree;
+    app.sidebar_view = SidebarView::Search;
+    app.search.hits = vec![crate::widgets::search::SearchHit {
+        path: tmp.path().join("b.py"),
+        line_no: 3,
+        line_text: "total += total".into(),
+        matches: 2,
+    }];
+    assert_eq!(app.a11y_snapshot().focus, "Search, 2 matches in 1 file");
+}
+
+#[test]
+fn the_selected_source_control_change_is_announced() {
+    use crate::git::{ChangeEntry, ChangeKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Tree;
+    app.sidebar_view = SidebarView::SourceControl;
+    let change = |path: &str, kind| ChangeEntry {
+        path: path.into(),
+        kind,
+        additions: 1,
+        deletions: 0,
+    };
+    app.source_control.entries = vec![
+        change("app.py", ChangeKind::Modified),
+        change("new.py", ChangeKind::StagedAdded),
+    ];
+    app.source_control.selected_change = None;
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Source Control, 2 changes");
+    assert_eq!(snap.item, None, "nothing selected, nothing read");
+    app.source_control.selected_change = Some(1);
+    assert_eq!(
+        app.a11y_snapshot().item.as_deref(),
+        Some("new.py, added, staged")
+    );
+    app.source_control.selected_change = Some(0);
+    assert_eq!(
+        app.a11y_snapshot().item.as_deref(),
+        Some("app.py, modified")
+    );
 }
 
 /// A format-on-save in flight for `m.py`, with `x` typed and not yet on

@@ -285,6 +285,29 @@ impl ProblemsPanel {
         self.groups.iter().map(|g| g.items.len()).sum()
     }
 
+    /// The first diagnostic the list shows from its scroll position down,
+    /// with its file: what screen reader mode reads out for the panel
+    /// (#1295), which has no row selection of its own yet.
+    pub fn top_diagnostic(&self) -> Option<(&ProblemGroup, &ProblemItem)> {
+        let mut row = 0usize;
+        for (g, items) in self.visible_groups() {
+            let group = &self.groups[g];
+            if self.group_by_file {
+                row += 1;
+                if self.collapsed.contains(&group.path) {
+                    continue;
+                }
+            }
+            for i in items {
+                if row >= self.scroll {
+                    return Some((group, &group.items[i]));
+                }
+                row += 1;
+            }
+        }
+        None
+    }
+
     pub fn error_count(&self) -> usize {
         self.severity_count(DiagnosticSeverity::Error)
     }
@@ -903,6 +926,37 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    #[test]
+    fn the_top_diagnostic_follows_the_scroll_filters_and_folds() {
+        use DiagnosticSeverity::{Error, Warning};
+        let mut p = ProblemsPanel::new();
+        assert!(p.top_diagnostic().is_none(), "no problems, no top row");
+        p.set_groups(vec![
+            group("a.rs", vec![diag(1, Warning, "w1"), diag(2, Error, "e1")]),
+            group("b.rs", vec![diag(5, Error, "e2")]),
+        ]);
+        let top = |p: &ProblemsPanel| {
+            p.top_diagnostic()
+                .map(|(g, it)| (g.name.clone(), it.message.clone()))
+        };
+        assert_eq!(top(&p), Some(("a.rs".into(), "w1".into())));
+        // Rows: a.rs header, w1, e1, b.rs header, e2. Scrolled past w1.
+        p.scroll_down(2);
+        assert_eq!(top(&p), Some(("a.rs".into(), "e1".into())));
+        // Scrolled onto b.rs's header: its first row below.
+        p.scroll_down(1);
+        assert_eq!(top(&p), Some(("b.rs".into(), "e2".into())));
+        p.scroll_up(10);
+        // Errors only: the warning is not shown, so not read.
+        p.cycle_filter();
+        assert_eq!(top(&p), Some(("a.rs".into(), "e1".into())));
+        p.cycle_filter();
+        p.cycle_filter();
+        // A folded file's rows are not shown, so not read.
+        p.toggle_collapse(&PathBuf::from("/repo/src/a.rs"));
+        assert_eq!(top(&p), Some(("b.rs".into(), "e2".into())));
     }
 
     /// Review round 1: the toolbar chip carries user text, so a long or

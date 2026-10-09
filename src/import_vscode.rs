@@ -104,6 +104,10 @@ fn never_means_disabled(v: &Value) -> Option<Value> {
     v.as_str().map(|s| Value::from(s == "never"))
 }
 
+fn none_means_disabled(v: &Value) -> Option<Value> {
+    v.as_str().map(|s| Value::from(s == "none"))
+}
+
 fn as_whitespace_mode(v: &Value) -> Option<Value> {
     // VS Code has five whitespace modes; croft has three (WhitespaceMode:
     // none, selection, all). Only ids croft can actually represent are
@@ -195,6 +199,11 @@ const SETTINGS: &[SettingMap] = &[
         convert: off_means_disabled,
     },
     SettingMap {
+        vscode: "debug.saveBeforeStart",
+        croft: "disable_save_before_debug",
+        convert: none_means_disabled,
+    },
+    SettingMap {
         vscode: "editor.renderWhitespace",
         croft: "render_whitespace",
         convert: as_whitespace_mode,
@@ -227,12 +236,11 @@ const SETTINGS: &[SettingMap] = &[
 /// does the same thing; a VS Code command with no true counterpart is left
 /// out so the import reports it rather than binding the user's chord to
 /// something that merely sounds similar.
-/// Two VS Code commands are deliberately ABSENT, having been mapped and
-/// then removed: `editor.action.revealDefinition` (F12) has no caret-driven
-/// croft equivalent, only `mouse_go_to_definition_at_click`, which reads the
-/// last POINTER position and would send F12 somewhere unrelated to the
-/// cursor; and `editor.action.showHover` is not `peek_definition`, which
-/// opens a different thing entirely.
+/// `editor.action.showHover` is deliberately ABSENT, having been mapped and
+/// then removed: it is not `peek_definition`, which opens a different thing
+/// entirely. `editor.action.revealDefinition` was once mapped to
+/// `mouse_go_to_definition_at_click`, which reads the last POINTER position;
+/// it now maps to the caret-driven `go_to_definition` (#1212).
 const COMMANDS: &[(&str, &str)] = &[
     ("workbench.action.files.save", "save_file"),
     ("workbench.action.files.saveAs", "save_as"),
@@ -338,6 +346,12 @@ const COMMANDS: &[(&str, &str)] = &[
     ("editor.action.blockComment", "toggle_block_comment"),
     ("editor.action.quickFix", "quick_fix"),
     ("editor.action.peekDefinition", "peek_definition"),
+    ("editor.action.revealDefinition", "go_to_definition"),
+    ("editor.action.goToReferences", "go_to_references"),
+    ("editor.action.revealDeclaration", "go_to_declaration"),
+    ("editor.action.goToTypeDefinition", "go_to_type_definition"),
+    ("editor.action.goToImplementation", "go_to_implementations"),
+    ("editor.action.rename", "rename_symbol"),
     ("editor.action.startFindReplaceAction", "replace_in_file"),
     ("editor.action.moveLinesUpAction", "move_line_up"),
     ("editor.action.moveLinesDownAction", "move_line_down"),
@@ -1356,6 +1370,85 @@ mod tests {
         );
     }
 
+    /// #1212: a remapped Go to Definition / References / Implementation /
+    /// Type Definition / Declaration / Rename chord carries over onto croft's
+    /// caret-driven commands, and croft loads every row it writes.
+    #[test]
+    fn the_lsp_navigation_and_rename_chords_import_onto_caret_commands() {
+        let pairs = [
+            (
+                "ctrl+alt+a",
+                "editor.action.revealDefinition",
+                "go_to_definition",
+            ),
+            (
+                "ctrl+alt+b",
+                "editor.action.goToReferences",
+                "go_to_references",
+            ),
+            (
+                "ctrl+alt+c",
+                "editor.action.revealDeclaration",
+                "go_to_declaration",
+            ),
+            (
+                "ctrl+alt+d",
+                "editor.action.goToTypeDefinition",
+                "go_to_type_definition",
+            ),
+            (
+                "ctrl+alt+e",
+                "editor.action.goToImplementation",
+                "go_to_implementations",
+            ),
+            ("ctrl+alt+f", "editor.action.rename", "rename_symbol"),
+        ];
+        let doc = Value::Array(
+            pairs
+                .iter()
+                .map(|(key, vscode, _)| json!({ "key": key, "command": vscode }))
+                .collect(),
+        );
+        let mut report = Report::default();
+        convert_keybindings(&doc, &mut report);
+        assert!(
+            report.dropped_keybindings.is_empty(),
+            "{:?}",
+            report.dropped_keybindings
+        );
+        let expected: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(key, _, croft)| (key.to_string(), croft.to_string()))
+            .collect();
+        assert_eq!(report.keybindings, expected);
+        let rows: Vec<Value> = report
+            .keybindings
+            .iter()
+            .map(|(key, command)| json!({ "key": key, "command": command }))
+            .collect();
+        let json = serde_json::to_string(&Value::Array(rows)).unwrap();
+        let (_keymap, warnings) = crate::keymap::Keymap::resolve(&json);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// The hover and peek commands still import as they did: `showHover` has
+    /// no croft counterpart and is reported, `peekDefinition` stays peek.
+    #[test]
+    fn hover_is_still_dropped_and_peek_still_imports_as_peek() {
+        let doc = json!([
+            { "key": "ctrl+alt+h", "command": "editor.action.showHover" },
+            { "key": "ctrl+alt+p", "command": "editor.action.peekDefinition" }
+        ]);
+        let mut report = Report::default();
+        convert_keybindings(&doc, &mut report);
+        assert_eq!(
+            report.keybindings,
+            vec![(String::from("ctrl+alt+p"), String::from("peek_definition"))]
+        );
+        assert_eq!(report.dropped_keybindings.len(), 1);
+        assert!(report.dropped_keybindings[0].contains("editor.action.showHover"));
+    }
+
     /// #852 (comment 3): VS Code's editor-tab commands import onto croft's
     /// palette commands of the same name, and croft loads every row.
     #[test]
@@ -1443,6 +1536,23 @@ mod tests {
                  happens to be, not at the caret"
             );
         }
+    }
+
+    /// #1400: `debug.saveBeforeStart: "none"` is the one value that turns
+    /// off saving before a launch; VS Code's other values all save.
+    #[test]
+    fn debug_save_before_start_none_disables_saving_before_a_launch() {
+        let none = json!({ "debug.saveBeforeStart": "none" });
+        let (mapped, _, _) = map_settings(none.as_object().unwrap());
+        assert_eq!(mapped["disable_save_before_debug"], json!(true));
+        for value in ["allEditorsInActiveGroup", "nonUntitledEditorsInActiveGroup"] {
+            let saves = json!({ "debug.saveBeforeStart": value });
+            let (mapped, _, _) = map_settings(saves.as_object().unwrap());
+            assert_eq!(mapped["disable_save_before_debug"], json!(false), "{value}");
+        }
+        let junk = json!({ "debug.saveBeforeStart": 3 });
+        let (mapped, _, _) = map_settings(junk.as_object().unwrap());
+        assert!(!mapped.contains_key("disable_save_before_debug"));
     }
 
     /// The workspace layer and this importer must read a VS Code settings

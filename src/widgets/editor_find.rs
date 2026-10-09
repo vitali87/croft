@@ -35,6 +35,10 @@ pub struct EditorFind {
     pub replace_visible: bool,
     pub replace: String,
     pub focus: FindField,
+    /// The whole query is selected (#1278): the seed Ctrl+F put in, or
+    /// Ctrl+A. The next typed character or paste replaces it and Backspace
+    /// clears it, as in VS Code; a caret key just drops the selection.
+    pub query_selected: bool,
 }
 
 impl EditorFind {
@@ -470,18 +474,24 @@ pub fn render_editor_find(
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    let input_row = |marker: &str, text: &str, focused: bool| {
+    let query_selected = state.query_selected && state.focus == FindField::Query;
+    let input_row = |marker: &str, text: &str, focused: bool, selected: bool| {
+        let text_style = if selected {
+            Style::default()
+                .fg(theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
+                .bg(theme.ui(Color::Rgb(0x26, 0x4f, 0x78)))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
+                .add_modifier(Modifier::BOLD)
+        };
         let mut spans = vec![
             Span::styled(
                 marker.to_string(),
                 Style::default().fg(theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
             ),
-            Span::styled(
-                text.to_string(),
-                Style::default()
-                    .fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(text.to_string(), text_style),
         ];
         if focused {
             spans.push(Span::styled(
@@ -495,12 +505,22 @@ pub fn render_editor_find(
     };
     if state.replace_visible && inner.height >= 2 {
         let rows = vec![
-            input_row("> ", &state.query, state.focus == FindField::Query),
-            input_row("⤷ ", &state.replace, state.focus == FindField::Replace),
+            input_row(
+                "> ",
+                &state.query,
+                state.focus == FindField::Query,
+                query_selected,
+            ),
+            input_row(
+                "⤷ ",
+                &state.replace,
+                state.focus == FindField::Replace,
+                false,
+            ),
         ];
         Widget::render(Paragraph::new(rows), inner, buf);
     } else {
-        let prompt = input_row("> ", &state.query, true);
+        let prompt = input_row("> ", &state.query, true, query_selected);
         Widget::render(Paragraph::new(prompt), inner, buf);
     }
 }
