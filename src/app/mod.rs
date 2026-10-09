@@ -4802,12 +4802,6 @@ pub struct App {
     /// Each line is escape-free text with the colour spans its SGR sequences
     /// set (#1501), so search and copy see `FAILED`, not `[31mFAILED[0m`.
     pub debug_console: Vec<crate::ansi_text::AnsiLine>,
-    /// The SGR state program output left in force, carried into its next
-    /// line the way a terminal carries it (#1501).
-    debug_console_style: crate::ansi_text::AnsiStyle,
-    /// An escape sequence cut off at the end of an output event, held until
-    /// the next event completes it: adapters chunk output arbitrarily.
-    debug_console_cut: String,
     /// True once the current/just-ended debug session stopped at least once
     /// (breakpoint / step / exception). Drives the "exited without hitting a
     /// breakpoint" end message. Reset when a new session starts.
@@ -6264,8 +6258,6 @@ impl App {
             watch_prev: std::collections::HashMap::new(),
             watch_baseline_pending: false,
             debug_console: Vec::new(),
-            debug_console_style: crate::ansi_text::AnsiStyle::default(),
-            debug_console_cut: String::new(),
             debug_ever_stopped: false,
             zoxide_jump: None,
             zoxide_add_folder: false,
@@ -30263,7 +30255,7 @@ impl App {
         // while in the background.
         let mut events = self.debug_sessions.take_focused_backlog();
         let mut background_ended: Vec<usize> = Vec::new();
-        let mut background_output: Vec<(String, String)> = Vec::new();
+        let mut background_output: Vec<crate::ansi_text::AnsiLine> = Vec::new();
         // By index, not name: a compound can list one configuration twice,
         // so two members can share a name.
         let mut background_stopped: Option<usize> = None;
@@ -30287,7 +30279,15 @@ impl App {
                     DapEvent::Output { category, text }
                         if crate::dap::session::output_is_user_visible(&category) =>
                     {
-                        background_output.push((named.name.clone(), text));
+                        // Parsed with this member's own stream state, so a
+                        // sibling's colour or cut escape never runs into it.
+                        let prefix = format!("[{}] ", named.name);
+                        background_output.extend(named.console_ansi.feed(&text).into_iter().map(
+                            |mut line| {
+                                line.prefix(&prefix);
+                                line
+                            },
+                        ));
                     }
                     DapEvent::Output { .. } => {}
                     other => {
@@ -30303,8 +30303,8 @@ impl App {
                 }
             }
         }
-        for (name, text) in background_output {
-            self.debug_console_push_output(&text, Some(&name));
+        for line in background_output {
+            self.debug_console_push_line(line);
         }
         // Highest index first, so removing one does not move the next.
         let mut ended_names = Vec::new();
@@ -30369,7 +30369,8 @@ impl App {
                 DapEvent::Output { category, text }
                     if crate::dap::session::output_is_user_visible(&category) =>
                 {
-                    self.debug_console_push_output(&text, None);
+                    let focused = self.debug_sessions.focused_index();
+                    self.debug_console_push_output(&text, focused);
                 }
                 // REPL submissions echo "❯ expr" then the result; watch/hover
                 // results are consumed elsewhere.
@@ -30779,24 +30780,23 @@ impl App {
         self.debug_console_push_line(crate::ansi_text::AnsiLine::plain(line));
     }
 
-    /// Append a program's output event to the debug console, one line per
-    /// embedded newline, with its colour sequences turned into spans and every
-    /// other escape dropped (#1501). `from` names a background session, whose
-    /// lines carry a `[name]` prefix. A sequence the event ends in the middle
-    /// of waits for the next event rather than leaking its tail as text.
-    fn debug_console_push_output(&mut self, text: &str, from: Option<&str>) {
-        let mut raw = std::mem::take(&mut self.debug_console_cut);
-        raw.push_str(text);
-        let whole = raw.len() - crate::ansi_text::unfinished_escape_len(&raw);
-        self.debug_console_cut = raw[whole..].to_string();
-        for part in raw[..whole].split('\n') {
-            let mut line = crate::ansi_text::parse_line(part, &mut self.debug_console_style);
-            if line.text.is_empty() {
-                continue;
-            }
-            if let Some(name) = from {
-                line.prefix(&format!("[{name}] "));
-            }
+    /// Append an output event of the session at `index` to the debug
+    /// console, one line per embedded newline, with its colour sequences
+    /// turned into spans and every other escape dropped (#1501). The parse
+    /// uses that session's own stream state: a sequence the event ends in the
+    /// middle of waits for that session's next event rather than leaking its
+    /// tail as text, and a colour it leaves on carries only into its own
+    /// lines, never a sibling's.
+    fn debug_console_push_output(&mut self, text: &str, index: usize) {
+        let lines = match self
+            .debug_sessions
+            .iter_named_mut_indexed()
+            .find(|(i, _)| *i == index)
+        {
+            Some((_, named)) => named.console_ansi.feed(text),
+            None => crate::ansi_text::AnsiStream::default().feed(text),
+        };
+        for line in lines {
             self.debug_console_push_line(line);
         }
     }
@@ -30934,8 +30934,6 @@ impl App {
         // tracking so the "exited without hitting a breakpoint" hint and the
         // console reflect only this run.
         self.debug_console.clear();
-        self.debug_console_style = crate::ansi_text::AnsiStyle::default();
-        self.debug_console_cut.clear();
         self.debug_ever_stopped = false;
         self.run_debug.session_ended = false;
         self.show_tree = true;
@@ -32850,7 +32848,7 @@ impl App {
                 DapEvent::Output { category, text }
                     if crate::dap::session::output_is_user_visible(&category) =>
                 {
-                    self.debug_console_push_output(&text, None);
+                    self.debug_console_push_output(&text, old);
                 }
                 DapEvent::Output { .. } => {}
                 other => keep.push(other),

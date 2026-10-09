@@ -100,6 +100,33 @@ impl AnsiLine {
     }
 }
 
+/// The parser state one output stream carries between its chunks: the SGR
+/// state left in force and an escape sequence cut off mid-chunk. Each debug
+/// session keeps its own (#1501), since two programs' output is two streams,
+/// not one terminal: a shared one let one session's cut `ESC[3` swallow the
+/// next session's first letter, and its unreset colour paint the other's text.
+#[derive(Clone, Debug, Default)]
+pub struct AnsiStream {
+    style: AnsiStyle,
+    cut: String,
+}
+
+impl AnsiStream {
+    /// Parse the next chunk into its non-empty lines, holding back an
+    /// escape sequence the chunk ends in the middle of until the next one.
+    pub fn feed(&mut self, text: &str) -> Vec<AnsiLine> {
+        let mut raw = std::mem::take(&mut self.cut);
+        raw.push_str(text);
+        let whole = raw.len() - unfinished_escape_len(&raw);
+        self.cut = raw[whole..].to_string();
+        raw[..whole]
+            .split('\n')
+            .map(|part| parse_line(part, &mut self.style))
+            .filter(|line| !line.text.is_empty())
+            .collect()
+    }
+}
+
 /// How many bytes at the end of `raw` are an escape sequence that has not
 /// finished yet: a stream cut mid-sequence (a debug adapter's output event,
 /// #1501) holds these back until the next chunk completes them, where

@@ -79124,3 +79124,51 @@ fn debug_console_plain_output_and_croft_lines_stay_plain() {
     assert_eq!(console_fg(echo, 0), None, "{:?}", echo.spans);
     assert_eq!(console_fg(console_line(&app, "2"), 0), None);
 }
+
+/// #1501: each debug session's output is its own ANSI stream. In a compound,
+/// session A ends an event mid-escape (`ESC[3`) with red left on; session B's
+/// next line must neither lose its first letter to A's escape nor turn red.
+#[test]
+fn debug_console_sessions_keep_their_own_colour_and_cut_escape() {
+    let tag = format!("streams-{}", std::process::id());
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let a_event = format!(
+        r#"{{"seq":1,"type":"event","event":"output","body":{{"category":"stdout","output":"\u001b[31mred from A {tag}\n\u001b[3"}}}}"#
+    );
+    app.debug_sessions.push("A", stub_emitting(&[&a_event]));
+    let a_line = format!("red from A {tag}");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "session A's output to reach the Debug Console",
+        || {
+            app.poll_dap();
+            app.debug_console.iter().any(|l| l.text == a_line)
+        },
+    );
+    // A is now in the background with red on and `ESC[3` held back.
+    let b_event = format!(
+        r#"{{"seq":1,"type":"event","event":"output","body":{{"category":"stdout","output":"hello from B {tag}\n"}}}}"#
+    );
+    app.debug_sessions.push("B", stub_emitting(&[&b_event]));
+    let b_line = format!("hello from B {tag}");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "session B's output to reach the Debug Console",
+        || {
+            app.poll_dap();
+            app.debug_console
+                .iter()
+                .any(|l| l.text.contains(&format!("from B {tag}")))
+        },
+    );
+    app.debug_stop();
+    let b = console_line(&app, &b_line);
+    assert_eq!(console_fg(b, 0), None, "A's red stays in A: {:?}", b.spans);
+    use crate::ansi_text::AnsiColor;
+    assert_eq!(
+        console_fg(console_line(&app, &a_line), 0),
+        Some(AnsiColor::Indexed(1)),
+        "A's own line is red"
+    );
+}
