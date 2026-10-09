@@ -70557,11 +70557,20 @@ type CodeqlCodeSearch = (
 /// The directory this croft keeps hot-exit backups and sticky notes under
 /// (#1578): `state`, after moving in what an earlier croft kept under
 /// `cache`, which cache cleaners are free to delete. Run at every launch,
-/// so a backup an older croft still writes to the cache is taken over too.
+/// so a backup an older croft still writes to the cache is taken over too,
+/// once that croft is gone (its own exit removes only the cache copy).
+/// Notes are merged note by note into the state store, since an older
+/// window may still be adding to its cache copy; lock files stay.
 pub(crate) fn user_data_dir(cache: &Path, state: &Path) -> PathBuf {
-    for kind in ["hot-exit", "notes"] {
-        crate::hot_exit::move_tree(&cache.join(kind), &state.join(kind));
-    }
+    crate::hot_exit::move_tree(
+        &cache.join("hot-exit"),
+        &state.join("hot-exit"),
+        &crate::hot_exit::owned_by_a_running_croft,
+    );
+    crate::sticky_notes::merge_stores(&cache.join("notes"), &state.join("notes"));
+    crate::hot_exit::move_tree(&cache.join("notes"), &state.join("notes"), &|p| {
+        p.extension().is_some_and(|x| x == "lock")
+    });
     state.to_path_buf()
 }
 

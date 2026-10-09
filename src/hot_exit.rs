@@ -253,14 +253,26 @@ fn is_gone(pid: u32) -> bool {
         && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
+/// Whether the backup at `path` belongs to another croft that still runs
+/// (#1578 review): an older croft writing its backups to the cache. Its
+/// clean exit removes only its cache copy, so a copy moved to the state
+/// directory under its feet would outlive it and come back on the next
+/// launch as though it had crashed. Its backup is left in the cache until
+/// it is gone. A file carrying this process's pid is never another
+/// croft's, the same rule as [`orphaned`].
+pub fn owned_by_a_running_croft(path: &Path) -> bool {
+    owner_of(path).is_some_and(|(pid, start)| pid != std::process::id() && owner_runs(pid, start))
+}
+
 /// Move everything under `old` into `new`, keeping the layout (#1578): how
 /// a launch takes over the backups and notes an earlier croft kept under
 /// the cache directory. A file already at its new path (an older croft
 /// still writing to the cache) keeps whichever copy is newer. A rename
 /// that cannot cross filesystems is a copy, which keeps the owner-only
-/// mode, then a removal. Emptied old directories go. Best-effort: what
-/// cannot be moved stays where it is, for the next launch to try again.
-pub fn move_tree(old: &Path, new: &Path) {
+/// mode, then a removal. A file `stays` picks is left where it is. Emptied
+/// old directories go. Best-effort: what cannot be moved stays where it
+/// is, for the next launch to try again.
+pub fn move_tree(old: &Path, new: &Path, stays: &dyn Fn(&Path) -> bool) {
     let Ok(entries) = std::fs::read_dir(old) else {
         return;
     };
@@ -271,10 +283,10 @@ pub fn move_tree(old: &Path, new: &Path) {
             continue;
         };
         if kind.is_dir() {
-            move_tree(&from, &to);
+            move_tree(&from, &to, stays);
             continue;
         }
-        if !kind.is_file() {
+        if !kind.is_file() || stays(&from) {
             continue;
         }
         let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
@@ -520,12 +532,44 @@ mod tests {
         let file = old.join("0123456789abcdef").join("42-7.json");
         crate::session_state::write_private_atomically(&file, b"{\"unsaved\":1}").unwrap();
 
-        move_tree(&old, &new);
+        move_tree(&old, &new, &|_| false);
         let moved = new.join("0123456789abcdef").join("42-7.json");
         assert_eq!(std::fs::read_to_string(&moved).unwrap(), "{\"unsaved\":1}");
         let mode = std::fs::metadata(&moved).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "still owner-only");
         assert!(!old.exists(), "the emptied cache directories go");
+    }
+
+    /// #1578 review: a backup whose croft still runs (an older croft that
+    /// writes to the cache, and on a clean exit removes only that copy)
+    /// stays in the cache; moving it would leave a copy behind that the next
+    /// launch restores as a crash. A gone croft's backup moves.
+    #[test]
+    fn move_tree_leaves_a_running_crofts_backup_in_the_cache() {
+        let cache = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let old = cache.path().join("hot-exit").join("0123456789abcdef");
+        let new = state.path().join("hot-exit").join("0123456789abcdef");
+        std::fs::create_dir_all(&old).unwrap();
+        let running = Running::start();
+        let pid = running.pid();
+        let started = start_time_of(pid).expect("a child's start time");
+        let live = format!("{pid}-{started}.json");
+        std::fs::write(old.join(&live), "{}").unwrap();
+        std::fs::write(old.join("999999999-7.json"), "{}").unwrap();
+
+        move_tree(
+            &cache.path().join("hot-exit"),
+            &state.path().join("hot-exit"),
+            &owned_by_a_running_croft,
+        );
+        assert!(old.join(&live).is_file(), "the running croft's copy stays");
+        assert!(!new.join(&live).exists());
+        assert!(
+            new.join("999999999-7.json").is_file(),
+            "a gone croft's moves"
+        );
+        assert!(!old.join("999999999-7.json").exists());
     }
 
     /// Negative: a file in both places (an older croft kept writing to the
@@ -552,7 +596,7 @@ mod tests {
         std::fs::write(new.join("b.json"), "new-newer").unwrap();
         set_age(&old.join("b.json"), 100);
         set_age(&new.join("b.json"), 10);
-        move_tree(&old, &new);
+        move_tree(&old, &new, &|_| false);
         assert_eq!(
             std::fs::read_to_string(new.join("a.json")).unwrap(),
             "old-newer"
@@ -564,7 +608,7 @@ mod tests {
         assert!(!old.exists());
 
         let nowhere = state.path().join("never");
-        move_tree(&cache.path().join("missing"), &nowhere);
+        move_tree(&cache.path().join("missing"), &nowhere, &|_| false);
         assert!(!nowhere.exists());
     }
 }
