@@ -77960,6 +77960,81 @@ fn the_wheel_away_from_the_hover_popup_still_closes_it() {
     );
 }
 
+/// #989: an App on the issue's repro, a merge stopped on a conflict.
+fn app_in_a_conflicted_merge() -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = r#"set -e
+git init -q -b main && git config user.email a@b && git config user.name a
+printf '# Orders\n\nRun `python pricing.py`.\n' > README.md && git add . && git commit -qm init
+git checkout -qb hotfix && sed 's/python pricing.py/python -m pricing/' README.md > README.tmp && mv README.tmp README.md && git commit -qam fix
+git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' README.md > README.tmp && mv README.tmp README.md && git commit -qam uv
+! git merge -q hotfix >/dev/null 2>&1"#;
+    let out = std::process::Command::new("sh")
+        .args(["-c", script])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.source_control.message = String::from("Merge hotfix");
+    (app, tmp)
+}
+
+fn committed_readme(root: &std::path::Path) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["show", "HEAD:README.md"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn commit_refuses_while_merge_conflicts_are_unresolved() {
+    let (mut app, tmp) = app_in_a_conflicted_merge();
+    app.commit_source_control();
+    wait_for_git_net(&mut app);
+    assert!(
+        !committed_readme(tmp.path()).contains("<<<<<<<"),
+        "the conflict markers were committed"
+    );
+    let feedback = app
+        .source_control
+        .commit_feedback
+        .clone()
+        .unwrap_or_default();
+    assert!(feedback.contains("Resolve 1 merge conflict"), "{feedback}");
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.source_control.message, "Merge hotfix",
+        "the message is kept"
+    );
+}
+
+#[test]
+fn commit_all_refuses_while_merge_conflicts_are_unresolved() {
+    // Commit All stages everything first, and `git add -A` marks a conflict
+    // resolved with its markers in it.
+    let (mut app, tmp) = app_in_a_conflicted_merge();
+    app.commit_all_source_control();
+    assert!(!committed_readme(tmp.path()).contains("<<<<<<<"));
+    assert_eq!(
+        crate::git::unmerged_paths(tmp.path()),
+        vec![String::from("README.md")],
+        "nothing was staged"
+    );
+    assert!(
+        app.status.contains("Resolve 1 merge conflict"),
+        "{}",
+        app.status
+    );
+}
+
 /// #910: `tax.py` open with an unsaved function, rewritten on disk behind
 /// it (a `git checkout`, a restore, an agent), and the sweep that notices.
 fn app_with_a_disk_conflict(tmp: &std::path::Path) -> (App, std::path::PathBuf) {
@@ -78333,6 +78408,162 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     let _ = render_buf(&mut app);
     assert!(app.source_control.nested_repos.is_empty());
     assert!(app.source_control.last_init_repo_button_area.width > 0);
+}
+
+/// An App over `tmp` whose user config lives in `cfg`, never the real one.
+fn settings_editor_app(cfg: &std::path::Path, tmp: &std::path::Path) -> App {
+    let mut app = App::new(tmp.to_path_buf()).unwrap();
+    app.config_dir = cfg.to_path_buf();
+    app.run_command(crate::widgets::command_palette::Command::OpenSettingsEditor);
+    assert!(app.settings_editor.is_some(), "the editor opens");
+    app
+}
+
+fn type_query(app: &mut App, q: &str) {
+    for c in q.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+#[test]
+fn the_settings_editor_flips_a_setting_into_the_user_layer_and_applies_it() {
+    // #612: search a setting, Enter edits it in place, the file and the live
+    // session both change, and the row names the layer that set it.
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        cfg.path().join("config.json"),
+        "{\n  \"auto_save\": false\n}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/config.json"),
+        "{ \"copy_on_select\": true }",
+    )
+    .unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    let copy = app
+        .settings_editor
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .find(|r| r.key == "copy_on_select")
+        .cloned()
+        .unwrap();
+    assert_eq!(copy.layer, crate::config_layers::LayerKind::Workspace);
+    type_query(&mut app, "auto save");
+    let row = app
+        .settings_editor
+        .as_ref()
+        .unwrap()
+        .selected_row()
+        .cloned()
+        .unwrap();
+    assert_eq!(row.key, "auto_save");
+    assert_eq!(row.value, serde_json::json!(false));
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cfg.path().join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(written["auto_save"], serde_json::json!(true));
+    assert!(app.auto_save, "applied to the live session");
+    let row = app
+        .settings_editor
+        .as_ref()
+        .unwrap()
+        .selected_row()
+        .cloned()
+        .unwrap();
+    assert_eq!(row.value, serde_json::json!(true));
+    assert_eq!(row.layer, crate::config_layers::LayerKind::User);
+}
+
+#[test]
+fn the_settings_editor_writes_the_workspace_layer_only_for_allowed_keys() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.settings_editor.as_ref().unwrap().target,
+        crate::config_layers::LayerKind::Workspace
+    );
+    type_query(&mut app, "format on save");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let ws: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".croft/config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ws["format_on_save"], serde_json::json!(true));
+    assert!(
+        !cfg.path().join("config.json").exists(),
+        "the user layer is untouched"
+    );
+    // A key only the user may set is refused for the workspace.
+    for _ in 0.."format on save".len() {
+        app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+            .unwrap();
+    }
+    type_query(&mut app, "sidebar auto hide");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.status.contains("user"), "{}", app.status);
+    let ws = std::fs::read_to_string(tmp.path().join(".croft/config.json")).unwrap();
+    assert!(!ws.contains("sidebar_auto_hide"), "{ws}");
+}
+
+#[test]
+fn the_settings_editor_asks_for_a_number_and_refuses_one_that_is_not() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "terminal scrollback");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(matches!(
+        app.input_prompt.as_ref().map(|p| &p.purpose),
+        Some(crate::widgets::input_prompt::InputPurpose::SettingValue { key }) if key == "terminal_scrollback"
+    ));
+    app.close_input_prompt();
+    app.submit_setting_value("terminal_scrollback", "lots");
+    assert!(app.status.contains("number"), "{}", app.status);
+    assert!(!cfg.path().join("config.json").exists());
+    app.submit_setting_value("terminal_scrollback", " 5000 ");
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cfg.path().join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(written["terminal_scrollback"], serde_json::json!(5000));
+}
+
+#[test]
+fn the_settings_editor_draws_its_value_prompt_on_top() {
+    // The prompt Enter opens for a number sits over the editor. Drawn under
+    // it, the user typed blind.
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "terminal scrollback");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.input_prompt.is_some(), "Enter asks for the number");
+    type_query(&mut app, "424242");
+    let backend = ratatui::backend::TestBackend::new(120, 36);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let screen: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(screen.contains("424242"), "the typed value is visible");
 }
 
 // ---- An empty Go to Definition / Declaration / Type Definition reply (#1302) ----
