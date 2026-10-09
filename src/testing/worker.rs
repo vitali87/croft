@@ -2223,6 +2223,55 @@ mod tests {
         assert_eq!(discovered(), (Vec::new(), Some(Some(true))));
     }
 
+    /// #1503: with `-n auto` in a project's addopts, pytest-xdist prints each
+    /// result outcome first. Run All read none of them and, the run exiting 1
+    /// for its failed test, the view showed "Run failed" over an empty list.
+    #[cfg(unix)]
+    #[test]
+    fn run_all_reads_results_under_pytest_xdist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("pyproject.toml"), "[project]\nname = \"x\"\n").unwrap();
+        fake_venv(
+            root,
+            ".venv",
+            "cat <<'EOF'\n\
+             ============================= test session starts ==============================\n\
+             created: 2/2 workers\n\
+             2 workers [2 items]\n\
+             \n\
+             scheduling tests via LoadScheduling\n\
+             \n\
+             [gw0] [ 50%] PASSED tests/test_x.py::test_a \n\
+             [gw1] [100%] FAILED tests/test_x.py::test_b \n\
+             =========================== short test summary info ============================\n\
+             FAILED tests/test_x.py::test_b - assert False\n\
+             ========================= 1 failed, 1 passed in 0.61s ==========================\n\
+             EOF\nexit 1",
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let etx = EpochTx {
+            tx: &tx,
+            epoch: 0,
+            codeql: Path::new("codeql"),
+        };
+        run_all(root, &etx);
+        let cases: Vec<(String, TestStatus)> = rx
+            .try_iter()
+            .filter_map(|(_, r)| match r {
+                TestResponse::Case(c) => Some((c.name, c.status)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cases,
+            vec![
+                (String::from("tests/test_x.py::test_a"), TestStatus::Passed),
+                (String::from("tests/test_x.py::test_b"), TestStatus::Failed),
+            ]
+        );
+    }
+
     /// #845: a project venv with pytest in it runs pytest as a module of the
     /// venv's own python, which puts the project root on `sys.path` (the
     /// bare `pytest` script does not, and a flat project's tests then fail
