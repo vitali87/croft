@@ -79435,3 +79435,83 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     assert!(!app.apply_build_scan(pane, Some(&cwd), "tsc --watch", "a.c:1:1: error: old\n"));
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
 }
+
+/// A WAL-mode database with one row, and the connection that wrote it,
+/// kept open like a running app's so nothing checkpoints into the file.
+fn wal_database(dir: &std::path::Path) -> (std::path::PathBuf, rusqlite::Connection) {
+    let db = dir.join("app.db");
+    let writer = rusqlite::Connection::open(&db).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; \
+             CREATE TABLE kv (k TEXT); INSERT INTO kv VALUES ('a');",
+        )
+        .unwrap();
+    (db, writer)
+}
+
+fn sqlite_keys(app: &App) -> Vec<String> {
+    let data = &app.editor.sheet.as_ref().expect("a SQLite tab").sheets[0];
+    data.rows.iter().map(|r| r[0].clone()).collect()
+}
+
+/// #1643: a commit from an app holding its WAL-mode connection open lands
+/// in `app.db-wal` and leaves `app.db` alone; the open database tab still
+/// picks it up on the next sweep.
+#[test]
+fn a_wal_commit_by_a_running_app_reloads_the_database_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (db, writer) = wal_database(tmp.path());
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&db).unwrap();
+    assert_eq!(sqlite_keys(&app), ["a"]);
+    let stamp = |p: &std::path::Path| {
+        let m = std::fs::metadata(p).unwrap();
+        (m.modified().unwrap(), m.len())
+    };
+    let before = stamp(&db);
+    writer.execute("INSERT INTO kv VALUES ('b')", []).unwrap();
+    assert_eq!(stamp(&db), before, "setup: the commit left app.db alone");
+    assert!(app.reload_open_file_after_external_change());
+    assert_eq!(sqlite_keys(&app), ["a", "b"]);
+    drop(writer);
+}
+
+/// #1643: the poll stats a SQLite tab's write-ahead log as well as the
+/// database, even before the log exists, and no log for any other tab.
+#[test]
+fn the_poll_watches_a_sqlite_tabs_log_and_no_other_tabs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = sqlite_table_of(tmp.path(), 3);
+    let txt = tmp.path().join("notes.txt");
+    std::fs::write(&txt, "x\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&txt).unwrap();
+    app.editor.open_in_new_tab(&db).unwrap();
+    let polled = app.polled_open_file_paths();
+    assert!(
+        polled.contains(&tmp.path().join("big.db-wal")),
+        "{polled:?}"
+    );
+    assert!(
+        !polled.contains(&tmp.path().join("notes.txt-wal")),
+        "{polled:?}"
+    );
+    assert!(polled.contains(&db) && polled.contains(&txt));
+}
+
+/// Negative (#1643): with no commit, the sweep leaves the database tab
+/// alone, cell cursor included, even while a writer holds it open.
+#[test]
+fn a_wal_database_with_no_new_commit_is_not_reloaded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (db, writer) = wal_database(tmp.path());
+    writer.execute("INSERT INTO kv VALUES ('b')", []).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&db).unwrap();
+    app.editor.sheet.as_mut().unwrap().sheets[0].cur_row = 1;
+    assert!(!app.reload_open_file_after_external_change());
+    assert_eq!(app.editor.sheet.as_ref().unwrap().sheets[0].cur_row, 1);
+    assert_eq!(sqlite_keys(&app), ["a", "b"]);
+    drop(writer);
+}

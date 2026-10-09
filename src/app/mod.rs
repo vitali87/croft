@@ -7721,8 +7721,31 @@ impl App {
     }
 
     fn sync_open_file_poll_mtime(&mut self) {
-        let paths = self.open_tab_paths();
+        let paths = self.polled_open_file_paths();
         self.fs_watch.sync_open_file_mtime(&paths);
+    }
+
+    /// What the poll stats for open tabs: each tab's file, and for a SQLite
+    /// tab its write-ahead log too, where a WAL-mode app's commits land
+    /// while the database file stays untouched (#1643). The log may not
+    /// exist yet; its appearing is a change like any other.
+    fn polled_open_file_paths(&self) -> Vec<PathBuf> {
+        let mut paths = self.open_tab_paths();
+        let wal = std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .filter(|e| {
+                e.sheet
+                    .as_ref()
+                    .is_some_and(|s| s.kind == crate::sheet::SheetKind::Sqlite)
+            })
+            .filter_map(|e| {
+                e.path
+                    .as_deref()
+                    .and_then(crate::widgets::editor::sqlite_wal_path)
+            });
+        paths.extend(wal);
+        paths
     }
 
     /// Every file backing an open tab, across all editor groups. The poll
@@ -7846,7 +7869,7 @@ impl App {
         if !self.fs_watch.poll_due() {
             return false;
         }
-        let open_paths = self.open_tab_paths();
+        let open_paths = self.polled_open_file_paths();
         let poll = self.fs_watch.poll(&mut self.tree, &open_paths);
         // Any directory change can also be a write to a file open in some
         // tab (background or active), so sweep all tabs whenever the poll

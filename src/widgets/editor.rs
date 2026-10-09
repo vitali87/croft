@@ -9487,7 +9487,22 @@ impl Editor {
     /// deleted out from under us).
     fn disk_stamp_of(path: &Path) -> Option<(SystemTime, u64)> {
         let meta = std::fs::metadata(path).ok()?;
-        Some((meta.modified().ok()?, meta.len()))
+        let stamp = (meta.modified().ok()?, meta.len());
+        // A SQLite database in WAL mode (#1643): a commit lands in
+        // `<path>-wal` and leaves the database file alone until a
+        // checkpoint, which can wait until the writing app exits. The log
+        // is part of what a reader sees, so it is part of the stamp: a
+        // commit moves it, and the database tab reloads like any other.
+        // Only SQLite names a file `<name>-wal`, so other files are as before.
+        Some(
+            match sqlite_wal_path(path).and_then(|w| std::fs::metadata(w).ok()) {
+                Some(wal) => (
+                    wal.modified().map_or(stamp.0, |m| m.max(stamp.0)),
+                    stamp.1 + wal.len(),
+                ),
+                None => stamp,
+            },
+        )
     }
 
     /// Record that this buffer is now in sync with disk. Called at open and
@@ -16980,6 +16995,13 @@ pub struct Crumb {
 /// A rendered breadcrumb crumb's hit-test span: `(x_start, width, jump target)`.
 type BreadcrumbRange = (u16, u16, Option<(u32, u32)>);
 
+/// Where SQLite keeps `path`'s write-ahead log, if `path` were a database
+/// in WAL mode: the same name with `-wal` after it (#1643).
+pub fn sqlite_wal_path(path: &Path) -> Option<PathBuf> {
+    let mut name = path.file_name()?.to_os_string();
+    name.push("-wal");
+    Some(path.with_file_name(name))
+}
 pub struct EditorTabs {
     /// The active editor's rect below the tab strip and breadcrumbs, from
     /// the last frame: where a view standing in for it (the history
