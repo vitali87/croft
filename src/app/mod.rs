@@ -49677,15 +49677,25 @@ impl App {
             Cmd::DebugAddWatch => self.open_add_watch_prompt(),
             Cmd::PeekDefinition => self.peek_definition_at_cursor(),
             Cmd::PeekReferences => self.peek_references_at_cursor(),
-            // Cmd+F12's request (#843), which has no `Ctrl` form.
-            Cmd::GoToImplementations => {
-                if self.editor.diff.is_none()
-                    && self.editor.sheet.is_none()
-                    && self.editor.image.is_none()
-                {
-                    self.request_implementation_at_cursor();
-                }
+            // The caret-driven LSP actions (#1212), the same calls the F-key
+            // chords make. A palette run or a rebound chord on a non-text
+            // view says why nothing happened instead of staying silent.
+            Cmd::GoToDefinition
+            | Cmd::GoToReferences
+            | Cmd::GoToDeclaration
+            | Cmd::GoToTypeDefinition
+            | Cmd::GoToImplementations
+            | Cmd::RenameSymbol
+                if self.editor.has_non_text_view() =>
+            {
+                self.status = format!("{} needs a text file", cmd.title());
             }
+            Cmd::GoToDefinition => self.request_definition_at_cursor(),
+            Cmd::GoToReferences => self.request_references_at_cursor(),
+            Cmd::GoToDeclaration => self.request_declaration_at_cursor(),
+            Cmd::GoToTypeDefinition => self.request_type_definition_at_cursor(),
+            Cmd::GoToImplementations => self.request_implementation_at_cursor(),
+            Cmd::RenameSymbol => self.start_rename_symbol(),
             // Position-carrying commands (#259). They read the click the
             // dispatcher set, and do nothing from the keyboard: invoked from
             // the palette there is no click to act on, and guessing the
