@@ -83,6 +83,9 @@ curl -fsSL "https://github.com/vitali87/croft/releases/latest/download/croft-$ar
 sudo mv "croft-$arch-$os/croft" /usr/local/bin/
 ```
 
+On Android in Termux there is no `sudo` and no `/usr/local/bin`: move it to
+`"$PREFIX/bin/"` instead.
+
 Every release also carries a `SHA256SUMS` covering all four archives, so a
 download can be verified independently. It lists every archive, so check only
 the one you fetched rather than running it whole:

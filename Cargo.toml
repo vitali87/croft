@@ -6,6 +6,10 @@ description = "VSCode-style TUI written in Rust"
 license = "MIT"
 repository = "https://github.com/vitali87/croft"
 homepage = "https://croft.software"
+# crates.io refuses a package over 10 MiB, and the docs' GIFs alone are ~3 MB
+# of it. Nothing the build reads lives in these (`include_str!` and
+# `include_bytes!` reach into assets/, docs/*.md and src/ only).
+exclude = ["/docs/images/", "/.github/", "/scripts/", "/sonar-project.properties", "/greptile.json", "/.coderabbit.yaml"]
 
 # Prebuilt binaries for `cargo binstall croft-software` (#376). The release
 # workflow publishes one tar.gz per target holding a single `croft` at the
