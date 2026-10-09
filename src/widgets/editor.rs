@@ -11257,8 +11257,10 @@ impl Editor {
     /// VS Code increment extensions all copy: bump the number under the
     /// cursor. When the cursor is not inside a number, the next one to its
     /// right on the same line is used, so the caret rarely needs positioning
-    /// precisely. Returns false when the line holds no number at or after
-    /// the cursor, leaving the buffer and the undo stack untouched.
+    /// precisely. With several carets every caret bumps its own number, in
+    /// one undo step, and each caret ends on its number (#1637). Returns
+    /// false when no caret's line holds a number at or after it, leaving the
+    /// buffer and the undo stack untouched.
     ///
     /// Formatting is preserved rather than normalised, because the point is
     /// to edit a literal in place: zero padding keeps its width (`007` ->
@@ -11266,44 +11268,100 @@ impl Editor {
     /// (`0xFF` -> `0x100`, `0Xff` -> `0X100`). Width only grows when the
     /// value needs the room.
     pub fn bump_number(&mut self, delta: i64) -> bool {
-        let row = self.cursor_row;
-        let Some(line) = self.lines.get(row) else {
+        // Every caret's number, read off the buffer before anything changes.
+        // Carets that share a number bump it once, so two carets on `19`
+        // give `20`, not `21`.
+        let all = self.selections_with_primary();
+        let mut owned: Vec<Option<(usize, usize)>> = Vec::with_capacity(all.len());
+        let mut bumps: Vec<(usize, NumberToken, String)> = Vec::new();
+        for s in &all {
+            let (row, col) = s.head;
+            let found = self.lines.get(row).and_then(|line| {
+                let tok = number_token_at_or_after(line, self.byte_index(row, col))?;
+                Some((tok, tok.bumped(line, delta)?))
+            });
+            let Some((tok, replacement)) = found else {
+                owned.push(None);
+                continue;
+            };
+            owned.push(Some((row, tok.start)));
+            if !bumps
+                .iter()
+                .any(|(r, t, _)| *r == row && t.start == tok.start)
+            {
+                bumps.push((row, tok, replacement));
+            }
+        }
+        if bumps.is_empty() {
             return false;
-        };
-        let caret = self.byte_index(row, self.cursor_col);
-        let Some(tok) = number_token_at_or_after(line, caret) else {
-            return false;
-        };
-        let Some(replacement) = tok.bumped(line, delta) else {
-            return false;
-        };
+        }
         // A clamped bump (`0x00` down) finds a number but changes nothing;
         // recording it would dirty a clean buffer and leave an undo step
         // that undoes nothing.
-        if replacement == line[tok.start..tok.end] {
+        bumps.retain(|(row, tok, rep)| *rep != self.lines[*row][tok.start..tok.end]);
+        if bumps.is_empty() {
             return true;
         }
 
         // A real edit from here on: pin a preview tab, or the next preview
         // open reuses it and the bump is lost with it.
         self.pin_on_edit();
+        // One undo step for every caret's bump.
         self.push_undo(EditKind::BumpNumber);
-        self.carets.clear();
         // Never coalesce: a run of bumps must undo one at a time, the way
         // holding Ctrl-A in vim does.
         self.last_edit_kind = None;
-        let line = &mut self.lines[row];
-        line.replace_range(tok.start..tok.end, &replacement);
-        // vim leaves the caret on the number's last digit, which is what
-        // makes a repeated bump keep working on the same literal even as it
-        // grows a digit.
-        let end_byte = tok.start + replacement.len();
-        let last = line[..end_byte]
-            .char_indices()
-            .next_back()
-            .map_or(end_byte, |(i, _)| i);
-        self.cursor_col = line[..last].chars().count();
-        self.selection = None;
+
+        // Where every caret lands, worked out on the text before the edits.
+        // Literals are ASCII, so a bump's growth in bytes is its growth in
+        // chars, and a point moves by what the bumps left of it on its row
+        // added.
+        let char_of =
+            |this: &Self, row: usize, byte: usize| this.lines[row][..byte].chars().count();
+        let growth_before = |this: &Self, row: usize, col: usize| -> isize {
+            bumps
+                .iter()
+                .filter(|(r, t, _)| *r == row && char_of(this, row, t.end) <= col)
+                .map(|(_, t, rep)| rep.len() as isize - (t.end - t.start) as isize)
+                .sum()
+        };
+        let shift = |this: &Self, (row, col): (usize, usize)| {
+            (
+                row,
+                col.saturating_add_signed(growth_before(this, row, col)),
+            )
+        };
+        let moved: Vec<EditorSelection> = all
+            .iter()
+            .zip(&owned)
+            .map(|(s, own)| {
+                let bump = own.and_then(|(row, start)| {
+                    bumps.iter().find(|(r, t, _)| *r == row && t.start == start)
+                });
+                match bump {
+                    // vim leaves the caret on the number's last digit, which
+                    // is what makes a repeated bump keep working on the same
+                    // literal even as it grows a digit.
+                    Some((row, tok, rep)) => {
+                        let start = char_of(self, *row, tok.start);
+                        let (_, start) = shift(self, (*row, start));
+                        EditorSelection::new(*row, start + rep.len().saturating_sub(1))
+                    }
+                    None => EditorSelection {
+                        anchor: shift(self, s.anchor),
+                        head: shift(self, s.head),
+                    },
+                }
+            })
+            .collect();
+
+        // Right to left along each row, so an edit never moves a literal
+        // still waiting for its own.
+        bumps.sort_by(|(ra, ta, _), (rb, tb, _)| (rb, tb.start).cmp(&(ra, ta.start)));
+        for (row, tok, replacement) in &bumps {
+            self.lines[*row].replace_range(tok.start..tok.end, replacement);
+        }
+        self.set_selections(&moved);
         self.mark_buffer_changed();
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
@@ -11417,46 +11475,102 @@ impl Editor {
     /// the one after it and advance the cursor (emacs `transpose-chars`). At
     /// the end of a non-final line the last character moves across the line
     /// break to the start of the next line. At the end of the final line it is
-    /// a no-op.
+    /// a no-op. With several carets each one swaps around itself, in one undo
+    /// step (#1637).
     pub fn transpose_chars(&mut self) {
-        let row = self.cursor_row;
-        let col = self.cursor_col;
+        let all = self.selections_with_primary();
+        let edits = all.iter().any(|s| {
+            let (row, col) = s.head;
+            if col >= self.line_char_len(row) {
+                row + 1 < self.lines.len()
+            } else {
+                col > 0
+            }
+        });
+        // One undo step for every caret's swap.
+        if edits {
+            self.push_undo(EditKind::Transpose);
+        }
+        // Bottom up and right to left: a swap only touches its own row's
+        // chars at its caret, or moves a row's last char to the start of the
+        // next, so every caret still waiting is where it was, and every caret
+        // already done is pinned from its line's end.
+        let mut order: Vec<usize> = (0..all.len()).collect();
+        order.sort_by(|&a, &b| all[b].head.cmp(&all[a].head));
+        // Two carets whose swaps share a character (`ab` with carets after
+        // `a` and after `b`) would each act on text the other already moved:
+        // the second of them, in this order, stays where it is instead.
+        let mut taken: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        let mut pinned = vec![(0, 0); all.len()];
+        for i in order {
+            let head = all[i].head;
+            let cells = self.transpose_cells(head);
+            if cells.iter().any(|c| taken.contains(c)) {
+                pinned[i] = self.pin_from_end(head);
+                continue;
+            }
+            taken.extend(cells);
+            let at = self.transpose_at(head);
+            pinned[i] = self.pin_from_end(at);
+        }
+        let moved: Vec<EditorSelection> = pinned
+            .iter()
+            .map(|&p| {
+                let (row, col) = self.unpin_from_end(p);
+                EditorSelection::new(row, col)
+            })
+            .collect();
+        self.set_selections(&moved);
+        if edits {
+            self.mark_buffer_changed();
+            self.recompute_highlights();
+        }
+        self.ensure_cursor_col_visible();
+    }
+
+    /// The `(row, char col)` cells one caret's Transpose Characters
+    /// changes, in the buffer as it is: the two chars it swaps, or a line's
+    /// last char and the line break it moves across (col = the line's
+    /// length). Empty when it only steps the caret.
+    fn transpose_cells(&self, (row, col): (usize, usize)) -> Vec<(usize, usize)> {
+        let len = self.line_char_len(row);
+        if col >= len {
+            if row + 1 >= self.lines.len() || len == 0 {
+                return Vec::new();
+            }
+            return vec![(row, len - 1), (row, len)];
+        }
+        if col == 0 {
+            return Vec::new();
+        }
+        vec![(row, col - 1), (row, col)]
+    }
+
+    /// One caret's Transpose Characters, returning where that caret goes.
+    fn transpose_at(&mut self, (row, col): (usize, usize)) -> (usize, usize) {
         let len = self.line_char_len(row);
         if col >= len {
             if row + 1 >= self.lines.len() {
-                return;
+                return (row, col);
             }
-            self.push_undo(EditKind::Transpose);
-            if len > 0 {
-                let mut chars: Vec<char> = self.lines[row].chars().collect();
-                let moved = chars.pop().unwrap();
-                self.lines[row] = chars.into_iter().collect();
-                self.lines[row + 1].insert(0, moved);
-                self.cursor_col = 1;
-            } else {
-                self.cursor_col = 0;
+            if len == 0 {
+                return (row + 1, 0);
             }
-            self.cursor_row = row + 1;
-            self.mark_buffer_changed();
-            self.recompute_highlights();
-            self.ensure_cursor_col_visible();
-            return;
+            let mut chars: Vec<char> = self.lines[row].chars().collect();
+            let moved = chars.pop().unwrap();
+            self.lines[row] = chars.into_iter().collect();
+            self.lines[row + 1].insert(0, moved);
+            return (row + 1, 1);
         }
         if col == 0 {
             // VS Code's single-character range at column 1: no swap, just step
             // the cursor right.
-            self.cursor_col = 1;
-            self.ensure_cursor_col_visible();
-            return;
+            return (row, 1);
         }
-        self.push_undo(EditKind::Transpose);
         let mut chars: Vec<char> = self.lines[row].chars().collect();
         chars.swap(col - 1, col);
         self.lines[row] = chars.into_iter().collect();
-        self.cursor_col = col + 1;
-        self.mark_buffer_changed();
-        self.recompute_highlights();
-        self.ensure_cursor_col_visible();
+        (row, col + 1)
     }
 
     /// VS Code "Convert Indentation to Spaces" (`editor.action.indentationToSpaces`):
@@ -29359,6 +29473,115 @@ mod tests {
         rows.push(e.cursor_row);
         rows.sort_unstable();
         rows
+    }
+
+    /// #1637: Increment and Decrement Number bump the number after every
+    /// caret, in one undo step, and keep every caret on its number.
+    #[test]
+    fn bump_number_changes_the_number_after_every_caret() {
+        let mut e = three_foo_selections();
+        assert!(e.bump_number(1));
+        assert_eq!(
+            e.lines,
+            vec!["let foo = 2;", "let bar = foo + 3;", "let baz = foo * 4;"]
+        );
+        assert_eq!(e.carets.len(), 2, "no caret is dropped");
+        let mut at: Vec<(usize, usize)> = e.carets.iter().map(|s| s.head).collect();
+        at.push((e.cursor_row, e.cursor_col));
+        at.sort_unstable();
+        assert_eq!(at, vec![(0, 10), (1, 16), (2, 16)], "each on its number");
+        assert!(e.undo());
+        assert_eq!(
+            e.lines,
+            vec!["let foo = 1;", "let bar = foo + 2;", "let baz = foo * 3;"]
+        );
+        let mut e = three_foo_selections();
+        assert!(e.bump_number(-1));
+        assert_eq!(
+            e.lines,
+            vec!["let foo = 0;", "let bar = foo + 1;", "let baz = foo * 2;"]
+        );
+    }
+
+    /// #1637: two carets on one number bump it once, two numbers on a line
+    /// with a caret before each both change, and a caret with no number
+    /// after it is kept where it was.
+    #[test]
+    fn bump_number_bumps_a_shared_number_once() {
+        let mut e = editor_with("x = 19; y = 5;");
+        carets_at(&mut e, &[(0, 4), (0, 5)]);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["x = 20; y = 5;"]);
+        let mut e = editor_with("x = 19; y = 5;");
+        carets_at(&mut e, &[(0, 0), (0, 8)]);
+        assert!(e.bump_number(10));
+        assert_eq!(e.lines, vec!["x = 29; y = 15;"]);
+        assert_eq!(e.carets.len(), 1);
+        let mut e = editor_with("n = 1\nno number");
+        carets_at(&mut e, &[(0, 0), (1, 3)]);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["n = 2", "no number"]);
+        assert_eq!(e.carets[0].head, (1, 3), "the caret with no number stays");
+    }
+
+    /// #1637: Transpose Characters swaps around every caret, in one undo
+    /// step, and each caret steps past its swap.
+    #[test]
+    fn transpose_swaps_at_every_caret() {
+        let mut e = editor_with("let foo = 1;\nlet bar = foo + 2;\nlet baz = foo * 3;");
+        carets_at(&mut e, &[(2, 5), (0, 5), (1, 5)]);
+        e.transpose_chars();
+        assert_eq!(
+            e.lines,
+            vec!["let ofo = 1;", "let abr = foo + 2;", "let abz = foo * 3;"]
+        );
+        assert_eq!(caret_rows(&e), vec![0, 1, 2]);
+        assert_eq!(
+            (e.cursor_row, e.cursor_col),
+            (2, 6),
+            "the primary stays primary"
+        );
+        assert!(e.carets.iter().all(|s| s.head.1 == 6));
+        assert!(e.undo());
+        assert_eq!(e.lines[0], "let foo = 1;");
+        assert_eq!(e.lines[2], "let baz = foo * 3;");
+    }
+
+    /// #1637: two carets whose swaps share a character do not act on text
+    /// the other already moved: `ab` with carets after `a` and after `b`
+    /// moves `b` to the next line once, and leaves `a` where it was.
+    #[test]
+    fn overlapping_transpose_carets_do_not_compound() {
+        let mut e = editor_with("ab\nx");
+        carets_at(&mut e, &[(0, 1), (0, 2)]);
+        e.transpose_chars();
+        assert_eq!(e.lines, vec!["a", "bx"]);
+        // Two carets with disjoint swaps on one line both still swap.
+        let mut e = editor_with("abcd");
+        carets_at(&mut e, &[(0, 1), (0, 3)]);
+        e.transpose_chars();
+        assert_eq!(e.lines, vec!["badc"]);
+    }
+
+    /// #1637 negative: one caret bumps and transposes as before, and a line
+    /// with no number is still reported as nothing to bump.
+    #[test]
+    fn a_single_caret_bumps_and_transposes_as_before() {
+        let mut e = editor_with("x = 41");
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["x = 42"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 5));
+        assert!(e.carets.is_empty());
+        let mut e = editor_with("abc\ndef");
+        e.cursor_col = 1;
+        e.transpose_chars();
+        assert_eq!(e.lines, vec!["bac", "def"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 2));
+        e.cursor_col = 3;
+        e.transpose_chars();
+        assert_eq!(e.lines, vec!["ba", "cdef"], "end of line moves to the next");
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 1));
+        assert!(!editor_with("none").bump_number(1));
     }
 
     #[test]
