@@ -20924,14 +20924,11 @@ impl App {
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
     }
 
-    /// The unsaved-changes prompt (#862): what would be lost and the three
-    /// ways out. Amber like Replace All's rather than red, since its default
-    /// (S / Enter) keeps the edits and only D throws anything away.
-    fn render_unsaved_confirm(&self, frame: &mut ratatui::Frame) {
-        let Some(exit) = self.pending_unsaved.as_ref() else {
-            return;
-        };
-        let (headline, names, save, discard) = match exit {
+    /// The unsaved-changes prompt's words: its headline, the files, and
+    /// what S and D do after their key letter ("ave and close"). Shared by
+    /// the modal and what screen reader mode reads out (#1584).
+    fn unsaved_confirm_text(&self, exit: &UnsavedExit) -> (String, String, String, String) {
+        match exit {
             UnsavedExit::CloseTab { idx, .. } => (
                 String::from("This tab has unsaved changes:"),
                 self.editor.tab_display_label(*idx),
@@ -20952,7 +20949,17 @@ impl App {
                     format!("iscard and {verb}"),
                 )
             }
+        }
+    }
+
+    /// The unsaved-changes prompt (#862): what would be lost and the three
+    /// ways out. Amber like Replace All's rather than red, since its default
+    /// (S / Enter) keeps the edits and only D throws anything away.
+    fn render_unsaved_confirm(&self, frame: &mut ratatui::Frame) {
+        let Some(exit) = self.pending_unsaved.as_ref() else {
+            return;
         };
+        let (headline, names, save, discard) = self.unsaved_confirm_text(exit);
         let area = frame.area();
         let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
         let height: u16 = 8;
@@ -57700,6 +57707,14 @@ impl App {
         use crate::a11y::Snapshot;
         let tr = |s: &str| crate::i18n::tr(s).into_owned();
         let status = tr(&self.status);
+        if let Some((focus, item)) = self.modal_a11y() {
+            return Snapshot {
+                focus,
+                item: Some(item),
+                status,
+                ..Default::default()
+            };
+        }
         if let Some(p) = &self.prompt {
             return Snapshot {
                 focus: p.label.clone(),
@@ -57811,6 +57826,213 @@ impl App {
                 }
             }
         }
+    }
+
+    /// The dialog waiting for a key, if one is open, as screen reader mode
+    /// reads it (#1584): its title, then what it says and which key does
+    /// what. Without this a confirmation was silent, so a reader heard
+    /// nothing after Ctrl+W and could not know that D throws edits away.
+    /// Topmost first, in the order they are drawn; a new dialog that waits
+    /// for a key belongs here too.
+    fn modal_a11y(&self) -> Option<(String, String)> {
+        let tr = |s: &str| crate::i18n::tr(s).into_owned();
+        // The title, and its sentences joined for speech: a full stop
+        // between them unless one already ends in a question mark.
+        let said = |title: &str, parts: &[String]| -> (String, String) {
+            let mut item = String::new();
+            for part in parts.iter().map(|p| p.trim().trim_end_matches('.')) {
+                if part.is_empty() {
+                    continue;
+                }
+                if !item.is_empty() {
+                    item.push_str(if item.ends_with('?') { " " } else { ". " });
+                }
+                item.push_str(part);
+            }
+            (tr(title), item)
+        };
+        let yes_no = |yes: &str| format!("{}. {}", tr(yes), tr("N or Escape, no"));
+        if self.pending_terminal_warning {
+            return Some(said(
+                "Unsupported terminal",
+                &[
+                    tr(
+                        "Croft's icons and images need an inline-image protocol this terminal does not support",
+                    ),
+                    tr("Any key dismisses. D, don't show again"),
+                ],
+            ));
+        }
+        if let Some(p) = &self.input_prompt {
+            let hint = p
+                .hint
+                .clone()
+                .unwrap_or_else(|| String::from("Enter to confirm, Escape to cancel"));
+            return Some(said(&p.title, &[tr(&hint)]));
+        }
+        if let Some(ed) = &self.settings_editor {
+            let target = if ed.target == crate::config_layers::LayerKind::Workspace {
+                tr("Settings, writing to workspace")
+            } else {
+                tr("Settings, writing to user")
+            };
+            let row = ed.selected_row().map_or_else(
+                || tr("No matching setting"),
+                |r| {
+                    format!(
+                        "{}, {}, {}",
+                        r.key.replace('_', " "),
+                        crate::settings_editor::display(&r.value),
+                        tr(r.layer.label())
+                    )
+                },
+            );
+            return Some((target, row));
+        }
+        if let Some(exit) = &self.pending_unsaved {
+            let (headline, names, save, discard) = self.unsaved_confirm_text(exit);
+            // The tab label carries the dirty dot, which a reader would read
+            // out as "bullet"; every file named here is unsaved anyway.
+            let names = names.replace("● ", "");
+            return Some(said(
+                "Unsaved changes",
+                &[
+                    format!("{} {names}", tr(&headline)),
+                    format!("S, {}", tr(&format!("S{save}"))),
+                    format!("D, {}", tr(&format!("D{discard}"))),
+                    tr("Escape, cancel"),
+                ],
+            ));
+        }
+        if let Some(block) = &self.pending_run_block {
+            let title = if block.destructive {
+                "Run this block? It looks destructive"
+            } else {
+                "Run this block?"
+            };
+            return Some(said(
+                title,
+                &[
+                    format!(
+                        "{} {} {} {}",
+                        tr("in pane"),
+                        block.pane_name,
+                        tr("at"),
+                        block.cwd.display()
+                    ),
+                    block.code.lines().collect::<Vec<_>>().join("; "),
+                    yes_no("Y, yes, run"),
+                ],
+            ));
+        }
+        if self.pending_broadcast_enable {
+            let receiving = self
+                .terminals
+                .iter()
+                .filter(|t| !t.broadcast_excluded)
+                .count()
+                .max(1);
+            return Some(said(
+                "Broadcast input to all panes?",
+                &[
+                    format!(
+                        "{} {receiving} {}",
+                        tr("Every keystroke and paste will go to"),
+                        tr("terminal panes at once")
+                    ),
+                    yes_no("Y, yes, broadcast"),
+                ],
+            ));
+        }
+        if let Some((occurrences, files, skipped)) = self.pending_replace_all {
+            let mut parts = vec![
+                format!(
+                    "Replace {occurrences} occurrence(s) across {files} file(s) with \"{}\"?",
+                    self.search.replace
+                ),
+                tr("Files are rewritten on disk"),
+            ];
+            if skipped > 0 {
+                parts.push(format!(
+                    "{skipped} open file(s) with unsaved changes will be skipped"
+                ));
+            }
+            parts.push(tr("Enter or Y, replace. Escape, cancel"));
+            return Some(said("Replace all?", &parts));
+        }
+        if let Some(pending) = &self.pending_unsaved_scm {
+            let verb = pending.op.verb();
+            let names: Vec<String> = pending
+                .files
+                .iter()
+                .map(|p| {
+                    p.strip_prefix(&pending.root)
+                        .unwrap_or(p)
+                        .display()
+                        .to_string()
+                })
+                .collect();
+            let n = names.len();
+            return Some(said(
+                "Unsaved changes",
+                &[
+                    format!(
+                        "{n} file{} {} unsaved changes: {}",
+                        if n == 1 { "" } else { "s" },
+                        if n == 1 { "has" } else { "have" },
+                        names.join(", ")
+                    ),
+                    format!("S, Save All & {verb}"),
+                    format!("C, {verb} Anyway"),
+                    tr("Escape, cancel"),
+                ],
+            ));
+        }
+        if self.pending_discard_all {
+            return Some(said(
+                "Discard all changes?",
+                &[
+                    tr("This reverts every tracked file to HEAD. Untracked files are kept."),
+                    yes_no("Y, yes, discard all"),
+                ],
+            ));
+        }
+        if let Some(pr) = &self.pending_revert_hunk {
+            return Some(said(
+                "Revert hunk?",
+                &[
+                    tr("This will undo the change hunk under the cursor on disk."),
+                    pr.rel_path.clone(),
+                    yes_no("Y, yes, revert"),
+                ],
+            ));
+        }
+        if let Some(pd) = &self.pending_discard {
+            let warn = if pd.untracked {
+                "This will permanently delete the file from disk."
+            } else {
+                "This will overwrite your local changes from HEAD."
+            };
+            return Some(said(
+                "Discard changes?",
+                &[tr(warn), pd.rel_path.clone(), yes_no("Y, yes, discard")],
+            ));
+        }
+        if let Some(url) = &self.pending_local_open {
+            return Some(said(
+                "Open on local Mac?",
+                &[
+                    tr("This URL will open in YOUR LOCAL MAC's browser via the croft relay."),
+                    url.clone(),
+                    format!(
+                        "{}. {}",
+                        tr("Y, yes once. A, always for this session"),
+                        tr("N or Escape, no")
+                    ),
+                ],
+            ));
+        }
+        None
     }
 
     /// What screen reader mode says for the bottom panel's front tab
@@ -57984,9 +58206,12 @@ impl App {
             return;
         }
         // A picker covers the caret: read its selection from the status bar.
+        // So does a dialog waiting for a key (#1584), except a text prompt,
+        // whose own caret is where the typing is.
         let picker = self.command_palette.is_some()
             || self.file_finder.is_some()
-            || self.list_picker.is_some();
+            || self.list_picker.is_some()
+            || (self.input_prompt.is_none() && self.modal_a11y().is_some());
         if picker && let Some(pos) = self.announce_pos {
             frame.set_cursor_position(pos);
             return;

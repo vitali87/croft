@@ -1,0 +1,1 @@
+fix: Screen reader mode now reads a dialog when it opens, with what it says and which key does what: Unsaved Changes on close or quit, Discard Changes, Discard All, Revert Hunk, Replace All, Run Block, Broadcast Input, Open on Local Mac, the Settings editor and every one-line prompt. Before, they were silent and the caret line behind them stayed on the status bar.

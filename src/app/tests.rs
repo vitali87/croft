@@ -79435,3 +79435,174 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     assert!(!app.apply_build_scan(pane, Some(&cwd), "tsc --watch", "a.c:1:1: error: old\n"));
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
 }
+
+/// Draw one frame of `app` and return the terminal and where the real
+/// cursor was left, which is what a screen reader follows.
+fn draw_and_cursor(
+    app: &mut App,
+) -> (
+    ratatui::Terminal<ratatui::backend::TestBackend>,
+    ratatui::layout::Position,
+) {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let pos = term.get_cursor_position().unwrap();
+    (term, pos)
+}
+
+/// #1584: Ctrl+W on an edited tab opens the unsaved-changes prompt, and
+/// screen reader mode reads its title, the file and what S, D and Escape
+/// do, once, with the cursor on that line rather than behind the dialog.
+#[test]
+fn the_unsaved_changes_prompt_is_announced_with_its_file_and_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    app.screen_reader = true;
+    draw_and_cursor(&mut app);
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.pending_unsaved.is_some(), "setup: the prompt opened");
+    let (_term, cursor) = draw_and_cursor(&mut app);
+    let said = app.announcer.line.clone();
+    for part in [
+        "Unsaved changes",
+        "This tab has unsaved changes: a.txt",
+        "S, Save and close",
+        "D, Don't save",
+        "Escape, cancel",
+    ] {
+        assert!(said.contains(part), "{part:?} missing from {said:?}");
+    }
+    let (x, y) = app.announce_pos.expect("the status bar shows the line");
+    assert_eq!((cursor.x, cursor.y), (x, y), "the cursor sits on the line");
+    // Said once: the next frame, with nothing changed, says nothing new.
+    let snap = app.a11y_snapshot();
+    assert!(!app.announcer.update(snap, None));
+}
+
+/// #1584: the quit prompt names the files and its own verbs.
+#[test]
+fn the_quit_prompt_is_announced_with_its_files_and_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    press_ctrl_q(&mut app);
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Unsaved changes");
+    let item = snap.item.unwrap_or_default();
+    for part in [
+        "1 file has unsaved changes: a.txt",
+        "S, Save all and quit",
+        "D, Discard and quit",
+    ] {
+        assert!(item.contains(part), "{part:?} missing from {item:?}");
+    }
+}
+
+/// #1584: the Source Control and Replace All confirmations say what they
+/// will do and which key does it.
+#[test]
+fn discard_and_replace_all_confirmations_are_announced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.pending_discard = Some(PendingDiscard {
+        rel_path: String::from("src/seed.txt"),
+        untracked: false,
+        staged: false,
+    });
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Discard changes?");
+    assert_eq!(
+        snap.item.as_deref(),
+        Some(
+            "This will overwrite your local changes from HEAD. src/seed.txt. \
+             Y, yes, discard. N or Escape, no"
+        )
+    );
+    app.pending_discard = None;
+    app.request_discard_all_source_control();
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Discard all changes?");
+    assert!(
+        snap.item
+            .as_deref()
+            .unwrap_or_default()
+            .ends_with("Y, yes, discard all. N or Escape, no"),
+        "{:?}",
+        snap.item
+    );
+    app.pending_discard_all = false;
+    app.search.replace = String::from("total");
+    app.pending_replace_all = Some((3, 2, 1));
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Replace all?");
+    assert_eq!(
+        snap.item.as_deref(),
+        Some(
+            "Replace 3 occurrence(s) across 2 file(s) with \"total\"? \
+             Files are rewritten on disk. \
+             1 open file(s) with unsaved changes will be skipped. \
+             Enter or Y, replace. Escape, cancel"
+        )
+    );
+}
+
+/// #1584 (comment): the Settings editor reads its target layer and the
+/// selected row, and a one-line prompt reads its title and keys; typing
+/// into the prompt is left to the reader's own echo, not re-read.
+#[test]
+fn the_settings_editor_and_an_input_prompt_are_announced() {
+    use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_settings_editor();
+    let ed = app.settings_editor.as_mut().unwrap();
+    ed.set_query(String::from("auto save"));
+    let key_name = ed.selected_row().unwrap().key.replace('_', " ");
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Settings, writing to user");
+    let item = snap.item.unwrap_or_default();
+    assert!(item.starts_with(&format!("{key_name}, ")), "{item}");
+    // The layer that set the value closes the line: the default here, or
+    // the user layer when the machine running the suite sets it.
+    assert!(
+        [", default", ", user"].iter().any(|l| item.ends_with(l)),
+        "{item}"
+    );
+    app.settings_editor.as_mut().unwrap().target = crate::config_layers::LayerKind::Workspace;
+    assert_eq!(app.a11y_snapshot().focus, "Settings, writing to workspace");
+    app.settings_editor = None;
+    app.input_prompt = Some(InputPrompt::new(
+        InputPurpose::PullRequestNumber,
+        "Review Pull Request",
+        "number or URL",
+    ));
+    let before = app.a11y_snapshot();
+    assert_eq!(before.focus, "Review Pull Request");
+    assert_eq!(
+        before.item.as_deref(),
+        Some("Enter to confirm, Escape to cancel")
+    );
+    app.input_prompt.as_mut().unwrap().value = String::from("12");
+    assert_eq!(app.a11y_snapshot(), before, "typing is not re-read");
+}
+
+/// Negative (#1584): with no dialog open the snapshot is the focused
+/// pane's as before, and screen reader mode off still says nothing and
+/// leaves the caret where it was.
+#[test]
+fn without_a_dialog_the_editor_is_announced_and_mode_off_stays_quiet() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Editor a.txt");
+    assert_eq!(snap.line.map(|(n, _)| n), Some(1));
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.pending_unsaved.is_some());
+    draw_and_cursor(&mut app);
+    assert!(app.announcer.line.is_empty(), "mode off announces nothing");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.pending_unsaved.is_none());
+    assert_eq!(app.a11y_snapshot().focus, "Editor a.txt");
+}
