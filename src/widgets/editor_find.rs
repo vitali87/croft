@@ -35,6 +35,10 @@ pub struct EditorFind {
     pub replace_visible: bool,
     pub replace: String,
     pub focus: FindField,
+    /// The whole query is selected (#1278): the seed Ctrl+F put in, or
+    /// Ctrl+A. The next typed character or paste replaces it and Backspace
+    /// clears it, as in VS Code; a caret key just drops the selection.
+    pub query_selected: bool,
 }
 
 impl EditorFind {
@@ -247,18 +251,19 @@ pub fn expand_replacement(
             return Some(replacement.to_string());
         }
         let mut dst = String::new();
-        caps.expand(&unescape_replacement(replacement), &mut dst);
+        caps.expand(&unescape_replacement(replacement, &re), &mut dst);
         return Some(dst);
     }
     None
 }
 
 /// Translate VS Code's regex-replacement escapes (`\n`, `\t`, `\r`, `\\`)
-/// into their characters, unknown escapes passing through, and braces the
-/// numbered capture references. Literal (non-regex) replacements are never
-/// unescaped.
-fn unescape_replacement(replacement: &str) -> String {
-    crate::widgets::search::brace_group_refs(&unescape_escapes(replacement))
+/// into their characters, unknown escapes passing through, and read the
+/// `$` references against `re` (see
+/// [`brace_group_refs`](crate::widgets::search::brace_group_refs)). Literal
+/// (non-regex) replacements are never unescaped.
+fn unescape_replacement(replacement: &str, re: &regex::Regex) -> String {
+    crate::widgets::search::brace_group_refs(&unescape_escapes(replacement), re)
 }
 
 /// The escape half of [`unescape_replacement`].
@@ -309,7 +314,7 @@ pub fn replace_all_in_lines(
     };
     let unescaped;
     let replacement = if opts.use_regex {
-        unescaped = unescape_replacement(replacement);
+        unescaped = unescape_replacement(replacement, re.as_ref()?);
         unescaped.as_str()
     } else {
         replacement
@@ -469,18 +474,24 @@ pub fn render_editor_find(
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    let input_row = |marker: &str, text: &str, focused: bool| {
+    let query_selected = state.query_selected && state.focus == FindField::Query;
+    let input_row = |marker: &str, text: &str, focused: bool, selected: bool| {
+        let text_style = if selected {
+            Style::default()
+                .fg(theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
+                .bg(theme.ui(Color::Rgb(0x26, 0x4f, 0x78)))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
+                .add_modifier(Modifier::BOLD)
+        };
         let mut spans = vec![
             Span::styled(
                 marker.to_string(),
                 Style::default().fg(theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
             ),
-            Span::styled(
-                text.to_string(),
-                Style::default()
-                    .fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(text.to_string(), text_style),
         ];
         if focused {
             spans.push(Span::styled(
@@ -494,12 +505,22 @@ pub fn render_editor_find(
     };
     if state.replace_visible && inner.height >= 2 {
         let rows = vec![
-            input_row("> ", &state.query, state.focus == FindField::Query),
-            input_row("⤷ ", &state.replace, state.focus == FindField::Replace),
+            input_row(
+                "> ",
+                &state.query,
+                state.focus == FindField::Query,
+                query_selected,
+            ),
+            input_row(
+                "⤷ ",
+                &state.replace,
+                state.focus == FindField::Replace,
+                false,
+            ),
         ];
         Widget::render(Paragraph::new(rows), inner, buf);
     } else {
-        let prompt = input_row("> ", &state.query, true);
+        let prompt = input_row("> ", &state.query, true, query_selected);
         Widget::render(Paragraph::new(prompt), inner, buf);
     }
 }
@@ -763,6 +784,26 @@ mod tests {
         let (new_lines, n) = replace_all_in_lines(&buf, r"(\w)=(\d)", "$2:$1", opts).unwrap();
         assert_eq!(n, 2);
         assert_eq!(new_lines, lines(&["1:a 2:b"]));
+    }
+
+    /// #1399: the editor's find bar keeps a `$NAME` that is no group as
+    /// text, in Replace and Replace All, while `$1` still expands.
+    #[test]
+    fn a_dollar_name_that_is_no_group_stays_literal_in_the_editor() {
+        let opts = SearchOpts {
+            use_regex: true,
+            ..SearchOpts::default()
+        };
+        let got = expand_replacement("cp /opt/app", 3, 8, r"/opt/(\S+)", "$PREFIX/$1", opts);
+        assert_eq!(got.as_deref(), Some("$PREFIX/app"));
+        let buf = lines(&["cp /opt/app", "cp /opt/app.conf"]);
+        let (new_lines, n) =
+            replace_all_in_lines(&buf, r"/opt/(\S+)", "${PREFIX}/$1", opts).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(
+            new_lines,
+            lines(&["cp ${PREFIX}/app", "cp ${PREFIX}/app.conf"])
+        );
     }
 
     #[test]
