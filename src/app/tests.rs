@@ -78025,6 +78025,114 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     assert!(app.source_control.last_init_repo_button_area.width > 0);
 }
 
+// ---- An empty Go to Definition / Declaration / Type Definition reply (#1302) ----
+
+/// `m.py` open with the caret on `undefined_name`, as in the issue.
+fn jump_app(dir: &std::path::Path) -> App {
+    std::fs::write(
+        dir.join("m.py"),
+        "total = 42\nprint(total + undefined_name)\n",
+    )
+    .unwrap();
+    let mut app = App::new(dir.to_path_buf()).unwrap();
+    app.editor.open_pinned(&dir.join("m.py")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 16;
+    app.status = String::from("Jumped to m.py line 2");
+    app
+}
+
+#[test]
+fn an_empty_jump_reply_says_nothing_was_found_and_clears_the_request() {
+    use crate::lsp::manager::{DeclarationResult, DefinitionResult, TypeDefinitionResult};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = jump_app(tmp.path());
+    let path = app.editor.path.clone().unwrap();
+
+    app.request_definition_at_cursor();
+    let id = app.definition_request_id.expect("F12 sent a request");
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_definition_for_test(DefinitionResult {
+            request_id: id,
+            path: path.clone(),
+            target: None,
+        });
+    let redrew = app.drain_lsp_definition();
+    assert_eq!(app.status, "No definition found");
+    assert!(redrew, "the empty reply redraws");
+    assert_eq!(app.definition_request_id, None);
+
+    app.request_declaration_at_cursor();
+    let id = app.declaration_request_id.expect("a declaration request");
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_declaration_for_test(DeclarationResult {
+            request_id: id,
+            path: path.clone(),
+            target: None,
+            unsupported: false,
+        });
+    assert!(app.drain_lsp_declaration());
+    assert_eq!(app.status, "No declaration found");
+    assert_eq!(app.declaration_request_id, None);
+
+    app.request_type_definition_at_cursor();
+    let id = app
+        .type_definition_request_id
+        .expect("a type definition request");
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_type_definition_for_test(TypeDefinitionResult {
+            request_id: id,
+            path,
+            target: None,
+            unsupported: false,
+        });
+    assert!(app.drain_lsp_type_definition());
+    assert_eq!(app.status, "No type definition found");
+    assert_eq!(app.type_definition_request_id, None);
+}
+
+#[test]
+fn a_stale_jump_reply_changes_nothing_and_a_found_target_still_jumps() {
+    // Negative: only the outstanding request's reply speaks, and a reply
+    // with a target jumps as before instead of reporting "not found".
+    use crate::lsp::manager::DefinitionResult;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = jump_app(tmp.path());
+    let path = app.editor.path.clone().unwrap();
+    app.request_definition_at_cursor();
+    let id = app.definition_request_id.expect("F12 sent a request");
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_definition_for_test(DefinitionResult {
+            request_id: id + 1000,
+            path: path.clone(),
+            target: None,
+        });
+    assert!(!app.drain_lsp_definition(), "a stale reply is dropped");
+    assert_eq!(app.status, "Jumped to m.py line 2");
+    assert_eq!(app.definition_request_id, Some(id), "still waiting");
+
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_definition_for_test(DefinitionResult {
+            request_id: id,
+            path: path.clone(),
+            target: Some((path, 0, 0)),
+        });
+    assert!(app.drain_lsp_definition());
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
+    assert_ne!(app.status, "No definition found");
+}
+
 // ── #1483: one snippet croft cannot read no longer empties the whole set ──
 
 /// A Python buffer holding `typed`, with a snippet set that mixes a plain

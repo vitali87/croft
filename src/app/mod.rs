@@ -11509,11 +11509,13 @@ impl App {
     pub fn drain_lsp_definition(&mut self) -> bool {
         let mut target = None;
         let mut peek = None;
+        let mut empty_reply = false;
         {
             let Some(lsp) = self.lsp.as_ref() else {
                 return false;
             };
             let mut peek_replied = false;
+            let mut replied = false;
             while let Some(result) = lsp.drain_definition() {
                 if Some(result.request_id) == self.peek_definition_request_id {
                     peek_replied = true;
@@ -11523,6 +11525,7 @@ impl App {
                 if Some(result.request_id) != self.definition_request_id {
                     continue;
                 }
+                replied = true;
                 target = result.target;
             }
             if peek_replied && peek.is_none() {
@@ -11531,8 +11534,17 @@ impl App {
                 self.peek_definition_request_id = None;
                 self.status = String::from("No definition found");
             }
+            if replied {
+                self.definition_request_id = None;
+                // An empty F12 reply said nothing (#1302): a slow server, a
+                // missing one and "nothing here" all looked alike.
+                if target.is_none() {
+                    self.status = String::from("No definition found");
+                    empty_reply = true;
+                }
+            }
         }
-        let mut changed = false;
+        let mut changed = empty_reply;
         if let Some((path, line, col)) = peek {
             self.peek_definition_request_id = None;
             self.open_peek_popup(path, line, col);
@@ -11655,6 +11667,7 @@ impl App {
     pub fn drain_lsp_declaration(&mut self) -> bool {
         let mut target = None;
         let mut unsupported = false;
+        let mut replied = false;
         {
             let Some(lsp) = self.lsp.as_ref() else {
                 return false;
@@ -11663,9 +11676,13 @@ impl App {
                 if Some(result.request_id) != self.declaration_request_id {
                     continue;
                 }
+                replied = true;
                 target = result.target;
                 unsupported = result.unsupported;
             }
+        }
+        if replied {
+            self.declaration_request_id = None;
         }
         match target {
             // The jump itself is identical to definition: open the target file,
@@ -11682,6 +11699,10 @@ impl App {
                     String::from("Go to Declaration: not supported by this file's language server");
                 true
             }
+            None if replied => {
+                self.status = String::from("No declaration found");
+                true
+            }
             None => false,
         }
     }
@@ -11689,6 +11710,7 @@ impl App {
     pub fn drain_lsp_type_definition(&mut self) -> bool {
         let mut target = None;
         let mut unsupported = false;
+        let mut replied = false;
         {
             let Some(lsp) = self.lsp.as_ref() else {
                 return false;
@@ -11697,9 +11719,13 @@ impl App {
                 if Some(result.request_id) != self.type_definition_request_id {
                     continue;
                 }
+                replied = true;
                 target = result.target;
                 unsupported = result.unsupported;
             }
+        }
+        if replied {
+            self.type_definition_request_id = None;
         }
         match target {
             // The jump itself is identical to definition: open the target file,
@@ -11712,6 +11738,10 @@ impl App {
                 self.status = String::from(
                     "Go to Type Definition: not supported by this file's language server",
                 );
+                true
+            }
+            None if replied => {
+                self.status = String::from("No type definition found");
                 true
             }
             None => false,
