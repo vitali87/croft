@@ -78339,6 +78339,127 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     assert!(app.source_control.last_init_repo_button_area.width > 0);
 }
 
+/// A workspace whose `node_modules/.bin/tsc` logs its arguments and, run on
+/// `tsconfig.app.json`, reports one error, the way tsc does.
+#[cfg(unix)]
+fn fake_tsc_workspace(tsconfig: &str) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("tsconfig.json"), tsconfig).unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("src/main.ts"), "const n: string = 1;\n").unwrap();
+    let bin = tmp.path().join("node_modules/.bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        bin.join("tsc"),
+        "#!/bin/sh\necho \"$*\" >> calls.log\ncase \"$*\" in *tsconfig.app.json*) \
+         echo \"src/main.ts(1,7): error TS2322: Type 'number' is not assignable to type 'string'.\"; \
+         exit 2;; esac\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("tsc"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    tmp
+}
+
+#[cfg(unix)]
+fn run_project_check(tmp: &tempfile::TempDir) -> (String, String) {
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::ProblemsCheckProject);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while app.project_check_running && std::time::Instant::now() < deadline {
+        if !app.drain_project_check() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    let calls = std::fs::read_to_string(tmp.path().join("calls.log")).unwrap_or_default();
+    (app.status.clone(), calls)
+}
+
+/// A solution-style tsconfig (`"files": []` plus `references`, as Vite's
+/// TypeScript templates write) checks each referenced project, so their
+/// errors are reported instead of "no problems" (#1291).
+#[cfg(unix)]
+#[test]
+fn the_project_check_checks_each_referenced_tsconfig() {
+    let tmp = fake_tsc_workspace(
+        r#"{
+  // Vite's layout
+  "files": [],
+  "references": [{ "path": "./tsconfig.app.json" }, { "path": "./tsconfig.node.json" }],
+}"#,
+    );
+    let (status, calls) = run_project_check(&tmp);
+    assert_eq!(
+        calls,
+        "-p ./tsconfig.app.json --noEmit\n-p ./tsconfig.node.json --noEmit\n"
+    );
+    assert_eq!(status, "Whole-project check: 1 problem");
+}
+
+/// A root tsconfig that names no files and no references compiles
+/// nothing, so the check says that rather than "no problems".
+#[cfg(unix)]
+#[test]
+fn a_tsconfig_that_includes_nothing_is_never_reported_clean() {
+    let tmp = fake_tsc_workspace(r#"{ "files": [] }"#);
+    let (status, calls) = run_project_check(&tmp);
+    assert_eq!(
+        status,
+        "Whole-project check: tsconfig.json includes no files"
+    );
+    assert_eq!(calls, "", "nothing is run");
+}
+
+/// Negative: a plain tsconfig is still checked by one `tsc --noEmit`, and
+/// `"files": []` with an `include`, or with an `extends` base that may
+/// supply one, is a plain tsconfig.
+#[cfg(unix)]
+#[test]
+fn a_plain_tsconfig_still_gets_one_no_emit_run() {
+    for tsconfig in [
+        r#"{ "compilerOptions": { "strict": true } }"#,
+        r#"{ "files": [], "include": ["src"] }"#,
+        r#"{ "extends": "./tsconfig.base.json", "files": [] }"#,
+    ] {
+        let tmp = fake_tsc_workspace(tsconfig);
+        let (status, calls) = run_project_check(&tmp);
+        assert_eq!(calls, "--noEmit\n", "{tsconfig}");
+        assert_eq!(status, "Whole-project check: no problems", "{tsconfig}");
+    }
+}
+
+/// A root tsconfig with `references` that also owns files gets its own
+/// `--noEmit` run: tsc does not check references on a plain project
+/// check, so skipping the root would hide its files' errors (#1291).
+#[cfg(unix)]
+#[test]
+fn a_root_with_references_and_its_own_files_is_checked_too() {
+    let tmp = fake_tsc_workspace(
+        r#"{ "include": ["src"], "references": [{ "path": "./tsconfig.app.json" }] }"#,
+    );
+    let (status, calls) = run_project_check(&tmp);
+    assert_eq!(calls, "--noEmit\n-p ./tsconfig.app.json --noEmit\n");
+    assert_eq!(status, "Whole-project check: 1 problem");
+}
+
+/// A reference that is itself a solution-style config is followed to its
+/// leaves rather than run on its own, which would compile nothing (#1291).
+#[cfg(unix)]
+#[test]
+fn a_nested_solution_reference_is_checked_through_its_leaves() {
+    let tmp = fake_tsc_workspace(r#"{ "files": [], "references": [{ "path": "./web" }] }"#);
+    std::fs::create_dir_all(tmp.path().join("web")).unwrap();
+    std::fs::write(
+        tmp.path().join("web/tsconfig.json"),
+        r#"{ "files": [], "references": [{ "path": "./tsconfig.app.json" }, { "path": ".." }] }"#,
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("web/tsconfig.app.json"), "{}").unwrap();
+    let (status, calls) = run_project_check(&tmp);
+    assert_eq!(calls, "-p ./web/./tsconfig.app.json --noEmit\n");
+    assert_eq!(status, "Whole-project check: 1 problem");
+}
+
 /// An App over `tmp` whose user config lives in `cfg`, never the real one.
 fn settings_editor_app(cfg: &std::path::Path, tmp: &std::path::Path) -> App {
     let mut app = App::new(tmp.to_path_buf()).unwrap();
