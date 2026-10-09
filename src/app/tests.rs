@@ -24107,6 +24107,125 @@ fn run_active_file_with_python_file_spawns_a_new_terminal_and_focuses_it() {
     assert!(!app.run_debug.feedback_is_error);
 }
 
+/// #1400 fixture: `name` holds "old\n" on disk and "new\nold\n" in its
+/// open, unsaved tab.
+fn app_with_unsaved_file(name: &str) -> (tempfile::TempDir, App, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let file = root.join(name);
+    std::fs::write(&file, "old\n").unwrap();
+    let mut app = App::new(root).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.editor.insert_str("new\n");
+    assert!(app.editor.dirty);
+    (tmp, app, file)
+}
+
+/// #1400: F5 writes the unsaved tab before the launch, so the debuggee
+/// runs the text the breakpoints were set against.
+#[test]
+fn f5_saves_the_unsaved_buffer_before_launching() {
+    let (_tmp, mut app, file) = app_with_unsaved_file("notes.txt");
+    app.debug_start_or_continue();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    assert!(!app.editor.dirty);
+    assert!(
+        app.status.starts_with("No debugger for .txt files"),
+        "the launch itself still runs and reports: {}",
+        app.status
+    );
+}
+
+/// #1400: every dirty tab is saved, not only the one being debugged: the
+/// debuggee imports the others.
+#[test]
+fn f5_saves_every_unsaved_tab_not_only_the_active_one() {
+    let (tmp, mut app, helper) = app_with_unsaved_file("helper.txt");
+    let main = tmp.path().canonicalize().unwrap().join("main.txt");
+    std::fs::write(&main, "main\n").unwrap();
+    app.editor.open_pinned(&main).unwrap();
+    app.debug_start_or_continue();
+    assert_eq!(std::fs::read_to_string(&helper).unwrap(), "new\nold\n");
+    assert_eq!(app.unsaved_count(), 0);
+}
+
+/// #1400: Run writes the unsaved tab before the run command starts.
+#[test]
+fn run_saves_the_unsaved_buffer_before_running() {
+    let (_tmp, mut app, file) = app_with_unsaved_file("hello.py");
+    app.run_active_file();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    assert!(!app.editor.dirty);
+}
+
+/// #1400: Debug Test saves too: the test runs from the files on disk.
+#[test]
+fn debug_test_saves_the_unsaved_buffer_before_launching() {
+    let (_tmp, mut app, file) = app_with_unsaved_file("test_x.txt");
+    app.debug_named_test(String::from("test_x"));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    assert_eq!(app.status, "No test runner detected in this workspace");
+}
+
+/// #1400 negative: with `debug.saveBeforeStart: "none"` the file on disk
+/// is left alone, and the status says the debuggee runs the saved file.
+#[test]
+fn with_save_before_debug_off_f5_leaves_the_disk_and_warns() {
+    let (_tmp, mut app, file) = app_with_unsaved_file("notes.txt");
+    app.save_before_debug = false;
+    app.debug_start_or_continue();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+    assert!(app.editor.dirty);
+    assert!(
+        app.status
+            .starts_with("notes.txt has unsaved changes: the launch uses the file on disk"),
+        "{}",
+        app.status
+    );
+    assert!(
+        app.status.contains("No debugger for .txt files"),
+        "{}",
+        app.status
+    );
+}
+
+/// #1400 negative: a tab whose file changed on disk is never overwritten
+/// blind to start a launch; it stays unsaved and the status says so.
+#[test]
+fn f5_never_overwrites_a_file_changed_on_disk() {
+    let (_tmp, mut app, file) = app_with_unsaved_file("notes.txt");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&file, "theirs, changed elsewhere\n").unwrap();
+    app.debug_start_or_continue();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "theirs, changed elsewhere\n"
+    );
+    assert!(app.editor.dirty);
+    assert!(
+        app.status.contains("notes.txt has unsaved changes"),
+        "{}",
+        app.status
+    );
+}
+
+/// #1400 negative: with nothing unsaved, a launch writes nothing and says
+/// nothing about saving.
+#[test]
+fn f5_with_nothing_unsaved_writes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let file = root.join("notes.txt");
+    std::fs::write(&file, "old\n").unwrap();
+    let stamp = std::fs::metadata(&file).unwrap().modified().unwrap();
+    let mut app = App::new(root).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    app.debug_start_or_continue();
+    assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), stamp);
+    assert!(!app.status.contains("unsaved"), "{}", app.status);
+}
+
 /// #1444: View Changes vs main on a branch behind a moved main shows the
 /// branch's own work and names the merge base it starts from.
 #[test]
