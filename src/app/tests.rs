@@ -26356,6 +26356,109 @@ fn f5_with_nothing_unsaved_writes_nothing() {
     assert!(!app.status.contains("unsaved"), "{}", app.status);
 }
 
+/// #1639 fixture: [`app_with_unsaved_pinned_file`] with a tasks.json task
+/// `run hello` that cats the file.
+fn app_with_unsaved_file_and_task(name: &str) -> (tempfile::TempDir, App, PathBuf) {
+    let (tmp, app, file) = app_with_unsaved_pinned_file(name);
+    let vscode = tmp.path().join(".vscode");
+    std::fs::create_dir_all(&vscode).unwrap();
+    std::fs::write(
+        vscode.join("tasks.json"),
+        format!(
+            r#"{{ "version": "2.0.0", "tasks": [ {{ "label": "run hello", "type": "shell", "command": "cat {name}", "group": {{ "kind": "build", "isDefault": true }} }} ] }}"#
+        ),
+    )
+    .unwrap();
+    (tmp, app, file)
+}
+
+/// #1639: Tasks: Run Task writes the unsaved tab before the command
+/// starts, as F5 and Run do since #1400, so the task runs the text shown.
+#[test]
+fn run_task_saves_the_unsaved_buffer_before_the_task_starts() {
+    use crate::widgets::list_picker::ListPurpose;
+    let (_tmp, mut app, file) = app_with_unsaved_file_and_task("hello.py");
+    app.run_command(crate::widgets::command_palette::Command::RunTask);
+    assert_eq!(
+        app.list_picker.as_ref().map(|p| p.purpose),
+        Some(ListPurpose::RunTask)
+    );
+    app.confirm_list_picker();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    assert!(!app.editor.dirty);
+    assert_eq!(app.status, "Running run hello");
+}
+
+/// #1639: the build task and Rerun Last Task save first too.
+#[test]
+fn the_build_task_and_rerun_last_task_save_first() {
+    let (_tmp, mut app, file) = app_with_unsaved_file_and_task("hello.py");
+    app.run_build_task();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    app.editor.insert_str("newer\n");
+    app.rerun_last_task();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nnewer\nold\n");
+    assert_eq!(app.unsaved_count(), 0);
+}
+
+/// #1639: with saving before a run turned off, the task leaves the disk
+/// alone and the status names the file it did not see.
+#[test]
+fn with_save_before_run_off_a_task_names_the_unsaved_file() {
+    let (_tmp, mut app, file) = app_with_unsaved_file_and_task("hello.py");
+    app.save_before_debug = false;
+    app.run_build_task();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+    assert_eq!(
+        app.status,
+        "hello.py has unsaved changes: the task uses the file on disk - Running run hello"
+    );
+}
+
+/// #1639: a Testing run writes unsaved tabs first: the runner compiles or
+/// imports the files on disk.
+#[test]
+fn a_test_run_saves_the_unsaved_buffer_first() {
+    let (tmp, mut app, file) = app_with_unsaved_pinned_file("lib.rs");
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"t\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+    app.run_all_tests();
+    assert_ne!(app.status, crate::testing::NO_RUNNER_STATUS);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    app.editor.insert_str("newer\n");
+    app.testing.apply_case(crate::testing::model::TestCase {
+        name: "parse::run".into(),
+        status: crate::testing::model::TestStatus::NotRun,
+    });
+    app.run_named_test(String::from("run"));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nnewer\nold\n");
+    assert_eq!(app.status, "Running test parse::run");
+}
+
+/// #1639 negative: with nothing unsaved, a task writes nothing and says
+/// nothing about saving; a workspace with no test runner saves nothing.
+#[test]
+fn a_task_with_nothing_unsaved_writes_nothing() {
+    let (tmp, mut app, file) = app_with_unsaved_file_and_task("hello.py");
+    app.save_all();
+    let stamp = std::fs::metadata(&file).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    app.run_build_task();
+    assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), stamp);
+    assert_eq!(app.status, "Running run hello");
+
+    let other = tmp.path().canonicalize().unwrap().join("notes.txt");
+    std::fs::write(&other, "old\n").unwrap();
+    app.editor.open_pinned(&other).unwrap();
+    app.editor.insert_str("new\n");
+    app.run_all_tests();
+    assert_eq!(app.status, crate::testing::NO_RUNNER_STATUS);
+    assert_eq!(std::fs::read_to_string(&other).unwrap(), "old\n");
+}
+
 /// #1444: View Changes vs main on a branch behind a moved main shows the
 /// branch's own work and names the merge base it starts from.
 #[test]

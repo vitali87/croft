@@ -24029,9 +24029,11 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
-        self.test_worker.run_coverage();
-        self.set_sidebar_view(SidebarView::Testing);
-        self.status = String::from("Running tests with coverage");
+        self.run_with_unsaved_saved("the test run", |app| {
+            app.test_worker.run_coverage();
+            app.set_sidebar_view(SidebarView::Testing);
+            app.status = String::from("Running tests with coverage");
+        });
     }
 
     /// Fold a finished coverage run into the editor, and keep the active
@@ -24437,8 +24439,10 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
-        self.test_worker.run_all();
-        self.set_sidebar_view(SidebarView::Testing);
+        self.run_with_unsaved_saved("the test run", |app| {
+            app.test_worker.run_all();
+            app.set_sidebar_view(SidebarView::Testing);
+        });
     }
 
     /// Run a single test by exact name (click-to-run from the tree). Marks just
@@ -24447,9 +24451,11 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
-        self.testing.start_single(&name);
-        self.test_worker.run_one(name);
-        self.set_sidebar_view(SidebarView::Testing);
+        self.run_with_unsaved_saved("the test run", |app| {
+            app.testing.start_single(&name);
+            app.test_worker.run_one(name);
+            app.set_sidebar_view(SidebarView::Testing);
+        });
     }
 
     /// Jump the editor to a test's `fn` definition (Cmd/Opt+click in the tree).
@@ -24473,10 +24479,12 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
-        self.testing
-            .start_filter(&crate::testing::suite_pattern(&suite));
-        self.test_worker.run_suite(suite);
-        self.set_sidebar_view(SidebarView::Testing);
+        self.run_with_unsaved_saved("the test run", |app| {
+            app.testing
+                .start_filter(&crate::testing::suite_pattern(&suite));
+            app.test_worker.run_suite(suite);
+            app.set_sidebar_view(SidebarView::Testing);
+        });
     }
 
     /// Run the test the editor caret sits in (Cmd+K Enter / palette). Finds the
@@ -24500,6 +24508,10 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
+        self.run_with_unsaved_saved("the test run", |app| app.run_named_test_now(name));
+    }
+
+    fn run_named_test_now(&mut self, name: String) {
         let (run, exact) = match self.testing.sole_case_with_leaf(&name) {
             Some(full) => (full, true),
             None => (name, false),
@@ -24576,6 +24588,12 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
+        self.run_with_unsaved_saved("the test run", |app| {
+            app.run_test_at_cursor_with_coverage_now(name)
+        });
+    }
+
+    fn run_test_at_cursor_with_coverage_now(&mut self, name: String) {
         let (run, exact) = match self.testing.sole_case_with_leaf(&name) {
             Some(full) => (full, true),
             None => (name, false),
@@ -24603,6 +24621,12 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
+        self.run_with_unsaved_saved("the test run", |app| {
+            app.run_scope_with_coverage_now(name, suite)
+        });
+    }
+
+    fn run_scope_with_coverage_now(&mut self, name: String, suite: bool) {
         if suite {
             self.testing
                 .start_filter(&crate::testing::suite_pattern(&name));
@@ -31015,6 +31039,15 @@ impl App {
     /// with `disable_save_before_debug`, is named in front of the launch's
     /// own status.
     fn launch_with_unsaved_saved(&mut self, launch: impl FnOnce(&mut Self)) {
+        self.run_with_unsaved_saved("the launch", launch);
+    }
+
+    /// [`Self::launch_with_unsaved_saved`] for anything that runs the
+    /// project's files: a task, a Testing run (#1639). VS Code saves before
+    /// a task by default (`task.saveBeforeRun`); without it a build or test
+    /// run reported on code the editor had already changed. `what` names
+    /// the run in the warning.
+    fn run_with_unsaved_saved(&mut self, what: &str, launch: impl FnOnce(&mut Self)) {
         if self.save_before_debug && self.unsaved_count() > 0 {
             self.sweep_dirty_buffers(false, false);
         }
@@ -31029,7 +31062,7 @@ impl App {
             [first, rest @ ..] => (format!("{first} and {} more", rest.len()), "have"),
             [] => unreachable!("checked above"),
         };
-        let warning = format!("{names} {verb} unsaved changes: the launch uses the file on disk");
+        let warning = format!("{names} {verb} unsaved changes: {what} uses the file on disk");
         self.status = if self.status.is_empty() {
             warning
         } else {
@@ -37269,7 +37302,7 @@ impl App {
             }
             ListPurpose::RunTask => {
                 if let Some(task) = self.run_tasks.get(index).cloned() {
-                    self.run_project_task(task);
+                    self.start_project_task(task);
                 }
             }
             ListPurpose::ReviewPullRequest => {
@@ -37891,9 +37924,7 @@ impl App {
     pub fn run_build_task(&mut self) {
         let tasks = crate::tasks::discover_tasks(&self.active_workspace_root());
         match crate::tasks::default_build_task(&tasks).cloned() {
-            Some(task) => {
-                self.run_project_task(task);
-            }
+            Some(task) => self.start_project_task(task),
             None => {
                 self.open_run_task_picker();
                 self.status = "No build task detected; pick one".to_string();
@@ -37904,11 +37935,17 @@ impl App {
     /// Tasks: Rerun Last Task.
     pub fn rerun_last_task(&mut self) {
         match self.last_task.clone() {
-            Some(task) => {
-                self.run_project_task(task);
-            }
+            Some(task) => self.start_project_task(task),
             None => self.status = "No task has run yet".to_string(),
         }
+    }
+
+    /// Run `task` as the user asked for it (Run Task, the build task, Rerun
+    /// Last Task), unsaved tabs written first (#1639).
+    fn start_project_task(&mut self, task: crate::tasks::Task) {
+        self.run_with_unsaved_saved("the task", |app| {
+            app.run_project_task(task);
+        });
     }
 
     /// Resolve the branch-picker selection per its open purpose.
