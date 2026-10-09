@@ -7,8 +7,10 @@
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 use super::model::{Activity, TestCase, TestStatus};
 use super::parse::{
@@ -102,8 +104,72 @@ pub enum CoverageError {
     Unsupported { runner: &'static str },
 }
 
+/// What a cancel (#1534) needs to reach the runner the worker thread is
+/// blocked on: the process group of the child it is streaming, and how
+/// many requests the app has cancelled. Requests are counted on both sides
+/// in channel order, so a cancel covers the request in flight and any the
+/// worker has not picked up yet, and never a later one.
+#[derive(Clone, Default)]
+pub struct RunControl {
+    /// The streaming child's pid, which is its process group (it is
+    /// spawned as a group leader).
+    running: Arc<Mutex<Option<i32>>>,
+    /// Requests numbered up to this one are cancelled.
+    cancelled_upto: Arc<AtomicU64>,
+}
+
+impl RunControl {
+    /// Cancel every request numbered up to `upto`: kill the running child's
+    /// whole process group (the runner, pytest-xdist workers, a `cargo
+    /// test` binary), and keep any further child of those requests from
+    /// starting.
+    fn cancel(&self, upto: u64) {
+        self.cancelled_upto.fetch_max(upto, Ordering::SeqCst);
+        if let Some(pgid) = *self.running.lock().unwrap() {
+            // SAFETY: `pgid` is the group of a child this worker spawned as
+            // its own group leader, so only the test run is signalled.
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+        }
+    }
+
+    fn is_cancelled(&self, request: u64) -> bool {
+        request <= self.cancelled_upto.load(Ordering::SeqCst)
+    }
+
+    /// Spawn `cmd` as the leader of a new process group and record it, or
+    /// refuse with `None` when `request` was cancelled. Checked and
+    /// recorded under the lock, so a cancel either sees the pid or the
+    /// spawn sees the cancel.
+    fn spawn(&self, request: u64, cmd: &mut Command) -> Option<std::io::Result<Child>> {
+        use std::os::unix::process::CommandExt;
+        let mut running = self.running.lock().unwrap();
+        if self.is_cancelled(request) {
+            return None;
+        }
+        cmd.process_group(0);
+        let child = cmd.spawn();
+        if let Ok(c) = &child {
+            *running = i32::try_from(c.id()).ok();
+        }
+        Some(child)
+    }
+
+    fn finished(&self) {
+        *self.running.lock().unwrap() = None;
+    }
+}
+
 pub struct TestWorker {
     request_tx: Sender<TestRequest>,
+    /// Reaches the runner the worker thread is blocked on (#1534).
+    control: RunControl,
+    /// Requests sent so far: the worker numbers them in the same order.
+    sent: u64,
+    /// A cancel is waiting for its run's end, which the drain reports as
+    /// cancelled rather than as a verdict.
+    cancel_pending: bool,
     /// Responses arrive tagged with the epoch of the root they ran under; the
     /// drain drops tags older than [`Self::expected_epoch`] so a run still
     /// streaming when the Explorer re-roots can't pollute the new project's
@@ -125,9 +191,16 @@ impl TestWorker {
         let (response_tx, response_rx) = std::sync::mpsc::channel::<(u64, TestResponse)>();
         #[cfg(test)]
         let root = workspace_root.clone();
-        std::thread::spawn(move || worker_loop(workspace_root, request_rx, response_tx));
+        let control = RunControl::default();
+        let worker_control = control.clone();
+        std::thread::spawn(move || {
+            worker_loop(workspace_root, request_rx, response_tx, &worker_control)
+        });
         Self {
             request_tx,
+            control,
+            sent: 0,
+            cancel_pending: false,
             response_rx,
             expected_epoch: 0,
             #[cfg(test)]
@@ -144,6 +217,9 @@ impl TestWorker {
         (
             Self {
                 request_tx,
+                control: RunControl::default(),
+                sent: 0,
+                cancel_pending: false,
                 response_rx,
                 expected_epoch: 0,
                 root: PathBuf::new(),
@@ -152,37 +228,51 @@ impl TestWorker {
         )
     }
 
-    pub fn run_coverage(&self) {
-        let _ = self.request_tx.send(TestRequest::RunCoverage(None));
+    /// Queue `req`, numbered as the worker will number it.
+    fn send(&mut self, req: TestRequest) {
+        self.sent += 1;
+        let _ = self.request_tx.send(req);
+    }
+
+    pub fn run_coverage(&mut self) {
+        self.send(TestRequest::RunCoverage(None));
     }
 
     /// Run only the tests `scope` names with coverage on (#263).
-    pub fn run_coverage_scoped(&self, scope: CoverageScope) {
-        let _ = self.request_tx.send(TestRequest::RunCoverage(Some(scope)));
+    pub fn run_coverage_scoped(&mut self, scope: CoverageScope) {
+        self.send(TestRequest::RunCoverage(Some(scope)));
     }
 
-    pub fn run_all(&self) {
-        let _ = self.request_tx.send(TestRequest::RunAll);
+    pub fn run_all(&mut self) {
+        self.send(TestRequest::RunAll);
     }
 
-    pub fn run_one(&self, name: String) {
-        let _ = self.request_tx.send(TestRequest::RunOne(name));
+    pub fn run_one(&mut self, name: String) {
+        self.send(TestRequest::RunOne(name));
     }
 
-    pub fn run_filter(&self, pattern: String) {
-        let _ = self.request_tx.send(TestRequest::RunFilter(pattern));
+    pub fn run_filter(&mut self, pattern: String) {
+        self.send(TestRequest::RunFilter(pattern));
     }
 
-    pub fn run_suite(&self, suite: String) {
-        let _ = self.request_tx.send(TestRequest::RunSuite(suite));
+    pub fn run_suite(&mut self, suite: String) {
+        self.send(TestRequest::RunSuite(suite));
     }
 
-    pub fn discover(&self) {
-        let _ = self.request_tx.send(TestRequest::Discover);
+    pub fn discover(&mut self) {
+        self.send(TestRequest::Discover);
     }
 
-    pub fn set_codeql_program(&self, program: PathBuf) {
-        let _ = self.request_tx.send(TestRequest::SetCodeqlProgram(program));
+    pub fn set_codeql_program(&mut self, program: PathBuf) {
+        self.send(TestRequest::SetCodeqlProgram(program));
+    }
+
+    /// Stop the run or discovery in flight (#1534): its runner's process
+    /// group is killed, and its end reaches the panel as cancelled. Also
+    /// called on quit, so no runner outlives croft.
+    pub fn cancel(&mut self) {
+        self.control.cancel(self.sent);
+        self.cancel_pending = true;
     }
 
     /// Rebind the worker to a new workspace root after an Explorer re-root.
@@ -194,7 +284,7 @@ impl TestWorker {
             self.root = root.clone();
         }
         self.expected_epoch += 1;
-        let _ = self.request_tx.send(TestRequest::SetRoot(root));
+        self.send(TestRequest::SetRoot(root));
     }
 
     #[cfg(test)]
@@ -216,6 +306,11 @@ impl TestWorker {
                 TestResponse::Started(activity) => panel.on_busy_started(activity),
                 TestResponse::Case(case) => panel.apply_case(case),
                 TestResponse::Progress(line) => panel.set_progress(line),
+                TestResponse::Finished { .. } | TestResponse::Refused
+                    if std::mem::take(&mut self.cancel_pending) =>
+                {
+                    panel.on_cancelled()
+                }
                 TestResponse::Finished { ok } => panel.on_finished(ok),
                 TestResponse::Refused => panel.on_refused(),
                 TestResponse::Coverage(result) => panel.on_coverage(result),
@@ -235,6 +330,10 @@ struct EpochTx<'a> {
     /// [`TestRequest::SetCodeqlProgram`]); carried here because every
     /// handler already takes the sender.
     codeql: &'a Path,
+    /// Where the streaming child is recorded for a cancel (#1534), and the
+    /// number of the request being served.
+    control: &'a RunControl,
+    request: u64,
 }
 
 impl EpochTx<'_> {
@@ -248,16 +347,25 @@ impl EpochTx<'_> {
     }
 }
 
-fn worker_loop(mut root: PathBuf, rx: Receiver<TestRequest>, tx: Sender<(u64, TestResponse)>) {
+fn worker_loop(
+    mut root: PathBuf,
+    rx: Receiver<TestRequest>,
+    tx: Sender<(u64, TestResponse)>,
+    control: &RunControl,
+) {
     let mut epoch = 0u64;
     // Found on PATH, as the CodeQL side bar finds it, until the app says
     // otherwise.
     let mut codeql = PathBuf::from("codeql");
+    let mut request = 0u64;
     while let Ok(req) = rx.recv() {
+        request += 1;
         let etx = EpochTx {
             tx: &tx,
             epoch,
             codeql: &codeql,
+            control,
+            request,
         };
         match req {
             TestRequest::RunAll => run_all(&root, &etx),
@@ -888,9 +996,11 @@ fn run_streaming_exit(
     show: impl Fn(&str) -> Option<String>,
     parse: impl Fn(&str) -> Vec<TestCase>,
 ) -> Option<Option<i32>> {
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
+    let mut child = match tx.control.spawn(tx.request, &mut cmd) {
+        // Cancelled before it started: it ended without a verdict.
+        None => return Some(None),
+        Some(Ok(c)) => c,
+        Some(Err(e)) => {
             output::push(
                 output::CHANNEL_TESTS,
                 OutputLevel::Error,
@@ -923,7 +1033,9 @@ fn run_streaming_exit(
     if let Some(h) = stderr_handle {
         let _ = h.join();
     }
-    Some(child.wait().ok().and_then(|s| s.code()))
+    let code = child.wait().ok().and_then(|s| s.code());
+    tx.control.finished();
+    Some(code)
 }
 
 /// The cargo build-status verbs printed to stderr (whitespace-indented on a
@@ -1454,6 +1566,8 @@ mod tests {
             tx: &tx,
             epoch: 0,
             codeql: Path::new("codeql"),
+            control: &RunControl::default(),
+            request: 1,
         };
         run_all(tmp.path(), &etx);
         run_one(tmp.path(), &etx, "a::b");
@@ -1478,6 +1592,124 @@ mod tests {
                 .any(|m| matches!(m, TestResponse::Finished { .. })),
             "a bare Finished after start_single/start_filter strands cases Running"
         );
+    }
+
+    /// Running and not a zombie: a killed runner's background child is
+    /// reparented and may wait to be reaped.
+    #[cfg(unix)]
+    fn running(pid: i32) -> bool {
+        // SAFETY: signal 0 only checks that the pid exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+            !stat
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+        })
+    }
+
+    #[cfg(unix)]
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// #1534: a run whose test hangs (here a `codeql` that never returns,
+    /// with a child of its own) is cancelled: the whole process group dies,
+    /// the panel goes idle with the run marked cancelled, and the next run
+    /// goes ahead and reports its own verdict.
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_a_hung_run_kills_its_processes_and_frees_the_worker() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("test/Find")).unwrap();
+        std::fs::write(
+            root.join("test/qlpack.yml"),
+            "name: acme/tests\nextractor: javascript\ntests: .\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("test/Find/Find.qlref"), "Find.ql\n").unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let hang = bin.path().join("hang");
+        std::fs::write(
+            &hang,
+            format!(
+                "#!/bin/sh\necho $$ > '{d}/runner.pid'\nsleep 1000 &\necho $! > '{d}/child.pid'\nwait\n",
+                d = bin.path().display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hang, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pid = |name: &str| -> Option<i32> {
+            std::fs::read_to_string(bin.path().join(name))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        };
+
+        let mut worker = TestWorker::spawn(root.to_path_buf());
+        let mut panel = TestingPanel::new();
+        worker.set_codeql_program(hang);
+        worker.run_all();
+        wait_until("the hung run starts", || {
+            worker.drain(&mut panel);
+            panel.is_busy() && pid("child.pid").is_some()
+        });
+        let (runner, child) = (pid("runner.pid").unwrap(), pid("child.pid").unwrap());
+        worker.cancel();
+        wait_until("the run ends", || {
+            worker.drain(&mut panel);
+            !panel.is_busy()
+        });
+        assert!(panel.take_cancelled(), "the end reads as cancelled");
+        wait_until("the runner dies", || !running(runner));
+        wait_until("the runner's child dies", || !running(child));
+
+        // The next run is not cancelled: it reports its own verdict.
+        let codeql = fake_codeql(
+            bin.path(),
+            root,
+            "[1/1 comp 1.1s eval 20ms] PASSED @ROOT@/test/Find/Find.qlref\n",
+        );
+        worker.set_codeql_program(codeql);
+        worker.run_all();
+        panel.take_finished();
+        let mut verdict = None;
+        wait_until("the second run ends", || {
+            worker.drain(&mut panel);
+            verdict = panel.take_finished();
+            verdict.is_some()
+        });
+        assert!(!panel.take_cancelled());
+        assert_eq!(verdict, Some(Some(true)));
+    }
+
+    /// #1534 negative: a cancel covers the requests sent before it, never a
+    /// later one, and refuses to start their further children.
+    #[cfg(unix)]
+    #[test]
+    fn a_cancel_covers_only_the_requests_sent_before_it() {
+        let control = RunControl::default();
+        control.cancel(2);
+        assert!(control.is_cancelled(1));
+        assert!(control.is_cancelled(2));
+        assert!(!control.is_cancelled(3));
+        let mut cmd = Command::new("true");
+        assert!(
+            control.spawn(2, &mut cmd).is_none(),
+            "a cancelled run starts nothing"
+        );
+        let mut child = control.spawn(3, &mut cmd).unwrap().unwrap();
+        child.wait().unwrap();
+        control.finished();
+        assert!(control.running.lock().unwrap().is_none());
     }
 
     /// A stand-in `codeql` in `dir` that logs its arguments and prints
@@ -1536,6 +1768,8 @@ mod tests {
             tx: &tx,
             epoch: 0,
             codeql: &codeql,
+            control: &RunControl::default(),
+            request: 1,
         };
         let drain = |rx: &Receiver<(u64, TestResponse)>| {
             let mut cases = Vec::new();
@@ -1629,6 +1863,8 @@ mod tests {
             tx: &tx,
             epoch: 0,
             codeql: Path::new("codeql"),
+            control: &RunControl::default(),
+            request: 1,
         };
         let cases = |rx: &Receiver<(u64, TestResponse)>| {
             let mut v: Vec<(String, TestStatus)> = rx
@@ -2185,6 +2421,8 @@ mod tests {
             tx: &tx,
             epoch: 0,
             codeql: Path::new("codeql"),
+            control: &RunControl::default(),
+            request: 1,
         };
         let discovered = || {
             discover(root, &etx);
@@ -2279,6 +2517,8 @@ mod tests {
             tx: &tx,
             epoch: 0,
             codeql: Path::new("codeql"),
+            control: &RunControl::default(),
+            request: 1,
         };
         let finished = || {
             discover(root, &etx);
@@ -2446,6 +2686,8 @@ mod tests {
             tx: &tx,
             epoch: 0,
             codeql: Path::new("codeql"),
+            control: &RunControl::default(),
+            request: 1,
         };
         discover(root, &etx);
         let mut cases = Vec::new();
