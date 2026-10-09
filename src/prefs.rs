@@ -667,6 +667,12 @@ impl From<ReplaceError> for std::io::Error {
 /// be given; and it is impossible where the directory refuses the temp file.
 /// Those are written in place, with the space for the new contents reserved
 /// before the first byte changes.
+///
+/// So is a file with room for its new contents but not for a second copy of
+/// them (#1614): on a nearly full disk, a one-character edit to a file bigger
+/// than the free space could never be saved. That fallback is Linux only,
+/// where the reservation is made, and only when the space is reserved, so
+/// a write that doesn't fit still fails with the file whole.
 pub(crate) fn replace_file_contents(path: &Path, bytes: &[u8]) -> Result<(), ReplaceError> {
     let untouched = |error| ReplaceError {
         error,
@@ -694,11 +700,25 @@ pub(crate) fn replace_file_contents(path: &Path, bytes: &[u8]) -> Result<(), Rep
                     untouched(e)
                 });
             }
+            #[cfg(target_os = "linux")]
+            Err(Aside::Failed(e)) if is_out_of_space(&e) => {
+                return write_in_place(&target, bytes, true).map_err(|r| {
+                    // Nothing changed: the save failed for the reason the
+                    // copy aside did, and that is what the user can act on.
+                    if r.touched { r } else { untouched(e) }
+                });
+            }
             Err(Aside::Failed(e)) => return Err(untouched(e)),
             Err(Aside::InPlace) => {}
         }
     }
-    write_in_place(&target, bytes)
+    write_in_place(&target, bytes, false)
+}
+
+/// The disk or the user's quota is full.
+#[cfg(target_os = "linux")]
+fn is_out_of_space(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT))
 }
 
 /// Why [`write_aside`] gave up: the write failed (a full disk), or the
@@ -749,6 +769,10 @@ fn write_aside(target: &Path, meta: &std::fs::Metadata, bytes: &[u8]) -> Result<
         let _ = std::fs::remove_file(tmp);
         Aside::Failed(e)
     };
+    #[cfg(test)]
+    if test_hooks::ASIDE_OUT_OF_SPACE.get() {
+        return Err(fail(&tmp, std::io::Error::from_raw_os_error(libc::ENOSPC)));
+    }
     if let Err(e) = file.write_all(bytes).and_then(|()| file.flush()) {
         return Err(fail(&tmp, e));
     }
@@ -840,9 +864,13 @@ fn copy_xattrs(_fd: libc::c_int, _target: &Path) -> bool {
 
 /// Overwrite `target` with `bytes` without truncating it first. On Linux
 /// the space a longer file needs is reserved before the first byte changes,
-/// so running out of it fails with the file untouched.
-fn write_in_place(target: &Path, bytes: &[u8]) -> Result<(), ReplaceError> {
+/// so running out of it fails with the file untouched. With `must_reserve`,
+/// a filesystem that can't reserve space fails the write too, untouched,
+/// instead of writing on unguarded.
+fn write_in_place(target: &Path, bytes: &[u8], must_reserve: bool) -> Result<(), ReplaceError> {
     use std::io::{Seek as _, Write as _};
+    #[cfg(not(target_os = "linux"))]
+    let _ = must_reserve;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .open(target)
@@ -861,7 +889,14 @@ fn write_in_place(target: &Path, bytes: &[u8]) -> Result<(), ReplaceError> {
     if new_len > old_len {
         use std::os::unix::io::AsRawFd as _;
         let err = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, new_len as libc::off_t) };
-        if err != 0 && err != libc::EOPNOTSUPP && err != libc::EINVAL {
+        let unsupported = err == libc::EOPNOTSUPP || err == libc::EINVAL;
+        if unsupported && must_reserve {
+            return Err(ReplaceError {
+                error: std::io::Error::from_raw_os_error(err),
+                touched: false,
+            });
+        }
+        if err != 0 && !unsupported {
             // A reservation that failed partway may have grown the file: cut
             // it back. The contents are as they were, but the attempt can
             // still have moved the file's timestamp (ext4 marks it modified
@@ -886,6 +921,16 @@ fn write_in_place(target: &Path, bytes: &[u8]) -> Result<(), ReplaceError> {
             error,
             touched: true,
         })
+}
+
+/// Faults a test can inject into the save path.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    thread_local! {
+        /// Fail the copy aside the way a full disk does (#1614).
+        pub(crate) static ASIDE_OUT_OF_SPACE: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
 }
 
 /// The settings file under `config_dir`. The real config dir means the

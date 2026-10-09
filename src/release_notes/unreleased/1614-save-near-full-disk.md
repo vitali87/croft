@@ -1,0 +1,1 @@
+fix: On a nearly full disk, saving a file bigger than the free space no longer fails with "No space left on device": when there is no room for a second copy, croft writes the file in place, with the space reserved first so a save that doesn't fit still leaves the file whole.
