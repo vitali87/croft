@@ -64,6 +64,12 @@ pub enum ScmAction {
     // Tags submenu.
     CreateTag,
     DeleteTag,
+    // The operation in progress (#1356), listed first while there is one.
+    ContinueOperation,
+    SkipOperation,
+    AbortOperation,
+    BisectGood,
+    BisectBad,
 }
 
 /// A leaf row: the action it fires, its label, and its codicon glyph.
@@ -116,6 +122,7 @@ const ICON_BROADCAST: char = '\u{eaad}'; // remote
 const ICON_ARCHIVE: char = '\u{ea98}'; // stash
 const ICON_TAG: char = '\u{ea66}'; // tags
 const ICON_NEW_FOLDER: char = '\u{ea80}'; // create from
+const ICON_ARROW_RIGHT: char = '\u{ea9c}'; // skip
 
 /// The codicon painted on the `⋯` header pill that opens this menu.
 pub const ICON_ELLIPSIS: char = '\u{ea7c}';
@@ -184,8 +191,53 @@ const TAGS_ITEMS: &[Leaf] = &[
     leaf(ScmAction::DeleteTag, "Delete Tag", ICON_TRASH),
 ];
 
+/// The rows a stopped operation adds (#1356): its way forward, then its
+/// way out. Labels name the operation, as VS Code's do.
+fn operation_items(op: crate::git::RepoOp) -> Vec<Leaf> {
+    use crate::git::RepoOp;
+    let (cont, skip, abort): (Option<&str>, Option<&str>, &str) = match op {
+        RepoOp::Merge => (None, None, "Abort Merge"),
+        RepoOp::Rebase { .. } => (Some("Continue Rebase"), Some("Skip Commit"), "Abort Rebase"),
+        RepoOp::CherryPick => (
+            Some("Continue Cherry-Pick"),
+            Some("Skip Commit"),
+            "Abort Cherry-Pick",
+        ),
+        RepoOp::Revert => (Some("Continue Revert"), Some("Skip Commit"), "Abort Revert"),
+        RepoOp::Bisect => {
+            return vec![
+                leaf(ScmAction::BisectGood, "Bisect: Mark Good", ICON_CHECK),
+                leaf(ScmAction::BisectBad, "Bisect: Mark Bad", ICON_DISCARD),
+                leaf(ScmAction::AbortOperation, "Bisect: Reset", ICON_TRASH),
+            ];
+        }
+    };
+    let mut items = Vec::new();
+    if let Some(label) = cont {
+        items.push(leaf(ScmAction::ContinueOperation, label, ICON_CHECK));
+    }
+    if let Some(label) = skip {
+        items.push(leaf(ScmAction::SkipOperation, label, ICON_ARROW_RIGHT));
+    }
+    items.push(leaf(ScmAction::AbortOperation, abort, ICON_DISCARD));
+    items
+}
+
+/// [`menu`] for a repository in the middle of `op` (#1356): the
+/// operation's Continue / Skip / Abort rows come first, above a separator.
+pub fn menu_for(op: Option<crate::git::RepoOp>) -> Vec<Node> {
+    let mut nodes: Vec<Node> = op
+        .map(|op| operation_items(op).into_iter().map(Node::Item).collect())
+        .unwrap_or_default();
+    if !nodes.is_empty() {
+        nodes.push(Node::Sep);
+    }
+    nodes.extend(base_menu());
+    nodes
+}
+
 /// The full top-level menu, mirroring VS Code's SCM "⋯" menu order.
-pub fn menu() -> Vec<Node> {
+fn base_menu() -> Vec<Node> {
     vec![
         Node::Item(leaf(ScmAction::Pull, "Pull", ICON_CLOUD_DOWNLOAD)),
         Node::Item(leaf(ScmAction::Push, "Push", ICON_CLOUD_UPLOAD)),
@@ -250,10 +302,13 @@ pub enum TopHit {
 #[derive(Default)]
 pub struct ScmMenuState {
     pub open: bool,
-    /// Index (into `menu()`) of the submenu whose fly-out is showing.
+    /// Index (into `menu_for(operation)`) of the submenu whose fly-out is showing.
     pub expanded: Option<usize>,
     pub top_hits: Vec<(Rect, TopHit)>,
     pub sub_hits: Vec<(Rect, ScmAction)>,
+    /// The repository's operation in progress (#1356), whose rows the menu
+    /// shows first. Set by the App when it opens the menu.
+    pub operation: Option<crate::git::RepoOp>,
 }
 
 impl ScmMenuState {
@@ -346,6 +401,9 @@ fn action_color(action: ScmAction) -> Color {
         | PopStashPick
         | CreateTag => ACCENT_AMBER,
         UnstageAll | ShowGitOutput => ACCENT_GREY,
+        ContinueOperation | BisectGood => ACCENT_GREEN,
+        SkipOperation => ACCENT_AMBER,
+        AbortOperation | BisectBad => ACCENT_RED,
     }
 }
 
@@ -381,7 +439,7 @@ pub fn render(
 ) {
     state.top_hits.clear();
     state.sub_hits.clear();
-    let nodes = menu();
+    let nodes = menu_for(state.operation);
 
     let top_w = column_width(
         nodes.iter().filter_map(|n| match n {
@@ -556,9 +614,33 @@ fn paint_row(
 mod tests {
     use super::*;
 
+    /// #1356: a stopped rebase puts Continue, Skip and Abort first, above
+    /// a separator; a merge gets only Abort (a commit concludes it); no
+    /// operation, no extra rows.
+    #[test]
+    fn an_operation_in_progress_leads_the_menu() {
+        use crate::git::RepoOp;
+        let labels = |op| -> Vec<&'static str> {
+            menu_for(op)
+                .iter()
+                .map_while(|n| match n {
+                    Node::Item(l) => Some(l.label),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            labels(Some(RepoOp::Rebase { step: 2, total: 5 })),
+            ["Continue Rebase", "Skip Commit", "Abort Rebase"]
+        );
+        assert_eq!(labels(Some(RepoOp::Merge)), ["Abort Merge"]);
+        assert!(matches!(menu_for(Some(RepoOp::Merge))[1], Node::Sep));
+        assert_eq!(menu_for(None).len(), base_menu().len());
+    }
+
     #[test]
     fn menu_has_the_expected_top_level_shape() {
-        let m = menu();
+        let m = menu_for(None);
         // 5 leaves + sep + 7 submenus + sep + 1 leaf = 15 nodes.
         assert_eq!(m.len(), 15);
         let subs = m.iter().filter(|n| matches!(n, Node::Sub { .. })).count();
@@ -580,7 +662,7 @@ mod tests {
             crate::theme::Theme::default(),
         );
         // Find the "Branch" submenu's top-level index and its rect.
-        let branch_idx = menu()
+        let branch_idx = menu_for(None)
             .iter()
             .position(|n| matches!(n, Node::Sub { label, .. } if *label == "Branch"))
             .unwrap();
@@ -653,7 +735,7 @@ mod tests {
         let screen = Rect::new(0, 0, 120, 40);
         let mut buf = Buffer::empty(screen);
         st.open = true;
-        let stash_idx = menu()
+        let stash_idx = menu_for(None)
             .iter()
             .position(|n| matches!(n, Node::Sub { label, .. } if *label == "Stash"))
             .unwrap();
