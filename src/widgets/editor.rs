@@ -2222,6 +2222,50 @@ const UNDO_BYTES_LIMIT: usize = if cfg!(test) {
 /// Undo steps kept whatever their size (see [`UNDO_BYTES_LIMIT`]).
 const UNDO_MIN_STEPS: usize = 16;
 
+/// The undo and redo history of a file whose tab closed (#1568), kept for
+/// the session so reopening the file brings it back, as VS Code's
+/// `files.restoreUndoStack` does. It only applies to the text it was
+/// recorded against: `text_hash` is the buffer at close, and a file that
+/// reopens with other content (edited elsewhere, or closed with its unsaved
+/// edits discarded) starts with no history.
+struct ClosedHistory {
+    path: PathBuf,
+    text_hash: u64,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    /// The editor's save point, so an undo across it re-dirties the buffer
+    /// exactly as it would have in the tab that closed.
+    save_seq: u64,
+    bytes: usize,
+}
+
+/// Closed files whose history is kept, newest last; the oldest go first.
+const CLOSED_HISTORY_FILES: usize = 30;
+
+/// Bytes of history kept across every closed file, on top of the per-buffer
+/// [`UNDO_BYTES_LIMIT`]: the oldest closed file's history goes first.
+const CLOSED_HISTORY_BYTES: usize = UNDO_BYTES_LIMIT;
+
+thread_local! {
+    static CLOSED_HISTORY: std::cell::RefCell<Vec<ClosedHistory>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One hash of a buffer's lines, to tell whether a reopened file still has
+/// the text a closed tab's history was recorded against.
+fn lines_hash(lines: &[String]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    lines.hash(&mut h);
+    h.finish()
+}
+
+/// The key a file's closed history is filed under: its canonical path, so a
+/// symlink or a relative spelling finds the same history.
+fn closed_history_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Max selected-text length that still drives occurrence highlighting, matching
 /// VS Code's default `editor.selectionHighlightMaxLength`.
 const SELECTION_HIGHLIGHT_MAX_LEN: usize = 200;
@@ -2531,6 +2575,14 @@ struct SnippetSession {
 #[cfg(test)]
 thread_local! {
     static FOLD_RANGE_REBUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A tab closing drops its editor: its history is kept for the file
+/// (#1568), whichever of the many close paths dropped it.
+impl Drop for Editor {
+    fn drop(&mut self) {
+        self.stash_history();
+    }
 }
 
 pub struct Editor {
@@ -4822,7 +4874,90 @@ impl Editor {
         chars[start..end].iter().collect()
     }
 
+    /// Open `path` in this tab. Moving the tab to another file keeps the
+    /// history of the one it leaves for when that file opens again, and the
+    /// file it arrives at gets its own back if it has one (#1568).
     pub fn open(&mut self, path: &Path) -> Result<()> {
+        let changed_file = self.path.as_deref() != Some(path);
+        if changed_file {
+            self.stash_history();
+        }
+        let opened = self.open_file(path);
+        if changed_file {
+            // On a failed open the tab may still hold the file it left, and
+            // takes its history back the same way.
+            self.restore_history();
+        }
+        opened
+    }
+
+    /// File this tab's undo/redo history away when the file leaves the tab
+    /// (#1568). A tab with no history, no file, or a non-text view (whose
+    /// `lines` are a placeholder) has nothing to keep, and a symbol tab's
+    /// history covers a clip of the file, not the file.
+    fn stash_history(&mut self) {
+        let Some(path) = self.path.as_deref() else {
+            return;
+        };
+        if (self.undo_stack.is_empty() && self.redo_stack.is_empty())
+            || self.has_non_text_view()
+            || self.symbol_view.is_some()
+        {
+            return;
+        }
+        let undo = std::mem::take(&mut self.undo_stack);
+        let redo = std::mem::take(&mut self.redo_stack);
+        let entry = ClosedHistory {
+            path: closed_history_key(path),
+            text_hash: lines_hash(&self.lines),
+            bytes: undo.iter().chain(&redo).map(|s| s.bytes).sum(),
+            undo,
+            redo,
+            save_seq: self.save_seq,
+        };
+        // `try_with`: a tab dropped while the thread's storage is being torn
+        // down has nowhere to keep it, and must not panic.
+        let _ = CLOSED_HISTORY.try_with(|kept| {
+            let mut kept = kept.borrow_mut();
+            kept.retain(|h| h.path != entry.path);
+            kept.push(entry);
+            let mut total: usize = kept.iter().map(|h| h.bytes).sum();
+            while kept.len() > CLOSED_HISTORY_FILES
+                || (total > CLOSED_HISTORY_BYTES && kept.len() > 1)
+            {
+                total -= kept.remove(0).bytes;
+            }
+        });
+    }
+
+    /// Take back the history kept for this tab's file when it closed, if the
+    /// buffer is the text that history was recorded against (#1568).
+    /// Whichever way it goes, the kept copy is used up: a second tab of the
+    /// file must not replay the same history over its own edits.
+    fn restore_history(&mut self) {
+        let Some(path) = self.path.as_deref() else {
+            return;
+        };
+        if self.has_non_text_view() || self.symbol_view.is_some() {
+            return;
+        }
+        let key = closed_history_key(path);
+        let Ok(Some(entry)) = CLOSED_HISTORY.try_with(|kept| {
+            let mut kept = kept.borrow_mut();
+            let i = kept.iter().position(|h| h.path == key)?;
+            Some(kept.remove(i))
+        }) else {
+            return;
+        };
+        if entry.text_hash != lines_hash(&self.lines) {
+            return;
+        }
+        self.undo_stack = entry.undo;
+        self.redo_stack = entry.redo;
+        self.save_seq = entry.save_seq;
+    }
+
+    fn open_file(&mut self, path: &Path) -> Result<()> {
         // A FIFO, socket or device blocks the first read until some other
         // process writes to it, freezing the UI thread indefinitely; none of
         // them is a document. (Directories and missing paths go on to the
