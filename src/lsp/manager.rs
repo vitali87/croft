@@ -954,6 +954,15 @@ pub struct LspManager {
     signature_help_rx: std_mpsc::Receiver<SignatureHelpResult>,
     hover_rx: std_mpsc::Receiver<HoverResult>,
     def_rx: std_mpsc::Receiver<DefinitionResult>,
+    /// Test hooks: senders into the three jump channels, so app tests can
+    /// answer a definition, declaration or type definition request
+    /// without a server.
+    #[cfg(test)]
+    jump_test_tx: (
+        std_mpsc::Sender<DefinitionResult>,
+        std_mpsc::Sender<DeclarationResult>,
+        std_mpsc::Sender<TypeDefinitionResult>,
+    ),
     doc_symbols_rx: std_mpsc::Receiver<DocumentSymbolsResult>,
     decl_rx: std_mpsc::Receiver<DeclarationResult>,
     type_def_rx: std_mpsc::Receiver<TypeDefinitionResult>,
@@ -1044,6 +1053,8 @@ impl LspManager {
         let (doc_symbols_tx, doc_symbols_rx) = std_mpsc::channel();
         let (decl_tx, decl_rx) = std_mpsc::channel();
         let (type_def_tx, type_def_rx) = std_mpsc::channel();
+        #[cfg(test)]
+        let jump_test_tx = (def_tx.clone(), decl_tx.clone(), type_def_tx.clone());
         let (impl_tx, impl_rx) = std_mpsc::channel();
         let (ref_tx, ref_rx) = std_mpsc::channel();
         let (doc_highlights_tx, doc_highlights_rx) = std_mpsc::channel();
@@ -1139,6 +1150,8 @@ impl LspManager {
             signature_help_rx,
             hover_rx,
             def_rx,
+            #[cfg(test)]
+            jump_test_tx,
             doc_symbols_rx,
             decl_rx,
             type_def_rx,
@@ -1496,6 +1509,25 @@ impl LspManager {
 
     pub fn drain_definition(&self) -> Option<DefinitionResult> {
         self.def_rx.try_recv().ok()
+    }
+
+    /// Test hook: deliver a definition reply as if a server had answered.
+    #[cfg(test)]
+    pub fn push_definition_for_test(&self, result: DefinitionResult) {
+        let _ = self.jump_test_tx.0.send(result);
+    }
+
+    /// Test hook: deliver a declaration reply as if a server had answered.
+    #[cfg(test)]
+    pub fn push_declaration_for_test(&self, result: DeclarationResult) {
+        let _ = self.jump_test_tx.1.send(result);
+    }
+
+    /// Test hook: deliver a type definition reply as if a server had
+    /// answered.
+    #[cfg(test)]
+    pub fn push_type_definition_for_test(&self, result: TypeDefinitionResult) {
+        let _ = self.jump_test_tx.2.send(result);
     }
 
     /// Ask the server for the document's symbol tree (the Outline). Fire on
@@ -7044,8 +7076,24 @@ fn standard_semantic_token_modifiers() -> Vec<SemanticTokenModifier> {
 }
 
 fn build_client_capabilities() -> ClientCapabilities {
+    // `linkSupport` on every goto: without it a server flattens each
+    // `LocationLink` into a `Location` over the whole declaration, and the
+    // jump lands on its first character instead of the name, lines above it
+    // in a multi-line declaration (#1284). `def_location` reads a link's
+    // `targetSelectionRange`.
+    let goto = || {
+        Some(lsp_types::GotoCapability {
+            dynamic_registration: Some(false),
+            link_support: Some(true),
+        })
+    };
     ClientCapabilities {
         text_document: Some(TextDocumentClientCapabilities {
+            definition: goto(),
+            declaration: goto(),
+            type_definition: goto(),
+            implementation: goto(),
+
             // croft sends didSave, and only to a server that advertised
             // `save` (#854). No dynamic registration: croft answers no
             // `client/registerCapability`, and rust-analyzer registers didSave
@@ -7723,6 +7771,58 @@ mod tests {
         let caps = build_client_capabilities();
         let window = caps.window.expect("window capabilities must be set");
         assert_eq!(window.work_done_progress, Some(true));
+    }
+
+    /// Without `linkSupport` a server turns each `LocationLink` into a
+    /// `Location` spanning the whole declaration, so F12 lands on its first
+    /// character, lines above a name in a multi-line declaration (#1284).
+    #[test]
+    fn client_capabilities_ask_for_location_links_on_every_goto() {
+        let caps = build_client_capabilities();
+        let td = caps.text_document.expect("text document capabilities");
+        for (name, goto) in [
+            ("definition", td.definition),
+            ("declaration", td.declaration),
+            ("typeDefinition", td.type_definition),
+            ("implementation", td.implementation),
+        ] {
+            let goto = goto.unwrap_or_else(|| panic!("{name} capability must be declared"));
+            assert_eq!(goto.link_support, Some(true), "{name}.linkSupport");
+            assert_eq!(goto.dynamic_registration, Some(false), "{name}");
+        }
+    }
+
+    /// Negative: a server that still answers with a plain `Location`
+    /// jumps to its start, and a link whose declaration starts lines above
+    /// its name lands on the name, not the declaration.
+    #[test]
+    fn a_plain_location_still_jumps_to_its_start_and_a_link_to_its_name() {
+        let uri = Url::from_file_path("/tmp/config.ts").unwrap();
+        let plain = GotoDefinitionResponse::Array(vec![Location {
+            uri: uri.clone(),
+            range: lsp_types::Range::new(Position::new(7, 0), Position::new(11, 10)),
+        }]);
+        assert_eq!(
+            def_location(&plain),
+            Some((PathBuf::from("/tmp/config.ts"), 7, 0))
+        );
+        let link = GotoDefinitionResponse::Link(vec![LocationLink {
+            origin_selection_range: None,
+            target_uri: uri,
+            target_range: lsp_types::Range::new(Position::new(7, 0), Position::new(11, 10)),
+            target_selection_range: lsp_types::Range::new(
+                Position::new(10, 2),
+                Position::new(10, 7),
+            ),
+        }]);
+        assert_eq!(
+            def_location(&link),
+            Some((PathBuf::from("/tmp/config.ts"), 10, 2))
+        );
+        assert_eq!(
+            def_locations(&link),
+            vec![(PathBuf::from("/tmp/config.ts"), 10, 2)]
+        );
     }
 
     #[test]
