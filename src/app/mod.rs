@@ -58117,8 +58117,9 @@ impl App {
             }
             self.status = keybindings_reload_status(&warns);
         } else if path == crate::snippets::snippets_path() {
-            self.snippets = crate::snippets::SnippetSet::load(path);
-            self.status = String::from("Snippets reloaded");
+            let (set, warning) = crate::snippets::SnippetSet::load_with_warning(path);
+            self.snippets = set;
+            self.status = snippets_reload_status(warning.is_some());
         } else if path == crate::agents::agents_path() {
             self.agents = crate::agents::AgentTable::load(path);
             let dropped = self.agents.dropped_patterns();
@@ -66000,6 +66001,16 @@ fn is_cmd_shift_letter(key: KeyEvent, letter: char) -> bool {
     let has_ctrl_or_super = key.modifiers.contains(KeyModifiers::CONTROL)
         || key.modifiers.contains(KeyModifiers::SUPER);
     has_shift && has_ctrl_or_super
+}
+
+/// The status after snippets.json is saved: a file that loaded nothing
+/// says so, with the detail in OUTPUT (#1191), as keybindings.json does.
+fn snippets_reload_status(broken: bool) -> String {
+    if broken {
+        String::from("Snippets not loaded: the file does not parse — see OUTPUT · Snippets")
+    } else {
+        String::from("Snippets reloaded")
+    }
 }
 
 /// The status line shown after a keybindings reload.
