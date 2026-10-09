@@ -78090,6 +78090,81 @@ fn the_multiline_paste_warning_setting_parses() {
     );
 }
 
+/// #989: an App on the issue's repro, a merge stopped on a conflict.
+fn app_in_a_conflicted_merge() -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = r#"set -e
+git init -q -b main && git config user.email a@b && git config user.name a
+printf '# Orders\n\nRun `python pricing.py`.\n' > README.md && git add . && git commit -qm init
+git checkout -qb hotfix && sed 's/python pricing.py/python -m pricing/' README.md > README.tmp && mv README.tmp README.md && git commit -qam fix
+git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' README.md > README.tmp && mv README.tmp README.md && git commit -qam uv
+! git merge -q hotfix >/dev/null 2>&1"#;
+    let out = std::process::Command::new("sh")
+        .args(["-c", script])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.source_control.message = String::from("Merge hotfix");
+    (app, tmp)
+}
+
+fn committed_readme(root: &std::path::Path) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["show", "HEAD:README.md"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn commit_refuses_while_merge_conflicts_are_unresolved() {
+    let (mut app, tmp) = app_in_a_conflicted_merge();
+    app.commit_source_control();
+    wait_for_git_net(&mut app);
+    assert!(
+        !committed_readme(tmp.path()).contains("<<<<<<<"),
+        "the conflict markers were committed"
+    );
+    let feedback = app
+        .source_control
+        .commit_feedback
+        .clone()
+        .unwrap_or_default();
+    assert!(feedback.contains("Resolve 1 merge conflict"), "{feedback}");
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(
+        app.source_control.message, "Merge hotfix",
+        "the message is kept"
+    );
+}
+
+#[test]
+fn commit_all_refuses_while_merge_conflicts_are_unresolved() {
+    // Commit All stages everything first, and `git add -A` marks a conflict
+    // resolved with its markers in it.
+    let (mut app, tmp) = app_in_a_conflicted_merge();
+    app.commit_all_source_control();
+    assert!(!committed_readme(tmp.path()).contains("<<<<<<<"));
+    assert_eq!(
+        crate::git::unmerged_paths(tmp.path()),
+        vec![String::from("README.md")],
+        "nothing was staged"
+    );
+    assert!(
+        app.status.contains("Resolve 1 merge conflict"),
+        "{}",
+        app.status
+    );
+}
+
 /// #910: `tax.py` open with an unsaved function, rewritten on disk behind
 /// it (a `git checkout`, a restore, an agent), and the sweep that notices.
 fn app_with_a_disk_conflict(tmp: &std::path::Path) -> (App, std::path::PathBuf) {
