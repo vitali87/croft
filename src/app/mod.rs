@@ -5674,7 +5674,7 @@ impl App {
                 // machine (#262): applied on arrival like the files above.
                 crate::config_layers::synced_config_path(),
             ]),
-            snippets: crate::snippets::SnippetSet::load(&crate::snippets::snippets_path()),
+            snippets: load_snippets(&crate::snippets::snippets_path()),
             format_on_save: loaded_prefs.format_on_save,
             copy_on_select: loaded_prefs.copy_on_select,
             files_exclude: Vec::new(),
@@ -56717,7 +56717,7 @@ impl App {
         }
         let (map, _) = crate::keymap::Keymap::load_with_warnings(&self.keybindings_file);
         self.keymap = map;
-        self.snippets = crate::snippets::SnippetSet::load(&crate::snippets::snippets_path());
+        self.snippets = load_snippets(&crate::snippets::snippets_path());
         self.status = format!(
             "Profile: {}; keybindings and snippets applied, settings apply at the next launch",
             name.as_deref().unwrap_or("Default")
@@ -58314,9 +58314,9 @@ impl App {
             }
             self.status = keybindings_reload_status(&warns);
         } else if path == crate::snippets::snippets_path() {
-            let (set, warning) = crate::snippets::SnippetSet::load_with_warning(path);
-            self.snippets = set;
-            self.status = snippets_reload_status(warning.is_some());
+            self.snippets = load_snippets(path);
+            self.status =
+                snippets_reload_status(self.snippets.is_broken(), self.snippets.warnings());
         } else if path == crate::agents::agents_path() {
             self.agents = crate::agents::AgentTable::load(path);
             let dropped = self.agents.dropped_patterns();
@@ -66201,13 +66201,31 @@ fn is_cmd_shift_letter(key: KeyEvent, letter: char) -> bool {
     has_shift && has_ctrl_or_super
 }
 
-/// The status after snippets.json is saved: a file that loaded nothing
-/// says so, with the detail in OUTPUT (#1191), as keybindings.json does.
-fn snippets_reload_status(broken: bool) -> String {
+/// Load the snippets file, writing what could not be read to OUTPUT ·
+/// Snippets: one bad entry used to empty the whole set without a word (#1483).
+fn load_snippets(path: &std::path::Path) -> crate::snippets::SnippetSet {
+    let set = crate::snippets::SnippetSet::load(path);
+    for w in set.warnings() {
+        crate::output::push("Snippets", crate::output::OutputLevel::Warn, w);
+    }
+    set
+}
+
+/// The status line shown after a snippets reload, tested the same way. A
+/// file that loaded nothing says so, with the detail in OUTPUT (#1191), as
+/// keybindings.json does; skipped entries are counted (#1483).
+fn snippets_reload_status(broken: bool, warns: &[String]) -> String {
     if broken {
-        String::from("Snippets not loaded: the file does not parse — see OUTPUT · Snippets")
-    } else {
-        String::from("Snippets reloaded")
+        return String::from(
+            "Snippets not loaded: the file does not parse — see OUTPUT · Snippets",
+        );
+    }
+    match warns.len() {
+        0 => String::from("Snippets reloaded"),
+        n => format!(
+            "Snippets reloaded with {n} warning{} — see OUTPUT · Snippets",
+            if n == 1 { "" } else { "s" }
+        ),
     }
 }
 

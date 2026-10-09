@@ -73016,10 +73016,13 @@ fn the_synced_settings_layer_is_in_the_reload_chain() {
 fn a_snippets_file_that_loads_nothing_says_where_to_look() {
     // #1191: a broken snippets.json used to reload as "Snippets reloaded"
     // with nothing loaded.
-    let status = super::snippets_reload_status(true);
+    let status = super::snippets_reload_status(true, &[]);
     assert!(status.contains("not loaded"), "{status}");
     assert!(status.contains("OUTPUT · Snippets"), "{status}");
-    assert_eq!(super::snippets_reload_status(false), "Snippets reloaded");
+    assert_eq!(
+        super::snippets_reload_status(false, &[]),
+        "Snippets reloaded"
+    );
 }
 
 /// Every cell of a drawn frame, row after row.
@@ -75163,6 +75166,69 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     let _ = render_buf(&mut app);
     assert!(app.source_control.nested_repos.is_empty());
     assert!(app.source_control.last_init_repo_button_area.width > 0);
+}
+
+// ── #1483: one snippet croft cannot read no longer empties the whole set ──
+
+/// A Python buffer holding `typed`, with a snippet set that mixes a plain
+/// prefix and an array one; returns the first line after Tab.
+fn expand_with_array_prefix_snippets(typed: &str) -> String {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("loop.py");
+    std::fs::write(&f, "").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.snippets = crate::snippets::SnippetSet::from_json(
+        r#"{
+            "Python main guard": { "prefix": "main", "body": "if __name__ == '__main__':", "scope": "python" },
+            "For loop": { "prefix": ["for", "fori"], "body": ["for ${1:i} in range(${2:10}):", "    $0"], "scope": "python" }
+        }"#,
+    );
+    app.editor.insert_str(typed);
+    app.handle_editor_tab();
+    app.editor.lines[0].clone()
+}
+
+#[test]
+fn tab_expands_each_word_of_an_array_prefix() {
+    assert_eq!(
+        expand_with_array_prefix_snippets("fori"),
+        "for i in range(10):"
+    );
+    assert_eq!(
+        expand_with_array_prefix_snippets("for"),
+        "for i in range(10):"
+    );
+    // The snippet beside it still expands too.
+    assert_eq!(
+        expand_with_array_prefix_snippets("main"),
+        "if __name__ == '__main__':"
+    );
+}
+
+#[test]
+fn a_snippet_reload_with_a_skipped_entry_says_so() {
+    // Built in memory: writing the real snippets.json would leak into every
+    // concurrently running test that builds an `App`.
+    let set = crate::snippets::SnippetSet::from_json(
+        r#"{ "Broken": { "prefix": 42, "body": "x" }, "Log": { "prefix": "log", "body": "y" } }"#,
+    );
+    let status = super::snippets_reload_status(set.is_broken(), set.warnings());
+    assert!(
+        status.contains("1 warning") && status.contains("OUTPUT · Snippets"),
+        "{status:?}"
+    );
+}
+
+/// Negative: a clean reload says nothing about warnings.
+#[test]
+fn a_clean_snippet_reload_has_no_warning() {
+    let set =
+        crate::snippets::SnippetSet::from_json(r#"{ "Log": { "prefix": "log", "body": "y" } }"#);
+    assert_eq!(
+        super::snippets_reload_status(set.is_broken(), set.warnings()),
+        "Snippets reloaded"
+    );
 }
 
 /// A diagnostic for the Problems panel, as a language server reports it.
