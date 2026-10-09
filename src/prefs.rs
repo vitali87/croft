@@ -865,8 +865,10 @@ fn copy_xattrs(_fd: libc::c_int, _target: &Path) -> bool {
 /// Overwrite `target` with `bytes` without truncating it first. On Linux
 /// the space a longer file needs is reserved before the first byte changes,
 /// so running out of it fails with the file untouched. With `must_reserve`,
-/// a filesystem that can't reserve space fails the write too, untouched,
-/// instead of writing on unguarded.
+/// the whole output is reserved even when it is not longer (a sparse or
+/// copy-on-write file can need new blocks to overwrite), and a filesystem
+/// that can't reserve space fails the write too, untouched, instead of
+/// writing on unguarded.
 fn write_in_place(target: &Path, bytes: &[u8], must_reserve: bool) -> Result<(), ReplaceError> {
     use std::io::{Seek as _, Write as _};
     #[cfg(not(target_os = "linux"))]
@@ -885,8 +887,12 @@ fn write_in_place(target: &Path, bytes: &[u8], must_reserve: bool) -> Result<(),
     let before = file.metadata().ok();
     #[cfg(target_os = "linux")]
     let old_len = before.as_ref().map_or(0, |m| m.len());
+    // A mandatory reservation covers the whole output even when it is no
+    // longer than the file: overwriting a sparse file's holes, or any block
+    // on a copy-on-write filesystem, can still need new blocks and fail
+    // halfway through the old contents.
     #[cfg(target_os = "linux")]
-    if new_len > old_len {
+    if new_len > old_len || (must_reserve && new_len > 0) {
         use std::os::unix::io::AsRawFd as _;
         let err = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, new_len as libc::off_t) };
         let unsupported = err == libc::EOPNOTSUPP || err == libc::EINVAL;
