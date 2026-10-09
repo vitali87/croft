@@ -38268,6 +38268,7 @@ impl App {
                         app.active_git_bypass_debounce();
                         app.refresh_git_status_debounced();
                         app.refresh_source_control();
+                        app.continue_rebase_after_commit();
                     }
                     Err(err) => app.report_commit_failure(&err),
                 }
