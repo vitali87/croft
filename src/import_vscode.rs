@@ -104,6 +104,10 @@ fn never_means_disabled(v: &Value) -> Option<Value> {
     v.as_str().map(|s| Value::from(s == "never"))
 }
 
+fn none_means_disabled(v: &Value) -> Option<Value> {
+    v.as_str().map(|s| Value::from(s == "none"))
+}
+
 fn as_whitespace_mode(v: &Value) -> Option<Value> {
     // VS Code has five whitespace modes; croft has three (WhitespaceMode:
     // none, selection, all). Only ids croft can actually represent are
@@ -135,12 +139,25 @@ fn as_scrollback(v: &Value) -> Option<Value> {
 /// set to `true`. A `false` entry switches a glob off, and a `when` clause
 /// hides a file only next to a sibling croft does not look for, so both are
 /// left out: a dropped entry shows a file, a misread one would hide it.
+///
+/// VS Code matches these globs against the workspace-relative path, so a
+/// bare `build` is the root's `build` only, where croft's own bare glob
+/// matches at any depth and hid `scripts/build/` too (#1479). Such a glob
+/// crosses anchored, as `/build`. A glob that already starts with `/`
+/// matches no workspace-relative path in VS Code, so it is left out rather
+/// than read as croft's root anchor, which would hide a file VS Code shows.
 fn as_enabled_globs(v: &Value) -> Option<Value> {
     let obj = v.as_object()?;
     Some(Value::from(
         obj.iter()
-            .filter(|(_, on)| on.as_bool() == Some(true))
-            .map(|(glob, _)| glob.clone())
+            .filter(|(glob, on)| on.as_bool() == Some(true) && !glob.starts_with('/'))
+            .map(|(glob, _)| {
+                if glob.contains('/') || glob.starts_with("**") {
+                    glob.clone()
+                } else {
+                    format!("/{glob}")
+                }
+            })
             .collect::<Vec<String>>(),
     ))
 }
@@ -180,6 +197,11 @@ const SETTINGS: &[SettingMap] = &[
         vscode: "debug.inlineValues",
         croft: "disable_inline_values",
         convert: off_means_disabled,
+    },
+    SettingMap {
+        vscode: "debug.saveBeforeStart",
+        croft: "disable_save_before_debug",
+        convert: none_means_disabled,
     },
     SettingMap {
         vscode: "editor.renderWhitespace",
@@ -274,6 +296,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "focus_right_editor_group",
     ),
     ("workbench.action.terminal.focus", "focus_terminal"),
+    (
+        "workbench.action.terminal.runSelectedText",
+        "run_selected_text",
+    ),
     ("workbench.actions.view.problems", "show_problems"),
     ("workbench.action.toggleZenMode", "toggle_zen_mode"),
     (
@@ -1177,6 +1203,37 @@ mod tests {
         assert_eq!(parsed.files_exclude, vec![String::from("**/generated")]);
     }
 
+    /// #1479: VS Code matches an exclude glob against the workspace-relative
+    /// path, so a bare `build` is the root's `build` only. It crosses over
+    /// anchored (`/build`), where croft's own bare globs match at any depth;
+    /// a glob that already says where it applies crosses unchanged, and one
+    /// with its own leading `/` (which VS Code never matches) is left out.
+    #[test]
+    fn a_bare_vscode_exclude_glob_stays_anchored_to_the_root() {
+        let mut report = Report::default();
+        convert_settings(
+            &json!({
+                "files.exclude": {
+                    "build": true,
+                    "*.log": true,
+                    "**/node_modules": true,
+                    "src/gen": true,
+                    "/dist": true
+                },
+                "search.exclude": { "coverage": true }
+            }),
+            &mut report,
+        );
+        let mut files: Vec<String> =
+            serde_json::from_value(report.settings["files_exclude"].clone()).unwrap();
+        files.sort();
+        assert_eq!(
+            files,
+            vec!["**/node_modules", "/*.log", "/build", "src/gen"]
+        );
+        assert_eq!(report.settings["search_exclude"], json!(["/coverage"]));
+    }
+
     /// #1345 negative: an exclude setting that is not an object maps to
     /// nothing and is reported, not read as "exclude everything".
     #[test]
@@ -1393,6 +1450,23 @@ mod tests {
                  happens to be, not at the caret"
             );
         }
+    }
+
+    /// #1400: `debug.saveBeforeStart: "none"` is the one value that turns
+    /// off saving before a launch; VS Code's other values all save.
+    #[test]
+    fn debug_save_before_start_none_disables_saving_before_a_launch() {
+        let none = json!({ "debug.saveBeforeStart": "none" });
+        let (mapped, _, _) = map_settings(none.as_object().unwrap());
+        assert_eq!(mapped["disable_save_before_debug"], json!(true));
+        for value in ["allEditorsInActiveGroup", "nonUntitledEditorsInActiveGroup"] {
+            let saves = json!({ "debug.saveBeforeStart": value });
+            let (mapped, _, _) = map_settings(saves.as_object().unwrap());
+            assert_eq!(mapped["disable_save_before_debug"], json!(false), "{value}");
+        }
+        let junk = json!({ "debug.saveBeforeStart": 3 });
+        let (mapped, _, _) = map_settings(junk.as_object().unwrap());
+        assert!(!mapped.contains_key("disable_save_before_debug"));
     }
 
     /// The workspace layer and this importer must read a VS Code settings
@@ -1771,6 +1845,24 @@ mod tests {
             vec![(String::from("ctrl+s"), String::from("save_file"))]
         );
         assert_eq!(report.snippets["Test"]["scope"], json!("rust"));
+    }
+
+    /// #1292: VS Code's Run Selected Text keybinding imports instead of
+    /// being dropped.
+    #[test]
+    fn run_selected_text_keybinding_imports() {
+        let mut report = Report::default();
+        convert_keybindings(
+            &json!([{ "key": "ctrl+alt+enter", "command": "workbench.action.terminal.runSelectedText" }]),
+            &mut report,
+        );
+        assert_eq!(
+            report.keybindings,
+            vec![(
+                String::from("ctrl+alt+enter"),
+                String::from("run_selected_text")
+            )]
+        );
     }
 
     /// #1286: VSCodeVim installed in the profile's product turns croft's

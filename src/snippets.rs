@@ -270,16 +270,44 @@ impl Body {
 
 impl SnippetSet {
     pub fn load(path: &Path) -> Self {
-        let Ok(json) = std::fs::read_to_string(path) else {
-            return Self::default();
-        };
-        Self::from_json(&json)
+        Self::load_with_warning(path).0
     }
 
+    /// [`Self::load`], with the reason a file that exists loaded nothing,
+    /// also reported to OUTPUT · Snippets where keybindings.json reports its.
+    pub fn load_with_warning(path: &Path) -> (Self, Option<String>) {
+        let Ok(json) = std::fs::read_to_string(path) else {
+            return (Self::default(), None);
+        };
+        let (set, warning) = Self::parse(&json);
+        let warning = warning.map(|w| format!("{}: {w}", path.display()));
+        if let Some(w) = &warning {
+            crate::output::push("Snippets", crate::output::OutputLevel::Warn, w);
+        }
+        (set, warning)
+    }
+
+    #[cfg(test)]
     pub fn from_json(json: &str) -> Self {
-        let stripped = crate::keymap::strip_line_comments(json);
+        Self::parse(json).0
+    }
+
+    /// The snippets in `json`, read as JSONC like VS Code's snippet files
+    /// and croft's settings (comments and trailing commas, #1191), and why
+    /// none were loaded when the file does not parse at all.
+    pub fn parse(json: &str) -> (Self, Option<String>) {
+        if json.trim().is_empty() {
+            return (Self::default(), None);
+        }
         let raw: std::collections::BTreeMap<String, RawSnippet> =
-            serde_json::from_str(&stripped).unwrap_or_default();
+            match serde_json::from_str(&crate::tasks::strip_jsonc(json)) {
+                Ok(raw) => raw,
+                Err(e) => {
+                    let why =
+                        format!("the file does not parse ({e}); NO snippets were loaded from it");
+                    return (Self::default(), Some(why));
+                }
+            };
         let snippets = raw
             .into_values()
             .filter(|r| !r.prefix.is_empty())
@@ -297,7 +325,7 @@ impl SnippetSet {
                     .unwrap_or_default(),
             })
             .collect();
-        Self { snippets }
+        (Self { snippets }, None)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -353,6 +381,42 @@ pub const TEMPLATE: &str = r#"// croft user snippets. Keyed by name; each has a 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snippets_with_a_trailing_comma_or_block_comment_still_load() {
+        // #1191: VS Code's snippet files are JSONC, and a pasted one has both.
+        let set = SnippetSet::from_json(
+            "{\n  /* logging */\n  \"log\": { \"prefix\": \"log\", \"body\": \"console.log($1);\" },\n  \"todo\": { \"prefix\": \"todo\", \"body\": [\"// TODO: $1\",], },\n}\n",
+        );
+        assert_eq!(set.matching("log", "javascript").len(), 1);
+        let todo = set.matching("todo", "javascript");
+        assert_eq!(todo.len(), 1);
+        assert_eq!(
+            todo[0].body, "// TODO: $1",
+            "a comment marker inside a string stays"
+        );
+    }
+
+    #[test]
+    fn snippet_bodies_keep_what_only_looks_like_jsonc() {
+        // Negative: commas before a brace and comment markers inside strings
+        // are the snippet's text, not JSONC to strip.
+        let set =
+            SnippetSet::from_json(r#"{"c": {"prefix": "cm", "body": "/* $1 */ f(a, }) // end"}}"#);
+        assert_eq!(set.matching("cm", "c")[0].body, "/* $1 */ f(a, }) // end");
+    }
+
+    #[test]
+    fn a_snippets_file_that_does_not_parse_says_so() {
+        // A file that is broken (not merely JSONC) loads nothing, as before,
+        // but no longer silently: the reason comes back for OUTPUT.
+        let (set, warning) = SnippetSet::parse(r#"{"log": {"prefix": "log" "body": "x"}}"#);
+        assert!(set.matching("log", "javascript").is_empty());
+        let warning = warning.expect("a warning");
+        assert!(warning.contains("does not parse"), "{warning}");
+        let (_, none) = SnippetSet::parse("{}");
+        assert_eq!(none, None, "an empty file is fine");
+    }
 
     #[test]
     fn lsp_snippets_keep_backslashes_nest_placeholders_and_pick_a_choice() {
