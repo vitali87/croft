@@ -76345,6 +76345,89 @@ fn a_save_as_that_fails_leaves_the_tab_where_it_was() {
     assert!(error.is_some(), "the prompt stays open with the reason");
 }
 
+/// A workspace with `report.py` open and an unsaved comment typed on line 1.
+fn app_with_an_edited_report(dir: &Path) -> App {
+    std::fs::write(
+        dir.join("report.py"),
+        "def total(xs):\n    return sum(xs)\n",
+    )
+    .unwrap();
+    let mut app = App::new(dir.to_path_buf()).unwrap();
+    app.editor.open_pinned(&dir.join("report.py")).unwrap();
+    app.focus = Pane::Editor;
+    app.editor.insert_str("# draft ");
+    assert!(app.editor.dirty, "precondition: the tab has unsaved edits");
+    app
+}
+
+/// Run File: Revert File the way the palette does.
+fn revert_file(app: &mut App) {
+    let cmd = crate::widgets::command_palette::Command::from_id("revert_file")
+        .expect("there is a File: Revert File command");
+    app.run_command(cmd);
+}
+
+/// #1285: Revert File drops every unsaved edit in one step and says so.
+#[test]
+fn revert_file_restores_the_text_on_disk_and_clears_dirty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_an_edited_report(tmp.path());
+    revert_file(&mut app);
+    assert_eq!(
+        app.editor.lines,
+        vec!["def total(xs):", "    return sum(xs)"]
+    );
+    assert!(!app.editor.dirty);
+    assert_eq!(app.status, "Reverted report.py");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("report.py")).unwrap(),
+        "def total(xs):\n    return sum(xs)\n",
+        "the file on disk is not touched"
+    );
+}
+
+/// #1285: the revert is one undo step, so Ctrl+Z brings the edits back,
+/// marked unsaved again, and redo reverts again.
+#[test]
+fn undo_after_revert_file_brings_the_edits_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_an_edited_report(tmp.path());
+    revert_file(&mut app);
+    assert!(app.editor.undo());
+    assert_eq!(app.editor.lines[0], "# draft def total(xs):");
+    assert!(app.editor.dirty, "the restored edits are unsaved again");
+    assert!(app.editor.redo());
+    assert_eq!(app.editor.lines[0], "def total(xs):");
+}
+
+/// #1285 negative: on a tab with nothing unsaved Revert File changes
+/// nothing, adds no undo step, and says there is nothing to revert.
+#[test]
+fn revert_file_on_a_clean_tab_does_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("report.py"), "x = 1\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_pinned(&tmp.path().join("report.py"))
+        .unwrap();
+    revert_file(&mut app);
+    assert_eq!(app.editor.lines, vec!["x = 1"]);
+    assert!(!app.editor.undo(), "no undo step was added");
+    assert!(app.status.contains("no unsaved changes"), "{}", app.status);
+}
+
+/// #1285 negative: a buffer with no file behind it has nothing to revert
+/// to, so its text stays.
+#[test]
+fn revert_file_keeps_a_buffer_with_no_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.insert_str("scratch");
+    revert_file(&mut app);
+    assert_eq!(app.editor.lines, vec!["scratch"]);
+    assert!(app.status.contains("no file"), "{}", app.status);
+}
+
 /// #852: every bottom-panel tab is reachable from the keyboard. Each tab
 /// names the palette command that shows it (`show_command` has no
 /// catch-all, so a new tab cannot compile without one, and the strip paints
