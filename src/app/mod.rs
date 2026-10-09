@@ -38465,22 +38465,6 @@ impl App {
         }
     }
 
-    /// Rebuild every open diff view, in every split group, whose sides may
-    /// have moved (#471), keeping each reader's viewport. Returns true when
-    /// any view's content actually changed, so the caller owes a redraw.
-    ///
-    /// Two triggers, two costs. A filesystem event or poll (`git_too` false)
-    /// re-reads only file-backed sides, and only those whose stat stamp
-    /// moved, so an idle tick is a stat per open diff and nothing more. A
-    /// git-status drain (`git_too` true; the worker debounces it) also
-    /// re-runs the `git diff` behind a staged / branch / previous-commit
-    /// view, whose input is the index or a ref rather than a file, and
-    /// re-reads the HEAD blob behind a Source Control view for the roots in
-    /// `heads_moved` -- the drain already knows whose HEAD oid changed, and
-    /// a `git show` per open diff per status refresh would otherwise run
-    /// during every write burst for a HEAD that had not moved.
-    /// A view whose content came back identical is left untouched: no reset
-    /// of selection or find, no redraw.
     /// The unsaved text of `path` in whichever editor group holds it dirty
     /// (#1572): a split shows the same file in several groups, and the dirty
     /// copy may sit in an inactive one while the active group's is clean.
@@ -38499,6 +38483,22 @@ impl App {
             .open_diff_resolved(left, right, left_unsaved, right_unsaved)
     }
 
+    /// Rebuild every open diff view, in every split group, whose sides may
+    /// have moved (#471), keeping each reader's viewport. Returns true when
+    /// any view's content actually changed, so the caller owes a redraw.
+    ///
+    /// Two triggers, two costs. A filesystem event or poll (`git_too` false)
+    /// re-reads only file-backed sides, and only those whose stat stamp
+    /// moved, so an idle tick is a stat per open diff and nothing more. A
+    /// git-status drain (`git_too` true; the worker debounces it) also
+    /// re-runs the `git diff` behind a staged / branch / previous-commit
+    /// view, whose input is the index or a ref rather than a file, and
+    /// re-reads the HEAD blob behind a Source Control view for the roots in
+    /// `heads_moved` -- the drain already knows whose HEAD oid changed, and
+    /// a `git show` per open diff per status refresh would otherwise run
+    /// during every write burst for a HEAD that had not moved.
+    /// A view whose content came back identical is left untouched: no reset
+    /// of selection or find, no redraw.
     pub fn refresh_open_diff_views(
         &mut self,
         git_too: bool,
