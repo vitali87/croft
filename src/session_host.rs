@@ -1930,6 +1930,7 @@ fn client_teardown_seq() -> Vec<u8> {
         crossterm::terminal::LeaveAlternateScreen,
         crossterm::event::DisableMouseCapture,
         crossterm::event::DisableBracketedPaste,
+        crossterm::event::DisableFocusChange,
         crossterm::cursor::Show,
     );
     seq
@@ -3975,6 +3976,7 @@ mod tests {
             ("\x1b[?1003l", "mouse motion"),
             ("\x1b[?1006l", "SGR mouse"),
             ("\x1b[?2004l", "bracketed paste"),
+            ("\x1b[?1004l", "focus reports"),
             ("\x1b[<1u", "kitty keyboard flags"),
             ("\x1b[?25h", "cursor visibility"),
         ] {

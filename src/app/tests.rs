@@ -79435,3 +79435,116 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     assert!(!app.apply_build_scan(pane, Some(&cwd), "tsc --watch", "a.c:1:1: error: old\n"));
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
 }
+
+/// Issue #1622: auto save "onWindowChange". The terminal window croft runs
+/// in losing focus (alt-tab, another tmux window) writes every dirty buffer,
+/// the one being typed into included: the editor still has croft's own
+/// focus, but the whole window lost the user's.
+#[test]
+fn the_window_losing_focus_saves_the_buffer_being_edited() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
+    app.auto_save = false;
+    app.auto_save_on_focus_change = true;
+    app.focus_pane(Pane::Editor);
+    app.tick_auto_save();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.dirty);
+    assert!(!app.tick_auto_save(), "focus inside croft has not moved");
+    assert!(app.on_window_focus_lost(), "the window lost focus");
+    assert!(!app.editor.dirty, "the active buffer is saved");
+    let on_disk = std::fs::read_to_string(tmp.path().join("a.txt")).unwrap();
+    assert!(on_disk.contains('x'), "the edit is on disk: {on_disk:?}");
+}
+
+/// Every open buffer is written, not only the active one.
+#[test]
+fn the_window_losing_focus_saves_every_dirty_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "aaa").unwrap();
+    std::fs::write(&b, "bbb").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.auto_save = false;
+    app.auto_save_on_focus_change = false;
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('A'), KeyModifiers::NONE))
+        .unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.handle_key(key(KeyCode::Char('B'), KeyModifiers::NONE))
+        .unwrap();
+    app.tick_auto_save();
+    app.auto_save_on_focus_change = true;
+    assert!(app.on_window_focus_lost());
+    let a_disk = std::fs::read_to_string(&a).unwrap();
+    let b_disk = std::fs::read_to_string(&b).unwrap();
+    assert!(
+        a_disk.contains('A'),
+        "the background tab is saved: {a_disk:?}"
+    );
+    assert!(b_disk.contains('B'), "the active tab is saved: {b_disk:?}");
+}
+
+/// Negative: with the focus-change mode off, the window losing focus
+/// writes nothing, even with afterDelay on and a buffer old enough.
+#[test]
+fn the_window_losing_focus_saves_nothing_when_the_mode_is_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
+    app.auto_save = true;
+    app.auto_save_on_focus_change = false;
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    age_last_edit(&mut app.editor);
+    assert!(!app.on_window_focus_lost(), "the mode is off");
+    assert!(app.editor.dirty, "the buffer stays dirty");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+        "hello"
+    );
+}
+
+/// Negative: a clean buffer is not rewritten when the window loses focus.
+#[test]
+fn the_window_losing_focus_leaves_clean_buffers_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
+    app.auto_save = false;
+    app.auto_save_on_focus_change = true;
+    app.focus_pane(Pane::Editor);
+    let before = std::fs::metadata(tmp.path().join("a.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert!(!app.on_window_focus_lost(), "nothing to save");
+    let after = std::fs::metadata(tmp.path().join("a.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(before, after, "a clean file is not rewritten");
+}
+
+/// The terminal only reports focus in and out once asked to (mode 1004),
+/// so the takeover turns it on and every restore path turns it back off.
+#[test]
+fn focus_reports_are_turned_on_at_startup_and_off_on_exit() {
+    let takeover = String::from_utf8(takeover_mode_seq()).unwrap();
+    assert!(
+        takeover.contains("\x1b[?1004h"),
+        "takeover must enable focus reports: {takeover:?}"
+    );
+    let restore = String::from_utf8_lossy(TERMINAL_RESTORE_SEQ);
+    assert!(
+        restore.contains("\x1b[?1004l"),
+        "the restore sequence must disable focus reports"
+    );
+    assert!(
+        !restore.contains("\x1b[?1004h"),
+        "restoring must never re-enable them"
+    );
+}
