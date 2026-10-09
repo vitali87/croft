@@ -265,7 +265,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 
 | Keys | Action |
 |------|--------|
-| Arrows, Home, End | Navigate (clears any selection) |
+| Arrows, Home, End | Navigate (clears any selection). `Down` on the last line goes to its end and `Up` on the first line to its start, so `Shift`+`Down` / `Shift`+`Up` select through the ends of the file |
 | `Shift`+arrows / `Home` / `End` / `PageUp` / `PageDown` | Extend the selection by the same motion |
 | `Shift`+`Alt`+`→` / `Shift`+`Alt`+`←` | Expand / Shrink Selection (VS Code's smart select): grow every cursor to the next semantically meaningful range and retrace back exactly. Ranges come from the language server (`textDocument/selectionRange`, one request covering all cursors) when it advertises the capability, else from tree-sitter node ancestry — so the gesture works with no LSP at all; a plain-text file grows line → buffer. Any edit, click, or caret change restarts the gesture |
 | `PageUp` / `PageDown` (`fn`+`↑` / `fn`+`↓` on Mac) | Scroll one viewport |
