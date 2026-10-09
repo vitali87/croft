@@ -806,6 +806,22 @@ mod tests {
         );
     }
 
+    /// #1636: the editor's find bar keeps a numbered reference with no
+    /// group as text, in Replace and Replace All.
+    #[test]
+    fn a_numbered_reference_with_no_group_stays_literal_in_the_editor() {
+        let opts = SearchOpts {
+            use_regex: true,
+            ..SearchOpts::default()
+        };
+        let got = expand_replacement("apple", 0, 5, "(apple)", "v$10 costs $5", opts);
+        assert_eq!(got.as_deref(), Some("vapple0 costs $5"));
+        let buf = lines(&["apple", "apple pie"]);
+        let (new_lines, n) = replace_all_in_lines(&buf, "(apple)", "$1 costs $5", opts).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(new_lines, lines(&["apple costs $5", "apple costs $5 pie"]));
+    }
+
     #[test]
     fn replace_all_in_lines_returns_none_for_empty_needle() {
         let buf = lines(&["alpha"]);
