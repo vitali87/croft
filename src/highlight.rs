@@ -848,7 +848,8 @@ pub fn lang_for_fence(info: &str) -> Option<LangKind> {
 /// Rename the older nvim-treesitter capture names some bundled queries use
 /// (`@conditional`, `@repeat`, `@field`, ...) to the ones in
 /// [`HIGHLIGHT_NAMES`], so their keywords and fields colour like every
-/// other language's (#1226).
+/// other language's (#1226), and drop the spell-check tags that would
+/// otherwise blank the colour before them (#1465).
 fn standard_captures(query: &str) -> String {
     static RENAMES: std::sync::OnceLock<[(regex::Regex, &str); 6]> = std::sync::OnceLock::new();
     let renames = RENAMES.get_or_init(|| {
@@ -869,7 +870,13 @@ fn standard_captures(query: &str) -> String {
     for (re, to) in renames {
         out = re.replace_all(&out, *to).into_owned();
     }
-    out
+    // Spell-check tags carry no colour, and a later capture on the same
+    // node wins: `(comment) @comment @spell` drew comments as plain code
+    // (#1465). Drop them where they follow another capture.
+    static SPELL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let spell =
+        SPELL.get_or_init(|| regex::Regex::new(r"(@[\w.]+)\s+@(?:no)?spell\b").expect("static"));
+    spell.replace_all(&out, "$1").into_owned()
 }
 
 /// A C or C++ char literal is a string, as VS Code colours it, not the
@@ -1193,7 +1200,7 @@ fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
         LangKind::Dockerfile => HighlightConfiguration::new(
             tree_sitter_containerfile::LANGUAGE.into(),
             "dockerfile",
-            tree_sitter_containerfile::HIGHLIGHTS_QUERY,
+            &standard_captures(tree_sitter_containerfile::HIGHLIGHTS_QUERY),
             "",
             "",
         )
@@ -2955,6 +2962,77 @@ def f() -> Config:\n\
         assert_eq!(
             standard_captures("(a) @fieldset (b) @keyword"),
             "(a) @fieldset (b) @keyword"
+        );
+    }
+
+    /// #1465: a line comment in SQL and in a Dockerfile is coloured as a
+    /// comment. Both queries tag it `@comment @spell`, and the later,
+    /// colourless `@spell` replaced the comment colour.
+    #[test]
+    fn sql_and_dockerfile_line_comments_are_comments() {
+        let cases = [
+            (
+                LangKind::Sql,
+                "-- line comment\nSELECT 1; -- trailing comment\n/* block comment */\nSELECT 2;\n",
+                vec![
+                    (0, "-- line comment"),
+                    (1, "-- trailing comment"),
+                    (2, "/* block comment */"),
+                ],
+            ),
+            (
+                LangKind::Dockerfile,
+                "# line comment\nFROM alpine:3.20\n# install curl\nRUN apk add curl\n",
+                vec![(0, "# line comment"), (2, "# install curl")],
+            ),
+        ];
+        let p = SyntaxPalette::BASE16;
+        let comment = palette_style_for_name(&p, "comment");
+        for (kind, src, comments) in cases {
+            let mut reg = LangRegistry::new();
+            let ls = compute_line_starts(src.as_bytes());
+            let h = highlight_text_with_palette(&mut reg, kind, src.as_bytes(), &ls, &p).0;
+            for (row, text) in comments {
+                let line = src.lines().nth(row).unwrap();
+                let span = span_at(&h[row], line, text)
+                    .unwrap_or_else(|| panic!("{kind:?}: no span on {text:?}"));
+                assert_eq!(span.style, comment, "{kind:?}: {text:?} is a comment");
+            }
+        }
+    }
+
+    /// #1465 negative: the code beside those comments keeps its own colour.
+    /// Only the comments change.
+    #[test]
+    fn code_beside_sql_and_dockerfile_comments_keeps_its_colour() {
+        let p = SyntaxPalette::BASE16;
+        let keyword = palette_style_for_name(&p, "keyword");
+        for (kind, src, row, word) in [
+            (LangKind::Sql, "-- c\nSELECT 1; -- c\n", 1, "SELECT"),
+            (LangKind::Dockerfile, "# c\nFROM alpine:3.20\n", 1, "FROM"),
+        ] {
+            let mut reg = LangRegistry::new();
+            let ls = compute_line_starts(src.as_bytes());
+            let h = highlight_text_with_palette(&mut reg, kind, src.as_bytes(), &ls, &p).0;
+            let line = src.lines().nth(row).unwrap();
+            let span = span_at(&h[row], line, word)
+                .unwrap_or_else(|| panic!("{kind:?}: no span on {word:?}"));
+            assert_eq!(span.style, keyword, "{kind:?}: {word:?}");
+        }
+    }
+
+    /// #1465: a spell-check tag that follows a colour capture is dropped,
+    /// so it cannot replace the colour. Names that only start like it, and
+    /// captures in a predicate, are left alone.
+    #[test]
+    fn spell_check_tags_never_replace_a_colour_capture() {
+        assert_eq!(
+            standard_captures("(comment) @comment @spell\n(x) @keyword.directive @nospell"),
+            "(comment) @comment\n(x) @keyword.directive"
+        );
+        assert_eq!(
+            standard_captures("(a) @comment @spelling (b) @spell"),
+            "(a) @comment @spelling (b) @spell"
         );
     }
 
