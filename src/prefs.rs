@@ -715,6 +715,12 @@ pub(crate) fn replace_file_contents(path: &Path, bytes: &[u8]) -> Result<(), Rep
     write_in_place(&target, bytes, false)
 }
 
+/// `statfs` magic numbers of the filesystems that copy every overwritten
+/// block, where reserving space does not make an overwrite safe: Btrfs, ZFS
+/// and bcachefs.
+#[cfg(target_os = "linux")]
+const COPY_ON_WRITE_FS_MAGIC: [u32; 3] = [0x9123_683E, 0x2FC1_2FC1, 0xCA45_1A4E];
+
 /// The disk or the user's quota is full.
 #[cfg(target_os = "linux")]
 fn is_out_of_space(e: &std::io::Error) -> bool {
@@ -887,6 +893,37 @@ fn write_in_place(target: &Path, bytes: &[u8], must_reserve: bool) -> Result<(),
     let before = file.metadata().ok();
     #[cfg(target_os = "linux")]
     let old_len = before.as_ref().map_or(0, |m| m.len());
+    // Reserving space does not hold on a filesystem that writes every
+    // overwritten block somewhere new (Btrfs, ZFS, bcachefs): an overwrite
+    // can still run out halfway through the old contents, so the mandatory
+    // fallback refuses there, untouched. XFS shares reflinked extents the
+    // same way but can unshare them up front, which leaves nothing to copy
+    // on write.
+    #[cfg(target_os = "linux")]
+    if must_reserve {
+        use std::os::unix::io::AsRawFd as _;
+        let fd = file.as_raw_fd();
+        let refuse = |err: i32| ReplaceError {
+            error: std::io::Error::from_raw_os_error(err),
+            touched: false,
+        };
+        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatfs(fd, &mut st) } != 0 {
+            return Err(refuse(libc::EOPNOTSUPP));
+        }
+        if COPY_ON_WRITE_FS_MAGIC.contains(&(st.f_type as u32)) {
+            return Err(refuse(libc::EOPNOTSUPP));
+        }
+        if old_len > 0 {
+            let err = unsafe {
+                libc::fallocate(fd, libc::FALLOC_FL_UNSHARE_RANGE, 0, old_len as libc::off_t)
+            };
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if err != 0 && errno != libc::EOPNOTSUPP && errno != libc::EINVAL {
+                return Err(refuse(errno));
+            }
+        }
+    }
     // A mandatory reservation covers the whole output even when it is no
     // longer than the file: overwriting a sparse file's holes, or any block
     // on a copy-on-write filesystem, can still need new blocks and fail
