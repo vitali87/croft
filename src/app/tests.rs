@@ -15023,6 +15023,7 @@ fn optional_members_survive_the_first_typed_letter() {
     };
     assert!(app.apply_completion_result(CompletionResult {
         request_id: 1,
+        is_incomplete: false,
         path: path.clone(),
         items: vec![member("email"), member("name")],
     }));
@@ -15106,6 +15107,7 @@ fn typing_into_an_incomplete_list_asks_the_server_again() {
     assert!(app.completion_popup.is_some());
     app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
         .unwrap();
+    sync_then_reask(&mut app);
     let again = app
         .completion_request_id
         .expect("an incomplete list keeps a request in flight");
@@ -15142,6 +15144,7 @@ fn an_incomplete_list_keeps_its_matches_until_the_new_reply_lands() {
         .as_ref()
         .expect("`local` still matches");
     assert_eq!(popup.visible_indices().len(), 1);
+    sync_then_reask(&mut app);
     // The first ask answering late is dropped by id.
     tx.send(incomplete_reply(first, &path, &["stale"])).unwrap();
     assert!(!app.drain_lsp_completion());
@@ -15162,6 +15165,7 @@ fn typing_into_a_complete_list_only_filters_it() {
     app.drain_lsp_completion();
     app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE))
         .unwrap();
+    sync_then_reask(&mut app);
     assert_eq!(app.completion_request_id, Some(first), "no re-ask");
     assert!(app.completion_popup.is_some());
     app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
@@ -15182,8 +15186,77 @@ fn leaving_the_word_ends_an_incomplete_list() {
     app.drain_lsp_completion();
     app.handle_key(key(KeyCode::Char(' '), KeyModifiers::NONE))
         .unwrap();
+    sync_then_reask(&mut app);
     assert!(app.completion_popup.is_none());
     assert_eq!(app.completion_request_id, None);
+}
+
+/// One event-loop tick's LSP steps: the edit's `didChange`, then the re-ask
+/// an incomplete list left due (#1529).
+fn sync_then_reask(app: &mut App) {
+    app.sync_lsp();
+    app.send_due_completion_reask();
+}
+
+/// #1529: when a keystroke filters out every item of an incomplete list,
+/// the popup closes but the session stays: the next keystroke, typed before
+/// the re-ask answers, asks again for the newer word.
+#[test]
+fn an_emptied_incomplete_list_still_re_asks_on_the_next_keystroke() {
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.trigger_completion();
+    let first = app.completion_request_id.unwrap();
+    draw(&mut app, 100, 30);
+    tx.send(incomplete_reply(first, &path, &["load", "local"]))
+        .unwrap();
+    app.drain_lsp_completion();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.completion_popup.is_none(), "nothing matches `lox`");
+    sync_then_reask(&mut app);
+    let second = app.completion_request_id.expect("re-asked for `lox`");
+    assert_ne!(second, first);
+    app.handle_key(key(KeyCode::Char('o'), KeyModifiers::NONE))
+        .unwrap();
+    sync_then_reask(&mut app);
+    let third = app.completion_request_id.expect("re-asked for `loxo`");
+    assert_ne!(third, second, "a keystroke with no popup still re-asks");
+    draw(&mut app, 100, 30);
+    tx.send(incomplete_reply(third, &path, &["loxodrome"]))
+        .unwrap();
+    assert!(app.drain_lsp_completion());
+    let popup = app.completion_popup.as_ref().expect("the new list opens");
+    assert_eq!(popup.prefix, "loxo");
+}
+
+/// #1529: the re-ask waits for the tick's `sync_lsp`, so the server has the
+/// edit's `didChange` before it is asked about the new caret position.
+#[test]
+fn an_incomplete_re_ask_waits_until_the_edit_is_synced() {
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.trigger_completion();
+    let first = app.completion_request_id.unwrap();
+    draw(&mut app, 100, 30);
+    tx.send(incomplete_reply(first, &path, &["load"])).unwrap();
+    app.drain_lsp_completion();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('o'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.completion_request_id,
+        Some(first),
+        "no request goes out from the key handler"
+    );
+    app.send_due_completion_reask();
+    let again = app.completion_request_id.unwrap();
+    assert_ne!(again, first, "one re-ask covers both keystrokes");
+    app.send_due_completion_reask();
+    assert_eq!(
+        app.completion_request_id,
+        Some(again),
+        "nothing more is due"
+    );
 }
 
 /// One completion reply for `path`, offering each of `labels`.
