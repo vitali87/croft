@@ -2240,6 +2240,14 @@ pub enum ExternalChange {
     Conflict,
 }
 
+/// Why a buffer is written. Only an auto-save, which fires mid-typing,
+/// leaves the caret lines' trailing whitespace for later (#1455).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaveReason {
+    Explicit,
+    Auto,
+}
+
 /// Outcome of a guarded `save_to_disk`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaveOutcome {
@@ -9672,11 +9680,21 @@ impl Editor {
     /// `DiskConflict` instead of writing in that case; the caller surfaces
     /// the conflict and may call `save_to_disk_force` to overwrite anyway.
     pub fn save_to_disk(&mut self) -> Result<SaveOutcome> {
+        self.save_to_disk_for(SaveReason::Explicit)
+    }
+
+    /// `save_to_disk` for auto-save: the one save that leaves the caret
+    /// lines' trailing whitespace alone, since it fires mid-typing (#1455).
+    pub fn auto_save_to_disk(&mut self) -> Result<SaveOutcome> {
+        self.save_to_disk_for(SaveReason::Auto)
+    }
+
+    fn save_to_disk_for(&mut self, reason: SaveReason) -> Result<SaveOutcome> {
         if self.disk_changed_externally() {
             self.disk_conflict = true;
             return Ok(SaveOutcome::DiskConflict);
         }
-        self.write_buffer_to_disk()
+        self.write_buffer_to_disk(reason)
     }
 
     /// Save past a disk conflict, overwriting the external change. The
@@ -9687,7 +9705,7 @@ impl Editor {
     /// buffer with both problems still reports `EncodingLoss` here and needs
     /// `lossy_save_armed` on top.
     pub fn save_to_disk_force(&mut self) -> Result<SaveOutcome> {
-        self.write_buffer_to_disk()
+        self.write_buffer_to_disk(SaveReason::Explicit)
     }
 
     /// File: Save As… (#1203): write the buffer to `path` and make this tab
@@ -9701,7 +9719,7 @@ impl Editor {
         );
         self.disk_stamp = Self::disk_stamp_of(path);
         self.disk_conflict = false;
-        let outcome = self.write_buffer_to_disk();
+        let outcome = self.write_buffer_to_disk(SaveReason::Explicit);
         if matches!(outcome, Ok(SaveOutcome::Saved)) {
             let lang = crate::highlight::lang_for_path(path);
             if lang != self.lang {
@@ -9807,7 +9825,7 @@ impl Editor {
         content
     }
 
-    fn write_buffer_to_disk(&mut self) -> Result<SaveOutcome> {
+    fn write_buffer_to_disk(&mut self, reason: SaveReason) -> Result<SaveOutcome> {
         // Preview tabs (image/PDF, sheet, diff, hex) hold the whole-
         // buffer-swap PLACEHOLDER in `lines`, not the file's content:
         // serialising it truncated the previewed file to nothing (#185).
@@ -9816,7 +9834,7 @@ impl Editor {
         if self.has_non_text_view() {
             anyhow::bail!("This tab is a read-only preview; nothing to save");
         }
-        self.apply_editorconfig_on_save();
+        self.apply_editorconfig_on_save(reason);
         let path = self
             .path
             .as_ref()
@@ -10972,16 +10990,21 @@ impl Editor {
         true
     }
 
-    /// `trim_trailing_whitespace` for a save: every line except the ones a
-    /// caret sits on (primary and extra carets). Auto-save runs a second
-    /// after typing stops, so trimming the caret's own line would eat the
-    /// space just typed and glue the next word onto the previous one. The
-    /// caret lines are normalised by a later save once the caret has moved;
-    /// the explicit Trim Trailing Whitespace command still trims them all.
-    fn trim_trailing_whitespace_off_caret_lines(&mut self) -> bool {
-        let spared: std::collections::HashSet<usize> = std::iter::once(self.cursor_row)
-            .chain(self.carets.iter().map(|c| c.head.0))
-            .collect();
+    /// `trim_trailing_whitespace` for a save. An auto-save spares every line
+    /// a caret sits on (primary and extra carets): it runs a second after
+    /// typing stops, so trimming the caret's own line would eat the space
+    /// just typed and glue the next word onto the previous one. The caret
+    /// lines are normalised by a later save once the caret has moved. Any
+    /// other save trims them too, as VS Code does (#1455): the line just
+    /// edited is the one with the stray spaces. Unlike the command, it keeps
+    /// the extra carets, clamped to their trimmed lines.
+    fn trim_trailing_whitespace_on_save(&mut self, reason: SaveReason) -> bool {
+        let spared: std::collections::HashSet<usize> = match reason {
+            SaveReason::Auto => std::iter::once(self.cursor_row)
+                .chain(self.carets.iter().map(|c| c.head.0))
+                .collect(),
+            SaveReason::Explicit => std::collections::HashSet::new(),
+        };
         let dirty = |(i, l): (usize, &String)| {
             !spared.contains(&i) && l.trim_end_matches([' ', '\t']).len() != l.len()
         };
@@ -10995,6 +11018,7 @@ impl Editor {
                 line.truncate(trimmed_len);
             }
         }
+        self.remap_carets(|p| p);
         self.mark_buffer_changed();
         self.recompute_highlights();
         true
@@ -11002,15 +11026,16 @@ impl Editor {
 
     /// Apply the `.editorconfig` properties that act at save time, from the
     /// single write choke point so every save path (explicit, force, auto,
-    /// format-on-save) gets them.
+    /// format-on-save) gets them. Only an auto-save spares the caret lines
+    /// from the trim.
     ///
     /// Both are no-ops unless a `.editorconfig` explicitly asked for them:
     /// rewriting someone's whitespace on an unconfigured project would be a
     /// surprise, and a noisy diff.
-    fn apply_editorconfig_on_save(&mut self) -> bool {
+    fn apply_editorconfig_on_save(&mut self, reason: SaveReason) -> bool {
         let mut changed = false;
         if self.editorconfig.trim_trailing_whitespace == Some(true) {
-            changed |= self.trim_trailing_whitespace_off_caret_lines();
+            changed |= self.trim_trailing_whitespace_on_save(reason);
         }
         if self.editorconfig.insert_final_newline == Some(true) {
             // `lines` joins with the EOL on write, so a trailing empty
@@ -32455,13 +32480,66 @@ mod tests {
         e.cursor_row = 0;
         e.cursor_col = 4;
         e.carets.push(EditorSelection::new(2, 4));
-        e.save_to_disk().unwrap();
+        e.auto_save_to_disk().unwrap();
         assert_eq!(
             std::fs::read_to_string(&f).unwrap(),
             "foo \nbar\nbaz\t",
             "only the line without a caret is trimmed"
         );
         assert_eq!((e.cursor_row, e.cursor_col), (0, 4), "the caret stays put");
+    }
+
+    /// #1455: an explicit save (Cmd+S, Save All) trims the caret lines too,
+    /// as VS Code does: sparing them is for auto-save only, and the line
+    /// just edited is the one with the stray spaces. The carets stay,
+    /// clamped to their trimmed lines.
+    #[test]
+    fn editorconfig_trim_on_an_explicit_save_includes_the_caret_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\ntrim_trailing_whitespace = true\n",
+        )
+        .unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "foo \nbar  \nbaz\t").unwrap();
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.cursor_row = 0;
+        e.cursor_col = 4;
+        e.carets.push(EditorSelection::new(2, 4));
+        e.save_to_disk().unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "foo\nbar\nbaz");
+        assert_eq!(
+            (e.cursor_row, e.cursor_col),
+            (0, 3),
+            "clamped to the line end"
+        );
+        assert_eq!(e.carets.len(), 1, "the extra caret is kept");
+        assert_eq!(e.carets[0].head, (2, 3));
+        assert!(e.undo(), "the trim is one undo step");
+        assert_eq!(e.lines[0], "foo ");
+    }
+
+    /// #1455 negative: an auto-save after an explicit one still spares the
+    /// caret line: the explicit save leaves no mode behind.
+    #[test]
+    fn an_auto_save_after_an_explicit_save_still_spares_the_caret_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\ntrim_trailing_whitespace = true\n",
+        )
+        .unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "foo\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.save_to_disk().unwrap();
+        e.cursor_col = 3;
+        e.insert_char(' ');
+        e.auto_save_to_disk().unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "foo \n");
     }
 
     /// Neither save-time property fires unless a `.editorconfig` asked for

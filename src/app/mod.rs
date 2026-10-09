@@ -31016,7 +31016,7 @@ impl App {
     /// own status.
     fn launch_with_unsaved_saved(&mut self, launch: impl FnOnce(&mut Self)) {
         if self.save_before_debug && self.unsaved_count() > 0 {
-            self.sweep_dirty_buffers(false, false);
+            self.sweep_dirty_buffers(false, false, false);
         }
         let unsaved = self.unsaved_editor_names();
         launch(self);
@@ -57148,13 +57148,20 @@ impl App {
     /// not lost it yet). Returns true when anything changed on screen.
     fn sweep_auto_save(&mut self, require_delay: bool) -> bool {
         let skip_active = !require_delay && self.focus == Pane::Editor;
-        self.sweep_dirty_buffers(require_delay, skip_active)
+        self.sweep_dirty_buffers(require_delay, skip_active, true)
     }
 
     /// Write every dirty buffer the auto-save rules allow, in every split,
     /// leaving the active tab alone when `skip_active`. Shared by the
-    /// auto-save sweep and File: Save All (#852).
-    fn sweep_dirty_buffers(&mut self, require_delay: bool, skip_active: bool) -> bool {
+    /// auto-save sweep and File: Save All (#852). `automatic` is the
+    /// auto-save sweep, whose writes spare the caret lines' trailing
+    /// whitespace; Save All's are explicit saves (#1455).
+    fn sweep_dirty_buffers(
+        &mut self,
+        require_delay: bool,
+        skip_active: bool,
+        automatic: bool,
+    ) -> bool {
         // Each saved tab's own map rides along (#349): the recorder must not
         // look it up by path afterwards, since a split can hold the same file
         // in a second buffer with a different map.
@@ -57233,7 +57240,12 @@ impl App {
                 // `save_to_disk` re-checks the disk and flags (never
                 // overwrites) an external change; auto save must not
                 // arm the force-overwrite path an explicit Cmd+S offers.
-                match e.save_to_disk() {
+                let saved = if automatic {
+                    e.auto_save_to_disk()
+                } else {
+                    e.save_to_disk()
+                };
+                match saved {
                     Ok(crate::widgets::editor::SaveOutcome::Saved) => {
                         if let Some(p) = e.path.clone() {
                             // The bytes this editor just wrote, so the
@@ -57337,7 +57349,7 @@ impl App {
             self.save();
         }
         let active_status = self.status.clone();
-        self.sweep_dirty_buffers(false, true);
+        self.sweep_dirty_buffers(false, true, false);
         // A format-on-save write lands with its formatter reply: it is on
         // its way, not left behind.
         let pending = self
