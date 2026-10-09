@@ -1322,12 +1322,15 @@ pub fn is_descendant_or_same(target: &Path, source: &Path) -> bool {
 }
 
 /// Whether `source` already sits directly in `dir`, so moving it there moves
-/// nothing (#1174).
+/// nothing (#1174). A source that no longer exists (deleted or renamed since
+/// it was cut) is not in place: it takes the ordinary path, which reports it
+/// missing. A dangling symlink still exists, as the link itself.
 pub fn is_directly_in(dir: &Path, source: &Path) -> bool {
     let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    source
-        .parent()
-        .is_some_and(|parent| canon(parent) == canon(dir))
+    source.symlink_metadata().is_ok()
+        && source
+            .parent()
+            .is_some_and(|parent| canon(parent) == canon(dir))
 }
 
 /// Move `source` to a fresh path inside `dest_dir`. Falls back to
@@ -3406,6 +3409,22 @@ mod tests {
         names.sort();
         assert_eq!(names, ["a.txt", "src"]);
         assert_eq!(std::fs::read_to_string(&src).unwrap(), "x");
+    }
+
+    /// #1174 negative: a cut file deleted before the paste is not "already
+    /// in this folder"; the move fails as missing.
+    #[test]
+    fn move_into_its_own_folder_of_a_missing_file_fails() {
+        let tmp = TempDir::new().unwrap();
+        let gone = tmp.path().join("gone.txt");
+        assert!(!is_directly_in(tmp.path(), &gone));
+        assert!(move_into(tmp.path(), &gone).is_err());
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("dangling");
+            std::os::unix::fs::symlink(tmp.path().join("nowhere"), &link).unwrap();
+            assert!(is_directly_in(tmp.path(), &link), "the link itself exists");
+        }
     }
 
     #[test]
