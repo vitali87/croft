@@ -10282,42 +10282,39 @@ impl Editor {
     /// the current line — or, when a selection is active, every line the
     /// selection touches as one block — directly below the original, then
     /// moves the cursor (and the selection, if any) onto the duplicate so
-    /// the next keystroke acts on the copy. Recorded as a single undo
-    /// step via the dedicated `EditKind::DuplicateLines`.
+    /// the next keystroke acts on the copy. With several carets every
+    /// caret's lines are copied (#1467); carets on touching lines share one
+    /// block. Recorded as a single undo step via the dedicated
+    /// `EditKind::DuplicateLines`.
     pub fn duplicate_lines_down(&mut self) {
         self.push_undo(EditKind::DuplicateLines);
-        // A single-caret command: extra carets would be left pointing at
-        // rows and columns the edit moved.
-        self.carets.clear();
-        let (start_row, end_row) = self.selected_or_cursor_row_range();
-        let block: Vec<String> = self.lines[start_row..=end_row].to_vec();
-        let block_len = block.len();
-        let insert_at = end_row + 1;
-        for (i, line) in block.into_iter().enumerate() {
-            self.lines.insert(insert_at + i, line);
+        let blocks = self.selected_row_blocks();
+        for &(start, end) in blocks.iter().rev() {
+            let block: Vec<String> = self.lines[start..=end].to_vec();
+            self.lines.splice(end + 1..end + 1, block);
         }
-        self.cursor_row += block_len;
-        if let Some(sel) = self.selection.as_mut() {
-            sel.anchor.0 += block_len;
-            sel.head.0 += block_len;
-        }
+        // A caret moves down by every block copied at or above it, its own
+        // block's copy included.
+        self.remap_carets(|(r, c)| (r + rows_in_blocks(&blocks, |b| b.0 <= r), c));
         self.mark_buffer_changed();
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
     }
 
-    /// VS Code's "Copy Line Up" (Shift+Option+Up on macOS). Mirror of
+    /// VS Code "Copy Line Up" (Shift+Option+Up on macOS). Mirror of
     /// `duplicate_lines_down`: inserts the copy *above* the original
     /// block, leaving the cursor on the upper copy at the same row index
     /// it started at (the original is pushed down by `block_len`).
     pub fn duplicate_lines_up(&mut self) {
         self.push_undo(EditKind::DuplicateLines);
-        self.carets.clear();
-        let (start_row, end_row) = self.selected_or_cursor_row_range();
-        let block: Vec<String> = self.lines[start_row..=end_row].to_vec();
-        for (i, line) in block.into_iter().enumerate() {
-            self.lines.insert(start_row + i, line);
+        let blocks = self.selected_row_blocks();
+        for &(start, end) in blocks.iter().rev() {
+            let block: Vec<String> = self.lines[start..=end].to_vec();
+            self.lines.splice(start..start, block);
         }
+        // Only the blocks wholly above a caret push it down: its own copy
+        // goes in above it, onto the row it already has.
+        self.remap_carets(|(r, c)| (r + rows_in_blocks(&blocks, |b| b.1 < r), c));
         self.mark_buffer_changed();
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
@@ -10331,6 +10328,100 @@ impl Editor {
             }
             None => (self.cursor_row, self.cursor_row),
         }
+    }
+
+    /// The primary selection (a bare caret when there is none) followed by
+    /// every extra caret.
+    fn selections_with_primary(&self) -> Vec<EditorSelection> {
+        let primary = self
+            .selection
+            .unwrap_or_else(|| EditorSelection::new(self.cursor_row, self.cursor_col));
+        std::iter::once(primary)
+            .chain(self.carets.iter().copied())
+            .collect()
+    }
+
+    /// The rows every selection or caret touches, as sorted `(first, last)`
+    /// blocks. Blocks that overlap or touch are one block, so a line
+    /// command never edits a row twice or moves one block into another.
+    fn selected_row_blocks(&self) -> Vec<(usize, usize)> {
+        let last = self.lines.len().saturating_sub(1);
+        let rows = self
+            .selections_with_primary()
+            .iter()
+            .map(|s| {
+                let (a, b) = s.normalised();
+                (a.0.min(last), b.0.min(last))
+            })
+            .collect();
+        merge_row_blocks(rows, true)
+    }
+
+    /// Move the primary caret and selection and every extra caret through
+    /// `f`, clamp each onto its line, and merge carets that landed together.
+    fn remap_carets(&mut self, f: impl Fn((usize, usize)) -> (usize, usize)) {
+        let last = self.lines.len().saturating_sub(1);
+        let clamp = |this: &Self, p: (usize, usize)| {
+            let (r, c) = f(p);
+            let r = r.min(last);
+            (r, c.min(this.line_char_len(r)))
+        };
+        let map = |this: &Self, s: EditorSelection| EditorSelection {
+            anchor: clamp(this, s.anchor),
+            head: clamp(this, s.head),
+        };
+        self.selection = self.selection.map(|s| map(self, s));
+        (self.cursor_row, self.cursor_col) = clamp(self, (self.cursor_row, self.cursor_col));
+        self.carets = self.carets.iter().map(|&s| map(self, s)).collect();
+        self.dedup_carets();
+    }
+
+    /// Make `all[0]` the primary selection (or bare caret) and the rest
+    /// extra carets.
+    fn set_selections(&mut self, all: &[EditorSelection]) {
+        let Some((&primary, rest)) = all.split_first() else {
+            return;
+        };
+        self.selection = primary.has_area().then_some(primary);
+        (self.cursor_row, self.cursor_col) = primary.head;
+        self.carets = rest.to_vec();
+        self.dedup_carets();
+    }
+
+    /// Drop extra carets that sit on the primary or on an earlier caret: kept
+    /// apart, the next key would edit the same spot twice.
+    fn dedup_carets(&mut self) {
+        let primary = self.selections_with_primary()[0].normalised();
+        let mut kept: Vec<EditorSelection> = Vec::with_capacity(self.carets.len());
+        for s in std::mem::take(&mut self.carets) {
+            let n = s.normalised();
+            if n != primary && !kept.iter().any(|k| k.normalised() == n) {
+                kept.push(s);
+            }
+        }
+        self.carets = kept;
+    }
+
+    /// A position kept as (rows from the last line, chars from its line's
+    /// end). Edits above it, or left of it on its line, leave both true, so
+    /// a command that edits from the bottom of the buffer up pins each
+    /// caret as it passes and finds it again at the end.
+    fn pin_from_end(&self, (row, col): (usize, usize)) -> (usize, usize) {
+        let last = self.lines.len().saturating_sub(1);
+        (
+            last.saturating_sub(row),
+            self.line_char_len(row).saturating_sub(col),
+        )
+    }
+
+    /// The position `pin_from_end` kept, in the buffer as it is now.
+    fn unpin_from_end(&self, (from_bottom, from_end): (usize, usize)) -> (usize, usize) {
+        let row = self
+            .lines
+            .len()
+            .saturating_sub(1)
+            .saturating_sub(from_bottom);
+        (row, self.line_char_len(row).saturating_sub(from_end))
     }
 
     /// Char-based slice of the buffer between two `(row, char_col)` points
@@ -10366,96 +10457,132 @@ impl Editor {
 
     /// VS Code "Move Line Down" (Alt+Down): swap the current line / selected
     /// block with the line below it, carrying the cursor and selection along.
-    /// No-op when the block already touches the last line.
+    /// With several carets every caret's block moves. No-op when a block
+    /// already touches the last line: all of them move or none does.
     pub fn move_lines_down(&mut self) {
-        let (start, end) = self.selected_or_cursor_row_range();
+        let blocks = self.selected_row_blocks();
         // A symbol tab's block stops at the symbol's last line.
         let limit = self.symbol_clip().map_or(self.lines.len(), |(_, e)| e);
-        if end + 1 >= limit {
+        if blocks.last().is_none_or(|&(_, end)| end + 1 >= limit) {
             return;
         }
         self.push_undo(EditKind::MoveLines);
-        self.carets.clear();
-        self.forget_folds_in(start, end + 1);
-        self.lines[start..=end + 1].rotate_right(1);
-        self.cursor_row += 1;
-        if let Some(sel) = self.selection.as_mut() {
-            sel.anchor.0 += 1;
-            sel.head.0 += 1;
+        for &(start, end) in blocks.iter().rev() {
+            self.forget_folds_in(start, end + 1);
+            self.lines[start..=end + 1].rotate_right(1);
         }
+        self.remap_carets(|(r, c)| {
+            let row = match blocks.iter().find(|b| b.0 <= r && r <= b.1 + 1) {
+                // The line below a block swaps up over it.
+                Some(&(start, end)) if r == end + 1 => start,
+                Some(_) => r + 1,
+                None => r,
+            };
+            (row, c)
+        });
         self.mark_buffer_changed();
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
     }
 
     /// VS Code "Move Line Up" (Alt+Up): mirror of `move_lines_down`. No-op
-    /// when the block already touches the first line.
+    /// when a block already touches the first line.
     pub fn move_lines_up(&mut self) {
-        let (start, end) = self.selected_or_cursor_row_range();
-        if start <= self.symbol_clip().map_or(0, |(first, _)| first) {
+        let blocks = self.selected_row_blocks();
+        let first = self.symbol_clip().map_or(0, |(first, _)| first);
+        if blocks.first().is_none_or(|&(start, _)| start <= first) {
             return;
         }
         self.push_undo(EditKind::MoveLines);
-        self.carets.clear();
-        self.forget_folds_in(start - 1, end);
-        self.lines[start - 1..=end].rotate_left(1);
-        self.cursor_row -= 1;
-        if let Some(sel) = self.selection.as_mut() {
-            sel.anchor.0 -= 1;
-            sel.head.0 -= 1;
+        for &(start, end) in &blocks {
+            self.forget_folds_in(start - 1, end);
+            self.lines[start - 1..=end].rotate_left(1);
         }
+        self.remap_carets(|(r, c)| {
+            let row = match blocks.iter().find(|b| b.0 <= r + 1 && r <= b.1) {
+                // The line above a block swaps down under it.
+                Some(&(start, end)) if r + 1 == start => end,
+                Some(_) => r - 1,
+                None => r,
+            };
+            (row, c)
+        });
         self.mark_buffer_changed();
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
     }
 
     /// VS Code "Toggle Line Comment" (Cmd+/): comment or uncomment every line
-    /// the cursor or selection touches using the language's line-comment
-    /// marker. Comments are inserted at the block's common (minimum)
-    /// indentation so the markers align; the whole block uncomments only when
-    /// every non-blank line is already commented. Returns false (a no-op) for
-    /// languages with no line comment.
+    /// the cursor, the selection or any extra caret touches using the
+    /// language's line-comment marker. Comments are inserted at each block's
+    /// common (minimum) indentation so the markers align; the lines
+    /// uncomment only when every non-blank one is already commented. Each
+    /// caret moves with the text on its line, so a selection still covers
+    /// what it did. Returns false (a no-op) for languages with no line
+    /// comment.
     pub fn toggle_line_comment(&mut self) -> bool {
         let Some(token) = line_comment_token(self.lang) else {
             return false;
         };
-        let (start, end) = self.selected_or_cursor_row_range();
-        let non_blank: Vec<usize> = (start..=end)
+        let blocks = self.selected_row_blocks();
+        let non_blank: Vec<usize> = blocks
+            .iter()
+            .flat_map(|&(start, end)| start..=end)
             .filter(|&r| !self.lines[r].trim().is_empty())
             .collect();
         if non_blank.is_empty() {
             return false;
         }
         self.push_undo(EditKind::ToggleComment);
-        self.carets.clear();
         let all_commented = non_blank
             .iter()
             .all(|&r| self.lines[r].trim_start().starts_with(token));
+        // Each changed row with the char column of its edit and the chars it
+        // added (negative: removed), to carry the carets on it along.
+        let mut edits: Vec<(usize, usize, isize)> = Vec::with_capacity(non_blank.len());
         if all_commented {
             for &r in &non_blank {
                 let line = self.lines[r].clone();
                 let off = line.len() - line.trim_start().len();
                 let mut rest = line[off..].to_string();
                 rest.drain(..token.len());
+                let mut removed = token.chars().count();
                 if rest.starts_with(' ') {
                     rest.drain(..1);
+                    removed += 1;
                 }
                 self.lines[r] = format!("{}{}", &line[..off], rest);
+                edits.push((r, line[..off].chars().count(), -(removed as isize)));
             }
         } else {
-            let min_indent = non_blank
-                .iter()
-                .map(|&r| {
-                    let l = &self.lines[r];
-                    l.len() - l.trim_start().len()
-                })
-                .min()
-                .unwrap_or(0);
-            for &r in &non_blank {
-                self.lines[r].insert_str(min_indent, &format!("{token} "));
+            let marker = format!("{token} ");
+            for &(start, end) in &blocks {
+                let rows: Vec<usize> = non_blank
+                    .iter()
+                    .copied()
+                    .filter(|r| (start..=end).contains(r))
+                    .collect();
+                let Some(min_indent) = rows
+                    .iter()
+                    .map(|&r| {
+                        let l = &self.lines[r];
+                        l.len() - l.trim_start().len()
+                    })
+                    .min()
+                else {
+                    continue;
+                };
+                for &r in &rows {
+                    self.lines[r].insert_str(min_indent, &marker);
+                    let at = self.lines[r][..min_indent].chars().count();
+                    edits.push((r, at, marker.chars().count() as isize));
+                }
             }
         }
-        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+        self.remap_carets(|(r, c)| match edits.iter().find(|e| e.0 == r) {
+            Some(&(_, at, delta)) => (r, shift_col(c, at, delta)),
+            None => (r, c),
+        });
         self.mark_buffer_changed();
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
@@ -10465,87 +10592,160 @@ impl Editor {
     /// VS Code "Toggle Block Comment" (Shift+Alt+A): wrap the selection (or,
     /// with no selection, the current line) in the language's block-comment
     /// delimiters, or strip them when the selection already is a block
-    /// comment. Returns false for languages with no block comment (e.g. YAML).
+    /// comment. Every extra caret's selection or line is done the same way,
+    /// each on its own. Returns false for languages with no block comment
+    /// (e.g. YAML).
     pub fn toggle_block_comment(&mut self) -> bool {
         let Some((open, close)) = block_comment_tokens(self.lang) else {
             return false;
         };
-        let (start, end) = match &self.selection {
-            Some(sel) => sel.normalised(),
-            None => {
-                let len = self.line_char_len(self.cursor_row);
-                ((self.cursor_row, 0), (self.cursor_row, len))
+        let last = self.lines.len().saturating_sub(1);
+        let mut ranges: Vec<(BPos, BPos, bool)> = self
+            .selections_with_primary()
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let (start, end) = if s.has_area() {
+                    s.normalised()
+                } else {
+                    let row = s.head.0.min(last);
+                    ((row, 0), (row, self.line_char_len(row)))
+                };
+                (start, end, i == 0)
+            })
+            .collect();
+        // Two carets on one line comment it once.
+        ranges.sort_unstable();
+        let mut merged: Vec<(BPos, BPos, bool)> = Vec::new();
+        for (start, end, primary) in ranges {
+            match merged.last_mut() {
+                Some(m) if start < m.1 || start == m.0 => {
+                    m.1 = m.1.max(end);
+                    m.2 |= primary;
+                }
+                _ => merged.push((start, end, primary)),
             }
-        };
-        let text = self.char_range_text(start, end);
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
+        }
+        if merged
+            .iter()
+            .all(|&(start, end, _)| self.char_range_text(start, end).trim().is_empty())
+        {
             return false;
         }
         self.push_undo(EditKind::ToggleComment);
-        self.carets.clear();
-        let wrapped = trimmed.starts_with(open)
-            && trimmed.ends_with(close)
-            && trimmed.len() >= open.len() + close.len();
-        let new = if wrapped {
-            trimmed[open.len()..trimmed.len() - close.len()]
-                .trim()
-                .to_string()
-        } else {
-            format!("{open} {trimmed} {close}")
-        };
-        // Only the trimmed core is replaced: the whitespace around it (the
-        // line's indent, and the line break a whole-line selection ends
-        // with) stays as it was. Replacing the whole range joined the next
-        // line into this one and dropped the indent.
-        let lead = &text[..text.len() - text.trim_start().len()];
-        let trail = &text[text.trim_end().len()..];
-        let before = format!("{lead}{new}");
-        self.replace_char_range(start, end, &format!("{before}{trail}"));
-        self.selection = None;
-        // The caret lands just after the (un)commented text.
-        match before.rsplit_once('\n') {
-            Some((head, tail)) => {
-                self.cursor_row = start.0 + head.matches('\n').count() + 1;
-                self.cursor_col = tail.chars().count();
-            }
-            None => {
-                self.cursor_row = start.0;
-                self.cursor_col = start.1 + before.chars().count();
-            }
+        // From the bottom up, so an edit never moves a range still to come.
+        let mut placed: Vec<(bool, (usize, usize))> = Vec::with_capacity(merged.len());
+        for &(start, end, primary) in merged.iter().rev() {
+            let text = self.char_range_text(start, end);
+            let trimmed = text.trim();
+            let caret = if trimmed.is_empty() {
+                end
+            } else {
+                let wrapped = trimmed.starts_with(open)
+                    && trimmed.ends_with(close)
+                    && trimmed.len() >= open.len() + close.len();
+                let new = if wrapped {
+                    trimmed[open.len()..trimmed.len() - close.len()]
+                        .trim()
+                        .to_string()
+                } else {
+                    format!("{open} {trimmed} {close}")
+                };
+                // Only the trimmed core is replaced: the whitespace around it
+                // (the line's indent, and the line break a whole-line
+                // selection ends with) stays as it was. Replacing the whole
+                // range joined the next line into this one and dropped the
+                // indent.
+                let lead = &text[..text.len() - text.trim_start().len()];
+                let trail = &text[text.trim_end().len()..];
+                let before = format!("{lead}{new}");
+                self.replace_char_range(start, end, &format!("{before}{trail}"));
+                // The caret lands just after the (un)commented text.
+                text_end(start, &before)
+            };
+            placed.push((primary, self.pin_from_end(caret)));
         }
+        self.place_pinned_carets(&placed);
         self.mark_buffer_changed();
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
         true
     }
 
+    /// Put a bare caret at each pinned position, the one marked primary as
+    /// the primary caret.
+    fn place_pinned_carets(&mut self, placed: &[(bool, (usize, usize))]) {
+        let mut all: Vec<EditorSelection> = placed
+            .iter()
+            .map(|&(_, pin)| {
+                let (r, c) = self.unpin_from_end(pin);
+                EditorSelection::new(r, c)
+            })
+            .collect();
+        if let Some(i) = placed.iter().position(|&(primary, _)| primary) {
+            all.swap(0, i);
+        }
+        self.set_selections(&all);
+    }
+
     /// VS Code "Join Lines": collapse the selected lines (or the current line
     /// with the one below it) into one, trimming each joined line's leading
-    /// whitespace and separating with a single space. No-op when there is no
-    /// following line to join.
+    /// whitespace and separating with a single space. Every extra caret
+    /// joins its own lines too. No-op when no caret has a following line to
+    /// join.
     pub fn join_lines(&mut self) {
-        let (start, end) = self.selected_or_cursor_row_range();
-        let last = if start == end { start + 1 } else { end };
         // A symbol tab's last line has nothing below it to join.
-        if last >= self.symbol_clip().map_or(self.lines.len(), |(_, e)| e) {
+        let limit = self.symbol_clip().map_or(self.lines.len(), |(_, e)| e);
+        // (first row, last row, primary, caret) for each selection.
+        let mut items: Vec<(usize, usize, bool, (usize, usize))> = self
+            .selections_with_primary()
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let (a, b) = s.normalised();
+                let last = if a.0 == b.0 { a.0 + 1 } else { b.0 };
+                (a.0, last, i == 0, s.head)
+            })
+            .collect();
+        items.sort_unstable();
+        let mut merged: Vec<(usize, usize, bool, (usize, usize))> = Vec::new();
+        for (start, last, primary, head) in items {
+            match merged.last_mut() {
+                Some(m) if start <= m.1 => {
+                    m.1 = m.1.max(last);
+                    m.2 |= primary;
+                }
+                _ => merged.push((start, last, primary, head)),
+            }
+        }
+        if merged.iter().all(|&(_, last, _, _)| last >= limit) {
             return;
         }
         self.push_undo(EditKind::JoinLines);
-        self.carets.clear();
-        let mut result = self.lines[start].trim_end().to_string();
-        let cursor_col = result.chars().count();
-        for line in &self.lines[start + 1..=last] {
-            let piece = line.trim_start();
-            if !result.is_empty() && !result.ends_with(char::is_whitespace) && !piece.is_empty() {
-                result.push(' ');
-            }
-            result.push_str(piece);
+        let mut placed: Vec<(bool, (usize, usize))> = Vec::with_capacity(merged.len());
+        for &(start, last, primary, head) in merged.iter().rev() {
+            // A caret with no line below it stays where it is.
+            let caret = if last >= limit {
+                head
+            } else {
+                let mut result = self.lines[start].trim_end().to_string();
+                let cursor_col = result.chars().count();
+                for line in &self.lines[start + 1..=last] {
+                    let piece = line.trim_start();
+                    if !result.is_empty()
+                        && !result.ends_with(char::is_whitespace)
+                        && !piece.is_empty()
+                    {
+                        result.push(' ');
+                    }
+                    result.push_str(piece);
+                }
+                self.lines.splice(start..=last, std::iter::once(result));
+                (start, cursor_col)
+            };
+            placed.push((primary, self.pin_from_end(caret)));
         }
-        self.lines.splice(start..=last, std::iter::once(result));
-        self.cursor_row = start;
-        self.cursor_col = cursor_col;
-        self.selection = None;
+        self.place_pinned_carets(&placed);
         self.mark_buffer_changed();
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
@@ -10553,64 +10753,146 @@ impl Editor {
 
     /// VS Code "Transform to Upper/Lower/Title Case": rewrite the selection
     /// (or, with no selection, the word under the cursor) in the requested
-    /// case. No-op when there is nothing to transform.
+    /// case, and the same for every extra caret, keeping each selection.
+    /// No-op when there is nothing to transform.
     pub fn transform_selection_case(&mut self, kind: CaseTransform) {
-        let range = match &self.selection {
-            Some(sel) => Some(sel.normalised()),
-            None => self
-                .word_at(self.cursor_row, self.cursor_col)
-                .map(|(s, e)| ((self.cursor_row, s), (self.cursor_row, e))),
-        };
-        let Some((start, end)) = range else {
-            return;
-        };
-        let text = self.char_range_text(start, end);
-        if text.is_empty() {
+        let sels = self.selections_with_primary();
+        let ranges: Vec<Option<(BPos, BPos)>> = sels
+            .iter()
+            .map(|s| {
+                if s.has_area() {
+                    Some(s.normalised())
+                } else {
+                    self.word_at(s.head.0, s.head.1)
+                        .map(|(a, b)| ((s.head.0, a), (s.head.0, b)))
+                }
+            })
+            .collect();
+        if ranges
+            .iter()
+            .flatten()
+            .all(|&(start, end)| self.char_range_text(start, end).is_empty())
+        {
             return;
         }
         self.push_undo(EditKind::TransformCase);
-        self.carets.clear();
-        let new = match kind {
-            CaseTransform::Upper => text.to_uppercase(),
-            CaseTransform::Lower => text.to_lowercase(),
-            CaseTransform::Title => title_case(&text),
-        };
-        self.replace_char_range(start, end, &new);
+        // Overlapping ranges (two carets in one word, nested selections)
+        // merge into one span, so each character is rewritten exactly once.
+        let mut by_start: Vec<usize> = (0..sels.len()).filter(|&i| ranges[i].is_some()).collect();
+        by_start.sort_by_key(|&i| ranges[i].map(|r| r.0));
+        let mut spans: Vec<(BPos, BPos, Vec<usize>)> = Vec::new();
+        for i in by_start {
+            let Some((start, end)) = ranges[i] else {
+                continue;
+            };
+            match spans.last_mut() {
+                Some(span) if start < span.1 || start == span.0 => {
+                    span.1 = span.1.max(end);
+                    span.2.push(i);
+                }
+                _ => spans.push((start, end, vec![i])),
+            }
+        }
+        // From the bottom up, so an edit never moves a span still to come.
+        // A caret with no word is a span with nothing to rewrite.
+        for i in 0..sels.len() {
+            if ranges[i].is_none() {
+                spans.push((sels[i].head, sels[i].head, vec![i]));
+            }
+        }
+        spans.sort_by_key(|span| std::cmp::Reverse(span.0));
+        let mut pinned = vec![((0, 0), (0, 0)); sels.len()];
+        for (start, end, members) in spans {
+            let text = self.char_range_text(start, end);
+            // Each endpoint as a char offset into the span, so it lands on
+            // the same character once the span is rewritten.
+            let offset = |e: &Self, pos: BPos| {
+                e.char_range_text(start, pos.max(start).min(end))
+                    .chars()
+                    .count()
+            };
+            let offsets: Vec<(usize, usize)> = members
+                .iter()
+                .map(|&i| (offset(self, sels[i].anchor), offset(self, sels[i].head)))
+                .collect();
+            let new = match kind {
+                CaseTransform::Upper => text.to_uppercase(),
+                CaseTransform::Lower => text.to_lowercase(),
+                CaseTransform::Title => title_case(&text),
+            };
+            if !text.is_empty() {
+                self.replace_char_range(start, end, &new);
+            }
+            let at = |k: usize| text_end(start, &new.chars().take(k).collect::<String>());
+            for (&i, &(anchor, head)) in members.iter().zip(&offsets) {
+                let after = if text.is_empty() {
+                    sels[i]
+                } else {
+                    EditorSelection {
+                        anchor: at(anchor),
+                        head: at(head),
+                    }
+                };
+                pinned[i] = (
+                    self.pin_from_end(after.anchor),
+                    self.pin_from_end(after.head),
+                );
+            }
+        }
+        let all: Vec<EditorSelection> = pinned
+            .iter()
+            .map(|&(anchor, head)| EditorSelection {
+                anchor: self.unpin_from_end(anchor),
+                head: self.unpin_from_end(head),
+            })
+            .collect();
+        self.set_selections(&all);
         self.mark_buffer_changed();
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
     }
 
     /// VS Code "Sort Lines Ascending/Descending": sort the selected lines
-    /// lexicographically, or the whole buffer when nothing is selected. No-op
+    /// lexicographically, or the whole buffer when nothing is selected. With
+    /// several carets each selection's lines are sorted on their own. No-op
     /// on a single line.
     pub fn sort_lines(&mut self, ascending: bool) {
-        let (start, end) = match &self.selection {
-            Some(sel) => {
-                let (s, e) = sel.normalised();
-                (s.0, e.0)
-            }
-            None => (0, self.lines.len().saturating_sub(1)),
+        let blocks = if self.carets.is_empty() {
+            vec![match &self.selection {
+                Some(sel) => {
+                    let (s, e) = sel.normalised();
+                    (s.0, e.0)
+                }
+                None => (0, self.lines.len().saturating_sub(1)),
+            }]
+        } else {
+            let rows = self
+                .selections_with_primary()
+                .iter()
+                .map(|s| {
+                    let (a, b) = s.normalised();
+                    (a.0, b.0)
+                })
+                .collect();
+            merge_row_blocks(rows, false)
         };
-        if start >= end {
+        let blocks: Vec<(usize, usize)> = blocks.into_iter().filter(|&(s, e)| s < e).collect();
+        if blocks.is_empty() {
             return;
         }
         self.push_undo(EditKind::SortLines);
-        self.carets.clear();
-        let mut block: Vec<String> = self.lines[start..=end].to_vec();
-        block.sort();
-        if !ascending {
-            block.reverse();
+        for &(start, end) in &blocks {
+            let mut block: Vec<String> = self.lines[start..=end].to_vec();
+            block.sort();
+            if !ascending {
+                block.reverse();
+            }
+            self.lines.splice(start..=end, block);
+            self.forget_folds_in(start, end);
         }
-        self.lines.splice(start..=end, block);
-        // The rows changed under the cursor and selection: a column past the
-        // new line's end made the next word motion index out of bounds.
-        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
-        if let Some(sel) = self.selection.as_mut() {
-            sel.anchor.1 = sel.anchor.1.min(self.lines[sel.anchor.0].chars().count());
-            sel.head.1 = sel.head.1.min(self.lines[sel.head.0].chars().count());
-        }
-        self.forget_folds_in(start, end);
+        // The rows changed under the carets: a column past the new line's
+        // end made the next word motion index out of bounds.
+        self.remap_carets(|p| p);
         self.mark_buffer_changed();
         self.recompute_highlights();
     }
@@ -12384,12 +12666,12 @@ fn floor_grapheme_col(line: &str, col: usize) -> usize {
     start
 }
 
-fn is_word_char(c: char) -> bool {
+pub(crate) fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-/// A `(row, char_col)` position of a bracket character, used by the bracket
-/// matching helpers.
+/// A `(row, char_col)` buffer position: a bracket character's in the
+/// bracket matching helpers, a selection end's in the line commands.
 type BPos = (usize, usize);
 
 /// The bracket pairs croft matches, mirroring VS Code's default language
@@ -12495,6 +12777,53 @@ fn block_comment_tokens(lang: Option<LangKind>) -> Option<(&'static str, &'stati
         // Toggle Block Comment onto a triple-quoted string (`""" """`).
         Some(LangKind::Python) => Some(("\"\"\"", "\"\"\"")),
         _ => None,
+    }
+}
+
+/// Sort `(first, last)` row blocks and merge the ones that overlap, and
+/// with `touching` also the ones that meet end to end.
+fn merge_row_blocks(mut blocks: Vec<(usize, usize)>, touching: bool) -> Vec<(usize, usize)> {
+    blocks.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(blocks.len());
+    for (start, end) in blocks {
+        match out.last_mut() {
+            Some(last) if start <= last.1 + usize::from(touching) => last.1 = last.1.max(end),
+            _ => out.push((start, end)),
+        }
+    }
+    out
+}
+
+/// How many rows the blocks that `keep` picks span.
+fn rows_in_blocks(blocks: &[(usize, usize)], keep: impl Fn(&(usize, usize)) -> bool) -> usize {
+    blocks
+        .iter()
+        .filter(|b| keep(b))
+        .map(|&(start, end)| end - start + 1)
+        .sum()
+}
+
+/// Where a caret at char column `col` lands after `delta` chars are
+/// inserted (positive) or removed (negative) at column `at` of its line.
+fn shift_col(col: usize, at: usize, delta: isize) -> usize {
+    let n = delta.unsigned_abs();
+    if delta >= 0 {
+        if col >= at { col + n } else { col }
+    } else if col >= at + n {
+        col - n
+    } else {
+        col.min(at)
+    }
+}
+
+/// The position just after `text` when it is written at `start`.
+fn text_end(start: (usize, usize), text: &str) -> (usize, usize) {
+    match text.rsplit_once('\n') {
+        Some((head, tail)) => (
+            start.0 + head.matches('\n').count() + 1,
+            tail.chars().count(),
+        ),
+        None => (start.0, start.1 + text.chars().count()),
     }
 }
 
@@ -28869,6 +29198,307 @@ mod tests {
         e.cursor_col = 7; // inside "beta"
         e.transform_selection_case(CaseTransform::Upper);
         assert_eq!(e.lines, vec!["alpha BETA"]);
+    }
+
+    // ---- Line commands with several selections (#1467) ----
+
+    /// The issue's buffer with every `foo` selected by three Ctrl+D presses.
+    fn three_foo_selections() -> Editor {
+        let mut e = editor_with("let foo = 1;\nlet bar = foo + 2;\nlet baz = foo * 3;");
+        e.lang = Some(LangKind::JavaScript);
+        e.cursor_row = 0;
+        e.cursor_col = 5;
+        for _ in 0..3 {
+            e.select_next_occurrence();
+        }
+        assert_eq!(e.carets.len(), 2, "three selections to start from");
+        e
+    }
+
+    /// The text under the primary selection and under every extra caret.
+    fn selected_texts(e: &Editor) -> Vec<String> {
+        let mut out: Vec<String> = e
+            .carets
+            .iter()
+            .chain(e.selection.iter())
+            .map(|s| {
+                let (a, b) = s.normalised();
+                e.char_range_text(a, b)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A bare caret at each `(row, col)`, the first one primary.
+    fn carets_at(e: &mut Editor, at: &[(usize, usize)]) {
+        e.selection = None;
+        e.cursor_row = at[0].0;
+        e.cursor_col = at[0].1;
+        e.carets = at[1..]
+            .iter()
+            .map(|&(r, c)| EditorSelection::new(r, c))
+            .collect();
+    }
+
+    /// Every caret's row, the primary's included, in order.
+    fn caret_rows(e: &Editor) -> Vec<usize> {
+        let mut rows: Vec<usize> = e.carets.iter().map(|s| s.head.0).collect();
+        rows.push(e.cursor_row);
+        rows.sort_unstable();
+        rows
+    }
+
+    #[test]
+    fn transform_case_changes_every_selection_and_keeps_them() {
+        let mut e = three_foo_selections();
+        e.transform_selection_case(CaseTransform::Upper);
+        assert_eq!(
+            e.lines,
+            vec!["let FOO = 1;", "let bar = FOO + 2;", "let baz = FOO * 3;"]
+        );
+        assert_eq!(e.carets.len(), 2, "no selection is dropped");
+        assert_eq!(selected_texts(&e), vec!["FOO", "FOO", "FOO"]);
+        // One undo puts all three back.
+        assert!(e.undo());
+        assert_eq!(
+            e.lines,
+            vec!["let foo = 1;", "let bar = foo + 2;", "let baz = foo * 3;"]
+        );
+    }
+
+    #[test]
+    fn transform_case_with_bare_carets_changes_the_word_under_each() {
+        let mut e = editor_with("alpha beta\ngamma delta");
+        carets_at(&mut e, &[(1, 7), (0, 1)]);
+        e.transform_selection_case(CaseTransform::Upper);
+        assert_eq!(e.lines, vec!["ALPHA beta", "gamma DELTA"]);
+        assert_eq!(e.carets.len(), 1);
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 7), "the caret stays put");
+    }
+
+    #[test]
+    fn transform_case_with_two_selections_on_one_line_changes_both() {
+        let mut e = editor_with("foo bar foo");
+        e.selection = Some(EditorSelection {
+            anchor: (0, 8),
+            head: (0, 11),
+        });
+        e.carets = vec![EditorSelection {
+            anchor: (0, 0),
+            head: (0, 3),
+        }];
+        e.transform_selection_case(CaseTransform::Title);
+        assert_eq!(e.lines, vec!["Foo bar Foo"]);
+        assert_eq!(selected_texts(&e), vec!["Foo", "Foo"]);
+    }
+
+    #[test]
+    fn transform_case_rewrites_all_of_nested_selections() {
+        let mut e = editor_with("hello world");
+        e.selection = Some(EditorSelection {
+            anchor: (0, 2),
+            head: (0, 3),
+        });
+        e.carets = vec![EditorSelection {
+            anchor: (0, 0),
+            head: (0, 5),
+        }];
+        e.transform_selection_case(CaseTransform::Upper);
+        assert_eq!(e.lines, vec!["HELLO world"]);
+        assert_eq!(selected_texts(&e), vec!["HELLO", "L"]);
+    }
+
+    #[test]
+    fn transform_case_rewrites_all_of_partly_overlapping_selections() {
+        let mut e = editor_with("hello world");
+        e.selection = Some(EditorSelection {
+            anchor: (0, 8),
+            head: (0, 3),
+        });
+        e.carets = vec![EditorSelection {
+            anchor: (0, 0),
+            head: (0, 5),
+        }];
+        e.transform_selection_case(CaseTransform::Upper);
+        assert_eq!(e.lines, vec!["HELLO WOrld"]);
+        assert_eq!(selected_texts(&e), vec!["HELLO", "LO WO"]);
+        assert_eq!(e.selection.unwrap().head, (0, 3), "direction is kept");
+    }
+
+    #[test]
+    fn toggle_line_comment_comments_every_selected_line_and_shifts_the_selections() {
+        let mut e = three_foo_selections();
+        assert!(e.toggle_line_comment());
+        assert_eq!(
+            e.lines,
+            vec![
+                "// let foo = 1;",
+                "// let bar = foo + 2;",
+                "// let baz = foo * 3;"
+            ]
+        );
+        assert_eq!(e.carets.len(), 2, "no selection is dropped");
+        // Each selection moved right with its text, so it still covers foo.
+        assert_eq!(selected_texts(&e), vec!["foo", "foo", "foo"]);
+        // And toggling again uncomments all three.
+        assert!(e.toggle_line_comment());
+        assert_eq!(
+            e.lines,
+            vec!["let foo = 1;", "let bar = foo + 2;", "let baz = foo * 3;"]
+        );
+        assert_eq!(selected_texts(&e), vec!["foo", "foo", "foo"]);
+    }
+
+    #[test]
+    fn toggle_line_comment_comments_a_line_with_two_carets_once() {
+        let mut e = editor_with("let a = 1;\nlet b = 2;\nlet c = 3;");
+        e.lang = Some(LangKind::JavaScript);
+        carets_at(&mut e, &[(0, 1), (0, 5), (2, 0)]);
+        assert!(e.toggle_line_comment());
+        assert_eq!(
+            e.lines,
+            vec!["// let a = 1;", "let b = 2;", "// let c = 3;"]
+        );
+    }
+
+    #[test]
+    fn toggle_line_comment_leaves_a_caret_inside_the_indent_alone() {
+        let mut e = editor_with("    let x = 1;");
+        e.lang = Some(LangKind::Rust);
+        carets_at(&mut e, &[(0, 2)]);
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["    // let x = 1;"]);
+        assert_eq!(e.cursor_col, 2);
+    }
+
+    #[test]
+    fn toggle_block_comment_wraps_every_selection() {
+        let mut e = three_foo_selections();
+        assert!(e.toggle_block_comment());
+        assert_eq!(
+            e.lines,
+            vec![
+                "let /* foo */ = 1;",
+                "let bar = /* foo */ + 2;",
+                "let baz = /* foo */ * 3;"
+            ]
+        );
+        assert_eq!(e.carets.len(), 2, "a caret after each comment");
+        assert_eq!((e.cursor_row, e.cursor_col), (2, 19));
+    }
+
+    #[test]
+    fn duplicate_lines_down_copies_every_caret_line() {
+        let mut e = editor_with("a\nb\nc");
+        carets_at(&mut e, &[(2, 0), (0, 0)]);
+        e.duplicate_lines_down();
+        assert_eq!(e.lines, vec!["a", "a", "b", "c", "c"]);
+        assert_eq!(caret_rows(&e), vec![1, 4], "each caret moves onto its copy");
+        assert!(e.undo());
+        assert_eq!(e.lines, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn duplicate_lines_up_copies_every_caret_line() {
+        let mut e = editor_with("a\nb\nc");
+        carets_at(&mut e, &[(2, 0), (0, 0)]);
+        e.duplicate_lines_up();
+        assert_eq!(e.lines, vec!["a", "a", "b", "c", "c"]);
+        assert_eq!(
+            caret_rows(&e),
+            vec![0, 3],
+            "each caret stays on the upper copy"
+        );
+    }
+
+    #[test]
+    fn duplicate_lines_down_copies_adjacent_caret_lines_as_one_block() {
+        let mut e = editor_with("a\nb\nc");
+        carets_at(&mut e, &[(1, 0), (0, 0)]);
+        e.duplicate_lines_down();
+        assert_eq!(e.lines, vec!["a", "b", "a", "b", "c"]);
+        assert_eq!(caret_rows(&e), vec![2, 3]);
+    }
+
+    #[test]
+    fn move_lines_down_moves_every_caret_line() {
+        let mut e = editor_with("a\nb\nc\nd");
+        carets_at(&mut e, &[(2, 0), (0, 0)]);
+        e.move_lines_down();
+        assert_eq!(e.lines, vec!["b", "a", "d", "c"]);
+        assert_eq!(caret_rows(&e), vec![1, 3]);
+    }
+
+    #[test]
+    fn move_lines_down_is_a_noop_when_a_caret_is_on_the_last_line() {
+        let mut e = editor_with("a\nb\nc");
+        carets_at(&mut e, &[(2, 0), (0, 0)]);
+        e.move_lines_down();
+        assert_eq!(e.lines, vec!["a", "b", "c"]);
+        assert_eq!(caret_rows(&e), vec![0, 2]);
+    }
+
+    #[test]
+    fn move_lines_up_moves_every_caret_line() {
+        let mut e = editor_with("a\nb\nc\nd");
+        carets_at(&mut e, &[(3, 0), (1, 0)]);
+        e.move_lines_up();
+        assert_eq!(e.lines, vec!["b", "a", "d", "c"]);
+        assert_eq!(caret_rows(&e), vec![0, 2]);
+    }
+
+    #[test]
+    fn move_lines_up_is_a_noop_when_a_caret_is_on_the_first_line() {
+        let mut e = editor_with("a\nb\nc");
+        carets_at(&mut e, &[(2, 0), (0, 0)]);
+        e.move_lines_up();
+        assert_eq!(e.lines, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn join_lines_joins_at_every_caret() {
+        let mut e = editor_with("a\n  b\nc\n  d");
+        carets_at(&mut e, &[(2, 0), (0, 0)]);
+        e.join_lines();
+        assert_eq!(e.lines, vec!["a b", "c d"]);
+        assert_eq!(e.carets.len(), 1);
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 1));
+        assert_eq!(e.carets[0].head, (0, 1));
+    }
+
+    #[test]
+    fn join_lines_keeps_a_caret_on_the_last_line_that_has_nothing_to_join() {
+        let mut e = editor_with("a\nb\nc");
+        carets_at(&mut e, &[(2, 0), (0, 0)]);
+        e.join_lines();
+        assert_eq!(e.lines, vec!["a b", "c"]);
+        assert_eq!(caret_rows(&e), vec![0, 1]);
+    }
+
+    #[test]
+    fn sort_lines_sorts_each_selection_on_its_own() {
+        let mut e = editor_with("c\nb\na\nz\ny\nx\n0");
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (2, 1),
+        });
+        e.carets = vec![EditorSelection {
+            anchor: (3, 0),
+            head: (5, 1),
+        }];
+        e.sort_lines(true);
+        assert_eq!(e.lines, vec!["a", "b", "c", "x", "y", "z", "0"]);
+        assert_eq!(e.carets.len(), 1, "the selections are kept");
+    }
+
+    #[test]
+    fn a_single_caret_still_moves_only_its_own_line() {
+        let mut e = editor_with("a\nb\nc");
+        carets_at(&mut e, &[(0, 0)]);
+        e.move_lines_down();
+        assert_eq!(e.lines, vec!["b", "a", "c"]);
+        assert_eq!(caret_rows(&e), vec![1]);
     }
 
     // ---- Folds follow line inserts and deletes (#1509) ----

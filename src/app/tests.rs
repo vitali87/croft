@@ -20230,8 +20230,12 @@ fn editor_find_pre_fills_the_query_from_word_under_cursor_on_open() {
         .unwrap();
     assert_eq!(
         app.editor_find.as_ref().unwrap().query,
-        "alpha",
-        "opening Cmd+F with the cursor mid-word must pre-fill the query with the identifier chars to the left of the cursor, matching VS Code"
+        "alphabet",
+        "opening Cmd+F with the cursor mid-word pre-fills the whole word under it, as VS Code does (#1278)"
+    );
+    assert!(
+        app.editor_find.as_ref().unwrap().query_selected,
+        "and selects it, so typing replaces it"
     );
 }
 
@@ -24172,6 +24176,125 @@ fn run_active_file_with_python_file_spawns_a_new_terminal_and_focuses_it() {
     assert!(app.show_terminal, "terminal pane must become visible");
     assert!(matches!(app.focus, Pane::Terminal));
     assert!(!app.run_debug.feedback_is_error);
+}
+
+/// #1400 fixture: `name` holds "old\n" on disk and "new\nold\n" in its
+/// open, unsaved tab.
+fn app_with_unsaved_file(name: &str) -> (tempfile::TempDir, App, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let file = root.join(name);
+    std::fs::write(&file, "old\n").unwrap();
+    let mut app = App::new(root).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.editor.insert_str("new\n");
+    assert!(app.editor.dirty);
+    (tmp, app, file)
+}
+
+/// #1400: F5 writes the unsaved tab before the launch, so the debuggee
+/// runs the text the breakpoints were set against.
+#[test]
+fn f5_saves_the_unsaved_buffer_before_launching() {
+    let (_tmp, mut app, file) = app_with_unsaved_file("notes.txt");
+    app.debug_start_or_continue();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    assert!(!app.editor.dirty);
+    assert!(
+        app.status.starts_with("No debugger for .txt files"),
+        "the launch itself still runs and reports: {}",
+        app.status
+    );
+}
+
+/// #1400: every dirty tab is saved, not only the one being debugged: the
+/// debuggee imports the others.
+#[test]
+fn f5_saves_every_unsaved_tab_not_only_the_active_one() {
+    let (tmp, mut app, helper) = app_with_unsaved_file("helper.txt");
+    let main = tmp.path().canonicalize().unwrap().join("main.txt");
+    std::fs::write(&main, "main\n").unwrap();
+    app.editor.open_pinned(&main).unwrap();
+    app.debug_start_or_continue();
+    assert_eq!(std::fs::read_to_string(&helper).unwrap(), "new\nold\n");
+    assert_eq!(app.unsaved_count(), 0);
+}
+
+/// #1400: Run writes the unsaved tab before the run command starts.
+#[test]
+fn run_saves_the_unsaved_buffer_before_running() {
+    let (_tmp, mut app, file) = app_with_unsaved_file("hello.py");
+    app.run_active_file();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    assert!(!app.editor.dirty);
+}
+
+/// #1400: Debug Test saves too: the test runs from the files on disk.
+#[test]
+fn debug_test_saves_the_unsaved_buffer_before_launching() {
+    let (_tmp, mut app, file) = app_with_unsaved_file("test_x.txt");
+    app.debug_named_test(String::from("test_x"));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    assert_eq!(app.status, "No test runner detected in this workspace");
+}
+
+/// #1400 negative: with `debug.saveBeforeStart: "none"` the file on disk
+/// is left alone, and the status says the debuggee runs the saved file.
+#[test]
+fn with_save_before_debug_off_f5_leaves_the_disk_and_warns() {
+    let (_tmp, mut app, file) = app_with_unsaved_file("notes.txt");
+    app.save_before_debug = false;
+    app.debug_start_or_continue();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+    assert!(app.editor.dirty);
+    assert!(
+        app.status
+            .starts_with("notes.txt has unsaved changes: the launch uses the file on disk"),
+        "{}",
+        app.status
+    );
+    assert!(
+        app.status.contains("No debugger for .txt files"),
+        "{}",
+        app.status
+    );
+}
+
+/// #1400 negative: a tab whose file changed on disk is never overwritten
+/// blind to start a launch; it stays unsaved and the status says so.
+#[test]
+fn f5_never_overwrites_a_file_changed_on_disk() {
+    let (_tmp, mut app, file) = app_with_unsaved_file("notes.txt");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&file, "theirs, changed elsewhere\n").unwrap();
+    app.debug_start_or_continue();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "theirs, changed elsewhere\n"
+    );
+    assert!(app.editor.dirty);
+    assert!(
+        app.status.contains("notes.txt has unsaved changes"),
+        "{}",
+        app.status
+    );
+}
+
+/// #1400 negative: with nothing unsaved, a launch writes nothing and says
+/// nothing about saving.
+#[test]
+fn f5_with_nothing_unsaved_writes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let file = root.join("notes.txt");
+    std::fs::write(&file, "old\n").unwrap();
+    let stamp = std::fs::metadata(&file).unwrap().modified().unwrap();
+    let mut app = App::new(root).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    app.debug_start_or_continue();
+    assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), stamp);
+    assert!(!app.status.contains("unsaved"), "{}", app.status);
 }
 
 /// #1444: View Changes vs main on a branch behind a moved main shows the
@@ -31953,7 +32076,9 @@ fn replace_chord_toggles_the_replace_row_on_an_open_find_bar() {
 fn tab_switches_focus_between_the_find_and_replace_fields() {
     use crate::widgets::editor_find::FindField;
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha beta");
+    // The caret opens off any word, so nothing is seeded and focus starts
+    // in the query row (a seeded query would start in the replace row).
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "- alpha beta");
     app.handle_key(replace_chord()).unwrap();
     for c in "alpha".chars() {
         app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
@@ -31990,7 +32115,9 @@ fn tab_switches_focus_between_the_find_and_replace_fields() {
 #[test]
 fn enter_in_the_replace_field_replaces_the_current_match_and_advances() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha beta\ngamma alpha");
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "- alpha beta\ngamma alpha");
+    // The caret opens off any word, so nothing is seeded (#1278) and the
+    // query is typed.
     app.handle_key(replace_chord()).unwrap();
     for c in "alpha".chars() {
         app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
@@ -32003,7 +32130,7 @@ fn enter_in_the_replace_field_replaces_the_current_match_and_advances() {
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert_eq!(
-        app.editor.lines[0], "x beta",
+        app.editor.lines[0], "- x beta",
         "the current match is replaced"
     );
     assert_eq!(
@@ -32016,13 +32143,15 @@ fn enter_in_the_replace_field_replaces_the_current_match_and_advances() {
     );
     assert!(app.editor.dirty, "a replace dirties the buffer");
     assert!(app.editor.undo(), "the replace is undoable");
-    assert_eq!(app.editor.lines[0], "alpha beta");
+    assert_eq!(app.editor.lines[0], "- alpha beta");
 }
 
 #[test]
 fn replace_all_chord_replaces_every_match_in_one_undo_step() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha beta\ngamma alpha");
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "- alpha beta\ngamma alpha");
+    // The caret opens off any word, so nothing is seeded (#1278) and the
+    // query is typed.
     app.handle_key(replace_chord()).unwrap();
     for c in "alpha".chars() {
         app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
@@ -32034,11 +32163,11 @@ fn replace_all_chord_replaces_every_match_in_one_undo_step() {
         .unwrap();
     app.handle_key(key(KeyCode::Enter, KeyModifiers::ALT | KeyModifiers::SUPER))
         .unwrap();
-    assert_eq!(app.editor.lines[0], "x beta");
+    assert_eq!(app.editor.lines[0], "- x beta");
     assert_eq!(app.editor.lines[1], "gamma x");
     assert!(app.editor.dirty, "replace all dirties the buffer");
     assert!(app.editor.undo(), "replace all is one undo step");
-    assert_eq!(app.editor.lines[0], "alpha beta");
+    assert_eq!(app.editor.lines[0], "- alpha beta");
     assert_eq!(app.editor.lines[1], "gamma alpha");
 }
 
@@ -73496,6 +73625,16 @@ fn a_failed_clone_names_git_s_fatal_line() {
     assert_one_line_858(&app);
 }
 
+#[test]
+fn a_snippets_file_that_loads_nothing_says_where_to_look() {
+    // #1191: a broken snippets.json used to reload as "Snippets reloaded"
+    // with nothing loaded.
+    let status = super::snippets_reload_status(true);
+    assert!(status.contains("not loaded"), "{status}");
+    assert!(status.contains("OUTPUT · Snippets"), "{status}");
+    assert_eq!(super::snippets_reload_status(false), "Snippets reloaded");
+}
+
 /// Every cell of a drawn frame, row after row.
 fn screen_text_863(app: &mut App, w: u16, h: u16) -> String {
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
@@ -75378,6 +75517,103 @@ fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
     assert_eq!(app.status, "Tab is already kept open");
 }
 
+// ---- Find bar seeding selects the word under the caret (#1278) ----
+
+/// orders.py from the issue, open and focused, caret at `(row, col)`.
+fn find_seed_app(row: usize, col: usize) -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("orders.py");
+    std::fs::write(
+        &f,
+        "def loadOrders(path):\n    return readRows(path)\n\n\ndef saveOrders(path, rows):\n    writeRows(path, rows)\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = row;
+    app.editor.cursor_col = col;
+    (app, tmp)
+}
+
+fn ctrl(c: char) -> KeyEvent {
+    key(KeyCode::Char(c), KeyModifiers::CONTROL)
+}
+
+fn type_str(app: &mut App, s: &str) {
+    for c in s.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+fn find_query(app: &App) -> String {
+    app.editor_find.as_ref().map(|s| s.query.clone()).unwrap()
+}
+
+#[test]
+fn find_seeds_the_whole_word_and_typing_replaces_it() {
+    // Caret after `def loadOr`, mid-word.
+    let (mut app, _tmp) = find_seed_app(0, 10);
+    app.handle_key(ctrl('f')).unwrap();
+    assert_eq!(find_query(&app), "loadOrders");
+    type_str(&mut app, "save");
+    assert_eq!(find_query(&app), "save");
+    assert!(app.editor_find.as_ref().unwrap().match_count >= 1);
+}
+
+#[test]
+fn find_seeds_the_word_the_caret_just_left() {
+    // Caret right after `loadOrders`, where it sits after typing a word.
+    let (mut app, _tmp) = find_seed_app(0, 14);
+    app.handle_key(ctrl('f')).unwrap();
+    assert_eq!(find_query(&app), "loadOrders");
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(find_query(&app), "", "Backspace clears a selected seed");
+}
+
+#[test]
+fn ctrl_a_selects_the_query_and_ctrl_backspace_deletes_a_word() {
+    let (mut app, _tmp) = find_seed_app(2, 0);
+    app.handle_key(ctrl('f')).unwrap();
+    type_str(&mut app, "write rows");
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(find_query(&app), "write ");
+    app.handle_key(ctrl('a')).unwrap();
+    type_str(&mut app, "read");
+    assert_eq!(find_query(&app), "read");
+}
+
+#[test]
+fn ctrl_f_on_an_open_bar_selects_its_query_again() {
+    let (mut app, _tmp) = find_seed_app(0, 10);
+    app.handle_key(ctrl('f')).unwrap();
+    type_str(&mut app, "save");
+    app.handle_key(ctrl('f')).unwrap();
+    type_str(&mut app, "write");
+    assert_eq!(find_query(&app), "write");
+}
+
+#[test]
+fn an_unseeded_or_deselected_query_still_appends() {
+    // Negative: with nothing to seed, typing appends as before; after a
+    // caret key the seed is no longer selected and typing extends it.
+    let (mut app, _tmp) = find_seed_app(2, 0);
+    app.handle_key(ctrl('f')).unwrap();
+    assert_eq!(find_query(&app), "");
+    type_str(&mut app, "sa");
+    type_str(&mut app, "ve");
+    assert_eq!(find_query(&app), "save");
+    let (mut app, _tmp) = find_seed_app(0, 10);
+    app.handle_key(ctrl('f')).unwrap();
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    type_str(&mut app, "X");
+    assert_eq!(find_query(&app), "loadOrdersX");
+}
+
 /// A stand-in `codeql` still open for writing, the way a test's freshly
 /// written script is while another test thread forks: exec fails with
 /// "Text file busy" until the writer lets go. The handle is dropped after
@@ -75540,6 +75776,183 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     let _ = render_buf(&mut app);
     assert!(app.source_control.nested_repos.is_empty());
     assert!(app.source_control.last_init_repo_button_area.width > 0);
+}
+
+/// A diagnostic for the Problems panel, as a language server reports it.
+fn problem(
+    line: u32,
+    severity: crate::lsp::manager::DiagnosticSeverity,
+    message: &str,
+) -> crate::widgets::problems::ProblemItem {
+    crate::widgets::problems::ProblemItem {
+        line,
+        col: 0,
+        col_utf16: true,
+        severity,
+        message: message.into(),
+        source: "ruff".into(),
+    }
+}
+
+#[test]
+fn the_problems_tab_is_announced_with_its_counts_and_top_entry() {
+    use crate::lsp::manager::DiagnosticSeverity::{Error, Warning};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Terminal;
+    app.bottom_panel_tab = BottomPanelTab::Problems;
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Problems, no problems");
+    assert_eq!(snap.item, None);
+    app.problems
+        .set_groups(vec![crate::widgets::problems::ProblemGroup {
+            path: tmp.path().join("app.py"),
+            name: "app.py".into(),
+            rel_dir: String::new(),
+            items: vec![
+                problem(3, Error, "Undefined name `totl`"),
+                problem(4, Error, "Type mismatch"),
+                problem(4, Warning, "Unused variable"),
+            ],
+        }]);
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Problems, 2 errors, 1 warning");
+    assert_eq!(
+        snap.item.as_deref(),
+        Some("app.py line 4: Undefined name `totl` (ruff)")
+    );
+}
+
+#[test]
+fn the_terminal_tab_is_still_announced_as_its_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Terminal;
+    app.bottom_panel_tab = BottomPanelTab::Terminal;
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Terminal 1");
+    assert_eq!(snap.item, None);
+}
+
+#[test]
+fn the_output_ports_and_captures_tabs_are_announced_by_name_and_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Terminal;
+
+    let channel = "a11y-1295-channel";
+    crate::output::push(channel, crate::output::OutputLevel::Info, "hello");
+    app.output.sync();
+    assert!(app.output.select_by_name(channel));
+    app.bottom_panel_tab = BottomPanelTab::Output;
+    assert_eq!(app.a11y_snapshot().focus, format!("Output, {channel}"));
+
+    app.bottom_panel_tab = BottomPanelTab::Ports;
+    let snap = app.a11y_snapshot();
+    assert_eq!((snap.focus.as_str(), snap.item), ("Ports, none", None));
+    app.ports.upsert(
+        3000,
+        Some("http://localhost:3000".into()),
+        Some("node".into()),
+        crate::widgets::ports::PortOrigin::Local,
+    );
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Ports, 1 port");
+    assert_eq!(
+        snap.item.as_deref(),
+        Some("Port 3000, node, http://localhost:3000")
+    );
+
+    app.bottom_panel_tab = BottomPanelTab::Captures;
+    assert_eq!(app.a11y_snapshot().focus, "Captures, none");
+    app.captures.push(crate::widgets::captures::CapturedLine {
+        pane: "zsh".into(),
+        shell_pid: None,
+        message: "Build failed".into(),
+        line: "error: build failed".into(),
+    });
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Captures, 1 capture");
+    assert_eq!(snap.item.as_deref(), Some("Build failed, from zsh"));
+}
+
+#[test]
+fn search_results_are_announced_with_the_count_and_the_selected_match() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Tree;
+    app.sidebar_view = SidebarView::Search;
+    assert_eq!(app.a11y_snapshot().focus, "Search");
+    assert_eq!(
+        app.a11y_snapshot().item,
+        None,
+        "no results, nothing selected"
+    );
+    let hit = |file: &str, line_no: usize, text: &str| crate::widgets::search::SearchHit {
+        path: tmp.path().join(file),
+        line_no,
+        line_text: text.into(),
+        matches: 1,
+    };
+    app.search.hits = vec![
+        hit("app.py", 1, "def total(xs):"),
+        hit("b.py", 1, "total = 0"),
+        hit("b.py", 3, "total += i"),
+    ];
+    app.search.selected = 2;
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Search, 3 matches in 2 files");
+    assert_eq!(snap.item.as_deref(), Some("b.py line 3: total += i"));
+}
+
+/// #1295: the announced total counts matches, not matching lines, the same
+/// as the Search header: a line with two matches is two.
+#[test]
+fn search_announces_every_match_on_a_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Tree;
+    app.sidebar_view = SidebarView::Search;
+    app.search.hits = vec![crate::widgets::search::SearchHit {
+        path: tmp.path().join("b.py"),
+        line_no: 3,
+        line_text: "total += total".into(),
+        matches: 2,
+    }];
+    assert_eq!(app.a11y_snapshot().focus, "Search, 2 matches in 1 file");
+}
+
+#[test]
+fn the_selected_source_control_change_is_announced() {
+    use crate::git::{ChangeEntry, ChangeKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Tree;
+    app.sidebar_view = SidebarView::SourceControl;
+    let change = |path: &str, kind| ChangeEntry {
+        path: path.into(),
+        kind,
+        additions: 1,
+        deletions: 0,
+    };
+    app.source_control.entries = vec![
+        change("app.py", ChangeKind::Modified),
+        change("new.py", ChangeKind::StagedAdded),
+    ];
+    app.source_control.selected_change = None;
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Source Control, 2 changes");
+    assert_eq!(snap.item, None, "nothing selected, nothing read");
+    app.source_control.selected_change = Some(1);
+    assert_eq!(
+        app.a11y_snapshot().item.as_deref(),
+        Some("new.py, added, staged")
+    );
+    app.source_control.selected_change = Some(0);
+    assert_eq!(
+        app.a11y_snapshot().item.as_deref(),
+        Some("app.py, modified")
+    );
 }
 
 /// A format-on-save in flight for `m.py`, with `x` typed and not yet on

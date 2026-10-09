@@ -1,0 +1,1 @@
+fix: In the Search sidebar, a regex that will not compile, such as an unclosed `(`, a look-ahead or a backreference, now shows its error ("Invalid regex: unclosed group") instead of "0 results in 0 files".
