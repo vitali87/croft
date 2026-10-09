@@ -416,19 +416,15 @@ const HTML_HIDDEN: &[&str] = &["style", "script", "head", "title", "template"];
 /// dropped, and `<style>` / `<script>` contents never show.
 fn html_to_markdown(html: &str) -> String {
     let mut md = String::new();
-    // Rows and cells of the open table, if any.
-    let mut table: Option<Vec<Vec<String>>> = None;
+    // The open table, if any.
+    let mut table: Option<HtmlTable> = None;
     let mut hidden = 0usize;
     let mut rest = html;
-    let push = |md: &mut String, table: &mut Option<Vec<Vec<String>>>, text: &str| match table {
+    let push = |md: &mut String, table: &mut Option<HtmlTable>, text: &str| match table {
         None => md.push_str(text),
         // A cell is one line of a pipe table; text between a table's cells
         // is whitespace or junk.
-        Some(t) => {
-            if let Some(cell) = t.last_mut().and_then(|r| r.last_mut()) {
-                cell.push_str(&text.replace('\n', " "));
-            }
-        }
+        Some(t) => t.push_text(&text.replace('\n', " ")),
     };
     while !rest.is_empty() {
         let Some(lt) = rest.find('<') else {
@@ -466,28 +462,49 @@ fn html_to_markdown(html: &str) -> String {
         if hidden > 0 {
             continue;
         }
+        // Preformatted text keeps its lines and spacing (#1615): a fenced
+        // block of the element's text, verbatim, rather than a paragraph
+        // that collapses it onto one line.
+        if name == "pre" && !closing && table.is_none() {
+            let (inner, after) = match find_ascii_ci(rest, "</pre") {
+                Some(end) => (
+                    &rest[..end],
+                    rest[end..].find('>').map_or("", |gt| &rest[end + gt + 1..]),
+                ),
+                None => (rest, ""),
+            };
+            rest = after;
+            md.push_str(&fenced_pre(inner));
+            continue;
+        }
         let mark = match (name.as_str(), closing) {
             ("table", false) => {
-                table = Some(Vec::new());
+                table = Some(HtmlTable::default());
                 ""
             }
             ("table", true) => {
-                if let Some(rows) = table.take() {
+                if let Some(t) = table.take() {
                     md.push_str("\n\n");
-                    md.push_str(&pipe_table(rows));
+                    md.push_str(&t.into_pipe_table());
                     md.push('\n');
+                }
+                ""
+            }
+            ("thead", closing) => {
+                if let Some(t) = table.as_mut() {
+                    t.in_head = !closing;
                 }
                 ""
             }
             ("tr", false) => {
                 if let Some(t) = table.as_mut() {
-                    t.push(Vec::new());
+                    t.start_row();
                 }
                 ""
             }
             ("td" | "th", false) => {
-                if let Some(row) = table.as_mut().and_then(|t| t.last_mut()) {
-                    row.push(String::new());
+                if let Some(t) = table.as_mut() {
+                    t.start_cell(span_attr(tag, "colspan"), span_attr(tag, "rowspan"));
                 }
                 ""
             }
@@ -507,11 +524,197 @@ fn html_to_markdown(html: &str) -> String {
         };
         push(&mut md, &mut table, mark);
     }
-    if let Some(rows) = table.take() {
+    if let Some(t) = table.take() {
         md.push_str("\n\n");
-        md.push_str(&pipe_table(rows));
+        md.push_str(&t.into_pipe_table());
     }
     md.trim().to_string()
+}
+
+/// The most columns or rows one cell may span. pandas never comes close;
+/// the cap keeps a corrupt `colspan="99999999"` from building a huge row.
+const MAX_CELL_SPAN: usize = 1000;
+
+/// Past this many cells in one table, spans are read as 1, so a handful of
+/// spanning tags cannot grow the grid a cell per column they claim.
+const MAX_SPANNED_CELLS: usize = 100_000;
+
+/// A `colspan` / `rowspan` attribute's value, 1 when absent or unreadable.
+fn span_attr(tag: &str, attr: &str) -> usize {
+    let lower = tag.to_ascii_lowercase();
+    let Some(at) = lower.find(attr) else {
+        return 1;
+    };
+    let value = lower[at + attr.len()..]
+        .trim_start()
+        .strip_prefix('=')
+        .map(|v| v.trim_start().trim_start_matches(['"', '\'']))
+        .unwrap_or("");
+    let digits: String = value.chars().take_while(char::is_ascii_digit).collect();
+    digits
+        .parse::<usize>()
+        .ok()
+        .filter(|&n| n >= 1)
+        .map_or(1, |n| n.min(MAX_CELL_SPAN))
+}
+
+/// The byte index of `needle` (ASCII) in `hay`, ignoring ASCII case.
+fn find_ascii_ci(hay: &str, needle: &str) -> Option<usize> {
+    hay.as_bytes()
+        .windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+/// A `<pre>` element's content as a fenced block: tags dropped, entities
+/// decoded, every space and line kept.
+fn fenced_pre(inner: &str) -> String {
+    let mut raw = String::new();
+    let mut rest = inner;
+    while let Some(lt) = rest.find('<') {
+        raw.push_str(&rest[..lt]);
+        rest = rest[lt..].find('>').map_or("", |gt| &rest[lt + gt + 1..]);
+    }
+    raw.push_str(rest);
+    let text = decode_entities(&raw);
+    let text = text.strip_prefix('\n').unwrap_or(&text).trim_end();
+    if text.trim().is_empty() {
+        return String::new();
+    }
+    let longest_run = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest_run.max(2) + 1);
+    format!("\n\n{fence}\n{text}\n{fence}\n\n")
+}
+
+/// One cell of an HTML table as it is laid out on the grid.
+#[derive(Default)]
+struct HtmlCell {
+    text: String,
+    /// A column a `colspan` cell to the left covers: shown as that cell's
+    /// text in a header, empty in the body.
+    spanned: bool,
+}
+
+/// An HTML table laid out on a grid, honouring `colspan` and `rowspan`
+/// (#1615): pandas writes both for every MultiIndex, and dropping them
+/// slid each later value under the wrong column.
+#[derive(Default)]
+struct HtmlTable {
+    rows: Vec<Vec<HtmlCell>>,
+    /// How many of the first rows are header rows (`<thead>`).
+    head_rows: usize,
+    in_head: bool,
+    /// The cell text goes into: its column in the last row.
+    current: Option<usize>,
+    /// Per column, how many more rows a `rowspan` cell above still covers.
+    covered: Vec<usize>,
+    /// Cells laid out so far, fillers included.
+    cells: usize,
+}
+
+impl HtmlTable {
+    fn start_row(&mut self) {
+        self.finish_row();
+        self.rows.push(Vec::new());
+        if self.in_head {
+            self.head_rows += 1;
+        }
+        self.current = None;
+    }
+
+    /// Fill the columns a `rowspan` from above still covers at the end of
+    /// the last row, so the next row's spans line up.
+    fn finish_row(&mut self) {
+        let Some(row) = self.rows.last_mut() else {
+            return;
+        };
+        for col in row.len()..self.covered.len() {
+            if self.covered[col] > 0 {
+                self.covered[col] -= 1;
+                while row.len() <= col {
+                    row.push(HtmlCell::default());
+                }
+            }
+        }
+    }
+
+    fn start_cell(&mut self, colspan: usize, rowspan: usize) {
+        let (colspan, rowspan) = if self.cells.saturating_add(colspan * rowspan) > MAX_SPANNED_CELLS
+        {
+            (1, 1)
+        } else {
+            (colspan, rowspan)
+        };
+        self.cells += colspan * rowspan;
+        if self.rows.is_empty() {
+            self.rows.push(Vec::new());
+        }
+        let row = self.rows.last_mut().expect("a row");
+        // Skip the columns a `rowspan` cell above still covers.
+        while self.covered.get(row.len()).is_some_and(|&n| n > 0) {
+            self.covered[row.len()] -= 1;
+            row.push(HtmlCell::default());
+        }
+        let col = row.len();
+        row.push(HtmlCell::default());
+        for _ in 1..colspan {
+            row.push(HtmlCell {
+                text: String::new(),
+                spanned: true,
+            });
+        }
+        if self.covered.len() < col + colspan {
+            self.covered.resize(col + colspan, 0);
+        }
+        for c in col..col + colspan {
+            self.covered[c] = rowspan - 1;
+        }
+        self.current = Some(col);
+    }
+
+    fn push_text(&mut self, text: &str) {
+        let Some(col) = self.current else { return };
+        if let Some(cell) = self.rows.last_mut().and_then(|r| r.get_mut(col)) {
+            cell.text.push_str(text);
+        }
+    }
+
+    /// The grid as a pipe table. Several header rows (pandas' MultiIndex
+    /// columns, or a named index under them) become one, each column's
+    /// labels joined top to bottom, since a pipe table has one header row.
+    fn into_pipe_table(mut self) -> String {
+        self.finish_row();
+        let head_rows = self.head_rows.min(self.rows.len()).max(1);
+        let cols = self.rows.iter().map(Vec::len).max().unwrap_or(0);
+        if cols == 0 {
+            return String::new();
+        }
+        let mut body = self.rows.split_off(head_rows.min(self.rows.len()));
+        let head = self.rows;
+        let mut header = vec![String::new(); cols];
+        for row in &head {
+            let mut left = String::new();
+            for (c, cell) in row.iter().enumerate() {
+                let text = if cell.spanned {
+                    left.clone()
+                } else {
+                    cell.text.trim().to_string()
+                };
+                left = text.clone();
+                if !text.is_empty() {
+                    if !header[c].is_empty() {
+                        header[c].push(' ');
+                    }
+                    header[c].push_str(&text);
+                }
+            }
+        }
+        let mut rows = vec![header];
+        rows.extend(
+            body.drain(..)
+                .map(|r| r.into_iter().map(|cell| cell.text).collect()),
+        );
+        pipe_table(rows)
+    }
 }
 
 /// The level of a heading tag name (`h1`..`h6`).
@@ -522,9 +725,8 @@ fn heading_level(name: &str) -> Option<usize> {
     }
 }
 
-/// An HTML text run as Markdown text: entities decoded, whitespace
-/// collapsed as a browser does, Markdown's own characters escaped.
-fn html_text(raw: &str) -> String {
+/// HTML entities decoded; everything else, whitespace included, as is.
+fn decode_entities(raw: &str) -> String {
     let mut text = String::new();
     let mut rest = raw;
     while let Some(amp) = rest.find('&') {
@@ -556,6 +758,13 @@ fn html_text(raw: &str) -> String {
         }
     }
     text.push_str(rest);
+    text
+}
+
+/// An HTML text run as Markdown text: entities decoded, whitespace
+/// collapsed as a browser does, Markdown's own characters escaped.
+fn html_text(raw: &str) -> String {
+    let text = decode_entities(raw);
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.is_empty() {
         // Whitespace between two tags still separates their text.
@@ -767,6 +976,188 @@ mod tests {
         let row = text.lines().find(|l| l.contains("apple")).expect(&text);
         assert!(row.contains('│') && row.contains('3'), "{text}");
         assert!(text.contains("pear <ripe>"), "{text}");
+    }
+
+    /// pandas' `groupby("region").agg({"units": ["sum", "mean"], "price":
+    /// ["min", "max"]})._repr_html_()`, trimmed of its style block.
+    const GROUPBY_HTML: &str = r#"<table border="1" class="dataframe">
+  <thead>
+    <tr>
+      <th></th>
+      <th colspan="2" halign="left">units</th>
+      <th colspan="2" halign="left">price</th>
+    </tr>
+    <tr>
+      <th></th>
+      <th>sum</th>
+      <th>mean</th>
+      <th>min</th>
+      <th>max</th>
+    </tr>
+    <tr>
+      <th>region</th>
+      <th></th>
+      <th></th>
+      <th></th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th>north</th>
+      <td>255</td>
+      <td>127</td>
+      <td>9</td>
+      <td>10</td>
+    </tr>
+    <tr>
+      <th>south</th>
+      <td>175</td>
+      <td>87</td>
+      <td>10</td>
+      <td>11</td>
+    </tr>
+  </tbody>
+</table>"#;
+
+    /// pandas' `set_index(["region", "year"])._repr_html_()`: the shared
+    /// `region` cell spans two rows.
+    const SET_INDEX_HTML: &str = r#"<table border="1" class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th></th>
+      <th></th>
+      <th>units</th>
+      <th>price</th>
+    </tr>
+    <tr>
+      <th>region</th>
+      <th>year</th>
+      <th></th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th rowspan="2" valign="top">north</th>
+      <th>2024</th>
+      <td>120</td>
+      <td>9</td>
+    </tr>
+    <tr>
+      <th>2025</th>
+      <td>135</td>
+      <td>10</td>
+    </tr>
+    <tr>
+      <th rowspan="2" valign="top">south</th>
+      <th>2024</th>
+      <td>80</td>
+      <td>11</td>
+    </tr>
+    <tr>
+      <th>2025</th>
+      <td>95</td>
+      <td>12</td>
+    </tr>
+  </tbody>
+</table>"#;
+
+    /// #1615: a column header spanning two columns labels both of them, and
+    /// pandas' three header rows become one, so every value sits under its
+    /// own column.
+    #[test]
+    fn a_colspan_header_labels_every_column_it_spans() {
+        assert_eq!(
+            html_to_markdown(GROUPBY_HTML),
+            "| region | units sum | units mean | price min | price max |\n\
+             |---|---|---|---|---|\n\
+             | north | 255 | 127 | 9 | 10 |\n\
+             | south | 175 | 87 | 10 | 11 |"
+        );
+    }
+
+    /// #1615: the rows under a `rowspan` cell keep that column empty instead
+    /// of sliding their values left into it.
+    #[test]
+    fn a_rowspan_cell_keeps_the_rows_below_it_aligned() {
+        assert_eq!(
+            html_to_markdown(SET_INDEX_HTML),
+            "| region | year | units | price |\n\
+             |---|---|---|---|\n\
+             | north | 2024 | 120 | 9 |\n\
+             |  | 2025 | 135 | 10 |\n\
+             | south | 2024 | 80 | 11 |\n\
+             |  | 2025 | 95 | 12 |"
+        );
+    }
+
+    /// The issue's notebook, rendered: 135 is in the units column of 2025's
+    /// row, not under year.
+    #[test]
+    fn a_multiindex_table_renders_values_under_their_headers() {
+        let html = SET_INDEX_HTML.replace('"', "\\\"").replace('\n', "\\n");
+        let (_tmp, _, _, text) =
+            rich_output(&format!(r##"{{"text/html":"{html}","text/plain":"x"}}"##));
+        let cells = |needle: &str| -> Vec<String> {
+            let row = text.lines().find(|l| l.contains(needle)).expect(&text);
+            row.split('│').map(|c| c.trim().to_string()).collect()
+        };
+        let header = cells("units");
+        let row = cells("135");
+        let col = |cells: &[String], v: &str| cells.iter().position(|c| c == v);
+        assert_eq!(col(&row, "135"), col(&header, "units"), "{text}");
+        assert_eq!(col(&row, "2025"), col(&header, "year"), "{text}");
+    }
+
+    /// #1615: `<pre>` output keeps its lines and spacing.
+    #[test]
+    fn preformatted_html_keeps_its_lines() {
+        let md = html_to_markdown("<pre>step  loss\n   1  0.912\n   2  0.640</pre>");
+        assert_eq!(md, "```\nstep  loss\n   1  0.912\n   2  0.640\n```");
+        let (_tmp, _, _, text) = rich_output(
+            r##"{"text/html":"<pre>step  loss\n   1  0.912\n   2  &lt;0.640&gt;</pre>","text/plain":"<HTML>"}"##,
+        );
+        assert!(text.contains("step  loss"), "{text}");
+        assert!(text.contains("   1  0.912"), "{text}");
+        assert!(text.contains("<0.640>"), "entities decoded: {text}");
+        assert!(!text.contains("loss 1"), "not joined onto one line: {text}");
+    }
+
+    /// Negative: a table without spans and inline HTML are unchanged, and a
+    /// corrupt span cannot blow up the grid.
+    #[test]
+    fn plain_tables_and_inline_html_are_unchanged() {
+        assert_eq!(
+            html_to_markdown(
+                "<table><thead><tr><th></th><th>name</th></tr></thead>\
+                 <tbody><tr><th>0</th><td>apple</td></tr></tbody></table>"
+            ),
+            "|  | name |\n|---|---|\n| 0 | apple |"
+        );
+        assert_eq!(
+            html_to_markdown(
+                "<table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>"
+            ),
+            "| a | b |\n|---|---|\n| c | d |",
+            "with no <thead> the first row is still the header"
+        );
+        assert_eq!(
+            html_to_markdown("<b>bold</b> and <code>x</code>"),
+            "**bold** and `x`"
+        );
+        let huge = html_to_markdown(
+            "<table><tr><td colspan=\"99999999\" rowspan=\"99999999\">a</td></tr><tr><td>b</td></tr></table>",
+        );
+        assert!(
+            huge.len() < 10_000,
+            "a corrupt span is capped: {} bytes",
+            huge.len()
+        );
+        assert_eq!(span_attr("td colspan=\"0\"", "colspan"), 1);
+        assert_eq!(span_attr("td colspan='3'", "colspan"), 3);
+        assert_eq!(span_attr("td ROWSPAN=2", "rowspan"), 2);
+        assert_eq!(span_attr("td", "rowspan"), 1);
     }
 
     /// #1188 negative: an output with only `text/plain` still shows it.
