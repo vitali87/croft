@@ -10516,6 +10516,7 @@ while True:
             format!(
                 "{head}\n\
                  while True:\n    msg = read_msg()\n    if msg is None:\n        break\n\
+                 \x20   if msg.get('method') == 'exit':\n        break\n\
                  \x20   if msg.get('method') == 'initialize':\n\
                  \x20       open(sys.argv[2], 'w').write(json.dumps(msg['params']))\n\
                  \x20       send({{'jsonrpc': '2.0', 'id': msg['id'], 'result': {{'capabilities': {{}}}}}})\n\
