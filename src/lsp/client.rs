@@ -674,11 +674,14 @@ pub struct LspRequests {
 }
 
 impl LspRequests {
+    /// `incomplete` re-asks for a list the server marked `isIncomplete`
+    /// (#1529), as `TriggerForIncompleteCompletions`.
     pub async fn completion(
         &mut self,
         uri: Url,
         line: u32,
         character: u32,
+        incomplete: bool,
     ) -> Result<Option<CompletionResponse>> {
         self.server
             .completion(CompletionParams {
@@ -689,7 +692,11 @@ impl LspRequests {
                 work_done_progress_params: WorkDoneProgressParams::default(),
                 partial_result_params: PartialResultParams::default(),
                 context: Some(CompletionContext {
-                    trigger_kind: CompletionTriggerKind::INVOKED,
+                    trigger_kind: if incomplete {
+                        CompletionTriggerKind::TRIGGER_FOR_INCOMPLETE_COMPLETIONS
+                    } else {
+                        CompletionTriggerKind::INVOKED
+                    },
                     trigger_character: None,
                 }),
             })
