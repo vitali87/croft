@@ -2,10 +2,6 @@
 //! layer that set it, searchable, edited in place and written to the user
 //! or the workspace layer.
 
-// "Preferences: Open Settings (UI)" (the next step of #612) opens this;
-// until it lands, only the tests do.
-#![allow(dead_code)]
-
 use crate::config_layers::LayerKind;
 use crate::settings_editor::Row;
 use ratatui::buffer::Buffer;
