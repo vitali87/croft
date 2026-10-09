@@ -13192,6 +13192,136 @@ fn ctrl_k_chords_reach_croft_off_macos_but_not_from_the_shell_or_vim() {
     );
 }
 
+/// The shell script from #1563, open in the editor with the caret at 1:1.
+fn app_with_run_script() -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("r.sh");
+    std::fs::write(
+        &p,
+        "echo one\necho two\nfor i in 1 2; do\n  echo loop $i\ndone\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&p).unwrap();
+    app.focus_pane(Pane::Editor);
+    (tmp, app)
+}
+
+/// #1563: Shift+Down from line 1 stopped at the start of the last line, so
+/// the selection, and Run Selected Text on it, dropped the script's `done`.
+/// Down on the last line now goes to its end, as in VS Code, so Shift+Down
+/// selects through it.
+#[test]
+fn shift_down_selects_through_the_end_of_the_last_line() {
+    let (_tmp, mut app) = app_with_run_script();
+    let last = app.editor.lines.len() - 1;
+    assert_eq!(app.editor.lines[last], "done");
+    for _ in 0..6 {
+        app.handle_key(key(KeyCode::Down, KeyModifiers::SHIFT))
+            .unwrap();
+    }
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (last, 4));
+    assert_eq!(
+        app.editor.selection_text(),
+        "echo one\necho two\nfor i in 1 2; do\n  echo loop $i\ndone"
+    );
+}
+
+/// #1563: Down on the last line goes to its end; Up on the first line goes
+/// to its start, and Shift+Up selects back to the start of the file.
+#[test]
+fn down_on_the_last_line_and_up_on_the_first_reach_the_line_ends() {
+    let (_tmp, mut app) = app_with_run_script();
+    let last = app.editor.lines.len() - 1;
+    app.editor.cursor_row = last;
+    app.editor.cursor_col = 1;
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (last, 4));
+
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 8;
+    app.handle_key(key(KeyCode::Up, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
+
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 4;
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Up, KeyModifiers::SHIFT))
+            .unwrap();
+    }
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
+    assert_eq!(app.editor.selection_text(), "echo one\necho");
+}
+
+/// #1563: with word wrap on, the edges are the first and last wrapped rows:
+/// Down on the last row goes to the end of the line, Up on the first row to
+/// its start.
+#[test]
+fn wrapped_arrows_reach_the_ends_of_the_first_and_last_rows() {
+    use ratatui::widgets::Widget as _;
+    let (_tmp, mut app) = app_with_run_script();
+    let last = app.editor.lines.len() - 1;
+    let long = "done # ".to_string() + &"word ".repeat(30);
+    app.editor.lines[last] = long.clone();
+    app.editor.toggle_wrap();
+    assert!(app.editor.wrap_enabled());
+    let area = Rect::new(0, 0, 40, 20);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    (&mut *app.editor).render(area, &mut buf);
+
+    app.editor.cursor_row = last;
+    app.editor.cursor_col = 2;
+    for _ in 0..10 {
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        (app.editor.cursor_row, app.editor.cursor_col),
+        (last, long.chars().count())
+    );
+
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 6;
+    app.handle_key(key(KeyCode::Up, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
+}
+
+/// Negative: Down between lines keeps the caret's column rather than
+/// jumping to the line end; only the last line has the new edge.
+#[test]
+fn down_between_lines_keeps_the_column() {
+    let (_tmp, mut app) = app_with_run_script();
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 5));
+    app.handle_key(key(KeyCode::Up, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 5));
+}
+
+/// Negative: Vim's `j` and `k` stop at the last and first line without
+/// moving along it, as in Vim; the edge belongs to the arrow keys.
+#[test]
+fn vim_j_and_k_do_not_move_along_the_edge_lines() {
+    let (_tmp, mut app) = app_with_run_script();
+    app.vim.enabled = true;
+    let last = app.editor.lines.len() - 1;
+    app.editor.cursor_row = last;
+    app.editor.cursor_col = 1;
+    app.handle_key(key(KeyCode::Char('j'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (last, 1));
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 3;
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 3));
+}
+
 /// #843: LINUX.md promises that off macOS a `Cmd` chord "works as the same
 /// chord with `Ctrl`", except the chords its table lists. This walks every
 /// `is_*_key` predicate over every `Cmd` chord it takes and checks the `Ctrl`

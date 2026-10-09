@@ -9888,6 +9888,29 @@ impl Editor {
         self.last_edit_kind = None;
     }
 
+    /// The Up arrow: [`Self::move_up`], and on the first line (or wrapped
+    /// row) the caret goes to the start of the line, as in VS Code, so
+    /// Shift+Up selects to the start of the file (#1563). Vim's `k` keeps
+    /// `move_up`, which stops on the first line as Vim does.
+    pub fn arrow_up(&mut self) {
+        let before = (self.cursor_row, self.cursor_col);
+        self.move_up();
+        if (self.cursor_row, self.cursor_col) == before {
+            self.cursor_col = 0;
+        }
+    }
+
+    /// The Down arrow: [`Self::move_down`], and on the last line (or
+    /// wrapped row) the caret goes to the end of the line, so Shift+Down
+    /// selects through it instead of stopping at its start (#1563).
+    pub fn arrow_down(&mut self) {
+        let before = (self.cursor_row, self.cursor_col);
+        self.move_down();
+        if (self.cursor_row, self.cursor_col) == before {
+            self.cursor_col = self.line_char_len(self.cursor_row);
+        }
+    }
+
     pub fn goto_top(&mut self) {
         self.clear_selection();
         self.cursor_row = 0;

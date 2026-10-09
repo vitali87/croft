@@ -43230,8 +43230,8 @@ impl App {
                 self.editor.start_selection_at_cursor();
             }
             match key.code {
-                KeyCode::Up => self.editor.move_up(),
-                KeyCode::Down => self.editor.move_down(),
+                KeyCode::Up => self.editor.arrow_up(),
+                KeyCode::Down => self.editor.arrow_down(),
                 KeyCode::Left if alt => self.editor.move_word_left(),
                 KeyCode::Right if alt => self.editor.move_word_right(),
                 KeyCode::Left => self.editor.move_left(),
@@ -43252,8 +43252,8 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Up => self.editor.move_up(),
-            KeyCode::Down => self.editor.move_down(),
+            KeyCode::Up => self.editor.arrow_up(),
+            KeyCode::Down => self.editor.arrow_down(),
             KeyCode::Left if alt => self.editor.move_word_left(),
             KeyCode::Right if alt => self.editor.move_word_right(),
             KeyCode::Left => self.editor.move_left(),
