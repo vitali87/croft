@@ -17011,7 +17011,10 @@ impl App {
         self.show_terminal = true;
         self.bottom_panel_tab = BottomPanelTab::Terminal;
         self.reveal_terminal_pane(self.active_terminal);
-        self.paste_terminal_input(text.as_bytes());
+        // Running the selection is the ask, so it skips the multi-line paste
+        // confirm (#1274); held there, the Enter below would reach the shell
+        // without the text.
+        self.paste_terminal_input_now(text.as_bytes());
         self.write_terminal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         self.status = format!(
             "Ran {lines} line{} in {}",

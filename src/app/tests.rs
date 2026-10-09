@@ -4346,6 +4346,21 @@ fn run_selected_text_sends_the_selection_and_enter_to_the_terminal() {
     assert!(app.show_terminal, "the terminal is shown");
 }
 
+/// #1274: Run Selected Text is not a paste to confirm, even with the
+/// multi-line warning always on; the lines and their Enter go together.
+#[test]
+fn run_selected_text_skips_the_multiline_paste_confirm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "explore.py", "a = 1\nb = 2\n");
+    app.multiline_paste_warning = crate::prefs::MultilinePasteWarning::Always;
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 0),
+        head: (1, 5),
+    });
+    assert_eq!(unbracketed(&run_selected_text(&mut app)), "a = 1\nb = 2\r");
+    assert!(app.pending_terminal_paste.is_none(), "nothing held");
+}
+
 /// #1292: a multi-line block arrives as one bracketed paste when the
 /// program in the pane asked for it, and Enter follows outside it.
 #[test]
