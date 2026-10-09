@@ -168,6 +168,9 @@ pub struct PortSniffer {
     fresh: usize,
     /// The escape sequence a read ended inside, if any.
     esc: Esc,
+    /// URL hits held back because they ended a read and may still grow;
+    /// [`PortSniffer::flush`] sends them when no further read comes.
+    pending: Vec<PortHit>,
 }
 
 /// Where a read left the escape-sequence stripper (#1449), so a sequence
@@ -232,6 +235,7 @@ impl PortSniffer {
             carry: String::new(),
             fresh: 0,
             esc: Esc::Text,
+            pending: Vec::new(),
         }
     }
 
@@ -243,6 +247,8 @@ impl PortSniffer {
         // The printed text, not the bytes: escape codes sit around and even
         // inside a URL (#1449).
         let printed = strip_escapes(&mut self.esc, &String::from_utf8_lossy(chunk));
+        // Held-back hits are rescanned from the carry with this read added.
+        self.pending.clear();
         let fresh = self.fresh;
         let text = format!("{}{printed}", self.carry);
         // A URL that ends the text may still be growing (`localhost:` with
@@ -262,6 +268,7 @@ impl PortSniffer {
                 && text.len() - start <= CARRY_BYTES
             {
                 growing_from = Some(growing_from.map_or(start, |g| g.min(start)));
+                self.pending.push(hit);
                 continue;
             }
             let _ = tx.send(hit);
@@ -278,6 +285,21 @@ impl PortSniffer {
         // Any match ending past a growing URL's start is reported next time,
         // even when the next read adds nothing to the URL itself.
         self.fresh = growing_from.map_or(self.carry.len(), |g| g - keep_from);
+    }
+
+    /// Whether a URL is held back waiting for the next read.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// The output went quiet (or ended) after a URL that ended a read: it
+    /// has stopped growing, so send it as it stands. Everything carried
+    /// counts as reported, so the next read does not send it again.
+    pub fn flush(&mut self, tx: &std::sync::mpsc::Sender<PortHit>) {
+        for hit in self.pending.drain(..) {
+            let _ = tx.send(hit);
+        }
+        self.fresh = self.carry.len();
     }
 }
 
@@ -800,6 +822,25 @@ mod tests {
     fn a_url_cut_before_its_port_is_not_reported_on_port_80() {
         let got = sniff_all(&[b"Local: http://localhost:", b"5173/\n"]);
         assert_eq!(got.iter().map(|h| h.port).collect::<Vec<_>>(), vec![5173]);
+    }
+
+    /// #1449: a URL that ends the server's output, with no newline and no
+    /// further read, is held back only until the output goes quiet: the
+    /// reader's flush sends it, once.
+    #[test]
+    fn a_url_ending_the_output_is_sent_by_the_flush_once() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut s = PortSniffer::new();
+        s.sniff(b"Local: \x1b[36mhttp://localhost:5173\x1b[39m", &tx);
+        assert!(rx.try_iter().next().is_none(), "held back, may still grow");
+        assert!(s.has_pending());
+        s.flush(&tx);
+        let got: Vec<_> = rx.try_iter().collect();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].url.as_deref(), Some("http://localhost:5173"));
+        assert!(!s.has_pending());
+        s.sniff(b"\n", &tx);
+        assert!(rx.try_iter().next().is_none(), "not sent a second time");
     }
 
     /// #1449 negative: a URL at the very end of a read waits for the next
