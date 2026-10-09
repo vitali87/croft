@@ -42833,8 +42833,10 @@ impl App {
         // reachable from the Command Palette, which guarantees parity on
         // terminals that don't deliver the Alt+letter chords.
         if is_toggle_line_comment_key(key) {
-            if self.editor_is_text() {
-                self.editor.toggle_line_comment();
+            // The palette's message too: a key that does nothing must say so
+            // (#1181).
+            if self.editor_is_text() && !self.editor.toggle_line_comment() {
+                self.status = String::from("Toggle Line Comment: no comment for this language");
             }
             return;
         }
