@@ -22,7 +22,7 @@ Each section is individually collapsible, grows to at most half the region, and 
 
 ![Search: find TODO across the workspace and open a hit at its line](images/search.gif)
 
-`Cmd`/`Ctrl`+`Shift`+`F` opens Search in the sidebar: find in files on the ripgrep engine as you type, with match case, whole word and regex toggles (`Aa`, `ab`, `.*`), "files to include" / "files to exclude" globs behind the `⋯`, and Replace All. Click a hit to open the file at that line.
+`Cmd`/`Ctrl`+`Shift`+`F` opens Search in the sidebar: find in files on the ripgrep engine as you type, with match case, whole word and regex toggles (`Aa`, `ab`, `.*`), "files to include" / "files to exclude" globs behind the `⋯`, and Replace All. A regex that won't compile, such as an unclosed `(` or a look-ahead, shows its error (`Invalid regex: unclosed group`) where the result count would be. Click a hit to open the file at that line.
 
 ### Activity bar
 
@@ -170,6 +170,8 @@ The TERMINAL tab is your `$SHELL` on a real PTY, splittable into side-by-side pa
 Source Control mirrors VS Code's git flow: stage, unstage, and discard per file or in bulk, commit / amend / push / pull / sync, branches, stashes, and tags, with clickable change rows opening a side-by-side diff against HEAD.
 
 Inside that diff, single keys act on the change hunk under the cursor: `S` stages just that hunk, `U` unstages it, and `R` reverts it after a confirm. Drag a selection across rows first and `S`/`U` narrow to exactly those lines (VS Code's Stage Selected Ranges), leaving the rest of the hunk untouched in the index — so one messy working tree becomes several focused commits without leaving the editor.
+
+When a merge, rebase, cherry-pick or revert stops on a conflict, or a bisect is running, the status bar names it next to the branch (`main | MERGING`, `REBASING 2/5`, `CHERRY-PICKING`, `REVERTING`, `BISECTING`) and so does the Source Control header. The ⋯ menu then starts with that operation's way forward and way out: **Continue Rebase / Cherry-Pick / Revert** (resolve and stage the conflicts first; each commit keeps its message), **Skip Commit**, and **Abort Merge / Rebase / Cherry-Pick / Revert**; a bisect gets **Mark Good**, **Mark Bad** and **Reset**. The palette has them as **Git: Continue ...**, **Git: Skip Commit ...** and **Git: Abort ...**. A merge is concluded by committing. Committing from Source Control in the middle of a rebase continues the rebase too, so it never stops on a detached HEAD.
 
 Below the change list, a **COMMITS** section draws the repo-wide commit graph (VS Code's built-in Source Control Graph, in the tig / lazygit idiom): colour-cycled box-drawing rails trace every branch and merge across local branches and tags, each row showing its ref badges (HEAD's branch bold, tags gold), subject, and age. Clicking a commit opens its full patch — header, message, diffstat, diff — in a read-only editor tab, and the graph refreshes itself whenever HEAD moves.
 
