@@ -11930,10 +11930,22 @@ impl Editor {
         self.last_edit_kind = None;
     }
 
-    /// Home. With wrap on (#1569) it first goes to the start of the wrapped
-    /// row the caret is on, as VS Code does, and to the line's start from
-    /// there.
+    /// Start of the logical line (`Ctrl+A`, and Home's second step).
     pub fn home_line(&mut self) {
+        self.cursor_col = 0;
+        self.last_edit_kind = None;
+    }
+
+    /// End of the logical line (`Ctrl+E`, and End's second step).
+    pub fn end_line(&mut self) {
+        self.cursor_col = self.line_char_len(self.cursor_row);
+        self.last_edit_kind = None;
+    }
+
+    /// The Home key. With wrap on (#1569) it first goes to the start of the
+    /// wrapped row the caret is on, as VS Code does, and to the line's start
+    /// from there.
+    pub fn home_key(&mut self) {
         self.cursor_col = match self.wrapped_row_of_cursor() {
             Some((start, _)) if self.cursor_col > start => start,
             _ => 0,
@@ -11941,11 +11953,11 @@ impl Editor {
         self.last_edit_kind = None;
     }
 
-    /// End. With wrap on (#1569) it first goes to the end of the wrapped row
-    /// the caret is on, before the character the row breaks at (the space,
-    /// usually), since the column after it is drawn on the next row; from
-    /// there, to the line's end.
-    pub fn end_line(&mut self) {
+    /// The End key. With wrap on (#1569) it first goes to the end of the
+    /// wrapped row the caret is on, before the character the row breaks at
+    /// (the space, usually), since the column after it is drawn on the next
+    /// row; from there, to the line's end.
+    pub fn end_key(&mut self) {
         let len = self.line_char_len(self.cursor_row);
         self.cursor_col = match self.wrapped_row_of_cursor() {
             Some((_, end)) if end < len => {
@@ -24330,7 +24342,7 @@ mod tests {
         let (mut e, segs) = wrapped_paragraph(true);
         let len = e.line_char_len(0);
         e.cursor_col = segs[1].0;
-        e.end_line();
+        e.end_key();
         assert_eq!(e.cursor_col, segs[1].1 - 1, "the end of row 2: {segs:?}");
         assert_eq!(e.lines[0].chars().nth(e.cursor_col), Some(' '));
         let width = e.visible_text_width();
@@ -24339,12 +24351,12 @@ mod tests {
             1,
             "still on row 2"
         );
-        e.end_line();
+        e.end_key();
         assert_eq!(
             e.cursor_col, len,
             "a second End goes to the end of the line"
         );
-        e.end_line();
+        e.end_key();
         assert_eq!(e.cursor_col, len);
     }
 
@@ -24353,9 +24365,9 @@ mod tests {
     fn home_in_a_wrapped_line_stops_at_the_start_of_the_row_first() {
         let (mut e, segs) = wrapped_paragraph(true);
         e.cursor_col = segs[2].0 + 5;
-        e.home_line();
+        e.home_key();
         assert_eq!(e.cursor_col, segs[2].0, "the start of row 3: {segs:?}");
-        e.home_line();
+        e.home_key();
         assert_eq!(
             e.cursor_col, 0,
             "a second Home goes to the start of the line"
@@ -24368,10 +24380,10 @@ mod tests {
         let (mut e, segs) = wrapped_paragraph(true);
         let len = e.line_char_len(0);
         e.cursor_col = segs.last().unwrap().0 + 1;
-        e.end_line();
+        e.end_key();
         assert_eq!(e.cursor_col, len);
         e.cursor_col = 3;
-        e.home_line();
+        e.home_key();
         assert_eq!(e.cursor_col, 0);
     }
 
@@ -24381,10 +24393,10 @@ mod tests {
         let (mut e, segs) = wrapped_paragraph(false);
         let len = e.line_char_len(0);
         e.cursor_col = segs[1].0;
-        e.end_line();
+        e.end_key();
         assert_eq!(e.cursor_col, len);
         e.cursor_col = segs[2].0 + 5;
-        e.home_line();
+        e.home_key();
         assert_eq!(e.cursor_col, 0);
     }
 

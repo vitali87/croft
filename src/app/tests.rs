@@ -79005,3 +79005,27 @@ fn shift_end_in_a_wrapped_paragraph_selects_to_the_end_of_the_row() {
     let selected = app.editor.selection_text();
     assert!(selected.ends_with("word59"), "{selected:?}");
 }
+
+/// #1569 negative: Ctrl+A / Ctrl+E stay readline's start / end of the
+/// logical line in a wrapped paragraph, one press each.
+#[test]
+fn ctrl_a_and_ctrl_e_reach_the_line_ends_in_a_wrapped_paragraph() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("long.txt");
+    let words: Vec<String> = (0..60).map(|i| format!("word{i}")).collect();
+    std::fs::write(&f, format!("Notes: {}\n", words.join(" "))).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.editor.toggle_wrap();
+    assert!(app.editor.wrap_enabled());
+    app.focus_pane(Pane::Editor);
+    draw(&mut app, 100, 30);
+    app.handle_editor_key(key(KeyCode::Down, KeyModifiers::NONE));
+    assert!(app.editor.cursor_col > 0, "Down moved onto row 2 of line 1");
+    let mid_row = app.editor.cursor_col + 3;
+    app.handle_editor_key(key(KeyCode::Char('e'), KeyModifiers::CONTROL));
+    assert_eq!(app.editor.cursor_col, app.editor.lines[0].chars().count());
+    app.editor.cursor_col = mid_row;
+    app.handle_editor_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert_eq!(app.editor.cursor_col, 0);
+}
