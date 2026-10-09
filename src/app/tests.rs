@@ -26239,7 +26239,7 @@ fn run_active_file_with_python_file_spawns_a_new_terminal_and_focuses_it() {
 
 /// #1400 fixture: `name` holds "old\n" on disk and "new\nold\n" in its
 /// open, unsaved tab.
-fn app_with_unsaved_file(name: &str) -> (tempfile::TempDir, App, PathBuf) {
+fn app_with_unsaved_pinned_file(name: &str) -> (tempfile::TempDir, App, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let file = root.join(name);
@@ -26255,7 +26255,7 @@ fn app_with_unsaved_file(name: &str) -> (tempfile::TempDir, App, PathBuf) {
 /// runs the text the breakpoints were set against.
 #[test]
 fn f5_saves_the_unsaved_buffer_before_launching() {
-    let (_tmp, mut app, file) = app_with_unsaved_file("notes.txt");
+    let (_tmp, mut app, file) = app_with_unsaved_pinned_file("notes.txt");
     app.debug_start_or_continue();
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
     assert!(!app.editor.dirty);
@@ -26270,7 +26270,7 @@ fn f5_saves_the_unsaved_buffer_before_launching() {
 /// debuggee imports the others.
 #[test]
 fn f5_saves_every_unsaved_tab_not_only_the_active_one() {
-    let (tmp, mut app, helper) = app_with_unsaved_file("helper.txt");
+    let (tmp, mut app, helper) = app_with_unsaved_pinned_file("helper.txt");
     let main = tmp.path().canonicalize().unwrap().join("main.txt");
     std::fs::write(&main, "main\n").unwrap();
     app.editor.open_pinned(&main).unwrap();
@@ -26282,7 +26282,7 @@ fn f5_saves_every_unsaved_tab_not_only_the_active_one() {
 /// #1400: Run writes the unsaved tab before the run command starts.
 #[test]
 fn run_saves_the_unsaved_buffer_before_running() {
-    let (_tmp, mut app, file) = app_with_unsaved_file("hello.py");
+    let (_tmp, mut app, file) = app_with_unsaved_pinned_file("hello.py");
     app.run_active_file();
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
     assert!(!app.editor.dirty);
@@ -26291,7 +26291,7 @@ fn run_saves_the_unsaved_buffer_before_running() {
 /// #1400: Debug Test saves too: the test runs from the files on disk.
 #[test]
 fn debug_test_saves_the_unsaved_buffer_before_launching() {
-    let (_tmp, mut app, file) = app_with_unsaved_file("test_x.txt");
+    let (_tmp, mut app, file) = app_with_unsaved_pinned_file("test_x.txt");
     app.debug_named_test(String::from("test_x"));
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
     assert_eq!(app.status, "No test runner detected in this workspace");
@@ -26301,7 +26301,7 @@ fn debug_test_saves_the_unsaved_buffer_before_launching() {
 /// is left alone, and the status says the debuggee runs the saved file.
 #[test]
 fn with_save_before_debug_off_f5_leaves_the_disk_and_warns() {
-    let (_tmp, mut app, file) = app_with_unsaved_file("notes.txt");
+    let (_tmp, mut app, file) = app_with_unsaved_pinned_file("notes.txt");
     app.save_before_debug = false;
     app.debug_start_or_continue();
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
@@ -26323,7 +26323,7 @@ fn with_save_before_debug_off_f5_leaves_the_disk_and_warns() {
 /// blind to start a launch; it stays unsaved and the status says so.
 #[test]
 fn f5_never_overwrites_a_file_changed_on_disk() {
-    let (_tmp, mut app, file) = app_with_unsaved_file("notes.txt");
+    let (_tmp, mut app, file) = app_with_unsaved_pinned_file("notes.txt");
     std::thread::sleep(std::time::Duration::from_millis(20));
     std::fs::write(&file, "theirs, changed elsewhere\n").unwrap();
     app.debug_start_or_continue();
@@ -78262,6 +78262,162 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     let _ = render_buf(&mut app);
     assert!(app.source_control.nested_repos.is_empty());
     assert!(app.source_control.last_init_repo_button_area.width > 0);
+}
+
+/// An App over `tmp` whose user config lives in `cfg`, never the real one.
+fn settings_editor_app(cfg: &std::path::Path, tmp: &std::path::Path) -> App {
+    let mut app = App::new(tmp.to_path_buf()).unwrap();
+    app.config_dir = cfg.to_path_buf();
+    app.run_command(crate::widgets::command_palette::Command::OpenSettingsEditor);
+    assert!(app.settings_editor.is_some(), "the editor opens");
+    app
+}
+
+fn type_query(app: &mut App, q: &str) {
+    for c in q.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+#[test]
+fn the_settings_editor_flips_a_setting_into_the_user_layer_and_applies_it() {
+    // #612: search a setting, Enter edits it in place, the file and the live
+    // session both change, and the row names the layer that set it.
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        cfg.path().join("config.json"),
+        "{\n  \"auto_save\": false\n}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/config.json"),
+        "{ \"copy_on_select\": true }",
+    )
+    .unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    let copy = app
+        .settings_editor
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .find(|r| r.key == "copy_on_select")
+        .cloned()
+        .unwrap();
+    assert_eq!(copy.layer, crate::config_layers::LayerKind::Workspace);
+    type_query(&mut app, "auto save");
+    let row = app
+        .settings_editor
+        .as_ref()
+        .unwrap()
+        .selected_row()
+        .cloned()
+        .unwrap();
+    assert_eq!(row.key, "auto_save");
+    assert_eq!(row.value, serde_json::json!(false));
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cfg.path().join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(written["auto_save"], serde_json::json!(true));
+    assert!(app.auto_save, "applied to the live session");
+    let row = app
+        .settings_editor
+        .as_ref()
+        .unwrap()
+        .selected_row()
+        .cloned()
+        .unwrap();
+    assert_eq!(row.value, serde_json::json!(true));
+    assert_eq!(row.layer, crate::config_layers::LayerKind::User);
+}
+
+#[test]
+fn the_settings_editor_writes_the_workspace_layer_only_for_allowed_keys() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.settings_editor.as_ref().unwrap().target,
+        crate::config_layers::LayerKind::Workspace
+    );
+    type_query(&mut app, "format on save");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let ws: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".croft/config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ws["format_on_save"], serde_json::json!(true));
+    assert!(
+        !cfg.path().join("config.json").exists(),
+        "the user layer is untouched"
+    );
+    // A key only the user may set is refused for the workspace.
+    for _ in 0.."format on save".len() {
+        app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+            .unwrap();
+    }
+    type_query(&mut app, "sidebar auto hide");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.status.contains("user"), "{}", app.status);
+    let ws = std::fs::read_to_string(tmp.path().join(".croft/config.json")).unwrap();
+    assert!(!ws.contains("sidebar_auto_hide"), "{ws}");
+}
+
+#[test]
+fn the_settings_editor_asks_for_a_number_and_refuses_one_that_is_not() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "terminal scrollback");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(matches!(
+        app.input_prompt.as_ref().map(|p| &p.purpose),
+        Some(crate::widgets::input_prompt::InputPurpose::SettingValue { key }) if key == "terminal_scrollback"
+    ));
+    app.close_input_prompt();
+    app.submit_setting_value("terminal_scrollback", "lots");
+    assert!(app.status.contains("number"), "{}", app.status);
+    assert!(!cfg.path().join("config.json").exists());
+    app.submit_setting_value("terminal_scrollback", " 5000 ");
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cfg.path().join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(written["terminal_scrollback"], serde_json::json!(5000));
+}
+
+#[test]
+fn the_settings_editor_draws_its_value_prompt_on_top() {
+    // The prompt Enter opens for a number sits over the editor. Drawn under
+    // it, the user typed blind.
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "terminal scrollback");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.input_prompt.is_some(), "Enter asks for the number");
+    type_query(&mut app, "424242");
+    let backend = ratatui::backend::TestBackend::new(120, 36);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let screen: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(screen.contains("424242"), "the typed value is visible");
 }
 
 // ---- An empty Go to Definition / Declaration / Type Definition reply (#1302) ----
