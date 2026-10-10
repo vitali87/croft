@@ -1796,6 +1796,40 @@ struct PendingDebugLaunch {
     step: PendingLaunchStep,
     /// When the task was written, for the no-command-mark fallback below.
     started: std::time::Instant,
+    /// A background task (#1541): settled by the end of its first build
+    /// cycle, which its watch matcher reports, since it never exits.
+    watch: bool,
+}
+
+/// How a launch waits on its `preLaunchTask` (#1541), as VS Code does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreLaunchWait {
+    /// An ordinary task: until it exits, and only exit 0 launches.
+    Exit,
+    /// A background task with a watch matcher: until its first build
+    /// cycle ends, and only a cycle with no errors launches.
+    FirstBuild,
+    /// A background task with no matcher to say when a build ends: it is
+    /// never going to exit, so the launch goes ahead at once.
+    Untracked,
+}
+
+impl PreLaunchWait {
+    fn of(task: &crate::tasks::Task) -> Self {
+        if !task.is_background {
+            return Self::Exit;
+        }
+        let watches = task
+            .problem_matcher
+            .as_ref()
+            .and_then(crate::problem_matchers::from_tasks_json)
+            .is_some_and(|m| m.background.is_some());
+        if watches {
+            Self::FirstBuild
+        } else {
+            Self::Untracked
+        }
+    }
 }
 
 /// Whether a finished pane command settles the pending preLaunchTask: same
@@ -31485,25 +31519,65 @@ impl App {
         let command = self
             .task_command_line(&task)
             .unwrap_or_else(|_| task.command.clone());
+        let step = PendingLaunchStep::Members(Box::new(CompoundLaunch {
+            members,
+            compound,
+            stop_all,
+        }));
+        self.park_launch_behind(
+            task,
+            command,
+            step,
+            "compound preLaunchTask",
+            "its sessions start",
+        );
+    }
+
+    /// Run `task` and park `step` until it is done, as its [`PreLaunchWait`]
+    /// says (#250, #1541). `what` names the task in the status ("preLaunchTask",
+    /// "compound preLaunchTask") and `starts` says what follows it.
+    fn park_launch_behind(
+        &mut self,
+        task: crate::tasks::Task,
+        command: String,
+        step: PendingLaunchStep,
+        what: &str,
+        starts: &str,
+    ) {
+        let task_label = task.label.clone();
+        let wait = PreLaunchWait::of(&task);
         let Some(pane) = self.run_project_task(task) else {
             // run_project_task already reported why the pane failed.
             return;
         };
+        if wait == PreLaunchWait::Untracked {
+            // VS Code warns that such a task cannot be tracked; waiting for
+            // an exit that never comes is the hang this avoids.
+            crate::output::push(
+                "Tasks",
+                crate::output::OutputLevel::Warn,
+                &format!(
+                    "{what} \"{task_label}\" is a background task with no problem matcher that marks when its build ends, so debugging started without waiting for it"
+                ),
+            );
+            self.resume_pending_launch(Some(0), step);
+            return;
+        }
         self.pending_debug_launch = Some(PendingDebugLaunch {
             pane,
             command,
-            step: PendingLaunchStep::Members(Box::new(CompoundLaunch {
-                members,
-                compound,
-                stop_all,
-            })),
+            step,
             started: std::time::Instant::now(),
+            watch: wait == PreLaunchWait::FirstBuild,
         });
-        self.run_debug.feedback = Some(format!("compound preLaunchTask \"{task_label}\" running…"));
+        self.run_debug.feedback = Some(format!("{what} \"{task_label}\" running…"));
         self.run_debug.feedback_is_error = false;
-        self.status = format!(
-            "compound preLaunchTask \"{task_label}\" running — its sessions start when it exits 0"
-        );
+        let when = if wait == PreLaunchWait::FirstBuild {
+            "when its first build ends"
+        } else {
+            "when it exits 0"
+        };
+        self.status = format!("{what} \"{task_label}\" running — {starts} {when}");
     }
 
     /// Launch every member of a compound, in declaration order (#310).
@@ -31670,20 +31744,12 @@ impl App {
         let command = self
             .task_command_line(&task)
             .unwrap_or_else(|_| task.command.clone());
-        let Some(pane) = self.run_project_task(task) else {
-            // run_project_task already reported why the pane failed.
-            return;
-        };
-        self.pending_debug_launch = Some(PendingDebugLaunch {
-            pane,
+        self.park_launch_behind(
+            task,
             command,
-            step: PendingLaunchStep::Member(Box::new(member)),
-            started: std::time::Instant::now(),
-        });
-        self.run_debug.feedback = Some(format!("compound preLaunchTask \"{task_label}\" running…"));
-        self.run_debug.feedback_is_error = false;
-        self.status = format!(
-            "compound preLaunchTask \"{task_label}\" running — debug starts when it exits 0"
+            PendingLaunchStep::Member(Box::new(member)),
+            "compound preLaunchTask",
+            "debug starts",
         );
     }
 
@@ -31722,20 +31788,13 @@ impl App {
             let command = self
                 .task_command_line(&task)
                 .unwrap_or_else(|_| task.command.clone());
-            let Some(pane) = self.run_project_task(task) else {
-                // run_project_task already reported why the pane failed.
-                return;
-            };
-            self.pending_debug_launch = Some(PendingDebugLaunch {
-                pane,
+            self.park_launch_behind(
+                task,
                 command,
-                step: PendingLaunchStep::Resolved(Box::new(rc)),
-                started: std::time::Instant::now(),
-            });
-            self.run_debug.feedback = Some(format!("preLaunchTask \"{task_label}\" running…"));
-            self.run_debug.feedback_is_error = false;
-            self.status =
-                format!("preLaunchTask \"{task_label}\" running — debug starts when it exits 0");
+                PendingLaunchStep::Resolved(Box::new(rc)),
+                "preLaunchTask",
+                "debug starts",
+            );
             return;
         }
         self.launch_resolved_config(rc);
@@ -46672,6 +46731,8 @@ impl App {
         // A preLaunchTask completing settles the parked debug launch (#250);
         // recorded here and acted on after the sweep (launching mutates self).
         let mut settled_launch: Option<Option<i32>> = None;
+        // A watch preLaunchTask's first build ended, with this many errors.
+        let mut settled_watch: Option<usize> = None;
         // The newest OSC 52 copy any pane's program made this tick (#678).
         let mut copied: Option<String> = None;
         // A task's or fenced block's command ended (#856): (pane uid, exit,
@@ -46686,6 +46747,19 @@ impl App {
             t.set_triggers(self.triggers.clone());
             t.set_watch_set(self.watch_set.clone());
             for (cwd, batch) in t.drain_watch_batches() {
+                // A watch task's first build settles the launch parked on
+                // it (#1541): it will never exit to do so.
+                if settled_watch.is_none()
+                    && let Some(p) = self.pending_debug_launch.as_ref()
+                    && p.watch
+                    && p.pane == t.uid()
+                {
+                    let errors = batch
+                        .iter()
+                        .filter(|d| d.severity == crate::lsp::manager::DiagnosticSeverity::Error)
+                        .count();
+                    settled_watch = Some(errors);
+                }
                 watch_installs.push((t.uid(), cwd, batch));
             }
             for h in t.drain_trigger_hits() {
@@ -46826,6 +46900,19 @@ impl App {
             && let Some(pending) = self.pending_debug_launch.take()
         {
             self.resume_pending_launch(exit, pending.step);
+        } else if let Some(errors) = settled_watch
+            && let Some(pending) = self.pending_debug_launch.take()
+        {
+            if errors == 0 {
+                self.resume_pending_launch(Some(0), pending.step);
+            } else {
+                // The watcher keeps running: fixing the errors rebuilds,
+                // and F5 then launches against a clean build.
+                self.debug_error(format!(
+                    "preLaunchTask build finished with {errors} error{} — debug launch aborted (PROBLEMS lists them; the task keeps watching)",
+                    if errors == 1 { "" } else { "s" }
+                ));
+            }
         }
         // Liveness fallback for a still-parked launch: the FinishedCommand
         // match depends on OSC 133 marks, and a pane without integration (or
@@ -46870,8 +46957,11 @@ impl App {
         }
         // Captures collect silently (iTerm2's model: the panel is the
         // surface, not the status bar), but still trigger a redraw.
-        let had_captures =
-            !captured.is_empty() || build_changed || settled_launch.is_some() || pending_aborted;
+        let had_captures = !captured.is_empty()
+            || build_changed
+            || settled_launch.is_some()
+            || settled_watch.is_some()
+            || pending_aborted;
         for c in captured {
             self.captures.push(c);
         }
@@ -58398,6 +58488,7 @@ impl App {
                     is_build: false,
                     is_default: false,
                     problem_matcher: None,
+                    is_background: false,
                     vscode: None,
                 });
             }

@@ -63878,6 +63878,7 @@ fn long_task(label: &str) -> crate::tasks::Task {
         is_build: false,
         is_default: false,
         problem_matcher: None,
+        is_background: false,
         vscode: None,
     }
 }
@@ -79434,4 +79435,163 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     app.watch_published_panes.insert(pane);
     assert!(!app.apply_build_scan(pane, Some(&cwd), "tsc --watch", "a.c:1:1: error: old\n"));
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
+}
+
+/// #1541: a workspace whose launch config waits on a `watch` task, as the
+/// usual TypeScript setup does. The stand-in watcher prints tsc's watch
+/// banners around `build`'s lines and then keeps running, as `tsc --watch`
+/// does. The config debugs a program that is not there, so a launch that
+/// went ahead is told apart by its "does not exist" error.
+fn watch_task_workspace(background: bool, build: &str) -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    let script = format!(
+        "sleep 1; echo 'Starting compilation in watch mode...'; {build} echo 'Found 0 errors. Watching for file changes.'; sleep 30"
+    );
+    let task = serde_json::json!({
+        "version": "2.0.0",
+        "tasks": [{
+            "label": "watch", "type": "shell", "command": "sh", "args": ["-c", script],
+            "isBackground": background, "problemMatcher": "$tsc-watch"
+        }]
+    });
+    std::fs::write(tmp.path().join(".vscode/tasks.json"), task.to_string()).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [ { "name": "Built", "type": "lldb", "request": "launch",
+             "program": "/nope/bin", "preLaunchTask": "watch" } ] }"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_debug_config_picker();
+    let idx = app
+        .list_picker
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with("Built"))
+        .expect("Built is listed");
+    app.list_picker.as_mut().unwrap().selected = idx;
+    app.confirm_list_picker();
+    (tmp, app)
+}
+
+/// #1541: the watch task's first build ended with no errors, so the launch
+/// goes ahead while the watcher keeps running. It waited for an exit that
+/// never comes.
+#[test]
+fn a_watch_pre_launch_task_launches_once_its_first_build_ends() {
+    let (_tmp, mut app) = watch_task_workspace(true, "");
+    assert!(app.pending_debug_launch.is_some(), "{}", app.status);
+    assert!(
+        app.status.contains("when its first build ends"),
+        "{}",
+        app.status
+    );
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE * 4,
+        "the watcher's first build to settle the launch",
+        || {
+            app.drain_terminal_bells();
+            app.pending_debug_launch.is_none()
+        },
+    );
+    assert!(
+        app.status.contains("program /nope/bin does not exist"),
+        "the launch went ahead: {}",
+        app.status
+    );
+    assert!(
+        app.terminals.iter().any(|t| t.label().contains("watch")),
+        "the watcher's pane is left open"
+    );
+}
+
+/// #1541: a first build with errors does not launch against them; it says
+/// so, and the watcher keeps running to rebuild once they are fixed.
+#[test]
+fn a_watch_pre_launch_task_with_build_errors_does_not_launch() {
+    let (_tmp, mut app) = watch_task_workspace(
+        true,
+        r#"echo "src/index.ts(1,5): error TS2322: Type 'string' is not assignable to type 'number'.";"#,
+    );
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE * 4,
+        "the watcher's first build to settle the launch",
+        || {
+            app.drain_terminal_bells();
+            app.pending_debug_launch.is_none()
+        },
+    );
+    assert!(app.run_debug.feedback_is_error);
+    assert!(
+        app.status.contains("finished with 1 error"),
+        "{}",
+        app.status
+    );
+    assert!(!app.status.contains("does not exist"), "{}", app.status);
+}
+
+/// #1541 negative: a task that is not `isBackground` still waits for its
+/// exit, whatever its output says.
+#[test]
+fn an_ordinary_pre_launch_task_still_waits_for_its_exit() {
+    let (_tmp, mut app) = watch_task_workspace(
+        false,
+        r#"echo "src/index.ts(1,5): error TS2322: Type 'string' is not assignable to type 'number'.";"#,
+    );
+    assert!(app.status.contains("when it exits 0"), "{}", app.status);
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE * 4,
+        "the watcher's build to reach PROBLEMS",
+        || {
+            app.drain_terminal_bells();
+            !app.build_diagnostics.is_empty()
+        },
+    );
+    assert!(
+        app.pending_debug_launch.is_some(),
+        "still waiting: {}",
+        app.status
+    );
+    assert!(
+        !app.run_debug.feedback_is_error,
+        "{:?}",
+        app.run_debug.feedback
+    );
+}
+
+/// #1541: how a launch waits, by the task's `isBackground` and whether its
+/// matcher can say when a build ends.
+#[test]
+fn a_pre_launch_wait_follows_is_background_and_the_matcher() {
+    let task = |background: bool, matcher: Option<serde_json::Value>| crate::tasks::Task {
+        label: String::from("t"),
+        command: String::from("t"),
+        source: String::from("tasks.json"),
+        is_build: false,
+        is_default: false,
+        problem_matcher: matcher,
+        is_background: background,
+        vscode: None,
+    };
+    let watch = Some(serde_json::json!("$tsc-watch"));
+    assert_eq!(
+        PreLaunchWait::of(&task(false, watch.clone())),
+        PreLaunchWait::Exit
+    );
+    assert_eq!(
+        PreLaunchWait::of(&task(true, watch)),
+        PreLaunchWait::FirstBuild
+    );
+    assert_eq!(
+        PreLaunchWait::of(&task(true, Some(serde_json::json!("$tsc")))),
+        PreLaunchWait::Untracked
+    );
+    assert_eq!(
+        PreLaunchWait::of(&task(true, None)),
+        PreLaunchWait::Untracked
+    );
+    assert_eq!(PreLaunchWait::of(&task(false, None)), PreLaunchWait::Exit);
 }
