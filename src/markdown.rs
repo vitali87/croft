@@ -2282,6 +2282,94 @@ mod tests {
         );
     }
 
+    /// The colour the preview gives `word` on the code line containing
+    /// `line` in a fence tagged `info`; `None` when it is not its own span
+    /// or carries no colour of its own.
+    fn fence_keyword_colour(info: &str, line: &str, word: &str) -> Option<Color> {
+        let lines = render(&format!("```{info}\n{line}\n```"));
+        let code_line = lines.iter().find(|l| text_of(l).contains(line))?;
+        code_line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref().trim() == word)?
+            .style
+            .fg
+    }
+
+    /// #1642: rustdoc and mdBook attributes after a comma, and Pandoc's
+    /// braces, are not part of the language.
+    #[test]
+    fn fence_attributes_do_not_hide_the_language() {
+        for info in [
+            "rust,ignore",
+            "rust,no_run",
+            "rust,should_panic",
+            "Rust,editable",
+        ] {
+            assert_eq!(lang_for_fence(info), Some(LangKind::Rust), "{info}");
+        }
+        for info in [
+            "{python}",
+            "{.python}",
+            "{.python .numberLines}",
+            "{python echo=false}",
+            "{#example .python .numberLines}",
+            "{ #example .python }",
+            "{.python #example}",
+            "python,linenos",
+        ] {
+            assert_eq!(lang_for_fence(info), Some(LangKind::Python), "{info}");
+        }
+        assert_eq!(lang_for_fence("{r, echo=FALSE}"), lang_for_fence("r"));
+    }
+
+    /// The issue's chapter: each block is coloured like the same block
+    /// tagged with the bare language.
+    #[test]
+    fn the_preview_colours_fences_that_carry_attributes() {
+        let rust = fence_keyword_colour("rust", "fn main() {}", "fn");
+        assert!(rust.is_some(), "a plain rust fence is coloured");
+        for info in ["rust,ignore", "rust,no_run"] {
+            assert_eq!(
+                fence_keyword_colour(info, "fn main() {}", "fn"),
+                rust,
+                "{info}"
+            );
+        }
+        let python = fence_keyword_colour("python", "def f(): return 1", "def");
+        assert!(python.is_some(), "a plain python fence is coloured");
+        for info in ["{python}", "{.python .numberLines}"] {
+            assert_eq!(
+                fence_keyword_colour(info, "def f(): return 1", "def"),
+                python,
+                "{info}"
+            );
+        }
+    }
+
+    /// Negative: fences with no language, or one croft does not know, stay
+    /// plain, attributes or not.
+    #[test]
+    fn fences_without_a_known_language_stay_plain() {
+        for info in [
+            "",
+            "text",
+            "text,ignore",
+            "{}",
+            "{.}",
+            "{#example}",
+            "{#example linenos=true}",
+            ",rust",
+            "nosuchlang,rust",
+        ] {
+            assert_eq!(lang_for_fence(info), None, "{info:?}");
+        }
+        assert_eq!(
+            fence_keyword_colour("text,ignore", "fn main() {}", "fn"),
+            None
+        );
+    }
+
     #[test]
     fn lists_nest_with_indentation_and_ordered_counters() {
         let lines = render("- top\n  - inner\n\n1. first\n2. second");

@@ -827,8 +827,26 @@ pub fn lang_for_path(path: &std::path::Path) -> Option<LangKind> {
 /// the common fence names and falls back to the file-extension table. Shared
 /// by the rendered preview and the editor's Markdown injections, so a fence
 /// colours the same in both.
+///
+/// Attributes after the language are not part of it (#1642): rustdoc and
+/// mdBook write `rust,ignore` and `rust,no_run`, Pandoc and Quarto
+/// `{python}`, `{.python .numberLines}` and `{#id .python}`.
 pub fn lang_for_fence(info: &str) -> Option<LangKind> {
-    let tag = info.split_whitespace().next().unwrap_or("");
+    let info = info.trim_start();
+    let tag = if let Some(attrs) = info.strip_prefix('{') {
+        // A Pandoc attribute list: the language is its first class (or a
+        // bare Quarto word), wherever it sits; `#id` and `key=value`
+        // entries are skipped.
+        let attrs = attrs.split('}').next().unwrap_or("");
+        attrs
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .find(|entry| !entry.is_empty() && !entry.starts_with('#') && !entry.contains('='))
+            .unwrap_or("")
+            .trim_start_matches('.')
+    } else {
+        let word = info.split_whitespace().next().unwrap_or("");
+        word.split(',').next().unwrap_or("")
+    };
     Some(match tag.to_ascii_lowercase().as_str() {
         "rust" => LangKind::Rust,
         "python" => LangKind::Python,
