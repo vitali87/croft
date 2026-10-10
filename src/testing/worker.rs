@@ -275,6 +275,28 @@ fn worker_loop(mut root: PathBuf, rx: Receiver<TestRequest>, tx: Sender<(u64, Te
     }
 }
 
+/// `args` for a cargo test or coverage run at `root`, with `--workspace`
+/// after the subcommand when the root manifest has a `[workspace]` table
+/// (#1508). At the root of a workspace that is also a package, plain `cargo
+/// test` builds and runs only that package, so the members' tests were
+/// never listed or run; for a virtual manifest the flag changes nothing.
+fn workspace_args<'a>(root: &Path, args: &[&'a str]) -> Vec<&'a str> {
+    let mut out = args.to_vec();
+    let subcommand = matches!(args.first(), Some(&"test" | &"llvm-cov"));
+    if subcommand && !args.contains(&"--version") && declares_workspace(root) {
+        out.insert(1, "--workspace");
+    }
+    out
+}
+
+/// Whether `root/Cargo.toml` has a `[workspace]` table.
+fn declares_workspace(root: &Path) -> bool {
+    std::fs::read_to_string(root.join("Cargo.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .is_some_and(|manifest| manifest.contains_key("workspace"))
+}
+
 /// `cargo <args>` rooted at the workspace, with piped stdio. cargo is resolved
 /// by absolute path (GUI-launched croft inherits a stripped PATH) and its own
 /// dir is prepended to the child PATH so the rustup shim finds its sibling
@@ -282,7 +304,7 @@ fn worker_loop(mut root: PathBuf, rx: Receiver<TestRequest>, tx: Sender<(u64, Te
 fn cargo_cmd(root: &Path, args: &[&str]) -> Command {
     let cargo = crate::widgets::dependencies::cargo_binary();
     let mut cmd = Command::new(&cargo);
-    cmd.args(args)
+    cmd.args(workspace_args(root, args))
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1762,6 +1784,102 @@ mod tests {
         .unwrap();
         assert!(w.drain(&mut panel));
         assert!(!panel.is_empty());
+    }
+
+    /// A root that is a package with `members` beside it (#1508).
+    fn package_and_workspace() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\nmembers = [\"util\"]\n",
+        )
+        .unwrap();
+        tmp
+    }
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// #1508: at the root of a workspace that is also a package, every test
+    /// and coverage run covers the members too: listing, Run All, one test,
+    /// a filter, the debug build and llvm-cov.
+    #[test]
+    fn cargo_runs_at_a_workspace_root_cover_every_member() {
+        let tmp = package_and_workspace();
+        let root = tmp.path();
+        for (args, want) in [
+            (
+                &["test", "--color=never", "--", "--list"][..],
+                &["test", "--workspace", "--color=never", "--", "--list"][..],
+            ),
+            (
+                &["test", "--no-fail-fast", "--color=never"][..],
+                &["test", "--workspace", "--no-fail-fast", "--color=never"][..],
+            ),
+            (
+                &[
+                    "test",
+                    "tests::util_works",
+                    "--color=never",
+                    "--",
+                    "--exact",
+                ][..],
+                &[
+                    "test",
+                    "--workspace",
+                    "tests::util_works",
+                    "--color=never",
+                    "--",
+                    "--exact",
+                ][..],
+            ),
+            (
+                &["test", "--no-run", "--message-format=json"][..],
+                &["test", "--workspace", "--no-run", "--message-format=json"][..],
+            ),
+            (
+                &["llvm-cov", "--no-fail-fast", "--lcov"][..],
+                &["llvm-cov", "--workspace", "--no-fail-fast", "--lcov"][..],
+            ),
+        ] {
+            assert_eq!(args_of(&cargo_cmd(root, args)), want);
+        }
+        // A virtual manifest takes the flag too; it changes nothing there.
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"a\", \"b\"]\n",
+        )
+        .unwrap();
+        assert_eq!(workspace_args(root, &["test"]), ["test", "--workspace"]);
+    }
+
+    /// #1508, negative: a single package, a probe for llvm-cov and a
+    /// manifest croft cannot read run as they always did.
+    #[test]
+    fn cargo_runs_without_a_workspace_table_are_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"solo\"\nversion = \"0.1.0\"\n# [workspace] in a comment\n",
+        )
+        .unwrap();
+        assert_eq!(
+            workspace_args(root, &["test", "--no-fail-fast"]),
+            ["test", "--no-fail-fast"]
+        );
+        let ws = package_and_workspace();
+        assert_eq!(
+            workspace_args(ws.path(), &["llvm-cov", "--version"]),
+            ["llvm-cov", "--version"]
+        );
+        std::fs::write(root.join("Cargo.toml"), "[workspace\nbroken").unwrap();
+        assert_eq!(workspace_args(root, &["test"]), ["test"]);
+        let none = tempfile::tempdir().unwrap();
+        assert_eq!(workspace_args(none.path(), &["test"]), ["test"]);
     }
 
     #[test]
