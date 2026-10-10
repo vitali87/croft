@@ -14,6 +14,8 @@ pub enum Magic {
     Gif,
     WebP,
     Bmp,
+    /// A Windows icon (`.ico`, a favicon), which wraps PNG or BMP images.
+    Ico,
     Pdf,
     /// Any zip container — an Office document, a jar, or a plain
     /// archive; the caller decides what to try (xlsx via the sheet
@@ -28,7 +30,7 @@ impl Magic {
     pub fn is_image(self) -> bool {
         matches!(
             self,
-            Magic::Png | Magic::Jpeg | Magic::Gif | Magic::WebP | Magic::Bmp
+            Magic::Png | Magic::Jpeg | Magic::Gif | Magic::WebP | Magic::Bmp | Magic::Ico
         )
     }
 }
@@ -70,12 +72,30 @@ pub fn sniff(bytes: &[u8]) -> Option<Magic> {
     if bytes.len() > 262 && &bytes[257..262] == b"ustar" {
         return Some(Magic::Tar);
     }
+    if is_ico(bytes) {
+        return Some(Magic::Ico);
+    }
     // BMP last: "BM" is only two bytes, the weakest signature here, so
     // every stronger prefix gets its chance first.
     if bytes.len() >= 6 && bytes.starts_with(b"BM") {
         return Some(Magic::Bmp);
     }
     None
+}
+
+/// A Windows icon (#1652): `00 00 01 00` and an image count, then a
+/// 16-byte directory entry per image. Four bytes that are mostly zeros
+/// start plenty of binary files, so the first entry has to read as one
+/// too: its reserved byte zero, at most one colour plane, and its image
+/// data after the directory.
+fn is_ico(bytes: &[u8]) -> bool {
+    let u16_at = |i: usize| u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+    if bytes.len() < 22 || !bytes.starts_with(b"\0\0\x01\0") {
+        return false;
+    }
+    let count = u16_at(4) as u32;
+    let offset = u32::from_le_bytes([bytes[18], bytes[19], bytes[20], bytes[21]]);
+    count > 0 && bytes[9] == 0 && u16_at(10) <= 1 && offset >= 6 + 16 * count
 }
 
 #[cfg(test)]
@@ -118,6 +138,36 @@ mod tests {
         assert_eq!(sniff(&not_tar), None);
     }
 
+    /// The header and first directory entry of a one-image icon whose
+    /// data starts at `offset`.
+    fn ico_head(offset: u32) -> Vec<u8> {
+        let mut h = vec![0, 0, 1, 0, 1, 0, 32, 32, 0, 0, 1, 0, 32, 0];
+        h.extend_from_slice(&100u32.to_le_bytes());
+        h.extend_from_slice(&offset.to_le_bytes());
+        h
+    }
+
+    /// #1652: a favicon is recognised by its header and directory.
+    #[test]
+    fn recognises_a_windows_icon() {
+        assert_eq!(sniff(&ico_head(22)), Some(Magic::Ico));
+    }
+
+    /// Negative (#1652): `00 00 01 00` alone, an icon with no images, or a
+    /// directory entry that cannot be one is not an icon.
+    #[test]
+    fn mostly_zero_heads_are_not_icons() {
+        assert_eq!(sniff(b"\0\0\x01\0"), None, "too short");
+        let mut none = ico_head(22);
+        none[4] = 0;
+        assert_eq!(sniff(&none), None, "zero images");
+        assert_eq!(sniff(&ico_head(6)), None, "data inside the directory");
+        let mut reserved = ico_head(22);
+        reserved[9] = 7;
+        assert_eq!(sniff(&reserved), None, "reserved byte set");
+        assert_eq!(sniff(&[0u8; 64]), None, "all zeros");
+    }
+
     #[test]
     fn stronger_prefixes_win_over_bmp() {
         // "BM" never shadows a real signature that begins differently;
@@ -134,6 +184,7 @@ mod tests {
             (Magic::Gif, true),
             (Magic::WebP, true),
             (Magic::Bmp, true),
+            (Magic::Ico, true),
             (Magic::Pdf, false),
             (Magic::Zip, false),
             (Magic::Gzip, false),

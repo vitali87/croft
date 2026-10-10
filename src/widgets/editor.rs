@@ -40,7 +40,7 @@ fn image_dimensions_of(bytes: &[u8]) -> Option<(u32, u32)> {
         .into_dimensions()
         .ok()
 }
-const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp", "ico"];
 
 /// Read-only image preview attached to a tab. Holds the raw file bytes so
 /// the OSC-1337 inline-image bake can re-fit on resize without rereading
@@ -24534,6 +24534,58 @@ mod tests {
         );
     }
 
+    /// A 32x16 favicon: a PNG wrapped in an ICO container (#1652).
+    fn favicon_bytes() -> Vec<u8> {
+        let img: image::RgbaImage =
+            image::ImageBuffer::from_pixel(32, 16, image::Rgba([74, 144, 226, 255]));
+        let mut buf: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Ico)
+            .unwrap();
+        assert!(buf.starts_with(b"\0\0\x01\0"), "setup: an ICO container");
+        buf
+    }
+
+    /// #1652: a `.ico` opens in the image viewer with its size, not as hex.
+    #[test]
+    fn a_favicon_opens_as_an_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("favicon.ico");
+        std::fs::write(&path, favicon_bytes()).unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        assert!(e.hex.is_none(), "not the hex viewer");
+        let img = e.image.as_ref().expect("image-mode tab");
+        assert_eq!((img.pixel_w, img.pixel_h), (32, 16));
+        assert_eq!(img.format_label, "ICO");
+    }
+
+    /// #1652: an icon with no extension routes to the image viewer by its
+    /// bytes, like an extensionless PNG.
+    #[test]
+    fn an_extensionless_icon_routes_to_the_image_viewer_by_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("icon");
+        std::fs::write(&path, favicon_bytes()).unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        let img = e.image.as_ref().expect("image-mode tab");
+        assert_eq!((img.pixel_w, img.pixel_h), (32, 16));
+    }
+
+    /// Negative (#1652): a truncated `.ico` that does not decode falls back
+    /// to the hex viewer, without a panic.
+    #[test]
+    fn a_broken_icon_falls_back_to_hex() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.ico");
+        std::fs::write(&path, &favicon_bytes()[..30]).unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        assert!(e.image.is_none());
+        assert!(e.hex.is_some(), "an undecodable icon opens as bytes");
+    }
+
     #[test]
     fn open_png_populates_image_view_and_skips_text_buffer() {
         // 1×1 transparent PNG, hand-crafted via the image crate.
@@ -24652,7 +24704,9 @@ mod tests {
 
     #[test]
     fn extension_is_image_recognises_common_formats() {
-        for ext in ["png", "PNG", "jpg", "jpeg", "JPEG", "gif", "bmp", "webp"] {
+        for ext in [
+            "png", "PNG", "jpg", "jpeg", "JPEG", "gif", "bmp", "webp", "ico", "ICO",
+        ] {
             assert!(extension_is_image(ext), "should recognise: {ext}");
         }
         for ext in ["txt", "rs", "md", "py", ""] {
