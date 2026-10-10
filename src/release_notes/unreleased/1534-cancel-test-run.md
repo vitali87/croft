@@ -1,0 +1,1 @@
+feature: A test run can be stopped: the Testing view shows a ■ Stop control while a run is in flight (also `s`, and "Testing: Cancel Test Run"). Quitting croft ends a run still going, and starting a run while one is in flight says so instead of doing nothing.
