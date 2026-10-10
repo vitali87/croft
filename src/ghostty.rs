@@ -27,7 +27,9 @@ use crate::iterm2::payloads as pl;
 /// names it reads in each, the current one first (#1439).
 const XDG_DIR: &str = "ghostty";
 const APP_SUPPORT_DIR: &str = "Library/Application Support/com.mitchellh.ghostty";
-const CONFIG_NAMES: [&str; 2] = ["config.ghostty", "config"];
+/// In the order Ghostty loads them from one folder: the legacy name first,
+/// then `config.ghostty`, whose values win.
+const CONFIG_NAMES: [&str; 2] = ["config", "config.ghostty"];
 
 /// Marker lines that fence croft's managed keybind block inside the user's
 /// Ghostty config. Re-running setup replaces everything between them, leaving
@@ -246,10 +248,13 @@ pub fn default_config_path() -> PathBuf {
     config_path_in(&home, xdg.as_deref(), cfg!(target_os = "macos"))
 }
 
-/// The Ghostty config to edit (#1439): the first that exists of
-/// `config.ghostty` then `config` in `$XDG_CONFIG_HOME/ghostty` (a relative
-/// or empty `XDG_CONFIG_HOME` is ignored, as the XDG spec says) and, on
-/// macOS, in `~/Library/Application Support/com.mitchellh.ghostty`. With
+/// The Ghostty config to edit (#1439): the LAST that exists in the order
+/// Ghostty loads them, `config` then `config.ghostty` in
+/// `$XDG_CONFIG_HOME/ghostty` (a relative or empty `XDG_CONFIG_HOME` is
+/// ignored, as the XDG spec says) and then, on macOS, in
+/// `~/Library/Application Support/com.mitchellh.ghostty`. A later file's
+/// keybind for the same trigger overrides an earlier one, so croft's
+/// mappings only hold in the file loaded last. With
 /// none, a new `config` (the name every Ghostty version reads) in the
 /// application-support folder on macOS, else in the XDG folder. Checking
 /// one fixed path and falling back to the macOS one wrote, on Linux, a file
@@ -266,7 +271,8 @@ pub(crate) fn config_path_in(home: &Path, xdg_config_home: Option<&Path>, macos:
     }
     dirs.iter()
         .flat_map(|dir| CONFIG_NAMES.iter().map(move |name| dir.join(name)))
-        .find(|p| p.is_file())
+        .filter(|p| p.is_file())
+        .last()
         .unwrap_or_else(|| dirs.last().unwrap_or(&xdg).join("config"))
 }
 
@@ -290,17 +296,27 @@ mod tests {
         for macos in [false, true] {
             assert_eq!(config_path_in(home, None, macos), named);
         }
-        // `config.ghostty` is preferred to a legacy `config` beside it.
+        // `config.ghostty` loads after a legacy `config` beside it, so it wins.
         put(".config/ghostty/config");
         assert_eq!(config_path_in(home, None, false), named);
         // XDG_CONFIG_HOME moves the folder.
         let dots = put("dots/ghostty/config");
         assert_eq!(config_path_in(home, Some(&home.join("dots")), false), dots);
-        // The XDG folder is read before Application Support on macOS.
+        // Application Support is loaded after the XDG folder on macOS, so
+        // its file is the one whose keybinds win; Linux never reads it.
         let app = put("Library/Application Support/com.mitchellh.ghostty/config.ghostty");
-        assert_eq!(config_path_in(home, None, true), named);
-        std::fs::remove_dir_all(home.join(".config")).unwrap();
         assert_eq!(config_path_in(home, None, true), app);
+        assert_eq!(config_path_in(home, None, false), named);
+        let legacy_app = put("Library/Application Support/com.mitchellh.ghostty/config");
+        assert_eq!(
+            config_path_in(home, None, true),
+            app,
+            "config.ghostty loads after the legacy name beside it"
+        );
+        std::fs::remove_file(&app).unwrap();
+        assert_eq!(config_path_in(home, None, true), legacy_app);
+        std::fs::remove_dir_all(home.join(".config")).unwrap();
+        assert_eq!(config_path_in(home, None, true), legacy_app);
     }
 
     /// #1439: with no config yet, a new one goes where this OS's Ghostty
