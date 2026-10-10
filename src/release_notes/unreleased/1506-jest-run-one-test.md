@@ -1,0 +1,1 @@
+fix: Running one jest or vitest test from the TESTING view now runs only that test: its full name is matched exactly, and jest runs only that exact file, not same-named files elsewhere or tests whose names merely contain its title.

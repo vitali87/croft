@@ -753,17 +753,38 @@ pub fn build_test_binary(
 }
 
 /// vitest argv for one exact test: the file scopes the run and `-t` narrows
-/// to the title. vitest's `-t/--testNamePattern` is jest-compatible — a
-/// REGEX over the full name — so the title is escaped like jest's.
+/// to the test. vitest's `-t/--testNamePattern` is jest-compatible — a
+/// REGEX over the full name — so the name is escaped like jest's, and
+/// anchored (see [`exact_title_anchor`]).
 fn vitest_one_args(name: &str) -> Vec<String> {
-    let (file, title) = js_id_parts(name);
-    let mut args = vec![String::from("run"), file.to_string()];
-    if let Some(t) = title {
+    let mut args = vec![String::from("run"), js_id_parts(name).0.to_string()];
+    if let Some(anchor) = exact_title_anchor(name) {
         args.push(String::from("-t"));
-        args.push(regex_escape(t));
+        args.push(anchor);
     }
     args.push(String::from("--reporter=tap-flat"));
     args
+}
+
+/// `-t` regex for one test (#1506): its describe chain and title, escaped,
+/// joined with single spaces the way vitest and jest build the full name
+/// they search `-t` in, and anchored at both ends. The bare title is a
+/// search too, so `works` also ran `works with negatives` and a `works` in
+/// another describe. `None` for an ID that is only a file.
+fn exact_title_anchor(id: &str) -> Option<String> {
+    full_name_regex(id).map(|name| format!("^{name}$"))
+}
+
+/// The describe chain and title of a JS node ID as the escaped, space-joined
+/// full name the runners match `-t` against; `None` for a bare file.
+fn full_name_regex(id: &str) -> Option<String> {
+    let (_, rest) = id.split_once("::")?;
+    Some(
+        rest.split("::")
+            .map(regex_escape)
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 /// `-t` regex for a suite click's describe chain: every segment after the
@@ -772,15 +793,9 @@ fn vitest_one_args(name: &str) -> Vec<String> {
 /// `getTaskFullName`, jest's `getTestID`), anchored at the start and closed
 /// with the joining space so describe `auth` cannot sweep an `auth-helper`
 /// sibling. `None` when the suite is the whole file (no describe segments),
-/// where the positional file argument already scopes the run exactly.
+/// where the file argument alone scopes the run.
 fn suite_title_anchor(pattern: &str) -> Option<String> {
-    let (_, rest) = pattern.split_once("::")?;
-    let joined = rest
-        .split("::")
-        .map(regex_escape)
-        .collect::<Vec<_>>()
-        .join(" ");
-    Some(format!("^{joined} "))
+    full_name_regex(pattern).map(|joined| format!("^{joined} "))
 }
 
 /// vitest argv for a filter run: a suite click passes a node-ID prefix
@@ -809,15 +824,21 @@ fn vitest_filter_args(pattern: &str, suite: bool) -> Vec<String> {
     args
 }
 
-/// jest argv for one exact test, mirroring [`vitest_one_args`]: the file
-/// scopes the run and `-t` (a regex over the full name) narrows to the
-/// escaped title.
+/// jest's own way to name one test file (#1506). A bare positional file is
+/// a `testPathPattern`, a regex searched in each absolute path, so
+/// `src/a.test.js` also ran `legacy/src/a.test.js`; `--runTestsByPath`
+/// takes it as that exact path.
+fn jest_file_args(file: &str) -> [String; 2] {
+    [String::from("--runTestsByPath"), file.to_string()]
+}
+
+/// jest argv for one exact test, mirroring [`vitest_one_args`]: the exact
+/// file and an anchored `-t` (a regex over the full name) for the test.
 fn jest_one_args(name: &str) -> Vec<String> {
-    let (file, title) = js_id_parts(name);
-    let mut args = vec![file.to_string()];
-    if let Some(t) = title {
+    let mut args = jest_file_args(js_id_parts(name).0).to_vec();
+    if let Some(anchor) = exact_title_anchor(name) {
         args.push(String::from("-t"));
-        args.push(regex_escape(t));
+        args.push(anchor);
     }
     args.push(String::from("--json"));
     args
@@ -830,7 +851,7 @@ fn jest_filter_args(pattern: &str, suite: bool) -> Vec<String> {
     let mut args = Vec::new();
     if is_js_file(pattern) {
         let (file, title) = js_id_parts(pattern);
-        args.push(file.to_string());
+        args.extend(jest_file_args(file));
         if suite {
             if let Some(anchor) = suite_title_anchor(pattern) {
                 args.push(String::from("-t"));
@@ -1707,7 +1728,7 @@ mod tests {
                 "run",
                 "tests/math.test.js",
                 "-t",
-                r"adds \(1 \+ 1\)",
+                r"^math adds \(1 \+ 1\)$",
                 "--reporter=tap-flat"
             ]
         );
@@ -1978,7 +1999,13 @@ mod tests {
         // vitest escaping bug came exactly from that kind of divergence.
         assert_eq!(
             jest_one_args("tests/math.test.js::math::adds (1 + 1)"),
-            vec!["tests/math.test.js", "-t", r"adds \(1 \+ 1\)", "--json"]
+            vec![
+                "--runTestsByPath",
+                "tests/math.test.js",
+                "-t",
+                r"^math adds \(1 \+ 1\)$",
+                "--json"
+            ]
         );
         assert_eq!(
             jest_filter_args("parses [ tokens", false),
@@ -1986,8 +2013,97 @@ mod tests {
         );
         assert_eq!(
             jest_filter_args("tests/a.test.js::group (x)", false),
-            vec!["tests/a.test.js", "-t", r"group \(x\)", "--json"]
+            vec![
+                "--runTestsByPath",
+                "tests/a.test.js",
+                "-t",
+                r"group \(x\)",
+                "--json"
+            ]
         );
+    }
+
+    /// #1506: Run on one jest or vitest test names it by its whole describe
+    /// chain, anchored at both ends, so `works` no longer also runs `works
+    /// with negatives` or a `works` under another describe.
+    #[test]
+    fn one_js_test_is_named_by_its_whole_chain_anchored() {
+        let id = "src/math.test.js::add::works";
+        let jest = jest_one_args(id);
+        assert_eq!(
+            jest,
+            vec![
+                "--runTestsByPath",
+                "src/math.test.js",
+                "-t",
+                "^add works$",
+                "--json"
+            ]
+        );
+        let vitest = vitest_one_args(id);
+        assert_eq!(vitest[3], "^add works$", "{vitest:?}");
+        let filter = regex::Regex::new(&jest[3]).unwrap();
+        assert!(filter.is_match("add works"));
+        for other in ["add works with negatives", "sub add works", "add  works"] {
+            assert!(!filter.is_match(other), "{other} must not run");
+        }
+        // A test outside any describe is its title alone.
+        assert_eq!(
+            exact_title_anchor("src/a.test.js::works").as_deref(),
+            Some("^works$")
+        );
+        // Regex syntax in a title is still literal.
+        let odd =
+            regex::Regex::new(&exact_title_anchor("a.test.js::x.y::[1] $ok").unwrap()).unwrap();
+        assert!(odd.is_match("x.y [1] $ok") && !odd.is_match("xzy [1] $ok"));
+    }
+
+    /// #1506: jest reads a bare file argument as a path regex, so
+    /// `src/math.test.js` also ran `legacy/src/math.test.js`. Every run
+    /// that names a file names it with `--runTestsByPath`.
+    #[test]
+    fn every_jest_run_names_its_file_as_an_exact_path() {
+        assert_eq!(
+            jest_filter_args("src/math.test.js", true),
+            vec!["--runTestsByPath", "src/math.test.js", "--json"]
+        );
+        assert_eq!(
+            jest_filter_args("src/math.test.js::add", true),
+            vec![
+                "--runTestsByPath",
+                "src/math.test.js",
+                "-t",
+                "^add ",
+                "--json"
+            ]
+        );
+        let coverage = coverage_scope_args(
+            Runner::Jest,
+            &CoverageScope {
+                name: String::from("src/math.test.js::add::works"),
+                exact: true,
+                suite: false,
+            },
+        );
+        assert_eq!(
+            coverage,
+            vec!["--runTestsByPath", "src/math.test.js", "-t", "^add works$"]
+        );
+    }
+
+    /// #1506, negative: run-at-cursor's bare title names no file, so it
+    /// gets neither `--runTestsByPath` nor an anchor.
+    #[test]
+    fn a_bare_title_run_stays_an_unanchored_search() {
+        assert_eq!(
+            jest_filter_args("works", false),
+            vec!["-t", "works", "--json"]
+        );
+        assert_eq!(
+            vitest_filter_args("works", false),
+            vec!["run", "-t", "works", "--reporter=tap-flat"]
+        );
+        assert_eq!(exact_title_anchor("src/math.test.js"), None);
     }
 
     /// A suite click's `-t` must not be a bare substring: describe `auth`
@@ -2010,7 +2126,13 @@ mod tests {
         );
         assert_eq!(
             jest_filter_args("tests/a.test.js::group (x)::inner", true),
-            vec!["tests/a.test.js", "-t", r"^group \(x\) inner ", "--json"]
+            vec![
+                "--runTestsByPath",
+                "tests/a.test.js",
+                "-t",
+                r"^group \(x\) inner ",
+                "--json"
+            ]
         );
         // A suite that is the whole file needs no `-t`: the positional file
         // argument already scopes the run exactly.
