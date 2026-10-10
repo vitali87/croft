@@ -32062,6 +32062,27 @@ mod tests {
         );
     }
 
+    /// #1550: `!` in an empty HTML file becomes the page skeleton, with the
+    /// caret on the indented line inside `<body>`.
+    #[test]
+    fn emmet_turns_an_exclamation_mark_into_a_page() {
+        let mut e = html_editor("!", 1);
+        assert!(e.expand_emmet_abbreviation());
+        assert_eq!(e.lines.first().map(String::as_str), Some("<!DOCTYPE html>"));
+        assert_eq!(e.lines.last().map(String::as_str), Some("</html>"));
+        assert_eq!(e.lines[e.cursor_row - 1], "<body>");
+        assert_eq!(e.lines[e.cursor_row], "    ");
+        assert_eq!(e.cursor_col, 4);
+    }
+
+    /// #1550 negative: an exclamation mark ending a sentence is no snippet.
+    #[test]
+    fn emmet_leaves_an_exclamation_in_prose_alone() {
+        let mut e = html_editor("Hello!", 6);
+        assert!(!e.expand_emmet_abbreviation());
+        assert_eq!(e.lines, vec!["Hello!"]);
+    }
+
     /// The caret has to end up somewhere useful, or the user just has to go
     /// looking for the hole they meant to type into.
     #[test]

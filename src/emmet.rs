@@ -12,12 +12,15 @@
 //! * The climb-up operator `^`. It only ever saves a pair of parentheses,
 //!   and it is the one piece of the grammar whose meaning readers argue
 //!   about.
-//! * CSS abbreviations (`m10-20`) and the document snippet `!`. They are
-//!   separate features that happen to share a keystroke.
+//! * CSS abbreviations (`m10-20`). They are a separate feature that happens
+//!   to share a keystroke.
 //!
 //! Emmet's HTML aliases (`input:email`, `btn:s`, `link:css`, ...) and lorem
 //! ipsum (`lorem`, `lorem5`) are in (#1230): a form is mostly typed inputs,
 //! and a colon name that is no alias would otherwise become a made-up tag.
+//!
+//! So are the document snippets (#1550): `!` and `html:5` write the HTML5
+//! page skeleton, `doc` its `<html>` element and `!!!` the doctype.
 //!
 //! An abbreviation that does not parse expands to nothing, so the chord is
 //! inert on prose rather than mangling it.
@@ -381,6 +384,11 @@ fn resolve(nodes: &mut [Node], profile: Profile) -> Option<()> {
 /// content position, which is where typing continues. It is a byte offset
 /// into the returned string.
 pub fn expand(abbr: &str, indent: &str, profile: Profile) -> Option<(String, usize)> {
+    if profile == Profile::Html
+        && let Some(page) = document_snippet(abbr, indent)
+    {
+        return Some(page);
+    }
     let mut nodes = parse(abbr)?;
     // An alias on its own is HTML; XML reads the word as a namespaced tag,
     // which a bare word is not allowed to be.
@@ -410,6 +418,41 @@ pub fn expand(abbr: &str, indent: &str, profile: Profile) -> Option<(String, usi
     // expansion in.
     let caret = r.caret.unwrap_or(r.out.len() - 1);
     Some((r.out, caret))
+}
+
+/// Emmet's document snippets (#1550), written out whole rather than parsed:
+/// they are a page, not an element, and Emmet itself formats them with
+/// `<head>` and `<body>` flush against `<html>`. `!` and `html:5` are the
+/// HTML5 skeleton, `doc` the same without the doctype, `!!!` the doctype
+/// alone. The caret goes on an indented line inside `<body>`, as VS Code
+/// leaves it.
+fn document_snippet(abbr: &str, indent: &str) -> Option<(String, usize)> {
+    const DOCTYPE: &str = "<!DOCTYPE html>\n";
+    let doctype = match abbr {
+        "!" | "html:5" => true,
+        "doc" => false,
+        "!!!" => return Some((DOCTYPE.to_string(), DOCTYPE.len() - 1)),
+        _ => return None,
+    };
+    let mut out = String::new();
+    if doctype {
+        out.push_str(DOCTYPE);
+    }
+    out.push_str("<html lang=\"en\">\n<head>\n");
+    for line in [
+        "<meta charset=\"UTF-8\">",
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">",
+        "<title>Document</title>",
+    ] {
+        out.push_str(indent);
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("</head>\n<body>\n");
+    out.push_str(indent);
+    let caret = out.len();
+    out.push_str("\n</body>\n</html>\n");
+    Some((out, caret))
 }
 
 /// How many elements `nodes` renders, saturating rather than overflowing on
@@ -1554,5 +1597,85 @@ mod tests {
     fn a_word_like_lorem_is_not_lorem() {
         assert!(expand("loremipsum", "  ").is_none());
         assert!(expand("lorem0", "  ").is_none());
+    }
+
+    /// The page `!` writes in VS Code, with a four-space indent and `|` for
+    /// the caret.
+    const PAGE: &str = "<!DOCTYPE html>
+<html lang=\"en\">
+<head>
+    <meta charset=\"UTF-8\">
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">
+    <title>Document</title>
+</head>
+<body>
+    |
+</body>
+</html>
+";
+
+    /// `expand`'s result with `|` spliced in at the caret.
+    fn with_caret(abbr: &str) -> Option<String> {
+        expand(abbr, "    ").map(|(mut out, caret)| {
+            out.insert(caret, '|');
+            out
+        })
+    }
+
+    /// #1550: `!` was read as a tag name that is no tag, so the page
+    /// skeleton, Emmet's most used snippet, expanded to nothing.
+    #[test]
+    fn an_exclamation_mark_writes_the_page_skeleton() {
+        assert_eq!(with_caret("!").as_deref(), Some(PAGE));
+    }
+
+    /// #1550: `html:5` is the same snippet under its long name.
+    #[test]
+    fn html5_writes_the_same_page() {
+        assert_eq!(with_caret("html:5").as_deref(), Some(PAGE));
+    }
+
+    /// #1550: `doc` is the page without its doctype, `!!!` the doctype alone.
+    #[test]
+    fn doc_and_triple_bang_write_their_parts_of_the_page() {
+        let doc = PAGE.strip_prefix("<!DOCTYPE html>\n").unwrap();
+        assert_eq!(with_caret("doc").as_deref(), Some(doc));
+        assert_eq!(with_caret("!!!").as_deref(), Some("<!DOCTYPE html>|\n"));
+    }
+
+    /// #1550: the skeleton is indented with the buffer's own unit.
+    #[test]
+    fn the_page_is_indented_with_the_buffers_unit() {
+        let (page, _) = expand("!", "\t").unwrap();
+        assert!(page.contains("\n\t<meta charset=\"UTF-8\">\n"), "{page}");
+        assert!(page.contains("<body>\n\t\n</body>"), "{page}");
+    }
+
+    /// #1550 negative: near misses are no snippet, and XML and JSX, where a
+    /// whole HTML page makes no sense, get none.
+    #[test]
+    fn near_misses_and_other_dialects_write_no_page() {
+        for abbr in ["!!", "!!!!", "html:4", "html:5x", "docs", "!div"] {
+            assert!(
+                !expand(abbr, "  ").is_some_and(|(o, _)| o.contains("<head>")),
+                "{abbr:?} wrote a page"
+            );
+        }
+        for profile in [Profile::Xml, Profile::Jsx] {
+            for abbr in ["!", "html:5", "!!!"] {
+                assert_eq!(
+                    super::expand(abbr, "  ", profile),
+                    None,
+                    "{abbr:?} in {profile:?}"
+                );
+            }
+        }
+    }
+
+    /// #1550 negative: ordinary abbreviations are unchanged.
+    #[test]
+    fn abbreviations_that_are_no_snippet_still_expand_as_before() {
+        assert_eq!(ex("html"), "<html></html>\n");
+        assert_eq!(ex("head>title"), "<head>\n  <title></title>\n</head>\n");
     }
 }
