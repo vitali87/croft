@@ -34271,6 +34271,54 @@ fn the_emmet_chord_expands_the_abbreviation_in_the_editor() {
     assert_eq!(app.status, "Emmet: expanded abbreviation");
 }
 
+/// #1640: the climb-up `^` used to stop the scan, so only the part after it
+/// expanded and `header>nav>a*2^` stayed on the line as text.
+#[test]
+fn the_emmet_chord_expands_an_abbreviation_that_climbs_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("climb.html");
+    std::fs::write(&f, "header>nav>a*2^h1\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 17;
+    app.handle_editor_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(
+        app.editor.lines,
+        vec![
+            "<header>",
+            "    <nav>",
+            "        <a href=\"\"></a>",
+            "        <a href=\"\"></a>",
+            "    </nav>",
+            "    <h1></h1>",
+            "</header>",
+        ]
+    );
+    assert_eq!(app.status, "Emmet: expanded abbreviation");
+}
+
+/// #1640 negative: a caret in prose is left alone, with the usual status.
+#[test]
+fn the_emmet_chord_leaves_a_power_in_prose_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("page.html");
+    std::fs::write(&f, "<p>2^10\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 7;
+    app.handle_editor_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(app.editor.lines, vec!["<p>2^10"]);
+    assert_eq!(app.status, "Emmet: no abbreviation at the cursor");
+}
+
 /// Silence would leave the user unable to tell "wrong language" from
 /// "typo in the abbreviation".
 #[test]

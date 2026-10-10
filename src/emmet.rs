@@ -6,12 +6,9 @@
 //! both reach for it through plugins for the same reason.
 //!
 //! This is the abbreviation subset that covers ordinary markup authoring —
-//! nesting, siblings, grouping, repetition, numbering, ids, classes,
-//! attributes and text. Deliberately absent:
+//! nesting, siblings, climbing up (`^`, #1640), grouping, repetition,
+//! numbering, ids, classes, attributes and text. Deliberately absent:
 //!
-//! * The climb-up operator `^`. It only ever saves a pair of parentheses,
-//!   and it is the one piece of the grammar whose meaning readers argue
-//!   about.
 //! * CSS abbreviations (`m10-20`) and the document snippet `!`. They are
 //!   separate features that happen to share a keystroke.
 //!
@@ -499,6 +496,7 @@ fn is_abbr_char(c: char) -> bool {
                 | '?'
                 | '&'
                 | ','
+                | '^'
         )
 }
 
@@ -635,6 +633,13 @@ const KNOWN_TAGS: &[&str] = &[
 struct Parser<'a> {
     src: &'a [char],
     pos: usize,
+    /// Levels a `^` run still has to climb (#1640): set where the run is
+    /// read, spent one per child list on the way back up.
+    climb: usize,
+    /// A `^` read where there was no child list to climb out of (`x^2`).
+    /// Emmet reads it as `+`, but that shape is far likelier to be math in
+    /// prose, so the abbreviation is left alone.
+    stray_caret: bool,
 }
 
 fn parse(abbr: &str) -> Option<Vec<Node>> {
@@ -645,9 +650,11 @@ fn parse(abbr: &str) -> Option<Vec<Node>> {
     let mut p = Parser {
         src: &chars,
         pos: 0,
+        climb: 0,
+        stray_caret: false,
     };
-    let nodes = p.sequence()?;
-    if p.pos != p.src.len() {
+    let nodes = p.sequence(true)?;
+    if p.pos != p.src.len() || p.stray_caret {
         return None;
     }
     // Reject the degenerate parse that prose reaches: a single nameless,
@@ -718,20 +725,49 @@ impl Parser<'_> {
         }
     }
 
-    /// `item ('+' sequence)?` — siblings, right-associative so that a `>`
-    /// inside a later item keeps its own subtree.
-    fn sequence(&mut self) -> Option<Vec<Node>> {
-        let mut out = vec![self.item()?];
-        while self.eat('+') {
+    /// `item (('+' | '^'+) item)*` — siblings, right-associative so that a
+    /// `>` inside a later item keeps its own subtree.
+    ///
+    /// A run of `^` climbs out of this child list and as many more as it has
+    /// carets (#1640): `a>b^c` is `a>b` then `c`. A `root` list (the whole
+    /// abbreviation, or the inside of a `(...)` group) is as high as a climb
+    /// goes, so extra carets stop there, as in Emmet.
+    fn sequence(&mut self, root: bool) -> Option<Vec<Node>> {
+        let mut out = Vec::new();
+        loop {
             out.push(self.item()?);
+            if self.climb > 0 {
+                // A child list below just climbed out into this one.
+                self.climb -= 1;
+                if self.climb == 0 || root {
+                    self.climb = 0;
+                    continue;
+                }
+                return Some(out);
+            }
+            if self.eat('+') {
+                continue;
+            }
+            let mut carets = 0;
+            while self.eat('^') {
+                carets += 1;
+            }
+            if carets == 0 {
+                return Some(out);
+            }
+            if root {
+                self.stray_caret = true;
+                continue;
+            }
+            self.climb = carets;
+            return Some(out);
         }
-        Some(out)
     }
 
     /// `(atom | '(' sequence ')') multiplier? ('>' sequence)?`
     fn item(&mut self) -> Option<Node> {
         let mut node = if self.eat('(') {
-            let inner = self.sequence()?;
+            let inner = self.sequence(true)?;
             if !self.eat(')') {
                 return None;
             }
@@ -757,7 +793,7 @@ impl Parser<'_> {
             }
         }
         if self.eat('>') {
-            let kids = self.sequence()?;
+            let kids = self.sequence(false)?;
             if node.group {
                 // `(a+b)>c` would have to distribute c over both, which
                 // Emmet does not do either.
@@ -1384,6 +1420,90 @@ mod tests {
     fn an_unknown_name_with_other_syntax_still_expands() {
         assert_eq!(ex("fox.red"), "<fox class=\"red\"></fox>\n");
         assert_eq!(ex("fox>cub"), "<fox>\n  <cub></cub>\n</fox>\n");
+    }
+
+    // ---- Climbing up (#1640) ---------------------------------------------
+
+    /// The issue's abbreviation: `^` climbs out of `nav`, so the `h1` is
+    /// `nav`'s sibling inside `header`, and nothing is left as text.
+    #[test]
+    fn a_caret_climbs_out_of_the_child_list() {
+        assert_eq!(
+            ex("header>nav>a*2^h1"),
+            "<header>\n  <nav>\n    <a href=\"\"></a>\n    <a href=\"\"></a>\n  </nav>\n  <h1></h1>\n</header>\n"
+        );
+    }
+
+    #[test]
+    fn each_caret_climbs_one_level() {
+        assert_eq!(
+            ex("div>ul>li^p"),
+            "<div>\n  <ul>\n    <li></li>\n  </ul>\n  <p></p>\n</div>\n"
+        );
+        assert_eq!(
+            ex("div>ul>li^^p"),
+            "<div>\n  <ul>\n    <li></li>\n  </ul>\n</div>\n<p></p>\n"
+        );
+        assert_eq!(
+            ex("div.card>h2^div.card>h2"),
+            "<div class=\"card\">\n  <h2></h2>\n</div>\n<div class=\"card\">\n  <h2></h2>\n</div>\n"
+        );
+    }
+
+    /// Extra carets stop at the top, and at the top of a group, as in Emmet.
+    #[test]
+    fn extra_carets_stop_at_the_top_and_at_a_group() {
+        assert_eq!(
+            ex("div>p^^span"),
+            "<div>\n  <p></p>\n</div>\n<span></span>\n"
+        );
+        assert_eq!(
+            ex("section>(ul>li^^^p)+footer"),
+            "<section>\n  <ul>\n    <li></li>\n  </ul>\n  <p></p>\n  <footer></footer>\n</section>\n"
+        );
+    }
+
+    /// A climb continues the outer list, so `+` and `*` after it keep working.
+    #[test]
+    fn siblings_and_repeats_follow_a_climb() {
+        assert_eq!(
+            ex("ul>li^p*2+hr"),
+            "<ul>\n  <li></li>\n</ul>\n<p></p>\n<p></p>\n<hr>\n"
+        );
+    }
+
+    /// The scan back from the caret takes the whole abbreviation, `^` and
+    /// all, so nothing before it is left behind as text.
+    #[test]
+    fn the_abbreviation_before_the_caret_includes_its_carets() {
+        let line = "  header>nav>a*2^h1";
+        let (start, abbr) = abbreviation_before(line, line.chars().count()).unwrap();
+        assert_eq!(start, 2);
+        assert_eq!(abbr, "header>nav>a*2^h1");
+    }
+
+    /// Negative: a caret with nothing to climb into, or nothing to climb out
+    /// of, does not expand, so the chord stays inert on `x^2` in prose.
+    #[test]
+    fn a_caret_that_climbs_nothing_does_not_expand() {
+        assert!(expand("ul>li^", "  ").is_none(), "nothing after the climb");
+        assert!(expand("x^2", "  ").is_none(), "math, not markup");
+        assert!(expand("2^10", "  ").is_none());
+        assert!(
+            expand("(p^span)", "  ").is_none(),
+            "a group's top climbs nowhere"
+        );
+    }
+
+    /// Negative: abbreviations without a caret are unchanged.
+    #[test]
+    fn abbreviations_without_a_caret_are_unchanged() {
+        assert_eq!(
+            ex("ul>li*3"),
+            "<ul>\n  <li></li>\n  <li></li>\n  <li></li>\n</ul>\n"
+        );
+        assert_eq!(ex("div>h1+p"), "<div>\n  <h1></h1>\n  <p></p>\n</div>\n");
+        assert_eq!(ex("p{2^10}"), "<p>2^10</p>\n", "a caret in text is text");
     }
 
     #[test]
