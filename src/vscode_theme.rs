@@ -552,14 +552,14 @@ fn existing_ids() -> Vec<String> {
         .collect()
 }
 
-/// The picker labels of every installed theme this importer did not write,
-/// for the same reason as [`existing_ids`]: re-importing a theme must not
-/// collide with its own earlier import.
-fn existing_labels() -> Vec<String> {
+/// The `(id, picker label)` of every installed theme. [`convert`] drops
+/// only the entry for the id it is about to overwrite, so a re-import does
+/// not collide with its own earlier label while imports under other ids
+/// still count.
+fn existing_labels() -> Vec<(String, String)> {
     crate::theme::Theme::all()
         .iter()
-        .filter(|t| !was_generated_by_import(t.id()))
-        .map(|t| t.label().to_string())
+        .map(|t| (t.id().to_string(), t.label().to_string()))
         .collect()
 }
 
@@ -568,10 +568,13 @@ fn existing_labels() -> Vec<String> {
 /// import of a theme croft also ships (Nord, One Dark Pro, Dracula) was a
 /// second row with the same name and no way to tell which was which.
 fn unique_label(label: &str, taken: &[String]) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    // Case-folded and canonically composed, so `Éclair` and `éclair`, or
+    // the two spellings of `Café`, read as the same label they look like.
+    let key = |l: &str| -> String { l.trim().to_lowercase().nfc().collect() };
     let clash = |l: &str| {
-        taken
-            .iter()
-            .any(|t| t.trim().eq_ignore_ascii_case(l.trim()))
+        let wanted = key(l);
+        taken.iter().any(|t| key(t) == wanted)
     };
     if !clash(label) {
         return label.to_string();
@@ -657,7 +660,7 @@ fn convert_with_taken(
     id_override: Option<&str>,
     stem: &str,
     taken: &[String],
-    taken_labels: &[String],
+    taken_labels: &[(String, String)],
 ) -> Result<Converted> {
     let light = theme
         .kind
@@ -821,7 +824,6 @@ fn convert_with_taken(
         .name
         .clone()
         .unwrap_or_else(|| stem.replace(['-', '_'], " "));
-    let label = unique_label(&name, taken_labels);
     let wanted = match id_override {
         Some(id) => slug(id),
         None => slug(&name),
@@ -836,6 +838,14 @@ fn convert_with_taken(
     let id = unique_id(wanted.clone(), taken).ok_or_else(|| {
         anyhow!("every id from {wanted:?} to {wanted}-999 is already taken; pass --id")
     })?;
+    // The theme being overwritten (an earlier import under this same id)
+    // gives up its label; every other installed theme keeps its own.
+    let others: Vec<String> = taken_labels
+        .iter()
+        .filter(|(taken_id, _)| *taken_id != id)
+        .map(|(_, label)| label.clone())
+        .collect();
+    let label = unique_label(&name, &others);
     if id != slug(id_override.unwrap_or(&name)) {
         notes.push(format!(
             "a theme with id {:?} already exists, so this one was installed as {id:?}",
@@ -1431,6 +1441,54 @@ mod tests {
         let taken = vec![String::from("nord"), String::from("Nord (Imported)")];
         assert_eq!(unique_label("Nord", &taken), "Nord (imported 2)");
         assert_eq!(unique_label("Nord", &[]), "Nord");
+    }
+
+    /// Labels compare as a reader sees them: Unicode case and composition
+    /// do not make two identical-looking rows distinct.
+    #[test]
+    fn labels_clash_across_unicode_case_and_composition() {
+        let taken = vec![String::from("\u{c9}clair"), String::from("Cafe\u{301}")];
+        assert_eq!(
+            unique_label("\u{e9}clair", &taken),
+            "\u{e9}clair (imported)"
+        );
+        assert_eq!(unique_label("Caf\u{e9}", &taken), "Caf\u{e9} (imported)");
+        assert_eq!(unique_label("Cafe", &taken), "Cafe", "a different word");
+    }
+
+    /// Two imports of the same theme under different `--id`s get different
+    /// labels; only the import being overwritten gives up its label.
+    #[test]
+    fn imports_under_other_ids_keep_their_labels_taken() {
+        let src = r##"{ "name": "Midnight Moss", "type": "dark", "colors": {} }"##;
+        let installed = vec![
+            (String::from("midnight-moss"), String::from("Midnight Moss")),
+            (
+                String::from("moss-a"),
+                String::from("Midnight Moss (imported)"),
+            ),
+        ];
+        let b = convert_with_taken(
+            parse_theme(src).unwrap(),
+            Some("moss-b"),
+            "moss",
+            &[],
+            &installed,
+        )
+        .unwrap();
+        assert_eq!(b.label, "Midnight Moss (imported 2)");
+        let a_again = convert_with_taken(
+            parse_theme(src).unwrap(),
+            Some("moss-a"),
+            "moss",
+            &[],
+            &installed,
+        )
+        .unwrap();
+        assert_eq!(
+            a_again.label, "Midnight Moss (imported)",
+            "re-import keeps its label"
+        );
     }
 
     /// Negative: a theme with a name of its own keeps it, and a re-import
