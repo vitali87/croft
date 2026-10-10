@@ -4032,6 +4032,12 @@ pub struct App {
     /// manager. sync_lsp diffs every tick against the current tabs to
     /// emit did_open / did_change / did_close.
     lsp_last_seen: std::collections::HashMap<PathBuf, u64>,
+    /// Whether this session already looked for shellcheck when a shell
+    /// script was opened (#1511), so its notice is shown at most once.
+    shell_lint_notice_shown: bool,
+    /// The PATH the helper tools servers shell out to are looked up in
+    /// (#1511): croft's own, which its servers inherit.
+    tool_search_path: Option<std::ffi::OsString>,
     /// Newest semantic-token request generation already applied per path.
     /// `seq` alone is not enough: two full requests can be in flight at the
     /// same seq (`sync_lsp` plus a server-driven refresh), and the request
@@ -6101,6 +6107,8 @@ impl App {
                 }
             },
             lsp_last_seen: std::collections::HashMap::new(),
+            shell_lint_notice_shown: false,
+            tool_search_path: std::env::var_os("PATH"),
             semantic_generation_seen: std::collections::HashMap::new(),
             problems_open_set: std::collections::BTreeSet::new(),
             lsp_diagnostics: std::collections::HashMap::new(),
@@ -8483,6 +8491,12 @@ impl App {
             Some(l) => l,
             None => return,
         };
+        // Only when bash-language-server is registered: a disabled
+        // `lsp-bash` lints nothing, with or without shellcheck.
+        let opened_shell = to_send
+            .iter()
+            .any(|(is_open, path, ..)| *is_open && is_shell_script(path))
+            && lsp.server_registered(crate::lsp::Language::BASH, BASH_SERVER);
         for (is_open, path, text, seq, viewport) in to_send {
             let line_count = text.lines().count() as u32 + 1;
             if is_open {
@@ -8537,6 +8551,15 @@ impl App {
             dropped_any |= self.lsp_diagnostics.remove(&p).is_some();
             // Reopening asks for its lenses again anyway.
             self.code_lens_requested.remove(&p);
+        }
+        // bash-language-server lints only through shellcheck and says so
+        // only in its log (#1511): tell the user once, when a shell script
+        // first reaches it, rather than leave PROBLEMS empty and silent.
+        if opened_shell && !self.shell_lint_notice_shown {
+            self.shell_lint_notice_shown = true;
+            if !tool_on_path("shellcheck", self.tool_search_path.as_deref()) {
+                self.status = String::from(SHELLCHECK_MISSING);
+            }
         }
         // A closed file's problems must leave the PROBLEMS panel too.
         // Under Open Files scope the panel also depends on WHICH buffers are
@@ -13997,6 +14020,7 @@ impl App {
         let mut edits: Option<Vec<crate::widgets::editor::TextSpanEdit>> = None;
         let mut unsupported = false;
         let mut path: Option<PathBuf> = None;
+        let mut server: Option<String> = None;
         if let Some(lsp) = self.lsp.as_ref() {
             while let Some(result) = lsp.drain_formatting() {
                 if Some(result.request_id) != self.format_request_id {
@@ -14006,6 +14030,7 @@ impl App {
                 edits = result.edits;
                 unsupported = result.unsupported;
                 path = Some(result.path);
+                server = result.server;
             }
         }
         if !arrived {
@@ -14020,7 +14045,7 @@ impl App {
             return overdue;
         }
         self.format_request_id = None;
-        self.land_format(edits, unsupported, path);
+        self.land_format(edits, unsupported, path, server.as_deref());
         true
     }
 
@@ -14064,9 +14089,16 @@ impl App {
         edits: Option<Vec<crate::widgets::editor::TextSpanEdit>>,
         unsupported: bool,
         path: Option<PathBuf>,
+        server: Option<&str>,
     ) {
         let selection = std::mem::take(&mut self.format_request_selection);
         let requested_at = self.format_request_seq.take();
+        // bash-language-server formats only through shfmt; without it, it
+        // answers every request with no edits (#1511), which is not "already
+        // formatted". Another formatter's empty reply is its own answer.
+        let shfmt_missing = server == Some(BASH_SERVER)
+            && path.as_deref().is_some_and(is_shell_script)
+            && !tool_on_path("shfmt", self.tool_search_path.as_deref());
         if unsupported {
             self.status = if selection {
                 String::from("No range formatter available for this file")
@@ -14110,6 +14142,7 @@ impl App {
                     None => self.status = String::from("Format failed: document not open"),
                 }
             }
+            _ if shfmt_missing => self.status = String::from(SHFMT_MISSING),
             _ => {
                 self.status = if selection {
                     String::from("Selection already formatted")
@@ -66803,6 +66836,47 @@ impl App {
 fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+}
+
+/// The bundled shell language server, the one that needs shfmt and
+/// shellcheck (#1511).
+const BASH_SERVER: &str = "bash-language-server";
+
+/// What Format Document says for a shell script when shfmt is missing (#1511).
+const SHFMT_MISSING: &str =
+    "Not formatted: bash-language-server formats shell scripts with shfmt, which is not on PATH";
+
+/// The one-time notice when a shell script opens and shellcheck is missing
+/// (#1511).
+const SHELLCHECK_MISSING: &str = "Shell scripts are not linted: bash-language-server lints with shellcheck, which is not on PATH";
+
+/// Whether `path` is a shell script, the files bash-language-server serves.
+fn is_shell_script(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .and_then(crate::lsp::Language::from_extension)
+        == Some(crate::lsp::Language::BASH)
+}
+
+/// Whether an executable file named `tool` is in one of `path_var`'s
+/// directories, where a server croft starts would look for it.
+fn tool_on_path(tool: &str, path_var: Option<&std::ffi::OsStr>) -> bool {
+    path_var.is_some_and(|paths| {
+        std::env::split_paths(paths).any(|dir| {
+            let candidate = dir.join(tool);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                candidate
+                    .metadata()
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            }
+            #[cfg(not(unix))]
+            {
+                candidate.is_file() || candidate.with_extension("exe").is_file()
+            }
+        })
+    })
 }
 
 /// The terminal modes croft turns on whenever it takes over a screen: alt
