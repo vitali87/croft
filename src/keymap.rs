@@ -486,7 +486,7 @@ pub enum MouseContext {
 }
 
 impl MouseContext {
-    fn parse(s: &str) -> Option<Self> {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
         Some(match s.trim().to_ascii_lowercase().as_str() {
             "editor" => Self::Editor,
             "terminal" => Self::Terminal,

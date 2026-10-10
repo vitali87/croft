@@ -1056,17 +1056,21 @@ pub fn apply_into_dirs(
             };
             // A key is bound per context (#1436): an existing editor-only
             // row does not stop a file-tree row for the same key.
-            let bound: Vec<(String, Option<String>)> = rows
+            // Contexts compare as the keymap reads them, so an existing
+            // `filetree` or ` Editor ` row is the same scope as an imported
+            // `file_tree` or `editor` one and keeps winning.
+            let bound: Vec<(String, Option<WhenScope>)> = rows
                 .iter()
                 .filter_map(|r| {
                     let key = r.get("key").and_then(Value::as_str)?;
-                    let when = r.get("when").and_then(Value::as_str).map(str::to_string);
+                    let when = r.get("when").and_then(Value::as_str).map(WhenScope::of);
                     Some((key.to_string(), when))
                 })
                 .collect();
             let mut changed = false;
             for (key, command, when) in &report.keybindings {
-                if bound.iter().any(|(k, w)| k == key && w == when) {
+                let scope = when.as_deref().map(WhenScope::of);
+                if bound.iter().any(|(k, w)| k == key && *w == scope) {
                     report
                         .conflicts
                         .push(format!("keybindings.json {key}: already bound, left alone"));
@@ -1134,6 +1138,21 @@ pub fn apply_into_dirs(
 fn write_json(path: &Path, value: &Value) -> Result<()> {
     let text = serde_json::to_string_pretty(value)?;
     std::fs::write(path, format!("{text}\n")).with_context(|| format!("writing {}", path.display()))
+}
+
+/// A keybinding's `when` as the keymap resolves it: a known context
+/// whatever its spelling, else the raw text.
+#[derive(Debug, PartialEq, Eq)]
+enum WhenScope {
+    Known(crate::keymap::MouseContext),
+    Other(String),
+}
+
+impl WhenScope {
+    fn of(when: &str) -> Self {
+        crate::keymap::MouseContext::parse(when)
+            .map_or_else(|| Self::Other(when.to_string()), Self::Known)
+    }
 }
 
 #[cfg(test)]
@@ -2428,6 +2447,52 @@ mod tests {
                 json!({ "key": "ctrl+alt+j", "command": "quick_open" }),
                 json!({ "key": "ctrl+alt+k", "command": "quick_open" }),
             ]
+        );
+    }
+
+    /// #1436: an existing croft row whose `when` is another spelling of the
+    /// imported context (`filetree`, ` Editor `) is the same binding, so it
+    /// is left alone rather than shadowed by an appended imported row.
+    #[test]
+    fn an_existing_row_in_another_spelling_of_the_context_keeps_winning() {
+        let profile = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            profile.path().join("keybindings.json"),
+            r#"[
+                { "key": "ctrl+j", "command": "editor.action.joinLines", "when": "editorTextFocus" },
+                { "key": "ctrl+alt+p", "command": "workbench.action.quickOpen", "when": "filesExplorerFocus" },
+                { "key": "ctrl+alt+t", "command": "workbench.action.quickOpen", "when": "filesExplorerFocus" }
+            ]"#,
+        )
+        .unwrap();
+        let out = tempfile::TempDir::new().unwrap();
+        let existing = json!([
+            { "key": "ctrl+j", "command": "save", "when": " Editor " },
+            { "key": "ctrl+alt+p", "command": "save", "when": "filetree" },
+            { "key": "ctrl+alt+t", "command": "save", "when": "terminal" }
+        ]);
+        std::fs::write(
+            out.path().join("keybindings.json"),
+            serde_json::to_string(&existing).unwrap(),
+        )
+        .unwrap();
+        let mut report = scan_profile(profile.path()).expect("the profile scans");
+        apply_into(out.path(), &mut report).expect("apply runs");
+        let rows: Vec<Value> = serde_json::from_str(
+            &std::fs::read_to_string(out.path().join("keybindings.json")).unwrap(),
+        )
+        .unwrap();
+        for key in ["ctrl+j", "ctrl+alt+p"] {
+            assert_eq!(
+                rows.iter().filter(|r| r["key"] == key).count(),
+                1,
+                "{key} keeps only the existing row: {rows:?}"
+            );
+        }
+        assert!(
+            rows.iter()
+                .any(|r| r["key"] == "ctrl+alt+t" && r["when"] == "file_tree"),
+            "a different context is still imported: {rows:?}"
         );
     }
 }
