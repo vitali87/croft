@@ -86,8 +86,8 @@ pub fn sniff(bytes: &[u8]) -> Option<Magic> {
 /// A Windows icon (#1652): `00 00 01 00` and an image count, then a
 /// 16-byte directory entry per image. Four bytes that are mostly zeros
 /// start plenty of binary files, so the first entry has to read as one
-/// too: its reserved byte zero, at most one colour plane, and its image
-/// data after the directory.
+/// too: its reserved byte zero (or 255, which .NET's `Icon.Save` writes),
+/// at most one colour plane, and its image data after the directory.
 fn is_ico(bytes: &[u8]) -> bool {
     let u16_at = |i: usize| u16::from_le_bytes([bytes[i], bytes[i + 1]]);
     if bytes.len() < 22 || !bytes.starts_with(b"\0\0\x01\0") {
@@ -95,7 +95,7 @@ fn is_ico(bytes: &[u8]) -> bool {
     }
     let count = u16_at(4) as u32;
     let offset = u32::from_le_bytes([bytes[18], bytes[19], bytes[20], bytes[21]]);
-    count > 0 && bytes[9] == 0 && u16_at(10) <= 1 && offset >= 6 + 16 * count
+    count > 0 && matches!(bytes[9], 0 | 255) && u16_at(10) <= 1 && offset >= 6 + 16 * count
 }
 
 #[cfg(test)]
@@ -151,6 +151,9 @@ mod tests {
     #[test]
     fn recognises_a_windows_icon() {
         assert_eq!(sniff(&ico_head(22)), Some(Magic::Ico));
+        let mut dotnet = ico_head(22);
+        dotnet[9] = 255;
+        assert_eq!(sniff(&dotnet), Some(Magic::Ico), ".NET's reserved byte");
     }
 
     /// Negative (#1652): `00 00 01 00` alone, an icon with no images, or a
