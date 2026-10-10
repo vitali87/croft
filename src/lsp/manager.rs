@@ -371,6 +371,9 @@ pub struct FormatResult {
     /// `documentFormattingProvider`, so the app can tell "nothing to format"
     /// apart from "no formatter for this language".
     pub unsupported: bool,
+    /// The server that answered, `None` when none did (#1511), so the app
+    /// can attribute an empty reply to the formatter that sent it.
+    pub server: Option<String>,
 }
 
 /// A fresh batch of semantic tokens for a document, pushed to the editor
@@ -942,6 +945,9 @@ struct LangCapabilitySupport {
 type CapabilitySupport = Arc<StdMutex<LangCapabilitySupport>>;
 
 pub struct LspManager {
+    /// The servers registered per language once the disable set is
+    /// applied (#1511), so the app can tell whether a server is in play.
+    registered_servers: HashMap<Language, Vec<&'static str>>,
     /// Monotonic stamp handed to each semantic-token request. `seq`
     /// identifies CONTENT, not a request: `sync_lsp` and a server-driven
     /// refresh can have two full requests in flight at the same seq, and the
@@ -1080,6 +1086,13 @@ impl LspManager {
         crate::lsp::languages::init_with_user_sources(&user_refs);
         let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
         let registry = ServerRegistry::with_user_extensions_filtered(&user_refs, &disabled);
+        let registered_servers: HashMap<Language, Vec<&'static str>> = registry
+            .languages()
+            .map(|lang| {
+                let names = registry.for_language(lang).iter().map(|c| c.name).collect();
+                (lang, names)
+            })
+            .collect();
         runtime.handle().spawn(worker_loop(
             root,
             registry,
@@ -1122,6 +1135,7 @@ impl LspManager {
             servers_restarted.clone(),
         ));
         Ok(Self {
+            registered_servers,
             semantic_generation: std::sync::atomic::AtomicU64::new(0),
             cmd_tx,
             completion_rx,
@@ -1744,6 +1758,21 @@ impl LspManager {
                 .get(path)
                 .is_some_and(|names| names.iter().any(|n| n == name))
         })
+    }
+
+    /// Whether the server named `name` is registered for `lang`, i.e. no
+    /// disabled extension removed it (#1511).
+    pub fn server_registered(&self, lang: Language, name: &str) -> bool {
+        self.registered_servers
+            .get(&lang)
+            .is_some_and(|names| names.contains(&name))
+    }
+
+    /// Test hook: replace the servers registered for `lang`, as a disabled
+    /// or added extension would.
+    #[cfg(test)]
+    pub fn set_registered_servers_for_test(&mut self, lang: Language, names: &[&'static str]) {
+        self.registered_servers.insert(lang, names.to_vec());
     }
 
     /// Test hook: record `names` as the servers reporting on `path`, as an
@@ -5478,6 +5507,7 @@ impl WorkerState {
                 path,
                 edits: None,
                 unsupported: true,
+                server: None,
             });
             return;
         };
@@ -5512,6 +5542,7 @@ impl WorkerState {
                 path: path_clone,
                 edits,
                 unsupported: false,
+                server: Some(server_name),
             });
         });
     }
@@ -5583,6 +5614,7 @@ impl WorkerState {
                 path: path_clone,
                 edits,
                 unsupported: false,
+                server: Some(server_name),
             });
         });
     }
@@ -5645,6 +5677,7 @@ impl WorkerState {
                 path: path_clone,
                 edits,
                 unsupported: false,
+                server: Some(server_name),
             });
         });
     }
@@ -6079,6 +6112,7 @@ fn answer_unsupported(tx: &std_mpsc::Sender<FormatResult>, request_id: u64, path
         path,
         edits: None,
         unsupported: true,
+        server: None,
     });
 }
 

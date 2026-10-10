@@ -8491,9 +8491,12 @@ impl App {
             Some(l) => l,
             None => return,
         };
+        // Only when bash-language-server is registered: a disabled
+        // `lsp-bash` lints nothing, with or without shellcheck.
         let opened_shell = to_send
             .iter()
-            .any(|(is_open, path, ..)| *is_open && is_shell_script(path));
+            .any(|(is_open, path, ..)| *is_open && is_shell_script(path))
+            && lsp.server_registered(crate::lsp::Language::BASH, BASH_SERVER);
         for (is_open, path, text, seq, viewport) in to_send {
             let line_count = text.lines().count() as u32 + 1;
             if is_open {
@@ -14017,6 +14020,7 @@ impl App {
         let mut edits: Option<Vec<crate::widgets::editor::TextSpanEdit>> = None;
         let mut unsupported = false;
         let mut path: Option<PathBuf> = None;
+        let mut server: Option<String> = None;
         if let Some(lsp) = self.lsp.as_ref() {
             while let Some(result) = lsp.drain_formatting() {
                 if Some(result.request_id) != self.format_request_id {
@@ -14026,6 +14030,7 @@ impl App {
                 edits = result.edits;
                 unsupported = result.unsupported;
                 path = Some(result.path);
+                server = result.server;
             }
         }
         if !arrived {
@@ -14040,7 +14045,7 @@ impl App {
             return overdue;
         }
         self.format_request_id = None;
-        self.land_format(edits, unsupported, path);
+        self.land_format(edits, unsupported, path, server.as_deref());
         true
     }
 
@@ -14084,13 +14089,15 @@ impl App {
         edits: Option<Vec<crate::widgets::editor::TextSpanEdit>>,
         unsupported: bool,
         path: Option<PathBuf>,
+        server: Option<&str>,
     ) {
         let selection = std::mem::take(&mut self.format_request_selection);
         let requested_at = self.format_request_seq.take();
         // bash-language-server formats only through shfmt; without it, it
         // answers every request with no edits (#1511), which is not "already
-        // formatted".
-        let shfmt_missing = path.as_deref().is_some_and(is_shell_script)
+        // formatted". Another formatter's empty reply is its own answer.
+        let shfmt_missing = server == Some(BASH_SERVER)
+            && path.as_deref().is_some_and(is_shell_script)
             && !tool_on_path("shfmt", self.tool_search_path.as_deref());
         if unsupported {
             self.status = if selection {
@@ -66831,16 +66838,10 @@ fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
         | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
 }
 
-/// The terminal modes croft turns on whenever it takes over a screen: alt
-/// screen, mouse tracking, bracketed paste, steady-bar cursor. SINGLE SOURCE
-/// OF TRUTH — the startup takeover, the post-scp TUI restore, and the
-/// dtach-reattach re-assert all emit exactly this block, so the mode lists
-/// can never drift apart. A mode enabled at startup but missing from the
-/// reattach re-assert is the "mouse dead after reconnecting to a persisted
-/// remote session" bug (0.1.611); add any new startup mode HERE, never as an
-/// inline `execute!` at a call site. The kitty keyboard flags are the one
-/// deliberate exception: startup pushes them (the push pairs with the
-/// teardown pop), while [`mode_reassert_seq`] appends the SET form.
+/// The bundled shell language server, the one that needs shfmt and
+/// shellcheck (#1511).
+const BASH_SERVER: &str = "bash-language-server";
+
 /// What Format Document says for a shell script when shfmt is missing (#1511).
 const SHFMT_MISSING: &str =
     "Not formatted: bash-language-server formats shell scripts with shfmt, which is not on PATH";
@@ -66878,6 +66879,16 @@ fn tool_on_path(tool: &str, path_var: Option<&std::ffi::OsStr>) -> bool {
     })
 }
 
+/// The terminal modes croft turns on whenever it takes over a screen: alt
+/// screen, mouse tracking, bracketed paste, steady-bar cursor. SINGLE SOURCE
+/// OF TRUTH — the startup takeover, the post-scp TUI restore, and the
+/// dtach-reattach re-assert all emit exactly this block, so the mode lists
+/// can never drift apart. A mode enabled at startup but missing from the
+/// reattach re-assert is the "mouse dead after reconnecting to a persisted
+/// remote session" bug (0.1.611); add any new startup mode HERE, never as an
+/// inline `execute!` at a call site. The kitty keyboard flags are the one
+/// deliberate exception: startup pushes them (the push pairs with the
+/// teardown pop), while [`mode_reassert_seq`] appends the SET form.
 fn takeover_mode_seq() -> Vec<u8> {
     let mut seq = Vec::new();
     let _ = execute!(

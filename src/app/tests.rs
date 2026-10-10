@@ -45429,6 +45429,7 @@ fn an_on_type_reply_applies_only_while_its_buffer_and_tab_are_unmoved() {
         path: path.to_path_buf(),
         edits: Some(Vec::new()),
         unsupported: false,
+        server: None,
     };
 
     // Nothing armed: any reply is a leftover.
@@ -72365,7 +72366,7 @@ fn a_format_on_save_reply_for_a_buffer_typed_into_since_saves_it_unformatted() {
     let (mut app, file) = app_with_week_notes(&tmp);
     send_format_request(&mut app, &file, true);
     type_at_line_end(&mut app, 2, "\nbutter");
-    app.land_format(Some(uppercase_headings()), false, Some(file.clone()));
+    app.land_format(Some(uppercase_headings()), false, Some(file.clone()), None);
     let typed = "# shopping list\nmilk\nbread\nbutter\neggs\n# todo\ncall bob\npay rent";
     assert_eq!(app.editor.lines.join("\n"), typed, "eggs survives");
     assert_eq!(
@@ -72387,7 +72388,7 @@ fn a_format_document_reply_for_a_buffer_typed_into_since_is_dropped() {
     send_format_request(&mut app, &file, false);
     type_at_line_end(&mut app, 2, "\nbutter");
     let before = app.editor.lines.clone();
-    app.land_format(Some(uppercase_headings()), false, Some(file.clone()));
+    app.land_format(Some(uppercase_headings()), false, Some(file.clone()), None);
     assert_eq!(app.editor.lines, before);
     assert_eq!(
         app.status,
@@ -72402,7 +72403,7 @@ fn a_format_reply_for_an_untouched_buffer_is_still_applied() {
     send_format_request(&mut app, &file, false);
     app.editor.cursor_row = 5;
     app.editor.cursor_col = 2;
-    app.land_format(Some(uppercase_headings()), false, Some(file.clone()));
+    app.land_format(Some(uppercase_headings()), false, Some(file.clone()), None);
     assert_eq!(
         app.editor.lines.join("\n"),
         "# SHOPPING LIST\nmilk\nbread\neggs\n# TODO\ncall bob\npay rent",
@@ -72416,7 +72417,7 @@ fn a_format_on_save_reply_for_an_untouched_buffer_saves_the_formatted_text() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut app, file) = app_with_week_notes(&tmp);
     send_format_request(&mut app, &file, true);
-    app.land_format(Some(uppercase_headings()), false, Some(file.clone()));
+    app.land_format(Some(uppercase_headings()), false, Some(file.clone()), None);
     assert_eq!(
         std::fs::read_to_string(&file).unwrap(),
         "# SHOPPING LIST\nmilk\nbread\neggs\n# TODO\ncall bob\npay rent\n"
@@ -79337,7 +79338,7 @@ fn a_format_reply_inside_the_wait_still_formats_before_saving() {
         utf16: false,
     }];
     app.format_request_id = None;
-    app.land_format(Some(formatted), false, Some(file.clone()));
+    app.land_format(Some(formatted), false, Some(file.clone()), None);
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "yx = 2\n");
     let saved = app.status.clone();
     let later = std::time::Instant::now() + FORMAT_ON_SAVE_TIMEOUT * 2;
@@ -79469,7 +79470,12 @@ fn formatting_a_shell_script_without_shfmt_says_shfmt_is_missing() {
     let (mut app, file) = app_with_script(&tmp, "run.sh");
     app.tool_search_path = Some(tool_dir(tmp.path(), &["shellcheck"]));
     send_format_request(&mut app, &file, false);
-    app.land_format(Some(Vec::new()), false, Some(file.clone()));
+    app.land_format(
+        Some(Vec::new()),
+        false,
+        Some(file.clone()),
+        Some(BASH_SERVER),
+    );
     assert_eq!(app.status, SHFMT_MISSING);
     assert!(app.status.contains("shfmt"), "{}", app.status);
 }
@@ -79483,15 +79489,53 @@ fn an_empty_format_reply_is_already_formatted_with_shfmt_or_for_other_files() {
     let (mut app, file) = app_with_script(&tmp, "run.sh");
     app.tool_search_path = Some(tool_dir(tmp.path(), &["shfmt"]));
     send_format_request(&mut app, &file, false);
-    app.land_format(Some(Vec::new()), false, Some(file.clone()));
+    app.land_format(
+        Some(Vec::new()),
+        false,
+        Some(file.clone()),
+        Some(BASH_SERVER),
+    );
     assert_eq!(app.status, "Document already formatted");
 
     let tmp = tempfile::tempdir().unwrap();
     let (mut app, file) = app_with_script(&tmp, "notes.py");
     app.tool_search_path = Some(tool_dir(tmp.path(), &[]));
     send_format_request(&mut app, &file, false);
-    app.land_format(Some(Vec::new()), false, Some(file.clone()));
+    app.land_format(
+        Some(Vec::new()),
+        false,
+        Some(file.clone()),
+        Some(BASH_SERVER),
+    );
     assert_eq!(app.status, "Document already formatted");
+}
+
+/// #1511: an empty reply from another formatter (a user extension's, say)
+/// is that formatter's answer; shfmt has nothing to do with it.
+#[cfg(unix)]
+#[test]
+fn an_empty_format_reply_from_another_server_does_not_blame_shfmt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_script(&tmp, "run.sh");
+    app.tool_search_path = Some(tool_dir(tmp.path(), &[]));
+    send_format_request(&mut app, &file, false);
+    app.land_format(
+        Some(Vec::new()),
+        false,
+        Some(file.clone()),
+        Some("my-shell-fmt"),
+    );
+    assert_eq!(app.status, "Document already formatted");
+}
+
+/// Register (or, with no names, unregister) bash-language-server for
+/// shell scripts, as the `lsp-bash` extension being enabled or disabled
+/// would.
+fn register_bash_servers(app: &mut App, names: &[&'static str]) {
+    app.lsp
+        .as_mut()
+        .expect("a test App has an LSP manager")
+        .set_registered_servers_for_test(crate::lsp::Language::BASH, names);
 }
 
 /// #1511: opening a shell script without shellcheck says, once, that it
@@ -79501,6 +79545,7 @@ fn an_empty_format_reply_is_already_formatted_with_shfmt_or_for_other_files() {
 fn opening_a_shell_script_without_shellcheck_says_so_once() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut app, _) = app_with_script(&tmp, "run.sh");
+    register_bash_servers(&mut app, &[BASH_SERVER]);
     app.tool_search_path = Some(tool_dir(tmp.path(), &["shfmt"]));
     app.sync_lsp();
     assert_eq!(app.status, SHELLCHECK_MISSING);
@@ -79526,6 +79571,16 @@ fn no_lint_notice_with_shellcheck_or_for_other_files() {
 
     let tmp = tempfile::tempdir().unwrap();
     let (mut app, _) = app_with_script(&tmp, "notes.py");
+    app.tool_search_path = Some(tool_dir(tmp.path(), &[]));
+    app.status.clear();
+    app.sync_lsp();
+    assert_eq!(app.status, "");
+
+    // A disabled `lsp-bash` runs no bash-language-server, so there is
+    // nothing shellcheck would lint for.
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_script(&tmp, "run.sh");
+    register_bash_servers(&mut app, &[]);
     app.tool_search_path = Some(tool_dir(tmp.path(), &[]));
     app.status.clear();
     app.sync_lsp();
