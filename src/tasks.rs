@@ -438,7 +438,7 @@ fn vscode_tasks(root: &Path) -> Vec<Task> {
 /// level, as VS Code does (#1441): the top-level `options` sit under the
 /// task's own (its `cwd` wins, and the `env` maps merge key by key with the
 /// task's values winning), and a task with no `command` of its own runs the
-/// top-level `command` and, unless it has its own, `args`. A `type` it
+/// top-level `command` and its `args`, followed by any of its own. A `type` it
 /// leaves out is the top level's too. A `dependsOn` task with no command
 /// stays a compound task.
 fn with_top_level(t: &serde_json::Value, top: &serde_json::Value) -> serde_json::Value {
@@ -457,10 +457,14 @@ fn with_top_level(t: &serde_json::Value, top: &serde_json::Value) -> serde_json:
         && let Some(command) = top.get("command")
     {
         task.insert("command".into(), command.clone());
-        if let Some(args) = top.get("args")
-            && !task.contains_key("args")
-        {
-            task.insert("args".into(), args.clone());
+        // The task's own `args` are extra arguments to the shared command,
+        // after the top-level ones, as VS Code's `fillGlobals` joins them.
+        if let Some(Value::Array(shared)) = top.get("args") {
+            let mut args = shared.clone();
+            if let Some(Value::Array(own)) = task.get("args") {
+                args.extend(own.iter().cloned());
+            }
+            task.insert("args".into(), Value::Array(args));
         }
     }
     if let Some(Value::Object(shared)) = top.get("options") {
@@ -1083,19 +1087,22 @@ mod tests {
     }
 
     /// #1441: a task with no command of its own runs the top-level one, with
-    /// its own `args` if it has them; a `dependsOn` task stays compound.
+    /// the top-level `args` and then its own; a `dependsOn` task stays
+    /// compound.
     #[test]
     fn a_task_without_a_command_runs_the_top_level_one() {
         let (_tmp, root) = tasks_workspace(
             r#"{ "version": "2.0.0", "command": "echo", "args": ["top"], "type": "shell",
                  "tasks": [
                    { "label": "mine", "args": ["mine"] },
+                   { "label": "none", "args": [] },
                    { "label": "bare" },
                    { "label": "both", "dependsOn": ["mine", "bare"] },
                    { "label": "own", "command": "echo own" }
                  ] }"#,
         );
-        assert_eq!(run_task(&root, "mine"), "mine\n");
+        assert_eq!(run_task(&root, "mine"), "top mine\n", "top args first");
+        assert_eq!(run_task(&root, "none"), "top\n", "empty args add nothing");
         assert_eq!(run_task(&root, "bare"), "top\n");
         assert_eq!(
             run_task(&root, "own"),
