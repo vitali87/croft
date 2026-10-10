@@ -1,0 +1,1 @@
+fix: Snippets scoped to `javascriptreact` (VS Code's id for `.jsx`, and what `croft import-vscode` writes for `javascriptreact.json`) now expand in `.jsx` files, and `jsonc` ones in `.jsonc` files. Snippets scoped to `javascript` or `json` still apply there too.
