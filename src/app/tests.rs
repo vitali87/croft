@@ -79435,3 +79435,50 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     assert!(!app.apply_build_scan(pane, Some(&cwd), "tsc --watch", "a.c:1:1: error: old\n"));
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
 }
+
+/// Snippets the way `croft import-vscode` writes them from VS Code's
+/// per-language files (#1641).
+fn react_snippets() -> crate::snippets::SnippetSet {
+    crate::snippets::SnippetSet::from_json(
+        r#"{
+          "Component": { "prefix": "rfc", "body": "function $1() {}", "scope": "javascriptreact" },
+          "TS component": { "prefix": "tfc", "body": "const $1: FC = () => null", "scope": "typescriptreact" },
+          "Log": { "prefix": "clg", "body": "console.log($1)", "scope": "javascript" },
+          "Main": { "prefix": "ifm", "body": "if __name__ == '__main__':", "scope": "python" },
+          "Key": { "prefix": "key", "body": "\"$1\": ", "scope": "jsonc" }
+        }"#,
+    )
+}
+
+/// Open `name` (empty) with the snippets above, type `prefix`, press Tab,
+/// and return the line.
+fn tab_after(name: &str, prefix: &str) -> String {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join(name);
+    std::fs::write(&p, "\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    app.snippets = react_snippets();
+    app.editor.insert_str(prefix);
+    app.handle_editor_tab();
+    app.editor.lines[app.editor.cursor_row].clone()
+}
+
+/// #1641: a `javascriptreact` snippet expands in a `.jsx` file, and a
+/// `jsonc` one in a `.jsonc` file, as in VS Code.
+#[test]
+fn a_javascriptreact_snippet_expands_in_a_jsx_file() {
+    assert_eq!(tab_after("App.jsx", "rfc"), "function () {}");
+    assert_eq!(tab_after("tsconfig.jsonc", "key"), "\"\": ");
+}
+
+/// Negative (#1641): `.tsx` keeps `typescriptreact`, a `javascript`
+/// snippet keeps working in `.jsx` as it did, a `.js` file does not take
+/// `javascriptreact` ones, and other languages' snippets stay out.
+#[test]
+fn jsx_snippet_scopes_leave_other_files_and_languages_alone() {
+    assert_eq!(tab_after("App.tsx", "tfc"), "const : FC = () => null");
+    assert_eq!(tab_after("App.jsx", "clg"), "console.log()");
+    assert!(!tab_after("app.js", "rfc").contains("function"));
+    assert!(!tab_after("App.jsx", "ifm").contains("__main__"));
+}

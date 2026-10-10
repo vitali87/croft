@@ -7565,8 +7565,23 @@ impl Editor {
     }
 
     /// The language id (VS Code identifier) of this buffer, for snippet scoping.
+    ///
+    /// `.jsx` and `.jsonc` share a grammar with JavaScript and JSON but not
+    /// VS Code's id (#1641): snippets imported from `javascriptreact.json`
+    /// are scoped `javascriptreact`, and never applied while a `.jsx` file
+    /// was called `javascript`.
     pub fn scope_id(&self) -> &'static str {
-        language_scope_id(self.lang)
+        let ext = self
+            .path
+            .as_deref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase);
+        match (self.lang, ext.as_deref()) {
+            (Some(LangKind::JavaScript), Some("jsx")) => "javascriptreact",
+            (Some(LangKind::Json), Some("jsonc")) => "jsonc",
+            _ => language_scope_id(self.lang),
+        }
     }
 
     /// True while a snippet's tab stops are being cycled with Tab.
