@@ -13258,6 +13258,15 @@ impl App {
         self.hover_diagnostic = None;
         self.editor.open_preview(path)?;
         self.sync_open_file_poll_mtime();
+        self.place_caret(row, col);
+        self.focus_pane(Pane::Editor);
+        self.poke_cursor();
+        Ok(())
+    }
+
+    /// Put the caret on `row`/`col` (0-based, clamped to the buffer) with
+    /// the line centred in the view.
+    fn place_caret(&mut self, row: usize, col: usize) {
         let row = row.min(self.editor.lines.len().saturating_sub(1));
         let max_col = self
             .editor
@@ -13271,9 +13280,14 @@ impl App {
         self.editor.scroll = row.saturating_sub(page / 2);
         self.editor.scroll_col = 0;
         self.editor.ensure_cursor_col_visible();
-        self.focus_pane(Pane::Editor);
+    }
+
+    /// The caret on a `croft file:line[:col]` location (#1487), 1-based as
+    /// typed.
+    fn place_caret_at(&mut self, at: crate::file_location::FileLocation) {
+        let col = at.col.unwrap_or(1);
+        self.place_caret(at.line as usize - 1, col as usize - 1);
         self.poke_cursor();
-        Ok(())
     }
 
     /// The active editor's position as a NavLoc, for threading through
@@ -16554,7 +16568,7 @@ impl App {
         // rather than tested.
         let reply = match crate::view_ipc::read_request(&stream, deadline) {
             Ok(req) if req.probe => self.probe_view_path(&req.to_path()),
-            Ok(req) => self.apply_view_request(&req.to_path()),
+            Ok(req) => self.apply_view_request_at(&req.to_path(), req.at),
             Err(e) => crate::view_ipc::ViewReply::Err {
                 message: format!("unreadable request: {e}"),
             },
@@ -33381,10 +33395,24 @@ impl App {
     /// A relative `path` is taken under the workspace root, so the tab gets
     /// the absolute path its language server is keyed by; a file that can't
     /// be opened says why instead of opening nothing (#1193).
+    #[cfg(test)]
     pub fn open_file_at_launch(&mut self, path: &Path) {
+        self.open_file_at_launch_at(path, None);
+    }
+
+    /// [`Self::open_file_at_launch`], with the caret on `at` when the user
+    /// typed `croft file:line[:col]` (#1487).
+    pub fn open_file_at_launch_at(
+        &mut self,
+        path: &Path,
+        at: Option<crate::file_location::FileLocation>,
+    ) {
         let path = self.workspace_root().join(path);
         match self.editor.open_pinned(&path) {
             Ok(_) => {
+                if let Some(at) = at {
+                    self.place_caret_at(at);
+                }
                 // Launch is not a user focus gesture: collapsing here would
                 // hide the sidebar before the user has interacted at all
                 // (#260).
@@ -46381,7 +46409,18 @@ impl App {
     /// The path arrives absolute (the client resolved it against the pane's
     /// own cwd, which croft only approximates), so the checks here are about
     /// whether the file can be shown, not about where it is.
+    #[cfg(test)]
     fn apply_view_request(&mut self, path: &Path) -> crate::view_ipc::ViewReply {
+        self.apply_view_request_at(path, None)
+    }
+
+    /// [`Self::apply_view_request`], with the caret on `at` for `croft view
+    /// file:line[:col]` (#1487).
+    fn apply_view_request_at(
+        &mut self,
+        path: &Path,
+        at: Option<crate::file_location::FileLocation>,
+    ) -> crate::view_ipc::ViewReply {
         use crate::view_ipc::ViewReply;
         // The invariant `view_ipc`'s header states, actually enforced. The
         // client resolves against ITS cwd before sending, so a relative path
@@ -46470,6 +46509,9 @@ impl App {
                 // it, not to find it filed behind the pane they typed in.
                 self.focus_pane(Pane::Editor);
                 self.sync_open_file_poll_mtime();
+                if let Some(at) = at {
+                    self.place_caret_at(at);
+                }
                 self.status = if crate::rebase_todo::is_todo(path) {
                     String::from(crate::rebase_todo::HINT)
                 } else {
@@ -71419,7 +71461,7 @@ type CroftTerminal = Terminal<CrosstermBackend<CountingWriter>>;
 pub fn run(
     root: PathBuf,
     restore_session: Option<PathBuf>,
-    open_file: Option<PathBuf>,
+    open_file: Option<(PathBuf, Option<crate::file_location::FileLocation>)>,
     zen: bool,
     workspace_folders: Vec<PathBuf>,
 ) -> Result<()> {
@@ -71494,8 +71536,8 @@ pub fn run(
     }
     // `croft <root> --open-file <path>`: open the handed-off file (used by the
     // new window that Move / Copy into New Window spawns).
-    if let Some(file) = open_file.as_ref() {
-        app.open_file_at_launch(file);
+    if let Some((file, at)) = open_file.as_ref() {
+        app.open_file_at_launch_at(file, *at);
     }
     // A `croft://` link (#359) names what to land on.
     match std::env::var("CROFT_FOCUS").as_deref() {

@@ -78747,6 +78747,64 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     assert!(app.source_control.last_init_repo_button_area.width > 0);
 }
 
+// ── #1487: a view request or launch with a line puts the caret there ──
+
+fn ten_line_file(tmp: &std::path::Path) -> std::path::PathBuf {
+    let f = tmp.join("four.c");
+    let body: String = (1..=10).map(|i| format!("line number {i}\n")).collect();
+    std::fs::write(&f, body).unwrap();
+    f
+}
+
+#[test]
+fn a_view_request_with_a_location_puts_the_caret_there() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = ten_line_file(tmp.path());
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let reply = app.apply_view_request_at(
+        &f,
+        Some(crate::file_location::FileLocation {
+            line: 5,
+            col: Some(6),
+        }),
+    );
+    assert_eq!(reply, crate::view_ipc::ViewReply::Ok);
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (4, 5));
+}
+
+#[test]
+fn a_launch_with_a_location_puts_the_caret_there() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = ten_line_file(tmp.path());
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_file_at_launch_at(
+        &f,
+        Some(crate::file_location::FileLocation { line: 8, col: None }),
+    );
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (7, 0));
+}
+
+/// Negative: a line past the end lands on the last line, and a request
+/// without a location leaves the caret at the top.
+#[test]
+fn a_location_past_the_end_is_clamped_and_none_moves_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = ten_line_file(tmp.path());
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_view_request_at(
+        &f,
+        Some(crate::file_location::FileLocation {
+            line: 500,
+            col: Some(500),
+        }),
+    );
+    let last = app.editor.lines.len() - 1;
+    assert_eq!(app.editor.cursor_row, last);
+    let mut fresh = App::new(tmp.path().to_path_buf()).unwrap();
+    fresh.apply_view_request_at(&f, None);
+    assert_eq!((fresh.editor.cursor_row, fresh.editor.cursor_col), (0, 0));
+}
+
 /// An App over `tmp` whose user config lives in `cfg`, never the real one.
 fn settings_editor_app(cfg: &std::path::Path, tmp: &std::path::Path) -> App {
     let mut app = App::new(tmp.to_path_buf()).unwrap();

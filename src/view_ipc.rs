@@ -59,6 +59,10 @@ pub struct ViewRequest {
     /// the same to an older croft.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub probe: bool,
+    /// Where to put the caret, for `croft view file:line[:col]` (#1487).
+    /// Omitted when unset, like `probe`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<crate::file_location::FileLocation>,
 }
 
 /// The server's answer. `Err` carries a message the client prints verbatim,
@@ -76,6 +80,7 @@ impl ViewRequest {
         Self {
             path: path.as_os_str().as_bytes().to_vec(),
             probe: false,
+            at: None,
         }
     }
 
@@ -677,7 +682,7 @@ pub fn edit(target: &std::ffi::OsStr, wait: bool, cache_dir: &Path) -> anyhow::R
     let Some(socket) = std::env::var_os(SOCK_ENV).filter(|s| !s.is_empty()) else {
         return Ok(());
     };
-    let path = resolve(&std::env::current_dir()?, Path::new(target));
+    let path = wait_path(&std::env::current_dir()?, Path::new(target));
     let probe = ViewRequest::probe(&path);
     loop {
         std::thread::sleep(WAIT_POLL);
@@ -689,6 +694,14 @@ pub fn edit(target: &std::ffi::OsStr, wait: bool, cache_dir: &Path) -> anyhow::R
             ),
         }
     }
+}
+
+/// The file `croft edit --wait <target>` waits on: the one `run` opened,
+/// so `file.c:5` waits on `file.c`'s tab rather than on a path no tab has
+/// (#1487).
+fn wait_path(cwd: &Path, target: &Path) -> PathBuf {
+    let (target, _) = crate::file_location::split(target, cwd);
+    resolve(cwd, &target)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -803,6 +816,23 @@ fn resolve_target(
     }
 }
 
+/// [`resolve_target`] after splitting off a `:line[:col]` that names a spot
+/// in a file that exists, so `croft edit four.c:5:5` opens four.c there
+/// instead of creating an empty `four.c:5:5` (#1487).
+fn resolve_located_target(
+    verb: Verb,
+    cwd: &Path,
+    target: &Path,
+) -> anyhow::Result<(
+    PathBuf,
+    Option<Created>,
+    Option<crate::file_location::FileLocation>,
+)> {
+    let (target, at) = crate::file_location::split(target, cwd);
+    let (path, created) = resolve_target(verb, cwd, &target)?;
+    Ok((path, created, at))
+}
+
 /// `croft view <path>` / `croft view -`, and the opening half of `croft
 /// edit`, with `verb` saying which of the two the user typed.
 pub fn run(
@@ -834,6 +864,7 @@ pub fn run(
         );
     }
 
+    let mut at = None;
     let (path, created) = if target == "-" {
         let buf = read_capped(std::io::stdin(), MAX_STAGED_STDIN_BYTES)?;
         if buf.is_empty() {
@@ -843,10 +874,13 @@ pub fn run(
     } else {
         // After the socket check, so `croft edit` run outside croft leaves
         // no empty file behind.
-        resolve_target(verb, &std::env::current_dir()?, Path::new(target))?
+        let (path, created, found) =
+            resolve_located_target(verb, &std::env::current_dir()?, Path::new(target))?;
+        at = found;
+        (path, created)
     };
 
-    let opened = open_in_croft(v, &socket, &path);
+    let opened = open_in_croft(v, &socket, &path, at);
     // Nor does one whose croft cannot open it: a stale socket (the croft
     // that set it has exited) or a refusal takes back the empty file created
     // just above, and never a file that was already there (#848).
@@ -886,8 +920,17 @@ fn take_back(path: &Path, created: Created) {
 
 /// Ask the croft listening on `socket` to open `path`, naming the command
 /// `v` in every refusal.
-fn open_in_croft(v: &str, socket: &Path, path: &Path) -> anyhow::Result<()> {
-    match send(socket, &ViewRequest::new(path)) {
+fn open_in_croft(
+    v: &str,
+    socket: &Path,
+    path: &Path,
+    at: Option<crate::file_location::FileLocation>,
+) -> anyhow::Result<()> {
+    let request = ViewRequest {
+        at,
+        ..ViewRequest::new(path)
+    };
+    match send(socket, &request) {
         Ok(ViewReply::Ok) => Ok(()),
         Ok(ViewReply::Err { message }) => anyhow::bail!("croft {v}: {message}"),
         Err(e)
@@ -1654,5 +1697,81 @@ mod tests {
         let err = send(&sock, &ViewRequest::new(Path::new("/x"))).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
         server.join().unwrap();
+    }
+
+    // ── #1487: `croft edit file:line:col` ──
+
+    #[test]
+    fn edit_with_a_location_opens_the_file_and_creates_no_junk() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("four.c"), "int x;\n").unwrap();
+        let (path, created, at) =
+            resolve_located_target(Verb::Edit, dir.path(), Path::new("four.c:5:5")).unwrap();
+        assert_eq!(path, dir.path().join("four.c"));
+        assert!(created.is_none(), "nothing was created");
+        assert_eq!(
+            at,
+            Some(crate::file_location::FileLocation {
+                line: 5,
+                col: Some(5)
+            })
+        );
+        assert!(!dir.path().join("four.c:5:5").exists(), "no junk file");
+    }
+
+    /// `croft edit --wait file.c:5` waits on file.c's tab, the one it opened.
+    #[test]
+    fn edit_wait_with_a_location_waits_on_the_opened_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.c"), "int x;\n").unwrap();
+        assert_eq!(
+            wait_path(dir.path(), Path::new("file.c:5")),
+            dir.path().join("file.c")
+        );
+        assert_eq!(
+            wait_path(dir.path(), Path::new("new.c")),
+            dir.path().join("new.c")
+        );
+    }
+
+    /// Negative: a new file named without a location is still created,
+    /// as `EDITOR="croft edit --wait"` needs (#848).
+    #[test]
+    fn edit_of_a_new_file_still_creates_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, created, at) =
+            resolve_located_target(Verb::Edit, dir.path(), Path::new("new.md")).unwrap();
+        assert_eq!(path, dir.path().join("new.md"));
+        assert!(created.is_some());
+        assert_eq!(at, None);
+    }
+
+    #[test]
+    fn view_with_a_location_opens_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("four.c"), "int x;\n").unwrap();
+        let (path, _, at) =
+            resolve_located_target(Verb::View, dir.path(), Path::new("four.c:5")).unwrap();
+        assert_eq!(path, dir.path().join("four.c"));
+        assert_eq!(at.map(|a| a.line), Some(5));
+    }
+
+    /// The location rides the request only when there is one, so a request
+    /// without it reads the same to an older croft.
+    #[test]
+    fn the_location_is_on_the_wire_only_when_set() {
+        let plain = serde_json::to_string(&ViewRequest::new(Path::new("/x"))).unwrap();
+        assert!(!plain.contains("\"at\""), "{plain}");
+        let located = ViewRequest {
+            at: Some(crate::file_location::FileLocation {
+                line: 5,
+                col: Some(2),
+            }),
+            ..ViewRequest::new(Path::new("/x"))
+        };
+        let wire = serde_json::to_string(&located).unwrap();
+        assert!(wire.contains("\"at\":{\"line\":5,\"col\":2}"), "{wire}");
+        let back: ViewRequest = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, located);
     }
 }
