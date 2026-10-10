@@ -44577,6 +44577,10 @@ fn a_prepare_rename_verdict_routes_to_the_prompt_status_or_fallback() {
         "renamed",
         "the server's placeholder pre-fills the prompt"
     );
+    assert_eq!(
+        app.status, "",
+        "\"Preparing rename…\" goes once the prompt opens"
+    );
 
     // No placeholder: the validated range's own text.
     arm(&mut app);
@@ -44610,6 +44614,13 @@ fn a_prepare_rename_verdict_routes_to_the_prompt_status_or_fallback() {
         app.prompt.as_ref().expect("fallback prompt opened").buffer,
         "value"
     );
+    assert_eq!(app.status, "", "and when the fallback prompt opens");
+
+    // A status something else set after F2 is not the verdict's to clear.
+    arm(&mut app);
+    app.status = String::from("Saved lib.rs");
+    assert!(app.apply_prepare_rename_verdict(verdict(None, None, true)));
+    assert_eq!(app.status, "Saved lib.rs");
 
     // The buffer moved under the in-flight request: say so rather than
     // leaving "Preparing rename…" wedged on screen forever.

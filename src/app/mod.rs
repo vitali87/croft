@@ -13762,6 +13762,11 @@ impl App {
             return false;
         }
         self.prepare_rename_request = None;
+        // The verdict is in, whichever way it went: "Preparing rename…" no
+        // longer describes anything (it stayed up beside the open prompt).
+        if self.status == "Preparing rename…" {
+            self.status.clear();
+        }
         if self.editor.path.as_deref() != Some(path.as_path()) || self.editor.edit_seq != seq {
             // The caret moved on (an edit, or a tab switch — which also
             // bumps edit_seq). Say so: bailing silently would strand

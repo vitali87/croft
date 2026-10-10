@@ -5398,50 +5398,19 @@ impl WorkerState {
             unsupported(tx, path);
             return;
         };
-        let tx = tx.clone();
-        let path_clone = path.clone();
-        tokio::spawn(async move {
-            let mut client = client_arc.lock().await.requests();
-            let resp = client.prepare_rename(uri, line, character).await;
-            drop(client);
-            let (error, target, fallback) = match resp {
-                Ok(Some(lsp_types::PrepareRenameResponse::Range(r))) => {
-                    (None, Some((range_tuple(&r), None)), false)
-                }
-                Ok(Some(lsp_types::PrepareRenameResponse::RangeWithPlaceholder {
-                    range,
-                    placeholder,
-                })) => (None, Some((range_tuple(&range), Some(placeholder))), false),
-                // "Default behavior": the server validates the position
-                // but wants the client's own word logic — route the app
-                // to its word-under-cursor prompt via `unsupported`.
-                Ok(Some(lsp_types::PrepareRenameResponse::DefaultBehavior { .. })) => {
-                    (None, None, true)
-                }
-                Ok(None) => (None, None, false),
-                Err(e) => {
-                    log_file::log(&format!("lsp[{server_name}] prepareRename error: {e:#}"));
-                    // Surface the server's own message: the fail-fast half
-                    // of prepare-rename. Trim the anyhow context chain to
-                    // the root cause line.
-                    let msg = e
-                        .root_cause()
-                        .to_string()
-                        .lines()
-                        .next()
-                        .unwrap_or("rename rejected")
-                        .to_string();
-                    (Some(msg), None, false)
-                }
-            };
-            let _ = tx.send(PrepareRenameResult {
+        spawn_prepare_rename(
+            PrepareRenameAsk {
                 request_id,
-                path: path_clone,
-                unsupported: fallback,
-                error,
-                target,
-            });
-        });
+                path,
+                server_name,
+                client: client_arc,
+                uri,
+                line,
+                character,
+            },
+            PREPARE_RENAME_TIMEOUT,
+            tx,
+        );
     }
 
     async fn request_formatting(
@@ -6217,6 +6186,102 @@ const WORKSPACE_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 const MAX_CODE_LENSES: usize = 500;
 /// How long a codeLens request, and then all its resolves together, may take.
 const CODE_LENS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a server may take to answer `textDocument/prepareRename`
+/// (#1677) before F2 opens the word-under-cursor prompt instead. A
+/// responsive server answers in about a millisecond; one that is busy,
+/// paused or cut off must not strand "Preparing rename…" for good.
+const PREPARE_RENAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One routed prepare-rename: the server picked for it and where the
+/// caret is.
+struct PrepareRenameAsk {
+    request_id: u64,
+    path: PathBuf,
+    server_name: String,
+    client: Arc<TokioMutex<LspClient>>,
+    uri: Url,
+    line: u32,
+    character: u32,
+}
+
+/// Ask the server and always send a verdict (#254). Waiting on the lock and
+/// on the reply together is bounded by `timeout` (#1677): past it the verdict
+/// is `unsupported`, which opens the word-under-cursor prompt, so the rename
+/// still goes through.
+fn spawn_prepare_rename(
+    ask: PrepareRenameAsk,
+    timeout: std::time::Duration,
+    tx: &std_mpsc::Sender<PrepareRenameResult>,
+) {
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let PrepareRenameAsk {
+            request_id,
+            path,
+            server_name,
+            client,
+            uri,
+            line,
+            character,
+        } = ask;
+        let resp = tokio::time::timeout(timeout, async {
+            let mut requests = client.lock().await.requests();
+            requests.prepare_rename(uri, line, character).await
+        })
+        .await;
+        let Ok(resp) = resp else {
+            log_file::log(&format!(
+                "lsp[{server_name}] prepareRename timed out after {timeout:?}"
+            ));
+            let _ = tx.send(PrepareRenameResult {
+                request_id,
+                path,
+                unsupported: true,
+                error: None,
+                target: None,
+            });
+            return;
+        };
+        let (error, target, fallback) = match resp {
+            Ok(Some(lsp_types::PrepareRenameResponse::Range(r))) => {
+                (None, Some((range_tuple(&r), None)), false)
+            }
+            Ok(Some(lsp_types::PrepareRenameResponse::RangeWithPlaceholder {
+                range,
+                placeholder,
+            })) => (None, Some((range_tuple(&range), Some(placeholder))), false),
+            // "Default behavior": the server validates the position
+            // but wants the client's own word logic — route the app
+            // to its word-under-cursor prompt via `unsupported`.
+            Ok(Some(lsp_types::PrepareRenameResponse::DefaultBehavior { .. })) => {
+                (None, None, true)
+            }
+            Ok(None) => (None, None, false),
+            Err(e) => {
+                log_file::log(&format!("lsp[{server_name}] prepareRename error: {e:#}"));
+                // Surface the server's own message: the fail-fast half
+                // of prepare-rename. Trim the anyhow context chain to
+                // the root cause line.
+                let msg = e
+                    .root_cause()
+                    .to_string()
+                    .lines()
+                    .next()
+                    .unwrap_or("rename rejected")
+                    .to_string();
+                (Some(msg), None, false)
+            }
+        };
+        let _ = tx.send(PrepareRenameResult {
+            request_id,
+            path,
+            unsupported: fallback,
+            error,
+            target,
+        });
+    });
+}
 
 /// How long one server may take to answer `willRenameFiles` (#610) before
 /// the Explorer move goes ahead without its edit. VS Code waits about as
@@ -9855,6 +9920,213 @@ while True:
         assert_eq!(reply.request_id, 21);
         assert!(reply.unsupported);
         assert!(reply.error.is_none() && reply.target.is_none());
+    }
+
+    /// A stub server for prepareRename (#1677). `mode` decides its answer:
+    /// `mute` never answers (the bug), `range` answers a range with a
+    /// placeholder, `error` refuses with a message.
+    fn prepare_rename_server_script(dir: &Path) -> std::path::PathBuf {
+        let path = dir.join("prepare_rename_server.py");
+        std::fs::write(
+            &path,
+            r#"
+import json, sys
+
+mode = sys.argv[1]
+
+def read():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    if length is None:
+        return None
+    return json.loads(sys.stdin.buffer.read(length))
+
+def write(msg):
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+while True:
+    msg = read()
+    if msg is None:
+        break
+    method = msg.get("method")
+    if method == "initialize":
+        write({"jsonrpc": "2.0", "id": msg["id"], "result": {"capabilities": {
+            "renameProvider": {"prepareProvider": True},
+        }}})
+    elif method == "textDocument/prepareRename":
+        if mode == "range":
+            write({"jsonrpc": "2.0", "id": msg["id"], "result": {
+                "range": {"start": {"line": 0, "character": 4},
+                          "end": {"line": 0, "character": 9}},
+                "placeholder": "total",
+            }})
+        elif mode == "error":
+            write({"jsonrpc": "2.0", "id": msg["id"], "error": {
+                "code": -32803, "message": "cannot rename a keyword",
+            }})
+    elif method == "shutdown":
+        write({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+    elif "id" in msg:
+        write({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+"#,
+        )
+        .expect("write stub server");
+        path
+    }
+
+    /// Run one prepareRename against the stub in `mode`, bounded by
+    /// `timeout`, and return the verdict and how long it took to arrive.
+    /// `None` when python3 is missing.
+    fn prepare_rename_against(
+        mode: &str,
+        timeout: std::time::Duration,
+    ) -> Option<(PrepareRenameResult, std::time::Duration)> {
+        let python = python_for_stub_server()?;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let script = prepare_rename_server_script(&root);
+        let file = root.join("calc.py");
+        std::fs::write(&file, "def total(items):\n    return sum(items)\n").unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let (tx, rx) = std_mpsc::channel();
+        let started = runtime.block_on(async {
+            let config = ServerConfig {
+                name: "prepare-rename",
+                command: python.to_string_lossy().into_owned(),
+                args: vec![script.to_string_lossy().into_owned(), mode.to_string()],
+                language: Language::PYTHON,
+                initialization_options: None,
+                provision: None,
+            };
+            let (diag_tx, _diag_rx) = std_mpsc::channel();
+            let (prog_tx, _prog_rx) = std_mpsc::channel();
+            let client = LspClient::spawn(
+                &config,
+                &root,
+                build_client_capabilities(),
+                &[],
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                diag_tx,
+                prog_tx,
+            )
+            .await
+            .expect("the stub server handshakes");
+            assert!(
+                prepare_rename_supported(&client.capabilities().rename_provider),
+                "the stub must advertise prepareProvider, or F2 never asks it"
+            );
+            let started = std::time::Instant::now();
+            spawn_prepare_rename(
+                PrepareRenameAsk {
+                    request_id: 7,
+                    path: file.clone(),
+                    server_name: String::from("prepare-rename"),
+                    client: Arc::new(TokioMutex::new(client)),
+                    uri: Url::from_file_path(&file).unwrap(),
+                    line: 0,
+                    character: 5,
+                },
+                timeout,
+                &tx,
+            );
+            started
+        });
+        let reply = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("prepareRename must always answer");
+        let took = started.elapsed();
+        drop(runtime);
+        Some((reply, took))
+    }
+
+    /// The bug (#1677): a server that never answers prepareRename left F2 on
+    /// "Preparing rename…" for good. Past the deadline the verdict is
+    /// `unsupported`, which opens the word-under-cursor prompt.
+    #[test]
+    fn a_prepare_rename_the_server_never_answers_falls_back_after_the_deadline() {
+        let deadline = std::time::Duration::from_millis(300);
+        let Some((reply, took)) = prepare_rename_against("mute", deadline) else {
+            eprintln!("SKIPPED: no python3 on PATH");
+            return;
+        };
+        assert_eq!(reply.request_id, 7);
+        assert!(
+            reply.unsupported,
+            "a timed-out prepare routes to the fallback prompt"
+        );
+        assert!(reply.error.is_none(), "a slow server is not a refusal");
+        assert!(reply.target.is_none());
+        assert!(
+            took >= deadline,
+            "the verdict must wait out the deadline, took {took:?}"
+        );
+    }
+
+    /// The deadline F2 runs with is short enough to feel like an answer and
+    /// long enough for a busy server.
+    #[test]
+    fn the_prepare_rename_deadline_is_a_couple_of_seconds() {
+        assert!(PREPARE_RENAME_TIMEOUT >= std::time::Duration::from_secs(1));
+        assert!(PREPARE_RENAME_TIMEOUT <= std::time::Duration::from_secs(5));
+    }
+
+    /// Negative: a server that answers in time keeps its range and
+    /// placeholder; the deadline only matters when no answer comes.
+    #[test]
+    fn a_prepare_rename_answered_in_time_keeps_the_servers_range() {
+        let Some((reply, _)) = prepare_rename_against("range", std::time::Duration::from_secs(20))
+        else {
+            eprintln!("SKIPPED: no python3 on PATH");
+            return;
+        };
+        assert!(!reply.unsupported);
+        assert!(reply.error.is_none());
+        assert_eq!(
+            reply.target,
+            Some(((0, 4, 0, 9), Some(String::from("total"))))
+        );
+    }
+
+    /// Negative: a server's refusal still fails fast with its own message,
+    /// rather than being mistaken for a timeout and falling back.
+    #[test]
+    fn a_prepare_rename_refusal_is_not_turned_into_the_fallback() {
+        let Some((reply, took)) =
+            prepare_rename_against("error", std::time::Duration::from_secs(20))
+        else {
+            eprintln!("SKIPPED: no python3 on PATH");
+            return;
+        };
+        assert!(
+            !reply.unsupported,
+            "a refusal must not open the fallback prompt"
+        );
+        let error = reply.error.unwrap_or_default();
+        assert!(
+            error.starts_with("cannot rename a keyword"),
+            "the server's own reason is shown: {error}"
+        );
+        assert!(
+            took < std::time::Duration::from_secs(20),
+            "a refusal answers at once, not at the deadline"
+        );
     }
 
     /// Format Selection keeps whole-document formatting's always-answer
