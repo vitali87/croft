@@ -16,11 +16,12 @@
 //! ]
 //! ```
 //!
-//! ponytail: no `when` clauses. The app only consults the keymap when the
-//! terminal pane is not focused and the chord carries a real modifier (or is a
-//! function key), which stands in for VS Code's `editorTextFocus`-style context
-//! and keeps plain typing and raw terminal control keys untouched. Add real
-//! `when` contexts only if a user actually needs finer scoping.
+//! The app only consults the keymap when the terminal pane is not focused and
+//! the chord carries a real modifier (or is a function key), which keeps plain
+//! typing and raw terminal control keys untouched. A chord row may add
+//! `"when": "editor"` or `"when": "file_tree"` (#1436), VS Code's
+//! `editorTextFocus` and `filesExplorerFocus`: it then fires only while that
+//! pane has focus, and wins there over an unscoped row for the same chord.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -485,7 +486,7 @@ pub enum MouseContext {
 }
 
 impl MouseContext {
-    fn parse(s: &str) -> Option<Self> {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
         Some(match s.trim().to_ascii_lowercase().as_str() {
             "editor" => Self::Editor,
             "terminal" => Self::Terminal,
@@ -497,8 +498,7 @@ impl MouseContext {
 }
 
 /// One `{ "key": ..., "command": ... }` row as written on disk. `when` scopes
-/// a MOUSE binding to a region and is ignored for key chords, which keep the
-/// existing focus-based rule (see the module note).
+/// a mouse binding to a region, and a key chord to the focused pane (#1436).
 #[derive(Debug, Deserialize)]
 struct Binding {
     key: String,
@@ -513,6 +513,8 @@ struct Binding {
 #[derive(Debug, Clone, Default)]
 pub struct Keymap {
     bindings: HashMap<Chord, Command>,
+    /// Chords with a `when`: they fire only while that pane has focus.
+    scoped: HashMap<(Chord, MouseContext), Command>,
     mouse: HashMap<(Gesture, MouseContext), Command>,
 }
 
@@ -597,7 +599,8 @@ impl Keymap {
         // What each binding was last claimed by, so an override can name the
         // row that lost as well as the one that won (#315). Kept per surface:
         // a chord and a gesture cannot collide with each other.
-        let mut key_sources: HashMap<Chord, String> = HashMap::new();
+        let mut key_sources: HashMap<(Chord, Option<MouseContext>), String> = HashMap::new();
+        let mut scoped: HashMap<(Chord, MouseContext), Command> = HashMap::new();
         let mut mouse_sources: HashMap<(Gesture, MouseContext), String> = HashMap::new();
         for row in rows {
             let Some(cmd) = Command::from_id(&row.command) else {
@@ -665,13 +668,44 @@ impl Keymap {
             }
             match Chord::parse(&row.key) {
                 Some(chord) => {
-                    if let Some(previous) = key_sources.insert(chord, row.command.clone()) {
+                    // A chord's `when` is a focused pane (#1436). Once
+                    // ignored, so a row scoped to the editor fired from the
+                    // Explorer too. The terminal and the tab strip are
+                    // refused rather than accepted: the terminal's keys pass
+                    // through raw to the shell, and the tab strip never
+                    // holds focus, so either scope would bind nothing.
+                    let ctx = match row.when.as_deref() {
+                        None => None,
+                        Some(w) => match MouseContext::parse(w) {
+                            Some(c @ (MouseContext::Editor | MouseContext::FileTree)) => Some(c),
+                            Some(_) => {
+                                warnings.push(format!(
+                                    "{}: \"when\": \"{w}\" never applies to a key chord (only \"editor\" and \"file_tree\" do); the row binding \"{}\" was skipped",
+                                    row.key, row.command
+                                ));
+                                continue;
+                            }
+                            None => {
+                                warnings
+                                    .push(format!("{}: unknown \"when\" context \"{w}\"", row.key));
+                                continue;
+                            }
+                        },
+                    };
+                    if let Some(previous) = key_sources.insert((chord, ctx), row.command.clone()) {
                         warnings.push(format!(
                             "`{}` is bound more than once; the later row (`{}`) wins and the earlier one (`{}`) was discarded",
                             row.key, row.command, previous
                         ));
                     }
-                    bindings.insert(chord, cmd);
+                    match ctx {
+                        None => {
+                            bindings.insert(chord, cmd);
+                        }
+                        Some(ctx) => {
+                            scoped.insert((chord, ctx), cmd);
+                        }
+                    }
                 }
                 None => warnings.push(format!(
                     "{}: not a key chord or mouse gesture; the row binding \"{}\" was skipped",
@@ -679,7 +713,14 @@ impl Keymap {
                 )),
             }
         }
-        (Self { bindings, mouse }, warnings)
+        (
+            Self {
+                bindings,
+                scoped,
+                mouse,
+            },
+            warnings,
+        )
     }
 
     /// The command a mouse gesture is bound to in `ctx`, if any.
@@ -724,30 +765,58 @@ impl Keymap {
     /// [`Self::has_mouse_bindings`], because the key path's caller uses this
     /// to skip its lookup and must not be affected by mouse rows.
     pub fn is_empty(&self) -> bool {
-        self.bindings.is_empty()
+        self.bindings.is_empty() && self.scoped.is_empty()
     }
 
     /// Every bound chord, for the terminal-setup pass that installs forwarders.
     pub fn chords(&self) -> Vec<Chord> {
-        self.bindings.keys().copied().collect()
+        let mut chords: Vec<Chord> = self.bindings.keys().copied().collect();
+        for (chord, _) in self.scoped.keys() {
+            if !chords.contains(chord) {
+                chords.push(*chord);
+            }
+        }
+        chords
     }
 
-    /// The command a live key event is bound to, if any. Bare keys and
-    /// modifier-less letters are never matched here (see the module note): the
-    /// caller only asks for chords that carry a modifier or are function keys.
+    /// The command a live key event is bound to by an unscoped row, if any.
+    /// Bare keys and modifier-less letters are never matched here (see the
+    /// module note): the caller only asks for chords that carry a modifier or
+    /// are function keys.
     pub fn command_for(&self, key: KeyEvent) -> Option<Command> {
         self.bindings.get(&Chord::from_event(key)).copied()
+    }
+
+    /// The command a live key event is bound to while `ctx` has focus: a row
+    /// scoped to `ctx` first, then an unscoped one (#1436). A row scoped to
+    /// another pane never answers here.
+    pub fn command_in(&self, key: KeyEvent, ctx: MouseContext) -> Option<Command> {
+        let chord = Chord::from_event(key);
+        self.scoped
+            .get(&(chord, ctx))
+            .or_else(|| self.bindings.get(&chord))
+            .copied()
     }
 
     /// The user's chord for `cmd`, when `keybindings.json` binds one (#612).
     /// Several chords can name one command; the lowest-sorting spelling is
     /// returned so the display does not flicker between them.
+    /// A chord scoped to one pane (#1436) is shown only when no unscoped
+    /// chord names the command.
     pub fn chord_for(&self, cmd: Command) -> Option<String> {
-        self.bindings
+        let unscoped = self
+            .bindings
             .iter()
             .filter(|(_, c)| **c == cmd)
             .map(|(chord, _)| chord.to_config_string())
-            .min()
+            .min();
+        unscoped.or_else(|| {
+            self.scoped
+                .iter()
+                .filter(|(_, c)| **c == cmd)
+                .map(|((chord, _), _)| chord.to_config_string())
+                .min()
+        })
     }
 }
 
@@ -1447,5 +1516,46 @@ mod tests {
         let (map, warnings) = Keymap::resolve(json);
         assert_eq!(map.chords().len(), 2);
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// #1436: a key chord's `when` is no longer ignored. The terminal and
+    /// the tab strip would bind nothing, so they are refused with a reason,
+    /// and an unknown context warns as it does on a mouse row.
+    #[test]
+    fn a_chord_when_that_can_never_apply_is_refused_with_a_reason() {
+        let (km, warnings) = Keymap::resolve(
+            r#"[{"key": "ctrl+n", "command": "new_terminal", "when": "terminal"},
+                {"key": "ctrl+alt+n", "command": "new_terminal", "when": "tab_strip"},
+                {"key": "ctrl+alt+m", "command": "new_terminal", "when": "nowhere"}]"#,
+        );
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(
+            warnings[0].contains("ctrl+n") && warnings[0].contains("never applies to a key chord"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[1].contains("never applies to a key chord"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[2].contains("unknown \"when\" context"),
+            "{warnings:?}"
+        );
+        assert!(km.is_empty(), "none of them binds");
+    }
+
+    /// #1436 negative: one chord bound unscoped, for the editor and for the
+    /// file tree is three bindings, not an override, and installs one
+    /// terminal forwarder.
+    #[test]
+    fn one_chord_per_context_loads_without_an_override_warning() {
+        let (km, warnings) = Keymap::resolve(
+            r#"[{"key": "ctrl+alt+j", "command": "quick_open"},
+                {"key": "ctrl+alt+j", "command": "join_lines", "when": "editor"},
+                {"key": "ctrl+alt+j", "command": "save_file", "when": "file_tree"}]"#,
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(km.chords().len(), 1);
+        assert!(!km.is_empty());
     }
 }

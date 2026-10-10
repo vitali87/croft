@@ -1640,8 +1640,11 @@ fn import_vscode(from: Option<PathBuf>, dry_run: bool) -> Result<()> {
     for (key, value) in &report.settings {
         println!("  {key} = {value}");
     }
-    for (key, command) in &report.keybindings {
-        println!("  {key} -> {command}");
+    for (key, command, when) in &report.keybindings {
+        match when {
+            Some(when) => println!("  {key} -> {command} (when {when})"),
+            None => println!("  {key} -> {command}"),
+        }
     }
     if let Some(theme) = &report.theme {
         println!(

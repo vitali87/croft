@@ -176,6 +176,7 @@ All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macO
 * `key` is a chord like `ctrl+shift+p`, `cmd+,`, `alt+up`, or `f2`. Modifiers are `ctrl`, `alt`/`opt`, `shift`, `cmd`/`super`, and `mod` (Cmd on macOS, Ctrl elsewhere).
 * `command` is a palette command id (see the ids in `Preferences: Open Settings`, e.g. `save_file`, `quick_open`, `toggle_terminal`).
 * A bound chord wins over the built-in default for the same chord.
+* `when` is optional: `"when": "editor"` makes the chord fire only while the editor has focus, and `"when": "file_tree"` only while the Explorer has focus. In that pane it wins over a row for the same chord with no `when`, which still fires everywhere else. `terminal` and `tab_strip` are mouse-only regions and are refused on a chord with a warning.
 
 These restrictions cover KEYBOARD chords only. They apply while any pane except the terminal is focused, and only to chords that carry a modifier or are function keys, so plain typing and the terminal's control keys are never shadowed. Mouse gestures bind in the same file under different rules — they reach the terminal, and a bare gesture is allowed where it collides with nothing (see [Mouse bindings in `keybindings.json`](#mouse-bindings-in-keybindingsjson) below).
 

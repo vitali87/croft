@@ -22895,12 +22895,15 @@ impl App {
         // only when the terminal is not focused (its raw control keys must pass
         // through) and the chord carries a real modifier or is a function key
         // (so plain typing and bare Enter/Tab/Esc keep their contextual meaning).
-        // This stands in for VS Code's `when: editorTextFocus` without a full
-        // context engine.
+        // A row with `when` fires only while that pane has focus (#1436); an
+        // unscoped row fires wherever the terminal does not.
         if self.focus != Pane::Terminal
             && !self.keymap.is_empty()
             && is_rebindable_chord(key)
-            && let Some(cmd) = self.keymap.command_for(key)
+            && let Some(cmd) = match self.key_context() {
+                Some(ctx) => self.keymap.command_in(key, ctx),
+                None => self.keymap.command_for(key),
+            }
         {
             self.run_command(cmd);
             return Ok(());
@@ -68436,6 +68439,23 @@ fn snippet_completion_item(snip: &crate::snippets::Snippet) -> crate::lsp::Compl
         kind: Some(lsp_types::CompletionItemKind::SNIPPET),
         is_snippet: true,
         ..Default::default()
+    }
+}
+
+impl App {
+    /// The `when` context a key chord is asked about (#1436): the editor, or
+    /// the file tree while the sidebar shows it, as for the mouse. `None`
+    /// elsewhere (another sidebar view, the bottom panel), where only
+    /// unscoped rows fire.
+    fn key_context(&self) -> Option<crate::keymap::MouseContext> {
+        use crate::keymap::MouseContext;
+        match self.focus {
+            Pane::Editor => Some(MouseContext::Editor),
+            Pane::Tree if self.sidebar_view == SidebarView::Explorer => {
+                Some(MouseContext::FileTree)
+            }
+            _ => None,
+        }
     }
 }
 
