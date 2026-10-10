@@ -767,7 +767,7 @@ fn vitest_one_args(name: &str) -> Vec<String> {
 }
 
 /// `-t` regex for one test (#1506): its describe chain and title, escaped,
-/// joined with single spaces the way vitest and jest build the full name
+/// joined with [`JS_NAME_JOIN`] the way vitest and jest build the full name
 /// they search `-t` in, and anchored at both ends. The bare title is a
 /// search too, so `works` also ran `works with negatives` and a `works` in
 /// another describe. `None` for an ID that is only a file.
@@ -775,27 +775,36 @@ fn exact_title_anchor(id: &str) -> Option<String> {
     full_name_regex(id).map(|name| format!("^{name}$"))
 }
 
-/// The describe chain and title of a JS node ID as the escaped, space-joined
-/// full name the runners match `-t` against; `None` for a bare file.
+/// What joins a describe and the next title in the full name `-t` is
+/// matched against: a space for jest and vitest before 5, ` > ` from vitest
+/// 5 on. A title can itself hold `::` (`connects to ::1`), which the node
+/// ID cannot tell from a boundary, so `::` matches at a boundary too.
+const JS_NAME_JOIN: &str = "(?: | > |::)";
+
+/// The describe and title separator alone, closing a suite's chain.
+const JS_SUITE_JOIN: &str = "(?: | > )";
+
+/// The describe chain and title of a JS node ID as the escaped full name
+/// the runners match `-t` against; `None` for a bare file.
 fn full_name_regex(id: &str) -> Option<String> {
     let (_, rest) = id.split_once("::")?;
     Some(
         rest.split("::")
             .map(regex_escape)
             .collect::<Vec<_>>()
-            .join(" "),
+            .join(JS_NAME_JOIN),
     )
 }
 
 /// `-t` regex for a suite click's describe chain: every segment after the
 /// file, escaped and joined the way vitest and jest build the full name they
-/// match `-t` against (describes + title joined with single spaces — vitest's
-/// `getTaskFullName`, jest's `getTestID`), anchored at the start and closed
-/// with the joining space so describe `auth` cannot sweep an `auth-helper`
-/// sibling. `None` when the suite is the whole file (no describe segments),
+/// match `-t` against (describes + title joined by a space, or ` > ` from
+/// vitest 5 — vitest's `getTaskFullName`, jest's `getTestID`), anchored at
+/// the start and closed with the separator so describe `auth` cannot sweep
+/// an `auth-helper` sibling. `None` when the suite is the whole file (no describe segments),
 /// where the file argument alone scopes the run.
 fn suite_title_anchor(pattern: &str) -> Option<String> {
-    full_name_regex(pattern).map(|joined| format!("^{joined} "))
+    full_name_regex(pattern).map(|joined| format!("^{joined}{JS_SUITE_JOIN}"))
 }
 
 /// vitest argv for a filter run: a suite click passes a node-ID prefix
@@ -1728,7 +1737,7 @@ mod tests {
                 "run",
                 "tests/math.test.js",
                 "-t",
-                r"^math adds \(1 \+ 1\)$",
+                r"^math(?: | > |::)adds \(1 \+ 1\)$",
                 "--reporter=tap-flat"
             ]
         );
@@ -2003,7 +2012,7 @@ mod tests {
                 "--runTestsByPath",
                 "tests/math.test.js",
                 "-t",
-                r"^math adds \(1 \+ 1\)$",
+                r"^math(?: | > |::)adds \(1 \+ 1\)$",
                 "--json"
             ]
         );
@@ -2036,14 +2045,15 @@ mod tests {
                 "--runTestsByPath",
                 "src/math.test.js",
                 "-t",
-                "^add works$",
+                "^add(?: | > |::)works$",
                 "--json"
             ]
         );
         let vitest = vitest_one_args(id);
-        assert_eq!(vitest[3], "^add works$", "{vitest:?}");
+        assert_eq!(vitest[3], "^add(?: | > |::)works$", "{vitest:?}");
         let filter = regex::Regex::new(&jest[3]).unwrap();
         assert!(filter.is_match("add works"));
+        assert!(filter.is_match("add > works"), "vitest 5's separator");
         for other in ["add works with negatives", "sub add works", "add  works"] {
             assert!(!filter.is_match(other), "{other} must not run");
         }
@@ -2073,7 +2083,7 @@ mod tests {
                 "--runTestsByPath",
                 "src/math.test.js",
                 "-t",
-                "^add ",
+                "^add(?: | > )",
                 "--json"
             ]
         );
@@ -2087,7 +2097,12 @@ mod tests {
         );
         assert_eq!(
             coverage,
-            vec!["--runTestsByPath", "src/math.test.js", "-t", "^add works$"]
+            vec![
+                "--runTestsByPath",
+                "src/math.test.js",
+                "-t",
+                "^add(?: | > |::)works$"
+            ]
         );
     }
 
@@ -2120,7 +2135,7 @@ mod tests {
                 "run",
                 "tests/a.test.js",
                 "-t",
-                "^auth ",
+                "^auth(?: | > )",
                 "--reporter=tap-flat"
             ]
         );
@@ -2130,7 +2145,7 @@ mod tests {
                 "--runTestsByPath",
                 "tests/a.test.js",
                 "-t",
-                r"^group \(x\) inner ",
+                r"^group \(x\)(?: | > |::)inner(?: | > )",
                 "--json"
             ]
         );
@@ -2637,5 +2652,21 @@ mod tests {
             "echo 'Error: Transform failed with 1 error' >&2\nexit 1",
         );
         assert_eq!(discovery_of(tmp.path()), (Vec::new(), Some(Some(false))));
+    }
+
+    /// A title holding `::` (`connects to ::1`) is not split into a chain
+    /// that matches nothing: the anchored name still selects it, under
+    /// jest's and vitest 5's separators alike.
+    #[test]
+    fn a_js_title_with_a_double_colon_still_runs_exactly() {
+        let id = "src/net.test.js::server::connects to ::1";
+        let anchor = vitest_one_args(id)[3].clone();
+        let filter = regex::Regex::new(&anchor).unwrap();
+        for full in ["server connects to ::1", "server > connects to ::1"] {
+            assert!(filter.is_match(full), "{full} must run: {anchor}");
+        }
+        for other in ["server connects to ::12", "server connects to"] {
+            assert!(!filter.is_match(other), "{other} must not run");
+        }
     }
 }
