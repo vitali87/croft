@@ -529,8 +529,9 @@ pub struct Report {
     pub settings: BTreeMap<String, Value>,
     /// VS Code settings keys with no croft equivalent.
     pub unmapped_settings: Vec<String>,
-    /// Croft keybinding rows, ready to serialise.
-    pub keybindings: Vec<(String, String)>,
+    /// Croft keybinding rows, ready to serialise: key, command, and the
+    /// croft `when` context the VS Code row was scoped to (#1436).
+    pub keybindings: Vec<(String, String, Option<String>)>,
     /// VS Code keybinding rows dropped, with the reason.
     pub dropped_keybindings: Vec<String>,
     /// Snippet name to its croft entry.
@@ -663,7 +664,7 @@ pub fn convert_keybindings(doc: &Value, report: &mut Report) {
         ));
         return;
     };
-    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    let mut seen: BTreeMap<(String, Option<String>), String> = BTreeMap::new();
     for row in rows {
         let Some(command) = row.get("command").and_then(Value::as_str) else {
             continue;
@@ -689,18 +690,50 @@ pub fn convert_keybindings(doc: &Value, report: &mut Report) {
                 .push(format!("{key}: croft has no multi-key chord sequences"));
             continue;
         }
-        match COMMANDS.iter().find(|(vs, _)| *vs == command) {
-            Some((_, croft)) => {
-                // A later row wins in VS Code too.
-                seen.insert(key.to_string(), (*croft).to_string());
-            }
-            None => report
+        let Some((_, croft)) = COMMANDS.iter().find(|(vs, _)| *vs == command) else {
+            report
                 .dropped_keybindings
-                .push(format!("{key}: no croft command matches {command}")),
-        }
+                .push(format!("{key}: no croft command matches {command}"));
+            continue;
+        };
+        // The `when` was once never read (#1436), so a row VS Code scoped to
+        // the editor fired from every pane, and one scoped to the terminal
+        // fired everywhere BUT the terminal. Only the focus contexts croft
+        // has are carried over; anything else is reported, not widened to a
+        // global binding.
+        let when = match row.get("when").and_then(Value::as_str).map(str::trim) {
+            None | Some("") => None,
+            Some(expr) => match when_context(expr) {
+                Ok(ctx) => Some(ctx.to_string()),
+                Err(reason) => {
+                    report
+                        .dropped_keybindings
+                        .push(format!("{key}: {command} when \"{expr}\": {reason}"));
+                    continue;
+                }
+            },
+        };
+        // A later row wins in VS Code too, within one context; rows for
+        // different contexts are kept side by side.
+        seen.insert((key.to_string(), when), (*croft).to_string());
     }
-    report.keybindings = seen.into_iter().collect();
+    report.keybindings = seen
+        .into_iter()
+        .map(|((key, when), command)| (key, command, when))
+        .collect();
     report.dropped_keybindings.sort();
+}
+
+/// The croft `when` context for a VS Code `when` expression, or why there is
+/// none (#1436). Only the plain focus keys translate; a compound expression
+/// narrows the scope further than croft can, so it is never carried over.
+fn when_context(expr: &str) -> Result<&'static str, &'static str> {
+    match expr {
+        "editorTextFocus" | "editorFocus" => Ok("editor"),
+        "filesExplorerFocus" | "explorerViewletFocus" => Ok("file_tree"),
+        "terminalFocus" => Err("croft does not apply user chords inside the terminal"),
+        _ => Err("croft has no equivalent for this condition"),
+    }
 }
 
 /// Convert one VS Code snippets file. `language` comes from the file name for
@@ -1021,13 +1054,19 @@ pub fn apply_into_dirs(
                 }
                 None => Vec::new(),
             };
-            let bound: Vec<String> = rows
+            // A key is bound per context (#1436): an existing editor-only
+            // row does not stop a file-tree row for the same key.
+            let bound: Vec<(String, Option<String>)> = rows
                 .iter()
-                .filter_map(|r| r.get("key").and_then(Value::as_str).map(str::to_string))
+                .filter_map(|r| {
+                    let key = r.get("key").and_then(Value::as_str)?;
+                    let when = r.get("when").and_then(Value::as_str).map(str::to_string);
+                    Some((key.to_string(), when))
+                })
                 .collect();
             let mut changed = false;
-            for (key, command) in &report.keybindings {
-                if bound.iter().any(|k| k == key) {
+            for (key, command, when) in &report.keybindings {
+                if bound.iter().any(|(k, w)| k == key && w == when) {
                     report
                         .conflicts
                         .push(format!("keybindings.json {key}: already bound, left alone"));
@@ -1036,6 +1075,9 @@ pub fn apply_into_dirs(
                 let mut row = Map::new();
                 row.insert(String::from("key"), Value::from(key.clone()));
                 row.insert(String::from("command"), Value::from(command.clone()));
+                if let Some(when) = when {
+                    row.insert(String::from("when"), Value::from(when.clone()));
+                }
                 rows.push(Value::Object(row));
                 changed = true;
             }
@@ -1324,7 +1366,7 @@ mod tests {
         let rows: Vec<Value> = report
             .keybindings
             .iter()
-            .map(|(key, command)| json!({ "key": key, "command": command }))
+            .map(|(key, command, _)| json!({ "key": key, "command": command }))
             .collect();
         let json = serde_json::to_string(&Value::Array(rows)).unwrap();
         let (_keymap, warnings) = crate::keymap::Keymap::resolve(&json);
@@ -1347,7 +1389,11 @@ mod tests {
 
         assert_eq!(
             report.keybindings,
-            vec![(String::from("ctrl+shift+p"), String::from("quick_open"))],
+            vec![(
+                String::from("ctrl+shift+p"),
+                String::from("quick_open"),
+                None
+            )],
             "only rows croft can both understand and PARSE are written: \
              `ctrl+k z` is a chord sequence croft cannot express"
         );
@@ -1414,15 +1460,15 @@ mod tests {
             "{:?}",
             report.dropped_keybindings
         );
-        let expected: Vec<(String, String)> = pairs
+        let expected: Vec<(String, String, Option<String>)> = pairs
             .iter()
-            .map(|(key, _, croft)| (key.to_string(), croft.to_string()))
+            .map(|(key, _, croft)| (key.to_string(), croft.to_string(), None))
             .collect();
         assert_eq!(report.keybindings, expected);
         let rows: Vec<Value> = report
             .keybindings
             .iter()
-            .map(|(key, command)| json!({ "key": key, "command": command }))
+            .map(|(key, command, _)| json!({ "key": key, "command": command }))
             .collect();
         let json = serde_json::to_string(&Value::Array(rows)).unwrap();
         let (_keymap, warnings) = crate::keymap::Keymap::resolve(&json);
@@ -1441,7 +1487,11 @@ mod tests {
         convert_keybindings(&doc, &mut report);
         assert_eq!(
             report.keybindings,
-            vec![(String::from("ctrl+alt+p"), String::from("peek_definition"))]
+            vec![(
+                String::from("ctrl+alt+p"),
+                String::from("peek_definition"),
+                None
+            )]
         );
         assert_eq!(report.dropped_keybindings.len(), 1);
         assert!(report.dropped_keybindings[0].contains("editor.action.showHover"));
@@ -1489,15 +1539,15 @@ mod tests {
             "{:?}",
             report.dropped_keybindings
         );
-        let expected: Vec<(String, String)> = pairs
+        let expected: Vec<(String, String, Option<String>)> = pairs
             .iter()
-            .map(|(key, _, croft)| (key.to_string(), croft.to_string()))
+            .map(|(key, _, croft)| (key.to_string(), croft.to_string(), None))
             .collect();
         assert_eq!(report.keybindings, expected);
         let rows: Vec<Value> = report
             .keybindings
             .iter()
-            .map(|(key, command)| json!({ "key": key, "command": command }))
+            .map(|(key, command, _)| json!({ "key": key, "command": command }))
             .collect();
         let json = serde_json::to_string(&Value::Array(rows)).unwrap();
         let (_keymap, warnings) = crate::keymap::Keymap::resolve(&json);
@@ -1614,9 +1664,11 @@ mod tests {
         );
 
         let mut report = Report::default();
-        report
-            .keybindings
-            .push((String::from("ctrl+shift+p"), String::from("quick_open")));
+        report.keybindings.push((
+            String::from("ctrl+shift+p"),
+            String::from("quick_open"),
+            None,
+        ));
         report
             .snippets
             .insert(String::from("S"), json!({ "prefix": "s", "body": "x" }));
@@ -1672,9 +1724,11 @@ mod tests {
         report
             .settings
             .insert(String::from("format_on_save"), json!(true));
-        report
-            .keybindings
-            .push((String::from("ctrl+shift+p"), String::from("quick_open")));
+        report.keybindings.push((
+            String::from("ctrl+shift+p"),
+            String::from("quick_open"),
+            None,
+        ));
         report
             .snippets
             .insert(String::from("S"), json!({ "prefix": "s", "body": "x" }));
@@ -1766,9 +1820,11 @@ mod tests {
         report
             .settings
             .insert(String::from("format_on_save"), json!(true));
-        report
-            .keybindings
-            .push((String::from("ctrl+shift+p"), String::from("quick_open")));
+        report.keybindings.push((
+            String::from("ctrl+shift+p"),
+            String::from("quick_open"),
+            None,
+        ));
         apply_into(dir.path(), &mut report).expect("apply runs");
 
         assert!(
@@ -1926,7 +1982,7 @@ mod tests {
         );
         assert_eq!(
             report.keybindings,
-            vec![(String::from("ctrl+s"), String::from("save_file"))]
+            vec![(String::from("ctrl+s"), String::from("save_file"), None)]
         );
         assert_eq!(report.snippets["Test"]["scope"], json!("rust"));
     }
@@ -1944,7 +2000,8 @@ mod tests {
             report.keybindings,
             vec![(
                 String::from("ctrl+alt+enter"),
-                String::from("run_selected_text")
+                String::from("run_selected_text"),
+                None
             )]
         );
     }
@@ -2251,5 +2308,126 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let report = scan_profile(dir.path()).expect("an empty profile is fine");
         assert!(report.is_empty());
+    }
+
+    /// #1436: import `rows` as a VS Code profile into an empty croft config
+    /// directory, returning the rows written to croft's keybindings.json and
+    /// the rows reported as not carried over.
+    fn import_keybinding_rows(rows: &str) -> (Vec<Value>, Vec<String>) {
+        let profile = tempfile::TempDir::new().unwrap();
+        std::fs::write(profile.path().join("keybindings.json"), rows).unwrap();
+        let mut report = scan_profile(profile.path()).expect("the profile scans");
+        let out = tempfile::TempDir::new().unwrap();
+        apply_into(out.path(), &mut report).expect("apply runs");
+        let written = std::fs::read_to_string(out.path().join("keybindings.json"))
+            .unwrap_or_else(|_| String::from("[]"));
+        let rows: Vec<Value> = serde_json::from_str(&written).unwrap();
+        (rows, report.dropped_keybindings)
+    }
+
+    /// #1436: a VS Code row scoped to the editor or the Explorer is written
+    /// with croft's matching `when`, and croft loads it without a warning.
+    /// The `when` was once thrown away, so the row became a global binding.
+    #[test]
+    fn editor_and_explorer_scoped_rows_import_with_their_croft_context() {
+        let (rows, dropped) = import_keybinding_rows(
+            r#"[
+                { "key": "ctrl+j", "command": "editor.action.joinLines", "when": "editorTextFocus" },
+                { "key": "ctrl+alt+j", "command": "editor.action.joinLines", "when": "editorFocus" },
+                { "key": "ctrl+alt+p", "command": "workbench.action.quickOpen", "when": "filesExplorerFocus" },
+                { "key": "ctrl+alt+o", "command": "workbench.action.quickOpen", "when": "  explorerViewletFocus " }
+            ]"#,
+        );
+        assert!(dropped.is_empty(), "{dropped:?}");
+        let when_of = |key: &str| {
+            rows.iter()
+                .find(|r| r["key"] == key)
+                .unwrap_or_else(|| panic!("{key} was not written: {rows:?}"))["when"]
+                .clone()
+        };
+        assert_eq!(when_of("ctrl+j"), json!("editor"));
+        assert_eq!(when_of("ctrl+alt+j"), json!("editor"));
+        assert_eq!(when_of("ctrl+alt+p"), json!("file_tree"));
+        assert_eq!(when_of("ctrl+alt+o"), json!("file_tree"));
+        let (_keymap, warnings) =
+            crate::keymap::Keymap::resolve(&serde_json::to_string(&rows).unwrap());
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// #1436: a terminal-scoped row and a compound condition are named under
+    /// "not carried over" with the reason, and nothing is written for them,
+    /// rather than becoming bindings that fire everywhere.
+    #[test]
+    fn terminal_and_compound_when_rows_are_reported_not_written() {
+        let (rows, dropped) = import_keybinding_rows(
+            r#"[
+                { "key": "ctrl+n", "command": "workbench.action.terminal.new", "when": "terminalFocus" },
+                { "key": "ctrl+k", "command": "editor.action.joinLines", "when": "editorTextFocus && editorLangId == python" },
+                { "key": "ctrl+l", "command": "editor.action.joinLines", "when": "!terminalFocus" }
+            ]"#,
+        );
+        assert!(rows.is_empty(), "nothing is written: {rows:?}");
+        assert_eq!(dropped.len(), 3, "{dropped:?}");
+        let reason = |key: &str| {
+            dropped
+                .iter()
+                .find(|d| d.starts_with(&format!("{key}:")))
+                .unwrap_or_else(|| panic!("{key} is not reported: {dropped:?}"))
+                .clone()
+        };
+        assert!(
+            reason("ctrl+n").contains("croft does not apply user chords inside the terminal"),
+            "{dropped:?}"
+        );
+        assert!(
+            reason("ctrl+k").contains("editorLangId == python"),
+            "the condition is named: {dropped:?}"
+        );
+        assert!(reason("ctrl+l").contains("!terminalFocus"), "{dropped:?}");
+    }
+
+    /// #1436: one key bound in two contexts keeps a row for each, where the
+    /// later row once replaced the earlier one.
+    #[test]
+    fn one_key_keeps_a_row_per_context() {
+        let (rows, dropped) = import_keybinding_rows(
+            r#"[
+                { "key": "ctrl+j", "command": "editor.action.joinLines", "when": "editorTextFocus" },
+                { "key": "ctrl+j", "command": "workbench.action.quickOpen", "when": "filesExplorerFocus" }
+            ]"#,
+        );
+        assert!(dropped.is_empty(), "{dropped:?}");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(
+            rows.iter()
+                .any(|r| r["command"] == "join_lines" && r["when"] == "editor"),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r["command"] == "quick_open" && r["when"] == "file_tree"),
+            "{rows:?}"
+        );
+    }
+
+    /// #1436 negative: a row without `when` imports as before, unscoped, and
+    /// a later row for the same key and context still wins.
+    #[test]
+    fn a_row_without_when_imports_unscoped_and_the_later_row_wins() {
+        let (rows, dropped) = import_keybinding_rows(
+            r#"[
+                { "key": "ctrl+alt+j", "command": "editor.action.joinLines" },
+                { "key": "ctrl+alt+j", "command": "workbench.action.quickOpen" },
+                { "key": "ctrl+alt+k", "command": "workbench.action.quickOpen", "when": "" }
+            ]"#,
+        );
+        assert!(dropped.is_empty(), "{dropped:?}");
+        assert_eq!(
+            rows,
+            vec![
+                json!({ "key": "ctrl+alt+j", "command": "quick_open" }),
+                json!({ "key": "ctrl+alt+k", "command": "quick_open" }),
+            ]
+        );
     }
 }
