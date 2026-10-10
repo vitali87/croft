@@ -195,7 +195,7 @@ croft snapshots each file as you save it, and the Explorer's TIMELINE lists thos
 
 ## Testing
 
-A **Testing** view (the beaker icon, or `Cmd`/`Ctrl`+`K` `B`) mirrors VS Code's Test Explorer. It discovers the project's tests on first open — `cargo test` for Rust, `pytest` for Python, `vitest` or `jest` for JS/TS (detected from package.json), `go test` for a Go module — and lists them as a suite tree with live pass/fail/skip glyphs. Each runner is a built-in extension, so switching one off in the Extensions panel stops its projects being detected.
+A **Testing** view (the beaker icon, or `Cmd`/`Ctrl`+`K` `B`) mirrors VS Code's Test Explorer. It discovers the project's tests on first open — `cargo test` for Rust, `pytest` for Python, `vitest` or `jest` for JS/TS (detected from package.json), `go test` for a Go module or a `go.work` workspace — and lists them as a suite tree with live pass/fail/skip glyphs. Each runner is a built-in extension, so switching one off in the Extensions panel stops its projects being detected.
 
 Each row's play glyph runs that test or suite (a green ▷ also marks test functions in the editor gutter, click it to run), clicking a test's name jumps to its source, Enter runs everything, and `Cmd`/`Ctrl`+`K` `Enter` runs the test under the editor caret. A test started from the caret or a gutter ▷ replaces its "Running test …" status with how it went once it ends (`test_total passed (0.4 s)`, or "Run failed" pointing at OUTPUT). The beaker icon wears a red badge counting failures.
 

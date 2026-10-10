@@ -185,6 +185,18 @@ mod tests {
         assert_eq!(resolve(&s, &off, tmp.path()), None);
     }
 
+    /// #1505: a multi-module repo held together by a root `go.work` is a
+    /// Go project too, though the root has no `go.mod`.
+    #[test]
+    fn a_go_work_root_routes_to_go_test() {
+        let s = bundled();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("go.work"), "go 1.24\n\nuse ./lib\n").unwrap();
+        assert_eq!(resolve(&s, &none(), tmp.path()), Some(Runner::Go));
+        let off: BTreeSet<String> = [String::from("test-go")].into();
+        assert_eq!(resolve(&s, &off, tmp.path()), None);
+    }
+
     #[test]
     fn a_codeql_test_pack_routes_to_codeql_but_a_query_pack_does_not() {
         let s = bundled();
