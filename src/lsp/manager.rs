@@ -2100,6 +2100,11 @@ struct ManagedClient {
     /// Set once this server lets a document pull expire; it is not asked
     /// again, for the reason `diagnostic_pull_stalled` gives.
     document_pull_stalled: Arc<AtomicBool>,
+    /// Set once this server lets a prepareRename expire (#1677); later
+    /// renames go straight to the word-under-cursor prompt, for the reason
+    /// `diagnostic_pull_stalled` gives: an abandoned request leaks a
+    /// mainloop entry, so one leak per client, not one per F2.
+    prepare_rename_stalled: Arc<AtomicBool>,
     /// The newest pull generation per document (#866). A pull an edit has
     /// overtaken neither goes out nor, answered late, lands over a newer one.
     document_pull_generations: Arc<StdMutex<HashMap<PathBuf, u64>>>,
@@ -3044,6 +3049,7 @@ impl WorkerState {
                             save_notify,
                             supports_document_diagnostics,
                             document_pull_stalled: Arc::new(AtomicBool::new(false)),
+                            prepare_rename_stalled: Arc::new(AtomicBool::new(false)),
                             document_pull_generations: Arc::new(StdMutex::new(HashMap::new())),
                             supports_hover,
                             supports_definition,
@@ -5386,11 +5392,14 @@ impl WorkerState {
             unsupported(tx, path);
             return;
         };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_prepare_rename)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
+        let picked = clients.iter().find(|c| c.supports_prepare_rename).map(|c| {
+            (
+                c.name.clone(),
+                c.client.clone(),
+                c.prepare_rename_stalled.clone(),
+            )
+        });
+        let Some((server_name, client_arc, stalled)) = picked else {
             unsupported(tx, path);
             return;
         };
@@ -5407,6 +5416,7 @@ impl WorkerState {
                 uri,
                 line,
                 character,
+                stalled,
             },
             PREPARE_RENAME_TIMEOUT,
             tx,
@@ -6203,12 +6213,14 @@ struct PrepareRenameAsk {
     uri: Url,
     line: u32,
     character: u32,
+    /// The client's `prepare_rename_stalled`.
+    stalled: Arc<AtomicBool>,
 }
 
 /// Ask the server and always send a verdict (#254). Waiting on the lock and
 /// on the reply together is bounded by `timeout` (#1677): past it the verdict
 /// is `unsupported`, which opens the word-under-cursor prompt, so the rename
-/// still goes through.
+/// still goes through. A server that has let one expire is not asked again.
 fn spawn_prepare_rename(
     ask: PrepareRenameAsk,
     timeout: std::time::Duration,
@@ -6224,23 +6236,42 @@ fn spawn_prepare_rename(
             uri,
             line,
             character,
+            stalled,
         } = ask;
+        let unsupported = |request_id, path| PrepareRenameResult {
+            request_id,
+            path,
+            unsupported: true,
+            error: None,
+            target: None,
+        };
+        if stalled.load(Ordering::Relaxed) {
+            let _ = tx.send(unsupported(request_id, path));
+            return;
+        }
+        // Only a request that actually went out can leak, so only then does
+        // the timeout retire the server; waiting on a busy lock does not.
+        let sent = AtomicBool::new(false);
         let resp = tokio::time::timeout(timeout, async {
             let mut requests = client.lock().await.requests();
+            sent.store(true, Ordering::Relaxed);
             requests.prepare_rename(uri, line, character).await
         })
         .await;
         let Ok(resp) = resp else {
+            let retire = sent.load(Ordering::Relaxed);
+            if retire {
+                stalled.store(true, Ordering::Relaxed);
+            }
             log_file::log(&format!(
-                "lsp[{server_name}] prepareRename timed out after {timeout:?}"
+                "lsp[{server_name}] prepareRename timed out after {timeout:?}{}",
+                if retire {
+                    "; renames use the word under the cursor for this session"
+                } else {
+                    ""
+                }
             ));
-            let _ = tx.send(PrepareRenameResult {
-                request_id,
-                path,
-                unsupported: true,
-                error: None,
-                target: None,
-            });
+            let _ = tx.send(unsupported(request_id, path));
             return;
         };
         let (error, target, fallback) = match resp {
@@ -7971,6 +8002,7 @@ while True:
             save_notify: SaveNotify::Never,
             supports_document_diagnostics: false,
             document_pull_stalled: Arc::new(AtomicBool::new(false)),
+            prepare_rename_stalled: Arc::new(AtomicBool::new(false)),
             document_pull_generations: Arc::new(StdMutex::new(HashMap::new())),
             supports_completion: false,
             supports_signature_help: false,
@@ -9991,6 +10023,7 @@ while True:
     fn prepare_rename_against(
         mode: &str,
         timeout: std::time::Duration,
+        stalled: Arc<AtomicBool>,
     ) -> Option<(PrepareRenameResult, std::time::Duration)> {
         let python = python_for_stub_server()?;
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -10042,6 +10075,7 @@ while True:
                     uri: Url::from_file_path(&file).unwrap(),
                     line: 0,
                     character: 5,
+                    stalled,
                 },
                 timeout,
                 &tx,
@@ -10062,7 +10096,8 @@ while True:
     #[test]
     fn a_prepare_rename_the_server_never_answers_falls_back_after_the_deadline() {
         let deadline = std::time::Duration::from_millis(300);
-        let Some((reply, took)) = prepare_rename_against("mute", deadline) else {
+        let stalled = Arc::new(AtomicBool::new(false));
+        let Some((reply, took)) = prepare_rename_against("mute", deadline, stalled.clone()) else {
             eprintln!("SKIPPED: no python3 on PATH");
             return;
         };
@@ -10077,6 +10112,29 @@ while True:
             took >= deadline,
             "the verdict must wait out the deadline, took {took:?}"
         );
+        assert!(
+            stalled.load(Ordering::Relaxed),
+            "the expired request retires the server from prepareRename"
+        );
+    }
+
+    /// A server retired by an earlier timeout is not asked again, so it
+    /// cannot leak another abandoned request: F2 goes straight to the
+    /// fallback prompt, without waiting out a deadline.
+    #[test]
+    fn a_retired_server_is_not_asked_to_prepare_a_rename_again() {
+        let stalled = Arc::new(AtomicBool::new(true));
+        let deadline = std::time::Duration::from_secs(20);
+        let Some((reply, took)) = prepare_rename_against("range", deadline, stalled) else {
+            eprintln!("SKIPPED: no python3 on PATH");
+            return;
+        };
+        assert!(reply.unsupported, "a retired server routes to the fallback");
+        assert!(
+            reply.target.is_none(),
+            "the answering server was never asked"
+        );
+        assert!(took < deadline, "no deadline is waited out, took {took:?}");
     }
 
     /// The deadline F2 runs with is short enough to feel like an answer and
@@ -10091,8 +10149,11 @@ while True:
     /// placeholder; the deadline only matters when no answer comes.
     #[test]
     fn a_prepare_rename_answered_in_time_keeps_the_servers_range() {
-        let Some((reply, _)) = prepare_rename_against("range", std::time::Duration::from_secs(20))
-        else {
+        let Some((reply, _)) = prepare_rename_against(
+            "range",
+            std::time::Duration::from_secs(20),
+            Arc::new(AtomicBool::new(false)),
+        ) else {
             eprintln!("SKIPPED: no python3 on PATH");
             return;
         };
@@ -10108,9 +10169,11 @@ while True:
     /// rather than being mistaken for a timeout and falling back.
     #[test]
     fn a_prepare_rename_refusal_is_not_turned_into_the_fallback() {
-        let Some((reply, took)) =
-            prepare_rename_against("error", std::time::Duration::from_secs(20))
-        else {
+        let Some((reply, took)) = prepare_rename_against(
+            "error",
+            std::time::Duration::from_secs(20),
+            Arc::new(AtomicBool::new(false)),
+        ) else {
             eprintln!("SKIPPED: no python3 on PATH");
             return;
         };
