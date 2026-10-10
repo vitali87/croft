@@ -2313,6 +2313,9 @@ mod tests {
             "{.python}",
             "{.python .numberLines}",
             "{python echo=false}",
+            "{#example .python .numberLines}",
+            "{ #example .python }",
+            "{.python #example}",
             "python,linenos",
         ] {
             assert_eq!(lang_for_fence(info), Some(LangKind::Python), "{info}");
@@ -2354,6 +2357,8 @@ mod tests {
             "text,ignore",
             "{}",
             "{.}",
+            "{#example}",
+            "{#example linenos=true}",
             ",rust",
             "nosuchlang,rust",
         ] {
