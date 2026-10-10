@@ -552,6 +552,40 @@ fn existing_ids() -> Vec<String> {
         .collect()
 }
 
+/// The picker labels of every installed theme this importer did not write,
+/// for the same reason as [`existing_ids`]: re-importing a theme must not
+/// collide with its own earlier import.
+fn existing_labels() -> Vec<String> {
+    crate::theme::Theme::all()
+        .iter()
+        .filter(|t| !was_generated_by_import(t.id()))
+        .map(|t| t.label().to_string())
+        .collect()
+}
+
+/// `label`, or `label (imported)`, `label (imported 2)`, ... until no
+/// installed theme wears it (#1628). The picker shows labels only, so an
+/// import of a theme croft also ships (Nord, One Dark Pro, Dracula) was a
+/// second row with the same name and no way to tell which was which.
+fn unique_label(label: &str, taken: &[String]) -> String {
+    let clash = |l: &str| {
+        taken
+            .iter()
+            .any(|t| t.trim().eq_ignore_ascii_case(l.trim()))
+    };
+    if !clash(label) {
+        return label.to_string();
+    }
+    let imported = format!("{label} (imported)");
+    if !clash(&imported) {
+        return imported;
+    }
+    (2..1000)
+        .map(|n| format!("{label} (imported {n})"))
+        .find(|candidate| !clash(candidate))
+        .unwrap_or(imported)
+}
+
 /// Whether `id`'s manifest is one this importer wrote.
 ///
 /// COUPLING, stated because every other judgment call in this file is: this
@@ -597,15 +631,33 @@ fn unique_id(wanted: String, taken: &[String]) -> Option<String> {
 }
 
 fn convert(theme: RawTheme, id_override: Option<&str>, stem: &str) -> Result<Converted> {
-    let existing = existing_ids();
-    convert_with_ids(theme, id_override, stem, &existing)
+    convert_with_taken(
+        theme,
+        id_override,
+        stem,
+        &existing_ids(),
+        &existing_labels(),
+    )
 }
 
+#[cfg(test)]
 fn convert_with_ids(
     theme: RawTheme,
     id_override: Option<&str>,
     stem: &str,
     taken: &[String],
+) -> Result<Converted> {
+    convert_with_taken(theme, id_override, stem, taken, &[])
+}
+
+/// Convert `theme`, keeping clear of the ids and picker labels in `taken`
+/// and `taken_labels`.
+fn convert_with_taken(
+    theme: RawTheme,
+    id_override: Option<&str>,
+    stem: &str,
+    taken: &[String],
+    taken_labels: &[String],
 ) -> Result<Converted> {
     let light = theme
         .kind
@@ -765,16 +817,17 @@ fn convert_with_ids(
         syntax.push((String::from("syn_fg"), hex_of(fg)));
     }
 
-    let label = theme
+    let name = theme
         .name
         .clone()
         .unwrap_or_else(|| stem.replace(['-', '_'], " "));
+    let label = unique_label(&name, taken_labels);
     let wanted = match id_override {
         Some(id) => slug(id),
-        None => slug(&label),
+        None => slug(&name),
     };
     if wanted.is_empty() {
-        return Err(anyhow!("could not derive a theme id from {label:?}"));
+        return Err(anyhow!("could not derive a theme id from {name:?}"));
     }
     // An id that collides with a theme croft already ships is worse than an
     // error: the picker resolves the id to the BUILT-IN, so the import
@@ -783,10 +836,15 @@ fn convert_with_ids(
     let id = unique_id(wanted.clone(), taken).ok_or_else(|| {
         anyhow!("every id from {wanted:?} to {wanted}-999 is already taken; pass --id")
     })?;
-    if id != slug(id_override.unwrap_or(&label)) {
+    if id != slug(id_override.unwrap_or(&name)) {
         notes.push(format!(
             "a theme with id {:?} already exists, so this one was installed as {id:?}",
-            slug(id_override.unwrap_or(&label))
+            slug(id_override.unwrap_or(&name))
+        ));
+    }
+    if label != name {
+        notes.push(format!(
+            "a theme named {name:?} is already installed, so this one shows in the picker as {label:?}"
         ));
     }
 
@@ -803,7 +861,7 @@ fn convert_with_ids(
     m.push_str(&format!("name = \"{}\"\n", toml_escape(&label)));
     m.push_str(&format!(
         "description = \"{} imported from VS Code.\"\n",
-        toml_escape(&label)
+        toml_escape(&name)
     ));
     m.push_str("api_version = 1\n\n");
     m.push_str("[[themes]]\n");
@@ -1303,6 +1361,97 @@ mod tests {
             ids.iter().any(|i| i == "black"),
             "the bundled ids must be what collision is checked against"
         );
+    }
+
+    /// The bundled theme a picker label belongs to, for the #1628 tests.
+    fn bundled_label(id: &str) -> String {
+        crate::theme::Theme::all()
+            .iter()
+            .find(|t| t.id() == id)
+            .map(|t| t.label().to_string())
+            .expect("a bundled theme")
+    }
+
+    fn picker_label(converted: &Converted) -> String {
+        crate::lsp::manifest::parse(&converted.manifest)
+            .expect("the manifest parses")
+            .themes[0]
+            .label
+            .clone()
+    }
+
+    /// #1628: importing upstream Nord used to add a second "Nord" row to the
+    /// picker. The import's label now says it is the import.
+    #[test]
+    fn an_import_named_like_a_bundled_theme_gets_its_own_label() {
+        let nord = bundled_label("nord");
+        let src = format!(
+            r##"{{ "name": "{nord}", "type": "dark", "colors": {{ "editor.background": "#2e3440" }} }}"##
+        );
+        let converted = convert(parse_theme(&src).unwrap(), None, "nord").unwrap();
+        assert_eq!(converted.id, "nord-2");
+        assert_eq!(converted.label, format!("{nord} (imported)"));
+        assert_eq!(picker_label(&converted), converted.label);
+        assert!(
+            converted
+                .notes
+                .iter()
+                .any(|n| n.contains("(imported)") && n.contains("already installed")),
+            "the note names the new label: {:?}",
+            converted.notes
+        );
+        assert!(
+            converted
+                .manifest
+                .contains(&format!("description = \"{nord} imported from VS Code.\"")),
+            "the description still names the theme"
+        );
+    }
+
+    /// `--id` moves the id clear of the built-in but not the label, so the
+    /// label is made unique there too.
+    #[test]
+    fn an_id_override_still_gets_a_unique_label() {
+        let dracula = bundled_label("dracula");
+        let src = format!(r##"{{ "name": "{dracula}", "type": "dark", "colors": {{}} }}"##);
+        let converted = convert(
+            parse_theme(&src).unwrap(),
+            Some("dracula-upstream"),
+            "dracula",
+        )
+        .unwrap();
+        assert_eq!(converted.id, "dracula-upstream");
+        assert_eq!(converted.label, format!("{dracula} (imported)"));
+    }
+
+    /// A second import under a label already taken by an import is numbered,
+    /// and the comparison ignores case, as a reader does.
+    #[test]
+    fn a_taken_imported_label_is_numbered() {
+        let taken = vec![String::from("nord"), String::from("Nord (Imported)")];
+        assert_eq!(unique_label("Nord", &taken), "Nord (imported 2)");
+        assert_eq!(unique_label("Nord", &[]), "Nord");
+    }
+
+    /// Negative: a theme with a name of its own keeps it, and a re-import
+    /// does not count its own earlier label as taken.
+    #[test]
+    fn an_unrelated_theme_name_is_kept() {
+        let src = r##"{ "name": "Midnight Moss", "type": "dark", "colors": {} }"##;
+        let converted = convert(parse_theme(src).unwrap(), None, "moss").unwrap();
+        assert_eq!(converted.label, "Midnight Moss");
+        assert_eq!(converted.id, "midnight-moss");
+        assert!(
+            !converted
+                .notes
+                .iter()
+                .any(|n| n.contains("already installed")),
+            "{:?}",
+            converted.notes
+        );
+        let raw = parse_theme(src).unwrap();
+        let again = convert_with_taken(raw, None, "moss", &[], &[]).unwrap();
+        assert_eq!(again.label, "Midnight Moss");
     }
 
     /// TextMate takes the LAST scope-less rule as the default foreground.
