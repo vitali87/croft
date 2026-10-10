@@ -271,8 +271,7 @@ pub(crate) fn config_path_in(home: &Path, xdg_config_home: Option<&Path>, macos:
     }
     dirs.iter()
         .flat_map(|dir| CONFIG_NAMES.iter().map(move |name| dir.join(name)))
-        .filter(|p| p.is_file())
-        .last()
+        .rfind(|p| p.is_file())
         .unwrap_or_else(|| dirs.last().unwrap_or(&xdg).join("config"))
 }
 
