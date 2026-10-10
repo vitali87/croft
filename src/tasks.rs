@@ -48,7 +48,10 @@ pub struct Task {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VscodeCommand {
     pub command: String,
-    pub args: Vec<String>,
+    /// How a `{ "value", "quoting" }` command is quoted (#1441); None for a
+    /// plain string, whose text keeps its shell meaning.
+    pub command_quoting: Option<Quoting>,
+    pub args: Vec<TaskArg>,
     /// `options.cwd`.
     pub cwd: Option<String>,
     /// `options.env`, in file order.
@@ -57,6 +60,84 @@ pub struct VscodeCommand {
     /// or a `dependsOn`-only compound task). The task is still listed, so
     /// its build-default slot is never handed to another task (#1185).
     pub unrunnable: Option<String>,
+}
+
+/// One tasks.json argument: a plain string, or VS Code's
+/// `{ "value": …, "quoting": … }` (`ShellQuotedString`, #1441).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskArg {
+    pub value: String,
+    pub quoting: Option<Quoting>,
+}
+
+/// VS Code's `ShellQuoting` for a `{ "value", "quoting" }` word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Quoting {
+    /// Each character the shell would read as syntax gets a backslash.
+    Escape,
+    /// Single quotes: nothing inside is expanded.
+    Strong,
+    /// Double quotes: `$VAR` still expands.
+    Weak,
+}
+
+impl Quoting {
+    /// The `quoting` of a tasks.json word; VS Code quotes strongly when it
+    /// is left out.
+    fn parse(v: Option<&serde_json::Value>) -> Quoting {
+        match v.and_then(|q| q.as_str()) {
+            Some("escape") => Quoting::Escape,
+            Some("weak") => Quoting::Weak,
+            _ => Quoting::Strong,
+        }
+    }
+
+    /// `value` as one shell word, quoted this way.
+    fn apply(self, value: &str) -> String {
+        match self {
+            Quoting::Strong => quote_word(value),
+            Quoting::Weak => format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")),
+            // A backslash before a newline joins lines instead of keeping
+            // the newline, so such a value is quoted strongly instead.
+            Quoting::Escape if value.is_empty() || value.contains('\n') => quote_word(value),
+            Quoting::Escape => value
+                .chars()
+                .flat_map(|c| {
+                    let plain =
+                        c.is_ascii_alphanumeric() || "/._-+=:,@%".contains(c) || !c.is_ascii();
+                    (!plain)
+                        .then_some('\\')
+                        .into_iter()
+                        .chain(std::iter::once(c))
+                })
+                .collect(),
+        }
+    }
+}
+
+impl TaskArg {
+    /// A tasks.json word: a string, or an object with a string `value`.
+    fn parse(v: &serde_json::Value) -> Option<TaskArg> {
+        match v {
+            serde_json::Value::String(s) => Some(TaskArg {
+                value: s.clone(),
+                quoting: None,
+            }),
+            serde_json::Value::Object(o) => Some(TaskArg {
+                value: o.get("value")?.as_str()?.to_string(),
+                quoting: Some(Quoting::parse(o.get("quoting"))),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The word as the picker shows it.
+    fn shown(&self) -> String {
+        match self.quoting {
+            Some(q) => q.apply(&self.value),
+            None => self.value.clone(),
+        }
+    }
 }
 
 impl Task {
@@ -76,8 +157,20 @@ impl Task {
         }
         // The command's literal text keeps its shell meaning (`&&`, globs);
         // an argument's is quoted only when it must stay one word.
-        let mut line = expand_task_text(&v.command, ctx, false)?;
-        for raw in &v.args {
+        let mut line = match v.command_quoting {
+            Some(q) => q.apply(&expand_task_value(&v.command, ctx)?),
+            None => expand_task_text(&v.command, ctx, false)?,
+        };
+        for TaskArg {
+            value: raw,
+            quoting,
+        } in &v.args
+        {
+            if let Some(q) = quoting {
+                line.push(' ');
+                line.push_str(&q.apply(&expand_task_value(raw, ctx)?));
+                continue;
+            }
             let literal_space =
                 raw.is_empty() || literal_parts(raw).any(|l| l.contains(char::is_whitespace));
             line.push(' ');
@@ -161,6 +254,34 @@ fn expand_task_text(
     Ok(out)
 }
 
+/// `raw` with its `${...}` variables substituted and nothing quoted, for a
+/// word its `quoting` then quotes whole (#1441). Refuses the same variables
+/// [`expand_task_text`] refuses.
+fn expand_task_value(raw: &str, ctx: &crate::dap::configs::SubstCtx) -> Result<String, String> {
+    let mut out = String::new();
+    let mut rest = raw;
+    while let Some(start) = rest.find("${") {
+        let Some(len) = rest[start + 2..].find('}') else {
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let var = &rest[start + 2..start + 2 + len];
+        let whole = format!("${{{var}}}");
+        match crate::dap::configs::substitute(&whole, ctx) {
+            Ok(value) => out.push_str(&value),
+            Err(e) if e.contains("no active file") => return Err(e),
+            Err(_) if var.starts_with("input:") || var.starts_with("command:") => {
+                return Err(format!("${{{var}}}: croft cannot prompt for task inputs"));
+            }
+            Err(_) if var.starts_with("env:") => {}
+            Err(_) => out.push_str(&whole),
+        }
+        rest = &rest[start + 2 + len + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
 /// The literal text of `raw` between its `${...}` variables.
 fn literal_parts(raw: &str) -> impl Iterator<Item = &str> {
     let mut rest = Some(raw);
@@ -235,23 +356,22 @@ fn vscode_tasks(root: &Path) -> Vec<Task> {
     };
     tasks
         .iter()
+        .map(|t| with_top_level(t, &v))
         .filter_map(|t| {
+            let t = &t;
             let entry = provider_command(root, t)?;
             let command = entry.command.as_str();
-            let mut args: Vec<String> = entry.args;
+            let mut args: Vec<TaskArg> = entry.args;
             args.extend(
                 t.get("args")
                     .and_then(|a| a.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|a| a.as_str().map(str::to_string))
-                            .collect::<Vec<_>>()
-                    })
+                    .map(|a| a.iter().filter_map(TaskArg::parse).collect::<Vec<_>>())
                     .unwrap_or_default(),
             );
             let options = t.get("options");
             let vscode = VscodeCommand {
                 command: command.to_string(),
+                command_quoting: entry.command_quoting,
                 args: args.clone(),
                 cwd: options
                     .and_then(|o| o.get("cwd"))
@@ -274,10 +394,13 @@ fn vscode_tasks(root: &Path) -> Vec<Task> {
                     })
                     .unwrap_or_default(),
             };
-            let mut line = command.to_string();
+            let mut line = match entry.command_quoting {
+                Some(q) => q.apply(command),
+                None => command.to_string(),
+            };
             for a in &args {
                 line.push(' ');
-                line.push_str(a);
+                line.push_str(&a.shown());
             }
             // VS Code labels a label-less entry by its full command line,
             // not the bare program: three label-less `npm` entries must
@@ -311,10 +434,58 @@ fn vscode_tasks(root: &Path) -> Vec<Task> {
         .collect()
 }
 
+/// A tasks.json entry with what it leaves out taken from the file's top
+/// level, as VS Code does (#1441): the top-level `options` sit under the
+/// task's own (its `cwd` wins, and the `env` maps merge key by key with the
+/// task's values winning), and a task with no `command` of its own runs the
+/// top-level `command` and, unless it has its own, `args`. A `type` it
+/// leaves out is the top level's too. A `dependsOn` task with no command
+/// stays a compound task.
+fn with_top_level(t: &serde_json::Value, top: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    let mut t = t.clone();
+    let Some(task) = t.as_object_mut() else {
+        return t;
+    };
+    if let Some(kind) = top.get("type")
+        && !task.contains_key("type")
+    {
+        task.insert("type".into(), kind.clone());
+    }
+    if !task.contains_key("command")
+        && !task.contains_key("dependsOn")
+        && let Some(command) = top.get("command")
+    {
+        task.insert("command".into(), command.clone());
+        if let Some(args) = top.get("args")
+            && !task.contains_key("args")
+        {
+            task.insert("args".into(), args.clone());
+        }
+    }
+    if let Some(Value::Object(shared)) = top.get("options") {
+        let mut options = shared.clone();
+        if let Some(Value::Object(own)) = task.get("options") {
+            for (key, value) in own {
+                if let (Some(Value::Object(env)), "env", Value::Object(own_env)) =
+                    (options.get_mut(key), key.as_str(), value)
+                {
+                    env.extend(own_env.clone());
+                } else {
+                    options.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        task.insert("options".into(), Value::Object(options));
+    }
+    t
+}
+
 /// What a tasks.json entry runs, before its own `args` and `options`.
 struct ProviderCommand {
     command: String,
-    args: Vec<String>,
+    command_quoting: Option<Quoting>,
+    args: Vec<TaskArg>,
     cwd: Option<String>,
     /// VS Code's label for a provider task with none of its own.
     label: Option<String>,
@@ -329,9 +500,10 @@ struct ProviderCommand {
 /// as an entry croft refuses to run, so a default build is never swapped
 /// for another task (#1185). `None` only for an entry that is not a task.
 fn provider_command(root: &Path, t: &serde_json::Value) -> Option<ProviderCommand> {
-    if let Some(command) = t.get("command").and_then(|c| c.as_str()) {
+    if let Some(command) = t.get("command").and_then(TaskArg::parse) {
         return Some(ProviderCommand {
-            command: command.to_string(),
+            command: command.value,
+            command_quoting: command.quoting,
             args: Vec::new(),
             cwd: None,
             label: None,
@@ -350,7 +522,11 @@ fn provider_command(root: &Path, t: &serde_json::Value) -> Option<ProviderComman
         let runner = js_runner(root);
         return Some(ProviderCommand {
             command: runner.to_string(),
-            args: vec![script.to_string()],
+            command_quoting: None,
+            args: vec![TaskArg {
+                value: script.to_string(),
+                quoting: None,
+            }],
             cwd: path.map(|p| format!("${{workspaceFolder}}/{p}")),
             label: Some(match path {
                 Some(p) => format!("npm: {script} - {p}"),
@@ -372,6 +548,7 @@ fn provider_command(root: &Path, t: &serde_json::Value) -> Option<ProviderComman
     };
     Some(ProviderCommand {
         command: String::new(),
+        command_quoting: None,
         args: Vec::new(),
         cwd: None,
         label: Some(label),
@@ -808,6 +985,154 @@ mod tests {
         assert!(
             task("build").command_line(&no_file).is_err(),
             "${{file}} with no file"
+        );
+    }
+
+    /// A workspace whose `.vscode/tasks.json` is `json`, with `sub` and
+    /// `other` folders, and its real path (what `pwd` prints).
+    fn tasks_workspace(json: &str) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        for dir in [".vscode", "sub", "other"] {
+            std::fs::create_dir(tmp.path().join(dir)).unwrap();
+        }
+        std::fs::write(tmp.path().join(".vscode/tasks.json"), json).unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        (tmp, root)
+    }
+
+    /// What `label`'s command line prints when `sh` runs it in `root`.
+    fn run_task(root: &Path, label: &str) -> String {
+        let tasks = discover_tasks(root);
+        let task = tasks
+            .iter()
+            .find(|t| t.label == label)
+            .unwrap_or_else(|| panic!("no task {label} in {tasks:?}"));
+        let line = task.command_line(&ctx_at(root)).unwrap();
+        let out = std::process::Command::new("sh")
+            .args(["-c", &line])
+            .current_dir(root)
+            .env_remove("GREETING")
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// #1441: the top-level `options` apply to every task; a task's own
+    /// `cwd` wins, and its `env` merges over the shared one key by key.
+    #[test]
+    fn top_level_options_apply_to_every_task_and_a_tasks_own_win() {
+        let (_tmp, root) = tasks_workspace(
+            r#"{ "version": "2.0.0",
+                 "options": { "cwd": "${workspaceFolder}/sub", "env": { "GREETING": "hi", "A": "1", "B": "1" } },
+                 "tasks": [
+                   { "label": "where", "type": "shell", "command": "pwd; echo \"GREETING=$GREETING A=$A B=$B\"" },
+                   { "label": "own", "type": "shell", "command": "pwd; echo \"A=$A B=$B\"",
+                     "options": { "cwd": "${workspaceFolder}/other", "env": { "B": "2" } } }
+                 ] }"#,
+        );
+        assert_eq!(
+            run_task(&root, "where"),
+            format!("{}\nGREETING=hi A=1 B=1\n", root.join("sub").display())
+        );
+        assert_eq!(
+            run_task(&root, "own"),
+            format!("{}\nA=1 B=2\n", root.join("other").display())
+        );
+    }
+
+    /// #1441: `{ "value", "quoting" }` arguments and commands are kept, each
+    /// one shell word quoted the way it asks.
+    #[test]
+    fn quoted_arguments_and_commands_are_kept_as_one_word() {
+        let (_tmp, root) = tasks_workspace(
+            r#"{ "version": "2.0.0", "tasks": [
+                 { "label": "argobj", "type": "shell", "command": "echo",
+                   "args": ["A", { "value": "two words", "quoting": "strong" }, "Z"] },
+                 { "label": "kinds", "type": "shell", "command": "printf '[%s]'",
+                   "args": [ { "value": "$NOPE stays", "quoting": "strong" },
+                             { "value": "a b;c 'q'", "quoting": "escape" },
+                             { "value": "say \"hi\" $GREETING", "quoting": "weak" },
+                             { "value": "${workspaceFolder}/x y" },
+                             { "value": "", "quoting": "escape" } ] },
+                 { "label": "tool", "type": "process",
+                   "command": { "value": "my tool", "quoting": "strong" }, "args": ["--v"] }
+               ] }"#,
+        );
+        let tasks = discover_tasks(&root);
+        let line = |label: &str| {
+            tasks
+                .iter()
+                .find(|t| t.label == label)
+                .unwrap()
+                .command_line(&ctx_at(&root))
+                .unwrap()
+        };
+        assert_eq!(line("argobj"), "echo A 'two words' Z");
+        assert_eq!(run_task(&root, "argobj"), "A two words Z\n");
+        assert_eq!(
+            run_task(&root, "kinds"),
+            format!(
+                "[$NOPE stays][a b;c 'q'][say \"hi\" ][{}/x y][]",
+                root.display()
+            ),
+            "strong keeps `$` literal, escape and weak keep one word, weak still expands"
+        );
+        assert_eq!(line("tool"), "'my tool' --v");
+        let tool = tasks.iter().find(|t| t.label == "tool").unwrap();
+        assert_eq!(tool.command, "'my tool' --v", "the picker shows it quoted");
+    }
+
+    /// #1441: a task with no command of its own runs the top-level one, with
+    /// its own `args` if it has them; a `dependsOn` task stays compound.
+    #[test]
+    fn a_task_without_a_command_runs_the_top_level_one() {
+        let (_tmp, root) = tasks_workspace(
+            r#"{ "version": "2.0.0", "command": "echo", "args": ["top"], "type": "shell",
+                 "tasks": [
+                   { "label": "mine", "args": ["mine"] },
+                   { "label": "bare" },
+                   { "label": "both", "dependsOn": ["mine", "bare"] },
+                   { "label": "own", "command": "echo own" }
+                 ] }"#,
+        );
+        assert_eq!(run_task(&root, "mine"), "mine\n");
+        assert_eq!(run_task(&root, "bare"), "top\n");
+        assert_eq!(
+            run_task(&root, "own"),
+            "own\n",
+            "its own command, no top args"
+        );
+        let tasks = discover_tasks(&root);
+        let both = tasks.iter().find(|t| t.label == "both").unwrap();
+        assert!(
+            both.command_line(&ctx_at(&root))
+                .unwrap_err()
+                .contains("dependsOn"),
+            "a compound task does not run the top-level command"
+        );
+    }
+
+    /// #1441, negative: a file with no top level runs each task as written,
+    /// in the workspace root, and words that are neither a string nor an
+    /// object with a string `value` are still dropped.
+    #[test]
+    fn without_a_top_level_tasks_run_as_written_and_odd_words_are_dropped() {
+        let (_tmp, root) = tasks_workspace(
+            r#"{ "version": "2.0.0", "tasks": [
+                 { "label": "plain", "type": "shell", "command": "pwd" },
+                 { "label": "odd", "type": "shell", "command": "echo",
+                   "args": ["a", 7, { "quoting": "strong" }, { "value": ["x"] }, "b"] },
+                 { "label": "numeric", "command": 42 }
+               ] }"#,
+        );
+        let tasks = discover_tasks(&root);
+        let plain = tasks.iter().find(|t| t.label == "plain").unwrap();
+        assert_eq!(plain.command_line(&ctx_at(&root)).unwrap(), "pwd");
+        assert_eq!(run_task(&root, "plain"), format!("{}\n", root.display()));
+        assert_eq!(run_task(&root, "odd"), "a b\n");
+        assert!(
+            !tasks.iter().any(|t| t.label == "numeric"),
+            "a command that is no word is no task: {tasks:?}"
         );
     }
 
