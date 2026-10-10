@@ -79443,16 +79443,25 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
 /// does. The config debugs a program that is not there, so a launch that
 /// went ahead is told apart by its "does not exist" error.
 fn watch_task_workspace(background: bool, build: &str) -> (tempfile::TempDir, App) {
-    let tmp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
     let script = format!(
         "sleep 1; echo 'Starting compilation in watch mode...'; {build} echo 'Found 0 errors. Watching for file changes.'; sleep 30"
     );
+    watch_task_workspace_with(background, &script, serde_json::json!("$tsc-watch"))
+}
+
+/// [`watch_task_workspace`] with the watcher's whole script and matcher.
+fn watch_task_workspace_with(
+    background: bool,
+    script: &str,
+    matcher: serde_json::Value,
+) -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
     let task = serde_json::json!({
         "version": "2.0.0",
         "tasks": [{
             "label": "watch", "type": "shell", "command": "sh", "args": ["-c", script],
-            "isBackground": background, "problemMatcher": "$tsc-watch"
+            "isBackground": background, "problemMatcher": matcher
         }]
     });
     std::fs::write(tmp.path().join(".vscode/tasks.json"), task.to_string()).unwrap();
@@ -79531,6 +79540,43 @@ fn a_watch_pre_launch_task_with_build_errors_does_not_launch() {
         app.status
     );
     assert!(!app.status.contains("does not exist"), "{}", app.status);
+}
+
+/// #1541: an `activeOnStart` watcher starts inside its first build, and
+/// may print only the end of it; that still settles the launch, which
+/// otherwise waited for a `beginsPattern` that never comes.
+#[test]
+fn an_active_on_start_watch_pre_launch_task_launches_on_its_first_end() {
+    let (_tmp, mut app) = watch_task_workspace_with(
+        true,
+        "echo 'Found 0 errors. Watching for file changes.'; sleep 300",
+        serde_json::json!({
+            "base": "$tsc",
+            "background": {
+                "activeOnStart": true,
+                "beginsPattern": "^File change detected",
+                "endsPattern": "Watching for file changes\\."
+            }
+        }),
+    );
+    assert!(
+        app.status.contains("when its first build ends"),
+        "{}",
+        app.status
+    );
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE * 4,
+        "the watcher's first build end to settle the launch",
+        || {
+            app.drain_terminal_bells();
+            app.pending_debug_launch.is_none()
+        },
+    );
+    assert!(
+        app.status.contains("program /nope/bin does not exist"),
+        "the launch went ahead: {}",
+        app.status
+    );
 }
 
 /// #1541 negative: a task that is not `isBackground` still waits for its

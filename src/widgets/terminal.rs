@@ -2271,11 +2271,16 @@ impl PtyTerminal {
                             (None, None) => true,
                             _ => false,
                         };
-                        if !Arc::ptr_eq(&wset, &last_wset) || !pwatch_same {
+                        // A newly assigned task matcher that is
+                        // `activeOnStart` opens its first window here
+                        // (#1541).
+                        if !pwatch_same {
+                            watch_engine.assign(pwatch.as_ref());
+                        } else if !Arc::ptr_eq(&wset, &last_wset) {
                             watch_engine.reset();
-                            last_wset = wset.clone();
-                            last_pwatch = pwatch.clone();
                         }
+                        last_wset = wset.clone();
+                        last_pwatch = pwatch.clone();
                         if wset.matchers.is_empty() && pwatch.is_none() {
                             trigger_scanner.scan(&buf[..n], &trig, &mut trigger_hits);
                         } else {

@@ -85,6 +85,10 @@ struct CompiledPattern {
 pub struct Background {
     begins: Regex,
     ends: Regex,
+    /// VS Code `activeOnStart`: the task starts already inside its first
+    /// window, which may then close on `ends` with no `begins` ever seen
+    /// (#1541). Only a task-assigned matcher opens a window this way.
+    active_on_start: bool,
 }
 
 /// One matcher, from any source, compiled and ready to scan.
@@ -514,6 +518,7 @@ fn compile_row(row: MatcherRow) -> Result<CompiledMatcher, String> {
                 begins: Regex::new(&b.begins)
                     .map_err(|e| format!("{name}: bad begins regex: {e}"))?,
                 ends: Regex::new(&b.ends).map_err(|e| format!("{name}: bad ends regex: {e}"))?,
+                active_on_start: false,
             })
         })
         .transpose()?;
@@ -559,6 +564,7 @@ pub fn well_known(name: &str) -> Option<CompiledMatcher> {
                     )
                     .unwrap(),
                     ends: Regex::new(r"Watching for file changes\.").unwrap(),
+                    active_on_start: false,
                 }),
                 also: Vec::new(),
             });
@@ -651,6 +657,10 @@ fn from_vscode_object(o: &serde_json::Map<String, serde_json::Value>) -> Option<
         Some(Background {
             begins: pattern_str(b.get("beginsPattern"))?,
             ends: pattern_str(b.get("endsPattern"))?,
+            active_on_start: b
+                .get("activeOnStart")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
         })
     });
     if patterns.is_empty() && background.is_none() {
@@ -754,6 +764,16 @@ impl WatchEngine {
     /// the next `ends` can't scan stale lines with the old matcher.
     pub fn reset(&mut self) {
         self.active = None;
+    }
+
+    /// A new task matcher took over the pane: drop any half-open window,
+    /// as [`Self::reset`] does, and open the first one at once when the
+    /// matcher is `activeOnStart` (#1541), since its task may print only
+    /// `ends` for its initial build.
+    pub fn assign(&mut self, pane_matcher: Option<&Arc<CompiledMatcher>>) {
+        self.active = pane_matcher
+            .filter(|m| m.background.as_ref().is_some_and(|b| b.active_on_start))
+            .map(|m| (m.clone(), Vec::new()));
     }
 }
 
@@ -990,6 +1010,42 @@ mod tests {
             "the restarted window dropped stale lines: {batch:?}"
         );
         assert_eq!(batch[0].file, "fresh.c");
+    }
+
+    /// #1541: an `activeOnStart` task matcher opens its first window when
+    /// it is assigned, so an initial build that prints only `ends` still
+    /// publishes; later cycles wait for `begins` again. Without the flag the
+    /// same lines publish nothing.
+    #[test]
+    fn an_active_on_start_matcher_publishes_a_first_cycle_with_no_begins() {
+        let json = |active: bool| {
+            serde_json::json!({
+                "owner": "t",
+                "pattern": { "regexp": "^(\\S+):(\\d+):(\\d+): (.+)$", "message": 4 },
+                "background": {
+                    "activeOnStart": active,
+                    "beginsPattern": "^BUILD START$",
+                    "endsPattern": "^BUILD END$"
+                }
+            })
+        };
+        let watch = WatchSet::default();
+        let task = Arc::new(from_tasks_json(&json(true)).unwrap());
+        let mut engine = WatchEngine::default();
+        engine.assign(Some(&task));
+        assert!(engine.feed("a.c:1:2: boom", &watch, Some(&task)).is_none());
+        let batch = engine.feed("BUILD END", &watch, Some(&task)).unwrap();
+        assert_eq!(batch.len(), 1, "{batch:?}");
+        assert_eq!(batch[0].file, "a.c");
+        // The next cycle is an ordinary one: no begins, no window.
+        assert!(engine.feed("b.c:1:2: boom", &watch, Some(&task)).is_none());
+        assert!(engine.feed("BUILD END", &watch, Some(&task)).is_none());
+
+        let lazy = Arc::new(from_tasks_json(&json(false)).unwrap());
+        let mut engine = WatchEngine::default();
+        engine.assign(Some(&lazy));
+        assert!(engine.feed("a.c:1:2: boom", &watch, Some(&lazy)).is_none());
+        assert!(engine.feed("BUILD END", &watch, Some(&lazy)).is_none());
     }
 
     #[test]

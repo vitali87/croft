@@ -37892,22 +37892,28 @@ impl App {
             // a pane that is never rendered runs invisibly under a status line
             // saying it started.
             self.reveal_terminal_pane(idx);
+            // The matcher goes in before the command does: a watcher whose
+            // first cycle comes at once would otherwise be read with no
+            // matcher, and a launch parked on that cycle (#1541) never ends.
+            let uid = self.terminals[idx].uid();
+            self.assign_task_matcher(uid, matcher);
             self.terminals[idx].write_input(command.as_bytes());
             self.show_terminal = true;
             self.focus_pane(Pane::Terminal);
             self.status = format!("Running {}", task.label);
-            let uid = self.terminals[idx].uid();
             self.await_pane_outcome(uid, task.label);
-            self.assign_task_matcher(uid, matcher);
             return Some(uid);
         }
         match crate::widgets::terminal::PtyTerminal::new(&self.active_workspace_root()) {
             Ok(mut term) => {
                 term.set_manual_name(Some(pane_name));
-                term.write_input(command.as_bytes());
                 let uid = term.uid();
                 self.insert_terminal(term);
+                // Matcher first, then the command, as above.
                 self.assign_task_matcher(uid, matcher);
+                if let Some(t) = self.terminals.iter_mut().find(|t| t.uid() == uid) {
+                    t.write_input(command.as_bytes());
+                }
                 self.status = format!("Running {}", task.label);
                 self.await_pane_outcome(uid, task.label);
                 Some(uid)
