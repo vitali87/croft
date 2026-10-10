@@ -1,0 +1,1 @@
+fix: A watch task (`"isBackground": true`, such as `tsc --watch`) as a `preLaunchTask` now starts debugging once its first build ends with no errors, and leaves the watcher running. It used to wait for the task to exit, which a watcher never does.
