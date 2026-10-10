@@ -22,12 +22,12 @@ use std::path::{Path, PathBuf};
 
 use crate::iterm2::payloads as pl;
 
-/// `~/.config/ghostty/config` (XDG) and the macOS application-support config
-/// path Ghostty also reads. The XDG file wins when it already exists so croft
-/// edits the file the user is actually maintaining; otherwise the macOS-native
-/// location is created.
-const XDG_CONFIG_REL: &str = ".config/ghostty/config";
-const APP_SUPPORT_CONFIG_REL: &str = "Library/Application Support/com.mitchellh.ghostty/config";
+/// The folders Ghostty reads its config from, under `$XDG_CONFIG_HOME`
+/// (default `~/.config`) on every OS and, on macOS, under `~`, and the file
+/// names it reads in each, the current one first (#1439).
+const XDG_DIR: &str = "ghostty";
+const APP_SUPPORT_DIR: &str = "Library/Application Support/com.mitchellh.ghostty";
+const CONFIG_NAMES: [&str; 2] = ["config.ghostty", "config"];
 
 /// Marker lines that fence croft's managed keybind block inside the user's
 /// Ghostty config. Re-running setup replaces everything between them, leaving
@@ -236,22 +236,98 @@ pub fn install_keybinds(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the Ghostty config croft should edit: the XDG file when it already
-/// exists, otherwise the macOS application-support location.
+/// Resolve the Ghostty config croft should edit, from `HOME` and
+/// `XDG_CONFIG_HOME` (see [`config_path_in`]).
 pub fn default_config_path() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default();
-    let xdg = home.join(XDG_CONFIG_REL);
-    if xdg.exists() {
-        return xdg;
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    config_path_in(&home, xdg.as_deref(), cfg!(target_os = "macos"))
+}
+
+/// The Ghostty config to edit (#1439): the first that exists of
+/// `config.ghostty` then `config` in `$XDG_CONFIG_HOME/ghostty` (a relative
+/// or empty `XDG_CONFIG_HOME` is ignored, as the XDG spec says) and, on
+/// macOS, in `~/Library/Application Support/com.mitchellh.ghostty`. With
+/// none, a new `config` (the name every Ghostty version reads) in the
+/// application-support folder on macOS, else in the XDG folder. Checking
+/// one fixed path and falling back to the macOS one wrote, on Linux, a file
+/// Ghostty never reads.
+pub(crate) fn config_path_in(home: &Path, xdg_config_home: Option<&Path>, macos: bool) -> PathBuf {
+    let xdg = xdg_config_home
+        .filter(|p| p.is_absolute())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| home.join(".config"))
+        .join(XDG_DIR);
+    let mut dirs = vec![xdg.clone()];
+    if macos {
+        dirs.push(home.join(APP_SUPPORT_DIR));
     }
-    home.join(APP_SUPPORT_CONFIG_REL)
+    dirs.iter()
+        .flat_map(|dir| CONFIG_NAMES.iter().map(move |name| dir.join(name)))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| dirs.last().unwrap_or(&xdg).join("config"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1439: the config is looked for where Ghostty reads it, under either
+    /// file name and `XDG_CONFIG_HOME`.
+    #[test]
+    fn the_config_is_found_under_xdg_and_either_name() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path();
+        let put = |rel: &str| {
+            let p = home.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "font-size = 14\n").unwrap();
+            p
+        };
+        let named = put(".config/ghostty/config.ghostty");
+        for macos in [false, true] {
+            assert_eq!(config_path_in(home, None, macos), named);
+        }
+        // `config.ghostty` is preferred to a legacy `config` beside it.
+        put(".config/ghostty/config");
+        assert_eq!(config_path_in(home, None, false), named);
+        // XDG_CONFIG_HOME moves the folder.
+        let dots = put("dots/ghostty/config");
+        assert_eq!(config_path_in(home, Some(&home.join("dots")), false), dots);
+        // The XDG folder is read before Application Support on macOS.
+        let app = put("Library/Application Support/com.mitchellh.ghostty/config.ghostty");
+        assert_eq!(config_path_in(home, None, true), named);
+        std::fs::remove_dir_all(home.join(".config")).unwrap();
+        assert_eq!(config_path_in(home, None, true), app);
+    }
+
+    /// #1439: with no config yet, a new one goes where this OS's Ghostty
+    /// reads it; a Linux setup never creates `~/Library`.
+    #[test]
+    fn a_missing_config_is_created_where_this_os_reads_it() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path();
+        assert_eq!(
+            config_path_in(home, None, false),
+            home.join(".config/ghostty/config")
+        );
+        assert_eq!(
+            config_path_in(home, Some(&home.join("dots")), false),
+            home.join("dots/ghostty/config")
+        );
+        assert_eq!(
+            config_path_in(home, None, true),
+            home.join("Library/Application Support/com.mitchellh.ghostty/config")
+        );
+        // A relative XDG_CONFIG_HOME is not a base directory.
+        assert_eq!(
+            config_path_in(home, Some(Path::new("rel")), false),
+            home.join(".config/ghostty/config")
+        );
+        assert!(!home.join("Library").exists());
+    }
 
     #[test]
     fn user_keybinding_appends_a_forwarding_keybind_line() {
