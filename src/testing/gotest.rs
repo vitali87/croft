@@ -4,10 +4,11 @@
 //! event parsers, the `-run` selectors, and turning a Go cover profile into
 //! the LCOV the coverage view reads.
 //!
-//! A package is named by its directory relative to the module root (`.` for
-//! the root package, `./internal/db` below it), which is both what the tree
-//! shows and what `go test` takes as a package argument. A package outside
-//! the module (no `go.mod`, or a `go.work` sibling) keeps its import path,
+//! A package is named by its directory relative to the workspace root (`.`
+//! for the root package, `./internal/db` below it), which is both what the
+//! tree shows and what `go test` takes as a package argument. The root is a
+//! module (`go.mod`) or, with no `go.mod`, a `go.work` whose `use`d modules
+//! sit below it (#1505). A package outside them keeps its import path,
 //! which `go test` also accepts.
 
 use std::collections::BTreeMap;
@@ -30,14 +31,144 @@ pub fn module_path(root: &Path) -> Option<String> {
     })
 }
 
+/// The Go modules a workspace root holds: its own `go.mod`'s, or, when it
+/// has none, each module a root `go.work` `use`s (#1505). Each is its
+/// `module` path and its directory relative to the root (empty for the
+/// root itself).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Modules(Vec<(String, String)>);
+
+impl Modules {
+    pub fn of(root: &Path) -> Modules {
+        if let Some(m) = module_path(root) {
+            return Modules(vec![(m, String::new())]);
+        }
+        let Ok(work) = std::fs::read_to_string(root.join("go.work")) else {
+            return Modules::default();
+        };
+        Modules(
+            work_uses(&work)
+                .iter()
+                .filter_map(|dir| {
+                    let dir = below_root(dir)?;
+                    Some((module_path(&root.join(&dir))?, dir))
+                })
+                .collect(),
+        )
+    }
+
+    /// `args` with each `./...` (every package) spelled so `go test` takes
+    /// it at this root. A `go.work` root with no module of its own refuses
+    /// `./...` ("directory prefix . does not contain modules listed in
+    /// go.work"), so there it is one `./<module dir>/...` per module.
+    pub fn expand<S: AsRef<str>>(&self, args: &[S]) -> Vec<String> {
+        let whole_root = self.0.is_empty() || self.0.iter().any(|(_, dir)| dir.is_empty());
+        args.iter()
+            .flat_map(|a| match a.as_ref() {
+                "./..." if !whole_root => self
+                    .0
+                    .iter()
+                    .map(|(_, dir)| format!("./{dir}/..."))
+                    .collect::<Vec<_>>(),
+                a => vec![a.to_string()],
+            })
+            .collect()
+    }
+
+    /// The path below the root of import path `path` (a package, or a file
+    /// in one), from the innermost module that holds it: `""` for a
+    /// module at the root's own package. `None` outside every module.
+    fn relative(&self, path: &str) -> Option<String> {
+        self.0
+            .iter()
+            .filter_map(|(module, dir)| {
+                let rest = if path == module {
+                    ""
+                } else {
+                    path.strip_prefix(module.as_str())?.strip_prefix('/')?
+                };
+                Some((module.len(), dir, rest))
+            })
+            .max_by_key(|(len, _, _)| *len)
+            .map(|(_, dir, rest)| {
+                [dir.as_str(), rest]
+                    .iter()
+                    .filter(|p| !p.is_empty())
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+    }
+}
+
+/// The directories a `go.work` `use`s: `use ./a` lines and `use ( … )`
+/// blocks, comments dropped.
+fn work_uses(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut block = false;
+    for line in text.lines() {
+        let line = line.split("//").next().unwrap_or_default().trim();
+        if block {
+            match line.strip_prefix(')') {
+                Some(_) => block = false,
+                None if line.is_empty() => {}
+                None => out.push(line.trim_matches('"').to_string()),
+            }
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("use") else {
+            continue;
+        };
+        if !rest.starts_with([' ', '\t', '(']) {
+            continue;
+        }
+        let rest = rest.trim();
+        if let Some(inner) = rest.strip_prefix('(') {
+            match inner.strip_suffix(')') {
+                Some(one_line) => out.extend(
+                    one_line
+                        .split_whitespace()
+                        .map(|d| d.trim_matches('"').to_string()),
+                ),
+                None => {
+                    block = true;
+                    out.extend(
+                        inner
+                            .split_whitespace()
+                            .map(|d| d.trim_matches('"').to_string()),
+                    );
+                }
+            }
+        } else if !rest.is_empty() {
+            out.push(rest.trim_matches('"').to_string());
+        }
+    }
+    out
+}
+
+/// A `use` directory as a plain path below the root (`./svc/` is `svc`);
+/// `None` for one outside it, whose packages keep their import paths.
+fn below_root(dir: &str) -> Option<String> {
+    let path = Path::new(dir);
+    if path.is_absolute() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::Normal(p) => parts.push(p.to_str()?.to_string()),
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    Some(parts.join("/"))
+}
+
 /// The tree's name for the package at import path `pkg`.
-pub fn package_id(module: Option<&str>, pkg: &str) -> String {
-    match module {
-        Some(m) if pkg == m => String::from("."),
-        Some(m) => match pkg.strip_prefix(m).and_then(|r| r.strip_prefix('/')) {
-            Some(rest) => format!("./{rest}"),
-            None => pkg.to_string(),
-        },
+pub fn package_id(modules: &Modules, pkg: &str) -> String {
+    match modules.relative(pkg) {
+        Some(rel) if rel.is_empty() => String::from("."),
+        Some(rel) => format!("./{rel}"),
         None => pkg.to_string(),
     }
 }
@@ -69,7 +200,7 @@ fn event(line: &str) -> Option<Event> {
 
 /// A finished test from one `go test -json` line: `pass`, `fail` or `skip`
 /// for a named test. Package-level results and output are not cases.
-pub fn parse_event(module: Option<&str>, line: &str) -> Option<TestCase> {
+pub fn parse_event(modules: &Modules, line: &str) -> Option<TestCase> {
     let e = event(line)?;
     let status = match e.action.as_str() {
         "pass" => TestStatus::Passed,
@@ -79,7 +210,7 @@ pub fn parse_event(module: Option<&str>, line: &str) -> Option<TestCase> {
     };
     let test = e.test?;
     Some(TestCase {
-        name: format!("{}::{test}", package_id(module, &e.package)),
+        name: format!("{}::{test}", package_id(modules, &e.package)),
         status,
     })
 }
@@ -87,7 +218,7 @@ pub fn parse_event(module: Option<&str>, line: &str) -> Option<TestCase> {
 /// A test `go test -json -list .` names: its output lines that are a bare
 /// `Test…`, `Example…` or `Fuzz…` identifier. The `ok  pkg 0.1s` trailer
 /// and benchmarks (which a plain run skips) are not.
-pub fn parse_list_event(module: Option<&str>, line: &str) -> Option<String> {
+pub fn parse_list_event(modules: &Modules, line: &str) -> Option<String> {
     let e = event(line)?;
     if e.action != "output" {
         return None;
@@ -97,7 +228,7 @@ pub fn parse_list_event(module: Option<&str>, line: &str) -> Option<String> {
         .iter()
         .any(|p| name.starts_with(p));
     let ident = name.chars().all(|c| c.is_alphanumeric() || c == '_');
-    (runnable && ident).then(|| format!("{}::{name}", package_id(module, &e.package)))
+    (runnable && ident).then(|| format!("{}::{name}", package_id(modules, &e.package)))
 }
 
 /// What the OUTPUT channel shows for a `go test -json` line: the text the
@@ -159,10 +290,10 @@ pub fn test_binary_args(id: &str) -> Vec<String> {
 }
 
 /// Turn a Go cover profile into LCOV `DA:` records, paths relative to the
-/// module root. Each block's count applies to every line it spans; where
+/// workspace root. Each block's count applies to every line it spans; where
 /// blocks share a line, the line keeps the highest count. Files outside
 /// the module are left out: there is nothing in the workspace to paint.
-pub fn cover_profile_to_lcov(profile: &str, module: Option<&str>) -> String {
+pub fn cover_profile_to_lcov(profile: &str, modules: &Modules) -> String {
     let mut files: BTreeMap<String, BTreeMap<u32, u64>> = BTreeMap::new();
     for line in profile.lines().skip_while(|l| l.starts_with("mode:")) {
         // `import/path/file.go:3.24,4.13 1 1`
@@ -184,12 +315,8 @@ pub fn cover_profile_to_lcov(profile: &str, module: Option<&str>) -> String {
         let (Some(from), Some(to)) = (line_of(start), line_of(end)) else {
             continue;
         };
-        let rel = match module {
-            Some(m) => match file.strip_prefix(m).and_then(|r| r.strip_prefix('/')) {
-                Some(r) => r.to_string(),
-                None => continue,
-            },
-            None => continue,
+        let Some(rel) = modules.relative(file).filter(|r| !r.is_empty()) else {
+            continue;
         };
         let hits = files.entry(rel).or_default();
         for n in from..=to {
@@ -212,13 +339,15 @@ pub fn cover_profile_to_lcov(profile: &str, module: Option<&str>) -> String {
 mod tests {
     use super::*;
 
-    const M: Option<&str> = Some("example.com/m");
+    fn m() -> Modules {
+        Modules(vec![(String::from("example.com/m"), String::new())])
+    }
 
     #[test]
     fn go_json_events_become_cases_named_by_package_directory() {
         let pass = r#"{"Action":"pass","Package":"example.com/m/foo","Test":"TestAdd/small_one","Elapsed":0}"#;
         assert_eq!(
-            parse_event(M, pass),
+            parse_event(&m(), pass),
             Some(TestCase {
                 name: String::from("./foo::TestAdd/small_one"),
                 status: TestStatus::Passed,
@@ -226,11 +355,11 @@ mod tests {
         );
         let fail = r#"{"Action":"fail","Package":"example.com/m","Test":"TestRoot"}"#;
         assert_eq!(
-            parse_event(M, fail).map(|c| (c.name, c.status)),
+            parse_event(&m(), fail).map(|c| (c.name, c.status)),
             Some((String::from(".::TestRoot"), TestStatus::Failed))
         );
         let skip = r#"{"Action":"skip","Package":"example.com/m/foo","Test":"TestSkip"}"#;
-        assert_eq!(parse_event(M, skip).unwrap().status, TestStatus::Skipped);
+        assert_eq!(parse_event(&m(), skip).unwrap().status, TestStatus::Skipped);
         // A package's own result, a run marker and output are not cases.
         for line in [
             r#"{"Action":"fail","Package":"example.com/m/foo","Elapsed":0.003}"#,
@@ -238,12 +367,12 @@ mod tests {
             r#"{"Action":"output","Package":"example.com/m/foo","Test":"TestAdd","Output":"--- PASS\n"}"#,
             "# example.com/m/foo [build failed]",
         ] {
-            assert_eq!(parse_event(M, line), None, "{line}");
+            assert_eq!(parse_event(&m(), line), None, "{line}");
         }
         // Outside the module the import path stays.
         assert_eq!(
             parse_event(
-                M,
+                &m(),
                 r#"{"Action":"pass","Package":"other.org/x","Test":"TestX"}"#
             )
             .unwrap()
@@ -258,16 +387,16 @@ mod tests {
             format!(r#"{{"Action":"output","Package":"example.com/m/foo","Output":"{s}\n"}}"#)
         };
         assert_eq!(
-            parse_list_event(M, &out("TestAdd")).as_deref(),
+            parse_list_event(&m(), &out("TestAdd")).as_deref(),
             Some("./foo::TestAdd")
         );
         assert_eq!(
-            parse_list_event(M, &out("ExampleAdd")).as_deref(),
+            parse_list_event(&m(), &out("ExampleAdd")).as_deref(),
             Some("./foo::ExampleAdd")
         );
-        assert_eq!(parse_list_event(M, &out("BenchmarkAdd")), None);
+        assert_eq!(parse_list_event(&m(), &out("BenchmarkAdd")), None);
         assert_eq!(
-            parse_list_event(M, &out("ok  \\texample.com/m/foo\\t0.002s")),
+            parse_list_event(&m(), &out("ok  \\texample.com/m/foo\\t0.002s")),
             None
         );
     }
@@ -304,6 +433,92 @@ mod tests {
         assert_eq!(package_dir(d.path(), "other.org/x"), None);
     }
 
+    /// A `go.work` root with no module of its own: `lib` and `svc` (with an
+    /// `inner` package) below it, `tools` named on a `use` line of its own,
+    /// and a module outside the root.
+    fn go_work_root() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        let module = |dir: &str, path: &str| {
+            std::fs::create_dir_all(d.path().join(dir)).unwrap();
+            std::fs::write(
+                d.path().join(dir).join("go.mod"),
+                format!("module {path}\n\ngo 1.24\n"),
+            )
+            .unwrap();
+        };
+        module("lib", "example.com/lib");
+        module("svc", "\"example.com/svc\"");
+        module("tools", "example.com/tools");
+        std::fs::write(
+            d.path().join("go.work"),
+            "go 1.24\n\nuse (\n\t./lib // the library\n\t\"./svc/\"\n)\nuse ./tools\nuse ../elsewhere\n",
+        )
+        .unwrap();
+        d
+    }
+
+    /// #1505: a `go.work` root's packages are named by their directory,
+    /// as a module root's are, so the tree and `go test` agree.
+    #[test]
+    fn a_go_work_roots_packages_are_named_by_directory() {
+        let d = go_work_root();
+        let modules = Modules::of(d.path());
+        assert_eq!(
+            modules,
+            Modules(vec![
+                (String::from("example.com/lib"), String::from("lib")),
+                (String::from("example.com/svc"), String::from("svc")),
+                (String::from("example.com/tools"), String::from("tools")),
+            ])
+        );
+        assert_eq!(package_id(&modules, "example.com/lib"), "./lib");
+        assert_eq!(package_id(&modules, "example.com/svc/inner"), "./svc/inner");
+        assert_eq!(package_id(&modules, "example.com/svcx"), "example.com/svcx");
+        assert_eq!(package_id(&modules, "other.org/x"), "other.org/x");
+        let fail = r#"{"Action":"fail","Package":"example.com/svc","Test":"TestSvc"}"#;
+        assert_eq!(parse_event(&modules, fail).unwrap().name, "./svc::TestSvc");
+        assert_eq!(
+            package_dir(d.path(), "./svc/inner"),
+            Some(d.path().join("svc/inner"))
+        );
+        let profile = "mode: set\nexample.com/svc/inner/in.go:3.1,4.2 1 1\n";
+        assert_eq!(
+            cover_profile_to_lcov(profile, &modules),
+            "SF:svc/inner/in.go\nDA:3,1\nDA:4,1\nend_of_record\n"
+        );
+    }
+
+    /// #1505: `go test ./...` fails at a `go.work` root with no module of
+    /// its own, so "every package" is one pattern per module there.
+    #[test]
+    fn every_package_at_a_go_work_root_is_one_pattern_per_module() {
+        let d = go_work_root();
+        assert_eq!(
+            Modules::of(d.path()).expand(&["-list", ".", "./..."]),
+            ["-list", ".", "./lib/...", "./svc/...", "./tools/..."]
+        );
+        assert_eq!(
+            Modules::of(d.path()).expand(&["./svc", "-run", "^TestSvc$"]),
+            ["./svc", "-run", "^TestSvc$"],
+            "a single package is left as it is"
+        );
+    }
+
+    /// #1505, negative: a module root (with or without a `go.work` beside
+    /// it) and a root with neither keep `./...` and their ids.
+    #[test]
+    fn a_module_root_keeps_dot_dot_dot() {
+        let d = go_work_root();
+        std::fs::write(d.path().join("go.mod"), "module example.com/m\n").unwrap();
+        let modules = Modules::of(d.path());
+        assert_eq!(modules.expand(&["./..."]), ["./..."]);
+        assert_eq!(package_id(&modules, "example.com/m/foo"), "./foo");
+        assert_eq!(package_id(&modules, "example.com/lib"), "example.com/lib");
+        let none = tempfile::tempdir().unwrap();
+        assert_eq!(Modules::of(none.path()), Modules::default());
+        assert_eq!(Modules::of(none.path()).expand(&["./..."]), ["./..."]);
+    }
+
     #[test]
     fn a_cover_profile_becomes_lcov_line_hits() {
         let profile = "mode: set\n\
@@ -312,7 +527,7 @@ mod tests {
             example.com/m/foo/foo.go:7.2,7.14 1 1\n\
             other.org/x/x.go:1.1,2.2 1 1\n";
         assert_eq!(
-            cover_profile_to_lcov(profile, M),
+            cover_profile_to_lcov(profile, &m()),
             "SF:foo/foo.go\nDA:3,1\nDA:4,1\nDA:5,0\nDA:6,0\nDA:7,1\nend_of_record\n"
         );
     }

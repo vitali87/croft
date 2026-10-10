@@ -455,11 +455,13 @@ fn go_cmd<S: AsRef<std::ffi::OsStr>>(root: &Path, args: &[S]) -> Command {
 }
 
 /// Run `go test -json` and stream its finished tests, showing the text the
-/// tests printed (not the JSON events) in the OUTPUT channel.
-fn run_go<S: AsRef<std::ffi::OsStr>>(tx: &EpochTx, root: &Path, args: &[S]) -> Option<bool> {
-    let module = super::gotest::module_path(root);
-    run_streaming_shown(tx, go_cmd(root, args), super::gotest::shown, |line| {
-        super::gotest::parse_event(module.as_deref(), line)
+/// tests printed (not the JSON events) in the OUTPUT channel. `./...` is
+/// spelled for the root's modules (see [`super::gotest::Modules::expand`]).
+fn run_go<S: AsRef<str>>(tx: &EpochTx, root: &Path, args: &[S]) -> Option<bool> {
+    let modules = super::gotest::Modules::of(root);
+    let cmd = go_cmd(root, &modules.expand(args));
+    run_streaming_shown(tx, cmd, super::gotest::shown, |line| {
+        super::gotest::parse_event(&modules, line)
             .into_iter()
             .collect()
     })
@@ -1242,8 +1244,8 @@ fn run_coverage(root: &Path, tx: &EpochTx, scope: Option<&CoverageScope>) {
     .unwrap_or(false);
     let lcov = if runner == Runner::Go {
         std::fs::read_to_string(go_cover_profile(&dir)).map(|profile| {
-            let module = super::gotest::module_path(root);
-            super::gotest::cover_profile_to_lcov(&profile, module.as_deref())
+            let modules = super::gotest::Modules::of(root);
+            super::gotest::cover_profile_to_lcov(&profile, &modules)
         })
     } else {
         std::fs::read_to_string(coverage_report(&dir))
@@ -1414,10 +1416,10 @@ fn discover(root: &Path, tx: &EpochTx) {
         }
         // `go test -list` compiles each package's tests but runs none.
         Runner::Go => {
-            let module = super::gotest::module_path(root);
-            let cmd = go_cmd(root, &["-list", ".", "./..."]);
+            let modules = super::gotest::Modules::of(root);
+            let cmd = go_cmd(root, &modules.expand(&["-list", ".", "./..."]));
             run_streaming_shown(tx, cmd, super::gotest::shown, |line| {
-                super::gotest::parse_list_event(module.as_deref(), line)
+                super::gotest::parse_list_event(&modules, line)
                     .map(not_run)
                     .into_iter()
                     .collect()
@@ -2458,6 +2460,59 @@ mod tests {
             }
         }
         (cases, finished)
+    }
+
+    /// #1505, end to end with the real `go` when it is installed: a
+    /// `go.work` root lists every module's tests and Run All runs them.
+    #[test]
+    fn a_go_work_workspace_lists_and_runs_every_module() {
+        if Command::new(go_binary()).arg("version").output().is_err() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str, text: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        write("lib/go.mod", "module example.com/lib\n\ngo 1.21\n");
+        write(
+            "lib/lib_test.go",
+            "package lib\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {}\n",
+        );
+        write("svc/go.mod", "module example.com/svc\n\ngo 1.21\n");
+        write(
+            "svc/svc_test.go",
+            "package svc\n\nimport \"testing\"\n\nfunc TestSvc(t *testing.T) { t.Fatal(\"svc broken\") }\n",
+        );
+        write("go.work", "go 1.21\n\nuse (\n\t./lib\n\t./svc\n)\n");
+        let (mut listed, finished) = discovery_of(root);
+        listed.sort();
+        assert_eq!(listed, ["./lib::TestAdd", "./svc::TestSvc"], "{finished:?}");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let etx = EpochTx {
+            tx: &tx,
+            epoch: 0,
+            codeql: Path::new("codeql"),
+        };
+        run_all(root, &etx);
+        let mut ran: Vec<(String, TestStatus)> = rx
+            .try_iter()
+            .filter_map(|(_, r)| match r {
+                TestResponse::Case(c) => Some((c.name, c.status)),
+                _ => None,
+            })
+            .collect();
+        ran.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            ran,
+            [
+                (String::from("./lib::TestAdd"), TestStatus::Passed),
+                (String::from("./svc::TestSvc"), TestStatus::Failed),
+            ]
+        );
     }
 
     /// A JS project whose `runner` (`vitest` or `jest`) is the stand-in
