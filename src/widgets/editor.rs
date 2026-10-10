@@ -3066,6 +3066,10 @@ pub struct Editor {
     /// severity)`, recomputed from `diagnostics` whenever they or the buffer
     /// change. The render loop paints a coloured underline over each run.
     diagnostic_spans: Vec<Vec<(usize, usize, crate::lsp::manager::DiagnosticSeverity)>>,
+    /// Per-logical-line runs of tagged diagnostics `(start_char, end_char,
+    /// tags)` (#1522): Unnecessary code is drawn faded and Deprecated code
+    /// struck through, on top of (or, for a hint, instead of) an underline.
+    diagnostic_tag_spans: Vec<Vec<(usize, usize, crate::lsp::manager::DiagnosticTags)>>,
     /// Inlay hints for the loaded file, retained with their raw LSP UTF-16
     /// positions so `inlay_spans` can be re-decoded against the buffer after
     /// each edit. `inlay_path` guards a stale batch from annotating the wrong
@@ -3360,6 +3364,7 @@ impl Editor {
             diagnostics: Vec::new(),
             diagnostics_path: None,
             diagnostic_spans: Vec::new(),
+            diagnostic_tag_spans: Vec::new(),
             inlay_hints: Vec::new(),
             inlay_path: None,
             step_marks: Vec::new(),
@@ -6857,23 +6862,34 @@ impl Editor {
     /// switch. A zero-width diagnostic (e.g. a "missing token" pointing between
     /// two characters) is widened to one cell so it is still visible, matching
     /// VS Code drawing a squiggle under at least one character.
+    ///
+    /// Hints follow VS Code (#1522): a tagged hint (unused, unreachable,
+    /// deprecated) gets no underline, only its tag's look over the text, and
+    /// a plain hint is marked under its first two characters rather than
+    /// underlined end to end like a real problem.
     fn recompute_diagnostic_spans(&mut self) {
+        use crate::lsp::manager::DiagnosticSeverity;
         let same_file = self.diagnostics_path.as_deref() == self.path.as_deref();
         if !same_file || self.diagnostics.is_empty() {
             self.diagnostic_spans = Vec::new();
+            self.diagnostic_tag_spans = Vec::new();
             return;
         }
-        let mut spans: Vec<Vec<(usize, usize, crate::lsp::manager::DiagnosticSeverity)>> =
+        let mut spans: Vec<Vec<(usize, usize, DiagnosticSeverity)>> =
+            vec![Vec::new(); self.lines.len()];
+        let mut tag_spans: Vec<Vec<(usize, usize, crate::lsp::manager::DiagnosticTags)>> =
             vec![Vec::new(); self.lines.len()];
         for d in &self.diagnostics {
+            let hint = d.severity == DiagnosticSeverity::Hint;
             let start_line = d.start_line as usize;
             let end_line = d.end_line as usize;
             // Zip bounds the walk to the buffer, replacing the per-line
             // `lines.get` check a stale diagnostic range would otherwise need.
-            for (line, (text, line_spans)) in self
+            for (line, ((text, line_spans), line_tags)) in self
                 .lines
                 .iter()
                 .zip(spans.iter_mut())
+                .zip(tag_spans.iter_mut())
                 .enumerate()
                 .take(end_line + 1)
                 .skip(start_line)
@@ -6889,12 +6905,36 @@ impl Editor {
                 } else {
                     line_chars
                 };
+                // A zero-width tagged diagnostic gets its look on one
+                // character, like the one-cell squiggle below, so a tagged
+                // point hint is never left unmarked. At the end of a line
+                // there is no character to fade, so a hint falls through
+                // to its short underline instead.
+                let point = start_line == end_line && from == to;
+                let tag_to = if point {
+                    (from + 1).min(line_chars)
+                } else {
+                    to
+                };
+                if d.tags.any() && tag_to > from {
+                    line_tags.push((from, tag_to, d.tags));
+                }
+                if hint && d.tags.any() && (!point || tag_to > from) {
+                    continue;
+                }
                 // Widen an empty run to one cell so a point diagnostic is seen.
                 let to = to.max(from + 1);
+                if hint {
+                    if line == start_line {
+                        line_spans.push((from, to.min(from + 2), d.severity));
+                    }
+                    continue;
+                }
                 line_spans.push((from, to, d.severity));
             }
         }
         self.diagnostic_spans = spans;
+        self.diagnostic_tag_spans = tag_spans;
     }
 
     /// Re-decode the retained semantic-token batch against the current
@@ -15451,6 +15491,18 @@ impl Widget for &mut Editor {
                     );
                 }
             }
+            let empty_tags: Vec<(usize, usize, crate::lsp::manager::DiagnosticTags)> = Vec::new();
+            for &(sc, ec, tags) in self
+                .diagnostic_tag_spans
+                .get(line_idx)
+                .unwrap_or(&empty_tags)
+            {
+                let vs = (sc + ex(sc)).saturating_sub(row_start);
+                let ve = (ec + ex(ec.saturating_sub(1))).saturating_sub(row_start);
+                if ve > vs {
+                    paint_diagnostic_tags(buf, text_x, y, row_width, vs, ve, tags);
+                }
+            }
 
             // LSP occurrences of the symbol under the caret (word highlight):
             // painted before the find layer, the selection band, and the
@@ -16925,7 +16977,8 @@ fn paint_selection_band(
 
 /// Paint a coloured underline across `[start_char, end_char)` of a rendered
 /// row to mark an LSP diagnostic. The colour encodes severity, matching VS
-/// Code's palette (red error, yellow warning, teal info/hint). Uses the
+/// Code's palette (red error, yellow warning, blue info, faint grey for a
+/// hint's short marker). Uses the
 /// terminal's separate underline colour so the glyph's foreground (its syntax
 /// or semantic colour) is left untouched, the way VS Code's squiggle sits
 /// under unchanged text.
@@ -16944,9 +16997,8 @@ fn paint_diagnostic_underline(
     let color = match severity {
         DiagnosticSeverity::Error => theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c)),
         DiagnosticSeverity::Warning => theme.ui(Color::Rgb(0xcc, 0xa7, 0x00)),
-        DiagnosticSeverity::Information | DiagnosticSeverity::Hint => {
-            theme.ui(Color::Rgb(0x3b, 0x9e, 0xff))
-        }
+        DiagnosticSeverity::Information => theme.ui(Color::Rgb(0x3b, 0x9e, 0xff)),
+        DiagnosticSeverity::Hint => theme.ui(Color::Rgb(0x80, 0x80, 0x80)),
     };
     let s = start_char.min(text_width as usize);
     let e = end_char.min(text_width as usize);
@@ -16961,6 +17013,34 @@ fn paint_diagnostic_underline(
                 .add_modifier(Modifier::UNDERLINED)
                 .underline_color(color),
         );
+    }
+}
+
+/// Draw a tagged diagnostic's look across `[start_char, end_char)` of a
+/// rendered row (#1522): Unnecessary code (unused, unreachable) faded, as VS
+/// Code draws it at reduced opacity, and Deprecated code struck through. The
+/// glyphs keep their syntax colour.
+fn paint_diagnostic_tags(
+    buf: &mut Buffer,
+    text_x: u16,
+    y: u16,
+    text_width: u16,
+    start_char: usize,
+    end_char: usize,
+    tags: crate::lsp::manager::DiagnosticTags,
+) {
+    let mut look = Modifier::empty();
+    if tags.unnecessary {
+        look |= Modifier::DIM;
+    }
+    if tags.deprecated {
+        look |= Modifier::CROSSED_OUT;
+    }
+    let s = start_char.min(text_width as usize);
+    let e = end_char.min(text_width as usize);
+    for col in s..e {
+        let cell = &mut buf[(text_x + col as u16, y)];
+        cell.set_style(cell.style().add_modifier(look));
     }
 }
 
@@ -21054,6 +21134,7 @@ mod tests {
             end_char,
             severity,
             message: String::from("test diagnostic"),
+            tags: Default::default(),
         }
     }
 
@@ -21458,6 +21539,7 @@ mod tests {
                 end_char: 7,
                 severity: DiagnosticSeverity::Error,
                 message: String::from("Type 'number' is not assignable to type 'string'."),
+                tags: Default::default(),
             }],
         );
         assert_eq!(
@@ -21489,6 +21571,7 @@ mod tests {
                 end_char: 6,
                 severity: DiagnosticSeverity::Warning,
                 message: String::from("missing semicolon"),
+                tags: Default::default(),
             }],
         );
         assert_eq!(
@@ -21517,6 +21600,7 @@ mod tests {
                 end_char: 2,
                 severity: DiagnosticSeverity::Error,
                 message: String::from("unexpected token"),
+                tags: Default::default(),
             }],
         );
         assert_eq!(
@@ -21566,6 +21650,215 @@ mod tests {
             underlined[0].2, "x",
             "the underline must sit under the offending `x` glyph"
         );
+    }
+
+    /// Render `text` with `diags` applied and report, per cell of the first
+    /// text row, its glyph and the modifiers the diagnostics added (#1522).
+    fn diagnostic_looks(
+        text: &str,
+        diags: Vec<crate::lsp::manager::Diagnostic>,
+    ) -> Vec<(String, Modifier, Color)> {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 5,
+        };
+        let draw = |diags: Vec<crate::lsp::manager::Diagnostic>| {
+            let mut e = editor_with(text);
+            let p = std::path::PathBuf::from("/tmp/diag.ts");
+            e.path = Some(p.clone());
+            e.apply_diagnostics(p, diags);
+            e.focused = true;
+            let mut buf = ratatui::buffer::Buffer::empty(area);
+            (&mut e as &mut Editor).render(area, &mut buf);
+            buf
+        };
+        let plain = draw(Vec::new());
+        let marked = draw(diags);
+        let row = (0..area.height)
+            .find(|&y| {
+                let line: String = (0..area.width).map(|x| plain[(x, y)].symbol()).collect();
+                line.contains(text)
+            })
+            .expect("the text row is drawn");
+        (0..area.width)
+            .map(|x| {
+                let (was, now) = (&plain[(x, row)], &marked[(x, row)]);
+                (
+                    now.symbol().to_string(),
+                    now.modifier - was.modifier,
+                    now.underline_color,
+                )
+            })
+            .collect()
+    }
+
+    fn with_tags(
+        d: crate::lsp::manager::Diagnostic,
+        unnecessary: bool,
+        deprecated: bool,
+    ) -> crate::lsp::manager::Diagnostic {
+        crate::lsp::manager::Diagnostic {
+            tags: crate::lsp::manager::DiagnosticTags {
+                unnecessary,
+                deprecated,
+            },
+            ..d
+        }
+    }
+
+    fn glyphs_with(looks: &[(String, Modifier, Color)], m: Modifier) -> String {
+        looks
+            .iter()
+            .filter(|(_, added, _)| added.contains(m))
+            .map(|(g, _, _)| g.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn an_unnecessary_hint_is_faded_and_not_underlined() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let looks = diagnostic_looks(
+            "const tmp = 42;",
+            vec![with_tags(
+                diag(0, 6, 0, 9, DiagnosticSeverity::Hint),
+                true,
+                false,
+            )],
+        );
+        assert_eq!(glyphs_with(&looks, Modifier::DIM), "tmp", "{looks:?}");
+        assert_eq!(
+            glyphs_with(&looks, Modifier::UNDERLINED),
+            "",
+            "unused code is faded, never underlined like a problem"
+        );
+    }
+
+    #[test]
+    fn a_deprecated_warning_is_struck_through_and_keeps_its_underline() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let looks = diagnostic_looks(
+            "old(); fresh();",
+            vec![with_tags(
+                diag(0, 0, 0, 3, DiagnosticSeverity::Warning),
+                false,
+                true,
+            )],
+        );
+        assert_eq!(glyphs_with(&looks, Modifier::CROSSED_OUT), "old");
+        assert_eq!(glyphs_with(&looks, Modifier::UNDERLINED), "old");
+        assert_eq!(
+            glyphs_with(&looks, Modifier::DIM),
+            "",
+            "deprecated is not faded"
+        );
+    }
+
+    #[test]
+    fn a_plain_hint_is_marked_under_its_first_two_characters_in_grey() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let looks = diagnostic_looks(
+            "let total = add(a, b);",
+            vec![diag(0, 4, 0, 9, DiagnosticSeverity::Hint)],
+        );
+        assert_eq!(glyphs_with(&looks, Modifier::UNDERLINED), "to");
+        assert!(
+            looks
+                .iter()
+                .filter(|(_, added, _)| added.contains(Modifier::UNDERLINED))
+                .all(|(_, _, colour)| *colour == Color::Rgb(0x80, 0x80, 0x80)),
+            "a hint's marker is grey, not the information blue: {looks:?}"
+        );
+        assert_eq!(
+            glyphs_with(&looks, Modifier::DIM),
+            "",
+            "an untagged hint is not faded"
+        );
+    }
+
+    #[test]
+    fn errors_warnings_and_information_keep_their_full_underline_and_no_fade() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let looks = diagnostic_looks(
+            "bad; odd; note;",
+            vec![
+                diag(0, 0, 0, 3, DiagnosticSeverity::Error),
+                diag(0, 5, 0, 8, DiagnosticSeverity::Warning),
+                diag(0, 10, 0, 14, DiagnosticSeverity::Information),
+            ],
+        );
+        assert_eq!(glyphs_with(&looks, Modifier::UNDERLINED), "badoddnote");
+        assert_eq!(glyphs_with(&looks, Modifier::DIM), "");
+        assert_eq!(glyphs_with(&looks, Modifier::CROSSED_OUT), "");
+    }
+
+    #[test]
+    fn a_tagged_error_is_both_underlined_and_faded() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let looks = diagnostic_looks(
+            "import os",
+            vec![with_tags(
+                diag(0, 7, 0, 9, DiagnosticSeverity::Error),
+                true,
+                false,
+            )],
+        );
+        assert_eq!(glyphs_with(&looks, Modifier::UNDERLINED), "os");
+        assert_eq!(glyphs_with(&looks, Modifier::DIM), "os");
+    }
+
+    #[test]
+    fn a_zero_width_tagged_hint_is_still_marked() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let looks = diagnostic_looks(
+            "let tmp = 1;",
+            vec![with_tags(
+                diag(0, 4, 0, 4, DiagnosticSeverity::Hint),
+                true,
+                false,
+            )],
+        );
+        assert_eq!(glyphs_with(&looks, Modifier::DIM), "t", "{looks:?}");
+        assert_eq!(glyphs_with(&looks, Modifier::UNDERLINED), "");
+        // At the end of the line there is nothing to fade, so the hint keeps
+        // its short underline rather than vanishing.
+        let mut e = editor_with("let tmp = 1;");
+        let p = std::path::PathBuf::from("/tmp/diag.ts");
+        e.path = Some(p.clone());
+        e.apply_diagnostics(
+            p,
+            vec![with_tags(
+                diag(0, 12, 0, 12, DiagnosticSeverity::Hint),
+                false,
+                true,
+            )],
+        );
+        assert!(e.diagnostic_tag_spans[0].is_empty());
+        assert_eq!(e.diagnostic_spans_for_test()[0].len(), 1);
+    }
+
+    #[test]
+    fn a_multi_line_unnecessary_hint_fades_every_line_it_covers() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = editor_with("return 1;\nlog(\"never\");\ndone();");
+        let p = std::path::PathBuf::from("/tmp/diag.ts");
+        e.path = Some(p.clone());
+        e.apply_diagnostics(
+            p,
+            vec![with_tags(
+                diag(1, 0, 2, 7, DiagnosticSeverity::Hint),
+                true,
+                false,
+            )],
+        );
+        assert!(e.diagnostic_spans_for_test().iter().all(|l| l.is_empty()));
+        let tagged: Vec<_> = e
+            .diagnostic_tag_spans
+            .iter()
+            .map(|l| l.iter().map(|&(s, e, _)| (s, e)).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(tagged, vec![vec![], vec![(0, 13)], vec![(0, 7)]]);
     }
 
     #[test]

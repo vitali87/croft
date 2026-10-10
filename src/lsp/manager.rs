@@ -652,6 +652,23 @@ pub struct Diagnostic {
     pub end_char: u32,
     pub severity: DiagnosticSeverity,
     pub message: String,
+    pub tags: DiagnosticTags,
+}
+
+/// The LSP `DiagnosticTag`s croft draws (#1522). Servers tag unused names
+/// and unreachable code `Unnecessary`, which the editor fades instead of
+/// underlining, and `Deprecated` API, which it strikes through.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiagnosticTags {
+    pub unnecessary: bool,
+    pub deprecated: bool,
+}
+
+impl DiagnosticTags {
+    /// Whether the diagnostic carries a tag the editor draws on the text.
+    pub fn any(self) -> bool {
+        self.unnecessary || self.deprecated
+    }
 }
 
 /// A fresh, COMPLETE set of diagnostics for one document from one server,
@@ -5757,8 +5774,9 @@ fn code_action_items(resp: &CodeActionResponse, server: &str) -> Vec<CodeActionI
 }
 
 /// Re-materialise one of croft's normalised diagnostics into the LSP wire type
-/// so it can ride along as `codeAction` context. We carry range, severity, and
-/// message (the fields croft keeps); the server matches its fixes by range.
+/// so it can ride along as `codeAction` context. We carry range, severity,
+/// message and tags (the fields croft keeps); the server matches its fixes by
+/// range.
 fn to_lsp_diagnostic(d: &Diagnostic) -> lsp_types::Diagnostic {
     let severity = match d.severity {
         DiagnosticSeverity::Error => lsp_types::DiagnosticSeverity::ERROR,
@@ -5779,6 +5797,16 @@ fn to_lsp_diagnostic(d: &Diagnostic) -> lsp_types::Diagnostic {
         },
         severity: Some(severity),
         message: d.message.clone(),
+        tags: d.tags.any().then(|| {
+            let mut tags = Vec::new();
+            if d.tags.unnecessary {
+                tags.push(lsp_types::DiagnosticTag::UNNECESSARY);
+            }
+            if d.tags.deprecated {
+                tags.push(lsp_types::DiagnosticTag::DEPRECATED);
+            }
+            tags
+        }),
         ..Default::default()
     }
 }
@@ -7220,8 +7248,16 @@ fn build_client_capabilities() -> ClientCapabilities {
             // `textDocument/publishDiagnostics` on the client advertising this
             // (ty and ruff push regardless, but vtsls stays silent without it);
             // declaring it is what every real LSP client (VS Code, Neovim) does.
+            // `tagSupport` (#1522): servers that check it before tagging
+            // unused or deprecated code would otherwise leave the tag out.
             publish_diagnostics: Some(PublishDiagnosticsClientCapabilities {
                 related_information: Some(true),
+                tag_support: Some(lsp_types::TagSupport {
+                    value_set: vec![
+                        lsp_types::DiagnosticTag::UNNECESSARY,
+                        lsp_types::DiagnosticTag::DEPRECATED,
+                    ],
+                }),
                 ..Default::default()
             }),
             // Advertise rich code-action support. Without codeActionLiteralSupport
@@ -8750,6 +8786,50 @@ while True:
                 .refresh_support,
             Some(true),
             "refreshSupport is what lets a server ask for a re-pull"
+        );
+    }
+
+    #[test]
+    fn client_capabilities_offer_the_unnecessary_and_deprecated_tags() {
+        let caps = build_client_capabilities();
+        let publish = caps
+            .text_document
+            .and_then(|td| td.publish_diagnostics)
+            .expect("publishDiagnostics must be declared");
+        assert_eq!(
+            publish.tag_support.map(|t| t.value_set),
+            Some(vec![
+                lsp_types::DiagnosticTag::UNNECESSARY,
+                lsp_types::DiagnosticTag::DEPRECATED,
+            ]),
+            "a server that checks tagSupport would otherwise leave the tags out"
+        );
+    }
+
+    #[test]
+    fn a_tagged_diagnostic_rides_back_to_code_actions_with_its_tags() {
+        let d = |tags: DiagnosticTags| Diagnostic {
+            start_line: 3,
+            start_char: 4,
+            end_line: 3,
+            end_char: 7,
+            severity: DiagnosticSeverity::Hint,
+            message: "`tmp` is declared but its value is never read.".into(),
+            tags,
+        };
+        let unused = to_lsp_diagnostic(&d(DiagnosticTags {
+            unnecessary: true,
+            deprecated: false,
+        }));
+        assert_eq!(
+            unused.tags,
+            Some(vec![lsp_types::DiagnosticTag::UNNECESSARY]),
+            "the server matches \"Remove unused declaration\" against the tag"
+        );
+        assert_eq!(
+            to_lsp_diagnostic(&d(DiagnosticTags::default())).tags,
+            None,
+            "an untagged diagnostic sends no tags field"
         );
     }
 

@@ -10609,7 +10609,13 @@ impl App {
             let mut items: Vec<ProblemItem> = Vec::new();
             if let Some(by_server) = self.lsp_diagnostics.get(path) {
                 for (server, diags) in by_server {
-                    for d in diags {
+                    // Hints (unused names, unreachable code) stay in the
+                    // editor and its hover, out of the list and its count,
+                    // as in VS Code (#1522).
+                    let shown = diags
+                        .iter()
+                        .filter(|d| d.severity != crate::lsp::manager::DiagnosticSeverity::Hint);
+                    for d in shown {
                         items.push(ProblemItem {
                             line: d.start_line,
                             col: d.start_char,
@@ -10622,7 +10628,14 @@ impl App {
                 }
             }
             if let Some(build) = self.build_diagnostics.get(path) {
-                items.extend(build.iter().map(|(_, item)| item.clone()));
+                // A task matcher can emit `hint` too; same rule (#1522).
+                items.extend(
+                    build
+                        .iter()
+                        .map(|(_, item)| item)
+                        .filter(|i| i.severity != crate::lsp::manager::DiagnosticSeverity::Hint)
+                        .cloned(),
+                );
             }
             if items.is_empty() {
                 continue;
