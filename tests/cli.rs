@@ -1716,3 +1716,28 @@ fn a_live_croft_still_gets_the_plan() {
         "pick 1234567 one\n"
     );
 }
+
+/// #1439: off macOS, `setup-ghostty` refuses instead of writing a macOS
+/// path Ghostty never reads there and reporting success.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn setup_ghostty_refuses_off_macos_and_writes_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join(".config/ghostty/config.ghostty");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "font-size = 14\n").unwrap();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .args(["setup-ghostty", "-y"])
+        .env("HOME", home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("macOS-only"), "stderr was: {stderr}");
+    assert!(!home.path().join("Library").exists());
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        "font-size = 14\n"
+    );
+}
