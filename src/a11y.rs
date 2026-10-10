@@ -28,7 +28,7 @@ pub struct Snapshot {
 }
 
 /// The longest line text read out; beyond this a reader drones.
-const MAX_LINE: usize = 160;
+pub const MAX_LINE: usize = 160;
 
 fn clip(s: &str) -> String {
     let s = s.trim();

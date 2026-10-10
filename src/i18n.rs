@@ -230,6 +230,21 @@ pub const TRANSLATABLE: &[&str] = &[
     "Testing",
     "Unpin",
     "Untitled",
+    "Any key dismisses. D, don't show again",
+    "Enter or Y, replace. Escape, cancel",
+    "Escape, cancel",
+    "Every keystroke and paste will go to",
+    "Files are rewritten on disk",
+    "N or Escape, no",
+    "No matching setting",
+    "Settings, writing to user",
+    "Settings, writing to workspace",
+    "This URL will open in YOUR LOCAL MAC's browser via the croft relay.",
+    "This will undo the change hunk under the cursor on disk.",
+    "Y, yes once. A, always for this session",
+    "at",
+    "in pane",
+    "terminal panes at once",
 ];
 
 /// A JSON template for translating into `lang`: every palette title, every
