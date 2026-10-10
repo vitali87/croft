@@ -1102,7 +1102,7 @@ SVG file-preview rasterisation: `usvg` parse plus `resvg` render into a PNG that
 
 ### tasks.rs
 
-Auto-detected project tasks. It reads the manifests the repo already has — `.vscode/tasks.json` with JSONC tolerated, Makefile, justfile, `package.json` with a lockfile-matched runner, `Cargo.toml`, `pyproject.toml` with the runner its project uses (uv, Poetry, PDM or the project venv) — into runnable `Task` commands, backing "Tasks: Run Task" and the Cmd+Shift+B default build. A `tasks.json` `isDefault` outranks the first build task.
+Auto-detected project tasks. It reads the manifests the repo already has — `.vscode/tasks.json` with JSONC tolerated, Makefile, justfile, `package.json` with a lockfile-matched runner, `Cargo.toml`, `pyproject.toml` with the runner its project uses (uv, Poetry, PDM or the project venv) — into runnable `Task` commands, backing "Tasks: Run Task" and the Cmd+Shift+B default build. A `tasks.json` `isDefault` outranks the first build task. As in VS Code, the file's top-level `options` sit under every task's own (the task's `cwd` wins, `env` maps merge key by key), a task with no `command` runs the top-level `command` and `args`, and a `{ "value", "quoting" }` command or argument stays one shell word quoted as it asks (`strong`, `weak` or `escape`).
 
 **Terminal-pane reuse is strict about the directory.** Each task runs in a named terminal pane that is reused only while its shell sits idle at EXACTLY the task's directory; a shell that has cd'd into a subdirectory is not reused. Where the platform cannot report a cwd at all (Android, a remote pane's ssh process), reuse falls back to the pane's name alone. The cwd is kernel-reported, and the write clears a half-typed prompt line first.
 
