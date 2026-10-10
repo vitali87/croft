@@ -8,8 +8,10 @@
 //! for the root package, `./internal/db` below it), which is both what the
 //! tree shows and what `go test` takes as a package argument. The root is a
 //! module (`go.mod`) or, with no `go.mod`, a `go.work` whose `use`d modules
-//! sit below it (#1505). A package outside them keeps its import path,
-//! which `go test` also accepts.
+//! it lists (#1505). A package of a module `use`d from outside the root
+//! (`use ../service`) is named by its path from the root
+//! (`../service/inner`), which `go test` takes too. A package outside
+//! every module keeps its import path, which `go test` also accepts.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -26,7 +28,9 @@ pub fn module_path(root: &Path) -> Option<String> {
         if !rest.starts_with(char::is_whitespace) {
             return None;
         }
-        let m = rest.trim().trim_matches('"');
+        // A trailing `// comment` is not part of the path.
+        let m = rest.split("//").next().unwrap_or_default().trim();
+        let m = m.trim_matches(|c| c == '"' || c == '`');
         (!m.is_empty()).then(|| m.to_string())
     })
 }
@@ -34,7 +38,8 @@ pub fn module_path(root: &Path) -> Option<String> {
 /// The Go modules a workspace root holds: its own `go.mod`'s, or, when it
 /// has none, each module a root `go.work` `use`s (#1505). Each is its
 /// `module` path and its directory relative to the root (empty for the
-/// root itself).
+/// root itself, `../service` for a module beside it, or an absolute
+/// path).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Modules(Vec<(String, String)>);
 
@@ -50,7 +55,7 @@ impl Modules {
             work_uses(&work)
                 .iter()
                 .filter_map(|dir| {
-                    let dir = below_root(dir)?;
+                    let dir = from_root(dir)?;
                     Some((module_path(&root.join(&dir))?, dir))
                 })
                 .collect(),
@@ -60,7 +65,8 @@ impl Modules {
     /// `args` with each `./...` (every package) spelled so `go test` takes
     /// it at this root. A `go.work` root with no module of its own refuses
     /// `./...` ("directory prefix . does not contain modules listed in
-    /// go.work"), so there it is one `./<module dir>/...` per module.
+    /// go.work"), so there it is one `<module dir>/...` per module
+    /// (`./lib/...`, `../service/...`).
     pub fn expand<S: AsRef<str>>(&self, args: &[S]) -> Vec<String> {
         let whole_root = self.0.is_empty() || self.0.iter().any(|(_, dir)| dir.is_empty());
         args.iter()
@@ -68,7 +74,7 @@ impl Modules {
                 "./..." if !whole_root => self
                     .0
                     .iter()
-                    .map(|(_, dir)| format!("./{dir}/..."))
+                    .map(|(_, dir)| format!("{}/...", dir_arg(dir)))
                     .collect::<Vec<_>>(),
                 a => vec![a.to_string()],
             })
@@ -146,37 +152,66 @@ fn work_uses(text: &str) -> Vec<String> {
     out
 }
 
-/// A `use` directory as a plain path below the root (`./svc/` is `svc`);
-/// `None` for one outside it, whose packages keep their import paths.
-fn below_root(dir: &str) -> Option<String> {
+/// A `use` directory as a plain path from the root: `./svc/` is `svc`,
+/// `./a/../../service` is `../service`, an absolute path stays absolute.
+fn from_root(dir: &str) -> Option<String> {
     let path = Path::new(dir);
     if path.is_absolute() {
-        return None;
+        let s = path.to_str()?.trim_end_matches('/');
+        return Some(if s.is_empty() {
+            String::from("/")
+        } else {
+            s.to_string()
+        });
     }
-    let mut parts = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
     for part in path.components() {
         match part {
             std::path::Component::Normal(p) => parts.push(p.to_str()?.to_string()),
             std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if parts.last().is_some_and(|p| p != "..") {
+                    parts.pop();
+                } else {
+                    parts.push(String::from(".."));
+                }
+            }
             _ => return None,
         }
     }
     Some(parts.join("/"))
 }
 
+/// Whether a path from the root already reads as one to `go test` (it
+/// leaves the root or is absolute), so it takes no `./` prefix.
+fn outside_root(path: &str) -> bool {
+    path == ".." || path.starts_with("../") || Path::new(path).is_absolute()
+}
+
+/// A path from the root spelled as a `go test` package argument.
+fn dir_arg(path: &str) -> String {
+    if outside_root(path) {
+        path.to_string()
+    } else {
+        format!("./{path}")
+    }
+}
+
 /// The tree's name for the package at import path `pkg`.
 pub fn package_id(modules: &Modules, pkg: &str) -> String {
     match modules.relative(pkg) {
         Some(rel) if rel.is_empty() => String::from("."),
-        Some(rel) => format!("./{rel}"),
+        Some(rel) => dir_arg(&rel),
         None => pkg.to_string(),
     }
 }
 
-/// The directory of a package id, when it is one of the module's own.
+/// The directory of a package id, when it is one of the workspace's own
+/// (below the root, or a `go.work` module beside or outside it).
 pub fn package_dir(root: &Path, package: &str) -> Option<PathBuf> {
     match package {
         "." => Some(root.to_path_buf()),
+        p if outside_root(p) => Some(root.join(p)),
         p => p.strip_prefix("./").map(|rest| root.join(rest)),
     }
 }
@@ -517,6 +552,96 @@ mod tests {
         let none = tempfile::tempdir().unwrap();
         assert_eq!(Modules::of(none.path()), Modules::default());
         assert_eq!(Modules::of(none.path()).expand(&["./..."]), ["./..."]);
+    }
+
+    /// #1505: a `go.work` may `use` modules beside or outside its root
+    /// (`use ../service`, an absolute path). They are kept, named by their
+    /// path from the root, and "every package" reaches them too.
+    #[test]
+    fn go_work_modules_outside_the_root_are_kept() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = d.path().join("ws");
+        let module = |dir: &Path, path: &str| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("go.mod"), format!("module {path}\n")).unwrap();
+        };
+        module(&d.path().join("service"), "example.com/service");
+        module(&d.path().join("abs"), "example.com/abs");
+        let abs = d.path().join("abs");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("go.work"), "go 1.24\n\nuse ../service/\n").unwrap();
+        // Every module outside the root: `./...` must not survive.
+        let modules = Modules::of(&ws);
+        assert_eq!(
+            modules,
+            Modules(vec![(
+                String::from("example.com/service"),
+                String::from("../service")
+            )])
+        );
+        assert_eq!(modules.expand(&["./..."]), ["../service/..."]);
+        assert_eq!(package_id(&modules, "example.com/service"), "../service");
+        assert_eq!(
+            package_id(&modules, "example.com/service/inner"),
+            "../service/inner"
+        );
+        let pass = r#"{"Action":"pass","Package":"example.com/service/inner","Test":"TestIn"}"#;
+        let id = parse_event(&modules, pass).unwrap().name;
+        assert_eq!(id, "../service/inner::TestIn");
+        assert_eq!(one_args(&id), ["../service/inner", "-run", "^TestIn$"]);
+        assert_eq!(
+            package_dir(&ws, "../service/inner"),
+            Some(ws.join("../service/inner"))
+        );
+        let profile = "mode: set\nexample.com/service/inner/in.go:3.1,3.9 1 2\n";
+        let lcov = cover_profile_to_lcov(profile, &modules);
+        assert_eq!(lcov, "SF:../service/inner/in.go\nDA:3,2\nend_of_record\n");
+        // Mixed with one below the root and one by absolute path.
+        module(&ws.join("lib"), "example.com/lib");
+        std::fs::write(
+            ws.join("go.work"),
+            format!(
+                "go 1.24\n\nuse (\n\t./lib\n\t./lib/../../service\n\t\"{}\"\n)\n",
+                abs.display()
+            ),
+        )
+        .unwrap();
+        let modules = Modules::of(&ws);
+        let abs = abs.to_str().unwrap().to_string();
+        assert_eq!(
+            modules.expand(&["./..."]),
+            [
+                String::from("./lib/..."),
+                String::from("../service/..."),
+                format!("{abs}/..."),
+            ]
+        );
+        assert_eq!(
+            package_id(&modules, "example.com/abs/x"),
+            format!("{abs}/x")
+        );
+        assert_eq!(
+            package_dir(&ws, &format!("{abs}/x")),
+            Some(Path::new(&abs).join("x"))
+        );
+    }
+
+    /// A `module` line's trailing comment is not part of the path.
+    #[test]
+    fn a_commented_module_directive_keeps_only_the_path() {
+        let d = tempfile::tempdir().unwrap();
+        for text in [
+            "module example.com/service // owner note\n",
+            "module \"example.com/service\" // owner note\n",
+            "module example.com/service//note\n",
+        ] {
+            std::fs::write(d.path().join("go.mod"), text).unwrap();
+            assert_eq!(
+                module_path(d.path()).as_deref(),
+                Some("example.com/service"),
+                "{text}"
+            );
+        }
     }
 
     #[test]
