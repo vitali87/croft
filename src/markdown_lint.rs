@@ -224,6 +224,7 @@ fn diag(
         end_char: end_char as u32,
         severity,
         message: message.to_string(),
+        tags: Default::default(),
     }
 }
 

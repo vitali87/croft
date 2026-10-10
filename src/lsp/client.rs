@@ -289,6 +289,7 @@ pub(crate) fn convert_diagnostic(d: &lsp_types::Diagnostic) -> Diagnostic {
         Some(LspDiagnosticSeverity::HINT) => DiagnosticSeverity::Hint,
         _ => DiagnosticSeverity::Error,
     };
+    let tagged = |tag| d.tags.as_ref().is_some_and(|tags| tags.contains(&tag));
     Diagnostic {
         start_line: d.range.start.line,
         start_char: d.range.start.character,
@@ -296,6 +297,10 @@ pub(crate) fn convert_diagnostic(d: &lsp_types::Diagnostic) -> Diagnostic {
         end_char: d.range.end.character,
         severity,
         message: d.message.clone(),
+        tags: crate::lsp::manager::DiagnosticTags {
+            unnecessary: tagged(lsp_types::DiagnosticTag::UNNECESSARY),
+            deprecated: tagged(lsp_types::DiagnosticTag::DEPRECATED),
+        },
     }
 }
 
@@ -1752,6 +1757,41 @@ mod tests {
             DiagnosticSeverity::Error,
             "an unclassified problem is shown as an error, not silently dropped"
         );
+    }
+
+    #[test]
+    fn convert_diagnostic_keeps_the_unnecessary_and_deprecated_tags() {
+        let wire = |tags: Option<Vec<lsp_types::DiagnosticTag>>| lsp_types::Diagnostic {
+            severity: Some(LspDiagnosticSeverity::HINT),
+            message: "`ctx` is unused".into(),
+            tags,
+            ..Default::default()
+        };
+        let unused = convert_diagnostic(&wire(Some(vec![lsp_types::DiagnosticTag::UNNECESSARY])));
+        assert_eq!(unused.severity, DiagnosticSeverity::Hint);
+        assert!(unused.tags.unnecessary && !unused.tags.deprecated);
+        let old = convert_diagnostic(&wire(Some(vec![lsp_types::DiagnosticTag::DEPRECATED])));
+        assert!(old.tags.deprecated && !old.tags.unnecessary);
+        let both = convert_diagnostic(&wire(Some(vec![
+            lsp_types::DiagnosticTag::DEPRECATED,
+            lsp_types::DiagnosticTag::UNNECESSARY,
+        ])));
+        assert!(both.tags.deprecated && both.tags.unnecessary);
+    }
+
+    #[test]
+    fn convert_diagnostic_without_tags_or_with_unknown_ones_is_untagged() {
+        let wire = |tags: Option<Vec<lsp_types::DiagnosticTag>>| lsp_types::Diagnostic {
+            severity: Some(LspDiagnosticSeverity::ERROR),
+            message: "type error".into(),
+            tags,
+            ..Default::default()
+        };
+        assert!(!convert_diagnostic(&wire(None)).tags.any());
+        assert!(!convert_diagnostic(&wire(Some(Vec::new()))).tags.any());
+        let unknown: lsp_types::DiagnosticTag =
+            serde_json::from_value(serde_json::json!(7)).unwrap();
+        assert!(!convert_diagnostic(&wire(Some(vec![unknown]))).tags.any());
     }
 
     #[test]

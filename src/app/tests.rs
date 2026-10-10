@@ -1726,6 +1726,7 @@ fn hovering_a_diagnostic_on_punctuation_shows_its_message_synchronously() {
             end_char: 2,
             severity: DiagnosticSeverity::Error,
             message: String::from("unexpected token"),
+            tags: Default::default(),
         }],
     );
     // text_x = x(0) + gutter(2) + 1 = 3, so cell col 4 is char 1 (the `.`).
@@ -30208,6 +30209,7 @@ fn diag(
         end_char,
         severity,
         message: String::from("test"),
+        tags: Default::default(),
     }
 }
 
@@ -31689,6 +31691,7 @@ fn typing_in_the_problems_panel_filters_and_esc_clears_before_leaving() {
                 end_char: 1,
                 severity: DiagnosticSeverity::Error,
                 message: String::from("mismatched types"),
+                tags: Default::default(),
             },
             Diagnostic {
                 start_line: 2,
@@ -31697,6 +31700,7 @@ fn typing_in_the_problems_panel_filters_and_esc_clears_before_leaving() {
                 end_char: 6,
                 severity: DiagnosticSeverity::Warning,
                 message: String::from("function `run` is never used"),
+                tags: Default::default(),
             },
         ],
     );
@@ -31747,6 +31751,7 @@ fn clicking_a_problem_row_opens_that_file_at_the_line() {
             end_char: 6,
             severity: DiagnosticSeverity::Warning,
             message: String::from("function `run` is never used"),
+            tags: Default::default(),
         }],
     );
     app.lsp_diagnostics.insert(file.clone(), by_server);
@@ -31765,6 +31770,86 @@ fn clicking_a_problem_row_opens_that_file_at_the_line() {
         "clicking the row opens the file",
     );
     assert_eq!(app.editor.cursor_row, 2, "and jumps to the diagnostic line");
+}
+
+/// #1522: unused names and unreachable code come as hints; like VS Code,
+/// the PROBLEMS list and its count leave them out, while the editor (its
+/// hover and quick fixes) still has them.
+#[test]
+fn hints_stay_out_of_the_problems_list_and_its_count() {
+    use crate::lsp::manager::{Diagnostic, DiagnosticSeverity, DiagnosticTags};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let a = tmp.path().join("a.ts");
+    let unused = DiagnosticTags {
+        unnecessary: true,
+        deprecated: false,
+    };
+    let mut by_server = std::collections::HashMap::new();
+    by_server.insert(
+        String::from("vtsls"),
+        vec![
+            diag(0, 1, DiagnosticSeverity::Error),
+            Diagnostic {
+                tags: unused,
+                ..diag(2, 5, DiagnosticSeverity::Hint)
+            },
+            diag(6, 9, DiagnosticSeverity::Hint),
+            diag(10, 12, DiagnosticSeverity::Warning),
+        ],
+    );
+    app.lsp_diagnostics.insert(a.clone(), by_server);
+    app.rebuild_problems();
+    assert_eq!(
+        app.problems.total_count(),
+        2,
+        "only the error and the warning count"
+    );
+    let listed: Vec<DiagnosticSeverity> = app
+        .problems
+        .groups()
+        .iter()
+        .flat_map(|g| g.items.iter().map(|i| i.severity))
+        .collect();
+    assert_eq!(
+        listed,
+        vec![DiagnosticSeverity::Error, DiagnosticSeverity::Warning]
+    );
+    assert_eq!(
+        app.merged_diagnostics(&a).len(),
+        4,
+        "the editor still gets every hint, for its hover and Ctrl+."
+    );
+}
+
+/// #1522, negative: a file with nothing but hints has no PROBLEMS group,
+/// while information diagnostics are still listed.
+#[test]
+fn a_file_with_only_hints_has_no_problems_group_but_information_is_listed() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let hints = tmp.path().join("hints.py");
+    let info = tmp.path().join("info.py");
+    let mut h = std::collections::HashMap::new();
+    h.insert(
+        String::from("ty"),
+        vec![
+            diag(0, 3, DiagnosticSeverity::Hint),
+            diag(4, 7, DiagnosticSeverity::Hint),
+        ],
+    );
+    app.lsp_diagnostics.insert(hints, h);
+    let mut i = std::collections::HashMap::new();
+    i.insert(
+        String::from("ty"),
+        vec![diag(0, 3, DiagnosticSeverity::Information)],
+    );
+    app.lsp_diagnostics.insert(info.clone(), i);
+    app.rebuild_problems();
+    let paths: Vec<&std::path::PathBuf> = app.problems.groups().iter().map(|g| &g.path).collect();
+    assert_eq!(paths, vec![&info]);
+    assert_eq!(app.problems.total_count(), 1);
 }
 
 #[test]
@@ -49577,6 +49662,7 @@ fn fix_with_navigator_lands_on_the_diagnostic_and_refuses_without_a_seat() {
             end_char: 11,
             severity: DiagnosticSeverity::Warning,
             message: String::from("unused import: `std::io`"),
+            tags: Default::default(),
         }],
     );
     app.lsp_diagnostics.insert(file.clone(), by_server);
@@ -62390,6 +62476,7 @@ fn a_proposals_diagnostics_show_in_the_popup_not_the_buffer() {
             end_char: 18,
             severity: crate::lsp::manager::DiagnosticSeverity::Error,
             message: "Undefined name `nope_undefined`".into(),
+            tags: Default::default(),
         }],
     }]);
     assert!(
