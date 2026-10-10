@@ -10628,7 +10628,14 @@ impl App {
                 }
             }
             if let Some(build) = self.build_diagnostics.get(path) {
-                items.extend(build.iter().map(|(_, item)| item.clone()));
+                // A task matcher can emit `hint` too; same rule (#1522).
+                items.extend(
+                    build
+                        .iter()
+                        .map(|(_, item)| item)
+                        .filter(|i| i.severity != crate::lsp::manager::DiagnosticSeverity::Hint)
+                        .cloned(),
+                );
             }
             if items.is_empty() {
                 continue;

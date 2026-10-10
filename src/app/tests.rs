@@ -31822,6 +31822,45 @@ fn hints_stay_out_of_the_problems_list_and_its_count() {
     );
 }
 
+/// #1522: a task or terminal problem matcher can emit `hint` severity too;
+/// those build rows stay out of the PROBLEMS list and its count as well.
+#[test]
+fn task_matcher_hints_stay_out_of_the_problems_list_and_its_count() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    use crate::widgets::problems::ProblemItem;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let a = tmp.path().join("a.rs");
+    let row = |line: u32, severity: DiagnosticSeverity| ProblemItem {
+        line,
+        col: 0,
+        col_utf16: false,
+        severity,
+        message: String::from("m"),
+        source: String::from("task"),
+    };
+    app.build_diagnostics.insert(
+        a.clone(),
+        vec![
+            (1, row(0, DiagnosticSeverity::Hint)),
+            (1, row(1, DiagnosticSeverity::Warning)),
+        ],
+    );
+    app.build_diagnostics.insert(
+        tmp.path().join("only_hints.rs"),
+        vec![(1, row(0, DiagnosticSeverity::Hint))],
+    );
+    app.rebuild_problems();
+    assert_eq!(app.problems.total_count(), 1, "only the warning counts");
+    let listed: Vec<(&std::path::PathBuf, DiagnosticSeverity)> = app
+        .problems
+        .groups()
+        .iter()
+        .flat_map(|g| g.items.iter().map(move |i| (&g.path, i.severity)))
+        .collect();
+    assert_eq!(listed, vec![(&a, DiagnosticSeverity::Warning)]);
+}
+
 /// #1522, negative: a file with nothing but hints has no PROBLEMS group,
 /// while information diagnostics are still listed.
 #[test]

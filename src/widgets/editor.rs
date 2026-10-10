@@ -6905,10 +6905,21 @@ impl Editor {
                 } else {
                     line_chars
                 };
-                if d.tags.any() && to > from {
-                    line_tags.push((from, to, d.tags));
+                // A zero-width tagged diagnostic gets its look on one
+                // character, like the one-cell squiggle below, so a tagged
+                // point hint is never left unmarked. At the end of a line
+                // there is no character to fade, so a hint falls through
+                // to its short underline instead.
+                let point = start_line == end_line && from == to;
+                let tag_to = if point {
+                    (from + 1).min(line_chars)
+                } else {
+                    to
+                };
+                if d.tags.any() && tag_to > from {
+                    line_tags.push((from, tag_to, d.tags));
                 }
-                if hint && d.tags.any() {
+                if hint && d.tags.any() && (!point || tag_to > from) {
                     continue;
                 }
                 // Widen an empty run to one cell so a point diagnostic is seen.
@@ -21795,6 +21806,36 @@ mod tests {
         );
         assert_eq!(glyphs_with(&looks, Modifier::UNDERLINED), "os");
         assert_eq!(glyphs_with(&looks, Modifier::DIM), "os");
+    }
+
+    #[test]
+    fn a_zero_width_tagged_hint_is_still_marked() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let looks = diagnostic_looks(
+            "let tmp = 1;",
+            vec![with_tags(
+                diag(0, 4, 0, 4, DiagnosticSeverity::Hint),
+                true,
+                false,
+            )],
+        );
+        assert_eq!(glyphs_with(&looks, Modifier::DIM), "t", "{looks:?}");
+        assert_eq!(glyphs_with(&looks, Modifier::UNDERLINED), "");
+        // At the end of the line there is nothing to fade, so the hint keeps
+        // its short underline rather than vanishing.
+        let mut e = editor_with("let tmp = 1;");
+        let p = std::path::PathBuf::from("/tmp/diag.ts");
+        e.path = Some(p.clone());
+        e.apply_diagnostics(
+            p,
+            vec![with_tags(
+                diag(0, 12, 0, 12, DiagnosticSeverity::Hint),
+                false,
+                true,
+            )],
+        );
+        assert!(e.diagnostic_tag_spans[0].is_empty());
+        assert_eq!(e.diagnostic_spans_for_test()[0].len(), 1);
     }
 
     #[test]
