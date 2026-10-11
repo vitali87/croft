@@ -1529,30 +1529,25 @@ impl PtyTerminal {
     /// next, read under the same lock: redaction joins wrapped rows, since a
     /// secret split across two rows matches neither on its own.
     pub fn grid_lines_wrapped(&self) -> (Vec<String>, Vec<bool>, i32) {
+        grid_rows_wrapped(&self.term.lock())
+    }
+
+    /// The grid as find's logical lines: soft-wrapped rows joined, so a
+    /// match the pane's width cut in two is found (#1275). See
+    /// [`join_wrapped_rows`].
+    pub fn find_lines(&self) -> Vec<FindLine> {
+        let (lines, wraps, top) = self.grid_lines_wrapped();
+        join_wrapped_rows(lines, &wraps, top)
+    }
+
+    /// [`Self::find_lines`] plus the scroll-clock reading, captured under
+    /// ONE term lock. Terminal find stamps its match anchor with the clock;
+    /// separate reads would let output land between them and mis-pair a
+    /// line with a reading it wasn't captured at.
+    pub fn find_lines_and_clock(&self) -> (Vec<FindLine>, i64) {
         let term = self.term.lock();
-        if term.columns() == 0 {
-            return (Vec::new(), Vec::new(), 0);
-        }
-        let top = term.grid().topmost_line().0;
-        let bottom = term.screen_lines() as i32 - 1;
-        let mut lines = Vec::new();
-        let mut wraps = Vec::new();
-        let mut l = top;
-        while l <= bottom {
-            let (s, _cols) = row_text_and_cols(&term, l);
-            // A wrapped row keeps its trailing blanks: a space in its last
-            // column separates words of the logical line (`Bearer ` then the
-            // token), and trimming it glued them so a redact rule missed.
-            let wraps_on = l < bottom && row_wraps(&term, l);
-            lines.push(if wraps_on {
-                s
-            } else {
-                s.trim_end().to_string()
-            });
-            wraps.push(wraps_on);
-            l += 1;
-        }
-        (lines, wraps, top)
+        let (lines, wraps, top) = grid_rows_wrapped(&term);
+        (join_wrapped_rows(lines, &wraps, top), self.clock_now(&term))
     }
 
     /// Every readable grid row as `(plain, coloured)`: the plain text
@@ -1605,27 +1600,6 @@ impl PtyTerminal {
         (rows, cursor)
     }
 
-    /// [`Self::grid_lines`] plus the scroll-clock reading, captured under
-    /// ONE term lock. Terminal find stamps its match anchor with the clock;
-    /// separate reads would let output land between them and mis-pair a
-    /// line with a reading it wasn't captured at.
-    pub fn grid_lines_and_clock(&self) -> (Vec<String>, i32, i64) {
-        let term = self.term.lock();
-        if term.columns() == 0 {
-            return (Vec::new(), 0, self.clock_now(&term));
-        }
-        let top = term.grid().topmost_line().0;
-        let bottom = term.screen_lines() as i32 - 1;
-        let mut lines = Vec::new();
-        let mut l = top;
-        while l <= bottom {
-            let (s, _cols) = row_text_and_cols(&term, l);
-            lines.push(s.trim_end().to_string());
-            l += 1;
-        }
-        (lines, top, self.clock_now(&term))
-    }
-
     /// The OSC 8 hyperlink URI stored under viewport cell `(row, col)`, if
     /// any. Hyperlinked cells carry the URI invisibly; the app's
     /// Cmd/Ctrl+click handler checks this before the plain-text URL regex.
@@ -1652,9 +1626,11 @@ impl PtyTerminal {
     }
 
     /// Mark which occurrence is the active match `(abs_line, col, len)` so the
-    /// render loop paints it in the brighter accent. `clock` is the
+    /// render loop paints it in the brighter accent. `abs_line` is the first
+    /// row of the match's logical line and `col` a char index into it (see
+    /// [`FindLine`]). `clock` is the
     /// scroll-clock reading the line was captured against (the
-    /// [`Self::grid_lines_and_clock`] snapshot); the render re-bases per
+    /// [`Self::find_lines_and_clock`] snapshot); the render re-bases per
     /// frame so the highlight follows its text through streaming output.
     pub fn set_current_match(&mut self, m: Option<(i32, usize, usize)>, clock: i64) {
         self.current_match = m.map(|(line, col, len)| (clock, line, col, len));
@@ -4466,6 +4442,13 @@ impl Drop for PtyTerminal {
 /// neighbours joined, at most 64 rows either way) and the char offset of
 /// that row's text within it, both in `row_text_and_cols` terms.
 pub fn logical_row_text(term: &Term<VoidListener>, line_idx: i32) -> (String, usize) {
+    let (joined, offset, _start) = logical_row_span(term, line_idx);
+    (joined, offset)
+}
+
+/// [`logical_row_text`] plus the absolute grid line the logical line starts
+/// on, which names a find match (see [`FindLine::start`]).
+pub fn logical_row_span(term: &Term<VoidListener>, line_idx: i32) -> (String, usize, i32) {
     const REACH: i32 = 64;
     let top = term.grid().topmost_line().0;
     let bottom = term.screen_lines() as i32 - 1;
@@ -4486,7 +4469,85 @@ pub fn logical_row_text(term: &Term<VoidListener>, line_idx: i32) -> (String, us
         }
         joined.push_str(&s);
     }
-    (joined, offset)
+    (joined, offset, start)
+}
+
+/// Every grid row from the top of the scrollback, with its soft-wrap flag
+/// and the absolute line of row 0: see [`PtyTerminal::grid_lines_wrapped`].
+fn grid_rows_wrapped(term: &Term<VoidListener>) -> (Vec<String>, Vec<bool>, i32) {
+    if term.columns() == 0 {
+        return (Vec::new(), Vec::new(), 0);
+    }
+    let top = term.grid().topmost_line().0;
+    let bottom = term.screen_lines() as i32 - 1;
+    let mut lines = Vec::new();
+    let mut wraps = Vec::new();
+    let mut l = top;
+    while l <= bottom {
+        let (s, _cols) = row_text_and_cols(term, l);
+        // A wrapped row keeps its trailing blanks: a space in its last
+        // column separates words of the logical line (`Bearer ` then the
+        // token), and trimming it glued them so a redact rule missed.
+        let wraps_on = l < bottom && row_wraps(term, l);
+        lines.push(if wraps_on {
+            s
+        } else {
+            s.trim_end().to_string()
+        });
+        wraps.push(wraps_on);
+        l += 1;
+    }
+    (lines, wraps, top)
+}
+
+/// One logical line of terminal output as find sees it: a run of rows the
+/// pane soft-wrapped, joined back into the text that was printed (#1275).
+/// A match position is a char index into `text`; `start` is the absolute
+/// grid line of its first row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindLine {
+    pub text: String,
+    pub start: i32,
+    /// Chars per row, in order, so a position maps back to its row.
+    pub row_lens: Vec<usize>,
+}
+
+impl FindLine {
+    /// The absolute grid line holding char `col` of this logical line.
+    pub fn line_of(&self, col: usize) -> i32 {
+        let mut seen = 0;
+        for (i, len) in self.row_lens.iter().enumerate() {
+            seen += len;
+            if col < seen {
+                return self.start + i as i32;
+            }
+        }
+        self.start + self.row_lens.len().saturating_sub(1) as i32
+    }
+}
+
+/// Join each run of rows whose wrap flag is set into one [`FindLine`]. A
+/// row without the flag ends its line, so rows that merely sit next to each
+/// other are never searched as one.
+pub fn join_wrapped_rows(lines: Vec<String>, wraps: &[bool], top: i32) -> Vec<FindLine> {
+    let mut out: Vec<FindLine> = Vec::new();
+    let mut continues = false;
+    for (i, row) in lines.into_iter().enumerate() {
+        let len = row.chars().count();
+        match out.last_mut() {
+            Some(line) if continues => {
+                line.text.push_str(&row);
+                line.row_lens.push(len);
+            }
+            _ => out.push(FindLine {
+                text: row,
+                start: top + i as i32,
+                row_lens: vec![len],
+            }),
+        }
+        continues = wraps.get(i).copied().unwrap_or(false);
+    }
+    out
 }
 
 /// Grid rows from `top` to the bottom of the screen as `(plain, coloured,
@@ -5338,14 +5399,24 @@ impl Widget for &mut PtyTerminal {
             // (the same text the find bar searched); the colmap translates
             // them back to grid columns. 0 = no match, 1 = match, 2 = active.
             let row_line_idx = (y as i32) - (display_offset as i32);
+            //
+            // Matches are found on the logical line, as the find bar counts
+            // them, and each paints the part that falls on this row: a match
+            // the soft wrap cut in two lights up on both rows (#1275).
             let row_paint: Option<Vec<u8>> = self.search_needle.as_deref().map(|needle| {
                 let (text, colmap) = row_text_and_cols(&term, row_line_idx);
+                let (logical, offset, start) = logical_row_span(&term, row_line_idx);
+                let row_len = text.chars().count();
                 let mut paint = vec![0u8; cols as usize];
                 for (mc, ml) in
-                    crate::widgets::editor_find::line_matches(&text, self.search_opts, needle)
+                    crate::widgets::editor_find::line_matches(&logical, self.search_opts, needle)
                 {
-                    let active = active_match == Some((row_line_idx, mc, ml));
-                    for k in mc..mc + ml {
+                    let (lo, hi) = (mc.max(offset), (mc + ml).min(offset + row_len));
+                    if lo >= hi {
+                        continue;
+                    }
+                    let active = active_match == Some((start, mc, ml));
+                    for k in lo - offset..hi - offset {
                         if let Some(&col) = colmap.get(k) {
                             paint[col] = if active { 2 } else { 1 };
                         }
@@ -6341,6 +6412,36 @@ mod tests {
         let set = crate::triggers::TriggerSet::default().with_builtin_redactions();
         let masked = crate::triggers::mask_rows(&lines, &wraps, &set).concat();
         assert!(!masked.contains("c2lnbmF0dXJl"), "{masked}");
+    }
+
+    /// Find's logical lines join only rows that soft-wrap, and a position
+    /// maps back to the row that shows it, which is where the jump scrolls
+    /// (#1275).
+    #[test]
+    fn find_lines_join_wrapped_rows_and_map_a_position_to_its_row() {
+        let rows = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let lines = join_wrapped_rows(
+            rows(&["abc", "def", "gh", "solo", "x"]),
+            &[true, true, false, false, false],
+            -3,
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .map(|l| (l.text.as_str(), l.start))
+                .collect::<Vec<_>>(),
+            vec![("abcdefgh", -3), ("solo", 0), ("x", 1)]
+        );
+        assert_eq!(lines[0].row_lens, vec![3, 3, 2]);
+        assert_eq!(lines[0].line_of(0), -3);
+        assert_eq!(lines[0].line_of(3), -2);
+        assert_eq!(lines[0].line_of(7), -1);
+        assert_eq!(
+            lines[0].line_of(99),
+            -1,
+            "past the end stays on the last row"
+        );
+        assert_eq!(lines[1].line_of(2), 0);
     }
 
     #[test]
