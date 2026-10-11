@@ -131,7 +131,7 @@ The collapse is also held off whenever something else on screen depends on the s
 
 **Language server features**
 
-Completion, signature help / parameter hints, hover, go-to-definition, rename (prepare-rename validated, server placeholder pre-filled), formatting (whole document and Format Selection), quick fixes / code actions, and diagnostics, plus:
+Completion, signature help / parameter hints, hover, go-to-definition, rename (prepare-rename validated, server placeholder pre-filled; a server that has not answered prepare-rename within two seconds gets the word-under-cursor prompt instead), formatting (whole document and Format Selection), quick fixes / code actions, and diagnostics, plus:
 
 * Linked editing — editing one HTML/JSX tag renames its pair live via `textDocument/linkedEditingRange`.
 * Color swatches (`textDocument/documentColor`): a `■` in the value's color spliced before `#rrggbb`/`rgb()` literals, with a "Change Color Presentation" picker to rewrite the spelling.
