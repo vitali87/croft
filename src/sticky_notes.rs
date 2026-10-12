@@ -261,6 +261,45 @@ impl Notes {
     }
 }
 
+/// Merge every store under `old` into the store of the same name under
+/// `new` and remove it (#1578 review): how a launch takes over the notes an
+/// older croft keeps in the cache. Merged note by note, not one file picked
+/// over the other: an older window still open goes on writing its copy to
+/// the cache while this version writes to the state directory, and each
+/// may hold notes the other lacks. The old store's lock is held throughout,
+/// so an older croft saving meanwhile is not lost; it writes a fresh cache
+/// store that the next launch merges in. Lock files and anything that is
+/// not a store are left for the caller. Best-effort: a store that cannot
+/// be merged stays where it is.
+pub fn merge_stores(old: &Path, new: &Path) {
+    let Ok(entries) = std::fs::read_dir(old) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let from = entry.path();
+        if from.extension().is_none_or(|x| x != "json")
+            || !entry.file_type().is_ok_and(|t| t.is_file())
+        {
+            continue;
+        }
+        let Ok(lock) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(from.with_extension("json.lock"))
+        else {
+            continue;
+        };
+        if lock.lock().is_err() {
+            continue;
+        }
+        let mut notes = Notes::load(&from);
+        if notes.save(&new.join(entry.file_name())).is_ok() {
+            let _ = std::fs::remove_file(&from);
+        }
+    }
+}
+
 /// The notes in the store at `path`; none when it does not exist. A store
 /// that does not parse is moved aside to `.bak` first, so the next save
 /// writes a fresh file instead of replacing the only copy of those notes.
@@ -280,6 +319,40 @@ fn read_store(path: &Path) -> Vec<Note> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1578 review: an older window still writing its notes to the cache
+    /// and a newer one writing to the state directory each hold notes the
+    /// other lacks; taking over the cache store merges the two note by
+    /// note, the higher revision winning, instead of keeping one file.
+    #[test]
+    fn taking_over_the_cache_store_merges_it_with_the_state_store() {
+        let cache = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let old = cache.path().join("notes");
+        let new = state.path().join("notes");
+        let mut legacy = Notes::load(&old.join("n.json"));
+        let shared = legacy.add("ann", "f.rs", 1, "x", "v1");
+        let only_old = legacy.add("ann", "f.rs", 2, "y", "old only");
+        let mut current = Notes::load(&new.join("n.json"));
+        current.merge(shared.clone());
+        current.update(&shared.id, |n| n.body = "v2".into());
+        let only_new = current.add("bob", "g.rs", 3, "z", "new only");
+        current.save(&new.join("n.json")).unwrap();
+        legacy.save(&old.join("n.json")).unwrap();
+
+        merge_stores(&old, &new);
+        let merged = Notes::load(&new.join("n.json"));
+        assert_eq!(merged.get(&shared.id).unwrap().body, "v2");
+        assert!(merged.get(&only_old.id).is_some());
+        assert!(merged.get(&only_new.id).is_some());
+        assert!(!old.join("n.json").exists(), "the cache store is gone");
+
+        // Negative: nothing under the cache merges nothing and creates
+        // nothing.
+        let nowhere = state.path().join("never");
+        merge_stores(&cache.path().join("missing"), &nowhere);
+        assert!(!nowhere.exists());
+    }
 
     #[test]
     fn two_windows_saving_keep_each_others_notes_and_a_bad_store_is_kept() {
