@@ -39233,6 +39233,12 @@ fn collab_solo_apps_bootstrap_edit_and_gate_saves() {
         "guest gets a hint, got: {}",
         guest.status
     );
+    // Nor does File: Save with Sudo (#1379).
+    let panes = guest.terminals.len();
+    guest.run_command(crate::widgets::command_palette::Command::SaveWithSudo);
+    assert_eq!(guest.terminals.len(), panes);
+    assert!(guest.pending_sudo_saves.is_empty());
+    assert!(guest.status.contains("owner saves"), "{}", guest.status);
 
     // The owner writes the converged text.
     owner.save();
@@ -81177,8 +81183,13 @@ fn a_save_refused_for_permission_offers_sudo_and_the_next_press_stages_it() {
         app.focus == Pane::Terminal,
         "sudo's password prompt has the keys"
     );
+    let pending: Vec<_> = app
+        .pending_sudo_saves
+        .iter()
+        .map(|(p, bytes, _)| (p.clone(), bytes.clone()))
+        .collect();
     assert_eq!(
-        app.pending_sudo_saves,
+        pending,
         vec![(f.clone(), b"#127.0.0.1 localhost\n".to_vec())]
     );
     assert!(
@@ -81210,6 +81221,76 @@ fn a_sudo_save_waits_while_the_file_holds_anything_else() {
     app.reload_open_file_after_external_change();
     assert!(app.editor.dirty, "another write is not this save");
     assert_eq!(app.pending_sudo_saves.len(), 1, "still waiting on tee");
+}
+
+#[test]
+fn a_sudo_save_over_an_external_change_asks_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "hosts", "a\n");
+    let f = tmp.path().join("hosts");
+    app.editor.insert_char('b');
+    std::fs::write(&f, "someone else's longer line\n").unwrap();
+    let panes = app.terminals.len();
+    app.run_command(crate::widgets::command_palette::Command::SaveWithSudo);
+    assert_eq!(app.terminals.len(), panes, "nothing staged yet");
+    assert!(app.pending_sudo_saves.is_empty());
+    assert!(app.editor.disk_conflict);
+    assert!(
+        app.status.contains("changed on disk") && app.status.contains("Cmd+S again"),
+        "{}",
+        app.status
+    );
+    app.save();
+    assert_eq!(
+        app.terminals.len(),
+        panes + 1,
+        "the second press overwrites"
+    );
+    assert_eq!(app.pending_sudo_saves.len(), 1);
+}
+
+#[test]
+fn a_second_sudo_save_waits_for_the_first_ones_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "hosts", "a\n");
+    app.editor.insert_char('b');
+    app.run_command(crate::widgets::command_palette::Command::SaveWithSudo);
+    let panes = app.terminals.len();
+    let first = app.pending_sudo_saves.clone();
+    assert_eq!(first.len(), 1);
+    app.focus_pane(Pane::Editor);
+    app.editor.insert_char('c');
+    app.run_command(crate::widgets::command_palette::Command::SaveWithSudo);
+    assert_eq!(app.terminals.len(), panes, "no second sudo prompt");
+    assert_eq!(app.pending_sudo_saves, first);
+    assert!(app.status.contains("still waiting"), "{}", app.status);
+    // Closing that terminal ends its command; a new save may start.
+    let pane = first[0].2;
+    let idx = app
+        .terminals
+        .iter()
+        .position(|t| t.shell_pid() == pane)
+        .unwrap();
+    app.close_terminal_at(idx);
+    app.run_command(crate::widgets::command_palette::Command::SaveWithSudo);
+    assert_eq!(app.pending_sudo_saves.len(), 1);
+    assert_eq!(app.pending_sudo_saves[0].1, b"bca\n".to_vec());
+}
+
+#[test]
+fn a_finished_sudo_save_runs_the_usual_save_follow_ups() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "hosts", "a\n");
+    app.history_root = hist.path().to_path_buf();
+    let f = tmp.path().join("hosts");
+    app.editor.insert_char('b');
+    app.run_command(crate::widgets::command_palette::Command::SaveWithSudo);
+    std::fs::write(&f, "ba\n").unwrap();
+    assert!(app.reload_open_file_after_external_change());
+    let snaps = wait_for_snapshots(&app.history_root, &f);
+    assert_eq!(snaps.len(), 1, "a sudo save records a snapshot");
+    assert_eq!(std::fs::read_to_string(&snaps[0].file).unwrap(), "ba\n");
 }
 
 #[test]

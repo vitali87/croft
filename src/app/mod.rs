@@ -3256,7 +3256,7 @@ pub struct App {
     sudo_save_armed: Option<PathBuf>,
     /// Saves handed to `sudo tee` in a terminal pane (#1379): each file and
     /// the bytes it should end up holding, settled once it holds them.
-    pending_sudo_saves: Vec<(PathBuf, Vec<u8>)>,
+    pending_sudo_saves: Vec<(PathBuf, Vec<u8>, Option<i32>)>,
     pub terminals: Vec<PtyTerminal>,
     pub active_terminal: usize,
     perf: PerfHud,
@@ -59206,18 +59206,7 @@ impl App {
         // link down, reconnect pending): with nobody to defer to, blocking
         // strands the offline work in RAM for the whole outage. And when
         // the owner left (#1147): there is nobody to save for this guest.
-        if self.is_collab_guest()
-            && self
-                .editor
-                .path
-                .as_ref()
-                .and_then(|p| collab_file_key(&self.tree.root, p))
-                .is_some_and(|file| {
-                    self.collab
-                        .as_ref()
-                        .is_some_and(|s| !s.is_local_only(&file) && !s.owner_gone())
-                })
-        {
+        if self.owner_saves_active_file() {
             self.status =
                 String::from("Shared file: the session owner saves (your edits are already live)");
             return;
@@ -59908,6 +59897,22 @@ impl App {
         );
     }
 
+    /// Whether the active tab is a collab-shared file this guest must leave
+    /// to the session owner to write (see `save`).
+    fn owner_saves_active_file(&self) -> bool {
+        self.is_collab_guest()
+            && self
+                .editor
+                .path
+                .as_ref()
+                .and_then(|p| collab_file_key(&self.tree.root, p))
+                .is_some_and(|file| {
+                    self.collab
+                        .as_ref()
+                        .is_some_and(|s| !s.is_local_only(&file) && !s.owner_gone())
+                })
+    }
+
     /// Report a failed explicit save. One that failed for want of
     /// permission offers the sudo route on the next Cmd+S (#1379): saving
     /// again as the same user could only fail again.
@@ -59931,6 +59936,14 @@ impl App {
     /// it, and `tee` writes the file in place, so it keeps its owner and
     /// mode. The tab turns clean once the file holds the buffer's bytes.
     fn save_with_sudo(&mut self) {
+        // A consent to overwrite an external change lasts one press, as in
+        // `save`.
+        let overwrite = std::mem::take(&mut self.force_save_armed);
+        if self.owner_saves_active_file() {
+            self.status =
+                String::from("Shared file: the session owner saves (your edits are already live)");
+            return;
+        }
         if self.editor.has_non_text_view() {
             self.status = String::from("Save with Sudo works on text tabs");
             return;
@@ -59951,6 +59964,33 @@ impl App {
             );
             return;
         };
+        // Another process wrote the file since it was read: overwriting
+        // that takes the same press-again consent a plain save asks for.
+        if !overwrite && (self.editor.disk_conflict || self.editor.disk_changed_externally()) {
+            self.editor.disk_conflict = true;
+            self.force_save_armed = true;
+            self.sudo_save_armed = Some(path.clone());
+            self.status = format!(
+                "{} changed on disk since you opened it - press Cmd+S again to overwrite it with sudo, or close the tab to keep the disk version",
+                self.status_path(&path)
+            );
+            return;
+        }
+        // A sudo save of this file still waiting in its terminal could
+        // finish after this one and put the older bytes back.
+        if self
+            .pending_sudo_saves
+            .iter()
+            .find(|(p, ..)| *p == path)
+            .and_then(|(.., pane)| *pane)
+            .is_some_and(|pane| self.terminals.iter().any(|t| t.shell_pid() == Some(pane)))
+        {
+            self.status = format!(
+                "A sudo save of {} is still waiting in its terminal: finish it there, or close that terminal first",
+                self.status_path(&path)
+            );
+            return;
+        }
         let Some(bytes) = self.editor.prepare_bytes_for_save() else {
             self.status = format!(
                 "Not saved: {} can't hold every character in this file - switch encoding via the status bar",
@@ -59970,6 +60010,7 @@ impl App {
         match PtyTerminal::new(&cwd) {
             Ok(mut term) => {
                 term.set_manual_name(Some(String::from("sudo save")));
+                let pane = term.shell_pid();
                 // Tests stop short of running sudo for real.
                 if !cfg!(test) {
                     term.write_input(format!("{command}\r").as_bytes());
@@ -59978,8 +60019,8 @@ impl App {
                 self.show_terminal = true;
                 self.bottom_panel_tab = BottomPanelTab::Terminal;
                 self.focus_pane(Pane::Terminal);
-                self.pending_sudo_saves.retain(|(p, _)| *p != path);
-                self.pending_sudo_saves.push((path.clone(), bytes));
+                self.pending_sudo_saves.retain(|(p, ..)| *p != path);
+                self.pending_sudo_saves.push((path.clone(), bytes, pane));
                 self.status = format!(
                     "Saving {} with sudo: enter your password in the terminal",
                     self.status_path(&path)
@@ -60003,27 +60044,44 @@ impl App {
             return false;
         }
         let mut saved = Vec::new();
-        for (path, bytes) in std::mem::take(&mut self.pending_sudo_saves) {
+        for (path, bytes, pane) in std::mem::take(&mut self.pending_sudo_saves) {
             let mut open = false;
-            let mut settled = false;
+            let mut settled = None;
             for e in std::iter::once(&mut self.editor)
                 .chain(self.editor_layout.inactive_groups_mut())
                 .flat_map(|g| g.editors.iter_mut())
                 .filter(|e| e.path.as_ref() == Some(&path))
             {
                 open = true;
-                settled |= e.settle_save_made_elsewhere(&bytes);
+                if e.settle_save_made_elsewhere(&bytes) && settled.is_none() {
+                    settled = Some((
+                        e.provenance_to_record(),
+                        e.bytes_for_disk(),
+                        e.lines.join("\n"),
+                    ));
+                }
             }
-            if settled {
-                saved.push(path);
+            if let Some((seats, described, text)) = settled {
+                saved.push((path, seats, described, text));
             } else if open {
-                self.pending_sudo_saves.push((path, bytes));
+                self.pending_sudo_saves.push((path, bytes, pane));
             }
         }
-        if let Some(path) = saved.last() {
-            self.status = format!("Saved {} with sudo", self.status_path(path));
+        let Some(last) = saved.last().map(|(path, ..)| path.clone()) else {
+            return false;
+        };
+        // Set first: a reloaded config file reports on itself.
+        self.status = format!("Saved {} with sudo", self.status_path(&last));
+        // The same follow-ups as every other save path.
+        for (path, seats, described, text) in saved {
+            self.reload_config_for_path(&path);
+            self.approve_saved_edit(&path);
+            if let Some(lsp) = self.lsp.as_ref() {
+                lsp.save_doc(path.clone(), text);
+            }
+            self.record_history_snapshot_of(&path, seats, described);
         }
-        !saved.is_empty()
+        true
     }
 
     /// An explicit save was refused because the encoding cannot represent the
