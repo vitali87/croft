@@ -34,7 +34,10 @@ user config decided it.
 The **Preferences: Open Settings** hub is also a searchable editor over the
 settings themselves. Type to filter, Enter flips a toggle or asks for a
 value, and Tab switches which layer the change is written to: your user
-config or the workspace.
+config or the workspace. Del resets the selected setting: it removes the key
+from that layer's file, so the value falls back to the layers below it or
+croft's default. A dot marks every setting whose value differs from croft's
+default.
 
 ![Settings editor: search a setting, flip a toggle, set a number, then write to the workspace layer](images/settings-editor.gif)
 

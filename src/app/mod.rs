@@ -48690,9 +48690,65 @@ impl App {
         self.status = format!("{key} saved to {}", path.display());
     }
 
+    /// Reset Setting (#1655): remove `key` from the layer the Settings
+    /// editor writes to, so the value falls back to the layers below it or
+    /// croft's default, and re-merge. Once only a hand edit of `config.json`
+    /// could undo a setting, and toggling one back left a redundant entry.
+    fn reset_setting(&mut self, key: &str) {
+        use crate::config_layers::LayerKind;
+        let Some(target) = self.settings_editor.as_ref().map(|e| e.target) else {
+            return;
+        };
+        let (path, layer) = match target {
+            LayerKind::Workspace => (
+                crate::config_layers::workspace_config_path(self.roots.primary()),
+                "workspace",
+            ),
+            _ => (self.config_dir.join("config.json"), "user"),
+        };
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let new = match crate::settings_editor::remove_key(&text, key) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                self.status =
+                    format!("{key} is not set in your {layer} settings (Tab switches layer)");
+                return;
+            }
+            Err(e) => {
+                self.status = format!("{}: {e}", path.display());
+                return;
+            }
+        };
+        if let Err(e) = std::fs::write(&path, new) {
+            self.status = format!("{}: {e}", path.display());
+            return;
+        }
+        let merged = self.merged_settings_here();
+        for w in &merged.warnings {
+            crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
+        }
+        self.apply_merged_settings(&merged.prefs);
+        self.settings_provenance = merged.provenance.clone();
+        let rows = crate::settings_editor::rows(&merged.prefs, &merged.provenance);
+        let now = rows.iter().find(|r| r.key == key).map(|r| {
+            format!(
+                "{} ({})",
+                crate::settings_editor::display(&r.value),
+                r.layer.label()
+            )
+        });
+        if let Some(ed) = self.settings_editor.as_mut() {
+            ed.rows = rows;
+        }
+        self.status = match now {
+            Some(now) => format!("{key} reset in {}: now {now}", path.display()),
+            None => format!("{key} reset in {}", path.display()),
+        };
+    }
+
     /// Keys while the Settings editor is open (#612): typing searches, Enter
-    /// edits the selected setting, Tab switches between the user and the
-    /// workspace layer.
+    /// edits the selected setting, Del resets it (#1655), Tab switches
+    /// between the user and the workspace layer.
     fn handle_settings_editor_key(&mut self, key: KeyEvent) {
         use crate::config_layers::LayerKind;
         use crate::settings_editor::Kind;
@@ -48745,6 +48801,11 @@ impl App {
                             ConfigFileSeed::Settings,
                         );
                     }
+                }
+            }
+            (KeyCode::Delete, _) => {
+                if let Some(key) = ed.selected_row().map(|r| r.key.clone()) {
+                    self.reset_setting(&key);
                 }
             }
             (KeyCode::Backspace, _) => {

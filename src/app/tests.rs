@@ -79435,3 +79435,178 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     assert!(!app.apply_build_scan(pane, Some(&cwd), "tsc --watch", "a.c:1:1: error: old\n"));
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
 }
+
+/// #1655: the user `config.json` the Settings editor test app reads.
+fn user_config(cfg: &std::path::Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(cfg.join("config.json")).unwrap()).unwrap()
+}
+
+/// #1655: the selected Settings editor row.
+fn selected_setting(app: &App) -> crate::settings_editor::Row {
+    app.settings_editor
+        .as_ref()
+        .unwrap()
+        .selected_row()
+        .cloned()
+        .unwrap()
+}
+
+/// #1655: Del removes a toggled setting from `config.json`, where toggling it
+/// back only wrote the default value explicitly, and the row returns to
+/// `default`. Other keys in the file stay.
+#[test]
+fn del_resets_a_toggled_setting_and_drops_its_key() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        cfg.path().join("config.json"),
+        "{\n  \"auto_save_on_focus_change\": false,\n  \"copy_on_select\": true\n}\n",
+    )
+    .unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "auto save on focus change");
+    assert_eq!(
+        selected_setting(&app).layer,
+        crate::config_layers::LayerKind::User
+    );
+    app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
+        .unwrap();
+    let written = user_config(cfg.path());
+    assert!(
+        written.get("auto_save_on_focus_change").is_none(),
+        "{written}"
+    );
+    assert_eq!(written["copy_on_select"], serde_json::json!(true));
+    let row = selected_setting(&app);
+    assert_eq!(row.key, "auto_save_on_focus_change");
+    assert_eq!(row.layer, crate::config_layers::LayerKind::Default);
+    assert!(app.status.contains("reset"), "{}", app.status);
+}
+
+/// #1655: a number setting, which Enter could only overwrite, resets too,
+/// and the live session takes the default again.
+#[test]
+fn del_resets_a_number_setting_to_its_default() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        cfg.path().join("config.json"),
+        "{ \"terminal_scrollback\": 5000, \"auto_save\": true }",
+    )
+    .unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "terminal scrollback");
+    app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
+        .unwrap();
+    let written = user_config(cfg.path());
+    assert!(written.get("terminal_scrollback").is_none(), "{written}");
+    let default = serde_json::to_value(crate::prefs::Prefs::default()).unwrap();
+    assert_eq!(selected_setting(&app).value, default["terminal_scrollback"]);
+    assert!(app.auto_save, "the other key still applies");
+}
+
+/// #1655: resetting the user value of a key the workspace also sets leaves
+/// the workspace value in force, with the row naming the workspace.
+#[test]
+fn resetting_the_user_value_leaves_the_workspace_one_in_force() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        cfg.path().join("config.json"),
+        "{ \"copy_on_select\": false }",
+    )
+    .unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/config.json"),
+        "{ \"copy_on_select\": true }",
+    )
+    .unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "copy on select");
+    app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
+        .unwrap();
+    assert!(user_config(cfg.path()).get("copy_on_select").is_none());
+    let row = selected_setting(&app);
+    assert_eq!(row.layer, crate::config_layers::LayerKind::Workspace);
+    assert_eq!(row.value, serde_json::json!(true));
+    let ws = std::fs::read_to_string(tmp.path().join(".croft/config.json")).unwrap();
+    assert!(
+        ws.contains("copy_on_select"),
+        "the workspace layer is untouched: {ws}"
+    );
+}
+
+/// #1655 negative: Del on a setting the target layer does not set writes
+/// nothing (no file is created, another layer's file is untouched) and says
+/// so, rather than failing silently.
+#[test]
+fn del_on_a_setting_the_layer_does_not_set_writes_nothing() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "copy on select");
+    app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!cfg.path().join("config.json").exists());
+    assert!(app.status.contains("not set"), "{}", app.status);
+
+    std::fs::write(
+        cfg.path().join("config.json"),
+        "{ \"copy_on_select\": true }",
+    )
+    .unwrap();
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        !tmp.path().join(".croft/config.json").exists(),
+        "the workspace layer has nothing to reset"
+    );
+    assert_eq!(
+        user_config(cfg.path())["copy_on_select"],
+        serde_json::json!(true),
+        "and the user layer is not the target"
+    );
+}
+
+/// #1655: a row whose value differs from croft's default carries a dot,
+/// whichever layer set it, and the footer names Del reset. A value set
+/// explicitly to its default carries none (negative).
+#[test]
+fn the_settings_editor_marks_changed_rows_and_shows_del_reset() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        cfg.path().join("config.json"),
+        "{ \"auto_save\": true, \"auto_save_on_focus_change\": false }",
+    )
+    .unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "auto save");
+    let buf = render_buf(&mut app);
+    let lines: Vec<String> = (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect();
+    let line_of = |needle: &str| {
+        lines
+            .iter()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} not drawn:\n{}", lines.join("\n")))
+            .clone()
+    };
+    assert!(line_of("Esc close").contains("Del reset"));
+    let changed = lines
+        .iter()
+        .find(|l| l.contains("auto save ") && !l.contains("focus") && !l.contains("> auto"))
+        .cloned()
+        .unwrap_or_default();
+    assert!(changed.contains("\u{2022} auto save "), "{changed}");
+    let same = line_of("auto save on focus change");
+    assert!(!same.contains('\u{2022}'), "{same}");
+}
