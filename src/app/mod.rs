@@ -22741,6 +22741,7 @@ impl App {
     /// built-in defaults call their app methods directly, so a command-level
     /// recorder would miss most of what a user does.
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        self.editor.sync_occurrence_word_sel();
         // Esc dismisses an open ssh-pane offer (#364) without being consumed:
         // the offer is a status-bar hint, not a modal, so whatever Esc meant
         // to the focused pane still happens.
@@ -54110,6 +54111,7 @@ impl App {
     }
 
     fn handle_mouse(&mut self, m: MouseEvent) {
+        self.editor.sync_occurrence_word_sel();
         self.recording_file_switches(|app| app.handle_mouse_inner(m));
     }
 

@@ -2973,7 +2973,10 @@ pub struct Editor {
     /// word at the caret (#1558). While the primary selection is that one,
     /// further matches are whole words, as in VS Code; a selection made by
     /// hand matches as plain text, so `oo` is found inside every `foo`.
-    occurrence_word_sel: Option<EditorSelection>,
+    /// Paired with the `edit_seq` it was made at; dropped as soon as the
+    /// selection is seen to differ (see `sync_occurrence_word_sel`), so a
+    /// later hand-made selection at the same place is not mistaken for it.
+    occurrence_word_sel: Option<(EditorSelection, u64)>,
     /// True when the user has pinned this tab (VS Code "Pin"). Pinned tabs are
     /// kept leftmost in the strip, survive Close Others / Close to the Right,
     /// and show a thumb-tack glyph in place of the close `\u{2715}`. A pinned
@@ -8183,7 +8186,8 @@ impl Editor {
             .skip(start.1)
             .take(end.1 - start.1)
             .collect();
-        let whole_word = self.occurrence_word_sel == Some(sel);
+        self.sync_occurrence_word_sel();
+        let whole_word = self.occurrence_word_sel.is_some();
         let occ = self.occurrence_starts(&word, whole_word);
         if occ.is_empty() {
             return 0;
@@ -8255,7 +8259,7 @@ impl Editor {
                 head: (self.cursor_row, e),
             };
             self.selection = Some(word);
-            self.occurrence_word_sel = Some(word);
+            self.occurrence_word_sel = Some((word, self.edit_seq));
             self.cursor_col = e;
             self.ensure_cursor_col_visible();
             return 1;
@@ -8275,7 +8279,8 @@ impl Editor {
         }
         // Every occurrence in document order, and the set already selected
         // (the primary plus each existing caret), keyed by its start.
-        let whole_word = self.occurrence_word_sel == Some(sel);
+        self.sync_occurrence_word_sel();
+        let whole_word = self.occurrence_word_sel.is_some();
         let occ = self.occurrence_starts(&word, whole_word);
         let mut taken: Vec<(usize, usize)> = self.carets.iter().map(|c| c.normalised().0).collect();
         taken.push(start);
@@ -8298,7 +8303,7 @@ impl Editor {
         };
         self.selection = Some(found);
         if whole_word {
-            self.occurrence_word_sel = Some(found);
+            self.occurrence_word_sel = Some((found, self.edit_seq));
         }
         self.cursor_row = head.0;
         self.cursor_col = head.1;
@@ -8556,6 +8561,21 @@ impl Editor {
 
     pub fn clear_selection(&mut self) {
         self.selection = None;
+        self.occurrence_word_sel = None;
+    }
+
+    /// Forget the Add Selection to Next Find Match word marker (#1558) once
+    /// the selection or the buffer has moved on from it. Called before each
+    /// input event and by the occurrence commands, so a selection that left
+    /// the marked one and came back (Esc, then the same word selected by
+    /// hand) matches as plain text again.
+    pub fn sync_occurrence_word_sel(&mut self) {
+        if self
+            .occurrence_word_sel
+            .is_some_and(|(sel, seq)| self.selection != Some(sel) || seq != self.edit_seq)
+        {
+            self.occurrence_word_sel = None;
+        }
     }
 
     // ---- Linked editing (#254) ------------------------------------------

@@ -34359,6 +34359,33 @@ fn cmd_d_from_a_hand_made_selection_matches_as_text() {
     assert_eq!(app.editor.carets.len() + 1, 3, "`food` is no whole `foo`");
 }
 
+/// #1558: the word `Cmd+D` selected is forgotten once that selection is
+/// dropped, so selecting the same `foo` again by hand matches plain text and
+/// reaches the `foo` inside `food`.
+#[test]
+fn cmd_d_after_esc_and_a_hand_made_reselection_matches_as_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = occurrences_app(tmp.path());
+    app.editor.cursor_col = 1;
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.editor.selection.unwrap().normalised(), ((0, 0), (0, 3)));
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.selection.is_none());
+    app.editor.cursor_col = 0;
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Right, KeyModifiers::SHIFT))
+            .unwrap();
+    }
+    assert_eq!(app.editor.selection.unwrap().normalised(), ((0, 0), (0, 3)));
+    for _ in 0..4 {
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER))
+            .unwrap();
+    }
+    assert_eq!(app.editor.carets.len() + 1, 4, "`food` holds a text `foo`");
+}
+
 /// #1558: `Shift+Alt+I` puts a caret at the end of each selected line, so
 /// typing appends to all three; a selection ending at column 0 of the next
 /// line leaves that line out.
