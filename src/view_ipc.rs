@@ -407,6 +407,10 @@ pub fn extension_for(magic: crate::magic::Magic) -> &'static str {
         // both fail soft to the archive view, so this is the useful guess.
         Magic::Zip => "zip",
         Magic::Gzip => "gz",
+        // `txz`, not `xz`: `archive::kind_from_ext` claims it, so a stream
+        // past the text-size guard still reaches the tar.xz browser rather
+        // than hex. A plain xz that is not a tar falls through to hex anyway.
+        Magic::Xz => "txz",
         Magic::Tar => "tar",
         Magic::Sqlite => "sqlite",
     }
@@ -1477,6 +1481,33 @@ mod tests {
             "the editor routes on extension, so staging without one lands in text"
         );
         assert_eq!(std::fs::read(&p).unwrap(), b"a,b\n1,2\n");
+    }
+
+    /// #1645: piped xz is staged under a name `archive::kind_from_ext`
+    /// claims. `Editor::open` runs that extension route before its 50 MiB
+    /// text-size guard and content sniffing only after it, so a bare `.xz`
+    /// name sent a 50 to 100 MiB tar.xz stream to hex instead of the browser.
+    #[test]
+    fn staged_xz_stdin_routes_to_the_tar_xz_browser_by_extension() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut t = tar::Builder::new(Vec::new());
+        let mut hdr = tar::Header::new_ustar();
+        hdr.set_size(3);
+        hdr.set_mode(0o644);
+        hdr.set_cksum();
+        t.append_data(&mut hdr, "a.txt", &b"hi\n"[..]).unwrap();
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut std::io::Cursor::new(t.into_inner().unwrap()), &mut xz).unwrap();
+        let p = stage_stdin(tmp.path(), &xz, None).unwrap();
+        assert_eq!(
+            crate::archive::kind_from_ext(&p),
+            Some(crate::archive::ArchiveKind::TarXz),
+            "{}",
+            p.display()
+        );
+        let mut e = crate::widgets::editor::Editor::new();
+        e.open(&p).unwrap();
+        assert_eq!(e.archive.as_ref().expect("browsed").kind.label(), "TAR.XZ");
     }
 
     #[test]

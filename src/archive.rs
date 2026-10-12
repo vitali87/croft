@@ -1,5 +1,5 @@
 //! Archive browser core (#179): list the members of a zip / jar / whl /
-//! tar / tar.gz archive without touching payloads, and extract ONE
+//! tar / tar.gz / tar.xz archive without touching payloads, and extract ONE
 //! member on demand into a scratch directory so the standard open
 //! dispatch (text, image, PDF, sheet, hex) can render it. Extraction is
 //! containment-checked: a member whose path escapes the target
@@ -83,6 +83,10 @@ pub enum ArchiveKind {
     Zip,
     Tar,
     TarGz,
+    /// `.tar.xz` / `.txz` (#1645): kernel, GNU, Python and Node source
+    /// releases. Decoded with `lzma-rs`, already a dependency for the
+    /// language-server installs.
+    TarXz,
 }
 
 impl ArchiveKind {
@@ -91,8 +95,50 @@ impl ArchiveKind {
             ArchiveKind::Zip => "ZIP",
             ArchiveKind::Tar => "TAR",
             ArchiveKind::TarGz => "TAR.GZ",
+            ArchiveKind::TarXz => "TAR.XZ",
         }
     }
+}
+
+/// The tar a `.tar.xz` holds, decoded whole: `lzma-rs` has no streaming xz
+/// reader. So the listing cap is checked against the size the stream's own
+/// index declares before a byte is decoded (an unreadable index is refused,
+/// as the installer refuses it), and the output is capped again in case the
+/// index lies. A decoded stream that is not a tar, a plain `notes.txt.xz`,
+/// is an error (here or in the header walk), so the file falls through to
+/// the hex viewer.
+fn xz_tar_bytes(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
+    let past_cap = |size: String| {
+        std::io::Error::other(format!("archive expands past the listing cap ({size})"))
+    };
+    let bytes = std::fs::read(path)?;
+    let declared = crate::lsp::install::xz_declared_size(&bytes)
+        .ok_or_else(|| std::io::Error::other("the xz index cannot be read"))?;
+    if declared > cap {
+        return Err(past_cap(format!("{declared} bytes")));
+    }
+    let mut sink = crate::lsp::install::Capped {
+        buf: Vec::new(),
+        cap,
+    };
+    if let Err(e) = lzma_rs::xz_decompress(&mut std::io::Cursor::new(&bytes), &mut sink) {
+        // The sink's refusal: the index understated the stream.
+        let e = format!("{e:?}");
+        return Err(if e.contains("ceiling") {
+            past_cap(String::from("more than its index declares"))
+        } else {
+            std::io::Error::other(format!("xz: {e}"))
+        });
+    }
+    // `tar::Archive` validates the headers (a checksum per member) as the
+    // caller walks them, so a V7 tar with no `ustar` magic and an empty tar
+    // with no blocks at all both list. A tar is whole 512-byte blocks, so
+    // anything else, a plain `notes.txt.xz`, is refused here without a walk.
+    let tar = sink.buf;
+    if !tar.len().is_multiple_of(512) {
+        return Err(std::io::Error::other("not a tar archive"));
+    }
+    Ok(tar)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,10 +167,19 @@ pub fn kind_from_ext(path: &Path) -> Option<ArchiveKind> {
     if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
         return Some(ArchiveKind::TarGz);
     }
+    if name.ends_with(".tar.xz") || name.ends_with(".txz") {
+        return Some(ArchiveKind::TarXz);
+    }
     if name.ends_with(".tar") {
         return Some(ArchiveKind::Tar);
     }
-    if name.ends_with(".zip") || name.ends_with(".jar") || name.ends_with(".whl") {
+    // Zip containers by another name (#1645): Android and Java packages,
+    // NuGet and VS Code extension packages, e-books. Content sniffing
+    // already caught them; the extension makes the route explicit.
+    const ZIP_EXTS: &[&str] = &[
+        ".zip", ".jar", ".whl", ".apk", ".aar", ".war", ".ear", ".nupkg", ".vsix", ".epub",
+    ];
+    if ZIP_EXTS.iter().any(|ext| name.ends_with(ext)) {
         return Some(ArchiveKind::Zip);
     }
     None
@@ -157,7 +212,7 @@ pub fn list(path: &Path, kind: ArchiveKind) -> std::io::Result<ArchiveView> {
                 });
             }
         }
-        ArchiveKind::Tar | ArchiveKind::TarGz => {
+        ArchiveKind::Tar | ArchiveKind::TarGz | ArchiveKind::TarXz => {
             if meta.len() > TAR_LIST_CAP {
                 return Err(std::io::Error::other(format!(
                     "tar archive too large to list ({} bytes)",
@@ -165,15 +220,17 @@ pub fn list(path: &Path, kind: ArchiveKind) -> std::io::Result<ArchiveView> {
                 )));
             }
             let f = std::fs::File::open(path)?;
-            let read: Box<dyn std::io::Read> = if kind == ArchiveKind::TarGz {
+            let read: Box<dyn std::io::Read> = match kind {
                 // Cap the DECODED bytes too: a small .tar.gz can expand
                 // far past the source-size gate above (#198 review).
-                Box::new(CappedRead {
+                ArchiveKind::TarGz => Box::new(CappedRead {
                     inner: flate2::read::GzDecoder::new(f),
                     remaining: TAR_LIST_CAP,
-                })
-            } else {
-                Box::new(f)
+                }),
+                ArchiveKind::TarXz => {
+                    Box::new(std::io::Cursor::new(xz_tar_bytes(path, TAR_LIST_CAP)?))
+                }
+                _ => Box::new(f),
             };
             let mut a = tar::Archive::new(read);
             for entry in a.entries()? {
@@ -234,12 +291,14 @@ pub fn extract_member(
             }
             write_out(&dest, &mut e)?;
         }
-        ArchiveKind::Tar | ArchiveKind::TarGz => {
+        ArchiveKind::Tar | ArchiveKind::TarGz | ArchiveKind::TarXz => {
             let f = std::fs::File::open(path)?;
-            let read: Box<dyn std::io::Read> = if kind == ArchiveKind::TarGz {
-                Box::new(flate2::read::GzDecoder::new(f))
-            } else {
-                Box::new(f)
+            let read: Box<dyn std::io::Read> = match kind {
+                ArchiveKind::TarGz => Box::new(flate2::read::GzDecoder::new(f)),
+                ArchiveKind::TarXz => {
+                    Box::new(std::io::Cursor::new(xz_tar_bytes(path, TAR_LIST_CAP)?))
+                }
+                _ => Box::new(f),
             };
             let mut a = tar::Archive::new(read);
             for entry in a.entries()? {
@@ -879,6 +938,153 @@ mod tests {
         let err = extract_member(&zp, ArchiveKind::Zip, "evil.txt", &dest).unwrap_err();
         assert!(err.to_string().contains("symlink"), "{err}");
         assert!(!outside.join("evil.txt").exists());
+    }
+
+    /// #1645: the issue's `proj-1.0.tar.xz`, built from a tar of `proj/`,
+    /// `proj/README.md` and `proj/main.rs`.
+    fn make_tar_xz(p: &Path) {
+        let mut t = tar::Builder::new(Vec::new());
+        let mut dir = tar::Header::new_ustar();
+        dir.set_entry_type(tar::EntryType::Directory);
+        dir.set_size(0);
+        dir.set_mode(0o755);
+        dir.set_cksum();
+        t.append_data(&mut dir, "proj/", std::io::empty()).unwrap();
+        for (name, body) in [
+            ("proj/README.md", "hello\n"),
+            ("proj/main.rs", "fn main(){}\n"),
+        ] {
+            let mut hdr = tar::Header::new_ustar();
+            hdr.set_size(body.len() as u64);
+            hdr.set_mode(0o644);
+            hdr.set_cksum();
+            t.append_data(&mut hdr, name, body.as_bytes()).unwrap();
+        }
+        let tar_bytes = t.into_inner().unwrap();
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut std::io::Cursor::new(&tar_bytes), &mut xz).unwrap();
+        std::fs::write(p, xz).unwrap();
+    }
+
+    /// #1645: a `.tar.xz`, a `.txz` and the same bytes with no extension all
+    /// browse as `TAR.XZ` with their three members, where each opened as a
+    /// hex dump.
+    #[test]
+    fn a_tar_xz_lists_its_members_by_extension_and_by_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["proj-1.0.tar.xz", "proj-1.0.txz", "release-asset"] {
+            let p = tmp.path().join(name);
+            make_tar_xz(&p);
+            let mut e = crate::widgets::editor::Editor::new();
+            e.open(&p).unwrap();
+            let view = e
+                .archive
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} opens as an archive, not hex"));
+            assert_eq!(view.kind.label(), "TAR.XZ", "{name}");
+            let names: Vec<&str> = view.entries.iter().map(|m| m.path.as_str()).collect();
+            assert_eq!(
+                names,
+                vec!["proj/", "proj/README.md", "proj/main.rs"],
+                "{name}"
+            );
+        }
+    }
+
+    /// #1645: a member of a `.tar.xz` extracts like one of a `.tar.gz`, so
+    /// Enter on it opens the file.
+    #[test]
+    fn a_tar_xz_member_extracts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("proj-1.0.tar.xz");
+        make_tar_xz(&p);
+        let mut e = crate::widgets::editor::Editor::new();
+        e.open(&p).unwrap();
+        let kind = e.archive.as_ref().expect("listed").kind;
+        let out = extract_member(&p, kind, "proj/main.rs", &tmp.path().join("out")).unwrap();
+        assert_eq!(std::fs::read_to_string(out).unwrap(), "fn main(){}\n");
+    }
+
+    /// #1645: a V7 tar (no `ustar` magic, `tar --format=v7`) and an empty
+    /// tar (zero blocks) inside xz both list, where each fell through to hex.
+    #[test]
+    fn a_v7_or_empty_tar_xz_lists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut t = tar::Builder::new(Vec::new());
+        let body = "old\n";
+        let mut hdr = tar::Header::new_old();
+        hdr.set_size(body.len() as u64);
+        hdr.set_mode(0o644);
+        hdr.set_cksum();
+        t.append_data(&mut hdr, "v7.txt", body.as_bytes()).unwrap();
+        let v7 = t.into_inner().unwrap();
+        assert_ne!(&v7[257..262], b"ustar");
+        for (name, tar_bytes, want) in [
+            ("v7.tar.xz", v7, vec!["v7.txt"]),
+            ("empty.tar.xz", Vec::new(), vec![]),
+        ] {
+            let p = tmp.path().join(name);
+            let mut xz = Vec::new();
+            lzma_rs::xz_compress(&mut std::io::Cursor::new(&tar_bytes), &mut xz).unwrap();
+            std::fs::write(&p, xz).unwrap();
+            let mut e = crate::widgets::editor::Editor::new();
+            e.open(&p).unwrap();
+            let view = e
+                .archive
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} opens as an archive, not hex"));
+            assert_eq!(view.kind.label(), "TAR.XZ", "{name}");
+            let names: Vec<&str> = view.entries.iter().map(|m| m.path.as_str()).collect();
+            assert_eq!(names, want, "{name}");
+        }
+    }
+
+    /// #1645 negative: an xz file that is not a tar is not listed as an
+    /// archive; it opens as it did before.
+    #[test]
+    fn a_plain_xz_file_is_not_an_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("notes.txt.xz");
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut std::io::Cursor::new(b"just some notes\n"), &mut xz).unwrap();
+        std::fs::write(&p, xz).unwrap();
+        let mut e = crate::widgets::editor::Editor::new();
+        e.open(&p).unwrap();
+        assert!(e.archive.is_none(), "not a tar, so not an archive");
+    }
+
+    /// #1645 negative: a `.tar.xz` whose stream declares more than the cap
+    /// is refused before decoding, with the same listing-cap message as a
+    /// `.tar.gz`, so the hex viewer says why.
+    #[test]
+    fn a_tar_xz_past_the_decoded_cap_is_refused_as_a_listing_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("proj-1.0.tar.xz");
+        make_tar_xz(&p);
+        let err = xz_tar_bytes(&p, 1024).unwrap_err();
+        assert!(is_list_cap_refusal(&err.to_string()), "{err}");
+        assert!(xz_tar_bytes(&p, TAR_LIST_CAP).is_ok());
+    }
+
+    /// #1645: the zip containers by other names route by extension.
+    #[test]
+    fn zip_based_packages_route_as_zip_by_extension() {
+        for name in [
+            "app.apk",
+            "lib.aar",
+            "site.war",
+            "app.ear",
+            "pkg.nupkg",
+            "ext.vsix",
+            "book.epub",
+        ] {
+            assert_eq!(
+                kind_from_ext(Path::new(name)),
+                Some(ArchiveKind::Zip),
+                "{name}"
+            );
+        }
+        assert_eq!(kind_from_ext(Path::new("notes.txt.xz")), None);
     }
 
     #[test]
