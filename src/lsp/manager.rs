@@ -52,6 +52,9 @@ pub struct CompletionItem {
     /// `additionalTextEdits`: an auto-import or `#include` elsewhere in the
     /// file, applied along with the item.
     pub additional_edits: Vec<TextSpanEdit>,
+    /// The item's documentation, Markdown or plain text as the server sent
+    /// it, for the popup's details pane (#1527).
+    pub documentation: Option<String>,
 }
 
 #[derive(Debug)]
@@ -5810,9 +5813,21 @@ fn into_item(item: lsp_types::CompletionItem) -> CompletionItem {
         .flatten()
         .map(text_edit_to_span)
         .collect();
+    let documentation = item.documentation.map(|d| match d {
+        lsp_types::Documentation::String(s) => s,
+        lsp_types::Documentation::MarkupContent(m) => m.value,
+    });
+    // A server that puts the signature only in `labelDetails` (#1527)
+    // still gets it shown.
+    let detail = item.detail.or_else(|| {
+        item.label_details
+            .and_then(|l| l.description.or(l.detail))
+            .filter(|d| !d.trim().is_empty())
+    });
     CompletionItem {
         label: item.label,
-        detail: item.detail,
+        detail,
+        documentation,
         insert_text: item.insert_text,
         filter_text: item.filter_text,
         kind: item.kind,
@@ -7539,6 +7554,47 @@ mod tests {
             self.completion_rx = rx;
             tx
         }
+    }
+
+    /// #1527: an item's documentation and its `labelDetails` signature
+    /// survive the conversion; they were dropped, so nothing could show them.
+    #[test]
+    fn a_completion_item_keeps_its_documentation_and_label_details() {
+        let item: lsp_types::CompletionItem = serde_json::from_value(serde_json::json!({
+            "label": "trim",
+            "detail": "fn(&self) -> &str",
+            "documentation": { "kind": "markdown", "value": "Returns a string slice." }
+        }))
+        .unwrap();
+        let ours = into_item(item);
+        assert_eq!(
+            ours.documentation.as_deref(),
+            Some("Returns a string slice.")
+        );
+        assert_eq!(ours.detail.as_deref(), Some("fn(&self) -> &str"));
+
+        let item: lsp_types::CompletionItem = serde_json::from_value(serde_json::json!({
+            "label": "dumps",
+            "labelDetails": { "detail": "(obj, ...)", "description": "def dumps(obj) -> str" },
+            "documentation": "Serialize obj to a JSON formatted str."
+        }))
+        .unwrap();
+        let ours = into_item(item);
+        assert_eq!(ours.detail.as_deref(), Some("def dumps(obj) -> str"));
+        assert_eq!(
+            ours.documentation.as_deref(),
+            Some("Serialize obj to a JSON formatted str.")
+        );
+    }
+
+    /// #1527 negative: an item with neither keeps neither.
+    #[test]
+    fn a_bare_completion_item_has_no_documentation() {
+        let item: lsp_types::CompletionItem =
+            serde_json::from_value(serde_json::json!({ "label": "x" })).unwrap();
+        let ours = into_item(item);
+        assert_eq!(ours.documentation, None);
+        assert_eq!(ours.detail, None);
     }
 
     #[test]

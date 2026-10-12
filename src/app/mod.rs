@@ -19421,6 +19421,10 @@ impl App {
                 let area = popup_ref.area_for(focused_area);
                 if area.width > 0 && area.height > 0 {
                     frame.render_widget(popup_ref, area);
+                    // The selected item's signature and documentation (#1527).
+                    if let Some(details) = popup_ref.details_area_for(area, focused_area) {
+                        frame.render_widget(popup_ref.details(), details);
+                    }
                 }
             }
             // Parameter hints sit ABOVE the caret, so they coexist with the
