@@ -2889,6 +2889,12 @@ pub struct ClosedTerminal {
 /// its result, the test's name, and the workspace root it builds for (so a
 /// re-root mid-build discards the binary instead of debugging it in the
 /// wrong workspace).
+type PendingCargoLaunch = (
+    std::sync::mpsc::Receiver<Result<PathBuf, String>>,
+    Box<crate::dap::configs::ResolvedConfig>,
+    LaunchSlot,
+);
+
 type PendingTestDebug = (
     std::sync::mpsc::Receiver<Result<PathBuf, String>>,
     String,
@@ -4799,6 +4805,10 @@ pub struct App {
     /// name rides along for the launch. Drained per tick; a second request
     /// while one is pending is refused with a status line.
     pending_test_debug: Option<PendingTestDebug>,
+    /// A CodeLLDB `cargo` launch building its program on a background
+    /// thread (#1392): the receiver yields the executable (or the build
+    /// error), and the config launches into its slot when it lands.
+    pending_cargo_launch: Option<PendingCargoLaunch>,
     /// Variable `variablesReference`s the user has expanded in the Variables
     /// panel. Persisted across polls so re-fetched variables stay open.
     pub debug_expanded: std::collections::HashSet<i64>,
@@ -6331,6 +6341,7 @@ impl App {
             pending_debug_launch: None,
             pending_attach: None,
             pending_test_debug: None,
+            pending_cargo_launch: None,
             debug_expanded: std::collections::HashSet::new(),
             watch_exprs: Vec::new(),
             watch_vals: std::collections::HashMap::new(),
@@ -25069,6 +25080,55 @@ impl App {
         self.pending_test_debug = Some((rx, name, root));
     }
 
+    /// Run a launch's `cargo` build on a background thread (#1392); the
+    /// drain launches the config once cargo names the executable.
+    fn start_cargo_program_build(
+        &mut self,
+        rc: crate::dap::configs::ResolvedConfig,
+        slot: LaunchSlot,
+        spec: crate::dap::configs::CargoSpec,
+    ) {
+        let cwd = rc
+            .cwd
+            .clone()
+            .unwrap_or_else(|| self.active_workspace_root());
+        let line = format!("cargo {}", spec.args.join(" "));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::dap::configs::build_cargo_program(&spec, &cwd));
+        });
+        self.run_debug.feedback = Some(format!("Building with {line}\u{2026}"));
+        self.run_debug.feedback_is_error = false;
+        self.status = format!(
+            "config \"{}\": building with {line} \u{2014} debug starts when it succeeds",
+            rc.name
+        );
+        self.pending_cargo_launch = Some((rx, Box::new(rc), slot));
+    }
+
+    /// Launch a `cargo` config whose build finished, or report why it did
+    /// not. True when anything landed.
+    fn drain_pending_cargo_launch(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+        let Some((rx, _, _)) = self.pending_cargo_launch.as_ref() else {
+            return false;
+        };
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => Err(String::from("the build thread died")),
+        };
+        let (_, mut rc, slot) = self.pending_cargo_launch.take().expect("checked above");
+        match result {
+            Ok(program) => {
+                rc.program = Some(program.to_string_lossy().into_owned());
+                self.launch_resolved_in(*rc, slot);
+            }
+            Err(e) => self.debug_error(format!("config \"{}\": {e}", rc.name)),
+        }
+        true
+    }
+
     /// Drain the background test-binary build: on success launch lldb-dap
     /// (with the editor's breakpoints as they are NOW — the user may have set
     /// more while the build ran), on failure surface the error. Returns true
@@ -32015,6 +32075,7 @@ impl App {
             self.debug_stop();
         }
         self.pending_debug_launch = None;
+        self.pending_cargo_launch = None;
         // A new run: the previous run's cleanup is not this one's.
         self.debug_post_tasks.clear();
         let root = self.active_workspace_root();
@@ -32199,6 +32260,19 @@ impl App {
         // does not depend on it; a missing lldb-dap is reported on resume.
         if rc.pick_process && rc.process_id.is_none() {
             self.open_attach_process_picker(rc, slot);
+            return;
+        }
+        // A CodeLLDB `cargo` launch names no program: cargo builds it first
+        // (#1392), off the UI thread, and the launch resumes here with it.
+        if rc.kind == AdapterKind::LldbDap
+            && rc.request == RequestKind::Launch
+            && rc.program.is_none()
+            && let Some(spec) = configs::cargo_spec(&rc)
+        {
+            match spec {
+                Ok(spec) => self.start_cargo_program_build(rc, slot, spec),
+                Err(e) => self.debug_error(format!("config \"{}\": {e}", rc.name)),
+            }
             return;
         }
         let breakpoints = self.collect_editor_breakpoints();
@@ -72949,8 +73023,9 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let progress_changed = app.drain_lsp_progress();
         let dap_changed = app.poll_dap();
-        let tests_changed =
-            app.test_worker.drain(&mut app.testing) | app.drain_pending_test_debug();
+        let tests_changed = app.test_worker.drain(&mut app.testing)
+            | app.drain_pending_test_debug()
+            | app.drain_pending_cargo_launch();
         // A queued run the worker refused (runner disabled after the entry
         // check) rolled its cases back in the drain; say why nothing ran.
         if app.testing.take_refusal() {

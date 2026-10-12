@@ -81921,3 +81921,52 @@ fn go_and_lint_rows_reach_problems_only_for_real_files() {
         ]
     );
 }
+
+/// #1392: a CodeLLDB `cargo` launch with no `program` builds with cargo
+/// first instead of being refused; an lldb launch with neither is still
+/// refused.
+#[test]
+fn a_cargo_launch_builds_first_and_a_bare_one_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "type": "lldb", "request": "launch", "name": "Debug executable 'rc'",
+              "cargo": { "args": ["build", "--bin=rc", "--package=rc"],
+                         "filter": { "name": "rc", "kind": "bin" } },
+              "cwd": "${workspaceFolder}" },
+            { "type": "lldb", "request": "launch", "name": "Bare" }
+        ]}"#,
+    )
+    .unwrap();
+    let launch = |name: &str| {
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let cfg = crate::dap::configs::discover_configs(tmp.path())
+            .into_iter()
+            .find(|c| c.name == name)
+            .unwrap();
+        app.launch_debug_config(&cfg);
+        app
+    };
+    let app = launch("Debug executable 'rc'");
+    assert!(
+        app.pending_cargo_launch.is_some() && !app.run_debug.feedback_is_error,
+        "{}",
+        app.status
+    );
+    assert!(
+        app.status
+            .contains("building with cargo build --bin=rc --package=rc"),
+        "{}",
+        app.status
+    );
+    let app = launch("Bare");
+    assert!(app.pending_cargo_launch.is_none());
+    assert!(app.run_debug.feedback_is_error);
+    assert!(
+        app.status.contains("an lldb launch needs a \"program\""),
+        "{}",
+        app.status
+    );
+}

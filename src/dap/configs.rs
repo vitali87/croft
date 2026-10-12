@@ -942,6 +942,8 @@ pub fn debugpy_request(rc: &ResolvedConfig, project_python: &Path) -> Value {
 /// lldb-vscode. Attach targets `pid`.
 pub fn lldb_request(rc: &ResolvedConfig) -> Value {
     let mut args = base_arguments(rc);
+    // CodeLLDB's build step (#1392), done before the launch; not lldb-dap's.
+    args.remove("cargo");
     if !rc.env.is_empty() {
         let pairs: Vec<String> = rc.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
         args.insert("env".into(), json!(pairs));
@@ -958,6 +960,167 @@ pub fn lldb_request(rc: &ResolvedConfig) -> Value {
             request_value("attach", args)
         }
     }
+}
+
+/// A CodeLLDB `cargo` block (#1392): the program is whatever executable
+/// `cargo <args>` builds that matches `filter`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CargoSpec {
+    pub args: Vec<String>,
+    /// `filter.name`: the target's name.
+    pub name: Option<String>,
+    /// `filter.kind`: one of the target's kinds (`bin`, `lib`, `test`, …).
+    pub kind: Option<String>,
+    pub env: BTreeMap<String, String>,
+    pub cwd: Option<PathBuf>,
+}
+
+/// The `cargo` block of an lldb-family launch, if it has one; Err when it
+/// is there but unreadable.
+pub fn cargo_spec(rc: &ResolvedConfig) -> Option<Result<CargoSpec, String>> {
+    let cargo = rc.extra.get("cargo")?;
+    let strings = |v: Option<&Value>| -> Option<Vec<String>> {
+        v?.as_array()?
+            .iter()
+            .map(|a| a.as_str().map(str::to_string))
+            .collect()
+    };
+    let Some(args) = strings(cargo.get("args")).filter(|a| !a.is_empty()) else {
+        return Some(Err(String::from(
+            "\"cargo.args\" must list cargo's arguments (\"build\", …)",
+        )));
+    };
+    let filter = cargo.get("filter");
+    let text = |key: &str| {
+        filter
+            .and_then(|f| f.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let env = cargo
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|e| {
+            e.iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(Ok(CargoSpec {
+        args,
+        name: text("name"),
+        kind: text("kind"),
+        env,
+        cwd: cargo.get("cwd").and_then(Value::as_str).map(PathBuf::from),
+    }))
+}
+
+/// The cargo command line for `spec`, as CodeLLDB runs it: JSON messages,
+/// and `test` builds only (`--no-run`).
+pub fn cargo_build_args(spec: &CargoSpec) -> Vec<String> {
+    let mut args = spec.args.clone();
+    if args.first().map(String::as_str) == Some("test") && !args.iter().any(|a| a == "--no-run") {
+        args.insert(1, String::from("--no-run"));
+    }
+    if !args.iter().any(|a| a.starts_with("--message-format")) {
+        args.push(String::from("--message-format=json"));
+    }
+    args
+}
+
+/// The one executable in cargo's JSON output that matches the filter: a
+/// `compiler-artifact` with an `executable`, whose target name is `name`
+/// and whose kinds include `kind`, when those are set. None or several is
+/// an error naming the filter.
+pub fn cargo_artifact(output: &str, spec: &CargoSpec) -> Result<PathBuf, String> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    for line in output.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v.get("reason").and_then(Value::as_str) != Some("compiler-artifact") {
+            continue;
+        }
+        let Some(exe) = v.get("executable").and_then(Value::as_str) else {
+            continue;
+        };
+        let target = v.get("target");
+        let name_ok = spec.name.as_deref().is_none_or(|want| {
+            target.and_then(|t| t.get("name")).and_then(Value::as_str) == Some(want)
+        });
+        let kind_ok = spec.kind.as_deref().is_none_or(|want| {
+            target
+                .and_then(|t| t.get("kind"))
+                .and_then(Value::as_array)
+                .is_some_and(|k| k.iter().any(|k| k.as_str() == Some(want)))
+        });
+        let exe = PathBuf::from(exe);
+        if name_ok && kind_ok && !found.contains(&exe) {
+            found.push(exe);
+        }
+    }
+    let filter = match (&spec.name, &spec.kind) {
+        (Some(n), Some(k)) => format!("name \"{n}\", kind \"{k}\""),
+        (Some(n), None) => format!("name \"{n}\""),
+        (None, Some(k)) => format!("kind \"{k}\""),
+        (None, None) => String::from("no filter"),
+    };
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => Err(format!("cargo built no executable matching {filter}")),
+        n => Err(format!(
+            "cargo built {n} executables matching {filter} ({}): set \"cargo.filter\" to pick one",
+            found
+                .iter()
+                .filter_map(|p| p.file_name())
+                .map(|f| f.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// Run `cargo` for `spec` in `cwd` and pick its executable. A failed build
+/// is an error carrying cargo's first error line. Blocking: the App runs
+/// this on a background thread.
+pub fn build_cargo_program(spec: &CargoSpec, cwd: &Path) -> Result<PathBuf, String> {
+    let dir = spec.cwd.as_deref().map_or_else(
+        || cwd.to_path_buf(),
+        |c| absolute_in(&c.to_string_lossy(), cwd),
+    );
+    let out = std::process::Command::new("cargo")
+        .args(cargo_build_args(spec))
+        .envs(&spec.env)
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("cargo: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() {
+        // With JSON messages, the compile errors are on stdout; cargo's own
+        // complaints (bad flags, no Cargo.toml) on stderr.
+        let rendered = stdout.lines().find_map(|l| {
+            let v: Value = serde_json::from_str(l).ok()?;
+            let m = v.get("message")?;
+            (m.get("level")?.as_str()? == "error")
+                .then(|| m.get("message")?.as_str().map(str::to_string))?
+        });
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let why = rendered
+            .or_else(|| {
+                stderr
+                    .lines()
+                    .find(|l| l.starts_with("error"))
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| stderr.lines().last().unwrap_or("").to_string());
+        return Err(format!(
+            "cargo {} failed: {}",
+            spec.args.join(" "),
+            why.trim()
+        ));
+    }
+    cargo_artifact(&stdout, spec)
 }
 
 /// Build the delve `launch`/`attach` request (#264). `mode` passes through
@@ -2800,5 +2963,130 @@ mod tests {
             .map(|c| c.name)
             .collect();
         assert_eq!(names, ["First", "Web"], "and the file is whole: {before}");
+    }
+
+    /// What `cargo build`/`cargo test --no-run --message-format=json` print
+    /// for a crate with a lib and a bin named `rc` (shapes from cargo 1.97).
+    const CARGO_JSON_1392: &str = concat!(
+        r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"rc","src_path":"/w/src/lib.rs"},"profile":{"test":false},"executable":null}"#,
+        "\n",
+        r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"rc","src_path":"/w/src/main.rs"},"profile":{"test":false},"executable":"/w/target/debug/rc"}"#,
+        "\n",
+        r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"rc","src_path":"/w/src/lib.rs"},"profile":{"test":true},"executable":"/w/target/debug/deps/rc-1a2b"}"#,
+        "\n",
+        r#"{"reason":"build-finished","success":true}"#,
+        "\n"
+    );
+
+    fn cargo_cfg(cargo: &str) -> ResolvedConfig {
+        let text = format!(
+            r#"[{{ "name": "Debug executable 'rc'", "type": "lldb", "request": "launch", "cargo": {cargo}, "args": [] }}]"#
+        );
+        resolve(&config(&text), &ctx()).unwrap()
+    }
+
+    /// #1392: a CodeLLDB `cargo` launch builds with cargo's JSON messages
+    /// and debugs the executable its filter picks; the block is croft's
+    /// build step, not something lldb-dap is sent.
+    #[test]
+    fn a_cargo_launch_debugs_the_executable_its_filter_picks() {
+        let rc = cargo_cfg(
+            r#"{ "args": ["build", "--bin=rc", "--package=rc"], "filter": { "name": "rc", "kind": "bin" },
+                 "env": { "RUSTFLAGS": "-g" }, "cwd": "sub" }"#,
+        );
+        assert!(rc.program.is_none());
+        let spec = cargo_spec(&rc).expect("a cargo block").unwrap();
+        assert_eq!(
+            cargo_build_args(&spec),
+            ["build", "--bin=rc", "--package=rc", "--message-format=json"]
+        );
+        assert_eq!(spec.env.get("RUSTFLAGS").map(String::as_str), Some("-g"));
+        assert_eq!(spec.cwd, Some(PathBuf::from("sub")));
+        assert_eq!(
+            cargo_artifact(CARGO_JSON_1392, &spec).unwrap(),
+            PathBuf::from("/w/target/debug/rc")
+        );
+        let lib_tests = cargo_spec(&cargo_cfg(
+            r#"{ "args": ["test", "--lib"], "filter": { "kind": "lib" } }"#,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            cargo_build_args(&lib_tests),
+            ["test", "--no-run", "--lib", "--message-format=json"]
+        );
+        assert_eq!(
+            cargo_artifact(CARGO_JSON_1392, &lib_tests).unwrap(),
+            PathBuf::from("/w/target/debug/deps/rc-1a2b")
+        );
+        let mut with_program = rc.clone();
+        with_program.program = Some(String::from("/w/target/debug/rc"));
+        let req = lldb_request(&with_program);
+        assert!(req["arguments"].get("cargo").is_none(), "{req}");
+        assert_eq!(req["arguments"]["program"], "/w/target/debug/rc");
+    }
+
+    /// #1392 negatives: no executable or several matching the filter is an
+    /// error naming it; a `cargo` block with no args is refused; a config
+    /// without one has no cargo step.
+    #[test]
+    fn a_cargo_launch_refuses_no_match_or_several() {
+        let spec = |cargo: &str| cargo_spec(&cargo_cfg(cargo)).unwrap();
+        let none = spec(r#"{ "args": ["build"], "filter": { "name": "nope" } }"#).unwrap();
+        let err = cargo_artifact(CARGO_JSON_1392, &none).unwrap_err();
+        assert!(
+            err.contains("no executable matching name \"nope\""),
+            "{err}"
+        );
+        let both = spec(r#"{ "args": ["build"] }"#).unwrap();
+        let err = cargo_artifact(CARGO_JSON_1392, &both).unwrap_err();
+        assert!(
+            err.contains("2 executables matching no filter") && err.contains("rc, rc-1a2b"),
+            "{err}"
+        );
+        assert!(spec(r#"{ "filter": { "name": "rc" } }"#).is_err());
+        assert!(spec(r#"{ "args": [] }"#).is_err());
+        let plain = config(r#"[{ "name": "P", "type": "lldb", "program": "/bin/true" }]"#);
+        assert!(cargo_spec(&resolve(&plain, &ctx()).unwrap()).is_none());
+    }
+
+    /// #1392 end to end: cargo really builds a crate and the bin is picked;
+    /// a crate that does not compile is an error carrying cargo's message.
+    #[test]
+    fn cargo_builds_the_program_or_says_why_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = tmp.path();
+        std::fs::create_dir_all(w.join("src")).unwrap();
+        std::fs::write(
+            w.join("Cargo.toml"),
+            "[package]\nname = \"rc\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(w.join("src/main.rs"), "fn main() { println!(\"hi\"); }\n").unwrap();
+        let spec = CargoSpec {
+            args: vec![
+                String::from("build"),
+                String::from("--bin=rc"),
+                String::from("--offline"),
+            ],
+            name: Some(String::from("rc")),
+            kind: Some(String::from("bin")),
+            // Its own target dir: the suite's is locked by the outer cargo.
+            env: BTreeMap::from([(
+                String::from("CARGO_TARGET_DIR"),
+                w.join("target").to_string_lossy().into_owned(),
+            )]),
+            cwd: None,
+        };
+        let exe = build_cargo_program(&spec, w).unwrap();
+        assert!(exe.is_file(), "{}", exe.display());
+        assert_eq!(exe.file_name().unwrap(), "rc");
+        std::fs::write(w.join("src/main.rs"), "fn main() { let x: u8 = \"no\"; }\n").unwrap();
+        let err = build_cargo_program(&spec, w).unwrap_err();
+        assert!(
+            err.starts_with("cargo build --bin=rc --offline failed: ")
+                && err.contains("mismatched types"),
+            "{err}"
+        );
     }
 }
