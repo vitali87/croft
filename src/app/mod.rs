@@ -30833,16 +30833,19 @@ impl App {
                 // Said once this stop's stack trace has placed it, so the
                 // announcement names the file and line (#1547). The frames
                 // are cleared at each stop and the location is not, so an
-                // empty stack means the location is still the last stop's.
-                let placed = self
+                // empty stack means the location is still the last stop's,
+                // and so does a top frame without a source: that stop is
+                // read without a file and line rather than with stale ones.
+                let top = self
                     .debug_sessions
                     .focused()
-                    .is_some_and(|s| !s.stack_frames.is_empty());
-                if placed
-                    && let Some(loc) = &loc
+                    .and_then(|s| s.stack_frames.first())
+                    .map(|f| (f.name.clone(), f.path.is_some()));
+                if let Some((frame, has_source)) = top
                     && let Some(reason) = self.debug_pause_reason.take()
                 {
-                    let said = self.debug_pause_announcement(&reason, loc);
+                    let at = if has_source { loc.as_ref() } else { None };
+                    let said = self.debug_pause_announcement(&reason, at, &frame);
                     self.announce_event(said);
                     changed = true;
                 }
@@ -58465,11 +58468,23 @@ impl App {
     /// What a debugger pause reads as (#1547): why it stopped, where, and
     /// the line's text, as in `Paused on breakpoint, app.py line 3: total
     /// += n`. The line comes from the buffer when the file is the one being
-    /// edited, else from disk.
-    fn debug_pause_announcement(&self, reason: &str, (path, line): &(PathBuf, usize)) -> String {
+    /// edited, else from disk. A stop with no source location (`at` is
+    /// `None`) names its frame instead, as in `Paused on step, in memcpy`.
+    fn debug_pause_announcement(
+        &self,
+        reason: &str,
+        at: Option<&(PathBuf, usize)>,
+        frame: &str,
+    ) -> String {
         let what = match reason {
             "" | "pause" => String::from("Paused"),
             r => format!("Paused on {r}"),
+        };
+        let Some((path, line)) = at else {
+            return match frame.trim() {
+                "" => what,
+                f => format!("{what}, in {f}"),
+            };
         };
         let name = path.file_name().map_or_else(
             || path.display().to_string(),

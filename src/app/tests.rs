@@ -81926,6 +81926,12 @@ fn go_and_lint_rows_reach_problems_only_for_real_files() {
 /// stop is a breakpoint on line 3, and every `next` or `continue` stops on
 /// line 3 again, as a loop body does.
 fn loop_stop_adapter(dir: &Path) -> crate::dap::session::DapSession {
+    stop_adapter(dir, false)
+}
+
+/// [`loop_stop_adapter`], where with `sourceless_step` a `next` stops in a
+/// frame with no source, as native code does.
+fn stop_adapter(dir: &Path, sourceless_step: bool) -> crate::dap::session::DapSession {
     let app_py = dir.join("app.py");
     std::fs::write(
         &app_py,
@@ -81936,6 +81942,8 @@ fn loop_stop_adapter(dir: &Path) -> crate::dap::session::DapSession {
         r#"
 import json, sys
 seq = [1000]
+stepped = [False]
+sourceless = {sourceless}
 def read():
     length = None
     while True:
@@ -81973,9 +81981,14 @@ while True:
     elif c == "threads":
         reply(req, {{"threads": [{{"id": 1, "name": "main"}}]}})
     elif c == "stackTrace":
-        reply(req, {{"stackFrames": [{{"id": 1, "name": "<module>", "line": 3, "column": 1,
-                    "source": {{"path": {path}}}}}], "totalFrames": 1}})
+        if sourceless and stepped[0]:
+            reply(req, {{"stackFrames": [{{"id": 2, "name": "memcpy", "line": 0, "column": 0}}],
+                        "totalFrames": 1}})
+        else:
+            reply(req, {{"stackFrames": [{{"id": 1, "name": "<module>", "line": 3, "column": 1,
+                        "source": {{"path": {path}}}}}], "totalFrames": 1}})
     elif c == "next":
+        stepped[0] = True
         reply(req)
         stop("step")
     elif c == "continue":
@@ -81987,7 +82000,8 @@ while True:
     else:
         reply(req)
 "#,
-        path = serde_json::to_string(&app_py.display().to_string()).unwrap()
+        path = serde_json::to_string(&app_py.display().to_string()).unwrap(),
+        sourceless = if sourceless_step { "True" } else { "False" },
     );
     let path = dir.join("loop_dap.py");
     std::fs::write(&path, script).unwrap();
@@ -82084,6 +82098,28 @@ fn every_stop_is_read_even_on_the_same_line() {
         said.contains("Paused on breakpoint, app.py line 3: total += n"),
         "said: {said}"
     );
+}
+
+/// #1547: a stop whose top frame has no source keeps the last stop's
+/// location in the session; the pause is read with the frame's name, not
+/// that stale file and line.
+#[test]
+fn a_sourceless_stop_is_not_read_with_the_last_stops_location() {
+    if !has_python3() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.screen_reader = true;
+    app.debug_sessions.push("P", stop_adapter(tmp.path(), true));
+    await_a11y_event(&mut app, None);
+    let first = app.a11y_event.as_ref().map(|(n, _)| *n);
+
+    app.debug_step("next");
+    let said = await_a11y_event(&mut app, first);
+    app.debug_stop();
+    assert!(said.contains("Paused on step, in memcpy"), "said: {said}");
+    assert!(!said.contains("app.py"), "said: {said}");
 }
 
 /// #1547 negative: with screen reader mode off a pause records nothing,
