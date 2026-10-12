@@ -81119,3 +81119,157 @@ fn go_and_lint_rows_reach_problems_only_for_real_files() {
         ]
     );
 }
+
+/// A stand-in adapter that writes every request croft sends it to `log`
+/// and never answers, so a test reads exactly what a click asked for.
+fn recording_member(log: &std::path::Path) -> crate::dap::session::DapSession {
+    crate::dap::session::DapSession::launch_with(
+        "sh",
+        &[String::from("-c"), format!("cat > '{}'", log.display())],
+        std::path::Path::new("."),
+        serde_json::json!({"seq": 2, "type": "request", "command": "launch", "arguments": {}}),
+        std::collections::BTreeMap::new(),
+    )
+    .expect("sh spawns")
+}
+
+/// An app on the Run and Debug view with one session, paused (thread 1
+/// stopped) or running, its requests recorded to the returned log.
+fn debug_toolbar_app(
+    paused: bool,
+) -> (
+    tempfile::TempDir,
+    App,
+    ratatui::Terminal<ratatui::backend::TestBackend>,
+    std::path::PathBuf,
+) {
+    use crate::dap::session::SessionPhase;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let log = tmp.path().join("requests.log");
+    let mut session = recording_member(&log);
+    // Thread 1 is known either way, so a step the toolbar let through
+    // while running would reach the adapter.
+    session.stopped_thread = Some(1);
+    session.phase = if paused {
+        SessionPhase::Stopped
+    } else {
+        SessionPhase::Running
+    };
+    app.debug_sessions.push("app.py", session);
+    app.set_sidebar_view(SidebarView::RunDebug);
+    app.refresh_debug_panel();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 32)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    (tmp, app, term, log)
+}
+
+/// The screen cell of a toolbar button, found the way a pointer finds it.
+fn debug_control_cell(
+    app: &App,
+    control: crate::widgets::run_debug::DebugControl,
+) -> Option<(u16, u16)> {
+    let area = app.run_debug.last_area;
+    (area.y..area.y + area.height)
+        .flat_map(|y| (area.x..area.x + area.width).map(move |x| (x, y)))
+        .find(|&(x, y)| app.run_debug.debug_control_painted_at(x, y) == Some(control))
+}
+
+/// Wait for the adapter's log to hold a request for `command`.
+fn adapter_got(log: &std::path::Path, command: &str) -> bool {
+    let needle = format!("\"command\":\"{command}\"");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if std::fs::read_to_string(log).is_ok_and(|s| s.contains(&needle)) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    false
+}
+
+/// #1545: while paused the Run and Debug panel has VS Code's debug
+/// toolbar, and a click on each button sends the same DAP request as its
+/// key: Step Over `next`, Step Into `stepIn`, Step Out `stepOut`, Continue
+/// `continue`.
+#[test]
+fn the_debug_toolbar_steps_and_continues_a_paused_session() {
+    use crate::widgets::run_debug::DebugControl;
+    use crossterm::event::{MouseButton, MouseEventKind};
+    for (control, command) in [
+        (DebugControl::StepOver, "next"),
+        (DebugControl::StepInto, "stepIn"),
+        (DebugControl::StepOut, "stepOut"),
+        (DebugControl::Continue, "continue"),
+    ] {
+        let (_tmp, mut app, _term, log) = debug_toolbar_app(true);
+        let (x, y) = debug_control_cell(&app, control)
+            .unwrap_or_else(|| panic!("{control:?} is on the toolbar"));
+        assert!(
+            debug_control_cell(&app, DebugControl::Pause).is_none(),
+            "a paused session offers Continue, not Pause"
+        );
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        assert!(adapter_got(&log, command), "{control:?} sends {command}");
+    }
+}
+
+/// #1545: while running the first button is Pause, which sends `pause`,
+/// and the steps are greyed out: a click on one sends nothing.
+#[test]
+fn a_running_sessions_toolbar_pauses_and_its_steps_do_nothing() {
+    use crate::widgets::run_debug::DebugControl;
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (_tmp, mut app, _term, log) = debug_toolbar_app(false);
+    assert!(debug_control_cell(&app, DebugControl::Continue).is_none());
+    let (sx, sy) = debug_control_cell(&app, DebugControl::StepOver).expect("Step Over is shown");
+    assert_eq!(app.run_debug.debug_control_at(sx, sy), None, "greyed out");
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), sx, sy));
+    let (x, y) = debug_control_cell(&app, DebugControl::Pause).expect("Pause leads while running");
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+    assert!(adapter_got(&log, "pause"));
+    let sent = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(!sent.contains("\"command\":\"next\""), "{sent}");
+}
+
+/// #1545: Stop ends the session as Shift+F5 does, and each button names
+/// itself and its key in the pointer's tooltip.
+#[test]
+fn the_debug_toolbar_stops_and_names_its_keys() {
+    use crate::widgets::run_debug::DebugControl;
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (_tmp, mut app, _term, log) = debug_toolbar_app(true);
+    for (control, tip) in [
+        (DebugControl::Continue, "Continue (F5)"),
+        (DebugControl::StepOver, "Step Over (F10)"),
+        (DebugControl::StepInto, "Step Into (F11)"),
+        (DebugControl::StepOut, "Step Out (Shift+F11)"),
+        (DebugControl::Restart, "Restart (Ctrl+Shift+F5)"),
+        (DebugControl::Stop, "Stop (Shift+F5)"),
+    ] {
+        let (x, y) = debug_control_cell(&app, control).unwrap();
+        assert_eq!(app.ui_tooltip_at(x, y), Some(tip));
+    }
+    let (x, y) = debug_control_cell(&app, DebugControl::Stop).unwrap();
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+    assert!(adapter_got(&log, "disconnect"));
+}
+
+/// #1545 negative: with no session there is no toolbar; the panel shows
+/// its Run and Debug button as before.
+#[test]
+fn no_session_no_debug_toolbar() {
+    use crate::widgets::run_debug::DebugControl;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::RunDebug);
+    app.refresh_debug_panel();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 32)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    for control in DebugControl::toolbar(true)
+        .into_iter()
+        .chain([DebugControl::Pause])
+    {
+        assert_eq!(debug_control_cell(&app, control), None, "{control:?}");
+    }
+}
