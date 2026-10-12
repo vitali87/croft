@@ -80418,6 +80418,35 @@ fn ctrl_right_takes_the_next_word_and_keeps_the_rest_live() {
     assert!(app.editor.live_ghost().is_none());
 }
 
+/// #1625: the caret a Ctrl+Right leaves a remainder at counts as asked,
+/// so Esc on that remainder does not send a fresh request there.
+#[test]
+fn escaping_a_partly_taken_suggestion_does_not_ask_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_body_suggestion(tmp.path());
+    app.inline_config = Some(crate::inline_complete::Config {
+        backend: crate::inline_complete::Backend::Claude {
+            base_url: String::from("http://127.0.0.1:1"),
+            api_key: String::from("test-key"),
+        },
+        model: String::from("claude-opus-5"),
+    });
+    app.inline_worker = Some(crate::inline_complete::Worker::spawn());
+    app.inline_enabled = true;
+    app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.editor.live_ghost().is_some(), "a remainder is live");
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.live_ghost().is_none());
+    app.editor.last_edit_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+    let first = app.inline_next_id;
+    for _ in 0..5 {
+        app.tick_inline_complete();
+    }
+    assert_eq!(app.inline_next_id, first, "no request after Esc");
+}
+
 /// #1625: Ctrl+Down takes one line of the suggestion at a time.
 #[test]
 fn ctrl_down_takes_the_suggestion_a_line_at_a_time() {

@@ -9079,11 +9079,17 @@ impl Editor {
             return;
         };
         let skip = if wrap { 0 } else { self.scroll_col };
+        // Clipped by terminal cells, not chars: a wide character takes two,
+        // and `set_string` would paint past the text column otherwise.
+        let mut cells = 0usize;
         let shown: String = line
             .replace('\t', &" ".repeat(self.indent_style().width.max(1) as usize))
             .chars()
             .skip(skip)
-            .take(text_width as usize)
+            .take_while(|&c| {
+                cells += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+                cells <= text_width as usize
+            })
             .collect();
         buf.set_string(
             text_x,
@@ -20109,6 +20115,32 @@ mod tests {
             !e.is_bookmarked(5),
             "off-by-one would light up the wrong row"
         );
+    }
+
+    /// #1625: a ghost continuation row of wide (CJK) characters is clipped
+    /// by terminal cells, so it never paints past the editor's own area.
+    #[test]
+    fn a_wide_character_ghost_row_stays_inside_the_editor() {
+        let mut e = editor_with("x = 1");
+        e.focused = true;
+        e.cursor_row = 0;
+        e.cursor_col = 5;
+        let wide: String = "\u{4e2d}".repeat(60);
+        e.ghost = Some((0, 5, e.edit_seq, format!("\n{wide}")));
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(Rect { width: 80, ..area });
+        ratatui::widgets::Widget::render(&mut e, area, &mut buf);
+        let row = (0..area.height)
+            .find(|&y| (0..area.width).any(|x| buf[(x, y)].symbol() == "\u{4e2d}"))
+            .expect("the ghost row is painted");
+        for x in area.width..80 {
+            assert_eq!(buf[(x, row)].symbol(), " ", "nothing painted at column {x}");
+        }
     }
 
     #[test]

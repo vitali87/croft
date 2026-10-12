@@ -57809,6 +57809,11 @@ impl App {
                 self.editor.edit_seq,
             );
             self.editor.ghost = Some((at.0, at.1, at.2, rest.to_string()));
+            // Recorded as asked too: once the ghost is Esc'd the tick
+            // would otherwise send a fresh (paid) request at this caret.
+            if let Some(path) = self.editor.path.clone() {
+                self.inline_asked = Some((path, at.2, at.0, at.1));
+            }
         }
         true
     }
