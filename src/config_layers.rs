@@ -436,7 +436,8 @@ fn merge_setting(acc: &mut Map<String, Value>, key: &str, value: &Value) {
 /// `"glob": false`); it is kept until every layer is in, so a layer can
 /// also take back a glob an `extends` base added, and is stripped by
 /// [`drop_negations`]. A later plain `glob` cancels an earlier `!glob`.
-/// Anything but a list of strings replaces, so the usual type warning still
+/// A glob that really starts with `!` is written `\!glob`, which merges as
+/// a plain glob. Anything but a list of strings replaces, so the usual type warning still
 /// names it.
 fn union_globs(base: &mut Value, over: &Value) {
     let Some(entries) = over.as_array().filter(|a| a.iter().all(Value::is_string)) else {
@@ -464,11 +465,19 @@ fn union_globs(base: &mut Value, over: &Value) {
 }
 
 /// Strip the `!glob` removals once every layer is merged: they only take
-/// globs away, and are not globs to match themselves.
+/// globs away, and are not globs to match themselves. An escaped `\!glob`
+/// then becomes the literal `!glob` the matcher reads.
 fn drop_negations(merged: &mut Map<String, Value>) {
     for key in UNION_KEYS {
         if let Some(Value::Array(items)) = merged.get_mut(*key) {
             items.retain(|v| !v.as_str().is_some_and(|g| g.starts_with('!')));
+            for item in items.iter_mut() {
+                if let Some(literal) = item.as_str().and_then(|g| g.strip_prefix('\\'))
+                    && literal.starts_with('!')
+                {
+                    *item = Value::from(literal);
+                }
+            }
         }
     }
 }
@@ -1188,6 +1197,28 @@ mod tests {
         .unwrap();
         let merged = load_merged_from(user.path(), Some(root.path()), "linux");
         assert_eq!(merged.prefs.files_exclude, ["**/out"]);
+    }
+
+    /// #1494: a glob that really starts with `!` is escaped as `\!glob`; it
+    /// merges as a plain glob, `!\!glob` takes it back, and it reaches the
+    /// matcher as the literal `!glob`.
+    #[test]
+    fn an_escaped_bang_is_a_literal_glob_not_a_removal() {
+        let user = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            user.path().join("config.json"),
+            r#"{ "files_exclude": ["\\!important", "\\!draft"] }"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join(".croft")).unwrap();
+        std::fs::write(
+            root.path().join(".croft/config.json"),
+            r#"{ "files_exclude": ["!\\!draft"] }"#,
+        )
+        .unwrap();
+        let merged = load_merged_from(user.path(), Some(root.path()), "linux");
+        assert_eq!(merged.prefs.files_exclude, ["!important"]);
     }
 
     /// #1494 negative: every other list still replaces, and a malformed

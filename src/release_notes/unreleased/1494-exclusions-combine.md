@@ -1,1 +1,1 @@
-fix: `files_exclude` and `search_exclude` now combine across the user, `.vscode` and `.croft` layers instead of the last layer replacing the others, and a `!glob` entry (or VS Code's `"glob": false`) takes back an earlier layer's exclusion.
+fix: `files_exclude` and `search_exclude` now combine across the user, `.vscode` and `.croft` layers instead of the last layer replacing the others, and a `!glob` entry (or VS Code's `"glob": false`) takes back an earlier layer's exclusion; a glob that really starts with `!` is written `\!glob`.

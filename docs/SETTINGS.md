@@ -160,6 +160,8 @@ merges `files.exclude` across user and workspace: a user `**/tests`, a
 `.vscode` `"**/dist": true` and a `.croft` `**/generated` all apply. To take
 an earlier layer's glob back, list it with a leading `!` (`"!**/tests"`), or
 set it to `false` in `.vscode/settings.json`; a later layer can add it again.
+A glob that really starts with `!` is escaped with a backslash: `\!draft`,
+which is `"\\!draft"` in JSON.
 
 Search adds what you type in "files to exclude" to these. With the box
 open, a `[x] project excludes: ...` row under it names the active globs;

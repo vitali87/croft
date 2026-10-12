@@ -148,14 +148,17 @@ fn as_scrollback(v: &Value) -> Option<Value> {
 /// than read as croft's root anchor, which would hide a file VS Code shows.
 ///
 /// A glob set to `false` takes back the same glob from a lower layer, as in
-/// VS Code, so it crosses as `!glob` (#1494).
+/// VS Code, so it crosses as `!glob` (#1494). A glob that itself starts
+/// with `!` is a literal one in VS Code, so it crosses escaped, as `\!glob`.
 fn as_enabled_globs(v: &Value) -> Option<Value> {
     let obj = v.as_object()?;
     Some(Value::from(
         obj.iter()
             .filter(|(glob, on)| on.as_bool().is_some() && !glob.starts_with('/'))
             .map(|(glob, on)| {
-                let glob = if glob.contains('/') || glob.starts_with("**") {
+                let glob = if glob.starts_with('!') && glob.contains('/') {
+                    format!("\\{glob}")
+                } else if glob.contains('/') || glob.starts_with("**") {
                     glob.clone()
                 } else {
                     format!("/{glob}")
@@ -1214,6 +1217,23 @@ mod tests {
         assert_eq!(
             report.settings["search_exclude"],
             json!(["**/tests/fixtures"])
+        );
+    }
+
+    /// #1494: a VS Code glob that starts with `!` is literal there, so it
+    /// crosses escaped and stays an exclusion instead of a removal.
+    #[test]
+    fn a_literal_bang_glob_crosses_escaped() {
+        let mut report = Report::default();
+        convert_settings(
+            &json!({
+                "files.exclude": { "!keep/out": true, "!drafts/old": false, "!bare": true }
+            }),
+            &mut report,
+        );
+        assert_eq!(
+            report.settings["files_exclude"],
+            json!(["/!bare", "!\\!drafts/old", "\\!keep/out"])
         );
     }
 
