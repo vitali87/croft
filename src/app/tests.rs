@@ -35556,6 +35556,79 @@ fn find_in_selection_off_and_closed_is_the_whole_file() {
     assert_eq!(state.in_selection, None);
 }
 
+/// #1577: the range belongs to the tab it was taken in. Another tab under
+/// the same bar searches and replaces whole instead of by the first tab's
+/// coordinates, and closing the bar from it still drops the first tab's
+/// range.
+#[test]
+fn find_in_selection_stays_with_its_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = find_in_selection_app(tmp.path());
+    alt_l(&mut app);
+    assert_eq!(find_count(&app), 2);
+    let g = tmp.path().join("g.py");
+    std::fs::write(&g, FIND_IN_SELECTION_SRC).unwrap();
+    app.editor.open_pinned(&g).unwrap();
+    assert_eq!(app.editor.find_range, None);
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::ALT | KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.status, "Replaced 6 occurrences");
+    assert!(app.editor.lines.iter().all(|l| !l.contains('x')));
+    assert_eq!(app.editor.editors[0].find_range, Some(((3, 0), (5, 0))));
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor_find.is_none());
+    assert_eq!(app.editor.editors[0].find_range, None);
+}
+
+/// #1577: `Alt+L` on a query seeded from a one-line selection keeps the
+/// query, rather than clearing it as a typed character would.
+#[test]
+fn alt_l_keeps_a_seeded_query() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "f.py", FIND_IN_SELECTION_SRC);
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (1, 4),
+        head: (1, 10),
+    });
+    (app.editor.cursor_row, app.editor.cursor_col) = (1, 10);
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.editor_find.as_ref().unwrap().query_selected);
+    alt_l(&mut app);
+    let state = app.editor_find.as_ref().unwrap();
+    assert_eq!(state.query, "return");
+    assert_eq!(state.in_selection, Some(((1, 4), (1, 10))));
+    assert_eq!(find_count(&app), 1);
+}
+
+/// #1577: a regex replacement's `\r` breaks the line, and the range's end
+/// moves down with it, so the selection's later matches stay in it.
+#[test]
+fn the_range_follows_a_carriage_return_replacement() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = find_in_selection_app(tmp.path());
+    app.editor_find.as_mut().unwrap().opts.use_regex = true;
+    alt_l(&mut app);
+    assert_eq!(app.editor.active_search_match, Some((3, 6, 1)));
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    for c in "a\\rb".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[3], "def b(a");
+    assert_eq!(app.editor.lines[4], "b):");
+    assert_eq!(app.editor.find_range, Some(((3, 0), (6, 0))));
+    assert_eq!(find_count(&app), 1, "the `x` the break pushed down");
+}
+
 // --- Merge conflict resolution ---------------------------------------------
 
 const CONFLICTED_BODY: &str =

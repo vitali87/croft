@@ -16827,22 +16827,7 @@ fn paint_search_highlight(
     }
 }
 
-/// The char columns of buffer row `row` a find limited to `range` covers
-/// (#1577): `None` with no range (the whole line), `Some((0, 0))` for a row
-/// outside it.
-fn find_window(
-    range: Option<crate::widgets::editor_find::FindRange>,
-    row: usize,
-) -> Option<(usize, usize)> {
-    let ((r0, c0), (r1, c1)) = range?;
-    if row < r0 || row > r1 {
-        return Some((0, 0));
-    }
-    Some((
-        if row == r0 { c0 } else { 0 },
-        if row == r1 { c1 } else { usize::MAX },
-    ))
-}
+use crate::widgets::editor_find::find_window;
 
 /// Paint VS Code-style "selection highlight": a muted blue box over every
 /// occurrence of `needle` on this line. Matches the literal selected text

@@ -53128,7 +53128,16 @@ impl App {
 
     fn close_editor_find(&mut self) {
         if self.editor_find.take().is_some() {
-            self.editor.find_range = None;
+            // Every tab's: a range taken in one tab and left there when the
+            // bar closes from another would clip that tab's next find.
+            for tab in self.editor.editors.iter_mut() {
+                tab.find_range = None;
+            }
+            for group in self.editor_layout.inactive_groups_mut() {
+                for tab in group.editors.iter_mut() {
+                    tab.find_range = None;
+                }
+            }
             self.editor.set_search_highlight(None, self.search.opts);
             if let Some(diff) = self.editor.diff.as_mut() {
                 diff.find.needle = None;
@@ -53234,15 +53243,15 @@ impl App {
             self.log_find_set_query(new_query);
             return;
         }
-        let range = self.editor_find.as_ref().and_then(|s| s.in_selection);
-        let (scope, _, _) = editor_find_lines(&self.editor, range);
+        let range = self.editor_find_range();
+        let (scope, _, window) = editor_find_lines(&self.editor, range);
         let Some(state) = self.editor_find.as_mut() else {
             return;
         };
         state.query = new_query;
         let opts = state.opts;
         state.set_match_count(
-            crate::widgets::editor_find::count_matches(&scope, &state.query, opts),
+            crate::widgets::editor_find::count_matches_in(scope, &state.query, opts, window),
             false,
         );
         if state.query.is_empty() {
@@ -53498,36 +53507,47 @@ impl App {
         col: usize,
         skip_current: bool,
     ) -> Option<crate::widgets::editor_find::MatchPos> {
-        let range = self.editor_find.as_ref().and_then(|s| s.in_selection);
-        let (scope, first, col0) = editor_find_lines(&self.editor, range);
-        let (row, col) = editor_find_scope_pos(&scope, first, col0, range.is_some(), (row, col))?;
+        let range = self.editor_find_range();
+        let (scope, first, window) = editor_find_lines(&self.editor, range);
+        let (row, col) = editor_find_scope_pos(scope, first, window, (row, col))?;
         let step = if forward {
-            crate::widgets::editor_find::find_next_match
+            crate::widgets::editor_find::find_next_match_in
         } else {
-            crate::widgets::editor_find::find_prev_match
+            crate::widgets::editor_find::find_prev_match_in
         };
-        let mut m = step(&scope, needle, opts, row, col, skip_current)?;
-        if m.row == 0 {
-            m.col_chars += col0;
-        }
+        let mut m = step(scope, needle, opts, window, row, col, skip_current)?;
         m.row += first;
         Some(m)
     }
 
     fn refresh_editor_find_index(&mut self) {
-        let range = self.editor_find.as_ref().and_then(|s| s.in_selection);
-        let (scope, first, col0) = editor_find_lines(&self.editor, range);
+        let range = self.editor_find_range();
+        let (scope, first, window) = editor_find_lines(&self.editor, range);
         let caret = (self.editor.cursor_row, self.editor.cursor_col);
         // A caret outside the selection is on none of its matches.
         let outside = range.is_some_and(|(a, b)| caret < a || caret > b);
-        let at = editor_find_scope_pos(&scope, first, col0, range.is_some(), caret);
+        let at = editor_find_scope_pos(scope, first, window, caret);
         let Some(state) = self.editor_find.as_mut() else {
             return;
         };
         let opts = state.opts;
         state.match_index = at.filter(|_| !outside).and_then(|(row, col)| {
-            crate::widgets::editor_find::match_index_at(&scope, &state.query, opts, row, col)
+            crate::widgets::editor_find::match_index_at_in(
+                scope,
+                &state.query,
+                opts,
+                window,
+                row,
+                col,
+            )
         });
+    }
+
+    /// The range Find in Selection limits the open find bar to: the active
+    /// tab's own (#1577), so another tab never searches by its coordinates.
+    fn editor_find_range(&self) -> Option<crate::widgets::editor_find::FindRange> {
+        self.editor_find.as_ref()?;
+        self.editor.find_range
     }
 
     /// Find in Selection (#1577, `Alt+L` in the find bar, VS Code's `≡`):
@@ -53561,9 +53581,11 @@ impl App {
         let Some(state) = self.editor_find.as_mut() else {
             return;
         };
-        let on = state.in_selection.is_none();
-        state.in_selection = on.then_some(range);
-        self.editor.find_range = state.in_selection;
+        // The range belongs to the tab it was taken in (#1577): another
+        // tab under the same find bar searches whole until it gets its own.
+        let on = self.editor.find_range.is_none();
+        self.editor.find_range = on.then_some(range);
+        state.in_selection = self.editor.find_range;
         self.status = String::from(if on {
             "Find in Selection: on"
         } else {
@@ -53575,14 +53597,14 @@ impl App {
     /// Recount the find bar's matches and re-place the active one, after
     /// its scope changed under an unchanged query.
     fn editor_find_recount(&mut self) {
-        let range = self.editor_find.as_ref().and_then(|s| s.in_selection);
-        let (scope, _, _) = editor_find_lines(&self.editor, range);
+        let range = self.editor_find_range();
+        let (scope, _, window) = editor_find_lines(&self.editor, range);
         let Some(state) = self.editor_find.as_mut() else {
             return;
         };
         let (needle, opts) = (state.query.clone(), state.opts);
         state.set_match_count(
-            crate::widgets::editor_find::count_matches(&scope, &needle, opts),
+            crate::widgets::editor_find::count_matches_in(scope, &needle, opts, window),
             false,
         );
         self.editor.active_search_match = None;
@@ -53664,6 +53686,13 @@ impl App {
             self.reselect_editor_find();
             return;
         }
+        // Find in Selection (#1577): VS Code's `Alt+L`. A bare Alt only, so
+        // a macOS keyboard typing `¬` with Option keeps it.
+        // Ahead of the selected query below, which `Alt+L` must not clear.
+        if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('l' | 'L')) {
+            self.toggle_editor_find_in_selection();
+            return;
+        }
         // A selected query (#1278) is replaced by what is typed or pasted
         // and cleared by Backspace / Delete; any other editing or caret key
         // drops the selection and then acts as usual.
@@ -53696,12 +53725,6 @@ impl App {
                     return;
                 }
             }
-        }
-        // Find in Selection (#1577): VS Code's `Alt+L`. A bare Alt only, so
-        // a macOS keyboard typing `¬` with Option keeps it.
-        if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('l' | 'L')) {
-            self.toggle_editor_find_in_selection();
-            return;
         }
         let word_delete = key.code == KeyCode::Backspace
             && key
@@ -53840,8 +53863,10 @@ impl App {
         // The selected range ends further on (or sooner) by what the
         // replacement added (#1577).
         if let Some(s) = self.editor_find.as_mut()
-            && let Some((start, end)) = s.in_selection.as_mut()
+            && let Some((start, end)) = self.editor.find_range.as_mut()
         {
+            // As `replace_find_match` put it in: a `\r` is a line break too.
+            let text = crate::widgets::editor::normalize_newlines(&text);
             let breaks = text.matches('\n').count();
             if row == end.0 {
                 let after = end.1.saturating_sub(col + len);
@@ -53854,15 +53879,15 @@ impl App {
                 end.0 += breaks;
             }
             debug_assert!(*start <= *end);
-            self.editor.find_range = s.in_selection;
+            s.in_selection = self.editor.find_range;
         }
         self.editor.active_search_match = None;
         self.editor.set_search_highlight(Some(needle.clone()), opts);
-        let range = self.editor_find.as_ref().and_then(|s| s.in_selection);
-        let (scope, _, _) = editor_find_lines(&self.editor, range);
+        let range = self.editor_find_range();
+        let (scope, _, window) = editor_find_lines(&self.editor, range);
         if let Some(s) = self.editor_find.as_mut() {
             s.set_match_count(
-                crate::widgets::editor_find::count_matches(&scope, &needle, opts),
+                crate::widgets::editor_find::count_matches_in(scope, &needle, opts, window),
                 false,
             );
         }
@@ -53894,47 +53919,55 @@ impl App {
         let (needle, replacement, opts) = (state.query.clone(), state.replace.clone(), state.opts);
         // A symbol tab replaces within its symbol only (#369), and Find in
         // Selection within the selected range (#1577).
-        let range = state.in_selection;
-        let (scope, first, _) = editor_find_lines(&self.editor, range);
+        let range = self.editor_find_range();
+        let (scope, first, window) = editor_find_lines(&self.editor, range);
         let scope_end = first + scope.len();
-        let Some((replaced, n)) =
-            crate::widgets::editor_find::replace_all_in_lines(&scope, &needle, &replacement, opts)
-        else {
+        let Some((replaced, n)) = crate::widgets::editor_find::replace_all_in_lines_in(
+            scope,
+            &needle,
+            &replacement,
+            opts,
+            window,
+        ) else {
             return;
         };
         if n == 0 {
             self.status = String::from("Replace All: no matches");
             return;
         }
-        let (new_lines, new_range) = match range {
-            Some(range) => {
-                let (lines, end) =
-                    crate::widgets::editor_find::splice_clip(&self.editor.lines, range, &replaced);
-                let start = crate::widgets::editor_find::clamp_range(&self.editor.lines, range).0;
-                (lines, Some((start, end)))
-            }
-            None => {
-                let mut lines = self.editor.lines[..first].to_vec();
-                lines.extend(replaced);
-                lines.extend_from_slice(&self.editor.lines[scope_end..]);
-                (lines, None)
-            }
-        };
+        // Text after the range's end is untouched, so the end keeps its
+        // distance from the end of its (now last replaced) line.
+        let new_range = window.map(|(start, (_, c1))| {
+            let tail = scope
+                .last()
+                .map_or(0, |l| l.chars().count().saturating_sub(c1));
+            let last = replaced.last().map_or(0, |l| l.chars().count());
+            (
+                (first + start.0, start.1),
+                (
+                    first + replaced.len().saturating_sub(1),
+                    last.saturating_sub(tail),
+                ),
+            )
+        });
+        let mut new_lines = self.editor.lines[..first].to_vec();
+        new_lines.extend(replaced);
+        new_lines.extend_from_slice(&self.editor.lines[scope_end..]);
         self.editor.replace_all_lines(new_lines);
         self.editor.active_search_match = None;
-        if let Some(s) = self.editor_find.as_mut()
-            && s.in_selection.is_some()
-        {
-            s.in_selection = new_range;
+        if range.is_some() {
             self.editor.find_range = new_range;
+            if let Some(s) = self.editor_find.as_mut() {
+                s.in_selection = new_range;
+            }
         }
-        let (scope, _, _) = editor_find_lines(&self.editor, new_range);
+        let (scope, _, window) = editor_find_lines(&self.editor, new_range);
         if let Some(s) = self.editor_find.as_mut() {
             // Recount against the new buffer: `a` -> `aa` doubles the
             // matches, and a hard zero would read "No results" over a body
             // still painted full of highlights.
             s.set_match_count(
-                crate::widgets::editor_find::count_matches(&scope, &needle, opts),
+                crate::widgets::editor_find::count_matches_in(scope, &needle, opts, window),
                 false,
             );
             s.match_index = None;
@@ -53952,6 +53985,8 @@ impl App {
         let Some(state) = self.editor_find.as_mut() else {
             return;
         };
+        // The chip shows the active tab's range, not one left in another.
+        state.in_selection = self.editor.find_range;
         let area = self.editor.last_full_area;
         if area.width == 0 || area.height == 0 {
             return;
@@ -67924,50 +67959,45 @@ fn is_replace_in_files_key(key: KeyEvent) -> bool {
 }
 
 /// The lines the find bar searches, the buffer row the first of them is,
-/// and the column that line starts at: with Find in Selection the `range`
-/// cut out of the buffer (#1577), else a symbol tab's symbol (#369) or the
-/// whole buffer.
+/// and the part of them it searches: with Find in Selection the whole rows
+/// the `range` spans and the range relative to them (#1577), so matches
+/// are found on the real lines and kept when wholly inside; else a symbol
+/// tab's symbol (#369) or the whole buffer.
 fn editor_find_lines(
     editor: &crate::widgets::editor::Editor,
     range: Option<crate::widgets::editor_find::FindRange>,
-) -> (std::borrow::Cow<'_, [String]>, usize, usize) {
-    use crate::widgets::editor_find::{clamp_range, clip_lines};
+) -> (
+    &[String],
+    usize,
+    Option<crate::widgets::editor_find::FindRange>,
+) {
     if let Some(range) = range {
-        let ((r0, c0), _) = clamp_range(&editor.lines, range);
-        return (
-            std::borrow::Cow::Owned(clip_lines(&editor.lines, range)),
-            r0,
-            c0,
-        );
+        let ((r0, c0), (r1, c1)) = crate::widgets::editor_find::clamp_range(&editor.lines, range);
+        let lines = editor.lines.get(r0..=r1).unwrap_or(&[]);
+        return (lines, r0, Some(((0, c0), (r1 - r0, c1))));
     }
     let (scope, first) = editor.find_scope();
-    (std::borrow::Cow::Borrowed(scope), first, 0)
+    (scope, first, None)
 }
 
 /// Buffer position `(row, col)` as a position in the lines
-/// [`editor_find_lines`] returned. Outside a selected range it goes to the
-/// range's nearer edge, so the next match from a caret above the selection
-/// is its first, and from below it wraps to it.
+/// [`editor_find_lines`] returned. Outside a selected `window` it goes to
+/// the window's nearer edge, so the next match from a caret above the
+/// selection is its first, and from below it wraps to it.
 fn editor_find_scope_pos(
     scope: &[String],
     first: usize,
-    col0: usize,
-    selected: bool,
+    window: Option<crate::widgets::editor_find::FindRange>,
     (row, col): (usize, usize),
 ) -> Option<(usize, usize)> {
     let last = scope.len().checked_sub(1)?;
-    if !selected {
+    let Some((start, end)) = window else {
         return Some((row.saturating_sub(first).min(last), col));
-    }
-    if (row, col) < (first, col0) {
-        return Some((0, 0));
-    }
-    let r = row - first;
-    if r > last {
-        return Some((last, scope[last].chars().count()));
-    }
-    let c = if r == 0 { col - col0 } else { col };
-    Some((r, c.min(scope[r].chars().count())))
+    };
+    let Some(r) = row.checked_sub(first) else {
+        return Some(start);
+    };
+    Some((r, col).clamp(start, end))
 }
 
 /// `Alt+C` / `Alt+W` / `Alt+R` while a Search side bar input has focus: the
