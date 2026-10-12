@@ -16599,6 +16599,7 @@ fn the_tags_menu_annotates_pushes_and_deletes_a_remote_tag() {
     assert_eq!(
         app.input_prompt.as_ref().map(|p| p.purpose.clone()),
         Some(InputPurpose::DeleteRemoteTag {
+            root: app.scm_root(),
             remote: String::from("origin"),
             name: String::from("v1.0"),
         }),
@@ -16649,6 +16650,53 @@ fn remote_tags_stay_without_a_confirmation_or_a_remote() {
     app.dispatch_scm_action(ScmAction::DeleteRemoteTag);
     assert!(app.git_net_job.is_none());
     assert_eq!(app.status, "Delete remote tag: no remote to push tags to");
+}
+
+/// #1582: the remote-tag deletion stays bound to the repository whose
+/// remote was listed. When Source Control has moved to another root by
+/// the time the listing lands, the picker is chosen from, or the
+/// confirmation is submitted, nothing is deleted.
+#[test]
+fn a_remote_tag_is_not_deleted_after_source_control_moved_repos() {
+    use crate::widgets::input_prompt::InputPurpose;
+    use crate::widgets::scm_menu::ScmAction;
+    let (tmp, bare) = repo_with_bare_origin();
+    git_stdout(tmp.path(), &["tag", "v3"]);
+    git_stdout(tmp.path(), &["push", "-q", "origin", "v3"]);
+    let other = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let moved = "Delete remote tag cancelled: Source Control moved to another repository";
+
+    // The listing lands after the move: no picker.
+    app.show_remote_tags(other.path(), "origin", Ok(vec![String::from("v3")]));
+    assert!(app.list_picker.is_none());
+    assert_eq!(app.status, moved);
+
+    // The picker was listed for another root: no confirmation.
+    app.dispatch_scm_action(ScmAction::DeleteRemoteTag);
+    wait_for_git_net(&mut app);
+    assert!(app.list_picker.is_some());
+    app.remote_tag_root = Some(other.path().to_path_buf());
+    app.confirm_list_picker();
+    assert!(app.input_prompt.is_none());
+    assert_eq!(app.status, moved);
+
+    // The confirmation was for another root: nothing runs.
+    app.dispatch_scm_action(ScmAction::DeleteRemoteTag);
+    wait_for_git_net(&mut app);
+    app.confirm_list_picker();
+    match &mut app.input_prompt.as_mut().expect("the confirmation").purpose {
+        InputPurpose::DeleteRemoteTag { root, .. } => *root = other.path().to_path_buf(),
+        other => panic!("unexpected prompt {other:?}"),
+    }
+    app.submit_input_prompt();
+    assert!(app.input_prompt.is_none() && app.git_net_job.is_none());
+    assert_eq!(app.status, moved);
+    assert_eq!(
+        git_stdout(bare.path(), &["tag"]),
+        "v3",
+        "kept on the remote"
+    );
 }
 
 #[test]

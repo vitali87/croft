@@ -246,7 +246,6 @@ const COMMANDS: &[(&str, &str)] = &[
     ("git.createTag", "git_create_tag"),
     ("git.pushTags", "git_push_tags"),
     ("git.deleteRemoteTag", "git_delete_remote_tag"),
-
     ("workbench.action.files.saveAs", "save_as"),
     ("workbench.action.files.revert", "revert_file"),
     ("workbench.action.files.saveAll", "save_all"),

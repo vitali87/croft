@@ -181,8 +181,11 @@ pub enum InputPurpose {
         name: String,
     },
     /// Confirm deleting tag `name` from `remote` (#1582). Submitting (Enter)
-    /// deletes it there; Esc keeps it. The value is a sentinel.
+    /// deletes it there; Esc keeps it. The value is a sentinel. `root` is
+    /// the repository whose remote was listed: the deletion is dropped if
+    /// Source Control has moved to another one by then.
     DeleteRemoteTag {
+        root: std::path::PathBuf,
         remote: String,
         name: String,
     },

@@ -3773,6 +3773,9 @@ pub struct App {
     /// unsaved edits (#1438). The write records the files on disk, so the
     /// modal asks first: save them all, go ahead without them, or cancel.
     pending_unsaved_scm: Option<PendingUnsavedScm>,
+    /// The repository the open Delete Remote Tag picker listed (#1582),
+    /// so the deletion stays bound to it if Source Control moves.
+    remote_tag_root: Option<PathBuf>,
     /// Set for the one call that runs a write the prompt already cleared.
     scm_unsaved_cleared: bool,
     /// A write waiting on a format-on-save reply: Save All armed the
@@ -6099,6 +6102,7 @@ impl App {
             pending_local_open: None,
             pending_discard: None,
             pending_unsaved_scm: None,
+            remote_tag_root: None,
             scm_unsaved_cleared: false,
             scm_after_format_save: None,
             pending_revert_hunk: None,
@@ -34886,13 +34890,29 @@ impl App {
         };
         self.spawn_git_net("ls-remote --tags", move || {
             let tags = crate::git::list_remote_tags(&root, &remote);
-            Box::new(move |app: &mut App| app.show_remote_tags(&remote, tags))
+            Box::new(move |app: &mut App| app.show_remote_tags(&root, &remote, tags))
         });
     }
 
-    /// The picker over `remote`'s tags, once listed (#1582).
-    fn show_remote_tags(&mut self, remote: &str, tags: Result<Vec<String>, String>) {
+    /// Whether Source Control now points at a repository other than
+    /// `root`, the one whose remote tags were listed (#1582). The deletion
+    /// is then dropped rather than sent to another repository's remote of
+    /// the same name, and the status says so.
+    fn remote_tag_root_moved(&mut self, root: &Path) -> bool {
+        if self.scm_root() == root {
+            return false;
+        }
+        self.status =
+            String::from("Delete remote tag cancelled: Source Control moved to another repository");
+        true
+    }
+
+    /// The picker over `remote`'s tags in `root`, once listed (#1582).
+    fn show_remote_tags(&mut self, root: &Path, remote: &str, tags: Result<Vec<String>, String>) {
         use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        if self.remote_tag_root_moved(root) {
+            return;
+        }
         let tags = match tags {
             Ok(tags) => tags,
             Err(err) => {
@@ -34901,6 +34921,7 @@ impl App {
             }
         };
         self.status.clear();
+        self.remote_tag_root = Some(root.to_path_buf());
         let rows = tags
             .into_iter()
             .map(|tag| ListRow {
@@ -35281,8 +35302,11 @@ impl App {
                 let r = crate::git::create_tag(&self.scm_root(), &name, message);
                 self.run_scm_op("tag", r, "Created tag", "Create tag");
             }
-            InputPurpose::DeleteRemoteTag { remote, name } => {
+            InputPurpose::DeleteRemoteTag { root, remote, name } => {
                 self.close_input_prompt();
+                if self.remote_tag_root_moved(&root) {
+                    return;
+                }
                 self.spawn_scm_op(
                     "push --delete",
                     "Deleted remote tag",
@@ -37546,11 +37570,18 @@ impl App {
             ListPurpose::DeleteRemoteTag => {
                 // Deleting from a remote reaches everyone who fetches it,
                 // so it is confirmed first (#1582).
+                let Some(root) = self.remote_tag_root.take() else {
+                    return;
+                };
+                if self.remote_tag_root_moved(&root) {
+                    return;
+                }
                 if let Some((remote, name)) = row.id.split_once('\t') {
                     use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
                     self.open_input_prompt(
                         InputPrompt::new(
                             InputPurpose::DeleteRemoteTag {
+                                root,
                                 remote: remote.to_string(),
                                 name: name.to_string(),
                             },
