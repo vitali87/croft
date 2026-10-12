@@ -71597,6 +71597,9 @@ pub fn run(
     // the finished build straight out of it on first open (or builds on demand
     // if the user opens a file before the prewarm finishes).
     std::thread::spawn(crate::highlight::prewarm_configs);
+    // Hand the heap a large file's parse passes freed back to the OS
+    // (#1707), so croft doesn't stay resident at the parse's peak.
+    crate::mem_relief::start();
     let title = build_title(&root);
     let mut app = App::new(root.clone())?;
     // Resurrect this workspace's terminal panel from the last session
