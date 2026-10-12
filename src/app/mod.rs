@@ -42124,7 +42124,20 @@ impl App {
         self.quit = true;
     }
 
+    /// The session an update relaunch hands to the new process: every
+    /// unsaved buffer, a merge editor's Result included, since the
+    /// relaunch exits at once and the Result exists nowhere else.
     pub fn capture_session_state(&self) -> crate::session_state::SessionState {
+        self.capture_session_state_with(true)
+    }
+
+    /// `keep_merge_results` false leaves a merge editor's unsaved Result
+    /// out (#1588), for hot exit, whose backup outlives the conflict it was
+    /// taken from.
+    fn capture_session_state_with(
+        &self,
+        keep_merge_results: bool,
+    ) -> crate::session_state::SessionState {
         let mut tabs = Vec::new();
         let mut active_tab = 0;
         let mut active_path: Option<PathBuf> = None;
@@ -42157,7 +42170,13 @@ impl App {
             if idx == self.editor.active_index() {
                 active_tab = tabs.len();
             }
-            let unsaved_text = if ed.dirty {
+            // A merge editor's buffer is its Result pane, not an edit of the
+            // file (#1588): kept in a hot-exit backup it came back as a plain
+            // tab whose Ctrl+S wrote the Result over the user's own
+            // resolution, so there the tab reopens on the file as it is on
+            // disk. A relaunch carries it, or the Result would be lost.
+            let dirty = ed.dirty && (keep_merge_results || ed.merge.is_none());
+            let unsaved_text = if dirty {
                 Some(ed.lines.join("\n"))
             } else {
                 None
@@ -42168,7 +42187,7 @@ impl App {
                 cursor_col: ed.cursor_col,
                 scroll: ed.scroll,
                 scroll_col: ed.scroll_col,
-                dirty: ed.dirty,
+                dirty,
                 unsaved_text,
             });
         }
@@ -42178,7 +42197,10 @@ impl App {
         // (the same file open in two splits) keeps the dirty copy.
         for group in self.editor_layout.inactive_groups() {
             for ed in &group.editors {
-                if ed.has_non_text_view() || !ed.dirty {
+                if ed.has_non_text_view()
+                    || !ed.dirty
+                    || (!keep_merge_results && ed.merge.is_some())
+                {
                     continue;
                 }
                 let unsaved = Some(ed.lines.join("\n"));
@@ -61543,7 +61565,7 @@ impl App {
             .flat_map(|g| g.editors.iter())
             .collect();
         let buffers = self
-            .capture_session_state()
+            .capture_session_state_with(false)
             .tabs
             .into_iter()
             .filter(|t| {
