@@ -11722,8 +11722,15 @@ impl Editor {
         self.push_undo(EditKind::EmmetExpand);
         self.last_edit_kind = None;
         let old_end = self.lines.len() - tail;
+        let added = new.len() - tail - head;
         self.lines
             .splice(head..old_end, new[head..new.len() - tail].iter().cloned());
+        // Rows below the rewrite keep their seats; the rewritten rows are
+        // markup croft generated.
+        self.provenance.splice(head, old_end - head, added);
+        self.provenance
+            .record(head..head + added, crate::provenance::Seat::Generated);
+        self.provenance.truncate(self.lines.len());
         self.mark_buffer_changed();
         self.recompute_highlights();
     }
@@ -33322,6 +33329,30 @@ mod tests {
         e.dirty = false;
         assert!(e.expand_emmet_abbreviation());
         assert!(e.dirty, "an expansion is an edit");
+    }
+
+    /// #1557: a wrap or tag removal that changes the line count moves the
+    /// provenance of the rows below with them, and leaves none past the end.
+    #[test]
+    fn emmet_rewrites_keep_provenance_on_the_rows_below() {
+        use crate::provenance::Seat;
+        let mut e = html_editor("Home\nAbout\ntail", 0);
+        e.cursor_row = 0;
+        e.provenance.record(2..3, Seat::Peer(String::from("ada")));
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (1, 5),
+        });
+        assert!(e.emmet_wrap("ul>li*"));
+        assert_eq!(e.lines.len(), 5);
+        assert_eq!(e.provenance.seat(4), Some(&Seat::Peer(String::from("ada"))));
+        assert_eq!(e.provenance.seat(0), Some(&Seat::Generated));
+        e.cursor_row = 0;
+        e.cursor_col = 1;
+        assert!(e.emmet_remove_tag());
+        assert_eq!(e.lines.len(), 3);
+        assert_eq!(e.provenance.seat(2), Some(&Seat::Peer(String::from("ada"))));
+        assert!(e.provenance.seat(3).is_none() && e.provenance.seat(4).is_none());
     }
 
     #[test]

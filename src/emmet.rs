@@ -945,9 +945,25 @@ pub fn wrap(
     let chars: Vec<char> = abbr.trim().chars().collect();
     let mut spelled = String::new();
     let mut per_line = false;
+    // A `*` inside `[...]`, `{...}` or quotes is literal text, not the
+    // repetition operator.
+    let mut quote: Option<char> = None;
+    let mut depth = 0usize;
     for (i, &c) in chars.iter().enumerate() {
         spelled.push(c);
-        if c == '*' && !chars.get(i + 1).is_some_and(char::is_ascii_digit) {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') if depth > 0 => quote = Some(c),
+            (None, '[' | '{') => depth += 1,
+            (None, ']' | '}') => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if quote.is_none()
+            && depth == 0
+            && c == '*'
+            && !chars.get(i + 1).is_some_and(char::is_ascii_digit)
+        {
             spelled.push_str(&lines.len().max(1).to_string());
             per_line = true;
         }
@@ -1027,7 +1043,7 @@ impl Element {
 /// opening tags. Comments, `<!doctype>`, `<?xml?>`, quoted attribute values
 /// and JSX `{...}` attributes are skipped, the bodies of `<script>` and
 /// `<style>` are not read as markup, and HTML's void elements need no
-/// closing tag. A closing tag with no opening one is ignored, and an
+/// closing tag, though one given a closing tag (as XML may) is paired. A closing tag with no opening one is ignored, and an
 /// opening tag never closed is left out.
 pub fn elements(text: &str) -> Vec<Element> {
     let b = text.as_bytes();
@@ -1072,6 +1088,19 @@ pub fn elements(text: &str) -> Vec<Element> {
                     open: range,
                     close: Some(start..end),
                 });
+            } else if let Some(void) = out
+                .iter_mut()
+                .filter(|e| {
+                    e.close.is_none()
+                        && e.name.eq_ignore_ascii_case(&name)
+                        && !text[..e.open.end - 1].ends_with('/')
+                })
+                .max_by_key(|e| e.open.start)
+                .filter(|e| open.last().is_none_or(|(_, r)| r.start < e.open.start))
+            {
+                // An HTML void name given a closing tag (`<input>v</input>`,
+                // as XML allows) is an ordinary element after all.
+                void.close = Some(start..end);
             }
             i = end;
             continue;
@@ -1986,6 +2015,38 @@ mod tests {
             wrap("b", WrapContent::Inline("Home"), "  ", Profile::Html).unwrap(),
             "<b>Home</b>\n",
             "part of a line stays on its line; a lone word is a tag here"
+        );
+    }
+
+    /// #1557: a `*` inside an attribute or text value is literal, not the
+    /// per-line repetition.
+    #[test]
+    fn wrap_leaves_a_quoted_asterisk_alone() {
+        let two = lines("a\nb");
+        assert_eq!(
+            wrap(
+                "div[title='*']",
+                WrapContent::Lines(&two),
+                "  ",
+                Profile::Html
+            )
+            .unwrap(),
+            "<div title=\"*\">\n  a\n  b\n</div>\n"
+        );
+    }
+
+    /// #1557: an HTML void name given a closing tag, as XML allows, pairs
+    /// with it, so Update Tag renames both tags.
+    #[test]
+    fn a_void_name_with_a_closing_tag_pairs_up() {
+        let text = "<form><input>value</input><br></form>";
+        let all = elements(text);
+        let input = all.iter().find(|e| e.name == "input").unwrap();
+        assert_eq!(input.outer(), 6..text.find("<br>").unwrap());
+        assert_eq!(all.iter().find(|e| e.name == "br").unwrap().close, None);
+        assert_eq!(
+            rename_tag(text, 8, "field").unwrap(),
+            "<form><field>value</field><br></form>"
         );
     }
 
