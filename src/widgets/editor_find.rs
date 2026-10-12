@@ -1,4 +1,4 @@
-use crate::widgets::search::{SearchOpts, split_for_highlight};
+use crate::widgets::search::{Pattern, SearchOpts, split_for_highlight};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -257,11 +257,12 @@ pub fn find_prev_match(
     None
 }
 
-/// Compile the find query + `SearchOpts` into a `regex::Regex` mirroring
-/// `split_for_highlight`'s matching exactly (no trimming — a query with
-/// leading / trailing spaces matches literally, like the highlighter), so
-/// replace touches precisely what the find bar shows.
-fn build_find_regex(needle: &str, opts: SearchOpts) -> Option<regex::Regex> {
+/// Compile the find query + `SearchOpts` into the pattern
+/// `split_for_highlight` matches with (no trimming — a query with leading /
+/// trailing spaces matches literally, like the highlighter), look-around and
+/// backreferences included (#1552), so replace touches precisely what the
+/// find bar shows.
+fn build_find_regex(needle: &str, opts: SearchOpts) -> Option<Pattern> {
     if needle.is_empty() {
         return None;
     }
@@ -270,18 +271,7 @@ fn build_find_regex(needle: &str, opts: SearchOpts) -> Option<regex::Regex> {
     } else {
         regex::escape(needle)
     };
-    let mut pattern = String::new();
-    if !opts.case_sensitive {
-        pattern.push_str("(?i)");
-    }
-    if opts.whole_word {
-        pattern.push_str("\\b(?:");
-        pattern.push_str(&body);
-        pattern.push_str(")\\b");
-    } else {
-        pattern.push_str(&body);
-    }
-    regex::Regex::new(&pattern).ok()
+    Pattern::for_find(&body, opts)
 }
 
 /// Expand what the match at `(col_chars, len_chars)` in `line` should be
@@ -307,35 +297,22 @@ pub fn expand_replacement(
             .then(|| replacement.to_string());
     }
     let re = build_find_regex(needle, opts)?;
-    for caps in re.captures_iter(line) {
-        let m = caps.get(0)?;
-        let start_chars = line[..m.start()].chars().count();
-        if start_chars != col_chars {
+    for (start, end) in re.spans(line) {
+        if line[..start].chars().count() != col_chars {
             continue;
         }
-        if line[m.start()..m.end()].chars().count() != len_chars {
+        if line[start..end].chars().count() != len_chars {
             return None;
         }
-        if !opts.use_regex {
-            return Some(replacement.to_string());
-        }
-        let mut dst = String::new();
-        caps.expand(&unescape_replacement(replacement, &re), &mut dst);
-        return Some(dst);
+        return re.expand_at(line, start, end, &unescape_escapes(replacement));
     }
     None
 }
 
 /// Translate VS Code's regex-replacement escapes (`\n`, `\t`, `\r`, `\\`)
-/// into their characters, unknown escapes passing through, and read the
-/// `$` references against `re` (see
-/// [`brace_group_refs`](crate::widgets::search::brace_group_refs)). Literal
-/// (non-regex) replacements are never unescaped.
-fn unescape_replacement(replacement: &str, re: &regex::Regex) -> String {
-    crate::widgets::search::brace_group_refs(&unescape_escapes(replacement), re)
-}
-
-/// The escape half of [`unescape_replacement`].
+/// into their characters, unknown escapes passing through; the `$`
+/// references are read against the pattern when `Pattern::expand_at`
+/// expands them. Literal (non-regex) replacements are never unescaped.
 fn unescape_escapes(replacement: &str) -> String {
     let mut out = String::with_capacity(replacement.len());
     let mut it = replacement.chars();
@@ -383,7 +360,7 @@ pub fn replace_all_in_lines(
     };
     let unescaped;
     let replacement = if opts.use_regex {
-        unescaped = unescape_replacement(replacement, re.as_ref()?);
+        unescaped = unescape_escapes(replacement);
         unescaped.as_str()
     } else {
         replacement
@@ -413,16 +390,11 @@ pub fn replace_all_in_lines(
                     // the segment's offset recovers the capture groups. The
                     // guard falls back to the original text rather than
                     // ever splicing a mismatched span.
-                    Some(re) => match re.captures_at(line, pos) {
-                        Some(caps)
-                            if caps.get(0).is_some_and(|m| {
-                                m.start() == pos && m.end() == pos + chunk.len()
-                            }) =>
-                        {
-                            caps.expand(replacement, &mut new);
-                        }
-                        _ => new.push_str(chunk),
-                    },
+                    Some(re) => new.push_str(
+                        re.expand_at(line, pos, pos + chunk.len(), replacement)
+                            .as_deref()
+                            .unwrap_or(chunk),
+                    ),
                     // Literal replacement goes in verbatim: no capture
                     // references, no escapes.
                     None => new.push_str(replacement),
@@ -866,6 +838,22 @@ mod tests {
         };
         let got = expand_replacement("foo(1, 2)", 0, 9, r"foo\((\d), (\d)\)", "foo($2, $1)", opts);
         assert_eq!(got.as_deref(), Some("foo(2, 1)"));
+    }
+
+    /// #1552: a backreference the find bar now shows is replaced too, by
+    /// Replace and Replace All, `$1` and escapes included.
+    #[test]
+    fn replace_runs_a_backreference_the_find_bar_shows() {
+        let opts = SearchOpts {
+            use_regex: true,
+            ..SearchOpts::default()
+        };
+        let got = expand_replacement("saw the the cat", 4, 7, r"(\w+) \1", "[$1]", opts);
+        assert_eq!(got.as_deref(), Some("[the]"));
+        let buf = lines(&["saw the the cat", "ok ok", "one"]);
+        let (new_lines, n) = replace_all_in_lines(&buf, r"(\w+) \1", r"$1\t", opts).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(new_lines, lines(&["saw the\t cat", "ok\t", "one"]));
     }
 
     #[test]
