@@ -1726,6 +1726,7 @@ fn hovering_a_diagnostic_on_punctuation_shows_its_message_synchronously() {
             end_char: 2,
             severity: DiagnosticSeverity::Error,
             message: String::from("unexpected token"),
+            tags: Default::default(),
         }],
     );
     // text_x = x(0) + gutter(2) + 1 = 3, so cell col 4 is char 1 (the `.`).
@@ -4048,6 +4049,170 @@ fn go_to_definition_opens_the_target_file_and_moves_the_caret() {
     );
 }
 
+/// The paths of the open tabs, in tab order.
+fn open_tab_paths(app: &App) -> Vec<PathBuf> {
+    app.editor
+        .editors
+        .iter()
+        .filter_map(|e| e.path.clone())
+        .collect()
+}
+
+/// Three C files: `m.c` opened pinned, `main.c` and `m.h` beside it.
+fn preview_nav_fixture() -> (tempfile::TempDir, App, PathBuf, PathBuf, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mc = tmp.path().join("m.c");
+    let main = tmp.path().join("main.c");
+    let mh = tmp.path().join("m.h");
+    std::fs::write(&mh, "#pragma once\nint add(int a, int b);\n").unwrap();
+    std::fs::write(
+        &mc,
+        "#include \"m.h\"\nint add(int a, int b) { return a + b; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &main,
+        "#include \"m.h\"\nint main(void) { return add(1, 2); }\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&mc).unwrap();
+    (tmp, app, mc, main, mh)
+}
+
+/// #1561: Go to Definition from a preview tab opened the target in that
+/// same preview slot, closing the file being read, and Go Back swapped them
+/// again. A code navigation now keeps the tab it starts from open (VS
+/// Code's default), so after F12 the call and the definition are both tabs.
+#[test]
+fn go_to_definition_from_a_preview_tab_keeps_that_file_open() {
+    let (_tmp, mut app, mc, main, mh) = preview_nav_fixture();
+    app.editor.open_preview(&main).unwrap();
+    assert!(app.editor.is_preview(app.editor.active_index()));
+    app.editor.cursor_row = 1;
+
+    app.go_to_definition(mh.clone(), 1, 4);
+    assert_eq!(app.editor.path.as_deref(), Some(mh.as_path()));
+    assert_eq!(
+        open_tab_paths(&app),
+        vec![mc.clone(), main.clone(), mh.clone()],
+        "the file the jump started from is still open"
+    );
+    let main_idx = open_tab_paths(&app)
+        .iter()
+        .position(|p| *p == main)
+        .unwrap();
+    assert!(
+        !app.editor.is_preview(main_idx),
+        "and no longer the preview a later open would replace"
+    );
+
+    app.nav_back();
+    assert_eq!(app.editor.path.as_deref(), Some(main.as_path()));
+    assert_eq!(
+        app.editor.cursor_row, 1,
+        "back lands where the jump started"
+    );
+    assert_eq!(
+        open_tab_paths(&app),
+        vec![mc, main, mh],
+        "and Go Back does not close the definition"
+    );
+}
+
+/// #1561: Go Forward after Go Back keeps both files open the same way.
+#[test]
+fn go_forward_after_go_back_keeps_both_files_open() {
+    let (_tmp, mut app, mc, main, mh) = preview_nav_fixture();
+    app.editor.open_preview(&main).unwrap();
+    app.go_to_definition(mh.clone(), 1, 4);
+    app.nav_back();
+    app.nav_forward();
+    assert_eq!(app.editor.path.as_deref(), Some(mh.as_path()));
+    assert_eq!(open_tab_paths(&app), vec![mc, main, mh]);
+}
+
+/// A definition whose target cannot be opened (a stale language-server
+/// answer) leaves the user where they were, so the tab the jump started
+/// from stays the preview it was rather than being pinned for nothing.
+#[test]
+fn a_failed_definition_jump_leaves_the_preview_tab_a_preview() {
+    let (tmp, mut app, mc, main, _mh) = preview_nav_fixture();
+    app.editor.open_preview(&main).unwrap();
+    let gone = tmp.path().join("gone_dir");
+    std::fs::create_dir(&gone).unwrap();
+    app.go_to_definition(gone, 0, 0);
+    assert_eq!(app.editor.path.as_deref(), Some(main.as_path()));
+    assert_eq!(open_tab_paths(&app), vec![mc, main]);
+    assert!(
+        app.editor.is_preview(app.editor.active_index()),
+        "no navigation happened, so the tab is still the preview"
+    );
+}
+
+/// Go Back to a location whose file has since become unopenable keeps the
+/// preview tab a preview too.
+#[test]
+fn a_failed_go_back_leaves_the_preview_tab_a_preview() {
+    let (tmp, mut app, _mc, main, _mh) = preview_nav_fixture();
+    let doomed = tmp.path().join("doomed");
+    std::fs::create_dir(&doomed).unwrap();
+    app.nav.record(NavLoc {
+        path: doomed,
+        row: 0,
+        col: 0,
+    });
+    app.editor.open_preview(&main).unwrap();
+    app.nav_back();
+    assert_eq!(app.editor.path.as_deref(), Some(main.as_path()));
+    assert!(app.editor.is_preview(app.editor.active_index()));
+}
+
+/// A tab opened through a symlink and a language server's canonical path
+/// for the same file are one file: the jump stays inside the tab, so it
+/// stays a preview.
+#[cfg(unix)]
+#[test]
+fn a_definition_at_the_canonical_path_of_a_symlinked_preview_stays_a_preview() {
+    let (tmp, mut app, mc, main, _mh) = preview_nav_fixture();
+    let link = tmp.path().join("link.c");
+    std::os::unix::fs::symlink(&main, &link).unwrap();
+    app.editor.open_preview(&link).unwrap();
+    app.go_to_definition(main.canonicalize().unwrap(), 1, 0);
+    assert_eq!(app.editor.cursor_row, 1);
+    assert_eq!(open_tab_paths(&app), vec![mc, link]);
+    assert!(app.editor.is_preview(app.editor.active_index()));
+}
+
+/// Negative: a jump inside the same file (an outline entry, a local
+/// definition) moves the caret without promoting the preview tab, so the
+/// next single-click open still replaces it.
+#[test]
+fn a_definition_in_the_same_file_leaves_the_preview_tab_a_preview() {
+    let (_tmp, mut app, mc, main, mh) = preview_nav_fixture();
+    app.editor.open_preview(&main).unwrap();
+    app.go_to_definition(main.clone(), 1, 0);
+    assert_eq!(app.editor.cursor_row, 1);
+    assert!(app.editor.is_preview(app.editor.active_index()));
+    app.editor.open_preview(&mh).unwrap();
+    assert_eq!(
+        open_tab_paths(&app),
+        vec![mc, mh],
+        "the preview slot is still reused"
+    );
+}
+
+/// Negative: opening a location from a panel (a search hit, a problem) is
+/// not a code navigation from the tab, so a preview tab is still replaced
+/// as before.
+#[test]
+fn a_panel_open_still_replaces_the_preview_tab() {
+    let (_tmp, mut app, mc, main, mh) = preview_nav_fixture();
+    app.editor.open_preview(&main).unwrap();
+    app.open_at(&mh, 1, 0).unwrap();
+    assert_eq!(open_tab_paths(&app), vec![mc, mh]);
+}
+
 #[test]
 fn go_back_returns_to_the_location_before_a_definition_jump() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4175,6 +4340,146 @@ fn ctrl_minus_and_the_palette_both_navigate_back() {
         Some(a.as_path()),
         "the Go Back palette command goes back"
     );
+}
+
+/// #1635 fixture: `a.txt` (120 lines) open with the caret on line 40, and
+/// `b.txt` (60 lines, then `needle here`) beside it.
+fn nav_switch_fixture() -> (tempfile::TempDir, App, PathBuf, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let a = root.join("a.txt");
+    let b = root.join("b.txt");
+    let lines = |name: &str, n: usize| -> String {
+        (1..=n).map(|i| format!("{name} line {i}\n")).collect()
+    };
+    std::fs::write(&a, lines("alpha", 120)).unwrap();
+    std::fs::write(&b, lines("beta", 60) + "needle here\n").unwrap();
+    let mut app = App::new(root).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 39;
+    (tmp, app, a, b)
+}
+
+/// Go Back, as Ctrl+- types it.
+fn press_go_back(app: &mut App) {
+    app.handle_key(key(KeyCode::Char('-'), KeyModifiers::CONTROL))
+        .unwrap();
+}
+
+/// #1635: a file opened from Quick Open, a Search result or the Explorer
+/// records where the user left, so Go Back returns there.
+#[test]
+fn go_back_returns_to_the_file_left_by_any_open() {
+    let at = |app: &App| (app.editor.path.clone(), app.editor.cursor_row);
+    // Quick Open.
+    let (_tmp, mut app, a, b) = nav_switch_fixture();
+    quick_open_typing(&mut app, "b.txt");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()));
+    press_go_back(&mut app);
+    assert_eq!(at(&app), (Some(a.clone()), 39), "{}", app.status);
+
+    // A Search result.
+    let (_tmp, mut app, a, b) = nav_switch_fixture();
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.query = String::from("needle");
+    app.search.run_query();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()));
+    press_go_back(&mut app);
+    assert_eq!(at(&app), (Some(a.clone()), 39), "{}", app.status);
+
+    // The Explorer.
+    let (_tmp, mut app, a, b) = nav_switch_fixture();
+    app.set_sidebar_view(SidebarView::Explorer);
+    app.focus_pane(Pane::Tree);
+    app.tree.selected = app
+        .tree
+        .nodes
+        .iter()
+        .position(|n| n.path == b)
+        .expect("b.txt is listed");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()));
+    press_go_back(&mut app);
+    assert_eq!(at(&app), (Some(a), 39), "{}", app.status);
+}
+
+/// #1635 negative: moving focus to another editor group showing another
+/// file is not a file switch. A history entry holds no group, so Go Back
+/// would reopen the left group's file in the focused one.
+#[test]
+fn focusing_another_editor_group_records_no_go_back_location() {
+    let (_tmp, mut app, a, b) = nav_switch_fixture();
+    app.split_editor(); // right group (focused) duplicates a.txt
+    app.editor.open_pinned(&b).unwrap();
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()));
+    let changes = app.nav.changes();
+    app.handle_key(key(KeyCode::Left, KeyModifiers::SUPER | KeyModifiers::ALT))
+        .unwrap();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(a.as_path()),
+        "{}",
+        app.status
+    );
+    assert_eq!(app.nav.changes(), changes, "no history entry recorded");
+}
+
+/// #1635: Go to Line, then Quick Open, then Back twice visits the line the
+/// file was left on, then the line before the Go to Line; Forward returns.
+#[test]
+fn go_back_walks_a_go_to_line_then_a_file_switch_in_order() {
+    let (_tmp, mut app, a, b) = nav_switch_fixture();
+    quick_open_typing(&mut app, ":80");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.cursor_row, 79, "{}", app.status);
+    quick_open_typing(&mut app, "b.txt");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    press_go_back(&mut app);
+    assert_eq!(
+        (app.editor.path.clone(), app.editor.cursor_row),
+        (Some(a.clone()), 79)
+    );
+    press_go_back(&mut app);
+    assert_eq!(
+        (app.editor.path.clone(), app.editor.cursor_row),
+        (Some(a), 39)
+    );
+    app.run_command(crate::widgets::command_palette::Command::NavigateForward);
+    app.run_command(crate::widgets::command_palette::Command::NavigateForward);
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(b.as_path()),
+        "{}",
+        app.status
+    );
+}
+
+/// #1635 negative: moving through a file with the keys records nothing,
+/// and Go Back itself is not recorded as a switch.
+#[test]
+fn moving_within_a_file_records_no_go_back_location() {
+    let (_tmp, mut app, a, _b) = nav_switch_fixture();
+    for code in [
+        KeyCode::PageDown,
+        KeyCode::PageDown,
+        KeyCode::Down,
+        KeyCode::Up,
+    ] {
+        app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
+    }
+    app.handle_key(key(KeyCode::End, KeyModifiers::CONTROL))
+        .unwrap();
+    press_go_back(&mut app);
+    assert_eq!(app.status, "No previous location");
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
 }
 
 #[test]
@@ -12003,6 +12308,53 @@ fn hot_exit_backs_up_an_unsaved_buffer_once_it_settles() {
     assert_eq!(mode & 0o777, 0o600, "it holds unsaved text: owner-only");
     assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
     assert!(!app.quit);
+}
+
+/// #1578: hot-exit backups lived under `~/.cache/croft`, which cache
+/// cleaners delete, taking the only copy of unsaved edits with them. They
+/// now live in the state directory; a backup an earlier croft left in the
+/// cache moves there on launch and is restored from it, and so do sticky
+/// notes.
+#[test]
+fn a_backup_left_in_the_cache_is_restored_from_the_state_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let (app, a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, &cache.path().join("hot-exit"));
+    settle_hot_exit(&mut app);
+    drop(app);
+    let notes = cache.path().join("notes").join("0123456789abcdef.json");
+    std::fs::create_dir_all(notes.parent().unwrap()).unwrap();
+    std::fs::write(&notes, "[]").unwrap();
+
+    let data = user_data_dir(cache.path(), state.path());
+    assert_eq!(data, state.path());
+    assert!(
+        !cache.path().join("hot-exit").exists(),
+        "nothing is left in the cache"
+    );
+    assert!(
+        state
+            .path()
+            .join("notes")
+            .join("0123456789abcdef.json")
+            .is_file()
+    );
+
+    let mut next = with_hot_exit(
+        App::new(tmp.path().to_path_buf()).unwrap(),
+        &data.join("hot-exit"),
+    );
+    next.restore_hot_exit();
+    let ed = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .expect("the unsaved tab is back");
+    assert!(ed.dirty);
+    assert_eq!(ed.lines[0], "xalpha");
 }
 
 /// #862 hot exit: croft killed with an unsaved buffer (no quit ran, the
@@ -24112,6 +24464,198 @@ fn copying_on_a_relay_session_pushes_the_text_to_the_local_clipboard() {
     );
 }
 
+/// Run `copy` on a relay session and return what it sent home to the local
+/// clipboard, or `None` when nothing went over the relay.
+fn relay_copied(app: &mut App, copy: impl FnOnce(&mut App)) -> Option<String> {
+    let home = tempfile::tempdir().unwrap();
+    app.is_relay_session = true;
+    let (log, inbox) = with_relay_home(home.path(), || {
+        let log = app.relay_log_path().expect("relay log path derivable");
+        let inbox = app.relay_inbox_path().expect("relay inbox path derivable");
+        copy(app);
+        (log, inbox)
+    });
+    let written = std::fs::read_to_string(&log).ok()?;
+    let id = written.lines().last()?.strip_prefix("copy\t")?.to_string();
+    std::fs::read_to_string(inbox.join(format!("{id}.txt"))).ok()
+}
+
+/// A pane whose script emits one OSC 133 command printing `out-1667`, and
+/// that command's decoration.
+fn app_with_one_finished_command(
+    tmp: &std::path::Path,
+) -> (App, crate::widgets::terminal::CommandDecoration) {
+    let mut app = App::new(tmp.to_path_buf()).unwrap();
+    let script = "x=out; printf '\\033]133;A\\007$ \\033]133;B\\007cmd\\n\\033]133;C\\007'\"$x\"'-1667\\n\\033]133;D;0\\007'; sleep 30";
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), script.into()],
+        tmp,
+    )
+    .unwrap();
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the shell to finish its command",
+        || !app.terminals[0].command_decorations().is_empty(),
+    );
+    let deco = app.terminals[0].command_decorations()[0];
+    (app, deco)
+}
+
+/// #1667: Copy Output on a relay session sends the output home to the
+/// clipboard the user pastes from, like a selection copy does (#538). It
+/// wrote the remote box's clipboard, which nothing on the user's machine can
+/// paste from.
+#[test]
+fn copy_output_on_a_relay_session_reaches_the_local_clipboard() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, deco) = app_with_one_finished_command(tmp.path());
+    let sent = relay_copied(&mut app, |app| app.copy_command_output(0, deco));
+    assert_eq!(sent.as_deref().map(str::trim_end), Some("out-1667"));
+    assert_eq!(
+        app.status,
+        "Sent command output (1 line) to the local clipboard"
+    );
+}
+
+/// #1667: copy mode, quick select and copy on select go home on a relay
+/// session too, so no terminal copy is left writing the remote box.
+#[test]
+fn every_terminal_copy_on_a_relay_session_reaches_the_local_clipboard() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let script = "x=de40; printf \"sha ${x}bdf12ab34\\n\"; sleep 60";
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from(script)],
+        tmp.path(),
+    )
+    .unwrap();
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the pane output \"de40bdf12ab34\"",
+        || {
+            app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.starts_with("sha de40bdf12ab34"))
+        },
+    );
+    app.show_terminal = true;
+    app.focus_pane(Pane::Terminal);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+
+    // Quick select: commit the hash's label.
+    let sent = relay_copied(&mut app, |app| {
+        app.handle_terminal_key(key(
+            KeyCode::Char(' '),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        let label = app
+            .terminal_quick_select
+            .as_ref()
+            .expect("Ctrl+Shift+Space enters quick select")
+            .hints
+            .iter()
+            .find(|h| h.text == "de40bdf12ab34")
+            .expect("the hash is labelled")
+            .label
+            .clone();
+        for c in label.chars() {
+            app.handle_terminal_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    });
+    assert_eq!(sent.as_deref(), Some("de40bdf12ab34"), "quick select");
+    assert!(
+        app.status.ends_with("to the local clipboard"),
+        "{}",
+        app.status
+    );
+
+    // Copy mode: a line selection on the hash's row, then y.
+    let (lines, _) = app.terminals[0].grid_lines();
+    let row = lines
+        .iter()
+        .position(|l| l.starts_with("sha de40bdf12ab34"))
+        .unwrap();
+    let sent = relay_copied(&mut app, |app| {
+        app.handle_terminal_key(key(
+            KeyCode::Char('y'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert!(
+            app.terminal_copy_mode.is_some(),
+            "Ctrl+Shift+Y enters copy mode"
+        );
+        app.handle_terminal_key(key(KeyCode::Char('g'), KeyModifiers::NONE));
+        for _ in 0..row {
+            app.handle_terminal_key(key(KeyCode::Char('j'), KeyModifiers::NONE));
+        }
+        app.handle_terminal_key(key(KeyCode::Char('V'), KeyModifiers::NONE));
+        app.handle_terminal_key(key(KeyCode::Char('y'), KeyModifiers::NONE));
+    });
+    assert_eq!(
+        sent.as_deref().map(str::trim_end),
+        Some("sha de40bdf12ab34"),
+        "copy mode"
+    );
+    assert!(
+        app.status.ends_with("to the local clipboard"),
+        "{}",
+        app.status
+    );
+
+    // Copy on select: a finished drag over the hash's row.
+    app.copy_on_select = true;
+    let inner = app.terminals[0].last_inner;
+    let (lines, top) = app.terminals[0].grid_lines();
+    let vrow = (top
+        + lines
+            .iter()
+            .position(|l| l.starts_with("sha de40bdf12ab34"))
+            .unwrap() as i32) as u16;
+    app.terminals[0].start_selection_at(inner.x, inner.y + vrow);
+    app.terminals[0].extend_selection_to(inner.x + 2, inner.y + vrow);
+    let expected = app.terminals[0].selection_text();
+    assert!(expected.starts_with("sh"), "precondition: {expected:?}");
+    let sent = relay_copied(&mut app, |app| {
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            inner.x + 2,
+            inner.y + vrow,
+        ));
+    });
+    assert_eq!(sent, Some(expected), "copy on select");
+}
+
+/// #1667 negative: off a relay session Copy Output still writes this
+/// machine's clipboard and queues nothing for a relay.
+#[test]
+fn copy_output_off_a_relay_session_writes_this_machines_clipboard() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (mut app, deco) = app_with_one_finished_command(tmp.path());
+    assert!(!app.is_relay_session);
+    let log = with_relay_home(home.path(), || {
+        app.copy_command_output(0, deco);
+        app.relay_log_path().expect("relay log path derivable")
+    });
+    assert!(!log.exists(), "nothing goes over a relay");
+    let clip = crate::clipboard::read_string().unwrap_or_default();
+    assert_eq!(clip.trim_end(), "out-1667");
+    assert!(
+        app.status.starts_with("Copied command output (1 line)"),
+        "{}",
+        app.status
+    );
+}
+
 #[test]
 fn pure_path_payload_distinguishes_finder_drag_from_text_paste() {
     // A genuine Finder drag carries only absolute path tokens.
@@ -26356,6 +26900,130 @@ fn f5_with_nothing_unsaved_writes_nothing() {
     app.debug_start_or_continue();
     assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), stamp);
     assert!(!app.status.contains("unsaved"), "{}", app.status);
+}
+
+/// #1639 fixture: [`app_with_unsaved_pinned_file`] with a tasks.json task
+/// `run hello` that cats the file.
+fn app_with_unsaved_file_and_task(name: &str) -> (tempfile::TempDir, App, PathBuf) {
+    let (tmp, app, file) = app_with_unsaved_pinned_file(name);
+    let vscode = tmp.path().join(".vscode");
+    std::fs::create_dir_all(&vscode).unwrap();
+    std::fs::write(
+        vscode.join("tasks.json"),
+        format!(
+            r#"{{ "version": "2.0.0", "tasks": [ {{ "label": "run hello", "type": "shell", "command": "cat {name}", "group": {{ "kind": "build", "isDefault": true }} }} ] }}"#
+        ),
+    )
+    .unwrap();
+    (tmp, app, file)
+}
+
+/// #1639: Tasks: Run Task writes the unsaved tab before the command
+/// starts, as F5 and Run do since #1400, so the task runs the text shown.
+#[test]
+fn run_task_saves_the_unsaved_buffer_before_the_task_starts() {
+    use crate::widgets::list_picker::ListPurpose;
+    let (_tmp, mut app, file) = app_with_unsaved_file_and_task("hello.py");
+    app.run_command(crate::widgets::command_palette::Command::RunTask);
+    assert_eq!(
+        app.list_picker.as_ref().map(|p| p.purpose),
+        Some(ListPurpose::RunTask)
+    );
+    app.confirm_list_picker();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    assert!(!app.editor.dirty);
+    assert_eq!(app.status, "Running run hello");
+}
+
+/// #1639: the build task and Rerun Last Task save first too.
+#[test]
+fn the_build_task_and_rerun_last_task_save_first() {
+    let (_tmp, mut app, file) = app_with_unsaved_file_and_task("hello.py");
+    app.run_build_task();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    app.editor.insert_str("newer\n");
+    app.rerun_last_task();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nnewer\nold\n");
+    assert_eq!(app.unsaved_count(), 0);
+}
+
+/// #1639: with saving before a run turned off, the task leaves the disk
+/// alone and the status names the file it did not see.
+#[test]
+fn with_save_before_run_off_a_task_names_the_unsaved_file() {
+    let (_tmp, mut app, file) = app_with_unsaved_file_and_task("hello.py");
+    app.save_before_debug = false;
+    app.run_build_task();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+    assert_eq!(
+        app.status,
+        "hello.py has unsaved changes: the task uses the file on disk - Running run hello"
+    );
+}
+
+/// #1639: a Testing run writes unsaved tabs first: the runner compiles or
+/// imports the files on disk.
+#[test]
+fn a_test_run_saves_the_unsaved_buffer_first() {
+    let (tmp, mut app, file) = app_with_unsaved_pinned_file("lib.rs");
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"t\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+    app.run_all_tests();
+    assert_ne!(app.status, crate::testing::NO_RUNNER_STATUS);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    app.editor.insert_str("newer\n");
+    app.testing.apply_case(crate::testing::model::TestCase {
+        name: "parse::run".into(),
+        status: crate::testing::model::TestStatus::NotRun,
+    });
+    app.run_named_test(String::from("run"));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nnewer\nold\n");
+    assert_eq!(app.status, "Running test parse::run");
+}
+
+/// #1639: a rust-analyzer "Run Test" code lens is a task too, and saves
+/// first: cargo builds the file on disk.
+#[test]
+fn a_code_lens_test_run_saves_the_unsaved_buffer_first() {
+    let (tmp, mut app, file) = app_with_unsaved_pinned_file("lib.rs");
+    let mut lens = lens_at(0, "new", "Run Test", "rust-analyzer.runSingle");
+    lens.arguments = vec![serde_json::json!({
+        "label": "test tests::it_works",
+        "kind": "cargo",
+        "args": {
+            "cwd": tmp.path().canonicalize().unwrap(),
+            "cargoArgs": ["test", "--lib"],
+            "executableArgs": ["tests::it_works", "--exact"]
+        }
+    })];
+    app.editor.code_lenses = vec![lens];
+    app.run_code_lens(0);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    assert_eq!(app.status, "Running test tests::it_works");
+}
+
+/// #1639 negative: with nothing unsaved, a task writes nothing and says
+/// nothing about saving; a workspace with no test runner saves nothing.
+#[test]
+fn a_task_with_nothing_unsaved_writes_nothing() {
+    let (tmp, mut app, file) = app_with_unsaved_file_and_task("hello.py");
+    app.save_all();
+    let stamp = std::fs::metadata(&file).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    app.run_build_task();
+    assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), stamp);
+    assert_eq!(app.status, "Running run hello");
+
+    let other = tmp.path().canonicalize().unwrap().join("notes.txt");
+    std::fs::write(&other, "old\n").unwrap();
+    app.editor.open_pinned(&other).unwrap();
+    app.editor.insert_str("new\n");
+    app.run_all_tests();
+    assert_eq!(app.status, crate::testing::NO_RUNNER_STATUS);
+    assert_eq!(std::fs::read_to_string(&other).unwrap(), "old\n");
 }
 
 /// #1444: View Changes vs main on a branch behind a moved main shows the
@@ -30210,6 +30878,7 @@ fn diag(
         end_char,
         severity,
         message: String::from("test"),
+        tags: Default::default(),
     }
 }
 
@@ -31336,51 +32005,168 @@ fn the_run_block_popup_marks_a_truncated_line() {
     );
 }
 
-#[test]
-fn fence_command_shapes_the_typed_block() {
-    assert_eq!(
-        super::fence_command("sh", "echo a\necho b\n"),
-        "echo a\necho b\r"
-    );
-    assert_eq!(
-        super::fence_command("python3", "print(1)\n"),
-        "python3 - <<'CROFT_BLOCK'\nprint(1)\nCROFT_BLOCK\r"
-    );
-    // A block that contains the terminator gets a different one, so no
-    // line of it can close the heredoc early.
-    let tricky = "print(1)\nCROFT_BLOCK\nimport os; os.system('id')\n";
-    let cmd = super::fence_command("python3", tricky);
-    assert!(cmd.starts_with("python3 - <<'CROFT_BLOCK_1'\n"), "{cmd}");
-    assert!(cmd.ends_with("\nCROFT_BLOCK_1\r"), "{cmd}");
-    let body = &cmd["python3 - <<'CROFT_BLOCK_1'\n".len()..cmd.len() - "\nCROFT_BLOCK_1\r".len()];
-    assert_eq!(body, tricky.trim_end_matches('\n'));
+/// The file a `python3 - < '<file>'` line reads (#1630).
+fn staged_block_path(cmd: &str) -> std::path::PathBuf {
+    let rest = cmd
+        .split_once(" - < '")
+        .unwrap_or_else(|| panic!("not a redirect: {cmd:?}"))
+        .1;
+    std::path::PathBuf::from(rest.strip_suffix("'\r").expect("ends the quoted path"))
 }
 
-/// A tab or `!` never reaches the shell's line editor as typed input: the
-/// block goes as one quoted printf argument, and running that line through
-/// a real shell reproduces the block byte for byte.
+/// Run a typed block line through a real `sh` in `cwd`, as a pane would.
+fn run_typed_line(line: &str, cwd: &std::path::Path) -> String {
+    let out = std::process::Command::new("sh")
+        .args(["-c", line.trim_end_matches('\r')])
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap() + &String::from_utf8(out.stderr).unwrap()
+}
+
+#[test]
+fn fence_command_shapes_the_typed_block() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scripts = tmp.path().join("blocks");
+    assert_eq!(
+        super::fence_command("sh", "echo a\necho b\n", &scripts),
+        "echo a\necho b\r"
+    );
+    assert!(!scripts.exists(), "a shell block is typed, not written");
+    // #1630: any other language is read from a private file on stdin, never
+    // typed as a heredoc, which fish has no syntax for.
+    let cmd = super::fence_command("python3", "print(1)\n", &scripts);
+    assert!(cmd.starts_with("python3 - < '"), "{cmd:?}");
+    assert!(!cmd.contains("<<") && !cmd.contains('\n'), "{cmd:?}");
+    let file = staged_block_path(&cmd);
+    assert!(file.starts_with(&scripts));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "print(1)\n");
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&file), 0o600, "only the user reads the block");
+    assert_eq!(mode(&scripts), 0o700);
+    // Two runs of one block never share a file.
+    let again = super::fence_command("python3", "print(1)\n", &scripts);
+    assert_ne!(staged_block_path(&again), file);
+    let node = super::fence_command("node", "console.log(1)\n", &scripts);
+    assert!(
+        node.starts_with("node - < '") && node.contains(".js'"),
+        "{node:?}"
+    );
+}
+
+/// #1630: the issue's block prints its output when the typed line runs, and
+/// the line holds nothing but a command, a redirect and a quoted path, which
+/// bash, zsh and fish all read the same way.
+#[test]
+fn a_python_block_runs_from_its_file_and_prints() {
+    if !(crate::markdown::runnable_interpreter("python") == Some("python3")) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let code = "print(\"hello from python\")\nprint(2 + 2)\n";
+    let cmd = super::fence_command("python3", code, &tmp.path().join("blocks"));
+    assert_eq!(run_typed_line(&cmd, tmp.path()), "hello from python\n4\n");
+}
+
+/// #1630: with HOME unset or relative the cache is relative, but the typed
+/// line runs in the pane's directory, so the staged block's directory is
+/// made absolute (against croft's own directory) before it is named.
+#[test]
+fn a_relative_block_directory_is_made_absolute() {
+    let dir = super::absolute_block_dir(PathBuf::from(".cache/croft/blocks"));
+    assert!(dir.is_absolute(), "{dir:?}");
+    assert_eq!(
+        dir,
+        std::env::current_dir().unwrap().join(".cache/croft/blocks")
+    );
+    assert!(super::block_script_dir().is_absolute());
+}
+
+/// A tab or `!` never reaches the shell's line editor as typed input: a
+/// python block's tabs and bangs go into its file byte for byte, and a shell
+/// block goes as one quoted printf argument that a real shell decodes back
+/// to the block.
 #[test]
 fn fence_blocks_with_tabs_or_bangs_run_exactly_as_shown() {
+    let tmp = tempfile::tempdir().unwrap();
     let code = "if True:\n\tprint(\"hi!\")\nx = 'a\\n'\n";
-    let cmd = super::fence_command("python3", code);
-    assert!(!cmd.contains('\t') && cmd.ends_with("| python3\r"), "{cmd}");
-    // What the pipe feeds the interpreter, via a real sh with cat standing in.
-    let line = cmd.trim_end_matches('\r').replace("| python3", "| cat");
-    let out = std::process::Command::new("sh")
-        .args(["-c", &line])
-        .output()
-        .unwrap();
-    assert_eq!(String::from_utf8(out.stdout).unwrap(), code);
+    let cmd = super::fence_command("python3", code, &tmp.path().join("blocks"));
+    assert!(!cmd.contains('\t') && !cmd.contains('!'), "{cmd:?}");
+    assert_eq!(
+        std::fs::read_to_string(staged_block_path(&cmd)).unwrap(),
+        code
+    );
+    if crate::markdown::runnable_interpreter("python") == Some("python3") {
+        assert_eq!(run_typed_line(&cmd, tmp.path()), "hi!\n");
+    }
     // `sh` blocks run in the pane's own shell through eval: a `cd` in the
     // block persists after it.
-    let sh = super::fence_command("sh", "cd /\necho 'hi!'\n");
+    let sh = super::fence_command("sh", "cd /\necho 'hi!'\n", &tmp.path().join("blocks"));
     assert!(sh.starts_with("eval \"$(printf '%b' "), "{sh}");
     let probe = format!("{}; pwd", sh.trim_end_matches('\r'));
-    let out = std::process::Command::new("sh")
-        .args(["-c", &probe])
-        .output()
+    assert_eq!(run_typed_line(&probe, tmp.path()), "hi!\n/\n");
+}
+
+/// Negative (#1630): the block still runs from the pane's directory, so a
+/// module beside the document imports as it did through the heredoc.
+#[test]
+fn a_python_block_still_imports_from_the_pane_s_directory() {
+    if !(crate::markdown::runnable_interpreter("python") == Some("python3")) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("helper_1630.py"), "X = 'local'\n").unwrap();
+    let scripts = tempfile::tempdir().unwrap();
+    let cmd = super::fence_command(
+        "python3",
+        "import helper_1630\nprint(helper_1630.X)\n",
+        scripts.path(),
+    );
+    assert_eq!(run_typed_line(&cmd, tmp.path()), "local\n");
+}
+
+/// Negative (#1630): when the file cannot be written the block is still
+/// typed whole, as the heredoc it was, rather than not run at all.
+#[test]
+fn a_block_that_cannot_be_written_falls_back_to_the_heredoc() {
+    let tmp = tempfile::tempdir().unwrap();
+    let not_a_dir = tmp.path().join("blocks");
+    std::fs::write(&not_a_dir, "").unwrap();
+    let cmd = super::fence_command("python3", "print(1)\n", &not_a_dir);
+    assert_eq!(cmd, "python3 - <<'CROFT_BLOCK'\nprint(1)\nCROFT_BLOCK\r");
+    // A block holding the terminator gets a different one.
+    let tricky = "print(1)\nCROFT_BLOCK\n";
+    let cmd = super::fence_command("python3", tricky, &not_a_dir);
+    assert!(cmd.starts_with("python3 - <<'CROFT_BLOCK_1'\n"), "{cmd}");
+}
+
+/// Negative (#1630): writing a block clears day-old blocks and nothing else.
+#[test]
+fn writing_a_block_clears_only_old_blocks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scripts = tmp.path().join("blocks");
+    let first = super::stage_block(&scripts, "python3", "print(1)").unwrap();
+    let stale = scripts.join("block-1-0-0.py");
+    std::fs::write(&stale, "print(0)\n").unwrap();
+    let two_days = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 60 * 60);
+    std::fs::File::options()
+        .write(true)
+        .open(&stale)
+        .unwrap()
+        .set_modified(two_days)
         .unwrap();
-    assert_eq!(String::from_utf8(out.stdout).unwrap(), "hi!\n/\n");
+    let other = scripts.join("notes.txt");
+    std::fs::write(&other, "keep").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&other)
+        .unwrap()
+        .set_modified(two_days)
+        .unwrap();
+    let second = super::stage_block(&scripts, "python3", "print(2)").unwrap();
+    assert!(!stale.exists(), "a day-old block is cleared");
+    assert!(first.exists() && second.exists() && other.exists());
 }
 
 /// #360: the built-in secret rules sit in the trigger set by default,
@@ -31691,6 +32477,7 @@ fn typing_in_the_problems_panel_filters_and_esc_clears_before_leaving() {
                 end_char: 1,
                 severity: DiagnosticSeverity::Error,
                 message: String::from("mismatched types"),
+                tags: Default::default(),
             },
             Diagnostic {
                 start_line: 2,
@@ -31699,6 +32486,7 @@ fn typing_in_the_problems_panel_filters_and_esc_clears_before_leaving() {
                 end_char: 6,
                 severity: DiagnosticSeverity::Warning,
                 message: String::from("function `run` is never used"),
+                tags: Default::default(),
             },
         ],
     );
@@ -31749,6 +32537,7 @@ fn clicking_a_problem_row_opens_that_file_at_the_line() {
             end_char: 6,
             severity: DiagnosticSeverity::Warning,
             message: String::from("function `run` is never used"),
+            tags: Default::default(),
         }],
     );
     app.lsp_diagnostics.insert(file.clone(), by_server);
@@ -31767,6 +32556,125 @@ fn clicking_a_problem_row_opens_that_file_at_the_line() {
         "clicking the row opens the file",
     );
     assert_eq!(app.editor.cursor_row, 2, "and jumps to the diagnostic line");
+}
+
+/// #1522: unused names and unreachable code come as hints; like VS Code,
+/// the PROBLEMS list and its count leave them out, while the editor (its
+/// hover and quick fixes) still has them.
+#[test]
+fn hints_stay_out_of_the_problems_list_and_its_count() {
+    use crate::lsp::manager::{Diagnostic, DiagnosticSeverity, DiagnosticTags};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let a = tmp.path().join("a.ts");
+    let unused = DiagnosticTags {
+        unnecessary: true,
+        deprecated: false,
+    };
+    let mut by_server = std::collections::HashMap::new();
+    by_server.insert(
+        String::from("vtsls"),
+        vec![
+            diag(0, 1, DiagnosticSeverity::Error),
+            Diagnostic {
+                tags: unused,
+                ..diag(2, 5, DiagnosticSeverity::Hint)
+            },
+            diag(6, 9, DiagnosticSeverity::Hint),
+            diag(10, 12, DiagnosticSeverity::Warning),
+        ],
+    );
+    app.lsp_diagnostics.insert(a.clone(), by_server);
+    app.rebuild_problems();
+    assert_eq!(
+        app.problems.total_count(),
+        2,
+        "only the error and the warning count"
+    );
+    let listed: Vec<DiagnosticSeverity> = app
+        .problems
+        .groups()
+        .iter()
+        .flat_map(|g| g.items.iter().map(|i| i.severity))
+        .collect();
+    assert_eq!(
+        listed,
+        vec![DiagnosticSeverity::Error, DiagnosticSeverity::Warning]
+    );
+    assert_eq!(
+        app.merged_diagnostics(&a).len(),
+        4,
+        "the editor still gets every hint, for its hover and Ctrl+."
+    );
+}
+
+/// #1522: a task or terminal problem matcher can emit `hint` severity too;
+/// those build rows stay out of the PROBLEMS list and its count as well.
+#[test]
+fn task_matcher_hints_stay_out_of_the_problems_list_and_its_count() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    use crate::widgets::problems::ProblemItem;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let a = tmp.path().join("a.rs");
+    let row = |line: u32, severity: DiagnosticSeverity| ProblemItem {
+        line,
+        col: 0,
+        col_utf16: false,
+        severity,
+        message: String::from("m"),
+        source: String::from("task"),
+    };
+    app.build_diagnostics.insert(
+        a.clone(),
+        vec![
+            (1, row(0, DiagnosticSeverity::Hint)),
+            (1, row(1, DiagnosticSeverity::Warning)),
+        ],
+    );
+    app.build_diagnostics.insert(
+        tmp.path().join("only_hints.rs"),
+        vec![(1, row(0, DiagnosticSeverity::Hint))],
+    );
+    app.rebuild_problems();
+    assert_eq!(app.problems.total_count(), 1, "only the warning counts");
+    let listed: Vec<(&std::path::PathBuf, DiagnosticSeverity)> = app
+        .problems
+        .groups()
+        .iter()
+        .flat_map(|g| g.items.iter().map(move |i| (&g.path, i.severity)))
+        .collect();
+    assert_eq!(listed, vec![(&a, DiagnosticSeverity::Warning)]);
+}
+
+/// #1522, negative: a file with nothing but hints has no PROBLEMS group,
+/// while information diagnostics are still listed.
+#[test]
+fn a_file_with_only_hints_has_no_problems_group_but_information_is_listed() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let hints = tmp.path().join("hints.py");
+    let info = tmp.path().join("info.py");
+    let mut h = std::collections::HashMap::new();
+    h.insert(
+        String::from("ty"),
+        vec![
+            diag(0, 3, DiagnosticSeverity::Hint),
+            diag(4, 7, DiagnosticSeverity::Hint),
+        ],
+    );
+    app.lsp_diagnostics.insert(hints, h);
+    let mut i = std::collections::HashMap::new();
+    i.insert(
+        String::from("ty"),
+        vec![diag(0, 3, DiagnosticSeverity::Information)],
+    );
+    app.lsp_diagnostics.insert(info.clone(), i);
+    app.rebuild_problems();
+    let paths: Vec<&std::path::PathBuf> = app.problems.groups().iter().map(|g| &g.path).collect();
+    assert_eq!(paths, vec![&info]);
+    assert_eq!(app.problems.total_count(), 1);
 }
 
 #[test]
@@ -42704,11 +43612,11 @@ fn terminal_find_navigation_survives_streaming_output() {
         app.handle_terminal_key(key(KeyCode::Char(c), KeyModifiers::NONE));
     }
     let anchored_line = |app: &App| -> String {
-        let (lines, top, now) = app.terminals[0].grid_lines_and_clock();
+        let (lines, now) = app.terminals[0].find_lines_and_clock();
         let (clock, abs, _c, _l) = app.terminal_find_match.expect("an anchored match");
         let abs = abs - (now - clock) as i32;
-        let row = (abs - top).clamp(0, lines.len() as i32 - 1) as usize;
-        lines[row].clone()
+        let row = lines.iter().rposition(|l| l.start <= abs).unwrap_or(0);
+        lines[row].text.clone()
     };
     assert!(
         anchored_line(&app).contains("match-three"),
@@ -44728,6 +45636,10 @@ fn a_prepare_rename_verdict_routes_to_the_prompt_status_or_fallback() {
         "renamed",
         "the server's placeholder pre-fills the prompt"
     );
+    assert_eq!(
+        app.status, "",
+        "\"Preparing rename…\" goes once the prompt opens"
+    );
 
     // No placeholder: the validated range's own text.
     arm(&mut app);
@@ -44761,6 +45673,13 @@ fn a_prepare_rename_verdict_routes_to_the_prompt_status_or_fallback() {
         app.prompt.as_ref().expect("fallback prompt opened").buffer,
         "value"
     );
+    assert_eq!(app.status, "", "and when the fallback prompt opens");
+
+    // A status something else set after F2 is not the verdict's to clear.
+    arm(&mut app);
+    app.status = String::from("Saved lib.rs");
+    assert!(app.apply_prepare_rename_verdict(verdict(None, None, true)));
+    assert_eq!(app.status, "Saved lib.rs");
 
     // The buffer moved under the in-flight request: say so rather than
     // leaving "Preparing rename…" wedged on screen forever.
@@ -45631,6 +46550,87 @@ fn an_on_type_reply_applies_only_while_its_buffer_and_tab_are_unmoved() {
         OnTypeReply::Stale,
         "the tab that typed must still be the active one"
     );
+}
+
+/// vtsls 0.3.0's on-type reply after typing `if(a>1){return  0;` right
+/// after the `{` of `export function f(a: number) {` (#1633), captured with
+/// a minimal LSP client. Pairs of edits share a position.
+fn vtsls_on_type_reply() -> Vec<crate::widgets::editor::TextSpanEdit> {
+    let edit = |col: usize, end: usize, text: &str| crate::widgets::editor::TextSpanEdit {
+        start: (0, col),
+        end: (0, end),
+        new_text: text.to_string(),
+        utf16: true,
+    };
+    vec![
+        edit(30, 30, "\n"),
+        edit(30, 30, "  "),
+        edit(32, 32, " "),
+        edit(34, 34, " "),
+        edit(35, 35, " "),
+        edit(37, 37, " "),
+        edit(38, 38, "\n"),
+        edit(38, 38, "    "),
+        edit(44, 46, " "),
+    ]
+}
+
+/// #1633: format on type indents the lines it breaks and leaves the caret
+/// right after the `;` that was typed, on the line the text moved to.
+#[test]
+fn format_on_type_keeps_the_caret_after_the_typed_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ts = tmp.path().join("fmt2.ts");
+    std::fs::write(
+        &ts,
+        "export function f(a: number) {if(a>1){return  0;\n  return a;\n}\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&ts).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 48;
+    assert!(app.apply_on_type_edits(&ts, &vtsls_on_type_reply()));
+    assert_eq!(
+        app.editor.lines[..4],
+        [
+            "export function f(a: number) {",
+            "  if (a > 1) {",
+            "    return 0;",
+            "  return a;"
+        ]
+        .map(String::from)
+    );
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 13));
+}
+
+/// #1633 negative: edits that all sit after the caret leave it where it is,
+/// and an edit on the caret's line before it moves it by the text added.
+#[test]
+fn format_on_type_moves_the_caret_only_for_edits_before_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ts = tmp.path().join("a.ts");
+    std::fs::write(&ts, "let a=1;\nlet  b = 2;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&ts).unwrap();
+    app.focus_pane(Pane::Editor);
+    let edit =
+        |row: usize, col: usize, end: usize, text: &str| crate::widgets::editor::TextSpanEdit {
+            start: (row, col),
+            end: (row, end),
+            new_text: text.to_string(),
+            utf16: true,
+        };
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 3;
+    assert!(app.apply_on_type_edits(&ts, &[edit(1, 3, 5, " ")]));
+    assert_eq!(app.editor.lines[1], "let b = 2;");
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 3));
+    app.editor.cursor_col = 8;
+    assert!(app.apply_on_type_edits(&ts, &[edit(0, 5, 5, " "), edit(0, 6, 6, " ")]));
+    assert_eq!(app.editor.lines[0], "let a = 1;");
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 10));
 }
 
 #[test]
@@ -49704,6 +50704,118 @@ fn a_large_log_opens_before_its_index_is_complete_and_the_loop_finishes_it() {
     );
 }
 
+/// #1538: a large log viewed at its end and reloaded after an append
+/// reopens on a partial index; the main loop's `poll_log_index` settles the
+/// view on the new end as the index reaches it, instead of leaving it
+/// clamped to the head the open indexed.
+#[test]
+fn the_loop_brings_a_reloaded_large_log_to_its_new_end() {
+    use ratatui::widgets::Widget as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("huge.log");
+    let mut body = Vec::new();
+    body.extend_from_slice(b"\x1b[32mINFO\x1b[0m head\n");
+    let mut lines = 1usize;
+    while (body.len() as u64) < crate::log_view::HEAD_INDEX_BYTES + 1024 * 1024 {
+        body.extend_from_slice(format!("line{lines} some padding text\n").as_bytes());
+        lines += 1;
+    }
+    std::fs::write(&p, &body).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    let area = Rect::new(0, 0, 80, 12);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    (&mut *app.editor).render(area, &mut buf);
+    app.editor.log.as_mut().unwrap().finish_index();
+    app.editor.scroll_down(usize::MAX / 2);
+    let rows = (app.editor.last_inner.height as usize).saturating_sub(1);
+    assert_eq!(
+        app.editor.scroll + rows,
+        lines,
+        "the view is on the last line"
+    );
+
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        writeln!(f, "\x1b[31mERROR\x1b[0m disk full").unwrap();
+    }
+    app.editor.reload_or_flag_conflict();
+    assert!(app.editor.log.as_ref().unwrap().indexing());
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the background log index",
+        || {
+            app.poll_log_index();
+            !app.editor.log.as_ref().unwrap().indexing()
+        },
+    );
+    assert_eq!(
+        app.editor.scroll + rows,
+        lines + 1,
+        "the view follows the log to its new last line"
+    );
+}
+
+/// #1538: a find-bar jump while a reloaded large log is still indexing is
+/// the reader's place; the next index batch does not snap the view back to
+/// the place the reload was settling.
+#[test]
+fn a_log_search_jump_during_a_reload_index_is_not_undone() {
+    use ratatui::widgets::Widget as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("huge.log");
+    let mut body = Vec::new();
+    body.extend_from_slice(b"\x1b[32mINFO\x1b[0m head\n");
+    let mut lines = 1usize;
+    while (body.len() as u64) < crate::log_view::HEAD_INDEX_BYTES + 1024 * 1024 {
+        body.extend_from_slice(format!("line{lines} some padding text\n").as_bytes());
+        lines += 1;
+    }
+    std::fs::write(&p, &body).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.open(&p).unwrap();
+    let area = Rect::new(0, 0, 80, 12);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    (&mut *app.editor).render(area, &mut buf);
+    app.editor.log.as_mut().unwrap().finish_index();
+    app.editor.scroll_down(5);
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        writeln!(f, "\x1b[31mERROR\x1b[0m disk full").unwrap();
+    }
+    app.editor.reload_or_flag_conflict();
+    assert!(app.editor.log.as_ref().unwrap().indexing());
+
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    for ch in "line400 ".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.editor.active_search_match.map(|(row, ..)| row),
+        Some(400),
+        "the search lands on its match"
+    );
+    let scroll = app.editor.scroll;
+    assert!(scroll > 5 && scroll <= 400, "and the view moved to it");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the background log index",
+        || {
+            app.poll_log_index();
+            !app.editor.log.as_ref().unwrap().indexing()
+        },
+    );
+    assert_eq!(app.editor.scroll, scroll, "the index did not move the view");
+}
+
 /// #374: Fix with Navigator from PROBLEMS. With no navigator seated the
 /// action lands on the diagnostic and says the navigator is not active
 /// rather than doing nothing; the caret-side entry points resolve the
@@ -49728,6 +50840,7 @@ fn fix_with_navigator_lands_on_the_diagnostic_and_refuses_without_a_seat() {
             end_char: 11,
             severity: DiagnosticSeverity::Warning,
             message: String::from("unused import: `std::io`"),
+            tags: Default::default(),
         }],
     );
     app.lsp_diagnostics.insert(file.clone(), by_server);
@@ -51957,7 +53070,7 @@ fn alt_enter_on_a_symlinked_symbol_still_opens_its_tab() {
     let root = std::fs::canonicalize(tmp.path()).unwrap();
     let file = root.join("two.rs");
     std::fs::write(&file, "fn a() {\n    1\n}\nfn b() {\n    2\n}").unwrap();
-    let link = root.join("link.rs");
+    let link = root.join("link.c");
     std::os::unix::fs::symlink(&file, &link).unwrap();
     let mut app = App::new(root.clone()).unwrap();
     app.editor.open_pinned(&file).unwrap();
@@ -62541,6 +63654,7 @@ fn a_proposals_diagnostics_show_in_the_popup_not_the_buffer() {
             end_char: 18,
             severity: crate::lsp::manager::DiagnosticSeverity::Error,
             message: "Undefined name `nope_undefined`".into(),
+            tags: Default::default(),
         }],
     }]);
     assert!(
@@ -63977,6 +65091,56 @@ fn a_run_asked_for_mid_run_does_not_take_over_the_first_runs_outcome() {
         "{}",
         s.app.status
     );
+}
+
+/// #1639: a test run started with saving turned off shows the unsaved
+/// file's warning in front of its "Running …" status, and its outcome
+/// still replaces that status when it ends.
+#[cfg(unix)]
+#[test]
+fn a_test_run_started_with_the_unsaved_warning_still_reports_its_outcome() {
+    let mut s = CodeqlStandIn::new();
+    s.will(STAND_IN_PASS, 0);
+    let file = PathBuf::from(&s.root).join("test/Find/Find.ql");
+    std::fs::write(&file, "old\n").unwrap();
+    s.app.editor.open_pinned(&file).unwrap();
+    s.app.editor.insert_str("new\n");
+    s.app.save_before_debug = false;
+    s.app.run_named_test(String::from("Find.qlref"));
+    assert_eq!(
+        s.app.status,
+        "Find.ql has unsaved changes: the test run uses the file on disk - Running test test/Find::Find.qlref"
+    );
+    s.finish();
+    assert!(
+        s.app.status.starts_with("Find.qlref passed ("),
+        "{}",
+        s.app.status
+    );
+}
+
+/// #1639: with a watched scope, the save a test run makes before it
+/// starts schedules no second, watched run after it.
+#[cfg(unix)]
+#[test]
+fn the_save_before_a_test_run_schedules_no_watched_rerun() {
+    let mut s = CodeqlStandIn::new();
+    s.will(STAND_IN_PASS, 0);
+    s.app
+        .testing
+        .watch
+        .toggle(crate::testing::watch::WatchScope::All);
+    let file = PathBuf::from(&s.root).join("test/Find/Find.ql");
+    assert!(file.starts_with(&s.app.active_test_root));
+    std::fs::write(&file, "old\n").unwrap();
+    s.app.editor.open_pinned(&file).unwrap();
+    s.app.editor.insert_str("new\n");
+    s.app.run_named_test(String::from("Find.qlref"));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\nold\n");
+    assert_eq!(s.app.testing.watch.due_at(), None);
+    s.finish();
+    assert!(!s.app.testing.is_busy());
+    assert_eq!(s.app.testing.watch.due_at(), None);
 }
 
 /// #856 guard: a coverage run that never ran (CodeQL tests have no source
@@ -76721,6 +77885,89 @@ fn a_save_as_that_fails_leaves_the_tab_where_it_was() {
     assert!(error.is_some(), "the prompt stays open with the reason");
 }
 
+/// A workspace with `report.py` open and an unsaved comment typed on line 1.
+fn app_with_an_edited_report(dir: &Path) -> App {
+    std::fs::write(
+        dir.join("report.py"),
+        "def total(xs):\n    return sum(xs)\n",
+    )
+    .unwrap();
+    let mut app = App::new(dir.to_path_buf()).unwrap();
+    app.editor.open_pinned(&dir.join("report.py")).unwrap();
+    app.focus = Pane::Editor;
+    app.editor.insert_str("# draft ");
+    assert!(app.editor.dirty, "precondition: the tab has unsaved edits");
+    app
+}
+
+/// Run File: Revert File the way the palette does.
+fn revert_file(app: &mut App) {
+    let cmd = crate::widgets::command_palette::Command::from_id("revert_file")
+        .expect("there is a File: Revert File command");
+    app.run_command(cmd);
+}
+
+/// #1285: Revert File drops every unsaved edit in one step and says so.
+#[test]
+fn revert_file_restores_the_text_on_disk_and_clears_dirty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_an_edited_report(tmp.path());
+    revert_file(&mut app);
+    assert_eq!(
+        app.editor.lines,
+        vec!["def total(xs):", "    return sum(xs)"]
+    );
+    assert!(!app.editor.dirty);
+    assert_eq!(app.status, "Reverted report.py");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("report.py")).unwrap(),
+        "def total(xs):\n    return sum(xs)\n",
+        "the file on disk is not touched"
+    );
+}
+
+/// #1285: the revert is one undo step, so Ctrl+Z brings the edits back,
+/// marked unsaved again, and redo reverts again.
+#[test]
+fn undo_after_revert_file_brings_the_edits_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_an_edited_report(tmp.path());
+    revert_file(&mut app);
+    assert!(app.editor.undo());
+    assert_eq!(app.editor.lines[0], "# draft def total(xs):");
+    assert!(app.editor.dirty, "the restored edits are unsaved again");
+    assert!(app.editor.redo());
+    assert_eq!(app.editor.lines[0], "def total(xs):");
+}
+
+/// #1285 negative: on a tab with nothing unsaved Revert File changes
+/// nothing, adds no undo step, and says there is nothing to revert.
+#[test]
+fn revert_file_on_a_clean_tab_does_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("report.py"), "x = 1\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_pinned(&tmp.path().join("report.py"))
+        .unwrap();
+    revert_file(&mut app);
+    assert_eq!(app.editor.lines, vec!["x = 1"]);
+    assert!(!app.editor.undo(), "no undo step was added");
+    assert!(app.status.contains("no unsaved changes"), "{}", app.status);
+}
+
+/// #1285 negative: a buffer with no file behind it has nothing to revert
+/// to, so its text stays.
+#[test]
+fn revert_file_keeps_a_buffer_with_no_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.insert_str("scratch");
+    revert_file(&mut app);
+    assert_eq!(app.editor.lines, vec!["scratch"]);
+    assert!(app.status.contains("no file"), "{}", app.status);
+}
+
 /// #852: every bottom-panel tab is reachable from the keyboard. Each tab
 /// names the palette command that shows it (`show_command` has no
 /// catch-all, so a new tab cannot compile without one, and the strip paints
@@ -78265,6 +79512,239 @@ fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
     assert_eq!(app.status, "Tab is already kept open");
 }
 
+// --- #1215: keys that move the caret sideways scroll the view to it -----------
+
+fn wide_line_app(tmp: &std::path::Path) -> (App, ratatui::Terminal<ratatui::backend::TestBackend>) {
+    let line = format!(
+        "start {} END",
+        (0..120)
+            .map(|i| format!("w{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let mut app = app_with_open_file(tmp, "h300.txt", &format!("{line}\nshort\n"));
+    app.focus_pane(Pane::Editor);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    (app, term)
+}
+
+fn caret_on_screen(app: &App) -> bool {
+    let bar = usize::from(app.editor.last_scrollbar.width > 0);
+    let width = (app.editor.last_inner.width as usize)
+        .saturating_sub(app.editor.last_gutter_width as usize + 2 + bar);
+    app.editor.cursor_col >= app.editor.scroll_col
+        && app.editor.cursor_col < app.editor.scroll_col + width
+}
+
+#[test]
+fn end_on_a_wide_line_scrolls_the_caret_into_view() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _term) = wide_line_app(tmp.path());
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.cursor_col, 609);
+    assert!(app.editor.scroll_col > 0, "the view follows the caret");
+    assert!(
+        caret_on_screen(&app),
+        "scroll_col {}",
+        app.editor.scroll_col
+    );
+}
+
+#[test]
+fn typing_past_the_right_edge_keeps_the_caret_in_view() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _term) = wide_line_app(tmp.path());
+    app.editor.cursor_col = 60;
+    for _ in 0..40 {
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(app.editor.cursor_col, 100);
+    assert!(
+        caret_on_screen(&app),
+        "scroll_col {}",
+        app.editor.scroll_col
+    );
+}
+
+#[test]
+fn home_after_scrolling_right_brings_the_view_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _term) = wide_line_app(tmp.path());
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    app.editor.scroll_col = 500;
+    app.editor.cursor_col = 600;
+    app.handle_key(key(KeyCode::Home, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.cursor_col, 0);
+    assert_eq!(app.editor.scroll_col, 0);
+}
+
+#[test]
+fn shift_end_extends_the_selection_and_follows_the_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _term) = wide_line_app(tmp.path());
+    app.handle_key(key(KeyCode::End, KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(app.editor.selection.is_some());
+    assert!(
+        caret_on_screen(&app),
+        "scroll_col {}",
+        app.editor.scroll_col
+    );
+}
+
+#[test]
+fn enter_at_the_end_of_a_wide_line_scrolls_back_to_column_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _term) = wide_line_app(tmp.path());
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    app.editor.scroll_col = 560;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 0));
+    assert_eq!(app.editor.scroll_col, 0);
+}
+
+#[test]
+fn end_on_a_short_line_leaves_the_view_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _term) = wide_line_app(tmp.path());
+    app.editor.cursor_row = 1;
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.cursor_col, 5);
+    assert_eq!(app.editor.scroll_col, 0);
+}
+
+// --- #1252: Quick Fix sends the selection --------------------------------------
+
+fn diag_on_line(line: u32, message: &str) -> crate::lsp::manager::Diagnostic {
+    crate::lsp::manager::Diagnostic {
+        start_line: line,
+        start_char: 0,
+        end_line: line,
+        end_char: 1,
+        severity: crate::lsp::manager::DiagnosticSeverity::Warning,
+        message: String::from(message),
+        tags: Default::default(),
+    }
+}
+
+const QUICK_FIX_BODY: &str = "def f():\n    a = 1\n    b = 2\n    c = 3\n    return a\n";
+
+#[test]
+fn quick_fix_with_a_selection_asks_about_the_whole_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "f.py", QUICK_FIX_BODY);
+    // Select lines 2-3 top to bottom: the caret ends at the start of line 4.
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (1, 0),
+        head: (3, 0),
+    });
+    app.editor.cursor_row = 3;
+    app.editor.cursor_col = 0;
+    let (start, end, _) = app.code_action_request();
+    assert_eq!(
+        (start, end),
+        ((1, 0), (3, 0)),
+        "the code action range must be the selection, not the caret point"
+    );
+}
+
+#[test]
+fn quick_fix_with_a_backwards_selection_sends_it_start_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "f.py", QUICK_FIX_BODY);
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (2, 9),
+        head: (1, 4),
+    });
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 4;
+    let (start, end, _) = app.code_action_request();
+    assert_eq!((start, end), ((1, 4), (2, 9)));
+}
+
+#[test]
+fn quick_fix_with_a_selection_sends_the_diagnostics_of_every_selected_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "f.py", QUICK_FIX_BODY);
+    let path = app.editor.path.clone().unwrap();
+    app.editor.apply_diagnostics(
+        path,
+        vec![
+            diag_on_line(1, "a unused"),
+            diag_on_line(2, "b unused"),
+            diag_on_line(4, "outside"),
+        ],
+    );
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (1, 0),
+        head: (2, 9),
+    });
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 9;
+    let (_, _, diagnostics) = app.code_action_request();
+    let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+    assert_eq!(messages, vec!["a unused", "b unused"]);
+}
+
+#[test]
+fn quick_fix_without_a_selection_still_asks_about_the_caret_point() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "f.py", QUICK_FIX_BODY);
+    let path = app.editor.path.clone().unwrap();
+    app.editor.apply_diagnostics(
+        path,
+        vec![diag_on_line(1, "a unused"), diag_on_line(2, "b unused")],
+    );
+    app.editor.selection = None;
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 6;
+    let (start, end, diagnostics) = app.code_action_request();
+    assert_eq!((start, end), ((2, 6), (2, 6)));
+    let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+    assert_eq!(
+        messages,
+        vec!["b unused"],
+        "only the caret line's diagnostics"
+    );
+}
+
+#[test]
+fn quick_fix_with_an_empty_selection_falls_back_to_the_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "f.py", QUICK_FIX_BODY);
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (3, 4),
+        head: (3, 4),
+    });
+    app.editor.cursor_row = 3;
+    app.editor.cursor_col = 4;
+    let (start, end, _) = app.code_action_request();
+    assert_eq!((start, end), ((3, 4), (3, 4)));
+}
+
+#[test]
+fn quick_fix_selection_columns_are_utf16() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "f.py", "s = \"🙂🙂\"\n");
+    // Select the two emoji: chars 5..7, UTF-16 units 5..9.
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 5),
+        head: (0, 7),
+    });
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 7;
+    let (start, end, _) = app.code_action_request();
+    assert_eq!((start, end), ((0, 5), (0, 9)));
+}
+
 // ---- Git diffs of files that aren't UTF-8 (#1242) ----
 
 /// A repo with `name` committed as `head` bytes, then `head + added` on disk.
@@ -78896,6 +80376,153 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     let _ = render_buf(&mut app);
     assert!(app.source_control.nested_repos.is_empty());
     assert!(app.source_control.last_init_repo_button_area.width > 0);
+}
+
+/// #1433: the bytes croft writes for one frame, through the real crossterm
+/// backend, at `depth`.
+fn frame_bytes_at(depth: crate::color_depth::ColorDepth) -> String {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.py"), "print(1)\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&tmp.path().join("a.py")).unwrap();
+    app.color_depth = depth;
+    struct Sink(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let bytes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let backend = ratatui::backend::CrosstermBackend::new(Sink(bytes.clone()));
+    let mut term = ratatui::Terminal::with_options(
+        backend,
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 100, 30)),
+        },
+    )
+    .unwrap();
+    term.draw(|f| app.render_for_terminal(f)).unwrap();
+    drop(term);
+    String::from_utf8_lossy(&bytes.borrow()).into_owned()
+}
+
+/// #1433: on a 256-colour terminal the frame carries no 24-bit colour
+/// sequence, only palette indexes.
+#[test]
+fn a_256_colour_terminal_gets_no_24_bit_colour() {
+    let out = frame_bytes_at(crate::color_depth::ColorDepth::Ansi256);
+    assert_eq!(out.matches(";2;").count(), 0, "{out:?}");
+    assert!(out.contains("48;5;"), "background indexes are written");
+}
+
+/// #1433: the Linux console gets the 16 ANSI colours only (crossterm
+/// writes them as palette entries 0-15).
+#[test]
+fn a_16_colour_terminal_gets_only_the_16_ansi_colours() {
+    let out = frame_bytes_at(crate::color_depth::ColorDepth::Ansi16);
+    assert_eq!(out.matches(";2;").count(), 0, "{out:?}");
+    let indexes: Vec<u32> = out
+        .split("8;5;")
+        .skip(1)
+        .map(|rest| {
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().unwrap()
+        })
+        .collect();
+    assert!(!indexes.is_empty());
+    assert!(indexes.iter().all(|&i| i < 16), "{indexes:?}");
+}
+
+/// #1433 negative: a truecolor terminal still gets the theme's exact
+/// 24-bit colours.
+#[test]
+fn a_truecolor_terminal_keeps_24_bit_colour() {
+    let out = frame_bytes_at(crate::color_depth::ColorDepth::TrueColor);
+    assert!(out.matches(";2;").count() > 50, "{out:?}");
+}
+
+/// A quiet 30-column pane holding `text`, with the find bar open on it.
+fn wrapped_find_app(text: &str) -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sleep",
+        &[String::from("60")],
+        tmp.path(),
+    )
+    .unwrap();
+    app.terminals[0].resize(30, 10);
+    app.terminals[0].feed_bytes_for_test(format!("\x1b[2J\x1b[H{text}").as_bytes());
+    app.focus_pane(Pane::Terminal);
+    app.open_terminal_find();
+    (tmp, app)
+}
+
+fn terminal_find_count(app: &mut App, query: &str) -> usize {
+    app.terminal_find_set_query(query.to_string());
+    app.terminal_find.as_ref().unwrap().match_count
+}
+
+/// The background the pane paints at `col` of the `row`th screen row of
+/// the fed text (the pane's run-label header may sit above it).
+fn terminal_cell_bg(app: &mut App, row: u16, col: u16) -> ratatui::style::Color {
+    let area = ratatui::layout::Rect::new(0, 0, 32, 12);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    ratatui::widgets::Widget::render(&mut app.terminals[0], area, &mut buf);
+    let first = (1..area.height - 1)
+        .find(|&y| buf[(1, y)].symbol() == "x")
+        .expect("the fed text is on screen");
+    buf[(col + 1, first + row)].bg
+}
+
+/// A match the pane's soft wrap cut in two is found once, and both halves
+/// are painted as the active match (#1275).
+#[test]
+fn terminal_find_matches_across_a_soft_wrap() {
+    let line = format!("{}connection-refused port 5432\r\n", "x".repeat(24));
+    let (_tmp, mut app) = wrapped_find_app(&line);
+    assert_eq!(terminal_find_count(&mut app, "connection-refused"), 1);
+    assert_eq!(
+        app.terminal_find.as_ref().unwrap().match_index,
+        Some(1),
+        "1 of 1"
+    );
+    let reset = ratatui::style::Color::Reset;
+    // `connec` ends row 0; `tion-refused` starts row 1.
+    let first_half = terminal_cell_bg(&mut app, 0, 26);
+    let second_half = terminal_cell_bg(&mut app, 1, 8);
+    assert_ne!(first_half, reset, "the half before the wrap is painted");
+    assert_eq!(first_half, second_half, "both halves are the active match");
+    assert_eq!(terminal_cell_bg(&mut app, 0, 10), reset, "the x run is not");
+    assert_eq!(terminal_cell_bg(&mut app, 1, 14), reset, "nor is `port`");
+}
+
+/// Negative: rows that merely sit next to each other, with no soft wrap
+/// between them, never match across their boundary, and a word that ends
+/// exactly at the wrap is counted once.
+#[test]
+fn terminal_find_never_joins_rows_without_a_wrap_and_counts_an_edge_match_once() {
+    let text = format!("{}connec\r\ntion-refused\r\n", "x".repeat(24));
+    let (_tmp, mut app) = wrapped_find_app(&text);
+    assert_eq!(terminal_find_count(&mut app, "connection-refused"), 0);
+    assert_eq!(
+        terminal_cell_bg(&mut app, 0, 26),
+        ratatui::style::Color::Reset
+    );
+    assert_eq!(terminal_find_count(&mut app, "connec"), 1);
+
+    let edge = format!("{}abcdef{}\r\n", "x".repeat(24), "y".repeat(10));
+    let (_tmp, mut app) = wrapped_find_app(&edge);
+    assert_eq!(terminal_find_count(&mut app, "abcdef"), 1);
+    assert_eq!(
+        terminal_find_count(&mut app, "fyy"),
+        1,
+        "and across the edge"
+    );
 }
 
 /// An App over `tmp` whose user config lives in `cfg`, never the real one.
@@ -79585,4 +81212,61 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     app.watch_published_panes.insert(pane);
     assert!(!app.apply_build_scan(pane, Some(&cwd), "tsc --watch", "a.c:1:1: error: old\n"));
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
+}
+
+/// #1594: a user matcher named `go` is not one of the loose built-in rows,
+/// so its rows are kept even for a file not on disk.
+#[test]
+fn a_custom_matcher_named_go_keeps_rows_for_missing_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.matchers = std::sync::Arc::new(crate::problem_matchers::MatcherSet::from_json(
+        r##"[ { "name": "go",
+               "pattern": "^(?P<file>\\S+):(?P<line>\\d+):(?P<col>\\d+) (?P<severity>\\w+) (?P<message>.+)$",
+               "applies_to": "mygo*" } ]"##,
+    ));
+    let out = "gen/missing.go:3:1 error generated file absent\n";
+    assert!(app.apply_build_scan(0, Some(tmp.path()), "mygo build", out));
+    let groups = app.problems.groups().to_vec();
+    let g = groups
+        .iter()
+        .find(|g| g.path == tmp.path().join("gen/missing.go"))
+        .expect("a user matcher's row must not need an existing file");
+    assert_eq!(g.items[0].source, "go");
+}
+
+/// #1594: a `go build` error and a flake8 row land in PROBLEMS for files
+/// that exist; the same shapes naming no file are not problems.
+#[test]
+fn go_and_lint_rows_reach_problems_only_for_real_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("main.go"), "package main\n").unwrap();
+    std::fs::write(tmp.path().join("app.py"), "import os\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let out = "./main.go:4:6: declared and not used: unused\n\
+               app.py:1:1: F401 'os' imported but unused\n\
+               notes.go:9:9: just some text\n\
+               ghost.py:3:1: E999 not a real file\n\
+               app.py:2: error: Incompatible types in assignment\n";
+    assert!(app.apply_build_scan(3, Some(tmp.path()), "go build ./... ; flake8 app.py", out));
+    let mut rows: Vec<(String, u32, String)> = app
+        .problems
+        .groups()
+        .iter()
+        .flat_map(|g| {
+            let name = g.path.file_name().unwrap().to_string_lossy().into_owned();
+            g.items
+                .iter()
+                .map(move |i| (name.clone(), i.line, i.source.clone()))
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        [
+            (String::from("app.py"), 0, String::from("lint")),
+            (String::from("app.py"), 1, String::from("no-column")),
+            (String::from("main.go"), 3, String::from("go")),
+        ]
+    );
 }
