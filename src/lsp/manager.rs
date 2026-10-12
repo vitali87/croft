@@ -2073,6 +2073,15 @@ struct ManagedClient {
 /// auto-detect that project's environment.
 type ClientKey = (Language, PathBuf);
 
+/// Why [`WorkerState::pick_server`] found no server to ask.
+enum NoServer {
+    /// The file is not open, or no server set exists for its language and
+    /// root: the request is dropped without a reply.
+    Unknown,
+    /// Servers run for the file, but none carries the method.
+    Unsupported,
+}
+
 struct WorkerState {
     workspace_root: PathBuf,
     /// Secondary workspace roots (multi-root, #147). Servers stay one
@@ -3072,6 +3081,29 @@ impl WorkerState {
         self.clients.get(&key).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    /// The first server running for the open document `path` that `supports`
+    /// a method, as its name and client. Re-probes first, so a server
+    /// installed since the file was opened (e.g. the managed vtsls finishing
+    /// its lazy background install) is picked up without reopening the file;
+    /// cheap once the list is non-empty.
+    async fn pick_server(
+        &mut self,
+        path: &Path,
+        supports: fn(&ManagedClient) -> bool,
+    ) -> Result<(String, Arc<TokioMutex<LspClient>>), NoServer> {
+        let doc = self.docs.get(path).ok_or(NoServer::Unknown)?;
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        self.clients
+            .get(&(lang, root))
+            .ok_or(NoServer::Unknown)?
+            .iter()
+            .find(|c| supports(c))
+            .map(|c| (c.name.clone(), c.client.clone()))
+            .ok_or(NoServer::Unsupported)
+    }
+
     /// Spawn (or begin provisioning) the servers for every language whose
     /// root marker is evident in the workspace root — exactly what the
     /// first `open_doc` of that language would do, minus the document.
@@ -3471,28 +3503,16 @@ impl WorkerState {
         character: u32,
         tx: &std_mpsc::Sender<HoverResult>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        // Re-probe so a server installed since the file was opened (e.g. the
-        // managed vtsls finishing its lazy background install) is picked up
-        // without reopening the file. Cheap once the list is non-empty.
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_hover)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
-            let _ = tx.send(HoverResult {
-                request_id,
-                text: None,
-            });
-            return;
+        let (server_name, client_arc) = match self.pick_server(&path, |c| c.supports_hover).await {
+            Ok(picked) => picked,
+            Err(NoServer::Unsupported) => {
+                let _ = tx.send(HoverResult {
+                    request_id,
+                    text: None,
+                });
+                return;
+            }
+            Err(NoServer::Unknown) => return,
         };
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
@@ -3624,20 +3644,9 @@ impl WorkerState {
         seq: u64,
         tx: &std_mpsc::Sender<InlayHintsUpdate>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_inlay_hints)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
+        let Ok((server_name, client_arc)) =
+            self.pick_server(&path, |c| c.supports_inlay_hints).await
+        else {
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
@@ -3673,20 +3682,9 @@ impl WorkerState {
         seq: u64,
         tx: &std_mpsc::Sender<DocumentLinksUpdate>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_document_link)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
+        let Ok((server_name, client_arc)) =
+            self.pick_server(&path, |c| c.supports_document_link).await
+        else {
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
@@ -3839,20 +3837,9 @@ impl WorkerState {
         seq: u64,
         tx: &std_mpsc::Sender<FoldingRangesUpdate>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_folding_range)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
+        let Ok((server_name, client_arc)) =
+            self.pick_server(&path, |c| c.supports_folding_range).await
+        else {
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
@@ -3886,20 +3873,9 @@ impl WorkerState {
         seq: u64,
         tx: &std_mpsc::Sender<DocumentColorsUpdate>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_document_color)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
+        let Ok((server_name, client_arc)) =
+            self.pick_server(&path, |c| c.supports_document_color).await
+        else {
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
@@ -3937,22 +3913,9 @@ impl WorkerState {
                 presentations: Vec::new(),
             });
         };
-        let Some(doc) = self.docs.get(&path) else {
-            empty(tx);
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            empty(tx);
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_document_color)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
+        let Ok((server_name, client_arc)) =
+            self.pick_server(&path, |c| c.supports_document_color).await
+        else {
             empty(tx);
             return;
         };
@@ -4085,29 +4048,18 @@ impl WorkerState {
         character: u32,
         tx: &std_mpsc::Sender<DefinitionResult>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        // Re-probe so a server installed since the file was opened (e.g. the
-        // managed vtsls finishing its lazy background install) is picked up
-        // without reopening the file. Cheap once the list is non-empty.
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_definition)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
-            let _ = tx.send(DefinitionResult {
-                request_id,
-                target: None,
-            });
-            return;
-        };
+        let (server_name, client_arc) =
+            match self.pick_server(&path, |c| c.supports_definition).await {
+                Ok(picked) => picked,
+                Err(NoServer::Unsupported) => {
+                    let _ = tx.send(DefinitionResult {
+                        request_id,
+                        target: None,
+                    });
+                    return;
+                }
+                Err(NoServer::Unknown) => return,
+            };
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
         };
@@ -4142,28 +4094,22 @@ impl WorkerState {
         seq: u64,
         tx: &std_mpsc::Sender<DocumentSymbolsResult>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_document_symbol)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
-            // No symbol provider: send an empty outline so the panel shows
-            // "No symbols" rather than a stale tree from a previous file.
-            let _ = tx.send(DocumentSymbolsResult {
-                path,
-                seq,
-                symbols: Vec::new(),
-            });
-            return;
+        let (server_name, client_arc) = match self
+            .pick_server(&path, |c| c.supports_document_symbol)
+            .await
+        {
+            Ok(picked) => picked,
+            Err(NoServer::Unsupported) => {
+                // No symbol provider: send an empty outline so the panel shows
+                // "No symbols" rather than a stale tree from a previous file.
+                let _ = tx.send(DocumentSymbolsResult {
+                    path,
+                    seq,
+                    symbols: Vec::new(),
+                });
+                return;
+            }
+            Err(NoServer::Unknown) => return,
         };
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
@@ -4202,30 +4148,19 @@ impl WorkerState {
         character: u32,
         tx: &std_mpsc::Sender<DeclarationResult>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        // Re-probe so a server installed since the file was opened (e.g. the
-        // managed vtsls finishing its lazy background install) is picked up
-        // without reopening the file. Cheap once the list is non-empty.
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_declaration)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
-            let _ = tx.send(DeclarationResult {
-                request_id,
-                target: None,
-                unsupported: true,
-            });
-            return;
-        };
+        let (server_name, client_arc) =
+            match self.pick_server(&path, |c| c.supports_declaration).await {
+                Ok(picked) => picked,
+                Err(NoServer::Unsupported) => {
+                    let _ = tx.send(DeclarationResult {
+                        request_id,
+                        target: None,
+                        unsupported: true,
+                    });
+                    return;
+                }
+                Err(NoServer::Unknown) => return,
+            };
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
         };
@@ -4268,29 +4203,20 @@ impl WorkerState {
         character: u32,
         tx: &std_mpsc::Sender<TypeDefinitionResult>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        // Re-probe so a server installed since the file was opened (e.g. the
-        // managed vtsls finishing its lazy background install) is picked up
-        // without reopening the file. Cheap once the list is non-empty.
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_type_definition)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
-            let _ = tx.send(TypeDefinitionResult {
-                request_id,
-                target: None,
-                unsupported: true,
-            });
-            return;
+        let (server_name, client_arc) = match self
+            .pick_server(&path, |c| c.supports_type_definition)
+            .await
+        {
+            Ok(picked) => picked,
+            Err(NoServer::Unsupported) => {
+                let _ = tx.send(TypeDefinitionResult {
+                    request_id,
+                    target: None,
+                    unsupported: true,
+                });
+                return;
+            }
+            Err(NoServer::Unknown) => return,
         };
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
@@ -4334,30 +4260,19 @@ impl WorkerState {
         character: u32,
         tx: &std_mpsc::Sender<ImplementationResult>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        // Re-probe so a server installed since the file was opened (e.g. the
-        // managed vtsls finishing its lazy background install) is picked up
-        // without reopening the file. Cheap once the list is non-empty.
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_implementation)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
-            let _ = tx.send(ImplementationResult {
-                request_id,
-                targets: Vec::new(),
-                unsupported: true,
-            });
-            return;
-        };
+        let (server_name, client_arc) =
+            match self.pick_server(&path, |c| c.supports_implementation).await {
+                Ok(picked) => picked,
+                Err(NoServer::Unsupported) => {
+                    let _ = tx.send(ImplementationResult {
+                        request_id,
+                        targets: Vec::new(),
+                        unsupported: true,
+                    });
+                    return;
+                }
+                Err(NoServer::Unknown) => return,
+            };
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
         };
@@ -4486,30 +4401,19 @@ impl WorkerState {
         character: u32,
         tx: &std_mpsc::Sender<ReferencesResult>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        // Re-probe so a server installed since the file was opened (e.g. the
-        // managed vtsls finishing its lazy background install) is picked up
-        // without reopening the file. Cheap once the list is non-empty.
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_references)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
-            let _ = tx.send(ReferencesResult {
-                request_id,
-                targets: Vec::new(),
-                unsupported: true,
-            });
-            return;
-        };
+        let (server_name, client_arc) =
+            match self.pick_server(&path, |c| c.supports_references).await {
+                Ok(picked) => picked,
+                Err(NoServer::Unsupported) => {
+                    let _ = tx.send(ReferencesResult {
+                        request_id,
+                        targets: Vec::new(),
+                        unsupported: true,
+                    });
+                    return;
+                }
+                Err(NoServer::Unknown) => return,
+            };
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
         };
@@ -4552,23 +4456,13 @@ impl WorkerState {
         character: u32,
         tx: &std_mpsc::Sender<DocumentHighlightsResult>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
         // No unsupported reply: occurrences are a silent background
         // decoration, so a language without the capability just never
         // paints (the app cleared the old set when the caret moved).
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_document_highlight)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
+        let Ok((server_name, client_arc)) = self
+            .pick_server(&path, |c| c.supports_document_highlight)
+            .await
+        else {
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
@@ -4604,20 +4498,9 @@ impl WorkerState {
         character: u32,
         tx: &std_mpsc::Sender<LinkedEditingResult>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_linked_editing)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
+        let Ok((server_name, client_arc)) =
+            self.pick_server(&path, |c| c.supports_linked_editing).await
+        else {
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
@@ -4664,22 +4547,10 @@ impl WorkerState {
                 chains: Vec::new(),
             });
         };
-        let Some(doc) = self.docs.get(&path) else {
-            unsupported(tx);
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            unsupported(tx);
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_selection_range)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
+        let Ok((server_name, client_arc)) = self
+            .pick_server(&path, |c| c.supports_selection_range)
+            .await
+        else {
             unsupported(tx);
             return;
         };
@@ -4734,28 +4605,20 @@ impl WorkerState {
         } else {
             HierarchyKind::OutgoingCalls
         };
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_call_hierarchy)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
-            let _ = tx.send(CallHierarchyResult {
-                request_id,
-                kind,
-                sites: Vec::new(),
-                unsupported: true,
-            });
-            return;
-        };
+        let (server_name, client_arc) =
+            match self.pick_server(&path, |c| c.supports_call_hierarchy).await {
+                Ok(picked) => picked,
+                Err(NoServer::Unsupported) => {
+                    let _ = tx.send(CallHierarchyResult {
+                        request_id,
+                        kind,
+                        sites: Vec::new(),
+                        unsupported: true,
+                    });
+                    return;
+                }
+                Err(NoServer::Unknown) => return,
+            };
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
         };
@@ -5048,20 +4911,9 @@ impl WorkerState {
         command: String,
         arguments: Vec<serde_json::Value>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_code_action)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
+        let Ok((server_name, client_arc)) =
+            self.pick_server(&path, |c| c.supports_code_action).await
+        else {
             return;
         };
         tokio::spawn(async move {
@@ -5089,25 +4941,8 @@ impl WorkerState {
                 edits: None,
             });
         };
-        let Some(doc) = self.docs.get(&path) else {
-            unanswerable();
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        // Re-probe so a server installed since the file was opened (e.g. the
-        // managed vtsls finishing its lazy background install) is picked up
-        // without reopening the file. Cheap once the list is non-empty.
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            unanswerable();
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_rename)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
+        let Ok((server_name, client_arc)) = self.pick_server(&path, |c| c.supports_rename).await
+        else {
             unanswerable();
             return;
         };
@@ -5430,22 +5265,10 @@ impl WorkerState {
         insert_spaces: bool,
         tx: &std_mpsc::Sender<FormatResult>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            answer_unsupported(tx, request_id, path);
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            answer_unsupported(tx, request_id, path);
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_range_formatting)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
+        let Ok((server_name, client_arc)) = self
+            .pick_server(&path, |c| c.supports_range_formatting)
+            .await
+        else {
             answer_unsupported(tx, request_id, path);
             return;
         };
