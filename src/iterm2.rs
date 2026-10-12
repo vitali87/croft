@@ -330,9 +330,9 @@ const CMD_OPT_DOWN_KEY: &str = "0xf701-0x180000";
 const CMD_OPT_DOWN_HEX: &str = "0x1b 0x5b 0x31 0x3b 0x31 0x31 0x42";
 /// `Cmd+Shift+Opt+arrows` -> column (box) selection (#1560), VS Code's
 /// `cursorColumnSelect*`. Same function-key form with the Cmd+Shift+Opt
-/// mask 0x1a0000; payload `ESC [ 1 ; 12 (A|B|D|C)` (12 = 1 base + Shift(1)
-/// + Alt(2) + Super(8)) decodes to the arrow + SHIFT | ALT | SUPER, which
-/// `handle_editor_key` routes to `column_select`.
+/// mask 0x1a0000; payload `ESC [ 1 ; 12 (A|B|D|C)` (12 is 1 base plus
+/// Shift 1, Alt 2 and Super 8) decodes to the arrow + SHIFT | ALT | SUPER,
+/// which `handle_editor_key` routes to `column_select`.
 const CMD_OPT_SHIFT_UP_KEY: &str = "0xf700-0x1a0000";
 const CMD_OPT_SHIFT_UP_HEX: &str = "0x1b 0x5b 0x31 0x3b 0x31 0x32 0x41";
 const CMD_OPT_SHIFT_DOWN_KEY: &str = "0xf701-0x1a0000";
