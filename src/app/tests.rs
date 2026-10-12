@@ -81128,6 +81128,53 @@ fn a_new_association_relanguages_open_tabs_but_not_a_hand_picked_one() {
     );
 }
 
+/// #1574: an association that moves an open file to another language
+/// server closes it on the old one, so the next sync opens it on the new.
+#[test]
+fn an_association_change_reopens_the_file_on_its_new_server() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "fn main() {}\n");
+    let rs = app.editor.path.clone().unwrap();
+    std::fs::write(tmp.path().join("b.go"), "package b\n").unwrap();
+    let go = tmp.path().join("b.go");
+    app.lsp_last_seen.insert(rs.clone(), 3);
+    app.lsp_last_seen.insert(go.clone(), 4);
+    let mut prefs = crate::prefs::Prefs::default();
+    prefs
+        .files_associations
+        .insert(String::from("*.rs"), String::from("python"));
+    app.apply_file_associations(&prefs);
+    assert!(
+        !app.lsp_last_seen.contains_key(&rs),
+        "rerouted file is resent"
+    );
+    assert_eq!(app.lsp_last_seen.get(&go), Some(&4), "untouched file stays");
+}
+
+/// #1574: a folder added to the workspace gets the associations, and one
+/// removed loses them, though the settings themselves did not change.
+#[test]
+fn associations_follow_workspace_folders_in_and_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let extra = tempfile::tempdir().unwrap();
+    let extra_root = extra.path().canonicalize().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "x\n");
+    let mut prefs = crate::prefs::Prefs::default();
+    prefs
+        .files_associations
+        .insert(String::from("*.tpl"), String::from("html"));
+    app.apply_file_associations(&prefs);
+    let card = extra_root.join("card.tpl");
+    assert_eq!(crate::highlight::associated_language_id(&card), None);
+    app.add_workspace_folder(extra_root.clone());
+    assert_eq!(
+        crate::highlight::associated_language_id(&card).as_deref(),
+        Some("html")
+    );
+    app.remove_workspace_folder(extra_root.clone());
+    assert_eq!(crate::highlight::associated_language_id(&card), None);
+}
+
 /// #1574 negative: with no association, an unknown extension stays Plain
 /// Text and a known one keeps its language.
 #[test]

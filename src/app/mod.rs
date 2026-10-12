@@ -3086,6 +3086,9 @@ pub struct App {
     files_exclude: Vec<String>,
     /// The `files_associations` in effect (#1574), to tell a change.
     files_associations: std::collections::BTreeMap<String, String>,
+    /// The workspace roots `files_associations` were installed for, so a
+    /// root added, removed or replaced gets them or loses them (#1574).
+    files_associations_roots: Vec<PathBuf>,
     /// Tailspin highlighting in rendered log views (#466): the inverse of
     /// the `disable_log_highlight` preference. Pushed into `log_view`'s
     /// default for views opened later and into every open view on toggle.
@@ -5774,6 +5777,7 @@ impl App {
             copy_on_select: loaded_prefs.copy_on_select,
             files_exclude: Vec::new(),
             files_associations: std::collections::BTreeMap::new(),
+            files_associations_roots: Vec::new(),
             log_highlight: !loaded_prefs.disable_log_highlight,
             secret_redaction: !loaded_prefs.disable_secret_redaction,
             redaction_reveal_until: None,
@@ -8449,8 +8453,9 @@ impl App {
             let Some(path) = tab.path.as_ref() else {
                 continue;
             };
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if crate::lsp::Language::from_extension(ext).is_none() {
+            // `files_associations` count (#1574): a `.tpl` associated with
+            // HTML goes to the HTML server though its extension has none.
+            if crate::lsp::manager::path_to_language(path).is_none() {
                 continue;
             }
             if i != active && active_path.as_ref() == Some(path) {
@@ -59383,7 +59388,17 @@ impl App {
     /// glob names for it. Open tabs still in the language croft picked for
     /// them follow a change; one whose language was picked by hand keeps it.
     fn apply_file_associations(&mut self, p: &crate::prefs::Prefs) {
-        if p.files_associations == self.files_associations {
+        self.install_file_associations(p.files_associations.clone());
+    }
+
+    /// Install `map` for every workspace root (#1574), clearing it from a
+    /// root that left the workspace. Runs again when the roots change, so
+    /// a folder added gets the associations too. An open file whose
+    /// language server changes with them is closed on the old server; the
+    /// next sync opens it on the new one.
+    fn install_file_associations(&mut self, map: std::collections::BTreeMap<String, String>) {
+        let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
+        if map == self.files_associations && roots == self.files_associations_roots {
             return;
         }
         let picked = |e: &crate::widgets::editor::Editor| {
@@ -59396,10 +59411,40 @@ impl App {
             .flat_map(|g| g.editors.iter())
             .filter_map(picked)
             .collect();
-        for root in self.roots.iter() {
-            crate::highlight::set_file_associations(root, &p.files_associations);
+        let servers_before: Vec<(PathBuf, Option<crate::lsp::Language>)> = self
+            .lsp_last_seen
+            .keys()
+            .map(|p| (p.clone(), crate::lsp::manager::path_to_language(p)))
+            .collect();
+        let empty = std::collections::BTreeMap::new();
+        for gone in self
+            .files_associations_roots
+            .iter()
+            .filter(|r| !roots.contains(r))
+        {
+            crate::highlight::set_file_associations(gone, &empty);
         }
-        self.files_associations = p.files_associations.clone();
+        for root in &roots {
+            crate::highlight::set_file_associations(root, &map);
+        }
+        self.files_associations = map;
+        self.files_associations_roots = roots;
+        let mut dropped_any = false;
+        for (path, before) in servers_before {
+            if crate::lsp::manager::path_to_language(&path) == before {
+                continue;
+            }
+            if let Some(lsp) = self.lsp.as_ref() {
+                lsp.close_doc(path.clone());
+            }
+            self.lsp_last_seen.remove(&path);
+            dropped_any |= self.lsp_diagnostics.remove(&path).is_some();
+            self.code_lens_requested.remove(&path);
+        }
+        if dropped_any {
+            self.rebuild_problems();
+            self.refresh_problems_badge();
+        }
         for e in std::iter::once(&mut self.editor)
             .chain(self.editor_layout.inactive_groups_mut())
             .flat_map(|g| g.editors.iter_mut())
@@ -60111,6 +60156,7 @@ impl App {
         self.sync_workspace_fanout();
         self.refresh_workspace_title();
         self.save_workspace_folders();
+        self.install_file_associations(self.files_associations.clone());
         self.status = format!("Added folder: {}", path.display());
     }
 
@@ -60126,6 +60172,7 @@ impl App {
             return;
         }
         self.tree.remove_root(&path);
+        self.install_file_associations(self.files_associations.clone());
         // The removed folder's review queue goes with it (#345). Its rows
         // leave the tree, so no stale DOT renders — but the status chip
         // counts the same set, and a count that outlives the folder it
