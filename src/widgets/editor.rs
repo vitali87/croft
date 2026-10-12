@@ -5035,6 +5035,17 @@ impl Editor {
                     Err(_) => {}
                 }
             }
+            // A `.tar.xz` under another name (#1645); a plain xz file is not
+            // a tar and falls through to hex.
+            Some(crate::magic::Magic::Xz) => {
+                match self.open_archive(path, crate::archive::ArchiveKind::TarXz) {
+                    Ok(()) => return Ok(()),
+                    Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
+                        self.route_note = Some((path.to_path_buf(), e.to_string()));
+                    }
+                    Err(_) => {}
+                }
+            }
             Some(crate::magic::Magic::Sqlite) => {
                 return self.open_sqlite(path);
             }

@@ -407,6 +407,7 @@ pub fn extension_for(magic: crate::magic::Magic) -> &'static str {
         // both fail soft to the archive view, so this is the useful guess.
         Magic::Zip => "zip",
         Magic::Gzip => "gz",
+        Magic::Xz => "xz",
         Magic::Tar => "tar",
         Magic::Sqlite => "sqlite",
     }
