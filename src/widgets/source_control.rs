@@ -1209,7 +1209,7 @@ impl Widget for &mut SourceControlPanel {
         buf.set_stringn(
             inner.x,
             inner.y,
-            "SOURCE CONTROL",
+            crate::i18n::tr("SOURCE CONTROL"),
             inner.width as usize,
             Style::default()
                 .fg(self.theme.ui(Color::Rgb(0xb0, 0xb8, 0xc8)))

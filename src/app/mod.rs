@@ -923,14 +923,15 @@ impl BottomPanelTab {
         BottomPanelTab::Captures,
     ];
 
-    /// The tab's strip label, padded to its click target.
+    /// The tab's strip label in English, the catalog key it is drawn
+    /// through (#1583).
     fn label(self) -> &'static str {
         match self {
-            BottomPanelTab::Problems => " PROBLEMS ",
-            BottomPanelTab::Output => " OUTPUT ",
-            BottomPanelTab::Terminal => " TERMINAL ",
-            BottomPanelTab::Ports => " PORTS ",
-            BottomPanelTab::Captures => " CAPTURES ",
+            BottomPanelTab::Problems => "PROBLEMS",
+            BottomPanelTab::Output => "OUTPUT",
+            BottomPanelTab::Terminal => "TERMINAL",
+            BottomPanelTab::Ports => "PORTS",
+            BottomPanelTab::Captures => "CAPTURES",
         }
     }
 
@@ -18432,11 +18433,13 @@ impl App {
 
         // VS Code panel-group order: PROBLEMS, OUTPUT, TERMINAL, PORTS. PROBLEMS
         // alone carries the orange count badge after its label.
-        let tabs = BottomPanelTab::ALL.map(|tab| (tab, tab.label()));
+        // Each label is translated and padded to its click target.
+        let tabs =
+            BottomPanelTab::ALL.map(|tab| (tab, format!(" {} ", crate::i18n::tr(tab.label()))));
 
         // Lay each tab out left to right, recording its hit rect (which, for
         // PROBLEMS, spans the label and the pill together).
-        let mut placed: Vec<(BottomPanelTab, &str, Rect, u16)> = Vec::with_capacity(tabs.len());
+        let mut placed: Vec<(BottomPanelTab, String, Rect, u16)> = Vec::with_capacity(tabs.len());
         let mut x = strip.x + 1;
         for (tab, label) in tabs {
             if x >= right {
@@ -18451,7 +18454,7 @@ impl App {
             } else {
                 0
             };
-            let w = label.chars().count() as u16 + badge_w;
+            let w = unicode_width::UnicodeWidthStr::width(label.as_str()) as u16 + badge_w;
             let rect = Rect {
                 x,
                 y: strip.y,
@@ -18498,7 +18501,7 @@ impl App {
             // the cells stay blank strip_bg and we just record the anchor.
             // Otherwise the powerline-cap pill is drawn as text.
             if *badge_w > 0 {
-                let bx = rect.x + label.chars().count() as u16;
+                let bx = rect.x + unicode_width::UnicodeWidthStr::width(label.as_str()) as u16;
                 if images {
                     if bx < right {
                         self.problems_badge_cell = Some((bx, rect.y));
@@ -18532,7 +18535,7 @@ impl App {
             // stopping before the padding spaces and the pill.
             if is_active {
                 let leading = label.chars().take_while(|c| *c == ' ').count() as u16;
-                let word_len = label.trim().chars().count() as u16;
+                let word_len = unicode_width::UnicodeWidthStr::width(label.trim()) as u16;
                 let start = rect.x + leading;
                 for ux in start..(start + word_len).min(right) {
                     buf[(ux, rect.y)].modifier.insert(Modifier::UNDERLINED);
@@ -20809,7 +20812,7 @@ impl App {
             .border_style(Style::default().fg(warn))
             .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
             .title(ratatui::text::Span::styled(
-                " DISCARD CHANGES? ",
+                format!(" {} ", crate::i18n::tr("DISCARD CHANGES?")),
                 Style::default()
                     .fg(Color::White)
                     .bg(warn)
@@ -20824,9 +20827,9 @@ impl App {
             height: rect.height.saturating_sub(2),
         };
         let warn_text = if pd.untracked {
-            "This will permanently delete the file from disk."
+            crate::i18n::tr("This will permanently delete the file from disk.")
         } else {
-            "This will overwrite your local changes from HEAD."
+            crate::i18n::tr("This will overwrite your local changes from HEAD.")
         };
         let body = ratatui::text::Text::from(vec![
             ratatui::text::Line::from(ratatui::text::Span::styled(
@@ -20933,7 +20936,7 @@ impl App {
         };
         let (headline, names, save, discard) = match exit {
             UnsavedExit::CloseTab { idx, .. } => (
-                String::from("This tab has unsaved changes:"),
+                crate::i18n::tr("This tab has unsaved changes:").into_owned(),
                 self.editor.tab_display_label(*idx),
                 String::from("ave and close"),
                 String::from("on't save"),
@@ -20969,7 +20972,7 @@ impl App {
             .border_style(Style::default().fg(warn))
             .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
             .title(ratatui::text::Span::styled(
-                " UNSAVED CHANGES ",
+                format!(" {} ", crate::i18n::tr("UNSAVED CHANGES")),
                 Style::default()
                     .fg(Color::Black)
                     .bg(warn)
@@ -21095,7 +21098,7 @@ impl App {
             .border_style(Style::default().fg(accent))
             .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
             .title(ratatui::text::Span::styled(
-                " UNSAVED CHANGES ",
+                format!(" {} ", crate::i18n::tr("UNSAVED CHANGES")),
                 Style::default()
                     .fg(Color::Black)
                     .bg(accent)

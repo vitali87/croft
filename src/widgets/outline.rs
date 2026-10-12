@@ -336,7 +336,7 @@ impl Widget for &mut OutlinePanel {
                 Style::default().fg(self.theme.ui(COLOR_DIM)),
             ),
             Span::styled(
-                "OUTLINE",
+                crate::i18n::tr("OUTLINE"),
                 Style::default()
                     .fg(self.theme.ui(COLOR_HEADER))
                     .add_modifier(Modifier::BOLD),

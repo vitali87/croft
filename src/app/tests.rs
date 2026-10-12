@@ -79435,3 +79435,144 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     assert!(!app.apply_build_scan(pane, Some(&cwd), "tsc --watch", "a.c:1:1: error: old\n"));
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
 }
+
+/// #1583: a German catalog for the frame's own titles, as a translator
+/// would write it.
+const CHROME_DE: &str = r#"{
+    "EXPLORER": "ERKUNDER",
+    "OUTLINE": "GLIEDERUNG",
+    "TIMELINE": "ZEITACHSE",
+    "SOURCE CONTROL": "QUELLCODEVERWALTUNG",
+    "PROBLEMS": "PROBLEME",
+    "OUTPUT": "AUSGABE",
+    "TERMINAL": "KONSOLE",
+    "Command Palette — Esc to close, ↑/↓ to navigate, Enter to run": "Befehlspalette — Esc schließt",
+    "UNSAVED CHANGES": "NICHT GESPEICHERT",
+    "This tab has unsaved changes:": "Dieser Tab ist nicht gespeichert:",
+    "DISCARD CHANGES?": "ÄNDERUNGEN VERWERFEN?",
+    "This will overwrite your local changes from HEAD.": "Lokale Änderungen werden überschrieben."
+}"#;
+
+/// Render `app` at 140x50 with `catalog` active and return the screen.
+fn screen_with_catalog(app: &mut App, catalog: &str) -> String {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 50)).unwrap();
+    crate::i18n::with_test_catalog(catalog, || term.draw(|f| app.render(f)).unwrap());
+    screen_text(&term)
+}
+
+/// #1583: the side bar and panel titles were literals drawn without `tr`,
+/// so a catalog entry for them changed nothing.
+#[test]
+fn the_side_bar_and_panel_titles_come_from_the_catalog() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for view in [ExplorerView::Outline, ExplorerView::Timeline] {
+        if !app.explorer_views.is_visible(view) {
+            app.toggle_explorer_view(view);
+        }
+    }
+    let screen = screen_with_catalog(&mut app, CHROME_DE);
+    for want in [
+        " ERKUNDER ",
+        "GLIEDERUNG",
+        "ZEITACHSE",
+        " PROBLEME ",
+        " AUSGABE ",
+        " KONSOLE ",
+    ] {
+        assert!(screen.contains(want), "{want:?} missing:\n{screen}");
+    }
+    for gone in [" EXPLORER ", " PROBLEMS ", " OUTPUT ", " TERMINAL "] {
+        assert!(!screen.contains(gone), "{gone:?} still drawn:\n{screen}");
+    }
+}
+
+/// #1583: the Source Control view's title.
+#[test]
+fn the_source_control_title_comes_from_the_catalog() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_view = SidebarView::SourceControl;
+    let screen = screen_with_catalog(&mut app, CHROME_DE);
+    assert!(screen.contains("QUELLCODEVERWALTUNG"), "{screen}");
+    assert!(!screen.contains("SOURCE CONTROL"), "{screen}");
+}
+
+/// #1583: the Command Palette's title line.
+#[test]
+fn the_palette_title_comes_from_the_catalog() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_command_palette();
+    let screen = screen_with_catalog(&mut app, CHROME_DE);
+    assert!(
+        screen.contains(" Befehlspalette — Esc schließt "),
+        "{screen}"
+    );
+    assert!(
+        !screen.contains("Command Palette — Esc to close"),
+        "{screen}"
+    );
+}
+
+/// #1583: the unsaved-changes and discard prompts' titles and text.
+#[test]
+fn the_unsaved_and_discard_prompts_come_from_the_catalog() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "x = 1\n");
+    app.pending_unsaved = Some(UnsavedExit::CloseTab { idx: 0, path: None });
+    let screen = screen_with_catalog(&mut app, CHROME_DE);
+    assert!(screen.contains(" NICHT GESPEICHERT "), "{screen}");
+    assert!(
+        screen.contains("Dieser Tab ist nicht gespeichert:"),
+        "{screen}"
+    );
+    assert!(!screen.contains("UNSAVED CHANGES"), "{screen}");
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.pending_discard = Some(PendingDiscard {
+        rel_path: String::from("a.txt"),
+        untracked: false,
+        staged: false,
+    });
+    let screen = screen_with_catalog(&mut app, CHROME_DE);
+    assert!(screen.contains(" ÄNDERUNGEN VERWERFEN? "), "{screen}");
+    assert!(
+        screen.contains("Lokale Änderungen werden überschrieben."),
+        "{screen}"
+    );
+    assert!(!screen.contains("DISCARD CHANGES?"), "{screen}");
+}
+
+/// #1583: a panel tab's click target is as wide as its translated label,
+/// measured in cells: a CJK label is twice as wide as its char count, and
+/// the next tab starts after it rather than on top of it.
+#[test]
+fn a_translated_panel_tab_is_clickable_across_its_whole_label() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    screen_with_catalog(
+        &mut app,
+        r#"{"PROBLEMS": "問題", "OUTPUT": "AUSGABE-UND-PROTOKOLL"}"#,
+    );
+    let problems = app.problems_tab_rect;
+    let output = app.output_tab_rect;
+    assert_eq!(problems.width, 6, "' 問題 ' is six cells wide");
+    assert_eq!(output.x, problems.x + problems.width + 1);
+    assert_eq!(output.width, " AUSGABE-UND-PROTOKOLL ".len() as u16);
+    left_click(&mut app, output.x + output.width - 2, output.y);
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Output);
+}
+
+/// #1583 negative: with no entry for them the titles stay English, and a
+/// tab's click target keeps its English width.
+#[test]
+fn titles_without_a_catalog_entry_stay_english() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let screen = screen_with_catalog(&mut app, r#"{"Move Line Up": "Zeile nach oben"}"#);
+    for want in [" EXPLORER ", " PROBLEMS ", " OUTPUT ", " TERMINAL "] {
+        assert!(screen.contains(want), "{want:?} missing:\n{screen}");
+    }
+    assert_eq!(app.output_tab_rect.width, " OUTPUT ".len() as u16);
+}

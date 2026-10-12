@@ -1483,16 +1483,17 @@ impl Widget for &mut FileTree {
         };
         // Black theme: chipless brand header (panelTitle.activeForeground);
         // Croft Dark keeps the historical white-on-navy chip.
+        let label = format!(" {} ", crate::i18n::tr("EXPLORER"));
         let title = if self.focus_gradient {
             Span::styled(
-                " EXPLORER ",
+                label,
                 Style::default()
                     .fg(crate::gradient::rgb_color(crate::gradient::PANEL_TITLE_FG))
                     .add_modifier(Modifier::BOLD),
             )
         } else {
             Span::styled(
-                " EXPLORER ",
+                label,
                 Style::default()
                     .fg(self.theme.ui(Color::White))
                     .bg(self.theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e)))
