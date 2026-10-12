@@ -1106,21 +1106,14 @@ fn trim_leading_context(lead: &str, avail: usize, need: usize) -> Option<String>
     Some(lead[start..].to_string())
 }
 
-/// `replacement` made safe for `Captures::expand` against `re`, read the way
+/// `replacement` made safe for `Captures::expand`, read the way
 /// VS Code reads it. A numbered reference is braced (`$1_old` to
 /// `${1}_old`): the regex crate reads `$1_old` as a group NAMED `1_old`,
 /// which expands to nothing and deletes the match, where VS Code reads group
 /// 1 then `_old`. `$&` is the whole match and `$$` a literal dollar. A
-/// `$NAME` or `${NAME}` expands only when `re` has a group of that name;
+/// `$NAME` or `${NAME}` expands only when `is_group` knows that name;
 /// any other `$` is text (#1399), so a shell, PHP or Perl variable such as
 /// `$PREFIX` survives instead of expanding to nothing.
-pub fn brace_group_refs(replacement: &str, re: &regex::Regex) -> String {
-    brace_refs(replacement, |name| {
-        re.capture_names().flatten().any(|n| n == name)
-    })
-}
-
-/// [`brace_group_refs`] for a pattern whose group names `is_group` knows.
 fn brace_refs(replacement: &str, is_group: impl Fn(&str) -> bool) -> String {
     let is_name = |c: &char| c.is_ascii_alphanumeric() || *c == '_';
     let mut out = String::with_capacity(replacement.len());

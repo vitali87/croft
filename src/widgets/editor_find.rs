@@ -242,8 +242,7 @@ pub fn expand_replacement(
 
 /// Translate VS Code's regex-replacement escapes (`\n`, `\t`, `\r`, `\\`)
 /// into their characters, unknown escapes passing through; the `$`
-/// references are then read against the pattern (see
-/// [`brace_group_refs`](crate::widgets::search::brace_group_refs)) when it
+/// references are read against the pattern when `Pattern::expand_at`
 /// expands them. Literal (non-regex) replacements are never unescaped.
 fn unescape_escapes(replacement: &str) -> String {
     let mut out = String::with_capacity(replacement.len());
