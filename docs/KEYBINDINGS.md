@@ -185,6 +185,8 @@ In iTerm2, reserved `Cmd` chords must be forwarded first (`croft setup-iterm2`);
 
 **User snippets.** `snippets.json` mirrors VS Code's global snippets file: an object keyed by a name, each with a `prefix` (a string, or an array of them so one snippet answers to several words), a `body` (a string or an array of lines), and an optional `scope` (comma-separated language ids; omit for every language). A snippet croft cannot read is skipped and named in OUTPUT · Snippets; the rest still load. Type a snippet's prefix and press `Tab` to expand it, or pick it from the completion popup, where it appears alongside language-server suggestions and is accepted with `Enter`/`Tab`. Like VS Code's, the file is JSONC: comments and trailing commas are fine. A file that still does not parse loads no snippets and says why in OUTPUT · Snippets.
 
+**Project snippets.** A repository's own snippets load too, so a team's shared boilerplate expands for everyone: every `.vscode/*.code-snippets` file (VS Code's project snippets) and `.croft/snippets.json`, in each workspace folder, in the same format. Your `snippets.json` comes first, so on a prefix both define your snippet wins `Tab`, and the project's still shows in completion. Adding, editing or removing one of these files applies within a couple of seconds, from croft or from a `git pull`.
+
 The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in order with `Tab`, `$0` is the final caret, and `${1:name}` seeds a stop with selected placeholder text. Continuation lines are re-indented to the caret. Language-server completions that arrive as snippets (rust-analyzer's `println!` and the like) expand the same way.
 
 ## Explorer (file tree)

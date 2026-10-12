@@ -167,6 +167,15 @@ impl ConfigWatch {
         changed
     }
 
+    /// Also watch `path`, taking its current state as already applied. A
+    /// path already watched is left as it is.
+    pub fn watch(&mut self, path: PathBuf) {
+        if !self.files.iter().any(|(p, _)| *p == path) {
+            let s = stamp(&path);
+            self.files.push((path, s));
+        }
+    }
+
     /// Record `path` as applied in its current state, so a reload croft has
     /// just done itself (on its own save) is not repeated by the next poll.
     pub fn note(&mut self, path: &std::path::Path) {

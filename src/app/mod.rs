@@ -5759,7 +5759,7 @@ impl App {
                 // machine (#262): applied on arrival like the files above.
                 crate::config_layers::synced_config_path(),
             ]),
-            snippets: load_snippets(&crate::snippets::snippets_path()),
+            snippets: load_all_snippets([root.as_path()]),
             format_on_save: loaded_prefs.format_on_save,
             copy_on_select: loaded_prefs.copy_on_select,
             files_exclude: Vec::new(),
@@ -6480,6 +6480,7 @@ impl App {
         // The agent review queue as this workspace last left it (#345).
         let root = app.workspace_root().to_path_buf();
         app.apply_project_excludes(&loaded_prefs);
+        app.watch_project_snippets();
         app.agent_ledger = app.load_agent_ledger(&root);
         app.sync_agent_lane_decorations();
         Ok(app)
@@ -57571,7 +57572,7 @@ impl App {
         }
         let (map, _) = crate::keymap::Keymap::load_with_warnings(&self.keybindings_file);
         self.keymap = map;
-        self.snippets = load_snippets(&crate::snippets::snippets_path());
+        self.snippets = load_all_snippets(self.roots.iter());
         self.status = format!(
             "Profile: {}; keybindings and snippets applied, settings apply at the next launch",
             name.as_deref().unwrap_or("Default")
@@ -59133,6 +59134,35 @@ impl App {
         !changed.is_empty()
     }
 
+    /// Whether `path` is one of the workspace's project snippets files, or a
+    /// folder's `.vscode` directory, whose change can add or remove one.
+    fn is_project_snippets_path(&self, path: &std::path::Path) -> bool {
+        self.roots.iter().any(|root| {
+            path == root.join(".vscode")
+                || (path.starts_with(root) && crate::snippets::is_project_file(path))
+        })
+    }
+
+    /// Reload every snippet (#1484) and watch any project snippets file
+    /// that has appeared, so a later edit to it, by croft or by `git pull`,
+    /// applies too.
+    fn reload_project_snippets(&mut self) {
+        self.snippets = load_all_snippets(self.roots.iter());
+        self.watch_project_snippets();
+    }
+
+    /// Put each workspace folder's `.vscode` directory and project snippets
+    /// files under the config watch (#1484).
+    fn watch_project_snippets(&mut self) {
+        let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
+        for root in roots {
+            self.config_watch.watch(root.join(".vscode"));
+            for file in crate::snippets::project_files(&root) {
+                self.config_watch.watch(file);
+            }
+        }
+    }
+
     /// After a save, if the file was one of croft's JSON configs, re-read it so
     /// the change applies without a relaunch (VS Code applies keybindings and
     /// snippets on save). settings.json fields are read at startup, so that one
@@ -59168,9 +59198,28 @@ impl App {
             }
             self.status = keybindings_reload_status(&warns);
         } else if path == crate::snippets::snippets_path() {
-            self.snippets = load_snippets(path);
+            self.snippets = load_all_snippets(self.roots.iter());
             self.status =
                 snippets_reload_status(self.snippets.is_broken(), self.snippets.warnings());
+        } else if self.is_project_snippets_path(path) {
+            // A project's snippets file, or its `.vscode` folder gaining or
+            // losing one (#1484).
+            // A `.vscode` change that touched no snippets (settings.json
+            // saved) says nothing.
+            let before = self.snippets.clone();
+            self.reload_project_snippets();
+            if self.snippets != before {
+                self.status = format!(
+                    "Project snippets reloaded{}",
+                    match self.snippets.warnings().len() {
+                        0 => String::new(),
+                        n => format!(
+                            " with {n} warning{} — see OUTPUT · Snippets",
+                            if n == 1 { "" } else { "s" }
+                        ),
+                    }
+                );
+            }
         } else if path == crate::agents::agents_path() {
             self.agents = crate::agents::AgentTable::load(path);
             let dropped = self.agents.dropped_patterns();
@@ -59936,6 +59985,7 @@ impl App {
             return;
         }
         self.tree.add_root(path.clone());
+        self.reload_project_snippets();
         self.git_extra
             .push((path.clone(), GitWorker::spawn(path.clone())));
         self.rebind_workspace_watchers();
@@ -59957,6 +60007,7 @@ impl App {
             return;
         }
         self.tree.remove_root(&path);
+        self.snippets = load_all_snippets(self.roots.iter());
         // The removed folder's review queue goes with it (#345). Its rows
         // leave the tree, so no stale DOT renders — but the status chip
         // counts the same set, and a count that outlives the folder it
@@ -67943,6 +67994,31 @@ fn load_snippets(path: &std::path::Path) -> crate::snippets::SnippetSet {
     let set = crate::snippets::SnippetSet::load(path);
     for w in set.warnings() {
         crate::output::push("Snippets", crate::output::OutputLevel::Warn, w);
+    }
+    set
+}
+
+/// The user's snippets, then each workspace folder's project snippets
+/// (#1484): `.vscode/*.code-snippets` and `.croft/snippets.json`. The user's
+/// come first, so their own snippet wins a prefix both define. What a
+/// project file could not load goes to OUTPUT · Snippets under its path.
+fn load_all_snippets<'a>(
+    roots: impl IntoIterator<Item = &'a std::path::Path>,
+) -> crate::snippets::SnippetSet {
+    let mut set = load_snippets(&crate::snippets::snippets_path());
+    for root in roots {
+        for file in crate::snippets::project_files(root) {
+            let project = crate::snippets::SnippetSet::load(&file);
+            for w in project.warnings() {
+                let w = w.replacen("snippets.json could not be read", "could not be read", 1);
+                crate::output::push(
+                    "Snippets",
+                    crate::output::OutputLevel::Warn,
+                    &format!("{}: {w}", file.display()),
+                );
+            }
+            set.append(project);
+        }
     }
     set
 }
