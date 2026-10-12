@@ -18588,6 +18588,14 @@ impl Widget for &mut EditorTabs {
             } else {
                 TAB_INACTIVE_FG
             };
+            // A high contrast theme resolves the label greys to its pure
+            // foreground (#1548): white on High Contrast Light's pale active
+            // tab would be unreadable.
+            let fg = if theme.high_contrast() {
+                theme.ui(fg)
+            } else {
+                fg
+            };
             let mut modifiers = Modifier::empty();
             if is_active {
                 modifiers |= Modifier::BOLD;
@@ -29223,6 +29231,64 @@ mod tests {
             pill,
             "an un-hovered cross gets no pill"
         );
+    }
+
+    /// #1548: on High Contrast Light the tab labels are black, not the
+    /// dark themes' white and grey, so the active tab reads on its pale
+    /// fill; High Contrast keeps white on its dark blue.
+    #[test]
+    fn high_contrast_tab_labels_use_the_themes_foreground() {
+        use ratatui::buffer::Buffer;
+        for (id, want) in [
+            ("hc-light", Color::Rgb(0, 0, 0)),
+            ("hc-black", Color::Rgb(0xff, 0xff, 0xff)),
+        ] {
+            let theme = crate::theme::Theme::from_id(id);
+            let mut t = EditorTabs::new();
+            t.editors[0].path = Some(std::path::PathBuf::from("/foo.rs"));
+            t.add_tab_with_path(std::path::PathBuf::from("/bar.rs"));
+            for ed in t.editors.iter_mut() {
+                ed.theme = theme;
+            }
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 10,
+            };
+            let mut buf = Buffer::empty(area);
+            (&mut t).render(area, &mut buf);
+            let label_fg = |name: &str| buf[(cell_of(&buf, area.width, name), 0)].fg;
+            assert_eq!(label_fg("bar.rs"), want, "{id}: the active tab's label");
+            assert_eq!(label_fg("foo.rs"), want, "{id}: an inactive tab's label");
+        }
+        // Negative: the ordinary light theme keeps its own tab colours.
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/foo.rs"));
+        t.editors[0].theme = crate::theme::Theme::from_id("light");
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        assert_eq!(
+            buf[(cell_of(&buf, area.width, "foo.rs"), 0)].fg,
+            TAB_ACTIVE_FG
+        );
+    }
+
+    /// The column where `text` starts on row 0, cell by cell (a tab's icon
+    /// may be several bytes wide in one cell).
+    fn cell_of(buf: &ratatui::buffer::Buffer, width: u16, text: &str) -> u16 {
+        let cells: Vec<String> = (0..width)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+        (0..cells.len())
+            .find(|&i| cells[i..].concat().starts_with(text))
+            .unwrap_or_else(|| panic!("{text} is on the tab row: {cells:?}")) as u16
     }
 
     #[test]
