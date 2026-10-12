@@ -13069,6 +13069,12 @@ impl App {
                     .map(|md| md.has_selection()),
                 self.status.clone(),
             ),
+            (
+                self.editor.comment_focus.is_some(),
+                self.vim.enabled,
+                self.vim.mode(),
+                self.vim.has_pending(),
+            ),
         )
     }
 

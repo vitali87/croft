@@ -34177,6 +34177,38 @@ fn an_esc_that_did_something_is_not_half_of_esc_esc() {
     assert!(app.zen_mode, "Escapes for a terminal program stay its own");
 }
 
+/// #1585: an Esc that leaves a comment box's reply field or vim's Insert
+/// mode did something, so it is not half of Esc Esc.
+#[test]
+fn an_esc_leaving_a_comment_box_or_insert_mode_is_not_half_of_esc_esc() {
+    let (_tmp, mut app) = zen_app();
+    app.toggle_zen_mode();
+    app.editor.comment_focus = Some(crate::widgets::editor::CommentFocus {
+        id: 1,
+        reply: String::new(),
+        cursor: 0,
+    });
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.editor.comment_focus.is_none(),
+        "the first Esc left the box"
+    );
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.zen_mode, "the Esc that left the box did not count");
+
+    app.zen_esc_at = None;
+    app.vim.enabled = true;
+    app.vim.enter_insert_mode();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.vim.mode(), crate::vim::VimMode::Normal);
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.zen_mode, "the Esc that left Insert mode did not count");
+}
+
 /// #1585: Zen hides the status bar, so entering it shows how to leave for
 /// a few seconds; leaving takes the hint with it.
 #[test]
