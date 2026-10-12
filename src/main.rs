@@ -63,6 +63,7 @@ mod markdown_lint;
 mod marketplace;
 mod mcp;
 mod media;
+mod mem_relief;
 mod merge;
 mod merge_editor;
 mod notebook;
