@@ -12189,19 +12189,34 @@ impl App {
     /// Whether the current file's language server implements call hierarchy;
     /// drives the right-click menu rows, like the other capability gates.
     fn editor_language_supports_call_hierarchy(&self) -> bool {
-        let Some(lang) = self
-            .editor
+        self.editor_language_supports(crate::lsp::LspManager::language_supports_call_hierarchy)
+    }
+
+    /// The language the current editor file's extension maps to, if any.
+    fn editor_language(&self) -> Option<crate::lsp::Language> {
+        self.editor
             .path
             .as_deref()
             .and_then(|p| p.extension())
             .and_then(|e| e.to_str())
             .and_then(crate::lsp::Language::from_extension)
-        else {
+    }
+
+    /// Whether the current editor file's language server reports support
+    /// through `supports`, one of the `language_supports_*` getters on
+    /// [`crate::lsp::LspManager`]. Unknown (server not yet spawned) or no
+    /// server counts as unsupported, so a gated row only appears once support
+    /// is confirmed.
+    fn editor_language_supports(
+        &self,
+        supports: fn(&crate::lsp::LspManager, crate::lsp::Language) -> Option<bool>,
+    ) -> bool {
+        let Some(lang) = self.editor_language() else {
             return false;
         };
         self.lsp
             .as_ref()
-            .and_then(|lsp| lsp.language_supports_call_hierarchy(lang))
+            .and_then(|lsp| supports(lsp, lang))
             .unwrap_or(false)
     }
 
@@ -12439,14 +12454,7 @@ impl App {
         if self.editor.expand_selection_from_stack() {
             return;
         }
-        let lang_known = self
-            .editor
-            .path
-            .as_deref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
-            .is_some();
+        let lang_known = self.editor_language().is_some();
         if lang_known
             && self.lsp.is_some()
             && let Some(path) = self.editor.path.clone()
@@ -13825,20 +13833,7 @@ impl App {
     /// "Go to Declaration" row. Unknown (server not yet spawned) or no server is
     /// treated as unsupported, so the row only appears once support is confirmed.
     fn editor_language_supports_declaration(&self) -> bool {
-        let Some(lang) = self
-            .editor
-            .path
-            .as_deref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
-        else {
-            return false;
-        };
-        self.lsp
-            .as_ref()
-            .and_then(|lsp| lsp.language_supports_declaration(lang))
-            .unwrap_or(false)
+        self.editor_language_supports(crate::lsp::LspManager::language_supports_declaration)
     }
 
     /// Whether the current editor file's language server implements
@@ -13847,20 +13842,7 @@ impl App {
     /// server is treated as unsupported, so the row only appears once support is
     /// confirmed.
     fn editor_language_supports_type_definition(&self) -> bool {
-        let Some(lang) = self
-            .editor
-            .path
-            .as_deref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
-        else {
-            return false;
-        };
-        self.lsp
-            .as_ref()
-            .and_then(|lsp| lsp.language_supports_type_definition(lang))
-            .unwrap_or(false)
+        self.editor_language_supports(crate::lsp::LspManager::language_supports_type_definition)
     }
 
     /// Whether the current editor file's language server implements
@@ -13869,20 +13851,7 @@ impl App {
     /// server is treated as unsupported, so the row only appears once support is
     /// confirmed.
     fn editor_language_supports_implementation(&self) -> bool {
-        let Some(lang) = self
-            .editor
-            .path
-            .as_deref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
-        else {
-            return false;
-        };
-        self.lsp
-            .as_ref()
-            .and_then(|lsp| lsp.language_supports_implementation(lang))
-            .unwrap_or(false)
+        self.editor_language_supports(crate::lsp::LspManager::language_supports_implementation)
     }
 
     /// Whether the current editor file's language server implements
@@ -13890,37 +13859,11 @@ impl App {
     /// "Go to References" row. Unknown (server not yet spawned) or no server is
     /// treated as unsupported, so the row only appears once support is confirmed.
     fn editor_language_supports_references(&self) -> bool {
-        let Some(lang) = self
-            .editor
-            .path
-            .as_deref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
-        else {
-            return false;
-        };
-        self.lsp
-            .as_ref()
-            .and_then(|lsp| lsp.language_supports_references(lang))
-            .unwrap_or(false)
+        self.editor_language_supports(crate::lsp::LspManager::language_supports_references)
     }
 
     fn editor_language_supports_code_action(&self) -> bool {
-        let Some(lang) = self
-            .editor
-            .path
-            .as_deref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
-        else {
-            return false;
-        };
-        self.lsp
-            .as_ref()
-            .and_then(|lsp| lsp.language_supports_code_action(lang))
-            .unwrap_or(false)
+        self.editor_language_supports(crate::lsp::LspManager::language_supports_code_action)
     }
 
     /// VS Code "Change All Occurrences" (Cmd/Ctrl+F2): select every textual
@@ -57751,20 +57694,7 @@ impl App {
     /// Gates format-on-save so a file whose server advertises no formatter is
     /// saved directly rather than waiting on a reply that never mutates it.
     fn editor_language_supports_formatting(&self) -> bool {
-        let Some(lang) = self
-            .editor
-            .path
-            .as_deref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
-        else {
-            return false;
-        };
-        self.lsp
-            .as_ref()
-            .and_then(|lsp| lsp.language_supports_formatting(lang))
-            .unwrap_or(false)
+        self.editor_language_supports(crate::lsp::LspManager::language_supports_formatting)
     }
 
     /// Whether `Cmd+S` should format before writing: the pref is on, a
