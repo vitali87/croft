@@ -2163,7 +2163,7 @@ struct WorkerState {
     workspace_root: PathBuf,
     /// Secondary workspace roots (multi-root, #147). Servers stay one
     /// instance per (language, project root); these only widen the bound
-    /// `project_root_for` walks within, so a file under a secondary root
+    /// `project_root_for_roots` walks within, so a file under a secondary root
     /// spawns its servers AT that root instead of falling back to the
     /// primary — the per-root-instance model every server supports.
     extra_roots: Vec<PathBuf>,
