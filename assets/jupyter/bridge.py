@@ -69,7 +69,9 @@ if name == "--list":
     sys.exit(0)
 
 specs = installed_specs()
-if specs and name not in {s["name"] for s in specs}:
+# jupyter_client lowercases the requested name before lookup, so a
+# notebook asking for "Python3" still launches the installed "python3".
+if specs and name.lower() not in {s["name"].lower() for s in specs}:
     emit({"ev": "missing", "kernel": name, "specs": specs})
     sys.exit(1)
 
