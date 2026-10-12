@@ -1769,20 +1769,20 @@ pub const DIFF_DEADLINE: std::time::Duration = std::time::Duration::from_millis(
 /// visual row. Adjacent Delete + Insert runs are paired (so a one-line
 /// "edit" becomes a single Replaced row, not a Removed row above an Added
 /// row), which is what makes the side-by-side alignment readable.
-pub fn build_diff_rows(left: &[String], right: &[String]) -> Vec<DiffRow> {
+pub fn build_diff_rows<L: AsRef<str>, R: AsRef<str>>(left: &[L], right: &[R]) -> Vec<DiffRow> {
     build_diff_rows_within(left, right, DIFF_DEADLINE).0
 }
 
 /// [`build_diff_rows`] with its search bounded by `budget`; the flag is
 /// true when the budget ran out and the rows are the coarser diff.
-pub fn build_diff_rows_within(
-    left: &[String],
-    right: &[String],
+pub fn build_diff_rows_within<L: AsRef<str>, R: AsRef<str>>(
+    left: &[L],
+    right: &[R],
     budget: std::time::Duration,
 ) -> (Vec<DiffRow>, bool) {
     use similar::{ChangeTag, TextDiff};
-    let l: Vec<&str> = left.iter().map(|s| s.as_str()).collect();
-    let r: Vec<&str> = right.iter().map(|s| s.as_str()).collect();
+    let l: Vec<&str> = left.iter().map(AsRef::as_ref).collect();
+    let r: Vec<&str> = right.iter().map(AsRef::as_ref).collect();
     let started = std::time::Instant::now();
     let diff = TextDiff::configure().timeout(budget).diff_slices(&l, &r);
     let coarse = started.elapsed() >= budget;

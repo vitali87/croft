@@ -14,6 +14,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::highlight::{
     HiSpan, LangKind, LangRegistry, compute_line_starts, decode_semantic_tokens,
 };
+use crate::packed_lines::PackedLines;
 use crate::widgets::scrollbar;
 
 /// Hard cap on the size of a single text file the editor will load.
@@ -2187,7 +2188,8 @@ enum CaretEdit {
 
 #[derive(Clone, Debug)]
 struct Snapshot {
-    lines: Vec<String>,
+    /// Packed (#1707): a step held as a `Vec<String>` cost twice its text.
+    lines: PackedLines,
     cursor_row: usize,
     cursor_col: usize,
     selection: Option<EditorSelection>,
@@ -2202,8 +2204,8 @@ struct Snapshot {
     /// with it, so a cycle never credits lines to whoever wrote a different
     /// buffer.
     provenance: crate::provenance::Provenance,
-    /// The text this step holds, each line's `String` header included,
-    /// measured once when it is taken (see [`UNDO_BYTES_LIMIT`]).
+    /// The bytes this step's text holds, measured once when it is taken
+    /// (see [`UNDO_BYTES_LIMIT`]).
     bytes: usize,
 }
 
@@ -2642,7 +2644,7 @@ pub struct Editor {
     /// HEAD baseline for the git gutter: the committed version's lines. Set by
     /// the app (read off the workspace git root once per file / HEAD change).
     /// `None` when the file is untracked, outside a repo, or not yet fetched.
-    pub git_head_lines: Option<Vec<String>>,
+    pub git_head_lines: Option<PackedLines>,
     /// The path `git_head_lines` was fetched for. The app refetches when this
     /// stops matching `path` (the tab switched files) so the gutter can never
     /// show another file's diff.
@@ -2694,7 +2696,7 @@ pub struct Editor {
     /// by the app off-thread once per (file, HEAD); `None` until fetched or
     /// when blame is disabled. Drives the GitLens-style current-line inline
     /// annotation.
-    pub blame_lines: Option<Vec<crate::git::BlameLine>>,
+    pub blame_lines: Option<crate::git::Blame>,
     /// The path `blame_lines` was fetched for; the app refetches when this
     /// stops matching `path` so blame can never show another file's authors.
     pub blame_for: Option<PathBuf>,
@@ -2965,7 +2967,7 @@ pub struct Editor {
     /// syntax spans by every syntax pass and carried through edits between
     /// passes, never per frame. App-synced from prefs; on by default.
     pub show_bracket_colors: bool,
-    bracket_colors: Vec<Vec<(usize, u8)>>,
+    bracket_colors: BracketColors,
     /// Byte ranges of every string and comment in the buffer (lines joined
     /// by `\n`), from the same highlight pass as `bracket_colors`. Quote
     /// auto-pairing reads it to see a string or block comment an earlier
@@ -3024,8 +3026,9 @@ pub struct Editor {
     /// the buffer was edited after it started.
     highlight_requests: u64,
     /// The text `highlights` and `bracket_colors` describe, line for line:
-    /// what an edit is diffed against to carry them over.
-    highlight_base: Vec<String>,
+    /// what an edit is diffed against to carry them over. Packed (#1707):
+    /// a second `Vec<String>` of a large file cost twice its text.
+    highlight_base: PackedLines,
     /// How long the last pass took. An edit waits for its pass only when the
     /// last one fit the budget, so a small file still colors each keystroke
     /// in the same frame and a large one never makes it wait.
@@ -3357,7 +3360,7 @@ impl Editor {
             highlights: Vec::new(),
             highlight_job: None,
             highlight_requests: 0,
-            highlight_base: Vec::new(),
+            highlight_base: PackedLines::default(),
             highlight_cost: std::time::Duration::ZERO,
             highlight_budget: (!cfg!(test)).then_some(HIGHLIGHT_INLINE_BUDGET),
             highlight_generation: 0,
@@ -3918,7 +3921,7 @@ impl Editor {
     /// calls this once per file (and again after HEAD moves) with the
     /// committed version's lines; `None` means untracked / not a repo. Forces
     /// the per-line marks to recompute on the next render.
-    pub fn set_git_head_lines(&mut self, path: PathBuf, head: Option<Vec<String>>) {
+    pub fn set_git_head_lines(&mut self, path: PathBuf, head: Option<PackedLines>) {
         self.git_baseline_for = Some(path);
         self.git_head_lines = head;
         self.git_marks_seq = u64::MAX;
@@ -3926,7 +3929,7 @@ impl Editor {
 
     /// Install (or clear) per-line git blame for `path`. The app fetches this
     /// off-thread once per file and after HEAD moves.
-    pub fn set_blame(&mut self, path: PathBuf, blame: Option<Vec<crate::git::BlameLine>>) {
+    pub fn set_blame(&mut self, path: PathBuf, blame: Option<crate::git::Blame>) {
         self.blame_for = Some(path);
         self.blame_lines = blame;
     }
@@ -3990,25 +3993,21 @@ impl Editor {
         if blame.len() != self.lines.len() {
             return None;
         }
-        let line = blame.get(self.cursor_row)?;
+        let (commit, text) = blame.line(self.cursor_row)?;
         // Same count is not same lines: a cut and paste further down keeps
         // the count and shifts every row between, each then wearing the
         // blame of the line that used to sit there.
-        if line
-            .text
-            .as_ref()
-            .is_some_and(|t| Some(t) != self.lines.get(self.cursor_row))
-        {
+        if text.is_some_and(|t| Some(t) != self.lines.get(self.cursor_row).map(String::as_str)) {
             return None;
         }
-        if line.uncommitted {
+        if commit.uncommitted {
             return Some("Uncommitted changes".to_string());
         }
         Some(format!(
             "{}, {} • {}",
-            line.author,
-            crate::git::humanize_age(line.age_secs),
-            line.summary
+            commit.author,
+            crate::git::humanize_age(commit.age_secs),
+            commit.summary
         ))
     }
 
@@ -4083,7 +4082,8 @@ impl Editor {
         // `build_diff_rows` pairs consecutive delete+insert into `Replaced`, so
         // a bare `Removed` run is a real deletion: attach a `Deleted` marker to
         // the next surviving line (the gutter's deletion boundary, VS Code-style).
-        let rows = crate::widgets::diff::build_diff_rows(head, &self.lines);
+        let head: Vec<&str> = head.iter().collect();
+        let rows = crate::widgets::diff::build_diff_rows(&head, &self.lines);
         let mut pending_delete = false;
         for row in &rows {
             match *row {
@@ -4279,7 +4279,7 @@ impl Editor {
         // Built off the UI thread, and no tick polls a scrubber view: take
         // the whole pass here rather than leaving it to land later.
         e.recompute_highlights_within(None);
-        e.set_git_head_lines(path.to_path_buf(), Some(baseline));
+        e.set_git_head_lines(path.to_path_buf(), Some(PackedLines::from(baseline)));
         // Never edited, so the marks are computed once, here.
         e.refresh_git_marks();
         e.warm_render_caches();
@@ -6379,7 +6379,7 @@ impl Editor {
             }
             None => {
                 self.highlight_job = None;
-                self.highlight_base = Vec::new();
+                self.highlight_base = PackedLines::default();
                 self.highlights = vec![Vec::new(); self.lines.len()];
                 self.protected_ranges.clear();
                 // No grammar means no string/comment knowledge; brackets in
@@ -6497,7 +6497,7 @@ impl Editor {
         self.highlights = pass.spans;
         self.bracket_colors = pass.brackets;
         // String and comment ranges hold only for the text the pass read.
-        self.protected_current = pass.lines == self.lines;
+        self.protected_current = pass.lines == self.lines[..];
         self.protected_ranges = if self.protected_current {
             pass.protected
         } else {
@@ -6792,7 +6792,12 @@ impl Editor {
     pub fn line_spans_for_test(&self, line: usize) -> Vec<(usize, usize, Style)> {
         self.highlights
             .get(line)
-            .map(|spans| spans.iter().map(|s| (s.start, s.end, s.style)).collect())
+            .map(|spans| {
+                spans
+                    .iter()
+                    .map(|s| (s.range().start, s.range().end, s.style))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -7391,7 +7396,7 @@ impl Editor {
         if self
             .undo_stack
             .last()
-            .is_some_and(|s| s.lines == self.lines)
+            .is_some_and(|s| s.lines == self.lines[..])
         {
             self.undo_stack.pop();
         }
@@ -9345,11 +9350,8 @@ impl Editor {
     }
 
     fn snapshot(&self) -> Snapshot {
-        let lines = self.lines.clone();
-        let bytes = lines
-            .iter()
-            .map(|l| l.capacity() + std::mem::size_of::<String>())
-            .sum();
+        let lines = PackedLines::from(&self.lines[..]);
+        let bytes = lines.heap_bytes();
         Snapshot {
             lines,
             bytes,
@@ -9452,7 +9454,7 @@ impl Editor {
     /// Replace the buffer state with a snapshot (shared by undo/redo), clamping
     /// the caret into the restored buffer and refreshing highlights.
     fn restore_snapshot(&mut self, snap: Snapshot) {
-        self.lines = snap.lines;
+        self.lines = snap.lines.iter().map(String::from).collect();
         // The map that described this text comes back with it (#349): an
         // undo re-credits the lines it restores to the seats that wrote
         // them, a redo re-credits the edit to its seat. Truncated below to
@@ -9672,7 +9674,7 @@ impl Editor {
         if self.has_non_text_view() || self.encoding != encoding {
             return;
         }
-        if before.lines == self.lines {
+        if before.lines == self.lines[..] {
             // Only the stamp moved (`touch`, a formatter with nothing to
             // do): no step that undoes to the same text.
             self.undo_stack = undo;
@@ -12354,11 +12356,11 @@ impl Editor {
                 if col >= w {
                     break;
                 }
-                while si < merged.len() && merged[si].end <= byte {
+                while si < merged.len() && merged[si].range().end <= byte {
                     si += 1;
                 }
                 if !ch.is_whitespace() {
-                    let (r, g, b) = if si < merged.len() && merged[si].start <= byte {
+                    let (r, g, b) = if si < merged.len() && merged[si].range().start <= byte {
                         span_rgb(merged[si].style, fg)
                     } else {
                         fg
@@ -13100,7 +13102,14 @@ fn identifier_tokens(line: &str) -> Vec<&str> {
 /// Colour-index marker for an unmatched closing bracket (painted red).
 const UNEXPECTED_BRACKET: u8 = u8::MAX;
 /// Per line, the `(char column, colour index)` of every colored bracket.
-type BracketColors = Vec<Vec<(usize, u8)>>;
+/// The column is a `u32` (#1707): 8 bytes a bracket rather than 16, and no
+/// line the editor holds is four billion characters long.
+type BracketColors = Vec<Vec<(u32, u8)>>;
+
+/// A bracket's char column as [`BracketColors`] holds it.
+fn bracket_col(col: usize) -> u32 {
+    u32::try_from(col).unwrap_or(u32::MAX)
+}
 /// Plain-text buffers above this size skip bracket colorization: a
 /// no-grammar file has no tree-sitter pass absorbing a per-edit full scan,
 /// so typing in a large log must not pay O(total chars) per keystroke.
@@ -13120,13 +13129,13 @@ const BRACKET_COLOR_CYCLE: usize = 3;
 /// nothing — or not the innermost open bracket — marks `UNEXPECTED_BRACKET`
 /// while leaving the stack alone, so `(]` reddens the `]` and a later `)`
 /// still pairs with the `(`.
-fn scan_bracket_colors(lines: &[String], protected: &[(usize, usize)]) -> Vec<Vec<(usize, u8)>> {
+fn scan_bracket_colors<S: AsRef<str>>(lines: &[S], protected: &[(usize, usize)]) -> BracketColors {
     let mut out = vec![Vec::new(); lines.len()];
     let mut stack: Vec<char> = Vec::new();
     let mut abs = 0usize;
     let mut pi = 0usize;
     for (li, line) in lines.iter().enumerate() {
-        for (ci, ch) in line.chars().enumerate() {
+        for (ci, ch) in line.as_ref().chars().enumerate() {
             let b = abs;
             abs += ch.len_utf8();
             while pi < protected.len() && protected[pi].1 <= b {
@@ -13137,7 +13146,7 @@ fn scan_bracket_colors(lines: &[String], protected: &[(usize, usize)]) -> Vec<Ve
             }
             match ch {
                 '(' | '[' | '{' => {
-                    out[li].push((ci, (stack.len() % BRACKET_COLOR_CYCLE) as u8));
+                    out[li].push((bracket_col(ci), (stack.len() % BRACKET_COLOR_CYCLE) as u8));
                     stack.push(ch);
                 }
                 ')' | ']' | '}' => {
@@ -13148,9 +13157,9 @@ fn scan_bracket_colors(lines: &[String], protected: &[(usize, usize)]) -> Vec<Ve
                     };
                     if stack.last() == Some(&want) {
                         stack.pop();
-                        out[li].push((ci, (stack.len() % BRACKET_COLOR_CYCLE) as u8));
+                        out[li].push((bracket_col(ci), (stack.len() % BRACKET_COLOR_CYCLE) as u8));
                     } else {
-                        out[li].push((ci, UNEXPECTED_BRACKET));
+                        out[li].push((bracket_col(ci), UNEXPECTED_BRACKET));
                     }
                 }
                 _ => {}
@@ -13182,7 +13191,7 @@ struct HighlightPass {
     kind: LangKind,
     /// The text highlighted, line for line: the base the result is carried
     /// from when edits landed while it ran.
-    lines: Vec<String>,
+    lines: PackedLines,
     spans: Vec<Vec<HiSpan>>,
     brackets: BracketColors,
     /// Byte ranges of the strings and comments the grammar found (#844).
@@ -13196,17 +13205,21 @@ struct HighlightPass {
 fn run_highlight_pass(kind: LangKind, text: String) -> HighlightPass {
     let started = std::time::Instant::now();
     let line_starts = compute_line_starts(text.as_bytes());
-    let (spans, protected) = crate::highlight::highlight_text_with_protected(
+    let (mut spans, protected) = crate::highlight::highlight_text_with_protected(
         &mut LangRegistry::new(),
         kind,
         text.as_bytes(),
         &line_starts,
     );
-    let lines: Vec<String> = text.split('\n').map(String::from).collect();
-    let brackets = scan_bracket_colors(&lines, &protected);
+    let mut brackets = scan_bracket_colors(&text.split('\n').collect::<Vec<_>>(), &protected);
+    // The result lives as long as the tab (#1707): each line's list grew by
+    // doubling, which left about a third of it spare. Trimmed here, on the
+    // worker, rather than on the UI thread that keeps it.
+    spans.iter_mut().for_each(Vec::shrink_to_fit);
+    brackets.iter_mut().for_each(Vec::shrink_to_fit);
     HighlightPass {
         kind,
-        lines,
+        lines: PackedLines::from_joined(text),
         spans,
         brackets,
         protected,
@@ -13228,7 +13241,7 @@ const CARRY_DIFF_BUDGET: std::time::Duration = std::time::Duration::from_millis(
 /// pass. Every offset stays inside its line and on a char boundary. False
 /// when `base` already matches `lines`.
 fn carry_highlights(
-    base: &mut Vec<String>,
+    base: &mut PackedLines,
     spans: &mut Vec<Vec<HiSpan>>,
     brackets: &mut BracketColors,
     lines: &[String],
@@ -13238,13 +13251,13 @@ fn carry_highlights(
         // Not computed for `base`, so there is nothing sound to carry.
         *spans = vec![Vec::new(); lines.len()];
         *brackets = vec![Vec::new(); lines.len()];
-        *base = lines.to_vec();
+        *base = PackedLines::from(lines);
         return true;
     }
     let prefix = base
         .iter()
         .zip(lines)
-        .take_while(|(old, new)| old == new)
+        .take_while(|(old, new)| *old == new.as_str())
         .count();
     if prefix == base.len() && prefix == lines.len() {
         return false;
@@ -13255,15 +13268,16 @@ fn carry_highlights(
         .rev()
         .zip(lines.iter().rev())
         .take(room)
-        .take_while(|(old, new)| old == new)
+        .take_while(|(old, new)| *old == new.as_str())
         .count();
     let (old_end, new_end) = (base.len() - suffix, lines.len() - suffix);
-    let (old, new) = (&base[prefix..old_end], &lines[prefix..new_end]);
+    let old: Vec<&str> = base.lines_in(prefix..old_end).collect();
+    let new: Vec<&str> = lines[prefix..new_end].iter().map(String::as_str).collect();
     let (old_spans, old_brackets) = (&spans[prefix..old_end], &brackets[prefix..old_end]);
     let ops = similar::capture_diff_slices_deadline(
         similar::Algorithm::Myers,
-        old,
-        new,
+        &old,
+        &new,
         Some(std::time::Instant::now() + CARRY_DIFF_BUDGET),
     );
     let mut mid_spans = Vec::with_capacity(new.len());
@@ -13311,7 +13325,7 @@ fn carry_highlights(
     debug_assert_eq!(mid_spans.len(), new.len());
     spans.splice(prefix..old_end, mid_spans);
     brackets.splice(prefix..old_end, mid_brackets);
-    base.splice(prefix..old_end, new.iter().cloned());
+    base.splice(prefix..old_end, &new);
     true
 }
 
@@ -13325,10 +13339,10 @@ fn carry_highlights(
 /// then re-split at `new`'s line ends. A bracket keeps its colour wherever
 /// the change left it.
 fn carry_changed_lines(
-    old: &[String],
-    new: &[String],
+    old: &[&str],
+    new: &[&str],
     spans: &[Vec<HiSpan>],
-    brackets: &[Vec<(usize, u8)>],
+    brackets: &[Vec<(u32, u8)>],
 ) -> (Vec<Vec<HiSpan>>, BracketColors) {
     let mut out_spans = vec![Vec::new(); new.len()];
     let mut out_brackets = vec![Vec::new(); new.len()];
@@ -13379,11 +13393,12 @@ fn carry_changed_lines(
     let mut old_start = 0usize;
     for (i, line) in old.iter().enumerate() {
         for span in &spans[i] {
-            let end = span.end.min(line.len());
-            if span.start >= end {
+            let end = span.range().end.min(line.len());
+            if span.range().start >= end {
                 continue;
             }
-            let Some((mut from, to)) = carry_span(old_start + span.start, old_start + end) else {
+            let Some((mut from, to)) = carry_span(old_start + span.range().start, old_start + end)
+            else {
                 continue;
             };
             let mut li = line_of(from);
@@ -13391,11 +13406,11 @@ fn carry_changed_lines(
                 let line_start = new_starts[li];
                 let piece_end = to.min(line_start + new[li].len());
                 if piece_end > from {
-                    out_spans[li].push(HiSpan {
-                        start: from - line_start,
-                        end: piece_end - line_start,
-                        style: span.style,
-                    });
+                    out_spans[li].push(HiSpan::new(
+                        from - line_start,
+                        piece_end - line_start,
+                        span.style,
+                    ));
                 }
                 li += 1;
                 if let Some(&next) = new_starts.get(li) {
@@ -13406,7 +13421,7 @@ fn carry_changed_lines(
         // Columns ascend, so one pass over the line's chars finds them all.
         let mut chars = line.char_indices().enumerate();
         for &(col, depth) in &brackets[i] {
-            let Some((_, (byte, _))) = chars.find(|(c, _)| *c == col) else {
+            let Some((_, (byte, _))) = chars.find(|(c, _)| *c == col as usize) else {
                 break;
             };
             let at = old_start + byte;
@@ -13421,7 +13436,7 @@ fn carry_changed_lines(
             }
             cursor.2 += new[li][cursor.1..in_line].chars().count();
             cursor.1 = in_line;
-            out_brackets[li].push((cursor.2, depth));
+            out_brackets[li].push((bracket_col(cursor.2), depth));
         }
         old_start += line.len() + 1;
     }
@@ -14443,16 +14458,15 @@ pub(crate) fn normalize_newlines(text: &str) -> String {
 fn shift_spans_for_view(spans: &[HiSpan], byte_start: usize) -> Vec<HiSpan> {
     let mut out = Vec::with_capacity(spans.len());
     for sp in spans {
-        if sp.end <= byte_start {
+        let range = sp.range();
+        if range.end <= byte_start {
             continue;
         }
-        let new_start = sp.start.saturating_sub(byte_start);
-        let new_end = sp.end - byte_start;
-        out.push(HiSpan {
-            start: new_start,
-            end: new_end,
-            style: sp.style,
-        });
+        out.push(HiSpan::new(
+            range.start.saturating_sub(byte_start),
+            range.end - byte_start,
+            sp.style,
+        ));
     }
     out
 }
@@ -14551,14 +14565,15 @@ fn build_line_spans<'a>(line: &'a str, spans: &[HiSpan]) -> Vec<Span<'a>> {
     let mut out: Vec<Span> = Vec::with_capacity(spans.len() * 2);
     let mut cursor = 0usize;
     for sp in spans {
-        if sp.start > cursor && sp.start <= line.len() {
-            let slice = &line[cursor..sp.start];
+        let range = sp.range();
+        if range.start > cursor && range.start <= line.len() {
+            let slice = &line[cursor..range.start];
             if !slice.is_empty() {
                 out.push(Span::raw(slice));
             }
         }
-        let s = sp.start.min(line.len());
-        let e = sp.end.min(line.len());
+        let s = range.start.min(line.len());
+        let e = range.end.min(line.len());
         if e > s {
             out.push(Span::styled(&line[s..e], sp.style));
             cursor = e;
@@ -15315,13 +15330,7 @@ impl Widget for &mut Editor {
                 // segment so build_line_spans never slices past `visible_raw`.
                 let shifted: Vec<HiSpan> = shift_spans_for_view(&merged, byte_start)
                     .into_iter()
-                    .filter_map(|mut sp| {
-                        if sp.start >= seg_bytes {
-                            return None;
-                        }
-                        sp.end = sp.end.min(seg_bytes);
-                        Some(sp)
-                    })
+                    .filter_map(|sp| sp.clipped(seg_bytes))
                     .collect();
                 let spans = build_line_spans(visible_raw, &shifted);
                 buf.set_line(text_x, y, &Line::from(spans), row_width);
@@ -15370,6 +15379,7 @@ impl Widget for &mut Editor {
                 && let Some(cols) = self.bracket_colors.get(line_idx)
             {
                 for &(c, ci) in cols {
+                    let c = c as usize;
                     if c < row_start {
                         continue;
                     }
@@ -16236,13 +16246,7 @@ impl Editor {
         let raw_bytes = raw.len();
         let clamped: Vec<HiSpan> = merged
             .into_iter()
-            .filter_map(|mut sp| {
-                if sp.start >= raw_bytes {
-                    return None;
-                }
-                sp.end = sp.end.min(raw_bytes);
-                Some(sp)
-            })
+            .filter_map(|sp| sp.clipped(raw_bytes))
             .collect();
         let spans = build_line_spans(raw, &clamped);
         buf.set_line(text_x, y, &Line::from(spans), width);
@@ -16439,13 +16443,7 @@ fn inlay_text_segment<'a>(
     let seg_bytes = byte_to - byte_from;
     let shifted: Vec<HiSpan> = shift_spans_for_view(merged, byte_from)
         .into_iter()
-        .filter_map(|mut sp| {
-            if sp.start >= seg_bytes {
-                return None;
-            }
-            sp.end = sp.end.min(seg_bytes);
-            Some(sp)
-        })
+        .filter_map(|sp| sp.clipped(seg_bytes))
         .collect();
     build_line_spans(seg, &shifted)
 }
@@ -18703,15 +18701,19 @@ mod tests {
         summary: &str,
         age: i64,
         uncommitted: bool,
-    ) -> crate::git::BlameLine {
-        crate::git::BlameLine {
+    ) -> std::sync::Arc<crate::git::BlameCommit> {
+        std::sync::Arc::new(crate::git::BlameCommit {
             short_hash: "abc12345".into(),
             summary: summary.into(),
             author: author.into(),
             age_secs: age,
             uncommitted,
-            text: None,
-        }
+        })
+    }
+
+    /// Blame for lines whose text as blamed is not known.
+    fn blame_of(commits: Vec<std::sync::Arc<crate::git::BlameCommit>>) -> crate::git::Blame {
+        crate::git::Blame::new(commits, None)
     }
 
     #[test]
@@ -18958,10 +18960,10 @@ mod tests {
         e.path = Some(PathBuf::from("f.rs"));
         e.set_blame(
             PathBuf::from("f.rs"),
-            Some(vec![
+            Some(blame_of(vec![
                 blame_line("Vitali", "fix: the thing", 90, false),
                 blame_line("Alice", "feat: two", 7200, false),
-            ]),
+            ])),
         );
         e.cursor_row = 0;
         assert_eq!(
@@ -18979,17 +18981,13 @@ mod tests {
     fn blame_is_not_shown_on_a_row_that_holds_another_lines_text() {
         let mut e = editor_with("one\ntwo\nthree\n");
         e.path = Some(PathBuf::from("f.rs"));
-        let with_text = |author: &str, text: &str| crate::git::BlameLine {
-            text: Some(text.into()),
-            ..blame_line(author, "s", 90, false)
-        };
+        let commits = ["A", "B", "C"].map(|author| blame_line(author, "s", 90, false));
         e.set_blame(
             PathBuf::from("f.rs"),
-            Some(vec![
-                with_text("A", "one"),
-                with_text("B", "two"),
-                with_text("C", "three"),
-            ]),
+            Some(crate::git::Blame::new(
+                commits.to_vec(),
+                Some(PackedLines::from(&["one", "two", "three"][..])),
+            )),
         );
         // A cut and paste that keeps the count: `one` moved to the end.
         e.lines = vec!["two".into(), "three".into(), "one".into()];
@@ -19003,7 +19001,12 @@ mod tests {
         e.path = Some(PathBuf::from("f.rs"));
         e.set_blame(
             PathBuf::from("f.rs"),
-            Some(vec![blame_line("Not Committed Yet", "x", 0, true)]),
+            Some(blame_of(vec![blame_line(
+                "Not Committed Yet",
+                "x",
+                0,
+                true,
+            )])),
         );
         e.cursor_row = 0;
         assert_eq!(
@@ -19020,7 +19023,7 @@ mod tests {
         assert!(e.current_line_blame_annotation().is_none());
         e.set_blame(
             PathBuf::from("f.rs"),
-            Some(vec![blame_line("V", "s", 5, false)]),
+            Some(blame_of(vec![blame_line("V", "s", 5, false)])),
         );
         e.blame_enabled = false;
         assert!(
@@ -19042,10 +19045,10 @@ mod tests {
         e.path = Some(PathBuf::from("a.rs"));
         e.set_blame(
             PathBuf::from("a.rs"),
-            Some(vec![
+            Some(blame_of(vec![
                 blame_line("Alice", "s", 5, false),
                 blame_line("Alice", "s", 5, false),
-            ]),
+            ])),
         );
         e.path = Some(PathBuf::from("b.rs"));
         assert!(
@@ -20211,8 +20214,8 @@ mod tests {
         e
     }
 
-    fn head(lines: &[&str]) -> Option<Vec<String>> {
-        Some(lines.iter().map(|s| s.to_string()).collect())
+    fn head(lines: &[&str]) -> Option<PackedLines> {
+        Some(PackedLines::from(lines))
     }
 
     #[test]
@@ -20325,10 +20328,10 @@ mod tests {
         e.path = Some(PathBuf::from("f.rs"));
         e.set_blame(
             PathBuf::from("f.rs"),
-            Some(vec![
+            Some(blame_of(vec![
                 blame_line("Vitali", "fix: the thing", 90, false),
                 blame_line("Alice", "feat: two", 7200, false),
-            ]),
+            ])),
         );
         e.provenance
             .record(0..1, Seat::Agent(String::from("pane 2")));
@@ -21558,7 +21561,7 @@ mod tests {
         // A HEAD baseline that differs from the buffer on known lines.
         let mut head: Vec<String> = (1..=100).map(|i| format!("line {i}")).collect();
         head[10] = String::from("line 11 as committed");
-        e.git_head_lines = Some(head);
+        e.git_head_lines = Some(PackedLines::from(head));
         e.git_baseline_for = e.path.clone();
         let rows = e.overview_ruler_rows(100);
         assert_eq!(
@@ -23915,6 +23918,28 @@ mod tests {
             small.push_undo(EditKind::Paste);
         }
         assert_eq!(small.undo_stack.len(), 40);
+    }
+
+    /// An undo step holds the buffer's text packed (#1707): about the text's
+    /// own size, not the ~45 bytes a line more a `Vec<String>` copy took.
+    #[test]
+    fn an_undo_step_holds_about_its_texts_size() {
+        let text: String = (0..1000).map(|i| format!("line {i}\n")).collect();
+        let mut e = editor_with(&text);
+        e.push_undo(EditKind::Paste);
+        let held = e.undo_stack[0].bytes;
+        let text_bytes: usize = e.lines.iter().map(|l| l.len() + 1).sum();
+        assert!(
+            held <= text_bytes + 8 * e.lines.len(),
+            "{held} bytes held for {text_bytes} bytes of text"
+        );
+        e.lines[0] = String::from("changed");
+        assert!(e.undo());
+        assert_eq!(
+            e.lines,
+            text.lines().collect::<Vec<_>>(),
+            "and undoes to it"
+        );
     }
 
     #[test]
@@ -29627,12 +29652,12 @@ mod tests {
         assert!(e.toggle_line_comment());
         let after: Vec<(usize, usize, Option<Color>)> = e.highlights[0]
             .iter()
-            .map(|s| (s.start, s.end, s.style.fg))
+            .map(|s| (s.range().start, s.range().end, s.style.fg))
             .collect();
         e.recompute_highlights();
         let fresh: Vec<(usize, usize, Option<Color>)> = e.highlights[0]
             .iter()
-            .map(|s| (s.start, s.end, s.style.fg))
+            .map(|s| (s.range().start, s.range().end, s.style.fg))
             .collect();
         assert_eq!(
             after, fresh,
@@ -31414,7 +31439,7 @@ mod tests {
                 .flat_map(|(row, bs)| {
                     bs.iter()
                         .filter(|b| b.1 == UNEXPECTED_BRACKET)
-                        .map(move |b| (row, b.0))
+                        .map(move |b| (row, b.0 as usize))
                 })
                 .collect();
             assert!(
@@ -31485,7 +31510,11 @@ mod tests {
     fn span_tuples(spans: &[Vec<HiSpan>]) -> Vec<Vec<(usize, usize, Style)>> {
         spans
             .iter()
-            .map(|line| line.iter().map(|s| (s.start, s.end, s.style)).collect())
+            .map(|line| {
+                line.iter()
+                    .map(|s| (s.range().start, s.range().end, s.style))
+                    .collect()
+            })
             .collect()
     }
 
@@ -31497,7 +31526,7 @@ mod tests {
             Style::default().fg(Color::Blue),
         );
         let span = |start, end, style| HiSpan { start, end, style };
-        let mut base = vec![String::from("let name = 1;"), String::from("f(x)")];
+        let mut base = PackedLines::from(vec![String::from("let name = 1;"), String::from("f(x)")]);
         let mut spans = vec![
             vec![span(0, 3, kw), span(4, 8, id), span(11, 12, num)],
             Vec::new(),
@@ -31516,7 +31545,11 @@ mod tests {
             "the identifier covers the typed X; the number moves right"
         );
         assert_eq!(brackets[1], vec![(1, 0), (3, 0)], "an untouched line");
-        assert_eq!(base, lines, "the base follows the text");
+        assert_eq!(
+            base,
+            PackedLines::from(&lines[..]),
+            "the base follows the text"
+        );
         assert!(
             !carry_highlights(&mut base, &mut spans, &mut brackets, &lines),
             "nothing left to carry"
@@ -31537,7 +31570,7 @@ mod tests {
             // Before the second, after a gap no span covers: nobody's.
             ("ab Xcd", vec![(0, 2, a), (4, 6, b)]),
         ] {
-            let mut base = vec![String::from("ab cd")];
+            let mut base = PackedLines::from(vec![String::from("ab cd")]);
             let mut spans = vec![vec![span(0, 2, a), span(3, 5, b)]];
             let mut brackets = vec![Vec::new()];
             carry_highlights(&mut base, &mut spans, &mut brackets, &[String::from(typed)]);
@@ -31554,7 +31587,10 @@ mod tests {
             Style::default().fg(Color::Blue),
         );
         let span = |start, end, style| HiSpan { start, end, style };
-        let mut base = vec![String::from("// a comment"), String::from("fn x() {}")];
+        let mut base = PackedLines::from(vec![
+            String::from("// a comment"),
+            String::from("fn x() {}"),
+        ]);
         let mut spans = vec![vec![span(0, 12, comment)], vec![span(0, 2, kw)]];
         let mut brackets = vec![Vec::new(), vec![(4, 0), (5, 0), (7, 0), (8, 0)]];
         let lines = vec![String::from("let y = 2;"), String::from("fn x() {}")];
@@ -31570,10 +31606,10 @@ mod tests {
         // and so does each edited line's untouched text.
         let style = Style::default().fg(Color::Blue);
         let span = |start, end| HiSpan { start, end, style };
-        let mut base: Vec<String> = (0..6).map(|i| format!("word{i} tail")).collect();
+        let mut lines: Vec<String> = (0..6).map(|i| format!("word{i} tail")).collect();
+        let mut base = PackedLines::from(&lines[..]);
         let mut spans: Vec<Vec<HiSpan>> = (0..6).map(|_| vec![span(6, 10)]).collect();
         let mut brackets = vec![Vec::new(); 6];
-        let mut lines = base.clone();
         lines[0].insert(0, 'X');
         lines[5].insert(0, 'X');
         carry_highlights(&mut base, &mut spans, &mut brackets, &lines);
@@ -31593,11 +31629,11 @@ mod tests {
             Style::default().fg(Color::Green),
         );
         let span = |start, end, style| HiSpan { start, end, style };
-        let mut base = vec![
+        let mut base = PackedLines::from(vec![
             String::from("a"),
             String::from("\"hello\""),
             String::from("z"),
-        ];
+        ]);
         let mut spans = vec![Vec::new(), vec![span(0, 7, s)], vec![span(0, 1, z)]];
         let mut brackets = vec![Vec::new(); 3];
         let lines = vec![
@@ -31622,8 +31658,8 @@ mod tests {
 
     #[test]
     fn carry_moves_brackets_with_their_text_and_drops_deleted_ones() {
-        let carried = |before: &str, brackets: Vec<(usize, u8)>, after: &str| {
-            let mut base = vec![String::from(before)];
+        let carried = |before: &str, brackets: Vec<(u32, u8)>, after: &str| {
+            let mut base = PackedLines::from(vec![String::from(before)]);
             let mut spans = vec![Vec::new()];
             let mut brackets = vec![brackets];
             carry_highlights(&mut base, &mut spans, &mut brackets, &[String::from(after)]);
@@ -31656,11 +31692,11 @@ mod tests {
     }
 
     /// Each bracket of `line` at its char column, the way a pass colors them.
-    fn bracket_columns(line: &str) -> Vec<(usize, u8)> {
+    fn bracket_columns(line: &str) -> Vec<(u32, u8)> {
         line.chars()
             .enumerate()
             .filter(|(_, c)| "(){}[]".contains(*c))
-            .map(|(col, _)| (col, (col % 3) as u8))
+            .map(|(col, _)| (col as u32, (col % 3) as u8))
             .collect()
     }
 
@@ -31676,13 +31712,9 @@ mod tests {
         // A token every few bytes, each with its color, as a pass leaves them.
         let style = Style::default().fg(Color::Blue);
         let tokens: Vec<HiSpan> = (0..before.len() / 4)
-            .map(|k| HiSpan {
-                start: 4 * k,
-                end: 4 * k + 3,
-                style,
-            })
+            .map(|k| HiSpan::new(4 * k, 4 * k + 3, style))
             .collect();
-        let mut base = vec![before];
+        let mut base = PackedLines::from(vec![before]);
         let mut spans = vec![tokens.clone()];
         let mut carried = vec![brackets.clone()];
         let started = std::time::Instant::now();
@@ -31692,7 +31724,7 @@ mod tests {
             took < std::time::Duration::from_millis(500),
             "one keystroke's carry took {took:?}"
         );
-        let shifted: Vec<(usize, u8)> = brackets.iter().map(|&(c, d)| (c + 1, d)).collect();
+        let shifted: Vec<(u32, u8)> = brackets.iter().map(|&(c, d)| (c + 1, d)).collect();
         assert_eq!(carried[0], shifted, "every bracket moved one column right");
         assert_eq!(spans[0].len(), tokens.len());
         assert_eq!(
@@ -31707,13 +31739,13 @@ mod tests {
         // The single pass must land every bracket where counting its
         // column from scratch does: across new line breaks, deletions
         // that take brackets with them, and multi-byte text on either side.
-        fn counted(old: &str, brackets: &[(usize, u8)], new: &str) -> Vec<Vec<(usize, u8)>> {
+        fn counted(old: &str, brackets: &[(u32, u8)], new: &str) -> Vec<Vec<(u32, u8)>> {
             let (head, tail) = common_affixes(old, new);
             let (old_end, new_end) = (old.len() - tail, new.len() - tail);
             let new_lines: Vec<&str> = new.split('\n').collect();
             let mut out = vec![Vec::new(); new_lines.len()];
             for &(col, depth) in brackets {
-                let at = old.char_indices().nth(col).unwrap().0;
+                let at = old.char_indices().nth(col as usize).unwrap().0;
                 if at >= head && at < old_end {
                     continue;
                 }
@@ -31724,7 +31756,7 @@ mod tests {
                 };
                 let li = new[..moved].matches('\n').count();
                 let start = new[..moved].rfind('\n').map_or(0, |n| n + 1);
-                out[li].push((new[start..moved].chars().count(), depth));
+                out[li].push((new[start..moved].chars().count() as u32, depth));
             }
             out
         }
@@ -31742,7 +31774,7 @@ mod tests {
             "é(a, [b]) → {c}✓",
             "",
         ] {
-            let mut base = vec![String::from(old)];
+            let mut base = PackedLines::from(vec![String::from(old)]);
             let mut spans = vec![Vec::new()];
             let mut carried = vec![brackets.clone()];
             let lines: Vec<String> = new.split('\n').map(String::from).collect();
@@ -31755,7 +31787,7 @@ mod tests {
     fn carry_starts_clean_when_the_spans_do_not_describe_the_base() {
         // A non-text view resets `highlights` to one empty line without
         // touching the base; carrying from that must not misplace anything.
-        let mut base = vec![String::from("a"), String::from("b")];
+        let mut base = PackedLines::from(vec![String::from("a"), String::from("b")]);
         let mut spans = vec![Vec::new()];
         let mut brackets = Vec::new();
         let lines = vec![String::from("x()")];
@@ -31767,7 +31799,51 @@ mod tests {
         ));
         assert_eq!((spans.len(), brackets.len()), (1, 1));
         assert!(spans[0].is_empty() && brackets[0].is_empty());
-        assert_eq!(base, lines);
+        assert_eq!(base, PackedLines::from(&lines[..]));
+    }
+
+    /// What a syntax pass leaves is kept for as long as the tab (#1707): each
+    /// line's spans and brackets are held at their size, not at whatever the
+    /// list had doubled to while it grew.
+    #[test]
+    fn a_landed_pass_holds_no_spare_capacity() {
+        let src: String = (0..200)
+            .map(|i| format!("fn f{i}(a: u8, b: [u8; 4]) -> u8 {{ a + b[0] * {i} }}\n"))
+            .collect();
+        let mut e = editor_with(&src);
+        e.lang = Some(LangKind::Rust);
+        e.recompute_highlights();
+        assert!(
+            e.highlights.iter().any(|line| line.len() > 4),
+            "lines carry several spans"
+        );
+        for (i, line) in e.highlights.iter().enumerate() {
+            assert_eq!(line.capacity(), line.len(), "line {i}'s spans");
+        }
+        for (i, line) in e.bracket_colors.iter().enumerate() {
+            assert_eq!(line.capacity(), line.len(), "line {i}'s brackets");
+        }
+    }
+
+    /// The semantic overlay is decoded into lists sized to each line's tokens
+    /// (#1707), not grown to the next power of two.
+    #[test]
+    fn a_decoded_semantic_overlay_holds_no_spare_capacity() {
+        let mut e = editor_with("def f(x, y, z):\n    return x + y + z + x + y\n");
+        let p = std::path::PathBuf::from("/tmp/sem_fit.py");
+        e.path = Some(p.clone());
+        let legend = std::sync::Arc::new(vec!["parameter".to_string()]);
+        let data = vec![
+            0, 6, 1, 0, 0, 0, 3, 1, 0, 0, 0, 3, 1, 0, 0, // x, y, z
+            1, 11, 1, 0, 0, 0, 4, 1, 0, 0, 0, 4, 1, 0, 0, // x + y + z
+            0, 4, 1, 0, 0, 0, 4, 1, 0, 0, // + x + y
+        ];
+        e.apply_semantic_tokens(p, data, legend, true);
+        let overlay = e.semantic_overlay_for_test();
+        assert_eq!((overlay[0].len(), overlay[1].len()), (3, 5));
+        for (i, line) in overlay.iter().enumerate() {
+            assert_eq!(line.capacity(), line.len(), "line {i}");
+        }
     }
 
     #[test]
@@ -31791,8 +31867,8 @@ mod tests {
         let covering = |at: usize| {
             e.highlights[1]
                 .iter()
-                .find(|s| s.start <= at && at < s.end)
-                .map(|s| (s.start, s.end))
+                .find(|s| s.range().contains(&at))
+                .map(|s| s.range())
         };
         assert_eq!(
             covering(8),
@@ -31836,11 +31912,12 @@ mod tests {
         assert_eq!(e.bracket_colors.len(), e.lines.len(), "{after}");
         for (i, line) in e.lines.iter().enumerate() {
             for s in &e.highlights[i] {
+                let r = s.range();
                 assert!(
-                    s.start < s.end
-                        && s.end <= line.len()
-                        && line.is_char_boundary(s.start)
-                        && line.is_char_boundary(s.end),
+                    r.start < r.end
+                        && r.end <= line.len()
+                        && line.is_char_boundary(r.start)
+                        && line.is_char_boundary(r.end),
                     "{after}: span {}..{} on line {i} {line:?}",
                     s.start,
                     s.end
@@ -31849,7 +31926,10 @@ mod tests {
             let chars: Vec<char> = line.chars().collect();
             for &(col, _) in &e.bracket_colors[i] {
                 assert!(
-                    matches!(chars.get(col), Some('(' | ')' | '[' | ']' | '{' | '}')),
+                    matches!(
+                        chars.get(col as usize),
+                        Some('(' | ')' | '[' | ']' | '{' | '}')
+                    ),
                     "{after}: bracket color at {col} on line {i} {line:?}"
                 );
             }

@@ -9822,7 +9822,7 @@ while True:
         let col = body.find("value").expect("value in body");
         let hit = spans[1]
             .iter()
-            .find(|s| s.start <= col && col < s.end)
+            .find(|s| s.range().contains(&col))
             .expect("a semantic span should cover the body `value`");
         assert_eq!(
             hit.style.fg,
