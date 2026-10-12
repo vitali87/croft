@@ -11,7 +11,11 @@
 /// become one space, as TeX itself treats them, and empty rows go.
 pub fn to_unicode(tex: &str) -> String {
     let chars: Vec<char> = tex.chars().collect();
-    let mut p = Converter { chars, pos: 0 };
+    let mut p = Converter {
+        chars,
+        pos: 0,
+        depth: 0,
+    };
     let out = p.until(None);
     out.lines()
         .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
@@ -20,9 +24,14 @@ pub fn to_unicode(tex: &str) -> String {
         .join("\n")
 }
 
+/// How deep groups and arguments nest before the rest is left as it is,
+/// so a pathological formula can't overflow the stack.
+const MAX_DEPTH: usize = 128;
+
 struct Converter {
     chars: Vec<char>,
     pos: usize,
+    depth: usize,
 }
 
 impl Converter {
@@ -56,7 +65,11 @@ impl Converter {
             return String::new();
         };
         self.pos += 1;
-        match c {
+        if self.depth >= MAX_DEPTH {
+            return c.to_string();
+        }
+        self.depth += 1;
+        let out = match c {
             '{' => self.until(Some('}')),
             '\\' => self.command(),
             '&' => String::from(" "),
@@ -64,7 +77,9 @@ impl Converter {
             '~' | '\n' | '\r' | '\t' => String::from(" "),
             '\'' => String::from("′"),
             c => c.to_string(),
-        }
+        };
+        self.depth -= 1;
+        out
     }
 
     /// A script's or a command's argument: a group, or the next unit alone
@@ -115,11 +130,19 @@ impl Converter {
             "frac" | "dfrac" | "tfrac" => {
                 let num = self.argument();
                 let den = self.argument();
-                format!("{}/{}", grouped(&num), grouped(&den))
+                format!("{}/{}", grouped(&num), denominator(&den))
             }
             "sqrt" => {
+                // `\sqrt[3]{x}`: the optional index comes before the radicand.
+                let index = if self.peek() == Some('[') {
+                    self.pos += 1;
+                    let index = self.until(Some(']'));
+                    script(&index, true)
+                } else {
+                    String::new()
+                };
                 let arg = self.argument();
-                format!("√{}", grouped(&arg))
+                format!("{index}√{}", grouped(&arg))
             }
             "text" | "textrm" | "textit" | "textbf" | "mathrm" | "mathit" | "mathbf" | "mathsf"
             | "mathtt" | "mathcal" | "operatorname" | "boldsymbol" => self.argument(),
@@ -160,6 +183,49 @@ fn grouped(text: &str) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// `text` as a fraction's denominator: like [`grouped`], and also in
+/// parentheses when it is a product of juxtaposed terms (`2x`, `n(n+1)`),
+/// which `1/2x` would leave ambiguous.
+fn denominator(text: &str) -> String {
+    let grouped = grouped(text);
+    if grouped != text || single_term(text) {
+        grouped
+    } else {
+        format!("({text})")
+    }
+}
+
+/// One number, one symbol with its scripts, or one parenthesized group.
+fn single_term(text: &str) -> bool {
+    let is_script = |c: char| {
+        c == '′'
+            || "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ᵃᵇᶜᵈᵉᶠᵍʰⁱʲᵏˡᵐⁿᵒᵖʳˢᵗᵘᵛʷˣʸᶻᴬᴮᴰᴱᴳᴴᴵᴶᴷᴸᴹᴺᴼᴾᴿᵀᵁⱽᵂᵝᵞᵟᶿᶥᵠᵡ".contains(c)
+            || "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓᵦᵧᵨᵩᵪ".contains(c)
+    };
+    let base = text.trim_end_matches(is_script);
+    if base.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return true;
+    }
+    if base.chars().count() == 1 {
+        return true;
+    }
+    // `(…)` as a whole: the first parenthesis closes at the end.
+    if base.starts_with('(') {
+        let mut depth = 0i32;
+        for (i, c) in base.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                return i + c.len_utf8() == base.len();
+            }
+        }
+    }
+    false
 }
 
 /// A script as super- or subscript characters when each has one, else
@@ -362,6 +428,30 @@ mod tests {
         assert_eq!(to_unicode(r"\frac{a+b}{c}"), "(a+b)/c");
         assert_eq!(to_unicode(r"\frac12"), "1/2");
         assert_eq!(to_unicode(r"\sqrt{x^2+1}"), "√(x²+1)");
+    }
+
+    #[test]
+    fn an_nth_root_keeps_its_radicand() {
+        assert_eq!(to_unicode(r"\sqrt[3]{x+1}"), "³√(x+1)");
+        assert_eq!(to_unicode(r"\sqrt[n]{2}"), "ⁿ√2");
+        assert_eq!(to_unicode(r"\sqrt[q]{2}"), "^q√2");
+    }
+
+    #[test]
+    fn a_product_denominator_is_grouped() {
+        assert_eq!(to_unicode(r"\frac{1}{2x}"), "1/(2x)");
+        assert_eq!(to_unicode(r"\frac{1}{n(n+1)}"), "1/(n(n+1))");
+        assert_eq!(to_unicode(r"\frac{1}{10}"), "1/10");
+        assert_eq!(to_unicode(r"\frac{1}{x^2}"), "1/x²");
+        assert_eq!(to_unicode(r"\frac{1}{(a+b)}"), "1/(a+b)");
+    }
+
+    #[test]
+    fn deep_nesting_does_not_overflow() {
+        let braces = format!("{}x{}", "{".repeat(50_000), "}".repeat(50_000));
+        assert!(to_unicode(&braces).contains('x'));
+        to_unicode(&r"\frac".repeat(50_000));
+        to_unicode(&"x^".repeat(50_000));
     }
 
     #[test]
