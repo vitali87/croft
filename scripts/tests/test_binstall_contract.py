@@ -253,5 +253,39 @@ class TarLayoutDrift(unittest.TestCase):
         self.assertIn("no longer produces a tar.gz", r.stderr)
 
 
+    def test_a_release_that_never_publishes_the_crate_is_caught(self):
+        """#1680: binstall picks its version from crates.io. With no publish
+        step crates.io stayed on 0.2.3, which has no release, so every
+        install failed while every archive the workflow built was there."""
+        tree = self.build_tree(
+            workflow_sub=("          cargo publish --locked --no-verify\n", "")
+        )
+        r = self.run_checker(tree)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("never runs `cargo publish`", r.stderr)
+
+    def test_publishing_before_the_release_exists_is_caught(self):
+        """A publish that does not wait for the release can name a version on
+        crates.io whose archives are not uploaded yet."""
+        tree = self.build_tree(
+            workflow_sub=("    # version points at already exist.\n    needs: publish\n",
+                          "    # version points at already exist.\n    needs: build\n")
+        )
+        r = self.run_checker(tree)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("does not wait for the publish job", r.stderr)
+
+    def test_the_publish_skips_cleanly_without_a_token(self):
+        """The negative: a missing CARGO_REGISTRY_TOKEN warns and leaves the
+        release green, the same contract as the Homebrew job, and a version
+        already on crates.io is not published twice."""
+        workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+        crates = workflow.split("\n  crates:\n", 1)[1].split("\n  homebrew:\n", 1)[0]
+        self.assertIn("secrets.CARGO_REGISTRY_TOKEN", crates)
+        self.assertIn('if [ -z "$CARGO_REGISTRY_TOKEN" ]; then', crates)
+        self.assertIn("::warning::CARGO_REGISTRY_TOKEN is not set", crates)
+        self.assertIn("is already on crates.io", crates)
+        self.assertIn("needs: publish", crates)
+
 if __name__ == "__main__":
     unittest.main()
