@@ -15,6 +15,9 @@ So this asserts the contract between the two files:
   * the tag shape in `pkg-url` matches the workflow's trigger and its
     tag-to-version arithmetic
   * every target in `bin-dir`'s expansion is one the workflow actually builds
+  * the workflow publishes the crate on each tag: binstall picks the version
+    to download from crates.io, so a crate left on an old version sends every
+    install to a release that may not exist (#1680)
 
 Exit 0 when they agree, 1 with a message naming the drift when they do not.
 
@@ -222,6 +225,25 @@ def main() -> None:
     missing = sorted(EXPECTED_TARGETS - built)
     if missing:
         fail("release.yml does not build " + ", ".join(missing))
+
+    # 6. The version binstall downloads is the newest one on crates.io, not
+    #    the newest release. With no publish step crates.io stayed on 0.2.3,
+    #    whose tag never had a release, so every install 404'd while the
+    #    four archives above were all present (#1680). The publish must run
+    #    from a job that waits for the release, or binstall can resolve a
+    #    version whose archives are not up yet.
+    publish = re.search(r"^\s*cargo publish\b", workflow, re.M)
+    if not publish:
+        fail("release.yml never runs `cargo publish`, so crates.io keeps an "
+             "old version and binstall downloads that version's release")
+    # The job holding the publish: the last two-space-indented key above it.
+    headers = list(re.finditer(r"^  [\w-]+:\s*$", workflow[: publish.start()],
+                               re.M))
+    job = workflow[headers[-1].start(): publish.start()] if headers else ""
+    if not re.search(r"^\s*needs:\s*\[?[^\n]*\bpublish\b", job, re.M):
+        fail("release.yml runs `cargo publish` in a job that does not wait for "
+             "the publish job, so crates.io can name a version before its "
+             "archives exist")
 
     print(f"binstall contract: Cargo.toml and "
           f"{WORKFLOW.relative_to(ROOT)} agree "
