@@ -42129,12 +42129,13 @@ impl App {
 
     /// Reopen one captured tab, the update relaunch's or hot exit's (#862):
     /// its file at the saved cursor and scroll, with its unsaved text over
-    /// what the file holds now. Returns the tab, or `None` when there was
-    /// nothing to bring back.
+    /// what the file holds now. Returns the tab, with the xlsx cells of
+    /// `tab` it could not put back (#1593), or `None` when there was nothing
+    /// to bring back.
     fn restore_open_tab(
         &mut self,
         tab: &crate::session_state::OpenTabState,
-    ) -> Option<&mut Editor> {
+    ) -> Option<(&mut Editor, Vec<crate::widgets::editor::SheetCellEdit>)> {
         let unsaved = tab.unsaved_text.as_deref().filter(|_| tab.dirty);
         let opened = tab
             .path
@@ -42158,8 +42159,8 @@ impl App {
         if ed.sheet.is_some() {
             // A grid's edits go back into the grid (#1593); the text side
             // of a sheet tab is never its content.
-            ed.restore_sheet_edits(unsaved, &tab.sheet_cells);
-            return Some(ed);
+            let unapplied = ed.restore_sheet_edits(unsaved, &tab.sheet_cells);
+            return Some((ed, unapplied));
         }
         if let Some(text) = unsaved {
             // As an edit, not a bare assignment: the text is re-highlighted
@@ -42173,7 +42174,7 @@ impl App {
         ed.cursor_col = tab.cursor_col.min(max_col);
         ed.scroll = tab.scroll;
         ed.scroll_col = tab.scroll_col;
-        Some(ed)
+        Some((ed, Vec::new()))
     }
 
     fn tear_down_connect_auth(&mut self) {
@@ -61238,17 +61239,19 @@ impl App {
         for ed in std::iter::once(&self.editor)
             .chain(self.editor_layout.inactive_groups())
             .flat_map(|g| g.editors.iter())
-            .filter(|e| holds_unsaved(e))
+            .filter(|e| holds_unsaved(e) || e.sheet_pending_cell().is_some())
         {
             any = true;
             ed.path.hash(&mut h);
             ed.edit_seq.hash(&mut h);
-            // A grid's edits leave the text untouched (#1593).
+            // A grid's edits leave the text untouched (#1593), and the cell
+            // being typed into is in no cell yet.
             if let Some(view) = &ed.sheet {
                 for data in &view.sheets {
                     data.revision.hash(&mut h);
                 }
             }
+            ed.sheet_pending_cell().hash(&mut h);
         }
         any.then(|| h.finish())
     }
@@ -61521,9 +61524,28 @@ impl App {
                     held.push(buffer.clone());
                     continue;
                 }
-                let Some(ed) = self.restore_open_tab(&buffer.tab) else {
+                let has_cells = buffer.tab.dirty && !buffer.tab.sheet_cells.is_empty();
+                let Some((ed, unapplied)) = self.restore_open_tab(&buffer.tab) else {
+                    // An xlsx's cells whose workbook did not open (gone,
+                    // unreadable, unmounted) are kept for a later launch
+                    // rather than dropped with the backup (#1593).
+                    if has_cells {
+                        held.push(buffer.clone());
+                    }
                     continue;
                 };
+                if !unapplied.is_empty() {
+                    // Cells whose sheet or row the workbook no longer has
+                    // stay backed up too; a tab none of them reached was
+                    // not restored at all.
+                    let all = unapplied.len() == buffer.tab.sheet_cells.len();
+                    let mut kept = buffer.clone();
+                    kept.tab.sheet_cells = unapplied;
+                    held.push(kept);
+                    if all {
+                        continue;
+                    }
+                }
                 restored += 1;
                 let Some(path) = buffer.tab.path.clone() else {
                     continue;

@@ -6183,15 +6183,41 @@ impl Editor {
         Ok(SaveOutcome::Saved)
     }
 
+    /// The cell being typed into in this tab's grid, when what is typed
+    /// differs from the cell (#1593): `(sheet, row, col, value)`. It is
+    /// in no cell yet, so hot exit reads it here.
+    pub fn sheet_pending_cell(&self) -> Option<(usize, usize, usize, &str)> {
+        let view = self.sheet.as_ref()?;
+        let edit = view.editing.as_ref()?;
+        let data = view.sheets.get(view.current_sheet)?;
+        let (r, c) = (data.cur_row, data.cur_col);
+        (data.cell(r, c) != edit.value).then_some((view.current_sheet, r, c, edit.value.as_str()))
+    }
+
     /// What hot exit and the update relaunch keep of a grid's unsaved
     /// edits (#1593), `None` when it has none: a CSV/TSV grid as the text a
     /// save would write, an xlsx as its edited cells `(sheet, row, col,
-    /// value)`, the cells its save applies.
+    /// value)`, the cells its save applies. The cell being typed into
+    /// counts as edited, as a save would commit it.
     pub fn sheet_backup(&self) -> Option<(Option<String>, Vec<SheetCellEdit>)> {
-        let view = self.sheet.as_ref().filter(|v| v.dirty)?;
+        let view = self.sheet.as_ref()?;
+        let pending = self.sheet_pending_cell();
+        if !view.dirty && pending.is_none() {
+            return None;
+        }
         match view.kind {
             crate::sheet::SheetKind::Csv | crate::sheet::SheetKind::Tsv => {
                 let data = view.sheets.get(view.current_sheet)?;
+                let typed;
+                let data = match pending {
+                    Some((_, r, c, value)) => {
+                        let mut copy = data.clone();
+                        copy.set_cell(r, c, value.to_string());
+                        typed = copy;
+                        &typed
+                    }
+                    None => data,
+                };
                 let bytes =
                     crate::sheet::serialize_delimited(data, sheet_delim(view.kind), false, &[]);
                 Some((
@@ -6200,13 +6226,17 @@ impl Editor {
                 ))
             }
             crate::sheet::SheetKind::Xlsx => {
-                let cells: Vec<_> = view
+                let mut cells: Vec<_> = view
                     .cell_edits
                     .iter()
+                    .filter(|&&(s, r, c)| pending.is_none_or(|p| (p.0, p.1, p.2) != (s, r, c)))
                     .filter_map(|&(s, r, c)| {
                         Some((s, r, c, view.sheets.get(s)?.cell(r, c).to_string()))
                     })
                     .collect();
+                if let Some((s, r, c, value)) = pending {
+                    cells.push((s, r, c, value.to_string()));
+                }
                 (!cells.is_empty()).then_some((None, cells))
             }
             _ => None,
@@ -6215,16 +6245,19 @@ impl Editor {
 
     /// Put a grid's backed-up edits (#1593) over the file just opened in
     /// it, as unsaved edits: a CSV/TSV's text re-read into the grid, an
-    /// xlsx's cells set again and queued for its save. False when this tab
-    /// is no grid that takes them.
+    /// xlsx's cells set again and queued for its save. Returns the xlsx
+    /// cells it could not set (their sheet or row is gone from the
+    /// workbook), which the caller keeps rather than lose. The tab turns
+    /// dirty only when something was put back.
     pub fn restore_sheet_edits(
         &mut self,
         text: Option<&str>,
-        cells: &[(usize, usize, usize, String)],
-    ) -> bool {
+        cells: &[SheetCellEdit],
+    ) -> Vec<SheetCellEdit> {
         let Some(view) = self.sheet.as_mut() else {
-            return false;
+            return cells.to_vec();
         };
+        let mut unapplied = Vec::new();
         match (view.kind, text) {
             (crate::sheet::SheetKind::Csv | crate::sheet::SheetKind::Tsv, Some(text)) => {
                 let name = view
@@ -6234,14 +6267,16 @@ impl Editor {
                 let Ok(data) =
                     crate::sheet::parse_delimited(text.as_bytes(), sheet_delim(view.kind), &name)
                 else {
-                    return false;
+                    return Vec::new();
                 };
                 view.sheets = vec![data];
                 view.current_sheet = 0;
             }
             (crate::sheet::SheetKind::Xlsx, _) if !cells.is_empty() => {
-                for (s, r, c, value) in cells {
-                    let Some(data) = view.sheets.get_mut(*s) else {
+                for cell in cells {
+                    let (s, r, c, value) = cell;
+                    let Some(data) = view.sheets.get_mut(*s).filter(|d| *r < d.rows.len()) else {
+                        unapplied.push(cell.clone());
                         continue;
                     };
                     data.set_cell(*r, *c, value.clone());
@@ -6249,12 +6284,15 @@ impl Editor {
                         view.cell_edits.push((*s, *r, *c));
                     }
                 }
+                if unapplied.len() == cells.len() {
+                    return unapplied;
+                }
             }
-            _ => return false,
+            _ => return cells.to_vec(),
         }
         view.dirty = true;
         self.dirty = true;
-        true
+        unapplied
     }
 
     /// The page an open PDF preview is showing, if this tab is one.
