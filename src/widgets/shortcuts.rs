@@ -62,6 +62,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "",
             },
             ShortcutEntry {
+                keys: "Esc Esc",
+                description: "Leave Zen Mode",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "Ctrl+J",
                 description: "Toggle the terminal pane",
                 handler: "is_terminal_toggle_key",

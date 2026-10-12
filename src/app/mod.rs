@@ -325,6 +325,28 @@ struct ChromeLayout {
     sidebar_splitter_x: Option<u16>,
 }
 
+/// The editor rect for Centered Layout (#1585): `width` columns in the
+/// middle of `area`, or all of `area` when it is no wider than that.
+fn centered_editor_rect(area: Rect, width: u16) -> Rect {
+    if width == 0 || area.width <= width {
+        return area;
+    }
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        width,
+        ..area
+    }
+}
+
+/// The words the Zen hint shows, with the platform's command key (#1585).
+fn zen_hint_text() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Zen Mode: Cmd+K Z or Esc Esc to exit"
+    } else {
+        "Zen Mode: Ctrl+K Z or Esc Esc to exit"
+    }
+}
+
 /// Pure horizontal layout of the workspace chrome within `main`. Column order
 /// follows the primary side bar's position (the activity bar always flanks the
 /// primary side bar on its outer edge, like VS Code):
@@ -1414,6 +1436,8 @@ enum MenuAction {
     SetQuickInputPosition(QuickInputPosition),
     /// Customize Layout: toggle Zen Mode (hide all chrome / restore).
     ToggleZenMode,
+    /// Customize Layout: centre the editor (#1585).
+    ToggleCenteredLayout,
     /// Run the active editor's code lens at this index (#608).
     RunCodeLens(usize),
     /// Terminal pane right-click: rename the pane at `idx`.
@@ -3291,6 +3315,23 @@ pub struct App {
     /// Layout: Zen Mode hides the activity bar, both side bars, the panel,
     /// and the status bar; toggling off restores `pre_zen`.
     zen_mode: bool,
+    /// View: Toggle Centered Layout (#1585), persisted: the editor keeps
+    /// `centered_layout_width` columns in the middle of its column.
+    centered_layout: bool,
+    /// Zen Mode starts centred (`zen_center_layout`, persisted, on by
+    /// default), as VS Code's `zenMode.centerLayout`.
+    zen_center_layout: bool,
+    /// Whether this Zen session is centred: `zen_center_layout` on entry,
+    /// until Toggle Centered Layout turns it off.
+    zen_centered: bool,
+    /// The centred editor's width in columns (#1585).
+    centered_layout_width: u16,
+    /// When the last Esc in Zen Mode that did nothing else landed: a
+    /// second such Esc inside [`ZEN_ESC_WINDOW`] leaves Zen (#1585).
+    zen_esc_at: Option<std::time::Instant>,
+    /// Until when the "how to leave Zen" hint shows (#1585). Zen hides the
+    /// status bar, so the hint draws on its own.
+    zen_hint_until: Option<std::time::Instant>,
     /// Auto-hide the sidebar when focus moves to the editor or a terminal
     /// (#260, `sidebar_auto_hide`). Off by default. The sidebar comes back
     /// on any deliberate sidebar action — Cmd+B, an activity-bar icon, or a
@@ -5281,6 +5322,11 @@ const EDITOR_HEIGHT_MIN: u16 = 3;
 /// the workspace would be unusably squeezed, so the band collapses instead.
 const OSK_MIN_FRAME_HEIGHT: u16 = 16;
 const RIGHT_PANE_MIN: u16 = 20;
+/// Two Escapes in Zen Mode this close together leave it (#1585), the
+/// double-press window croft's clicks use too.
+const ZEN_ESC_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long the "how to leave Zen" hint shows after entering it (#1585).
+const ZEN_HINT_FOR: std::time::Duration = std::time::Duration::from_secs(4);
 /// Minimum width of the zoxide jump popup. The Explorer column it anchors
 /// over is typically ~32 cells, too narrow to read frecency paths like
 /// `~/Documents/platform/app/...`, so the box widens rightward to at least
@@ -5868,6 +5914,12 @@ impl App {
             panel_alignment: layout_prefs.panel_alignment,
             quick_input_position: layout_prefs.quick_input_position,
             zen_mode: false,
+            centered_layout: layout_prefs.centered_layout,
+            zen_center_layout: layout_prefs.zen_center_layout,
+            zen_centered: false,
+            centered_layout_width: layout_prefs.centered_layout_width,
+            zen_esc_at: None,
+            zen_hint_until: None,
             sidebar_auto_hide: loaded_prefs.sidebar_auto_hide,
             sidebar_auto_hide_suspended: false,
             sidebar_pinned_open: false,
@@ -12569,6 +12621,10 @@ impl App {
                 format!("{}Zen Mode", check(self.zen_mode)),
                 MenuAction::ToggleZenMode,
             ),
+            MenuEntry::item(
+                format!("{}Centered Layout", check(self.centered_layout_active())),
+                MenuAction::ToggleCenteredLayout,
+            ),
         ]
     }
 
@@ -12620,6 +12676,9 @@ impl App {
             secondary_side_bar: self.secondary_side_bar_visible,
             panel_alignment: self.panel_alignment,
             quick_input_position: self.quick_input_position,
+            centered_layout: self.centered_layout,
+            zen_center_layout: self.zen_center_layout,
+            centered_layout_width: self.centered_layout_width,
         });
     }
 
@@ -12799,6 +12858,8 @@ impl App {
             self.secondary_side_bar_visible = prev.secondary_side_bar;
             self.show_terminal = prev.panel;
             self.zen_mode = false;
+            self.zen_esc_at = None;
+            self.zen_hint_until = None;
             self.status = String::from("Zen Mode off");
         } else {
             self.pre_zen = Some(PreZenLayout {
@@ -12828,9 +12889,87 @@ impl App {
             self.secondary_side_bar_visible = false;
             self.show_terminal = false;
             self.zen_mode = true;
+            self.zen_centered = self.zen_center_layout;
+            self.zen_esc_at = None;
+            self.zen_hint_until = Some(std::time::Instant::now() + ZEN_HINT_FOR);
             self.status = String::from("Zen Mode on");
         }
         self.after_chrome_visibility_change();
+    }
+
+    /// Whether the editor is centred this frame (#1585): Toggle Centered
+    /// Layout, or a Zen session that started centred.
+    fn centered_layout_active(&self) -> bool {
+        self.centered_layout || (self.zen_mode && self.zen_centered)
+    }
+
+    /// View: Toggle Centered Layout (#1585). Off turns off both the setting
+    /// and a centred Zen session, so the toggle always flips what is on
+    /// screen; the setting persists, Zen's own centring does not.
+    fn toggle_centered_layout(&mut self) {
+        if self.centered_layout_active() {
+            self.centered_layout = false;
+            self.zen_centered = false;
+        } else {
+            self.centered_layout = true;
+        }
+        self.status = String::from(if self.centered_layout_active() {
+            "Centered Layout on"
+        } else {
+            "Centered Layout off"
+        });
+        self.persist_layout();
+    }
+
+    /// One Esc reached Zen Mode's editor and closed or cleared nothing
+    /// (#1585): the second inside [`ZEN_ESC_WINDOW`] leaves Zen, as VS
+    /// Code's Esc Esc does.
+    fn note_idle_zen_esc(&mut self, now: std::time::Instant) {
+        match self.zen_esc_at.take() {
+            Some(at) if now.saturating_duration_since(at) <= ZEN_ESC_WINDOW => {
+                self.toggle_zen_mode();
+            }
+            _ => self.zen_esc_at = Some(now),
+        }
+    }
+
+    /// What an Esc in the editor can close or clear (#1585), compared
+    /// across one Esc to tell an Esc that did something from one that did
+    /// nothing. Only an Esc that did nothing counts toward Esc Esc.
+    fn esc_fingerprint(&self) -> impl PartialEq + use<> {
+        (
+            (
+                self.focus,
+                self.zen_mode,
+                self.modal_overlay_open(),
+                self.context_menu.is_some(),
+                self.prompt.is_some(),
+                self.peek_popup.is_some(),
+                self.hover_popup.is_some(),
+                self.completion_popup.is_some(),
+                self.signature_help_popup.is_some(),
+            ),
+            (
+                self.editor.selection,
+                self.editor.has_multi_cursor(),
+                self.editor.snippet_active(),
+                self.editor
+                    .markdown_preview
+                    .as_ref()
+                    .map(|md| md.has_selection()),
+                self.status.clone(),
+            ),
+        )
+    }
+
+    /// Drop the Zen hint once its time is up; true when it just went, so
+    /// the frame without it is drawn (#1585).
+    fn expire_zen_hint(&mut self, now: std::time::Instant) -> bool {
+        if self.zen_hint_until.is_some_and(|until| now >= until) {
+            self.zen_hint_until = None;
+            return true;
+        }
+        false
     }
 
     /// Replace the gear menu with the Color Theme picker: one row per theme,
@@ -19036,6 +19175,13 @@ impl App {
             self.terminal_splitter_y = None;
             (right_area, None, None)
         };
+        // Centered Layout (#1585): the editor keeps its width in the middle
+        // of the column and the margins stay plain background.
+        let editor_area = if self.centered_layout_active() {
+            centered_editor_rect(editor_area, self.centered_layout_width)
+        } else {
+            editor_area
+        };
 
         if let Some(activity_area) = activity_area {
             self.render_activity_bar(frame, activity_area);
@@ -20412,6 +20558,7 @@ impl App {
         }
         self.render_port_toast(frame);
         self.render_update_toast(frame);
+        self.render_zen_hint(frame);
         self.render_context_menu(frame);
         self.render_commit_dropdown(frame);
         self.render_prompt(frame);
@@ -21558,6 +21705,47 @@ impl App {
     /// Paint the transient port-detection toast in the bottom-right corner and
     /// record its clickable action-button rects. Click-only: it never captures
     /// keystrokes, so it can't interfere with terminal typing.
+    /// Zen Mode hides the status bar, so for a few seconds after entering
+    /// it a box at the bottom says how to leave (#1585).
+    fn render_zen_hint(&self, frame: &mut ratatui::Frame) {
+        if !self.zen_mode
+            || !self
+                .zen_hint_until
+                .is_some_and(|until| std::time::Instant::now() < until)
+        {
+            return;
+        }
+        let text = zen_hint_text();
+        let area = frame.area();
+        let width = text.chars().count() as u16 + 4;
+        let height: u16 = 3;
+        if area.width < width || area.height < height + 1 {
+            return;
+        }
+        let rect = Rect {
+            x: area.x + (area.width - width) / 2,
+            y: area.y + area.height - height - 1,
+            width,
+            height,
+        };
+        let accent = self.theme.accent();
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::default().fg(accent))
+            .style(Style::default().bg(self.theme.editor_bg()));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(ratatui::text::Span::styled(
+                text,
+                Style::default().fg(accent),
+            ))
+            .alignment(ratatui::layout::Alignment::Center)
+            .block(block),
+            rect,
+        );
+    }
+
     fn render_port_toast(&mut self, frame: &mut ratatui::Frame) {
         let Some(toast) = self.port_toast.as_ref() else {
             return;
@@ -22571,7 +22759,23 @@ impl App {
         }
         let capture =
             self.macro_recording.is_some() && !self.macro_replaying && self.focus == Pane::Editor;
+        // Esc Esc leaves Zen Mode (#1585), counting only Escapes in the
+        // editor that closed or cleared nothing: one that dismisses a popup
+        // or a selection is that, not half of the pair.
+        let zen_esc = self.zen_mode
+            && self.focus == Pane::Editor
+            && key.code == KeyCode::Esc
+            && key.modifiers.is_empty()
+            && key.kind == KeyEventKind::Press;
+        let before = zen_esc.then(|| self.esc_fingerprint());
         let result = self.handle_key_inner(key);
+        match before {
+            Some(before) if before == self.esc_fingerprint() => {
+                self.note_idle_zen_esc(std::time::Instant::now());
+            }
+            _ if key.kind != KeyEventKind::Release => self.zen_esc_at = None,
+            _ => {}
+        }
         // Focus is re-checked after dispatch too: a key that hands focus to
         // the terminal would otherwise be recorded while everything after it
         // is dropped, producing a macro that replays a focus change and then
@@ -51144,6 +51348,7 @@ impl App {
             Cmd::ToggleAutoHideSideBar => self.toggle_sidebar_auto_hide(),
             Cmd::ToggleSecondarySideBar => self.toggle_secondary_side_bar(),
             Cmd::ToggleZenMode => self.toggle_zen_mode(),
+            Cmd::ToggleCenteredLayout => self.toggle_centered_layout(),
             Cmd::ToggleTerminal => self.toggle_terminal(),
             // Each tab names the command that shows it, so the palette reads
             // the tab from there rather than keeping a second mapping.
@@ -60682,6 +60887,10 @@ impl App {
                 self.open_customize_layout_menu_on(&MenuAction::SetQuickInputPosition(pos));
             }
             MenuAction::ToggleZenMode => self.toggle_zen_mode(),
+            MenuAction::ToggleCenteredLayout => {
+                self.toggle_centered_layout();
+                self.open_customize_layout_menu_on(&MenuAction::ToggleCenteredLayout);
+            }
             MenuAction::RunCodeLens(idx) => self.run_code_lens(idx),
             MenuAction::RenameTerminal(idx) => self.begin_rename_terminal(idx),
             MenuAction::ClearTerminal(idx) => self.clear_terminal_at(idx),
@@ -72299,6 +72508,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let pair_changed =
             app.maybe_seat_navigator() | app.poll_pair() | app.tick_proactive_navigator();
         let voice_changed = app.drain_voice();
+        let zen_hint_changed = app.expire_zen_hint(std::time::Instant::now());
         // Surface managed language-server install progress in the status bar so
         // the background work (which can take a few seconds) is visible.
         let install_status_changed = match crate::lsp::install::take_status() {
@@ -72319,6 +72529,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         }
 
         let non_pty_dirty = needs_redraw
+            || zen_hint_changed
             || fs_changed
             || mcp_changed
             || pair_changed
