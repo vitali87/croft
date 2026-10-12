@@ -14492,6 +14492,22 @@ fn other_enters_and_the_markdown_fence_keep_their_meaning() {
     assert_eq!(app.editor.lines, before, "no line inserted");
 }
 
+/// #1571: in Markdown prose, outside every runnable fence, `Cmd`+`Enter`
+/// is Insert Line Below; only a runnable fence under the caret claims it.
+#[test]
+fn cmd_enter_in_markdown_prose_inserts_a_line_below() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = markdown_fence_app(tmp.path());
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 2;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.pending_run_block.is_none());
+    assert_eq!(app.status, "Opened line below");
+    assert_eq!(app.editor.lines[..3], ["# Run", "", ""]);
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 0));
+}
+
 /// #1571: Insert Line Below / Above are palette commands with ids, so they
 /// can be found and rebound.
 #[test]
@@ -32164,17 +32180,16 @@ fn clicking_a_fence_play_glyph_runs_it_in_a_named_pane() {
     );
     app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
         .unwrap();
-    // Outside any fence it explains itself instead of running.
+    // Outside any fence it is Insert Line Below (#1571), never a run.
     app.focus_pane(super::Pane::Editor);
     app.editor.cursor_row = 6; // "Text between."
+    let lines = app.editor.lines.len();
     app.handle_key(key(KeyCode::Enter, KeyModifiers::SUPER))
         .unwrap();
     assert!(app.pending_run_block.is_none());
-    assert!(
-        app.status.contains("inside a runnable shell fence"),
-        "{}",
-        app.status
-    );
+    assert_eq!(app.status, "Opened line below");
+    assert_eq!(app.editor.lines.len(), lines + 1);
+    assert_eq!(app.editor.cursor_row, 7);
     // Cmd+Shift+Enter is the editor's "insert line above", never a run.
     assert!(!super::is_run_fence_key(key(
         KeyCode::Enter,

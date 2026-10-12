@@ -42984,7 +42984,9 @@ impl App {
             return;
         }
         // Runnable docs (#353): Cmd+Enter runs the fence under the caret.
-        if is_run_fence_key(key) && self.focus == Pane::Editor && self.run_fence_at_cursor() {
+        // Outside a runnable fence it falls through to Insert Line Below
+        // (#1571).
+        if is_run_fence_key(key) && self.focus == Pane::Editor && self.run_fence_at_cursor(false) {
             return;
         }
         // Markdown: Toggle Preview (Cmd/Ctrl+Shift+V, the VS Code default).
@@ -45673,7 +45675,10 @@ impl App {
     /// Cmd+Enter in a Markdown SOURCE buffer (#353): the fence under the
     /// caret, found by the parser's own source ranges (the same walk the
     /// preview uses, so the block number - and its pane - agree).
-    fn run_fence_at_cursor(&mut self) -> bool {
+    /// `report_miss`: a Markdown source caret outside every runnable fence
+    /// sets guidance and counts as handled (the palette command); without
+    /// it that case returns false so the key can fall through (#1571).
+    fn run_fence_at_cursor(&mut self, report_miss: bool) -> bool {
         let is_markdown = self
             .editor
             .path
@@ -45697,6 +45702,9 @@ impl App {
             .enumerate()
             .find(|(_, r)| row >= r.lines.0 && row < r.lines.1)
         else {
+            if !report_miss {
+                return false;
+            }
             self.status = String::from(
                 "Run code block: put the caret inside a runnable shell fence (sh/bash/zsh/fish; not {run=false})",
             );
@@ -50701,7 +50709,7 @@ impl App {
             Cmd::ToggleMarkdownPreview => self.toggle_markdown_preview(),
             // Cmd+Enter's run from any terminal (#843): the same confirm popup.
             Cmd::RunCodeBlockAtCursor => {
-                if !self.run_fence_at_cursor() {
+                if !self.run_fence_at_cursor(true) {
                     self.status = String::from(
                         "Run code block: open a Markdown file's source (not its preview) and put the caret in a runnable fence",
                     );
