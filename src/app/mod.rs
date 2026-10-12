@@ -51262,11 +51262,14 @@ impl App {
                     match self.editor.open(&p) {
                         // Plain text with no grammar (#1537): a `.txt` or
                         // `.out` capture, or a `.log`, gets the rendered
-                        // log view's colours instead of a refusal.
+                        // log view's colours instead of a refusal. The
+                        // log view reads raw bytes as UTF-8, so a UTF-16 or
+                        // legacy-encoded buffer keeps its decoded text.
                         Ok(())
                             if !self.editor.has_non_text_view()
                                 && self.editor.markdown_preview.is_none()
-                                && self.editor.language().is_none() =>
+                                && self.editor.language().is_none()
+                                && self.editor.encoding == encoding_rs::UTF_8 =>
                         {
                             self.editor.force_log = true;
                             if let Err(e) = self.editor.open(&p) {

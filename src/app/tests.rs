@@ -57088,6 +57088,30 @@ fn reopen_as_preview_shows_plain_text_as_a_rendered_log() {
     );
 }
 
+/// #1537 negative: the log view reads raw bytes as UTF-8, so a UTF-16
+/// capture stays in the decoded text buffer instead of turning to NULs.
+#[test]
+fn reopen_as_preview_keeps_a_utf16_capture_as_text() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("run.out");
+    let mut bytes = vec![0xFF, 0xFE];
+    for u in "ERROR boom\nINFO ok\n".encode_utf16() {
+        bytes.extend_from_slice(&u.to_le_bytes());
+    }
+    std::fs::write(&out, bytes).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&out).unwrap();
+    assert_eq!(app.editor.encoding, encoding_rs::UTF_16LE);
+    app.run_command(Command::ReopenAsPreview);
+    assert!(app.editor.log.is_none(), "no byte-level log view of UTF-16");
+    assert_eq!(app.editor.lines[0], "ERROR boom");
+    assert_eq!(
+        app.status,
+        "No preview for this file type; showing the text"
+    );
+}
+
 /// #1537 negative: source code has a grammar and no preview, so Reopen as
 /// Preview still says so rather than turning it into a log.
 #[test]
