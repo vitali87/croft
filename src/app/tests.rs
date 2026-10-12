@@ -60613,6 +60613,56 @@ fn poll_until(app: &mut App, done: impl Fn(&App) -> bool) {
     }
 }
 
+/// #1426: Alt+F9 sends js-debug's `all` filter and says it is on; with an
+/// adapter that offers no raised-exceptions filter it says so instead of
+/// claiming exceptions will break.
+#[test]
+fn the_raised_exceptions_toggle_follows_the_adapters_filters() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push(
+        "Node",
+        stub_emitting(&[
+            r#"{"seq":1,"type":"response","request_seq":1,"success":true,"command":"initialize","body":{"exceptionBreakpointFilters":[{"filter":"all","label":"Caught Exceptions"},{"filter":"uncaught","label":"Uncaught Exceptions"}]}}"#,
+        ]),
+    );
+    poll_until(&mut app, |a| {
+        a.debug_sessions
+            .focused()
+            .is_some_and(|s| !s.capabilities.is_null())
+    });
+    app.debug_toggle_raised_exceptions();
+    assert_eq!(app.status, "Breaking on raised exceptions (and uncaught)");
+    assert_eq!(
+        app.debug_sessions.focused().unwrap().exception_filters,
+        vec![String::from("uncaught"), String::from("all")]
+    );
+    app.debug_toggle_raised_exceptions();
+    assert_eq!(app.status, "Breaking on uncaught exceptions only");
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push(
+        "Go",
+        stub_emitting(&[
+            r#"{"seq":1,"type":"response","request_seq":1,"success":true,"command":"initialize","body":{"supportsConditionalBreakpoints":true}}"#,
+        ]),
+    );
+    poll_until(&mut app, |a| {
+        a.debug_sessions
+            .focused()
+            .is_some_and(|s| !s.capabilities.is_null())
+    });
+    app.debug_toggle_raised_exceptions();
+    assert_eq!(
+        app.status,
+        "This debugger has no filter for raised exceptions; exception breakpoints are unchanged"
+    );
+    assert_eq!(
+        app.debug_sessions.focused().unwrap().exception_filters,
+        vec![String::from("uncaught")]
+    );
+}
+
 /// #567 item 1: a background member's program output used to be drained and
 /// dropped. It reaches the debug console, tagged with the member's name.
 #[test]

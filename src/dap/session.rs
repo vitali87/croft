@@ -522,6 +522,25 @@ pub fn configuration_done_request() -> Value {
     json!({ "type": "request", "command": "configurationDone", "arguments": {} })
 }
 
+/// The ids adapters give their "break where an exception is thrown, caught
+/// or not" filter (#1426): debugpy `raised`, js-debug and netcoredbg `all`,
+/// java `caught`, lldb-dap and CodeLLDB `cpp_throw`. First offered wins.
+const RAISED_FILTER_IDS: &[&str] = &["raised", "all", "caught", "cpp_throw"];
+
+/// The exception filters an adapter's `initialize` reply offers, as
+/// `(id, default)`. `None` when the reply lists none.
+fn offered_exception_filters(caps: &Value) -> Option<Vec<(String, bool)>> {
+    let list = caps.get("exceptionBreakpointFilters")?.as_array()?;
+    Some(
+        list.iter()
+            .filter_map(|f| {
+                let id = f.get("filter")?.as_str()?.to_string();
+                Some((id, f.get("default").and_then(Value::as_bool) == Some(true)))
+            })
+            .collect(),
+    )
+}
+
 /// Build a `setExceptionBreakpoints` request. `filters` are adapter-defined ids;
 /// debugpy supports `raised`, `uncaught`, and `userUnhandled`. An empty slice
 /// disables exception breaking.
@@ -1067,9 +1086,12 @@ pub struct DapSession {
     /// stop or the end of the session clears it, so a reply that lands
     /// after the program moved on is dropped instead of labelling it.
     exception_info_seq: Option<i64>,
-    /// Active exception-breakpoint filter ids (debugpy: `raised`, `uncaught`).
-    /// Sent on `initialized` and whenever toggled. Defaults to `uncaught` so an
-    /// unhandled exception pauses the debugger instead of silently exiting.
+    /// Active exception-breakpoint filter ids (debugpy: `raised`, `uncaught`;
+    /// js-debug: `all`, `uncaught`; lldb-dap: `cpp_throw`, …). Sent on
+    /// `initialized` and whenever toggled. Defaults to `uncaught` so an
+    /// unhandled exception pauses the debugger instead of silently exiting;
+    /// once the adapter lists its own filters (#1426) only the ones it
+    /// offers are kept, plus those it turns on by default.
     pub exception_filters: Vec<String>,
     /// Most recently seen thread id (from `thread`/`stopped` events). Used to
     /// target `pause` while the program is running and `stopped_thread` is None.
@@ -1283,6 +1305,40 @@ impl DapSession {
             .send(set_exception_breakpoints_request(&self.exception_filters));
     }
 
+    /// This adapter's id for "break on raised exceptions" (#1426): debugpy's
+    /// `raised`, js-debug's `all`, lldb-dap's `cpp_throw`. Before the
+    /// adapter answers `initialize` it is debugpy's `raised`; `None` when the
+    /// adapter answered and offers no such filter (Delve).
+    pub fn raised_exception_filter(&self) -> Option<String> {
+        if self.capabilities.is_null() {
+            return Some(String::from("raised"));
+        }
+        let offered = offered_exception_filters(&self.capabilities)?;
+        RAISED_FILTER_IDS
+            .iter()
+            .find(|id| offered.iter().any(|(o, _)| o == *id))
+            .map(|id| id.to_string())
+    }
+
+    /// Turn the adapter's raised-exceptions filter on or off, keeping the
+    /// other active filters (`uncaught`), and resend. `Some(on)` says which
+    /// way it went; `None` (nothing sent) when the adapter has no such filter.
+    pub fn toggle_raised_exceptions(&mut self) -> Option<bool> {
+        let raised = self.raised_exception_filter()?;
+        let on = !self.has_exception_filter(&raised);
+        let mut filters: Vec<String> = self
+            .exception_filters
+            .iter()
+            .filter(|f| **f != raised)
+            .cloned()
+            .collect();
+        if on {
+            filters.push(raised);
+        }
+        self.set_exception_filters(filters);
+        Some(on)
+    }
+
     /// Whether an exception filter id is currently active.
     pub fn has_exception_filter(&self, filter: &str) -> bool {
         self.exception_filters.iter().any(|f| f == filter)
@@ -1492,6 +1548,22 @@ impl DapSession {
                 Some("initialize") => {
                     if let Some(body) = msg.get("body") {
                         self.capabilities = body.clone();
+                        // Keep only the filters this adapter knows (#1426),
+                        // plus those it turns on by default.
+                        if let Some(offered) = offered_exception_filters(body) {
+                            let mut keep: Vec<String> = self
+                                .exception_filters
+                                .iter()
+                                .filter(|f| offered.iter().any(|(id, _)| id == *f))
+                                .cloned()
+                                .collect();
+                            for (id, default) in offered {
+                                if default && !keep.contains(&id) {
+                                    keep.push(id);
+                                }
+                            }
+                            self.exception_filters = keep;
+                        }
                     }
                 }
                 Some("launch" | "attach")
@@ -3148,6 +3220,132 @@ while True:
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("timed out; requests so far: {:?}", requests(log));
+    }
+
+    /// The fake adapter, answering `initialize` with `filters` (a Python
+    /// literal) as its `exceptionBreakpointFilters`, or with none when
+    /// `filters` is empty; polled until it has had `configurationDone`.
+    fn exception_filter_session(filters: &str) -> Option<(DapSession, tempfile::TempDir, PathBuf)> {
+        std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .ok()?;
+        let caps = if filters.is_empty() {
+            String::from("{}")
+        } else {
+            format!("{{\"exceptionBreakpointFilters\": {filters}}}")
+        };
+        let script = FAKE_DAP.replace(
+            r#"reply(req, {"supportsFunctionBreakpoints": True, "supportsDataBreakpoints": True,
+                    "supportsHitConditionalBreakpoints": True})"#,
+            &format!("reply(req, {caps})"),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fake_dap.py");
+        std::fs::write(&path, script).unwrap();
+        let log = tmp.path().join("requests.jsonl");
+        let mut session = DapSession::launch_with(
+            "python3",
+            &[path.display().to_string(), log.display().to_string()],
+            tmp.path(),
+            json!({"type": "request", "command": "launch", "arguments": {}}),
+            BTreeMap::new(),
+        )
+        .expect("fake adapter spawns");
+        poll_until(&mut session, &log, |r| {
+            r.iter().any(|q| q["command"] == "configurationDone")
+        });
+        Some((session, tmp, log))
+    }
+
+    /// Every `setExceptionBreakpoints` filter list the adapter got, in order.
+    fn sent_exception_filters(log: &Path) -> Vec<Value> {
+        requests(log)
+            .into_iter()
+            .filter(|q| q["command"] == "setExceptionBreakpoints")
+            .map(|q| q["arguments"]["filters"].clone())
+            .collect()
+    }
+
+    /// #1426: js-debug calls its caught-exceptions filter `all`, so the
+    /// raised-exceptions toggle sends `all` there, not debugpy's `raised`.
+    #[test]
+    fn the_raised_exceptions_toggle_uses_js_debugs_all_filter() {
+        let Some((mut session, _tmp, log)) = exception_filter_session(
+            r#"[{"filter": "all", "label": "Caught Exceptions", "default": False},
+                {"filter": "uncaught", "label": "Uncaught Exceptions", "default": False}]"#,
+        ) else {
+            return;
+        };
+        assert_eq!(session.raised_exception_filter().as_deref(), Some("all"));
+        assert_eq!(session.toggle_raised_exceptions(), Some(true));
+        poll_until(&mut session, &log, |_| {
+            sent_exception_filters(&log).len() >= 2
+        });
+        assert_eq!(session.toggle_raised_exceptions(), Some(false));
+        poll_until(&mut session, &log, |_| {
+            sent_exception_filters(&log).len() >= 3
+        });
+        assert_eq!(
+            sent_exception_filters(&log),
+            vec![
+                json!(["uncaught"]),
+                json!(["uncaught", "all"]),
+                json!(["uncaught"])
+            ]
+        );
+    }
+
+    /// #1426: lldb-dap knows neither `uncaught` nor `raised`. croft stops
+    /// sending ids it does not offer, keeps the ones it turns on by
+    /// default, and the toggle sends `cpp_throw`.
+    #[test]
+    fn lldb_dap_gets_its_own_filters_and_cpp_throw_for_raised() {
+        let Some((mut session, _tmp, log)) = exception_filter_session(
+            r#"[{"filter": "cpp_catch", "label": "C++ Catch", "default": False},
+                {"filter": "cpp_throw", "label": "C++ Throw", "default": False},
+                {"filter": "rust_panic", "label": "Rust Panic", "default": True}]"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            session.raised_exception_filter().as_deref(),
+            Some("cpp_throw")
+        );
+        assert_eq!(session.toggle_raised_exceptions(), Some(true));
+        poll_until(&mut session, &log, |_| {
+            sent_exception_filters(&log).len() >= 2
+        });
+        assert_eq!(
+            sent_exception_filters(&log),
+            vec![json!(["rust_panic"]), json!(["rust_panic", "cpp_throw"])]
+        );
+    }
+
+    /// #1426: an adapter with no exception filters (Delve) has nothing to
+    /// toggle; nothing is sent beyond the startup request, and debugpy's
+    /// own filter list still maps to `raised`.
+    #[test]
+    fn an_adapter_without_exception_filters_has_nothing_to_toggle() {
+        let Some((mut session, _tmp, log)) = exception_filter_session("") else {
+            return;
+        };
+        assert_eq!(session.raised_exception_filter(), None);
+        assert_eq!(session.toggle_raised_exceptions(), None);
+        session.poll();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        session.poll();
+        assert_eq!(sent_exception_filters(&log), vec![json!(["uncaught"])]);
+
+        let Some((session, _tmp, _log)) = exception_filter_session(
+            r#"[{"filter": "raised", "label": "Raised Exceptions", "default": False},
+                {"filter": "uncaught", "label": "Uncaught Exceptions", "default": True},
+                {"filter": "userUnhandled", "label": "User Uncaught Exceptions", "default": False}]"#,
+        ) else {
+            return;
+        };
+        assert_eq!(session.raised_exception_filter().as_deref(), Some("raised"));
+        assert_eq!(session.exception_filters, vec![String::from("uncaught")]);
     }
 
     /// #264 against a fake adapter with two goroutines: a stop lists both,

@@ -1,0 +1,1 @@
+fix: Debug: Toggle Break on Raised Exceptions now works in JavaScript/TypeScript (js-debug's Caught Exceptions filter) and C/C++/Rust (lldb-dap's C++ throw filter) instead of sending Python's filter ids, which those debuggers ignore; croft only sends exception filters the debugger offers, and a debugger with no such filter says so instead of claiming exceptions will break.
