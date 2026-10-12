@@ -80375,6 +80375,29 @@ fn a_paste_into_another_pane_while_recording_is_skipped_and_logged() {
     );
 }
 
+/// #1464 negative: a paste the editor's find bar takes while recording never
+/// reached the document, so the macro does not record it and its replay
+/// does not insert it into the text.
+#[test]
+fn a_paste_into_the_find_bar_is_not_recorded_into_the_macro() {
+    use crate::widgets::command_palette::Command;
+    let mut app = editor_app_with_lines(&["a", "b"]);
+    app.run_command(Command::MacroStartStopRecording);
+    app.open_editor_find();
+    assert!(app.focus == Pane::Editor);
+    app.handle_paste("QUERY");
+    app.editor_find = None;
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    app.run_command(Command::MacroStartStopRecording);
+    app.run_command(Command::MacroReplayLast);
+    assert!(
+        app.editor.lines.iter().all(|l| !l.contains("QUERY")),
+        "{:?}",
+        app.editor.lines
+    );
+}
+
 /// #1464 negative: a replayed paste is not recorded again into the macro
 /// replaying it, and pasting with no recording records nothing.
 #[test]

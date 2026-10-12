@@ -45897,16 +45897,18 @@ impl App {
 
     /// A terminal paste. While a macro records, a paste into the editor is a
     /// step of it, on the same terms `handle_key` records a key: not while
-    /// replaying, and only when the editor had focus before and after
-    /// (#1464). Before, the replay silently left the pasted text out.
+    /// replaying, and only when the editor had focus before and after and
+    /// the text went into it (#1464). Before, the replay silently left the pasted text out.
     fn handle_paste(&mut self, s: &str) {
         let capture =
             self.macro_recording.is_some() && !self.macro_replaying && self.focus == Pane::Editor;
-        self.handle_paste_inner(s);
+        let into_editor = self.handle_paste_inner(s);
         if self.macro_recording.is_none() || self.macro_replaying {
             return;
         }
-        if capture && self.focus == Pane::Editor {
+        // A paste the palette, a prompt or the find bar took never reached
+        // the document, so replaying it there would insert stray text.
+        if capture && into_editor && self.focus == Pane::Editor {
             if let Some(rec) = self.macro_recording.as_mut() {
                 rec.recorded.push_paste(s);
             }
@@ -45924,7 +45926,9 @@ impl App {
         }
     }
 
-    fn handle_paste_inner(&mut self, s: &str) {
+    /// Route a paste to whatever owns it; true only when it went into the
+    /// editor's text, the one place a recording macro can replay it.
+    fn handle_paste_inner(&mut self, s: &str) -> bool {
         // Modal overlays own paste entirely while open — paste lands in
         // the modal's input field, never in the editor / tree / terminal
         // behind it. Without this, hitting Cmd+V right after Cmd+P pastes
@@ -45937,7 +45941,7 @@ impl App {
                     prompt.push_char(c);
                 }
             }
-            return;
+            return false;
         }
         if let Some(palette) = self.command_palette.as_mut() {
             for c in s.chars() {
@@ -45945,7 +45949,7 @@ impl App {
                     palette.push_char(c);
                 }
             }
-            return;
+            return false;
         }
         if let Some(picker) = self.go_to_symbol.as_mut() {
             for c in s.chars() {
@@ -45953,7 +45957,7 @@ impl App {
                     picker.push_char(c);
                 }
             }
-            return;
+            return false;
         }
         if let Some(picker) = self.workspace_symbols.as_mut() {
             for c in s.chars() {
@@ -45962,7 +45966,7 @@ impl App {
                 }
             }
             self.workspace_symbols_requery();
-            return;
+            return false;
         }
         if let Some(finder) = self.file_finder.as_mut() {
             for c in s.chars() {
@@ -45971,7 +45975,7 @@ impl App {
                 }
             }
             self.follow_quick_open_prefix();
-            return;
+            return false;
         }
         // The in-file find bar is a pane-scoped widget, not a modal: it only
         // owns the paste while the editor itself is focused. Without the focus
@@ -45990,7 +45994,7 @@ impl App {
                 }
             }
             self.editor_find_set_query(new_q);
-            return;
+            return false;
         }
         // Finder drag-and-drop into croft arrives via the host terminal as
         // a bracketed paste containing absolute filesystem path(s). The
@@ -46022,18 +46026,18 @@ impl App {
             .iter()
             .any(|p| p.is_absolute() && is_iterm2_inline_image_drop(p))
         {
-            return;
+            return false;
         }
         let dropped = parse_dropped_paths(s);
         if !dropped.is_empty() {
             match self.sidebar_view {
                 SidebarView::Remote if self.focus == Pane::Tree => {
                     self.import_paths_into_remote(&dropped);
-                    return;
+                    return false;
                 }
                 SidebarView::Explorer if self.focus == Pane::Tree => {
                     self.import_paths_into_explorer(&dropped);
-                    return;
+                    return false;
                 }
                 _ => {}
             }
@@ -46063,14 +46067,14 @@ impl App {
             let foreign = parse_foreign_dropped_paths(s);
             if !foreign.is_empty() {
                 self.request_remote_pulls(&foreign);
-                return;
+                return false;
             }
         }
         if self.sidebar_view == SidebarView::Search && self.focus == Pane::Tree {
             self.search.insert_str_into_query(s);
             self.submit_search_query();
             self.status = format!("Pasted {} chars", s.chars().count());
-            return;
+            return false;
         }
         // Source Control commit message box: bracketed paste must
         // populate it the same way Cmd+V via the key path does
@@ -46085,12 +46089,13 @@ impl App {
         {
             self.source_control.insert_str(s);
             self.status = format!("Pasted {} chars", s.chars().count());
-            return;
+            return false;
         }
         match self.focus {
             Pane::Editor => {
                 self.editor.insert_str(s);
                 self.status = format!("Pasted {} chars", s.chars().count());
+                return true;
             }
             Pane::Terminal => {
                 if self.terminal_find.is_some() {
@@ -46111,6 +46116,7 @@ impl App {
             }
             Pane::Tree => {}
         }
+        false
     }
 
     /// Move every dropped path into the directory the explorer is
