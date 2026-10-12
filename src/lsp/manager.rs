@@ -10719,9 +10719,6 @@ while True:
         assert!(fresh.try_restart(&key, t0 + RESTART_WINDOW + Duration::from_secs(1)));
     }
 
-    /// #694: a language server the kernel kills (croft makes them its first
-    /// OOM victims) comes back on the next command, its documents are
-    /// forgotten, and the app is told to re-open its tabs.
     /// A worker whose python and go servers are fake recorders that log
     /// their pid to `<root>/<lang>.pids` (#1621).
     fn two_language_worker(root: &Path, python: &Path) -> (WorkerState, Arc<AtomicBool>) {
@@ -10885,6 +10882,9 @@ while True:
         assert!(state.docs.contains_key(&py));
     }
 
+    /// #694: a language server the kernel kills (croft makes them its first
+    /// OOM victims) comes back on the next command, its documents are
+    /// forgotten, and the app is told to re-open its tabs.
     #[cfg(unix)]
     #[test]
     fn a_killed_language_server_is_restarted() {
