@@ -28,8 +28,8 @@ use crate::lsp::manager::{OutlineKind, OutlineSymbol};
 /// empty for a language croft has no grammar for. Callable off the UI
 /// thread, which is where the history scrubber builds it (#371).
 pub fn symbols_for_lines(path: &std::path::Path, lines: &[String]) -> Vec<OutlineSymbol> {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let Some(kind) = crate::highlight::lang_for_extension(ext) else {
+    // By full path, so `Gemfile` and `Rakefile` (no extension) reach Ruby.
+    let Some(kind) = crate::highlight::lang_for_path(path) else {
         return Vec::new();
     };
     symbols_for(kind, lines.join("\n").as_bytes())
@@ -102,16 +102,20 @@ pub fn symbols_for(kind: LangKind, source: &[u8]) -> Vec<OutlineSymbol> {
             .then(b.end_byte.cmp(&a.end_byte))
     });
 
-    // Depth = number of still-open ancestors. A stack of ancestor end-bytes is
-    // popped until its top still encloses the current symbol's start.
-    let mut stack: Vec<usize> = Vec::new();
+    // Depth = number of still-open ancestors. A stack of ancestor byte ranges
+    // is popped until its top still encloses the current symbol's start. A
+    // symbol with the very same range is a sibling, not a child: `int x, y;`
+    // yields one symbol per declarator, all spanning the one declaration.
+    let mut stack: Vec<(usize, usize)> = Vec::new();
     let mut out = Vec::with_capacity(raw.len());
     for r in raw {
-        while stack.last().is_some_and(|&end| r.start_byte >= end) {
+        while stack.last().is_some_and(|&(start, end)| {
+            r.start_byte >= end || (start, end) == (r.start_byte, r.end_byte)
+        }) {
             stack.pop();
         }
         let depth = stack.len() as u16;
-        stack.push(r.end_byte);
+        stack.push((r.start_byte, r.end_byte));
         out.push(OutlineSymbol {
             name: r.name,
             detail: None,
@@ -305,6 +309,7 @@ const JAVA_QUERY: &str = r#"
 (enum_declaration name: (identifier) @name.enum) @item
 (enum_constant name: (identifier) @name.enum_member) @item
 (constructor_declaration name: (identifier) @name.constructor) @item
+(compact_constructor_declaration name: (identifier) @name.constructor) @item
 (method_declaration name: (identifier) @name.method) @item
 (field_declaration declarator: (variable_declarator name: (identifier) @name.field)) @item
 "#;
@@ -496,6 +501,61 @@ mod tests {
             symbols_for(LangKind::Ruby, b"# a note\nputs total\ncart.add_item(3)\n").is_empty()
         );
         assert!(symbols_for(LangKind::CSharp, b"// a note\nusing System;\n").is_empty());
+    }
+
+    /// `int x, y;` is one declaration with two declarators: two sibling
+    /// fields, neither nested under the other. Likewise in C#.
+    #[test]
+    fn multi_declarator_fields_are_siblings() {
+        let java = b"class P {\n    int x, y;\n    void m() {}\n}\n";
+        assert_eq!(
+            names_kinds_depths(&symbols_for(LangKind::Java, java)),
+            vec![
+                ("P".into(), OutlineKind::Class, 0),
+                ("x".into(), OutlineKind::Field, 1),
+                ("y".into(), OutlineKind::Field, 1),
+                ("m".into(), OutlineKind::Method, 1),
+            ]
+        );
+        let csharp = b"class P {\n    int x, y;\n    void M() {}\n}\n";
+        assert_eq!(
+            names_kinds_depths(&symbols_for(LangKind::CSharp, csharp)),
+            vec![
+                ("P".into(), OutlineKind::Class, 0),
+                ("x".into(), OutlineKind::Field, 1),
+                ("y".into(), OutlineKind::Field, 1),
+                ("M".into(), OutlineKind::Method, 1),
+            ]
+        );
+    }
+
+    /// A record's compact constructor (`Range { ... }`, no parameter list)
+    /// is a constructor of the record.
+    #[test]
+    fn java_record_compact_constructor_is_extracted() {
+        let src = b"record Range(int lo, int hi) {\n    Range {\n        if (lo > hi) throw new IllegalArgumentException();\n    }\n}\n";
+        assert_eq!(
+            names_kinds_depths(&symbols_for(LangKind::Java, src)),
+            vec![
+                ("Range".into(), OutlineKind::Class, 0),
+                ("Range".into(), OutlineKind::Constructor, 1),
+            ]
+        );
+    }
+
+    /// `Gemfile`, `Rakefile` and friends have no extension but are Ruby, so
+    /// the path-based entry point outlines them.
+    #[test]
+    fn extensionless_ruby_files_are_outlined_by_name() {
+        let lines = vec!["def build".to_string(), "end".to_string()];
+        for name in ["Gemfile", "Rakefile", "Guardfile", "Vagrantfile"] {
+            let got = names_kinds_depths(&symbols_for_lines(std::path::Path::new(name), &lines));
+            assert_eq!(
+                got,
+                vec![("build".into(), OutlineKind::Method, 0)],
+                "{name}"
+            );
+        }
     }
 
     #[test]
