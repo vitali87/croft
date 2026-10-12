@@ -59385,6 +59385,9 @@ impl App {
         let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
         for root in roots {
             self.config_watch.watch(root.join(".vscode"));
+            // Watched before it exists, so creating or pulling it applies.
+            self.config_watch
+                .watch(root.join(".croft").join("snippets.json"));
             for file in crate::snippets::project_files(&root) {
                 self.config_watch.watch(file);
             }
@@ -60482,6 +60485,8 @@ impl App {
         // where the old workspace's next launch would restore it (#862).
         self.remove_own_hot_exit();
         self.roots.replace_primary(new_root.clone());
+        // The old repository's snippets go, the new one's apply (#1484).
+        self.reload_project_snippets();
         // A panel the user never touched — the startup default, one unnamed
         // shell with no input ever typed and no launched program — is swapped
         // for the incoming workspace's saved layout, the same restore startup
