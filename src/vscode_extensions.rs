@@ -40,13 +40,13 @@ pub const TABLE: &[Mapping] = &[
         vscode: "ms-python.python",
         croft: "lsp-python",
         status: Status::Builtin,
-        note: "Python language support ships built in (ty, basedpyright and ruff)",
+        note: "Python language support ships built in (ty and ruff); basedpyright is an optional fallback used when already installed",
     },
     Mapping {
         vscode: "ms-python.vscode-pylance",
         croft: "lsp-python",
         status: Status::Builtin,
-        note: "croft bundles ty, with basedpyright as the fallback language server",
+        note: "croft bundles ty; basedpyright is an optional fallback used when already installed",
     },
     Mapping {
         vscode: "ms-python.debugpy",
@@ -837,6 +837,12 @@ mod tests {
             let note = lookup(id).unwrap().note;
             assert!(
                 note.contains("ty") && !note.contains("(pyright)"),
+                "{id}: {note}"
+            );
+            // basedpyright is not provisioned, so no note may claim it ships.
+            assert!(
+                note.contains("optional fallback used when already installed")
+                    && !note.contains("basedpyright and"),
                 "{id}: {note}"
             );
         }
