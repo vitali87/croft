@@ -31795,11 +31795,15 @@ impl App {
         self.pending_debug_launch = None;
         let root = self.active_workspace_root();
         let tasks = crate::tasks::discover_tasks(&root);
-        let Some(task) = tasks.into_iter().find(|t| t.label == task_label) else {
-            self.debug_error(format!(
-                "compound preLaunchTask \"{task_label}\" not found — Tasks: Run Task lists what the workspace declares"
-            ));
-            return;
+        let task = match crate::tasks::find_task(tasks, task_label) {
+            Ok(task) => task,
+            Err(near) => {
+                self.debug_error(format!(
+                    "compound preLaunchTask \"{task_label}\" not found{} — Tasks: Run Task lists what the workspace declares",
+                    did_you_mean(near)
+                ));
+                return;
+            }
         };
         let command = self
             .task_command_line(&task)
@@ -31980,11 +31984,15 @@ impl App {
         self.pending_debug_launch = None;
         let root = self.active_workspace_root();
         let tasks = crate::tasks::discover_tasks(&root);
-        let Some(task) = tasks.into_iter().find(|t| t.label == task_label) else {
-            self.debug_error(format!(
-                "compound preLaunchTask \"{task_label}\" not found — Tasks: Run Task lists what the workspace declares"
-            ));
-            return;
+        let task = match crate::tasks::find_task(tasks, task_label) {
+            Ok(task) => task,
+            Err(near) => {
+                self.debug_error(format!(
+                    "compound preLaunchTask \"{task_label}\" not found{} — Tasks: Run Task lists what the workspace declares",
+                    did_you_mean(near)
+                ));
+                return;
+            }
         };
         let command = self
             .task_command_line(&task)
@@ -32032,11 +32040,15 @@ impl App {
         self.record_post_debug_task(&rc);
         if let Some(task_label) = rc.pre_launch_task.clone() {
             let tasks = crate::tasks::discover_tasks(&root);
-            let Some(task) = tasks.into_iter().find(|t| t.label == task_label) else {
-                self.debug_error(format!(
-                    "preLaunchTask \"{task_label}\" not found — Tasks: Run Task lists what the workspace declares"
-                ));
-                return;
+            let task = match crate::tasks::find_task(tasks, &task_label) {
+                Ok(task) => task,
+                Err(near) => {
+                    self.debug_error(format!(
+                        "preLaunchTask \"{task_label}\" not found{} — Tasks: Run Task lists what the workspace declares",
+                        did_you_mean(near)
+                    ));
+                    return;
+                }
             };
             let command = self
                 .task_command_line(&task)
@@ -33432,13 +33444,14 @@ impl App {
         }
         let tasks = crate::tasks::discover_tasks(&self.active_workspace_root());
         for label in labels {
-            match tasks.iter().find(|t| t.label == label) {
-                Some(task) => {
-                    self.run_project_task(task.clone());
+            match crate::tasks::find_task(tasks.clone(), &label) {
+                Ok(task) => {
+                    self.run_project_task(task);
                 }
-                None => {
+                Err(near) => {
                     self.status = format!(
-                        "postDebugTask \"{label}\" not found — Tasks: Run Task lists what the workspace declares"
+                        "postDebugTask \"{label}\" not found{} — Tasks: Run Task lists what the workspace declares",
+                        did_you_mean(near)
                     );
                 }
             }
@@ -72447,6 +72460,13 @@ fn install_terminal_restore_panic_hook() {
 
 /// Append a panic record (version, thread, location, message, backtrace) to
 /// `~/.cache/croft/panic.log`. Best-effort and silent on any I/O failure.
+/// ` (did you mean "npm run build"?)` for a task label that was not found
+/// but has a near match (#1412), else nothing.
+fn did_you_mean(near: Option<String>) -> String {
+    near.map(|n| format!(" (did you mean \"{n}\"?)"))
+        .unwrap_or_default()
+}
+
 fn log_panic_to_file(info: &std::panic::PanicHookInfo<'_>) {
     use std::io::Write;
     let Some(home) = std::env::var_os("HOME") else {

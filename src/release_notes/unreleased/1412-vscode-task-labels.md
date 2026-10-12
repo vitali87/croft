@@ -1,0 +1,1 @@
+fix: A launch.json `preLaunchTask` or `postDebugTask` written the way VS Code labels its auto-detected tasks now runs with no tasks.json: `npm: <script>` finds the package.json script (whatever runner the lockfile picks), and each root `tsconfig*.json` is a `tsc: build - <file>` task running `tsc -p <file>`. A label that names no task suggests the nearest one.
