@@ -8327,13 +8327,13 @@ impl App {
         while let Ok(event) = self.search_results_rx.try_recv() {
             match event {
                 SearchEvent::Hits(q, opts, batch) => {
-                    if q == self.search.query && opts == self.search.opts {
+                    if q == self.search.query && opts.same_matching(&self.search.opts) {
                         arrived.extend(batch);
                         applied = true;
                     }
                 }
                 SearchEvent::Done(q, opts) => {
-                    if q == self.search.query && opts == self.search.opts {
+                    if q == self.search.query && opts.same_matching(&self.search.opts) {
                         self.search.complete = true;
                         applied = true;
                     }

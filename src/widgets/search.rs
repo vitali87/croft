@@ -84,6 +84,17 @@ pub struct SearchOpts {
     pub preserve_case: bool,
 }
 
+impl SearchOpts {
+    /// Whether `other` finds the same hits: Preserve Case shapes the
+    /// replacements only, so a worker's results under either value of it
+    /// still belong to the query.
+    pub fn same_matching(&self, other: &SearchOpts) -> bool {
+        self.case_sensitive == other.case_sensitive
+            && self.whole_word == other.whole_word
+            && self.use_regex == other.use_regex
+    }
+}
+
 fn build_matcher(query: &str, opts: SearchOpts) -> Option<RegexMatcher> {
     if query.is_empty() {
         return None;

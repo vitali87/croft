@@ -77530,6 +77530,39 @@ fn alt_p_toggles_preserve_case_in_the_search_side_bar() {
     assert!(app.search.opts.preserve_case);
 }
 
+/// #1612: flipping Preserve Case while a search runs keeps its results:
+/// the worker's events carry the old toggle, and the search still
+/// completes so Replace All is not left blocked.
+#[test]
+fn toggling_preserve_case_mid_search_keeps_the_search_live() {
+    use crate::widgets::search::SearchEvent;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.query = String::from("user");
+    let before = app.search.opts;
+    app.toggle_search_opt(crate::widgets::search::SearchToggle::PreserveCase);
+    assert!(app.search.opts.preserve_case);
+    // Drain whatever the real worker sent, then hand in events stamped
+    // with the options from before the toggle.
+    app.drain_search_results();
+    app.search.complete = false;
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.search_results_rx = rx;
+    tx.send(SearchEvent::Done(String::from("user"), before))
+        .unwrap();
+    assert!(app.drain_search_results());
+    assert!(app.search.complete, "the search must finish");
+    // Negative: a result under a different Match Case is still dropped.
+    app.search.complete = false;
+    let mut other = before;
+    other.case_sensitive = !other.case_sensitive;
+    tx.send(SearchEvent::Done(String::from("user"), other))
+        .unwrap();
+    assert!(!app.drain_search_results());
+    assert!(!app.search.complete);
+}
+
 /// #860: `Ctrl/Cmd+Shift+H` is Replace in Files: the Search side bar opens
 /// with its Replace row expanded and focused, from the editor, and a second
 /// press never collapses it. In the live terminal `Ctrl+Shift+H` stays
