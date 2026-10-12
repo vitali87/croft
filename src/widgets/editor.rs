@@ -2168,13 +2168,21 @@ enum EditKind {
     EmmetExpand,
 }
 
-/// The three case transforms VS Code exposes as
-/// `editor.action.transformTo{Upper,Lower,Title}case`.
+/// The case transforms VS Code exposes as
+/// `editor.action.transformTo{Upper,Lower,Title,Snake,Camel,Pascal,Kebab}case`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaseTransform {
     Upper,
     Lower,
     Title,
+    /// `user_name` (#1573).
+    Snake,
+    /// `userName` (#1573).
+    Camel,
+    /// `UserName` (#1573).
+    Pascal,
+    /// `user-name` (#1573).
+    Kebab,
 }
 
 /// A single keystroke to fan out across every multi-cursor caret.
@@ -10871,6 +10879,10 @@ impl Editor {
                 CaseTransform::Upper => text.to_uppercase(),
                 CaseTransform::Lower => text.to_lowercase(),
                 CaseTransform::Title => title_case(&text),
+                CaseTransform::Snake
+                | CaseTransform::Camel
+                | CaseTransform::Pascal
+                | CaseTransform::Kebab => identifier_case(&text, kind),
             };
             if !text.is_empty() {
                 self.replace_char_range(start, end, &new);
@@ -12899,6 +12911,104 @@ fn title_case(s: &str) -> String {
         }
     }
     out
+}
+
+/// Rewrite every identifier in `s` in the naming style `kind` names, Snake,
+/// Camel, Pascal or Kebab (#1573). An identifier is a run of letters,
+/// digits, `_` and `-`; everything between runs (spaces, punctuation, line
+/// breaks) is kept, as are a run's leading and trailing `_` and `-`
+/// (`_private`). A run with no letter is left alone.
+fn identifier_case(s: &str, kind: CaseTransform) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if !run.is_empty() {
+            out.push_str(&case_run(run, kind));
+            run.clear();
+        }
+    };
+    for c in s.chars() {
+        if c.is_alphanumeric() || c == '_' || c == '-' {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
+/// One identifier run in `kind`'s style; see [`identifier_case`].
+fn case_run(run: &str, kind: CaseTransform) -> String {
+    let edge = |c: char| c == '_' || c == '-';
+    let core = run.trim_matches(edge);
+    if !core.chars().any(char::is_alphabetic) {
+        return run.to_string();
+    }
+    let lead = &run[..run.len() - run.trim_start_matches(edge).len()];
+    let trail = &run[run.trim_end_matches(edge).len()..];
+    let words = case_words(core);
+    let cap = |w: &str| {
+        let mut chars = w.chars();
+        chars.next().map_or_else(String::new, |f| {
+            f.to_uppercase()
+                .chain(chars.flat_map(char::to_lowercase))
+                .collect()
+        })
+    };
+    let body = match kind {
+        CaseTransform::Snake | CaseTransform::Kebab => {
+            let sep = if kind == CaseTransform::Snake {
+                "_"
+            } else {
+                "-"
+            };
+            words
+                .iter()
+                .map(|w| w.to_lowercase())
+                .collect::<Vec<_>>()
+                .join(sep)
+        }
+        CaseTransform::Camel => words
+            .iter()
+            .enumerate()
+            .map(|(i, w)| if i == 0 { w.to_lowercase() } else { cap(w) })
+            .collect(),
+        _ => words.iter().map(|w| cap(w)).collect(),
+    };
+    format!("{lead}{body}{trail}")
+}
+
+/// The words of an identifier: split at `_` and `-`, and where the case
+/// changes as VS Code's transforms read it: a lower-case letter before an
+/// upper-case one (`foo|Bar`), and before the last capital of a run of
+/// capitals or digits that a lower-case letter follows (`HTTP|Server`,
+/// `Base64|Encoder`).
+fn case_words(core: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    for part in core.split(['_', '-']).filter(|p| !p.is_empty()) {
+        let chars: Vec<char> = part.chars().collect();
+        let mut word = String::new();
+        for (i, &c) in chars.iter().enumerate() {
+            let prev = i.checked_sub(1).map(|j| chars[j]);
+            let next = chars.get(i + 1).copied();
+            let boundary = c.is_uppercase()
+                && prev.is_some_and(|p| {
+                    p.is_lowercase()
+                        || ((p.is_uppercase() || p.is_numeric())
+                            && next.is_some_and(char::is_lowercase))
+                });
+            if boundary && !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            word.push(c);
+        }
+        if !word.is_empty() {
+            words.push(word);
+        }
+    }
+    words
 }
 
 /// Whitespace rendering (#133, VS Code `editor.renderWhitespace`): which
@@ -29301,6 +29411,60 @@ mod tests {
         });
         e.transform_selection_case(CaseTransform::Title);
         assert_eq!(e.lines, vec!["Hello There World"]);
+    }
+
+    /// #1573: the four naming styles, from each other.
+    #[test]
+    fn identifiers_change_naming_style() {
+        use CaseTransform::*;
+        for (from, kind, want) in [
+            ("user_name", Camel, "userName"),
+            ("user_name", Pascal, "UserName"),
+            ("user_name", Kebab, "user-name"),
+            ("userName", Snake, "user_name"),
+            ("UserName", Snake, "user_name"),
+            ("user-name", Snake, "user_name"),
+            ("parseHTTPResponse", Snake, "parse_http_response"),
+            ("parseHTTPResponse", Camel, "parseHttpResponse"),
+            ("HTTPServer", Kebab, "http-server"),
+            ("Base64Encoder", Snake, "base64_encoder"),
+            ("utf8", Pascal, "Utf8"),
+            ("_private_var", Camel, "_privateVar"),
+            ("__dunder__", Pascal, "__Dunder__"),
+            ("user_name total_count", Camel, "userName totalCount"),
+            ("a.user_name(x_y)", Pascal, "A.UserName(XY)"),
+        ] {
+            assert_eq!(identifier_case(from, kind), want, "{from} as {kind:?}");
+        }
+    }
+
+    /// Negatives (#1573): text with no letters, and separators that are not
+    /// part of an identifier, are kept as they were.
+    #[test]
+    fn identifier_case_leaves_non_identifiers_alone() {
+        assert_eq!(identifier_case("42 - 7", CaseTransform::Camel), "42 - 7");
+        assert_eq!(identifier_case("___", CaseTransform::Snake), "___");
+        assert_eq!(identifier_case("", CaseTransform::Kebab), "");
+        assert_eq!(
+            identifier_case("a_b,\n  c_d;", CaseTransform::Camel),
+            "aB,\n  cD;"
+        );
+        assert_eq!(
+            identifier_case("already_snake", CaseTransform::Snake),
+            "already_snake"
+        );
+    }
+
+    /// #1573: two carets on `a_b` and `c_d` (no selection) both change, as
+    /// the other transforms do.
+    #[test]
+    fn camel_case_applies_at_every_caret() {
+        let mut e = editor_with("a_b = c_d");
+        e.cursor_row = 0;
+        e.cursor_col = 1;
+        e.carets = vec![EditorSelection::new(0, 7)];
+        e.transform_selection_case(CaseTransform::Camel);
+        assert_eq!(e.lines, vec!["aB = cD"]);
     }
 
     #[test]

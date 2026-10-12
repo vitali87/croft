@@ -359,6 +359,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("editor.action.transformToUppercase", "transform_upper"),
     ("editor.action.transformToLowercase", "transform_lower"),
     ("editor.action.transformToTitlecase", "transform_title"),
+    ("editor.action.transformToSnakecase", "transform_snake"),
+    ("editor.action.transformToCamelcase", "transform_camel"),
+    ("editor.action.transformToPascalcase", "transform_pascal"),
+    ("editor.action.transformToKebabcase", "transform_kebab"),
     (
         "editor.action.trimTrailingWhitespace",
         "trim_trailing_whitespace",
@@ -2251,5 +2255,30 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let report = scan_profile(dir.path()).expect("an empty profile is fine");
         assert!(report.is_empty());
+    }
+
+    /// #1573: VS Code's four naming-style transforms import onto croft's.
+    #[test]
+    fn naming_style_transforms_import() {
+        let doc = json!([
+            { "key": "ctrl+alt+s", "command": "editor.action.transformToSnakecase" },
+            { "key": "ctrl+alt+c", "command": "editor.action.transformToCamelcase" },
+            { "key": "ctrl+alt+k", "command": "editor.action.transformToKebabcase" },
+            { "key": "ctrl+alt+p", "command": "editor.action.transformToPascalcase" }
+        ]);
+        let mut report = Report::default();
+        convert_keybindings(&doc, &mut report);
+        assert_eq!(
+            report.keybindings.len(),
+            4,
+            "{:?}",
+            report.dropped_keybindings
+        );
+        assert!(report.dropped_keybindings.is_empty());
+        assert!(
+            report
+                .keybindings
+                .contains(&(String::from("ctrl+alt+c"), String::from("transform_camel")))
+        );
     }
 }

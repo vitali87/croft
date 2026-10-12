@@ -290,6 +290,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Cmd`+`Opt`+`Shift`+`N` | Trim Final Newlines: drop trailing blank lines at the end of the file (always keeping at least one line) |
 | `Cmd`+`Opt`+`Shift`+`J` | Join Lines: collapse the selected lines (or the current line with the next) into one, single-spaced |
 | `Cmd`+`Opt`+`Shift`+`U` / `L` / `C` | Transform the selection (or the word under the cursor) to Uppercase / Lowercase / Title Case |
+| Command Palette "Transform to Snake Case" / "Camel Case" / "Pascal Case" / "Kebab Case" | Rewrite each identifier in the selection (or the word under the cursor, at every caret) as `user_name` / `userName` / `UserName` / `user-name`, splitting at `_`, `-` and case changes (`parseHTTPResponse` is `parse_http_response`) |
 | `Cmd`+`Opt`+`Shift`+`A` / `D` | Sort the selected lines (or the whole file) Ascending / Descending |
 | `Cmd`+`Opt`+`Shift`+`W` | Trim Trailing Whitespace: strip trailing spaces and tabs from every line |
 | `Cmd`+`Opt`+`Shift`+`F` | Format Document: reformat the whole buffer through the language server (rustfmt, ruff, prettier, …); the edit lands as one undo step and leaves the tab dirty |
