@@ -3077,6 +3077,10 @@ pub struct App {
     /// server to format the buffer, then writes once the reply lands. Loaded
     /// from prefs at startup, toggled from the palette / `Cmd+K F`.
     format_on_save: bool,
+    /// Per-language overrides (#1440), VS Code's `"[python]": { … }`, keyed
+    /// by VS Code's language id. Read through the `*_for` helpers, which
+    /// fall back to the global setting.
+    language_prefs: std::collections::BTreeMap<String, crate::prefs::LanguagePrefs>,
     /// VS Code `terminal.integrated.copyOnSelection`: a finished terminal
     /// mouse selection lands on the clipboard without an explicit Cmd+C.
     /// Loaded from prefs at startup, toggled in the Settings hub.
@@ -5761,6 +5765,7 @@ impl App {
             ]),
             snippets: load_snippets(&crate::snippets::snippets_path()),
             format_on_save: loaded_prefs.format_on_save,
+            language_prefs: loaded_prefs.languages.clone(),
             copy_on_select: loaded_prefs.copy_on_select,
             files_exclude: Vec::new(),
             log_highlight: !loaded_prefs.disable_log_highlight,
@@ -8504,7 +8509,7 @@ impl App {
             lsp.request_semantic_tokens(path.clone(), seq);
             // Same cadence for inlay hints; the reply carries `seq` so a
             // stale batch (computed against older text) is dropped on drain.
-            if self.inlay_hints_enabled {
+            if self.inlay_hints_enabled_for(path_scope_id(&path)) {
                 lsp.request_inlay_hints(path.clone(), line_count, seq);
             }
             // Document links ride the same cadence (#254); silent when no
@@ -9075,7 +9080,12 @@ impl App {
     fn sync_blame(&mut self) {
         self.editor.blame_enabled = self.inline_blame_enabled;
         self.editor.provenance_overlay = self.provenance_overlay;
-        self.editor.auto_close_pairs = self.auto_close_pairs;
+        self.editor.auto_close_pairs = self.auto_close_pairs_for(self.editor.scope_id());
+        self.editor.whitespace_mode = whitespace_mode_in(
+            &self.language_prefs,
+            self.whitespace_mode,
+            self.editor.scope_id(),
+        );
         if !self.inline_blame_enabled {
             return;
         }
@@ -10827,9 +10837,7 @@ impl App {
         if !lsp.take_inlay_refresh() {
             return;
         }
-        if self.inlay_hints_enabled {
-            self.request_inlay_hints_for_open_editors();
-        }
+        self.request_inlay_hints_for_open_editors();
     }
 
     /// Re-pull whole-project diagnostics when a server asked us to via
@@ -10868,6 +10876,9 @@ impl App {
             }
         }
         for (p, line_count) in targets {
+            if !self.inlay_hints_enabled_for(path_scope_id(&p)) {
+                continue;
+            }
             if let Some(&seq) = self.lsp_last_seen.get(&p) {
                 lsp.request_inlay_hints(p, line_count, seq);
             }
@@ -12022,7 +12033,7 @@ impl App {
         let Some((ch, seq)) = taken else {
             return;
         };
-        if !self.format_on_type || !self.editor_is_text() {
+        if !self.format_on_type_for(self.editor.scope_id()) || !self.editor_is_text() {
             return;
         }
         if seq != self.editor.edit_seq {
@@ -18348,6 +18359,7 @@ impl App {
         // when disabled, the editor opens those file types as plain text.
         let pdf_on = self.is_extension_enabled("pdf");
         let csv_on = self.is_extension_enabled("csv");
+        let (langs, ws_global) = (&self.language_prefs, self.whitespace_mode);
         for ed in self.editor.editors.iter_mut() {
             ed.focus_gradient = gradient;
             ed.theme = self.theme;
@@ -18356,7 +18368,7 @@ impl App {
             ed.show_indent_guides = self.indent_guides_enabled;
             ed.show_bracket_colors = self.bracket_colors_enabled;
             ed.provenance_overlay = self.provenance_overlay;
-            ed.whitespace_mode = self.whitespace_mode;
+            ed.whitespace_mode = whitespace_mode_in(langs, ws_global, ed.scope_id());
             ed.diff_ws_default = self.diff_ws_default;
         }
         for group in self.editor_layout.inactive_groups_mut() {
@@ -18368,7 +18380,7 @@ impl App {
                 ed.show_indent_guides = self.indent_guides_enabled;
                 ed.show_bracket_colors = self.bracket_colors_enabled;
                 ed.provenance_overlay = self.provenance_overlay;
-                ed.whitespace_mode = self.whitespace_mode;
+                ed.whitespace_mode = whitespace_mode_in(langs, ws_global, ed.scope_id());
                 ed.diff_ws_default = self.diff_ws_default;
                 ed.diff_ws_default = self.diff_ws_default;
             }
@@ -57152,12 +57164,52 @@ impl App {
             .unwrap_or(false)
     }
 
+    /// The overrides `"[<scope>]"` holds (#1440), if any.
+    fn language_prefs_for(&self, scope: &str) -> Option<&crate::prefs::LanguagePrefs> {
+        self.language_prefs.get(scope)
+    }
+
+    /// Format on save for a file in language `scope` (#1440): its language
+    /// block's value, else the global one.
+    fn format_on_save_for(&self, scope: &str) -> bool {
+        self.language_prefs_for(scope)
+            .and_then(|l| l.format_on_save)
+            .unwrap_or(self.format_on_save)
+    }
+
+    /// Format on type for a file in language `scope` (#1440).
+    fn format_on_type_for(&self, scope: &str) -> bool {
+        self.language_prefs_for(scope)
+            .and_then(|l| l.format_on_type)
+            .unwrap_or(self.format_on_type)
+    }
+
+    /// Auto-closing pairs for a file in language `scope` (#1440).
+    fn auto_close_pairs_for(&self, scope: &str) -> bool {
+        self.language_prefs_for(scope)
+            .and_then(|l| l.disable_auto_close_pairs)
+            .map_or(self.auto_close_pairs, |off| !off)
+    }
+
+    /// Inlay hints for a file in language `scope` (#1440).
+    fn inlay_hints_enabled_for(&self, scope: &str) -> bool {
+        self.language_prefs_for(scope)
+            .and_then(|l| l.disable_inlay_hints)
+            .map_or(self.inlay_hints_enabled, |off| !off)
+    }
+
+    /// Whitespace rendering for a file in language `scope` (#1440).
+    #[cfg(test)]
+    fn whitespace_mode_for(&self, scope: &str) -> crate::widgets::editor::WhitespaceMode {
+        whitespace_mode_in(&self.language_prefs, self.whitespace_mode, scope)
+    }
+
     /// Whether `Cmd+S` should format before writing: the pref is on, a
     /// formatter is available, and the active tab is a real editable code file
     /// (not a diff/sheet/image preview). `supports_formatting` is passed in so
     /// the decision is pure and unit-testable.
     fn format_on_save_eligible(&self, supports_formatting: bool) -> bool {
-        self.format_on_save
+        self.format_on_save_for(self.editor.scope_id())
             && supports_formatting
             && self.editor.path.is_some()
             && self.editor.diff.is_none()
@@ -59302,6 +59354,7 @@ impl App {
         }
         self.format_on_save = p.format_on_save;
         self.format_on_type = p.format_on_type;
+        self.language_prefs = p.languages.clone();
         self.auto_save = p.auto_save;
         self.auto_save_on_focus_change = p.auto_save_on_focus_change;
         self.copy_on_select = p.copy_on_select;
@@ -68478,6 +68531,26 @@ fn is_delete_node_key(key: KeyEvent) -> bool {
 /// Returns true if the given key event should trigger "Save".
 /// Recognises Ctrl+S (cross-platform) and Cmd/Super+S (macOS-style).
 /// Case-insensitive on the letter so Shift+Ctrl+S also works.
+/// The VS Code language id of the file at `path`, as its tab would have
+/// it (#1440: which `languages` block applies).
+/// Whitespace rendering for a file in language `scope` (#1440): its
+/// language block's `editor.renderWhitespace`, else `global`. A free fn so
+/// the render loops can call it while they hold the editors mutably.
+fn whitespace_mode_in(
+    langs: &std::collections::BTreeMap<String, crate::prefs::LanguagePrefs>,
+    global: crate::widgets::editor::WhitespaceMode,
+    scope: &str,
+) -> crate::widgets::editor::WhitespaceMode {
+    langs
+        .get(scope)
+        .and_then(|l| l.render_whitespace.as_deref())
+        .map_or(global, crate::widgets::editor::WhitespaceMode::from_pref)
+}
+
+fn path_scope_id(path: &Path) -> &'static str {
+    crate::widgets::editor::language_scope_id(crate::highlight::lang_for_path(path))
+}
+
 fn is_word_continuation(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }

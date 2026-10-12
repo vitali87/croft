@@ -33944,6 +33944,111 @@ fn format_on_save_eligible_requires_pref_and_formatter_and_code_file() {
     assert!(app.format_on_save_eligible(true));
 }
 
+/// An app on a workspace whose `.vscode/settings.json` is `vscode`, with
+/// the merged settings applied, as a launch there applies them (#1440).
+fn app_with_vscode_settings(vscode: &str) -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(tmp.path().join(".vscode/settings.json"), vscode).unwrap();
+    for (name, body) in [
+        ("m.c", "int x;\n"),
+        ("m.py", "x=1\n"),
+        ("README.md", "# r\n"),
+    ] {
+        std::fs::write(tmp.path().join(name), body).unwrap();
+    }
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let merged = app.merged_settings_here();
+    app.apply_merged_settings(&merged.prefs);
+    (tmp, app)
+}
+
+/// #1440: a repo's `"[c]": { "editor.formatOnSave": true }` formats a C
+/// file on save, and only a C file.
+#[test]
+fn a_language_block_turns_format_on_save_on_for_that_language_only() {
+    let (tmp, mut app) = app_with_vscode_settings(r#"{ "[c]": { "editor.formatOnSave": true } }"#);
+    assert!(!app.format_on_save, "the global setting stays off");
+
+    app.editor.open(&tmp.path().join("m.c")).unwrap();
+    assert!(
+        app.format_on_save_eligible(true),
+        "a .c tab formats on save"
+    );
+
+    app.editor.open(&tmp.path().join("m.py")).unwrap();
+    assert!(
+        !app.format_on_save_eligible(true),
+        "a .py tab keeps the global off"
+    );
+}
+
+/// #1440 negative: a language block turning format on save off wins over
+/// the global on, for that language alone.
+#[test]
+fn a_language_block_turns_format_on_save_off_over_the_global_on() {
+    let (tmp, mut app) = app_with_vscode_settings(
+        r#"{ "editor.formatOnSave": true, "[markdown]": { "editor.formatOnSave": false } }"#,
+    );
+    app.editor.open(&tmp.path().join("README.md")).unwrap();
+    assert!(!app.format_on_save_eligible(true), "Markdown is excluded");
+
+    app.editor.open(&tmp.path().join("m.py")).unwrap();
+    assert!(
+        app.format_on_save_eligible(true),
+        "every other language formats"
+    );
+}
+
+/// #1440: the other per-language settings follow the tab's language too:
+/// format on type, auto-closing pairs, whitespace rendering, inlay hints.
+#[test]
+fn per_language_editor_settings_follow_the_tab_s_language() {
+    use crate::widgets::editor::WhitespaceMode;
+    let (_tmp, app) = app_with_vscode_settings(
+        r#"{
+            "[python]": {
+                "editor.formatOnType": true,
+                "editor.autoClosingBrackets": "never",
+                "editor.renderWhitespace": "all",
+                "editor.inlayHints.enabled": "off"
+            }
+        }"#,
+    );
+    assert!(app.format_on_type_for("python"));
+    assert!(!app.format_on_type_for("c"));
+    assert!(!app.auto_close_pairs_for("python"));
+    assert!(app.auto_close_pairs_for("c"));
+    assert_eq!(app.whitespace_mode_for("python"), WhitespaceMode::All);
+    assert_eq!(app.whitespace_mode_for("c"), app.whitespace_mode);
+    assert!(!app.inlay_hints_enabled_for("python"));
+    assert!(app.inlay_hints_enabled_for("c"));
+}
+
+/// #1440: the active tab's editor gets its language's auto-closing pairs
+/// and every editor its language's whitespace rendering when drawn.
+#[test]
+fn the_active_editor_takes_its_language_s_settings() {
+    use crate::widgets::editor::WhitespaceMode;
+    let (tmp, mut app) = app_with_vscode_settings(
+        r#"{ "[python]": { "editor.autoClosingBrackets": "never", "editor.renderWhitespace": "all" } }"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+
+    app.editor.open(&tmp.path().join("m.py")).unwrap();
+    app.sync_blame();
+    term.draw(|frame| app.render(frame)).unwrap();
+    assert!(!app.editor.auto_close_pairs);
+    assert_eq!(app.editor.whitespace_mode, WhitespaceMode::All);
+
+    app.editor.open(&tmp.path().join("m.c")).unwrap();
+    app.sync_blame();
+    term.draw(|frame| app.render(frame)).unwrap();
+    assert!(app.editor.auto_close_pairs, "C keeps the global on");
+    assert_eq!(app.editor.whitespace_mode, app.whitespace_mode);
+}
+
 #[test]
 fn a_second_save_while_a_format_is_in_flight_still_writes_the_first_file() {
     // The latch holds ONE path and the manager tracks one format request id,
@@ -78812,6 +78917,7 @@ fn diag_on_line(line: u32, message: &str) -> crate::lsp::manager::Diagnostic {
         end_char: 1,
         severity: crate::lsp::manager::DiagnosticSeverity::Warning,
         message: String::from(message),
+        tags: Default::default(),
     }
 }
 
