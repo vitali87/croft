@@ -523,6 +523,16 @@ impl SourceControlPanel {
             .map(|m| m.trim().to_string());
         match prepared {
             Some(prepared) => {
+                // An untouched seed gives way to a different prepared
+                // message: switching repositories, or a changed template,
+                // must not leave the other one's text to be committed.
+                if let Some(seed) = self.seeded_message.as_deref()
+                    && seed != prepared
+                    && self.message == seed
+                {
+                    self.clear_message();
+                    self.seeded_message = None;
+                }
                 if self.message.is_empty()
                     && !prepared.is_empty()
                     && self.seeded_message.as_deref() != Some(prepared.as_str())
@@ -3212,6 +3222,20 @@ mod tests {
         assert_eq!(p.message, "");
         p.set_status(merging(Some("PROJ-:\n\nWhy:")), Vec::new());
         assert_eq!(p.message, "PROJ-:\n\nWhy:", "seeded for the next commit");
+    }
+
+    /// #1620: an untouched seed is replaced when another repository (or a
+    /// changed template) prepares a different message, so A's template is
+    /// never committed in B; an edited seed is kept.
+    #[test]
+    fn an_untouched_seed_follows_the_repository() {
+        let mut p = SourceControlPanel::new();
+        p.set_status(merging(Some("A-:")), Vec::new());
+        p.set_status(merging(Some("B-:")), Vec::new());
+        assert_eq!(p.message, "B-:");
+        p.insert_str(" edited");
+        p.set_status(merging(Some("A-:")), Vec::new());
+        assert_eq!(p.message, "B-: edited");
     }
 
     /// Negative (#1620): text the user typed is kept when the template

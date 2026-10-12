@@ -249,21 +249,35 @@ fn prepared_message(root: &Path) -> Option<String> {
         ],
     )
     .ok()?;
+    let marker = comment_marker(root);
     paths
         .lines()
         .find_map(|p| {
             let text = std::fs::read_to_string(root.join(p.trim())).ok()?;
-            without_comments(&text)
+            without_comments(&text, &marker)
         })
-        .or_else(|| commit_template(root))
+        .or_else(|| commit_template(root, &marker))
 }
 
-/// `text` without its `#` comment lines and outer blank lines, or `None`
-/// when nothing is left.
-fn without_comments(text: &str) -> Option<String> {
+/// The marker that starts a comment line for `git commit`:
+/// `core.commentString`, else `core.commentChar`, else `#`. `auto` picks
+/// a character per message in git, so it falls back to `#` here.
+fn comment_marker(root: &Path) -> String {
+    ["core.commentString", "core.commentChar"]
+        .iter()
+        .find_map(|key| {
+            let v = run_git(root, &["config", key]).ok()?;
+            (!v.is_empty() && v != "auto").then_some(v)
+        })
+        .unwrap_or_else(|| String::from("#"))
+}
+
+/// `text` without its comment lines (those starting with `marker`) and
+/// outer blank lines, or `None` when nothing is left.
+fn without_comments(text: &str, marker: &str) -> Option<String> {
     let kept: Vec<&str> = text
         .lines()
-        .filter(|l| !l.starts_with('#'))
+        .filter(|l| !l.starts_with(marker))
         .map(str::trim_end)
         .collect();
     let message = kept.join("\n").trim().to_string();
@@ -276,7 +290,7 @@ fn without_comments(text: &str) -> Option<String> {
 /// required ticket prefix and headings were lost. `--path` expands `~`; a
 /// relative path is taken from the repository's top level, where `git
 /// commit` reads it.
-fn commit_template(root: &Path) -> Option<String> {
+fn commit_template(root: &Path, marker: &str) -> Option<String> {
     let named = run_git(root, &["config", "--path", "commit.template"]).ok()?;
     let named = Path::new(named.trim());
     if named.as_os_str().is_empty() {
@@ -288,7 +302,7 @@ fn commit_template(root: &Path) -> Option<String> {
         let top = run_git(root, &["rev-parse", "--show-toplevel"]).ok()?;
         Path::new(top.trim()).join(named)
     };
-    without_comments(&std::fs::read_to_string(path).ok()?)
+    without_comments(&std::fs::read_to_string(path).ok()?, marker)
 }
 
 /// The git-ignored paths under `root`, absolute.
@@ -5106,6 +5120,19 @@ mod tests {
             query(p).prepared_message.as_deref(),
             Some("Merge branch 'other'")
         );
+    }
+
+    /// #1620: with `core.commentChar` set, lines starting with it are the
+    /// comments, and `#` lines are message text.
+    #[test]
+    fn the_configured_comment_char_marks_template_comments() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join(".gitmessage"), "#42: \n; helper text\n").unwrap();
+        run_git(p, &["config", "commit.template", ".gitmessage"]).unwrap();
+        run_git(p, &["config", "core.commentChar", ";"]).unwrap();
+        assert_eq!(query(p).prepared_message.as_deref(), Some("#42:"));
     }
 
     /// Negative (#1620): a template that names no readable file, or holds
