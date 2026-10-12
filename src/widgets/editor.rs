@@ -7792,6 +7792,13 @@ impl Editor {
         let col = self.cursor_col;
         let line = self.lines[row].clone();
 
+        // Inside a doc comment the new line continues it (#1443).
+        let next_line = self.lines.get(row + 1).map(String::as_str);
+        if let Some(enter) = comment_on_enter(self.lang, &line, col, next_line) {
+            self.continue_comment(enter);
+            return;
+        }
+
         let leading: String = line
             .chars()
             .take(col)
@@ -7833,6 +7840,49 @@ impl Editor {
             }
             self.cursor_row -= 1;
             self.cursor_col = new_indent.chars().count();
+        }
+    }
+
+    /// Break the line at the caret into a comment's next line (#1443): the
+    /// new line starts with `enter.start`, and a `/**` just opened is closed
+    /// on a line below, the caret staying on the line between.
+    fn continue_comment(&mut self, enter: CommentEnter) {
+        let start_len = enter.start.chars().count();
+        if let CommentBelow::MoveCloser(_) = &enter.below {
+            // The `*/` right after the caret goes to the closing line, so
+            // the space before it goes with the break.
+            while self.lines[self.cursor_row]
+                .chars()
+                .nth(self.cursor_col)
+                .is_some_and(|c| c == ' ' || c == '\t')
+            {
+                self.delete_forward_raw();
+            }
+        }
+        self.insert_newline_raw();
+        for c in enter.start.chars() {
+            self.insert_char_raw(c);
+        }
+        match enter.below {
+            CommentBelow::Nothing => {}
+            CommentBelow::MoveCloser(indent) => {
+                self.insert_newline_raw();
+                for c in indent.chars() {
+                    self.insert_char_raw(c);
+                }
+                self.cursor_row -= 1;
+                self.cursor_col = start_len;
+            }
+            CommentBelow::AddCloser(closer) => {
+                let (row, col) = (self.cursor_row, self.cursor_col);
+                self.cursor_col = self.line_char_len(row);
+                self.insert_newline_raw();
+                for c in closer.chars() {
+                    self.insert_char_raw(c);
+                }
+                self.cursor_row = row;
+                self.cursor_col = col;
+            }
         }
     }
 
@@ -13978,6 +14028,119 @@ fn leading_outdent_chars(line: &str, unit_w: usize) -> usize {
     } else {
         ((spaces - 1) % unit_w) + 1
     }
+}
+
+/// What Enter types inside a doc comment (#1443), after VS Code's
+/// `onEnterRules`.
+#[derive(Debug, PartialEq)]
+struct CommentEnter {
+    /// The new line's text, ahead of whatever followed the caret.
+    start: String,
+    /// What happens on the line below the new one.
+    below: CommentBelow,
+}
+
+#[derive(Debug, PartialEq)]
+enum CommentBelow {
+    Nothing,
+    /// A `/**` was just opened with nothing closing it: this line closes it.
+    AddCloser(String),
+    /// The caret sat right before the `*/` of `/** */`: that `*/` moves to
+    /// a line of its own, indented by this.
+    MoveCloser(String),
+}
+
+/// The languages whose doc comments are `/** … */` blocks.
+fn has_block_doc_comments(lang: Option<LangKind>) -> bool {
+    matches!(
+        lang,
+        Some(
+            LangKind::JavaScript
+                | LangKind::TypeScript
+                | LangKind::Tsx
+                | LangKind::C
+                | LangKind::Cpp
+                | LangKind::Java
+                | LangKind::CSharp
+                | LangKind::Rust
+        )
+    )
+}
+
+/// How Enter at char `col` of `line` continues a doc comment (#1443), or
+/// None where it is a plain line break:
+/// - `/**` opening a block gives ` * `, closing the block below when
+///   nothing does yet;
+/// - a ` * …` line inside the block gives the next ` * ` at the same
+///   column;
+/// - a ` */` line steps back to the column of its `/**`;
+/// - in Rust, a `///` or `//!` line gives the next `/// ` or `//! `.
+///
+/// A plain `//` comment, as in VS Code, is not continued.
+fn comment_on_enter(
+    lang: Option<LangKind>,
+    line: &str,
+    col: usize,
+    next_line: Option<&str>,
+) -> Option<CommentEnter> {
+    let before: String = line.chars().take(col).collect();
+    let after: String = line.chars().skip(col).collect();
+    let indent: String = before
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect();
+    let body = &before[indent.len()..];
+    let nothing = |start: String| {
+        Some(CommentEnter {
+            start,
+            below: CommentBelow::Nothing,
+        })
+    };
+    if lang == Some(LangKind::Rust) && !body.starts_with("////") {
+        for intro in ["///", "//!"] {
+            if body.starts_with(intro) {
+                return nothing(format!("{indent}{intro} "));
+            }
+        }
+    }
+    if !has_block_doc_comments(lang) {
+        return None;
+    }
+    let closer_next = after.trim_start().starts_with("*/");
+    if let Some(rest) = body.strip_prefix("/**")
+        && !rest.starts_with('/')
+        && !rest.contains("*/")
+    {
+        let below = if closer_next {
+            CommentBelow::MoveCloser(format!("{indent} "))
+        } else if after.contains("*/") || next_line.is_some_and(|l| l.trim_start().starts_with('*'))
+        {
+            // Already closed, on this line or by the block's own lines.
+            CommentBelow::Nothing
+        } else {
+            CommentBelow::AddCloser(format!("{indent} */"))
+        };
+        return Some(CommentEnter {
+            start: format!("{indent} * "),
+            below,
+        });
+    }
+    // Only a `*` set in from its line's start is a block's continuation, as
+    // VS Code's rule has it.
+    if !indent.ends_with(' ') {
+        return None;
+    }
+    if let Some(rest) = body.strip_prefix('*')
+        && (rest.is_empty() || rest.starts_with(' '))
+        && !rest.contains("*/")
+        && !closer_next
+    {
+        return nothing(format!("{indent}* "));
+    }
+    if body.trim_end() == "*/" && after.trim().is_empty() {
+        return nothing(indent[..indent.len() - 1].to_string());
+    }
+    None
 }
 
 fn extra_indent_triggered(lang: Option<LangKind>, last_non_ws: Option<char>) -> bool {
@@ -23716,6 +23879,175 @@ mod tests {
         assert_eq!(e.lines, vec!["    abc".to_string(), "    ".to_string()]);
         assert_eq!(e.cursor_row, 1);
         assert_eq!(e.cursor_col, 4);
+    }
+
+    /// #1443: `text` with the caret at `|`, in `lang`, after one Enter.
+    fn enter_at(lang: LangKind, text: &str) -> (Vec<String>, (usize, usize)) {
+        let (row, line) = text
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains('|'))
+            .unwrap();
+        let mut e = editor_with(&text.replace('|', ""));
+        e.lang = Some(lang);
+        e.cursor_row = row;
+        e.cursor_col = line.chars().position(|c| c == '|').unwrap();
+        e.insert_newline();
+        (e.lines.clone(), (e.cursor_row, e.cursor_col))
+    }
+
+    #[test]
+    fn enter_after_a_doc_opener_starts_the_block_and_closes_it() {
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "/**|"),
+            (vec!["/**".into(), " * ".into(), " */".into()], (1, 3))
+        );
+        assert_eq!(
+            enter_at(LangKind::Java, "    /**|"),
+            (
+                vec!["    /**".into(), "     * ".into(), "     */".into()],
+                (1, 7)
+            )
+        );
+    }
+
+    #[test]
+    fn enter_between_a_doc_opener_and_its_closer_splits_them() {
+        assert_eq!(
+            enter_at(LangKind::TypeScript, "  /**| */"),
+            (vec!["  /**".into(), "   * ".into(), "   */".into()], (1, 5))
+        );
+    }
+
+    #[test]
+    fn enter_after_an_opener_already_closed_below_adds_no_closer() {
+        assert_eq!(
+            enter_at(LangKind::C, "/**|\n * Adds.\n */"),
+            (
+                vec!["/**".into(), " * ".into(), " * Adds.".into(), " */".into()],
+                (1, 3)
+            )
+        );
+    }
+
+    #[test]
+    fn enter_on_a_star_line_continues_it_at_the_same_column() {
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "/**\n * Adds two numbers.|\n */"),
+            (
+                vec![
+                    "/**".into(),
+                    " * Adds two numbers.".into(),
+                    " * ".into(),
+                    " */".into()
+                ],
+                (2, 3)
+            )
+        );
+        assert_eq!(
+            enter_at(LangKind::Cpp, "    * a|b"),
+            (vec!["    * a".into(), "    * b".into()], (1, 6))
+        );
+    }
+
+    #[test]
+    fn enter_after_a_closer_steps_back_to_the_opener_column() {
+        assert_eq!(
+            enter_at(LangKind::CSharp, "    /**\n     * x\n     */|"),
+            (
+                vec![
+                    "    /**".into(),
+                    "     * x".into(),
+                    "     */".into(),
+                    "    ".into()
+                ],
+                (3, 4)
+            )
+        );
+    }
+
+    #[test]
+    fn enter_on_a_rust_doc_line_continues_it() {
+        assert_eq!(
+            enter_at(LangKind::Rust, "/// Adds two numbers.|"),
+            (vec!["/// Adds two numbers.".into(), "/// ".into()], (1, 4))
+        );
+        assert_eq!(
+            enter_at(LangKind::Rust, "    //! Crate docs.|"),
+            (
+                vec!["    //! Crate docs.".into(), "    //! ".into()],
+                (1, 8)
+            )
+        );
+        assert_eq!(
+            enter_at(LangKind::Rust, "/// Adds| two"),
+            (vec!["/// Adds".into(), "///  two".into()], (1, 4))
+        );
+    }
+
+    #[test]
+    fn enter_leaves_code_and_plain_comments_alone() {
+        // Multiplication, a plain `//`, a four-slash rule, `/*` and the caret
+        // just before a `*/`.
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "x = a *|"),
+            (vec!["x = a *".into(), String::new()], (1, 0))
+        );
+        assert_eq!(
+            enter_at(LangKind::Rust, "// a|"),
+            (vec!["// a".into(), String::new()], (1, 0))
+        );
+        assert_eq!(
+            enter_at(LangKind::Rust, "//// a|"),
+            (vec!["//// a".into(), String::new()], (1, 0))
+        );
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "/*|"),
+            (vec!["/*".into(), String::new()], (1, 0))
+        );
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "/** a */|"),
+            (vec!["/** a */".into(), String::new()], (1, 0))
+        );
+        assert_eq!(
+            enter_at(LangKind::JavaScript, " * text |*/"),
+            (vec![" * text ".into(), " */".into()], (1, 1))
+        );
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "*|"),
+            (vec!["*".into(), String::new()], (1, 0))
+        );
+    }
+
+    #[test]
+    fn enter_in_languages_without_these_comments_is_unchanged() {
+        assert_eq!(
+            enter_at(LangKind::Python, "/**|"),
+            (vec!["/**".into(), String::new()], (1, 0))
+        );
+        assert_eq!(
+            enter_at(LangKind::Python, " * a|"),
+            (vec![" * a".into(), " ".into()], (1, 1))
+        );
+        assert_eq!(
+            enter_at(LangKind::Markdown, "/// a|"),
+            (vec!["/// a".into(), String::new()], (1, 0))
+        );
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "/// a|"),
+            (vec!["/// a".into(), String::new()], (1, 0))
+        );
+    }
+
+    #[test]
+    fn a_comment_continuation_undoes_in_one_step() {
+        let mut e = editor_with("/**");
+        e.lang = Some(LangKind::JavaScript);
+        e.cursor_col = 3;
+        e.insert_newline();
+        assert_eq!(e.lines, vec!["/**", " * ", " */"]);
+        assert!(e.undo());
+        assert_eq!(e.lines, vec!["/**"]);
     }
 
     #[test]
