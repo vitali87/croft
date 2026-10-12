@@ -187,6 +187,11 @@ fn lang_and_query(kind: LangKind) -> Option<(Language, &'static str)> {
         LangKind::Go => (tree_sitter_go::LANGUAGE.into(), GO_QUERY),
         LangKind::Lua => (tree_sitter_lua::LANGUAGE.into(), LUA_QUERY),
         LangKind::Ql => (tree_sitter_ql::LANGUAGE.into(), QL_QUERY),
+        // Highlighted since #1226 but with no bundled language server, so
+        // this query is their only outline (#1651).
+        LangKind::Java => (tree_sitter_java::LANGUAGE.into(), JAVA_QUERY),
+        LangKind::Ruby => (tree_sitter_ruby::LANGUAGE.into(), RUBY_QUERY),
+        LangKind::CSharp => (tree_sitter_c_sharp::LANGUAGE.into(), CSHARP_QUERY),
         // Other languages either lack a useful symbol structure (json/toml/
         // yaml/css/html/bash) or are not yet covered; they fall through to the
         // LSP outline. Add a query + arm here to light one up.
@@ -290,6 +295,42 @@ const QL_QUERY: &str = r#"
 (datatypeBranch name: (className) @name.enum_member) @item
 "#;
 
+// The definition patterns of each grammar's own `tags.scm`, widened to the
+// constructors, enums, records and fields an outline shows (#1651).
+const JAVA_QUERY: &str = r#"
+(class_declaration name: (identifier) @name.class) @item
+(record_declaration name: (identifier) @name.class) @item
+(interface_declaration name: (identifier) @name.interface) @item
+(annotation_type_declaration name: (identifier) @name.interface) @item
+(enum_declaration name: (identifier) @name.enum) @item
+(enum_constant name: (identifier) @name.enum_member) @item
+(constructor_declaration name: (identifier) @name.constructor) @item
+(method_declaration name: (identifier) @name.method) @item
+(field_declaration declarator: (variable_declarator name: (identifier) @name.field)) @item
+"#;
+
+const RUBY_QUERY: &str = r#"
+(module name: [(constant) @name.module (scope_resolution name: (_) @name.module)]) @item
+(class name: [(constant) @name.class (scope_resolution name: (_) @name.class)]) @item
+(method name: (_) @name.method) @item
+(singleton_method name: (_) @name.method) @item
+"#;
+
+const CSHARP_QUERY: &str = r#"
+(namespace_declaration name: (_) @name.module) @item
+(file_scoped_namespace_declaration name: (_) @name.module) @item
+(class_declaration name: (identifier) @name.class) @item
+(record_declaration name: (identifier) @name.class) @item
+(struct_declaration name: (identifier) @name.struct) @item
+(interface_declaration name: (identifier) @name.interface) @item
+(enum_declaration name: (identifier) @name.enum) @item
+(enum_member_declaration name: (identifier) @name.enum_member) @item
+(constructor_declaration name: (identifier) @name.constructor) @item
+(method_declaration name: (identifier) @name.method) @item
+(property_declaration name: (identifier) @name.property) @item
+(field_declaration (variable_declaration (variable_declarator name: (identifier) @name.field))) @item
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +418,84 @@ mod tests {
         assert!(got.contains(&("isSmall".into(), OutlineKind::Function, 1)));
         assert!(got.contains(&("Small".into(), OutlineKind::Class, 0)));
         assert!(got.contains(&("twice".into(), OutlineKind::Method, 1)));
+    }
+
+    /// #1651: the issue's `Cart.java`: the class, its field, constructor and
+    /// methods, in source order, nested under the class.
+    #[test]
+    fn java_classes_constructors_methods_and_fields_are_extracted() {
+        let src = b"public class Cart {\n    private int total;\n    public Cart(int total) { this.total = total; }\n    public int getTotal() { return total; }\n    public void addItem(int price) { this.total += price; }\n}\n\ninterface Priced { int price(); }\nenum Size { SMALL, LARGE }\n";
+        let got = names_kinds_depths(&symbols_for(LangKind::Java, src));
+        assert_eq!(
+            got,
+            vec![
+                ("Cart".into(), OutlineKind::Class, 0),
+                ("total".into(), OutlineKind::Field, 1),
+                ("Cart".into(), OutlineKind::Constructor, 1),
+                ("getTotal".into(), OutlineKind::Method, 1),
+                ("addItem".into(), OutlineKind::Method, 1),
+                ("Priced".into(), OutlineKind::Interface, 0),
+                ("price".into(), OutlineKind::Method, 1),
+                ("Size".into(), OutlineKind::Enum, 0),
+                ("SMALL".into(), OutlineKind::EnumMember, 1),
+                ("LARGE".into(), OutlineKind::EnumMember, 1),
+            ]
+        );
+    }
+
+    /// #1651: Ruby modules, classes (also `A::B`), instance and singleton
+    /// methods.
+    #[test]
+    fn ruby_modules_classes_and_methods_are_extracted() {
+        let src = b"module Shop\n  class Cart\n    def get_total\n      @total\n    end\n    def self.empty\n      new\n    end\n  end\nend\n\nclass Shop::Item\n  def price\n    1\n  end\nend\n";
+        let got = names_kinds_depths(&symbols_for(LangKind::Ruby, src));
+        assert_eq!(
+            got,
+            vec![
+                ("Shop".into(), OutlineKind::Module, 0),
+                ("Cart".into(), OutlineKind::Class, 1),
+                ("get_total".into(), OutlineKind::Method, 2),
+                ("empty".into(), OutlineKind::Method, 2),
+                ("Item".into(), OutlineKind::Class, 0),
+                ("price".into(), OutlineKind::Method, 1),
+            ]
+        );
+    }
+
+    /// #1651: a C# namespace with a class (field, property, constructor,
+    /// method), an interface, a struct and an enum.
+    #[test]
+    fn csharp_types_and_members_are_extracted() {
+        let src = b"namespace Shop {\n  public class Cart {\n    private int total;\n    public int Count { get; set; }\n    public Cart(int total) { this.total = total; }\n    public int GetTotal() { return total; }\n  }\n  interface IPriced { int Price(); }\n  struct Point { }\n  enum Size { Small, Large }\n}\n";
+        let got = names_kinds_depths(&symbols_for(LangKind::CSharp, src));
+        assert_eq!(
+            got,
+            vec![
+                ("Shop".into(), OutlineKind::Module, 0),
+                ("Cart".into(), OutlineKind::Class, 1),
+                ("total".into(), OutlineKind::Field, 2),
+                ("Count".into(), OutlineKind::Property, 2),
+                ("Cart".into(), OutlineKind::Constructor, 2),
+                ("GetTotal".into(), OutlineKind::Method, 2),
+                ("IPriced".into(), OutlineKind::Interface, 1),
+                ("Price".into(), OutlineKind::Method, 2),
+                ("Point".into(), OutlineKind::Struct, 1),
+                ("Size".into(), OutlineKind::Enum, 1),
+                ("Small".into(), OutlineKind::EnumMember, 2),
+                ("Large".into(), OutlineKind::EnumMember, 2),
+            ]
+        );
+    }
+
+    /// #1651 negative: a file of comments alone, or calls and expressions
+    /// with no definitions, has no symbols in any of the three.
+    #[test]
+    fn java_ruby_and_csharp_without_definitions_have_no_symbols() {
+        assert!(symbols_for(LangKind::Java, b"// just a note\n/* and another */\n").is_empty());
+        assert!(
+            symbols_for(LangKind::Ruby, b"# a note\nputs total\ncart.add_item(3)\n").is_empty()
+        );
+        assert!(symbols_for(LangKind::CSharp, b"// a note\nusing System;\n").is_empty());
     }
 
     #[test]

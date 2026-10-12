@@ -1267,7 +1267,7 @@ Notification sinks, configured under the `notifications` config key: one deliver
 
 The tree-sitter outline provider. It extracts the OUTLINE panel's symbol tree — functions, structs, methods, fields and so on — directly from the buffer's syntax tree using hand-written per-language queries.
 
-**Tree-sitter first, LSP second.** The panel paints instantly instead of waiting for a cold language server to answer `documentSymbol`; the LSP reply supersedes the syntax-tree outline when it arrives. This is the same approach Zed and aerial.nvim take. Rust, Python, JS, TS, TSX and Go are covered by queries; other languages fall back to the LSP outline.
+**Tree-sitter first, LSP second.** The panel paints instantly instead of waiting for a cold language server to answer `documentSymbol`; the LSP reply supersedes the syntax-tree outline when it arrives. This is the same approach Zed and aerial.nvim take. Rust, Python, JS, TS, TSX, Go, Lua, CodeQL, Java, Ruby and C# are covered by queries; for Java, Ruby and C#, which croft bundles no language server for, the query is the only outline, so Go to Symbol, the OUTLINE panel, breadcrumbs and sticky scroll all read it. Other languages fall back to the LSP outline.
 
 ### src/output.rs
 
