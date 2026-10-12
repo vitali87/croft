@@ -6,6 +6,10 @@ description = "VSCode-style TUI written in Rust"
 license = "MIT"
 repository = "https://github.com/vitali87/croft"
 homepage = "https://croft.software"
+# crates.io refuses a package over 10 MiB, and the docs' GIFs alone are ~3 MB
+# of it. Nothing the build reads lives in these (`include_str!` and
+# `include_bytes!` reach into assets/, docs/*.md and src/ only).
+exclude = ["/docs/images/", "/.github/", "/scripts/", "/sonar-project.properties", "/greptile.json", "/.coderabbit.yaml"]
 
 # Prebuilt binaries for `cargo binstall croft-software` (#376). The release
 # workflow publishes one tar.gz per target holding a single `croft` at the
@@ -103,6 +107,9 @@ ignore = "0.4"
 grep-searcher = "0.1"
 grep-regex = "0.1"
 grep-matcher = "0.1"
+# Look-around and backreferences in Search (#1552); already built for
+# umya-spreadsheet, so no new code is compiled.
+fancy-regex = "0.18"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 thiserror = "2"
