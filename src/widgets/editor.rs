@@ -14981,13 +14981,18 @@ impl Widget for &mut Editor {
                 };
                 let key = (image.generation, area.width, area.height, ibg);
                 if self.cell_image.as_ref().map(|c| c.key) != Some(key) {
-                    self.cell_image = halfblock_cells(&image.bytes, area.width, area.height, ibg)
-                        .map(|(cols, rows, cells)| CellImage {
-                            key,
-                            cols,
-                            rows,
-                            cells,
-                        });
+                    // A body that does not decode (a truncated file whose
+                    // header still gave dimensions) is cached as an empty
+                    // picture too, so each frame does not decode it again.
+                    let (cols, rows, cells) =
+                        halfblock_cells(&image.bytes, area.width, area.height, ibg)
+                            .unwrap_or_default();
+                    self.cell_image = Some(CellImage {
+                        key,
+                        cols,
+                        rows,
+                        cells,
+                    });
                 }
                 if let Some(picture) = self.cell_image.as_ref() {
                     paint_cell_image(picture, area, buf);
@@ -25943,6 +25948,33 @@ mod tests {
             (0..area.height).all(|y| (0..area.width).all(|x| buf[(x, y)].symbol() != "\u{2580}")),
             "no half blocks where the terminal shows the picture"
         );
+    }
+
+    /// #1591: an image whose body does not decode is remembered as an
+    /// empty picture under its key, so the next frame does not decode the
+    /// bytes again, and nothing is drawn.
+    #[test]
+    fn an_undecodable_image_body_is_cached_not_retried_each_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pic.png");
+        let png = png_of(4, 4, |_, _| RED);
+        std::fs::write(&path, &png).unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        e.cell_images = true;
+        e.image.as_mut().unwrap().bytes = png[..png.len() / 2].to_vec();
+        let area = Rect::new(0, 0, 30, 10);
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut e, area, &mut buf);
+        let cached = e.cell_image.clone().expect("the failed decode is cached");
+        assert_eq!(cached.key.0, e.image.as_ref().unwrap().generation);
+        assert!(cached.cells.is_empty());
+        assert!(
+            (0..area.height).all(|y| (0..area.width).all(|x| buf[(x, y)].symbol() != "\u{2580}")),
+            "nothing is drawn for an undecodable body"
+        );
+        Widget::render(&mut e, area, &mut Buffer::empty(area));
+        assert_eq!(e.cell_image, Some(cached), "the cache entry stays put");
     }
 
     #[test]
