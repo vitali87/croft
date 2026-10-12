@@ -38765,7 +38765,7 @@ impl App {
             let r = commit();
             Box::new(move |app: &mut App| {
                 if r.is_ok() && app.source_control.message.trim() == message.trim() {
-                    app.source_control.clear_message();
+                    app.source_control.clear_after_commit();
                 }
                 done(app, r)
             })

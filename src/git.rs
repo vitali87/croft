@@ -41,7 +41,8 @@ pub struct GitStatus {
     /// The message git prepared for the commit in progress (#1282): a
     /// conflicted merge, cherry-pick or revert writes `MERGE_MSG`, a
     /// `merge --squash` writes `SQUASH_MSG`. Comment lines are dropped, as
-    /// `commit.cleanup=strip` would. `None` when neither file is there.
+    /// `commit.cleanup=strip` would. Without either, the `commit.template`
+    /// file (#1620). `None` when there is none of them.
     pub prepared_message: Option<String>,
     /// The merge, rebase, cherry-pick, revert or bisect the repository is
     /// in the middle of (#1356), from [`repo_operation`].
@@ -248,16 +249,46 @@ fn prepared_message(root: &Path) -> Option<String> {
         ],
     )
     .ok()?;
-    paths.lines().find_map(|p| {
-        let text = std::fs::read_to_string(root.join(p.trim())).ok()?;
-        let kept: Vec<&str> = text
-            .lines()
-            .filter(|l| !l.starts_with('#'))
-            .map(str::trim_end)
-            .collect();
-        let message = kept.join("\n").trim().to_string();
-        (!message.is_empty()).then_some(message)
-    })
+    paths
+        .lines()
+        .find_map(|p| {
+            let text = std::fs::read_to_string(root.join(p.trim())).ok()?;
+            without_comments(&text)
+        })
+        .or_else(|| commit_template(root))
+}
+
+/// `text` without its `#` comment lines and outer blank lines, or `None`
+/// when nothing is left.
+fn without_comments(text: &str) -> Option<String> {
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(str::trim_end)
+        .collect();
+    let message = kept.join("\n").trim().to_string();
+    (!message.is_empty()).then_some(message)
+}
+
+/// The file git's `commit.template` names (#1620), comments dropped, for
+/// the message box when no merge or squash message is prepared: croft
+/// commits with `-m`, and with `-m` git skips the template, so a team's
+/// required ticket prefix and headings were lost. `--path` expands `~`; a
+/// relative path is taken from the repository's top level, where `git
+/// commit` reads it.
+fn commit_template(root: &Path) -> Option<String> {
+    let named = run_git(root, &["config", "--path", "commit.template"]).ok()?;
+    let named = Path::new(named.trim());
+    if named.as_os_str().is_empty() {
+        return None;
+    }
+    let path = if named.is_absolute() {
+        named.to_path_buf()
+    } else {
+        let top = run_git(root, &["rev-parse", "--show-toplevel"]).ok()?;
+        Path::new(top.trim()).join(named)
+    };
+    without_comments(&std::fs::read_to_string(path).ok()?)
 }
 
 /// The git-ignored paths under `root`, absolute.
@@ -5047,6 +5078,53 @@ mod tests {
             query(p).prepared_message.as_deref(),
             Some("Merge branch 'other'")
         );
+    }
+
+    /// #1620: `commit.template` fills the message, comments dropped, read
+    /// from the repository's top level even when croft is in a subfolder;
+    /// a merge's own message wins over it.
+    #[test]
+    fn the_commit_template_is_the_message_when_nothing_is_prepared() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(
+            p.join(".gitmessage"),
+            "PROJ-: \n\nWhy:\n\n# Subject: PROJ-<ticket>: <summary>, at most 50 characters\n",
+        )
+        .unwrap();
+        run_git(p, &["config", "commit.template", ".gitmessage"]).unwrap();
+        assert_eq!(query(p).prepared_message.as_deref(), Some("PROJ-:\n\nWhy:"));
+        std::fs::create_dir(p.join("sub")).unwrap();
+        assert_eq!(
+            query(&p.join("sub")).prepared_message.as_deref(),
+            Some("PROJ-:\n\nWhy:"),
+            "relative to the top level, not the folder croft is in"
+        );
+        std::fs::write(p.join(".git/MERGE_MSG"), "Merge branch 'other'\n").unwrap();
+        assert_eq!(
+            query(p).prepared_message.as_deref(),
+            Some("Merge branch 'other'")
+        );
+    }
+
+    /// Negative (#1620): a template that names no readable file, or holds
+    /// only comments, is no message; an absolute path is read as named.
+    #[test]
+    fn a_missing_or_comment_only_template_is_no_message() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        run_git(p, &["config", "commit.template", "nope.txt"]).unwrap();
+        assert_eq!(query(p).prepared_message, None);
+        let only = tmp.path().join("only-comments.txt");
+        std::fs::write(&only, "# write something\n\n").unwrap();
+        run_git(p, &["config", "commit.template", only.to_str().unwrap()]).unwrap();
+        assert_eq!(query(p).prepared_message, None);
+        let abs = tmp.path().join("abs.txt");
+        std::fs::write(&abs, "Ticket: \n").unwrap();
+        run_git(p, &["config", "commit.template", abs.to_str().unwrap()]).unwrap();
+        assert_eq!(query(p).prepared_message.as_deref(), Some("Ticket:"));
     }
 
     #[test]
