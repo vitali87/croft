@@ -13737,17 +13737,24 @@ impl App {
     /// position. Used by the editor right-click "Go to Definition" item, where
     /// the cursor has already been moved to the click point.
     fn request_definition_at_cursor(&mut self) {
+        if let Some(id) = self.request_at_cursor(crate::lsp::LspManager::request_definition) {
+            self.definition_request_id = Some(id);
+        }
+    }
+
+    /// Send `request` for the symbol at the editor caret, as the UTF-16
+    /// position LSP speaks, and return the id its reply will echo; `None`
+    /// when the buffer has no file or no language server runs.
+    fn request_at_cursor(
+        &mut self,
+        request: fn(&mut crate::lsp::LspManager, PathBuf, u32, u32) -> u64,
+    ) -> Option<u64> {
         let (line, character) = self
             .editor
             .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
-        let Some(path) = self.editor.path.clone() else {
-            return;
-        };
-        let Some(lsp) = self.lsp.as_mut() else {
-            return;
-        };
-        let id = lsp.request_definition(path, line, character);
-        self.definition_request_id = Some(id);
+        let path = self.editor.path.clone()?;
+        let lsp = self.lsp.as_mut()?;
+        Some(request(lsp, path, line, character))
     }
 
     /// Request the LSP declaration of the symbol at the current cursor (buffer)
@@ -13756,17 +13763,9 @@ impl App {
     /// no separate declaration site (e.g. Python); they diverge for C/C++ (header
     /// prototype) and TypeScript (`.d.ts`).
     fn request_declaration_at_cursor(&mut self) {
-        let (line, character) = self
-            .editor
-            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
-        let Some(path) = self.editor.path.clone() else {
-            return;
-        };
-        let Some(lsp) = self.lsp.as_mut() else {
-            return;
-        };
-        let id = lsp.request_declaration(path, line, character);
-        self.declaration_request_id = Some(id);
+        if let Some(id) = self.request_at_cursor(crate::lsp::LspManager::request_declaration) {
+            self.declaration_request_id = Some(id);
+        }
     }
 
     /// Request the LSP type definition of the symbol at the current cursor
@@ -13774,17 +13773,9 @@ impl App {
     /// item and the `⌃F12` keybinding. Jumps to where the *type* of the
     /// expression is defined, as opposed to the symbol itself (definition).
     fn request_type_definition_at_cursor(&mut self) {
-        let (line, character) = self
-            .editor
-            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
-        let Some(path) = self.editor.path.clone() else {
-            return;
-        };
-        let Some(lsp) = self.lsp.as_mut() else {
-            return;
-        };
-        let id = lsp.request_type_definition(path, line, character);
-        self.type_definition_request_id = Some(id);
+        if let Some(id) = self.request_at_cursor(crate::lsp::LspManager::request_type_definition) {
+            self.type_definition_request_id = Some(id);
+        }
     }
 
     /// Request the LSP implementations of the abstraction at the current cursor
@@ -13792,17 +13783,9 @@ impl App {
     /// item and the `⌘F12` keybinding. Meaningful on traits / interfaces /
     /// abstract methods; the server may return many, and croft jumps to the first.
     fn request_implementation_at_cursor(&mut self) {
-        let (line, character) = self
-            .editor
-            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
-        let Some(path) = self.editor.path.clone() else {
-            return;
-        };
-        let Some(lsp) = self.lsp.as_mut() else {
-            return;
-        };
-        let id = lsp.request_implementation(path, line, character);
-        self.implementation_request_id = Some(id);
+        if let Some(id) = self.request_at_cursor(crate::lsp::LspManager::request_implementation) {
+            self.implementation_request_id = Some(id);
+        }
     }
 
     /// Request the LSP references of the symbol at the current cursor (buffer)
@@ -13815,17 +13798,9 @@ impl App {
         // References would open in the peek popup.
         self.references_request_id = None;
         self.references_want_peek = false;
-        let (line, character) = self
-            .editor
-            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
-        let Some(path) = self.editor.path.clone() else {
-            return;
-        };
-        let Some(lsp) = self.lsp.as_mut() else {
-            return;
-        };
-        let id = lsp.request_references(path, line, character);
-        self.references_request_id = Some(id);
+        if let Some(id) = self.request_at_cursor(crate::lsp::LspManager::request_references) {
+            self.references_request_id = Some(id);
+        }
     }
 
     /// Whether the current editor file's language server implements
