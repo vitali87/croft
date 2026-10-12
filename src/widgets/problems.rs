@@ -361,6 +361,10 @@ impl ProblemsPanel {
         }
         let needle = self.text_filter.to_lowercase();
         it.message.to_lowercase().contains(&needle)
+            || it
+                .code
+                .as_ref()
+                .is_some_and(|c| c.label(&it.source).to_lowercase().contains(&needle))
             || group
                 .path
                 .to_string_lossy()
@@ -1058,6 +1062,36 @@ mod tests {
         assert_eq!(p.total_rows(), 0, "text and severity filters compose");
         assert!(p.clear_text_filter(), "clearing reports it had text");
         assert!(!p.clear_text_filter(), "second clear is a no-op");
+    }
+
+    /// #1540: the rule label a row shows is matched by the text filter.
+    #[test]
+    fn text_filter_matches_the_displayed_rule_code() {
+        let mut coded = diag(0, DiagnosticSeverity::Warning, "`os` imported but unused");
+        coded.code = Some(crate::lsp::manager::DiagnosticCode {
+            value: String::from("F401"),
+            source: Some(String::from("Ruff")),
+            href: None,
+        });
+        let plain = diag(1, DiagnosticSeverity::Warning, "unused variable");
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![group("app.py", vec![coded, plain])]);
+        for c in "f401".chars() {
+            p.push_filter_char(c);
+        }
+        assert_eq!(p.total_rows(), 2, "one header + the coded row");
+        p.clear_text_filter();
+        for c in "ruff(".chars() {
+            p.push_filter_char(c);
+        }
+        assert_eq!(p.total_rows(), 2, "the source(code) label matches");
+        p.clear_text_filter();
+        // Negative: the server name the label replaced, and an uncoded
+        // row's source, are not matched.
+        for c in "rustc".chars() {
+            p.push_filter_char(c);
+        }
+        assert_eq!(p.total_rows(), 0, "no row shows `rustc`");
     }
 
     /// The file header's count badge must reflect the ACTIVE severity

@@ -80754,6 +80754,24 @@ fn the_problems_tab_is_announced_with_its_counts_and_top_entry() {
         snap.item.as_deref(),
         Some("app.py line 4: Undefined name `totl` (ruff)")
     );
+    // #1540: a diagnostic with a rule announces it as the row shows it.
+    let mut coded = problem(0, Error, "`os` imported but unused");
+    coded.code = Some(crate::lsp::manager::DiagnosticCode {
+        value: String::from("F401"),
+        source: Some(String::from("Ruff")),
+        href: None,
+    });
+    app.problems
+        .set_groups(vec![crate::widgets::problems::ProblemGroup {
+            path: tmp.path().join("app.py"),
+            name: "app.py".into(),
+            rel_dir: String::new(),
+            items: vec![coded],
+        }]);
+    assert_eq!(
+        app.a11y_snapshot().item.as_deref(),
+        Some("app.py line 1: `os` imported but unused (Ruff(F401))")
+    );
 }
 
 #[test]
