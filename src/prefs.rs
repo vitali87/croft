@@ -248,8 +248,9 @@ pub struct Prefs {
     #[serde(default)]
     pub disable_inline_values: bool,
     /// Opt-out for saving unsaved editors before a debug or run launch
-    /// (#1400), on by default like VS Code's `debug.saveBeforeStart`
-    /// (`allEditorsInActiveGroup`); `"none"` there maps to true here.
+    /// (#1400), a task or a Testing run (#1639), on by default like VS
+    /// Code's `debug.saveBeforeStart` (`allEditorsInActiveGroup`); `"none"`
+    /// there maps to true here.
     #[serde(default)]
     pub disable_save_before_debug: bool,
     /// Start in Vim mode (#1286). Toggle Vim Mode saves it, so the mode a

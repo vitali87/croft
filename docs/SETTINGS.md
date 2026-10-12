@@ -124,7 +124,7 @@ means the same thing whichever path reads it.
 | `editor.guides.indentation` | `disable_indent_guides` (negated) |
 | `editor.inlayHints.enabled` | `disable_inlay_hints` (negated) |
 | `editor.autoClosingBrackets: "never"` | `disable_auto_close_pairs` |
-| `debug.saveBeforeStart: "none"` | `disable_save_before_debug` (every other value saves before a launch) |
+| `debug.saveBeforeStart: "none"` | `disable_save_before_debug` (every other value saves before a launch, a task or a Testing run) |
 | `terminal.integrated.copyOnSelection` | `copy_on_select` |
 | `files.exclude` | `files_exclude` (the globs set to `true`; `false` entries and `when` clauses are left out). VS Code reads a bare glob such as `build` from the workspace root, so it arrives anchored, as `/build`, and `scripts/build/` stays visible |
 | `search.exclude` | `search_exclude` (same) |
