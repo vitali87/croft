@@ -1,0 +1,1 @@
+fix: Files that aren't UTF-8 get git changes again: after Reopen with Encoding (windows-1252, Shift_JIS, …), and for UTF-16 files with a BOM, the gutter shows added/modified bars and clicking the file in Source Control opens its HEAD diff decoded the same way, instead of "git show HEAD failed … not UTF-8". Hunk staging stays UTF-8-only and says so.
