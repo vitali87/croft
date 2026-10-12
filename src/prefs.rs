@@ -263,8 +263,9 @@ pub struct Prefs {
     #[serde(default)]
     pub disable_inline_values: bool,
     /// Opt-out for saving unsaved editors before a debug or run launch
-    /// (#1400), on by default like VS Code's `debug.saveBeforeStart`
-    /// (`allEditorsInActiveGroup`); `"none"` there maps to true here.
+    /// (#1400), a task or a Testing run (#1639), on by default like VS
+    /// Code's `debug.saveBeforeStart` (`allEditorsInActiveGroup`); `"none"`
+    /// there maps to true here.
     #[serde(default)]
     pub disable_save_before_debug: bool,
     /// Start in Vim mode (#1286). Toggle Vim Mode saves it, so the mode a
@@ -379,6 +380,12 @@ pub struct Prefs {
     /// opens a plain shell. User layers only: it names a command to run.
     #[serde(default)]
     pub lane_agent: Option<String>,
+    /// The colour depth croft draws for (#1433): "truecolor", "256" or
+    /// "16". Unset, it is read from the terminal's environment; set it for
+    /// a terminal that draws 24-bit colour without saying so (often over
+    /// SSH, where `COLORTERM` is not passed on). Read at startup.
+    #[serde(default)]
+    pub color_depth: Option<String>,
     /// Scrollback lines kept per terminal pane (VS Code's
     /// `terminal.integrated.scrollback`). 0 — the default for older configs —
     /// means the built-in 5000. Applies to panes opened after the change.
@@ -1238,8 +1245,67 @@ pub(crate) fn config_dir() -> PathBuf {
     home.join(".config").join("croft")
 }
 
+/// Where croft keeps data that is the user's own and must outlive a cache
+/// clean (#1578): hot-exit backups of unsaved edits and sticky notes. XDG's
+/// state directory, `$XDG_STATE_HOME/croft`, by default
+/// `~/.local/state/croft`; the cache directory is for what can be rebuilt,
+/// and cleaners and `rm -rf ~/.cache` delete it.
+pub(crate) fn state_dir() -> PathBuf {
+    state_dir_from(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+}
+
+/// [`state_dir`] from the given `XDG_STATE_HOME` and `HOME`. The spec
+/// counts a relative value (an empty one included) as invalid, so it falls
+/// back to the default rather than landing under the working directory.
+fn state_dir_from(
+    xdg_state_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    if let Some(xdg) = xdg_state_home
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        return xdg.join("croft");
+    }
+    home.map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".local")
+        .join("state")
+        .join("croft")
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// #1578: hot-exit backups and sticky notes are the user's own text, so
+    /// they live in XDG's state directory, not the cache that cleaners and
+    /// `rm -rf ~/.cache` are free to delete.
+    #[test]
+    fn user_data_lives_in_the_xdg_state_directory() {
+        use std::path::PathBuf;
+        assert_eq!(
+            super::state_dir_from(Some("/x/state".into()), Some("/home/u".into())),
+            PathBuf::from("/x/state/croft")
+        );
+        assert_eq!(
+            super::state_dir_from(None, Some("/home/u".into())),
+            PathBuf::from("/home/u/.local/state/croft")
+        );
+    }
+
+    /// Negative: an empty or relative `XDG_STATE_HOME` is invalid under the
+    /// XDG spec and is ignored, never joined onto the working directory.
+    #[test]
+    fn an_empty_or_relative_xdg_state_home_is_ignored() {
+        use std::path::PathBuf;
+        for bad in ["", "rel/state"] {
+            assert_eq!(
+                super::state_dir_from(Some(bad.into()), Some("/home/u".into())),
+                PathBuf::from("/home/u/.local/state/croft"),
+                "{bad:?}"
+            );
+        }
+    }
 
     #[test]
     fn finishing_the_tour_leaves_an_unreadable_config_alone() {
