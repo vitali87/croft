@@ -31756,6 +31756,20 @@ fn a_python_block_runs_from_its_file_and_prints() {
     assert_eq!(run_typed_line(&cmd, tmp.path()), "hello from python\n4\n");
 }
 
+/// #1630: with HOME unset or relative the cache is relative, but the typed
+/// line runs in the pane's directory, so the staged block's directory is
+/// made absolute (against croft's own directory) before it is named.
+#[test]
+fn a_relative_block_directory_is_made_absolute() {
+    let dir = super::absolute_block_dir(PathBuf::from(".cache/croft/blocks"));
+    assert!(dir.is_absolute(), "{dir:?}");
+    assert_eq!(
+        dir,
+        std::env::current_dir().unwrap().join(".cache/croft/blocks")
+    );
+    assert!(super::block_script_dir().is_absolute());
+}
+
 /// A tab or `!` never reaches the shell's line editor as typed input: a
 /// python block's tabs and bangs go into its file byte for byte, and a shell
 /// block goes as one quoted printf argument that a real shell decodes back

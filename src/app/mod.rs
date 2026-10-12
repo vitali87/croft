@@ -67837,13 +67837,22 @@ fn fence_command(interpreter: &str, code: &str, scripts: &Path) -> String {
     format!("{code}\r")
 }
 
-/// Where [`fence_command`] writes the blocks it runs (#1630).
+/// Where [`fence_command`] writes the blocks it runs (#1630). Always
+/// absolute: the typed command runs in the pane's directory, so a relative
+/// cache (HOME unset or relative) would name a file that is not there.
 fn block_script_dir() -> PathBuf {
     // Never the user's own cache from a test.
-    if cfg!(test) {
-        return std::env::temp_dir().join(format!("croft-test-blocks-{}", std::process::id()));
-    }
-    croft_cache_dir().join("blocks")
+    let dir = if cfg!(test) {
+        std::env::temp_dir().join(format!("croft-test-blocks-{}", std::process::id()))
+    } else {
+        croft_cache_dir().join("blocks")
+    };
+    absolute_block_dir(dir)
+}
+
+/// `dir` made absolute against croft's own directory, where it was meant.
+fn absolute_block_dir(dir: PathBuf) -> PathBuf {
+    std::path::absolute(&dir).unwrap_or(dir)
 }
 
 /// How long a written block is kept: long enough for its interpreter to
