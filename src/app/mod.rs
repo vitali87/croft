@@ -64736,7 +64736,15 @@ impl App {
         let path = match (path, embedded) {
             (Some(p), _) => Some(p),
             (None, Some(contents)) => {
-                match self.open_sarif_embedded(&uri, &contents, line as usize, column as usize) {
+                // The copy has no buffer yet to convert in, so UTF-16
+                // columns are turned into characters against its own line.
+                let column = match (&contents, kind) {
+                    (crate::sarif::resolve::Embedded::Text(t), ColumnKind::Utf16CodeUnits) => {
+                        utf16_col_to_char_in(t.lines().nth(line as usize).unwrap_or(""), column)
+                    }
+                    _ => column as usize,
+                };
+                match self.open_sarif_embedded(&uri, &contents, line as usize, column) {
                     Err(e) => self.status = format!("Could not open the log's copy of {uri}: {e}"),
                     Ok(()) if archived => {
                         self.status = format!(
@@ -64933,8 +64941,11 @@ impl App {
 
     /// The CodeQL database whose query run wrote the SARIF log in the
     /// editor, when it is one (#1369).
+    /// The log is the one holding the selected result, which may be a log
+    /// added to the viewer rather than the tab's own.
     fn sarif_codeql_database(&self) -> Option<PathBuf> {
-        let log = self.editor.path.as_ref()?;
+        let view = self.editor.sarif.as_ref()?;
+        let log = &view.logs.get(view.selected_entry()?.log)?.path;
         let history = crate::codeql_query::History::load(&Self::codeql_history_path());
         let entry = history.entries.iter().find(|e| {
             e.output == *log
@@ -71387,6 +71398,18 @@ pub(crate) fn user_data_dir(cache: &Path, state: &Path) -> PathBuf {
         p.extension().is_some_and(|x| x == "lock")
     });
     state.to_path_buf()
+}
+
+/// The character index in `line` at which `units` UTF-16 code units have
+/// passed; past the end it is the line's length.
+fn utf16_col_to_char_in(line: &str, units: i64) -> usize {
+    let mut seen = 0i64;
+    line.chars()
+        .take_while(|c| {
+            seen += c.len_utf16() as i64;
+            seen <= units
+        })
+        .count()
 }
 
 pub(crate) fn croft_cache_dir() -> PathBuf {
