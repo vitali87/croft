@@ -6,8 +6,6 @@
 //! including the ones GitHub's code-scanning API serves, hold that
 //! directory one level down.
 
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::path::{Path, PathBuf};
 
 pub const DB_MARKER: &str = "codeql-database.yml";
