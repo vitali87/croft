@@ -60455,6 +60455,64 @@ fn add_debug_configuration_attaches_by_port() {
     );
 }
 
+/// #1425: in a multi-root workspace a compound member from another folder
+/// resolves in that folder: its preLaunchTask is found in web's tasks.json
+/// and its program is web's. Before, the compound failed with "which no
+/// launch.json declares".
+#[test]
+fn a_compound_member_from_another_folder_launches_from_that_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let api = tmp.path().join("api");
+    let web = tmp.path().join("web");
+    for d in [&api, &web] {
+        std::fs::create_dir_all(d.join(".vscode")).unwrap();
+    }
+    std::fs::write(
+        api.join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "name": "Run api", "type": "python", "request": "launch", "program": "${workspaceFolder}/main.py" }
+        ],
+        "compounds": [
+            { "name": "Web only", "configurations": [{ "folder": "web", "name": "Run web" }] }
+        ]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        web.join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "name": "Run web", "type": "python", "request": "launch", "program": "${workspaceFolder}/main.py", "preLaunchTask": "serve" }
+        ]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        web.join(".vscode/tasks.json"),
+        r#"{ "version": "2.0.0", "tasks": [
+            { "label": "serve", "type": "shell", "command": "sleep 30" }
+        ]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(api.clone()).unwrap();
+    app.roots.add(web.clone());
+    pick_debug_row(&mut app, "Web only");
+    assert!(
+        !app.status.contains("no launch.json declares"),
+        "status: {}",
+        app.status
+    );
+    let pending = app
+        .pending_debug_launch
+        .as_ref()
+        .expect("web's preLaunchTask parks the launch");
+    let PendingLaunchStep::Resolved(rc) = &pending.step else {
+        panic!("the member itself is parked behind its task");
+    };
+    assert_eq!(rc.name, "Run web");
+    assert_eq!(
+        rc.program.as_deref(),
+        Some(web.join("main.py").to_string_lossy().as_ref())
+    );
+}
+
 /// Open the debug picker and confirm the row whose label starts with `label`.
 fn pick_debug_row(app: &mut App, label: &str) {
     app.open_debug_config_picker();

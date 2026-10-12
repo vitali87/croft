@@ -8977,6 +8977,12 @@ impl App {
             .to_path_buf()
     }
 
+    /// Every workspace folder as `(name, root)`, for a compound member's
+    /// `"folder"` and `${workspaceFolder:name}` (#1425).
+    fn workspace_folders(&self) -> Vec<(String, PathBuf)> {
+        crate::dap::configs::workspace_folders(self.roots.iter())
+    }
+
     /// Feed the Source Control empty state the repos one folder below the
     /// active root when that root is in none (#1227), so it offers to open
     /// them rather than `git init` around them. A depth-1 `read_dir`,
@@ -31456,6 +31462,7 @@ impl App {
         // name, which is the very entry a `.vscode` compound
         // naming that name has to bind.
         let all = crate::dap::configs::discover_configs_all(&self.active_workspace_root());
+        let folders = self.workspace_folders();
         // #310 defers compounds that need SEVERAL sessions at
         // once. A compound naming ONE configuration needs one,
         // which croft has run since #250 — so the arity has to
@@ -31463,7 +31470,7 @@ impl App {
         // multi-session limit for a one-member compound cites
         // a limitation that does not apply and tells the user
         // something false about their own launch.json.
-        match crate::dap::configs::resolve_compound(compound, &all) {
+        match crate::dap::configs::resolve_compound(compound, &all, &folders) {
             Err(e) => self.debug_error(e),
             // A one-member compound carrying keys croft does
             // not honour is REFUSED rather than launched.
@@ -31558,10 +31565,6 @@ impl App {
                 // for and the order a client-then-server
                 // compound depends on.
                 let label = compound.name.clone();
-                // `resolve_compound` borrows from the config
-                // list; the launch outlives that borrow, so
-                // the members are owned from here on.
-                let members: Vec<_> = members.into_iter().cloned().collect();
                 match compound.pre_launch_task.clone() {
                     Some(task) => self.launch_after_compound_task_all(
                         &task,
@@ -31744,10 +31747,15 @@ impl App {
     /// interleave unpredictably. Its task is skipped with a status saying so,
     /// which is honest, and #310 is where the general form belongs.
     fn launch_member_into_set(&mut self, cfg: &crate::dap::configs::DebugConfig) -> MemberOutcome {
-        let root = self.active_workspace_root();
+        // A member from another workspace folder resolves there (#1425).
+        let root = cfg
+            .root
+            .clone()
+            .unwrap_or_else(|| self.active_workspace_root());
         let ctx = crate::dap::configs::SubstCtx {
             workspace_folder: root,
             file: self.editor.path.clone(),
+            folders: self.workspace_folders(),
         };
         let rc = match crate::dap::configs::resolve(cfg, &ctx) {
             Ok(rc) => rc,
@@ -32017,10 +32025,16 @@ impl App {
         self.pending_debug_launch = None;
         // A new run: the previous run's cleanup is not this one's.
         self.debug_post_tasks.clear();
-        let root = self.active_workspace_root();
+        // A compound member from another workspace folder resolves, and
+        // finds its preLaunchTask, there (#1425).
+        let root = cfg
+            .root
+            .clone()
+            .unwrap_or_else(|| self.active_workspace_root());
         let ctx = configs::SubstCtx {
             workspace_folder: root.clone(),
             file: self.editor.path.clone(),
+            folders: self.workspace_folders(),
         };
         let rc = match configs::resolve(cfg, &ctx) {
             Ok(rc) => rc,
@@ -38107,6 +38121,7 @@ impl App {
         task.command_line(&crate::dap::configs::SubstCtx {
             workspace_folder: self.active_workspace_root(),
             file: self.editor.path.clone(),
+            folders: self.workspace_folders(),
         })
     }
 
