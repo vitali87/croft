@@ -109,6 +109,10 @@ pub struct TestingPanel {
     /// Latched by [`Self::on_refused`] and consumed by the app's drain, which
     /// surfaces the no-runner status message.
     refused: bool,
+    /// Latched by [`Self::on_cancelled`] for the app's "Test run cancelled".
+    cancelled: bool,
+    /// The summary line's Stop control while a run is in flight (#1534).
+    pub last_stop: Rect,
     /// Pre-run statuses of the cases the last `start_single`/`start_filter`
     /// marked Running (`None` = the start inserted the case). A worker
     /// refusal restores the tree from this snapshot exactly — old
@@ -149,6 +153,8 @@ impl TestingPanel {
             last_cover_all: Rect::default(),
             progress: None,
             refused: false,
+            cancelled: false,
+            last_stop: Rect::default(),
             prerun: Vec::new(),
             scroll: 0,
             focus_gradient: false,
@@ -460,6 +466,27 @@ impl TestingPanel {
         std::mem::take(&mut self.refused)
     }
 
+    /// A cancelled run or discovery ended (#1534). The cases a single or
+    /// filtered start marked Running go back to what they were, like a
+    /// refusal; any other case that never reported is not run. The run
+    /// ends without a verdict.
+    pub fn on_cancelled(&mut self) {
+        self.on_refused();
+        self.refused = false;
+        for c in &mut self.cases {
+            if c.status == TestStatus::Running {
+                c.status = TestStatus::NotRun;
+            }
+        }
+        self.cancelled = true;
+        self.finished = Some(None);
+    }
+
+    /// Consume the cancel latch (one status message per cancel).
+    pub fn take_cancelled(&mut self) -> bool {
+        std::mem::take(&mut self.cancelled)
+    }
+
     pub fn is_running(&self) -> bool {
         self.activity == Activity::Running
     }
@@ -670,6 +697,7 @@ impl Widget for &mut TestingPanel {
         }
         self.last_area = area;
         self.last_output_hint = Rect::default();
+        self.last_stop = Rect::default();
         if inner.height == 0 || inner.width == 0 {
             return;
         }
@@ -741,6 +769,25 @@ impl Widget for &mut TestingPanel {
                 avail(inner.x + 1),
                 Style::default().fg(self.theme.accent()),
             );
+            // The Stop control (#1534): a click, `s`, or Testing: Cancel
+            // Test Run ends a run that hangs.
+            let stop = "\u{25a0} Stop (s)";
+            let stop_x = inner.x + 1 + label.chars().count() as u16 + 2;
+            let room = avail(stop_x);
+            if room >= stop.chars().count() {
+                buf.set_string(
+                    stop_x,
+                    summary_y,
+                    stop,
+                    Style::default().fg(self.theme.git_deleted()),
+                );
+                self.last_stop = Rect {
+                    x: stop_x,
+                    y: summary_y,
+                    width: stop.chars().count() as u16,
+                    height: 1,
+                };
+            }
         } else if self.cases.is_empty() {
             // A run or discovery that wiped the tree and then failed (compile
             // error on a full run, a collection error) must not hide behind
@@ -1226,6 +1273,64 @@ mod tests {
             summary.contains("run failed"),
             "a nonzero exit with no Failed case must say so, got {summary:?}"
         );
+    }
+
+    /// #1534: a cancelled run puts back what a single run marked, marks a
+    /// case that started but never reported as not run, ends with no
+    /// verdict, and latches the cancel once.
+    #[test]
+    fn a_cancelled_run_marks_unreported_cases_not_run() {
+        let mut p = TestingPanel::new();
+        p.on_busy_started(Activity::Running);
+        p.apply_case(TestCase {
+            name: "m::a".into(),
+            status: TestStatus::Passed,
+        });
+        p.on_finished(Some(true));
+        p.take_finished();
+        p.start_single("m::a");
+        p.apply_case(TestCase {
+            name: "m::hangs".into(),
+            status: TestStatus::Running,
+        });
+        p.on_cancelled();
+        assert!(!p.is_busy());
+        assert_eq!(
+            p.cases_for_test(),
+            vec![
+                (String::from("m::a"), TestStatus::Passed),
+                (String::from("m::hangs"), TestStatus::NotRun),
+            ]
+        );
+        assert_eq!(p.take_finished(), Some(None), "no verdict");
+        assert!(p.take_cancelled());
+        assert!(!p.take_cancelled(), "one status message per cancel");
+        assert!(!p.take_refusal(), "a cancel is not a refusal");
+    }
+
+    /// #1534: the Stop control shows while a run is in flight, and not when
+    /// the view is idle.
+    #[test]
+    fn the_stop_control_shows_only_while_busy() {
+        let mut p = TestingPanel::new();
+        let area = Rect::new(0, 0, 40, 10);
+        let summary = |p: &mut TestingPanel| {
+            let mut buf = Buffer::empty(area);
+            p.render(area, &mut buf);
+            (0..40).map(|x| buf[(x, 2)].symbol()).collect::<String>()
+        };
+        let idle = summary(&mut p);
+        assert!(!idle.contains("Stop"), "{idle:?}");
+        assert_eq!(p.last_stop, Rect::default());
+        p.on_busy_started(Activity::Running);
+        let busy = summary(&mut p);
+        assert!(busy.contains("Running tests"), "{busy:?}");
+        assert!(busy.contains("\u{25a0} Stop (s)"), "{busy:?}");
+        assert_eq!(p.last_stop.y, 2);
+        assert!(p.last_stop.width > 0);
+        p.on_cancelled();
+        summary(&mut p);
+        assert_eq!(p.last_stop, Rect::default(), "gone once the run ends");
     }
 
     /// A run that dies unreported must stay visible even when an OLD failure
