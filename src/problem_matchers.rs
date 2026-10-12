@@ -257,6 +257,7 @@ impl CompiledMatcher {
                 severity,
                 message,
                 source: self.name.clone(),
+                needs_file: false,
             });
             true
         };
@@ -546,6 +547,9 @@ pub fn well_known(name: &str) -> Option<CompiledMatcher> {
         "$rustc" => ("rustc", "rustc"),
         "$eslint-stylish" => ("eslint", "eslint"),
         "$gcc" => ("gcc", "build"),
+        "$go" => ("go", "go"),
+        "$eslint-compact" => ("eslint-compact", "eslint-compact"),
+        "$msCompile" => ("msCompile", "msCompile"),
         "$tsc-watch" => {
             return Some(CompiledMatcher {
                 name: String::from("tsc-watch"),
@@ -582,7 +586,21 @@ pub fn well_known(name: &str) -> Option<CompiledMatcher> {
 /// the built-in first-match-wins scan rather than erroring.
 pub fn from_tasks_json(value: &serde_json::Value) -> Option<CompiledMatcher> {
     match value {
-        serde_json::Value::String(s) => well_known(s),
+        serde_json::Value::String(s) => {
+            let known = well_known(s);
+            // Said, not dropped: the task otherwise runs with the generic
+            // table and nothing tells the user their matcher was ignored.
+            if known.is_none() {
+                crate::output::push(
+                    "Matchers",
+                    crate::output::OutputLevel::Warn,
+                    &format!(
+                        "tasks.json: problemMatcher \"{s}\" is not one croft knows; the built-in matchers run instead"
+                    ),
+                );
+            }
+            known
+        }
         serde_json::Value::Array(items) => {
             let mut all: Vec<CompiledMatcher> = items.iter().filter_map(from_tasks_json).collect();
             // A background entry anywhere makes it a watch task (VS Code), and
@@ -862,6 +880,40 @@ mod tests {
         assert_eq!(out[0].file, "main.c");
         assert!(well_known("$tsc-watch").unwrap().background.is_some());
         assert!(well_known("$made-up-name").is_none());
+    }
+
+    /// #1594: VS Code's `$go`, `$eslint-compact` and `$msCompile` are known,
+    /// each reporting its own tool's rows only, and `$gcc` does not pick up
+    /// mypy's column-less row.
+    #[test]
+    fn go_eslint_compact_and_ms_compile_are_well_known() {
+        let mixed = "./main.go:4:6: declared and not used: unused\n\
+                     web/a.js: line 2, col 1, Warning - Missing semicolon. (semi)\n\
+                     Program.cs(3,1): error CS0103: The name 'x' does not exist\n\
+                     main.c:7:3: error: expected ';'\n\
+                     app.py:2: error: Incompatible types in assignment\n";
+        for (name, file) in [
+            ("$gcc", "main.c"),
+            ("$go", "./main.go"),
+            ("$eslint-compact", "web/a.js"),
+            ("$msCompile", "Program.cs"),
+        ] {
+            let out = well_known(name).unwrap().scan_batch(mixed);
+            assert_eq!(out.len(), 1, "{name}: {out:?}");
+            assert_eq!(out[0].file, file, "{name}");
+        }
+    }
+
+    /// #1594: a matcher name croft does not know is said in OUTPUT ·
+    /// Matchers instead of being dropped without a word.
+    #[test]
+    fn an_unknown_task_matcher_name_is_reported() {
+        assert!(from_tasks_json(&serde_json::json!("$nosuch-1594")).is_none());
+        let lines = crate::output::snapshot("Matchers").unwrap_or_default();
+        assert!(
+            lines.iter().any(|l| l.text.contains("\"$nosuch-1594\"")),
+            "{lines:?}"
+        );
     }
 
     /// gcc diagnostics, then eslint's default "stylish" report (#1240).
