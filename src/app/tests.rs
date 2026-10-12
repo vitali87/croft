@@ -41985,12 +41985,6 @@ fn collab_caret_label_fade_signals_one_redraw_per_transition() {
     assert!(!app.collab_labels_dirty(), "stays hidden: quiet");
 }
 
-/// A right-click menu opened over an image tab was painted *under* the
-/// picture: on Kitty the editor preview was placed at the default z=0, which
-/// the spec puts above text. Placing it below text AND below non-default
-/// background cells (the same trick the sidebar illustrations use) lets any
-/// opaque popup box paint fully on top, while the preview still shows through
-/// the pane's default-bg canvas.
 /// #1591: with no inline-image protocol (tmux, plain SSH) an image tab
 /// draws its picture in half blocks; a terminal that shows inline images
 /// gets the empty canvas it paints over, as before.
@@ -42026,6 +42020,12 @@ fn an_image_tab_draws_half_blocks_without_an_inline_image_protocol() {
     assert_eq!(half_blocks(InlineImageProtocol::ITerm2), 0);
 }
 
+/// A right-click menu opened over an image tab was painted *under* the
+/// picture: on Kitty the editor preview was placed at the default z=0, which
+/// the spec puts above text. Placing it below text AND below non-default
+/// background cells (the same trick the sidebar illustrations use) lets any
+/// opaque popup box paint fully on top, while the preview still shows through
+/// the pane's default-bg canvas.
 #[test]
 fn editor_image_preview_sits_below_text_so_popups_paint_over_it() {
     let tmp = tempfile::tempdir().unwrap();
