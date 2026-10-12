@@ -105,7 +105,8 @@ impl ArchiveKind {
 /// index declares before a byte is decoded (an unreadable index is refused,
 /// as the installer refuses it), and the output is capped again in case the
 /// index lies. A decoded stream that is not a tar, a plain `notes.txt.xz`,
-/// is an error, so the file falls through to the hex viewer.
+/// is an error (here or in the header walk), so the file falls through to
+/// the hex viewer.
 fn xz_tar_bytes(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
     let past_cap = |size: String| {
         std::io::Error::other(format!("archive expands past the listing cap ({size})"))
@@ -129,8 +130,12 @@ fn xz_tar_bytes(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
             std::io::Error::other(format!("xz: {e}"))
         });
     }
+    // `tar::Archive` validates the headers (a checksum per member) as the
+    // caller walks them, so a V7 tar with no `ustar` magic and an empty tar
+    // with no blocks at all both list. A tar is whole 512-byte blocks, so
+    // anything else, a plain `notes.txt.xz`, is refused here without a walk.
     let tar = sink.buf;
-    if tar.len() <= 262 || &tar[257..262] != b"ustar" {
+    if !tar.len().is_multiple_of(512) {
         return Err(std::io::Error::other("not a tar archive"));
     }
     Ok(tar)
@@ -998,6 +1003,40 @@ mod tests {
         let kind = e.archive.as_ref().expect("listed").kind;
         let out = extract_member(&p, kind, "proj/main.rs", &tmp.path().join("out")).unwrap();
         assert_eq!(std::fs::read_to_string(out).unwrap(), "fn main(){}\n");
+    }
+
+    /// #1645: a V7 tar (no `ustar` magic, `tar --format=v7`) and an empty
+    /// tar (zero blocks) inside xz both list, where each fell through to hex.
+    #[test]
+    fn a_v7_or_empty_tar_xz_lists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut t = tar::Builder::new(Vec::new());
+        let body = "old\n";
+        let mut hdr = tar::Header::new_old();
+        hdr.set_size(body.len() as u64);
+        hdr.set_mode(0o644);
+        hdr.set_cksum();
+        t.append_data(&mut hdr, "v7.txt", body.as_bytes()).unwrap();
+        let v7 = t.into_inner().unwrap();
+        assert_ne!(&v7[257..262], b"ustar");
+        for (name, tar_bytes, want) in [
+            ("v7.tar.xz", v7, vec!["v7.txt"]),
+            ("empty.tar.xz", Vec::new(), vec![]),
+        ] {
+            let p = tmp.path().join(name);
+            let mut xz = Vec::new();
+            lzma_rs::xz_compress(&mut std::io::Cursor::new(&tar_bytes), &mut xz).unwrap();
+            std::fs::write(&p, xz).unwrap();
+            let mut e = crate::widgets::editor::Editor::new();
+            e.open(&p).unwrap();
+            let view = e
+                .archive
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} opens as an archive, not hex"));
+            assert_eq!(view.kind.label(), "TAR.XZ", "{name}");
+            let names: Vec<&str> = view.entries.iter().map(|m| m.path.as_str()).collect();
+            assert_eq!(names, want, "{name}");
+        }
     }
 
     /// #1645 negative: an xz file that is not a tar is not listed as an
