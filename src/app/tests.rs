@@ -81678,6 +81678,31 @@ fn the_debug_toolbar_stops_and_names_its_keys() {
     assert!(adapter_got(&log, "disconnect"));
 }
 
+/// #1545: at the sidebar's minimum width the toolbar wraps instead of
+/// dropping its rightmost buttons, so every control stays clickable.
+#[test]
+fn the_debug_toolbar_wraps_at_the_minimum_sidebar_width() {
+    use crate::widgets::run_debug::DebugControl;
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (_tmp, mut app, mut term, log) = debug_toolbar_app(true);
+    app.sidebar_width = SIDEBAR_WIDTH_MIN;
+    term.draw(|f| app.render(f)).unwrap();
+    let cells: Vec<_> = DebugControl::toolbar(true)
+        .into_iter()
+        .map(|control| {
+            debug_control_cell(&app, control)
+                .unwrap_or_else(|| panic!("{control:?} is on the narrow toolbar"))
+        })
+        .collect();
+    assert!(
+        cells.iter().any(|&(_, y)| y != cells[0].1),
+        "the buttons wrap onto a second row: {cells:?}"
+    );
+    let (x, y) = debug_control_cell(&app, DebugControl::Stop).unwrap();
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+    assert!(adapter_got(&log, "disconnect"));
+}
+
 /// #1545 negative: with no session there is no toolbar; the panel shows
 /// its Run and Debug button as before.
 #[test]

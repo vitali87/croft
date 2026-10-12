@@ -563,10 +563,17 @@ impl RunDebugPanel {
         // The debug toolbar (#1545): Continue / Pause, Step Over, Step Into,
         // Step Out, Restart, Stop, then the status pill, e.g.
         // " Paused (breakpoint) ". Each button's name and key is its tooltip.
+        // A sidebar too narrow for all six wraps them onto further rows, so
+        // Stop and the rest stay clickable at the minimum width.
         if !self.debug_status.is_empty() {
+            let bottom = inner.y + inner.height;
             let mut x = inner.x + 1;
             for control in DebugControl::toolbar(self.debug_paused) {
-                if x + 3 > right {
+                if x + 3 > right && x > inner.x + 1 {
+                    x = inner.x + 1;
+                    y += 1;
+                }
+                if x + 3 > right || y >= bottom {
                     break;
                 }
                 let fg = if control.enabled(self.debug_paused) {
