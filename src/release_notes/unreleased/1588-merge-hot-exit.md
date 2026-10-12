@@ -1,0 +1,1 @@
+fix: Closing croft with a merge editor open, such as when its terminal closes, no longer keeps the half-resolved Result as the file's unsaved text, so the next launch no longer brings the file back as a dirty copy whose save would write that Result over it. An update relaunch still carries the unsaved Result across.
