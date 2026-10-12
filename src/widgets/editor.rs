@@ -2338,6 +2338,10 @@ pub(crate) enum VisRow {
     },
     /// Row `box_row` (0-based within the block) of `comment_boxes[box_idx]`.
     Box { box_idx: usize, box_row: usize },
+    /// Line `index` (1-based; line 0 is the ghost text at the caret) of the
+    /// live inline suggestion (#1625), shown under the caret's line so a
+    /// multi-line suggestion is read before Tab takes it.
+    Ghost { index: usize },
 }
 
 /// The line-ending style of the open buffer, shown in the status bar and
@@ -4398,7 +4402,7 @@ impl Editor {
     fn text_row(&self, i: usize) -> Option<(usize, usize, usize)> {
         match self.last_wrap_rows.get(i)? {
             VisRow::Text { line, start, end } => Some((*line, *start, *end)),
-            VisRow::Box { .. } => None,
+            VisRow::Box { .. } | VisRow::Ghost { .. } => None,
         }
     }
 
@@ -9000,6 +9004,48 @@ impl Editor {
                 self.inline_values.insert(li, parts.join(", "));
             }
         }
+    }
+
+    /// Paint line `index` of the live inline suggestion (#1625) as its own
+    /// row under the caret's line: no line number, the suggestion's text in
+    /// the dim italic ghost style, scrolled with the buffer when not
+    /// wrapping and clipped at the pane edge.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_ghost_row(
+        &self,
+        buf: &mut Buffer,
+        inner: Rect,
+        y: u16,
+        gutter_width: u16,
+        text_x: u16,
+        text_width: u16,
+        index: usize,
+        wrap: bool,
+    ) {
+        buf.set_line(
+            inner.x,
+            y,
+            &Line::from(" ".repeat(gutter_width as usize)),
+            gutter_width,
+        );
+        let Some(line) = self.live_ghost().and_then(|t| t.split('\n').nth(index)) else {
+            return;
+        };
+        let skip = if wrap { 0 } else { self.scroll_col };
+        let shown: String = line
+            .replace('\t', &" ".repeat(self.indent_style().width.max(1) as usize))
+            .chars()
+            .skip(skip)
+            .take(text_width as usize)
+            .collect();
+        buf.set_string(
+            text_x,
+            y,
+            &shown,
+            Style::default()
+                .fg(self.theme.ignored_fg())
+                .add_modifier(Modifier::ITALIC),
+        );
     }
 
     /// The inline suggestion (#607) when it still applies: the caret where it
@@ -14810,6 +14856,24 @@ impl Widget for &mut Editor {
                 }
             }
         };
+        // The lines of a live inline suggestion after its first (#1625),
+        // hung under the caret's line as their own rows: only the first fits
+        // at the caret, and a "(+2 lines)" count let Tab insert a function
+        // body nobody had read. The caret row says how many did not fit.
+        let ghost_tail = if self.focused {
+            self.live_ghost()
+                .map_or(0, |t| t.split('\n').count().saturating_sub(1))
+        } else {
+            0
+        };
+        let push_ghost_rows = |rows: &mut Vec<VisRow>| {
+            for index in 1..=ghost_tail {
+                if rows.len() >= text_height {
+                    break;
+                }
+                rows.push(VisRow::Ghost { index });
+            }
+        };
         // A symbol tab stops painting at its symbol's last line.
         let clip_end = self.symbol_clip().map_or(self.lines.len(), |(_, end)| end);
         if wrap {
@@ -14835,6 +14899,9 @@ impl Widget for &mut Editor {
                         end: e,
                     });
                 }
+                if line == self.cursor_row && skip < segs.len() {
+                    push_ghost_rows(&mut visual_rows);
+                }
                 push_box_rows(&mut visual_rows, self, line, skip, segs.len(), tw);
                 skip = 0;
                 line += 1;
@@ -14856,6 +14923,9 @@ impl Widget for &mut Editor {
                             start: self.scroll_col,
                             end: self.scroll_col + text_width as usize,
                         });
+                        if line == self.cursor_row {
+                            push_ghost_rows(&mut visual_rows);
+                        }
                     }
                     push_box_rows(&mut visual_rows, self, line, skip, 1, tw);
                     skip = 0;
@@ -14900,6 +14970,19 @@ impl Widget for &mut Editor {
                         text_width,
                         box_idx,
                         box_row,
+                    );
+                    continue;
+                }
+                VisRow::Ghost { index } => {
+                    self.paint_ghost_row(
+                        buf,
+                        inner,
+                        y,
+                        gutter_width,
+                        text_x,
+                        text_width,
+                        index,
+                        wrap,
                     );
                     continue;
                 }
@@ -15670,9 +15753,10 @@ impl Widget for &mut Editor {
             }
 
             // Inline suggestion (#607): the first line as ghost text right at
-            // the caret (suggestions are only asked for at a line's end), with
-            // a count of the lines that come with it. It owns the line's tail,
-            // so the trailers below stand aside.
+            // the caret (suggestions are only asked for at a line's end); the
+            // rest hang below as `VisRow::Ghost` rows (#1625), and only lines
+            // that found no row are counted here. It owns the line's tail, so
+            // the trailers below stand aside.
             let ghost_here = self.focused
                 && line_idx == self.cursor_row
                 && row_end >= line_len
@@ -15682,9 +15766,12 @@ impl Widget for &mut Editor {
                 let x = text_x + text_cols as u16;
                 let right = inner.x + inner.width;
                 if x < right {
-                    let mut lines = text.split('\n');
-                    let first = lines.next().unwrap_or("");
-                    let more = lines.count();
+                    let first = text.split('\n').next().unwrap_or("");
+                    let shown_rows = visual_rows
+                        .iter()
+                        .filter(|r| matches!(r, VisRow::Ghost { .. }))
+                        .count();
+                    let more = text.split('\n').count() - 1 - shown_rows;
                     let shown = if more > 0 {
                         format!(
                             "{first}  (+{more} line{})",
