@@ -246,6 +246,9 @@ const COMMANDS: &[(&str, &str)] = &[
     ("git.createTag", "git_create_tag"),
     ("git.pushTags", "git_push_tags"),
     ("git.deleteRemoteTag", "git_delete_remote_tag"),
+
+    ("workbench.action.files.saveAs", "save_as"),
+    ("workbench.action.files.revert", "revert_file"),
     ("workbench.action.files.saveAll", "save_all"),
     ("explorer.newFile", "new_file"),
     ("explorer.newFolder", "new_folder"),
@@ -1932,6 +1935,32 @@ mod tests {
             vec![(String::from("ctrl+s"), String::from("save_file"))]
         );
         assert_eq!(report.snippets["Test"]["scope"], json!("rust"));
+    }
+
+    /// #1285: VS Code's Save As and Revert File keybindings import onto
+    /// croft's commands instead of being dropped.
+    #[test]
+    fn save_as_and_revert_keybindings_import() {
+        let mut report = Report::default();
+        convert_keybindings(
+            &json!([
+                { "key": "ctrl+alt+s", "command": "workbench.action.files.saveAs" },
+                { "key": "ctrl+alt+r", "command": "workbench.action.files.revert" },
+            ]),
+            &mut report,
+        );
+        assert_eq!(
+            report.keybindings,
+            vec![
+                (String::from("ctrl+alt+r"), String::from("revert_file")),
+                (String::from("ctrl+alt+s"), String::from("save_as")),
+            ]
+        );
+        assert!(
+            report.dropped_keybindings.is_empty(),
+            "{:?}",
+            report.dropped_keybindings
+        );
     }
 
     /// #1292: VS Code's Run Selected Text keybinding imports instead of
