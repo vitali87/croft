@@ -71,7 +71,7 @@ jobs:
           KEY: ${{ secrets.VERSION_BUMP_SSH_KEY }}
         run: |
           if [ -z "$KEY" ]; then
-            echo "::error::secrets.VERSION_BUMP_SSH_KEY is not set, so the pending release notes cannot be released. Add a deploy key with write access and its private key as that secret (CONTRIBUTING.md, 'Releases are cut after merge')."
+            echo "::error::secrets.VERSION_BUMP_SSH_KEY is not set, so the pending release notes cannot be released. Add a deploy key with write access and its private key as that secret (see the comment at the top of this workflow)."
             exit 1
           fi
 
