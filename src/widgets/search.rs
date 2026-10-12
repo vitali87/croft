@@ -1,4 +1,5 @@
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use grep_matcher::{LineMatchKind, LineTerminator, Match, Matcher, NoCaptures, NoError};
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, MmapChoice, Searcher, SearcherBuilder, Sink, SinkMatch};
 use ignore::{WalkBuilder, WalkState};
@@ -81,19 +82,212 @@ pub struct SearchOpts {
     pub use_regex: bool,
 }
 
-fn build_matcher(query: &str, opts: SearchOpts) -> Option<RegexMatcher> {
+fn build_matcher(query: &str, opts: SearchOpts) -> Option<SearchMatcher> {
     if query.is_empty() {
         return None;
     }
     compile_matcher(query, opts).ok()
 }
 
-fn compile_matcher(query: &str, opts: SearchOpts) -> Result<RegexMatcher, grep_regex::Error> {
+/// The search's matcher: ripgrep's own engine, or, for a pattern it can't
+/// compile because it needs look-around or a backreference, fancy-regex
+/// (#1552), as ripgrep's `--engine auto` falls back to PCRE2 and so VS Code
+/// runs `\d+ (?!USD)`, `(?<=@)\w+` and `(\w+) \1`. A pattern neither engine
+/// takes keeps ripgrep's error (#1496).
+fn compile_matcher(query: &str, opts: SearchOpts) -> Result<SearchMatcher, grep_regex::Error> {
     let mut b = RegexMatcherBuilder::new();
     b.case_insensitive(!opts.case_sensitive);
     b.word(opts.whole_word);
     b.fixed_strings(!opts.use_regex);
-    b.build(query)
+    match b.build(query) {
+        Ok(m) => Ok(SearchMatcher::Fast(m)),
+        Err(err) => {
+            if !opts.use_regex {
+                return Err(err);
+            }
+            let case = if opts.case_sensitive { "" } else { "(?i)" };
+            let pattern = if opts.whole_word {
+                format!(r"{case}(?<!\w)(?:{query})(?!\w)")
+            } else {
+                format!("{case}{query}")
+            };
+            fancy_regex::Regex::new(&pattern)
+                .map(|re| SearchMatcher::Fancy(Arc::new(re)))
+                .map_err(|_| err)
+        }
+    }
+}
+
+/// See [`compile_matcher`].
+#[derive(Clone, Debug)]
+enum SearchMatcher {
+    Fast(RegexMatcher),
+    /// Run line by line: it reports no line terminator, so the searcher
+    /// hands it one line at a time, which also keeps a `\s` or `[^x]` from
+    /// matching across lines, as with the fast engine.
+    Fancy(Arc<fancy_regex::Regex>),
+}
+
+impl Matcher for SearchMatcher {
+    type Captures = NoCaptures;
+    type Error = NoError;
+
+    fn find_at(&self, haystack: &[u8], at: usize) -> Result<Option<Match>, NoError> {
+        match self {
+            Self::Fast(m) => m.find_at(haystack, at),
+            // Text that isn't UTF-8 can't be searched by a `str` engine;
+            // it is a line with no match rather than an error. A pattern
+            // that runs past its backtracking limit is the same.
+            Self::Fancy(re) => Ok(std::str::from_utf8(haystack)
+                .ok()
+                .filter(|text| text.is_char_boundary(at))
+                .and_then(|text| re.find_from_pos(text, at).ok().flatten())
+                .map(|m| Match::new(m.start(), m.end()))),
+        }
+    }
+
+    fn new_captures(&self) -> Result<NoCaptures, NoError> {
+        Ok(NoCaptures::new())
+    }
+
+    fn shortest_match_at(&self, haystack: &[u8], at: usize) -> Result<Option<usize>, NoError> {
+        match self {
+            Self::Fast(m) => m.shortest_match_at(haystack, at),
+            Self::Fancy(_) => Ok(self.find_at(haystack, at)?.map(|m| m.end())),
+        }
+    }
+
+    fn is_match_at(&self, haystack: &[u8], at: usize) -> Result<bool, NoError> {
+        match self {
+            Self::Fast(m) => m.is_match_at(haystack, at),
+            Self::Fancy(_) => Ok(self.find_at(haystack, at)?.is_some()),
+        }
+    }
+
+    fn non_matching_bytes(&self) -> Option<&grep_matcher::ByteSet> {
+        match self {
+            Self::Fast(m) => m.non_matching_bytes(),
+            Self::Fancy(_) => None,
+        }
+    }
+
+    fn line_terminator(&self) -> Option<LineTerminator> {
+        match self {
+            Self::Fast(m) => m.line_terminator(),
+            Self::Fancy(_) => None,
+        }
+    }
+
+    fn find_candidate_line(&self, haystack: &[u8]) -> Result<Option<LineMatchKind>, NoError> {
+        match self {
+            Self::Fast(m) => m.find_candidate_line(haystack),
+            Self::Fancy(_) => Ok(self.shortest_match(haystack)?.map(LineMatchKind::Confirmed)),
+        }
+    }
+}
+
+/// A pattern for what the matcher can't do itself, highlighting a row's
+/// matches and expanding `$1` in a replacement: the `regex` crate's, or
+/// fancy-regex's for a pattern that needs it (#1552), as [`compile_matcher`].
+pub(crate) enum Pattern {
+    Plain(regex::Regex),
+    Fancy(fancy_regex::Regex),
+}
+
+impl Pattern {
+    fn new(pattern: &str) -> Option<Self> {
+        match regex::Regex::new(pattern) {
+            Ok(re) => Some(Self::Plain(re)),
+            Err(_) => fancy_regex::Regex::new(pattern).ok().map(Self::Fancy),
+        }
+    }
+
+    /// The regex `body` with the case and whole-word toggles, as the row
+    /// highlighter and the editor Find bar match it. A fancy-only pattern
+    /// takes whole-word by [`compile_matcher`]'s rule, `(?<!\w)` / `(?!\w)`,
+    /// so a match that starts or ends with punctuation (`-(?= )`) is shown
+    /// and replaced wherever the search counts it.
+    pub(crate) fn for_find(body: &str, opts: SearchOpts) -> Option<Self> {
+        let case = if opts.case_sensitive { "" } else { "(?i)" };
+        if !opts.whole_word {
+            return Self::new(&format!("{case}{body}"));
+        }
+        match regex::Regex::new(&format!(r"{case}\b(?:{body})\b")) {
+            Ok(re) => Some(Self::Plain(re)),
+            Err(_) => fancy_regex::Regex::new(&format!(r"{case}(?<!\w)(?:{body})(?!\w)"))
+                .ok()
+                .map(Self::Fancy),
+        }
+    }
+
+    fn has_group(&self, name: &str) -> bool {
+        match self {
+            Self::Plain(re) => re.capture_names().flatten().any(|n| n == name),
+            Self::Fancy(re) => re.capture_names().flatten().any(|n| n == name),
+        }
+    }
+
+    /// Every match in `line`, as byte spans.
+    pub(crate) fn spans(&self, line: &str) -> Vec<(usize, usize)> {
+        match self {
+            Self::Plain(re) => re.find_iter(line).map(|m| (m.start(), m.end())).collect(),
+            Self::Fancy(re) => re
+                .find_iter(line)
+                .map_while(Result::ok)
+                .map(|m| (m.start(), m.end()))
+                .collect(),
+        }
+    }
+
+    /// `replacement` expanded with the captures of the match spanning
+    /// exactly `start..end` of `line`. Captured from the whole line at the
+    /// match, so assertions like `\b` see the text around it (on the bare
+    /// substring `\b(\.rs)` no longer matched and `$1` came out literally);
+    /// the substring alone only as a fallback. None when neither holds a
+    /// match of exactly that span.
+    pub(crate) fn expand_at(
+        &self,
+        line: &str,
+        start: usize,
+        end: usize,
+        replacement: &str,
+    ) -> Option<String> {
+        let template = brace_refs(replacement, |name| self.has_group(name));
+        let mut out = String::new();
+        match self {
+            Self::Plain(re) => {
+                let caps = re
+                    .captures_at(line, start)
+                    .filter(|c| {
+                        c.get(0)
+                            .is_some_and(|m| (m.start(), m.end()) == (start, end))
+                    })
+                    .or_else(|| {
+                        re.captures(&line[start..end])
+                            .filter(|c| c.get(0).is_some_and(|m| m.range() == (0..end - start)))
+                    })?;
+                caps.expand(&template, &mut out);
+            }
+            Self::Fancy(re) => {
+                let caps = re
+                    .captures_from_pos(line, start)
+                    .ok()
+                    .flatten()
+                    .filter(|c| {
+                        c.get(0)
+                            .is_some_and(|m| (m.start(), m.end()) == (start, end))
+                    })
+                    .or_else(|| {
+                        re.captures(&line[start..end])
+                            .ok()
+                            .flatten()
+                            .filter(|c| c.get(0).is_some_and(|m| m.range() == (0..end - start)))
+                    })?;
+                caps.expand(&template, &mut out);
+            }
+        }
+        Some(out)
+    }
 }
 
 /// Why the query can't run, for the sidebar to show where the result count
@@ -265,7 +459,7 @@ impl PathFilter {
 
 struct HitSink<'a> {
     path: PathBuf,
-    matcher: &'a RegexMatcher,
+    matcher: &'a SearchMatcher,
     batch: &'a mut Vec<SearchHit>,
     cancel: Option<Arc<AtomicBool>>,
 }
@@ -545,39 +739,27 @@ pub fn split_for_highlight(line: &str, needle: &str, opts: SearchOpts) -> Vec<(S
 }
 
 fn split_for_highlight_regex(line: &str, needle: &str, opts: SearchOpts) -> Vec<(String, bool)> {
-    let mut pattern = String::new();
-    if !opts.case_sensitive {
-        pattern.push_str("(?i)");
-    }
-    if opts.whole_word {
-        pattern.push_str("\\b(?:");
-        pattern.push_str(needle);
-        pattern.push_str(")\\b");
-    } else {
-        pattern.push_str(needle);
-    }
-    let re = match regex::Regex::new(&pattern) {
-        Ok(r) => r,
-        Err(_) => return vec![(line.to_string(), false)],
+    let Some(re) = Pattern::for_find(needle, opts) else {
+        return vec![(line.to_string(), false)];
     };
     let mut out: Vec<(String, bool)> = Vec::new();
     let mut last = 0usize;
-    for m in re.find_iter(line) {
-        if m.start() > last {
-            out.push((line[last..m.start()].to_string(), false));
+    for (start, end) in re.spans(line) {
+        if start > last {
+            out.push((line[last..start].to_string(), false));
         }
         // Zero-width matches (`\b`, `^`) still count as match positions —
         // the replace preview inserts the expansion there, mirroring what
         // `replace_in_text` writes — and `last` must advance regardless, or
         // the text before the NEXT match re-emits and the row doubles
         // ("foofoo" for `\b` on "foo"; #124 review).
-        if m.end() == m.start() {
+        if end == start {
             out.push((String::new(), true));
-            last = m.end();
+            last = end;
             continue;
         }
-        out.push((line[m.start()..m.end()].to_string(), true));
-        last = m.end();
+        out.push((line[start..end].to_string(), true));
+        last = end;
     }
     if last < line.len() {
         out.push((line[last..].to_string(), false));
@@ -819,7 +1001,7 @@ pub fn collect_matches_in_text(
 /// matches exactly what the highlighter shows. In literal (non-regex) mode the
 /// query is escaped so metacharacters are matched verbatim. Returns `None` for
 /// an empty query or an uncompilable pattern.
-fn build_replace_regex(query: &str, opts: SearchOpts) -> Option<regex::Regex> {
+fn build_replace_regex(query: &str, opts: SearchOpts) -> Option<Pattern> {
     let q = as_typed(query);
     if q.is_empty() {
         return None;
@@ -838,7 +1020,7 @@ fn build_replace_regex(query: &str, opts: SearchOpts) -> Option<regex::Regex> {
     // each match by the search's own rule, not `\b`, which never matches
     // beside a query that starts or ends with punctuation (`$var`, `@x`).
     pattern.push_str(&body);
-    regex::Regex::new(&pattern).ok()
+    Pattern::new(&pattern)
 }
 
 /// Replace the matches in ONE line (no terminator), returning the new text
@@ -851,12 +1033,11 @@ fn build_replace_regex(query: &str, opts: SearchOpts) -> Option<regex::Regex> {
 /// as `Regex::replace_all` does, so `^` inserts at every line start.
 fn replace_in_line(
     line: &str,
-    matcher: &RegexMatcher,
-    full: Option<&regex::Regex>,
+    matcher: &SearchMatcher,
+    full: Option<&Pattern>,
     replacement: &str,
     opts: SearchOpts,
 ) -> (String, usize) {
-    use grep_matcher::Matcher;
     let mut out = String::with_capacity(line.len());
     let mut last = 0;
     let mut pos = 0;
@@ -873,29 +1054,10 @@ fn replace_in_line(
         let adjacent_empty = start == end && prev_end == Some(start);
         if !adjacent_empty {
             out.push_str(&line[last..start]);
-            // Captures from the whole line at the match, so assertions like
-            // `\b` see the text around it (on the bare substring `\b(\.rs)`
-            // no longer matched and `$1` came out literally); the substring
-            // alone only as a fallback.
-            let caps = full.and_then(|re| {
-                re.captures_at(line, start)
-                    .filter(|c| {
-                        c.get(0)
-                            .is_some_and(|m| (m.start(), m.end()) == (start, end))
-                    })
-                    .or_else(|| {
-                        re.captures(&line[start..end])
-                            .filter(|c| c.get(0).is_some_and(|m| m.range() == (0..end - start)))
-                    })
-            });
-            match caps.zip(full) {
-                Some((caps, re)) if opts.use_regex => {
-                    let mut expanded = String::new();
-                    caps.expand(&brace_group_refs(replacement, re), &mut expanded);
-                    out.push_str(&expanded);
-                }
-                _ => out.push_str(replacement),
-            }
+            let expanded = full
+                .filter(|_| opts.use_regex)
+                .and_then(|re| re.expand_at(line, start, end, replacement));
+            out.push_str(expanded.as_deref().unwrap_or(replacement));
             count += 1;
             last = end;
             prev_end = Some(end);
@@ -916,7 +1078,7 @@ fn replace_in_line(
 /// How many matches ONE line holds, by exactly the rule `replace_in_line`
 /// replaces them with, so the Search header's result count and the Replace
 /// All confirmation always agree (#860).
-fn count_in_line(line: &str, matcher: &RegexMatcher) -> usize {
+fn count_in_line(line: &str, matcher: &SearchMatcher) -> usize {
     replace_in_line(line, matcher, None, "", SearchOpts::default()).1
 }
 
@@ -944,17 +1106,16 @@ fn trim_leading_context(lead: &str, avail: usize, need: usize) -> Option<String>
     Some(lead[start..].to_string())
 }
 
-/// `replacement` made safe for `Captures::expand` against `re`, read the way
+/// `replacement` made safe for `Captures::expand`, read the way
 /// VS Code reads it. A numbered reference is braced (`$1_old` to
 /// `${1}_old`): the regex crate reads `$1_old` as a group NAMED `1_old`,
 /// which expands to nothing and deletes the match, where VS Code reads group
 /// 1 then `_old`. `$&` is the whole match and `$$` a literal dollar. A
-/// `$NAME` or `${NAME}` expands only when `re` has a group of that name;
+/// `$NAME` or `${NAME}` expands only when `is_group` knows that name;
 /// any other `$` is text (#1399), so a shell, PHP or Perl variable such as
 /// `$PREFIX` survives instead of expanding to nothing. A `$N` or `${N}`
 /// with no group N is text too (#1636).
-pub fn brace_group_refs(replacement: &str, re: &regex::Regex) -> String {
-    let is_group = |name: &str| re.capture_names().flatten().any(|n| n == name);
+fn brace_refs(replacement: &str, is_group: impl Fn(&str) -> bool) -> String {
     let is_name = |c: &char| c.is_ascii_alphanumeric() || *c == '_';
     let mut out = String::with_capacity(replacement.len());
     let mut rest = replacement;
@@ -1032,7 +1193,7 @@ pub fn replace_in_text(
     // a `(?x)` query's trailing `# comment` swallowed a closing `)$`.
     let full = if opts.use_regex {
         let case = if opts.case_sensitive { "" } else { "(?i)" };
-        Some(regex::Regex::new(&format!("{case}{q}")).ok()?)
+        Some(Pattern::new(&format!("{case}{q}"))?)
     } else {
         None
     };
@@ -1067,8 +1228,17 @@ pub fn expand_replacement(
         return replacement.to_string();
     };
     if opts.use_regex {
-        re.replace(matched, brace_group_refs(replacement, &re).as_str())
-            .into_owned()
+        re.spans(matched)
+            .first()
+            .and_then(|&(start, end)| {
+                let expanded = re.expand_at(matched, start, end, replacement)?;
+                Some(format!(
+                    "{}{expanded}{}",
+                    &matched[..start],
+                    &matched[end..]
+                ))
+            })
+            .unwrap_or_else(|| matched.to_string())
     } else {
         replacement.to_string()
     }
@@ -3760,8 +3930,8 @@ mod tests {
     }
 
     /// #1496: a regex that won't compile is an error, not "no matches".
-    /// Typos and the look-around / backreference syntax VS Code runs
-    /// through PCRE2 each name what is wrong.
+    /// #1552 negative: a typo is still one, though look-around now runs; it
+    /// keeps the fast engine's message, not the fallback's.
     #[test]
     fn a_regex_that_will_not_compile_names_the_problem() {
         let re = SearchOpts {
@@ -3772,15 +3942,154 @@ mod tests {
             query_error("foo(", re).as_deref(),
             Some("Invalid regex: unclosed group")
         );
-        let look_ahead = query_error(r"foo(?=\()", re).unwrap();
-        assert!(
-            look_ahead.starts_with("Invalid regex: look-around"),
-            "{look_ahead}"
+        let typo = query_error(r"(?<=@)\w+(", re).unwrap();
+        assert!(typo.starts_with("Invalid regex: "), "{typo}");
+    }
+
+    fn regex_opts() -> SearchOpts {
+        SearchOpts {
+            use_regex: true,
+            ..SearchOpts::default()
+        }
+    }
+
+    fn hit_lines(content: &str, query: &str, opts: SearchOpts) -> Vec<(usize, String)> {
+        let mut hits = Vec::new();
+        collect_matches_in_text(Path::new("a.py"), content, query, opts, &mut hits);
+        hits.into_iter().map(|h| (h.line_no, h.line_text)).collect()
+    }
+
+    /// #1552: a look-ahead, a look-behind and a backreference, which VS Code
+    /// runs through PCRE2, run, and carry no error.
+    #[test]
+    fn look_around_and_backreferences_search() {
+        let re = regex_opts();
+        let prices = "price: 10 USD\nprice: 20 EUR\n";
+        assert_eq!(query_error(r"\d+ (?!USD)", re), None);
+        assert_eq!(
+            hit_lines(prices, r"\d+ (?!USD)", re),
+            [(2, String::from("price: 20 EUR"))]
         );
-        let backref = query_error(r"(a)\1", re).unwrap();
-        assert!(
-            backref.starts_with("Invalid regex: backreferences"),
-            "{backref}"
+        assert_eq!(
+            hit_lines("to: ada@host\nno at here\n", r"(?<=@)\w+", re),
+            [(1, String::from("to: ada@host"))]
+        );
+        assert_eq!(query_error(r"(\w+) \1", re), None);
+        assert_eq!(
+            hit_lines("one two\nsaw the the cat\n", r"(\w+) \1", re),
+            [(2, String::from("saw the the cat"))]
+        );
+    }
+
+    /// #1552: the fallback keeps the case and whole-word toggles.
+    #[test]
+    fn look_around_keeps_case_and_whole_word() {
+        let text = "a@Host\nb@hostname\n";
+        let insensitive = regex_opts();
+        assert_eq!(hit_lines(text, r"(?<=@)host", insensitive).len(), 2);
+        let sensitive = SearchOpts {
+            case_sensitive: true,
+            ..insensitive
+        };
+        assert_eq!(
+            hit_lines(text, r"(?<=@)host", sensitive),
+            [(2, String::from("b@hostname"))]
+        );
+        let word = SearchOpts {
+            whole_word: true,
+            ..insensitive
+        };
+        assert_eq!(
+            hit_lines(text, r"(?<=@)host", word),
+            [(1, String::from("a@Host"))]
+        );
+    }
+
+    /// #1552: a result row highlights what the look-ahead matched, and the
+    /// count is of those matches.
+    #[test]
+    fn look_ahead_matches_are_highlighted_and_counted() {
+        let re = regex_opts();
+        assert_eq!(
+            split_for_highlight("10 USD 20 EUR 30 GBP", r"\d+ (?!USD)", re),
+            [
+                (String::from("10 USD "), false),
+                (String::from("20 "), true),
+                (String::from("EUR "), false),
+                (String::from("30 "), true),
+                (String::from("GBP"), false),
+            ]
+        );
+        let mut hits = Vec::new();
+        collect_matches_in_text(
+            Path::new("a"),
+            "10 USD 20 EUR 30 GBP\n",
+            r"\d+ (?!USD)",
+            re,
+            &mut hits,
+        );
+        assert_eq!(hits[0].matches, 2);
+    }
+
+    /// #1552: with whole-word on, a fancy-only match that starts or ends
+    /// with punctuation is highlighted where the search counts it, by the
+    /// matcher's `(?<!\w)` / `(?!\w)` rule, not `\b`.
+    #[test]
+    fn whole_word_look_ahead_highlights_by_the_search_rule() {
+        let word = SearchOpts {
+            whole_word: true,
+            ..regex_opts()
+        };
+        let mut hits = Vec::new();
+        collect_matches_in_text(Path::new("a"), "- \n", "-(?= )", word, &mut hits);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            split_for_highlight("- ", "-(?= )", word),
+            [(String::from("-"), true), (String::from(" "), false)]
+        );
+        assert_eq!(
+            split_for_highlight("a- ", "-(?= )", word),
+            [(String::from("a- "), false)]
+        );
+    }
+
+    /// #1552: Replace in Files runs a backreference too, `$1` and all, and
+    /// its preview shows the same.
+    #[test]
+    fn replace_with_a_backreference_pattern() {
+        let re = regex_opts();
+        assert_eq!(
+            replace_in_text("saw the the cat\nok ok\none\n", r"\b(\w+) \1\b", "$1", re),
+            Some((String::from("saw the cat\nok\none\n"), 2))
+        );
+        assert_eq!(
+            replace_in_text("price: 10 USD 20 EUR\n", r"(\d+) (?!USD)", "${1}€ ", re),
+            Some((String::from("price: 10 USD 20€ EUR\n"), 1))
+        );
+        assert_eq!(
+            expand_replacement("the the", r"(\w+) \1", "[$1]", re),
+            "[the]"
+        );
+    }
+
+    /// #1552 negative: a pattern the fast engine takes still runs on it, and
+    /// literal mode never falls back: `(?!USD)` there is just text.
+    #[test]
+    fn the_fallback_is_only_for_patterns_that_need_it() {
+        let re = regex_opts();
+        assert!(matches!(
+            compile_matcher(r"\d+ USD", re),
+            Ok(SearchMatcher::Fast(_))
+        ));
+        assert!(matches!(
+            compile_matcher(r"\d+ (?!USD)", re),
+            Ok(SearchMatcher::Fancy(_))
+        ));
+        let literal = SearchOpts::default();
+        assert!(hit_lines("price: 10 USD\n", "(?!USD)", literal).is_empty());
+        assert_eq!(
+            hit_lines("odd (?!USD) text\n", "(?!USD)", literal),
+            [(1, String::from("odd (?!USD) text"))]
         );
     }
 
@@ -3844,7 +4153,9 @@ mod tests {
         write(&tmp.path().join("a.py"), "foo(1)\n");
         let mut panel = SearchPanel::new(tmp.path().to_path_buf());
         panel.opts.use_regex = true;
-        panel.query = r"foo(?=\()".into();
+        // Unclosed, so neither engine runs it (#1552): the fast engine's
+        // look-around message is the long one this wraps.
+        panel.query = r"foo(?=\()(".into();
         panel.run_query();
         let area = Rect {
             x: 0,
