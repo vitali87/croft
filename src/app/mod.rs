@@ -71923,9 +71923,6 @@ fn repo_relative(repo_root: &Path, path: &Path) -> Option<String> {
     )
 }
 
-/// The workspace-relative key a file replicates under in a collab session
-/// (docs/MULTIPLAYER.md, Phase D). None outside the workspace: only
-/// workspace files are shared.
 /// The shell line a sudo save runs (#1379): `tee` copies the staged bytes
 /// into `target` as root, writing in place so the file keeps its owner and
 /// mode, and the staged copy is removed whether or not that worked.
@@ -71977,6 +71974,9 @@ fn stage_sudo_save(bytes: &[u8]) -> std::io::Result<PathBuf> {
     Err(last.unwrap_or_else(|| std::io::Error::other("no free staging name")))
 }
 
+/// The workspace-relative key a file replicates under in a collab session
+/// (docs/MULTIPLAYER.md, Phase D). None outside the workspace: only
+/// workspace files are shared.
 fn collab_file_key(root: &Path, path: &Path) -> Option<String> {
     path.strip_prefix(root)
         .ok()
