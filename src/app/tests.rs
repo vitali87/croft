@@ -56918,6 +56918,88 @@ fn copy_on_select_fires_for_a_click_only_forwarded_drag() {
     );
 }
 
+/// #1537: "File: Reopen as Preview" on a plain text capture opens the
+/// rendered log view instead of refusing, keeps it through a reload, and
+/// "Reopen as Text" goes back to the editable buffer.
+#[test]
+fn reopen_as_preview_shows_plain_text_as_a_rendered_log() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("run.out");
+    std::fs::write(&out, "2026-10-08 ERROR boom\nINFO ok\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&out).unwrap();
+    assert!(app.editor.log.is_none(), "plain text opens as text");
+
+    app.run_command(Command::ReopenAsPreview);
+    assert!(
+        app.editor.log.is_some(),
+        "the capture is shown as a rendered log; status {:?}",
+        app.status
+    );
+    assert!(!app.status.contains("No preview"), "{:?}", app.status);
+
+    std::fs::write(&out, "2026-10-08 ERROR boom\nINFO ok\nWARN late\n").unwrap();
+    assert!(app.editor.reload_if_clean().is_some_and(|r| r.is_ok()));
+    assert!(app.editor.log.is_some(), "a reload keeps the preview");
+
+    app.run_command(Command::ReopenAsText);
+    assert!(app.editor.log.is_none(), "back to the text");
+    assert_eq!(app.editor.lines[2], "WARN late");
+
+    let other = tmp.path().join("other.out");
+    std::fs::write(&other, "plain\n").unwrap();
+    app.editor.open_pinned(&out).unwrap();
+    app.run_command(Command::ReopenAsPreview);
+    app.editor.open(&other).unwrap();
+    assert!(
+        app.editor.log.is_none(),
+        "the choice belonged to run.out, not to the next file"
+    );
+}
+
+/// #1537 negative: source code has a grammar and no preview, so Reopen as
+/// Preview still says so rather than turning it into a log.
+#[test]
+fn reopen_as_preview_leaves_source_code_as_text() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("main.rs");
+    std::fs::write(&src, "fn main() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&src).unwrap();
+    app.run_command(Command::ReopenAsPreview);
+    assert!(app.editor.log.is_none());
+    assert_eq!(
+        app.status,
+        "No preview for this file type; showing the text"
+    );
+}
+
+/// #1537: the "Log: Highlighting (tailspin)" switch reaches a plain `.log`
+/// already open as text, not only rendered log views.
+#[test]
+fn the_log_highlight_switch_recolours_an_open_plain_log() {
+    let _exclusive = crate::log_view::DEFAULT_HIGHLIGHT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let before = crate::log_view::default_highlight();
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("app.log");
+    std::fs::write(&log, "ERROR boom\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_log_highlight(true);
+    app.editor.open_pinned(&log).unwrap();
+    assert!(app.editor.log.is_none(), "a plain log is a text tab");
+    let coloured = |app: &App| !app.editor.highlights_for_test()[0].is_empty();
+    assert!(coloured(&app), "ERROR is coloured");
+    app.set_log_highlight(false);
+    assert!(!coloured(&app), "switched off, the open tab goes plain");
+    app.set_log_highlight(true);
+    assert!(coloured(&app), "and back on, coloured again");
+    crate::log_view::set_default_highlight(before);
+}
+
 #[test]
 fn toggling_log_highlighting_flips_open_views_and_the_default() {
     // #466: the palette / Settings toggle reaches the view that is already
