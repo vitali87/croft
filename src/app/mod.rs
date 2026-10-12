@@ -3084,6 +3084,8 @@ pub struct App {
     /// The project's `files_exclude` globs (#1345), as last applied to the
     /// Explorer, so a settings reload re-lists the tree only on a change.
     files_exclude: Vec<String>,
+    /// The `files_associations` in effect (#1574), to tell a change.
+    files_associations: std::collections::BTreeMap<String, String>,
     /// Tailspin highlighting in rendered log views (#466): the inverse of
     /// the `disable_log_highlight` preference. Pushed into `log_view`'s
     /// default for views opened later and into every open view on toggle.
@@ -5763,6 +5765,7 @@ impl App {
             format_on_save: loaded_prefs.format_on_save,
             copy_on_select: loaded_prefs.copy_on_select,
             files_exclude: Vec::new(),
+            files_associations: std::collections::BTreeMap::new(),
             log_highlight: !loaded_prefs.disable_log_highlight,
             secret_redaction: !loaded_prefs.disable_secret_redaction,
             redaction_reveal_until: None,
@@ -6480,6 +6483,7 @@ impl App {
         // The agent review queue as this workspace last left it (#345).
         let root = app.workspace_root().to_path_buf();
         app.apply_project_excludes(&loaded_prefs);
+        app.apply_file_associations(&loaded_prefs);
         app.agent_ledger = app.load_agent_ledger(&root);
         app.sync_agent_lane_decorations();
         Ok(app)
@@ -59241,6 +59245,41 @@ impl App {
         }
     }
 
+    /// Apply `files_associations` (#1574): a file opens in the language a
+    /// glob names for it. Open tabs still in the language croft picked for
+    /// them follow a change; one whose language was picked by hand keeps it.
+    fn apply_file_associations(&mut self, p: &crate::prefs::Prefs) {
+        if p.files_associations == self.files_associations {
+            return;
+        }
+        let picked = |e: &crate::widgets::editor::Editor| {
+            let path = e.path.as_ref()?;
+            (!e.has_non_text_view() && e.language() == crate::highlight::lang_for_path(path))
+                .then(|| path.clone())
+        };
+        let following: Vec<PathBuf> = std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .filter_map(picked)
+            .collect();
+        for root in self.roots.iter() {
+            crate::highlight::set_file_associations(root, &p.files_associations);
+        }
+        self.files_associations = p.files_associations.clone();
+        for e in std::iter::once(&mut self.editor)
+            .chain(self.editor_layout.inactive_groups_mut())
+            .flat_map(|g| g.editors.iter_mut())
+        {
+            let Some(path) = e.path.clone().filter(|p| following.contains(p)) else {
+                continue;
+            };
+            let lang = crate::highlight::lang_for_path(&path);
+            if lang != e.language() {
+                e.set_language(lang);
+            }
+        }
+    }
+
     /// The Go to File index without the files the project excludes
     /// (#1345): VS Code's file search honours both exclude settings.
     fn without_project_excludes(
@@ -59306,6 +59345,7 @@ impl App {
         self.auto_save_on_focus_change = p.auto_save_on_focus_change;
         self.copy_on_select = p.copy_on_select;
         self.apply_project_excludes(p);
+        self.apply_file_associations(p);
         // The ssh-pane offer's switches apply live like every other pref
         // here (#364); turning it off also takes down an offer on screen.
         self.remote_offer_disabled = p.disable_remote_offer;

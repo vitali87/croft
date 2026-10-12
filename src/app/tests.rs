@@ -78812,6 +78812,7 @@ fn diag_on_line(line: u32, message: &str) -> crate::lsp::manager::Diagnostic {
         end_char: 1,
         severity: crate::lsp::manager::DiagnosticSeverity::Warning,
         message: String::from(message),
+        tags: Default::default(),
     }
 }
 
@@ -80325,4 +80326,83 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     app.watch_published_panes.insert(pane);
     assert!(!app.apply_build_scan(pane, Some(&cwd), "tsc --watch", "a.c:1:1: error: old\n"));
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
+}
+
+/// #1574: a workspace's `files_associations` open `card.tpl` as HTML, and
+/// again after the tab is closed and the file reopened.
+#[test]
+fn an_associated_template_opens_in_its_language_every_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/config.json"),
+        r#"{ "files_associations": { "*.tpl": "html" } }"#,
+    )
+    .unwrap();
+    let mut app = app_with_open_file(tmp.path(), "card.tpl", "<h1>{{ title }}</h1>\n");
+    assert_eq!(
+        app.editor.language(),
+        Some(crate::highlight::LangKind::Html)
+    );
+    assert_eq!(app.editor.language_label(), "HTML");
+    app.editor.close_active();
+    app.editor
+        .open_pinned(&tmp.path().join("card.tpl"))
+        .unwrap();
+    assert_eq!(
+        app.editor.language(),
+        Some(crate::highlight::LangKind::Html)
+    );
+}
+
+/// #1574: a settings change re-languages the open tabs croft chose a
+/// language for, and leaves one whose language was picked by hand.
+#[test]
+fn a_new_association_relanguages_open_tabs_but_not_a_hand_picked_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.tpl", "<b>x</b>\n");
+    assert_eq!(app.editor.language(), None, "no association yet");
+    std::fs::write(tmp.path().join("b.tpl"), "<i>y</i>\n").unwrap();
+    app.editor.open_pinned(&tmp.path().join("b.tpl")).unwrap();
+    app.editor
+        .set_language(Some(crate::highlight::LangKind::Xml));
+    let mut prefs = crate::prefs::Prefs::default();
+    prefs
+        .files_associations
+        .insert(String::from("*.tpl"), String::from("html"));
+    app.apply_file_associations(&prefs);
+    let langs: Vec<_> = app
+        .editor
+        .editors
+        .iter()
+        .map(|e| (e.path.clone().unwrap(), e.language()))
+        .collect();
+    assert!(
+        langs.contains(&(
+            tmp.path().join("a.tpl"),
+            Some(crate::highlight::LangKind::Html)
+        )),
+        "{langs:?}"
+    );
+    assert!(
+        langs.contains(&(
+            tmp.path().join("b.tpl"),
+            Some(crate::highlight::LangKind::Xml)
+        )),
+        "{langs:?}"
+    );
+}
+
+/// #1574 negative: with no association, an unknown extension stays Plain
+/// Text and a known one keeps its language.
+#[test]
+fn without_an_association_files_keep_the_built_in_languages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app_with_open_file(tmp.path(), "card.tpl", "<h1>x</h1>\n");
+    assert_eq!(app.editor.language(), None);
+    let app = app_with_open_file(tmp.path(), "main.rs", "fn main() {}\n");
+    assert_eq!(
+        app.editor.language(),
+        Some(crate::highlight::LangKind::Rust)
+    );
 }

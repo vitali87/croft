@@ -162,6 +162,25 @@ fn as_enabled_globs(v: &Value) -> Option<Value> {
     ))
 }
 
+/// VS Code's `files.associations` object (#1574): each glob with the
+/// language id it names, kept where croft can highlight or serve that
+/// language (or it is `plaintext`). An entry naming a language croft has
+/// neither is left out, so the file keeps the language croft picks for it.
+fn as_associations(v: &Value) -> Option<Value> {
+    let obj = v.as_object()?;
+    let kept: Map<String, Value> = obj
+        .iter()
+        .filter_map(|(glob, id)| {
+            let id = crate::highlight::normalised_language_id(id.as_str()?);
+            let known = id == "plaintext"
+                || crate::highlight::lang_for_language_id(&id).is_some()
+                || crate::lsp::languages::resolve(&id).is_some();
+            known.then(|| (glob.clone(), Value::from(id)))
+        })
+        .collect();
+    (!kept.is_empty()).then_some(Value::Object(kept))
+}
+
 const SETTINGS: &[SettingMap] = &[
     SettingMap {
         vscode: "editor.formatOnSave",
@@ -227,6 +246,11 @@ const SETTINGS: &[SettingMap] = &[
         vscode: "search.exclude",
         croft: "search_exclude",
         convert: as_enabled_globs,
+    },
+    SettingMap {
+        vscode: "files.associations",
+        croft: "files_associations",
+        convert: as_associations,
     },
 ];
 
@@ -1179,6 +1203,44 @@ mod tests {
                 "{key} is not a field of Prefs, so croft would ignore it"
             );
         }
+    }
+
+    /// #1574: `files.associations` maps to `files_associations`, with
+    /// VS Code's ids normalised and a language croft has neither a grammar
+    /// nor a server for left out.
+    #[test]
+    fn files_associations_keep_the_languages_croft_knows() {
+        let mut report = Report::default();
+        convert_settings(
+            &json!({
+                "files.associations": {
+                    "*.tpl": "html",
+                    "*.json5": "jsonc",
+                    "**/templates/*.txt": "jinja",
+                    "*.log": "plaintext"
+                }
+            }),
+            &mut report,
+        );
+        assert_eq!(
+            report.settings["files_associations"],
+            json!({ "*.tpl": "html", "*.json5": "json", "*.log": "plaintext" })
+        );
+        let parsed: crate::prefs::Prefs = serde_json::from_value(serde_json::Value::Object(
+            report.settings.clone().into_iter().collect(),
+        ))
+        .unwrap();
+        assert_eq!(parsed.files_associations["*.tpl"], "html");
+    }
+
+    #[test]
+    fn files_associations_naming_nothing_croft_knows_import_nothing() {
+        let mut report = Report::default();
+        convert_settings(
+            &json!({ "files.associations": { "*.j2": "jinja" } }),
+            &mut report,
+        );
+        assert!(!report.settings.contains_key("files_associations"));
     }
 
     /// #1345: `files.exclude` / `search.exclude` carry the globs set to

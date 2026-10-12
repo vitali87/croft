@@ -7465,6 +7465,11 @@ fn build_client_capabilities() -> ClientCapabilities {
 }
 
 fn path_to_language(path: &Path) -> Option<Language> {
+    // `files_associations` first (#1574), so the server serves the
+    // language the editor highlights: an id with no server gets none.
+    if let Some(id) = crate::highlight::associated_language_id(path) {
+        return crate::lsp::languages::resolve(&id);
+    }
     path.extension()
         .and_then(|e| e.to_str())
         .and_then(Language::from_extension)
@@ -7657,6 +7662,30 @@ mod tests {
         SemanticTokensOptions,
     };
     use std::time::{Duration, Instant};
+
+    /// #1574: the server follows `files_associations`: a `.tpl` associated
+    /// with HTML gets the HTML server, and a file associated with a
+    /// language that has no server gets none, not its extension's.
+    #[test]
+    fn an_associated_file_gets_its_associations_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let map = [("*.tpl", "html"), ("*.rs", "plaintext")]
+            .iter()
+            .map(|(g, id)| (g.to_string(), id.to_string()))
+            .collect();
+        crate::highlight::set_file_associations(tmp.path(), &map);
+        assert_eq!(
+            path_to_language(&tmp.path().join("card.tpl")),
+            crate::lsp::languages::resolve("html")
+        );
+        assert!(crate::lsp::languages::resolve("html").is_some());
+        assert_eq!(path_to_language(&tmp.path().join("main.rs")), None);
+        assert_eq!(
+            path_to_language(&tmp.path().join("lib.py")),
+            crate::lsp::languages::resolve("python"),
+            "an unassociated file keeps its extension's server"
+        );
+    }
 
     impl LspManager {
         /// Test seam for App-level completion tests: swap the completion
