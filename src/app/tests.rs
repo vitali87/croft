@@ -79435,3 +79435,336 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     assert!(!app.apply_build_scan(pane, Some(&cwd), "tsc --watch", "a.c:1:1: error: old\n"));
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
 }
+
+/// The issue's repo (#1627): `main` has "init app" and "update readme";
+/// `feature`, off "init app", has "fix crash on empty input" (appends to
+/// `app.txt`) and "add feature flag". HEAD is `main`.
+fn commit_actions_repo() -> tempfile::TempDir {
+    let tmp = make_committed_repo();
+    let p = tmp.path();
+    std::fs::write(p.join("app.txt"), "a\n").unwrap();
+    assert!(git_succeeds(p, &["add", "."]) && git_succeeds(p, &["commit", "-qm", "init app"]));
+    assert!(git_succeeds(p, &["checkout", "-qb", "feature"]));
+    std::fs::write(p.join("app.txt"), "a\nfix\n").unwrap();
+    assert!(git_succeeds(
+        p,
+        &["commit", "-qam", "fix crash on empty input"]
+    ));
+    std::fs::write(p.join("f.txt"), "f\n").unwrap();
+    assert!(
+        git_succeeds(p, &["add", "."]) && git_succeeds(p, &["commit", "-qm", "add feature flag"])
+    );
+    assert!(git_succeeds(p, &["checkout", "-q", "main"]));
+    std::fs::write(p.join("b.txt"), "b\n").unwrap();
+    assert!(git_succeeds(p, &["add", "."]) && git_succeeds(p, &["commit", "-qm", "update readme"]));
+    tmp
+}
+
+/// An app on `p` with Source Control showing and the COMMITS graph drawn
+/// from the repo's real history.
+fn commit_graph_app(p: &std::path::Path) -> App {
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.sidebar_view = SidebarView::SourceControl;
+    app.show_tree = true;
+    app.source_control.status.in_repo = true;
+    app.commit_graph
+        .set_rows(crate::widgets::commit_graph::layout_graph(
+            crate::git::commit_graph(p, 100),
+        ));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 44)).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    app
+}
+
+/// Right-click the COMMITS row whose summary is `summary`.
+fn right_click_commit(app: &mut App, summary: &str) {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let area = app.commit_graph.last_area;
+    let y = (area.y..area.y + area.height)
+        .find(|&y| {
+            app.commit_graph
+                .commit_at(y)
+                .is_some_and(|c| c.summary == summary)
+        })
+        .unwrap_or_else(|| panic!("{summary} is drawn in COMMITS"));
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        area.x + 4,
+        y,
+    ));
+}
+
+/// Pick `label` from the open context menu, or `label` inside the
+/// submenu `sub`, and run it.
+fn pick_commit_menu(app: &mut App, sub: Option<&str>, label: &str) {
+    let menu = app.context_menu.take().expect("a context menu is open");
+    let items = match sub {
+        None => &menu.items,
+        Some(sub) => menu
+            .items
+            .iter()
+            .find_map(|e| match e {
+                MenuEntry::Submenu { label: l, items } if l == sub => Some(items),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no {sub} submenu")),
+    };
+    let action = menu_action_of(items, label)
+        .unwrap_or_else(|| panic!("no {label} in {:?}", menu_labels(items)))
+        .clone();
+    app.dispatch_menu_action(action, menu.target_dir.clone());
+}
+
+/// #1627: right-clicking a COMMITS row opens the commit's actions, where
+/// it did nothing.
+#[test]
+fn right_clicking_a_commit_opens_its_actions() {
+    let tmp = commit_actions_repo();
+    let mut app = commit_graph_app(tmp.path());
+    right_click_commit(&mut app, "fix crash on empty input");
+    let menu = app
+        .context_menu
+        .as_ref()
+        .expect("right-click on a commit opens a menu");
+    let labels: Vec<&str> = menu_labels(&menu.items)
+        .into_iter()
+        .filter(|l| *l != "---")
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            "Cherry-Pick",
+            "Revert",
+            "Checkout (Detached)",
+            "Create Branch Here...",
+            "Create Tag Here...",
+            "Reset Current Branch to Here",
+            "Copy Commit Hash",
+            "Copy Commit Message",
+        ]
+    );
+}
+
+/// #1627: Cherry-Pick puts a clean commit from another branch on HEAD.
+#[test]
+fn cherry_pick_from_the_graph_adds_the_commit_to_head() {
+    let tmp = commit_actions_repo();
+    let p = tmp.path();
+    let before = git_stdout(p, &["rev-parse", "HEAD"]);
+    let mut app = commit_graph_app(p);
+    right_click_commit(&mut app, "fix crash on empty input");
+    pick_commit_menu(&mut app, None, "Cherry-Pick");
+    assert_eq!(
+        git_stdout(p, &["log", "-1", "--format=%s"]),
+        "fix crash on empty input"
+    );
+    assert_eq!(git_stdout(p, &["rev-parse", "HEAD~1"]), before);
+    assert_eq!(git_stdout(p, &["branch", "--show-current"]), "main");
+    assert_eq!(
+        std::fs::read_to_string(p.join("app.txt")).unwrap(),
+        "a\nfix\n"
+    );
+    assert!(app.status.starts_with("Cherry-picked"), "{}", app.status);
+}
+
+/// #1627: a cherry-pick that conflicts stops with `CHERRY_PICK_HEAD`, so
+/// Git: Continue / Abort take it from there; Abort puts HEAD back.
+#[test]
+fn a_conflicting_cherry_pick_from_the_graph_stops_for_continue_or_abort() {
+    use crate::git::RepoOp;
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    let before = git_stdout(p, &["rev-parse", "HEAD"]);
+    let mut app = commit_graph_app(p);
+    right_click_commit(&mut app, "feat");
+    pick_commit_menu(&mut app, None, "Cherry-Pick");
+    assert_eq!(crate::git::repo_operation(p), Some(RepoOp::CherryPick));
+    assert!(p.join(".git/CHERRY_PICK_HEAD").exists());
+    app.run_command(crate::widgets::command_palette::Command::GitAbortOperation);
+    assert_eq!(crate::git::repo_operation(p), None, "{}", app.status);
+    assert_eq!(git_stdout(p, &["rev-parse", "HEAD"]), before);
+}
+
+/// #1627: Revert commits the inverse with git's own message and body.
+#[test]
+fn revert_from_the_graph_commits_git_s_revert_message() {
+    let tmp = commit_actions_repo();
+    let p = tmp.path();
+    let target = git_stdout(p, &["rev-parse", "HEAD"]);
+    let mut app = commit_graph_app(p);
+    right_click_commit(&mut app, "update readme");
+    pick_commit_menu(&mut app, None, "Revert");
+    assert_eq!(
+        git_stdout(p, &["log", "-1", "--format=%s"]),
+        "Revert \"update readme\""
+    );
+    assert!(
+        git_stdout(p, &["log", "-1", "--format=%b"])
+            .contains(&format!("This reverts commit {target}")),
+    );
+    assert!(!p.join("b.txt").exists());
+}
+
+/// #1627: Checkout (Detached) moves HEAD to the commit, on no branch.
+#[test]
+fn checkout_detached_from_the_graph_moves_head_to_the_commit() {
+    let tmp = commit_actions_repo();
+    let p = tmp.path();
+    let target = git_stdout(p, &["rev-parse", "feature~1"]);
+    let mut app = commit_graph_app(p);
+    right_click_commit(&mut app, "fix crash on empty input");
+    pick_commit_menu(&mut app, None, "Checkout (Detached)");
+    assert_eq!(git_stdout(p, &["rev-parse", "HEAD"]), target);
+    assert_eq!(git_stdout(p, &["branch", "--show-current"]), "");
+}
+
+/// #1627: Create Branch Here asks for a name and points the new branch at
+/// the clicked commit, not at HEAD.
+#[test]
+fn create_branch_here_points_the_branch_at_the_clicked_commit() {
+    let tmp = commit_actions_repo();
+    let p = tmp.path();
+    let target = git_stdout(p, &["rev-parse", "feature~1"]);
+    let mut app = commit_graph_app(p);
+    right_click_commit(&mut app, "fix crash on empty input");
+    pick_commit_menu(&mut app, None, "Create Branch Here...");
+    for c in "hotfix".chars() {
+        app.input_prompt
+            .as_mut()
+            .expect("a name prompt")
+            .push_char(c);
+    }
+    app.submit_input_prompt();
+    assert_eq!(git_stdout(p, &["rev-parse", "hotfix"]), target);
+    assert_eq!(git_stdout(p, &["branch", "--show-current"]), "hotfix");
+}
+
+/// #1627: Create Tag Here tags the clicked commit; HEAD is untouched.
+#[test]
+fn create_tag_here_tags_the_clicked_commit_not_head() {
+    let tmp = commit_actions_repo();
+    let p = tmp.path();
+    let target = git_stdout(p, &["rev-parse", "feature"]);
+    let head = git_stdout(p, &["rev-parse", "HEAD"]);
+    let mut app = commit_graph_app(p);
+    right_click_commit(&mut app, "add feature flag");
+    pick_commit_menu(&mut app, None, "Create Tag Here...");
+    for c in "v0.1".chars() {
+        app.input_prompt
+            .as_mut()
+            .expect("a name prompt")
+            .push_char(c);
+    }
+    app.submit_input_prompt();
+    assert_eq!(git_stdout(p, &["rev-parse", "v0.1^{commit}"]), target);
+    assert_eq!(git_stdout(p, &["rev-parse", "HEAD"]), head);
+}
+
+/// #1627: a soft reset moves the branch and keeps the undone change
+/// staged, with no question asked.
+#[test]
+fn reset_soft_to_a_commit_keeps_the_changes_staged() {
+    let tmp = commit_actions_repo();
+    let p = tmp.path();
+    let target = git_stdout(p, &["rev-parse", "main~1"]);
+    let mut app = commit_graph_app(p);
+    right_click_commit(&mut app, "init app");
+    pick_commit_menu(
+        &mut app,
+        Some("Reset Current Branch to Here"),
+        "Soft (keep changes staged)",
+    );
+    assert_eq!(git_stdout(p, &["rev-parse", "main"]), target);
+    assert_eq!(git_stdout(p, &["diff", "--cached", "--name-only"]), "b.txt");
+}
+
+/// #1627 negative: a hard reset with a dirty tree asks first and changes
+/// nothing; only a second ask for the same commit resets.
+#[test]
+fn reset_hard_asks_first_and_changes_nothing_until_asked_again() {
+    let tmp = commit_actions_repo();
+    let p = tmp.path();
+    let head = git_stdout(p, &["rev-parse", "HEAD"]);
+    let target = git_stdout(p, &["rev-parse", "main~1"]);
+    std::fs::write(p.join("app.txt"), "a\nunsaved work\n").unwrap();
+    let mut app = commit_graph_app(p);
+    right_click_commit(&mut app, "init app");
+    pick_commit_menu(
+        &mut app,
+        Some("Reset Current Branch to Here"),
+        "Hard (discard changes)",
+    );
+    assert_eq!(
+        git_stdout(p, &["rev-parse", "HEAD"]),
+        head,
+        "the first ask only warns"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("app.txt")).unwrap(),
+        "a\nunsaved work\n"
+    );
+    assert!(app.status.contains("again"), "{}", app.status);
+    right_click_commit(&mut app, "init app");
+    pick_commit_menu(
+        &mut app,
+        Some("Reset Current Branch to Here"),
+        "Hard (discard changes)",
+    );
+    assert_eq!(git_stdout(p, &["rev-parse", "HEAD"]), target);
+    assert_eq!(std::fs::read_to_string(p.join("app.txt")).unwrap(), "a\n");
+}
+
+/// #1627 negative: a warned hard reset is not carried over to a different
+/// commit or past another action; each needs its own second ask.
+#[test]
+fn a_warned_hard_reset_does_not_carry_to_another_commit() {
+    let tmp = commit_actions_repo();
+    let p = tmp.path();
+    let head = git_stdout(p, &["rev-parse", "HEAD"]);
+    let mut app = commit_graph_app(p);
+    right_click_commit(&mut app, "init app");
+    pick_commit_menu(
+        &mut app,
+        Some("Reset Current Branch to Here"),
+        "Hard (discard changes)",
+    );
+    right_click_commit(&mut app, "init");
+    pick_commit_menu(
+        &mut app,
+        Some("Reset Current Branch to Here"),
+        "Hard (discard changes)",
+    );
+    assert_eq!(git_stdout(p, &["rev-parse", "HEAD"]), head);
+    right_click_commit(&mut app, "init app");
+    pick_commit_menu(
+        &mut app,
+        Some("Reset Current Branch to Here"),
+        "Mixed (keep changes unstaged)",
+    );
+    assert_ne!(
+        git_stdout(p, &["rev-parse", "HEAD"]),
+        head,
+        "mixed resets at once"
+    );
+}
+
+/// #1627 negative: a right-click on the COMMITS header opens no commit
+/// menu.
+#[test]
+fn a_right_click_off_the_commit_rows_opens_no_commit_menu() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = commit_actions_repo();
+    let mut app = commit_graph_app(tmp.path());
+    let area = app.commit_graph.last_area;
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        area.x + 4,
+        area.y,
+    ));
+    assert!(
+        app.context_menu
+            .as_ref()
+            .is_none_or(|m| !menu_labels(&m.items).contains(&"Cherry-Pick")),
+        "the header is not a commit"
+    );
+}

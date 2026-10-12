@@ -3082,6 +3082,61 @@ pub fn rebase_branch(root: &Path, branch: &str) -> Result<String, String> {
     run_mutation_keeping_conflicts(root, &["rebase", branch])
 }
 
+// --- Commit actions (the COMMITS graph's right-click menu, #1627) ---------
+
+/// Apply `hash` on top of HEAD (`git cherry-pick <hash>`). A conflict
+/// leaves `CHERRY_PICK_HEAD`, so Git: Continue / Skip / Abort take over.
+pub fn cherry_pick(root: &Path, hash: &str) -> Result<String, String> {
+    run_mutation_keeping_conflicts(root, &["cherry-pick", hash])
+}
+
+/// Commit the inverse of `hash` with git's own "Revert ..." message
+/// (`git revert --no-edit <hash>`); a conflict leaves `REVERT_HEAD`.
+pub fn revert_commit(root: &Path, hash: &str) -> Result<String, String> {
+    run_mutation_keeping_conflicts(root, &["revert", "--no-edit", hash])
+}
+
+/// Check out `hash` with no branch (`git switch --detach <hash>`).
+pub fn checkout_detached(root: &Path, hash: &str) -> Result<String, String> {
+    run_mutation(root, &["switch", "--detach", hash])
+}
+
+/// Create a lightweight tag at `target` (`git tag <name> <target>`).
+pub fn create_tag_at(root: &Path, name: &str, target: &str) -> Result<String, String> {
+    run_mutation(root, &["tag", name, target])
+}
+
+/// How far [`reset_to`] rewinds: HEAD only, HEAD and the index, or HEAD,
+/// the index and the working tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetMode {
+    Soft,
+    Mixed,
+    Hard,
+}
+
+impl ResetMode {
+    fn flag(self) -> &'static str {
+        match self {
+            ResetMode::Soft => "--soft",
+            ResetMode::Mixed => "--mixed",
+            ResetMode::Hard => "--hard",
+        }
+    }
+}
+
+/// Move the current branch to `hash` (`git reset --soft|--mixed|--hard`).
+pub fn reset_to(root: &Path, hash: &str, mode: ResetMode) -> Result<String, String> {
+    run_mutation(root, &["reset", "-q", mode.flag(), hash])
+}
+
+/// The full message of `hash` (`git log -1 --format=%B`), trimmed.
+pub fn commit_message(root: &Path, hash: &str) -> Result<String, String> {
+    run_git(root, &["log", "-1", "--format=%B", hash])
+        .map(|m| m.trim().to_string())
+        .map_err(|e| e.to_string())
+}
+
 // --- Remotes -------------------------------------------------------------
 
 /// A configured remote: its name and fetch URL, for the Remote submenu's

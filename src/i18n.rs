@@ -211,6 +211,7 @@ pub const TRANSLATABLE: &[&str] = &[
     "Remote",
     "Remove Folder from Workspace",
     "Rename",
+    "Reset Current Branch to Here",
     "Reveal in Explorer View",
     "Reveal in Finder",
     "Run and Debug",

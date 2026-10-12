@@ -175,6 +175,11 @@ pub enum InputPurpose {
         name: String,
     },
     CreateTag,
+    /// Create Tag Here on a COMMITS row (#1627): the tag goes on `target`,
+    /// the clicked commit, rather than on HEAD.
+    CreateTagAt {
+        target: String,
+    },
     /// Add a debugger watch expression (#112): submitting appends it to the
     /// App's watch list and re-evaluates at the current stop.
     AddWatch,
