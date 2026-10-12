@@ -35,7 +35,7 @@ Per platform:
 | `Ctrl+Shift+e` / `Cmd+Shift+e` | Jump to the Explorer sidebar |
 | `Ctrl+Shift+f` / `Cmd+Shift+f` | Jump to the Search sidebar |
 | `Ctrl+Shift+s` / `Cmd+Shift+s` | Jump to Source Control. `Ctrl+Shift+s` needs a terminal that reports the `Shift` (the kitty keyboard protocol: kitty, Ghostty, WezTerm, Alacritty); others send it as `Ctrl+s`, which saves. Under tmux only 3.2 to 3.4 with `extended-keys always` reports it ([LINUX.md](LINUX.md#the-command-modifier)) |
-| `Ctrl+Shift+b` / `Cmd+Shift+b` | Run the project's build task in a named terminal pane, auto-detected from its manifests (`.vscode/tasks.json`, Makefile, justfile, package.json, Cargo.toml, pyproject.toml). "Tasks: Run Task" and "Tasks: Rerun Last Task" live in the Command Palette |
+| `Ctrl+Shift+b` / `Cmd+Shift+b` | Run the project's build task in a named terminal pane, auto-detected from its manifests (`.vscode/tasks.json`, Makefile, justfile, package.json, Cargo.toml, pyproject.toml). "Tasks: Run Task" and "Tasks: Rerun Last Task" live in the Command Palette. Every task, like every Testing run, first saves the unsaved editors, as VS Code's `task.saveBeforeRun` does ([#1639](https://github.com/vitali87/croft/issues/1639)); `"disable_save_before_debug": true` turns that off too, and the status line then names the unsaved files the task runs without |
 | `Ctrl+Shift+d` / `Cmd+Shift+d` | Jump to Run and Debug |
 | `Ctrl+Shift+r` / `Cmd+Shift+r` | Jump to Remote (SSH) |
 | `Ctrl+Shift+x` / `Cmd+Shift+x` | Jump to Extensions |
@@ -267,7 +267,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 
 | Keys | Action |
 |------|--------|
-| Arrows, Home, End | Navigate (clears any selection) |
+| Arrows, Home, End | Navigate (clears any selection). `Down` on the last line goes to its end and `Up` on the first line to its start, so `Shift`+`Down` / `Shift`+`Up` select through the ends of the file |
 | `Shift`+arrows / `Home` / `End` / `PageUp` / `PageDown` | Extend the selection by the same motion |
 | `Shift`+`Alt`+`→` / `Shift`+`Alt`+`←` | Expand / Shrink Selection (VS Code's smart select): grow every cursor to the next semantically meaningful range and retrace back exactly. Ranges come from the language server (`textDocument/selectionRange`, one request covering all cursors) when it advertises the capability, else from tree-sitter node ancestry — so the gesture works with no LSP at all; a plain-text file grows line → buffer. Any edit, click, or caret change restarts the gesture |
 | `PageUp` / `PageDown` (`fn`+`↑` / `fn`+`↓` on Mac) | Scroll one viewport |

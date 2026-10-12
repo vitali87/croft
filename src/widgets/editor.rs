@@ -2067,10 +2067,21 @@ pub struct TextSpanEdit {
 /// earlier replacement never shifts the coordinates of a later one. Returns
 /// the number of edits applied. Out-of-range edits are skipped.
 pub fn apply_span_edits_to_lines(lines: &mut Vec<String>, edits: &[TextSpanEdit]) -> usize {
-    // Every edit names the ORIGINAL text, so its UTF-16 columns convert
-    // against the lines as they are before any edit lands.
+    let mut applied = 0;
+    for (e, count) in in_application_order(char_span_edits(lines, edits)) {
+        if replace_span(lines, &e) {
+            applied += count;
+        }
+    }
+    applied
+}
+
+/// `edits` with their UTF-16 columns read as chars. Every edit names the
+/// ORIGINAL text, so the columns convert against `lines` as they are before
+/// any edit lands.
+fn char_span_edits(lines: &[String], edits: &[TextSpanEdit]) -> Vec<TextSpanEdit> {
     let col = |row: usize, c: usize| lines.get(row).map_or(c, |l| utf16_to_char_col(l, c as u32));
-    let converted: Vec<TextSpanEdit> = edits
+    edits
         .iter()
         .map(|e| match e.utf16 {
             true => TextSpanEdit {
@@ -2081,16 +2092,59 @@ pub fn apply_span_edits_to_lines(lines: &mut Vec<String>, edits: &[TextSpanEdit]
             },
             false => e.clone(),
         })
-        .collect();
-    let mut order: Vec<&TextSpanEdit> = converted.iter().collect();
-    order.sort_by_key(|e| std::cmp::Reverse(e.start));
-    let mut applied = 0;
-    for e in order {
-        if replace_span(lines, e) {
-            applied += 1;
+        .collect()
+}
+
+/// `edits` bottom-up, the order they apply in, each with the number of edits
+/// it stands for. Edits that start at one position are joined into one, their
+/// texts in the order sent: the LSP spec puts them in array order, and
+/// applying them one by one bottom-up reversed them, so vtsls's `"\n"` then
+/// `"  "` landed as trailing spaces above an unindented line (#1633).
+fn in_application_order(mut edits: Vec<TextSpanEdit>) -> Vec<(TextSpanEdit, usize)> {
+    edits.sort_by_key(|e| e.start);
+    let mut joined: Vec<(TextSpanEdit, usize)> = Vec::with_capacity(edits.len());
+    for e in edits {
+        match joined.last_mut() {
+            Some((last, count)) if last.start == e.start => {
+                last.end = last.end.max(e.end);
+                last.new_text.push_str(&e.new_text);
+                *count += 1;
+            }
+            _ => joined.push((e, 1)),
         }
     }
-    applied
+    joined.reverse();
+    joined
+}
+
+/// Where `pos` (char columns) lands once `edits` apply to `lines`: moved by
+/// the text every edit before it adds or removes. A position inside an edit
+/// lands at the end of its new text.
+pub fn position_after_span_edits(
+    lines: &[String],
+    pos: (usize, usize),
+    edits: &[TextSpanEdit],
+) -> (usize, usize) {
+    let mut pos = pos;
+    for (e, _) in in_application_order(char_span_edits(lines, edits)) {
+        if pos < e.start || (pos == e.start && e.start != e.end) {
+            continue;
+        }
+        let rows = e.new_text.matches('\n').count();
+        let last = e.new_text.rsplit('\n').next().unwrap_or("").chars().count();
+        let new_end = match rows {
+            0 => (e.start.0, e.start.1 + last),
+            _ => (e.start.0 + rows, last),
+        };
+        pos = if pos < e.end {
+            new_end
+        } else if pos.0 == e.end.0 {
+            (new_end.0, new_end.1 + pos.1 - e.end.1)
+        } else {
+            (pos.0 + new_end.0 - e.end.0, pos.1)
+        };
+    }
+    pos
 }
 
 fn replace_span(lines: &mut Vec<String>, e: &TextSpanEdit) -> bool {
@@ -3000,8 +3054,8 @@ pub struct Editor {
     /// ranges are not carried through edits the way spans are (#850), so an
     /// edit leaves them stale until the next pass over the edited text lands.
     protected_current: bool,
-    /// Inline color-literal decorations (the "no colour-swatch decorations"
-    /// gap in `vscode_extensions.rs`, matching `naumovs.color-highlight`):
+    /// Inline color-literal decorations (`naumovs.color-highlight`'s row in
+    /// `vscode_extensions.rs`):
     /// per line, the `(start char col, end char col, background, foreground)`
     /// of every recognized `#hex` / `rgb()` / `hsl()` color literal, painted
     /// as a background tint over the literal's own text. Language-agnostic
@@ -7399,9 +7453,7 @@ impl Editor {
         self.push_undo(EditKind::Paste);
         let n = apply_span_edits_to_lines(&mut self.lines, edits);
         if n > 0 {
-            let mut order: Vec<&TextSpanEdit> = edits.iter().collect();
-            order.sort_by_key(|e| std::cmp::Reverse(e.start));
-            for e in order {
+            for (e, _) in in_application_order(edits.to_vec()) {
                 let removed = e.end.0.saturating_sub(e.start.0) + 1;
                 let added = e.new_text.matches('\n').count() + 1;
                 self.provenance.splice(e.start.0, removed, added);
@@ -7412,6 +7464,20 @@ impl Editor {
             self.mark_buffer_changed();
             self.recompute_highlights();
         }
+        n
+    }
+
+    /// [`Self::apply_span_edits`], the caret carried through the edits so it
+    /// stays beside the same text: format on type rewrites the line just
+    /// typed, and a clamp left the caret on the row above the `;` (#1633).
+    pub fn apply_span_edits_moving_caret(&mut self, edits: &[TextSpanEdit]) -> usize {
+        let caret = (self.cursor_row, self.cursor_col);
+        let moved = position_after_span_edits(&self.lines, caret, edits);
+        let n = self.apply_span_edits(edits);
+        if n > 0 {
+            (self.cursor_row, self.cursor_col) = moved;
+        }
+        self.clamp_cursor();
         n
     }
 
@@ -7857,6 +7923,13 @@ impl Editor {
         let col = self.cursor_col;
         let line = self.lines[row].clone();
 
+        // Inside a doc comment the new line continues it (#1443).
+        let below = self.lines.get(row + 1..).unwrap_or(&[]);
+        if let Some(enter) = comment_on_enter(self.lang, &line, col, below) {
+            self.continue_comment(enter);
+            return;
+        }
+
         let leading: String = line
             .chars()
             .take(col)
@@ -7898,6 +7971,49 @@ impl Editor {
             }
             self.cursor_row -= 1;
             self.cursor_col = new_indent.chars().count();
+        }
+    }
+
+    /// Break the line at the caret into a comment's next line (#1443): the
+    /// new line starts with `enter.start`, and a `/**` just opened is closed
+    /// on a line below, the caret staying on the line between.
+    fn continue_comment(&mut self, enter: CommentEnter) {
+        let start_len = enter.start.chars().count();
+        if let CommentBelow::MoveCloser(_) = &enter.below {
+            // The `*/` right after the caret goes to the closing line, so
+            // the space before it goes with the break.
+            while self.lines[self.cursor_row]
+                .chars()
+                .nth(self.cursor_col)
+                .is_some_and(|c| c == ' ' || c == '\t')
+            {
+                self.delete_forward_raw();
+            }
+        }
+        self.insert_newline_raw();
+        for c in enter.start.chars() {
+            self.insert_char_raw(c);
+        }
+        match enter.below {
+            CommentBelow::Nothing => {}
+            CommentBelow::MoveCloser(indent) => {
+                self.insert_newline_raw();
+                for c in indent.chars() {
+                    self.insert_char_raw(c);
+                }
+                self.cursor_row -= 1;
+                self.cursor_col = start_len;
+            }
+            CommentBelow::AddCloser(closer) => {
+                let (row, col) = (self.cursor_row, self.cursor_col);
+                self.cursor_col = self.line_char_len(row);
+                self.insert_newline_raw();
+                for c in closer.chars() {
+                    self.insert_char_raw(c);
+                }
+                self.cursor_row = row;
+                self.cursor_col = col;
+            }
         }
     }
 
@@ -10168,6 +10284,31 @@ impl Editor {
             }
         }
         self.last_edit_kind = None;
+    }
+
+    /// The Up arrow: [`Self::move_up`], and on the first line (or wrapped
+    /// row) the caret goes to the start of the line, as in VS Code, so
+    /// Shift+Up selects to the start of the file (#1563). Vim's `k` keeps
+    /// `move_up`, which stops on the first line as Vim does.
+    pub fn arrow_up(&mut self) {
+        let before = (self.cursor_row, self.cursor_col);
+        self.move_up();
+        if (self.cursor_row, self.cursor_col) == before {
+            self.cursor_col = 0;
+            self.ensure_cursor_col_visible();
+        }
+    }
+
+    /// The Down arrow: [`Self::move_down`], and on the last line (or
+    /// wrapped row) the caret goes to the end of the line, so Shift+Down
+    /// selects through it instead of stopping at its start (#1563).
+    pub fn arrow_down(&mut self) {
+        let before = (self.cursor_row, self.cursor_col);
+        self.move_down();
+        if (self.cursor_row, self.cursor_col) == before {
+            self.cursor_col = self.line_char_len(self.cursor_row);
+            self.ensure_cursor_col_visible();
+        }
     }
 
     pub fn goto_top(&mut self) {
@@ -14161,6 +14302,131 @@ fn leading_outdent_chars(line: &str, unit_w: usize) -> usize {
     } else {
         ((spaces - 1) % unit_w) + 1
     }
+}
+
+/// What Enter types inside a doc comment (#1443), after VS Code's
+/// `onEnterRules`.
+#[derive(Debug, PartialEq)]
+struct CommentEnter {
+    /// The new line's text, ahead of whatever followed the caret.
+    start: String,
+    /// What happens on the line below the new one.
+    below: CommentBelow,
+}
+
+#[derive(Debug, PartialEq)]
+enum CommentBelow {
+    Nothing,
+    /// A `/**` was just opened with nothing closing it: this line closes it.
+    AddCloser(String),
+    /// The caret sat right before the `*/` of `/** */`: that `*/` moves to
+    /// a line of its own, indented by this.
+    MoveCloser(String),
+}
+
+/// The languages whose doc comments are `/** … */` blocks.
+fn has_block_doc_comments(lang: Option<LangKind>) -> bool {
+    matches!(
+        lang,
+        Some(
+            LangKind::JavaScript
+                | LangKind::TypeScript
+                | LangKind::Tsx
+                | LangKind::C
+                | LangKind::Cpp
+                | LangKind::Java
+                | LangKind::CSharp
+                | LangKind::Rust
+        )
+    )
+}
+
+/// How Enter at char `col` of `line` continues a doc comment (#1443), or
+/// None where it is a plain line break:
+/// - `/**` opening a block gives ` * `, closing the block below when
+///   nothing does yet;
+/// - a ` * …` line inside the block gives the next ` * ` at the same
+///   column;
+/// - a ` */` line steps back to the column of its `/**`;
+/// - in Rust, a `///` or `//!` line gives the next `/// ` or `//! `.
+///
+/// A plain `//` comment, as in VS Code, is not continued.
+fn comment_on_enter(
+    lang: Option<LangKind>,
+    line: &str,
+    col: usize,
+    below: &[String],
+) -> Option<CommentEnter> {
+    let before: String = line.chars().take(col).collect();
+    let after: String = line.chars().skip(col).collect();
+    let indent: String = before
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect();
+    let body = &before[indent.len()..];
+    let nothing = |start: String| {
+        Some(CommentEnter {
+            start,
+            below: CommentBelow::Nothing,
+        })
+    };
+    if lang == Some(LangKind::Rust) && !body.starts_with("////") {
+        for intro in ["///", "//!"] {
+            if body.starts_with(intro) {
+                return nothing(format!("{indent}{intro} "));
+            }
+        }
+    }
+    if !has_block_doc_comments(lang) {
+        return None;
+    }
+    let closer_next = after.trim_start().starts_with("*/");
+    if let Some(rest) = body.strip_prefix("/**")
+        && !rest.starts_with('/')
+        && !rest.contains("*/")
+    {
+        let below = if closer_next {
+            CommentBelow::MoveCloser(format!("{indent} "))
+        } else if after.contains("*/") || block_closed_below(below) {
+            // Already closed, on this line or further down.
+            CommentBelow::Nothing
+        } else {
+            CommentBelow::AddCloser(format!("{indent} */"))
+        };
+        return Some(CommentEnter {
+            start: format!("{indent} * "),
+            below,
+        });
+    }
+    // Only a `*` set in from its line's start is a block's continuation, as
+    // VS Code's rule has it.
+    if !indent.ends_with(' ') {
+        return None;
+    }
+    if let Some(rest) = body.strip_prefix('*')
+        && (rest.is_empty() || rest.starts_with(' '))
+        && !rest.contains("*/")
+        && !closer_next
+    {
+        return nothing(format!("{indent}* "));
+    }
+    if body.trim_end() == "*/" && after.trim().is_empty() {
+        return nothing(indent[..indent.len() - 1].to_string());
+    }
+    None
+}
+
+/// Whether the lines below an opened block comment close it: a `*/`
+/// comes before any further `/*` would open another block.
+fn block_closed_below(below: &[String]) -> bool {
+    for line in below {
+        match (line.find("/*"), line.find("*/")) {
+            (open, Some(close)) if open.is_none_or(|open| close < open) => return true,
+            (Some(_), _) => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn extra_indent_triggered(lang: Option<LangKind>, last_non_ws: Option<char>) -> bool {
@@ -23593,6 +23859,117 @@ mod tests {
         assert_eq!(lines, vec!["baz bar baz".to_string()]);
     }
 
+    /// An insert of `text` at `(row, col)`, in UTF-16 columns as a
+    /// language server sends it.
+    fn lsp_insert(row: usize, col: usize, text: &str) -> TextSpanEdit {
+        TextSpanEdit {
+            start: (row, col),
+            end: (row, col),
+            new_text: text.to_string(),
+            utf16: true,
+        }
+    }
+
+    /// vtsls 0.3.0's Format Document reply for
+    /// `export function f(a: number) {if(a>1){return  0;}`, captured with a
+    /// minimal LSP client (#1633). The first two edits share a position.
+    fn vtsls_format_reply() -> Vec<TextSpanEdit> {
+        let mut edits = vec![
+            lsp_insert(0, 30, "\n"),
+            lsp_insert(0, 30, "  "),
+            lsp_insert(0, 32, " "),
+            lsp_insert(0, 34, " "),
+            lsp_insert(0, 35, " "),
+            lsp_insert(0, 37, " "),
+            lsp_insert(0, 38, " "),
+        ];
+        edits.push(TextSpanEdit {
+            start: (0, 44),
+            end: (0, 46),
+            new_text: " ".to_string(),
+            utf16: true,
+        });
+        edits.push(lsp_insert(0, 48, " "));
+        edits
+    }
+
+    /// #1633: edits that start at one position land in the order the server
+    /// sent them, as the LSP spec says.
+    #[test]
+    fn inserts_at_one_position_land_in_the_order_sent() {
+        let mut lines = vec!["ab".to_string()];
+        let edits = vec![lsp_insert(0, 1, "\n"), lsp_insert(0, 1, "  ")];
+        assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 2);
+        assert_eq!(lines, vec!["a".to_string(), "  b".to_string()]);
+        // An insert sent before a replacement of the text after it.
+        let mut lines = vec!["foobar".to_string()];
+        let edits = vec![
+            lsp_insert(0, 0, "X"),
+            TextSpanEdit {
+                start: (0, 0),
+                end: (0, 3),
+                new_text: String::new(),
+                utf16: true,
+            },
+        ];
+        assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 2);
+        assert_eq!(lines, vec!["Xbar".to_string()]);
+    }
+
+    /// #1633: the issue's TypeScript sample formats to an indented line with
+    /// no trailing spaces.
+    #[test]
+    fn a_vtsls_format_reply_indents_the_line_it_breaks() {
+        let mut lines: Vec<String> = [
+            "export function f(a: number) {if(a>1){return  0;}",
+            "  return a;",
+            "}",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            apply_span_edits_to_lines(&mut lines, &vtsls_format_reply()),
+            9
+        );
+        assert_eq!(
+            lines,
+            [
+                "export function f(a: number) {",
+                "  if (a > 1) { return 0; }",
+                "  return a;",
+                "}"
+            ]
+            .map(String::from)
+            .to_vec()
+        );
+    }
+
+    /// #1633 negative: edits at different positions, and a replacement sent
+    /// before an insert at its start, keep their meaning.
+    #[test]
+    fn edits_at_different_positions_keep_their_places() {
+        let mut lines = vec!["a b c".to_string()];
+        let edits = vec![
+            lsp_insert(0, 4, "Z"),
+            lsp_insert(0, 0, "X"),
+            lsp_insert(0, 2, "Y"),
+        ];
+        assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 3);
+        assert_eq!(lines, vec!["Xa Yb Zc".to_string()]);
+        let mut lines = vec!["foobar".to_string()];
+        let edits = vec![
+            TextSpanEdit {
+                start: (0, 0),
+                end: (0, 3),
+                new_text: String::new(),
+                utf16: true,
+            },
+            lsp_insert(0, 0, "X"),
+        ];
+        assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 2);
+        assert_eq!(lines, vec!["Xbar".to_string()]);
+    }
+
     #[test]
     fn apply_span_edits_splits_multiline_new_text_into_separate_lines() {
         // Ruff's "Organize Imports" returns ONE edit whose new_text spans several
@@ -24046,6 +24423,205 @@ mod tests {
         assert_eq!(e.lines, vec!["    abc".to_string(), "    ".to_string()]);
         assert_eq!(e.cursor_row, 1);
         assert_eq!(e.cursor_col, 4);
+    }
+
+    /// #1443: `text` with the caret at `|`, in `lang`, after one Enter.
+    fn enter_at(lang: LangKind, text: &str) -> (Vec<String>, (usize, usize)) {
+        let (row, line) = text
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains('|'))
+            .unwrap();
+        let mut e = editor_with(&text.replace('|', ""));
+        e.lang = Some(lang);
+        e.cursor_row = row;
+        e.cursor_col = line.chars().position(|c| c == '|').unwrap();
+        e.insert_newline();
+        (e.lines.clone(), (e.cursor_row, e.cursor_col))
+    }
+
+    #[test]
+    fn enter_after_a_doc_opener_starts_the_block_and_closes_it() {
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "/**|"),
+            (vec!["/**".into(), " * ".into(), " */".into()], (1, 3))
+        );
+        assert_eq!(
+            enter_at(LangKind::Java, "    /**|"),
+            (
+                vec!["    /**".into(), "     * ".into(), "     */".into()],
+                (1, 7)
+            )
+        );
+    }
+
+    #[test]
+    fn enter_between_a_doc_opener_and_its_closer_splits_them() {
+        assert_eq!(
+            enter_at(LangKind::TypeScript, "  /**| */"),
+            (vec!["  /**".into(), "   * ".into(), "   */".into()], (1, 5))
+        );
+    }
+
+    #[test]
+    fn enter_after_an_opener_already_closed_below_adds_no_closer() {
+        assert_eq!(
+            enter_at(LangKind::C, "/**|\n * Adds.\n */"),
+            (
+                vec!["/**".into(), " * ".into(), " * Adds.".into(), " */".into()],
+                (1, 3)
+            )
+        );
+    }
+
+    #[test]
+    fn enter_after_an_opener_closed_further_down_adds_no_closer() {
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "/**|\nDescription.\n */"),
+            (
+                vec![
+                    "/**".into(),
+                    " * ".into(),
+                    "Description.".into(),
+                    " */".into()
+                ],
+                (1, 3)
+            )
+        );
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "/**|\n\nf();\n/** g */"),
+            (
+                vec![
+                    "/**".into(),
+                    " * ".into(),
+                    " */".into(),
+                    "".into(),
+                    "f();".into(),
+                    "/** g */".into()
+                ],
+                (1, 3)
+            )
+        );
+    }
+
+    #[test]
+    fn enter_on_a_star_line_continues_it_at_the_same_column() {
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "/**\n * Adds two numbers.|\n */"),
+            (
+                vec![
+                    "/**".into(),
+                    " * Adds two numbers.".into(),
+                    " * ".into(),
+                    " */".into()
+                ],
+                (2, 3)
+            )
+        );
+        assert_eq!(
+            enter_at(LangKind::Cpp, "    * a|b"),
+            (vec!["    * a".into(), "    * b".into()], (1, 6))
+        );
+    }
+
+    #[test]
+    fn enter_after_a_closer_steps_back_to_the_opener_column() {
+        assert_eq!(
+            enter_at(LangKind::CSharp, "    /**\n     * x\n     */|"),
+            (
+                vec![
+                    "    /**".into(),
+                    "     * x".into(),
+                    "     */".into(),
+                    "    ".into()
+                ],
+                (3, 4)
+            )
+        );
+    }
+
+    #[test]
+    fn enter_on_a_rust_doc_line_continues_it() {
+        assert_eq!(
+            enter_at(LangKind::Rust, "/// Adds two numbers.|"),
+            (vec!["/// Adds two numbers.".into(), "/// ".into()], (1, 4))
+        );
+        assert_eq!(
+            enter_at(LangKind::Rust, "    //! Crate docs.|"),
+            (
+                vec!["    //! Crate docs.".into(), "    //! ".into()],
+                (1, 8)
+            )
+        );
+        assert_eq!(
+            enter_at(LangKind::Rust, "/// Adds| two"),
+            (vec!["/// Adds".into(), "///  two".into()], (1, 4))
+        );
+    }
+
+    #[test]
+    fn enter_leaves_code_and_plain_comments_alone() {
+        // Multiplication, a plain `//`, a four-slash rule, `/*` and the caret
+        // just before a `*/`.
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "x = a *|"),
+            (vec!["x = a *".into(), String::new()], (1, 0))
+        );
+        assert_eq!(
+            enter_at(LangKind::Rust, "// a|"),
+            (vec!["// a".into(), String::new()], (1, 0))
+        );
+        assert_eq!(
+            enter_at(LangKind::Rust, "//// a|"),
+            (vec!["//// a".into(), String::new()], (1, 0))
+        );
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "/*|"),
+            (vec!["/*".into(), String::new()], (1, 0))
+        );
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "/** a */|"),
+            (vec!["/** a */".into(), String::new()], (1, 0))
+        );
+        assert_eq!(
+            enter_at(LangKind::JavaScript, " * text |*/"),
+            (vec![" * text ".into(), " */".into()], (1, 1))
+        );
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "*|"),
+            (vec!["*".into(), String::new()], (1, 0))
+        );
+    }
+
+    #[test]
+    fn enter_in_languages_without_these_comments_is_unchanged() {
+        assert_eq!(
+            enter_at(LangKind::Python, "/**|"),
+            (vec!["/**".into(), String::new()], (1, 0))
+        );
+        assert_eq!(
+            enter_at(LangKind::Python, " * a|"),
+            (vec![" * a".into(), " ".into()], (1, 1))
+        );
+        assert_eq!(
+            enter_at(LangKind::Markdown, "/// a|"),
+            (vec!["/// a".into(), String::new()], (1, 0))
+        );
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "/// a|"),
+            (vec!["/// a".into(), String::new()], (1, 0))
+        );
+    }
+
+    #[test]
+    fn a_comment_continuation_undoes_in_one_step() {
+        let mut e = editor_with("/**");
+        e.lang = Some(LangKind::JavaScript);
+        e.cursor_col = 3;
+        e.insert_newline();
+        assert_eq!(e.lines, vec!["/**", " * ", " */"]);
+        assert!(e.undo());
+        assert_eq!(e.lines, vec!["/**"]);
     }
 
     #[test]
@@ -28439,6 +29015,41 @@ mod tests {
             long.last_inner.y + long.last_inner.height - 1,
             "the horizontal scrollbar sits on the bottom inner row"
         );
+    }
+
+    /// #1563: the edge arrows' line-end and line-start landings scroll the
+    /// view sideways to keep the caret on screen in a narrow pane.
+    #[test]
+    fn edge_arrows_keep_the_caret_horizontally_visible() {
+        let mut e = editor_with(&format!("short\n{}", "b".repeat(200)));
+        e.focused = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 6,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        e.cursor_row = 1;
+        e.cursor_col = 0;
+        e.arrow_down();
+        assert_eq!(e.cursor_col, 200);
+        assert!(
+            e.scroll_col > 0,
+            "the view follows the caret to the line end"
+        );
+        let width = e.visible_text_width();
+        assert!(
+            e.cursor_col < e.scroll_col + width,
+            "the caret is on screen"
+        );
+        e.cursor_row = 0;
+        e.cursor_col = 3;
+        e.scroll_col = 100;
+        e.arrow_up();
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 0));
+        assert_eq!(e.scroll_col, 0, "the view comes back to the line start");
     }
 
     #[test]
