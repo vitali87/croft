@@ -2049,8 +2049,10 @@ struct ExpandStack {
 }
 
 /// An xlsx grid's edited cell as hot exit keeps it (#1593):
-/// `(sheet, row, col, value)`.
-pub type SheetCellEdit = (usize, usize, usize, String);
+/// `(sheet name, row, col, value)`. The worksheet goes by its name, which
+/// a workbook keeps unique, so a reorder since the backup does not put the
+/// value on another worksheet.
+pub type SheetCellEdit = (String, usize, usize, String);
 
 /// A single text replacement in char-indexed `(row, col)` coordinates, as
 /// produced by an LSP rename `WorkspaceEdit`. Applied by
@@ -6288,7 +6290,7 @@ impl Editor {
     /// What hot exit and the update relaunch keep of a grid's unsaved
     /// edits (#1593), `None` when it has none: a CSV/TSV grid as the text a
     /// save would write, an xlsx as its edited cells `(sheet, row, col,
-    /// value)`, the cells its save applies. The cell being typed into
+    /// value)` by worksheet name, the cells its save applies. The cell being typed into
     /// counts as edited, as a save would commit it.
     pub fn sheet_backup(&self) -> Option<(Option<String>, Vec<SheetCellEdit>)> {
         let view = self.sheet.as_ref()?;
@@ -6322,11 +6324,14 @@ impl Editor {
                     .iter()
                     .filter(|&&(s, r, c)| pending.is_none_or(|p| (p.0, p.1, p.2) != (s, r, c)))
                     .filter_map(|&(s, r, c)| {
-                        Some((s, r, c, view.sheets.get(s)?.cell(r, c).to_string()))
+                        let data = view.sheets.get(s)?;
+                        Some((data.name.clone(), r, c, data.cell(r, c).to_string()))
                     })
                     .collect();
-                if let Some((s, r, c, value)) = pending {
-                    cells.push((s, r, c, value.to_string()));
+                if let Some((s, r, c, value)) = pending
+                    && let Some(data) = view.sheets.get(s)
+                {
+                    cells.push((data.name.clone(), r, c, value.to_string()));
                 }
                 (!cells.is_empty()).then_some((None, cells))
             }
@@ -6337,7 +6342,7 @@ impl Editor {
     /// Put a grid's backed-up edits (#1593) over the file just opened in
     /// it, as unsaved edits: a CSV/TSV's text re-read into the grid, an
     /// xlsx's cells set again and queued for its save. Returns the xlsx
-    /// cells it could not set (their sheet or row is gone from the
+    /// cells it could not set (their worksheet or row is gone from the
     /// workbook), which the caller keeps rather than lose. The tab turns
     /// dirty only when something was put back.
     pub fn restore_sheet_edits(
@@ -6365,14 +6370,18 @@ impl Editor {
             }
             (crate::sheet::SheetKind::Xlsx, _) if !cells.is_empty() => {
                 for cell in cells {
-                    let (s, r, c, value) = cell;
-                    let Some(data) = view.sheets.get_mut(*s).filter(|d| *r < d.rows.len()) else {
+                    let (name, r, c, value) = cell;
+                    let Some(s) = view
+                        .sheets
+                        .iter()
+                        .position(|d| d.name == *name && *r < d.rows.len())
+                    else {
                         unapplied.push(cell.clone());
                         continue;
                     };
-                    data.set_cell(*r, *c, value.clone());
-                    if !view.cell_edits.contains(&(*s, *r, *c)) {
-                        view.cell_edits.push((*s, *r, *c));
+                    view.sheets[s].set_cell(*r, *c, value.clone());
+                    if !view.cell_edits.contains(&(s, *r, *c)) {
+                        view.cell_edits.push((s, *r, *c));
                     }
                 }
                 if unapplied.len() == cells.len() {

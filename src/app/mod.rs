@@ -42277,8 +42277,13 @@ impl App {
         for group in self.editor_layout.inactive_groups() {
             for ed in &group.editors {
                 if let Some(tab) = sheet_tab_state(ed) {
-                    if !tabs.iter().any(|t| t.path == tab.path) {
-                        tabs.push(tab);
+                    // A clean tab of the same file (the focused split's,
+                    // or one reopened as text) gives way to the grid's
+                    // unsaved edits rather than drop them.
+                    match tabs.iter_mut().find(|t| t.path == tab.path) {
+                        Some(existing) if !existing.dirty => *existing = tab,
+                        Some(_) => {}
+                        None => tabs.push(tab),
                     }
                     continue;
                 }
@@ -42328,9 +42333,26 @@ impl App {
         }
     }
 
-    fn apply_session_state(&mut self, state: &crate::session_state::SessionState) {
+    /// Returns the xlsx cells (#1593) it could not put back, as the tabs
+    /// they belong to: their workbook did not open in the grid, or lacks
+    /// their worksheet or row. The caller keeps them for a later launch.
+    fn apply_session_state(
+        &mut self,
+        state: &crate::session_state::SessionState,
+    ) -> Vec<crate::session_state::OpenTabState> {
+        let mut left = Vec::new();
         for tab in &state.tabs {
-            self.restore_open_tab(tab);
+            let has_cells = tab.dirty && !tab.sheet_cells.is_empty();
+            let unapplied = match self.restore_open_tab(tab) {
+                Some((_, unapplied)) => unapplied,
+                None if has_cells => tab.sheet_cells.clone(),
+                None => Vec::new(),
+            };
+            if has_cells && !unapplied.is_empty() {
+                let mut kept = tab.clone();
+                kept.sheet_cells = unapplied;
+                left.push(kept);
+            }
         }
         if state.active_tab < self.editor.tab_count() {
             self.editor.select(state.active_tab);
@@ -42349,6 +42371,33 @@ impl App {
         } else {
             Pane::Tree
         };
+        left
+    }
+
+    /// Keep the xlsx cells an update relaunch could not put back (#1593)
+    /// in a hot-exit backup of their own, which the next launch restores
+    /// from as it would a killed croft's. Returns whether they are on disk.
+    fn hold_unrestored_tabs(&mut self, tabs: Vec<crate::session_state::OpenTabState>) -> bool {
+        if tabs.is_empty() {
+            return true;
+        }
+        let Some(own) = self.hot_exit_path() else {
+            return false;
+        };
+        let Some(path) = crate::hot_exit::free_path_beside(&own) else {
+            return false;
+        };
+        let backup = crate::hot_exit::Backup {
+            workspace_root: self.workspace_root().to_path_buf(),
+            buffers: tabs
+                .into_iter()
+                .map(|tab| crate::hot_exit::Buffer {
+                    tab,
+                    disk_stamp: None,
+                })
+                .collect(),
+        };
+        backup.save(&path).is_ok()
     }
 
     /// Reopen one captured tab, the update relaunch's or hot exit's (#862):
@@ -42385,6 +42434,11 @@ impl App {
             // of a sheet tab is never its content.
             let unapplied = ed.restore_sheet_edits(unsaved, &tab.sheet_cells);
             return Some((ed, unapplied));
+        }
+        if tab.dirty && !tab.sheet_cells.is_empty() {
+            // An xlsx that opened as text or hex (no longer readable as a
+            // workbook): none of its cells went back.
+            return Some((ed, tab.sheet_cells.clone()));
         }
         if let Some(text) = unsaved {
             // As an edit, not a bare assignment: the text is re-highlighted
@@ -61617,7 +61671,10 @@ impl App {
                 let disk_stamp = tab.path.as_deref().and_then(|p| {
                     editors
                         .iter()
-                        .find(|e| e.dirty && e.path.as_deref() == Some(p))
+                        .find(|e| {
+                            (e.dirty || e.sheet_pending_cell().is_some())
+                                && e.path.as_deref() == Some(p)
+                        })
                         .and_then(|e| e.disk_stamp())
                 });
                 crate::hot_exit::Buffer { tab, disk_stamp }
@@ -72106,8 +72163,16 @@ pub fn run(
     if let Some(session_path) = restore_session.as_ref() {
         match crate::session_state::SessionState::load(session_path) {
             Ok(state) => {
-                app.apply_session_state(&state);
-                let _ = std::fs::remove_file(session_path);
+                let left = app.apply_session_state(&state);
+                if app.hold_unrestored_tabs(left) {
+                    let _ = std::fs::remove_file(session_path);
+                } else {
+                    // Kept: it holds the only copy of cells not put back.
+                    app.status = format!(
+                        "Some unsaved xlsx cells could not be restored; the session is kept at {}",
+                        session_path.display()
+                    );
+                }
                 // The hot-exit backup follows what the relaunch brought
                 // back (#862), at once rather than after the first edit.
                 let _ = app.write_hot_exit();
