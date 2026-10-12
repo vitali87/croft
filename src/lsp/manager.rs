@@ -971,6 +971,11 @@ struct LangCapabilitySupport {
     /// lists it was on when it is retired from document pulls or given up
     /// on after crashing.
     document_servers: HashMap<PathBuf, Vec<String>>,
+    /// Every server open on each open document, by name (#1626), retired
+    /// from document pulls or not: a server that let one diagnostic pull
+    /// lapse still answers other requests, so this, not
+    /// `document_servers`, says whether it serves the file.
+    document_clients: HashMap<PathBuf, Vec<String>>,
 }
 type CapabilitySupport = Arc<StdMutex<LangCapabilitySupport>>;
 
@@ -1809,12 +1814,34 @@ impl LspManager {
         })
     }
 
+    /// Whether the server named `name` is open on the document `path`
+    /// (#1626), whether or not it still reports diagnostics on it.
+    pub fn document_served_by(&self, path: &Path, name: &str) -> bool {
+        self.capability_support.lock().is_ok_and(|s| {
+            s.document_clients
+                .get(path)
+                .is_some_and(|names| names.iter().any(|n| n == name))
+        })
+    }
+
     /// Test hook: record `names` as the servers reporting on `path`, as an
     /// open would, without starting any.
     #[cfg(test)]
     pub fn set_document_servers_for_test(&self, path: &Path, names: &[&str]) {
         if let Ok(mut support) = self.capability_support.lock() {
             support.document_servers.insert(
+                path.to_path_buf(),
+                names.iter().map(|n| n.to_string()).collect(),
+            );
+        }
+    }
+
+    /// Test hook: record `names` as the servers open on `path` (#1626),
+    /// without starting any or marking them as reporting on it.
+    #[cfg(test)]
+    pub fn set_document_clients_for_test(&self, path: &Path, names: &[&str]) {
+        if let Ok(mut support) = self.capability_support.lock() {
+            support.document_clients.insert(
                 path.to_path_buf(),
                 names.iter().map(|n| n.to_string()).collect(),
             );
@@ -2910,6 +2937,9 @@ impl WorkerState {
                         if let Some(names) = support.document_servers.get_mut(path) {
                             names.retain(|n| alive.iter().any(|m| &m.name == n));
                         }
+                        if let Some(names) = support.document_clients.get_mut(path) {
+                            names.retain(|n| alive.iter().any(|m| &m.name == n));
+                        }
                     }
                 }
                 self.restarts.incomplete.remove(&key);
@@ -2934,6 +2964,7 @@ impl WorkerState {
                 for (path, doc) in &self.docs {
                     if (doc.language, doc.project_root.clone()) == key {
                         support.document_servers.remove(path);
+                        support.document_clients.remove(path);
                     }
                 }
             }
@@ -3326,8 +3357,16 @@ impl WorkerState {
             .filter(|c| !c.document_pull_stalled.load(Ordering::Relaxed))
             .map(|c| c.name.clone())
             .collect();
+        let open_on: Vec<String> = self
+            .clients
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .map(|c| c.name.clone())
+            .collect();
         if let Ok(mut support) = self.capability_support.lock() {
             support.document_servers.insert(path.clone(), reporting);
+            support.document_clients.insert(path.clone(), open_on);
         }
         self.docs.insert(
             path,
@@ -3420,6 +3459,7 @@ impl WorkerState {
         };
         if let Ok(mut support) = self.capability_support.lock() {
             support.document_servers.remove(&path);
+            support.document_clients.remove(&path);
         }
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
@@ -8539,6 +8579,10 @@ while True:
                 file.clone(),
                 vec![String::from("doc-pull"), String::from("other")],
             );
+            support.lock().unwrap().document_clients.insert(
+                file.clone(),
+                vec![String::from("doc-pull"), String::from("other")],
+            );
             let pulls = document_pull_targets(std::iter::once(&managed), &file, &uri, &support);
             let (tx, rx) = std_mpsc::channel();
             spawn_document_pulls_within(
@@ -8575,6 +8619,11 @@ while True:
                 support.lock().unwrap().document_servers[&file],
                 ["other"],
                 "it no longer counts as reporting on the file, and only it left"
+            );
+            assert_eq!(
+                support.lock().unwrap().document_clients[&file],
+                ["doc-pull", "other"],
+                "but its client still runs, so it still serves the file (#1626)"
             );
         });
     }

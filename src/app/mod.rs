@@ -9745,12 +9745,15 @@ impl App {
         true
     }
 
-    /// Whether rust-analyzer reports on the active tab's file (#1626), so
-    /// its `Rust:` commands have a server to go to.
+    /// Whether rust-analyzer is open on the active tab's file (#1626), so
+    /// its `Rust:` commands have a server to go to. Asked of the servers
+    /// open on the file, not those reporting diagnostics on it: one slow
+    /// diagnostic pull retires rust-analyzer from reporting while its
+    /// client keeps answering.
     fn rust_analyzer_serves_active_file(&self) -> bool {
         match (self.editor.path.as_deref(), self.lsp.as_ref()) {
             (Some(path), Some(lsp)) => {
-                lsp.document_reported_by(path, crate::lsp::rust_analyzer::SERVER)
+                lsp.document_served_by(path, crate::lsp::rust_analyzer::SERVER)
             }
             _ => false,
         }

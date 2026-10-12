@@ -80356,7 +80356,7 @@ fn rust_analyzer_commands_are_offered_where_it_serves_the_file() {
     app.lsp
         .as_ref()
         .expect("a test App has an LSP manager")
-        .set_document_servers_for_test(&path, &["rust-analyzer"]);
+        .set_document_clients_for_test(&path, &["rust-analyzer"]);
     assert_eq!(
         rust_palette_rows(&mut app),
         [
@@ -80370,7 +80370,7 @@ fn rust_analyzer_commands_are_offered_where_it_serves_the_file() {
 }
 
 /// #1626 negative: a file rust-analyzer does not serve (a Python file, or
-/// a Rust file before it reports) lists none of them.
+/// a Rust file before it opens on it) lists none of them.
 #[test]
 fn rust_analyzer_commands_are_hidden_where_it_does_not_serve_the_file() {
     let tmp = tempfile::tempdir().unwrap();
@@ -80379,13 +80379,29 @@ fn rust_analyzer_commands_are_hidden_where_it_does_not_serve_the_file() {
     app.lsp
         .as_ref()
         .unwrap()
-        .set_document_servers_for_test(&path, &["basedpyright"]);
+        .set_document_clients_for_test(&path, &["basedpyright"]);
     assert!(rust_palette_rows(&mut app).is_empty());
     let mut app = app_with_open_file(tmp.path(), "main.rs", "fn main() {}\n");
     assert!(rust_palette_rows(&mut app).is_empty());
 }
 
-/// A Rust file rust-analyzer reports on, and an answer to `request` under
+/// #1626: rust-analyzer retired from diagnostic pulls (one pull timed out)
+/// no longer reports on the file, but its client still runs, so its
+/// commands stay offered and a keybinding still sends the request.
+#[test]
+fn rust_analyzer_commands_stay_offered_after_it_stops_reporting_diagnostics() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "main.rs", "fn main() {}\n");
+    let path = app.editor.path.clone().unwrap();
+    let lsp = app.lsp.as_ref().unwrap();
+    lsp.set_document_clients_for_test(&path, &["rust-analyzer"]);
+    lsp.set_document_servers_for_test(&path, &[]);
+    assert_eq!(rust_palette_rows(&mut app).len(), 5);
+    app.request_rust_analyzer(crate::lsp::rust_analyzer::RaRequest::ParentModule);
+    assert!(app.rust_analyzer_request.is_some(), "{}", app.status);
+}
+
+/// A Rust file rust-analyzer is open on, and an answer to `request` under
 /// the id the app now waits on.
 fn app_awaiting_rust_analyzer(
     tmp: &std::path::Path,
@@ -80400,7 +80416,7 @@ fn app_awaiting_rust_analyzer(
     app.lsp
         .as_ref()
         .unwrap()
-        .set_document_servers_for_test(&path, &["rust-analyzer"]);
+        .set_document_clients_for_test(&path, &["rust-analyzer"]);
     app.editor.cursor_row = 1;
     app.editor.cursor_col = 21;
     app.request_rust_analyzer(request);
