@@ -1033,6 +1033,7 @@ mod tests {
             end_char: 1,
             severity,
             message: message.into(),
+            tags: Default::default(),
         };
         let now = Instant::now();
         let mut check = ProposalCheck {
