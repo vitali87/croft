@@ -3661,6 +3661,10 @@ pub struct App {
     /// The `agents.json` row a new worktree lane starts in its pane (#348);
     /// `None` opens a plain shell. From `lane_agent` in settings.json.
     lane_agent: Option<String>,
+    /// The colour depth each frame is fitted to before it is written
+    /// (#1433): the `color_depth` setting, else what the terminal's
+    /// environment advertises.
+    pub(crate) color_depth: crate::color_depth::ColorDepth,
     /// Which panes are worktree lanes' (#348), by pane uid: saved with the
     /// terminal session so a relaunch seats the agent again, and consulted
     /// when a lane closes so its pane goes with it.
@@ -3777,7 +3781,8 @@ pub struct App {
     /// nothing has changed since.
     remote_handoff_ok: Option<u64>,
     /// Hot exit (#862): the directory this croft backs its unsaved buffers
-    /// up under (`~/.cache/croft/hot-exit`). `None` keeps no backups, as
+    /// up under (`~/.local/state/croft/hot-exit`, see [`user_data_dir`]).
+    /// `None` keeps no backups, as
     /// under test unless a test points it at a tempdir.
     pub hot_exit_dir: Option<PathBuf>,
     /// The [`App::unsaved_stamp`] this croft's backup on disk was written
@@ -5595,8 +5600,11 @@ impl App {
         }
         let loaded_prefs = merged_settings.prefs.clone();
         let (review_tx, review_rx) = std::sync::mpsc::channel();
-        let notes_path = (!cfg!(test))
-            .then(|| crate::sticky_notes::Notes::store_path(&croft_cache_dir(), &root));
+        let data_dir =
+            (!cfg!(test)).then(|| user_data_dir(&croft_cache_dir(), &crate::prefs::state_dir()));
+        let notes_path = data_dir
+            .as_deref()
+            .map(|dir| crate::sticky_notes::Notes::store_path(dir, &root));
         if !cfg!(test) {
             crate::i18n::init(loaded_prefs.locale.as_deref());
         }
@@ -5994,6 +6002,13 @@ impl App {
                 std::time::SystemTime::now(),
             ),
             lane_agent: loaded_prefs.lane_agent.clone(),
+            color_depth: loaded_prefs
+                .color_depth
+                .as_deref()
+                .and_then(crate::color_depth::ColorDepth::from_setting)
+                .unwrap_or_else(|| {
+                    crate::color_depth::ColorDepth::detect(|name| std::env::var(name).ok())
+                }),
             lane_panes: std::collections::BTreeMap::new(),
             tree_clipboard: None,
             tree_typeahead: None,
@@ -6024,11 +6039,7 @@ impl App {
             pending_revert_hunk: None,
             pending_unsaved: None,
             remote_handoff_ok: None,
-            hot_exit_dir: if cfg!(test) {
-                None
-            } else {
-                Some(croft_cache_dir().join("hot-exit"))
-            },
+            hot_exit_dir: data_dir.as_deref().map(|dir| dir.join("hot-exit")),
             hot_exit_written: None,
             hot_exit_retry_at: None,
             hot_exit_consumed: Vec::new(),
@@ -12124,16 +12135,28 @@ impl App {
                 OnTypeReply::Apply => self.on_type_request = None,
             }
             if let Some(edits) = result.edits.filter(|e| !e.is_empty())
-                && self
-                    .editor
-                    .apply_rename_to_open_tab(&result.path, &edits)
-                    .is_some()
+                && self.apply_on_type_edits(&result.path, &edits)
             {
-                self.editor.clamp_cursor();
                 changed = true;
             }
         }
         changed
+    }
+
+    /// Apply an on-type formatting reply for `path`, the active tab's file
+    /// (the reply's disposition checked that), keeping the caret beside the
+    /// text that was just typed.
+    pub(crate) fn apply_on_type_edits(
+        &mut self,
+        path: &std::path::Path,
+        edits: &[crate::widgets::editor::TextSpanEdit],
+    ) -> bool {
+        if self.editor.path.as_deref() == Some(path) {
+            return self.editor.apply_span_edits_moving_caret(edits) > 0;
+        }
+        let applied = self.editor.apply_rename_to_open_tab(path, edits).is_some();
+        self.editor.clamp_cursor();
+        applied
     }
 
     /// Linked editing (#254): replay the last keystroke across the
@@ -13310,6 +13333,39 @@ impl App {
             row: self.editor.cursor_row,
             col: self.editor.cursor_col,
         })
+    }
+
+    /// Run one key or mouse gesture, and when it moved the editor to
+    /// another file without going through the navigation history itself
+    /// (Quick Open, a Search result, the Explorer, a tab), record where the
+    /// user left (#1635): Go Back knew only the jumps that recorded
+    /// themselves, so the usual way of changing file left nothing to go
+    /// back to. A gesture that recorded or walked the history (Go to
+    /// Definition, Go Back itself) is left as it did it, and so is one that
+    /// moved focus to another editor group: a history entry holds no group,
+    /// so Go Back would reopen that group's file in the focused one.
+    fn recording_file_switches<R>(&mut self, gesture: impl FnOnce(&mut Self) -> R) -> R {
+        let left = self.current_nav_loc();
+        let changes = self.nav.changes();
+        let group = self.editor_group_identity();
+        let result = gesture(self);
+        if let Some(left) = left
+            && self.nav.changes() == changes
+            && self.editor_group_identity() == group
+            && self.editor.path.as_ref() != Some(&left.path)
+        {
+            self.nav.record(left);
+        }
+        result
+    }
+
+    /// Which editor group has focus, as the split's leaf count and the
+    /// focused leaf's position: a change in either is a group change.
+    fn editor_group_identity(&self) -> (usize, usize) {
+        (
+            self.editor_layout.leaf_count(),
+            self.editor_layout.active_dfs_index(),
+        )
     }
 
     /// A code navigation that leaves the active tab for another file keeps
@@ -18893,6 +18949,13 @@ impl App {
         }
     }
 
+    /// Render the frame the terminal is sent: [`Self::render`], with every
+    /// colour fitted to the terminal's depth (#1433).
+    fn render_for_terminal(&mut self, frame: &mut ratatui::Frame) {
+        self.render(frame);
+        self.color_depth.fit_buffer(frame.buffer_mut());
+    }
+
     fn render(&mut self, frame: &mut ratatui::Frame) {
         // Set again by the welcome panel when it paints the button.
         self.welcome_tour_button = Rect::default();
@@ -22661,7 +22724,7 @@ impl App {
         }
         let capture =
             self.macro_recording.is_some() && !self.macro_replaying && self.focus == Pane::Editor;
-        let result = self.handle_key_inner(key);
+        let result = self.recording_file_switches(|app| app.handle_key_inner(key));
         // Focus is re-checked after dispatch too: a key that hands focus to
         // the terminal would otherwise be recorded while everything after it
         // is dropped, producing a macro that replays a focus change and then
@@ -24119,9 +24182,11 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
-        self.test_worker.run_coverage();
-        self.set_sidebar_view(SidebarView::Testing);
-        self.status = String::from("Running tests with coverage");
+        self.test_run_with_unsaved_saved(|app| {
+            app.test_worker.run_coverage();
+            app.set_sidebar_view(SidebarView::Testing);
+            app.status = String::from("Running tests with coverage");
+        });
     }
 
     /// Fold a finished coverage run into the editor, and keep the active
@@ -24527,8 +24592,10 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
-        self.test_worker.run_all();
-        self.set_sidebar_view(SidebarView::Testing);
+        self.test_run_with_unsaved_saved(|app| {
+            app.test_worker.run_all();
+            app.set_sidebar_view(SidebarView::Testing);
+        });
     }
 
     /// Run a single test by exact name (click-to-run from the tree). Marks just
@@ -24537,9 +24604,11 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
-        self.testing.start_single(&name);
-        self.test_worker.run_one(name);
-        self.set_sidebar_view(SidebarView::Testing);
+        self.test_run_with_unsaved_saved(|app| {
+            app.testing.start_single(&name);
+            app.test_worker.run_one(name);
+            app.set_sidebar_view(SidebarView::Testing);
+        });
     }
 
     /// Jump the editor to a test's `fn` definition (Cmd/Opt+click in the tree).
@@ -24563,10 +24632,12 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
-        self.testing
-            .start_filter(&crate::testing::suite_pattern(&suite));
-        self.test_worker.run_suite(suite);
-        self.set_sidebar_view(SidebarView::Testing);
+        self.test_run_with_unsaved_saved(|app| {
+            app.testing
+                .start_filter(&crate::testing::suite_pattern(&suite));
+            app.test_worker.run_suite(suite);
+            app.set_sidebar_view(SidebarView::Testing);
+        });
     }
 
     /// Run the test the editor caret sits in (Cmd+K Enter / palette). Finds the
@@ -24590,6 +24661,10 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
+        self.test_run_with_unsaved_saved(|app| app.run_named_test_now(name));
+    }
+
+    fn run_named_test_now(&mut self, name: String) {
         let (run, exact) = match self.testing.sole_case_with_leaf(&name) {
             Some(full) => (full, true),
             None => (name, false),
@@ -24666,6 +24741,10 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
+        self.test_run_with_unsaved_saved(|app| app.run_test_at_cursor_with_coverage_now(name));
+    }
+
+    fn run_test_at_cursor_with_coverage_now(&mut self, name: String) {
         let (run, exact) = match self.testing.sole_case_with_leaf(&name) {
             Some(full) => (full, true),
             None => (name, false),
@@ -24693,6 +24772,10 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
+        self.test_run_with_unsaved_saved(|app| app.run_scope_with_coverage_now(name, suite));
+    }
+
+    fn run_scope_with_coverage_now(&mut self, name: String, suite: bool) {
         if suite {
             self.testing
                 .start_filter(&crate::testing::suite_pattern(&name));
@@ -31107,6 +31190,15 @@ impl App {
     /// with `disable_save_before_debug`, is named in front of the launch's
     /// own status.
     fn launch_with_unsaved_saved(&mut self, launch: impl FnOnce(&mut Self)) {
+        self.run_with_unsaved_saved("the launch", launch);
+    }
+
+    /// [`Self::launch_with_unsaved_saved`] for anything that runs the
+    /// project's files: a task, a Testing run (#1639). VS Code saves before
+    /// a task by default (`task.saveBeforeRun`); without it a build or test
+    /// run reported on code the editor had already changed. `what` names
+    /// the run in the warning.
+    fn run_with_unsaved_saved(&mut self, what: &str, launch: impl FnOnce(&mut Self)) {
         if self.save_before_debug && self.unsaved_count() > 0 {
             self.sweep_dirty_buffers(false, false);
         }
@@ -31121,12 +31213,36 @@ impl App {
             [first, rest @ ..] => (format!("{first} and {} more", rest.len()), "have"),
             [] => unreachable!("checked above"),
         };
-        let warning = format!("{names} {verb} unsaved changes: the launch uses the file on disk");
-        self.status = if self.status.is_empty() {
+        let warning = format!("{names} {verb} unsaved changes: {what} uses the file on disk");
+        let running = std::mem::take(&mut self.status);
+        self.status = if running.is_empty() {
             warning
         } else {
-            format!("{warning} - {}", self.status)
+            format!("{warning} - {running}")
         };
+        // The run registered its "Running …" status for its outcome to
+        // replace; that status now carries the warning, so the tracked text
+        // follows it, or the outcome would never land.
+        let tracked = self
+            .test_run_status
+            .iter_mut()
+            .chain(self.pane_run_statuses.iter_mut().map(|(_, run)| run));
+        for run in tracked {
+            if run.shown == running {
+                run.shown = self.status.clone();
+            }
+        }
+    }
+
+    /// [`Self::run_with_unsaved_saved`] for a Testing run: the saves it
+    /// makes are for this run, so a watched scope does not also hear
+    /// about them and rerun after it.
+    fn test_run_with_unsaved_saved(&mut self, launch: impl FnOnce(&mut Self)) {
+        let due = self.testing.watch.due_at();
+        self.run_with_unsaved_saved("the test run", |app| {
+            app.testing.watch.set_due_at(due);
+            launch(app);
+        });
     }
 
     /// File names of the editors with unsaved edits, deduped, the active
@@ -37361,7 +37477,7 @@ impl App {
             }
             ListPurpose::RunTask => {
                 if let Some(task) = self.run_tasks.get(index).cloned() {
-                    self.run_project_task(task);
+                    self.start_project_task(task);
                 }
             }
             ListPurpose::ReviewPullRequest => {
@@ -37983,9 +38099,7 @@ impl App {
     pub fn run_build_task(&mut self) {
         let tasks = crate::tasks::discover_tasks(&self.active_workspace_root());
         match crate::tasks::default_build_task(&tasks).cloned() {
-            Some(task) => {
-                self.run_project_task(task);
-            }
+            Some(task) => self.start_project_task(task),
             None => {
                 self.open_run_task_picker();
                 self.status = "No build task detected; pick one".to_string();
@@ -37996,11 +38110,17 @@ impl App {
     /// Tasks: Rerun Last Task.
     pub fn rerun_last_task(&mut self) {
         match self.last_task.clone() {
-            Some(task) => {
-                self.run_project_task(task);
-            }
+            Some(task) => self.start_project_task(task),
             None => self.status = "No task has run yet".to_string(),
         }
+    }
+
+    /// Run `task` as the user asked for it (Run Task, the build task, Rerun
+    /// Last Task), unsaved tabs written first (#1639).
+    fn start_project_task(&mut self, task: crate::tasks::Task) {
+        self.run_with_unsaved_saved("the task", |app| {
+            app.run_project_task(task);
+        });
     }
 
     /// Resolve the branch-picker selection per its open purpose.
@@ -41999,7 +42119,20 @@ impl App {
         self.quit = true;
     }
 
+    /// The session an update relaunch hands to the new process: every
+    /// unsaved buffer, a merge editor's Result included, since the
+    /// relaunch exits at once and the Result exists nowhere else.
     pub fn capture_session_state(&self) -> crate::session_state::SessionState {
+        self.capture_session_state_with(true)
+    }
+
+    /// `keep_merge_results` false leaves a merge editor's unsaved Result
+    /// out (#1588), for hot exit, whose backup outlives the conflict it was
+    /// taken from.
+    fn capture_session_state_with(
+        &self,
+        keep_merge_results: bool,
+    ) -> crate::session_state::SessionState {
         let mut tabs = Vec::new();
         let mut active_tab = 0;
         let mut active_path: Option<PathBuf> = None;
@@ -42032,7 +42165,13 @@ impl App {
             if idx == self.editor.active_index() {
                 active_tab = tabs.len();
             }
-            let unsaved_text = if ed.dirty {
+            // A merge editor's buffer is its Result pane, not an edit of the
+            // file (#1588): kept in a hot-exit backup it came back as a plain
+            // tab whose Ctrl+S wrote the Result over the user's own
+            // resolution, so there the tab reopens on the file as it is on
+            // disk. A relaunch carries it, or the Result would be lost.
+            let dirty = ed.dirty && (keep_merge_results || ed.merge.is_none());
+            let unsaved_text = if dirty {
                 Some(ed.lines.join("\n"))
             } else {
                 None
@@ -42043,7 +42182,7 @@ impl App {
                 cursor_col: ed.cursor_col,
                 scroll: ed.scroll,
                 scroll_col: ed.scroll_col,
-                dirty: ed.dirty,
+                dirty,
                 unsaved_text,
             });
         }
@@ -42053,7 +42192,10 @@ impl App {
         // (the same file open in two splits) keeps the dirty copy.
         for group in self.editor_layout.inactive_groups() {
             for ed in &group.editors {
-                if ed.has_non_text_view() || !ed.dirty {
+                if ed.has_non_text_view()
+                    || !ed.dirty
+                    || (!keep_merge_results && ed.merge.is_some())
+                {
                     continue;
                 }
                 let unsaved = Some(ed.lines.join("\n"));
@@ -43432,6 +43574,7 @@ impl App {
                 _ => {}
             }
             self.editor.extend_selection_to_cursor();
+            self.editor.ensure_cursor_col_visible();
             return;
         }
         if is_motion {
@@ -43491,6 +43634,10 @@ impl App {
             }
             _ => {}
         }
+        // Home, End, typing, Backspace, Delete and Enter move the caret
+        // sideways too; only ←/→ pulled the view along, so End on a wide
+        // line or typing past the edge left the caret off-screen (#1215).
+        self.editor.ensure_cursor_col_visible();
     }
 
     /// Vim-style chord layer for the editor: `cmd+gg` jumps to top, `cmd+G`
@@ -53949,6 +54096,10 @@ impl App {
     }
 
     fn handle_mouse(&mut self, m: MouseEvent) {
+        self.recording_file_switches(|app| app.handle_mouse_inner(m));
+    }
+
+    fn handle_mouse_inner(&mut self, m: MouseEvent) {
         // A click means the user moved on from a pending shortcut prompt.
         if matches!(m.kind, MouseEventKind::Down(_)) && self.recording_shortcut.take().is_some() {
             self.status = String::from("Shortcut unchanged");
@@ -58505,7 +58656,7 @@ impl App {
                 }
             }
             crate::code_lens::LensAction::RunInTerminal { label, command } => {
-                self.run_project_task(crate::tasks::Task {
+                self.start_project_task(crate::tasks::Task {
                     label,
                     command,
                     source: String::from("code lens"),
@@ -61347,7 +61498,7 @@ impl App {
             .flat_map(|g| g.editors.iter())
             .collect();
         let buffers = self
-            .capture_session_state()
+            .capture_session_state_with(false)
             .tabs
             .into_iter()
             .filter(|t| {
@@ -70912,6 +71063,26 @@ type CodeqlCodeSearch = (
     std::sync::mpsc::Receiver<Result<(Vec<String>, Option<String>), String>>,
 );
 
+/// The directory this croft keeps hot-exit backups and sticky notes under
+/// (#1578): `state`, after moving in what an earlier croft kept under
+/// `cache`, which cache cleaners are free to delete. Run at every launch,
+/// so a backup an older croft still writes to the cache is taken over too,
+/// once that croft is gone (its own exit removes only the cache copy).
+/// Notes are merged note by note into the state store, since an older
+/// window may still be adding to its cache copy; lock files stay.
+pub(crate) fn user_data_dir(cache: &Path, state: &Path) -> PathBuf {
+    crate::hot_exit::move_tree(
+        &cache.join("hot-exit"),
+        &state.join("hot-exit"),
+        &crate::hot_exit::owned_by_a_running_croft,
+    );
+    crate::sticky_notes::merge_stores(&cache.join("notes"), &state.join("notes"));
+    crate::hot_exit::move_tree(&cache.join("notes"), &state.join("notes"), &|p| {
+        p.extension().is_some_and(|x| x == "lock")
+    });
+    state.to_path_buf()
+}
+
 pub(crate) fn croft_cache_dir() -> PathBuf {
     #[cfg(test)]
     if let Some(dir) = CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap().clone() {
@@ -72679,9 +72850,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 app.forget_sent_images();
             }
             let draw_start = std::time::Instant::now();
-            let drawn = terminal.draw(|f| {
-                app.render(f);
-            })?;
+            let drawn = terminal.draw(|f| app.render_for_terminal(f))?;
             let mut underlays = app.image_underlays(drawn.buffer);
             app.drawn_buffer = Some(drawn.buffer.clone());
             // Record render+flush time and the bytes ratatui shipped this
@@ -72697,9 +72866,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 app.overlays.welcome.mark_dirty();
                 app.overlays.hero.mark_dirty();
                 app.forget_sent_images();
-                let drawn = terminal.draw(|f| {
-                    app.render(f);
-                })?;
+                let drawn = terminal.draw(|f| app.render_for_terminal(f))?;
                 underlays = app.image_underlays(drawn.buffer);
                 app.drawn_buffer = Some(drawn.buffer.clone());
             }
