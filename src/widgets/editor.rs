@@ -2185,6 +2185,9 @@ enum CaretEdit {
     DeleteForward,
 }
 
+/// Caret places, `(row, col)` each.
+type CaretPlaces = Vec<(usize, usize)>;
+
 /// What the auto-closing-pairs rules (#121) make of one typed character at
 /// one caret, decided apart from doing it so a single caret and every caret
 /// of a multi-cursor edit follow the same rules (#1597).
@@ -2691,7 +2694,7 @@ pub struct Editor {
     /// sides, at every caret that inserted one (the last list). A
     /// pre-existing `()` keeps its closer, as with one caret (#122 review),
     /// even when another caret of the same keystroke paired.
-    multi_auto_pair: Option<(u64, Vec<(usize, usize)>, Vec<(usize, usize)>)>,
+    multi_auto_pair: Option<(u64, CaretPlaces, CaretPlaces)>,
     /// Merge-conflict blocks in the buffer, lazily recomputed whenever
     /// `edit_seq` moves (same pattern as the git-gutter marks).
     conflicts: Vec<crate::merge::ConflictBlock>,
