@@ -13318,12 +13318,10 @@ fn find_word_occurrences(chars: &[char], word: &[char]) -> Vec<usize> {
     out
 }
 
-/// The line-comment marker for a language (VS Code `lineComment`), or `None`
-/// for languages with no line comment, in which case Toggle Line Comment is a
-/// no-op.
 /// How a comment is written in JSX children (#1623), where `//` and a bare
 /// `/* */` are text that React renders.
 const JSX_COMMENT_OPEN: &str = "{/*";
+/// The close of a JSX comment, matching [`JSX_COMMENT_OPEN`].
 const JSX_COMMENT_CLOSE: &str = "*/}";
 
 /// Whether the trimmed line is one `{/* … */}` comment.
@@ -13362,6 +13360,9 @@ fn jsx_child_starts_at(root: tree_sitter::Node, byte: usize) -> bool {
     }
 }
 
+/// The line-comment marker for a language (VS Code `lineComment`), or `None`
+/// for languages with no line comment, in which case Toggle Line Comment is a
+/// no-op.
 fn line_comment_token(lang: Option<LangKind>) -> Option<&'static str> {
     match lang {
         Some(LangKind::Rust)
