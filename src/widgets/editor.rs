@@ -2048,6 +2048,16 @@ struct ExpandStack {
     pos: usize,
 }
 
+/// A keyboard column selection (#1560): its corners as `(row, col)`, the
+/// head's column free to run past a short line's end as VS Code's does,
+/// and what it left, to tell whether the carets are still its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ColumnBox {
+    anchor: (usize, usize),
+    head: (usize, usize),
+    left: ((usize, usize), usize),
+}
+
 /// A single text replacement in char-indexed `(row, col)` coordinates, as
 /// produced by an LSP rename `WorkspaceEdit`. Applied by
 /// [`apply_span_edits_to_lines`] and [`Editor::apply_span_edits`].
@@ -2848,6 +2858,15 @@ pub struct Editor {
     /// as a `(row, col)` buffer position. `Some` while the box drag is live; each
     /// drag rebuilds `carets` from the rectangle between it and the pointer.
     box_anchor: Option<(usize, usize)>,
+    /// The keyboard column selection (#1560) the carets were last built
+    /// from: the box's anchor and head, and the primary caret and caret
+    /// count it left. The next column-select key grows this box while the
+    /// carets are still the ones it made, and starts a new one at the caret
+    /// once anything else moved them.
+    column_box: Option<ColumnBox>,
+    /// VS Code's Column Selection Mode (#1560): while on, Shift+arrows grow
+    /// a column selection instead of a stream one.
+    pub column_selection_mode: bool,
     /// Active snippet tab-stop session (VS Code snippet expansion). `Some` while
     /// the caret is cycling through `$1`, `$2`, … stops of a just-expanded
     /// snippet; Tab advances, and any structural key cancels it. See
@@ -3319,6 +3338,8 @@ impl Editor {
             sticky_lines: Vec::new(),
             sticky_click_rows: Vec::new(),
             box_anchor: None,
+            column_box: None,
+            column_selection_mode: false,
             snippet: None,
             folded: std::collections::BTreeSet::new(),
             hidden_ranges: Vec::new(),
@@ -11744,6 +11765,47 @@ impl Editor {
     /// End the column-selection drag, keeping the carets it produced.
     pub fn end_box_select(&mut self) {
         self.box_anchor = None;
+    }
+
+    /// Grow the column (box) selection from the keyboard (#1560), VS
+    /// Code's Ctrl+Shift+Alt+arrows: move its head `rows` rows and `cols`
+    /// columns, then rebuild one selection per spanned row, as the
+    /// Shift+Alt+drag does. A box starts at the caret (or the one-line
+    /// selection's anchor) unless the carets are still the ones the last
+    /// column-select key made. The head stays on the buffer's rows and,
+    /// like VS Code's, may sit past a short line's end, up to the longest
+    /// line in the box.
+    pub fn column_select(&mut self, rows: isize, cols: isize) {
+        let current = ((self.cursor_row, self.cursor_col), self.carets.len());
+        let (anchor, head) = match self.column_box {
+            Some(b) if b.left == current => (b.anchor, b.head),
+            _ => {
+                let caret = (self.cursor_row, self.cursor_col);
+                let anchor = match self.selection {
+                    Some(sel) if self.carets.is_empty() && sel.anchor.0 == sel.head.0 => sel.anchor,
+                    _ => caret,
+                };
+                (anchor, caret)
+            }
+        };
+        let last = self.lines.len().saturating_sub(1);
+        let row = head.0.saturating_add_signed(rows).min(last);
+        let (r0, r1) = (anchor.0.min(row), anchor.0.max(row));
+        let widest = (r0..=r1).map(|r| self.line_char_len(r)).max().unwrap_or(0);
+        let col = head.1.saturating_add_signed(cols).min(widest.max(anchor.1));
+        self.box_anchor = Some(anchor);
+        self.box_select_to(row, col);
+        self.box_anchor = None;
+        self.column_box = Some(ColumnBox {
+            anchor,
+            head: (row, col),
+            left: ((self.cursor_row, self.cursor_col), self.carets.len()),
+        });
+    }
+
+    /// Rows a column-select PageUp/PageDown moves: one screen.
+    pub fn column_select_page(&self) -> isize {
+        self.last_inner.height.max(1) as isize
     }
 
     /// VS Code "Add Cursor Above" (Cmd+Alt+Up): mirror of `add_cursor_below`.
@@ -30782,6 +30844,88 @@ mod tests {
         assert_eq!(e.carets[1].normalised(), ((1, 1), (1, 3)));
         e.end_box_select();
         assert!(!e.box_selecting());
+    }
+
+    /// #1560: the head may run past a short line's end, as VS Code's does;
+    /// the short line gets a bare caret at its end and the rows past it keep
+    /// the box's columns.
+    #[test]
+    fn column_select_runs_past_a_short_line() {
+        let mut e = editor_with("abcdef\nab\nabcdef");
+        e.cursor_row = 0;
+        e.cursor_col = 3;
+        e.column_select(0, 2);
+        e.column_select(2, 0);
+        assert_eq!(e.selection.unwrap().normalised(), ((2, 3), (2, 5)));
+        assert_eq!(e.carets.len(), 2);
+        assert_eq!(e.carets[0].normalised(), ((0, 3), (0, 5)));
+        assert_eq!(e.carets[1].normalised(), ((1, 2), (1, 2)));
+    }
+
+    /// Negative (#1560): Right stops at the widest line in the box, and Down
+    /// at the last line.
+    #[test]
+    fn column_select_stops_at_the_box_s_widest_line_and_the_last_row() {
+        let mut e = editor_with("abc\nab");
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        for _ in 0..5 {
+            e.column_select(1, 1);
+        }
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 2));
+        assert_eq!(e.carets.len(), 1);
+        assert_eq!(e.carets[0].normalised(), ((0, 0), (0, 3)));
+    }
+
+    /// #1560: a caret moved by anything else starts a fresh box there
+    /// instead of growing the old one.
+    #[test]
+    fn a_moved_caret_starts_a_new_column_box() {
+        let mut e = editor_with("aaaa\nbbbb\ncccc\ndddd");
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        e.column_select(1, 0);
+        e.carets.clear();
+        e.selection = None;
+        e.cursor_row = 2;
+        e.cursor_col = 2;
+        e.column_select(1, 0);
+        assert_eq!(e.carets.len(), 1);
+        assert_eq!(e.carets[0].normalised(), ((2, 2), (2, 2)));
+        assert_eq!((e.cursor_row, e.cursor_col), (3, 2));
+    }
+
+    /// #1560: a one-line selection anchors the box at its start.
+    #[test]
+    fn column_select_grows_from_a_one_line_selection() {
+        let mut e = editor_with("aaaa\nbbbb");
+        e.selection = Some(EditorSelection {
+            anchor: (0, 1),
+            head: (0, 3),
+        });
+        e.cursor_row = 0;
+        e.cursor_col = 3;
+        e.column_select(1, 0);
+        assert_eq!(e.selection.unwrap().normalised(), ((1, 1), (1, 3)));
+        assert_eq!(e.carets[0].normalised(), ((0, 1), (0, 3)));
+    }
+
+    /// #1560: PageDown moves the box head one screen.
+    #[test]
+    fn column_select_page_moves_one_screen() {
+        let text: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
+        let mut e = editor_with(&text.join("\n"));
+        e.last_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        e.column_select(e.column_select_page(), 0);
+        assert_eq!(e.cursor_row, 10);
+        assert_eq!(e.carets.len(), 10);
     }
 
     #[test]
