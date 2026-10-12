@@ -30649,6 +30649,11 @@ impl App {
                 }
                 // What the exception stop threw (#864): the panel's pill and
                 // the status line, which has the width the pill lacks.
+                // Step Into Target (#1543): one call steps straight in, several
+                // are offered by label, and a line with none steps in plainly.
+                DapEvent::StepInTargets { targets } => {
+                    self.offer_step_in_targets(targets);
+                }
                 DapEvent::ExceptionInfo { summary } => {
                     self.run_debug.feedback = Some(format!("Paused (exception): {summary}"));
                     self.status = format!("Paused on exception: {summary}");
@@ -32992,6 +32997,75 @@ impl App {
         // Every session (#310); see `debug_toggle_breakpoint_line`.
         for session in self.debug_sessions.iter_mut() {
             session.update_breakpoints(&path, &specs);
+        }
+    }
+
+    /// Debug: Continue (#1543): resume a paused session. Unlike F5 it never
+    /// starts one, so a binding for it is inert with nothing to continue.
+    fn debug_continue(&mut self) {
+        use crate::dap::session::SessionPhase;
+        match self.debug_sessions.focused().map(|s| s.phase) {
+            Some(SessionPhase::Stopped) => self.debug_start_or_continue(),
+            Some(_) => self.status = String::from("The program is already running"),
+            None => self.status = String::from("No debug session to continue"),
+        }
+    }
+
+    /// Debug: Step Into Target (#1543): ask the adapter which calls the
+    /// paused line makes; the answer arrives as `StepInTargets`. An adapter
+    /// that cannot say steps in plainly, as F11 does.
+    fn debug_step_into_target(&mut self) {
+        use crate::dap::session::SessionPhase;
+        let Some(session) = self.debug_sessions.focused_mut() else {
+            self.status = String::from("No debug session to step");
+            return;
+        };
+        if session.phase != SessionPhase::Stopped {
+            self.status = String::from("Step Into Target needs a paused program");
+            return;
+        }
+        if !session.request_step_in_targets() {
+            self.status = String::from(
+                "This debugger cannot list step-in targets; stepping into the first call",
+            );
+            self.debug_step("stepIn");
+        }
+    }
+
+    /// The adapter's answer to Step Into Target: nothing to choose between
+    /// steps in plainly, one target steps into it, several open a picker.
+    fn offer_step_in_targets(&mut self, targets: Vec<(i64, String)>) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        match targets.as_slice() {
+            [] => self.debug_step_into(None),
+            [(id, _)] => self.debug_step_into(Some(*id)),
+            _ => {
+                let rows = targets
+                    .into_iter()
+                    .map(|(id, label)| ListRow {
+                        id: id.to_string(),
+                        label,
+                    })
+                    .collect();
+                self.open_list_picker(
+                    ListPicker::new(ListPurpose::StepInTarget, "Step Into Target", rows),
+                    "",
+                );
+            }
+        }
+    }
+
+    /// Step into `target` on the paused line, or the first call to run.
+    fn debug_step_into(&mut self, target: Option<i64>) {
+        match target {
+            Some(id) => {
+                if let Some(session) = self.debug_sessions.focused_mut() {
+                    session.step_in_target(id);
+                    self.editor.stop_line = None;
+                    self.clear_inline_values();
+                }
+            }
+            None => self.debug_step("stepIn"),
         }
     }
 
@@ -37519,6 +37593,11 @@ impl App {
                     ),
                     "",
                 );
+            }
+            ListPurpose::StepInTarget => {
+                if let Ok(target) = row.id.parse::<i64>() {
+                    self.debug_step_into(Some(target));
+                }
             }
             ListPurpose::DebugConfigRequest => {
                 if let Some(draft) = self.debug_config_draft.as_mut() {
@@ -51555,6 +51634,10 @@ impl App {
             Cmd::ShowOutgoingCalls => self.request_call_hierarchy_at_cursor(false),
             Cmd::EditBreakpointCondition => self.debug_edit_condition(),
             Cmd::StepOver => self.debug_step("next"),
+            Cmd::ContinueDebugging => self.debug_continue(),
+            Cmd::StepInto => self.debug_step("stepIn"),
+            Cmd::StepOut => self.debug_step("stepOut"),
+            Cmd::StepIntoTarget => self.debug_step_into_target(),
             Cmd::ToggleRaisedExceptions => self.debug_toggle_raised_exceptions(),
             Cmd::AttachPythonProcess => self.open_attach_python_picker(),
             Cmd::ColorTheme => self.open_theme_picker(),

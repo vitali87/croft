@@ -56,6 +56,9 @@ pub enum ListPurpose {
     DebugConfigType,
     /// Second step: `id` is `launch` or `attach`.
     DebugConfigRequest,
+    /// Debug: Step Into Target (#1543): the calls on the paused line, `id`
+    /// the adapter's `targetId`.
+    StepInTarget,
     /// The searchable Settings hub (Preferences: Open Settings). Rows toggle a
     /// boolean setting (`id` = `toggle:<field>`) or run a follow-up command
     /// (`id` = `cmd:<command_id>`, e.g. open a JSON file or the theme picker).

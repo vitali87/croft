@@ -68,6 +68,10 @@ pub enum DapEvent {
     /// What an `exception` stop threw (#864), from the `exceptionInfo`
     /// response: `ModuleNotFoundError: No module named 'requests'`.
     ExceptionInfo { summary: String },
+    /// The calls on the paused line that Step Into Target can enter (#1543),
+    /// from a `stepInTargets` response: `(targetId, label)` in the
+    /// adapter's order. Empty when the line makes no call it can name.
+    StepInTargets { targets: Vec<(i64, String)> },
 }
 
 /// Why an adapter refused `launch`/`attach`: DAP puts the full text in
@@ -541,6 +545,42 @@ pub fn thread_request(command: &str, thread_id: i64) -> Value {
         "command": command,
         "arguments": { "threadId": thread_id }
     })
+}
+
+/// Build a `stepInTargets` request (#1543): the calls on `frame_id`'s line.
+pub fn step_in_targets_request(frame_id: i64) -> Value {
+    json!({
+        "type": "request",
+        "command": "stepInTargets",
+        "arguments": { "frameId": frame_id }
+    })
+}
+
+/// Build a `stepIn` into one of the line's calls (`targetId` from a
+/// `stepInTargets` response) rather than the first call to run.
+pub fn step_in_target_request(thread_id: i64, target_id: i64) -> Value {
+    json!({
+        "type": "request",
+        "command": "stepIn",
+        "arguments": { "threadId": thread_id, "targetId": target_id }
+    })
+}
+
+/// The `(id, label)` pairs of a `stepInTargets` response.
+pub fn parse_step_in_targets(msg: &Value) -> Vec<(i64, String)> {
+    msg.pointer("/body/targets")
+        .and_then(Value::as_array)
+        .map(|ts| {
+            ts.iter()
+                .filter_map(|t| {
+                    Some((
+                        t.get("id")?.as_i64()?,
+                        t.get("label")?.as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Build a `threads` request: every thread the debuggee has.
@@ -1067,6 +1107,9 @@ pub struct DapSession {
     /// stop or the end of the session clears it, so a reply that lands
     /// after the program moved on is dropped instead of labelling it.
     exception_info_seq: Option<i64>,
+    /// The `stepInTargets` request awaiting its answer (#1543), so a reply
+    /// for a stop that is already over is dropped.
+    step_in_targets_seq: Option<i64>,
     /// Active exception-breakpoint filter ids (debugpy: `raised`, `uncaught`).
     /// Sent on `initialized` and whenever toggled. Defaults to `uncaught` so an
     /// unhandled exception pauses the debugger instead of silently exiting.
@@ -1245,6 +1288,7 @@ impl DapSession {
             pending_var_refs: std::collections::HashMap::new(),
             pending_evals: std::collections::HashMap::new(),
             exception_info_seq: None,
+            step_in_targets_seq: None,
             exception_filters: vec![String::from("uncaught")],
             known_thread: None,
             capabilities: Value::Null,
@@ -1438,6 +1482,15 @@ impl DapSession {
                     self.threads = parse_threads(&msg);
                     out.push(DapEvent::InspectionUpdated);
                 }
+                Some("stepInTargets") => {
+                    let req_seq = msg.get("request_seq").and_then(Value::as_i64);
+                    if req_seq.is_some() && req_seq == self.step_in_targets_seq {
+                        self.step_in_targets_seq = None;
+                        out.push(DapEvent::StepInTargets {
+                            targets: parse_step_in_targets(&msg),
+                        });
+                    }
+                }
                 Some("exceptionInfo") => {
                     let req_seq = msg.get("request_seq").and_then(Value::as_i64);
                     if req_seq.is_some() && req_seq == self.exception_info_seq {
@@ -1622,7 +1675,8 @@ impl DapSession {
             DapEvent::BreakpointsUpdated
             | DapEvent::InspectionUpdated
             | DapEvent::Evaluated { .. }
-            | DapEvent::ExceptionInfo { .. } => {}
+            | DapEvent::ExceptionInfo { .. }
+            | DapEvent::StepInTargets { .. } => {}
         }
         // Suppress the parent's own `terminated` for js-debug while a child is
         // still live (the parent can wind down its bootstrap connection first).
@@ -1736,6 +1790,7 @@ impl DapSession {
             let _ = self.active().send(thread_request("continue", tid));
             self.phase = SessionPhase::Running;
             self.exception_info_seq = None;
+            self.step_in_targets_seq = None;
         }
     }
 
@@ -1757,6 +1812,34 @@ impl DapSession {
             let _ = self.active().send(thread_request(command, tid));
             // The stop is over; its exception reply no longer applies (#864).
             self.exception_info_seq = None;
+            self.step_in_targets_seq = None;
+        }
+    }
+
+    /// Ask for the calls on the selected frame's line (#1543), answered as
+    /// [`DapEvent::StepInTargets`]. `false` when there is nothing to ask
+    /// about: not paused, no frame, or an adapter without
+    /// `supportsStepInTargetsRequest`.
+    pub fn request_step_in_targets(&mut self) -> bool {
+        if self.phase != SessionPhase::Stopped || !self.supports("supportsStepInTargetsRequest") {
+            return false;
+        }
+        let Some(frame) = self
+            .selected_frame
+            .or_else(|| self.stack_frames.first().map(|f| f.id))
+        else {
+            return false;
+        };
+        self.step_in_targets_seq = self.active().send(step_in_targets_request(frame)).ok();
+        self.step_in_targets_seq.is_some()
+    }
+
+    /// Step into the call `target_id` on the paused line (#1543).
+    pub fn step_in_target(&mut self, target_id: i64) {
+        if let Some(tid) = self.stopped_thread {
+            let _ = self.active().send(step_in_target_request(tid, target_id));
+            self.exception_info_seq = None;
+            self.step_in_targets_seq = None;
         }
     }
 
@@ -3530,6 +3613,143 @@ def stopped():"#,
         )
         .expect("fake adapter spawns");
         (tmp, log, session)
+    }
+
+    /// A fake adapter paused at frame 7 of thread 1 on a line with three
+    /// calls (#1543), advertising `supportsStepInTargetsRequest` or not.
+    fn step_in_targets_session(supported: bool) -> (tempfile::TempDir, PathBuf, DapSession) {
+        let mut script = FAKE_DAP.replace(
+            "    elif c == \"dataBreakpointInfo\":",
+            r#"    elif c == "stackTrace":
+        reply(req, {"stackFrames": [{"id": 7, "name": "<module>", "line": 13, "column": 1, "source": {"path": "/tmp/app.py"}}], "totalFrames": 1})
+    elif c == "stepInTargets":
+        reply(req, {"targets": [{"id": 1, "label": "load('data.csv')"}, {"id": 2, "label": "scale(2)"}, {"id": 3, "label": "transform(...)"}]})
+    elif c == "dataBreakpointInfo":"#,
+        );
+        if supported {
+            script = script.replace(
+                r#""supportsHitConditionalBreakpoints": True"#,
+                r#""supportsHitConditionalBreakpoints": True, "supportsStepInTargetsRequest": True"#,
+            );
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fake_dap.py");
+        std::fs::write(&path, script).unwrap();
+        let log = tmp.path().join("requests.jsonl");
+        let mut session = DapSession::launch_with(
+            "python3",
+            &[path.display().to_string(), log.display().to_string()],
+            tmp.path(),
+            json!({"type": "request", "command": "launch", "arguments": {}}),
+            BTreeMap::new(),
+        )
+        .expect("fake adapter spawns");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !(session.stopped_thread.is_some() && !session.stack_frames.is_empty()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fake never paused"
+            );
+            session.poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        (tmp, log, session)
+    }
+
+    fn python3_missing() -> bool {
+        std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+    }
+
+    /// #1543: Step Into Target asks for the paused frame's calls, surfaces
+    /// them in the adapter's order, and steps into the chosen one by its
+    /// `targetId` rather than into the first call to run.
+    #[test]
+    fn step_into_target_lists_the_lines_calls_and_enters_the_chosen_one() {
+        if python3_missing() {
+            return;
+        }
+        let (_tmp, log, mut session) = step_in_targets_session(true);
+        assert!(session.request_step_in_targets());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let targets = loop {
+            assert!(std::time::Instant::now() < deadline, "no StepInTargets");
+            if let Some(DapEvent::StepInTargets { targets }) = session
+                .poll()
+                .into_iter()
+                .find(|e| matches!(e, DapEvent::StepInTargets { .. }))
+            {
+                break targets;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(
+            targets,
+            [
+                (1, String::from("load('data.csv')")),
+                (2, String::from("scale(2)")),
+                (3, String::from("transform(...)")),
+            ]
+        );
+        let asked = requests(&log);
+        let ask = asked
+            .iter()
+            .find(|q| q["command"] == "stepInTargets")
+            .expect("stepInTargets sent");
+        assert_eq!(ask["arguments"]["frameId"], 7, "for the paused frame");
+        session.step_in_target(2);
+        poll_until(&mut session, &log, |qs| {
+            qs.iter().any(|q| {
+                q["command"] == "stepIn"
+                    && q["arguments"]["targetId"] == 2
+                    && q["arguments"]["threadId"] == 1
+            })
+        });
+        session.disconnect();
+    }
+
+    /// #1543 negative: an adapter that does not advertise step-in targets is
+    /// never asked, and the caller falls back to a plain step in.
+    #[test]
+    fn an_adapter_without_step_in_targets_is_not_asked() {
+        if python3_missing() {
+            return;
+        }
+        let (_tmp, log, mut session) = step_in_targets_session(false);
+        assert!(!session.request_step_in_targets());
+        session.step("next");
+        poll_until(&mut session, &log, |qs| {
+            qs.iter().any(|q| q["command"] == "next")
+        });
+        assert!(
+            !requests(&log)
+                .iter()
+                .any(|q| q["command"] == "stepInTargets"),
+            "{:?}",
+            requests(&log)
+        );
+        session.disconnect();
+    }
+
+    #[test]
+    fn step_in_targets_parse_and_skip_malformed_entries() {
+        let msg = json!({"type": "response", "command": "stepInTargets", "body": {"targets": [
+            {"id": 4, "label": "f(x)"},
+            {"label": "no id"},
+            {"id": 5},
+            {"id": 6, "label": "g()"}
+        ]}});
+        assert_eq!(
+            parse_step_in_targets(&msg),
+            [(4, String::from("f(x)")), (6, String::from("g()"))]
+        );
+        assert!(parse_step_in_targets(&json!({"type": "response"})).is_empty());
+        assert_eq!(
+            step_in_target_request(1, 6)["arguments"],
+            json!({"threadId": 1, "targetId": 6})
+        );
     }
 
     /// Poll `session` to its exception stop, with the `exceptionInfo` request
