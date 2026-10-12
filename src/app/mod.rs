@@ -10840,9 +10840,12 @@ impl App {
             ServerEvent::ShowDocument {
                 uri,
                 external,
+                take_focus,
                 selection,
+                reply,
             } => {
-                self.show_server_document(uri, external, selection);
+                let shown = self.show_server_document(uri, external, take_focus, selection);
+                let _ = reply.send(shown);
                 true
             }
         }
@@ -10886,27 +10889,36 @@ impl App {
     }
 
     /// `window/showDocument`: a link goes to the browser, a file opens with
-    /// the server's range selected.
+    /// the server's range selected. Without `take_focus` the file still
+    /// opens but keyboard focus stays in the pane that had it. Returns
+    /// whether the document was shown, which is the server's answer.
     fn show_server_document(
         &mut self,
         uri: lsp_types::Url,
         external: bool,
+        take_focus: bool,
         selection: Option<lsp_types::Range>,
-    ) {
+    ) -> bool {
         let path = (!external && uri.scheme() == "file")
             .then(|| uri.to_file_path().ok())
             .flatten();
         let Some(path) = path else {
-            self.open_url_for_user(uri.as_str());
-            return;
+            return self.try_open_url_for_user(uri.as_str());
         };
         let start = selection.map(|r| r.start).unwrap_or_default();
-        self.go_to_definition(path.clone(), start.line, start.character);
+        let (focus, maximized) = (self.focus, self.terminal_maximized);
+        if !self.try_go_to_definition(path.clone(), start.line, start.character) {
+            return false;
+        }
+        if !take_focus && focus != Pane::Editor {
+            self.focus_pane(focus);
+            self.terminal_maximized = maximized;
+        }
         let Some(end) = selection.map(|r| r.end).filter(|&end| end != start) else {
-            return;
+            return true;
         };
         if self.editor.path.as_deref() != Some(path.as_path()) {
-            return;
+            return true;
         }
         let row = (end.line as usize).min(self.editor.lines.len().saturating_sub(1));
         let col = self.editor.utf16_col_to_char_pub(row, end.character);
@@ -10918,6 +10930,7 @@ impl App {
         self.editor.cursor_row = row;
         self.editor.cursor_col = col;
         self.editor.ensure_cursor_col_visible();
+        true
     }
 
     /// The active LSP progress line for the status bar, if any server is busy
@@ -11048,6 +11061,11 @@ impl App {
     }
 
     fn go_to_definition(&mut self, path: PathBuf, line: u32, col: u32) {
+        self.try_go_to_definition(path, line, col);
+    }
+
+    /// `go_to_definition`, returning whether the file opened.
+    fn try_go_to_definition(&mut self, path: PathBuf, line: u32, col: u32) -> bool {
         let pinned = self.keep_preview_open_for_navigation_to(&path);
         if let Some(from) = self.editor.path.clone() {
             self.nav.record(NavLoc {
@@ -11059,11 +11077,13 @@ impl App {
         // `col` is the server's UTF-16 column, not a character column.
         match self.open_at_utf16(&path, line, col) {
             Ok(()) => {
-                self.status = format!("Jumped to {} line {}", self.status_path(&path), line + 1)
+                self.status = format!("Jumped to {} line {}", self.status_path(&path), line + 1);
+                true
             }
             Err(e) => {
                 self.restore_preview_after_failed_navigation(pinned);
-                self.status = format!("Go to definition failed: {e}")
+                self.status = format!("Go to definition failed: {e}");
+                false
             }
         }
     }
@@ -26294,19 +26314,28 @@ impl App {
     /// Open `url` in the user's browser: through the relay or a detected
     /// URL on a remote session, and never from a test.
     fn open_url_for_user(&mut self, url: &str) {
+        self.try_open_url_for_user(url);
+    }
+
+    /// `open_url_for_user`, returning false when the browser could not be
+    /// started.
+    fn try_open_url_for_user(&mut self, url: &str) -> bool {
         if cfg!(test) {
             // Tests never start a browser.
             self.status = format!("Open {url}");
-            return;
+            return true;
         }
         if self.drop_relay_active() || is_remote_session() {
             self.open_detected_url(url);
-            return;
+            return true;
         }
-        self.status = match open_url(url) {
+        let opened = open_url(url);
+        let ok = opened.is_ok();
+        self.status = match opened {
             Ok(()) => format!("Opened {url}"),
             Err(e) => format!("Could not open a browser ({e}): {url}"),
         };
+        ok
     }
 
     /// The store index of the current database, for the palette commands

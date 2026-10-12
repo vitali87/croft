@@ -220,21 +220,28 @@ impl ClientState {
                 async move { Ok(answer.await.ok().flatten()) }
             })
             // `window/showDocument` (#1599): a file to open at a range, or
-            // a link for the browser. Success means the app was handed it.
+            // a link for the browser. Success is the app's word that it was
+            // shown; an app that is gone, or a file that would not open,
+            // answers false. Focus moves unless the server says
+            // `takeFocus: false`.
             .request::<lsp_types::request::ShowDocument, _>(|this, params| {
                 log_file::log(&format!("lsp[{}] shows {}", this.name, params.uri));
-                let success = this
-                    .progress_tx
-                    .send(ServerUpdate {
-                        server: this.name.clone(),
-                        event: ServerEvent::ShowDocument {
-                            uri: params.uri,
-                            external: params.external.unwrap_or(false),
-                            selection: params.selection,
-                        },
+                let (reply, shown) = tokio::sync::oneshot::channel();
+                let _ = this.progress_tx.send(ServerUpdate {
+                    server: this.name.clone(),
+                    event: ServerEvent::ShowDocument {
+                        uri: params.uri,
+                        external: params.external.unwrap_or(false),
+                        take_focus: params.take_focus.unwrap_or(true),
+                        selection: params.selection,
+                        reply,
+                    },
+                });
+                async move {
+                    Ok(lsp_types::ShowDocumentResult {
+                        success: shown.await.unwrap_or(false),
                     })
-                    .is_ok();
-                std::future::ready(Ok(lsp_types::ShowDocumentResult { success }))
+                }
             })
             .notification::<Progress>(|this, params| {
                 let ProgressParamsValue::WorkDone(work) = params.value;
@@ -2028,42 +2035,53 @@ mod tests {
             "window/showDocument",
             json!({ "uri": "https://go.dev/gopls", "external": true }),
         );
-        assert_eq!(
-            futures::executor::block_on(reply).expect("answered"),
-            json!({ "success": true })
-        );
         match rx.try_recv().expect("forwarded").event {
             ServerEvent::ShowDocument {
                 uri,
                 external,
+                take_focus,
                 selection,
+                reply: shown,
             } => {
                 assert_eq!(uri.as_str(), "https://go.dev/gopls");
                 assert!(external);
+                assert!(take_focus, "takeFocus defaults to true");
                 assert!(selection.is_none());
+                shown.send(true).unwrap();
             }
             other => panic!("expected a document, got {other:?}"),
         }
+        assert_eq!(
+            futures::executor::block_on(reply).expect("answered"),
+            json!({ "success": true })
+        );
         let reply = request(
             &mut router,
             "window/showDocument",
             json!({
                 "uri": "file:///tmp/a.go",
+                "takeFocus": false,
                 "selection": { "start": { "line": 4, "character": 2 }, "end": { "line": 4, "character": 6 } }
             }),
         );
-        futures::executor::block_on(reply).expect("answered");
         match rx.try_recv().expect("forwarded").event {
             ServerEvent::ShowDocument {
                 external,
+                take_focus,
                 selection,
                 ..
             } => {
                 assert!(!external, "external defaults to false");
+                assert!(!take_focus, "takeFocus: false is carried");
                 assert_eq!(selection.map(|r| r.start.line), Some(4));
             }
             other => panic!("expected a document, got {other:?}"),
         }
+        // The app dropped the reply without showing it: not a success.
+        assert_eq!(
+            futures::executor::block_on(reply).expect("answered"),
+            json!({ "success": false })
+        );
     }
 
     #[test]

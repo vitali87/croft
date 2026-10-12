@@ -716,11 +716,15 @@ pub enum ServerEvent {
         reply: oneshot::Sender<Option<lsp_types::MessageActionItem>>,
     },
     /// A `window/showDocument`: open `uri` in a tab, or in the browser when
-    /// `external`, with `selection` selected.
+    /// `external`, with `selection` selected, moving keyboard focus to it
+    /// only when `take_focus`. Whether it was shown goes back on `reply`;
+    /// dropping `reply` answers "not shown".
     ShowDocument {
         uri: lsp_types::Url,
         external: bool,
+        take_focus: bool,
         selection: Option<lsp_types::Range>,
+        reply: oneshot::Sender<bool>,
     },
 }
 

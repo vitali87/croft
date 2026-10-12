@@ -81255,14 +81255,18 @@ fn show_document_opens_the_file_with_the_range_selected() {
         start: lsp_types::Position::new(2, 5),
         end: lsp_types::Position::new(2, 9),
     };
+    let (reply, mut shown) = tokio::sync::oneshot::channel();
     app.apply_server_update(server_update(
         "gopls",
         crate::lsp::manager::ServerEvent::ShowDocument {
             uri: lsp_types::Url::from_file_path(&file).unwrap(),
             external: false,
+            take_focus: true,
             selection: Some(range),
+            reply,
         },
     ));
+    assert_eq!(shown.try_recv(), Ok(true), "the server hears it was shown");
     assert_eq!(app.editor.path.as_deref(), Some(file.as_path()));
     let sel = app
         .editor
@@ -81278,17 +81282,70 @@ fn show_document_sends_a_link_to_the_browser_and_not_to_a_tab() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     for external in [true, false] {
+        let (reply, mut shown) = tokio::sync::oneshot::channel();
         app.apply_server_update(server_update(
             "gopls",
             crate::lsp::manager::ServerEvent::ShowDocument {
                 uri: lsp_types::Url::parse("https://go.dev/gopls/features").unwrap(),
                 external,
+                take_focus: true,
                 selection: None,
+                reply,
             },
         ));
+        assert_eq!(shown.try_recv(), Ok(true));
         assert_eq!(app.status, "Open https://go.dev/gopls/features");
         assert!(app.editor.path.is_none(), "no tab for a web page");
     }
+}
+
+#[test]
+fn show_document_answers_false_for_a_file_that_will_not_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    let (reply, mut shown) = tokio::sync::oneshot::channel();
+    app.apply_server_update(server_update(
+        "gopls",
+        crate::lsp::manager::ServerEvent::ShowDocument {
+            uri: lsp_types::Url::from_file_path(root.join("missing.go")).unwrap(),
+            external: false,
+            take_focus: true,
+            selection: None,
+            reply,
+        },
+    ));
+    assert_eq!(shown.try_recv(), Ok(false), "not shown is not a success");
+    assert!(app.editor.path.is_none());
+}
+
+#[test]
+fn show_document_without_take_focus_leaves_focus_where_it_was() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let file = root.join("main.go");
+    std::fs::write(&file, "package main\n").unwrap();
+    let mut app = App::new(root).unwrap();
+    app.focus_pane(Pane::Tree);
+    let show = |app: &mut App, take_focus: bool| {
+        let (reply, mut shown) = tokio::sync::oneshot::channel();
+        app.apply_server_update(server_update(
+            "gopls",
+            crate::lsp::manager::ServerEvent::ShowDocument {
+                uri: lsp_types::Url::from_file_path(&file).unwrap(),
+                external: false,
+                take_focus,
+                selection: None,
+                reply,
+            },
+        ));
+        assert_eq!(shown.try_recv(), Ok(true));
+    };
+    show(&mut app, false);
+    assert_eq!(app.editor.path.as_deref(), Some(file.as_path()));
+    assert!(app.focus == Pane::Tree, "takeFocus: false keeps focus");
+    show(&mut app, true);
+    assert!(app.focus == Pane::Editor, "takeFocus: true moves it");
 }
 
 #[test]
