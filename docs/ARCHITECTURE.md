@@ -38,9 +38,9 @@ src/
 ├── log_view.rs           windowed backing store for the rendered ANSI log view: a `memchr` line-offset index plus a 256 KiB parsed window around the viewport, head indexed sync and the tail in a background thread
 ├── hex.rs                hex viewer/editor core and the routing fallback for files the text heuristic rejects; pure state + windowed file IO, never loads the file whole
 ├── asciicast.rs          writing a session as an asciicast v2 recording, behind "Session: Record Terminal as Asciicast"; payloads go through `serde_json`, backwards timestamps are clamped
-├── archive.rs            archive browser core: zip/jar/whl and tar/tar.gz member listing without payload reads, size-gated before the parse; extract_member writes one member under a strictly lexical containment check; the tab is read-only
+├── archive.rs            archive browser core: zip-based packages (zip/jar/whl/apk/vsix/epub/...) and tar/tar.gz/tar.xz member listing without payload reads, size-gated before the parse; extract_member writes one member under a strictly lexical containment check; the tab is read-only
 ├── highlight.rs          tree-sitter highlight registry per language; every span, captured or not, styles from the active theme's `SyntaxPalette`, snapshotted once per pass rather than a hardcoded Base16 literal; Markdown alone resolves injections (the inline grammar, fenced code by its language, front matter), each with its children included since the block grammar leaves delimiter hints inside the ranges it hands off
-├── hot_exit.rs           hot exit (#862): the workspace's unsaved buffers backed up while unsaved under `~/.cache/croft/hot-exit/<workspace digest>/<pid>.json`, one file per running croft; a launch restores only the files of crofts that are gone, as unsaved tabs, and a clean quit removes its own
+├── hot_exit.rs           hot exit (#862): the workspace's unsaved buffers backed up while unsaved under `~/.local/state/croft/hot-exit/<workspace digest>/<pid>.json`, one file per running croft; a launch restores only the files of crofts that are gone, as unsaved tabs, and a clean quit removes its own
 ├── history.rs            local history: per-save snapshots under `~/.config/croft/history` (raw bytes, deduped, capped, 10s merge window), merged into the Explorer timeline, backing snapshot diff/restore plus a per-line `.seats` authorship sidecar
 ├── icons.rs             Codicon and file-type Nerd Font glyphs and per-language colors
 ├── install_session.rs   streams install-progress events while a remote host builds / installs the croft binary
@@ -129,7 +129,7 @@ src/
 │   ├── locate.rs             test-name → source location: `find_test_source` walks the workspace grepping `fn <leaf>` and ranks by module path, while pytest and JS node IDs grep just their own file; run on a background thread so a big workspace cannot freeze the render loop
 │   ├── model.rs         TestStatus (NotRun/Running/Passed/Failed/Skipped) + TestCase; suite_and_leaf splits a `module::name` path for the tree
 │   ├── registry.rs           data-driven test-runner registry: maps a workspace root to a Runner from the `[[test_runners]]` blocks in bundled + user manifests, skipping runners whose extension is disabled in the Extensions panel
-│   ├── parse.rs              per-tool output parsers — libtest, pytest, vitest, jest — with all node IDs normalised to `::` separators so one panel tree serves every runner
+│   ├── parse.rs              per-tool output parsers — libtest, pytest (plain `-v` lines and pytest-xdist's outcome-first `[gwN]` lines), vitest, jest — with all node IDs normalised to `::` separators so one panel tree serves every runner
 │   └── worker.rs             the test-runner command layer: RunAll / RunOne / RunFilter / RunSuite / Discover per runner, building each tool's argv and streaming cases over an mpsc channel
 ├── mcp/                 MCP sidecar host (Tier-1 extensions): croft is a DETERMINISTIC MCP host — a human invokes a contributed palette command and croft calls one pre-known tool on one vetted local server (no LLM picks tools), which removes MCP's whole prompt-injection/tool-poisoning attack family
 │   ├── mod.rs           module overview + McpOutcome (the off-thread worker's result)
@@ -271,7 +271,7 @@ A tree-sitter highlighted editor with a full write path, mouse-drag selection, n
 
 **Canvas backgrounds.** The CSV and diff canvases fill with `canvas_bg`: `Reset` on iTerm2 to inherit the SetColors session bg, and the theme's `editor_bg` on every other host, where `Reset` would override the frame prefill and leave a host-black island. The image and PDF canvas uses `image_canvas_bg` instead — still `Reset` on Kitty hosts, because the preview sits at `KITTY_Z_BELOW_TEXT_AND_BG` and Kitty paints any cell with a non-default background over an image that deep, so an explicit fill would hide the picture behind its own canvas. The themed look survives via the bake's theme-bg letterbox.
 
-**Minimap.** The minimap rasterizer is `minimap_rgba`.
+**Minimap.** The minimap rasterizer is `minimap_rgba`. Where the terminal cannot draw images, `App::render_text_minimap` folds the same raster into braille cells (`braille_minimap`, 2x4 dots a cell, four source columns a dot) instead (#1231).
 
 **Highlighting off the keystroke path (#850).** tree-sitter-highlight parses the whole buffer from scratch on every call, tens to hundreds of milliseconds on a large file, and that pass used to run inside every edit. `recompute_highlights` now carries the current spans and bracket colours through the edit at once, then hands the text to a worker thread (`run_highlight_pass`, which also runs the bracket scan against the grammar's string and comment ranges). `carry_highlights` diffs the buffer against the text the spans describe: lines the edit left alone keep theirs, and in the edited stretch the text before and after the change keeps its colours, a span the change falls inside stretches over it, and new text stays uncoloured until the pass lands. Every carried offset stays inside its line and on a char boundary. An edit waits for its pass only when the last pass fit `HIGHLIGHT_INLINE_BUDGET` (8 ms), so a small file still colours each keystroke in the same frame and a large one never makes it wait. A pass that does not fit lands on a later tick through `App::poll_highlights`, which polls every tab in every group, and bumps `highlight_generation`, which the minimap's bake is keyed on. One pass runs per buffer at a time. Edits made while it runs are carried, and when it lands a single follow-up pass picks them all up, so a burst of typing costs a pass or two rather than one per key. A pass is dropped when the buffer changed language or the theme changed after it started. `Editor::historical` waits for the whole pass, since it is built off the UI thread and no tick polls a scrubber view. Reusing the parse tree between passes is the rest of #850.
 
@@ -575,7 +575,7 @@ On-screen keyboard for Termux, needed because mouse tracking blocks the native s
 
 ### scrubber.rs
 
-Moves through a branch's history. This is the cursor behind "Source Control: Scrub History": arrows step between commits, Home returns to the working tree. At a commit, Enter ("Open Scrubbed File Here") opens that version as a tab with no file behind it, and "Diff Scrubbed File to Working Tree" diffs it against the file on disk. Both leave the scrubber.
+Moves through a branch's history. This is the cursor behind "Source Control: Scrub History": arrows step between commits, Home returns to the working tree. At a commit, Enter ("Open Scrubbed File Here") opens that version as a tab with no file behind it, and "Diff Scrubbed File to Working Tree" diffs it against the working copy: its open tab's unsaved edits, else the file on disk. Both leave the scrubber.
 
 **Enter opens here only at a commit.** There, the edit guard already refuses typing into the live buffer hidden under the historical view. At the working tree, Enter is ordinary typing. The diff is a palette command.
 
@@ -846,9 +846,9 @@ An SGR span parser for colour-bearing text. One pass turns a raw line into visib
 
 ### archive.rs
 
-The archive browser core. It lists members without reading payloads: zip/jar/whl through the central directory, tar and tar.gz through a header walk.
+The archive browser core. It lists members without reading payloads: zip-based packages (zip, jar, whl, apk, aar, war, ear, nupkg, vsix, epub) through the central directory, tar, tar.gz and tar.xz through a header walk.
 
-**Why the size gate comes before the parse.** Each branch is bounded by FILE SIZE before parsing. Tar is capped at `TAR_LIST_CAP`, with an additional decoded-byte cap while a `.tar.gz` streams. Zip is capped at `ZIP_LIST_CAP`, because a zip's members cost ~87 bytes each, so a file under the editor's 50MB cap can declare 400k of them and take 1.65s to list on the frame loop. `ZipArchive::new` parses the whole central directory before any count exists, so the gate has to precede it.
+**Why the size gate comes before the parse.** Each branch is bounded by FILE SIZE before parsing. Tar is capped at `TAR_LIST_CAP`, with an additional decoded-byte cap while a `.tar.gz` streams. A `.tar.xz` is decoded into memory under the same cap: its declared size is checked first, then the decoder stops at the cap, so an xz bomb is refused as a listing cap rather than inflated. Zip is capped at `ZIP_LIST_CAP`, because a zip's members cost ~87 bytes each, so a file under the editor's 50MB cap can declare 400k of them and take 1.65s to list on the frame loop. `ZipArchive::new` parses the whole central directory before any count exists, so the gate has to precede it.
 
 **Extraction is lexically contained.** `extract_member` writes ONE member into a destination under a strictly LEXICAL containment check: absolute paths, drive prefixes and `..`-traversal are refused before anything is written, and zip-slip is tested. Extraction is capped at 100MB.
 
@@ -1008,7 +1008,7 @@ The proactive-look detector, pure text-in and row-out. Tree-sitter judges whethe
 
 Per-tool output parsers. All node IDs are normalised to `::` separators so one panel tree serves every runner.
 
-**The runners covered.** libtest (`parse_test_line` for run lines, `parse_list_line` for discovery), pytest (`-v` result lines, `--collect-only` node IDs), vitest (`parse_vitest_list_line` for `vitest list`, `parse_vitest_tap_line` for the streaming `--reporter=tap-flat` run lines, whose `file > describe > test` IDs are complete per line), and jest (`parse_jest_json`).
+**The runners covered.** libtest (`parse_test_line` for run lines, `parse_list_line` for discovery), pytest (`<id> PASSED` result lines at `--verbosity=1`, `--collect-only` node IDs at `--verbosity=-1`, both set outright so a project's `addopts` `-q` cannot shift them), vitest (`parse_vitest_list_line` for `vitest list`, `parse_vitest_tap_line` for the streaming `--reporter=tap-flat` run lines, whose `file > describe > test` IDs are complete per line), and jest (`parse_jest_json`).
 
 **Why jest is different.** jest prints one `--json` document to stdout at run end, with human output going to stderr, yielding every assertion with its describe chain and treating `pending`/`todo` as the skip family.
 
