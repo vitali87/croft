@@ -422,15 +422,28 @@ impl InputPrompt {
     }
 }
 
-/// Where a field `width` cells wide starts showing its value so the caret
+/// Where a field `width` cells wide starts showing `value` so the caret
 /// at char `cursor` is in view (#1601): the chars skipped, and whether a
-/// leading `…` takes the first cell to say so.
-fn field_scroll(cursor: usize, width: usize) -> (usize, bool) {
-    if width < 2 || cursor < width {
+/// leading `…` takes the first cell to say so. Measured in terminal cells,
+/// so wide (CJK) chars count as two.
+fn field_scroll(value: &str, cursor: usize, width: usize) -> (usize, bool) {
+    use unicode_width::UnicodeWidthChar;
+    let cells: Vec<usize> = value.chars().map(|c| c.width().unwrap_or(0)).collect();
+    let cursor = cursor.min(cells.len());
+    // The caret's own cell: the char under it, or one blank past the end.
+    let caret = cells.get(cursor).copied().unwrap_or(1).max(1);
+    let before: usize = cells[..cursor].iter().sum();
+    if width < 2 || before + caret <= width {
         return (0, false);
     }
-    // `…`, then the chars before the caret, then the caret's own cell.
-    (cursor + 2 - width, true)
+    // `…`, then as many chars before the caret as fit, then the caret.
+    let room = width.saturating_sub(1 + caret);
+    let (mut skip, mut used) = (cursor, 0);
+    while skip > 0 && used + cells[skip - 1] <= room {
+        skip -= 1;
+        used += cells[skip];
+    }
+    (skip, true)
 }
 
 pub fn render_input_prompt(
@@ -496,7 +509,7 @@ pub fn render_input_prompt(
         // The field scrolls to keep the caret in view (#1601): a value wider
         // than the box, any real path, hid its end and the caret, which
         // starts there. A `…` marks the hidden start.
-        let (skip, lead) = field_scroll(cursor, inner.width as usize);
+        let (skip, lead) = field_scroll(&prompt.value, cursor, inner.width as usize);
         let before: String = prompt
             .value
             .chars()
@@ -688,6 +701,31 @@ mod tests {
         p.move_cursor_home();
         let row = value_row(&mut p, 50);
         assert!(row.starts_with("/work/dir/"), "{row}");
+    }
+
+    /// #1601: scrolling is measured in cells, so a value of wide chars
+    /// that is fewer chars than the field but more cells still scrolls and
+    /// keeps the end caret inside the field.
+    #[test]
+    fn a_wide_char_value_scrolls_by_display_width() {
+        let mut p = prefilled(&"\u{4e2d}".repeat(20));
+        let screen = Rect::new(0, 0, 50, 12);
+        let mut buf = Buffer::empty(screen);
+        render_input_prompt(&mut p, screen, &mut buf, crate::theme::Theme::BLACK);
+        let r = p.last_rect;
+        let (left, right) = (r.x + 2, r.x + r.width - 2);
+        assert!(
+            20 < right - left && right - left < 40,
+            "field is {}",
+            right - left
+        );
+        let caret = (left..right)
+            .find(|&x| buf[(x, r.y + 1)].modifier.contains(Modifier::SLOW_BLINK))
+            .expect("caret drawn inside the field");
+        assert!(caret < right);
+        assert_eq!(buf[(left, r.y + 1)].symbol(), "\u{2026}");
+        p.move_cursor_home();
+        assert!(value_row(&mut p, 50).starts_with('\u{4e2d}'));
     }
 
     /// Negative (#1601): a value that fits is drawn from its first char.
