@@ -2958,6 +2958,9 @@ pub struct Editor {
     /// lines at each indent level in a line's leading whitespace, with the
     /// cursor's block highlighted. App-synced from prefs; on by default.
     pub show_indent_guides: bool,
+    /// Ruler columns (#1524, VS Code `editor.rulers`). App-synced from
+    /// prefs; empty by default.
+    pub rulers: Vec<u16>,
     /// Bracket-pair colorization (#131, VS Code on-by-default since 1.67):
     /// per-line `(char column, colour index)` pairs for every `()[]{}` outside
     /// strings and comments, colour cycling by nesting depth
@@ -3343,6 +3346,7 @@ impl Editor {
             final_newline: false,
             decode_lossy: false,
             show_indent_guides: true,
+            rulers: Vec::new(),
             show_bracket_colors: true,
             bracket_colors: Vec::new(),
             protected_ranges: Vec::new(),
@@ -15920,6 +15924,38 @@ impl Widget for &mut Editor {
             // caret (DECSCUSR `BlinkingBar`); App calls
             // `frame.set_cursor_position(...)` so the blink/overlay never
             // hides the underlying character.
+        }
+
+        // Rulers (#1524, VS Code `editor.rulers`): a dim │ at each ruler
+        // column down the whole text area, past the end of the file too.
+        // Blank cells only, so text always wins, as with the indent guides;
+        // a long line runs over its ruler, which still shows the limit. The
+        // column is fixed on screen: the flat path shifts it by the
+        // horizontal scroll, and in wrap mode every visual row carries it.
+        if !self.rulers.is_empty() {
+            let ruler_fg = self.theme.ruler();
+            let shift = if wrap { 0 } else { self.scroll_col };
+            for row in 0..text_height {
+                if matches!(visual_rows.get(row), Some(VisRow::Box { .. })) {
+                    continue;
+                }
+                let y = inner.y + row as u16;
+                for &ruler in &self.rulers {
+                    let Some(col) = usize::from(ruler).checked_sub(shift) else {
+                        continue;
+                    };
+                    if col >= text_width as usize {
+                        continue;
+                    }
+                    let cell = &mut buf[(text_x + col as u16, y)];
+                    if cell.symbol() != " " {
+                        continue;
+                    }
+                    cell.set_symbol("\u{2502}");
+                    let style = cell.style().fg(ruler_fg);
+                    cell.set_style(style);
+                }
+            }
         }
 
         // Ghost caret name tags (VS Code Live Share): while a peer's caret is
@@ -31345,6 +31381,77 @@ mod tests {
             "i",
             "the scrolled-off level-1 guide leaves the text alone"
         );
+    }
+
+    // ---- Rulers (editor.rulers, #1524) ----
+
+    #[test]
+    fn rulers_draw_down_blank_cells_and_past_the_end_of_the_file() {
+        let mut e = editor_with("xxxxxxxxxxxxxxxxxxxx\n\nshort");
+        e.rulers = vec![10, 15];
+        let buf = guide_buf(&mut e, 50, 8);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        let r = e.theme.ruler();
+        assert_eq!(
+            buf[(text_x + 10, y0)].symbol(),
+            "x",
+            "a long line runs over the ruler: text wins"
+        );
+        for row in [1, 2, 4] {
+            for col in [10, 15] {
+                let cell = &buf[(text_x + col, y0 + row)];
+                assert_eq!(cell.symbol(), "\u{2502}", "ruler {col} on row {row}");
+                assert_eq!(cell.fg, r);
+            }
+        }
+        assert_eq!(
+            buf[(text_x + 9, y0 + 1)].symbol(),
+            " ",
+            "only at the column"
+        );
+    }
+
+    #[test]
+    fn rulers_follow_the_horizontal_scroll() {
+        // A long first line, so the pane really scrolls.
+        let mut e = editor_with(&format!("{}\n\nb", "w".repeat(90)));
+        e.rulers = vec![10];
+        e.scroll_col = 4;
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        assert_eq!(buf[(text_x + 6, y0 + 1)].symbol(), "\u{2502}");
+        assert_eq!(buf[(text_x + 10, y0 + 1)].symbol(), " ");
+        e.scroll_col = 12;
+        let buf = guide_buf(&mut e, 40, 6);
+        let row: String = (0..30)
+            .map(|c| buf[(text_x + c, y0 + 1)].symbol().to_string())
+            .collect();
+        assert!(
+            !row.contains('\u{2502}'),
+            "a ruler scrolled off is not drawn: {row:?}"
+        );
+    }
+
+    #[test]
+    fn no_rulers_or_rulers_past_the_pane_draw_nothing() {
+        for rulers in [vec![], vec![500]] {
+            let mut e = editor_with("a\n\nb");
+            e.rulers = rulers.clone();
+            let buf = guide_buf(&mut e, 40, 6);
+            let text_x = e.last_inner.x + e.last_gutter_width + 1;
+            let y0 = e.last_inner.y;
+            for row in 0..4 {
+                let text: String = (0..30)
+                    .map(|c| buf[(text_x + c, y0 + row)].symbol().to_string())
+                    .collect();
+                assert!(
+                    !text.contains('\u{2502}'),
+                    "{rulers:?}, row {row}: {text:?}"
+                );
+            }
+        }
     }
 
     #[test]

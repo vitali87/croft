@@ -3165,6 +3165,9 @@ pub struct App {
     /// Whitespace rendering mode (#133), frame-synced to every editor;
     /// "selection" by default, the palette command cycles it.
     whitespace_mode: crate::widgets::editor::WhitespaceMode,
+    /// Ruler columns (#1524) from the `rulers` setting, synced onto every
+    /// editor each frame like `whitespace_mode`.
+    rulers: Vec<u16>,
     /// Default ignore-whitespace mode applied to newly opened diffs (#258).
     diff_ws_default: crate::widgets::diff::DiffWhitespace,
     /// Debugger inline values (#135): on by default; rebuilt on every
@@ -5817,6 +5820,7 @@ impl App {
             whitespace_mode: crate::widgets::editor::WhitespaceMode::from_pref(
                 &loaded_prefs.render_whitespace,
             ),
+            rulers: loaded_prefs.rulers.clone(),
             diff_ws_default: crate::widgets::diff::DiffWhitespace::from_config(
                 &loaded_prefs.diff_ignore_whitespace,
             ),
@@ -18358,6 +18362,7 @@ impl App {
             ed.provenance_overlay = self.provenance_overlay;
             ed.whitespace_mode = self.whitespace_mode;
             ed.diff_ws_default = self.diff_ws_default;
+            ed.rulers.clone_from(&self.rulers);
         }
         for group in self.editor_layout.inactive_groups_mut() {
             for ed in group.editors.iter_mut() {
@@ -18371,6 +18376,7 @@ impl App {
                 ed.whitespace_mode = self.whitespace_mode;
                 ed.diff_ws_default = self.diff_ws_default;
                 ed.diff_ws_default = self.diff_ws_default;
+                ed.rulers.clone_from(&self.rulers);
             }
         }
         self.tree.focus_gradient = gradient;
@@ -59385,6 +59391,7 @@ impl App {
         self.whitespace_mode =
             crate::widgets::editor::WhitespaceMode::from_pref(&p.render_whitespace);
         self.editor.whitespace_mode = self.whitespace_mode;
+        self.rulers.clone_from(&p.rulers);
         if !p.disable_inlay_hints && !self.inlay_hints_enabled {
             self.inlay_hints_enabled = true;
             self.request_inlay_hints_for_open_editors();

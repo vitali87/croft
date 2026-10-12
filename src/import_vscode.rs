@@ -131,6 +131,20 @@ fn as_whitespace_mode(v: &Value) -> Option<Value> {
     Some(Value::from(mapped))
 }
 
+/// VS Code's `editor.rulers` (#1524): each ruler is a column number or an
+/// object with a `column` (and a `color` croft does not carry). An entry
+/// that is neither, or not a usable column, is left out.
+fn as_rulers(v: &Value) -> Option<Value> {
+    let columns: Vec<u16> = v
+        .as_array()?
+        .iter()
+        .filter_map(|r| r.as_u64().or_else(|| r.get("column")?.as_u64()))
+        .filter_map(|c| u16::try_from(c).ok())
+        .filter(|&c| c > 0)
+        .collect();
+    Some(Value::from(columns))
+}
+
 fn as_scrollback(v: &Value) -> Option<Value> {
     v.as_u64().map(Value::from)
 }
@@ -207,6 +221,11 @@ const SETTINGS: &[SettingMap] = &[
         vscode: "editor.renderWhitespace",
         croft: "render_whitespace",
         convert: as_whitespace_mode,
+    },
+    SettingMap {
+        vscode: "editor.rulers",
+        croft: "rulers",
+        convert: as_rulers,
     },
     SettingMap {
         vscode: "terminal.integrated.scrollback",
@@ -1100,6 +1119,23 @@ fn write_json(path: &Path, value: &Value) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// #1524: `editor.rulers` imports in both of VS Code's forms, plain
+    /// columns and `{ "column", "color" }` objects; entries that are not a
+    /// usable column are left out.
+    #[test]
+    fn editor_rulers_import_as_columns() {
+        let doc = json!({
+            "editor.rulers": [80, { "column": 100, "color": "#ff0000" }, "wide", -4, 0, 70000]
+        });
+        let mut report = Report::default();
+        convert_settings(&doc, &mut report);
+        assert_eq!(report.settings["rulers"], json!([80, 100]));
+        let prefs: crate::prefs::Prefs =
+            serde_json::from_value(Value::Object(report.settings.clone().into_iter().collect()))
+                .unwrap();
+        assert_eq!(prefs.rulers, vec![80, 100]);
+    }
 
     #[test]
     fn settings_map_only_where_croft_has_a_real_equivalent() {

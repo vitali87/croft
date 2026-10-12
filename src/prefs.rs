@@ -262,6 +262,11 @@ pub struct Prefs {
     /// "all", or "none". Parsed by `WhitespaceMode::from_pref`.
     #[serde(default)]
     pub render_whitespace: String,
+    /// Vertical rulers (#1524), VS Code's `editor.rulers`: a dim line down
+    /// the editor at each of these columns marks a line-length limit, such
+    /// as 80 or 100. Empty draws none.
+    #[serde(default)]
+    pub rulers: Vec<u16>,
     /// Opt-out for bracket-pair colorization (#131), on by default like VS
     /// Code's `editor.bracketPairColorization.enabled` (default since 1.67).
     /// Stored as the disable flag so the derived `Default` and an older

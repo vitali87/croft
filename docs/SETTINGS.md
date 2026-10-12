@@ -94,7 +94,7 @@ never change what croft trusts or executes. They are limited to an explicit
 allowlist — appearance and editor/terminal behavior:
 
 `theme`, `format_on_save`, `format_on_type`, `auto_save`, `auto_save_on_focus_change`,
-`render_whitespace`, `disable_inline_blame`, `disable_auto_close_pairs`,
+`render_whitespace`, `rulers`, `disable_inline_blame`, `disable_auto_close_pairs`,
 `disable_inline_values`, `disable_save_before_debug`, `disable_bracket_colors`, `disable_indent_guides`,
 `disable_inlay_hints`, `copy_on_select`, `disable_secret_redaction`, `disable_log_highlight`, `explorer_views`,
 `files_exclude`, `search_exclude`.
@@ -120,6 +120,7 @@ means the same thing whichever path reads it.
 | `files.autoSave: "onFocusChange"` / `"onWindowChange"` | `auto_save_on_focus_change: true` |
 | `files.autoSave: "off"` | both auto-save modes off |
 | `editor.renderWhitespace` | `render_whitespace` (`none` / `selection` / `all`; VS Code's `boundary` and `trailing` have no croft mode and map to `none`) |
+| `editor.rulers` | `rulers` (columns such as `[80, 100]`; the object form `{ "column": 100, "color": … }` keeps its column, and croft draws every ruler in one colour) |
 | `editor.bracketPairColorization.enabled` | `disable_bracket_colors` (negated) |
 | `editor.guides.indentation` | `disable_indent_guides` (negated) |
 | `editor.inlayHints.enabled` | `disable_inlay_hints` (negated) |

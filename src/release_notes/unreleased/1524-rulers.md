@@ -1,0 +1,1 @@
+feature: Column rulers: the `rulers` setting (for example `[80, 100]`) draws a dim line down the editor at each column to show a line-length limit, a repository's `.croft/config.json` may set it, and `editor.rulers` from `.vscode/settings.json` and `croft import-vscode` carries over.
