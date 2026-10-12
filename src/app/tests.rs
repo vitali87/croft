@@ -76812,6 +76812,36 @@ fn search_toggles_and_details_answer_the_keyboard() {
     assert_eq!(app.search.query, "c");
 }
 
+/// #1612: `Alt+P` in the Search side bar flips Preserve Case, names it on
+/// the status line and types nothing; the palette carries it too.
+#[test]
+fn alt_p_toggles_preserve_case_in_the_search_side_bar() {
+    use crate::widgets::command_palette::{ALL_COMMANDS, Command};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.open_replace();
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::ALT))
+        .unwrap();
+    assert!(app.search.opts.preserve_case);
+    assert_eq!(app.status, "Search: Preserve Case on");
+    assert!(
+        app.search.replace.is_empty(),
+        "the key toggles, it does not type"
+    );
+    // Negative: the other toggles are untouched.
+    assert!(!app.search.opts.case_sensitive && !app.search.opts.use_regex);
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::ALT))
+        .unwrap();
+    assert!(!app.search.opts.preserve_case);
+    assert_eq!(app.status, "Search: Preserve Case off");
+    assert!(ALL_COMMANDS.contains(&Command::SearchTogglePreserveCase));
+    app.show_tree = false;
+    app.run_command(Command::SearchTogglePreserveCase);
+    assert!(app.show_tree);
+    assert!(app.search.opts.preserve_case);
+}
+
 /// #860: `Ctrl/Cmd+Shift+H` is Replace in Files: the Search side bar opens
 /// with its Replace row expanded and focused, from the editor, and a second
 /// press never collapses it. In the live terminal `Ctrl+Shift+H` stays

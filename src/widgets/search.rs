@@ -72,6 +72,8 @@ pub struct SearchHit {
 ///   - `case_sensitive` (Aa)
 ///   - `whole_word` (ab with underline)
 ///   - `use_regex` (.*)
+///   - `preserve_case` (AB, on the replace row): each replacement takes the
+///     case of the text it replaces (#1612)
 ///
 /// All-false matches the original case-insensitive substring behaviour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -79,6 +81,7 @@ pub struct SearchOpts {
     pub case_sensitive: bool,
     pub whole_word: bool,
     pub use_regex: bool,
+    pub preserve_case: bool,
 }
 
 fn build_matcher(query: &str, opts: SearchOpts) -> Option<RegexMatcher> {
@@ -888,13 +891,18 @@ fn replace_in_line(
                             .filter(|c| c.get(0).is_some_and(|m| m.range() == (0..end - start)))
                     })
             });
-            match caps.zip(full) {
+            let expanded = match caps.zip(full) {
                 Some((caps, re)) if opts.use_regex => {
                     let mut expanded = String::new();
                     caps.expand(&brace_group_refs(replacement, re), &mut expanded);
-                    out.push_str(&expanded);
+                    expanded
                 }
-                _ => out.push_str(replacement),
+                _ => replacement.to_string(),
+            };
+            if opts.preserve_case {
+                out.push_str(&preserve_case(&line[start..end], &expanded));
+            } else {
+                out.push_str(&expanded);
             }
             count += 1;
             last = end;
@@ -1036,23 +1044,70 @@ pub fn replace_in_text(
     Some((out, count))
 }
 
+/// `replacement` in the case of `matched`, VS Code's Preserve Case rules
+/// (`buildReplaceStringWithCasePreserved`): an all-upper match gives an
+/// all-upper replacement, all-lower gives all-lower, and a capitalised one a
+/// capitalised one. When both split into the same number of `-` (or `_`)
+/// parts, each part is shaped by its own, so `User-Name` over `account-id`
+/// gives `Account-Id`. Anything else goes in as typed (#1612).
+pub fn preserve_case(matched: &str, replacement: &str) -> String {
+    if matched.is_empty() {
+        return replacement.to_string();
+    }
+    let splits = |sep: char| {
+        matched.contains(sep)
+            && replacement.contains(sep)
+            && matched.split(sep).count() == replacement.split(sep).count()
+    };
+    let (hyphens, underscores) = (splits('-'), splits('_'));
+    if hyphens != underscores {
+        let sep = if hyphens { '-' } else { '_' };
+        return matched
+            .split(sep)
+            .zip(replacement.split(sep))
+            .map(|(m, r)| preserve_case(m, r))
+            .collect::<Vec<_>>()
+            .join(&sep.to_string());
+    }
+    if matched.to_uppercase() == matched {
+        return replacement.to_uppercase();
+    }
+    if matched.to_lowercase() == matched {
+        return replacement.to_lowercase();
+    }
+    let (Some(first), Some(lead)) = (matched.chars().next(), replacement.chars().next()) else {
+        return replacement.to_string();
+    };
+    let rest = &replacement[lead.len_utf8()..];
+    if first.is_uppercase() {
+        lead.to_uppercase().chain(rest.chars()).collect()
+    } else if first.is_lowercase() {
+        lead.to_lowercase().chain(rest.chars()).collect()
+    } else {
+        replacement.to_string()
+    }
+}
+
 /// Expand the replacement for ONE matched slice — regex capture references
-/// (`$1`, `${name}`) honoured in regex mode, verbatim otherwise. Drives the
-/// result rows' inline old→new preview (#123).
+/// (`$1`, `${name}`) honoured in regex mode, verbatim otherwise, then shaped
+/// to the match's case under Preserve Case (#1612). Drives the result rows'
+/// inline old→new preview (#123).
 pub fn expand_replacement(
     matched: &str,
     query: &str,
     replacement: &str,
     opts: SearchOpts,
 ) -> String {
-    let Some(re) = build_replace_regex(query, opts) else {
-        return replacement.to_string();
+    let expanded = match build_replace_regex(query, opts) {
+        Some(re) if opts.use_regex => re
+            .replace(matched, brace_group_refs(replacement, &re).as_str())
+            .into_owned(),
+        _ => replacement.to_string(),
     };
-    if opts.use_regex {
-        re.replace(matched, brace_group_refs(replacement, &re).as_str())
-            .into_owned()
+    if opts.preserve_case {
+        preserve_case(matched, &expanded)
     } else {
-        replacement.to_string()
+        expanded
     }
 }
 
@@ -1128,6 +1183,10 @@ pub struct SearchPanel {
     pub toggle_case_x: u16,
     pub toggle_word_x: u16,
     pub toggle_regex_x: u16,
+    /// The replace row's `AB` (Preserve Case) chip, 2 cells from
+    /// `toggle_preserve_x` on `toggle_preserve_y`; x 0 while the row is hidden.
+    pub toggle_preserve_x: u16,
+    pub toggle_preserve_y: u16,
     pub toggle_y: u16,
     pub paste_button_x: u16,
     pub paste_button_y: u16,
@@ -1237,6 +1296,8 @@ impl SearchPanel {
             toggle_case_x: 0,
             toggle_word_x: 0,
             toggle_regex_x: 0,
+            toggle_preserve_x: 0,
+            toggle_preserve_y: 0,
             toggle_y: 0,
             paste_button_x: 0,
             paste_button_y: 0,
@@ -1599,6 +1660,7 @@ impl SearchPanel {
                 SearchToggle::CaseSensitive => "Match Case (Alt+C)",
                 SearchToggle::WholeWord => "Match Whole Word (Alt+W)",
                 SearchToggle::UseRegex => "Use Regular Expression (Alt+R)",
+                SearchToggle::PreserveCase => "Preserve Case (Alt+P)",
             });
         }
         None
@@ -1812,6 +1874,10 @@ impl SearchPanel {
     /// corresponding flag so the caller can flip it. Returns `None`
     /// otherwise.
     pub fn toggle_at(&self, col: u16, row: u16) -> Option<SearchToggle> {
+        let preserve = self.toggle_preserve_x;
+        if preserve != 0 && row == self.toggle_preserve_y && col >= preserve && col < preserve + 2 {
+            return Some(SearchToggle::PreserveCase);
+        }
         if row != self.toggle_y {
             return None;
         }
@@ -1903,13 +1969,15 @@ impl SearchPanel {
         self.hits.get(self.selected)
     }
 
-    /// Flip one of the three mode toggles (`Aa` / `ab` / `.*`), from a click
-    /// or `Alt+C` / `Alt+W` / `Alt+R` (#860). Returns the new state.
+    /// Flip one of the mode toggles (`Aa` / `ab` / `.*`, and the replace
+    /// row's `AB`), from a click or `Alt+C` / `Alt+W` / `Alt+R` / `Alt+P`
+    /// (#860, #1612). Returns the new state.
     pub fn toggle_opt(&mut self, toggle: SearchToggle) -> bool {
         let flag = match toggle {
             SearchToggle::CaseSensitive => &mut self.opts.case_sensitive,
             SearchToggle::WholeWord => &mut self.opts.whole_word,
             SearchToggle::UseRegex => &mut self.opts.use_regex,
+            SearchToggle::PreserveCase => &mut self.opts.preserve_case,
         };
         *flag = !*flag;
         *flag
@@ -1958,13 +2026,15 @@ impl SearchPanel {
     }
 }
 
-/// Identifies which of the three search-mode toggles a click landed on, or
+/// Identifies which of the search-mode toggles a click landed on, or
 /// an `Alt` key named (#860).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchToggle {
     CaseSensitive,
     WholeWord,
     UseRegex,
+    /// `AB` on the replace row (#1612).
+    PreserveCase,
 }
 
 /// Parameters for [`render_field`], bundled so the long argument list stays
@@ -2351,6 +2421,7 @@ impl Widget for &mut SearchPanel {
         // now a single row, so the cluster is far shorter than the old boxes.
         let mut next_y = content_y + 1;
         self.replace_input_rect = Rect::default();
+        self.toggle_preserve_x = 0;
         self.replace_all_x = 0;
         self.replace_all_y = 0;
         if self.replace_open && next_y + 1 < inner.y + inner.height {
@@ -2380,11 +2451,32 @@ impl Widget for &mut SearchPanel {
                     field_focused: replace_focused,
                     accent,
                     bg,
-                    reserve_right: 0,
+                    reserve_right: 3,
                 },
                 self.theme,
                 &mut caret,
             );
+            // `AB` (Preserve Case) inset at the replace field's right edge,
+            // where VS Code keeps it, styled like the query's toggles.
+            let preserve_x = replace_fill_right.saturating_sub(2);
+            if preserve_x > bar_x + 1 {
+                let fill = lift_bg(
+                    bg,
+                    if replace_focused {
+                        FIELD_FILL_LIFT_FOCUS
+                    } else {
+                        FIELD_FILL_LIFT_IDLE
+                    },
+                );
+                let style = if self.opts.preserve_case {
+                    active_style
+                } else {
+                    inactive_style.bg(fill)
+                };
+                buf.set_string(preserve_x, next_y, "AB", style);
+                self.toggle_preserve_x = preserve_x;
+                self.toggle_preserve_y = next_y;
+            }
             buf.set_string(
                 replace_all_x,
                 next_y,
@@ -5061,6 +5153,119 @@ mod tests {
             "collapsed layout starts results at the 5-row offset"
         );
     }
+    /// #1612: the issue's file, `user` → `account` with Preserve Case on,
+    /// keeps each occurrence's case.
+    #[test]
+    fn preserve_case_renames_user_to_account_in_each_case() {
+        let file = "class UserService:\n    \"\"\"Load a user by id.\"\"\"\n\n    USER_TABLE = \"users\"\n\n    def get_user(self, user_id):\n        return self.db.find(USER_TABLE, user_id)\n";
+        let opts = SearchOpts {
+            preserve_case: true,
+            ..SearchOpts::default()
+        };
+        let (out, n) = replace_in_text(file, "user", "account", opts).unwrap();
+        assert_eq!(n, 8);
+        assert_eq!(
+            out,
+            "class AccountService:\n    \"\"\"Load a account by id.\"\"\"\n\n    ACCOUNT_TABLE = \"accounts\"\n\n    def get_account(self, account_id):\n        return self.db.find(ACCOUNT_TABLE, account_id)\n"
+        );
+    }
+
+    /// #1612 negative: with Preserve Case off the replacement still goes in
+    /// exactly as typed.
+    #[test]
+    fn without_preserve_case_the_replacement_goes_in_as_typed() {
+        let (out, _) = replace_in_text(
+            "UserService USER_TABLE",
+            "user",
+            "account",
+            SearchOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(out, "accountService account_TABLE");
+    }
+
+    /// #1612: VS Code's rules, part by part across `-` and `_`.
+    #[test]
+    fn preserve_case_follows_each_dash_or_underscore_part() {
+        assert_eq!(preserve_case("User", "account"), "Account");
+        assert_eq!(preserve_case("USER", "account"), "ACCOUNT");
+        assert_eq!(preserve_case("user", "Account"), "account");
+        assert_eq!(preserve_case("User-name", "account-id"), "Account-id");
+        assert_eq!(preserve_case("USER_name", "account_id"), "ACCOUNT_id");
+        assert_eq!(preserve_case("Élan", "été"), "Été");
+    }
+
+    /// #1612 negatives: parts that do not line up are not split, a match
+    /// with no case gives the replacement as typed, and nothing is lost.
+    #[test]
+    fn preserve_case_leaves_what_it_cannot_read() {
+        // Two parts against one: the whole match decides (mixed → capitalise).
+        assert_eq!(preserve_case("User-Name", "account"), "Account");
+        // Both separators: no part-by-part shaping.
+        assert_eq!(preserve_case("a-b_C", "x-y_z"), "x-y_z");
+        assert_eq!(preserve_case("", "Account"), "Account");
+        assert_eq!(preserve_case("1-2", "a-B"), "A-B");
+        assert_eq!(preserve_case("_x", "Ab"), "ab");
+    }
+
+    /// #1612: in regex mode the expanded captures are shaped too, and the
+    /// inline old→new preview shows what Replace All will write.
+    #[test]
+    fn preserve_case_shapes_regex_replacements_and_the_preview() {
+        let opts = SearchOpts {
+            use_regex: true,
+            preserve_case: true,
+            ..SearchOpts::default()
+        };
+        let (out, n) =
+            replace_in_text("USER_TABLE user_id", r"user_(\w+)", "account_$1", opts).unwrap();
+        assert_eq!((out.as_str(), n), ("ACCOUNT_TABLE account_id", 2));
+        let literal = SearchOpts {
+            preserve_case: true,
+            ..SearchOpts::default()
+        };
+        assert_eq!(
+            expand_replacement("User", "user", "account", literal),
+            "Account"
+        );
+        assert_eq!(
+            expand_replacement("User", "user", "account", SearchOpts::default()),
+            "account"
+        );
+    }
+
+    /// #1612: the replace row carries an `AB` chip that maps to Preserve
+    /// Case and names its key; with the row closed there is no chip.
+    #[test]
+    fn the_replace_row_has_a_preserve_case_toggle() {
+        use ratatui::buffer::Buffer;
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.focused = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 12,
+        };
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        assert_eq!(panel.toggle_preserve_x, 0, "no replace row, no chip");
+        panel.open_replace();
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let (x, y) = (panel.toggle_preserve_x, panel.toggle_preserve_y);
+        assert_ne!(x, 0);
+        assert_eq!(buf[(x, y)].symbol(), "A");
+        assert_eq!(buf[(x + 1, y)].symbol(), "B");
+        assert_eq!(panel.toggle_at(x + 1, y), Some(SearchToggle::PreserveCase));
+        assert_eq!(panel.tooltip_at(x, y), Some("Preserve Case (Alt+P)"));
+        assert!(panel.toggle_opt(SearchToggle::PreserveCase));
+        assert!(panel.opts.preserve_case);
+        // Negative: the cell left of the chip is the replace field.
+        assert_eq!(panel.toggle_at(x - 1, y), None);
+    }
+
     #[test]
     fn expand_replacement_honours_capture_references_in_regex_mode() {
         let opts = SearchOpts {
@@ -5138,6 +5343,7 @@ mod tests {
                         case_sensitive,
                         whole_word,
                         use_regex,
+                        ..SearchOpts::default()
                     });
                 }
             }
