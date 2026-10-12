@@ -248,8 +248,9 @@ pub struct Prefs {
     #[serde(default)]
     pub disable_inline_values: bool,
     /// Opt-out for saving unsaved editors before a debug or run launch
-    /// (#1400), on by default like VS Code's `debug.saveBeforeStart`
-    /// (`allEditorsInActiveGroup`); `"none"` there maps to true here.
+    /// (#1400), a task or a Testing run (#1639), on by default like VS
+    /// Code's `debug.saveBeforeStart` (`allEditorsInActiveGroup`); `"none"`
+    /// there maps to true here.
     #[serde(default)]
     pub disable_save_before_debug: bool,
     /// Start in Vim mode (#1286). Toggle Vim Mode saves it, so the mode a
@@ -364,6 +365,12 @@ pub struct Prefs {
     /// opens a plain shell. User layers only: it names a command to run.
     #[serde(default)]
     pub lane_agent: Option<String>,
+    /// The colour depth croft draws for (#1433): "truecolor", "256" or
+    /// "16". Unset, it is read from the terminal's environment; set it for
+    /// a terminal that draws 24-bit colour without saying so (often over
+    /// SSH, where `COLORTERM` is not passed on). Read at startup.
+    #[serde(default)]
+    pub color_depth: Option<String>,
     /// Scrollback lines kept per terminal pane (VS Code's
     /// `terminal.integrated.scrollback`). 0 — the default for older configs —
     /// means the built-in 5000. Applies to panes opened after the change.
