@@ -60613,6 +60613,78 @@ fn poll_until(app: &mut App, done: impl Fn(&App) -> bool) {
     }
 }
 
+/// #1421: an expensive scope (js-debug's Global) shows collapsed with a
+/// chevron and no variables; a click opens it and fetches it. A cheap
+/// scope stays open with no chevron.
+#[test]
+fn an_expensive_scope_shows_collapsed_and_opens_on_click() {
+    use crate::widgets::run_debug::DebugRowKind;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push(
+        "Node",
+        stub_emitting(&[
+            r#"{"seq":1,"type":"event","event":"stopped","body":{"reason":"breakpoint","threadId":1}}"#,
+            r#"{"seq":2,"type":"response","request_seq":9,"success":true,"command":"scopes","body":{"scopes":[{"name":"Local: work","variablesReference":10,"expensive":false},{"name":"Global","variablesReference":20,"expensive":true}]}}"#,
+        ]),
+    );
+    poll_until(&mut app, |a| {
+        a.debug_sessions
+            .focused()
+            .is_some_and(|s| s.scopes.len() == 2)
+    });
+    app.refresh_debug_panel();
+    let scope_rows = |app: &App| -> Vec<(String, Option<bool>)> {
+        app.run_debug
+            .debug_rows
+            .iter()
+            .filter_map(|r| match &r.kind {
+                DebugRowKind::Scope { name, open } => Some((name.clone(), *open)),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        scope_rows(&app),
+        vec![
+            (String::from("Local: work"), None),
+            (String::from("Global"), Some(false)),
+        ]
+    );
+    let global = app
+        .run_debug
+        .debug_rows
+        .iter()
+        .position(|r| matches!(&r.kind, DebugRowKind::Scope { name, .. } if name == "Global"))
+        .unwrap();
+    app.debug_panel_click(global);
+    assert_eq!(
+        scope_rows(&app),
+        vec![
+            (String::from("Local: work"), None),
+            (String::from("Global"), Some(true)),
+        ]
+    );
+    assert!(
+        app.debug_sessions
+            .focused()
+            .unwrap()
+            .open_expensive_scopes
+            .contains("Global")
+    );
+    // A second click closes it again; a click on the cheap scope does nothing.
+    app.debug_panel_click(global);
+    assert_eq!(scope_rows(&app)[1], (String::from("Global"), Some(false)));
+    let local = app
+        .run_debug
+        .debug_rows
+        .iter()
+        .position(|r| matches!(&r.kind, DebugRowKind::Scope { name, .. } if name == "Local: work"))
+        .unwrap();
+    app.debug_panel_click(local);
+    assert_eq!(scope_rows(&app)[0], (String::from("Local: work"), None));
+}
+
 /// #567 item 1: a background member's program output used to be drained and
 /// dropped. It reaches the debug console, tagged with the member's name.
 #[test]

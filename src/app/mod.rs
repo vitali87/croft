@@ -31020,12 +31020,17 @@ impl App {
             },
         });
         for scope in &session.scopes {
+            let open = session.scope_open(scope);
             rows.push(DebugRow {
                 indent: 1,
                 kind: DebugRowKind::Scope {
                     name: scope.name.clone(),
+                    open: scope.expensive.then_some(open),
                 },
             });
+            if !open {
+                continue;
+            }
             if let Some(vars) = session.variables.get(&scope.variables_ref) {
                 push_variable_rows(&mut rows, session, &self.debug_expanded, vars, 2);
             }
@@ -31216,6 +31221,15 @@ impl App {
             }
             DebugRowKind::WatchAdd => {
                 self.open_add_watch_prompt();
+            }
+            // An expensive scope opens (and is fetched) on click (#1421).
+            DebugRowKind::Scope {
+                name,
+                open: Some(_),
+            } => {
+                if let Some(session) = self.debug_sessions.focused_mut() {
+                    session.toggle_expensive_scope(&name);
+                }
             }
             _ => {}
         }

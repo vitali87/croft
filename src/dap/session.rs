@@ -669,6 +669,9 @@ pub struct StackFrame {
 pub struct Scope {
     pub name: String,
     pub variables_ref: i64,
+    /// The adapter marked it `expensive` (js-debug's Global, #1421): its
+    /// variables are fetched only once the user opens it.
+    pub expensive: bool,
 }
 
 /// A single variable. `variables_ref > 0` means it is expandable (its children
@@ -724,6 +727,7 @@ pub fn parse_scopes(scopes_response: &Value) -> Vec<Scope> {
                     Some(Scope {
                         name: s.get("name")?.as_str()?.to_string(),
                         variables_ref: s.get("variablesReference")?.as_i64()?,
+                        expensive: s.get("expensive").and_then(Value::as_bool) == Some(true),
                     })
                 })
                 .collect()
@@ -1050,6 +1054,10 @@ pub struct DapSession {
     pub stack_frames: Vec<StackFrame>,
     /// Scopes (Locals / Globals) of the selected frame.
     pub scopes: Vec<Scope>,
+    /// Names of the expensive scopes the user opened (#1421). They stay
+    /// open, and are fetched, at every later stop, as in VS Code; the
+    /// others stay collapsed and cost nothing.
+    pub open_expensive_scopes: std::collections::BTreeSet<String>,
     /// Variables keyed by `variablesReference`: the entry for a scope's ref holds
     /// that scope's members; expanding a variable adds its ref's children here.
     pub variables: BTreeMap<i64, Vec<Variable>>,
@@ -1240,6 +1248,7 @@ impl DapSession {
             unverified_breakpoints: BTreeMap::new(),
             stack_frames: Vec::new(),
             scopes: Vec::new(),
+            open_expensive_scopes: std::collections::BTreeSet::new(),
             variables: BTreeMap::new(),
             selected_frame: None,
             pending_var_refs: std::collections::HashMap::new(),
@@ -1342,6 +1351,28 @@ impl DapSession {
             .filter_map(|s| self.variables.get(&s.variables_ref))
             .flatten()
             .find(|v| v.name == name)
+    }
+
+    /// Whether `scope`'s variables are shown: always, unless it is an
+    /// expensive one the user has not opened (#1421).
+    pub fn scope_open(&self, scope: &Scope) -> bool {
+        !scope.expensive || self.open_expensive_scopes.contains(&scope.name)
+    }
+
+    /// Open or close the expensive scope `name` (#1421), fetching its
+    /// variables when it opens.
+    pub fn toggle_expensive_scope(&mut self, name: &str) {
+        if !self.open_expensive_scopes.remove(name) {
+            self.open_expensive_scopes.insert(name.to_string());
+            if let Some(r) = self
+                .scopes
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| s.variables_ref)
+            {
+                self.expand_variable(r);
+            }
+        }
     }
 
     /// Request the children of an expandable variable (its `variablesReference`)
@@ -1449,7 +1480,15 @@ impl DapSession {
                 }
                 Some("scopes") => {
                     self.scopes = parse_scopes(&msg);
-                    let refs: Vec<i64> = self.scopes.iter().map(|s| s.variables_ref).collect();
+                    // An expensive scope (a whole Global object) waits until
+                    // the user opens it (#1421), or every step would wait
+                    // for it.
+                    let refs: Vec<i64> = self
+                        .scopes
+                        .iter()
+                        .filter(|s| self.scope_open(s))
+                        .map(|s| s.variables_ref)
+                        .collect();
                     for r in refs {
                         self.request_variables(r);
                     }
@@ -2664,10 +2703,12 @@ while True:
             Scope {
                 name: String::from("Globals"),
                 variables_ref: 1,
+                expensive: false,
             },
             Scope {
                 name: String::from("Locals"),
                 variables_ref: 2,
+                expensive: false,
             },
         ];
         assert_eq!(
@@ -2678,6 +2719,7 @@ while True:
         let unnamed = vec![Scope {
             name: String::from("Registers"),
             variables_ref: 1,
+            expensive: false,
         }];
         assert_eq!(
             inline_locals(&unnamed, &vars),
@@ -3148,6 +3190,91 @@ while True:
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("timed out; requests so far: {:?}", requests(log));
+    }
+
+    /// #1421 against a fake adapter whose Global scope is `expensive`: a
+    /// stop fetches only the Local scope; opening Global fetches it, and it
+    /// stays open (and fetched) at the next stop until it is closed.
+    #[test]
+    fn an_expensive_scope_is_fetched_only_once_opened() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let script = FAKE_DAP.replace(
+            "    elif c == \"disconnect\":",
+            r#"    elif c == "stackTrace":
+        reply(req, {"stackFrames": [{"id": 5, "name": "work", "line": 4,
+                    "source": {"path": "/w/big.js"}}]})
+    elif c == "scopes":
+        reply(req, {"scopes": [
+            {"name": "Local: work", "variablesReference": 10, "expensive": False},
+            {"name": "Global", "variablesReference": 20, "expensive": True}]})
+    elif c == "variables":
+        ref = req["arguments"]["variablesReference"]
+        reply(req, {"variables": [{"name": "v%d" % ref, "value": "1", "variablesReference": 0}]})
+    elif c == "disconnect":"#,
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fake_dap.py");
+        std::fs::write(&path, script).unwrap();
+        let log = tmp.path().join("requests.jsonl");
+        let mut session = DapSession::launch_with(
+            "python3",
+            &[path.display().to_string(), log.display().to_string()],
+            tmp.path(),
+            json!({"type": "request", "command": "launch", "arguments": {}}),
+            BTreeMap::new(),
+        )
+        .expect("fake adapter spawns");
+        let fetched = |log: &Path| -> Vec<i64> {
+            requests(log)
+                .iter()
+                .filter(|q| q["command"] == "variables")
+                .filter_map(|q| q["arguments"]["variablesReference"].as_i64())
+                .collect()
+        };
+        let scopes_asked = |log: &Path| {
+            requests(log)
+                .iter()
+                .filter(|q| q["command"] == "scopes")
+                .count()
+        };
+        poll_until(&mut session, &log, |_| fetched(&log).len() == 1);
+        // Let any late request land before asserting it never went out.
+        for _ in 0..20 {
+            session.poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(fetched(&log), vec![10], "only the Local scope");
+        let global = session.scopes.iter().find(|s| s.name == "Global").unwrap();
+        assert!(global.expensive);
+        assert!(!session.scope_open(global));
+
+        session.toggle_expensive_scope("Global");
+        poll_until(&mut session, &log, |_| fetched(&log) == vec![10, 20]);
+        let global = session.scopes.iter().find(|s| s.name == "Global").unwrap();
+        assert!(session.scope_open(global));
+
+        // The next stop fetches both: Global stays open.
+        session.continue_execution();
+        poll_until(&mut session, &log, |_| fetched(&log).len() == 4);
+        assert_eq!(fetched(&log), vec![10, 20, 10, 20]);
+
+        // Closed again, the stop after that skips it.
+        session.toggle_expensive_scope("Global");
+        session.continue_execution();
+        poll_until(&mut session, &log, |_| {
+            scopes_asked(&log) == 3 && fetched(&log).len() == 5
+        });
+        for _ in 0..20 {
+            session.poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(fetched(&log), vec![10, 20, 10, 20, 10]);
     }
 
     /// #264 against a fake adapter with two goroutines: a stop lists both,
@@ -3790,6 +3917,18 @@ def stopped():"#,
         assert_eq!(scopes.len(), 2);
         assert_eq!(scopes[0].name, "Locals");
         assert_eq!(scopes[0].variables_ref, 7);
+        assert!(!scopes[0].expensive && !scopes[1].expensive);
+        // #1421: js-debug marks its Global scope `expensive`.
+        let scopes = parse_scopes(&json!({
+            "body": { "scopes": [
+                { "name": "Local: work", "variablesReference": 7, "expensive": false },
+                { "name": "Global", "variablesReference": 8, "expensive": true }
+            ]}
+        }));
+        assert_eq!(
+            scopes.iter().map(|s| s.expensive).collect::<Vec<_>>(),
+            vec![false, true]
+        );
 
         let vars = parse_variables(&json!({
             "body": { "variables": [
