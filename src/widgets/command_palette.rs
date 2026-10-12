@@ -114,6 +114,9 @@ pub enum Command {
     // --- File / editor management ---
     SaveFile,
     SaveAs,
+    /// File: Revert File (#1285): drop the tab's unsaved edits for the
+    /// text on disk, as one undo step.
+    RevertFile,
     /// File: Save All (#852): every dirty tab, in every split.
     SaveAll,
     /// File: New File… / New Folder… (#852): the Explorer's create prompt
@@ -571,6 +574,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::UnfoldAllRegions,
     Command::SaveFile,
     Command::SaveAs,
+    Command::RevertFile,
     Command::SaveAll,
     Command::NewFile,
     Command::NewFolder,
@@ -969,6 +973,7 @@ impl Command {
             Command::UnfoldAllRegions => "Unfold All Regions",
             Command::SaveFile => "File: Save",
             Command::SaveAs => "File: Save As…",
+            Command::RevertFile => "File: Revert File",
             Command::SaveAll => "File: Save All",
             Command::NewFile => "File: New File…",
             Command::NewFolder => "File: New Folder…",
@@ -1378,6 +1383,7 @@ impl Command {
             Command::UnfoldAllRegions => "Cmd+K Cmd+9",
             Command::SaveFile => "Cmd+S",
             Command::SaveAs => "",
+            Command::RevertFile => "",
             // VS Code's macOS chord; its Linux `Ctrl+K S` is Select for
             // Compare here, so Linux takes `Ctrl+Alt+S` instead.
             Command::SaveAll => "Cmd+Opt+S",
@@ -1765,6 +1771,7 @@ impl Command {
             Command::UnfoldAllRegions => "unfold_all_regions",
             Command::SaveFile => "save_file",
             Command::SaveAs => "save_as",
+            Command::RevertFile => "revert_file",
             Command::SaveAll => "save_all",
             Command::NewFile => "new_file",
             Command::NewFolder => "new_folder",
