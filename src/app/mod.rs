@@ -3673,6 +3673,10 @@ pub struct App {
     /// The `agents.json` row a new worktree lane starts in its pane (#348);
     /// `None` opens a plain shell. From `lane_agent` in settings.json.
     lane_agent: Option<String>,
+    /// The colour depth each frame is fitted to before it is written
+    /// (#1433): the `color_depth` setting, else what the terminal's
+    /// environment advertises.
+    pub(crate) color_depth: crate::color_depth::ColorDepth,
     /// Which panes are worktree lanes' (#348), by pane uid: saved with the
     /// terminal session so a relaunch seats the agent again, and consulted
     /// when a lane closes so its pane goes with it.
@@ -6006,6 +6010,13 @@ impl App {
                 std::time::SystemTime::now(),
             ),
             lane_agent: loaded_prefs.lane_agent.clone(),
+            color_depth: loaded_prefs
+                .color_depth
+                .as_deref()
+                .and_then(crate::color_depth::ColorDepth::from_setting)
+                .unwrap_or_else(|| {
+                    crate::color_depth::ColorDepth::detect(|name| std::env::var(name).ok())
+                }),
             lane_panes: std::collections::BTreeMap::new(),
             tree_clipboard: None,
             tree_typeahead: None,
@@ -12134,16 +12145,28 @@ impl App {
                 OnTypeReply::Apply => self.on_type_request = None,
             }
             if let Some(edits) = result.edits.filter(|e| !e.is_empty())
-                && self
-                    .editor
-                    .apply_rename_to_open_tab(&result.path, &edits)
-                    .is_some()
+                && self.apply_on_type_edits(&result.path, &edits)
             {
-                self.editor.clamp_cursor();
                 changed = true;
             }
         }
         changed
+    }
+
+    /// Apply an on-type formatting reply for `path`, the active tab's file
+    /// (the reply's disposition checked that), keeping the caret beside the
+    /// text that was just typed.
+    pub(crate) fn apply_on_type_edits(
+        &mut self,
+        path: &std::path::Path,
+        edits: &[crate::widgets::editor::TextSpanEdit],
+    ) -> bool {
+        if self.editor.path.as_deref() == Some(path) {
+            return self.editor.apply_span_edits_moving_caret(edits) > 0;
+        }
+        let applied = self.editor.apply_rename_to_open_tab(path, edits).is_some();
+        self.editor.clamp_cursor();
+        applied
     }
 
     /// Linked editing (#254): replay the last keystroke across the
@@ -13320,6 +13343,39 @@ impl App {
             row: self.editor.cursor_row,
             col: self.editor.cursor_col,
         })
+    }
+
+    /// Run one key or mouse gesture, and when it moved the editor to
+    /// another file without going through the navigation history itself
+    /// (Quick Open, a Search result, the Explorer, a tab), record where the
+    /// user left (#1635): Go Back knew only the jumps that recorded
+    /// themselves, so the usual way of changing file left nothing to go
+    /// back to. A gesture that recorded or walked the history (Go to
+    /// Definition, Go Back itself) is left as it did it, and so is one that
+    /// moved focus to another editor group: a history entry holds no group,
+    /// so Go Back would reopen that group's file in the focused one.
+    fn recording_file_switches<R>(&mut self, gesture: impl FnOnce(&mut Self) -> R) -> R {
+        let left = self.current_nav_loc();
+        let changes = self.nav.changes();
+        let group = self.editor_group_identity();
+        let result = gesture(self);
+        if let Some(left) = left
+            && self.nav.changes() == changes
+            && self.editor_group_identity() == group
+            && self.editor.path.as_ref() != Some(&left.path)
+        {
+            self.nav.record(left);
+        }
+        result
+    }
+
+    /// Which editor group has focus, as the split's leaf count and the
+    /// focused leaf's position: a change in either is a group change.
+    fn editor_group_identity(&self) -> (usize, usize) {
+        (
+            self.editor_layout.leaf_count(),
+            self.editor_layout.active_dfs_index(),
+        )
     }
 
     /// A code navigation that leaves the active tab for another file keeps
@@ -18903,6 +18959,13 @@ impl App {
         }
     }
 
+    /// Render the frame the terminal is sent: [`Self::render`], with every
+    /// colour fitted to the terminal's depth (#1433).
+    fn render_for_terminal(&mut self, frame: &mut ratatui::Frame) {
+        self.render(frame);
+        self.color_depth.fit_buffer(frame.buffer_mut());
+    }
+
     fn render(&mut self, frame: &mut ratatui::Frame) {
         // Set again by the welcome panel when it paints the button.
         self.welcome_tour_button = Rect::default();
@@ -22671,7 +22734,7 @@ impl App {
         }
         let capture =
             self.macro_recording.is_some() && !self.macro_replaying && self.focus == Pane::Editor;
-        let result = self.handle_key_inner(key);
+        let result = self.recording_file_switches(|app| app.handle_key_inner(key));
         // Focus is re-checked after dispatch too: a key that hands focus to
         // the terminal would otherwise be recorded while everything after it
         // is dropped, producing a macro that replays a focus change and then
@@ -24129,9 +24192,11 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
-        self.test_worker.run_coverage();
-        self.set_sidebar_view(SidebarView::Testing);
-        self.status = String::from("Running tests with coverage");
+        self.test_run_with_unsaved_saved(|app| {
+            app.test_worker.run_coverage();
+            app.set_sidebar_view(SidebarView::Testing);
+            app.status = String::from("Running tests with coverage");
+        });
     }
 
     /// Fold a finished coverage run into the editor, and keep the active
@@ -24537,8 +24602,10 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
-        self.test_worker.run_all();
-        self.set_sidebar_view(SidebarView::Testing);
+        self.test_run_with_unsaved_saved(|app| {
+            app.test_worker.run_all();
+            app.set_sidebar_view(SidebarView::Testing);
+        });
     }
 
     /// Run a single test by exact name (click-to-run from the tree). Marks just
@@ -24547,9 +24614,11 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
-        self.testing.start_single(&name);
-        self.test_worker.run_one(name);
-        self.set_sidebar_view(SidebarView::Testing);
+        self.test_run_with_unsaved_saved(|app| {
+            app.testing.start_single(&name);
+            app.test_worker.run_one(name);
+            app.set_sidebar_view(SidebarView::Testing);
+        });
     }
 
     /// Jump the editor to a test's `fn` definition (Cmd/Opt+click in the tree).
@@ -24573,10 +24642,12 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
-        self.testing
-            .start_filter(&crate::testing::suite_pattern(&suite));
-        self.test_worker.run_suite(suite);
-        self.set_sidebar_view(SidebarView::Testing);
+        self.test_run_with_unsaved_saved(|app| {
+            app.testing
+                .start_filter(&crate::testing::suite_pattern(&suite));
+            app.test_worker.run_suite(suite);
+            app.set_sidebar_view(SidebarView::Testing);
+        });
     }
 
     /// Run the test the editor caret sits in (Cmd+K Enter / palette). Finds the
@@ -24600,6 +24671,10 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
+        self.test_run_with_unsaved_saved(|app| app.run_named_test_now(name));
+    }
+
+    fn run_named_test_now(&mut self, name: String) {
         let (run, exact) = match self.testing.sole_case_with_leaf(&name) {
             Some(full) => (full, true),
             None => (name, false),
@@ -24676,6 +24751,10 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
+        self.test_run_with_unsaved_saved(|app| app.run_test_at_cursor_with_coverage_now(name));
+    }
+
+    fn run_test_at_cursor_with_coverage_now(&mut self, name: String) {
         let (run, exact) = match self.testing.sole_case_with_leaf(&name) {
             Some(full) => (full, true),
             None => (name, false),
@@ -24703,6 +24782,10 @@ impl App {
         if self.testing.is_busy() || !self.testing_runner_available() {
             return;
         }
+        self.test_run_with_unsaved_saved(|app| app.run_scope_with_coverage_now(name, suite));
+    }
+
+    fn run_scope_with_coverage_now(&mut self, name: String, suite: bool) {
         if suite {
             self.testing
                 .start_filter(&crate::testing::suite_pattern(&name));
@@ -31117,6 +31200,15 @@ impl App {
     /// with `disable_save_before_debug`, is named in front of the launch's
     /// own status.
     fn launch_with_unsaved_saved(&mut self, launch: impl FnOnce(&mut Self)) {
+        self.run_with_unsaved_saved("the launch", launch);
+    }
+
+    /// [`Self::launch_with_unsaved_saved`] for anything that runs the
+    /// project's files: a task, a Testing run (#1639). VS Code saves before
+    /// a task by default (`task.saveBeforeRun`); without it a build or test
+    /// run reported on code the editor had already changed. `what` names
+    /// the run in the warning.
+    fn run_with_unsaved_saved(&mut self, what: &str, launch: impl FnOnce(&mut Self)) {
         if self.save_before_debug && self.unsaved_count() > 0 {
             self.sweep_dirty_buffers(false, false);
         }
@@ -31131,12 +31223,36 @@ impl App {
             [first, rest @ ..] => (format!("{first} and {} more", rest.len()), "have"),
             [] => unreachable!("checked above"),
         };
-        let warning = format!("{names} {verb} unsaved changes: the launch uses the file on disk");
-        self.status = if self.status.is_empty() {
+        let warning = format!("{names} {verb} unsaved changes: {what} uses the file on disk");
+        let running = std::mem::take(&mut self.status);
+        self.status = if running.is_empty() {
             warning
         } else {
-            format!("{warning} - {}", self.status)
+            format!("{warning} - {running}")
         };
+        // The run registered its "Running …" status for its outcome to
+        // replace; that status now carries the warning, so the tracked text
+        // follows it, or the outcome would never land.
+        let tracked = self
+            .test_run_status
+            .iter_mut()
+            .chain(self.pane_run_statuses.iter_mut().map(|(_, run)| run));
+        for run in tracked {
+            if run.shown == running {
+                run.shown = self.status.clone();
+            }
+        }
+    }
+
+    /// [`Self::run_with_unsaved_saved`] for a Testing run: the saves it
+    /// makes are for this run, so a watched scope does not also hear
+    /// about them and rerun after it.
+    fn test_run_with_unsaved_saved(&mut self, launch: impl FnOnce(&mut Self)) {
+        let due = self.testing.watch.due_at();
+        self.run_with_unsaved_saved("the test run", |app| {
+            app.testing.watch.set_due_at(due);
+            launch(app);
+        });
     }
 
     /// File names of the editors with unsaved edits, deduped, the active
@@ -37371,7 +37487,7 @@ impl App {
             }
             ListPurpose::RunTask => {
                 if let Some(task) = self.run_tasks.get(index).cloned() {
-                    self.run_project_task(task);
+                    self.start_project_task(task);
                 }
             }
             ListPurpose::ReviewPullRequest => {
@@ -37993,9 +38109,7 @@ impl App {
     pub fn run_build_task(&mut self) {
         let tasks = crate::tasks::discover_tasks(&self.active_workspace_root());
         match crate::tasks::default_build_task(&tasks).cloned() {
-            Some(task) => {
-                self.run_project_task(task);
-            }
+            Some(task) => self.start_project_task(task),
             None => {
                 self.open_run_task_picker();
                 self.status = "No build task detected; pick one".to_string();
@@ -38006,11 +38120,17 @@ impl App {
     /// Tasks: Rerun Last Task.
     pub fn rerun_last_task(&mut self) {
         match self.last_task.clone() {
-            Some(task) => {
-                self.run_project_task(task);
-            }
+            Some(task) => self.start_project_task(task),
             None => self.status = "No task has run yet".to_string(),
         }
+    }
+
+    /// Run `task` as the user asked for it (Run Task, the build task, Rerun
+    /// Last Task), unsaved tabs written first (#1639).
+    fn start_project_task(&mut self, task: crate::tasks::Task) {
+        self.run_with_unsaved_saved("the task", |app| {
+            app.run_project_task(task);
+        });
     }
 
     /// Resolve the branch-picker selection per its open purpose.
@@ -53961,6 +54081,10 @@ impl App {
     }
 
     fn handle_mouse(&mut self, m: MouseEvent) {
+        self.recording_file_switches(|app| app.handle_mouse_inner(m));
+    }
+
+    fn handle_mouse_inner(&mut self, m: MouseEvent) {
         // A click means the user moved on from a pending shortcut prompt.
         if matches!(m.kind, MouseEventKind::Down(_)) && self.recording_shortcut.take().is_some() {
             self.status = String::from("Shortcut unchanged");
@@ -58523,7 +58647,7 @@ impl App {
                 }
             }
             crate::code_lens::LensAction::RunInTerminal { label, command } => {
-                self.run_project_task(crate::tasks::Task {
+                self.start_project_task(crate::tasks::Task {
                     label,
                     command,
                     source: String::from("code lens"),
@@ -72749,9 +72873,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 app.forget_sent_images();
             }
             let draw_start = std::time::Instant::now();
-            let drawn = terminal.draw(|f| {
-                app.render(f);
-            })?;
+            let drawn = terminal.draw(|f| app.render_for_terminal(f))?;
             let mut underlays = app.image_underlays(drawn.buffer);
             app.drawn_buffer = Some(drawn.buffer.clone());
             // Record render+flush time and the bytes ratatui shipped this
@@ -72767,9 +72889,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 app.overlays.welcome.mark_dirty();
                 app.overlays.hero.mark_dirty();
                 app.forget_sent_images();
-                let drawn = terminal.draw(|f| {
-                    app.render(f);
-                })?;
+                let drawn = terminal.draw(|f| app.render_for_terminal(f))?;
                 underlays = app.image_underlays(drawn.buffer);
                 app.drawn_buffer = Some(drawn.buffer.clone());
             }
