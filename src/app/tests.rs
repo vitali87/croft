@@ -80461,3 +80461,30 @@ fn a_list_setting_in_the_user_layer_opens_the_user_file_at_the_key() {
     );
     assert_eq!(app.editor.cursor_row, 3);
 }
+
+/// #1555: an explicitly empty `review_ai_prefix` (no marker) opens its
+/// prompt empty, so confirming it unchanged keeps it empty instead of
+/// unsetting it back to the default marker.
+#[test]
+fn confirming_an_empty_review_prefix_keeps_it_empty() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        cfg.path().join("config.json"),
+        "{\n  \"review_ai_prefix\": \"\"\n}\n",
+    )
+    .unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "review_ai_prefix");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let prompt = app.input_prompt.as_ref().expect("a text prompt");
+    assert_eq!(prompt.value, "", "opens empty, not on (default)");
+    let value = prompt.value.clone();
+    app.close_input_prompt();
+    app.submit_setting_value("review_ai_prefix", &value);
+    assert_eq!(
+        written_settings(cfg.path())["review_ai_prefix"],
+        serde_json::json!("")
+    );
+}

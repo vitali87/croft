@@ -48862,9 +48862,11 @@ impl App {
                     }
                     Kind::Number | Kind::Text => {
                         use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
-                        // An unset optional setting opens empty, not on
-                        // the `(default)` label, which typing would extend.
-                        let now = if row.value.is_null() {
+                        // An unset optional setting, or an empty one,
+                        // opens empty, not on the `(default)` label, which
+                        // typing would extend and which, confirmed as is,
+                        // would unset an explicitly empty `review_ai_prefix`.
+                        let now = if row.value.is_null() || row.value == "" {
                             String::new()
                         } else {
                             crate::settings_editor::display(&row.value)
