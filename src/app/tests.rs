@@ -80366,13 +80366,6 @@ fn hot_exit_does_not_keep_a_merge_result_as_the_files_unsaved_text() {
             .any(|b| b.tab.path.as_deref() == Some(file.as_path())),
         "no unsaved buffer for the merged file"
     );
-    let state = app.capture_session_state();
-    let tab = state
-        .tabs
-        .iter()
-        .find(|t| t.path.as_deref() == Some(file.as_path()))
-        .expect("the tab itself is kept");
-    assert!(!tab.dirty && tab.unsaved_text.is_none());
     drop(app);
 
     let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
@@ -80384,6 +80377,40 @@ fn hot_exit_does_not_keep_a_merge_result_as_the_files_unsaved_text() {
             .all(|e| e.path.as_deref() != Some(file.as_path()) || !e.dirty),
         "the file does not come back dirty"
     );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), disk);
+}
+
+/// #1588: an update relaunch, unlike hot exit, carries the merge editor's
+/// unsaved Result to the new process: it exits at once, and the Result
+/// exists nowhere else.
+#[test]
+fn an_update_relaunch_keeps_a_dirty_merge_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_merge_editor_open(tmp.path());
+    let disk = std::fs::read_to_string(&file).unwrap();
+    let result = app.editor.lines.clone();
+    assert_eq!(result, vec!["top", "mine", "bottom"]);
+    app.arm_reexec();
+    assert!(app.pending_reexec, "the relaunch is armed");
+    let state = app.capture_session_state();
+    let tab = state
+        .tabs
+        .iter()
+        .find(|t| t.path.as_deref() == Some(file.as_path()))
+        .expect("the tab is handed over");
+    assert!(tab.dirty);
+    assert_eq!(tab.unsaved_text.as_deref(), Some("top\nmine\nbottom"));
+
+    let mut next = App::new(tmp.path().to_path_buf()).unwrap();
+    next.apply_session_state(&state);
+    let ed = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(file.as_path()))
+        .expect("the file is reopened");
+    assert!(ed.dirty);
+    assert_eq!(ed.lines, result);
     assert_eq!(std::fs::read_to_string(&file).unwrap(), disk);
 }
 
