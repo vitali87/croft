@@ -78812,6 +78812,7 @@ fn diag_on_line(line: u32, message: &str) -> crate::lsp::manager::Diagnostic {
         end_char: 1,
         severity: crate::lsp::manager::DiagnosticSeverity::Warning,
         message: String::from(message),
+        tags: Default::default(),
     }
 }
 
@@ -80325,4 +80326,269 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     app.watch_published_panes.insert(pane);
     assert!(!app.apply_build_scan(pane, Some(&cwd), "tsc --watch", "a.c:1:1: error: old\n"));
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
+}
+
+// --- #1599: language-server messages, questions and documents ---------------
+
+fn server_update(
+    server: &str,
+    event: crate::lsp::manager::ServerEvent,
+) -> crate::lsp::manager::ServerUpdate {
+    crate::lsp::manager::ServerUpdate {
+        server: String::from(server),
+        event,
+    }
+}
+
+type ServerAnswer = tokio::sync::oneshot::Receiver<Option<lsp_types::MessageActionItem>>;
+
+/// gopls asking whether to update go.mod, with two actions.
+fn go_mod_question(app: &mut App) -> ServerAnswer {
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    let actions = ["Update", "Ignore"]
+        .map(|t| lsp_types::MessageActionItem {
+            title: String::from(t),
+            properties: Default::default(),
+        })
+        .to_vec();
+    app.apply_server_update(server_update(
+        "gopls",
+        crate::lsp::manager::ServerEvent::Question {
+            level: lsp_types::MessageType::WARNING,
+            text: String::from("go.mod needs updating"),
+            actions,
+            reply,
+        },
+    ));
+    answer
+}
+
+#[test]
+fn a_server_error_shows_on_the_status_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.status = String::from("Ready");
+    let changed = app.apply_server_update(server_update(
+        "rust-analyzer",
+        crate::lsp::manager::ServerEvent::Message {
+            level: lsp_types::MessageType::ERROR,
+            text: String::from(
+                "\n  Failed to load workspaces.\ncargo metadata exited with code 101",
+            ),
+        },
+    ));
+    assert!(changed, "the bar repaints");
+    assert_eq!(app.status, "rust-analyzer: Failed to load workspaces.");
+}
+
+#[test]
+fn progress_updates_still_set_and_clear_the_server_s_status() {
+    use crate::lsp::manager::ServerEvent;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_server_update(server_update(
+        "rust-analyzer",
+        ServerEvent::Progress(Some(String::from("Indexing 3/9"))),
+    ));
+    assert_eq!(
+        app.lsp_progress_status().as_deref(),
+        Some("rust-analyzer: Indexing 3/9")
+    );
+    assert!(app.apply_server_update(server_update("rust-analyzer", ServerEvent::Progress(None))));
+    assert_eq!(app.lsp_progress_status(), None);
+    assert!(
+        !app.apply_server_update(server_update("rust-analyzer", ServerEvent::Progress(None))),
+        "a second End changes nothing"
+    );
+}
+
+#[test]
+fn a_server_question_is_answered_with_the_picked_action() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut answer = go_mod_question(&mut app);
+    assert!(app.drain_lsp_progress(), "the picker opens");
+    let picker = app.list_picker.as_ref().expect("the question is asked");
+    assert_eq!(
+        picker.purpose,
+        crate::widgets::list_picker::ListPurpose::ServerQuestion
+    );
+    assert_eq!(picker.title, "gopls: go.mod needs updating");
+    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["Update", "Ignore"]);
+    app.handle_list_picker_key(key(KeyCode::Down, KeyModifiers::NONE));
+    app.handle_list_picker_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.list_picker.is_none());
+    let picked = answer.try_recv().expect("answered").expect("an action");
+    assert_eq!(picked.title, "Ignore");
+    assert_eq!(app.status, "gopls: Ignore");
+}
+
+#[test]
+fn escape_answers_a_server_question_with_no_action() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut answer = go_mod_question(&mut app);
+    app.drain_lsp_progress();
+    app.handle_list_picker_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.list_picker.is_none());
+    assert!(
+        matches!(
+            answer.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ),
+        "the server hears no action, rather than waiting forever"
+    );
+}
+
+#[test]
+fn a_server_question_waits_for_an_open_picker_and_questions_queue() {
+    use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_list_picker(
+        ListPicker::new(
+            ListPurpose::StashApply,
+            "Apply Stash",
+            vec![ListRow {
+                id: String::from("0"),
+                label: String::from("stash@{0}"),
+            }],
+        ),
+        "",
+    );
+    let mut first = go_mod_question(&mut app);
+    let mut second = go_mod_question(&mut app);
+    app.drain_lsp_progress();
+    assert_eq!(
+        app.list_picker.as_ref().map(|p| p.title.as_str()),
+        Some("Apply Stash"),
+        "the user's own picker is not replaced"
+    );
+    app.handle_list_picker_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(
+        matches!(
+            first.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "closing the stash picker does not answer the waiting question"
+    );
+    app.drain_lsp_progress();
+    app.handle_list_picker_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(first.try_recv().unwrap().unwrap().title, "Update");
+    app.drain_lsp_progress();
+    assert!(app.list_picker.is_some(), "then the next question");
+    app.handle_list_picker_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(second.try_recv().is_err());
+}
+
+#[test]
+fn a_question_without_actions_is_only_a_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let (reply, mut answer) = tokio::sync::oneshot::channel();
+    app.apply_server_update(server_update(
+        "gopls",
+        crate::lsp::manager::ServerEvent::Question {
+            level: lsp_types::MessageType::INFO,
+            text: String::from("Gopls is busy"),
+            actions: Vec::new(),
+            reply,
+        },
+    ));
+    app.drain_lsp_progress();
+    assert!(app.list_picker.is_none(), "no empty picker");
+    assert_eq!(app.status, "gopls: Gopls is busy");
+    assert!(matches!(
+        answer.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+    ));
+}
+
+#[test]
+fn show_document_opens_the_file_with_the_range_selected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let file = root.join("main.go");
+    std::fs::write(
+        &file,
+        "package main\n\nfunc main() {\n\tprintln(\"hi\")\n}\n",
+    )
+    .unwrap();
+    let mut app = App::new(root).unwrap();
+    let range = lsp_types::Range {
+        start: lsp_types::Position::new(2, 5),
+        end: lsp_types::Position::new(2, 9),
+    };
+    app.apply_server_update(server_update(
+        "gopls",
+        crate::lsp::manager::ServerEvent::ShowDocument {
+            uri: lsp_types::Url::from_file_path(&file).unwrap(),
+            external: false,
+            selection: Some(range),
+        },
+    ));
+    assert_eq!(app.editor.path.as_deref(), Some(file.as_path()));
+    let sel = app
+        .editor
+        .selection
+        .as_ref()
+        .expect("the range is selected");
+    assert_eq!((sel.anchor, sel.head), ((2, 5), (2, 9)), "`main`");
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 9));
+}
+
+#[test]
+fn show_document_sends_a_link_to_the_browser_and_not_to_a_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for external in [true, false] {
+        app.apply_server_update(server_update(
+            "gopls",
+            crate::lsp::manager::ServerEvent::ShowDocument {
+                uri: lsp_types::Url::parse("https://go.dev/gopls/features").unwrap(),
+                external,
+                selection: None,
+            },
+        ));
+        assert_eq!(app.status, "Open https://go.dev/gopls/features");
+        assert!(app.editor.path.is_none(), "no tab for a web page");
+    }
+}
+
+#[test]
+fn a_command_only_quick_fix_says_it_ran_rather_than_applied() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _file) = app_with_calc_open(&tmp);
+    app.apply_code_action(crate::lsp::manager::CodeActionItem {
+        title: String::from("Browse gopls feature documentation"),
+        server: String::from("gopls"),
+        edits: Vec::new(),
+        command: Some(crate::lsp::manager::CodeActionCommand {
+            command: String::from("gopls.doc.features"),
+            arguments: Vec::new(),
+        }),
+        needs_resolve: false,
+        resolve_action: None,
+        is_preferred: false,
+    });
+    assert_eq!(app.status, "Ran Browse gopls feature documentation");
+}
+
+#[test]
+fn a_quick_fix_with_edits_and_a_command_reports_the_edits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_calc_open(&tmp);
+    app.code_action_baseline = app.editor.edit_seqs();
+    let mut item = quick_fix_renaming_total(&file);
+    item.command = Some(crate::lsp::manager::CodeActionCommand {
+        command: String::from("srn.reindex"),
+        arguments: Vec::new(),
+    });
+    app.apply_code_action(item);
+    assert!(
+        app.status.starts_with("Rename to sum: changed "),
+        "{}",
+        app.status
+    );
 }

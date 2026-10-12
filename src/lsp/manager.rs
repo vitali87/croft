@@ -684,14 +684,55 @@ pub struct DiagnosticsUpdate {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-/// A server's work-done progress update, forwarded from a `$/progress`
-/// notification. `message` is `Some(text)` while a task is running (Begin /
-/// Report) and `None` when it ends (End), so the app can show or clear the
-/// per-server status (e.g. "rust-analyzer: Indexing 112/340 33%").
-#[derive(Debug, Clone)]
-pub struct ProgressUpdate {
+/// Something a server tells the user rather than the editor: its work-done
+/// progress and its `window/*` messages, in the order it sent them.
+#[derive(Debug)]
+pub struct ServerUpdate {
     pub server: String,
-    pub message: Option<String>,
+    pub event: ServerEvent,
+}
+
+#[derive(Debug)]
+pub enum ServerEvent {
+    /// A `$/progress` update: `Some(text)` while a task is running (Begin /
+    /// Report) and `None` when it ends (End), so the app can show or clear
+    /// the per-server status (e.g. "rust-analyzer: Indexing 112/340 33%").
+    Progress(Option<String>),
+    /// A `window/showMessage` the user should see (#1599): an error, a
+    /// warning, or a note with a link in it, such as rust-analyzer's
+    /// "Failed to load workspaces" or gopls's "open your browser to …".
+    /// Other notes and every `window/logMessage` stay in OUTPUT.
+    Message {
+        level: lsp_types::MessageType,
+        text: String,
+    },
+    /// A `window/showMessageRequest`: a question with `actions` to pick
+    /// from. The pick, or `None` when the user dismisses it, goes back on
+    /// `reply`; dropping `reply` answers `None` too.
+    Question {
+        level: lsp_types::MessageType,
+        text: String,
+        actions: Vec<lsp_types::MessageActionItem>,
+        reply: oneshot::Sender<Option<lsp_types::MessageActionItem>>,
+    },
+    /// A `window/showDocument`: open `uri` in a tab, or in the browser when
+    /// `external`, with `selection` selected.
+    ShowDocument {
+        uri: lsp_types::Url,
+        external: bool,
+        selection: Option<lsp_types::Range>,
+    },
+}
+
+/// Whether a `window/showMessage` is worth interrupting the user for: an
+/// error or a warning, or a note that points somewhere (gopls answers
+/// "Browse documentation" with "open your browser to <url>"). Anything else
+/// is chatter that OUTPUT keeps.
+pub fn message_is_shown(level: lsp_types::MessageType, text: &str) -> bool {
+    use lsp_types::MessageType as MT;
+    level == MT::ERROR
+        || level == MT::WARNING
+        || (level == MT::INFO && (text.contains("https://") || text.contains("http://")))
 }
 
 enum Cmd {
@@ -1008,7 +1049,7 @@ pub struct LspManager {
     colors_rx: std_mpsc::Receiver<DocumentColorsUpdate>,
     color_presentations_rx: std_mpsc::Receiver<ColorPresentationsResult>,
     diagnostics_rx: std_mpsc::Receiver<DiagnosticsUpdate>,
-    progress_rx: std_mpsc::Receiver<ProgressUpdate>,
+    progress_rx: std_mpsc::Receiver<ServerUpdate>,
     capability_support: CapabilitySupport,
     semantic_refresh: Arc<AtomicBool>,
     inlay_refresh: Arc<AtomicBool>,
@@ -1450,10 +1491,10 @@ impl LspManager {
         self.diagnostics_rx.try_recv().ok()
     }
 
-    /// Pop the next server work-done progress update, if any. `message` is
-    /// `Some` while a task runs and `None` when it ends; the app keeps a
-    /// per-server map so the status bar can show or clear "Indexing…".
-    pub fn drain_progress(&self) -> Option<ProgressUpdate> {
+    /// Pop the next server progress update or `window/*` message, if any.
+    /// The app keeps a per-server progress map so the status bar can show or
+    /// clear "Indexing…", and shows the messages.
+    pub fn drain_server_update(&self) -> Option<ServerUpdate> {
         self.progress_rx.try_recv().ok()
     }
 
@@ -2207,7 +2248,7 @@ struct WorkerState {
     diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
     // Cloned into every spawned client's router so server `$/progress`
     // notifications (rust-analyzer indexing, etc.) reach the status bar.
-    progress_tx: std_mpsc::Sender<ProgressUpdate>,
+    progress_tx: std_mpsc::Sender<ServerUpdate>,
     restarts: ServerRestarts,
 }
 
@@ -2297,7 +2338,7 @@ struct ResultSenders {
     document_colors: std_mpsc::Sender<DocumentColorsUpdate>,
     color_presentations: std_mpsc::Sender<ColorPresentationsResult>,
     diagnostics: std_mpsc::Sender<DiagnosticsUpdate>,
-    progress: std_mpsc::Sender<ProgressUpdate>,
+    progress: std_mpsc::Sender<ServerUpdate>,
 }
 
 // Every flag and channel here is an independent worker input, the same shape
@@ -7444,9 +7485,18 @@ fn build_client_capabilities() -> ClientCapabilities {
         // (rust-analyzer's "Indexing…", "Building CrateGraph", "Roots
         // Scanned"). The router forwards it to the status bar, so a server
         // that is busy priming is never silently mistaken for a dead one.
+        // `showMessage` and `showDocument` (#1599): croft answers a server's
+        // questions from a picker and opens the documents and links it
+        // points at, so gopls sends "Browse documentation" as a link to
+        // open rather than a line in OUTPUT.
         window: Some(WindowClientCapabilities {
             work_done_progress: Some(true),
-            ..Default::default()
+            show_message: Some(lsp_types::ShowMessageRequestClientCapabilities {
+                message_action_item: Some(lsp_types::MessageActionItemCapabilities {
+                    additional_properties_support: Some(true),
+                }),
+            }),
+            show_document: Some(lsp_types::ShowDocumentClientCapabilities { support: true }),
         }),
         // rust-analyzer emits its Run / Debug / references lenses only for
         // client-side commands the client says it can run (#608), and these
@@ -7888,6 +7938,40 @@ mod tests {
         let caps = build_client_capabilities();
         let window = caps.window.expect("window capabilities must be set");
         assert_eq!(window.work_done_progress, Some(true));
+    }
+
+    /// gopls only sends "Browse documentation" as a link to open, rather
+    /// than as a line nobody sees, to a client that says it can show
+    /// documents; servers only ask questions with actions of one that says
+    /// it can answer them (#1599).
+    #[test]
+    fn client_capabilities_offer_show_document_and_message_actions() {
+        let window = build_client_capabilities().window.expect("window");
+        assert_eq!(
+            window.show_document.map(|d| d.support),
+            Some(true),
+            "window.showDocument"
+        );
+        assert!(
+            window
+                .show_message
+                .and_then(|m| m.message_action_item)
+                .is_some(),
+            "window.showMessage.messageActionItem"
+        );
+    }
+
+    #[test]
+    fn only_errors_warnings_and_links_interrupt_the_user() {
+        use lsp_types::MessageType as MT;
+        assert!(message_is_shown(MT::ERROR, "Failed to load workspaces."));
+        assert!(message_is_shown(MT::WARNING, "cargo check failed"));
+        assert!(message_is_shown(
+            MT::INFO,
+            "Gopls: open your browser to https://go.dev/gopls"
+        ));
+        assert!(!message_is_shown(MT::INFO, "Indexing done"));
+        assert!(!message_is_shown(MT::LOG, "https://example.com"));
     }
 
     /// Without `linkSupport` a server turns each `LocationLink` into a
