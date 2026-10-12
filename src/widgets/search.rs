@@ -227,6 +227,14 @@ impl Pattern {
         }
     }
 
+    /// The number of capture groups, the whole match (group 0) included.
+    fn captures_len(&self) -> usize {
+        match self {
+            Self::Plain(re) => re.captures_len(),
+            Self::Fancy(re) => re.captures_len(),
+        }
+    }
+
     /// Every match in `line`, as byte spans.
     pub(crate) fn spans(&self, line: &str) -> Vec<(usize, usize)> {
         match self {
@@ -252,7 +260,9 @@ impl Pattern {
         end: usize,
         replacement: &str,
     ) -> Option<String> {
-        let template = brace_refs(replacement, |name| self.has_group(name));
+        let template = brace_refs(replacement, self.captures_len(), |name| {
+            self.has_group(name)
+        });
         let mut out = String::new();
         match self {
             Self::Plain(re) => {
@@ -1114,8 +1124,9 @@ fn trim_leading_context(lead: &str, avail: usize, need: usize) -> Option<String>
 /// `$NAME` or `${NAME}` expands only when `is_group` knows that name;
 /// any other `$` is text (#1399), so a shell, PHP or Perl variable such as
 /// `$PREFIX` survives instead of expanding to nothing. A `$N` or `${N}`
-/// with no group N is text too (#1636).
-fn brace_refs(replacement: &str, is_group: impl Fn(&str) -> bool) -> String {
+/// with no group N is text too (#1636); `groups` counts them, group 0
+/// included.
+fn brace_refs(replacement: &str, groups: usize, is_group: impl Fn(&str) -> bool) -> String {
     let is_name = |c: &char| c.is_ascii_alphanumeric() || *c == '_';
     let mut out = String::with_capacity(replacement.len());
     let mut rest = replacement;
@@ -1136,10 +1147,10 @@ fn brace_refs(replacement: &str, is_group: impl Fn(&str) -> bool) -> String {
         } else if after.starts_with('&') {
             (String::from("${0}"), 1)
         } else if digits > 0 {
-            numbered_ref(&after[..digits], re.captures_len())
+            numbered_ref(&after[..digits], groups)
         } else if let Some(name) = braced {
             let group = if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
-                name.parse::<usize>().is_ok_and(|g| g < re.captures_len())
+                name.parse::<usize>().is_ok_and(|g| g < groups)
             } else {
                 is_group(name)
             };
