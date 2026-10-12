@@ -1,0 +1,1 @@
+fix: A file open at launch, such as a restored tab, no longer keeps croft at the memory peak of parsing it: that memory is handed back a few seconds after launch, as it already was for a file opened later.
