@@ -80374,6 +80374,19 @@ fn restart_for_this_file_names_the_file() {
     assert_eq!(app.status, "Restarting the language servers for main.rs");
 }
 
+/// Negative (#1621): a file no language maps to has no servers to restart,
+/// so the status says so instead of claiming a restart.
+#[test]
+fn restart_for_this_file_reports_a_file_no_server_serves() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("notes.txt");
+    std::fs::write(&file, "hello\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&file).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::RestartLanguageServersForFile);
+    assert_eq!(app.status, "No language server serves notes.txt");
+}
+
 /// Negative (#1621): with no file open, or while an update build has the
 /// servers stopped, the restarts change nothing and say why.
 #[test]

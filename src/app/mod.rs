@@ -41695,11 +41695,20 @@ impl App {
                 String::from("No language servers are running; Restart All starts them again");
             return;
         };
-        lsp.restart_servers_for(path.clone());
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        let has_language = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(crate::lsp::Language::from_extension)
+            .is_some();
+        if !has_language {
+            self.status = format!("No language server serves {name}");
+            return;
+        }
+        lsp.restart_servers_for(path.clone());
         self.status = format!("Restarting the language servers for {name}");
     }
 

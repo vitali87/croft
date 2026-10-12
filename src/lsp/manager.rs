@@ -2898,23 +2898,23 @@ impl WorkerState {
     }
 
     /// Restart the servers serving `path` at the user's request (#1621): the
-    /// (language, root) its document was opened under, else every root of
-    /// the language its extension maps to. Unlike a crash restart this
-    /// spends no budget and lifts a give-up, since the user asked for it.
+    /// (language, root) its document was opened under, else the one its
+    /// language and project root would open it under, so the servers of
+    /// other roots keep running. Unlike a crash restart this spends no
+    /// budget and lifts a give-up, since the user asked for it.
     async fn restart_servers_for(&mut self, path: &Path) {
         let keys: Vec<ClientKey> = match self.docs.get(path) {
             Some(doc) => vec![(doc.language, doc.project_root.clone())],
-            None => {
-                let lang = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .and_then(Language::from_extension);
-                self.clients
-                    .keys()
-                    .filter(|key| Some(key.0) == lang)
-                    .cloned()
-                    .collect()
-            }
+            None => path_to_language(path)
+                .map(|lang| {
+                    (
+                        lang,
+                        project_root_for_roots(path, lang, &self.workspace_root, &self.extra_roots),
+                    )
+                })
+                .filter(|key| self.clients.contains_key(key))
+                .into_iter()
+                .collect(),
         };
         if keys.is_empty() {
             crate::output::push(
@@ -2935,6 +2935,21 @@ impl WorkerState {
     async fn restart_key(&mut self, key: ClientKey) {
         let clients = self.clients.remove(&key).unwrap_or_default();
         let names: Vec<String> = clients.iter().map(|c| c.name.clone()).collect();
+        // Withdraw what the old servers published for their documents: a
+        // server that does not come back would never clear it, and one that
+        // does republishes once the app re-opens the tabs.
+        for (path, doc) in &self.docs {
+            if (doc.language, doc.project_root.clone()) != key {
+                continue;
+            }
+            for name in &names {
+                let _ = self.diagnostics_tx.send(DiagnosticsUpdate {
+                    path: path.clone(),
+                    server: name.clone(),
+                    diagnostics: Vec::new(),
+                });
+            }
+        }
         for managed in clients {
             let mut client = managed.client.lock().await;
             if !client.has_exited() {
@@ -10820,6 +10835,8 @@ while True:
         std::fs::write(&py, "x = 1\n").unwrap();
         std::fs::write(&go, "package main\n").unwrap();
         let (mut state, restarted) = two_language_worker(&root, &python);
+        let (diag_tx, diag_rx) = std_mpsc::channel();
+        state.diagnostics_tx = diag_tx;
         let runtime = LspRuntime::new().expect("runtime");
         let handle = runtime.handle().clone();
         handle.block_on(state.open_doc(py.clone(), String::from("x = 1\n")));
@@ -10840,6 +10857,17 @@ while True:
             "the app re-opens its tabs"
         );
         assert!(!state.docs.contains_key(&py), "the new server never saw it");
+        let withdrawn: Vec<DiagnosticsUpdate> = diag_rx.try_iter().collect();
+        assert!(
+            withdrawn
+                .iter()
+                .any(|u| u.path == py && u.server == "fake-python" && u.diagnostics.is_empty()),
+            "the old server's diagnostics are withdrawn: {withdrawn:?}"
+        );
+        assert!(
+            !withdrawn.iter().any(|u| u.path == go),
+            "go keeps its diagnostics"
+        );
         assert!(
             state.clients[&py_key]
                 .iter()
@@ -10856,6 +10884,46 @@ while True:
         // SAFETY: signal 0 only asks whether the pid exists.
         assert_eq!(unsafe { libc::kill(first_go[0], 0) }, 0, "go still runs");
         assert!(state.docs.contains_key(&go), "go keeps its document");
+    }
+
+    /// #1621: a file whose document is not open restarts only the servers
+    /// of its own project root, not every root of its language.
+    #[cfg(unix)]
+    #[test]
+    fn restarting_for_an_unopened_file_restarts_only_its_root() {
+        let Some(python) = python_for_stub_server() else {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let (a, b) = (root.join("a"), root.join("b"));
+        for dir in [&a, &b] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("pyproject.toml"), "").unwrap();
+        }
+        let (in_a, in_b) = (a.join("x.py"), b.join("y.py"));
+        let (mut state, _restarted) = two_language_worker(&root, &python);
+        let runtime = LspRuntime::new().expect("runtime");
+        let handle = runtime.handle().clone();
+        handle.block_on(state.open_doc(in_a.clone(), String::from("x = 1\n")));
+        let first_a = logged_pids(&root, "python", 1);
+        handle.block_on(state.open_doc(in_b.clone(), String::from("y = 1\n")));
+        let both = logged_pids(&root, "python", 2);
+        assert_eq!((first_a.len(), both.len()), (1, 2));
+        let first_b = both[1];
+        // As when its open failed: the worker holds no document for it.
+        state.docs.remove(&in_a);
+
+        handle.block_on(state.restart_servers_for(&in_a));
+        let pids = logged_pids(&root, "python", 3);
+        assert_eq!(pids.len(), 3, "root a's server started again");
+        assert!(process_exits(first_a[0]), "root a's old server exited");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(logged_pids(&root, "python", 3).len(), 3);
+        // SAFETY: signal 0 only asks whether the pid exists.
+        assert_eq!(unsafe { libc::kill(first_b, 0) }, 0, "root b still runs");
+        assert!(state.docs.contains_key(&in_b), "root b keeps its document");
     }
 
     /// Negative (#1621): a file no server serves restarts nothing.
