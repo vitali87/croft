@@ -230,6 +230,9 @@ pub enum InputPurpose {
     DebugConfigField {
         field: crate::dap::configs::DraftField,
     },
+    /// A `${input:…}` a launch or task asks for (#1424); the question
+    /// itself is the App's.
+    LaunchInput,
 }
 
 pub struct InputPrompt {
@@ -245,6 +248,8 @@ pub struct InputPrompt {
     /// The line under the field; `None` is the generic "Enter to confirm ·
     /// Esc to cancel".
     pub hint: Option<String>,
+    /// Draw the value as dots (a `"password": true` input, #1424).
+    pub masked: bool,
 }
 
 impl InputPrompt {
@@ -262,6 +267,7 @@ impl InputPrompt {
             last_rect: Rect::default(),
             allow_blank: false,
             hint: None,
+            masked: false,
         }
     }
 
@@ -269,6 +275,12 @@ impl InputPrompt {
     /// confirm and cancel.
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
+        self
+    }
+
+    /// Draw the typed value as dots.
+    pub fn masked(mut self) -> Self {
+        self.masked = true;
         self
     }
 
@@ -407,10 +419,15 @@ pub fn render_input_prompt(
                 .add_modifier(Modifier::ITALIC),
         );
     } else {
-        let cursor = prompt.cursor.min(prompt.value.chars().count());
-        let before: String = prompt.value.chars().take(cursor).collect();
-        let at: String = prompt.value.chars().skip(cursor).take(1).collect();
-        let after: String = prompt.value.chars().skip(cursor + 1).collect();
+        let shown = if prompt.masked {
+            "•".repeat(prompt.value.chars().count())
+        } else {
+            prompt.value.clone()
+        };
+        let cursor = prompt.cursor.min(shown.chars().count());
+        let before: String = shown.chars().take(cursor).collect();
+        let at: String = shown.chars().skip(cursor).take(1).collect();
+        let after: String = shown.chars().skip(cursor + 1).collect();
         let caret = if at.is_empty() { " ".to_string() } else { at };
         let value_style = Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)));
         let caret_style = Style::default()
