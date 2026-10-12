@@ -1,0 +1,1 @@
+fix: The minimap now shows in terminals without inline images (tmux, Alacritty, GNOME Terminal, plain xterm) as braille dots, stays on the active group when the editor is split, and turning it on in a too-narrow editor says why it is hidden (#1231)
