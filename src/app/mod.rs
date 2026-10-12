@@ -4827,9 +4827,12 @@ pub struct App {
     /// clobbered the baseline with the stop's own values — the changed
     /// highlight never fired (#112).
     watch_baseline_pending: bool,
-    /// A Copy Value waiting on the adapter's `clipboard` evaluate (#1546):
-    /// the row's shown value, copied instead if the evaluate fails.
-    debug_copy_fallback: Option<String>,
+    /// The latest Copy Value waiting on the adapter's `clipboard` evaluate
+    /// (#1546): the expression asked for and the row's shown value, copied
+    /// instead if the evaluate fails. A response for any other expression
+    /// answers an earlier Copy Value the user has since replaced, and is
+    /// dropped.
+    debug_copy_pending: Option<(String, String)>,
     /// Debug console log: program stdout/stderr (DAP output events) plus REPL
     /// echoes and results. Capped; the tail is shown in the Run & Debug panel.
     pub debug_console: Vec<String>,
@@ -6289,7 +6292,7 @@ impl App {
             watch_vals: std::collections::HashMap::new(),
             watch_prev: std::collections::HashMap::new(),
             watch_baseline_pending: false,
-            debug_copy_fallback: None,
+            debug_copy_pending: None,
             debug_console: Vec::new(),
             debug_ever_stopped: false,
             zoxide_jump: None,
@@ -30576,11 +30579,16 @@ impl App {
                 // could not give it, the value the row showed.
                 DapEvent::Evaluated {
                     context,
+                    expression,
                     result,
                     success,
-                    ..
                 } if context == "clipboard" => {
-                    if let Some(fallback) = self.debug_copy_fallback.take() {
+                    if self
+                        .debug_copy_pending
+                        .as_ref()
+                        .is_some_and(|(expr, _)| *expr == expression)
+                        && let Some((_, fallback)) = self.debug_copy_pending.take()
+                    {
                         let text = if success { result } else { fallback };
                         self.status = self.copy_where_pasted(&text).status("value");
                     }
@@ -31138,7 +31146,7 @@ impl App {
             && session.supports("supportsClipboardContext")
         {
             session.evaluate(&expr, "clipboard");
-            self.debug_copy_fallback = Some(value);
+            self.debug_copy_pending = Some((expr, value));
             self.status = String::from("Copying value…");
             return;
         }

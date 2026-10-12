@@ -80384,7 +80384,13 @@ while True:
             "variablesReference": 0, "evaluateName": "payload"}}]}})
     elif c == "evaluate":
         ctx = req["arguments"].get("context")
-        result = "'{{\"user\": \"ada\", \"token\": \"FULL\"}}'" if ctx == "clipboard" else "CUT"
+        expr = req["arguments"].get("expression")
+        if ctx != "clipboard":
+            result = "CUT"
+        elif expr == "payload":
+            result = "'{{\"user\": \"ada\", \"token\": \"FULL\"}}'"
+        else:
+            result = "FULL " + expr
         reply(req, {{"result": result, "variablesReference": 0}})
     elif c == "disconnect":
         reply(req)
@@ -80503,6 +80509,32 @@ fn copy_value_copies_the_whole_value_from_the_adapter() {
         Some(r#"'{"user": "ada", "token": "FULL"}'"#)
     );
     assert!(status.starts_with("Copied value"), "status: {status}");
+}
+
+/// #1546: a second Copy Value sent before the first one's `clipboard`
+/// evaluate answers wins; the first answer, for a request the user has
+/// replaced, does not land on the clipboard.
+#[test]
+fn the_latest_copy_value_wins_over_an_earlier_pending_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(mut app) = app_paused_with_a_payload(tmp.path(), true) else {
+        return;
+    };
+    crate::clipboard::test_clip::mock_write("before");
+    let idx = debug_row_index(&app, "payload").unwrap();
+    run_debug_menu_entry(&mut app, idx, "Copy Value");
+    app.copy_debug_value(Some(String::from("other")), String::from("shown"));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "both clipboard evaluates",
+        || {
+            app.poll_dap();
+            crate::clipboard::test_clip::mock_read().as_deref() != Some("before")
+        },
+    );
+    let copied = crate::clipboard::test_clip::mock_read();
+    app.debug_stop();
+    assert_eq!(copied.as_deref(), Some("FULL other"));
 }
 
 /// #1546 negative: an adapter without `supportsClipboardContext` is sent
