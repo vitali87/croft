@@ -1,0 +1,1 @@
+fix: With a profile active, Preferences: Open Settings (UI) now shows and saves that profile's config.json, as the rest of croft does, instead of the Default profile's, so a change made there survives a relaunch. The header names the profile it writes to.
