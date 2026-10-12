@@ -291,6 +291,64 @@ mod tests {
         );
     }
 
+    /// #1526: the popup renders with word wrap, so a word that does not fit
+    /// moves whole to the next row. Sized by characters (152 / 78 = 2 rows)
+    /// it got one row short of the 3 word wrap needs, and the last words
+    /// were clipped without a sign.
+    #[test]
+    fn area_for_reserves_the_rows_word_wrap_needs() {
+        let line = format!("{} {} {}", "a".repeat(60), "b".repeat(60), "c".repeat(30));
+        let p = HoverPopup::new(line, (10, 30));
+        let vp = Rect::new(0, 0, 120, 40);
+        let a = p.area_for(vp);
+        assert_eq!(a.width, MAX_WIDTH);
+        assert_eq!(a.height, 3 + 2, "three wrapped rows plus the border");
+        let mut buf = Buffer::empty(vp);
+        (&p).render(a, &mut buf);
+        let text: String = (a.y..a.bottom())
+            .map(|y| {
+                (a.x..a.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains(&"c".repeat(30)),
+            "the last word is shown:\n{text}"
+        );
+    }
+
+    /// #1526: the debug hover's `name = '<long value>': type` puts the
+    /// value on its own rows after `name =`; the type at the end shows.
+    #[test]
+    fn a_long_debug_value_keeps_its_type_in_view() {
+        let value = format!("eyJhbGciOiJIUzI1NiJ9.{}", "a".repeat(117));
+        let p = HoverPopup::new(format!("token = '{value}': str"), (10, 30));
+        let vp = Rect::new(0, 0, 120, 40);
+        let a = p.area_for(vp);
+        let mut buf = Buffer::empty(vp);
+        (&p).render(a, &mut buf);
+        let last_row: String = (a.x..a.right())
+            .map(|x| buf[(x, a.bottom() - 2)].symbol())
+            .collect();
+        assert!(last_row.contains("': str"), "{last_row:?}");
+    }
+
+    /// #1526 negative: text that breaks evenly gets no extra rows. One long
+    /// word splits at the width exactly as before, short lines take one row
+    /// each, and the 16-row cap still holds.
+    #[test]
+    fn area_for_adds_no_rows_text_does_not_need() {
+        let vp = Rect::new(0, 0, 120, 60);
+        let word = HoverPopup::new("x".repeat(156), (10, 50)).area_for(vp);
+        assert_eq!(word.height, 2 + 2, "156 chars in 78-wide rows");
+        let short = HoverPopup::new("fn a()\nfn b()\nfn c()".into(), (10, 50)).area_for(vp);
+        assert_eq!(short.height, 3 + 2);
+        let long = HoverPopup::new(vec!["word"; 40].join("\n"), (10, 50)).area_for(vp);
+        assert_eq!(long.height, MAX_HEIGHT + 2);
+    }
+
     #[test]
     fn render_clears_editor_text_under_the_popup() {
         let area = Rect {
