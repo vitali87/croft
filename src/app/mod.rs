@@ -10454,7 +10454,9 @@ impl App {
     /// entries because the fresh scan is empty. Relative tool paths resolve
     /// against the command's cwd (falling back to the workspace root);
     /// resolution is lexical, no filesystem probe, so a path the tool
-    /// printed oddly still gets a row even if navigation later misses.
+    /// printed oddly still gets a row even if navigation later misses. The
+    /// exception is the loose go and lint rows (#1594), kept only for a
+    /// file that exists, so other `name:1:2: text` output is not a problem.
     pub(crate) fn apply_build_scan(
         &mut self,
         pane: u64,
@@ -10516,6 +10518,9 @@ impl App {
                     base.join(p)
                 }
             };
+            if d.needs_file && !path.is_file() {
+                continue;
+            }
             let entry = self.build_diagnostics.entry(path.clone()).or_default();
             // Unconditionally: recording only when the entry was empty meant
             // the SECOND producer to reach a file never listed it, so its
@@ -71778,6 +71783,9 @@ pub fn run(
     // the finished build straight out of it on first open (or builds on demand
     // if the user opens a file before the prewarm finishes).
     std::thread::spawn(crate::highlight::prewarm_configs);
+    // Hand the heap a large file's parse passes freed back to the OS
+    // (#1707), so croft doesn't stay resident at the parse's peak.
+    crate::mem_relief::start();
     let title = build_title(&root);
     let mut app = App::new(root.clone())?;
     // Resurrect this workspace's terminal panel from the last session
