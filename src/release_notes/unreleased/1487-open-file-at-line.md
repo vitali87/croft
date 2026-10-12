@@ -1,1 +1,1 @@
-feat: `croft file.c:5:5`, `croft view file.c:5` and `croft edit file.c:5:5` open the file with the caret on that line and column, the form compilers, linters and `grep -n` print, instead of failing to launch or creating an empty file named `file.c:5:5`.
+feature: `croft file.c:5:5`, `croft view file.c:5` and `croft edit file.c:5:5` open the file with the caret on that line and column, the form compilers, linters and `grep -n` print, instead of failing to launch or creating an empty file named `file.c:5:5`.
