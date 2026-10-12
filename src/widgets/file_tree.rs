@@ -1484,6 +1484,7 @@ impl Widget for &mut FileTree {
         // Black theme: chipless brand header (panelTitle.activeForeground);
         // Croft Dark keeps the historical white-on-navy chip.
         let label = format!(" {} ", crate::i18n::tr("EXPLORER"));
+        let label_width = unicode_width::UnicodeWidthStr::width(label.as_str());
         let title = if self.focus_gradient {
             Span::styled(
                 label,
@@ -1533,7 +1534,9 @@ impl Widget for &mut FileTree {
         // the shared header-action pill — a space-padded `" ⋯ "` inset one cell
         // from the rounded corner — so it matches the terminal `+` button
         // exactly instead of jamming a naked glyph against the corner.
-        if area.width > 12
+        // Only when the pill clears the (translated) title, which starts one
+        // cell in from the corner: `x + 1 + label_width <= x + width - 4`.
+        if usize::from(area.width) >= label_width + 5
             && let Some(rect) = crate::widgets::header_pill::render_action(
                 buf,
                 area.x + area.width - 1,
@@ -2294,6 +2297,53 @@ mod tests {
         );
         assert_eq!(tree.selected, 0);
         assert_eq!(tree.scroll, 0);
+    }
+
+    #[test]
+    fn views_pill_stays_clear_of_a_translated_explorer_title() {
+        // From the narrowest pane whose top border holds the whole title.
+        for width in 14..30u16 {
+            let (_tmp, mut tree) = fixture();
+            tree.focus_gradient = false;
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: 8,
+            };
+            let mut buf = Buffer::empty(area);
+            crate::i18n::with_test_catalog(r#"{"EXPLORER": "EXPLORADOR"}"#, || {
+                (&mut tree).render(area, &mut buf);
+            });
+            let title_row: String = (0..area.width).map(|x| buf[(x, area.y)].symbol()).collect();
+            assert!(
+                title_row.contains(" EXPLORADOR "),
+                "width {width}: the ⋯ pill painted over the title: {title_row:?}"
+            );
+            let btn = tree.header_views_btn;
+            assert!(
+                btn.width == 0 || btn.x >= area.x + 1 + 12,
+                "width {width}: ⋯ pill {btn:?} overlaps the title"
+            );
+        }
+        // Wide enough, the pill still renders.
+        assert!(
+            {
+                let (_tmp, mut tree) = fixture();
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width: 17,
+                    height: 8,
+                };
+                let mut buf = Buffer::empty(area);
+                crate::i18n::with_test_catalog(r#"{"EXPLORER": "EXPLORADOR"}"#, || {
+                    (&mut tree).render(area, &mut buf);
+                });
+                tree.header_views_btn.width > 0
+            },
+            "the ⋯ pill must render once the translated title fits"
+        );
     }
 
     #[test]
