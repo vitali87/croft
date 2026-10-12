@@ -11508,6 +11508,237 @@ impl Editor {
         true
     }
 
+    /// The buffer as one string, for the Emmet commands that edit markup
+    /// already written (#1557), and `(row, col)` as a byte offset into it.
+    fn emmet_text_and_offset(&self, row: usize, col: usize) -> (String, usize) {
+        let text = self.lines.join("\n");
+        let before: usize = self.lines[..row.min(self.lines.len())]
+            .iter()
+            .map(|l| l.len() + 1)
+            .sum();
+        let line = self.lines.get(row).map_or("", String::as_str);
+        let in_line = line.char_indices().nth(col).map_or(line.len(), |(i, _)| i);
+        (text, before + in_line)
+    }
+
+    /// Byte offset `at` of `text` as a (row, char column).
+    fn emmet_position(text: &str, at: usize) -> (usize, usize) {
+        let head = &text[..at.min(text.len())];
+        let row = head.matches('\n').count();
+        let start = head.rfind('\n').map_or(0, |i| i + 1);
+        (row, head[start..].chars().count())
+    }
+
+    /// Make the buffer `text`, as one undo step, rewriting only the lines
+    /// that changed.
+    fn emmet_set_text(&mut self, text: &str) {
+        let new: Vec<String> = text.split('\n').map(String::from).collect();
+        let (head, tail) = {
+            let old = &self.lines;
+            let head = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+            let room = old.len().min(new.len()) - head;
+            let tail = old
+                .iter()
+                .rev()
+                .zip(new.iter().rev())
+                .take(room)
+                .take_while(|(a, b)| a == b)
+                .count();
+            (head, tail)
+        };
+        self.pin_on_edit();
+        self.push_undo(EditKind::EmmetExpand);
+        self.last_edit_kind = None;
+        let old_end = self.lines.len() - tail;
+        self.lines
+            .splice(head..old_end, new[head..new.len() - tail].iter().cloned());
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+    }
+
+    /// Emmet: Wrap with Abbreviation (#1557): wrap the selected lines in
+    /// `abbr`, one level in, at their own indentation; a selection inside
+    /// one line is wrapped where it stands. With nothing selected it wraps
+    /// the element around the caret, as VS Code does, or the caret's line
+    /// outside any element. Returns whether anything was wrapped.
+    pub fn emmet_wrap(&mut self, abbr: &str) -> bool {
+        use crate::emmet::WrapContent;
+        let Some(profile) = self.emmet_profile() else {
+            return false;
+        };
+        let unit = self.indent_unit();
+        let sel = self
+            .selection
+            .filter(|s| s.has_area())
+            .map(|s| s.normalised())
+            .or_else(|| self.emmet_element_at_caret());
+        if let Some(((r0, c0), (r1, c1))) = sel
+            && r0 == r1
+        {
+            let chars: Vec<char> = self.lines[r0].chars().collect();
+            let before: String = chars[..c0].iter().collect();
+            let after: String = chars[c1.min(chars.len())..].iter().collect();
+            if !before.trim().is_empty() || !after.trim().is_empty() {
+                let picked: String = chars[c0..c1.min(chars.len())].iter().collect();
+                let Some(markup) =
+                    crate::emmet::wrap(abbr, WrapContent::Inline(&picked), &unit, profile)
+                else {
+                    return false;
+                };
+                let markup = markup.trim_end_matches('\n');
+                let (text, at) = self.emmet_text_and_offset(r0, c0);
+                let end = at + picked.len();
+                let new = format!("{}{markup}{}", &text[..at], &text[end..]);
+                self.emmet_set_text(&new);
+                (self.cursor_row, self.cursor_col) = Self::emmet_position(&new, at);
+                self.clear_selection();
+                self.ensure_cursor_col_visible();
+                return true;
+            }
+        }
+        let (first, last) = match sel {
+            // A selection ending at the start of a line leaves that line out.
+            Some(((r0, _), (r1, 0))) if r1 > r0 => (r0, r1 - 1),
+            Some(((r0, _), (r1, _))) => (r0, r1),
+            None => (self.cursor_row, self.cursor_row),
+        };
+        let rows = &self.lines[first..=last.min(self.lines.len() - 1)];
+        if rows.iter().all(|l| l.trim().is_empty()) {
+            return false;
+        }
+        // The lines' shared indentation stays outside the new element.
+        let base: String = rows
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                l.chars()
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .collect::<String>()
+            })
+            .min_by_key(String::len)
+            .unwrap_or_default();
+        let content: Vec<String> = rows
+            .iter()
+            .map(|l| {
+                l.strip_prefix(base.as_str())
+                    .unwrap_or(l.trim_start())
+                    .to_string()
+            })
+            .collect();
+        let Some(markup) = crate::emmet::wrap(abbr, WrapContent::Lines(&content), &unit, profile)
+        else {
+            return false;
+        };
+        let wrapped: Vec<String> = markup
+            .trim_end_matches('\n')
+            .split('\n')
+            .map(|l| {
+                if l.is_empty() {
+                    String::new()
+                } else {
+                    format!("{base}{l}")
+                }
+            })
+            .collect();
+        let mut lines = self.lines.clone();
+        lines.splice(first..=last, wrapped);
+        self.emmet_set_text(&lines.join("\n"));
+        self.cursor_row = first;
+        self.cursor_col = base.chars().count();
+        self.clear_selection();
+        self.ensure_cursor_col_visible();
+        true
+    }
+
+    /// The span of the element around the caret, a caret just past its
+    /// closing `>` included, for a wrap with nothing selected.
+    fn emmet_element_at_caret(&self) -> Option<((usize, usize), (usize, usize))> {
+        let (text, at) = self.emmet_text_and_offset(self.cursor_row, self.cursor_col);
+        let element = crate::emmet::enclosing(&text, at)
+            .or_else(|| crate::emmet::enclosing(&text, at.checked_sub(1)?))?;
+        let span = element.outer();
+        Some((
+            Self::emmet_position(&text, span.start),
+            Self::emmet_position(&text, span.end),
+        ))
+    }
+
+    /// Emmet: Remove Tag (#1557): take away the tags of the element around
+    /// the caret, keeping its content.
+    pub fn emmet_remove_tag(&mut self) -> bool {
+        if self.emmet_profile().is_none() {
+            return false;
+        }
+        let unit = self.indent_unit();
+        let (text, at) = self.emmet_text_and_offset(self.cursor_row, self.cursor_col);
+        let Some((new, caret)) = crate::emmet::remove_tag(&text, at, &unit) else {
+            return false;
+        };
+        self.emmet_set_text(&new);
+        (self.cursor_row, self.cursor_col) = Self::emmet_position(&new, caret);
+        self.clear_selection();
+        self.ensure_cursor_col_visible();
+        true
+    }
+
+    /// Emmet: Update Tag (#1557): rename the element around the caret.
+    pub fn emmet_update_tag(&mut self, name: &str) -> bool {
+        if self.emmet_profile().is_none() {
+            return false;
+        }
+        let (text, at) = self.emmet_text_and_offset(self.cursor_row, self.cursor_col);
+        let Some(new) = crate::emmet::rename_tag(&text, at, name) else {
+            return false;
+        };
+        self.emmet_set_text(&new);
+        true
+    }
+
+    /// Emmet: Go to Matching Pair (#1557): from an opening tag to its
+    /// closing tag, and back.
+    pub fn emmet_match_tag(&mut self) -> bool {
+        if self.emmet_profile().is_none() {
+            return false;
+        }
+        let (text, at) = self.emmet_text_and_offset(self.cursor_row, self.cursor_col);
+        let Some(to) = crate::emmet::matching_tag(&text, at) else {
+            return false;
+        };
+        (self.cursor_row, self.cursor_col) = Self::emmet_position(&text, to);
+        self.clear_selection();
+        self.ensure_cursor_col_visible();
+        true
+    }
+
+    /// Emmet: Balance outward / inward (#1557): grow the selection to the
+    /// enclosing element's content, then the element, and so on outward, or
+    /// walk it back in.
+    pub fn emmet_balance(&mut self, outward: bool) -> bool {
+        if self.emmet_profile().is_none() {
+            return false;
+        }
+        let ((r0, c0), (r1, c1)) = self.selection.map(|s| s.normalised()).unwrap_or((
+            (self.cursor_row, self.cursor_col),
+            (self.cursor_row, self.cursor_col),
+        ));
+        let (text, start) = self.emmet_text_and_offset(r0, c0);
+        let end = self.emmet_text_and_offset(r1, c1).1;
+        let range = if outward {
+            crate::emmet::balance_out(&text, start..end)
+        } else {
+            crate::emmet::balance_in(&text, start..end)
+        };
+        let Some(range) = range else {
+            return false;
+        };
+        let anchor = Self::emmet_position(&text, range.start);
+        let head = Self::emmet_position(&text, range.end);
+        self.selection = Some(EditorSelection { anchor, head });
+        (self.cursor_row, self.cursor_col) = head;
+        self.ensure_cursor_col_visible();
+        true
+    }
+
     /// VS Code "Transpose Characters around the Cursor"
     /// (`editor.action.transpose`): swap the character before the cursor with
     /// the one after it and advance the cursor (emacs `transpose-chars`). At
