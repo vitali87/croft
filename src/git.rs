@@ -811,14 +811,14 @@ fn status_kinds(x: char, y: char) -> [Option<ChangeKind>; 2] {
     if x == '?' && y == '?' {
         return [Some(ChangeKind::Untracked), None];
     }
-    let staged = (x != ' ' && x != '?').then(|| match x {
+    let staged = (x != ' ' && x != '?').then_some(match x {
         'A' => ChangeKind::StagedAdded,
         'M' => ChangeKind::StagedModified,
         'D' => ChangeKind::StagedDeleted,
         'R' | 'C' => ChangeKind::StagedRenamed,
         _ => ChangeKind::StagedModified,
     });
-    let unstaged = (y != ' ' && y != '?').then(|| match y {
+    let unstaged = (y != ' ' && y != '?').then_some(match y {
         'M' => ChangeKind::Modified,
         'D' => ChangeKind::Deleted,
         _ => ChangeKind::Modified,
