@@ -65261,15 +65261,17 @@ impl CodeqlStandIn {
 
 /// #856 guard: a run-at-cursor asked for while a run is in flight is
 /// turned away, and does not take over the first run's pending outcome:
-/// the status still names the first run when it ends.
+/// the status names the first run when it ends. Turned away with the way
+/// to stop the first (#1534), not silently.
 #[cfg(unix)]
 #[test]
 fn a_run_asked_for_mid_run_does_not_take_over_the_first_runs_outcome() {
     let mut s = CodeqlStandIn::new();
     s.will(STAND_IN_PASS, 0);
     s.app.run_named_test(String::from("Find.qlref"));
-    s.app.run_named_test(String::from("Other.qlref"));
     assert_eq!(s.app.status, "Running test test/Find::Find.qlref");
+    s.app.run_named_test(String::from("Other.qlref"));
+    assert_eq!(s.app.status, TEST_RUN_IN_PROGRESS);
     s.finish();
     assert!(
         s.app.status.starts_with("Find.qlref passed ("),
@@ -79700,6 +79702,77 @@ fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
     assert_eq!(app.status, "Tab is already kept open");
 }
 
+// --- #1254: long hovers scroll ---------------------------------------------------
+
+fn app_with_long_hover() -> (
+    App,
+    tempfile::TempDir,
+    ratatui::Terminal<ratatui::backend::TestBackend>,
+) {
+    let (mut app, tmp, col, row) = app_with_open_file_and_editor_cell();
+    let doc = (1..=40)
+        .map(|i| format!("doc line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+        doc,
+        (col, row),
+    ));
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    (app, tmp, term)
+}
+
+#[test]
+fn the_wheel_over_a_hover_popup_scrolls_it_instead_of_closing_it() {
+    use crossterm::event::MouseEventKind;
+    let (mut app, _tmp, mut term) = app_with_long_hover();
+    let area = app.hover_popup.as_ref().unwrap().last_area;
+    assert!(area.height > 2, "the popup painted");
+    let (x, y) = (area.x + 3, area.y + 2);
+    app.handle_mouse(mouse(MouseEventKind::ScrollDown, x, y));
+    let popup = app
+        .hover_popup
+        .as_ref()
+        .expect("the wheel keeps the popup open");
+    assert!(popup.scroll > 0, "and scrolls it");
+    let after_down = popup.scroll;
+    app.handle_mouse(mouse(MouseEventKind::ScrollUp, x, y));
+    assert!(app.hover_popup.as_ref().unwrap().scroll < after_down);
+    term.draw(|frame| app.render(frame)).unwrap();
+    assert!(app.hover_popup.is_some());
+}
+
+#[test]
+fn moving_the_pointer_onto_the_hover_popup_keeps_it_open() {
+    use crossterm::event::MouseEventKind;
+    let (mut app, _tmp, _term) = app_with_long_hover();
+    let area = app.hover_popup.as_ref().unwrap().last_area;
+    app.handle_mouse(mouse(MouseEventKind::Moved, area.x + 3, area.y + 2));
+    assert!(
+        app.hover_popup.is_some(),
+        "the pointer has to cross onto the popup to scroll it"
+    );
+}
+
+#[test]
+fn the_wheel_away_from_the_hover_popup_still_closes_it() {
+    use crossterm::event::MouseEventKind;
+    let (mut app, _tmp, _term) = app_with_long_hover();
+    let area = app.hover_popup.as_ref().unwrap().last_area;
+    let x = if area.x > 2 {
+        area.x - 2
+    } else {
+        area.right() + 2
+    };
+    app.handle_mouse(mouse(MouseEventKind::ScrollDown, x, area.y + 1));
+    assert!(
+        app.hover_popup.is_none(),
+        "scrolling the editor dismisses the hover"
+    );
+}
+
 // --- #1215: keys that move the caret sideways scroll the view to it -----------
 
 fn wide_line_app(tmp: &std::path::Path) -> (App, ratatui::Terminal<ratatui::backend::TestBackend>) {
@@ -80564,6 +80637,36 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     let _ = render_buf(&mut app);
     assert!(app.source_control.nested_repos.is_empty());
     assert!(app.source_control.last_init_repo_button_area.width > 0);
+}
+
+/// #1534: a run asked for while another is in flight says why nothing
+/// happened and how to stop the one running, instead of doing nothing.
+#[test]
+fn a_test_run_while_one_is_in_flight_says_how_to_stop_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname = \"t\"\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.testing
+        .on_busy_started(crate::testing::model::Activity::Running);
+    app.run_all_tests();
+    assert_eq!(app.status, TEST_RUN_IN_PROGRESS);
+    app.status.clear();
+    app.run_test(String::from("m::a"));
+    assert_eq!(app.status, TEST_RUN_IN_PROGRESS);
+}
+
+/// #1534: `s` in the Testing view cancels a run in flight; with nothing
+/// running, Testing: Cancel Test Run says so.
+#[test]
+fn cancel_test_run_stops_a_run_and_says_so_when_idle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.cancel_test_run();
+    assert_eq!(app.status, "No test run in progress");
+    app.testing
+        .on_busy_started(crate::testing::model::Activity::Running);
+    app.handle_testing_key(key(KeyCode::Char('s'), KeyModifiers::NONE));
+    assert_eq!(app.status, "Cancelling test run");
 }
 
 // --- Minimap without inline images (#1231) --------------------------------

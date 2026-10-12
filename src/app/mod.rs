@@ -9632,6 +9632,15 @@ impl App {
     }
 
     fn on_mouse_moved(&mut self, col: u16, row: u16, in_editor: bool) {
+        // Crossing onto the hover keeps it, so the wheel can reach it.
+        if self
+            .hover_popup
+            .as_ref()
+            .is_some_and(|p| rect_contains(p.last_area, col, row))
+        {
+            self.hover.clear();
+            return;
+        }
         // Activity-bar hover: brighten the icon under the pointer. Re-emit the
         // swapped pre-baked image only when the hovered icon actually changes,
         // so a pointer drifting within one icon (or anywhere else) costs
@@ -20654,6 +20663,7 @@ impl App {
         if let Some(popup) = self.hover_popup.as_mut() {
             popup.theme = self.theme;
             let area = popup.area_for(frame.area());
+            popup.last_area = area;
             if area.width > 0 && area.height > 0 {
                 frame.render_widget(&*popup, area);
             }
@@ -24212,6 +24222,7 @@ impl App {
         match key.code {
             KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
             KeyCode::Enter => self.run_all_tests(),
+            KeyCode::Char('s' | 'S') if self.testing.is_busy() => self.cancel_test_run(),
             KeyCode::Char('r' | 'R') => self.discover_tests(),
             KeyCode::Char('w' | 'W') => {
                 self.toggle_test_watch(crate::testing::watch::WatchScope::All)
@@ -24235,6 +24246,33 @@ impl App {
             self.status = String::from("The test runner has not written any output yet");
         }
         self.set_bottom_panel_tab(BottomPanelTab::Output);
+    }
+
+    /// A new run while one is in flight is refused with the way out
+    /// (#1534): it used to be dropped without a word, and a hung test left
+    /// the view refusing every run until croft quit.
+    fn refuse_test_run_while_busy(&mut self) -> bool {
+        if !self.testing.is_busy() {
+            return false;
+        }
+        self.status = String::from(TEST_RUN_IN_PROGRESS);
+        // The run in flight still reports its outcome over this (#856).
+        if let Some(run) = self.test_run_status.as_mut() {
+            run.shown = self.status.clone();
+        }
+        true
+    }
+
+    /// Testing: Cancel Test Run, `s` in the Testing view, or its Stop
+    /// control (#1534): kill the run or discovery in flight. The panel
+    /// settles when the worker reports the run's end.
+    fn cancel_test_run(&mut self) {
+        if !self.testing.is_busy() {
+            self.status = String::from("No test run in progress");
+            return;
+        }
+        self.test_worker.cancel();
+        self.status = String::from("Cancelling test run");
     }
 
     /// Whether an enabled runner extension claims this workspace. When none
@@ -24274,7 +24312,7 @@ impl App {
     /// stream into the tree as usual; the report lands in the editor's
     /// gutter, the status bar and the Testing summary.
     fn run_all_tests_with_coverage(&mut self) {
-        if self.testing.is_busy() || !self.testing_runner_available() {
+        if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
         self.test_run_with_unsaved_saved(|app| {
@@ -24602,8 +24640,7 @@ impl App {
             );
             return;
         }
-        if self.testing.is_busy() {
-            self.status = String::from("Tests are already running");
+        if self.refuse_test_run_while_busy() {
             return;
         }
         self.run_all_tests();
@@ -24684,7 +24721,7 @@ impl App {
     /// Kick off a full test run on the worker (no-op if a run/discovery is
     /// already in flight) and reveal the Testing view so results stream in.
     fn run_all_tests(&mut self) {
-        if self.testing.is_busy() || !self.testing_runner_available() {
+        if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
         self.test_run_with_unsaved_saved(|app| {
@@ -24696,7 +24733,7 @@ impl App {
     /// Run a single test by exact name (click-to-run from the tree). Marks just
     /// that case Running and keeps the rest of the discovered list intact.
     fn run_test(&mut self, name: String) {
-        if self.testing.is_busy() || !self.testing_runner_available() {
+        if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
         self.test_run_with_unsaved_saved(|app| {
@@ -24724,7 +24761,7 @@ impl App {
     /// filter and the panel's marking are substring matches, so the pattern is
     /// anchored (`parse::`) to keep `parse` from sweeping `parse_utils::b`.
     fn run_suite(&mut self, suite: String) {
-        if self.testing.is_busy() || !self.testing_runner_available() {
+        if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
         self.test_run_with_unsaved_saved(|app| {
@@ -24753,7 +24790,7 @@ impl App {
     /// A leaf unique in the discovered tree resolves to its full name for an
     /// exact run; otherwise cargo's substring filter is the best available.
     fn run_named_test(&mut self, name: String) {
-        if self.testing.is_busy() || !self.testing_runner_available() {
+        if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
         self.test_run_with_unsaved_saved(|app| app.run_named_test_now(name));
@@ -24833,7 +24870,7 @@ impl App {
                 String::from("Run Test at Cursor with Coverage: no function at the caret");
             return;
         };
-        if self.testing.is_busy() || !self.testing_runner_available() {
+        if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
         self.test_run_with_unsaved_saved(|app| app.run_test_at_cursor_with_coverage_now(name));
@@ -24864,7 +24901,7 @@ impl App {
     /// suite, under the coverage tool, marked in the tree as a plain run of
     /// it would be. The report replaces the last one.
     fn run_scope_with_coverage(&mut self, name: String, suite: bool) {
-        if self.testing.is_busy() || !self.testing_runner_available() {
+        if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
         self.test_run_with_unsaved_saved(|app| app.run_scope_with_coverage_now(name, suite));
@@ -51341,6 +51378,7 @@ impl App {
                 self.toggle_test_watch(crate::testing::watch::WatchScope::All)
             }
             Cmd::TestingGoToFirstFailure => self.go_to_first_failed_test(),
+            Cmd::TestingCancelRun => self.cancel_test_run(),
             Cmd::ReopenAsText => match self.editor.path.clone() {
                 // Merge editor (#253): back to the in-buffer marker flow.
                 // The Result buffer is deliberately discarded — it was
@@ -54972,6 +55010,23 @@ impl App {
         let in_editor_scrollbar = rect_contains(self.editor.last_scrollbar, m.column, m.row);
         let in_editor_hscrollbar = rect_contains(self.editor.last_hscrollbar, m.column, m.row);
 
+        // The wheel over a hover scrolls its text rather than dismissing it
+        // (#1254): a long docstring's Returns/Raises sit below the box.
+        if let Some(popup) = self.hover_popup.as_mut()
+            && rect_contains(popup.last_area, m.column, m.row)
+        {
+            match m.kind {
+                MouseEventKind::ScrollDown => {
+                    popup.scroll_by(3);
+                    return;
+                }
+                MouseEventKind::ScrollUp => {
+                    popup.scroll_by(-3);
+                    return;
+                }
+                _ => {}
+            }
+        }
         if matches!(m.kind, MouseEventKind::Moved) {
             self.pointer_cell = Some((m.column, m.row));
             self.on_mouse_moved(m.column, m.row, in_editor);
@@ -56329,6 +56384,8 @@ impl App {
                         self.run_all_tests_with_coverage();
                     } else if rect_contains(self.testing.last_output_hint, m.column, m.row) {
                         self.show_test_runner_output();
+                    } else if rect_contains(self.testing.last_stop, m.column, m.row) {
+                        self.cancel_test_run();
                     } else {
                         match self.testing.hit_at(m.column, m.row) {
                             Some(crate::widgets::testing::RowHit::ToggleWatch(scope)) => {
@@ -72164,6 +72221,9 @@ impl std::io::Write for CountingWriter {
 
 type CroftTerminal = Terminal<CrosstermBackend<CountingWriter>>;
 
+/// The status a run gesture gets while another run is in flight (#1534).
+const TEST_RUN_IN_PROGRESS: &str = "A test run is in progress (s in Testing stops it)";
+
 pub fn run(
     root: PathBuf,
     restore_session: Option<PathBuf>,
@@ -72363,6 +72423,12 @@ pub fn run(
     // Snapshot the terminal panel for the next launch (cwds are read live
     // here, so plain `cd`s during the session are captured at quit).
     app.save_terminal_session();
+    // A test run still in flight ends with croft (#1534): its runner was
+    // left running under PID 1.
+    if app.testing.is_busy() {
+        app.test_worker.cancel();
+    }
+
     // Quitting mid-debug ends the program as Stop Debugging does (#1536):
     // nothing sent `disconnect` here, and the debuggee outlived croft.
     // The teardowns run while the terminal is restored and are joined
@@ -73029,6 +73095,9 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         // check) rolled its cases back in the drain; say why nothing ran.
         if app.testing.take_refusal() {
             app.status = String::from(crate::testing::NO_RUNNER_STATUS);
+        }
+        if app.testing.take_cancelled() {
+            app.status = String::from("Test run cancelled");
         }
         // One notification per red run (#358), from the latch the panel
         // sets when a run ends, never per test case.
