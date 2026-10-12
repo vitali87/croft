@@ -311,6 +311,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Cmd`+`A` | Select the entire buffer (on Linux `Ctrl`+`A` is line start: the Command Palette's "Select All") |
 | `Ctrl`+`f` / `Cmd`+`f` | Inline Find bar: pre-filled from the selection or word under the cursor; active match in orange, the rest in yellow; `Enter`/`F3` forward, `Shift+Enter`/`Shift+F3` back, `Esc` closes |
 | `Ctrl`+`Alt`+`f` / `Cmd`+`Opt`+`f` | Replace in File: the Find bar expanded with a replace row; `Tab` switches field, `Enter` in the replace row replaces the current match and advances, `Cmd`+`Opt`+`Enter` (`Ctrl`+`Alt`+`Enter` on Linux) replaces all as one undo step; `$1` capture references work in regex mode |
+| `Alt`+`L` in the Find bar | Find in Selection: limit the matches, the count, Enter / Shift+Enter and Replace / Replace All to the selection (the caret's line with none), shown by a lit `≡` on the query row; again to search the whole file (also the Command Palette's "Find: Toggle Find in Selection") |
 | `Ctrl`+`A` / `Ctrl`+`E` | Move to start / end of line |
 | `Ctrl`+`K` / `Ctrl`+`U` | Kill to end / start of line (yanks to clipboard). On Linux (outside vim mode) and Termux `Ctrl`+`K` is the `Cmd+K` leader instead; the Command Palette's "Kill to End of Line" kills there, or bind `ctrl+k` to `kill_to_end_of_line` in `keybindings.json` |
 | `Cmd`+`o` / `Cmd`+`Shift`+`Enter` | Open a new line below / above, inheriting indent |

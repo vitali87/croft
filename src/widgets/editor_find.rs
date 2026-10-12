@@ -39,6 +39,75 @@ pub struct EditorFind {
     /// Ctrl+A. The next typed character or paste replaces it and Backspace
     /// clears it, as in VS Code; a caret key just drops the selection.
     pub query_selected: bool,
+    /// Find in Selection (#1577): the `(start, end)` positions, row and
+    /// char column, the matches are limited to. `Alt+L` sets it from the
+    /// selection and clears it again.
+    pub in_selection: Option<FindRange>,
+}
+
+/// A buffer range as `(start, end)` `(row, char column)` positions.
+pub type FindRange = ((usize, usize), (usize, usize));
+
+/// `range` held inside `lines`: rows past the end come back to the last
+/// line, columns past a line's end to that end, and the ends in order.
+pub fn clamp_range(lines: &[String], range: FindRange) -> FindRange {
+    let last = lines.len().saturating_sub(1);
+    let fit = |(r, c): (usize, usize)| {
+        let r = r.min(last);
+        let len = lines.get(r).map_or(0, |l| l.chars().count());
+        (r, c.min(len))
+    };
+    let (a, b) = (fit(range.0), fit(range.1));
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+/// The text of `range` as lines: the first starts at the range's start
+/// column and the last stops at its end column, so a match found in them
+/// lies wholly inside the range (#1577).
+pub fn clip_lines(lines: &[String], range: FindRange) -> Vec<String> {
+    let ((r0, c0), (r1, c1)) = clamp_range(lines, range);
+    (r0..=r1)
+        .filter_map(|r| {
+            let line = lines.get(r)?;
+            let from = if r == r0 { c0 } else { 0 };
+            let to = if r == r1 { c1 } else { usize::MAX };
+            Some(
+                line.chars()
+                    .skip(from)
+                    .take(to.saturating_sub(from))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// `lines` with `range` (as cut by [`clip_lines`]) replaced by `replaced`,
+/// and where the range now ends: what a Replace All in the selection
+/// leaves behind, the text either side of the range kept as it was.
+pub fn splice_clip(
+    lines: &[String],
+    range: FindRange,
+    replaced: &[String],
+) -> (Vec<String>, (usize, usize)) {
+    let ((r0, c0), (r1, c1)) = clamp_range(lines, range);
+    let head: String = lines
+        .get(r0)
+        .map_or_else(String::new, |l| l.chars().take(c0).collect());
+    let tail: String = lines
+        .get(r1)
+        .map_or_else(String::new, |l| l.chars().skip(c1).collect());
+    let mut out = lines[..r0.min(lines.len())].to_vec();
+    let mut mid: Vec<String> = replaced.to_vec();
+    if mid.is_empty() {
+        mid.push(String::new());
+    }
+    let last = mid.len() - 1;
+    let end_col = mid[last].chars().count() + if last == 0 { c0 } else { 0 };
+    mid[0] = format!("{head}{}", mid[0]);
+    mid[last].push_str(&tail);
+    out.extend(mid);
+    out.extend_from_slice(&lines[(r1 + 1).min(lines.len())..]);
+    (out, (r0 + last, end_col))
 }
 
 impl EditorFind {
@@ -503,6 +572,22 @@ pub fn render_editor_find(
         }
         Line::from(spans)
     };
+    // Find in Selection (#1577): `≡` at the query row's right edge, lit
+    // while the find is limited to the selection.
+    let paint_chip = |buf: &mut Buffer| {
+        if inner.width < 4 {
+            return;
+        }
+        let style = if state.in_selection.is_some() {
+            Style::default()
+                .fg(theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
+                .bg(theme.ui(Color::Rgb(0x26, 0x4f, 0x78)))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.ui(Color::Rgb(0x6b, 0x73, 0x85)))
+        };
+        buf.set_string(inner.x + inner.width - 2, inner.y, "≡", style);
+    };
     if state.replace_visible && inner.height >= 2 {
         let rows = vec![
             input_row(
@@ -523,6 +608,7 @@ pub fn render_editor_find(
         let prompt = input_row("> ", &state.query, true, query_selected);
         Widget::render(Paragraph::new(prompt), inner, buf);
     }
+    paint_chip(buf);
 }
 
 #[cfg(test)]
@@ -554,6 +640,59 @@ mod tests {
 
     fn lines(strs: &[&str]) -> Vec<String> {
         strs.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// #1577: the clipped lines hold the range's text only, so a count or
+    /// a replace on them never reaches past it.
+    #[test]
+    fn clip_lines_cut_the_range_out() {
+        let src = lines(&[
+            "def a(x):",
+            "    return x + 1",
+            "def b(x):",
+            "    return x * 2",
+        ]);
+        assert_eq!(
+            clip_lines(&src, ((2, 0), (3, 16))),
+            lines(&["def b(x):", "    return x * 2"])
+        );
+        assert_eq!(clip_lines(&src, ((1, 11), (1, 12))), lines(&["x"]));
+        assert_eq!(clip_lines(&src, ((0, 6), (1, 4))), lines(&["x):", "    "]));
+        let x = SearchOpts::default();
+        assert_eq!(
+            count_matches(&clip_lines(&src, ((2, 0), (3, 16))), "x", x),
+            2
+        );
+        assert_eq!(count_matches(&src, "x", x), 4);
+    }
+
+    /// #1577: a replace in the clip goes back between the untouched text
+    /// either side, and the range's end follows a longer replacement.
+    #[test]
+    fn splice_clip_keeps_the_text_around_the_range() {
+        let src = lines(&["x = x", "y = x + x", "z = x"]);
+        let range = ((0, 4), (1, 5));
+        let clip = clip_lines(&src, range);
+        assert_eq!(clip, lines(&["x", "y = x"]));
+        let (out, n) = replace_all_in_lines(&clip, "x", "long", SearchOpts::default()).unwrap();
+        assert_eq!(n, 2);
+        let (spliced, end) = splice_clip(&src, range, &out);
+        assert_eq!(spliced, lines(&["x = long", "y = long + x", "z = x"]));
+        assert_eq!(end, (1, 8));
+        // One line, both ends inside it.
+        let (spliced, end) = splice_clip(&src, ((1, 4), (1, 5)), &lines(&["abc"]));
+        assert_eq!(spliced, lines(&["x = x", "y = abc + x", "z = x"]));
+        assert_eq!(end, (1, 7));
+    }
+
+    /// Negative (#1577): a range past the buffer is held inside it and an
+    /// inverted one is put in order, rather than panicking or clipping
+    /// nothing.
+    #[test]
+    fn a_stale_range_is_clamped_not_trusted() {
+        let src = lines(&["ab", "cd"]);
+        assert_eq!(clamp_range(&src, ((9, 9), (0, 1))), ((0, 1), (1, 2)));
+        assert_eq!(clip_lines(&src, ((9, 9), (0, 1))), lines(&["b", "cd"]));
     }
 
     #[test]

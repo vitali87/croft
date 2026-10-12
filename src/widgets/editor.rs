@@ -381,6 +381,7 @@ fn render_log(
                 active_on_line,
                 &[],
                 Some(&cells),
+                None,
                 theme,
             );
         }
@@ -1575,6 +1576,7 @@ fn render_diff(
                     active,
                     &[],
                     None,
+                    None,
                     theme,
                 );
             }
@@ -1593,6 +1595,7 @@ fn render_diff(
                     diff.scroll_x,
                     active,
                     &[],
+                    None,
                     None,
                     theme,
                 );
@@ -3119,6 +3122,9 @@ pub struct Editor {
     /// "current match" highlight. Cleared when the find bar closes or when
     /// the highlight term is cleared.
     pub active_search_match: Option<(usize, usize, usize)>,
+    /// Find in Selection (#1577): while the find bar is limited to a range,
+    /// only matches inside it are highlighted.
+    pub find_range: Option<crate::widgets::editor_find::FindRange>,
     /// Some when this tab is a read-only image preview rather than a text
     /// buffer. The text fields (`lines`, undo, highlights, …) are left in
     /// their default empty state and the renderer paints metadata only;
@@ -3375,6 +3381,7 @@ impl Editor {
             search_highlight: None,
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
             active_search_match: None,
+            find_range: None,
             markdown_preview: None,
             md_outputs: crate::markdown::BlockOutputs::new(),
             image: None,
@@ -15480,7 +15487,11 @@ impl Widget for &mut Editor {
                 }
             }
 
-            if let Some(term) = self.search_highlight.as_deref() {
+            if let Some(term) = self
+                .search_highlight
+                .as_deref()
+                .filter(|_| find_window(self.find_range, line_idx) != Some((0, 0)))
+            {
                 let active_on_line = self
                     .active_search_match
                     .filter(|(r, _, _)| *r == line_idx)
@@ -15497,6 +15508,7 @@ impl Widget for &mut Editor {
                     active_on_line,
                     &hint_cells,
                     None,
+                    find_window(self.find_range, line_idx),
                     self.theme,
                 );
             }
@@ -16372,6 +16384,7 @@ fn paint_search_highlight(
     active_match_on_line: Option<(usize, usize)>,
     hints: &[(usize, usize)],
     cells: Option<&crate::cell_map::CellMap>,
+    window: Option<(usize, usize)>,
     theme: crate::theme::Theme,
 ) {
     if needle.is_empty() {
@@ -16385,7 +16398,9 @@ fn paint_search_highlight(
     let mut abs_col: usize = 0;
     for (chunk, is_match) in segments {
         let chunk_cols = chunk.chars().count();
-        if is_match {
+        // Find in Selection (#1577): only matches wholly inside the window.
+        let in_window = window.is_none_or(|(lo, hi)| abs_col >= lo && abs_col + chunk_cols <= hi);
+        if is_match && in_window {
             let is_active =
                 active_match_on_line.is_some_and(|(c, l)| c == abs_col && l == chunk_cols);
             let style = if is_active {
@@ -16427,6 +16442,23 @@ fn paint_search_highlight(
             break;
         }
     }
+}
+
+/// The char columns of buffer row `row` a find limited to `range` covers
+/// (#1577): `None` with no range (the whole line), `Some((0, 0))` for a row
+/// outside it.
+fn find_window(
+    range: Option<crate::widgets::editor_find::FindRange>,
+    row: usize,
+) -> Option<(usize, usize)> {
+    let ((r0, c0), (r1, c1)) = range?;
+    if row < r0 || row > r1 {
+        return Some((0, 0));
+    }
+    Some((
+        if row == r0 { c0 } else { 0 },
+        if row == r1 { c1 } else { usize::MAX },
+    ))
 }
 
 /// Paint VS Code-style "selection highlight": a muted blue box over every
@@ -24204,6 +24236,18 @@ mod tests {
         let killed = e.kill_to_bol();
         assert_eq!(killed, "");
         assert_eq!(e.lines, vec!["hello", "next"]);
+    }
+
+    /// #1577: the columns of each row a find in a range highlights.
+    #[test]
+    fn find_window_covers_the_range_rows_only() {
+        let range = Some(((2, 4), (4, 3)));
+        assert_eq!(find_window(None, 9), None, "no range: the whole line");
+        assert_eq!(find_window(range, 1), Some((0, 0)), "above");
+        assert_eq!(find_window(range, 2), Some((4, usize::MAX)));
+        assert_eq!(find_window(range, 3), Some((0, usize::MAX)));
+        assert_eq!(find_window(range, 4), Some((0, 3)));
+        assert_eq!(find_window(range, 5), Some((0, 0)), "below");
     }
 
     #[test]
