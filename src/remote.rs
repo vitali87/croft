@@ -1029,7 +1029,11 @@ fn ssh_socket_read(socket_path: &Path, host: &str, script: &str) -> Command {
 
 /// The remote's config-file hashes, or `None` when they can't be read.
 fn read_remote_hashes(mut command: Command) -> Option<std::collections::BTreeMap<String, String>> {
-    let out = command.output().ok()?;
+    // Waits out "Text file busy": ssh just installed or updated, or a
+    // test's stand-in ssh written a moment ago while another test forked.
+    let out = crate::review_ops::spawn_retrying_busy(&mut command)
+        .and_then(std::process::Child::wait_with_output)
+        .ok()?;
     if !out.status.success() {
         return None;
     }
