@@ -3,8 +3,13 @@
 croft turns command output into PROBLEMS entries with zero configuration:
 every finished command in a terminal pane runs through built-in matchers
 for rustc/cargo, tsc (both output shapes), gcc/clang and anything else
-using the `file:line:col: severity: message` shape, Python tracebacks
-(the deepest frame), and eslint's stylish format. Rerunning a command in
+using the `file:line:col: severity: message` shape, mypy and javac
+(`file:line: severity: message`, no column), `go build` and `go vet`,
+flake8, pylint and ruff (both its concise and default output), Python
+tracebacks (the deepest frame), eslint's stylish and compact formats, and
+MSBuild's `file(line,col): error CODE: message`. The go and
+flake8-style rows (`file:line:col: CODE message`) are loose enough to
+match other output, so they count only for a file that exists. Rerunning a command in
 a pane replaces that pane's previous entries, so a clean rebuild clears its
 errors.
 
@@ -90,8 +95,10 @@ A `.vscode/tasks.json` task's `problemMatcher` is honoured when the task
 runs (Tasks: Run Task / Run Build Task):
 
 - The well-known names **`$tsc`**, **`$tsc-watch`**, **`$rustc`**,
-  **`$eslint-stylish`**, **`$gcc`** map onto the built-in table,
-  narrowed to that tool's rows. `$tsc-watch` also carries tsc's
+  **`$eslint-stylish`**, **`$eslint-compact`**, **`$gcc`**, **`$go`**
+  and **`$msCompile`** map onto the built-in table, narrowed to that
+  tool's rows. A name croft does not know is reported in OUTPUT ·
+  Matchers, and the built-in table runs instead. `$tsc-watch` also carries tsc's
   watch-cycle delimiters, so a `tsc --watch` task repopulates PROBLEMS
   on every recompile without exiting.
 - An inline matcher object translates into the same machinery:
