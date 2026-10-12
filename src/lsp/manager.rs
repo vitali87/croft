@@ -5825,11 +5825,18 @@ fn into_item(item: lsp_types::CompletionItem) -> CompletionItem {
         lsp_types::Documentation::MarkupContent(m) => m.value,
     });
     // A server that puts the signature only in `labelDetails` (#1527)
-    // still gets it shown.
+    // still gets it shown: its `detail` (the suffix after the label, often
+    // the parameter list) then its `description` (a qualifier), both kept.
     let detail = item.detail.or_else(|| {
-        item.label_details
-            .and_then(|l| l.description.or(l.detail))
-            .filter(|d| !d.trim().is_empty())
+        item.label_details.and_then(|l| {
+            let parts: Vec<String> = [l.detail, l.description]
+                .into_iter()
+                .flatten()
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect();
+            (!parts.is_empty()).then(|| parts.join(" "))
+        })
     });
     CompletionItem {
         label: item.label,
@@ -7712,11 +7719,33 @@ mod tests {
         }))
         .unwrap();
         let ours = into_item(item);
-        assert_eq!(ours.detail.as_deref(), Some("def dumps(obj) -> str"));
+        assert_eq!(
+            ours.detail.as_deref(),
+            Some("(obj, ...) def dumps(obj) -> str")
+        );
         assert_eq!(
             ours.documentation.as_deref(),
             Some("Serialize obj to a JSON formatted str.")
         );
+    }
+
+    /// #1527: `labelDetails.detail` is the signature and `description` a
+    /// separate qualifier; having both must not drop the signature.
+    #[test]
+    fn label_details_keep_the_signature_beside_the_description() {
+        let item: lsp_types::CompletionItem = serde_json::from_value(serde_json::json!({
+            "label": "dumps",
+            "labelDetails": { "detail": "(obj, ...)", "description": "json" }
+        }))
+        .unwrap();
+        assert_eq!(into_item(item).detail.as_deref(), Some("(obj, ...) json"));
+
+        let item: lsp_types::CompletionItem = serde_json::from_value(serde_json::json!({
+            "label": "dumps",
+            "labelDetails": { "detail": "(obj, ...)", "description": "  " }
+        }))
+        .unwrap();
+        assert_eq!(into_item(item).detail.as_deref(), Some("(obj, ...)"));
     }
 
     /// #1527 negative: an item with neither keeps neither.
