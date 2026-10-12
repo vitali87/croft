@@ -149,6 +149,7 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | View: Focus Left Editor Group / View: Focus Right Editor Group | `Cmd`+`Opt`+`←` / `Cmd`+`Opt`+`→` | Move focus to the left / right editor group while split: the Linux route, where `Ctrl`+`Alt`+arrows switch desktop workspaces |
 | Terminal: Focus Next Terminal / Terminal: Focus Previous Terminal | `Cmd`+`]` / `Cmd`+`[` | Focus the terminal pane and cycle to the next / previous terminal: the Linux route, where `Ctrl`+`[` is `Esc` |
 | Go to Implementations | `Cmd`+`F12` | Go to the concrete implementors of the trait / interface at the caret: the Linux route, where `Ctrl`+`F12` is Go to Type Definition |
+| C/C++: Switch Header/Source | `Alt`+`O` | Open the counterpart of a C, C++ or Objective-C source or header |
 | Explorer: Jump to Directory (zoxide) | `Cmd`+`Z` in the Explorer | Open the zoxide jump popup from any pane: the Linux route, where `Ctrl`+`Z` is kept out of the Explorer |
 | Session: Detach | `Cmd`+`K` `Shift`+`Q` | Detach this client from the persistent session; the session keeps running. Run the same `croft attach` / `croft remote` command to reattach |
 | File: New File… / File: New Folder… | palette only (`Cmd`+`F` / `Cmd`+`Shift`+`N` while the Explorer is focused) | The Explorer's create prompt from any pane: beside the active file, or in the Explorer selection while the Explorer has focus (or no file is open) |
@@ -283,6 +284,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Cmd`+`/` / `Ctrl`+`/` | Toggle line comment for the current line or every line the selection touches (language-aware; comments at the block's common indent) |
 | `Shift`+`Alt`+`A` | Toggle block comment around the selection (languages with a block comment) |
 | `Alt`+`Z` | Toggle soft word wrap for this file (overrides the per-language default until the file is reopened) |
+| `Alt`+`O` | C/C++: Switch Header/Source: open the header of the C, C++ or Objective-C source in the editor, or the source of the header, found beside it, across an `include/` ↔ `src/` split, else the same-named file elsewhere in the workspace that shares the most folders with it (also Command Palette, id `switch_header_source`) |
 | `Cmd`/`Ctrl`+`Shift`+`V` | Markdown: Toggle Preview — flip the active Markdown tab between its source and the rendered view (headings, emphasis, lists, quotes, tables, links, and fenced code blocks with the editor's own syntax colours). Arrows / PgUp / PgDn / Home / End / wheel scroll the preview; the same chord returns to the source. The preview opens at the part of the document the source was showing and returns there; with the source and the preview side by side in a split, the other pane follows as you scroll (also Command Palette "Markdown: Toggle Preview") |
 | `Cmd`+`Shift`+`\` | Go to Bracket: jump the cursor to the matching bracket. From an opening bracket it lands on its close (and vice versa); from inside a pair it lands on the enclosing close |
 | `Cmd`+`Opt`+`\` | Select to Bracket: select the region between the matching brackets, including the brackets themselves |
