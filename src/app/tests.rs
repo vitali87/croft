@@ -81921,3 +81921,69 @@ fn go_and_lint_rows_reach_problems_only_for_real_files() {
         ]
     );
 }
+
+/// #1417: Python: Remote Attach (`attach` + `connect`) to a `debugpy
+/// --listen` process attaches to that port directly: croft's `initialize`
+/// and `attach` reach it, and the session is up.
+#[test]
+fn a_python_remote_attach_talks_to_the_listening_port() {
+    use std::io::{BufRead, Read};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut reader = std::io::BufReader::new(stream);
+        let mut first = String::new();
+        let mut len = 0;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                return first;
+            }
+            if let Some(v) = line.trim().strip_prefix("Content-Length:") {
+                len = v.trim().parse().unwrap();
+            }
+            if line.trim().is_empty() {
+                break;
+            }
+        }
+        let mut body = vec![0; len];
+        if reader.read_exact(&mut body).is_ok() {
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            first = v["command"].as_str().unwrap_or("").to_string();
+        }
+        first
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        format!(
+            r#"{{ "configurations": [ {{ "name": "Python: Remote Attach", "type": "debugpy",
+                 "request": "attach", "connect": {{ "host": "127.0.0.1", "port": {port} }} }} ] }}"#
+        ),
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let cfg = crate::dap::configs::discover_configs(tmp.path()).remove(0);
+    app.launch_debug_config(&cfg);
+    assert!(
+        !app.debug_sessions.is_empty() && !app.run_debug.feedback_is_error,
+        "{}",
+        app.status
+    );
+    assert!(
+        app.status.contains("Attached: Python: Remote Attach"),
+        "{}",
+        app.status
+    );
+    assert_eq!(
+        server.join().unwrap(),
+        "initialize",
+        "croft's own initialize reached the port"
+    );
+    app.debug_stop();
+}

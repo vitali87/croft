@@ -1138,6 +1138,24 @@ impl DapSession {
         Ok(session)
     }
 
+    /// Attach to a DAP server that is already listening at `host:port`
+    /// (#1417): a `debugpy --listen` process, whose port is its own adapter.
+    /// No adapter is spawned; `initialize` and `attach_request` go straight
+    /// to the socket.
+    pub fn attach_tcp(
+        host: &str,
+        port: u16,
+        attach_request: Value,
+        breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
+    ) -> Result<DapSession> {
+        let transport = DapTransport::connect_tcp(host, port)?;
+        transport.send(initialize_request())?;
+        transport.send(attach_request)?;
+        let mut session = Self::new_with_transport(transport, breakpoints, None);
+        session.attached = true;
+        Ok(session)
+    }
+
     /// Launch a vscode-js-debug session: spawn `node dapDebugServer.js <port>
     /// <host>` as a TCP debug server, connect the parent socket, and drive the
     /// `pwa-node` launch. The parent will later issue a `startDebugging` reverse
@@ -4197,5 +4215,61 @@ def stopped():"#,
             std::thread::sleep(std::time::Duration::from_millis(300));
             assert!(leftovers().is_empty(), "left behind: {:?}", leftovers());
         }
+    }
+
+    /// The first `n` DAP messages a client sends to a socket listening on a
+    /// free port (#1417): a stand-in for `debugpy --listen`.
+    fn listening_adapter(n: usize) -> (u16, std::thread::JoinHandle<Vec<Value>>) {
+        use std::io::{BufRead, Read};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut out = Vec::new();
+            while out.len() < n {
+                let mut len = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        return out;
+                    }
+                    if let Some(v) = line.trim().strip_prefix("Content-Length:") {
+                        len = v.trim().parse().unwrap();
+                    }
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                }
+                let mut body = vec![0; len];
+                reader.read_exact(&mut body).unwrap();
+                out.push(serde_json::from_slice(&body).unwrap());
+            }
+            out
+        });
+        (port, handle)
+    }
+
+    /// #1417: a Remote Attach talks DAP to the listening port itself: the
+    /// `initialize` and the `attach` arrive there, from croft, with no
+    /// adapter process in between.
+    #[test]
+    fn attach_tcp_talks_to_the_listening_adapter_directly() {
+        let (port, server) = listening_adapter(2);
+        let attach = serde_json::json!({
+            "type": "request", "command": "attach",
+            "arguments": { "request": "attach", "connect": { "host": "127.0.0.1", "port": port } }
+        });
+        let session =
+            DapSession::attach_tcp("127.0.0.1", port, attach, BTreeMap::new()).expect("connects");
+        let got = server.join().unwrap();
+        let commands: Vec<_> = got.iter().map(|m| m["command"].as_str().unwrap()).collect();
+        assert_eq!(commands, ["initialize", "attach"]);
+        assert_eq!(got[1]["arguments"]["connect"]["port"], port);
+        assert!(session.attached);
+        drop(session);
     }
 }
