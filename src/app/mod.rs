@@ -3749,6 +3749,17 @@ pub struct App {
     /// One Jupyter kernel per notebook that has run a cell (#355), by path.
     /// Dropping one (the map entry going) shuts its kernel down.
     notebook_kernels: std::collections::HashMap<PathBuf, crate::notebook_kernel::NotebookRun>,
+    /// Notebook: Select Kernel asking for the installed kernels (#1377):
+    /// the notebook it is for and the bridge listing them.
+    kernel_listing: Option<(PathBuf, crate::notebook_kernel::KernelSession)>,
+    /// The kernel picker's notebook, the kernelspecs its rows name, and
+    /// the kernel the notebook asked for that is not installed, if that is
+    /// why it opened.
+    kernel_choice: Option<(
+        PathBuf,
+        Vec<crate::notebook_kernel::KernelSpec>,
+        Option<String>,
+    )>,
     /// When the shown coverage report was taken, the file its editor lens
     /// was built for, and the install command a missing coverage tool
     /// needs (#263).
@@ -4976,6 +4987,11 @@ pub struct App {
     #[allow(clippy::type_complexity)]
     pair_spawn_override:
         Option<Box<dyn Fn(&crate::pair::PairConfig) -> anyhow::Result<crate::pair_host::PairHost>>>,
+    /// Test seam: the kernel bridge Select Kernel starts, by kernel name
+    /// (the real one runs Python).
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    kernel_start_override: Option<Box<dyn Fn(&str) -> crate::notebook_kernel::KernelSession>>,
     /// Rolling log of git commands croft has run and their summaries, shown
     /// read-only by the "Show Git Output" action (VS Code's Git channel).
     pub git_output_log: Vec<String>,
@@ -6092,6 +6108,8 @@ impl App {
             approval_edit: None,
             approval_merge_into: None,
             notebook_kernels: std::collections::HashMap::new(),
+            kernel_listing: None,
+            kernel_choice: None,
             coverage_at: None,
             coverage_lens_path: None,
             coverage_install: None,
@@ -6383,6 +6401,8 @@ impl App {
             proactive_scanned: std::collections::HashMap::new(),
             #[cfg(test)]
             pair_spawn_override: None,
+            #[cfg(test)]
+            kernel_start_override: None,
             collab_labels_visible: false,
             git_output_log: Vec::new(),
             build_diagnostics: std::collections::HashMap::new(),
@@ -34737,6 +34757,15 @@ impl App {
         self.overlays.list_picker_clear.request();
     }
 
+    /// The list picker closed with no row chosen (Esc, a click outside).
+    fn dismiss_list_picker(&mut self) {
+        let purpose = self.list_picker.as_ref().map(|p| p.purpose);
+        self.close_list_picker();
+        if purpose == Some(crate::widgets::list_picker::ListPurpose::NotebookKernel) {
+            self.kernel_choice_dismissed();
+        }
+    }
+
     fn close_list_picker(&mut self) {
         if self.list_picker.take().is_some() {
             self.overlays.list_picker_clear.request();
@@ -37744,6 +37773,7 @@ impl App {
                     self.set_panel_alignment(*al);
                 }
             }
+            ListPurpose::NotebookKernel => self.choose_notebook_kernel(&row.id),
             ListPurpose::QuickInputPosition => {
                 if let Some((pos, ..)) = QuickInputPosition::OPTIONS
                     .iter()
@@ -45634,7 +45664,8 @@ impl App {
     /// the active tab keeps its events until it is.
     fn poll_notebook_kernels(&mut self) -> bool {
         let active = self.editor.path.clone();
-        let mut changed = false;
+        let mut changed = self.poll_kernel_listing();
+        let mut choice = None;
         for (path, run) in self.notebook_kernels.iter_mut() {
             if !run.collect() || active.as_ref() != Some(path) {
                 continue;
@@ -45649,9 +45680,156 @@ impl App {
             if let Some(note) = notes.last() {
                 self.status = note.clone();
             }
+            if let Some(c) = run.choice.take() {
+                choice = Some((path.clone(), c));
+            }
             changed = true;
         }
+        if let Some((path, c)) = choice {
+            self.open_kernel_picker(path, c.specs, Some(c.requested));
+        }
         changed
+    }
+
+    /// Notebook: Select Kernel (#1377): ask the bridge which kernels are
+    /// installed; the picker opens when it answers.
+    fn select_notebook_kernel(&mut self) {
+        let Some(path) = self.editor.path.clone().filter(|_| {
+            self.editor
+                .markdown_preview
+                .as_ref()
+                .is_some_and(|m| m.notebook)
+        }) else {
+            self.status = String::from("Select Kernel works on a notebook's rendered view");
+            return;
+        };
+        let listing = self.start_kernel_session(&path, crate::notebook_kernel::LIST_KERNELS);
+        self.kernel_listing = Some((path, listing));
+        self.status = String::from("Looking for installed kernels…");
+    }
+
+    /// A kernel bridge for the notebook at `path`, run in its folder.
+    fn start_kernel_session(
+        &self,
+        path: &Path,
+        kernel: &str,
+    ) -> crate::notebook_kernel::KernelSession {
+        #[cfg(test)]
+        if let Some(start) = &self.kernel_start_override {
+            return start(kernel);
+        }
+        let root = self.workspace_root();
+        let dir = path.parent().unwrap_or(root);
+        crate::notebook_kernel::KernelSession::start(root, dir, kernel)
+    }
+
+    /// The installed kernels arriving for Select Kernel.
+    fn poll_kernel_listing(&mut self) -> bool {
+        use crate::notebook_kernel::Event;
+        let Some((path, listing)) = self.kernel_listing.as_ref() else {
+            return false;
+        };
+        let path = path.clone();
+        for event in listing.try_events() {
+            match event {
+                Event::Specs { specs } => {
+                    self.kernel_listing = None;
+                    if self.editor.path.as_ref() == Some(&path) {
+                        self.status.clear();
+                        self.open_kernel_picker(path, specs, None);
+                    }
+                    return true;
+                }
+                Event::Error { message } => {
+                    self.kernel_listing = None;
+                    self.status = format!("Kernel: {message}");
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// The kernel picker for the notebook at `path`, opened on its own
+    /// kernel when installed, else on one for its language. `missing` is
+    /// the kernel it names that this machine does not have.
+    fn open_kernel_picker(
+        &mut self,
+        path: PathBuf,
+        specs: Vec<crate::notebook_kernel::KernelSpec>,
+        missing: Option<String>,
+    ) {
+        use crate::notebook_kernel::{kernel_name, notebook_language, preferred_kernel};
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        if self.editor.path.as_ref() != Some(&path) {
+            return;
+        }
+        let text = self.editor.lines.join("\n");
+        let rows = specs
+            .iter()
+            .map(|s| ListRow {
+                id: s.name.clone(),
+                label: format!("{}  ({})", s.display, s.name),
+            })
+            .collect();
+        let title = match &missing {
+            Some(k) => format!("Kernel '{k}' is not installed: Select Kernel"),
+            None => String::from("Select Kernel"),
+        };
+        let mut picker = ListPicker::new(ListPurpose::NotebookKernel, title, rows);
+        picker.selected = preferred_kernel(
+            &specs,
+            &kernel_name(&text),
+            notebook_language(&text).as_deref(),
+        );
+        self.kernel_choice = Some((path, specs, missing));
+        self.open_list_picker(picker, "No Jupyter kernels are installed");
+    }
+
+    /// The kernel picked for a notebook: written to its
+    /// `metadata.kernelspec` (Save keeps it, as in Jupyter), and a kernel
+    /// already started, or waiting on a missing one, is replaced by it.
+    fn choose_notebook_kernel(&mut self, name: &str) {
+        let Some((path, specs, _)) = self.kernel_choice.take() else {
+            return;
+        };
+        let Some(spec) = specs.into_iter().find(|s| s.name == name) else {
+            return;
+        };
+        if self.editor.path.as_ref() != Some(&path) {
+            return;
+        }
+        let text = self.editor.lines.join("\n");
+        if let Some(next) = crate::notebook_kernel::set_kernelspec(&text, &spec) {
+            self.editor
+                .replace_all_lines(next.split('\n').map(str::to_string).collect());
+        }
+        if !self.notebook_kernels.contains_key(&path) {
+            self.status = format!("Kernel: {} (starts on the next run)", spec.display);
+            return;
+        }
+        let session = self.start_kernel_session(&path, &spec.name);
+        if let Some(run) = self.notebook_kernels.get_mut(&path) {
+            run.restart_with(session);
+            self.editor.notebook_running = run.running_indices();
+            self.status = format!("Starting kernel {}…", spec.display);
+        }
+    }
+
+    /// The kernel picker closed without a choice. Cells waiting on a
+    /// kernel that is not installed cannot run, so they stop waiting.
+    fn kernel_choice_dismissed(&mut self) {
+        let Some((path, _, Some(missing))) = self.kernel_choice.take() else {
+            return;
+        };
+        if self.notebook_kernels.remove(&path).is_some() && self.editor.path.as_ref() == Some(&path)
+        {
+            self.editor.notebook_running.clear();
+        }
+        self.status = format!(
+            "Kernel '{missing}' is not installed: run Notebook: Select Kernel to pick another"
+        );
     }
 
     /// Interrupt or restart the active notebook's kernel.
@@ -51152,6 +51330,7 @@ impl App {
             Cmd::NotebookRestart => {
                 self.notebook_kernel_request(crate::notebook_kernel::Request::Restart)
             }
+            Cmd::NotebookSelectKernel => self.select_notebook_kernel(),
             Cmd::TestingRunWithCoverage => self.run_all_tests_with_coverage(),
             Cmd::CoverageClear => self.clear_coverage(),
             Cmd::TestingInstallCoverageTool => self.install_coverage_tool(),
@@ -52382,7 +52561,7 @@ impl App {
             return;
         };
         match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) => self.close_list_picker(),
+            (KeyCode::Esc, _) => self.dismiss_list_picker(),
             (KeyCode::Enter, _) => self.confirm_list_picker(),
             (KeyCode::Up, _) => picker.select_prev(),
             (KeyCode::Down, _) => picker.select_next(),
@@ -52425,7 +52604,7 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
                 if !inside =>
             {
-                self.close_list_picker();
+                self.dismiss_list_picker();
             }
             // Click a row to select and run it, the way VS Code menus behave.
             MouseEventKind::Down(MouseButton::Left) => {
