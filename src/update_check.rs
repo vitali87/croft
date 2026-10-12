@@ -174,9 +174,10 @@ fn now_secs() -> u64 {
 /// crates.io's record of one version of the crate `cargo install` builds.
 const CRATES_IO_VERSION_URL: &str = "https://crates.io/api/v1/crates/croft-software";
 
-/// Whether the latest release carries the archive and checksums
-/// [`stage_update`] fetches for `triple` (`croft-<triple>.tar.gz` and
-/// `SHA256SUMS`), read from GitHub's release JSON `assets`.
+/// Whether the latest release carries the archive, checksums and signature
+/// [`stage_update`] fetches for `triple` (`croft-<triple>.tar.gz`,
+/// `SHA256SUMS` and `SHA256SUMS.sigstore.json`, without which the archive
+/// is refused), read from GitHub's release JSON `assets`.
 pub fn release_has_archive(json: &str, triple: &str) -> bool {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
         return false;
@@ -189,7 +190,9 @@ pub fn release_has_archive(json: &str, triple: &str) -> bool {
         .filter_map(|a| a.get("name")?.as_str())
         .collect();
     let archive = format!("croft-{triple}.tar.gz");
-    names.contains(&archive.as_str()) && names.contains(&"SHA256SUMS")
+    names.contains(&archive.as_str())
+        && names.contains(&"SHA256SUMS")
+        && names.contains(&"SHA256SUMS.sigstore.json")
 }
 
 /// Whether crates.io's JSON for one version says it is published and not
@@ -210,31 +213,44 @@ pub fn crate_version_listed(json: &str, version: &str) -> bool {
 /// release target, or crates.io has the version for `cargo install` to
 /// build. A release that is tagged but neither is never offered, since
 /// choosing Update could only fail.
+///
+/// `on_crates_io` answers `None` when crates.io could not be asked; that
+/// failure is passed on as `None` (rather than "not installable") so the
+/// caller keeps what it had cached, as it does when GitHub fails.
 pub fn installable_release(
     json: &str,
     triple: Option<&str>,
-    on_crates_io: &dyn Fn(&str) -> bool,
-) -> Option<String> {
-    let version = latest_from_release_json(json)?;
-    let archive = triple.is_some_and(|t| release_has_archive(json, t));
-    (archive || on_crates_io(&version)).then_some(version)
+    on_crates_io: &dyn Fn(&str) -> Option<bool>,
+) -> Option<Option<String>> {
+    let Some(version) = latest_from_release_json(json) else {
+        return Some(None);
+    };
+    if triple.is_some_and(|t| release_has_archive(json, t)) {
+        return Some(Some(version));
+    }
+    Some(on_crates_io(&version)?.then_some(version))
 }
 
 fn http_agent() -> ureq::Agent {
     ureq::AgentBuilder::new().timeout(REQUEST_TIMEOUT).build()
 }
 
-fn crate_version_published(version: &str) -> bool {
-    http_agent()
+/// `None` when crates.io could not be asked (a timeout, a 5xx, an
+/// unreadable body); `Some(false)` when it says the version is absent.
+fn crate_version_published(version: &str) -> Option<bool> {
+    let resp = http_agent()
         .get(&format!("{CRATES_IO_VERSION_URL}/{version}"))
         .set("User-Agent", concat!("croft/", env!("CARGO_PKG_VERSION")))
-        .call()
-        .ok()
-        .and_then(|resp| resp.into_string().ok())
-        .is_some_and(|body| crate_version_listed(&body, version))
+        .call();
+    match resp {
+        Ok(resp) => Some(crate_version_listed(&resp.into_string().ok()?, version)),
+        Err(ureq::Error::Status(404, _)) => Some(false),
+        Err(_) => None,
+    }
 }
 
-/// `None` when GitHub could not be asked; `Some(None)` when it answered
+/// `None` when GitHub (or, when it is consulted, crates.io) could not be
+/// asked; `Some(None)` when it answered
 /// but the latest release is not one this install can stage.
 fn fetch_latest() -> Option<Option<String>> {
     let resp = http_agent()
@@ -247,7 +263,7 @@ fn fetch_latest() -> Option<Option<String>> {
     latest_from_release_json(&body)?;
     let triple =
         prebuilt_triple().filter(|_| crate::remote_prebuilt::eligible(env!("CARGO_MANIFEST_DIR")));
-    Some(installable_release(&body, triple, &crate_version_published))
+    installable_release(&body, triple, &crate_version_published)
 }
 
 /// One background answer: `Some(version)` when a newer release is available
@@ -880,10 +896,10 @@ mod tests {
     /// `cargo install --version 0.2.28` that fails: nothing is offered.
     #[test]
     fn a_release_with_no_crate_and_no_archive_for_this_machine_is_not_offered() {
-        let not_on_crates_io = |_: &str| false;
+        let not_on_crates_io = |_: &str| Some(false);
         assert_eq!(
             installable_release(RELEASE_0_2_28, None, &not_on_crates_io),
-            None
+            Some(None)
         );
         assert_eq!(
             installable_release(
@@ -891,7 +907,7 @@ mod tests {
                 Some("riscv64gc-unknown-linux-gnu"),
                 &not_on_crates_io
             ),
-            None,
+            Some(None),
             "an archive for some other machine does not count"
         );
     }
@@ -903,11 +919,11 @@ mod tests {
         let asked = std::cell::RefCell::new(Vec::new());
         let on_crates_io = |v: &str| {
             asked.borrow_mut().push(v.to_string());
-            v == "0.2.28"
+            Some(v == "0.2.28")
         };
         assert_eq!(
-            installable_release(RELEASE_0_2_28, None, &on_crates_io).as_deref(),
-            Some("0.2.28")
+            installable_release(RELEASE_0_2_28, None, &on_crates_io),
+            Some(Some("0.2.28".to_string()))
         );
         assert_eq!(
             *asked.borrow(),
@@ -920,8 +936,8 @@ mod tests {
             "x86_64-unknown-linux-musl",
         ] {
             assert_eq!(
-                installable_release(RELEASE_0_2_28, Some(triple), &|_| false).as_deref(),
-                Some("0.2.28"),
+                installable_release(RELEASE_0_2_28, Some(triple), &|_| Some(false)),
+                Some(Some("0.2.28".to_string())),
                 "{triple}"
             );
         }
@@ -929,10 +945,33 @@ mod tests {
         let unsummed =
             r#"{"tag_name":"v0.2.29","assets":[{"name":"croft-x86_64-apple-darwin.tar.gz"}]}"#;
         assert_eq!(
-            installable_release(unsummed, Some("x86_64-apple-darwin"), &|_| false),
-            None
+            installable_release(unsummed, Some("x86_64-apple-darwin"), &|_| Some(false)),
+            Some(None)
         );
-        assert_eq!(installable_release("not json", None, &|_| true), None);
+        // Nor without the signature bundle `remote_prebuilt` refuses to go
+        // without: only the crate route is left, and here it is missing.
+        let unsigned = r#"{"tag_name":"v0.2.29","assets":[
+            {"name":"croft-x86_64-apple-darwin.tar.gz"},{"name":"SHA256SUMS"}]}"#;
+        assert_eq!(
+            installable_release(unsigned, Some("x86_64-apple-darwin"), &|_| Some(false)),
+            Some(None)
+        );
+        assert_eq!(
+            installable_release("not json", None, &|_| Some(true)),
+            Some(None)
+        );
+    }
+
+    /// A crates.io request that fails is a failed check, not a "no": the
+    /// caller keeps its cached offer instead of clearing it for a day.
+    #[test]
+    fn a_crates_io_failure_is_not_an_uninstallable_answer() {
+        assert_eq!(installable_release(RELEASE_0_2_28, None, &|_| None), None);
+        // An archive for this machine needs no crates.io answer at all.
+        assert_eq!(
+            installable_release(RELEASE_0_2_28, Some("x86_64-apple-darwin"), &|_| None),
+            Some(Some("0.2.28".to_string()))
+        );
     }
 
     #[test]
