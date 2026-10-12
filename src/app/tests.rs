@@ -79435,3 +79435,69 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     assert!(!app.apply_build_scan(pane, Some(&cwd), "tsc --watch", "a.c:1:1: error: old\n"));
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
 }
+
+/// #1621: "Language Servers: Restart All" starts a fresh manager and drops
+/// what the old servers left: diagnostics, progress and the per-file sync
+/// marks, so the next sync re-opens every tab against the new servers.
+#[test]
+fn restart_all_language_servers_starts_fresh_servers() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.py");
+    std::fs::write(&file, "x = 1\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&file).unwrap();
+    assert!(app.lsp.is_some());
+    let mut by_server = std::collections::HashMap::new();
+    by_server.insert(
+        String::from("ty"),
+        vec![diag(0, 1, DiagnosticSeverity::Error)],
+    );
+    app.lsp_diagnostics.insert(file.clone(), by_server);
+    app.rebuild_problems();
+    app.lsp_last_seen.insert(file.clone(), 7);
+    app.run_command(crate::widgets::command_palette::Command::RestartLanguageServers);
+    assert!(app.lsp.is_some(), "a new manager serves the workspace");
+    assert!(app.lsp_last_seen.is_empty(), "every tab is re-opened");
+    assert!(app.lsp_diagnostics.is_empty(), "stale diagnostics are gone");
+    assert_eq!(app.status, "Restarted all language servers");
+    let logged = crate::output::snapshot("Language Servers").unwrap_or_default();
+    assert!(
+        logged
+            .iter()
+            .any(|l| l.text == "Restarted all language servers")
+    );
+}
+
+/// #1621: "Restart for This File" asks the manager to restart the active
+/// file's servers and says so.
+#[test]
+fn restart_for_this_file_names_the_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&file).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::RestartLanguageServersForFile);
+    assert_eq!(app.status, "Restarting the language servers for main.rs");
+}
+
+/// Negative (#1621): with no file open, or while an update build has the
+/// servers stopped, the restarts change nothing and say why.
+#[test]
+fn the_restarts_refuse_without_a_file_or_during_a_build() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::RestartLanguageServersForFile);
+    assert_eq!(
+        app.status,
+        "Restart for This File needs a file open in the editor"
+    );
+    app.lsp_last_seen.insert(tmp.path().join("kept.py"), 3);
+    app.lsp = None;
+    app.lsp_paused_for_build = true;
+    app.run_command(crate::widgets::command_palette::Command::RestartLanguageServers);
+    assert!(app.lsp.is_none(), "nothing starts beside the build");
+    assert_eq!(app.lsp_last_seen.len(), 1);
+    assert!(app.status.contains("builds its update"), "{}", app.status);
+}

@@ -688,6 +688,11 @@ enum Cmd {
         path: PathBuf,
         text: String,
     },
+    /// Stop and start again the servers that serve `path` (#1621), leaving
+    /// every other language's servers running.
+    RestartServersFor {
+        path: PathBuf,
+    },
     /// Spawn the servers for every language whose project-root marker sits
     /// in the workspace root, before any file of theirs is opened (#27):
     /// rust-analyzer's cold indexing then overlaps with the user browsing
@@ -1214,6 +1219,13 @@ impl LspManager {
 
     pub fn close_doc(&self, path: PathBuf) {
         let _ = self.cmd_tx.send(Cmd::CloseDoc { path });
+    }
+
+    /// Restart the servers serving `path` (#1621): the user's "Language
+    /// Servers: Restart for This File". The app re-opens its tabs when they
+    /// are back, as after a crash restart.
+    pub fn restart_servers_for(&self, path: PathBuf) {
+        let _ = self.cmd_tx.send(Cmd::RestartServersFor { path });
     }
 
     pub fn request_completion(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
@@ -2322,6 +2334,7 @@ async fn worker_loop(
                 return;
             }
             Cmd::OpenDoc { path, text } => state.open_doc(path, text).await,
+            Cmd::RestartServersFor { path } => state.restart_servers_for(&path).await,
             Cmd::PrewarmWorkspace => state.prewarm_workspace().await,
             Cmd::SetExtraRoots { roots } => {
                 for root in &roots {
@@ -2860,6 +2873,77 @@ impl WorkerState {
             self.ensure_clients(key.0, &key.1).await;
             self.restarts.restarted.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Restart the servers serving `path` at the user's request (#1621): the
+    /// (language, root) its document was opened under, else every root of
+    /// the language its extension maps to. Unlike a crash restart this
+    /// spends no budget and lifts a give-up, since the user asked for it.
+    async fn restart_servers_for(&mut self, path: &Path) {
+        let keys: Vec<ClientKey> = match self.docs.get(path) {
+            Some(doc) => vec![(doc.language, doc.project_root.clone())],
+            None => {
+                let lang = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .and_then(Language::from_extension);
+                self.clients
+                    .keys()
+                    .filter(|key| Some(key.0) == lang)
+                    .cloned()
+                    .collect()
+            }
+        };
+        if keys.is_empty() {
+            crate::output::push(
+                "Language Servers",
+                crate::output::OutputLevel::Info,
+                &format!("No language server serves {}", path.display()),
+            );
+            return;
+        }
+        for key in keys {
+            self.restart_key(key).await;
+        }
+        self.restarts.restarted.store(true, Ordering::Relaxed);
+    }
+
+    /// Shut the servers of `key` down and start them again, forgetting its
+    /// documents, which the new servers never saw.
+    async fn restart_key(&mut self, key: ClientKey) {
+        let clients = self.clients.remove(&key).unwrap_or_default();
+        let names: Vec<String> = clients.iter().map(|c| c.name.clone()).collect();
+        for managed in clients {
+            let mut client = managed.client.lock().await;
+            if !client.has_exited() {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(3), client.shutdown())
+                    .await;
+            }
+        }
+        if let Ok(mut support) = self.capability_support.lock() {
+            for (path, doc) in &self.docs {
+                if (doc.language, doc.project_root.clone()) == key {
+                    support.document_servers.remove(path);
+                }
+            }
+        }
+        self.docs
+            .retain(|_, doc| (doc.language, doc.project_root.clone()) != key);
+        self.restarts.gave_up.remove(&key);
+        self.restarts.attempts.remove(&key);
+        let expected = self.restarts.incomplete.remove(&key).unwrap_or(names);
+        self.clients.insert(key.clone(), Vec::new());
+        if !expected.is_empty() {
+            self.restarts.respawn = Some(expected.clone());
+        }
+        self.ensure_clients(key.0, &key.1).await;
+        let msg = if expected.is_empty() {
+            format!("Started the language servers for {}", key.1.display())
+        } else {
+            format!("Restarted {} for {}", expected.join(", "), key.1.display())
+        };
+        log_file::log(&format!("lsp restart: {msg}"));
+        crate::output::push("Language Servers", crate::output::OutputLevel::Info, &msg);
     }
 
     async fn ensure_clients(&mut self, lang: Language, root: &Path) -> &[ManagedClient] {
@@ -10223,6 +10307,169 @@ while True:
     /// #694: a language server the kernel kills (croft makes them its first
     /// OOM victims) comes back on the next command, its documents are
     /// forgotten, and the app is told to re-open its tabs.
+    /// A worker whose python and go servers are fake recorders that log
+    /// their pid to `<root>/<lang>.pids` (#1621).
+    fn two_language_worker(root: &Path, python: &Path) -> (WorkerState, Arc<AtomicBool>) {
+        let script = root.join("fake_lsp.py");
+        std::fs::write(
+            &script,
+            format!(
+                "import os, sys\nopen(sys.argv[2], 'a').write(str(os.getpid()) + '\\n')\n{FAKE_LSP_RECORDER}"
+            ),
+        )
+        .expect("write fake server");
+        let mut registry = ServerRegistry::new();
+        for (lang, name, tag) in [
+            (Language::PYTHON, "fake-python", "python"),
+            (Language::GO, "fake-go", "go"),
+        ] {
+            registry.register(
+                lang,
+                ServerConfig {
+                    name,
+                    command: python.display().to_string(),
+                    args: vec![
+                        script.display().to_string(),
+                        root.join(format!("{tag}.log")).display().to_string(),
+                        root.join(format!("{tag}.pids")).display().to_string(),
+                    ],
+                    language: lang,
+                    initialization_options: None,
+                    provision: None,
+                },
+            );
+        }
+        let restarted = Arc::new(AtomicBool::new(false));
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let state = WorkerState {
+            workspace_root: root.to_path_buf(),
+            extra_roots: Vec::new(),
+            registry,
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+            restarts: ServerRestarts::reporting_to(restarted.clone()),
+        };
+        (state, restarted)
+    }
+
+    /// The pids a fake server of `tag` has logged under `root`, waiting up to
+    /// ten seconds for `n` of them.
+    fn logged_pids(root: &Path, tag: &str, n: usize) -> Vec<i32> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let seen: Vec<i32> = std::fs::read_to_string(root.join(format!("{tag}.pids")))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect();
+            if seen.len() >= n || Instant::now() >= deadline {
+                return seen;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Whether process `pid` is gone, waiting up to ten seconds for it.
+    fn process_exits(pid: i32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            // SAFETY: signal 0 only asks whether the pid exists.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// #1621: "Restart for This File" stops the file's server and starts a
+    /// new one, even one croft had given up on, and leaves the servers of
+    /// other languages running.
+    #[cfg(unix)]
+    #[test]
+    fn restarting_a_file_s_servers_leaves_other_languages_running() {
+        let Some(python) = python_for_stub_server() else {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let py = root.join("demo.py");
+        let go = root.join("main.go");
+        std::fs::write(&py, "x = 1\n").unwrap();
+        std::fs::write(&go, "package main\n").unwrap();
+        let (mut state, restarted) = two_language_worker(&root, &python);
+        let runtime = LspRuntime::new().expect("runtime");
+        let handle = runtime.handle().clone();
+        handle.block_on(state.open_doc(py.clone(), String::from("x = 1\n")));
+        handle.block_on(state.open_doc(go.clone(), String::from("package main\n")));
+        let first_py = logged_pids(&root, "python", 1);
+        let first_go = logged_pids(&root, "go", 1);
+        assert_eq!((first_py.len(), first_go.len()), (1, 1));
+        // A key croft gave up on after a crash loop still restarts on request.
+        let py_key: ClientKey = (Language::PYTHON, root.clone());
+        state.restarts.gave_up.insert(py_key.clone());
+
+        handle.block_on(state.restart_servers_for(&py));
+        let py_pids = logged_pids(&root, "python", 2);
+        assert_eq!(py_pids.len(), 2, "a new python server started");
+        assert!(process_exits(py_pids[0]), "the old python server exited");
+        assert!(
+            restarted.load(Ordering::Relaxed),
+            "the app re-opens its tabs"
+        );
+        assert!(!state.docs.contains_key(&py), "the new server never saw it");
+        assert!(
+            state.clients[&py_key]
+                .iter()
+                .all(|m| m.client.try_lock().is_ok_and(|c| !c.has_exited()))
+        );
+        assert!(!state.restarts.gave_up.contains(&py_key));
+
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            logged_pids(&root, "go", 1),
+            first_go,
+            "go was not restarted"
+        );
+        // SAFETY: signal 0 only asks whether the pid exists.
+        assert_eq!(unsafe { libc::kill(first_go[0], 0) }, 0, "go still runs");
+        assert!(state.docs.contains_key(&go), "go keeps its document");
+    }
+
+    /// Negative (#1621): a file no server serves restarts nothing.
+    #[cfg(unix)]
+    #[test]
+    fn restarting_for_a_file_no_server_serves_restarts_nothing() {
+        let Some(python) = python_for_stub_server() else {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let py = root.join("demo.py");
+        std::fs::write(&py, "x = 1\n").unwrap();
+        let (mut state, restarted) = two_language_worker(&root, &python);
+        let runtime = LspRuntime::new().expect("runtime");
+        let handle = runtime.handle().clone();
+        handle.block_on(state.open_doc(py.clone(), String::from("x = 1\n")));
+        let first = logged_pids(&root, "python", 1);
+        handle.block_on(state.restart_servers_for(&root.join("notes.txt")));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(logged_pids(&root, "python", 1), first);
+        assert!(!restarted.load(Ordering::Relaxed));
+        assert!(state.docs.contains_key(&py));
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_killed_language_server_is_restarted() {
