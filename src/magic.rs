@@ -20,6 +20,9 @@ pub enum Magic {
     /// viewer first, hex otherwise).
     Zip,
     Gzip,
+    /// An xz stream (#1645): a `.tar.xz` under any name, or a plain
+    /// compressed file the tar listing then declines.
+    Xz,
     Tar,
     Sqlite,
 }
@@ -62,6 +65,9 @@ pub fn sniff(bytes: &[u8]) -> Option<Magic> {
     if bytes.starts_with(b"\x1f\x8b") {
         return Some(Magic::Gzip);
     }
+    if bytes.starts_with(b"\xfd7zXZ\x00") {
+        return Some(Magic::Xz);
+    }
     if bytes.starts_with(b"SQLite format 3\0") {
         return Some(Magic::Sqlite);
     }
@@ -94,6 +100,7 @@ mod tests {
         assert_eq!(sniff(b"PK\x03\x04\x14\x00"), Some(Magic::Zip));
         assert_eq!(sniff(b"PK\x05\x06\x00\x00"), Some(Magic::Zip), "empty zip");
         assert_eq!(sniff(b"\x1f\x8b\x08\x00"), Some(Magic::Gzip));
+        assert_eq!(sniff(b"\xfd7zXZ\x00\x00\x04"), Some(Magic::Xz));
         assert_eq!(sniff(b"SQLite format 3\0"), Some(Magic::Sqlite));
         let mut tar = vec![0u8; 512];
         tar[257..262].copy_from_slice(b"ustar");
@@ -137,6 +144,7 @@ mod tests {
             (Magic::Pdf, false),
             (Magic::Zip, false),
             (Magic::Gzip, false),
+            (Magic::Xz, false),
             (Magic::Tar, false),
             (Magic::Sqlite, false),
         ] {
