@@ -136,9 +136,9 @@ fn as_scrollback(v: &Value) -> Option<Value> {
 }
 
 /// VS Code's `files.exclude` / `search.exclude` object (#1345): the globs
-/// set to `true`. A `false` entry switches a glob off, and a `when` clause
-/// hides a file only next to a sibling croft does not look for, so both are
-/// left out: a dropped entry shows a file, a misread one would hide it.
+/// set to `true`. A `when` clause hides a file only next to a sibling croft
+/// does not look for, so it is left out: a dropped entry shows a file, a
+/// misread one would hide it.
 ///
 /// VS Code matches these globs against the workspace-relative path, so a
 /// bare `build` is the root's `build` only, where croft's own bare glob
@@ -146,16 +146,24 @@ fn as_scrollback(v: &Value) -> Option<Value> {
 /// crosses anchored, as `/build`. A glob that already starts with `/`
 /// matches no workspace-relative path in VS Code, so it is left out rather
 /// than read as croft's root anchor, which would hide a file VS Code shows.
+///
+/// A glob set to `false` takes back the same glob from a lower layer, as in
+/// VS Code, so it crosses as `!glob` (#1494).
 fn as_enabled_globs(v: &Value) -> Option<Value> {
     let obj = v.as_object()?;
     Some(Value::from(
         obj.iter()
-            .filter(|(glob, on)| on.as_bool() == Some(true) && !glob.starts_with('/'))
-            .map(|(glob, _)| {
-                if glob.contains('/') || glob.starts_with("**") {
+            .filter(|(glob, on)| on.as_bool().is_some() && !glob.starts_with('/'))
+            .map(|(glob, on)| {
+                let glob = if glob.contains('/') || glob.starts_with("**") {
                     glob.clone()
                 } else {
                     format!("/{glob}")
+                };
+                if on.as_bool() == Some(true) {
+                    glob
+                } else {
+                    format!("!{glob}")
                 }
             })
             .collect::<Vec<String>>(),
@@ -1182,10 +1190,11 @@ mod tests {
     }
 
     /// #1345: `files.exclude` / `search.exclude` carry the globs set to
-    /// `true`; a `false` entry or a `when` clause (sibling-file rule croft
-    /// has no equivalent for) is left out rather than hiding files.
+    /// `true`; a `when` clause (sibling-file rule croft has no equivalent
+    /// for) is left out rather than hiding files. A `false` entry crosses as
+    /// a `!glob` removal (#1494), which hides nothing itself.
     #[test]
-    fn exclude_settings_keep_only_the_globs_set_to_true() {
+    fn exclude_settings_keep_the_true_globs_and_false_ones_as_removals() {
         let mut report = Report::default();
         convert_settings(
             &json!({
@@ -1198,16 +1207,14 @@ mod tests {
             }),
             &mut report,
         );
-        assert_eq!(report.settings["files_exclude"], json!(["**/generated"]));
+        assert_eq!(
+            report.settings["files_exclude"],
+            json!(["**/generated", "!**/keep"])
+        );
         assert_eq!(
             report.settings["search_exclude"],
             json!(["**/tests/fixtures"])
         );
-        let parsed: crate::prefs::Prefs = serde_json::from_value(serde_json::Value::Object(
-            report.settings.clone().into_iter().collect(),
-        ))
-        .unwrap();
-        assert_eq!(parsed.files_exclude, vec![String::from("**/generated")]);
     }
 
     /// #1479: VS Code matches an exclude glob against the workspace-relative
