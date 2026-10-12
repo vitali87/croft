@@ -152,6 +152,15 @@ pub enum Command {
     PinEditor,
     UnpinEditor,
     KeepEditor,
+    /// View: Move Editor Left / Right (#1565): the active tab one place
+    /// along its group's tab bar.
+    MoveEditorLeftInGroup,
+    MoveEditorRightInGroup,
+    /// View: Move Editor into Next / Previous Group (#1565): the active tab
+    /// to the next or previous group, creating one beside it when there is
+    /// none that way.
+    MoveEditorToNextGroup,
+    MoveEditorToPreviousGroup,
     SplitEditor,
     /// View: Focus Left / Right Editor Group (#843): Cmd+Opt+Left / Right,
     /// which have no `Ctrl` form off macOS.
@@ -593,6 +602,10 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::PinEditor,
     Command::UnpinEditor,
     Command::KeepEditor,
+    Command::MoveEditorLeftInGroup,
+    Command::MoveEditorRightInGroup,
+    Command::MoveEditorToNextGroup,
+    Command::MoveEditorToPreviousGroup,
     Command::SplitEditor,
     Command::FocusLeftEditorGroup,
     Command::FocusRightEditorGroup,
@@ -987,6 +1000,10 @@ impl Command {
             Command::PinEditor => "View: Pin Editor",
             Command::UnpinEditor => "View: Unpin Editor",
             Command::KeepEditor => "View: Keep Editor",
+            Command::MoveEditorLeftInGroup => "View: Move Editor Left",
+            Command::MoveEditorRightInGroup => "View: Move Editor Right",
+            Command::MoveEditorToNextGroup => "View: Move Editor into Next Group",
+            Command::MoveEditorToPreviousGroup => "View: Move Editor into Previous Group",
             Command::SplitEditor => "View: Split Editor",
             Command::FocusLeftEditorGroup => "View: Focus Left Editor Group",
             Command::FocusRightEditorGroup => "View: Focus Right Editor Group",
@@ -1386,6 +1403,15 @@ impl Command {
             Command::PinEditor => "Cmd+K P",
             Command::UnpinEditor => "Cmd+K P",
             Command::KeepEditor => "Cmd+K Shift+P",
+            // VS Code's Linux and Windows chords; its macOS Cmd+K
+            // Cmd+Shift+Left / Right are rebindable by id.
+            Command::MoveEditorLeftInGroup => "Ctrl+Shift+PageUp",
+            Command::MoveEditorRightInGroup => "Ctrl+Shift+PageDown",
+            // VS Code's Ctrl+Alt+Left / Right already move croft's caret a
+            // word (they carry Alt), so these two are palette commands,
+            // bindable by id.
+            Command::MoveEditorToNextGroup => "",
+            Command::MoveEditorToPreviousGroup => "",
             Command::SplitEditor => "Cmd+\\",
             Command::FocusLeftEditorGroup => "Cmd+Opt+←",
             Command::FocusRightEditorGroup => "Cmd+Opt+→",
@@ -1775,6 +1801,10 @@ impl Command {
             Command::PinEditor => "pin_editor",
             Command::UnpinEditor => "unpin_editor",
             Command::KeepEditor => "keep_editor",
+            Command::MoveEditorLeftInGroup => "move_editor_left_in_group",
+            Command::MoveEditorRightInGroup => "move_editor_right_in_group",
+            Command::MoveEditorToNextGroup => "move_editor_to_next_group",
+            Command::MoveEditorToPreviousGroup => "move_editor_to_previous_group",
             Command::SplitEditor => "split_editor",
             Command::FocusLeftEditorGroup => "focus_left_editor_group",
             Command::FocusRightEditorGroup => "focus_right_editor_group",

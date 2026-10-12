@@ -17773,6 +17773,55 @@ impl EditorTabs {
         now_pinned
     }
 
+    /// Move the tab at `from` to position `to` in this group (#1565), as VS
+    /// Code's tab drag and Move Editor Left / Right do. Pinned tabs stay ahead
+    /// of the rest, so `to` is clamped into the moved tab's own block. The
+    /// active tab stays active. Returns the tab's new index, or `None` when
+    /// `from` is out of range.
+    pub fn move_tab(&mut self, from: usize, to: usize) -> Option<usize> {
+        if from >= self.editors.len() {
+            return None;
+        }
+        let pinned = self.editors.iter().filter(|e| e.pinned).count();
+        let to = if self.editors[from].pinned {
+            to.min(pinned - 1)
+        } else {
+            to.clamp(pinned, self.editors.len() - 1)
+        };
+        if to == from {
+            return Some(from);
+        }
+        let active = self.active;
+        let ed = self.editors.remove(from);
+        self.editors.insert(to, ed);
+        self.active = if active == from {
+            to
+        } else if from < active && active <= to {
+            active - 1
+        } else if to <= active && active < from {
+            active + 1
+        } else {
+            active
+        };
+        Some(to)
+    }
+
+    /// View: Move Editor Left / Right (#1565): shift the active tab one place
+    /// within its group. False when it is already at that end (of its pinned
+    /// or unpinned block), so nothing moved.
+    pub fn move_active_tab(&mut self, right: bool) -> bool {
+        let from = self.active;
+        let to = if right {
+            from + 1
+        } else {
+            match from.checked_sub(1) {
+                Some(to) => to,
+                None => return false,
+            }
+        };
+        self.move_tab(from, to).is_some_and(|at| at != from)
+    }
+
     /// Remove and return the active editor (for a Move to another group). When
     /// it was the only tab the group falls back to a single blank tab (like
     /// closing the last tab), so the group stays renderable; the caller can

@@ -272,6 +272,22 @@ const COMMANDS: &[(&str, &str)] = &[
     ("workbench.action.pinEditor", "pin_editor"),
     ("workbench.action.unpinEditor", "unpin_editor"),
     ("workbench.action.keepEditor", "keep_editor"),
+    (
+        "workbench.action.moveEditorLeftInGroup",
+        "move_editor_left_in_group",
+    ),
+    (
+        "workbench.action.moveEditorRightInGroup",
+        "move_editor_right_in_group",
+    ),
+    (
+        "workbench.action.moveEditorToNextGroup",
+        "move_editor_to_next_group",
+    ),
+    (
+        "workbench.action.moveEditorToPreviousGroup",
+        "move_editor_to_previous_group",
+    ),
     ("workbench.action.splitEditor", "split_editor"),
     (
         "workbench.action.toggleSidebarVisibility",
@@ -1495,6 +1511,62 @@ mod tests {
             .iter()
             .map(|(key, _, croft)| (key.to_string(), croft.to_string()))
             .collect();
+        assert_eq!(report.keybindings, expected);
+        let rows: Vec<Value> = report
+            .keybindings
+            .iter()
+            .map(|(key, command)| json!({ "key": key, "command": command }))
+            .collect();
+        let json = serde_json::to_string(&Value::Array(rows)).unwrap();
+        let (_keymap, warnings) = crate::keymap::Keymap::resolve(&json);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// #1565: VS Code's move-editor commands import, with VS Code's own
+    /// default chords, and resolve to real croft commands.
+    #[test]
+    fn the_move_editor_commands_import_under_their_vscode_ids() {
+        let pairs = [
+            (
+                "ctrl+shift+pageup",
+                "workbench.action.moveEditorLeftInGroup",
+                "move_editor_left_in_group",
+            ),
+            (
+                "ctrl+shift+pagedown",
+                "workbench.action.moveEditorRightInGroup",
+                "move_editor_right_in_group",
+            ),
+            (
+                "ctrl+alt+right",
+                "workbench.action.moveEditorToNextGroup",
+                "move_editor_to_next_group",
+            ),
+            (
+                "ctrl+alt+left",
+                "workbench.action.moveEditorToPreviousGroup",
+                "move_editor_to_previous_group",
+            ),
+        ];
+        let doc = Value::Array(
+            pairs
+                .iter()
+                .map(|(key, vscode, _)| json!({ "key": key, "command": vscode }))
+                .collect(),
+        );
+        let mut report = Report::default();
+        convert_keybindings(&doc, &mut report);
+        assert!(
+            report.dropped_keybindings.is_empty(),
+            "{:?}",
+            report.dropped_keybindings
+        );
+        // The report lists bindings in key order.
+        let mut expected: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(key, _, croft)| (key.to_string(), croft.to_string()))
+            .collect();
+        expected.sort();
         assert_eq!(report.keybindings, expected);
         let rows: Vec<Value> = report
             .keybindings
