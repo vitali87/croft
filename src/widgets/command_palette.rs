@@ -107,6 +107,9 @@ pub enum Command {
     // --- File / editor management ---
     SaveFile,
     SaveAs,
+    /// File: Revert File (#1285): drop the tab's unsaved edits for the
+    /// text on disk, as one undo step.
+    RevertFile,
     /// File: Save All (#852): every dirty tab, in every split.
     SaveAll,
     /// File: New File… / New Folder… (#852): the Explorer's create prompt
@@ -204,6 +207,7 @@ pub enum Command {
     RunTestAtCursorWithCoverage,
     TestingToggleWatchAll,
     TestingGoToFirstFailure,
+    TestingCancelRun,
     HexFindNext,
     SheetInsertRowBelow,
     SheetDeleteRow,
@@ -559,6 +563,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::UnfoldAllRegions,
     Command::SaveFile,
     Command::SaveAs,
+    Command::RevertFile,
     Command::SaveAll,
     Command::NewFile,
     Command::NewFolder,
@@ -633,6 +638,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::RunTestAtCursorWithCoverage,
     Command::TestingToggleWatchAll,
     Command::TestingGoToFirstFailure,
+    Command::TestingCancelRun,
     Command::HexFindNext,
     Command::SheetInsertRowBelow,
     Command::SheetDeleteRow,
@@ -952,6 +958,7 @@ impl Command {
             Command::UnfoldAllRegions => "Unfold All Regions",
             Command::SaveFile => "File: Save",
             Command::SaveAs => "File: Save As…",
+            Command::RevertFile => "File: Revert File",
             Command::SaveAll => "File: Save All",
             Command::NewFile => "File: New File…",
             Command::NewFolder => "File: New Folder…",
@@ -1025,6 +1032,7 @@ impl Command {
             Command::RunTestAtCursorWithCoverage => "Testing: Run Test at Cursor with Coverage",
             Command::TestingToggleWatchAll => "Testing: Toggle Watch All Tests",
             Command::TestingGoToFirstFailure => "Testing: Go to First Failure",
+            Command::TestingCancelRun => "Testing: Cancel Test Run",
             Command::HexFindNext => "Hex: Find Next",
             Command::SheetInsertRowBelow => "Sheet: Insert Row Below",
             Command::SheetDeleteRow => "Sheet: Delete Row",
@@ -1356,6 +1364,7 @@ impl Command {
             Command::UnfoldAllRegions => "Cmd+K Cmd+9",
             Command::SaveFile => "Cmd+S",
             Command::SaveAs => "",
+            Command::RevertFile => "",
             // VS Code's macOS chord; its Linux `Ctrl+K S` is Select for
             // Compare here, so Linux takes `Ctrl+Alt+S` instead.
             Command::SaveAll => "Cmd+Opt+S",
@@ -1427,6 +1436,7 @@ impl Command {
             Command::RunTestAtCursorWithCoverage => "",
             Command::TestingToggleWatchAll => "",
             Command::TestingGoToFirstFailure => "",
+            Command::TestingCancelRun => "",
             Command::HexFindNext => "F3",
             Command::SheetInsertRowBelow => "",
             Command::SheetDeleteRow => "",
@@ -1738,6 +1748,7 @@ impl Command {
             Command::UnfoldAllRegions => "unfold_all_regions",
             Command::SaveFile => "save_file",
             Command::SaveAs => "save_as",
+            Command::RevertFile => "revert_file",
             Command::SaveAll => "save_all",
             Command::NewFile => "new_file",
             Command::NewFolder => "new_folder",
@@ -1811,6 +1822,7 @@ impl Command {
             Command::RunTestAtCursorWithCoverage => "run_test_at_cursor_with_coverage",
             Command::TestingToggleWatchAll => "testing_toggle_watch_all",
             Command::TestingGoToFirstFailure => "testing_go_to_first_failure",
+            Command::TestingCancelRun => "testing_cancel_run",
             Command::HexFindNext => "hex_find_next",
             Command::SheetInsertRowBelow => "sheet_insert_row_below",
             Command::SheetDeleteRow => "sheet_delete_row",
