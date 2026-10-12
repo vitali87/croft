@@ -271,7 +271,7 @@ A tree-sitter highlighted editor with a full write path, mouse-drag selection, n
 
 **Canvas backgrounds.** The CSV and diff canvases fill with `canvas_bg`: `Reset` on iTerm2 to inherit the SetColors session bg, and the theme's `editor_bg` on every other host, where `Reset` would override the frame prefill and leave a host-black island. The image and PDF canvas uses `image_canvas_bg` instead — still `Reset` on Kitty hosts, because the preview sits at `KITTY_Z_BELOW_TEXT_AND_BG` and Kitty paints any cell with a non-default background over an image that deep, so an explicit fill would hide the picture behind its own canvas. The themed look survives via the bake's theme-bg letterbox.
 
-**Minimap.** The minimap rasterizer is `minimap_rgba`.
+**Minimap.** The minimap rasterizer is `minimap_rgba`. Where the terminal cannot draw images, `App::render_text_minimap` folds the same raster into braille cells (`braille_minimap`, 2x4 dots a cell, four source columns a dot) instead (#1231).
 
 **Highlighting off the keystroke path (#850).** tree-sitter-highlight parses the whole buffer from scratch on every call, tens to hundreds of milliseconds on a large file, and that pass used to run inside every edit. `recompute_highlights` now carries the current spans and bracket colours through the edit at once, then hands the text to a worker thread (`run_highlight_pass`, which also runs the bracket scan against the grammar's string and comment ranges). `carry_highlights` diffs the buffer against the text the spans describe: lines the edit left alone keep theirs, and in the edited stretch the text before and after the change keeps its colours, a span the change falls inside stretches over it, and new text stays uncoloured until the pass lands. Every carried offset stays inside its line and on a char boundary. An edit waits for its pass only when the last pass fit `HIGHLIGHT_INLINE_BUDGET` (8 ms), so a small file still colours each keystroke in the same frame and a large one never makes it wait. A pass that does not fit lands on a later tick through `App::poll_highlights`, which polls every tab in every group, and bumps `highlight_generation`, which the minimap's bake is keyed on. One pass runs per buffer at a time. Edits made while it runs are carried, and when it lands a single follow-up pass picks them all up, so a burst of typing costs a pass or two rather than one per key. A pass is dropped when the buffer changed language or the theme changed after it started. `Editor::historical` waits for the whole pass, since it is built off the UI thread and no tick polls a scrubber view. Reusing the parse tree between passes is the rest of #850.
 
@@ -573,7 +573,7 @@ On-screen keyboard for Termux, needed because mouse tracking blocks the native s
 
 ### scrubber.rs
 
-Moves through a branch's history. This is the cursor behind "Source Control: Scrub History": arrows step between commits, Home returns to the working tree. At a commit, Enter ("Open Scrubbed File Here") opens that version as a tab with no file behind it, and "Diff Scrubbed File to Working Tree" diffs it against the file on disk. Both leave the scrubber.
+Moves through a branch's history. This is the cursor behind "Source Control: Scrub History": arrows step between commits, Home returns to the working tree. At a commit, Enter ("Open Scrubbed File Here") opens that version as a tab with no file behind it, and "Diff Scrubbed File to Working Tree" diffs it against the working copy: its open tab's unsaved edits, else the file on disk. Both leave the scrubber.
 
 **Enter opens here only at a commit.** There, the edit guard already refuses typing into the live buffer hidden under the historical view. At the working tree, Enter is ordinary typing. The diff is a palette command.
 
@@ -1006,7 +1006,7 @@ The proactive-look detector, pure text-in and row-out. Tree-sitter judges whethe
 
 Per-tool output parsers. All node IDs are normalised to `::` separators so one panel tree serves every runner.
 
-**The runners covered.** libtest (`parse_test_line` for run lines, `parse_list_line` for discovery), pytest (`-v` result lines, `--collect-only` node IDs), vitest (`parse_vitest_list_line` for `vitest list`, `parse_vitest_tap_line` for the streaming `--reporter=tap-flat` run lines, whose `file > describe > test` IDs are complete per line), and jest (`parse_jest_json`).
+**The runners covered.** libtest (`parse_test_line` for run lines, `parse_list_line` for discovery), pytest (`<id> PASSED` result lines at `--verbosity=1`, `--collect-only` node IDs at `--verbosity=-1`, both set outright so a project's `addopts` `-q` cannot shift them), vitest (`parse_vitest_list_line` for `vitest list`, `parse_vitest_tap_line` for the streaming `--reporter=tap-flat` run lines, whose `file > describe > test` IDs are complete per line), and jest (`parse_jest_json`).
 
 **Why jest is different.** jest prints one `--json` document to stdout at run end, with human output going to stderr, yielding every assertion with its describe chain and treating `pending`/`todo` as the skip family.
 
