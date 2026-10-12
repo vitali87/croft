@@ -657,7 +657,7 @@ fn extract_tar_xz_capped(bytes: &[u8], dir: &Path, target: &Path, cap: u64) -> s
 /// index cannot be read. Only a single-stream file is understood, which is
 /// what `xz` and cargo-dist produce; a concatenation of streams reads as
 /// unreadable and is refused by the caller, on the conservative side.
-fn xz_declared_size(bytes: &[u8]) -> Option<u64> {
+pub(crate) fn xz_declared_size(bytes: &[u8]) -> Option<u64> {
     // Stream footer, last 12 bytes: CRC32, backward size (index size / 4 - 1),
     // stream flags, "YZ". The index precedes it: 0x00, a record count, then
     // per record the unpadded and uncompressed sizes as 7-bit varints.
@@ -701,9 +701,9 @@ fn xz_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
 /// unpacked, not the decoder's own buffering; the declared-size check in
 /// [`extract_tar_xz_capped`] is what keeps an oversize stream from being
 /// decoded at all.
-struct Capped {
-    buf: Vec<u8>,
-    cap: u64,
+pub(crate) struct Capped {
+    pub(crate) buf: Vec<u8>,
+    pub(crate) cap: u64,
 }
 
 impl std::io::Write for Capped {

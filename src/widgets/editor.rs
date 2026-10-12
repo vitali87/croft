@@ -2068,10 +2068,21 @@ pub struct TextSpanEdit {
 /// earlier replacement never shifts the coordinates of a later one. Returns
 /// the number of edits applied. Out-of-range edits are skipped.
 pub fn apply_span_edits_to_lines(lines: &mut Vec<String>, edits: &[TextSpanEdit]) -> usize {
-    // Every edit names the ORIGINAL text, so its UTF-16 columns convert
-    // against the lines as they are before any edit lands.
+    let mut applied = 0;
+    for (e, count) in in_application_order(char_span_edits(lines, edits)) {
+        if replace_span(lines, &e) {
+            applied += count;
+        }
+    }
+    applied
+}
+
+/// `edits` with their UTF-16 columns read as chars. Every edit names the
+/// ORIGINAL text, so the columns convert against `lines` as they are before
+/// any edit lands.
+fn char_span_edits(lines: &[String], edits: &[TextSpanEdit]) -> Vec<TextSpanEdit> {
     let col = |row: usize, c: usize| lines.get(row).map_or(c, |l| utf16_to_char_col(l, c as u32));
-    let converted: Vec<TextSpanEdit> = edits
+    edits
         .iter()
         .map(|e| match e.utf16 {
             true => TextSpanEdit {
@@ -2082,16 +2093,59 @@ pub fn apply_span_edits_to_lines(lines: &mut Vec<String>, edits: &[TextSpanEdit]
             },
             false => e.clone(),
         })
-        .collect();
-    let mut order: Vec<&TextSpanEdit> = converted.iter().collect();
-    order.sort_by_key(|e| std::cmp::Reverse(e.start));
-    let mut applied = 0;
-    for e in order {
-        if replace_span(lines, e) {
-            applied += 1;
+        .collect()
+}
+
+/// `edits` bottom-up, the order they apply in, each with the number of edits
+/// it stands for. Edits that start at one position are joined into one, their
+/// texts in the order sent: the LSP spec puts them in array order, and
+/// applying them one by one bottom-up reversed them, so vtsls's `"\n"` then
+/// `"  "` landed as trailing spaces above an unindented line (#1633).
+fn in_application_order(mut edits: Vec<TextSpanEdit>) -> Vec<(TextSpanEdit, usize)> {
+    edits.sort_by_key(|e| e.start);
+    let mut joined: Vec<(TextSpanEdit, usize)> = Vec::with_capacity(edits.len());
+    for e in edits {
+        match joined.last_mut() {
+            Some((last, count)) if last.start == e.start => {
+                last.end = last.end.max(e.end);
+                last.new_text.push_str(&e.new_text);
+                *count += 1;
+            }
+            _ => joined.push((e, 1)),
         }
     }
-    applied
+    joined.reverse();
+    joined
+}
+
+/// Where `pos` (char columns) lands once `edits` apply to `lines`: moved by
+/// the text every edit before it adds or removes. A position inside an edit
+/// lands at the end of its new text.
+pub fn position_after_span_edits(
+    lines: &[String],
+    pos: (usize, usize),
+    edits: &[TextSpanEdit],
+) -> (usize, usize) {
+    let mut pos = pos;
+    for (e, _) in in_application_order(char_span_edits(lines, edits)) {
+        if pos < e.start || (pos == e.start && e.start != e.end) {
+            continue;
+        }
+        let rows = e.new_text.matches('\n').count();
+        let last = e.new_text.rsplit('\n').next().unwrap_or("").chars().count();
+        let new_end = match rows {
+            0 => (e.start.0, e.start.1 + last),
+            _ => (e.start.0 + rows, last),
+        };
+        pos = if pos < e.end {
+            new_end
+        } else if pos.0 == e.end.0 {
+            (new_end.0, new_end.1 + pos.1 - e.end.1)
+        } else {
+            (pos.0 + new_end.0 - e.end.0, pos.1)
+        };
+    }
+    pos
 }
 
 fn replace_span(lines: &mut Vec<String>, e: &TextSpanEdit) -> bool {
@@ -2184,6 +2238,24 @@ enum CaretEdit {
     Insert(char),
     Backspace,
     DeleteForward,
+}
+
+/// Caret places, `(row, col)` each.
+type CaretPlaces = Vec<(usize, usize)>;
+
+/// What the auto-closing-pairs rules (#121) make of one typed character at
+/// one caret, decided apart from doing it so a single caret and every caret
+/// of a multi-cursor edit follow the same rules (#1597).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PairAction {
+    /// Wrap the caret's selection in the opener or quote and this closer.
+    Surround(char),
+    /// Step over the same closer or quote already at the caret.
+    TypeOver,
+    /// Insert the opener with this closer after it, the caret between.
+    InsertPair(char),
+    /// An ordinary insert.
+    Plain,
 }
 
 #[derive(Clone, Debug)]
@@ -2672,6 +2744,13 @@ pub struct Editor {
     /// there with no edits since — a pre-existing `()` in the file must
     /// never lose both sides to one backspace (#122 review).
     auto_pair_at: Option<(usize, usize, u64)>,
+    /// The `edit_seq` and caret places after the last multi-cursor
+    /// keystroke that inserted pairs (#1597): while nothing has edited or
+    /// moved since, a multi-cursor Backspace inside an empty pair takes both
+    /// sides, at every caret that inserted one (the last list). A
+    /// pre-existing `()` keeps its closer, as with one caret (#122 review),
+    /// even when another caret of the same keystroke paired.
+    multi_auto_pair: Option<(u64, CaretPlaces, CaretPlaces)>,
     /// Merge-conflict blocks in the buffer, lazily recomputed whenever
     /// `edit_seq` moves (same pattern as the git-gutter marks).
     conflicts: Vec<crate::merge::ConflictBlock>,
@@ -3274,6 +3353,7 @@ impl Editor {
             auto_close_pairs: true,
             auto_close_tags: true,
             auto_pair_at: None,
+            multi_auto_pair: None,
             conflicts: Vec::new(),
             merge_action_spans: Vec::new(),
             code_lenses: Vec::new(),
@@ -5039,6 +5119,17 @@ impl Editor {
             // so its reason rides to the hex fallback rather than vanishing.
             Some(crate::magic::Magic::Gzip) => {
                 match self.open_archive(path, crate::archive::ArchiveKind::TarGz) {
+                    Ok(()) => return Ok(()),
+                    Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
+                        self.route_note = Some((path.to_path_buf(), e.to_string()));
+                    }
+                    Err(_) => {}
+                }
+            }
+            // A `.tar.xz` under another name (#1645); a plain xz file is not
+            // a tar and falls through to hex.
+            Some(crate::magic::Magic::Xz) => {
+                match self.open_archive(path, crate::archive::ArchiveKind::TarXz) {
                     Ok(()) => return Ok(()),
                     Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
                         self.route_note = Some((path.to_path_buf(), e.to_string()));
@@ -7202,50 +7293,57 @@ impl Editor {
         if self.lines.is_empty() {
             self.lines.push(String::new());
         }
+        match self.pair_action(c) {
+            PairAction::Plain => false,
+            PairAction::TypeOver => {
+                self.cursor_col += 1;
+                self.ensure_cursor_col_visible();
+                true
+            }
+            PairAction::Surround(close) => {
+                self.pin_on_edit();
+                self.push_undo(EditKind::Paste);
+                self.surround_selection_raw(c, close);
+                self.recompute_highlights();
+                true
+            }
+            PairAction::InsertPair(close) => {
+                self.pin_on_edit();
+                self.push_undo(EditKind::InsertChar);
+                self.insert_pair_raw(c, close);
+                self.recompute_highlights();
+                self.auto_pair_at = Some((self.cursor_row, self.cursor_col, self.edit_seq));
+                true
+            }
+        }
+    }
+
+    /// The pair rules' decision for `c` typed at the caret and its
+    /// selection, changing nothing.
+    fn pair_action(&self, c: char) -> PairAction {
+        let Some(line) = self.lines.get(self.cursor_row) else {
+            return PairAction::Plain;
+        };
         let close = auto_close_partner(c);
         let has_sel = self.selection.map(|s| s.has_area()).unwrap_or(false);
         // Selection surround: openers and quotes wrap, closers fall through
         // to the ordinary replace-selection insert.
         if has_sel {
-            let Some(close) = close else {
-                return false;
+            return match close {
+                Some(close) if !is_pair_closer(c) => PairAction::Surround(close),
+                _ => PairAction::Plain,
             };
-            if is_pair_closer(c) {
-                return false;
-            }
-            self.pin_on_edit();
-            self.push_undo(EditKind::Paste);
-            let ((sr, sc), (er, ec)) = self.selection.unwrap().normalised();
-            let close_byte = self.byte_index(er, ec);
-            self.lines[er].insert(close_byte, close);
-            let open_byte = self.byte_index(sr, sc);
-            self.lines[sr].insert(open_byte, c);
-            let inner_end = if sr == er { ec + 1 } else { ec };
-            self.selection = Some(EditorSelection {
-                anchor: (sr, sc + 1),
-                head: (er, inner_end),
-            });
-            self.cursor_row = er;
-            self.cursor_col = inner_end;
-            self.mark_buffer_changed();
-            self.recompute_highlights();
-            return true;
         }
-        let next = self
-            .lines
-            .get(self.cursor_row)
-            .and_then(|l| l.chars().nth(self.cursor_col));
+        let next = line.chars().nth(self.cursor_col);
         // Type-over: the exact closer/quote already sits at the caret.
         if (is_pair_closer(c) || is_pair_quote(c)) && next == Some(c) {
-            self.cursor_col += 1;
-            self.ensure_cursor_col_visible();
-            return true;
+            return PairAction::TypeOver;
         }
         let Some(close) = close else {
-            return false;
+            return PairAction::Plain;
         };
         if is_pair_closer(c) {
-            return false;
+            return PairAction::Plain;
         }
         // Opener guard: VS Code's `autoCloseBefore`, so only before
         // whitespace, a closer or punctuation. Anything else, a string's
@@ -7258,8 +7356,7 @@ impl Editor {
             true => next.is_none_or(|n| !n.is_alphanumeric() && n != '_' && n != c),
             false => next.is_none_or(|n| AUTO_CLOSE_BEFORE.contains(n)),
         };
-        let before =
-            &self.lines[self.cursor_row][..self.byte_index(self.cursor_row, self.cursor_col)];
+        let before = &line[..self.byte_index(self.cursor_row, self.cursor_col)];
         let prev_ok = !is_pair_quote(c)
             || before
                 .chars()
@@ -7268,7 +7365,7 @@ impl Editor {
             || (self.lang == Some(LangKind::Python)
                 && is_python_string_prefix(trailing_word(before)));
         if !next_ok || !prev_ok {
-            return false;
+            return PairAction::Plain;
         }
         // A quote typed inside a string or comment is text there, or that
         // string's closing quote, never an opener: pairing the closing `"`
@@ -7277,23 +7374,45 @@ impl Editor {
         // highlight pass; the line scan starts where it closes.
         if is_pair_quote(c) {
             let Some(from) = self.earlier_construct_end(self.cursor_row, before.len()) else {
-                return false;
+                return PairAction::Plain;
             };
             if ends_in_string_or_comment(&before[from..], self.lang) {
-                return false;
+                return PairAction::Plain;
             }
         }
-        self.pin_on_edit();
-        self.push_undo(EditKind::InsertChar);
+        PairAction::InsertPair(close)
+    }
+
+    /// Wrap the selection in `open` and `close`, keeping the text inside
+    /// selected and the caret at its end. No undo step, no re-highlight.
+    fn surround_selection_raw(&mut self, open: char, close: char) {
+        let Some(sel) = self.selection else {
+            return;
+        };
+        let ((sr, sc), (er, ec)) = sel.normalised();
+        let close_byte = self.byte_index(er, ec);
+        self.lines[er].insert(close_byte, close);
+        let open_byte = self.byte_index(sr, sc);
+        self.lines[sr].insert(open_byte, open);
+        let inner_end = if sr == er { ec + 1 } else { ec };
+        self.selection = Some(EditorSelection {
+            anchor: (sr, sc + 1),
+            head: (er, inner_end),
+        });
+        self.cursor_row = er;
+        self.cursor_col = inner_end;
+        self.mark_buffer_changed();
+    }
+
+    /// Insert `open` and `close` at the caret, the caret between them. No
+    /// undo step, no re-highlight.
+    fn insert_pair_raw(&mut self, open: char, close: char) {
         let row = self.cursor_row;
         let byte = self.byte_index(row, self.cursor_col);
         self.lines[row].insert(byte, close);
-        self.lines[row].insert(byte, c);
+        self.lines[row].insert(byte, open);
         self.cursor_col += 1;
         self.mark_buffer_changed();
-        self.recompute_highlights();
-        self.auto_pair_at = Some((self.cursor_row, self.cursor_col, self.edit_seq));
-        true
     }
 
     /// Where line `row` leaves a string or comment that an earlier line
@@ -7339,9 +7458,7 @@ impl Editor {
         self.push_undo(EditKind::Paste);
         let n = apply_span_edits_to_lines(&mut self.lines, edits);
         if n > 0 {
-            let mut order: Vec<&TextSpanEdit> = edits.iter().collect();
-            order.sort_by_key(|e| std::cmp::Reverse(e.start));
-            for e in order {
+            for (e, _) in in_application_order(edits.to_vec()) {
                 let removed = e.end.0.saturating_sub(e.start.0) + 1;
                 let added = e.new_text.matches('\n').count() + 1;
                 self.provenance.splice(e.start.0, removed, added);
@@ -7352,6 +7469,20 @@ impl Editor {
             self.mark_buffer_changed();
             self.recompute_highlights();
         }
+        n
+    }
+
+    /// [`Self::apply_span_edits`], the caret carried through the edits so it
+    /// stays beside the same text: format on type rewrites the line just
+    /// typed, and a clamp left the caret on the row above the `;` (#1633).
+    pub fn apply_span_edits_moving_caret(&mut self, edits: &[TextSpanEdit]) -> usize {
+        let caret = (self.cursor_row, self.cursor_col);
+        let moved = position_after_span_edits(&self.lines, caret, edits);
+        let n = self.apply_span_edits(edits);
+        if n > 0 {
+            (self.cursor_row, self.cursor_col) = moved;
+        }
+        self.clamp_cursor();
         n
     }
 
@@ -8104,6 +8235,34 @@ impl Editor {
     /// single undo step. Carets are processed bottom-to-top so an edit never
     /// shifts the coordinates of a caret still to be processed.
     fn multi_apply(&mut self, edit: CaretEdit) {
+        // A Backspace right after a keystroke that paired at every caret
+        // takes both sides of each empty pair, as one caret's does (#1597).
+        let armed: Vec<(usize, usize)> = match self.multi_auto_pair.take() {
+            Some((seq, places, paired))
+                if self.auto_close_pairs
+                    && edit == CaretEdit::Backspace
+                    && seq == self.edit_seq
+                    && places == self.caret_places() =>
+            {
+                paired
+            }
+            _ => Vec::new(),
+        };
+        // A closer or quote stepped over at every caret edits nothing, so it
+        // records no undo step, as one caret's type-over does.
+        if let CaretEdit::Insert(c) = edit
+            && self.auto_close_pairs
+            && self.types_over_at_every_caret(c)
+        {
+            self.selection = None;
+            self.cursor_col += 1;
+            for s in &mut self.carets {
+                s.head.1 += 1;
+                s.anchor = s.head;
+            }
+            self.ensure_cursor_col_visible();
+            return;
+        }
         self.pin_on_edit();
         self.push_undo(EditKind::MultiEdit);
 
@@ -8125,7 +8284,10 @@ impl Editor {
         // leave everything after it untouched, so those two stay true where a
         // plain (row, col) goes stale on its row (`abcd` with carets at 1 and
         // 3, typing X then Y, gave `aXYbcYXd`).
-        let mut placed: Vec<(bool, usize, usize)> = Vec::new();
+        // A selection a surround kept (#1597) has its anchor placed the same
+        // way: it sits after the later edits too.
+        type Place = (usize, usize);
+        let mut placed: Vec<(bool, Place, Option<Place>, bool)> = Vec::new();
         for (is_primary, sel) in items {
             if sel.has_area() {
                 self.selection = Some(sel);
@@ -8135,57 +8297,144 @@ impl Editor {
             let last = self.lines.len().saturating_sub(1);
             self.cursor_row = sel.head.0.min(last);
             self.cursor_col = sel.head.1.min(self.line_char_len(self.cursor_row));
-            self.apply_caret_edit_raw(edit);
-            let from_bottom = self.lines.len().saturating_sub(1) - self.cursor_row;
-            let from_end = self
-                .line_char_len(self.cursor_row)
-                .saturating_sub(self.cursor_col);
-            placed.push((is_primary, from_bottom, from_end));
+            let paired = self.apply_caret_edit_raw(edit, armed.contains(&sel.head));
+            let place = |this: &Self, (row, col): (usize, usize)| {
+                (
+                    this.lines.len().saturating_sub(1) - row,
+                    this.line_char_len(row).saturating_sub(col),
+                )
+            };
+            let anchor = self
+                .selection
+                .filter(|s| s.has_area())
+                .map(|s| place(self, s.anchor));
+            placed.push((
+                is_primary,
+                place(self, (self.cursor_row, self.cursor_col)),
+                anchor,
+                paired,
+            ));
         }
 
         self.selection = None;
         let last = self.lines.len().saturating_sub(1);
-        let resolve = |this: &Self, from_bottom: usize, from_end: usize| {
+        let resolve = |this: &Self, (from_bottom, from_end): (usize, usize)| {
             let row = last.saturating_sub(from_bottom);
             (row, this.line_char_len(row).saturating_sub(from_end))
         };
-        let mut new_primary = (self.cursor_row, self.cursor_col);
-        let mut new_secondary: Vec<(usize, usize)> = Vec::new();
-        for (is_primary, from_bottom, from_end) in placed {
-            let pos = resolve(self, from_bottom, from_end);
+        let mut new_primary = EditorSelection::new(self.cursor_row, self.cursor_col);
+        let mut primary_kept = false;
+        let mut new_secondary: Vec<EditorSelection> = Vec::new();
+        let mut paired_places: Vec<(usize, usize)> = Vec::new();
+        for (is_primary, head, anchor, paired) in placed {
+            let head = resolve(self, head);
+            if paired {
+                paired_places.push(head);
+            }
+            let sel = EditorSelection {
+                anchor: anchor.map_or(head, |a| resolve(self, a)),
+                head,
+            };
             if is_primary {
-                new_primary = pos;
+                new_primary = sel;
+                primary_kept = anchor.is_some();
             } else {
-                new_secondary.push(pos);
+                new_secondary.push(sel);
             }
         }
-        self.cursor_row = new_primary.0.min(last);
-        self.cursor_col = new_primary.1.min(self.line_char_len(self.cursor_row));
+        self.cursor_row = new_primary.head.0.min(last);
+        self.cursor_col = new_primary.head.1.min(self.line_char_len(self.cursor_row));
+        if primary_kept {
+            self.selection = Some(new_primary);
+        }
         // Carets an edit brought together are one caret from here on: kept
         // apart, the next key edited the same spot twice (one Backspace
         // deleting two line breaks).
         let primary = (self.cursor_row, self.cursor_col);
-        new_secondary.sort_unstable();
+        new_secondary.sort_unstable_by_key(|s| (s.head, s.anchor));
         new_secondary.dedup();
-        new_secondary.retain(|&p| p != primary);
-        self.carets = new_secondary
-            .into_iter()
-            .map(|(r, c)| EditorSelection::new(r, c))
-            .collect();
+        new_secondary.retain(|s| s.head != primary);
+        self.carets = new_secondary;
         self.recompute_highlights();
+        if !paired_places.is_empty() {
+            self.multi_auto_pair = Some((self.edit_seq, self.caret_places(), paired_places));
+        }
+    }
+
+    /// True when `c` typed at every caret only steps over the same closer
+    /// or quote: no caret has a selection and each sits right before `c`.
+    fn types_over_at_every_caret(&self, c: char) -> bool {
+        if !(is_pair_closer(c) || is_pair_quote(c)) {
+            return false;
+        }
+        let primary_sel = self.selection.is_some_and(|s| s.has_area());
+        !primary_sel
+            && self.carets.iter().all(|s| !s.has_area())
+            && self
+                .caret_places()
+                .into_iter()
+                .all(|(row, col)| self.lines.get(row).and_then(|l| l.chars().nth(col)) == Some(c))
+    }
+
+    /// Every caret's place, the primary first, the extra carets in order.
+    fn caret_places(&self) -> Vec<(usize, usize)> {
+        std::iter::once((self.cursor_row, self.cursor_col))
+            .chain(self.carets.iter().map(|c| c.head))
+            .collect()
     }
 
     /// One caret's worth of a multi-edit: no snapshot, no re-highlight (the
     /// batching caller in `multi_apply` does both once).
-    fn apply_caret_edit_raw(&mut self, edit: CaretEdit) {
+    ///
+    /// A typed character follows the same pair rules as one caret's
+    /// (#1597): surround, type-over and auto-close; with them skipped, a
+    /// quote replaced every Ctrl+D selection and `)` doubled the closer.
+    /// `pairs_armed` lets Backspace take both sides of an empty pair the
+    /// last keystroke inserted. Returns true when a pair was inserted.
+    fn apply_caret_edit_raw(&mut self, edit: CaretEdit, pairs_armed: bool) -> bool {
         match edit {
             CaretEdit::Insert(c) => {
-                self.delete_selection_inner();
-                self.insert_char_raw(c);
+                if self.lines.is_empty() {
+                    self.lines.push(String::new());
+                }
+                let action = match self.auto_close_pairs {
+                    true => self.pair_action(c),
+                    false => PairAction::Plain,
+                };
+                match action {
+                    PairAction::Surround(close) => self.surround_selection_raw(c, close),
+                    PairAction::TypeOver => self.cursor_col += 1,
+                    PairAction::InsertPair(close) => {
+                        self.insert_pair_raw(c, close);
+                        return true;
+                    }
+                    PairAction::Plain => {
+                        self.delete_selection_inner();
+                        self.insert_char_raw(c);
+                    }
+                }
             }
-            CaretEdit::Backspace => self.backspace_raw(),
+            CaretEdit::Backspace => {
+                if pairs_armed
+                    && !self.selection.is_some_and(|s| s.has_area())
+                    && self.cursor_col > 0
+                {
+                    let line = self.lines.get(self.cursor_row).cloned().unwrap_or_default();
+                    let prev = line.chars().nth(self.cursor_col - 1);
+                    let next = line.chars().nth(self.cursor_col);
+                    if let (Some(p), Some(n)) = (prev, next)
+                        && auto_close_partner(p) == Some(n)
+                        && !is_pair_closer(p)
+                    {
+                        let byte = self.byte_index(self.cursor_row, self.cursor_col);
+                        self.lines[self.cursor_row].remove(byte);
+                    }
+                }
+                self.backspace_raw();
+            }
             CaretEdit::DeleteForward => self.delete_forward_raw(),
         }
+        false
     }
 
     pub fn start_selection_at_cursor(&mut self) {
@@ -23234,6 +23483,153 @@ mod tests {
         assert_eq!(e.lines, vec!["  ".to_string()]);
     }
 
+    fn three_foos() -> Editor {
+        editor_with("foo = 1\nfoo = 2\nfoo = 3")
+    }
+
+    fn carets_after_foo(e: &mut Editor) {
+        e.cursor_row = 0;
+        e.cursor_col = 3;
+        e.carets = vec![EditorSelection::new(1, 3), EditorSelection::new(2, 3)];
+    }
+
+    /// #1597: a quote typed over several Ctrl+D selections wraps each one
+    /// and keeps it selected, in one undo step, instead of replacing them.
+    #[test]
+    fn a_quote_wraps_every_selection() {
+        let mut e = three_foos();
+        e.cursor_col = 0;
+        assert_eq!(e.select_all_occurrences_of_word_at_cursor(), 3);
+        e.multi_insert_char('"');
+        assert_eq!(e.lines, vec!["\"foo\" = 1", "\"foo\" = 2", "\"foo\" = 3"]);
+        let selected: Vec<String> = e
+            .selection
+            .iter()
+            .chain(e.carets.iter())
+            .filter(|s| s.has_area())
+            .map(|s| {
+                let ((r, a), (_, b)) = s.normalised();
+                e.lines[r].chars().skip(a).take(b - a).collect()
+            })
+            .collect();
+        assert_eq!(selected, vec!["foo", "foo", "foo"], "still selected");
+        e.multi_insert_char('(');
+        assert_eq!(e.lines[2], "\"(foo)\" = 3", "and wrap again");
+        assert!(e.undo());
+        assert!(e.undo());
+        assert_eq!(e.lines, vec!["foo = 1", "foo = 2", "foo = 3"]);
+    }
+
+    /// #1597: an opener typed at several carets closes at each, the carets
+    /// between the pairs.
+    #[test]
+    fn an_opener_closes_at_every_caret() {
+        let mut e = three_foos();
+        carets_after_foo(&mut e);
+        e.multi_insert_char('[');
+        assert_eq!(e.lines, vec!["foo[] = 1", "foo[] = 2", "foo[] = 3"]);
+        e.multi_insert_char('0');
+        assert_eq!(e.lines, vec!["foo[0] = 1", "foo[0] = 2", "foo[0] = 3"]);
+    }
+
+    /// #1597: a closer typed before the same closer steps over it at every
+    /// caret.
+    #[test]
+    fn a_closer_types_over_at_every_caret() {
+        let mut e = editor_with("print(x)\nprint(y)");
+        e.cursor_col = 7;
+        e.carets = vec![EditorSelection::new(1, 7)];
+        e.multi_insert_char(')');
+        assert_eq!(e.lines, vec!["print(x)", "print(y)"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 8));
+        assert_eq!(e.carets, vec![EditorSelection::new(1, 8)]);
+    }
+
+    /// #1597: Backspace right after pairing at several carets takes both
+    /// sides of every empty pair.
+    #[test]
+    fn backspace_after_pairing_at_every_caret_takes_both_sides() {
+        let mut e = three_foos();
+        carets_after_foo(&mut e);
+        e.multi_insert_char('(');
+        e.multi_backspace();
+        assert_eq!(e.lines, vec!["foo = 1", "foo = 2", "foo = 3"]);
+    }
+
+    /// Negative (#1597): a pair already in the file keeps its closer when
+    /// Backspace runs at several carets inside it.
+    #[test]
+    fn backspace_at_every_caret_keeps_a_pair_already_there() {
+        let mut e = editor_with("f()\ng()");
+        e.cursor_col = 2;
+        e.carets = vec![EditorSelection::new(1, 2)];
+        e.multi_backspace();
+        assert_eq!(e.lines, vec!["f)", "g)"]);
+    }
+
+    /// Negative (#1597): a quote that pairs at one caret but steps over a
+    /// quote already in the file at another arms only the caret that
+    /// paired; the next Backspace keeps the other's pre-existing quote.
+    #[test]
+    fn backspace_after_mixed_pairing_keeps_the_pair_already_there() {
+        let mut e = editor_with("\n\"\"");
+        e.cursor_col = 0;
+        e.carets = vec![EditorSelection::new(1, 0)];
+        e.multi_insert_char('"');
+        assert_eq!(e.lines, vec!["\"\"", "\"\""]);
+        e.multi_backspace();
+        assert_eq!(e.lines, vec!["", "\""]);
+    }
+
+    /// #1597: stepping over the closer at every caret records no undo step,
+    /// so one Undo reverts the edit before it.
+    #[test]
+    fn type_over_at_every_caret_records_no_undo_step() {
+        let mut e = editor_with("print(x)\nprint(y)");
+        e.cursor_col = 7;
+        e.carets = vec![EditorSelection::new(1, 7)];
+        e.multi_insert_char('z');
+        e.multi_insert_char(')');
+        assert_eq!(e.lines, vec!["print(xz)", "print(yz)"]);
+        assert!(e.undo());
+        assert_eq!(e.lines, vec!["print(x)", "print(y)"]);
+    }
+
+    /// Negative (#1597): carets moved after the pairing disarm the pair
+    /// Backspace, so it deletes one character as usual.
+    #[test]
+    fn carets_moved_after_pairing_backspace_one_character() {
+        let mut e = three_foos();
+        carets_after_foo(&mut e);
+        e.multi_insert_char('(');
+        e.cursor_col = 6;
+        e.carets = vec![EditorSelection::new(1, 6), EditorSelection::new(2, 6)];
+        e.multi_backspace();
+        assert_eq!(e.lines, vec!["foo()= 1", "foo()= 2", "foo()= 3"]);
+    }
+
+    /// Negative (#1597): with auto-closing pairs off, several carets type
+    /// the plain character.
+    #[test]
+    fn without_auto_close_every_caret_types_the_plain_character() {
+        let mut e = three_foos();
+        e.auto_close_pairs = false;
+        carets_after_foo(&mut e);
+        e.multi_insert_char('[');
+        assert_eq!(e.lines, vec!["foo[ = 1", "foo[ = 2", "foo[ = 3"]);
+    }
+
+    /// Negative (#1597): a closer typed over several selections replaces
+    /// them, as it does one selection.
+    #[test]
+    fn a_closer_replaces_every_selection() {
+        let mut e = three_foos();
+        e.cursor_col = 0;
+        e.select_all_occurrences_of_word_at_cursor();
+        e.multi_insert_char(')');
+        assert_eq!(e.lines, vec![") = 1", ") = 2", ") = 3"]);
+    }
+
     #[test]
     fn collapse_carets_drops_secondary_cursors() {
         let mut e = editor_with("x x x");
@@ -23264,6 +23660,117 @@ mod tests {
         ];
         assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 2);
         assert_eq!(lines, vec!["baz bar baz".to_string()]);
+    }
+
+    /// An insert of `text` at `(row, col)`, in UTF-16 columns as a
+    /// language server sends it.
+    fn lsp_insert(row: usize, col: usize, text: &str) -> TextSpanEdit {
+        TextSpanEdit {
+            start: (row, col),
+            end: (row, col),
+            new_text: text.to_string(),
+            utf16: true,
+        }
+    }
+
+    /// vtsls 0.3.0's Format Document reply for
+    /// `export function f(a: number) {if(a>1){return  0;}`, captured with a
+    /// minimal LSP client (#1633). The first two edits share a position.
+    fn vtsls_format_reply() -> Vec<TextSpanEdit> {
+        let mut edits = vec![
+            lsp_insert(0, 30, "\n"),
+            lsp_insert(0, 30, "  "),
+            lsp_insert(0, 32, " "),
+            lsp_insert(0, 34, " "),
+            lsp_insert(0, 35, " "),
+            lsp_insert(0, 37, " "),
+            lsp_insert(0, 38, " "),
+        ];
+        edits.push(TextSpanEdit {
+            start: (0, 44),
+            end: (0, 46),
+            new_text: " ".to_string(),
+            utf16: true,
+        });
+        edits.push(lsp_insert(0, 48, " "));
+        edits
+    }
+
+    /// #1633: edits that start at one position land in the order the server
+    /// sent them, as the LSP spec says.
+    #[test]
+    fn inserts_at_one_position_land_in_the_order_sent() {
+        let mut lines = vec!["ab".to_string()];
+        let edits = vec![lsp_insert(0, 1, "\n"), lsp_insert(0, 1, "  ")];
+        assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 2);
+        assert_eq!(lines, vec!["a".to_string(), "  b".to_string()]);
+        // An insert sent before a replacement of the text after it.
+        let mut lines = vec!["foobar".to_string()];
+        let edits = vec![
+            lsp_insert(0, 0, "X"),
+            TextSpanEdit {
+                start: (0, 0),
+                end: (0, 3),
+                new_text: String::new(),
+                utf16: true,
+            },
+        ];
+        assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 2);
+        assert_eq!(lines, vec!["Xbar".to_string()]);
+    }
+
+    /// #1633: the issue's TypeScript sample formats to an indented line with
+    /// no trailing spaces.
+    #[test]
+    fn a_vtsls_format_reply_indents_the_line_it_breaks() {
+        let mut lines: Vec<String> = [
+            "export function f(a: number) {if(a>1){return  0;}",
+            "  return a;",
+            "}",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            apply_span_edits_to_lines(&mut lines, &vtsls_format_reply()),
+            9
+        );
+        assert_eq!(
+            lines,
+            [
+                "export function f(a: number) {",
+                "  if (a > 1) { return 0; }",
+                "  return a;",
+                "}"
+            ]
+            .map(String::from)
+            .to_vec()
+        );
+    }
+
+    /// #1633 negative: edits at different positions, and a replacement sent
+    /// before an insert at its start, keep their meaning.
+    #[test]
+    fn edits_at_different_positions_keep_their_places() {
+        let mut lines = vec!["a b c".to_string()];
+        let edits = vec![
+            lsp_insert(0, 4, "Z"),
+            lsp_insert(0, 0, "X"),
+            lsp_insert(0, 2, "Y"),
+        ];
+        assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 3);
+        assert_eq!(lines, vec!["Xa Yb Zc".to_string()]);
+        let mut lines = vec!["foobar".to_string()];
+        let edits = vec![
+            TextSpanEdit {
+                start: (0, 0),
+                end: (0, 3),
+                new_text: String::new(),
+                utf16: true,
+            },
+            lsp_insert(0, 0, "X"),
+        ];
+        assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 2);
+        assert_eq!(lines, vec!["Xbar".to_string()]);
     }
 
     #[test]
