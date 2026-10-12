@@ -2890,6 +2890,11 @@ pub struct Editor {
     /// double-click / Ctrl+Enter / typing into the buffer pin the tab
     /// (preview = false) so subsequent previews don't overwrite it.
     pub preview: bool,
+    /// The selection Add Selection to Next Find Match last made from the
+    /// word at the caret (#1558). While the primary selection is that one,
+    /// further matches are whole words, as in VS Code; a selection made by
+    /// hand matches as plain text, so `oo` is found inside every `foo`.
+    occurrence_word_sel: Option<EditorSelection>,
     /// True when the user has pinned this tab (VS Code "Pin"). Pinned tabs are
     /// kept leftmost in the strip, survive Close Others / Close to the Right,
     /// and show a thumb-tack glyph in place of the close `\u{2715}`. A pinned
@@ -3319,6 +3324,7 @@ impl Editor {
             fallback_kind_folds: Vec::new(),
             fallback_folds_seq: None,
             preview: false,
+            occurrence_word_sel: None,
             pinned: false,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -7960,6 +7966,100 @@ impl Editor {
         self.carets.len() + 1
     }
 
+    /// The start of every occurrence of `word` in the buffer (a symbol tab's
+    /// symbol only), in document order: whole words when `whole_word`, else
+    /// every case-sensitive plain-text match, left to right without overlap.
+    fn occurrence_starts(&self, word: &[char], whole_word: bool) -> Vec<(usize, usize)> {
+        let (lo, hi) = self.symbol_clip().unwrap_or((0, self.lines.len()));
+        let mut occ = Vec::new();
+        for (row, line) in self.lines.iter().enumerate().take(hi).skip(lo) {
+            let chars: Vec<char> = line.chars().collect();
+            let cols = if whole_word {
+                find_word_occurrences(&chars, word)
+            } else {
+                find_text_occurrences(&chars, word)
+            };
+            occ.extend(cols.into_iter().map(|col| (row, col)));
+        }
+        occ
+    }
+
+    /// VS Code "Select All Occurrences of Find Match" (`Cmd+Shift+L`,
+    /// #1558): a selection on every match of the selected text, as plain
+    /// text for a hand-made selection and as whole words for one Add
+    /// Selection to Next Find Match took from the caret; with no selection,
+    /// every whole-word match of the word at the caret (Change All
+    /// Occurrences). The selection the caret is in stays primary. Returns
+    /// the number of selections, 0 when there is nothing to match.
+    pub fn select_all_occurrences(&mut self) -> usize {
+        let Some(sel) = self.selection.filter(|s| s.anchor != s.head) else {
+            return self.select_all_occurrences_of_word_at_cursor();
+        };
+        let (start, end) = sel.normalised();
+        if start.0 != end.0 {
+            // A match across lines is not looked for: the selection stays.
+            return 0;
+        }
+        let word: Vec<char> = self.lines[start.0]
+            .chars()
+            .skip(start.1)
+            .take(end.1 - start.1)
+            .collect();
+        let whole_word = self.occurrence_word_sel == Some(sel);
+        let occ = self.occurrence_starts(&word, whole_word);
+        if occ.is_empty() {
+            return 0;
+        }
+        let primary_idx = occ.iter().position(|&o| o == start).unwrap_or(0);
+        let as_sel = |(row, col): (usize, usize)| EditorSelection {
+            anchor: (row, col),
+            head: (row, col + word.len()),
+        };
+        let primary = as_sel(occ[primary_idx]);
+        self.selection = Some(primary);
+        (self.cursor_row, self.cursor_col) = primary.head;
+        self.carets = occ
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != primary_idx)
+            .map(|(_, &o)| as_sel(o))
+            .collect();
+        self.ensure_cursor_col_visible();
+        self.carets.len() + 1
+    }
+
+    /// VS Code "Add Cursors to Line Ends" (`Shift+Alt+I`, #1558): a caret at
+    /// the end of every line the selection covers, the selection dropped.
+    /// A last line the selection only reaches at column 0 is left out, as
+    /// VS Code does. The last line's caret is the primary. Returns the
+    /// number of carets, 0 with no selection.
+    pub fn add_cursors_to_line_ends(&mut self) -> usize {
+        let Some(sel) = self.selection.filter(|s| s.anchor != s.head) else {
+            return 0;
+        };
+        let (start, end) = sel.normalised();
+        let last = if end.1 == 0 && end.0 > start.0 {
+            end.0 - 1
+        } else {
+            end.0
+        };
+        let ends: Vec<(usize, usize)> = (start.0..=last)
+            .map(|row| (row, self.line_char_len(row)))
+            .collect();
+        let Some((&primary, rest)) = ends.split_last() else {
+            return 0;
+        };
+        self.selection = None;
+        (self.cursor_row, self.cursor_col) = primary;
+        self.carets = rest
+            .iter()
+            .map(|&(row, col)| EditorSelection::new(row, col))
+            .collect();
+        self.occurrence_word_sel = None;
+        self.ensure_cursor_col_visible();
+        self.carets.len() + 1
+    }
+
     /// VS Code "Add Selection to Next Find Match" (`Cmd+D`): the first press
     /// selects the word under the cursor; each further press finds the next
     /// occurrence of the selected text (document order, wrapping) that is not
@@ -7972,10 +8072,12 @@ impl Editor {
             let Some((s, e)) = self.word_at(self.cursor_row, self.cursor_col) else {
                 return 0;
             };
-            self.selection = Some(EditorSelection {
+            let word = EditorSelection {
                 anchor: (self.cursor_row, s),
                 head: (self.cursor_row, e),
-            });
+            };
+            self.selection = Some(word);
+            self.occurrence_word_sel = Some(word);
             self.cursor_col = e;
             self.ensure_cursor_col_visible();
             return 1;
@@ -7995,15 +8097,8 @@ impl Editor {
         }
         // Every occurrence in document order, and the set already selected
         // (the primary plus each existing caret), keyed by its start.
-        let mut occ: Vec<(usize, usize)> = Vec::new();
-        // A symbol tab matches only inside its symbol.
-        let (lo, hi) = self.symbol_clip().unwrap_or((0, self.lines.len()));
-        for (row, line) in self.lines.iter().enumerate().take(hi).skip(lo) {
-            let chars: Vec<char> = line.chars().collect();
-            for col in find_word_occurrences(&chars, &word) {
-                occ.push((row, col));
-            }
-        }
+        let whole_word = self.occurrence_word_sel == Some(sel);
+        let occ = self.occurrence_starts(&word, whole_word);
         let mut taken: Vec<(usize, usize)> = self.carets.iter().map(|c| c.normalised().0).collect();
         taken.push(start);
         // Scan forward from the primary, wrapping, for the first match not yet
@@ -8019,10 +8114,14 @@ impl Editor {
         // Demote the current primary to a caret, promote the new match.
         self.carets.push(sel);
         let head = (row, col + word.len());
-        self.selection = Some(EditorSelection {
+        let found = EditorSelection {
             anchor: (row, col),
             head,
-        });
+        };
+        self.selection = Some(found);
+        if whole_word {
+            self.occurrence_word_sel = Some(found);
+        }
         self.cursor_row = head.0;
         self.cursor_col = head.1;
         self.ensure_cursor_col_visible();
@@ -12775,6 +12874,26 @@ fn find_word_occurrences(chars: &[char], word: &[char]) -> Vec<usize> {
             }
         }
         i += 1;
+    }
+    out
+}
+
+/// Start char-indices of every case-sensitive occurrence of `text` within
+/// `chars`, as plain text and without overlap (#1558): what VS Code matches
+/// for a selection made by hand, so `oo` is found inside `foo`.
+fn find_text_occurrences(chars: &[char], text: &[char]) -> Vec<usize> {
+    let mut out = Vec::new();
+    if text.is_empty() || text.len() > chars.len() {
+        return out;
+    }
+    let mut i = 0;
+    while i + text.len() <= chars.len() {
+        if chars[i..i + text.len()] == *text {
+            out.push(i);
+            i += text.len();
+        } else {
+            i += 1;
+        }
     }
     out
 }
@@ -22604,6 +22723,19 @@ mod tests {
             !e.semantic_overlay_for_test()[1].is_empty(),
             "full reply must colour the previously-bare off-screen line"
         );
+    }
+
+    /// #1558: plain-text matching finds `oo` inside words, left to right
+    /// without overlapping, and nothing for an empty or longer needle.
+    #[test]
+    fn find_text_occurrences_matches_inside_words() {
+        let chars: Vec<char> = "foo food oooo".chars().collect();
+        let oo: Vec<char> = "oo".chars().collect();
+        assert_eq!(find_text_occurrences(&chars, &oo), vec![1, 5, 9, 11]);
+        assert_eq!(find_word_occurrences(&chars, &oo), Vec::<usize>::new());
+        assert!(find_text_occurrences(&chars, &[]).is_empty());
+        let long: Vec<char> = "foo food oooo!".chars().collect();
+        assert!(find_text_occurrences(&chars, &long).is_empty());
     }
 
     #[test]
