@@ -76,6 +76,17 @@ impl TestWatch {
         }
     }
 
+    /// When a scheduled rerun is due, if one is.
+    pub fn due_at(&self) -> Option<Instant> {
+        self.due_at
+    }
+
+    /// Put back a schedule read with [`Self::due_at`]: a caller whose own
+    /// saves should not schedule a rerun.
+    pub fn set_due_at(&mut self, due_at: Option<Instant>) {
+        self.due_at = due_at;
+    }
+
     /// The scope to rerun now, if one is due. While `busy` (a run of any
     /// kind in flight) it stays due and fires once the runner is free,
     /// rather than being dropped.
