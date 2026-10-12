@@ -189,7 +189,7 @@ impl Matcher for SearchMatcher {
 /// A pattern for what the matcher can't do itself, highlighting a row's
 /// matches and expanding `$1` in a replacement: the `regex` crate's, or
 /// fancy-regex's for a pattern that needs it (#1552), as [`compile_matcher`].
-enum Pattern {
+pub(crate) enum Pattern {
     Plain(regex::Regex),
     Fancy(fancy_regex::Regex),
 }
@@ -202,6 +202,24 @@ impl Pattern {
         }
     }
 
+    /// The regex `body` with the case and whole-word toggles, as the row
+    /// highlighter and the editor Find bar match it. A fancy-only pattern
+    /// takes whole-word by [`compile_matcher`]'s rule, `(?<!\w)` / `(?!\w)`,
+    /// so a match that starts or ends with punctuation (`-(?= )`) is shown
+    /// and replaced wherever the search counts it.
+    pub(crate) fn for_find(body: &str, opts: SearchOpts) -> Option<Self> {
+        let case = if opts.case_sensitive { "" } else { "(?i)" };
+        if !opts.whole_word {
+            return Self::new(&format!("{case}{body}"));
+        }
+        match regex::Regex::new(&format!(r"{case}\b(?:{body})\b")) {
+            Ok(re) => Some(Self::Plain(re)),
+            Err(_) => fancy_regex::Regex::new(&format!(r"{case}(?<!\w)(?:{body})(?!\w)"))
+                .ok()
+                .map(Self::Fancy),
+        }
+    }
+
     fn has_group(&self, name: &str) -> bool {
         match self {
             Self::Plain(re) => re.capture_names().flatten().any(|n| n == name),
@@ -210,7 +228,7 @@ impl Pattern {
     }
 
     /// Every match in `line`, as byte spans.
-    fn spans(&self, line: &str) -> Vec<(usize, usize)> {
+    pub(crate) fn spans(&self, line: &str) -> Vec<(usize, usize)> {
         match self {
             Self::Plain(re) => re.find_iter(line).map(|m| (m.start(), m.end())).collect(),
             Self::Fancy(re) => re
@@ -227,7 +245,13 @@ impl Pattern {
     /// substring `\b(\.rs)` no longer matched and `$1` came out literally);
     /// the substring alone only as a fallback. None when neither holds a
     /// match of exactly that span.
-    fn expand_at(&self, line: &str, start: usize, end: usize, replacement: &str) -> Option<String> {
+    pub(crate) fn expand_at(
+        &self,
+        line: &str,
+        start: usize,
+        end: usize,
+        replacement: &str,
+    ) -> Option<String> {
         let template = brace_refs(replacement, |name| self.has_group(name));
         let mut out = String::new();
         match self {
@@ -715,18 +739,7 @@ pub fn split_for_highlight(line: &str, needle: &str, opts: SearchOpts) -> Vec<(S
 }
 
 fn split_for_highlight_regex(line: &str, needle: &str, opts: SearchOpts) -> Vec<(String, bool)> {
-    let mut pattern = String::new();
-    if !opts.case_sensitive {
-        pattern.push_str("(?i)");
-    }
-    if opts.whole_word {
-        pattern.push_str("\\b(?:");
-        pattern.push_str(needle);
-        pattern.push_str(")\\b");
-    } else {
-        pattern.push_str(needle);
-    }
-    let Some(re) = Pattern::new(&pattern) else {
+    let Some(re) = Pattern::for_find(needle, opts) else {
         return vec![(line.to_string(), false)];
     };
     let mut out: Vec<(String, bool)> = Vec::new();
@@ -4005,6 +4018,28 @@ mod tests {
             &mut hits,
         );
         assert_eq!(hits[0].matches, 2);
+    }
+
+    /// #1552: with whole-word on, a fancy-only match that starts or ends
+    /// with punctuation is highlighted where the search counts it, by the
+    /// matcher's `(?<!\w)` / `(?!\w)` rule, not `\b`.
+    #[test]
+    fn whole_word_look_ahead_highlights_by_the_search_rule() {
+        let word = SearchOpts {
+            whole_word: true,
+            ..regex_opts()
+        };
+        let mut hits = Vec::new();
+        collect_matches_in_text(Path::new("a"), "- \n", "-(?= )", word, &mut hits);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            split_for_highlight("- ", "-(?= )", word),
+            [(String::from("-"), true), (String::from(" "), false)]
+        );
+        assert_eq!(
+            split_for_highlight("a- ", "-(?= )", word),
+            [(String::from("a- "), false)]
+        );
     }
 
     /// #1552: Replace in Files runs a backreference too, `$1` and all, and
