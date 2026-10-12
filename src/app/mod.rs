@@ -21930,9 +21930,6 @@ impl App {
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
     }
 
-    /// Paint the transient port-detection toast in the bottom-right corner and
-    /// record its clickable action-button rects. Click-only: it never captures
-    /// keystrokes, so it can't interfere with terminal typing.
     /// Zen Mode hides the status bar, so for a few seconds after entering
     /// it a box at the bottom says how to leave (#1585).
     fn render_zen_hint(&self, frame: &mut ratatui::Frame) {
@@ -21974,6 +21971,9 @@ impl App {
         );
     }
 
+    /// Paint the transient port-detection toast in the bottom-right corner and
+    /// record its clickable action-button rects. Click-only: it never captures
+    /// keystrokes, so it can't interfere with terminal typing.
     fn render_port_toast(&mut self, frame: &mut ratatui::Frame) {
         let Some(toast) = self.port_toast.as_ref() else {
             return;
