@@ -204,6 +204,8 @@ pub fn discover_tasks(root: &Path) -> Vec<Task> {
     out.extend(package_json_tasks(root));
     out.extend(cargo_tasks(root));
     out.extend(pyproject_tasks(root));
+    out.extend(go_tasks(root));
+    out.extend(cmake_tasks(root));
     dedup(out)
 }
 
@@ -517,6 +519,192 @@ fn cargo_tasks(root: &Path) -> Vec<Task> {
         vscode: None,
     })
     .collect()
+}
+
+/// A convention task: `command` under its own name, with a built-in
+/// problem matcher so its errors land in PROBLEMS.
+fn convention_task(command: String, source: &str, is_build: bool, matcher: Option<&str>) -> Task {
+    Task {
+        label: command.clone(),
+        command,
+        source: source.to_string(),
+        is_build,
+        is_default: false,
+        problem_matcher: matcher.map(serde_json::Value::from),
+        vscode: None,
+    }
+}
+
+/// Tasks for a Go module (#1361): build, test and vet every package, and
+/// `go run .` when the module root is a command. Errors go through the
+/// `$go` matcher.
+fn go_tasks(root: &Path) -> Vec<Task> {
+    if !root.join("go.mod").is_file() {
+        return Vec::new();
+    }
+    let mut out = vec![
+        convention_task("go build ./...".into(), "go.mod", true, Some("$go")),
+        convention_task("go test ./...".into(), "go.mod", false, Some("$go")),
+        convention_task("go vet ./...".into(), "go.mod", false, Some("$go")),
+    ];
+    if root_is_go_main(root) {
+        out.push(convention_task(
+            "go run .".into(),
+            "go.mod",
+            false,
+            Some("$go"),
+        ));
+    }
+    out
+}
+
+/// Whether the module root holds a `package main` (a test file aside).
+fn root_is_go_main(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|e| {
+        let name = e.file_name().to_string_lossy().into_owned();
+        name.ends_with(".go")
+            && !name.ends_with("_test.go")
+            && std::fs::read_to_string(e.path()).is_ok_and(|text| {
+                text.lines()
+                    .map(str::trim)
+                    .find(|l| l.starts_with("package "))
+                    .is_some_and(|l| l.split_whitespace().nth(1) == Some("main"))
+            })
+    })
+}
+
+/// Tasks for a CMake project (#1361): configure, build (the build task)
+/// and test. `CMakePresets.json` presets are used when it has them;
+/// otherwise the build folder is the one `compile_commands.json` already
+/// points into, else `build`. Before the folder is configured, the build
+/// task configures it first, so `Cmd+Shift+B` works on a fresh checkout.
+/// Compiler errors go through the `$gcc` matcher.
+fn cmake_tasks(root: &Path) -> Vec<Task> {
+    if !root.join("CMakeLists.txt").is_file() {
+        return Vec::new();
+    }
+    const SOURCE: &str = "CMakeLists.txt";
+    let word = |s: &str| {
+        if needs_quote(s) {
+            quote_word(s)
+        } else {
+            s.to_string()
+        }
+    };
+    if let Some(presets) = cmake_presets(root) {
+        let dir = word(&presets.binary_dir);
+        let mut out = vec![convention_task(
+            format!("cmake --preset {}", word(&presets.configure)),
+            SOURCE,
+            false,
+            None,
+        )];
+        let build = match &presets.build {
+            Some(b) => format!("cmake --build --preset {}", word(b)),
+            None => format!("cmake --build {dir}"),
+        };
+        out.push(convention_task(build, SOURCE, true, Some("$gcc")));
+        out.push(convention_task(
+            match &presets.test {
+                Some(t) => format!("ctest --preset {}", word(t)),
+                None => format!("ctest --test-dir {dir}"),
+            },
+            SOURCE,
+            false,
+            None,
+        ));
+        return out;
+    }
+    let dir = cmake_build_dir(root);
+    let shell_dir = word(&dir);
+    let configure = format!("cmake -S . -B {shell_dir}");
+    let build = format!("cmake --build {shell_dir}");
+    let build_line = if root.join(&dir).join("CMakeCache.txt").is_file() {
+        build
+    } else {
+        format!("{configure} && {build}")
+    };
+    vec![
+        convention_task(configure, SOURCE, false, None),
+        convention_task(build_line, SOURCE, true, Some("$gcc")),
+        convention_task(format!("ctest --test-dir {shell_dir}"), SOURCE, false, None),
+    ]
+}
+
+/// The build folder a CMake project already uses: the one the root's
+/// `compile_commands.json` link points into (how clangd is usually shown
+/// the build), else `build`.
+fn cmake_build_dir(root: &Path) -> String {
+    std::fs::read_link(root.join("compile_commands.json"))
+        .ok()
+        .and_then(|target| {
+            let target = if target.is_absolute() {
+                target.strip_prefix(root).ok()?.to_path_buf()
+            } else {
+                target
+            };
+            let dir = target
+                .parent()?
+                .to_str()?
+                .trim_start_matches("./")
+                .to_string();
+            (!dir.is_empty() && !dir.split('/').any(|c| c == "..")).then_some(dir)
+        })
+        .unwrap_or_else(|| String::from("build"))
+}
+
+/// What `CMakePresets.json` names: its first configure preset, that
+/// preset's build folder, and the first build and test presets made for
+/// it.
+struct CmakePresets {
+    configure: String,
+    binary_dir: String,
+    build: Option<String>,
+    test: Option<String>,
+}
+
+fn cmake_presets(root: &Path) -> Option<CmakePresets> {
+    let text = std::fs::read_to_string(root.join("CMakePresets.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let visible = |kind: &str| -> Vec<serde_json::Value> {
+        v.get(kind)
+            .and_then(|p| p.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter(|p| p.get("hidden").and_then(|h| h.as_bool()) != Some(true))
+                    .filter(|p| p.get("name").and_then(|n| n.as_str()).is_some())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let name = |p: &serde_json::Value| p["name"].as_str().unwrap_or_default().to_string();
+    let configure = visible("configurePresets").into_iter().next()?;
+    let configure_name = name(&configure);
+    let binary_dir = configure
+        .get("binaryDir")
+        .and_then(|b| b.as_str())
+        .map(|b| {
+            b.replace("${sourceDir}/", "")
+                .replace("${presetName}", &configure_name)
+        })
+        .filter(|b| !b.contains("${") && !b.is_empty())
+        .unwrap_or_else(|| String::from("build"));
+    let for_configure = |kind: &str| {
+        visible(kind)
+            .iter()
+            .find(|p| p.get("configurePreset").and_then(|c| c.as_str()) == Some(&configure_name))
+            .map(name)
+    };
+    Some(CmakePresets {
+        build: for_configure("buildPresets"),
+        test: for_configure("testPresets"),
+        configure: configure_name,
+        binary_dir,
+    })
 }
 
 fn pyproject_tasks(root: &Path) -> Vec<Task> {
@@ -927,6 +1115,173 @@ mod tests {
                 .any(|t| t.command == "cargo build" && t.is_build),
             "cargo build is the build task"
         );
+    }
+
+    fn task_commands(tasks: &[Task]) -> Vec<&str> {
+        tasks.iter().map(|t| t.command.as_str()).collect()
+    }
+
+    /// #1361: a Go module builds, tests and vets every package, runs a
+    /// root `package main`, and sends errors through `$go`.
+    #[test]
+    fn a_go_module_gets_build_test_vet_and_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("go.mod"),
+            "module example.com/hello\n\ngo 1.22\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("main.go"),
+            "// Command hello.\npackage main\n\nfunc main() {}\n",
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        assert_eq!(
+            task_commands(&tasks),
+            [
+                "go build ./...",
+                "go test ./...",
+                "go vet ./...",
+                "go run ."
+            ]
+        );
+        let build = default_build_task(&tasks).unwrap();
+        assert_eq!(build.command, "go build ./...");
+        assert!(
+            tasks
+                .iter()
+                .all(|t| t.problem_matcher == Some(serde_json::json!("$go")))
+        );
+        assert!(crate::problem_matchers::from_tasks_json(&serde_json::json!("$go")).is_some());
+    }
+
+    /// #1361, negative: a library module (no root `package main`; a test
+    /// file's package does not count) gets no `go run .`.
+    #[test]
+    fn a_go_library_has_no_run_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("go.mod"), "module example.com/lib\n").unwrap();
+        std::fs::write(tmp.path().join("lib.go"), "package lib\n").unwrap();
+        std::fs::write(tmp.path().join("main_test.go"), "package main\n").unwrap();
+        let tasks = discover_tasks(tmp.path());
+        assert_eq!(
+            task_commands(&tasks),
+            ["go build ./...", "go test ./...", "go vet ./..."]
+        );
+    }
+
+    /// #1361: a CMake project configures, builds and tests in `build`; on
+    /// a fresh checkout the build task configures first.
+    #[test]
+    fn a_cmake_project_builds_in_its_build_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.20)\nproject(hi C)\nadd_executable(hi main.c)\n",
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        assert_eq!(
+            task_commands(&tasks),
+            [
+                "cmake -S . -B build",
+                "cmake -S . -B build && cmake --build build",
+                "ctest --test-dir build"
+            ]
+        );
+        let build = default_build_task(&tasks).unwrap();
+        assert_eq!(build.problem_matcher, Some(serde_json::json!("$gcc")));
+        // Configured: the build task only builds.
+        std::fs::create_dir_all(tmp.path().join("build")).unwrap();
+        std::fs::write(tmp.path().join("build/CMakeCache.txt"), "").unwrap();
+        let tasks = discover_tasks(tmp.path());
+        assert_eq!(
+            default_build_task(&tasks).unwrap().command,
+            "cmake --build build"
+        );
+    }
+
+    /// #1361: the folder `compile_commands.json` already points into is
+    /// the build folder.
+    #[test]
+    fn a_cmake_project_keeps_the_build_folder_clangd_uses() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("CMakeLists.txt"), "project(hi)\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join("out/debug")).unwrap();
+        std::fs::write(tmp.path().join("out/debug/compile_commands.json"), "[]").unwrap();
+        std::fs::write(tmp.path().join("out/debug/CMakeCache.txt"), "").unwrap();
+        std::os::unix::fs::symlink(
+            "out/debug/compile_commands.json",
+            tmp.path().join("compile_commands.json"),
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        assert_eq!(
+            task_commands(&tasks),
+            [
+                "cmake -S . -B out/debug",
+                "cmake --build out/debug",
+                "ctest --test-dir out/debug"
+            ]
+        );
+    }
+
+    /// #1361: `CMakePresets.json` presets are used, the first visible
+    /// configure preset and the build and test presets made for it.
+    #[test]
+    fn cmake_presets_are_used_when_the_project_has_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("CMakeLists.txt"), "project(hi)\n").unwrap();
+        std::fs::write(
+            tmp.path().join("CMakePresets.json"),
+            r#"{"version": 3,
+              "configurePresets": [
+                {"name": "base", "hidden": true},
+                {"name": "dev", "inherits": "base", "binaryDir": "${sourceDir}/out/${presetName}"},
+                {"name": "release"}
+              ],
+              "buildPresets": [{"name": "rel-build", "configurePreset": "release"}, {"name": "dev-build", "configurePreset": "dev"}],
+              "testPresets": [{"name": "dev-test", "configurePreset": "dev"}]}"#,
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        assert_eq!(
+            task_commands(&tasks),
+            [
+                "cmake --preset dev",
+                "cmake --build --preset dev-build",
+                "ctest --preset dev-test"
+            ]
+        );
+        assert_eq!(
+            default_build_task(&tasks).unwrap().command,
+            "cmake --build --preset dev-build"
+        );
+        // A configure preset with no build or test preset of its own
+        // builds and tests its binaryDir.
+        std::fs::write(
+            tmp.path().join("CMakePresets.json"),
+            r#"{"version": 3, "configurePresets": [{"name": "dev", "binaryDir": "${sourceDir}/out/${presetName}"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            task_commands(&discover_tasks(tmp.path())),
+            [
+                "cmake --preset dev",
+                "cmake --build out/dev",
+                "ctest --test-dir out/dev"
+            ]
+        );
+    }
+
+    /// #1361, negative: neither source speaks without its file.
+    #[test]
+    fn no_go_or_cmake_tasks_without_their_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.go"), "package main\n").unwrap();
+        std::fs::write(tmp.path().join("main.c"), "int main(void){return 0;}\n").unwrap();
+        assert!(discover_tasks(tmp.path()).is_empty());
     }
 
     /// Everything that looks a task up does so by label, so de-duplication
