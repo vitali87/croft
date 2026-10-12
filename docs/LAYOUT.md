@@ -99,7 +99,7 @@ The collapse is also held off whenever something else on screen depends on the s
 
 * Tree-sitter highlighting, side-by-side splits, and bracket-match highlighting.
 * Inline previews for images / PDFs / spreadsheets. The rendered Markdown / notebook / document view is selectable: drag to select the text you can see, `Cmd`/`Ctrl`+`C` copies the rendered text rather than the source, `Esc` clears.
-* A minimap: a rasterized file preview in a right-edge strip; click or drag to jump, right-click to toggle or re-side it.
+* A minimap: a file preview in a right-edge strip beside the active editor group; click or drag to jump, right-click to toggle or re-side it. Terminals with inline images (Kitty, iTerm2, WezTerm, sixel) get a rasterized preview; everywhere else (tmux, Alacritty, GNOME Terminal, plain xterm) it is drawn in braille dots. It needs an editor at least 50 columns wide.
 * A breadcrumbs bar: the file path plus the enclosing symbol trail at the caret, click to jump.
 * Symbol tabs: `Cmd`+`K` `Shift`+`V` opens the function or class at the caret as its own tab. The tab shows only that symbol, edits land in the file, and it follows the symbol as the file changes.
 
