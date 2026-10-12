@@ -79435,3 +79435,141 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     assert!(!app.apply_build_scan(pane, Some(&cwd), "tsc --watch", "a.c:1:1: error: old\n"));
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
 }
+
+/// #1653: the issue's `nested.py` open with the caret on line 1. Lines:
+/// 0 `class Outer`, 1 `def method_one`, 2 `if`, 3 `for`, 4 `print`,
+/// 5 `def method_two`, 6 `return`.
+fn nested_fold_app(dir: &std::path::Path) -> App {
+    std::fs::write(
+        dir.join("nested.py"),
+        "class Outer:\n    def method_one(self):\n        if True:\n            for i in range(10):\n                print(i)\n    def method_two(self):\n        return 1\n",
+    )
+    .unwrap();
+    let mut app = App::new(dir.to_path_buf()).unwrap();
+    app.editor.open_pinned(&dir.join("nested.py")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app
+}
+
+/// #1653: the lines of the open buffer still in view.
+fn visible_lines(app: &App) -> Vec<usize> {
+    (0..app.editor.lines.len())
+        .filter(|&l| !app.editor.is_line_hidden(l))
+        .collect()
+}
+
+fn run_fold_command(app: &mut App, id: &str) {
+    let cmd = crate::widgets::command_palette::Command::from_id(id)
+        .unwrap_or_else(|| panic!("croft has no {id} command"));
+    app.run_command(cmd);
+}
+
+/// #1653: Fold Level 2 leaves the class and both methods in view with the
+/// bodies collapsed, the overview Fold All cannot give.
+#[test]
+fn fold_level_2_keeps_the_class_and_its_methods_in_view() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = nested_fold_app(tmp.path());
+    run_fold_command(&mut app, "fold_level_2");
+    assert_eq!(visible_lines(&app), vec![0, 1, 5]);
+}
+
+/// #1653: Fold Level 1 collapses the class, and what is inside it stays
+/// folded when the class is opened again.
+#[test]
+fn fold_level_1_collapses_the_class_and_everything_deeper() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = nested_fold_app(tmp.path());
+    run_fold_command(&mut app, "fold_level_1");
+    assert_eq!(visible_lines(&app), vec![0]);
+    app.editor.toggle_fold(0);
+    assert_eq!(visible_lines(&app), vec![0, 1, 5]);
+}
+
+/// #1653: Cmd+K Cmd+3 is Fold Level 3: the `if` and the `for` inside it
+/// collapse, both methods stay open.
+#[test]
+fn cmd_k_cmd_3_folds_level_3() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = nested_fold_app(tmp.path());
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('3'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(visible_lines(&app), vec![0, 1, 2, 5, 6]);
+}
+
+/// #1653: Fold Recursively on `method_one` collapses it and the `if`/`for`
+/// inside, so opening the method shows the `if` still folded; Unfold
+/// Recursively opens all of it.
+#[test]
+fn fold_recursively_collapses_the_block_and_everything_inside() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = nested_fold_app(tmp.path());
+    app.editor.cursor_row = 1;
+    run_fold_command(&mut app, "fold_recursively");
+    assert_eq!(visible_lines(&app), vec![0, 1, 5, 6]);
+    app.editor.toggle_fold(1);
+    assert_eq!(
+        visible_lines(&app),
+        vec![0, 1, 2, 5, 6],
+        "the if stays folded"
+    );
+    app.editor.toggle_fold(1);
+    run_fold_command(&mut app, "unfold_recursively");
+    assert_eq!(visible_lines(&app), (0..7).collect::<Vec<_>>());
+}
+
+/// #1653 negative: Unfold Recursively leaves a fold outside its block alone,
+/// and a fold level on a file with nothing to fold changes nothing.
+#[test]
+fn recursive_and_level_folds_stay_inside_their_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = nested_fold_app(tmp.path());
+    app.editor.toggle_fold(5);
+    app.editor.cursor_row = 1;
+    run_fold_command(&mut app, "fold_recursively");
+    run_fold_command(&mut app, "unfold_recursively");
+    assert_eq!(
+        visible_lines(&app),
+        vec![0, 1, 2, 3, 4, 5],
+        "method_two is still folded"
+    );
+
+    std::fs::write(tmp.path().join("flat.txt"), "one\ntwo\nthree\n").unwrap();
+    app.editor
+        .open_pinned(&tmp.path().join("flat.txt"))
+        .unwrap();
+    run_fold_command(&mut app, "fold_level_1");
+    assert_eq!(visible_lines(&app), vec![0, 1, 2]);
+}
+
+/// #1653: VS Code's fold level and recursive fold keybindings import.
+#[test]
+fn vscode_fold_level_keybindings_import() {
+    let mut report = crate::import_vscode::Report::default();
+    crate::import_vscode::convert_keybindings(
+        &serde_json::json!([
+            { "key": "ctrl+alt+2", "command": "editor.foldLevel2" },
+            { "key": "ctrl+alt+r", "command": "editor.foldRecursively" },
+            { "key": "ctrl+alt+u", "command": "editor.unfoldRecursively" }
+        ]),
+        &mut report,
+    );
+    assert!(
+        report.dropped_keybindings.is_empty(),
+        "{:?}",
+        report.dropped_keybindings
+    );
+    let commands: Vec<String> = serde_json::to_value(&report.keybindings)
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row[1].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        commands,
+        vec!["fold_level_2", "fold_recursively", "unfold_recursively"]
+    );
+}
