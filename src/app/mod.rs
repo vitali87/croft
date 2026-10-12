@@ -49027,7 +49027,11 @@ impl App {
             _ => (self.config_dir.join("config.json"), "user"),
         };
         let text = std::fs::read_to_string(&path).unwrap_or_default();
-        let new = match crate::settings_editor::remove_key(&text, key) {
+        let new = match crate::settings_editor::remove_key(
+            &text,
+            key,
+            crate::config_layers::current_platform(),
+        ) {
             Ok(Some(t)) => t,
             Ok(None) => {
                 self.status =
