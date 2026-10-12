@@ -55,9 +55,6 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color {
     Color::Rgb(r, g, b)
 }
 
-/// JSX-specific captures appended onto the shared TypeScript/TSX
-/// highlights query. The bundled query has none of these, so JSX
-/// tags and attribute names land in default foreground without it.
 /// What an HTML file embeds (#1649): `<style>` is CSS, and `<script>` is
 /// JavaScript unless its `type` names something else. Not the bundled
 /// query, which calls every script JavaScript and would colour a JSON-LD
@@ -87,6 +84,9 @@ const HTML_INJECTIONS_QUERY: &str = r#"
  (#set! injection.language "json"))
 "#;
 
+/// JSX-specific captures appended onto the shared TypeScript/TSX
+/// highlights query. The bundled query has none of these, so JSX
+/// tags and attribute names land in default foreground without it.
 const TSX_JSX_OVERLAY_QUERY: &str = r#"
 (jsx_opening_element name: (_) @tag)
 (jsx_closing_element name: (_) @tag)
