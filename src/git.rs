@@ -3130,12 +3130,16 @@ pub fn reset_to(root: &Path, hash: &str, mode: ResetMode) -> Result<String, Stri
     run_mutation(root, &["reset", "-q", mode.flag(), hash])
 }
 
-/// A snapshot of what a hard reset would throw away: HEAD, the status of
-/// every changed or untracked path, and each such file's size and mtime,
-/// so a save to an already-modified file changes it too. A warned
+/// A snapshot of what a hard reset would throw away: HEAD and the branch
+/// it is on (empty when detached), the index (each entry's blob, so
+/// staging another hunk of an already-staged file changes it), the status
+/// of every changed or untracked path, and each such file's size and
+/// mtime, so a save to an already-modified file changes it too. A warned
 /// Reset --hard (#1627) is confirmed only while this is unchanged.
 pub fn worktree_fingerprint(root: &Path) -> String {
     let head = run_git(root, &["rev-parse", "HEAD"]).unwrap_or_default();
+    let branch = run_git(root, &["symbolic-ref", "-q", "HEAD"]).unwrap_or_default();
+    let index = run_git(root, &["ls-files", "-s", "-z"]).unwrap_or_default();
     // Not `run_git`: its trim would eat the first entry's leading status
     // space (" M path"), and with it where that path starts.
     let status = Command::new("git")
@@ -3147,7 +3151,7 @@ pub fn worktree_fingerprint(root: &Path) -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
     let top = repo_toplevel(root).unwrap_or_else(|| root.to_path_buf());
-    let mut out = format!("{head}\n");
+    let mut out = format!("{head}\n{branch}\n{index}\n");
     for entry in status.split('\0').filter(|e| !e.is_empty()) {
         out.push_str(entry);
         let path = entry.get(3..).unwrap_or(entry);

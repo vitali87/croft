@@ -61014,14 +61014,16 @@ impl App {
                     Box::new(move |app: &mut App| app.run_scm_op("revert", r, &ok, "Revert"))
                 });
             }
+            // A big checkout or a slow `post-checkout` hook would freeze
+            // the click, so this and reset run on the git worker too.
             CommitAction::CheckoutDetached => {
-                let r = crate::git::checkout_detached(&root, hash);
-                self.run_scm_op(
-                    "switch --detach",
-                    r,
-                    &format!("Checked out {short} (detached)"),
-                    "Checkout",
-                );
+                let (hash, ok) = (hash.to_string(), format!("Checked out {short} (detached)"));
+                self.spawn_git_net("switch --detach", move || {
+                    let r = crate::git::checkout_detached(&root, &hash);
+                    Box::new(move |app: &mut App| {
+                        app.run_scm_op("switch --detach", r, &ok, "Checkout")
+                    })
+                });
             }
             CommitAction::CreateBranch => self.open_input_prompt(InputPrompt::new(
                 InputPurpose::CreateBranchFrom {
@@ -61056,8 +61058,11 @@ impl App {
                     return;
                 }
                 self.reset_hard_armed = None;
-                let r = crate::git::reset_to(&root, hash, mode);
-                self.run_scm_op("reset", r, &format!("Reset to {short}"), "Reset");
+                let (hash, ok) = (hash.to_string(), format!("Reset to {short}"));
+                self.spawn_git_net("reset", move || {
+                    let r = crate::git::reset_to(&root, &hash, mode);
+                    Box::new(move |app: &mut App| app.run_scm_op("reset", r, &ok, "Reset"))
+                });
             }
             CommitAction::CopyHash => {
                 self.status = if copy_to_clipboard(hash) {

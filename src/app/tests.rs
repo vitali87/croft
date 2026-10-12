@@ -80509,6 +80509,7 @@ fn checkout_detached_from_the_graph_moves_head_to_the_commit() {
     let mut app = commit_graph_app(p);
     right_click_commit(&mut app, "fix crash on empty input");
     pick_commit_menu(&mut app, None, "Checkout (Detached)");
+    wait_for_git_net(&mut app);
     assert_eq!(git_stdout(p, &["rev-parse", "HEAD"]), target);
     assert_eq!(git_stdout(p, &["branch", "--show-current"]), "");
 }
@@ -80569,6 +80570,7 @@ fn reset_soft_to_a_commit_keeps_the_changes_staged() {
         Some("Reset Current Branch to Here"),
         "Soft (keep changes staged)",
     );
+    wait_for_git_net(&mut app);
     assert_eq!(git_stdout(p, &["rev-parse", "main"]), target);
     assert_eq!(git_stdout(p, &["diff", "--cached", "--name-only"]), "b.txt");
 }
@@ -80589,6 +80591,7 @@ fn reset_hard_asks_first_and_changes_nothing_until_asked_again() {
         Some("Reset Current Branch to Here"),
         "Hard (discard changes)",
     );
+    wait_for_git_net(&mut app);
     assert_eq!(
         git_stdout(p, &["rev-parse", "HEAD"]),
         head,
@@ -80605,6 +80608,7 @@ fn reset_hard_asks_first_and_changes_nothing_until_asked_again() {
         Some("Reset Current Branch to Here"),
         "Hard (discard changes)",
     );
+    wait_for_git_net(&mut app);
     assert_eq!(git_stdout(p, &["rev-parse", "HEAD"]), target);
     assert_eq!(std::fs::read_to_string(p.join("app.txt")).unwrap(), "a\n");
 }
@@ -80626,6 +80630,7 @@ fn a_warned_hard_reset_warns_again_after_new_work() {
             Some("Reset Current Branch to Here"),
             "Hard (discard changes)",
         );
+        wait_for_git_net(app);
     };
     hard(&mut app);
     std::fs::write(p.join("app.txt"), "a\nfirst\nand much newer work\n").unwrap();
@@ -80644,6 +80649,82 @@ fn a_warned_hard_reset_warns_again_after_new_work() {
     assert_eq!(git_stdout(p, &["rev-parse", "HEAD"]), target);
 }
 
+/// #1627 negative: switching to another branch at the same commit after
+/// a hard reset's warning is warned about afresh, since the reset would
+/// now move a different branch.
+#[test]
+fn a_warned_hard_reset_warns_again_after_a_branch_switch() {
+    let tmp = commit_actions_repo();
+    let p = tmp.path();
+    let head = git_stdout(p, &["rev-parse", "HEAD"]);
+    std::fs::write(p.join("app.txt"), "a\nwork\n").unwrap();
+    assert!(git_succeeds(p, &["branch", "other"]));
+    let mut app = commit_graph_app(p);
+    let hard = |app: &mut App| {
+        right_click_commit(app, "init app");
+        pick_commit_menu(
+            app,
+            Some("Reset Current Branch to Here"),
+            "Hard (discard changes)",
+        );
+        wait_for_git_net(app);
+    };
+    hard(&mut app);
+    assert!(git_succeeds(p, &["switch", "-q", "other"]));
+    hard(&mut app);
+    assert_eq!(
+        git_stdout(p, &["rev-parse", "other"]),
+        head,
+        "the branch changed since the warning, so this ask only warns again"
+    );
+    assert!(app.status.contains("again"), "{}", app.status);
+    assert_eq!(git_stdout(p, &["rev-parse", "main"]), head);
+}
+
+/// #1627 negative: staging other content for a file whose status stays
+/// `MM` after a hard reset's warning is warned about afresh.
+#[test]
+fn a_warned_hard_reset_warns_again_after_new_staged_content() {
+    let tmp = commit_actions_repo();
+    let p = tmp.path();
+    let head = git_stdout(p, &["rev-parse", "HEAD"]);
+    std::fs::write(p.join("app.txt"), "a\nstaged\n").unwrap();
+    assert!(git_succeeds(p, &["add", "app.txt"]));
+    std::fs::write(p.join("app.txt"), "a\nstaged\nunstaged\n").unwrap();
+    let mut app = commit_graph_app(p);
+    let hard = |app: &mut App| {
+        right_click_commit(app, "init app");
+        pick_commit_menu(
+            app,
+            Some("Reset Current Branch to Here"),
+            "Hard (discard changes)",
+        );
+        wait_for_git_net(app);
+    };
+    hard(&mut app);
+    // Restage without touching the working file, so status and the
+    // file's size and mtime all stay as they were.
+    std::fs::write(p.join(".git/restaged"), "a\nrestaged\n").unwrap();
+    let blob = git_stdout(p, &["hash-object", "-w", ".git/restaged"]);
+    let status = git_stdout(p, &["status", "--porcelain"]);
+    assert!(git_succeeds(
+        p,
+        &[
+            "update-index",
+            "--cacheinfo",
+            &format!("100644,{blob},app.txt")
+        ]
+    ));
+    assert_eq!(git_stdout(p, &["status", "--porcelain"]), status);
+    hard(&mut app);
+    assert_eq!(
+        git_stdout(p, &["rev-parse", "HEAD"]),
+        head,
+        "the index changed since the warning, so this ask only warns again"
+    );
+    assert!(app.status.contains("again"), "{}", app.status);
+}
+
 /// #1627 negative: a warned hard reset is not carried over to a different
 /// commit or past another action; each needs its own second ask.
 #[test]
@@ -80658,12 +80739,14 @@ fn a_warned_hard_reset_does_not_carry_to_another_commit() {
         Some("Reset Current Branch to Here"),
         "Hard (discard changes)",
     );
+    wait_for_git_net(&mut app);
     right_click_commit(&mut app, "init");
     pick_commit_menu(
         &mut app,
         Some("Reset Current Branch to Here"),
         "Hard (discard changes)",
     );
+    wait_for_git_net(&mut app);
     assert_eq!(git_stdout(p, &["rev-parse", "HEAD"]), head);
     right_click_commit(&mut app, "init app");
     pick_commit_menu(
@@ -80671,6 +80754,7 @@ fn a_warned_hard_reset_does_not_carry_to_another_commit() {
         Some("Reset Current Branch to Here"),
         "Mixed (keep changes unstaged)",
     );
+    wait_for_git_net(&mut app);
     assert_ne!(
         git_stdout(p, &["rev-parse", "HEAD"]),
         head,
