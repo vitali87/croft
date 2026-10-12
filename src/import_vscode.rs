@@ -2023,8 +2023,12 @@ mod tests {
         assert_eq!(
             report.keybindings,
             vec![
-                (String::from("ctrl+alt+r"), String::from("revert_file")),
-                (String::from("ctrl+alt+s"), String::from("save_as")),
+                (
+                    String::from("ctrl+alt+r"),
+                    String::from("revert_file"),
+                    None
+                ),
+                (String::from("ctrl+alt+s"), String::from("save_as"), None),
             ]
         );
         assert!(
