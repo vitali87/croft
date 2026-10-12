@@ -10586,9 +10586,15 @@ impl Editor {
             return false;
         }
         self.push_undo(EditKind::ToggleComment);
-        let all_commented = non_blank
-            .iter()
-            .all(|&r| self.lines[r].trim_start().starts_with(token));
+        // Rows in JSX children take `{/* … */}`: there `//` is text (#1623).
+        let jsx: std::collections::HashSet<usize> = self.jsx_child_rows(&non_blank);
+        let all_commented = non_blank.iter().all(|&r| {
+            if jsx.contains(&r) {
+                is_jsx_comment(self.lines[r].trim())
+            } else {
+                self.lines[r].trim_start().starts_with(token)
+            }
+        });
         // Each changed row with the char column of its edit and the chars it
         // added (negative: removed), to carry the carets on it along.
         let mut edits: Vec<(usize, usize, isize)> = Vec::with_capacity(non_blank.len());
@@ -10596,6 +10602,17 @@ impl Editor {
             for &r in &non_blank {
                 let line = self.lines[r].clone();
                 let off = line.len() - line.trim_start().len();
+                if jsx.contains(&r) {
+                    let core = line[off..].trim_end();
+                    let inner = &core[JSX_COMMENT_OPEN.len()..core.len() - JSX_COMMENT_CLOSE.len()];
+                    let lead_space = usize::from(inner.starts_with(' '));
+                    let inner = &inner[lead_space..];
+                    let inner = inner.strip_suffix(' ').unwrap_or(inner);
+                    self.lines[r] = format!("{}{inner}", &line[..off]);
+                    let removed = JSX_COMMENT_OPEN.chars().count() + lead_space;
+                    edits.push((r, line[..off].chars().count(), -(removed as isize)));
+                    continue;
+                }
                 let mut rest = line[off..].to_string();
                 rest.drain(..token.len());
                 let mut removed = token.chars().count();
@@ -10625,6 +10642,16 @@ impl Editor {
                     continue;
                 };
                 for &r in &rows {
+                    if jsx.contains(&r) {
+                        let end = self.lines[r].trim_end().len();
+                        self.lines[r].truncate(end);
+                        self.lines[r].push_str(&format!(" {JSX_COMMENT_CLOSE}"));
+                        let open = format!("{JSX_COMMENT_OPEN} ");
+                        self.lines[r].insert_str(min_indent, &open);
+                        let at = self.lines[r][..min_indent].chars().count();
+                        edits.push((r, at, open.chars().count() as isize));
+                        continue;
+                    }
                     self.lines[r].insert_str(min_indent, &marker);
                     let at = self.lines[r][..min_indent].chars().count();
                     edits.push((r, at, marker.chars().count() as isize));
@@ -10648,7 +10675,7 @@ impl Editor {
     /// each on its own. Returns false for languages with no block comment
     /// (e.g. YAML).
     pub fn toggle_block_comment(&mut self) -> bool {
-        let Some((open, close)) = block_comment_tokens(self.lang) else {
+        let Some(tokens) = block_comment_tokens(self.lang) else {
             return false;
         };
         let last = self.lines.len().saturating_sub(1);
@@ -10685,9 +10712,28 @@ impl Editor {
             return false;
         }
         self.push_undo(EditKind::ToggleComment);
+        // A range starting in JSX children is wrapped `{/* … */}`, since a
+        // bare `/* */` there is text (#1623). Read before any edit.
+        let jsx_starts: Vec<(usize, usize)> = merged
+            .iter()
+            .map(|&(start, end, _)| {
+                let text = self.char_range_text(start, end);
+                let lead = text
+                    .chars()
+                    .take_while(|c| c.is_whitespace())
+                    .collect::<String>();
+                text_end(start, &lead)
+            })
+            .collect();
+        let jsx = self.jsx_children_at(&jsx_starts);
         // From the bottom up, so an edit never moves a range still to come.
         let mut placed: Vec<(bool, (usize, usize))> = Vec::with_capacity(merged.len());
-        for &(start, end, primary) in merged.iter().rev() {
+        for (i, &(start, end, primary)) in merged.iter().enumerate().rev() {
+            let (open, close) = if jsx[i] {
+                (JSX_COMMENT_OPEN, JSX_COMMENT_CLOSE)
+            } else {
+                tokens
+            };
             let text = self.char_range_text(start, end);
             let trimmed = text.trim();
             let caret = if trimmed.is_empty() {
@@ -10722,6 +10768,53 @@ impl Editor {
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
         true
+    }
+
+    /// The rows among `rows` whose first non-blank character sits in JSX
+    /// children (#1623).
+    fn jsx_child_rows(&self, rows: &[usize]) -> std::collections::HashSet<usize> {
+        let points: Vec<(usize, usize)> = rows
+            .iter()
+            .map(|&r| {
+                let line = &self.lines[r];
+                (r, line.chars().take_while(|c| c.is_whitespace()).count())
+            })
+            .collect();
+        // A line that is one `{/* … */}` is a commented JSX child even once
+        // commenting out a closing tag has left the markup unparseable, so
+        // a second Ctrl+/ still takes it off.
+        let js = matches!(self.lang, Some(LangKind::JavaScript) | Some(LangKind::Tsx));
+        rows.iter()
+            .zip(self.jsx_children_at(&points))
+            .filter_map(|(&r, jsx)| {
+                (jsx || js && is_jsx_comment(self.lines[r].trim())).then_some(r)
+            })
+            .collect()
+    }
+
+    /// Whether each of `points` (char positions) starts something in JSX
+    /// children, an element, a closing tag, text or a `{…}`, where a
+    /// comment must be written `{/* … */}` (#1623). Always false outside
+    /// the JSX-capable grammars, and on a line of plain code or attributes.
+    fn jsx_children_at(&self, points: &[(usize, usize)]) -> Vec<bool> {
+        let none = vec![false; points.len()];
+        if !matches!(self.lang, Some(LangKind::JavaScript) | Some(LangKind::Tsx)) {
+            return none;
+        }
+        let Some(lang) = self.lang.map(crate::highlight::language_for) else {
+            return none;
+        };
+        let mut parser = tree_sitter::Parser::new();
+        if parser.set_language(&lang).is_err() {
+            return none;
+        }
+        let Some(tree) = parser.parse(self.lines.join("\n"), None) else {
+            return none;
+        };
+        points
+            .iter()
+            .map(|&p| jsx_child_starts_at(tree.root_node(), self.char_pos_to_byte(p)))
+            .collect()
     }
 
     /// Put a bare caret at each pinned position, the one marked primary as
@@ -12782,6 +12875,47 @@ fn find_word_occurrences(chars: &[char], word: &[char]) -> Vec<usize> {
 /// The line-comment marker for a language (VS Code `lineComment`), or `None`
 /// for languages with no line comment, in which case Toggle Line Comment is a
 /// no-op.
+/// How a comment is written in JSX children (#1623), where `//` and a bare
+/// `/* */` are text that React renders.
+const JSX_COMMENT_OPEN: &str = "{/*";
+const JSX_COMMENT_CLOSE: &str = "*/}";
+
+/// Whether the trimmed line is one `{/* … */}` comment.
+fn is_jsx_comment(trimmed: &str) -> bool {
+    trimmed.len() >= JSX_COMMENT_OPEN.len() + JSX_COMMENT_CLOSE.len()
+        && trimmed.starts_with(JSX_COMMENT_OPEN)
+        && trimmed.ends_with(JSX_COMMENT_CLOSE)
+}
+
+/// Whether the text at `byte` is JSX children: inside a JSX element's text,
+/// or at the start of a child element, closing tag or `{…}` expression.
+/// A position in an opening tag's attributes, or in the code inside a
+/// `{…}`, is not.
+fn jsx_child_starts_at(root: tree_sitter::Node, byte: usize) -> bool {
+    let Some(mut node) = root.descendant_for_byte_range(byte, byte) else {
+        return false;
+    };
+    loop {
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        if matches!(parent.kind(), "jsx_element" | "jsx_fragment") {
+            match node.kind() {
+                "jsx_text" => return true,
+                "jsx_element"
+                | "jsx_self_closing_element"
+                | "jsx_expression"
+                | "jsx_closing_element" => return node.start_byte() == byte,
+                // The element's own opening tag: whether the element is
+                // a child is a question for the element's parent.
+                "jsx_opening_element" => {}
+                _ => return false,
+            }
+        }
+        node = parent;
+    }
+}
+
 fn line_comment_token(lang: Option<LangKind>) -> Option<&'static str> {
     match lang {
         Some(LangKind::Rust)
@@ -29111,6 +29245,113 @@ mod tests {
         e.lang = None;
         assert!(!e.toggle_line_comment());
         assert_eq!(e.lines, vec!["x = 1"]);
+    }
+
+    /// The issue's component (#1623).
+    const APP_TSX: &str = "export function App({ name }: { name: string }) {\n  return (\n    <div className=\"app\">\n      <h1>Hello {name}</h1>\n      <p>Welcome</p>\n    </div>\n  );\n}";
+
+    fn jsx_editor(lang: LangKind) -> Editor {
+        let mut e = editor_with(APP_TSX);
+        e.lang = Some(lang);
+        e
+    }
+
+    /// #1623: Ctrl+/ on a line in JSX children writes `{/* … */}`, which
+    /// React does not render, and a second Ctrl+/ takes it off again.
+    #[test]
+    fn toggle_line_comment_in_jsx_children_writes_a_jsx_comment() {
+        for lang in [LangKind::Tsx, LangKind::JavaScript] {
+            let mut e = jsx_editor(lang);
+            e.cursor_row = 4;
+            assert!(e.toggle_line_comment());
+            assert_eq!(e.lines[4], "      {/* <p>Welcome</p> */}", "{lang:?}");
+            assert!(e.toggle_line_comment());
+            assert_eq!(e.lines[4], "      <p>Welcome</p>", "{lang:?}");
+        }
+    }
+
+    /// #1623: the closing tag and a run of child lines comment the same way,
+    /// each line on its own, at the block's indent.
+    #[test]
+    fn toggle_line_comment_on_jsx_child_lines_and_closing_tags() {
+        let mut e = jsx_editor(LangKind::Tsx);
+        e.selection = Some(EditorSelection {
+            anchor: (3, 0),
+            head: (4, 3),
+        });
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[3], "      {/* <h1>Hello {name}</h1> */}");
+        assert_eq!(e.lines[4], "      {/* <p>Welcome</p> */}");
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[3], "      <h1>Hello {name}</h1>");
+        assert_eq!(e.lines[4], "      <p>Welcome</p>");
+        let mut e = jsx_editor(LangKind::Tsx);
+        e.cursor_row = 5;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[5], "    {/* </div> */}");
+    }
+
+    /// #1623: a commented-out closing tag leaves the markup unparseable;
+    /// Ctrl+/ on it, and on the child above it, still takes the JSX
+    /// comments off instead of adding `//`.
+    #[test]
+    fn a_commented_closing_tag_toggles_back() {
+        let mut e = jsx_editor(LangKind::Tsx);
+        e.cursor_row = 4;
+        assert!(e.toggle_line_comment());
+        e.cursor_row = 5;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[5], "    {/* </div> */}");
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[5], "    </div>");
+        e.cursor_row = 5;
+        assert!(e.toggle_line_comment());
+        e.cursor_row = 4;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[4], "      <p>Welcome</p>");
+    }
+
+    /// #1623: Toggle Block Comment in JSX children wraps in braces too.
+    #[test]
+    fn toggle_block_comment_in_jsx_children_wraps_in_braces() {
+        let mut e = jsx_editor(LangKind::Tsx);
+        e.cursor_row = 4;
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines[4], "      {/* <p>Welcome</p> */}");
+        e.cursor_row = 4;
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines[4], "      <p>Welcome</p>");
+    }
+
+    /// Negative (#1623): code around the JSX, the root element's line, an
+    /// attribute line and a plain `.ts` file keep `//`.
+    #[test]
+    fn toggle_line_comment_outside_jsx_children_keeps_slashes() {
+        let mut e = jsx_editor(LangKind::Tsx);
+        e.cursor_row = 1;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[1], "  // return (");
+        let mut e = jsx_editor(LangKind::Tsx);
+        e.cursor_row = 2;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[2], "    // <div className=\"app\">");
+        let mut e = editor_with("const el = (\n  <input\n    disabled\n  />\n);");
+        e.lang = Some(LangKind::Tsx);
+        e.cursor_row = 2;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[2], "    // disabled");
+        let mut e = editor_with("const x = 1;\nconst y = 2;");
+        e.lang = Some(LangKind::TypeScript);
+        e.cursor_row = 0;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[0], "// const x = 1;");
+        let mut e = jsx_editor(LangKind::Tsx);
+        e.selection = Some(EditorSelection {
+            anchor: (1, 2),
+            head: (1, 8),
+        });
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines[1], "  /* return */ (");
     }
 
     // ---- Toggle Block Comment (Shift+Alt+A) ----
