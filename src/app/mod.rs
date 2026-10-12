@@ -41940,7 +41940,12 @@ impl App {
             if idx == self.editor.active_index() {
                 active_tab = tabs.len();
             }
-            let unsaved_text = if ed.dirty {
+            // A merge editor's buffer is its Result pane, not an edit of the
+            // file (#1588): kept as unsaved text it came back as a plain tab
+            // whose Ctrl+S wrote the Result over the user's own resolution.
+            // The tab reopens on the file as it is on disk instead.
+            let dirty = ed.dirty && ed.merge.is_none();
+            let unsaved_text = if dirty {
                 Some(ed.lines.join("\n"))
             } else {
                 None
@@ -41951,7 +41956,7 @@ impl App {
                 cursor_col: ed.cursor_col,
                 scroll: ed.scroll,
                 scroll_col: ed.scroll_col,
-                dirty: ed.dirty,
+                dirty,
                 unsaved_text,
             });
         }
@@ -41961,7 +41966,7 @@ impl App {
         // (the same file open in two splits) keeps the dirty copy.
         for group in self.editor_layout.inactive_groups() {
             for ed in &group.editors {
-                if ed.has_non_text_view() || !ed.dirty {
+                if ed.has_non_text_view() || !ed.dirty || ed.merge.is_some() {
                     continue;
                 }
                 let unsaved = Some(ed.lines.join("\n"));
