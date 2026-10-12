@@ -1,0 +1,1 @@
+fix: In HTML files, `<script>` bodies are now highlighted as JavaScript and `<style>` bodies as CSS, as the same code is in a `.js` or `.css` file. A JSON `<script type>` (JSON-LD, import maps) is highlighted as JSON, and other script types (templates) are left as text.
