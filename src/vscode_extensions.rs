@@ -40,13 +40,13 @@ pub const TABLE: &[Mapping] = &[
         vscode: "ms-python.python",
         croft: "lsp-python",
         status: Status::Builtin,
-        note: "Python language support ships built in (pyright)",
+        note: "Python language support ships built in (ty, basedpyright and ruff)",
     },
     Mapping {
         vscode: "ms-python.vscode-pylance",
         croft: "lsp-python",
         status: Status::Builtin,
-        note: "pyright is the language server croft bundles",
+        note: "croft bundles ty, with basedpyright as the fallback language server",
     },
     Mapping {
         vscode: "ms-python.debugpy",
@@ -58,19 +58,19 @@ pub const TABLE: &[Mapping] = &[
         vscode: "ms-python.black-formatter",
         croft: "lsp-python",
         status: Status::Builtin,
-        note: "formatting runs through the Python language server (format_on_save)",
+        note: "ruff formats Python through the language server (format_on_save)",
     },
     Mapping {
         vscode: "ms-python.isort",
         croft: "lsp-python",
         status: Status::Builtin,
-        note: "import sorting runs through the Python language server's code actions",
+        note: "ruff sorts imports through the language server's code actions",
     },
     Mapping {
         vscode: "ms-toolsai.jupyter",
         croft: "notebook view",
         status: Status::Builtin,
-        note: "notebooks render in place; running cells is tracked in #355",
+        note: "notebooks render in place and their cells run (Notebook: Run All Cells)",
     },
     Mapping {
         vscode: "rust-lang.rust-analyzer",
@@ -332,9 +332,9 @@ pub const TABLE: &[Mapping] = &[
     },
     Mapping {
         vscode: "ms-vscode-remote.remote-containers",
-        croft: "",
-        status: Status::None,
-        note: "no dev-container support",
+        croft: "croft devcontainer",
+        status: Status::Builtin,
+        note: "croft devcontainer builds the .devcontainer image and opens croft inside it",
     },
     Mapping {
         vscode: "ms-vscode-remote.remote-wsl",
@@ -344,9 +344,9 @@ pub const TABLE: &[Mapping] = &[
     },
     Mapping {
         vscode: "ms-vsliveshare.vsliveshare",
-        croft: "croft pair",
+        croft: "croft attach",
         status: Status::Builtin,
-        note: "croft pair shares a live session",
+        note: "croft attach (or croft <host> over SSH) shares one live session with each person's caret",
     },
     Mapping {
         vscode: "eamodio.gitlens",
@@ -362,21 +362,21 @@ pub const TABLE: &[Mapping] = &[
     },
     Mapping {
         vscode: "mhutchie.git-graph",
-        croft: "",
-        status: Status::None,
-        note: "no commit graph; the commit scrubber is tracked in #371",
+        croft: "commit graph",
+        status: Status::Builtin,
+        note: "the Source Control view's COMMITS graph ships built in",
     },
     Mapping {
         vscode: "github.vscode-pull-request-github",
-        croft: "",
-        status: Status::None,
-        note: "PR review from the editor is tracked in #365 and #366",
+        croft: "croft pr",
+        status: Status::Builtin,
+        note: "croft pr <n> or Source Control: Review Pull Request reviews a pull request in the editor",
     },
     Mapping {
         vscode: "github.copilot",
         croft: "navigator",
         status: Status::Builtin,
-        note: "the Navigator (Cmd+I) covers code assistance; agent-aware panes are tracked in #344",
+        note: "the Navigator (Cmd+I) covers code assistance",
     },
     Mapping {
         vscode: "github.copilot-chat",
@@ -388,19 +388,19 @@ pub const TABLE: &[Mapping] = &[
         vscode: "continue.continue",
         croft: "navigator",
         status: Status::Builtin,
-        note: "the Navigator (Cmd+I) covers it; agent-aware panes are tracked in #344",
+        note: "the Navigator (Cmd+I) covers it",
     },
     Mapping {
         vscode: "saoudrizwan.claude-dev",
         croft: "navigator",
         status: Status::Builtin,
-        note: "run Claude Code in a terminal pane; agent-aware panes are tracked in #344",
+        note: "run Claude Code in a terminal pane",
     },
     Mapping {
         vscode: "anthropic.claude-code",
         croft: "navigator",
         status: Status::Builtin,
-        note: "run Claude Code in a terminal pane; agent-aware panes are tracked in #344",
+        note: "run Claude Code in a terminal pane",
     },
     Mapping {
         vscode: "tabnine.tabnine-vscode",
@@ -454,7 +454,7 @@ pub const TABLE: &[Mapping] = &[
         vscode: "formulahendry.code-runner",
         croft: "tasks",
         status: Status::Builtin,
-        note: "run through tasks.json or the terminal; runnable Markdown fences are tracked in #353",
+        note: "run through tasks.json or the terminal; a Markdown code block runs with Cmd+Enter",
     },
     Mapping {
         vscode: "vscode.emmet",
@@ -506,27 +506,27 @@ pub const TABLE: &[Mapping] = &[
     },
     Mapping {
         vscode: "naumovs.color-highlight",
-        croft: "",
-        status: Status::None,
-        note: "no colour-swatch decorations",
+        croft: "colour swatches",
+        status: Status::Builtin,
+        note: "colour literals are tinted in place, in any file",
     },
     Mapping {
         vscode: "ritwickdey.liveserver",
         croft: "",
         status: Status::None,
-        note: "no live server; croft web is tracked in #378",
+        note: "no live server",
     },
     Mapping {
         vscode: "ms-vscode.live-server",
         croft: "",
         status: Status::None,
-        note: "no live server; croft web is tracked in #378",
+        note: "no live server",
     },
     Mapping {
         vscode: "humao.rest-client",
-        croft: "",
-        status: Status::None,
-        note: ".http files are tracked in #370",
+        croft: "http files",
+        status: Status::Builtin,
+        note: ".http files: HTTP: Send Request Under Caret, or Copy Request as curl",
     },
     Mapping {
         vscode: "yzhang.markdown-all-in-one",
@@ -815,6 +815,53 @@ mod tests {
                 m.vscode,
                 m.croft
             );
+        }
+    }
+
+    /// #1595: the features this build ships are built in, named by what
+    /// covers them, and the gaps that remain stay gaps.
+    #[test]
+    fn rows_for_shipped_features_are_built_in() {
+        for (id, croft) in [
+            ("mhutchie.git-graph", "commit graph"),
+            ("github.vscode-pull-request-github", "croft pr"),
+            ("humao.rest-client", "http files"),
+            ("ms-vscode-remote.remote-containers", "croft devcontainer"),
+            ("naumovs.color-highlight", "colour swatches"),
+            ("ms-vsliveshare.vsliveshare", "croft attach"),
+        ] {
+            let m = lookup(id).unwrap();
+            assert_eq!((m.status, m.croft), (Status::Builtin, croft), "{id}");
+        }
+        for id in ["ms-python.python", "ms-python.vscode-pylance"] {
+            let note = lookup(id).unwrap().note;
+            assert!(
+                note.contains("ty") && !note.contains("(pyright)"),
+                "{id}: {note}"
+            );
+        }
+        // Negative: what croft still lacks is still reported as missing.
+        for id in [
+            "ritwickdey.liveserver",
+            "ms-vscode.live-server",
+            "tabnine.tabnine-vscode",
+            "streetsidesoftware.code-spell-checker",
+        ] {
+            assert_eq!(lookup(id).map(|m| m.status), Some(Status::None), "{id}");
+        }
+    }
+
+    /// #1595: a note shown to users never points at a tracker issue, which
+    /// goes stale the day it closes.
+    #[test]
+    fn no_note_cites_an_issue_number() {
+        for m in TABLE {
+            let cites = m
+                .note
+                .split('#')
+                .skip(1)
+                .any(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
+            assert!(!cites, "{}: {}", m.vscode, m.note);
         }
     }
 

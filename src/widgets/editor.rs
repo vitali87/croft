@@ -2975,8 +2975,8 @@ pub struct Editor {
     /// ranges are not carried through edits the way spans are (#850), so an
     /// edit leaves them stale until the next pass over the edited text lands.
     protected_current: bool,
-    /// Inline color-literal decorations (the "no colour-swatch decorations"
-    /// gap in `vscode_extensions.rs`, matching `naumovs.color-highlight`):
+    /// Inline color-literal decorations (`naumovs.color-highlight`'s row in
+    /// `vscode_extensions.rs`):
     /// per line, the `(start char col, end char col, background, foreground)`
     /// of every recognized `#hex` / `rgb()` / `hsl()` color literal, painted
     /// as a background tint over the literal's own text. Language-agnostic
