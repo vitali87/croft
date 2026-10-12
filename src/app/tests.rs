@@ -80446,6 +80446,7 @@ fn cherry_pick_from_the_graph_adds_the_commit_to_head() {
     let mut app = commit_graph_app(p);
     right_click_commit(&mut app, "fix crash on empty input");
     pick_commit_menu(&mut app, None, "Cherry-Pick");
+    wait_for_git_net(&mut app);
     assert_eq!(
         git_stdout(p, &["log", "-1", "--format=%s"]),
         "fix crash on empty input"
@@ -80470,6 +80471,7 @@ fn a_conflicting_cherry_pick_from_the_graph_stops_for_continue_or_abort() {
     let mut app = commit_graph_app(p);
     right_click_commit(&mut app, "feat");
     pick_commit_menu(&mut app, None, "Cherry-Pick");
+    wait_for_git_net(&mut app);
     assert_eq!(crate::git::repo_operation(p), Some(RepoOp::CherryPick));
     assert!(p.join(".git/CHERRY_PICK_HEAD").exists());
     app.run_command(crate::widgets::command_palette::Command::GitAbortOperation);
@@ -80486,6 +80488,7 @@ fn revert_from_the_graph_commits_git_s_revert_message() {
     let mut app = commit_graph_app(p);
     right_click_commit(&mut app, "update readme");
     pick_commit_menu(&mut app, None, "Revert");
+    wait_for_git_net(&mut app);
     assert_eq!(
         git_stdout(p, &["log", "-1", "--format=%s"]),
         "Revert \"update readme\""
@@ -80604,6 +80607,41 @@ fn reset_hard_asks_first_and_changes_nothing_until_asked_again() {
     );
     assert_eq!(git_stdout(p, &["rev-parse", "HEAD"]), target);
     assert_eq!(std::fs::read_to_string(p.join("app.txt")).unwrap(), "a\n");
+}
+
+/// #1627 negative: work made after a hard reset's warning is warned about
+/// afresh; the old warning does not confirm discarding it.
+#[test]
+fn a_warned_hard_reset_warns_again_after_new_work() {
+    let tmp = commit_actions_repo();
+    let p = tmp.path();
+    let head = git_stdout(p, &["rev-parse", "HEAD"]);
+    let target = git_stdout(p, &["rev-parse", "main~1"]);
+    std::fs::write(p.join("app.txt"), "a\nfirst\n").unwrap();
+    let mut app = commit_graph_app(p);
+    let hard = |app: &mut App| {
+        right_click_commit(app, "init app");
+        pick_commit_menu(
+            app,
+            Some("Reset Current Branch to Here"),
+            "Hard (discard changes)",
+        );
+    };
+    hard(&mut app);
+    std::fs::write(p.join("app.txt"), "a\nfirst\nand much newer work\n").unwrap();
+    hard(&mut app);
+    assert_eq!(
+        git_stdout(p, &["rev-parse", "HEAD"]),
+        head,
+        "the tree changed since the warning, so this ask only warns again"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("app.txt")).unwrap(),
+        "a\nfirst\nand much newer work\n"
+    );
+    assert!(app.status.contains("again"), "{}", app.status);
+    hard(&mut app);
+    assert_eq!(git_stdout(p, &["rev-parse", "HEAD"]), target);
 }
 
 /// #1627 negative: a warned hard reset is not carried over to a different

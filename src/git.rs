@@ -3130,6 +3130,40 @@ pub fn reset_to(root: &Path, hash: &str, mode: ResetMode) -> Result<String, Stri
     run_mutation(root, &["reset", "-q", mode.flag(), hash])
 }
 
+/// A snapshot of what a hard reset would throw away: HEAD, the status of
+/// every changed or untracked path, and each such file's size and mtime,
+/// so a save to an already-modified file changes it too. A warned
+/// Reset --hard (#1627) is confirmed only while this is unchanged.
+pub fn worktree_fingerprint(root: &Path) -> String {
+    let head = run_git(root, &["rev-parse", "HEAD"]).unwrap_or_default();
+    // Not `run_git`: its trim would eat the first entry's leading status
+    // space (" M path"), and with it where that path starts.
+    let status = Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let top = repo_toplevel(root).unwrap_or_else(|| root.to_path_buf());
+    let mut out = format!("{head}\n");
+    for entry in status.split('\0').filter(|e| !e.is_empty()) {
+        out.push_str(entry);
+        let path = entry.get(3..).unwrap_or(entry);
+        if let Ok(meta) = std::fs::metadata(top.join(path)) {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            out.push_str(&format!(" {} {mtime}", meta.len()));
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// The full message of `hash` (`git log -1 --format=%B`), trimmed.
 pub fn commit_message(root: &Path, hash: &str) -> Result<String, String> {
     run_git(root, &["log", "-1", "--format=%B", hash])

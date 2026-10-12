@@ -5002,9 +5002,12 @@ pub struct App {
     /// The HEAD a warned Undo Last Commit (#1350) is armed for: a commit
     /// already on its upstream is undone on the second ask at that HEAD.
     undo_pushed_commit_armed: Option<String>,
-    /// The commit a warned Reset Current Branch to Here > Hard (#1627) is
-    /// armed for: it runs on the second ask for that same commit.
-    reset_hard_armed: Option<String>,
+    /// What a warned Reset Current Branch to Here > Hard (#1627) is armed
+    /// for: the repo root, the commit, and the working tree's
+    /// [`crate::git::worktree_fingerprint`] when it warned. It runs on the
+    /// second ask only while all three still match, so work made since the
+    /// warning is warned about afresh.
+    reset_hard_armed: Option<(PathBuf, String, String)>,
     /// True while the "Discard All Changes" confirmation modal is up.
     pub pending_discard_all: bool,
     /// The Replace All confirmation (#123): `(occurrences, files, dirty
@@ -60993,18 +60996,23 @@ impl App {
             self.reset_hard_armed = None;
         }
         match action {
+            // Both commit, so signing and the commit hooks run: on the git
+            // worker, like a plain commit (#1153), not in the click.
             CommitAction::CherryPick => {
-                let r = crate::git::cherry_pick(&root, hash);
-                self.run_scm_op(
-                    "cherry-pick",
-                    r,
-                    &format!("Cherry-picked {short}"),
-                    "Cherry-pick",
-                );
+                let (hash, ok) = (hash.to_string(), format!("Cherry-picked {short}"));
+                self.spawn_git_net("cherry-pick", move || {
+                    let r = crate::git::cherry_pick(&root, &hash);
+                    Box::new(move |app: &mut App| {
+                        app.run_scm_op("cherry-pick", r, &ok, "Cherry-pick")
+                    })
+                });
             }
             CommitAction::Revert => {
-                let r = crate::git::revert_commit(&root, hash);
-                self.run_scm_op("revert", r, &format!("Reverted {short}"), "Revert");
+                let (hash, ok) = (hash.to_string(), format!("Reverted {short}"));
+                self.spawn_git_net("revert", move || {
+                    let r = crate::git::revert_commit(&root, &hash);
+                    Box::new(move |app: &mut App| app.run_scm_op("revert", r, &ok, "Revert"))
+                });
             }
             CommitAction::CheckoutDetached => {
                 let r = crate::git::checkout_detached(&root, hash);
@@ -61030,8 +61038,15 @@ impl App {
                 "Tag name (e.g. v1.0.0)",
             )),
             CommitAction::Reset(mode) => {
-                if mode == ResetMode::Hard && self.reset_hard_armed.as_deref() != Some(hash) {
-                    self.reset_hard_armed = Some(hash.to_string());
+                let armed = (mode == ResetMode::Hard).then(|| {
+                    (
+                        root.clone(),
+                        hash.to_string(),
+                        crate::git::worktree_fingerprint(&root),
+                    )
+                });
+                if armed.is_some() && self.reset_hard_armed != armed {
+                    self.reset_hard_armed = armed;
                     let warning = format!(
                         "Reset --hard to {short} discards every uncommitted change. Choose Hard again to reset anyway"
                     );
