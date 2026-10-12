@@ -2688,9 +2688,10 @@ pub struct Editor {
     /// The `edit_seq` and caret places after the last multi-cursor
     /// keystroke that inserted pairs (#1597): while nothing has edited or
     /// moved since, a multi-cursor Backspace inside an empty pair takes both
-    /// sides, at every caret. A pre-existing `()` keeps its closer, as with
-    /// one caret (#122 review).
-    multi_auto_pair: Option<(u64, Vec<(usize, usize)>)>,
+    /// sides, at every caret that inserted one (the last list). A
+    /// pre-existing `()` keeps its closer, as with one caret (#122 review),
+    /// even when another caret of the same keystroke paired.
+    multi_auto_pair: Option<(u64, Vec<(usize, usize)>, Vec<(usize, usize)>)>,
     /// Merge-conflict blocks in the buffer, lazily recomputed whenever
     /// `edit_seq` moves (same pattern as the git-gutter marks).
     conflicts: Vec<crate::merge::ConflictBlock>,
@@ -8151,10 +8152,32 @@ impl Editor {
     fn multi_apply(&mut self, edit: CaretEdit) {
         // A Backspace right after a keystroke that paired at every caret
         // takes both sides of each empty pair, as one caret's does (#1597).
-        let pairs_armed = self.auto_close_pairs
-            && edit == CaretEdit::Backspace
-            && self.multi_auto_pair.take() == Some((self.edit_seq, self.caret_places()));
-        let mut paired = false;
+        let armed: Vec<(usize, usize)> = match self.multi_auto_pair.take() {
+            Some((seq, places, paired))
+                if self.auto_close_pairs
+                    && edit == CaretEdit::Backspace
+                    && seq == self.edit_seq
+                    && places == self.caret_places() =>
+            {
+                paired
+            }
+            _ => Vec::new(),
+        };
+        // A closer or quote stepped over at every caret edits nothing, so it
+        // records no undo step, as one caret's type-over does.
+        if let CaretEdit::Insert(c) = edit
+            && self.auto_close_pairs
+            && self.types_over_at_every_caret(c)
+        {
+            self.selection = None;
+            self.cursor_col += 1;
+            for s in &mut self.carets {
+                s.head.1 += 1;
+                s.anchor = s.head;
+            }
+            self.ensure_cursor_col_visible();
+            return;
+        }
         self.pin_on_edit();
         self.push_undo(EditKind::MultiEdit);
 
@@ -8179,7 +8202,7 @@ impl Editor {
         // A selection a surround kept (#1597) has its anchor placed the same
         // way: it sits after the later edits too.
         type Place = (usize, usize);
-        let mut placed: Vec<(bool, Place, Option<Place>)> = Vec::new();
+        let mut placed: Vec<(bool, Place, Option<Place>, bool)> = Vec::new();
         for (is_primary, sel) in items {
             if sel.has_area() {
                 self.selection = Some(sel);
@@ -8189,7 +8212,7 @@ impl Editor {
             let last = self.lines.len().saturating_sub(1);
             self.cursor_row = sel.head.0.min(last);
             self.cursor_col = sel.head.1.min(self.line_char_len(self.cursor_row));
-            paired |= self.apply_caret_edit_raw(edit, pairs_armed);
+            let paired = self.apply_caret_edit_raw(edit, armed.contains(&sel.head));
             let place = |this: &Self, (row, col): (usize, usize)| {
                 (
                     this.lines.len().saturating_sub(1) - row,
@@ -8204,6 +8227,7 @@ impl Editor {
                 is_primary,
                 place(self, (self.cursor_row, self.cursor_col)),
                 anchor,
+                paired,
             ));
         }
 
@@ -8216,8 +8240,12 @@ impl Editor {
         let mut new_primary = EditorSelection::new(self.cursor_row, self.cursor_col);
         let mut primary_kept = false;
         let mut new_secondary: Vec<EditorSelection> = Vec::new();
-        for (is_primary, head, anchor) in placed {
+        let mut paired_places: Vec<(usize, usize)> = Vec::new();
+        for (is_primary, head, anchor, paired) in placed {
             let head = resolve(self, head);
+            if paired {
+                paired_places.push(head);
+            }
             let sel = EditorSelection {
                 anchor: anchor.map_or(head, |a| resolve(self, a)),
                 head,
@@ -8242,10 +8270,25 @@ impl Editor {
         new_secondary.dedup();
         new_secondary.retain(|s| s.head != primary);
         self.carets = new_secondary;
-        if paired {
-            self.multi_auto_pair = Some((self.edit_seq, self.caret_places()));
-        }
         self.recompute_highlights();
+        if !paired_places.is_empty() {
+            self.multi_auto_pair = Some((self.edit_seq, self.caret_places(), paired_places));
+        }
+    }
+
+    /// True when `c` typed at every caret only steps over the same closer
+    /// or quote: no caret has a selection and each sits right before `c`.
+    fn types_over_at_every_caret(&self, c: char) -> bool {
+        if !(is_pair_closer(c) || is_pair_quote(c)) {
+            return false;
+        }
+        let primary_sel = self.selection.is_some_and(|s| s.has_area());
+        !primary_sel
+            && self.carets.iter().all(|s| !s.has_area())
+            && self
+                .caret_places()
+                .into_iter()
+                .all(|(row, col)| self.lines.get(row).and_then(|l| l.chars().nth(col)) == Some(c))
     }
 
     /// Every caret's place, the primary first, the extra carets in order.
@@ -23439,6 +23482,34 @@ mod tests {
         e.carets = vec![EditorSelection::new(1, 2)];
         e.multi_backspace();
         assert_eq!(e.lines, vec!["f)", "g)"]);
+    }
+
+    /// Negative (#1597): a quote that pairs at one caret but steps over a
+    /// quote already in the file at another arms only the caret that
+    /// paired; the next Backspace keeps the other's pre-existing quote.
+    #[test]
+    fn backspace_after_mixed_pairing_keeps_the_pair_already_there() {
+        let mut e = editor_with("\n\"\"");
+        e.cursor_col = 0;
+        e.carets = vec![EditorSelection::new(1, 0)];
+        e.multi_insert_char('"');
+        assert_eq!(e.lines, vec!["\"\"", "\"\""]);
+        e.multi_backspace();
+        assert_eq!(e.lines, vec!["", "\""]);
+    }
+
+    /// #1597: stepping over the closer at every caret records no undo step,
+    /// so one Undo reverts the edit before it.
+    #[test]
+    fn type_over_at_every_caret_records_no_undo_step() {
+        let mut e = editor_with("print(x)\nprint(y)");
+        e.cursor_col = 7;
+        e.carets = vec![EditorSelection::new(1, 7)];
+        e.multi_insert_char('z');
+        e.multi_insert_char(')');
+        assert_eq!(e.lines, vec!["print(xz)", "print(yz)"]);
+        assert!(e.undo());
+        assert_eq!(e.lines, vec!["print(x)", "print(y)"]);
     }
 
     /// Negative (#1597): carets moved after the pairing disarm the pair
