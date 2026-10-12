@@ -11167,6 +11167,17 @@ impl Editor {
             .map(|s| {
                 if s.has_area() {
                     Some(s.normalised())
+                } else if matches!(
+                    kind,
+                    CaseTransform::Snake
+                        | CaseTransform::Camel
+                        | CaseTransform::Pascal
+                        | CaseTransform::Kebab
+                ) {
+                    // Naming styles take the whole identifier run, hyphens
+                    // included, so `user-name` converts as one identifier.
+                    self.identifier_run_at(s.head.0, s.head.1)
+                        .map(|(a, b)| ((s.head.0, a), (s.head.0, b)))
                 } else {
                     self.word_at(s.head.0, s.head.1)
                         .map(|(a, b)| ((s.head.0, a), (s.head.0, b)))
@@ -12944,6 +12955,25 @@ impl Editor {
         }
         let mut end = col + 1;
         while end < chars.len() && is_word_char(chars[end]) {
+            end += 1;
+        }
+        Some((start, end))
+    }
+
+    /// Like [`Self::word_at`], but over the identifier runs the naming-style
+    /// transforms rewrite: letters, digits, `_` and `-` (#1573).
+    fn identifier_run_at(&self, line: usize, col: usize) -> Option<(usize, usize)> {
+        let ident = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+        let chars: Vec<char> = self.lines.get(line)?.chars().collect();
+        if col >= chars.len() || !ident(chars[col]) {
+            return None;
+        }
+        let mut start = col;
+        while start > 0 && ident(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = col + 1;
+        while end < chars.len() && ident(chars[end]) {
             end += 1;
         }
         Some((start, end))
@@ -30531,6 +30561,19 @@ mod tests {
         e.carets = vec![EditorSelection::new(0, 7)];
         e.transform_selection_case(CaseTransform::Camel);
         assert_eq!(e.lines, vec!["aB = cD"]);
+    }
+
+    /// #1573: with no selection, a naming-style transform takes the whole
+    /// kebab-case identifier, whether the caret is on a word or the hyphen.
+    #[test]
+    fn snake_case_caret_takes_whole_kebab_identifier() {
+        for col in [5, 8, 12] {
+            let mut e = editor_with("let user-name = 1;");
+            e.cursor_row = 0;
+            e.cursor_col = col;
+            e.transform_selection_case(CaseTransform::Snake);
+            assert_eq!(e.lines, vec!["let user_name = 1;"], "caret at {col}");
+        }
     }
 
     #[test]
