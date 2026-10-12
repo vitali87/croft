@@ -81921,3 +81921,28 @@ fn go_and_lint_rows_reach_problems_only_for_real_files() {
         ]
     );
 }
+
+/// #1391: a node launch with nothing to run is refused naming every field
+/// that would have given it something.
+#[test]
+fn a_node_launch_with_nothing_to_run_names_what_it_needs() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [ { "name": "Bare", "type": "node", "request": "launch" } ] }"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let cfg = crate::dap::configs::discover_configs(tmp.path()).remove(0);
+    app.launch_debug_config(&cfg);
+    assert!(app.run_debug.feedback_is_error);
+    assert!(
+        app.status.contains(
+            "config \"Bare\": a node launch needs a \"program\", a \"runtimeExecutable\" or a \"command\""
+        ),
+        "{}",
+        app.status
+    );
+    assert!(app.debug_sessions.is_empty());
+}

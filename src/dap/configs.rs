@@ -786,11 +786,14 @@ pub fn resolve(cfg: &DebugConfig, ctx: &SubstCtx) -> Result<ResolvedConfig, Stri
         Some(Value::String(s)) => s.trim().parse::<i64>().ok(),
         _ => None,
     };
-    let extra: Map<String, Value> = obj
+    let mut extra: Map<String, Value> = obj
         .iter()
         .filter(|(k, _)| !MAPPED_KEYS.contains(&k.as_str()))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    if cfg.type_name == "node-terminal" && cfg.request == RequestKind::Launch {
+        node_terminal_command(&mut extra);
+    }
     Ok(ResolvedConfig {
         name: cfg.name.clone(),
         kind,
@@ -811,6 +814,42 @@ pub fn resolve(cfg: &DebugConfig, ctx: &SubstCtx) -> Result<ResolvedConfig, Stri
         pick_process,
         extra,
     })
+}
+
+/// A `node-terminal` launch's `command` (#1391), as the runtime js-debug
+/// starts: croft runs debuggees in its own console, not a terminal, so
+/// `"command": "npm run dev"` becomes `runtimeExecutable: "npm"` and
+/// `runtimeArgs: ["run", "dev"]`, and a command with shell syntax (`&&`,
+/// `|`, `$VAR`) runs under `sh -c`. js-debug attaches to the Node processes
+/// it starts either way. An explicit `runtimeExecutable` wins.
+fn node_terminal_command(extra: &mut Map<String, Value>) {
+    let Some(Value::String(command)) = extra.remove("command") else {
+        return;
+    };
+    if extra.contains_key("runtimeExecutable") || command.trim().is_empty() {
+        return;
+    }
+    let shell_syntax = command.contains(['&', '|', ';', '<', '>', '$', '`', '(', ')', '*', '?']);
+    let words = match shlex::split(&command) {
+        Some(words) if !shell_syntax && !words.is_empty() => words,
+        _ => vec![String::from("sh"), String::from("-c"), command],
+    };
+    let mut words = words.into_iter().map(Value::String);
+    extra.insert("runtimeExecutable".into(), words.next().expect("not empty"));
+    let mut runtime_args: Vec<Value> = words.collect();
+    if let Some(Value::Array(more)) = extra.get("runtimeArgs") {
+        runtime_args.extend(more.iter().cloned());
+    }
+    extra.insert("runtimeArgs".into(), Value::Array(runtime_args));
+}
+
+/// Whether a node launch names something to run (#1391): a `program`, or
+/// a `runtimeExecutable` / `runtimeArgs` (an npm script, `node-terminal`'s
+/// `command`), which js-debug starts on its own.
+pub fn js_launch_has_target(rc: &ResolvedConfig) -> bool {
+    rc.program.is_some()
+        || rc.extra.contains_key("runtimeExecutable")
+        || rc.extra.contains_key("runtimeArgs")
 }
 
 /// The current user's processes as `(pid, command name)` from
@@ -2800,5 +2839,80 @@ mod tests {
             .map(|c| c.name)
             .collect();
         assert_eq!(names, ["First", "Web"], "and the file is whole: {before}");
+    }
+
+    /// #1391: a node launch that starts an npm script names no `program`;
+    /// js-debug runs its `runtimeExecutable` and `runtimeArgs` instead.
+    #[test]
+    fn a_node_launch_can_start_an_npm_script() {
+        let cfg = config(
+            r#"[{ "name": "npm start", "type": "node", "request": "launch",
+                 "runtimeExecutable": "npm", "runtimeArgs": ["run", "start"],
+                 "cwd": "${workspaceFolder}" }]"#,
+        );
+        let rc = resolve(&cfg, &ctx()).unwrap();
+        assert!(js_launch_has_target(&rc));
+        let req = js_request(&rc);
+        assert_eq!(req["arguments"]["type"], "pwa-node");
+        assert_eq!(req["arguments"]["runtimeExecutable"], "npm");
+        assert_eq!(req["arguments"]["runtimeArgs"], json!(["run", "start"]));
+        assert!(req["arguments"].get("program").is_none());
+    }
+
+    /// #1391: a `node-terminal` launch's `command` is the runtime js-debug
+    /// starts, split into words, or run by `sh -c` when it uses shell syntax.
+    #[test]
+    fn a_node_terminal_command_becomes_the_runtime() {
+        let rc = |command: &str| {
+            let text = format!(
+                r#"[{{ "name": "dev", "type": "node-terminal", "request": "launch", "command": {} }}]"#,
+                json!(command)
+            );
+            resolve(&config(&text), &ctx()).unwrap()
+        };
+        let dev = rc("npm run dev -- --port 3001");
+        assert!(js_launch_has_target(&dev));
+        let req = js_request(&dev);
+        assert_eq!(req["arguments"]["type"], "pwa-node");
+        assert_eq!(req["arguments"]["runtimeExecutable"], "npm");
+        assert_eq!(
+            req["arguments"]["runtimeArgs"],
+            json!(["run", "dev", "--", "--port", "3001"])
+        );
+        assert!(req["arguments"].get("command").is_none());
+        let quoted = js_request(&rc("node 'my app.js'"));
+        assert_eq!(quoted["arguments"]["runtimeArgs"], json!(["my app.js"]));
+        let chained = js_request(&rc("npm run build && npm start"));
+        assert_eq!(chained["arguments"]["runtimeExecutable"], "sh");
+        assert_eq!(
+            chained["arguments"]["runtimeArgs"],
+            json!(["-c", "npm run build && npm start"])
+        );
+    }
+
+    /// #1391 negatives: a node launch with nothing to run still has no
+    /// target; `command` means nothing on a plain `node` config; an
+    /// explicit `runtimeExecutable` on `node-terminal` wins over `command`;
+    /// an empty command adds nothing.
+    #[test]
+    fn a_node_launch_with_nothing_to_run_has_no_target() {
+        let one = |text: &str| resolve(&config(text), &ctx()).unwrap();
+        let bare = one(r#"[{ "name": "n", "type": "node", "request": "launch" }]"#);
+        assert!(!js_launch_has_target(&bare));
+        let node = one(r#"[{ "name": "n", "type": "node", "command": "npm start" }]"#);
+        assert!(
+            !js_launch_has_target(&node),
+            "only node-terminal reads command"
+        );
+        assert_eq!(node.extra["command"], "npm start");
+        let explicit = one(
+            r#"[{ "name": "t", "type": "node-terminal", "command": "npm start",
+                 "runtimeExecutable": "yarn", "runtimeArgs": ["dev"] }]"#,
+        );
+        assert_eq!(explicit.extra["runtimeExecutable"], "yarn");
+        assert_eq!(explicit.extra["runtimeArgs"], json!(["dev"]));
+        assert!(!explicit.extra.contains_key("command"));
+        let empty = one(r#"[{ "name": "t", "type": "node-terminal", "command": "  " }]"#);
+        assert!(!js_launch_has_target(&empty));
     }
 }
