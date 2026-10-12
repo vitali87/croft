@@ -337,7 +337,8 @@ mod tests {
 
     /// #1526 negative: text that breaks evenly gets no extra rows. One long
     /// word splits at the width exactly as before, short lines take one row
-    /// each, and the 16-row cap still holds.
+    /// each, and the cap (half the viewport, at least 16 rows, past which
+    /// the popup scrolls) still holds.
     #[test]
     fn area_for_adds_no_rows_text_does_not_need() {
         let vp = Rect::new(0, 0, 120, 60);
@@ -346,7 +347,7 @@ mod tests {
         let short = HoverPopup::new("fn a()\nfn b()\nfn c()".into(), (10, 50)).area_for(vp);
         assert_eq!(short.height, 3 + 2);
         let long = HoverPopup::new(vec!["word"; 40].join("\n"), (10, 50)).area_for(vp);
-        assert_eq!(long.height, MAX_HEIGHT + 2);
+        assert_eq!(long.height, (vp.height / 2).max(MAX_HEIGHT) + 2);
     }
 
     #[test]
