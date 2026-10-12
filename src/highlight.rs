@@ -56,7 +56,8 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color {
 }
 
 /// What an HTML file embeds (#1649): `<style>` is CSS, and `<script>` is
-/// JavaScript unless its `type` names something else. Not the bundled
+/// JavaScript when its `type` is absent, empty, or a JavaScript MIME type
+/// (parameters allowed), as a browser runs it. Not the bundled
 /// query, which calls every script JavaScript and would colour a JSON-LD
 /// block or a `<script type="text/template">` as code it is not: JSON
 /// types get JSON, and any other non-JavaScript type stays raw text.
@@ -74,7 +75,7 @@ const HTML_INJECTIONS_QUERY: &str = r#"
 ((script_element
   (start_tag) @_start
   (raw_text) @injection.content)
- (#match? @_start "(?i)\\stype\\s*=\\s*[\"']?(module|text/javascript|application/javascript|text/ecmascript|application/ecmascript)[\"'\\s>]")
+ (#match? @_start "(?i)\\stype\\s*=\\s*(\"\\s*((module|(text|application)/(x-)?(java|ecma)script|text/javascript1\\.[0-5]|text/(jscript|livescript))\\s*(;[^\"]*)?)?\"|'\\s*((module|(text|application)/(x-)?(java|ecma)script|text/javascript1\\.[0-5]|text/(jscript|livescript))\\s*(;[^']*)?)?'|(module|(text|application)/(x-)?(java|ecma)script|text/javascript1\\.[0-5]|text/(jscript|livescript))(;[^\\s>]*)?[\\s/>])")
  (#set! injection.language "javascript"))
 
 ((script_element
@@ -2975,8 +2976,9 @@ def f() -> Config:\n\
         );
     }
 
-    /// #1649: a script whose `type` says JavaScript is JavaScript, a JSON
-    /// type is JSON, and anything else (a template) is left alone.
+    /// #1649: a script whose `type` says JavaScript (or is empty, or has
+    /// MIME parameters) is JavaScript, a JSON type is JSON, and anything
+    /// else (a template) is left alone.
     #[test]
     fn a_scripts_type_decides_what_its_body_is_highlighted_as() {
         let keyword = embedded_style(LangKind::JavaScript, "const x = 1;\n", 0, "const");
@@ -2987,6 +2989,22 @@ def f() -> Config:\n\
         let key = embedded_style(LangKind::Json, &format!("{json}\n"), 0, "\"name\"");
         assert!(key.is_some());
         assert_eq!(embedded_style(LangKind::Html, &ld, 1, "\"name\""), key);
+        for classic in [
+            "<script type=\"\">",
+            "<script type=\"  \">",
+            "<script type=''>",
+            "<script type=\"text/javascript; charset=utf-8\">",
+            "<script type=\" Text/JavaScript \">",
+            "<script type=application/x-javascript>",
+            "<script type=\"text/jscript\">",
+        ] {
+            let page = format!("{classic}\nconst x = 1;\n</script>\n");
+            assert_eq!(
+                embedded_style(LangKind::Html, &page, 1, "const"),
+                keyword,
+                "{classic} runs as a classic script"
+            );
+        }
         let template = "<script type=\"text/template\">\nconst x = 1;\n</script>\n";
         assert_ne!(
             embedded_style(LangKind::Html, template, 1, "const"),
