@@ -13559,6 +13559,136 @@ fn ctrl_k_chords_reach_croft_off_macos_but_not_from_the_shell_or_vim() {
     );
 }
 
+/// The shell script from #1563, open in the editor with the caret at 1:1.
+fn app_with_run_script() -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("r.sh");
+    std::fs::write(
+        &p,
+        "echo one\necho two\nfor i in 1 2; do\n  echo loop $i\ndone\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&p).unwrap();
+    app.focus_pane(Pane::Editor);
+    (tmp, app)
+}
+
+/// #1563: Shift+Down from line 1 stopped at the start of the last line, so
+/// the selection, and Run Selected Text on it, dropped the script's `done`.
+/// Down on the last line now goes to its end, as in VS Code, so Shift+Down
+/// selects through it.
+#[test]
+fn shift_down_selects_through_the_end_of_the_last_line() {
+    let (_tmp, mut app) = app_with_run_script();
+    let last = app.editor.lines.len() - 1;
+    assert_eq!(app.editor.lines[last], "done");
+    for _ in 0..6 {
+        app.handle_key(key(KeyCode::Down, KeyModifiers::SHIFT))
+            .unwrap();
+    }
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (last, 4));
+    assert_eq!(
+        app.editor.selection_text(),
+        "echo one\necho two\nfor i in 1 2; do\n  echo loop $i\ndone"
+    );
+}
+
+/// #1563: Down on the last line goes to its end; Up on the first line goes
+/// to its start, and Shift+Up selects back to the start of the file.
+#[test]
+fn down_on_the_last_line_and_up_on_the_first_reach_the_line_ends() {
+    let (_tmp, mut app) = app_with_run_script();
+    let last = app.editor.lines.len() - 1;
+    app.editor.cursor_row = last;
+    app.editor.cursor_col = 1;
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (last, 4));
+
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 8;
+    app.handle_key(key(KeyCode::Up, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
+
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 4;
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Up, KeyModifiers::SHIFT))
+            .unwrap();
+    }
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
+    assert_eq!(app.editor.selection_text(), "echo one\necho");
+}
+
+/// #1563: with word wrap on, the edges are the first and last wrapped rows:
+/// Down on the last row goes to the end of the line, Up on the first row to
+/// its start.
+#[test]
+fn wrapped_arrows_reach_the_ends_of_the_first_and_last_rows() {
+    use ratatui::widgets::Widget as _;
+    let (_tmp, mut app) = app_with_run_script();
+    let last = app.editor.lines.len() - 1;
+    let long = "done # ".to_string() + &"word ".repeat(30);
+    app.editor.lines[last] = long.clone();
+    app.editor.toggle_wrap();
+    assert!(app.editor.wrap_enabled());
+    let area = Rect::new(0, 0, 40, 20);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    (&mut *app.editor).render(area, &mut buf);
+
+    app.editor.cursor_row = last;
+    app.editor.cursor_col = 2;
+    for _ in 0..10 {
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        (app.editor.cursor_row, app.editor.cursor_col),
+        (last, long.chars().count())
+    );
+
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 6;
+    app.handle_key(key(KeyCode::Up, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
+}
+
+/// Negative: Down between lines keeps the caret's column rather than
+/// jumping to the line end; only the last line has the new edge.
+#[test]
+fn down_between_lines_keeps_the_column() {
+    let (_tmp, mut app) = app_with_run_script();
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 5));
+    app.handle_key(key(KeyCode::Up, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 5));
+}
+
+/// Negative: Vim's `j` and `k` stop at the last and first line without
+/// moving along it, as in Vim; the edge belongs to the arrow keys.
+#[test]
+fn vim_j_and_k_do_not_move_along_the_edge_lines() {
+    let (_tmp, mut app) = app_with_run_script();
+    app.vim.enabled = true;
+    let last = app.editor.lines.len() - 1;
+    app.editor.cursor_row = last;
+    app.editor.cursor_col = 1;
+    app.handle_key(key(KeyCode::Char('j'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (last, 1));
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 3;
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 3));
+}
+
 /// #843: LINUX.md promises that off macOS a `Cmd` chord "works as the same
 /// chord with `Ctrl`", except the chords its table lists. This walks every
 /// `is_*_key` predicate over every `Cmd` chord it takes and checks the `Ctrl`
@@ -65462,6 +65592,9 @@ fn sarif_columns_are_chosen_with_c_shown_on_rows_and_remembered() {
         let (tmp, log) = sarif_fixture();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.editor.open(&log).unwrap();
+        // The row is read at a fixed width; the minimap strip, drawn in
+        // every terminal since #1231, would take six of its columns.
+        app.minimap_visible = false;
         assert!(
             app.editor.sarif.as_ref().unwrap().columns.is_empty(),
             "none by default"
@@ -79577,6 +79710,77 @@ fn the_multiline_paste_warning_setting_parses() {
     );
 }
 
+// --- #1254: long hovers scroll ---------------------------------------------------
+
+fn app_with_long_hover() -> (
+    App,
+    tempfile::TempDir,
+    ratatui::Terminal<ratatui::backend::TestBackend>,
+) {
+    let (mut app, tmp, col, row) = app_with_open_file_and_editor_cell();
+    let doc = (1..=40)
+        .map(|i| format!("doc line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+        doc,
+        (col, row),
+    ));
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    (app, tmp, term)
+}
+
+#[test]
+fn the_wheel_over_a_hover_popup_scrolls_it_instead_of_closing_it() {
+    use crossterm::event::MouseEventKind;
+    let (mut app, _tmp, mut term) = app_with_long_hover();
+    let area = app.hover_popup.as_ref().unwrap().last_area;
+    assert!(area.height > 2, "the popup painted");
+    let (x, y) = (area.x + 3, area.y + 2);
+    app.handle_mouse(mouse(MouseEventKind::ScrollDown, x, y));
+    let popup = app
+        .hover_popup
+        .as_ref()
+        .expect("the wheel keeps the popup open");
+    assert!(popup.scroll > 0, "and scrolls it");
+    let after_down = popup.scroll;
+    app.handle_mouse(mouse(MouseEventKind::ScrollUp, x, y));
+    assert!(app.hover_popup.as_ref().unwrap().scroll < after_down);
+    term.draw(|frame| app.render(frame)).unwrap();
+    assert!(app.hover_popup.is_some());
+}
+
+#[test]
+fn moving_the_pointer_onto_the_hover_popup_keeps_it_open() {
+    use crossterm::event::MouseEventKind;
+    let (mut app, _tmp, _term) = app_with_long_hover();
+    let area = app.hover_popup.as_ref().unwrap().last_area;
+    app.handle_mouse(mouse(MouseEventKind::Moved, area.x + 3, area.y + 2));
+    assert!(
+        app.hover_popup.is_some(),
+        "the pointer has to cross onto the popup to scroll it"
+    );
+}
+
+#[test]
+fn the_wheel_away_from_the_hover_popup_still_closes_it() {
+    use crossterm::event::MouseEventKind;
+    let (mut app, _tmp, _term) = app_with_long_hover();
+    let area = app.hover_popup.as_ref().unwrap().last_area;
+    let x = if area.x > 2 {
+        area.x - 2
+    } else {
+        area.right() + 2
+    };
+    app.handle_mouse(mouse(MouseEventKind::ScrollDown, x, area.y + 1));
+    assert!(
+        app.hover_popup.is_none(),
+        "scrolling the editor dismisses the hover"
+    );
+}
+
 // --- #1215: keys that move the caret sideways scroll the view to it -----------
 
 fn wide_line_app(tmp: &std::path::Path) -> (App, ratatui::Terminal<ratatui::backend::TestBackend>) {
@@ -80443,6 +80647,160 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     assert!(app.source_control.last_init_repo_button_area.width > 0);
 }
 
+// --- Minimap without inline images (#1231) --------------------------------
+
+/// An app with a 300-line Rust file open, in a terminal that cannot draw
+/// inline images (tmux, Alacritty, GNOME Terminal, plain xterm).
+fn text_minimap_app() -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("long.rs");
+    let body: String = (0..300)
+        .map(|i| format!("fn f{i}() {{ let value = {i}; }}\n"))
+        .collect();
+    std::fs::write(&path, body).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::None;
+    app.cell_pixel = None;
+    app.editor.open(&path).unwrap();
+    (tmp, app)
+}
+
+fn is_braille(s: &str) -> bool {
+    s.chars()
+        .next()
+        .is_some_and(|c| ('\u{2801}'..='\u{28ff}').contains(&c))
+}
+
+/// The braille cells drawn inside `r`.
+fn braille_in(term: &ratatui::Terminal<ratatui::backend::TestBackend>, r: Rect) -> usize {
+    let buf = term.backend().buffer();
+    let mut n = 0;
+    for y in r.y..r.y + r.height {
+        for x in r.x..r.x + r.width {
+            if is_braille(buf[(x, y)].symbol()) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+#[test]
+fn the_minimap_draws_as_braille_without_inline_images() {
+    let (_tmp, mut app) = text_minimap_app();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let strip = app.minimap_img_rect;
+    assert_eq!(strip.width, 6, "the strip is carved: {strip:?}");
+    assert!(
+        braille_in(&term, strip) > 0,
+        "the strip shows the file's shape:\n{}",
+        screen_text(&term)
+    );
+    let text = app.editor.last_full_area;
+    assert_eq!(
+        strip.x,
+        text.x + text.width,
+        "the strip sits right of the text"
+    );
+}
+
+#[test]
+fn a_click_on_the_text_minimap_jumps_to_that_part_of_the_file() {
+    let (_tmp, mut app) = text_minimap_app();
+    draw(&mut app, 160, 40);
+    let strip = app.minimap_img_rect;
+    assert!(strip.height > 0);
+    assert_eq!(app.editor.scroll, 0);
+    // 300 lines at one dot row each fill 75 cell rows; the strip is shorter,
+    // so the whole file is folded into it and the bottom row is the end.
+    left_click(&mut app, strip.x + 2, strip.y + strip.height - 1);
+    assert!(
+        app.editor.cursor_row > 250,
+        "the bottom of the strip is the end of the file: row {}",
+        app.editor.cursor_row
+    );
+}
+
+#[test]
+fn the_minimap_stays_on_the_active_group_in_a_split() {
+    let (_tmp, mut app) = text_minimap_app();
+    app.split_editor();
+    assert!(app.editor_layout.is_split());
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let strip = app.minimap_img_rect;
+    let active = app.editor.last_full_area;
+    assert_eq!(strip.width, 6, "a split keeps the minimap: {strip:?}");
+    assert!(braille_in(&term, strip) > 0, "{}", screen_text(&term));
+    assert!(
+        strip.x == active.x + active.width || strip.x + strip.width == active.x,
+        "the strip is beside the active group: strip {strip:?}, group {active:?}"
+    );
+}
+
+#[test]
+fn the_minimap_off_draws_no_strip() {
+    let (_tmp, mut app) = text_minimap_app();
+    app.toggle_minimap();
+    assert_eq!(app.status, "Minimap off");
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.minimap_img_rect, Rect::default());
+    let screen = screen_text(&term);
+    assert!(
+        !screen.chars().any(|c| is_braille(&c.to_string())),
+        "{screen}"
+    );
+}
+
+#[test]
+fn turning_the_minimap_on_in_a_narrow_editor_says_why_it_is_hidden() {
+    let (_tmp, mut app) = text_minimap_app();
+    app.toggle_minimap();
+    draw(&mut app, 70, 30);
+    app.toggle_minimap();
+    assert!(
+        app.status.starts_with("Minimap on") && app.status.contains("wide"),
+        "{}",
+        app.status
+    );
+    // With room, the toggle just says it is on.
+    app.toggle_minimap();
+    draw(&mut app, 160, 40);
+    app.toggle_minimap();
+    assert_eq!(app.status, "Minimap on");
+}
+
+#[test]
+fn braille_minimap_folds_each_two_by_four_dot_block_into_a_cell() {
+    let bg = (0, 0, 0);
+    let ink = (200, 100, 50);
+    // One cell: 2 dot columns of 4 source chars each, 4 dot rows.
+    let (w, h) = (2 * MINIMAP_TEXT_CHARS_PER_DOT, 4);
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    for px in rgba.chunks_exact_mut(4) {
+        px[3] = 0xff;
+    }
+    let cells = braille_minimap(&rgba, w, h, bg, 1, 1);
+    assert_eq!(cells, vec![None], "a blank block is a blank cell");
+    // Ink in the second char of the first dot column, top row: dot 1.
+    let idx = 4;
+    rgba[idx..idx + 3].copy_from_slice(&[ink.0, ink.1, ink.2]);
+    assert_eq!(
+        braille_minimap(&rgba, w, h, bg, 1, 1),
+        vec![Some(('\u{2801}', ink))]
+    );
+    // Every dot lit is the full cell.
+    for px in rgba.chunks_exact_mut(4) {
+        px[..3].copy_from_slice(&[ink.0, ink.1, ink.2]);
+    }
+    assert_eq!(
+        braille_minimap(&rgba, w, h, bg, 1, 1),
+        vec![Some(('\u{28ff}', ink))]
+    );
+}
+
 /// #1433: the bytes croft writes for one frame, through the real crossterm
 /// backend, at `depth`.
 fn frame_bytes_at(depth: crate::color_depth::ColorDepth) -> String {
@@ -81277,6 +81635,142 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     app.watch_published_panes.insert(pane);
     assert!(!app.apply_build_scan(pane, Some(&cwd), "tsc --watch", "a.c:1:1: error: old\n"));
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
+}
+
+/// A file with one conflict block open in the merge editor, whose Result
+/// (`top / mine / bottom` once Accept Current runs) differs from the disk.
+fn app_with_merge_editor_open(dir: &std::path::Path) -> (App, std::path::PathBuf) {
+    let file = dir.join("f.txt");
+    std::fs::write(
+        &file,
+        "top\n<<<<<<< HEAD\nmine\n=======\nyours\n>>>>>>> other\nbottom\n",
+    )
+    .unwrap();
+    let mut app = App::new(dir.to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.run_command(crate::widgets::command_palette::Command::MergeOpenEditor);
+    assert!(app.editor.merge.is_some(), "setup: the merge editor is up");
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptCurrent);
+    assert!(app.editor.dirty, "setup: the Result is unsaved");
+    (app, file)
+}
+
+/// #1588: hot exit never backs up a merge editor's Result as an unsaved
+/// edit of the file, so a relaunch after the terminal closed brings the
+/// file back clean, as it is on disk, not as a dirty tab whose Ctrl+S
+/// writes the Result over it.
+#[test]
+fn hot_exit_does_not_keep_a_merge_result_as_the_files_unsaved_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, file) = app_with_merge_editor_open(tmp.path());
+    let disk = std::fs::read_to_string(&file).unwrap();
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    assert!(
+        !app.capture_hot_exit()
+            .buffers
+            .iter()
+            .any(|b| b.tab.path.as_deref() == Some(file.as_path())),
+        "no unsaved buffer for the merged file"
+    );
+    drop(app);
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert!(
+        next.editor
+            .editors
+            .iter()
+            .all(|e| e.path.as_deref() != Some(file.as_path()) || !e.dirty),
+        "the file does not come back dirty"
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), disk);
+}
+
+/// #1588: an update relaunch, unlike hot exit, carries the merge editor's
+/// unsaved Result to the new process: it exits at once, and the Result
+/// exists nowhere else.
+#[test]
+fn an_update_relaunch_keeps_a_dirty_merge_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_merge_editor_open(tmp.path());
+    let disk = std::fs::read_to_string(&file).unwrap();
+    let result = app.editor.lines.clone();
+    assert_eq!(result, vec!["top", "mine", "bottom"]);
+    app.arm_reexec();
+    assert!(app.pending_reexec, "the relaunch is armed");
+    let state = app.capture_session_state();
+    let tab = state
+        .tabs
+        .iter()
+        .find(|t| t.path.as_deref() == Some(file.as_path()))
+        .expect("the tab is handed over");
+    assert!(tab.dirty);
+    assert_eq!(tab.unsaved_text.as_deref(), Some("top\nmine\nbottom"));
+
+    let mut next = App::new(tmp.path().to_path_buf()).unwrap();
+    next.apply_session_state(&state);
+    let ed = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(file.as_path()))
+        .expect("the file is reopened");
+    assert!(ed.dirty);
+    assert_eq!(ed.lines, result);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), disk);
+}
+
+/// #1588: the same for a merge editor in another editor group.
+#[test]
+fn a_merge_editor_in_another_group_is_not_backed_up_either() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_merge_editor_open(tmp.path());
+    let other = tmp.path().join("other.txt");
+    std::fs::write(&other, "x\n").unwrap();
+    app.run_command(crate::widgets::command_palette::Command::SplitEditor);
+    app.editor.open_pinned(&other).unwrap();
+    assert!(
+        app.editor_layout
+            .inactive_groups()
+            .iter()
+            .any(|g| g.editors.iter().any(|e| e.merge.is_some())),
+        "setup: the merge editor is in the other group"
+    );
+    assert!(
+        !app.capture_hot_exit()
+            .buffers
+            .iter()
+            .any(|b| b.tab.path.as_deref() == Some(file.as_path()))
+    );
+}
+
+/// #1588 negative: a plain unsaved edit of the same file, once the merge
+/// editor is closed with Reopen as Text, is still backed up.
+#[test]
+fn an_unsaved_edit_after_reopen_as_text_is_still_backed_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_merge_editor_open(tmp.path());
+    app.run_command(crate::widgets::command_palette::Command::ReopenAsText);
+    assert!(app.editor.merge.is_none(), "setup: a plain text tab");
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    app.editor.insert_char('x');
+    let backup = app.capture_hot_exit();
+    let kept = backup
+        .buffers
+        .iter()
+        .find(|b| b.tab.path.as_deref() == Some(file.as_path()))
+        .expect("the unsaved edit is backed up");
+    assert!(
+        kept.tab
+            .unsaved_text
+            .as_deref()
+            .unwrap()
+            .starts_with("xtop")
+    );
 }
 
 /// #1594: a user matcher named `go` is not one of the loose built-in rows,
