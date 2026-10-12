@@ -79559,7 +79559,6 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     assert!(app.source_control.last_init_repo_button_area.width > 0);
 }
 
-<<<<<<< HEAD
 /// A workspace whose `node_modules/.bin/tsc` logs its arguments and, run on
 /// `tsconfig.app.json`, reports one error, the way tsc does.
 #[cfg(unix)]
@@ -79681,8 +79680,6 @@ fn a_nested_solution_reference_is_checked_through_its_leaves() {
     assert_eq!(status, "Whole-project check: 1 problem");
 }
 
-||||||| f1ca0831
-=======
 /// A quiet 30-column pane holding `text`, with the find bar open on it.
 fn wrapped_find_app(text: &str) -> (tempfile::TempDir, App) {
     let tmp = tempfile::tempdir().unwrap();
@@ -79763,7 +79760,6 @@ fn terminal_find_never_joins_rows_without_a_wrap_and_counts_an_edge_match_once()
     );
 }
 
->>>>>>> origin/main
 /// An App over `tmp` whose user config lives in `cfg`, never the real one.
 fn settings_editor_app(cfg: &std::path::Path, tmp: &std::path::Path) -> App {
     let mut app = App::new(tmp.to_path_buf()).unwrap();
