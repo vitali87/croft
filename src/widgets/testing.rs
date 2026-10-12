@@ -406,6 +406,38 @@ impl TestingPanel {
         }
     }
 
+    /// How the run that just ended went, for screen reader mode (#1547):
+    /// the counts, then the first failing test by name, so the result is
+    /// heard and not only shown. `ok` is the runner's exit success.
+    pub fn spoken_outcome(&self, ok: bool) -> String {
+        let (passed, failed, skipped) = self.run_tally;
+        if !ok && failed == 0 {
+            return String::from("Test run failed, see OUTPUT, Test Runner");
+        }
+        let counts: Vec<String> = [(failed, "failed"), (passed, "passed"), (skipped, "skipped")]
+            .iter()
+            .filter(|(n, _)| *n > 0)
+            .map(|(n, what)| format!("{n} {what}"))
+            .collect();
+        let mut out = if counts.is_empty() {
+            String::from("Tests finished: no test ran")
+        } else {
+            format!("Tests finished: {}", counts.join(", "))
+        };
+        if let Some(name) = self.run_first_failure() {
+            out.push_str(&format!(". First failure: {name}"));
+        }
+        out
+    }
+
+    /// The first failing test, when the run that just ended had a failure;
+    /// a failure kept from an earlier run is not this run's news.
+    pub fn run_first_failure(&self) -> Option<String> {
+        (self.run_tally.1 > 0)
+            .then(|| self.first_failed())
+            .flatten()
+    }
+
     /// A coverage run's report arrived (#263): keep it for the explorer
     /// percentages, the gutter and the status bar, or keep why there is
     /// none for the app to offer the install.
@@ -1570,6 +1602,43 @@ mod tests {
         assert_eq!(
             p.run_outcome("gone", true, 0.1),
             "gone: no test ran (0.1 s)"
+        );
+    }
+
+    /// #1547: a finished run as screen reader mode says it: the counts,
+    /// then the first failure of this run only.
+    #[test]
+    fn a_finished_run_is_spoken_with_its_first_failure() {
+        let case = |name: &str, status| TestCase {
+            name: name.to_string(),
+            status,
+        };
+        let mut p = TestingPanel::new();
+        p.start_filter("m::");
+        for (name, status) in [
+            ("m::a", TestStatus::Passed),
+            ("m::b", TestStatus::Failed),
+            ("m::c", TestStatus::Failed),
+            ("m::d", TestStatus::Skipped),
+        ] {
+            p.apply_case(case(name, status));
+        }
+        p.on_finished(Some(false));
+        assert_eq!(
+            p.spoken_outcome(false),
+            "Tests finished: 2 failed, 1 passed, 1 skipped. First failure: m::b"
+        );
+        // A green rerun of one test: the old failures are not its news.
+        p.start_single("m::a");
+        p.apply_case(case("m::a", TestStatus::Passed));
+        p.on_finished(Some(true));
+        assert_eq!(p.spoken_outcome(true), "Tests finished: 1 passed");
+        assert_eq!(p.run_first_failure(), None);
+        p.start_single("m::a");
+        p.on_finished(Some(false));
+        assert_eq!(
+            p.spoken_outcome(false),
+            "Test run failed, see OUTPUT, Test Runner"
         );
     }
 
