@@ -80336,20 +80336,25 @@ fn a_typed_path_expands_the_home_and_sits_under_the_workspace() {
     let root = std::path::Path::new("/work/ws");
     assert_eq!(
         resolve_typed_path("~/team.code-workspace", Some(home), root),
-        home.join("team.code-workspace")
+        Some(home.join("team.code-workspace"))
     );
     assert_eq!(
         resolve_typed_path(" sub/x.code-workspace ", Some(home), root),
-        root.join("sub/x.code-workspace")
+        Some(root.join("sub/x.code-workspace"))
     );
     assert_eq!(
         resolve_typed_path("/abs/x.code-workspace", Some(home), root),
-        std::path::Path::new("/abs/x.code-workspace")
+        Some(std::path::Path::new("/abs/x.code-workspace").to_path_buf())
     );
     assert_eq!(
         resolve_typed_path("~user/x", Some(home), root),
-        root.join("~user/x"),
+        Some(root.join("~user/x")),
         "only `~/` is the home directory"
+    );
+    assert_eq!(
+        resolve_typed_path("~/team.code-workspace", None, root),
+        None,
+        "with no home, `~/` is refused, not put under the workspace"
     );
 }
 

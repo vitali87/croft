@@ -29970,6 +29970,16 @@ impl App {
 
     /// A path as typed: `~` expanded, relative to the workspace root.
     fn typed_path(&self, value: &str) -> PathBuf {
+        self.typed_path_checked(value).unwrap_or_else(|| {
+            let v = value.trim();
+            self.workspace_root()
+                .join(v.strip_prefix("~/").unwrap_or(v))
+        })
+    }
+
+    /// As `typed_path`, but `None` for `~/…` when HOME is unset, so the
+    /// caller can refuse it rather than write under the workspace.
+    fn typed_path_checked(&self, value: &str) -> Option<PathBuf> {
         resolve_typed_path(
             value,
             std::env::var_os("HOME").map(PathBuf::from).as_deref(),
@@ -34939,7 +34949,10 @@ impl App {
                 // folder named `~` under the launch directory, while the
                 // status line said `~/`. A bare name gets the extension, as
                 // VS Code gives it.
-                let mut dest = self.typed_path(&value);
+                let Some(mut dest) = self.typed_path_checked(&value) else {
+                    self.status = String::from("Save workspace: cannot expand ~ (HOME is not set)");
+                    return;
+                };
                 if dest.extension().is_none() {
                     dest.set_extension("code-workspace");
                 }
@@ -70897,14 +70910,15 @@ fn moved_path(path: &Path, renames: &[crate::lsp::manager::FileRenameOp]) -> Pat
 }
 
 /// A path typed into a prompt: `~/` is `home`, and a relative path is under
-/// `root`, the workspace, not the directory croft was started from.
-fn resolve_typed_path(value: &str, home: Option<&Path>, root: &Path) -> PathBuf {
+/// `root`, the workspace, not the directory croft was started from. `None`
+/// for `~/…` with no home: it is not a path under the workspace.
+fn resolve_typed_path(value: &str, home: Option<&Path>, root: &Path) -> Option<PathBuf> {
     let v = value.trim();
     let p = match v.strip_prefix("~/") {
-        Some(rest) => home.map(Path::to_path_buf).unwrap_or_default().join(rest),
+        Some(rest) => home?.join(rest),
         None => PathBuf::from(v),
     };
-    if p.is_absolute() { p } else { root.join(p) }
+    Some(if p.is_absolute() { p } else { root.join(p) })
 }
 
 fn sidebar_view_label(view: SidebarView) -> &'static str {
