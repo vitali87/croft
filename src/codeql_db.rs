@@ -27,6 +27,72 @@ pub fn database_language(dir: &Path) -> Option<String> {
     })
 }
 
+/// The folder the database was created from (its yml's
+/// `sourceLocationPrefix`), which `%SRCROOT%` in its SARIF stands for
+/// (#1369).
+pub fn source_location_prefix(dir: &Path) -> Option<PathBuf> {
+    let yml = std::fs::read_to_string(dir.join(DB_MARKER)).ok()?;
+    yml.lines().find_map(|l| {
+        let v = l.trim().strip_prefix("sourceLocationPrefix:")?.trim();
+        let v = v.trim_matches(|c| c == '"' || c == '\'');
+        v.starts_with('/').then(|| PathBuf::from(v))
+    })
+}
+
+/// The most of one source file croft reads out of a database's archive.
+const ARCHIVED_SOURCE_LIMIT: u64 = 16 << 20;
+
+/// The text of the file a database's SARIF names as `uri` (relative to
+/// `%SRCROOT%`, or a `file:` URI), read from the copy of the source the
+/// database keeps: its `src` folder, else its `src.zip` (#1369). This is
+/// how a result opens when the source is not on this machine, as VS
+/// Code's CodeQL extension does. `None` when the archive lacks it, it is
+/// not text, or it is larger than [`ARCHIVED_SOURCE_LIMIT`].
+pub fn archived_source(dir: &Path, uri: &str) -> Option<String> {
+    use std::io::Read;
+    let path = crate::sarif::resolve::uri_to_path(uri)?;
+    let full = if path.is_absolute() {
+        path
+    } else {
+        source_location_prefix(dir)?.join(path)
+    };
+    // The archive keeps each file under its absolute path, minus the
+    // leading `/`; a `..` would step outside it.
+    let mut entry = PathBuf::new();
+    for c in full.components() {
+        match c {
+            std::path::Component::Normal(part) => entry.push(part),
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    let mut bytes = Vec::new();
+    match database_source(dir)? {
+        DbSource::Folder(src) => {
+            std::fs::File::open(src.join(&entry))
+                .ok()?
+                .take(ARCHIVED_SOURCE_LIMIT + 1)
+                .read_to_end(&mut bytes)
+                .ok()?;
+        }
+        DbSource::Zip(zip) => {
+            let file = std::fs::File::open(zip).ok()?;
+            let mut archive = zip::ZipArchive::new(file).ok()?;
+            let name = entry.to_str()?.to_string();
+            archive
+                .by_name(&name)
+                .ok()?
+                .take(ARCHIVED_SOURCE_LIMIT + 1)
+                .read_to_end(&mut bytes)
+                .ok()?;
+        }
+    }
+    if bytes.len() as u64 > ARCHIVED_SOURCE_LIMIT {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 /// `dir` itself when it is a database, else its only child that is one
 /// (how an extracted archive lays it out). `None` when there is none, or
 /// more than one and the choice would be a guess.
@@ -708,5 +774,96 @@ mod tests {
                 "/repos/apache/kafka/code-scanning/codeql/databases/java"
             ]
         );
+    }
+
+    /// A database created from `prefix` whose `src.zip` holds `files`
+    /// (paths under the prefix), as `codeql database create` writes it.
+    fn db_with_zipped_source(root: &Path, prefix: &str, files: &[(&str, &str)]) -> PathBuf {
+        use std::io::Write as _;
+        let db = root.join("db");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::write(
+            db.join(DB_MARKER),
+            format!("---\nsourceLocationPrefix: {prefix}\nprimaryLanguage: \"python\"\n"),
+        )
+        .unwrap();
+        let mut z = zip::ZipWriter::new(std::fs::File::create(db.join("src.zip")).unwrap());
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (path, text) in files {
+            let name = format!("{}/{path}", prefix.trim_start_matches('/'));
+            z.start_file(name, opts).unwrap();
+            z.write_all(text.as_bytes()).unwrap();
+        }
+        z.finish().unwrap();
+        db
+    }
+
+    #[test]
+    fn the_source_root_is_the_folder_the_database_was_created_from() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db_with_zipped_source(tmp.path(), "/tmp/cq/app", &[]);
+        assert_eq!(
+            source_location_prefix(&db),
+            Some(PathBuf::from("/tmp/cq/app"))
+        );
+        std::fs::write(
+            db.join(DB_MARKER),
+            "sourceLocationPrefix: \"/work/my app\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            source_location_prefix(&db),
+            Some(PathBuf::from("/work/my app"))
+        );
+        // Negative: none recorded, or not an absolute path.
+        std::fs::write(db.join(DB_MARKER), "primaryLanguage: python\n").unwrap();
+        assert_eq!(source_location_prefix(&db), None);
+        std::fs::write(db.join(DB_MARKER), "sourceLocationPrefix: app\n").unwrap();
+        assert_eq!(source_location_prefix(&db), None);
+    }
+
+    #[test]
+    fn a_result_file_is_read_from_the_databases_source_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db_with_zipped_source(
+            tmp.path(),
+            "/tmp/cq/app",
+            &[("web.py", "import sqlite3\n"), ("pkg/my mod.py", "x = 1\n")],
+        );
+        assert_eq!(
+            archived_source(&db, "web.py").as_deref(),
+            Some("import sqlite3\n")
+        );
+        assert_eq!(
+            archived_source(&db, "pkg/my%20mod.py").as_deref(),
+            Some("x = 1\n")
+        );
+        assert_eq!(
+            archived_source(&db, "file:///tmp/cq/app/web.py").as_deref(),
+            Some("import sqlite3\n")
+        );
+        // An extracted `src` folder is read the same way, and wins.
+        let src = db.join("src/tmp/cq/app");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("web.py"), "from the folder\n").unwrap();
+        assert_eq!(
+            archived_source(&db, "web.py").as_deref(),
+            Some("from the folder\n")
+        );
+    }
+
+    /// Negative: only files the archive has, and nothing outside it.
+    #[test]
+    fn the_source_archive_gives_nothing_it_does_not_hold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db_with_zipped_source(tmp.path(), "/tmp/cq/app", &[("web.py", "ok\n")]);
+        assert_eq!(archived_source(&db, "gone.py"), None);
+        assert_eq!(archived_source(&db, "../app/web.py"), None);
+        assert_eq!(archived_source(&db, "https://example.com/web.py"), None);
+        let bare = tmp.path().join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::write(bare.join(DB_MARKER), "sourceLocationPrefix: /tmp/cq/app\n").unwrap();
+        assert_eq!(archived_source(&bare, "web.py"), None, "no archive at all");
     }
 }

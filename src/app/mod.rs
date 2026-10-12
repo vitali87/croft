@@ -64617,17 +64617,20 @@ impl App {
     /// instead of replacing the list the user is working through.
     fn open_selected_sarif_result(&mut self) {
         use crate::sarif::region::ColumnKind;
-        let Some(crate::sarif::view::SelectedPlace {
-            path,
-            line,
-            column,
-            kind,
-            uri,
-            region: place,
-            embedded,
-            remote,
-            ..
-        }) = self.sarif_selected_place()
+        let Some((
+            crate::sarif::view::SelectedPlace {
+                path,
+                line,
+                column,
+                kind,
+                uri,
+                region: place,
+                embedded,
+                remote,
+                ..
+            },
+            archived,
+        )) = self.sarif_selected_place_and_origin()
         else {
             self.status = String::from("This result has no location to open");
             return;
@@ -64637,10 +64640,14 @@ impl App {
         let path = match (path, embedded) {
             (Some(p), _) => Some(p),
             (None, Some(contents)) => {
-                if let Err(e) =
-                    self.open_sarif_embedded(&uri, &contents, line as usize, column as usize)
-                {
-                    self.status = format!("Could not open the log's copy of {uri}: {e}");
+                match self.open_sarif_embedded(&uri, &contents, line as usize, column as usize) {
+                    Err(e) => self.status = format!("Could not open the log's copy of {uri}: {e}"),
+                    Ok(()) if archived => {
+                        self.status = format!(
+                            "Opened {uri} from the CodeQL database's source archive (read-only)"
+                        );
+                    }
+                    Ok(()) => {}
                 }
                 return;
             }
@@ -64792,17 +64799,54 @@ impl App {
 
     /// Where the selected SARIF result points, looked up in the workspace,
     /// the learned prefixes, the open files and the log's folder.
-    fn sarif_selected_place(&self) -> Option<crate::sarif::view::SelectedPlace> {
+    /// Also whether its file was read from the source archive of the
+    /// CodeQL database the log came from (#1369).
+    fn sarif_selected_place_and_origin(&self) -> Option<(crate::sarif::view::SelectedPlace, bool)> {
+        let view = self.editor.sarif.as_ref()?;
+        // A CodeQL run's SARIF says `%SRCROOT%` and leaves its meaning to
+        // the database (#1369): the folder it was created from.
+        let database = self.sarif_codeql_database();
+        let mut base_overrides = std::collections::BTreeMap::new();
+        if let Some(prefix) = database
+            .as_deref()
+            .and_then(crate::codeql_db::source_location_prefix)
+            .filter(|p| p.is_dir())
+        {
+            base_overrides.insert(String::from("%SRCROOT%"), prefix);
+        }
         let resolver = crate::sarif::resolve::Resolver {
             roots: vec![self.workspace_root().to_path_buf()],
+            base_overrides,
             learned: crate::sarif::resolve::saved_prefixes(self.workspace_root()),
             open: self.open_file_paths(),
             ..Default::default()
         };
-        self.editor
-            .sarif
-            .as_ref()?
-            .selected_place(resolver, &|p| p.is_file())
+        let mut place = view.selected_place(resolver, &|p| p.is_file())?;
+        // Not on this machine: the database keeps a copy of its source.
+        if place.path.is_none()
+            && place.embedded.is_none()
+            && let Some(text) = database
+                .as_deref()
+                .and_then(|db| crate::codeql_db::archived_source(db, &place.uri))
+        {
+            place.embedded = Some(crate::sarif::resolve::Embedded::Text(text));
+            return Some((place, true));
+        }
+        Some((place, false))
+    }
+
+    /// The CodeQL database whose query run wrote the SARIF log in the
+    /// editor, when it is one (#1369).
+    fn sarif_codeql_database(&self) -> Option<PathBuf> {
+        let log = self.editor.path.as_ref()?;
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        let entry = history.entries.iter().find(|e| {
+            e.output == *log
+                || e.output
+                    .canonicalize()
+                    .is_ok_and(|o| log.canonicalize().is_ok_and(|l| l == o))
+        })?;
+        Self::codeql_run_database(entry)
     }
 
     /// `path`'s text as the editor has it when it is open (it may be
@@ -64830,11 +64874,15 @@ impl App {
             target: 0,
             lines: Vec::new(),
         };
-        let preview = match self.sarif_selected_place() {
+        let preview = match self.sarif_selected_place_and_origin() {
             None => empty(String::from("This result has no location to preview.")),
-            Some(p) => {
+            Some((p, archived)) => {
                 let (title, text) = match (&p.path, &p.embedded) {
                     (Some(path), _) => (path.display().to_string(), self.sarif_file_text(path)),
+                    (None, Some(Embedded::Text(t))) if archived => (
+                        format!("{} (the database's source archive)", p.uri),
+                        Some(t.clone()),
+                    ),
                     (None, Some(Embedded::Text(t))) => {
                         (format!("{} (the log's copy)", p.uri), Some(t.clone()))
                     }

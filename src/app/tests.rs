@@ -71832,6 +71832,157 @@ fn a_missing_file_from_a_known_repository_downloads_once_its_host_is_trusted() {
     });
 }
 
+/// A CodeQL run's SARIF (#1369): `web.py` relative to `%SRCROOT%`, which
+/// only the database defines. Returns the log, after recording it in the
+/// query history as the output of a run on `db`.
+fn codeql_run_on(tmp: &std::path::Path, db: &std::path::Path) -> PathBuf {
+    let log = tmp.join("results/run-1/results.sarif");
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    std::fs::write(
+        &log,
+        r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"CodeQL"}},"results":[
+            {"message":{"text":"execute call"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"web.py","uriBaseId":"%SRCROOT%"},"region":{"startLine":4,"startColumn":5}}}]}
+        ]}]}"#,
+    )
+    .unwrap();
+    let mut history = crate::codeql_query::History::default();
+    history.push(crate::codeql_query::HistoryEntry {
+        query: tmp.join("find_calls.ql"),
+        database: String::from("db"),
+        database_path: Some(db.to_path_buf()),
+        started: 1,
+        seconds: 3,
+        status: crate::codeql_query::RunStatus::Succeeded,
+        output: log.clone(),
+        name: None,
+        results: Some(1),
+    });
+    history.save(&App::codeql_history_path()).unwrap();
+    log
+}
+
+const WEB_PY_1369: &str = "import sqlite3\n\ndef q(cur, name):\n    cur.execute(name)\n";
+
+/// #1369: a result of a database created from a sub-folder of the
+/// workspace opens that folder's file, not a Locate prompt.
+#[test]
+fn a_codeql_result_opens_from_the_folder_its_database_was_created_from() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = tmp.path().join("cq/app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("web.py"), WEB_PY_1369).unwrap();
+        let db = tmp.path().join("db");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::write(
+            db.join(crate::codeql_db::DB_MARKER),
+            format!("sourceLocationPrefix: {}\n", app_dir.display()),
+        )
+        .unwrap();
+        let log = codeql_run_on(tmp.path(), &db);
+        let mut app = App::new(tmp.path().join("cq")).unwrap();
+        app.editor.open_preview(&log).unwrap();
+        app.editor.sarif.as_mut().unwrap().selected = 1;
+        app.open_selected_sarif_result();
+        assert!(
+            app.input_prompt.is_none(),
+            "no Locate prompt: {}",
+            app.status
+        );
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(app_dir.join("web.py").as_path())
+        );
+        assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (3, 4));
+    });
+}
+
+/// #1369: with the source not on this machine, the result opens read-only
+/// from the database's `src.zip`, as VS Code's CodeQL extension does.
+#[test]
+fn a_codeql_result_opens_from_the_databases_source_archive() {
+    use std::io::Write as _;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("cq")).unwrap();
+        let db = tmp.path().join("db");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::write(
+            db.join(crate::codeql_db::DB_MARKER),
+            "sourceLocationPrefix: /home/someone/app\n",
+        )
+        .unwrap();
+        let mut z = zip::ZipWriter::new(std::fs::File::create(db.join("src.zip")).unwrap());
+        z.start_file(
+            "home/someone/app/web.py",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        z.write_all(WEB_PY_1369.as_bytes()).unwrap();
+        z.finish().unwrap();
+        let log = codeql_run_on(tmp.path(), &db);
+        let mut app = App::new(tmp.path().join("cq")).unwrap();
+        app.editor.open_preview(&log).unwrap();
+        app.editor.sarif.as_mut().unwrap().selected = 1;
+        app.open_selected_sarif_result();
+        assert!(
+            app.input_prompt.is_none(),
+            "no Locate prompt: {}",
+            app.status
+        );
+        let opened = app.editor.path.clone().expect("the archived copy opened");
+        assert!(opened.starts_with(croft_cache_dir()), "{opened:?}");
+        assert_eq!(opened.file_name().unwrap(), "web.py");
+        assert_eq!(app.editor.lines.join("\n"), WEB_PY_1369.trim_end());
+        assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (3, 4));
+        assert_eq!(
+            app.status,
+            "Opened web.py from the CodeQL database's source archive (read-only)"
+        );
+    });
+}
+
+/// #1369, negative: the same log not written by a CodeQL run (no history
+/// entry names it) has no database to ask, so croft still asks where the
+/// file is.
+#[test]
+fn a_sarif_log_from_no_codeql_run_still_asks_to_locate_its_file() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = tmp.path().join("cq/app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("web.py"), WEB_PY_1369).unwrap();
+        let db = tmp.path().join("db");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::write(
+            db.join(crate::codeql_db::DB_MARKER),
+            format!("sourceLocationPrefix: {}\n", app_dir.display()),
+        )
+        .unwrap();
+        let log = codeql_run_on(tmp.path(), &db);
+        let other = tmp.path().join("ci.sarif");
+        std::fs::copy(&log, &other).unwrap();
+        let mut app = App::new(tmp.path().join("cq")).unwrap();
+        app.editor.open_preview(&other).unwrap();
+        app.editor.sarif.as_mut().unwrap().selected = 1;
+        app.open_selected_sarif_result();
+        assert!(
+            matches!(
+                app.input_prompt.as_ref().map(|p| &p.purpose),
+                Some(crate::widgets::input_prompt::InputPurpose::SarifLocate { .. })
+            ),
+            "a Locate prompt: {}",
+            app.status
+        );
+    });
+}
+
 #[test]
 fn a_missing_file_asks_to_locate_it_and_the_mapping_is_learned_and_kept() {
     // #577: VS Code's Locate… prompt, with the learned prefix remembered.
