@@ -81122,6 +81122,142 @@ fn prompt_chords_leave_the_editor_alone() {
     assert!(app.editor.selection.is_none_or(|s| !s.has_area()));
 }
 
+/// A file with one conflict block open in the merge editor, whose Result
+/// (`top / mine / bottom` once Accept Current runs) differs from the disk.
+fn app_with_merge_editor_open(dir: &std::path::Path) -> (App, std::path::PathBuf) {
+    let file = dir.join("f.txt");
+    std::fs::write(
+        &file,
+        "top\n<<<<<<< HEAD\nmine\n=======\nyours\n>>>>>>> other\nbottom\n",
+    )
+    .unwrap();
+    let mut app = App::new(dir.to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.run_command(crate::widgets::command_palette::Command::MergeOpenEditor);
+    assert!(app.editor.merge.is_some(), "setup: the merge editor is up");
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptCurrent);
+    assert!(app.editor.dirty, "setup: the Result is unsaved");
+    (app, file)
+}
+
+/// #1588: hot exit never backs up a merge editor's Result as an unsaved
+/// edit of the file, so a relaunch after the terminal closed brings the
+/// file back clean, as it is on disk, not as a dirty tab whose Ctrl+S
+/// writes the Result over it.
+#[test]
+fn hot_exit_does_not_keep_a_merge_result_as_the_files_unsaved_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, file) = app_with_merge_editor_open(tmp.path());
+    let disk = std::fs::read_to_string(&file).unwrap();
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    assert!(
+        !app.capture_hot_exit()
+            .buffers
+            .iter()
+            .any(|b| b.tab.path.as_deref() == Some(file.as_path())),
+        "no unsaved buffer for the merged file"
+    );
+    drop(app);
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert!(
+        next.editor
+            .editors
+            .iter()
+            .all(|e| e.path.as_deref() != Some(file.as_path()) || !e.dirty),
+        "the file does not come back dirty"
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), disk);
+}
+
+/// #1588: an update relaunch, unlike hot exit, carries the merge editor's
+/// unsaved Result to the new process: it exits at once, and the Result
+/// exists nowhere else.
+#[test]
+fn an_update_relaunch_keeps_a_dirty_merge_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_merge_editor_open(tmp.path());
+    let disk = std::fs::read_to_string(&file).unwrap();
+    let result = app.editor.lines.clone();
+    assert_eq!(result, vec!["top", "mine", "bottom"]);
+    app.arm_reexec();
+    assert!(app.pending_reexec, "the relaunch is armed");
+    let state = app.capture_session_state();
+    let tab = state
+        .tabs
+        .iter()
+        .find(|t| t.path.as_deref() == Some(file.as_path()))
+        .expect("the tab is handed over");
+    assert!(tab.dirty);
+    assert_eq!(tab.unsaved_text.as_deref(), Some("top\nmine\nbottom"));
+
+    let mut next = App::new(tmp.path().to_path_buf()).unwrap();
+    next.apply_session_state(&state);
+    let ed = next
+        .editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(file.as_path()))
+        .expect("the file is reopened");
+    assert!(ed.dirty);
+    assert_eq!(ed.lines, result);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), disk);
+}
+
+/// #1588: the same for a merge editor in another editor group.
+#[test]
+fn a_merge_editor_in_another_group_is_not_backed_up_either() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_merge_editor_open(tmp.path());
+    let other = tmp.path().join("other.txt");
+    std::fs::write(&other, "x\n").unwrap();
+    app.run_command(crate::widgets::command_palette::Command::SplitEditor);
+    app.editor.open_pinned(&other).unwrap();
+    assert!(
+        app.editor_layout
+            .inactive_groups()
+            .iter()
+            .any(|g| g.editors.iter().any(|e| e.merge.is_some())),
+        "setup: the merge editor is in the other group"
+    );
+    assert!(
+        !app.capture_hot_exit()
+            .buffers
+            .iter()
+            .any(|b| b.tab.path.as_deref() == Some(file.as_path()))
+    );
+}
+
+/// #1588 negative: a plain unsaved edit of the same file, once the merge
+/// editor is closed with Reopen as Text, is still backed up.
+#[test]
+fn an_unsaved_edit_after_reopen_as_text_is_still_backed_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, file) = app_with_merge_editor_open(tmp.path());
+    app.run_command(crate::widgets::command_palette::Command::ReopenAsText);
+    assert!(app.editor.merge.is_none(), "setup: a plain text tab");
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    app.editor.insert_char('x');
+    let backup = app.capture_hot_exit();
+    let kept = backup
+        .buffers
+        .iter()
+        .find(|b| b.tab.path.as_deref() == Some(file.as_path()))
+        .expect("the unsaved edit is backed up");
+    assert!(
+        kept.tab
+            .unsaved_text
+            .as_deref()
+            .unwrap()
+            .starts_with("xtop")
+    );
+}
+
 /// #1594: a user matcher named `go` is not one of the loose built-in rows,
 /// so its rows are kept even for a file not on disk.
 #[test]
