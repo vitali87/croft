@@ -7924,8 +7924,8 @@ impl Editor {
         let line = self.lines[row].clone();
 
         // Inside a doc comment the new line continues it (#1443).
-        let next_line = self.lines.get(row + 1).map(String::as_str);
-        if let Some(enter) = comment_on_enter(self.lang, &line, col, next_line) {
+        let below = self.lines.get(row + 1..).unwrap_or(&[]);
+        if let Some(enter) = comment_on_enter(self.lang, &line, col, below) {
             self.continue_comment(enter);
             return;
         }
@@ -14330,7 +14330,7 @@ fn comment_on_enter(
     lang: Option<LangKind>,
     line: &str,
     col: usize,
-    next_line: Option<&str>,
+    below: &[String],
 ) -> Option<CommentEnter> {
     let before: String = line.chars().take(col).collect();
     let after: String = line.chars().skip(col).collect();
@@ -14362,9 +14362,8 @@ fn comment_on_enter(
     {
         let below = if closer_next {
             CommentBelow::MoveCloser(format!("{indent} "))
-        } else if after.contains("*/") || next_line.is_some_and(|l| l.trim_start().starts_with('*'))
-        {
-            // Already closed, on this line or by the block's own lines.
+        } else if after.contains("*/") || block_closed_below(below) {
+            // Already closed, on this line or further down.
             CommentBelow::Nothing
         } else {
             CommentBelow::AddCloser(format!("{indent} */"))
@@ -14390,6 +14389,19 @@ fn comment_on_enter(
         return nothing(indent[..indent.len() - 1].to_string());
     }
     None
+}
+
+/// Whether the lines below an opened block comment close it: a `*/`
+/// comes before any further `/*` would open another block.
+fn block_closed_below(below: &[String]) -> bool {
+    for line in below {
+        match (line.find("/*"), line.find("*/")) {
+            (open, Some(close)) if open.is_none_or(|open| close < open) => return true,
+            (Some(_), _) => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn extra_indent_triggered(lang: Option<LangKind>, last_non_ws: Option<char>) -> bool {
@@ -24432,6 +24444,36 @@ mod tests {
             enter_at(LangKind::C, "/**|\n * Adds.\n */"),
             (
                 vec!["/**".into(), " * ".into(), " * Adds.".into(), " */".into()],
+                (1, 3)
+            )
+        );
+    }
+
+    #[test]
+    fn enter_after_an_opener_closed_further_down_adds_no_closer() {
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "/**|\nDescription.\n */"),
+            (
+                vec![
+                    "/**".into(),
+                    " * ".into(),
+                    "Description.".into(),
+                    " */".into()
+                ],
+                (1, 3)
+            )
+        );
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "/**|\n\nf();\n/** g */"),
+            (
+                vec![
+                    "/**".into(),
+                    " * ".into(),
+                    " */".into(),
+                    "".into(),
+                    "f();".into(),
+                    "/** g */".into()
+                ],
                 (1, 3)
             )
         );
