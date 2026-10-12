@@ -45415,7 +45415,6 @@ fn a_prepare_rename_verdict_routes_to_the_prompt_status_or_fallback() {
 
     let verdict = |target, error, unsupported| PrepareRenameResult {
         request_id: 4,
-        path: path.clone(),
         unsupported,
         error,
         target,
@@ -45499,7 +45498,6 @@ fn a_prepare_rename_verdict_routes_to_the_prompt_status_or_fallback() {
     arm(&mut app);
     let stale = PrepareRenameResult {
         request_id: 3,
-        path: path.clone(),
         unsupported: false,
         error: None,
         target: None,
@@ -45528,7 +45526,6 @@ fn a_multi_line_validated_range_falls_back_to_the_word_prompt() {
     app.prepare_rename_request = Some((4, path.clone(), 1, 9, app.editor.edit_seq));
     assert!(app.apply_prepare_rename_verdict(PrepareRenameResult {
         request_id: 4,
-        path: path.clone(),
         unsupported: false,
         error: None,
         target: Some(((1, 8, 2, 4), None)),
@@ -45675,11 +45672,9 @@ fn linked_tick_only(app: &mut App) -> Option<u64> {
 }
 
 fn answer_linked(app: &App, id: u64, ranges: Vec<(u32, u32, u32, u32)>) {
-    let path = app.editor.path.clone().unwrap();
     app.lsp.as_ref().unwrap().push_linked_editing_for_test(
         crate::lsp::manager::LinkedEditingResult {
             request_id: id,
-            path,
             ranges,
         },
     );
@@ -80397,7 +80392,6 @@ fn an_empty_jump_reply_says_nothing_was_found_and_clears_the_request() {
     use crate::lsp::manager::{DeclarationResult, DefinitionResult, TypeDefinitionResult};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = jump_app(tmp.path());
-    let path = app.editor.path.clone().unwrap();
 
     app.request_definition_at_cursor();
     let id = app.definition_request_id.expect("F12 sent a request");
@@ -80406,7 +80400,6 @@ fn an_empty_jump_reply_says_nothing_was_found_and_clears_the_request() {
         .unwrap()
         .push_definition_for_test(DefinitionResult {
             request_id: id,
-            path: path.clone(),
             target: None,
         });
     let redrew = app.drain_lsp_definition();
@@ -80421,7 +80414,6 @@ fn an_empty_jump_reply_says_nothing_was_found_and_clears_the_request() {
         .unwrap()
         .push_declaration_for_test(DeclarationResult {
             request_id: id,
-            path: path.clone(),
             target: None,
             unsupported: false,
         });
@@ -80438,7 +80430,6 @@ fn an_empty_jump_reply_says_nothing_was_found_and_clears_the_request() {
         .unwrap()
         .push_type_definition_for_test(TypeDefinitionResult {
             request_id: id,
-            path,
             target: None,
             unsupported: false,
         });
@@ -80462,7 +80453,6 @@ fn a_stale_jump_reply_changes_nothing_and_a_found_target_still_jumps() {
         .unwrap()
         .push_definition_for_test(DefinitionResult {
             request_id: id + 1000,
-            path: path.clone(),
             target: None,
         });
     assert!(!app.drain_lsp_definition(), "a stale reply is dropped");
@@ -80474,7 +80464,6 @@ fn a_stale_jump_reply_changes_nothing_and_a_found_target_still_jumps() {
         .unwrap()
         .push_definition_for_test(DefinitionResult {
             request_id: id,
-            path: path.clone(),
             target: Some((path, 0, 0)),
         });
     assert!(app.drain_lsp_definition());

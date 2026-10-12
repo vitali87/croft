@@ -3,27 +3,6 @@ use std::collections::HashMap;
 use crate::lsp::config::{Language, ServerConfig};
 use crate::lsp::manifest;
 
-/// Bundled (first-party) extension manifests, embedded so they ship in the
-/// binary and load identically on every host. These are the same declarative
-/// `extension.toml` format a third-party extension uses; the language servers
-/// they declare reproduce the configs `with_defaults` used to hardcode.
-const BUNDLED_MANIFESTS: &[&str] = &[
-    include_str!("../../assets/extensions/lsp-python/extension.toml"),
-    include_str!("../../assets/extensions/lsp-typescript/extension.toml"),
-    include_str!("../../assets/extensions/lsp-rust/extension.toml"),
-    include_str!("../../assets/extensions/lsp-go/extension.toml"),
-    include_str!("../../assets/extensions/lsp-yaml/extension.toml"),
-    include_str!("../../assets/extensions/lsp-json/extension.toml"),
-    include_str!("../../assets/extensions/lsp-html/extension.toml"),
-    include_str!("../../assets/extensions/lsp-css/extension.toml"),
-    include_str!("../../assets/extensions/lsp-bash/extension.toml"),
-    include_str!("../../assets/extensions/lsp-toml/extension.toml"),
-    include_str!("../../assets/extensions/lsp-cpp/extension.toml"),
-    include_str!("../../assets/extensions/lsp-lua/extension.toml"),
-    include_str!("../../assets/extensions/lsp-markdown/extension.toml"),
-    include_str!("../../assets/extensions/codeql/extension.toml"),
-];
-
 pub struct ServerRegistry {
     by_language: HashMap<Language, Vec<ServerConfig>>,
 }
@@ -46,14 +25,16 @@ impl ServerRegistry {
     /// (go-to-implementation, inlay hints); ruff (priority 2) lints. Servers are
     /// registered in ascending priority so the registry's first-registered-wins
     /// rule matches that policy.
+    #[cfg(test)]
     pub fn with_defaults() -> Self {
-        Self::from_manifest_sources(BUNDLED_MANIFESTS)
+        Self::with_user_extensions(&[])
     }
 
     /// Build the registry from the bundled manifests plus user extension
     /// sources (read from `~/.config/croft/extensions`). User servers register
     /// after the bundled ones at equal priority, so a user extension extends
     /// the language coverage without displacing a first-party server.
+    #[cfg(test)]
     pub fn with_user_extensions(user_sources: &[&str]) -> Self {
         let mut sources: Vec<&str> = manifest::BUNDLED_MANIFESTS.to_vec();
         sources.extend_from_slice(user_sources);
@@ -111,15 +92,12 @@ impl ServerRegistry {
             .unwrap_or(&[])
     }
 
+    #[cfg(test)]
     pub fn for_extension(&self, ext: &str) -> &[ServerConfig] {
         match Language::from_extension(ext) {
             Some(lang) => self.for_language(lang),
             None => &[],
         }
-    }
-
-    pub fn languages(&self) -> impl Iterator<Item = Language> + '_ {
-        self.by_language.keys().copied()
     }
 }
 

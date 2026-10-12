@@ -366,7 +366,6 @@ pub struct LspClient {
     capabilities: ServerCapabilities,
     /// See [`LspClient::supports_type_hierarchy`].
     type_hierarchy: bool,
-    name: String,
     // Holds the process so kill_on_drop only fires when this client is
     // dropped, not when spawn() returns. Without this the server is
     // SIGKILLed mid-handshake and the mainloop reader sees EOF.
@@ -487,7 +486,7 @@ impl LspClient {
         let stdout = crate::lsp::trace::TraceRead::new(stdout, name.clone());
         let stdin = crate::lsp::trace::TraceWrite::new(stdin, name.clone());
 
-        let mainloop_name = name.clone();
+        let mainloop_name = name;
         let exited = Arc::new(AtomicBool::new(false));
         let exited_for_loop = exited.clone();
         let mainloop_task = tokio::spawn(async move {
@@ -530,15 +529,10 @@ impl LspClient {
             server,
             capabilities: init.capabilities,
             type_hierarchy,
-            name,
             child,
             mainloop_task,
             exited,
         })
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
     }
 
     pub fn capabilities(&self) -> &ServerCapabilities {
@@ -549,10 +543,6 @@ impl LspClient {
     /// [`ServerCapabilities`] cannot carry in `lsp-types` 0.95.
     pub fn supports_type_hierarchy(&self) -> bool {
         self.type_hierarchy
-    }
-
-    pub fn server_mut(&mut self) -> &mut ServerSocket {
-        &mut self.server
     }
 
     /// A detached handle to the server, for a request whose answer must be
@@ -1938,13 +1928,12 @@ mod tests {
             return;
         }
         let rt = LspRuntime::new().expect("runtime");
-        let expected_name = config.name;
         let display_name = config.name;
 
         let result: Result<()> = rt.handle().block_on(async move {
             let (diag_tx, _diag_rx) = std_mpsc::channel();
             let (prog_tx, _prog_rx) = std_mpsc::channel();
-            let client = LspClient::spawn(
+            let mut client = LspClient::spawn(
                 &config,
                 &root,
                 ClientCapabilities::default(),
@@ -1956,8 +1945,6 @@ mod tests {
                 prog_tx,
             )
             .await?;
-            assert_eq!(client.name(), expected_name);
-            let mut client = client;
             client.shutdown().await
         });
 
