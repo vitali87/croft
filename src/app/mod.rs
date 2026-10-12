@@ -52024,6 +52024,18 @@ impl App {
             (KeyCode::Right, _) => prompt.move_cursor_right(),
             (KeyCode::Home, _) => prompt.move_cursor_home(),
             (KeyCode::End, _) => prompt.move_cursor_end(),
+            // Replacing a prefilled value took a Backspace per character,
+            // typed blind (#1601): these select or clear it as the shell
+            // and VS Code do, and a word goes back to a path separator.
+            (KeyCode::Char('a'), KeyModifiers::CONTROL) => prompt.select_all(),
+            (KeyCode::Char('a'), KeyModifiers::SUPER) => prompt.select_all(),
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) => prompt.clear_to_start(),
+            (KeyCode::Char('k'), KeyModifiers::CONTROL) => prompt.clear_to_end(),
+            (KeyCode::Char('w'), KeyModifiers::CONTROL) => prompt.delete_word_back(),
+            (KeyCode::Backspace, m) if m.contains(KeyModifiers::SUPER) => prompt.clear_to_start(),
+            (KeyCode::Backspace, m) if m.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+                prompt.delete_word_back()
+            }
             (KeyCode::Backspace, _) => prompt.pop_char(),
             (KeyCode::Delete, _) => prompt.delete_char(),
             (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
