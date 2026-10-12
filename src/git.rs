@@ -2755,8 +2755,33 @@ pub fn create_branch(root: &Path, name: &str) -> Result<String, String> {
 
 /// Stash the working tree (`git stash push`). Tracked changes are saved
 /// and the working tree reverts to HEAD, exactly like VS Code's Stash.
-pub fn stash_push(root: &Path) -> Result<String, String> {
-    run_mutation(root, &["stash", "push"])
+/// A `message` names the stash (`-m`, #1581); without one git calls it
+/// `WIP on <branch>: <commit>`.
+pub fn stash_push(root: &Path, message: Option<&str>) -> Result<String, String> {
+    stash_push_args(root, &[], message)
+}
+
+/// Which of Source Control's three stash commands is asking for a
+/// message (#1581).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StashKind {
+    /// `git stash push`.
+    Tracked,
+    /// `git stash push -u`.
+    IncludeUntracked,
+    /// `git stash push --staged`.
+    Staged,
+}
+
+/// `git stash push <extra> [-m <message>]`, a blank message counting as
+/// none.
+fn stash_push_args(root: &Path, extra: &[&str], message: Option<&str>) -> Result<String, String> {
+    let mut args = vec!["stash", "push"];
+    args.extend_from_slice(extra);
+    if let Some(message) = message.map(str::trim).filter(|m| !m.is_empty()) {
+        args.extend(["-m", message]);
+    }
+    run_mutation(root, &args)
 }
 
 /// Restore and drop the most recent stash (`git stash pop`). A pop
@@ -3127,13 +3152,13 @@ pub fn remove_remote(root: &Path, name: &str) -> Result<String, String> {
 // --- Stash (full set) ----------------------------------------------------
 
 /// Stash including untracked files (`git stash push -u`).
-pub fn stash_push_untracked(root: &Path) -> Result<String, String> {
-    run_mutation(root, &["stash", "push", "-u"])
+pub fn stash_push_untracked(root: &Path, message: Option<&str>) -> Result<String, String> {
+    stash_push_args(root, &["-u"], message)
 }
 
 /// Stash only the staged changes (`git stash push --staged`).
-pub fn stash_push_staged(root: &Path) -> Result<String, String> {
-    run_mutation(root, &["stash", "push", "--staged"])
+pub fn stash_push_staged(root: &Path, message: Option<&str>) -> Result<String, String> {
+    stash_push_args(root, &["--staged"], message)
 }
 
 /// One entry in the stash list, for the apply/pop/drop pickers.
@@ -3143,16 +3168,41 @@ pub struct StashInfo {
     pub index: usize,
     /// The human description git stores (`WIP on main: …`).
     pub message: String,
+    /// How long ago it was made (`5 minutes ago`, #1581).
+    pub age: String,
+    /// The files it holds, untracked ones included (#1581), so two stashes
+    /// on the same commit can be told apart.
+    pub files: Vec<String>,
+}
+
+impl StashInfo {
+    /// The picker row (#1581): `stash@{N}: <message> · <age> · <files>`,
+    /// naming at most three files.
+    pub fn label(&self) -> String {
+        let mut label = format!("stash@{{{}}}: {}", self.index, self.message);
+        if !self.age.is_empty() {
+            label.push_str(&format!(" \u{b7} {}", self.age));
+        }
+        if !self.files.is_empty() {
+            let shown: Vec<&str> = self.files.iter().take(3).map(String::as_str).collect();
+            label.push_str(&format!(" \u{b7} {}", shown.join(", ")));
+            if self.files.len() > 3 {
+                label.push_str(&format!(" +{}", self.files.len() - 3));
+            }
+        }
+        label
+    }
 }
 
 /// List stashes newest-first (`git stash list`).
 pub fn list_stashes(root: &Path) -> Result<Vec<StashInfo>, String> {
-    let raw =
-        run_git(root, &["stash", "list", "--format=%gd\x1f%gs"]).map_err(|e| e.to_string())?;
+    let raw = run_git(root, &["stash", "list", "--format=%gd\x1f%cr\x1f%gs"])
+        .map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for line in raw.lines() {
         let mut parts = line.split('\x1f');
         let Some(reflog) = parts.next() else { continue };
+        let age = parts.next().unwrap_or("").to_string();
         let message = parts.next().unwrap_or("").to_string();
         // reflog looks like "stash@{2}" — pull the integer out.
         let index = reflog
@@ -3160,9 +3210,45 @@ pub fn list_stashes(root: &Path) -> Result<Vec<StashInfo>, String> {
             .trim_end_matches('}')
             .parse::<usize>()
             .unwrap_or(out.len());
-        out.push(StashInfo { index, message });
+        let files = run_git(
+            root,
+            &[
+                "stash",
+                "show",
+                "--name-only",
+                "--include-untracked",
+                reflog,
+            ],
+        )
+        .map(|names| names.lines().map(str::to_string).collect())
+        .unwrap_or_default();
+        out.push(StashInfo {
+            index,
+            message,
+            age,
+            files,
+        });
     }
     Ok(out)
+}
+
+/// A stash's changes as a patch against the commit it was made on,
+/// untracked files included (`git stash show --stat --patch
+/// --include-untracked stash@{N}`), for View Stash (#1581).
+pub fn show_stash(root: &Path, index: usize) -> Result<String, String> {
+    diff_text(
+        root,
+        &[
+            "stash",
+            "show",
+            "--no-color",
+            "--no-ext-diff",
+            "--stat",
+            "--patch",
+            "--include-untracked",
+            &format!("stash@{{{index}}}"),
+        ],
+    )
 }
 
 /// Apply a stash without dropping it (`git stash apply stash@{N}`).
@@ -6048,7 +6134,7 @@ filename seed.txt
         let p = tmp.path();
         init_repo_with_commit(p);
         std::fs::write(p.join("seed.txt"), "one\ntwo\nstashed\n").unwrap();
-        stash_push(p).expect("stash push must succeed");
+        stash_push(p, None).expect("stash push must succeed");
         // The dirty edit is gone from the working tree after stashing.
         assert_eq!(
             std::fs::read_to_string(p.join("seed.txt")).unwrap(),
@@ -6194,9 +6280,9 @@ filename seed.txt
         let p = tmp.path();
         init_repo_with_commit(p);
         std::fs::write(p.join("seed.txt"), "one\ntwo\nfirst\n").unwrap();
-        stash_push(p).expect("first stash");
+        stash_push(p, None).expect("first stash");
         std::fs::write(p.join("seed.txt"), "one\ntwo\nsecond\n").unwrap();
-        stash_push(p).expect("second stash");
+        stash_push(p, None).expect("second stash");
         let stashes = list_stashes(p).unwrap();
         assert_eq!(stashes.len(), 2);
         assert_eq!(stashes[0].index, 0, "newest stash is stash@{{0}}");
@@ -6211,6 +6297,88 @@ filename seed.txt
         // Drop the newest; one remains.
         stash_drop(p, 0).expect("stash_drop");
         assert_eq!(list_stashes(p).unwrap().len(), 1);
+    }
+
+    // #1581: a stash takes the name it is given, for every kind of stash,
+    // and its row says how old it is and which files it holds.
+    #[test]
+    fn a_stash_message_names_the_stash_and_the_row_lists_its_files() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join("seed.txt"), "one\ntwo\ntracked\n").unwrap();
+        stash_push(p, Some("retry tweak")).expect("named stash");
+        std::fs::write(p.join("new.txt"), "untracked\n").unwrap();
+        stash_push_untracked(p, Some("with the new file")).expect("named -u stash");
+        std::fs::write(p.join("seed.txt"), "one\ntwo\nstaged\n").unwrap();
+        run_git(p, &["add", "seed.txt"]).unwrap();
+        stash_push_staged(p, Some("only staged")).expect("named --staged stash");
+        let stashes = list_stashes(p).unwrap();
+        let messages: Vec<&str> = stashes.iter().map(|s| s.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            [
+                "On main: only staged",
+                "On main: with the new file",
+                "On main: retry tweak"
+            ]
+        );
+        assert_eq!(stashes[1].files, ["new.txt"], "untracked files are listed");
+        assert_eq!(stashes[2].files, ["seed.txt"]);
+        assert!(!stashes[2].age.is_empty(), "{:?}", stashes[2]);
+        let label = stashes[2].label();
+        assert!(
+            label.starts_with("stash@{2}: On main: retry tweak \u{b7} ")
+                && label.ends_with(" \u{b7} seed.txt"),
+            "{label}"
+        );
+    }
+
+    // Negative (#1581): a blank or missing message leaves git's own
+    // `WIP on` name, and a row never lists more than three files.
+    #[test]
+    fn a_blank_stash_message_keeps_the_wip_name_and_long_file_lists_are_cut() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join("seed.txt"), "one\ntwo\nblank\n").unwrap();
+        stash_push(p, Some("   ")).expect("blank-named stash");
+        let stashes = list_stashes(p).unwrap();
+        assert!(
+            stashes[0].message.starts_with("WIP on main: "),
+            "{:?}",
+            stashes[0]
+        );
+        let info = StashInfo {
+            index: 4,
+            message: "On main: big".into(),
+            age: String::new(),
+            files: ["a", "b", "c", "d", "e"].map(String::from).to_vec(),
+        };
+        assert_eq!(info.label(), "stash@{4}: On main: big \u{b7} a, b, c +2");
+    }
+
+    // #1581: View Stash shows the stash's diff, untracked files included,
+    // without applying it.
+    #[test]
+    fn show_stash_is_the_patch_without_applying_it() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join("seed.txt"), "one\ntwo\nretries = 5\n").unwrap();
+        std::fs::write(p.join("extra.txt"), "brand new\n").unwrap();
+        stash_push_untracked(p, Some("retries")).unwrap();
+        let patch = show_stash(p, 0).expect("show_stash");
+        assert!(patch.contains("+retries = 5"), "{patch}");
+        assert!(patch.contains("+brand new"), "untracked: {patch}");
+        assert!(patch.contains("2 files changed"), "the stat: {patch}");
+        assert_eq!(
+            std::fs::read_to_string(p.join("seed.txt")).unwrap(),
+            "one\ntwo\n",
+            "viewing does not apply"
+        );
+        assert_eq!(list_stashes(p).unwrap().len(), 1, "viewing does not drop");
+        assert!(show_stash(p, 3).is_err(), "no such stash");
     }
 
     #[test]

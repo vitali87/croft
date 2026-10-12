@@ -200,6 +200,12 @@ pub enum InputPurpose {
     /// that is not a positive number is refused rather than silently
     /// replaying once.
     MacroReplayCount,
+    /// The optional name for a stash (#1581), as VS Code's Git: Stash asks:
+    /// one becomes `git stash push -m`, a blank field keeps git's own
+    /// `WIP on <branch>: <commit>`.
+    StashMessage {
+        kind: crate::git::StashKind,
+    },
     /// Confirm uninstalling an installed extension. Submitting (Enter) performs
     /// the removal; Esc keeps it. The submitted value is a sentinel, ignored.
     ExtensionUninstall {

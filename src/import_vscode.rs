@@ -246,6 +246,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("workbench.action.files.saveAll", "save_all"),
     ("explorer.newFile", "new_file"),
     ("explorer.newFolder", "new_folder"),
+    ("git.viewStash", "git_view_stash"),
     ("editor.action.selectAll", "select_all"),
     ("workbench.action.quickOpen", "quick_open"),
     ("workbench.action.editor.nextChange", "next_change"),

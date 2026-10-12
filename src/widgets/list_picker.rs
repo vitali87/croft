@@ -28,6 +28,8 @@ pub enum ListPurpose {
     StashApply,
     StashPop,
     StashDrop,
+    /// A stash whose changes to open (#1581).
+    StashView,
     RemoveRemote,
     DeleteTag,
     PushToRemote,
