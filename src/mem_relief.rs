@@ -24,7 +24,10 @@ pub const THRESHOLD: usize = 8 << 20;
 /// When to release, given one reading of [`measure`] per tick: once the
 /// reading has grown [`THRESHOLD`] past the lowest seen since the last
 /// release. The low-water mark restarts from the reading taken right after
-/// a release, so memory croft still uses never triggers another.
+/// a release that freed something worthwhile, so memory croft still uses
+/// never triggers another. A release that freed little (the parse was still
+/// running, its memory live) keeps the old mark, so the next tick tries
+/// again once the parse has dropped it.
 #[derive(Debug, Default)]
 pub struct Policy {
     low: Option<usize>,
@@ -37,8 +40,10 @@ impl Policy {
         reading - low >= THRESHOLD
     }
 
-    pub fn released(&mut self, reading: usize) {
-        self.low = Some(reading);
+    pub fn released(&mut self, before: usize, after: usize) {
+        if before.saturating_sub(after) >= THRESHOLD {
+            self.low = Some(after);
+        }
     }
 }
 
@@ -113,9 +118,10 @@ pub fn start() {
             let mut policy = Policy::default();
             loop {
                 std::thread::sleep(INTERVAL);
-                if policy.should_release(measure()) {
+                let before = measure();
+                if policy.should_release(before) {
                     release_free_memory();
-                    policy.released(measure());
+                    policy.released(before, measure());
                 }
             }
         });
@@ -153,13 +159,27 @@ mod tests {
         let mut p = Policy::default();
         assert!(!p.should_release(40 * MB));
         assert!(p.should_release(300 * MB));
-        p.released(150 * MB);
+        p.released(300 * MB, 150 * MB);
         assert!(
             !p.should_release(150 * MB),
             "memory in use never retriggers"
         );
         assert!(!p.should_release(150 * MB + THRESHOLD - 1));
         assert!(p.should_release(150 * MB + THRESHOLD));
+    }
+
+    /// A release while the parse still holds its memory frees little, so
+    /// the old mark stays and the next tick, after the parse has dropped
+    /// it, releases again rather than taking the peak as the new floor.
+    #[test]
+    fn a_release_that_frees_little_is_retried() {
+        let mut p = Policy::default();
+        assert!(!p.should_release(40 * MB));
+        assert!(p.should_release(300 * MB));
+        p.released(300 * MB, 299 * MB);
+        assert!(p.should_release(299 * MB), "still far above the old mark");
+        p.released(299 * MB, 60 * MB);
+        assert!(!p.should_release(60 * MB));
     }
 
     /// Free 32 MB of small blocks that a live block keeps from the top of
