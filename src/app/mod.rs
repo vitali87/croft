@@ -19153,6 +19153,13 @@ impl App {
             // mirroring the terminal pane buttons' hover affordance.
             let pointer = self.pointer_cell;
             self.editor.hover_pointer = pointer;
+            // Without an inline-image protocol an image tab draws itself in
+            // half blocks (#1591).
+            let cell_images = !self.inline_images_enabled();
+            self.editor.cell_images = cell_images;
+            for group in self.editor_layout.inactive_groups_mut() {
+                group.cell_images = cell_images;
+            }
             // Breadcrumb bar: recompute the path + symbol trail for the active
             // file each frame so it tracks caret moves and outline updates.
             self.editor.breadcrumbs = self.build_breadcrumbs();

@@ -185,6 +185,86 @@ fn render_image_placeholder(
     );
 }
 
+/// An image drawn with half blocks (#1591): `rows` × `cols` cells, each a
+/// `▀` whose foreground is the upper pixel and background the lower one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CellImage {
+    /// `(image generation, area width, area height, background)`.
+    key: (u64, u16, u16, Color),
+    cols: u16,
+    rows: u16,
+    cells: Vec<(Color, Color)>,
+}
+
+/// Half-block cells as `(columns, rows, (upper, lower) colours)`.
+type HalfBlocks = (u16, u16, Vec<(Color, Color)>);
+
+/// Decode `bytes` and shrink the picture to fit `cols` × `rows` cells, two
+/// pixels a cell, keeping its shape (a cell is about twice as tall as it is
+/// wide, so a half cell is square) and never enlarging it. Transparency is
+/// blended over `bg`. `None` for bytes the decoder refuses or an empty
+/// area. Returns the cells' `(columns, rows, (upper, lower) colours)`.
+fn halfblock_cells(bytes: &[u8], cols: u16, rows: u16, bg: Color) -> Option<HalfBlocks> {
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (iw, ih) = img.dimensions();
+    if iw == 0 || ih == 0 {
+        return None;
+    }
+    let (max_w, max_h) = (u32::from(cols), u32::from(rows) * 2);
+    let scale = (f64::from(max_w) / f64::from(iw))
+        .min(f64::from(max_h) / f64::from(ih))
+        .min(1.0);
+    let w = ((f64::from(iw) * scale).round() as u32).clamp(1, max_w);
+    let h = ((f64::from(ih) * scale).round() as u32).clamp(1, max_h);
+    let small = if (w, h) == (iw, ih) {
+        img
+    } else {
+        image::imageops::resize(&img, w, h, image::imageops::FilterType::Triangle)
+    };
+    let (br, bg_g, bb) = match bg {
+        Color::Rgb(r, g, b) => (r, g, b),
+        _ => (0, 0, 0),
+    };
+    let blend = |p: &image::Rgba<u8>| {
+        let a = u16::from(p[3]);
+        let mix =
+            |c: u8, under: u8| ((u16::from(c) * a + u16::from(under) * (255 - a)) / 255) as u8;
+        Color::Rgb(mix(p[0], br), mix(p[1], bg_g), mix(p[2], bb))
+    };
+    let cell_rows = h.div_ceil(2);
+    let mut cells = Vec::with_capacity((w * cell_rows) as usize);
+    for r in 0..cell_rows {
+        for x in 0..w {
+            let upper = blend(small.get_pixel(x, 2 * r));
+            let lower = if 2 * r + 1 < h {
+                blend(small.get_pixel(x, 2 * r + 1))
+            } else {
+                Color::Rgb(br, bg_g, bb)
+            };
+            cells.push((upper, lower));
+        }
+    }
+    Some((w as u16, cell_rows as u16, cells))
+}
+
+/// Paint `picture` centred in `area`.
+fn paint_cell_image(picture: &CellImage, area: Rect, buf: &mut Buffer) {
+    let x0 = area.x + area.width.saturating_sub(picture.cols) / 2;
+    let y0 = area.y + area.height.saturating_sub(picture.rows) / 2;
+    for r in 0..picture.rows.min(area.height) {
+        for c in 0..picture.cols.min(area.width) {
+            let (upper, lower) =
+                picture.cells[usize::from(r) * usize::from(picture.cols) + usize::from(c)];
+            let cell = &mut buf[(x0 + c, y0 + r)];
+            cell.set_symbol("\u{2580}");
+            cell.set_style(Style::default().fg(upper).bg(lower));
+        }
+    }
+}
+
 /// Resolve one parsed ANSI colour against the active theme, so the rendered
 /// log matches what a terminal pane would show under the same theme. The low
 /// 16 stay symbolic until here precisely so a theme switch recolours without
@@ -2986,6 +3066,13 @@ pub struct Editor {
     /// server resolves one. Rebuilt in `recompute_highlights`, on by default.
     show_color_swatches: bool,
     color_swatches: Vec<Vec<(usize, usize, Color, Color)>>,
+    /// Draw an image tab with half-block cells (#1591): set by the app on a
+    /// terminal with no inline-image protocol (tmux, plain SSH, GNOME
+    /// Terminal), where the header line was all the tab showed.
+    pub cell_images: bool,
+    /// The last half-block rendering, kept until the image, the area or
+    /// the background changes, so a redraw does not decode the file again.
+    cell_image: Option<CellImage>,
     /// Whether the overview ruler paints its whole-file ticks over the
     /// vertical scrollbar track. On by default, like VS Code's; the palette's
     /// `View: Toggle Overview Ruler` turns it off for a plain bar.
@@ -3340,6 +3427,8 @@ impl Editor {
             protected_current: false,
             show_color_swatches: true,
             color_swatches: Vec::new(),
+            cell_images: false,
+            cell_image: None,
             whitespace_mode: WhitespaceMode::default(),
             diff_ws_default: crate::widgets::diff::DiffWhitespace::default(),
             inline_values: std::collections::BTreeMap::new(),
@@ -14513,6 +14602,26 @@ impl Widget for &mut Editor {
                 self.theme,
             );
             render_image_placeholder(image, self.path.as_deref(), inner, buf, ibg, self.theme);
+            if self.cell_images {
+                let area = Rect {
+                    y: inner.y + 1,
+                    height: inner.height.saturating_sub(1),
+                    ..inner
+                };
+                let key = (image.generation, area.width, area.height, ibg);
+                if self.cell_image.as_ref().map(|c| c.key) != Some(key) {
+                    self.cell_image = halfblock_cells(&image.bytes, area.width, area.height, ibg)
+                        .map(|(cols, rows, cells)| CellImage {
+                            key,
+                            cols,
+                            rows,
+                            cells,
+                        });
+                }
+                if let Some(picture) = self.cell_image.as_ref() {
+                    paint_cell_image(picture, area, buf);
+                }
+            }
             return;
         }
         if let Some(view) = self.sheet.as_mut() {
@@ -17024,6 +17133,8 @@ pub struct EditorTabs {
     /// pill behind the close `\u{2715}` cell when the pointer rests on it.
     /// `None` when the pointer is off-screen or unknown.
     pub hover_pointer: Option<(u16, u16)>,
+    /// Handed to the active editor each frame: see [`Editor::cell_images`].
+    pub cell_images: bool,
 }
 
 impl EditorTabs {
@@ -17035,6 +17146,7 @@ impl EditorTabs {
             breadcrumbs: Vec::new(),
             breadcrumb_ranges: Vec::new(),
             breadcrumb_y: None,
+            cell_images: false,
             tab_screen_ranges: Vec::new(),
             tab_close_x: Vec::new(),
             tab_strip_y: 0,
@@ -18271,6 +18383,7 @@ impl Widget for &mut EditorTabs {
 
         self.last_body = body;
         let active_editor = &mut self.editors[active];
+        active_editor.cell_images = self.cell_images;
         Widget::render(active_editor, body, buf);
     }
 }
@@ -24648,6 +24761,122 @@ mod tests {
             e.status
         );
         assert_eq!(e.pdf_page(), Some(1), "the page must not move");
+    }
+
+    /// A PNG of `w` × `h` pixels, `pixel(x, y)` each.
+    fn png_of(w: u32, h: u32, pixel: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
+        let img: image::RgbaImage =
+            image::ImageBuffer::from_fn(w, h, |x, y| image::Rgba(pixel(x, y)));
+        let mut buf: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        buf
+    }
+
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    const BLUE: [u8; 4] = [0, 0, 255, 255];
+
+    /// #1591: a cell is `▀` over two pixels, the upper one in front.
+    #[test]
+    fn a_half_block_cell_shows_the_upper_pixel_over_the_lower() {
+        let png = png_of(1, 2, |_, y| if y == 0 { RED } else { BLUE });
+        let bg = Color::Rgb(9, 9, 9);
+        assert_eq!(
+            halfblock_cells(&png, 1, 1, bg),
+            Some((1, 1, vec![(Color::Rgb(255, 0, 0), Color::Rgb(0, 0, 255))]))
+        );
+        // Transparent pixels take the background.
+        let clear = png_of(1, 2, |_, _| [200, 200, 200, 0]);
+        assert_eq!(
+            halfblock_cells(&clear, 1, 1, bg),
+            Some((1, 1, vec![(bg, bg)]))
+        );
+    }
+
+    /// #1591: a large picture shrinks to the area keeping its shape; an odd
+    /// last pixel row sits over the background.
+    #[test]
+    fn a_large_image_shrinks_to_fit_keeping_its_shape() {
+        let png = png_of(40, 20, |x, y| {
+            if y < 10 {
+                [x as u8 * 6, 0, 0, 255]
+            } else {
+                BLUE
+            }
+        });
+        let bg = Color::Rgb(1, 2, 3);
+        let (cols, rows, cells) = halfblock_cells(&png, 10, 10, bg).unwrap();
+        assert_eq!((cols, rows), (10, 3), "40×20 to 10×5 pixels, 3 cell rows");
+        assert_eq!(cells.len(), 30);
+        assert!(cells[20..].iter().all(|&(_, lower)| lower == bg));
+        let Color::Rgb(r, _, b) = cells[0].0 else {
+            panic!("{:?}", cells[0]);
+        };
+        assert!(
+            r < 60 && b < 40,
+            "the upper left stays dark red: {:?}",
+            cells[0]
+        );
+        let Color::Rgb(r, _, b) = cells[9].0 else {
+            panic!("{:?}", cells[9]);
+        };
+        assert!(
+            r > 150 && b < 40,
+            "the upper right is bright red: {:?}",
+            cells[9]
+        );
+        let Color::Rgb(r, _, b) = cells[20].0 else {
+            panic!("{:?}", cells[20]);
+        };
+        assert!(b > 200 && r < 40, "the bottom is blue: {:?}", cells[20]);
+    }
+
+    /// #1591 negatives: a small image is not enlarged, and bytes that do
+    /// not decode or an empty area draw nothing.
+    #[test]
+    fn half_blocks_never_enlarge_and_refuse_what_they_cannot_draw() {
+        let png = png_of(2, 2, |_, _| RED);
+        assert_eq!(
+            halfblock_cells(&png, 50, 50, Color::Black).map(|c| (c.0, c.1)),
+            Some((2, 1))
+        );
+        assert_eq!(halfblock_cells(b"not an image", 10, 10, Color::Black), None);
+        assert_eq!(halfblock_cells(&png, 0, 10, Color::Black), None);
+        assert_eq!(halfblock_cells(&png, 10, 0, Color::Black), None);
+    }
+
+    /// #1591: an image tab with `cell_images` draws the picture under its
+    /// header, centred; without it (an inline-image terminal paints the
+    /// picture itself) the canvas stays empty.
+    #[test]
+    fn an_image_tab_draws_half_blocks_only_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pic.png");
+        std::fs::write(&path, png_of(4, 4, |_, y| if y < 2 { RED } else { BLUE })).unwrap();
+        let area = Rect::new(0, 0, 30, 10);
+        let draw = |cell_images: bool| {
+            let mut e = Editor::new();
+            e.open(&path).unwrap();
+            e.cell_images = cell_images;
+            let mut buf = Buffer::empty(area);
+            Widget::render(&mut e, area, &mut buf);
+            buf
+        };
+        let buf = draw(true);
+        let blocks: Vec<(u16, u16)> = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].symbol() == "\u{2580}")
+            .collect();
+        assert_eq!(blocks.len(), 8, "4×4 pixels are 4×2 cells: {blocks:?}");
+        let &(x, y) = blocks.first().unwrap();
+        assert_eq!(buf[(x, y)].fg, Color::Rgb(255, 0, 0));
+        assert_eq!(buf[(x, y + 1)].bg, Color::Rgb(0, 0, 255));
+        let buf = draw(false);
+        assert!(
+            (0..area.height).all(|y| (0..area.width).all(|x| buf[(x, y)].symbol() != "\u{2580}")),
+            "no half blocks where the terminal shows the picture"
+        );
     }
 
     #[test]
