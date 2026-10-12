@@ -923,6 +923,15 @@ pub fn normalised_language_id(id: &str) -> String {
     .to_string()
 }
 
+/// Whether `files_associations` can use the language id `id` (#1574):
+/// `plaintext`, or a language croft highlights or has a server for.
+/// `id` is already [`normalised_language_id`].
+pub fn known_language_id(id: &str) -> bool {
+    id == "plaintext"
+        || lang_for_language_id(id).is_some()
+        || crate::lsp::languages::resolve(id).is_some()
+}
+
 /// One workspace's `files_associations` (#1574), ready to match: each glob
 /// with the language id it names, those with a `/` (matched against the
 /// workspace-relative path) ahead of file-name globs, and a longer glob
@@ -951,6 +960,13 @@ pub fn set_file_associations(
     let mut rules: Vec<(usize, AssociationRule)> = map
         .iter()
         .filter_map(|(pattern, id)| {
+            // An id croft knows nothing of is dropped here, before ranking,
+            // so it cannot shadow a less specific glob that names a real
+            // language.
+            let id = normalised_language_id(id);
+            if !known_language_id(&id) {
+                return None;
+            }
             let pattern = pattern.trim().trim_start_matches("./");
             let glob = globset::GlobBuilder::new(pattern)
                 .literal_separator(true)
@@ -961,7 +977,7 @@ pub fn set_file_associations(
                 AssociationRule {
                     matcher: glob.compile_matcher(),
                     by_path: pattern.contains('/'),
-                    id: normalised_language_id(id),
+                    id,
                 },
             ))
         })
@@ -1832,7 +1848,7 @@ mod tests {
         let (_tmp, root) = associated(&[
             ("*.txt", "markdown"),
             ("**/templates/*.txt", "html"),
-            ("Jenkinsfile", "groovy"),
+            ("Jenkinsfile", "java"),
         ]);
         assert_eq!(
             lang_for_path(&root.join("templates/a.txt")),
@@ -1841,7 +1857,7 @@ mod tests {
         assert_eq!(lang_for_path(&root.join("b.txt")), Some(LangKind::Markdown));
         assert_eq!(
             associated_language_id(&root.join("ci/Jenkinsfile")).as_deref(),
-            Some("groovy")
+            Some("java")
         );
     }
 
@@ -1850,6 +1866,19 @@ mod tests {
         let (_tmp, root) = associated(&[("*.json", "plaintext"), ("*.rs", "klingon")]);
         assert_eq!(lang_for_path(&root.join("big.json")), None);
         assert_eq!(lang_for_path(&root.join("main.rs")), Some(LangKind::Rust));
+    }
+
+    #[test]
+    fn an_unknown_id_does_not_shadow_a_less_specific_association() {
+        let (_tmp, root) = associated(&[("*.tpl", "html"), ("templates/*.tpl", "klingon")]);
+        assert_eq!(
+            lang_for_path(&root.join("templates/card.tpl")),
+            Some(LangKind::Html)
+        );
+        assert_eq!(
+            associated_language_id(&root.join("templates/card.tpl")).as_deref(),
+            Some("html")
+        );
     }
 
     #[test]

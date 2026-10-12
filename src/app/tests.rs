@@ -81100,7 +81100,7 @@ fn a_new_association_relanguages_open_tabs_but_not_a_hand_picked_one() {
     std::fs::write(tmp.path().join("b.tpl"), "<i>y</i>\n").unwrap();
     app.editor.open_pinned(&tmp.path().join("b.tpl")).unwrap();
     app.editor
-        .set_language(Some(crate::highlight::LangKind::Xml));
+        .pick_language(Some(crate::highlight::LangKind::Xml));
     let mut prefs = crate::prefs::Prefs::default();
     prefs
         .files_associations
@@ -81126,6 +81126,22 @@ fn a_new_association_relanguages_open_tabs_but_not_a_hand_picked_one() {
         )),
         "{langs:?}"
     );
+}
+
+/// #1574: a language picked by hand stays picked even when it is the one
+/// the file's name gave it, so a later association does not replace it.
+#[test]
+fn a_hand_picked_language_matching_the_inferred_one_survives_an_association() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.tpl", "<b>x</b>\n");
+    assert_eq!(app.editor.language(), None);
+    app.dispatch_menu_action(MenuAction::SetLanguage(None), tmp.path().to_path_buf());
+    let mut prefs = crate::prefs::Prefs::default();
+    prefs
+        .files_associations
+        .insert(String::from("*.tpl"), String::from("html"));
+    app.apply_file_associations(&prefs);
+    assert_eq!(app.editor.language(), None, "Plain Text was picked by hand");
 }
 
 /// #1574: an association that moves an open file to another language

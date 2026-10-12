@@ -59403,8 +59403,10 @@ impl App {
         }
         let picked = |e: &crate::widgets::editor::Editor| {
             let path = e.path.as_ref()?;
-            (!e.has_non_text_view() && e.language() == crate::highlight::lang_for_path(path))
-                .then(|| path.clone())
+            (!e.has_non_text_view()
+                && !e.language_picked_by_hand()
+                && e.language() == crate::highlight::lang_for_path(path))
+            .then(|| path.clone())
         };
         let following: Vec<PathBuf> = std::iter::once(&self.editor)
             .chain(self.editor_layout.inactive_groups())
@@ -61050,7 +61052,7 @@ impl App {
                 self.disable_minimap_image();
             }
             MenuAction::SetLanguage(lang) => {
-                self.editor.set_language(lang);
+                self.editor.pick_language(lang);
                 self.status = format!("Language Mode: {}", self.editor.language_label());
             }
             MenuAction::SetLineEnding(eol) => {

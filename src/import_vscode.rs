@@ -172,13 +172,26 @@ fn as_associations(v: &Value) -> Option<Value> {
         .iter()
         .filter_map(|(glob, id)| {
             let id = crate::highlight::normalised_language_id(id.as_str()?);
-            let known = id == "plaintext"
-                || crate::highlight::lang_for_language_id(&id).is_some()
-                || crate::lsp::languages::resolve(&id).is_some();
-            known.then(|| (glob.clone(), Value::from(id)))
+            crate::highlight::known_language_id(&id).then(|| (glob.clone(), Value::from(id)))
         })
         .collect();
     (!kept.is_empty()).then_some(Value::Object(kept))
+}
+
+/// The `files.associations` entries [`as_associations`] leaves out, one
+/// report line each, so the import lists every language croft lacks.
+fn rejected_associations(v: &Value) -> Vec<String> {
+    let Some(obj) = v.as_object() else {
+        return Vec::new();
+    };
+    obj.iter()
+        .filter(|(_, id)| {
+            id.as_str().is_none_or(|id| {
+                !crate::highlight::known_language_id(&crate::highlight::normalised_language_id(id))
+            })
+        })
+        .map(|(glob, id)| format!("files.associations {glob} (croft has no language {id})"))
+        .collect()
 }
 
 const SETTINGS: &[SettingMap] = &[
@@ -617,6 +630,16 @@ pub fn map_settings(
     let mut unmapped: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for (key, value) in obj {
+        if key == "files.associations" {
+            let rejected = rejected_associations(value);
+            if !rejected.is_empty() {
+                let none_kept = as_associations(value).is_none();
+                unmapped.extend(rejected);
+                if none_kept {
+                    continue;
+                }
+            }
+        }
         match SETTINGS.iter().find(|m| m.vscode == key) {
             Some(map) => match (map.convert)(value) {
                 Some(converted) => {
@@ -1231,6 +1254,12 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(parsed.files_associations["*.tpl"], "html");
+        assert_eq!(
+            report.unmapped_settings,
+            vec![String::from(
+                "files.associations **/templates/*.txt (croft has no language \"jinja\")"
+            )]
+        );
     }
 
     #[test]
@@ -1241,6 +1270,12 @@ mod tests {
             &mut report,
         );
         assert!(!report.settings.contains_key("files_associations"));
+        assert_eq!(
+            report.unmapped_settings,
+            vec![String::from(
+                "files.associations *.j2 (croft has no language \"jinja\")"
+            )]
+        );
     }
 
     /// #1345: `files.exclude` / `search.exclude` carry the globs set to
