@@ -356,6 +356,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("editor.action.deleteLines", "delete_line"),
     ("deleteAllRight", "kill_to_end_of_line"),
     ("editor.action.joinLines", "join_lines"),
+    ("editor.action.insertLineAfter", "insert_line_below"),
+    ("editor.action.insertLineBefore", "insert_line_above"),
     ("editor.action.transformToUppercase", "transform_upper"),
     ("editor.action.transformToLowercase", "transform_lower"),
     ("editor.action.transformToTitlecase", "transform_title"),
@@ -2251,5 +2253,35 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let report = scan_profile(dir.path()).expect("an empty profile is fine");
         assert!(report.is_empty());
+    }
+
+    /// #1571: VS Code's Insert Line Below / Above chords import onto croft's
+    /// commands instead of being dropped.
+    #[test]
+    fn insert_line_after_and_before_import() {
+        let doc = json!([
+            { "key": "ctrl+enter", "command": "editor.action.insertLineAfter" },
+            { "key": "ctrl+shift+enter", "command": "editor.action.insertLineBefore" },
+            { "key": "ctrl+alt+enter", "command": "editor.action.insertLineAround" }
+        ]);
+        let mut report = Report::default();
+        convert_keybindings(&doc, &mut report);
+        assert_eq!(
+            report.keybindings,
+            [
+                (
+                    String::from("ctrl+enter"),
+                    String::from("insert_line_below")
+                ),
+                (
+                    String::from("ctrl+shift+enter"),
+                    String::from("insert_line_above")
+                ),
+            ]
+        );
+        assert_eq!(
+            report.dropped_keybindings,
+            ["ctrl+alt+enter: no croft command matches editor.action.insertLineAround"]
+        );
     }
 }

@@ -43203,7 +43203,10 @@ impl App {
             }
             return;
         }
-        if is_editor_open_line_below_key(key) {
+        // Insert Line Below (#1571): VS Code's `Cmd+Enter` (`Ctrl+Enter` off
+        // macOS), with `Cmd+O` kept as an alias. A Markdown fence under the
+        // caret ran above, so here it only opens a line.
+        if is_editor_open_line_below_key(key) || is_run_fence_key(key) {
             self.editor.open_line_below();
             self.status = String::from("Opened line below");
             return;
@@ -50304,6 +50307,14 @@ impl App {
                 }
             }
             Cmd::JoinLines => self.editor.join_lines(),
+            Cmd::InsertLineBelow => {
+                self.editor.open_line_below();
+                self.status = String::from("Opened line below");
+            }
+            Cmd::InsertLineAbove => {
+                self.editor.open_line_above();
+                self.status = String::from("Opened line above");
+            }
             Cmd::DeleteLine => self.delete_current_line(),
             Cmd::KillToEndOfLine => self.kill_to_end_of_line(),
             Cmd::TransformUpper => self.editor.transform_selection_case(CaseTransform::Upper),
