@@ -9358,8 +9358,10 @@ impl Editor {
         out
     }
 
-    /// Collapse every fold `level` deep or deeper and leave the shallower
-    /// ones as they are (VS Code "Fold Level N", Cmd+K Cmd+N, #1653): Fold
+    /// Collapse every fold exactly `level` deep and leave the others as they
+    /// are (VS Code "Fold Level N", Cmd+K Cmd+N, #1653): a deeper fold is
+    /// hidden inside its collapsed parent anyway, and keeping its own state
+    /// means opening the parent again shows it as it was. Fold
     /// Level 2 on a module keeps its classes and their methods' headers in
     /// view with the bodies collapsed, the overview Fold All cannot give
     /// since it collapses the outermost block too. The cursor snaps up to the
@@ -9369,7 +9371,7 @@ impl Editor {
         let headers: Vec<usize> = self
             .fold_headers_with_levels()
             .into_iter()
-            .filter(|&(_, _, l)| l >= level)
+            .filter(|&(_, _, l)| l == level)
             .map(|(h, _, _)| h)
             .collect();
         if headers.is_empty() {

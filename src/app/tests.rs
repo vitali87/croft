@@ -80366,16 +80366,21 @@ fn fold_level_2_keeps_the_class_and_its_methods_in_view() {
     assert_eq!(visible_lines(&app), vec![0, 1, 5]);
 }
 
-/// #1653: Fold Level 1 collapses the class, and what is inside it stays
-/// folded when the class is opened again.
+/// #1653: Fold Level 1 collapses the class only, as VS Code does: opening
+/// the class again shows what was inside it as it was before.
 #[test]
-fn fold_level_1_collapses_the_class_and_everything_deeper() {
+fn fold_level_1_collapses_only_the_class() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = nested_fold_app(tmp.path());
     run_fold_command(&mut app, "fold_level_1");
     assert_eq!(visible_lines(&app), vec![0]);
     app.editor.toggle_fold(0);
-    assert_eq!(visible_lines(&app), vec![0, 1, 5]);
+    assert_eq!(visible_lines(&app), (0..7).collect::<Vec<_>>());
+    // A deeper fold the user closed earlier keeps its state.
+    app.editor.toggle_fold(2);
+    run_fold_command(&mut app, "fold_level_1");
+    app.editor.toggle_fold(0);
+    assert_eq!(visible_lines(&app), vec![0, 1, 2, 5, 6]);
 }
 
 /// #1653: Cmd+K Cmd+3 is Fold Level 3: the `if` and the `for` inside it
