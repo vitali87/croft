@@ -81093,12 +81093,21 @@ fn a_typed_path_expands_the_home_and_sits_under_the_workspace() {
     );
 }
 
-/// Removes a path made relative to the process directory, if a run made it.
-struct RemoveOnDrop(PathBuf);
+/// Removes a path made relative to the process directory, if a run made it:
+/// a path that was already there when the guard was made is never touched.
+struct RemoveOnDrop(Option<PathBuf>);
+
+impl RemoveOnDrop {
+    fn new(path: PathBuf) -> Self {
+        Self((!path.exists()).then_some(path))
+    }
+}
 
 impl Drop for RemoveOnDrop {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_dir_all(path);
+        }
     }
 }
 
@@ -81109,7 +81118,7 @@ impl Drop for RemoveOnDrop {
 fn save_workspace_as_writes_a_relative_path_under_the_workspace() {
     let tmp = tempfile::tempdir().unwrap();
     let rel = format!("croft-1602-{}", std::process::id());
-    let _cleanup = RemoveOnDrop(std::env::current_dir().unwrap().join(&rel));
+    let _cleanup = RemoveOnDrop::new(std::env::current_dir().unwrap().join(&rel));
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.run_command(crate::widgets::command_palette::Command::SaveWorkspaceAs);
     app.input_prompt.as_mut().unwrap().value = format!("{rel}/team.code-workspace");
