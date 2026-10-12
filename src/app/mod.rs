@@ -45339,7 +45339,7 @@ impl App {
         PendingRunBlock {
             pane_name: format!("{file}:{}", idx + 1),
             cwd,
-            command: fence_command(block.interpreter, &block.code),
+            command: fence_command(block.interpreter, &block.code, &block_script_dir()),
             code: block.code.clone(),
             destructive: block.destructive,
             doc: doc.clone(),
@@ -67799,18 +67799,35 @@ fn is_run_fence_key(key: KeyEvent) -> bool {
 }
 
 /// The command typed into a pane for a fenced block (#353): a shell block
-/// as written (a trailing newline runs its last line); python and node
-/// through a quoted heredoc so the block runs whole. The terminator is
-/// chosen not to occur in the block, or a line inside it could close the
-/// heredoc early and hand the rest to the shell.
+/// as written (a trailing newline runs its last line). Any other language
+/// is written to a private file under `scripts` and read from it on stdin,
+/// `python3 - < 'file'` (#1630): the heredoc it used to be typed as is
+/// POSIX shell syntax, so with fish as the pane's shell every python or
+/// node block failed. A redirect from a quoted path reads the same in bash,
+/// zsh and fish, and the block reaches the interpreter byte for byte, tabs
+/// and `!` included. The interpreter still reads stdin, so the block runs
+/// with the pane's directory on its import path, as before. Should the file
+/// not be written, the heredoc is the fallback.
 ///
-/// A block holding a tab or `!` goes as one single-quoted `printf '%b'`
-/// argument instead: typed into an interactive shell, a tab is completion
-/// (a python block lost its indentation) and bash expands `!` in a heredoc
-/// body as history, so what ran was not what the confirm popup showed.
-/// Inside single quotes neither happens, and the tab travels as `\t`.
-fn fence_command(interpreter: &str, code: &str) -> String {
+/// A shell block holding a tab or `!` goes as one single-quoted
+/// `printf '%b'` argument instead: typed into an interactive shell, a tab
+/// is completion and bash expands `!` as history, so what ran was not what
+/// the confirm popup showed. Inside single quotes neither happens, and the
+/// tab travels as `\t`.
+fn fence_command(interpreter: &str, code: &str, scripts: &Path) -> String {
     let code = code.trim_end_matches('\n');
+    if interpreter != "sh" {
+        if let Ok(file) = stage_block(scripts, interpreter, code) {
+            return format!("{interpreter} - < '{}'\r", file.display());
+        }
+        let mut end = String::from("CROFT_BLOCK");
+        let mut n = 0u32;
+        while code.contains(&end) {
+            n += 1;
+            end = format!("CROFT_BLOCK_{n}");
+        }
+        return format!("{interpreter} - <<'{end}'\n{code}\n{end}\r");
+    }
     if code.contains(['\t', '!']) {
         let escaped = format!("{code}\n")
             .replace('\\', "\\\\")
@@ -67819,24 +67836,80 @@ fn fence_command(interpreter: &str, code: &str) -> String {
             .replace('\'', "'\\''");
         // A shell block runs IN the pane's shell, as a typed one does (a
         // `cd` or `export` persists, bash-isms still work): `eval` of the
-        // decoded text. Other interpreters read it on stdin.
-        if interpreter == "sh" {
-            return format!("eval \"$(printf '%b' '{escaped}')\"\r");
-        }
-        return format!("printf '%b' '{escaped}' | {interpreter}\r");
+        // decoded text.
+        return format!("eval \"$(printf '%b' '{escaped}')\"\r");
     }
-    match interpreter {
-        "sh" => format!("{code}\r"),
-        other => {
-            let mut end = String::from("CROFT_BLOCK");
-            let mut n = 0u32;
-            while code.contains(&end) {
-                n += 1;
-                end = format!("CROFT_BLOCK_{n}");
+    format!("{code}\r")
+}
+
+/// Where [`fence_command`] writes the blocks it runs (#1630). Always
+/// absolute: the typed command runs in the pane's directory, so a relative
+/// cache (HOME unset or relative) would name a file that is not there.
+fn block_script_dir() -> PathBuf {
+    // Never the user's own cache from a test.
+    let dir = if cfg!(test) {
+        std::env::temp_dir().join(format!("croft-test-blocks-{}", std::process::id()))
+    } else {
+        croft_cache_dir().join("blocks")
+    };
+    absolute_block_dir(dir)
+}
+
+/// `dir` made absolute against croft's own directory, where it was meant.
+fn absolute_block_dir(dir: PathBuf) -> PathBuf {
+    std::path::absolute(&dir).unwrap_or(dir)
+}
+
+/// How long a written block is kept: long enough for its interpreter to
+/// have read it, short enough that the directory never grows.
+const BLOCK_SCRIPT_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Write `code` and a final newline to a new file under `dir` that only the
+/// user can read, for `interpreter` (#1630). Refuses a path the typed
+/// command could not quote in single quotes. Blocks older than
+/// [`BLOCK_SCRIPT_TTL`] are cleared first.
+fn stage_block(dir: &Path, interpreter: &str, code: &str) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > BLOCK_SCRIPT_TTL);
+            if old && entry.file_name().to_string_lossy().starts_with("block-") {
+                let _ = std::fs::remove_file(entry.path());
             }
-            format!("{other} - <<'{end}'\n{code}\n{end}\r")
         }
     }
+    let ext = match interpreter {
+        "python3" => "py",
+        "node" => "js",
+        _ => "txt",
+    };
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = dir.join(format!(
+        "block-{}-{seq}-{}.{ext}",
+        std::process::id(),
+        now_millis()
+    ));
+    if path.to_string_lossy().contains(['\'', '\\', '\n', '\r']) {
+        return Err(std::io::Error::other("the block path cannot be quoted"));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    file.write_all(format!("{code}\n").as_bytes())?;
+    Ok(path)
 }
 
 /// Milliseconds since the Unix epoch, for stamping local-history snapshots

@@ -31692,51 +31692,168 @@ fn the_run_block_popup_marks_a_truncated_line() {
     );
 }
 
-#[test]
-fn fence_command_shapes_the_typed_block() {
-    assert_eq!(
-        super::fence_command("sh", "echo a\necho b\n"),
-        "echo a\necho b\r"
-    );
-    assert_eq!(
-        super::fence_command("python3", "print(1)\n"),
-        "python3 - <<'CROFT_BLOCK'\nprint(1)\nCROFT_BLOCK\r"
-    );
-    // A block that contains the terminator gets a different one, so no
-    // line of it can close the heredoc early.
-    let tricky = "print(1)\nCROFT_BLOCK\nimport os; os.system('id')\n";
-    let cmd = super::fence_command("python3", tricky);
-    assert!(cmd.starts_with("python3 - <<'CROFT_BLOCK_1'\n"), "{cmd}");
-    assert!(cmd.ends_with("\nCROFT_BLOCK_1\r"), "{cmd}");
-    let body = &cmd["python3 - <<'CROFT_BLOCK_1'\n".len()..cmd.len() - "\nCROFT_BLOCK_1\r".len()];
-    assert_eq!(body, tricky.trim_end_matches('\n'));
+/// The file a `python3 - < '<file>'` line reads (#1630).
+fn staged_block_path(cmd: &str) -> std::path::PathBuf {
+    let rest = cmd
+        .split_once(" - < '")
+        .unwrap_or_else(|| panic!("not a redirect: {cmd:?}"))
+        .1;
+    std::path::PathBuf::from(rest.strip_suffix("'\r").expect("ends the quoted path"))
 }
 
-/// A tab or `!` never reaches the shell's line editor as typed input: the
-/// block goes as one quoted printf argument, and running that line through
-/// a real shell reproduces the block byte for byte.
+/// Run a typed block line through a real `sh` in `cwd`, as a pane would.
+fn run_typed_line(line: &str, cwd: &std::path::Path) -> String {
+    let out = std::process::Command::new("sh")
+        .args(["-c", line.trim_end_matches('\r')])
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap() + &String::from_utf8(out.stderr).unwrap()
+}
+
+#[test]
+fn fence_command_shapes_the_typed_block() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scripts = tmp.path().join("blocks");
+    assert_eq!(
+        super::fence_command("sh", "echo a\necho b\n", &scripts),
+        "echo a\necho b\r"
+    );
+    assert!(!scripts.exists(), "a shell block is typed, not written");
+    // #1630: any other language is read from a private file on stdin, never
+    // typed as a heredoc, which fish has no syntax for.
+    let cmd = super::fence_command("python3", "print(1)\n", &scripts);
+    assert!(cmd.starts_with("python3 - < '"), "{cmd:?}");
+    assert!(!cmd.contains("<<") && !cmd.contains('\n'), "{cmd:?}");
+    let file = staged_block_path(&cmd);
+    assert!(file.starts_with(&scripts));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "print(1)\n");
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&file), 0o600, "only the user reads the block");
+    assert_eq!(mode(&scripts), 0o700);
+    // Two runs of one block never share a file.
+    let again = super::fence_command("python3", "print(1)\n", &scripts);
+    assert_ne!(staged_block_path(&again), file);
+    let node = super::fence_command("node", "console.log(1)\n", &scripts);
+    assert!(
+        node.starts_with("node - < '") && node.contains(".js'"),
+        "{node:?}"
+    );
+}
+
+/// #1630: the issue's block prints its output when the typed line runs, and
+/// the line holds nothing but a command, a redirect and a quoted path, which
+/// bash, zsh and fish all read the same way.
+#[test]
+fn a_python_block_runs_from_its_file_and_prints() {
+    if !(crate::markdown::runnable_interpreter("python") == Some("python3")) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let code = "print(\"hello from python\")\nprint(2 + 2)\n";
+    let cmd = super::fence_command("python3", code, &tmp.path().join("blocks"));
+    assert_eq!(run_typed_line(&cmd, tmp.path()), "hello from python\n4\n");
+}
+
+/// #1630: with HOME unset or relative the cache is relative, but the typed
+/// line runs in the pane's directory, so the staged block's directory is
+/// made absolute (against croft's own directory) before it is named.
+#[test]
+fn a_relative_block_directory_is_made_absolute() {
+    let dir = super::absolute_block_dir(PathBuf::from(".cache/croft/blocks"));
+    assert!(dir.is_absolute(), "{dir:?}");
+    assert_eq!(
+        dir,
+        std::env::current_dir().unwrap().join(".cache/croft/blocks")
+    );
+    assert!(super::block_script_dir().is_absolute());
+}
+
+/// A tab or `!` never reaches the shell's line editor as typed input: a
+/// python block's tabs and bangs go into its file byte for byte, and a shell
+/// block goes as one quoted printf argument that a real shell decodes back
+/// to the block.
 #[test]
 fn fence_blocks_with_tabs_or_bangs_run_exactly_as_shown() {
+    let tmp = tempfile::tempdir().unwrap();
     let code = "if True:\n\tprint(\"hi!\")\nx = 'a\\n'\n";
-    let cmd = super::fence_command("python3", code);
-    assert!(!cmd.contains('\t') && cmd.ends_with("| python3\r"), "{cmd}");
-    // What the pipe feeds the interpreter, via a real sh with cat standing in.
-    let line = cmd.trim_end_matches('\r').replace("| python3", "| cat");
-    let out = std::process::Command::new("sh")
-        .args(["-c", &line])
-        .output()
-        .unwrap();
-    assert_eq!(String::from_utf8(out.stdout).unwrap(), code);
+    let cmd = super::fence_command("python3", code, &tmp.path().join("blocks"));
+    assert!(!cmd.contains('\t') && !cmd.contains('!'), "{cmd:?}");
+    assert_eq!(
+        std::fs::read_to_string(staged_block_path(&cmd)).unwrap(),
+        code
+    );
+    if crate::markdown::runnable_interpreter("python") == Some("python3") {
+        assert_eq!(run_typed_line(&cmd, tmp.path()), "hi!\n");
+    }
     // `sh` blocks run in the pane's own shell through eval: a `cd` in the
     // block persists after it.
-    let sh = super::fence_command("sh", "cd /\necho 'hi!'\n");
+    let sh = super::fence_command("sh", "cd /\necho 'hi!'\n", &tmp.path().join("blocks"));
     assert!(sh.starts_with("eval \"$(printf '%b' "), "{sh}");
     let probe = format!("{}; pwd", sh.trim_end_matches('\r'));
-    let out = std::process::Command::new("sh")
-        .args(["-c", &probe])
-        .output()
+    assert_eq!(run_typed_line(&probe, tmp.path()), "hi!\n/\n");
+}
+
+/// Negative (#1630): the block still runs from the pane's directory, so a
+/// module beside the document imports as it did through the heredoc.
+#[test]
+fn a_python_block_still_imports_from_the_pane_s_directory() {
+    if !(crate::markdown::runnable_interpreter("python") == Some("python3")) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("helper_1630.py"), "X = 'local'\n").unwrap();
+    let scripts = tempfile::tempdir().unwrap();
+    let cmd = super::fence_command(
+        "python3",
+        "import helper_1630\nprint(helper_1630.X)\n",
+        scripts.path(),
+    );
+    assert_eq!(run_typed_line(&cmd, tmp.path()), "local\n");
+}
+
+/// Negative (#1630): when the file cannot be written the block is still
+/// typed whole, as the heredoc it was, rather than not run at all.
+#[test]
+fn a_block_that_cannot_be_written_falls_back_to_the_heredoc() {
+    let tmp = tempfile::tempdir().unwrap();
+    let not_a_dir = tmp.path().join("blocks");
+    std::fs::write(&not_a_dir, "").unwrap();
+    let cmd = super::fence_command("python3", "print(1)\n", &not_a_dir);
+    assert_eq!(cmd, "python3 - <<'CROFT_BLOCK'\nprint(1)\nCROFT_BLOCK\r");
+    // A block holding the terminator gets a different one.
+    let tricky = "print(1)\nCROFT_BLOCK\n";
+    let cmd = super::fence_command("python3", tricky, &not_a_dir);
+    assert!(cmd.starts_with("python3 - <<'CROFT_BLOCK_1'\n"), "{cmd}");
+}
+
+/// Negative (#1630): writing a block clears day-old blocks and nothing else.
+#[test]
+fn writing_a_block_clears_only_old_blocks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scripts = tmp.path().join("blocks");
+    let first = super::stage_block(&scripts, "python3", "print(1)").unwrap();
+    let stale = scripts.join("block-1-0-0.py");
+    std::fs::write(&stale, "print(0)\n").unwrap();
+    let two_days = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 60 * 60);
+    std::fs::File::options()
+        .write(true)
+        .open(&stale)
+        .unwrap()
+        .set_modified(two_days)
         .unwrap();
-    assert_eq!(String::from_utf8(out.stdout).unwrap(), "hi!\n/\n");
+    let other = scripts.join("notes.txt");
+    std::fs::write(&other, "keep").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&other)
+        .unwrap()
+        .set_modified(two_days)
+        .unwrap();
+    let second = super::stage_block(&scripts, "python3", "print(2)").unwrap();
+    assert!(!stale.exists(), "a day-old block is cleared");
+    assert!(first.exists() && second.exists() && other.exists());
 }
 
 /// #360: the built-in secret rules sit in the trigger set by default,
