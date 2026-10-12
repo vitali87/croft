@@ -3781,7 +3781,8 @@ pub struct App {
     /// nothing has changed since.
     remote_handoff_ok: Option<u64>,
     /// Hot exit (#862): the directory this croft backs its unsaved buffers
-    /// up under (`~/.cache/croft/hot-exit`). `None` keeps no backups, as
+    /// up under (`~/.local/state/croft/hot-exit`, see [`user_data_dir`]).
+    /// `None` keeps no backups, as
     /// under test unless a test points it at a tempdir.
     pub hot_exit_dir: Option<PathBuf>,
     /// The [`App::unsaved_stamp`] this croft's backup on disk was written
@@ -5599,8 +5600,11 @@ impl App {
         }
         let loaded_prefs = merged_settings.prefs.clone();
         let (review_tx, review_rx) = std::sync::mpsc::channel();
-        let notes_path = (!cfg!(test))
-            .then(|| crate::sticky_notes::Notes::store_path(&croft_cache_dir(), &root));
+        let data_dir =
+            (!cfg!(test)).then(|| user_data_dir(&croft_cache_dir(), &crate::prefs::state_dir()));
+        let notes_path = data_dir
+            .as_deref()
+            .map(|dir| crate::sticky_notes::Notes::store_path(dir, &root));
         if !cfg!(test) {
             crate::i18n::init(loaded_prefs.locale.as_deref());
         }
@@ -6035,11 +6039,7 @@ impl App {
             pending_revert_hunk: None,
             pending_unsaved: None,
             remote_handoff_ok: None,
-            hot_exit_dir: if cfg!(test) {
-                None
-            } else {
-                Some(croft_cache_dir().join("hot-exit"))
-            },
+            hot_exit_dir: data_dir.as_deref().map(|dir| dir.join("hot-exit")),
             hot_exit_written: None,
             hot_exit_retry_at: None,
             hot_exit_consumed: Vec::new(),
@@ -42135,7 +42135,20 @@ impl App {
         self.quit = true;
     }
 
+    /// The session an update relaunch hands to the new process: every
+    /// unsaved buffer, a merge editor's Result included, since the
+    /// relaunch exits at once and the Result exists nowhere else.
     pub fn capture_session_state(&self) -> crate::session_state::SessionState {
+        self.capture_session_state_with(true)
+    }
+
+    /// `keep_merge_results` false leaves a merge editor's unsaved Result
+    /// out (#1588), for hot exit, whose backup outlives the conflict it was
+    /// taken from.
+    fn capture_session_state_with(
+        &self,
+        keep_merge_results: bool,
+    ) -> crate::session_state::SessionState {
         let mut tabs = Vec::new();
         let mut active_tab = 0;
         let mut active_path: Option<PathBuf> = None;
@@ -42168,7 +42181,13 @@ impl App {
             if idx == self.editor.active_index() {
                 active_tab = tabs.len();
             }
-            let unsaved_text = if ed.dirty {
+            // A merge editor's buffer is its Result pane, not an edit of the
+            // file (#1588): kept in a hot-exit backup it came back as a plain
+            // tab whose Ctrl+S wrote the Result over the user's own
+            // resolution, so there the tab reopens on the file as it is on
+            // disk. A relaunch carries it, or the Result would be lost.
+            let dirty = ed.dirty && (keep_merge_results || ed.merge.is_none());
+            let unsaved_text = if dirty {
                 Some(ed.lines.join("\n"))
             } else {
                 None
@@ -42179,7 +42198,7 @@ impl App {
                 cursor_col: ed.cursor_col,
                 scroll: ed.scroll,
                 scroll_col: ed.scroll_col,
-                dirty: ed.dirty,
+                dirty,
                 unsaved_text,
             });
         }
@@ -42189,7 +42208,10 @@ impl App {
         // (the same file open in two splits) keeps the dirty copy.
         for group in self.editor_layout.inactive_groups() {
             for ed in &group.editors {
-                if ed.has_non_text_view() || !ed.dirty {
+                if ed.has_non_text_view()
+                    || !ed.dirty
+                    || (!keep_merge_results && ed.merge.is_some())
+                {
                     continue;
                 }
                 let unsaved = Some(ed.lines.join("\n"));
@@ -43568,6 +43590,7 @@ impl App {
                 _ => {}
             }
             self.editor.extend_selection_to_cursor();
+            self.editor.ensure_cursor_col_visible();
             return;
         }
         if is_motion {
@@ -43627,6 +43650,10 @@ impl App {
             }
             _ => {}
         }
+        // Home, End, typing, Backspace, Delete and Enter move the caret
+        // sideways too; only ←/→ pulled the view along, so End on a wide
+        // line or typing past the edge left the caret off-screen (#1215).
+        self.editor.ensure_cursor_col_visible();
     }
 
     /// Vim-style chord layer for the editor: `cmd+gg` jumps to top, `cmd+G`
@@ -61486,7 +61513,7 @@ impl App {
             .flat_map(|g| g.editors.iter())
             .collect();
         let buffers = self
-            .capture_session_state()
+            .capture_session_state_with(false)
             .tabs
             .into_iter()
             .filter(|t| {
@@ -71050,6 +71077,26 @@ type CodeqlCodeSearch = (
     String,
     std::sync::mpsc::Receiver<Result<(Vec<String>, Option<String>), String>>,
 );
+
+/// The directory this croft keeps hot-exit backups and sticky notes under
+/// (#1578): `state`, after moving in what an earlier croft kept under
+/// `cache`, which cache cleaners are free to delete. Run at every launch,
+/// so a backup an older croft still writes to the cache is taken over too,
+/// once that croft is gone (its own exit removes only the cache copy).
+/// Notes are merged note by note into the state store, since an older
+/// window may still be adding to its cache copy; lock files stay.
+pub(crate) fn user_data_dir(cache: &Path, state: &Path) -> PathBuf {
+    crate::hot_exit::move_tree(
+        &cache.join("hot-exit"),
+        &state.join("hot-exit"),
+        &crate::hot_exit::owned_by_a_running_croft,
+    );
+    crate::sticky_notes::merge_stores(&cache.join("notes"), &state.join("notes"));
+    crate::hot_exit::move_tree(&cache.join("notes"), &state.join("notes"), &|p| {
+        p.extension().is_some_and(|x| x == "lock")
+    });
+    state.to_path_buf()
+}
 
 pub(crate) fn croft_cache_dir() -> PathBuf {
     #[cfg(test)]
