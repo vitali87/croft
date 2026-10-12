@@ -458,10 +458,7 @@ impl FileTree {
         entries.sort_by(|a, b| match (a.1, b.1) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
-            _ => natural_cmp(
-                &a.0.file_name().unwrap_or_default().to_string_lossy(),
-                &b.0.file_name().unwrap_or_default().to_string_lossy(),
-            ),
+            _ => explorer_name_cmp(&a.0, &b.0),
         });
         let new_nodes: Vec<Node> = entries
             .into_iter()
@@ -1880,17 +1877,28 @@ pub(crate) fn sticky_ancestors(nodes: &[Node], top_idx: usize, max: usize) -> Ve
     chain.split_off(skip)
 }
 
+/// Explorer order of two sibling paths: [`natural_cmp`] on their names,
+/// then the raw `OsStr` names, so non-UTF-8 names whose lossy renderings
+/// match still keep a fixed order.
+fn explorer_name_cmp(a: &Path, b: &Path) -> std::cmp::Ordering {
+    let (a, b) = (
+        a.file_name().unwrap_or_default(),
+        b.file_name().unwrap_or_default(),
+    );
+    natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()).then_with(|| a.cmp(b))
+}
+
 /// Explorer order (#1365), VS Code's default: digit runs compare by their
 /// value, so `chapter2` comes before `chapter10`, and text compares without
-/// case, so `apple.py` comes before `Makefile`. Names equal that way (`a`
-/// and `A`, `v1` and `v01`) fall back to their bytes, so the order is total
-/// and stable.
+/// case, so `apple.py` comes before `Makefile`. Names equal that way fall
+/// back to the shorter first (`v1` before `v01`, as VS Code does), then
+/// their bytes (`A` before `a`), so the order is total and stable.
 pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let (mut x, mut y) = (a.chars().peekable(), b.chars().peekable());
     loop {
         match (x.peek().copied(), y.peek().copied()) {
-            (None, None) => return a.cmp(b),
+            (None, None) => return a.len().cmp(&b.len()).then_with(|| a.cmp(b)),
             (None, Some(_)) => return Ordering::Less,
             (Some(_), None) => return Ordering::Greater,
             (Some(c), Some(d)) if c.is_ascii_digit() && d.is_ascii_digit() => {
@@ -2777,7 +2785,10 @@ mod tests {
         // Equal ignoring case: still a fixed order, the bytes'.
         assert_eq!(natural_cmp("A.txt", "a.txt"), Ordering::Less);
         assert_eq!(natural_cmp("a.txt", "A.txt"), Ordering::Greater);
-        assert_eq!(natural_cmp("v01", "v1"), Ordering::Less);
+        // Numerically equal: the shorter first, as VS Code does.
+        assert_eq!(natural_cmp("v1", "v01"), Ordering::Less);
+        assert_eq!(natural_cmp("v01", "v1"), Ordering::Greater);
+        assert_eq!(natural_cmp("v01", "v001"), Ordering::Less);
         assert_eq!(natural_cmp("v1", "v002"), Ordering::Less);
         let huge = "x123456789012345678901234567890";
         let huger = "x1234567890123456789012345678901";
@@ -2786,6 +2797,17 @@ mod tests {
         assert_eq!(natural_cmp("", "a"), Ordering::Less);
         assert_eq!(natural_cmp("a1", "a"), Ordering::Greater);
         assert_eq!(natural_cmp("_init.py", "apple.py"), Ordering::Less);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_names_with_the_same_lossy_rendering_keep_a_fixed_order() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let fe = Path::new("/d").join(OsStr::from_bytes(&[0xFE]));
+        let ff = Path::new("/d").join(OsStr::from_bytes(&[0xFF]));
+        assert_eq!(explorer_name_cmp(&fe, &ff), std::cmp::Ordering::Less);
+        assert_eq!(explorer_name_cmp(&ff, &fe), std::cmp::Ordering::Greater);
     }
 
     #[test]
