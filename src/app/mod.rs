@@ -9966,22 +9966,40 @@ impl App {
         }
         let mut changed = false;
         for u in updates {
-            if self.lsp_last_seen.get(&u.path) != Some(&u.seq) {
-                continue;
-            }
-            if self.editor.path.as_deref() == Some(u.path.as_path()) {
-                self.editor
-                    .apply_inlay_hints(u.path.clone(), u.hints.clone());
-                changed = true;
-            }
-            for group in self.editor_layout.inactive_groups_mut() {
-                if group.path.as_deref() == Some(u.path.as_path()) {
-                    group.apply_inlay_hints(u.path.clone(), u.hints.clone());
-                    changed = true;
-                }
-            }
+            changed |= self.fan_out_batch(&u.path, u.seq, |e| {
+                e.apply_inlay_hints(u.path.clone(), u.hints.clone())
+            });
         }
         changed
+    }
+
+    /// Hand a seq-stamped batch for `path` to every editor showing the file,
+    /// the active one and each inactive group, through `apply`. A batch whose
+    /// `seq` no longer matches the buffer's last-synced edit seq is dropped:
+    /// its anchors were computed against older text, and the request fired
+    /// for the current seq is still in flight. Returns whether any editor
+    /// took it.
+    fn fan_out_batch(
+        &mut self,
+        path: &Path,
+        seq: u64,
+        mut apply: impl FnMut(&mut EditorTabs),
+    ) -> bool {
+        if self.lsp_last_seen.get(path) != Some(&seq) {
+            return false;
+        }
+        let mut applied = false;
+        if self.editor.path.as_deref() == Some(path) {
+            apply(&mut self.editor);
+            applied = true;
+        }
+        for group in self.editor_layout.inactive_groups_mut() {
+            if group.path.as_deref() == Some(path) {
+                apply(group);
+                applied = true;
+            }
+        }
+        applied
     }
 
     /// Drain document-link batches (#254) into every editor showing the
@@ -9996,18 +10014,9 @@ impl App {
             updates.push(u);
         }
         for u in updates {
-            if self.lsp_last_seen.get(&u.path) != Some(&u.seq) {
-                continue;
-            }
-            if self.editor.path.as_deref() == Some(u.path.as_path()) {
-                self.editor
-                    .apply_document_links(u.path.clone(), u.links.clone());
-            }
-            for group in self.editor_layout.inactive_groups_mut() {
-                if group.path.as_deref() == Some(u.path.as_path()) {
-                    group.apply_document_links(u.path.clone(), u.links.clone());
-                }
-            }
+            self.fan_out_batch(&u.path, u.seq, |e| {
+                e.apply_document_links(u.path.clone(), u.links.clone())
+            });
         }
     }
 
@@ -10131,20 +10140,9 @@ impl App {
         }
         let mut changed = false;
         for u in updates {
-            if self.lsp_last_seen.get(&u.path) != Some(&u.seq) {
-                continue;
-            }
-            if self.editor.path.as_deref() == Some(u.path.as_path()) {
-                self.editor
-                    .apply_document_colors(u.path.clone(), u.colors.clone());
-                changed = true;
-            }
-            for group in self.editor_layout.inactive_groups_mut() {
-                if group.path.as_deref() == Some(u.path.as_path()) {
-                    group.apply_document_colors(u.path.clone(), u.colors.clone());
-                    changed = true;
-                }
-            }
+            changed |= self.fan_out_batch(&u.path, u.seq, |e| {
+                e.apply_document_colors(u.path.clone(), u.colors.clone())
+            });
         }
         changed
     }
@@ -11905,86 +11903,65 @@ impl App {
     }
 
     pub fn drain_lsp_declaration(&mut self) -> bool {
-        let mut target = None;
-        let mut unsupported = false;
-        let mut replied = false;
-        {
-            let Some(lsp) = self.lsp.as_ref() else {
-                return false;
-            };
-            while let Some(result) = lsp.drain_declaration() {
-                if Some(result.request_id) != self.declaration_request_id {
-                    continue;
-                }
-                replied = true;
-                target = result.target;
-                unsupported = result.unsupported;
+        let Some(lsp) = self.lsp.as_ref() else {
+            return false;
+        };
+        let mut reply = None;
+        while let Some(result) = lsp.drain_declaration() {
+            if Some(result.request_id) == self.declaration_request_id {
+                reply = Some((result.target, result.unsupported));
             }
         }
-        if replied {
-            self.declaration_request_id = None;
-        }
-        match target {
-            // The jump itself is identical to definition: open the target file,
-            // move the caret, record nav history.
-            Some((path, line, col)) => {
-                self.go_to_definition(path, line, col);
-                true
-            }
-            // Be explicit rather than silently no-op: say when the language
-            // server has no declaration provider (e.g. TypeScript's vtsls) and
-            // when it simply found nothing at this position.
-            None if unsupported => {
-                self.status =
-                    String::from("Go to Declaration: not supported by this file's language server");
-                true
-            }
-            None if replied => {
-                self.status = String::from("No declaration found");
-                true
-            }
-            None => false,
-        }
+        let Some((target, unsupported)) = reply else {
+            return false;
+        };
+        self.declaration_request_id = None;
+        self.finish_jump(target, unsupported, "Go to Declaration", "declaration");
+        true
     }
 
     pub fn drain_lsp_type_definition(&mut self) -> bool {
-        let mut target = None;
-        let mut unsupported = false;
-        let mut replied = false;
-        {
-            let Some(lsp) = self.lsp.as_ref() else {
-                return false;
-            };
-            while let Some(result) = lsp.drain_type_definition() {
-                if Some(result.request_id) != self.type_definition_request_id {
-                    continue;
-                }
-                replied = true;
-                target = result.target;
-                unsupported = result.unsupported;
+        let Some(lsp) = self.lsp.as_ref() else {
+            return false;
+        };
+        let mut reply = None;
+        while let Some(result) = lsp.drain_type_definition() {
+            if Some(result.request_id) == self.type_definition_request_id {
+                reply = Some((result.target, result.unsupported));
             }
         }
-        if replied {
-            self.type_definition_request_id = None;
-        }
+        let Some((target, unsupported)) = reply else {
+            return false;
+        };
+        self.type_definition_request_id = None;
+        self.finish_jump(
+            target,
+            unsupported,
+            "Go to Type Definition",
+            "type definition",
+        );
+        true
+    }
+
+    /// Act on the reply to a go-to request: jump to its target the way Go to
+    /// Definition does (open the file, move the caret, record nav history),
+    /// or say so rather than silently doing nothing, both when the language
+    /// server has no `feature` provider (`unsupported`, e.g. TypeScript's
+    /// vtsls has no declarations) and when it found no `noun` at this
+    /// position.
+    fn finish_jump(
+        &mut self,
+        target: Option<(PathBuf, u32, u32)>,
+        unsupported: bool,
+        feature: &str,
+        noun: &str,
+    ) {
         match target {
-            // The jump itself is identical to definition: open the target file,
-            // move the caret, record nav history.
-            Some((path, line, col)) => {
-                self.go_to_definition(path, line, col);
-                true
-            }
+            Some((path, line, col)) => self.go_to_definition(path, line, col),
             None if unsupported => {
-                self.status = String::from(
-                    "Go to Type Definition: not supported by this file's language server",
-                );
-                true
+                self.status = format!("{feature}: not supported by this file's language server");
             }
-            None if replied => {
-                self.status = String::from("No type definition found");
-                true
-            }
-            None => false,
+            None => self.status = format!("No {noun} found"),
         }
     }
 
