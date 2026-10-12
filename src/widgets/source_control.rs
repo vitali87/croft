@@ -2093,6 +2093,7 @@ mod tests {
             behind: 0,
             head_oid: None,
             ignored: std::sync::Arc::default(),
+            decorations: std::sync::Arc::default(),
             dirty: false,
             repo_root: None,
             changed_count: 0,

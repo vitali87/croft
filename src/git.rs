@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -26,6 +26,11 @@ pub struct GitStatus {
     /// resolved by walking ancestors, never enumerated. Arc: the status is
     /// cloned per consumer each refresh and the set can be large.
     pub ignored: Arc<HashSet<PathBuf>>,
+    /// The Explorer's git decorations (#1513): each changed file under the
+    /// workspace root with its status, and each folder above one with the
+    /// strongest status beneath it, keyed by absolute path in the root's
+    /// own spelling. Arc for the same reason as `ignored`.
+    pub decorations: Arc<HashMap<PathBuf, GitDecoration>>,
     /// The repository toplevel containing the workspace root, or `None`
     /// outside a repo. Porcelain and numstat paths are TOPLEVEL-relative,
     /// so every consumer that joins a repo-relative path or names one on a
@@ -200,8 +205,17 @@ pub fn query(root: &Path) -> GitStatus {
     } else {
         None
     };
-    let porcelain =
-        run_git(root, &["status", "--porcelain", "--untracked-files=all"]).unwrap_or_default();
+    // Untrimmed: `run_git` trims stdout, which would shift the first
+    // line's status column (` M a.py` -> `M a.py`) for the decorations.
+    let porcelain = git_raw(
+        root,
+        &["status", "--porcelain", "--untracked-files=all"],
+        None,
+    )
+    .map(|out| String::from_utf8_lossy(&out).into_owned())
+    .unwrap_or_default();
+    let prefix = run_git(root, &["rev-parse", "--show-prefix"]).unwrap_or_default();
+    let decorations = parse_decorations(root, &prefix, &porcelain);
     let dirty = parse_porcelain_dirty(&porcelain);
     let changed_count = porcelain.lines().filter(|l| !l.trim().is_empty()).count();
     let (ahead, behind) = match run_git(
@@ -224,6 +238,7 @@ pub fn query(root: &Path) -> GitStatus {
         behind,
         head_oid,
         ignored: Arc::new(query_ignored(root)),
+        decorations: Arc::new(decorations),
         repo_root: Some(repo_root),
         changed_count,
         prepared_message: prepared_message(root),
@@ -812,6 +827,85 @@ pub fn parse_porcelain_changes(out: &str) -> Vec<ChangeEntry> {
         }
     }
     entries
+}
+
+/// How the Explorer marks a changed path (#1513), after VS Code's git
+/// decorations. Ordered weakest to strongest: a folder wears the strongest
+/// status among the files beneath it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GitDecoration {
+    Untracked,
+    Added,
+    Renamed,
+    Deleted,
+    Modified,
+    Conflicted,
+}
+
+impl GitDecoration {
+    /// The letter VS Code puts after a changed file's name.
+    pub fn letter(self) -> char {
+        match self {
+            Self::Untracked => 'U',
+            Self::Added => 'A',
+            Self::Renamed => 'R',
+            Self::Deleted => 'D',
+            Self::Modified => 'M',
+            Self::Conflicted => '!',
+        }
+    }
+
+    fn from_kind(kind: ChangeKind) -> Self {
+        match kind {
+            ChangeKind::StagedAdded => Self::Added,
+            ChangeKind::StagedModified | ChangeKind::Modified => Self::Modified,
+            ChangeKind::StagedDeleted | ChangeKind::Deleted => Self::Deleted,
+            ChangeKind::StagedRenamed => Self::Renamed,
+            ChangeKind::Untracked => Self::Untracked,
+            ChangeKind::Conflicted => Self::Conflicted,
+        }
+    }
+}
+
+/// The Explorer's decorations from `git status --porcelain` output (#1513).
+/// Porcelain paths are toplevel-relative, so `prefix` (`rev-parse
+/// --show-prefix`: where `root` sits in the repository) is stripped and the
+/// rest joined onto `root`; a change outside `root` is not in its tree. A
+/// partially staged file keeps its strongest status, and each folder between
+/// a file and `root` takes the strongest status beneath it.
+pub fn parse_decorations(
+    root: &Path,
+    prefix: &str,
+    porcelain: &str,
+) -> HashMap<PathBuf, GitDecoration> {
+    let prefix = prefix.trim();
+    let mut out: HashMap<PathBuf, GitDecoration> = HashMap::new();
+    for entry in parse_porcelain_changes(porcelain) {
+        let Some(rel) = entry.path.strip_prefix(prefix) else {
+            continue;
+        };
+        if rel.is_empty() {
+            continue;
+        }
+        let dec = GitDecoration::from_kind(entry.kind);
+        let mut path = root.join(rel);
+        loop {
+            match out.get(&path) {
+                // Every ancestor already wears at least this status.
+                Some(&have) if have >= dec => break,
+                _ => {
+                    out.insert(path.clone(), dec);
+                }
+            }
+            match path.parent() {
+                Some(parent) if parent != root && parent.starts_with(root) => {
+                    path = parent.to_path_buf();
+                }
+                _ => break,
+            }
+        }
+    }
+    out
 }
 
 /// Run `git status --porcelain` against `root` and return parsed entries.
@@ -4977,6 +5071,107 @@ mod tests {
             None,
             "outside a repo there is no toplevel"
         );
+    }
+
+    /// #1513: each porcelain status maps to its Explorer letter, a partially
+    /// staged file keeps its strongest status, and each folder above a
+    /// change takes the strongest status beneath it, whatever order the
+    /// lines come in. The root itself is never decorated.
+    #[test]
+    fn decorations_carry_each_status_and_roll_up_to_folders() {
+        use GitDecoration as D;
+        let root = Path::new("/w");
+        let porcelain = " M a.py\n?? c.py\nA  d.py\nR  old.py -> new.py\nUU x.py\n D gone.py\nAM part.py\n?? pkg/new.py\n M pkg/old.py\n?? pkg/deep/n.py\n M lib/x/y.py\n?? lib/z.py\n";
+        let got = parse_decorations(root, "", porcelain);
+        let at = |p: &str| got.get(&root.join(p)).copied();
+        assert_eq!(at("a.py"), Some(D::Modified));
+        assert_eq!(at("c.py"), Some(D::Untracked));
+        assert_eq!(at("d.py"), Some(D::Added));
+        assert_eq!(at("new.py"), Some(D::Renamed));
+        assert_eq!(at("old.py"), None, "a rename decorates its destination");
+        assert_eq!(at("x.py"), Some(D::Conflicted));
+        assert_eq!(at("gone.py"), Some(D::Deleted));
+        assert_eq!(
+            at("part.py"),
+            Some(D::Modified),
+            "AM: the strongest of the two"
+        );
+        assert_eq!(
+            at("pkg"),
+            Some(D::Modified),
+            "untracked first, modified wins"
+        );
+        assert_eq!(at("pkg/deep"), Some(D::Untracked));
+        assert_eq!(
+            at("lib"),
+            Some(D::Modified),
+            "modified first, untracked does not demote"
+        );
+        assert_eq!(at("lib/x"), Some(D::Modified));
+        assert_eq!(got.get(root), None, "the root row is never decorated");
+        let letters: String = [
+            D::Untracked,
+            D::Added,
+            D::Renamed,
+            D::Deleted,
+            D::Modified,
+            D::Conflicted,
+        ]
+        .map(GitDecoration::letter)
+        .iter()
+        .collect();
+        assert_eq!(letters, "UARDM!");
+    }
+
+    /// #1513 negatives: a workspace root inside the repository keeps only
+    /// its own changes (porcelain paths are toplevel-relative), and a clean
+    /// tree has no decorations.
+    #[test]
+    fn decorations_stay_inside_the_workspace_root() {
+        let root = Path::new("/repo/app");
+        let got = parse_decorations(
+            root,
+            "app/\n",
+            " M app/src/x.py\n M other/y.py\n?? apple.py\n",
+        );
+        assert_eq!(
+            got.keys().cloned().collect::<HashSet<_>>(),
+            HashSet::from([root.join("src/x.py"), root.join("src")])
+        );
+        assert!(parse_decorations(Path::new("/w"), "", "").is_empty());
+    }
+
+    /// #1513, end to end over the issue's repro: modified, staged and
+    /// untracked files are decorated from a real `git status`, and the
+    /// unchanged file is not.
+    #[test]
+    fn query_decorates_changed_files_and_their_folders() {
+        use GitDecoration as D;
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        std::fs::create_dir_all(p.join("sub")).unwrap();
+        for f in ["a.py", "b.py", "sub/e.py"] {
+            std::fs::write(p.join(f), "x = 1\n").unwrap();
+        }
+        init_repo_with_commit(p);
+        std::fs::write(p.join("a.py"), "x = 1\ny = 2\n").unwrap();
+        std::fs::write(p.join("sub/e.py"), "x = 1\ny = 2\n").unwrap();
+        std::fs::write(p.join("c.py"), "new = 1\n").unwrap();
+        std::fs::write(p.join("d.py"), "staged = 1\n").unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(p)
+            .args(["add", "d.py"])
+            .status()
+            .unwrap();
+        let st = query(p);
+        let at = |f: &str| st.decorations.get(&p.join(f)).copied();
+        assert_eq!(at("a.py"), Some(D::Modified));
+        assert_eq!(at("sub/e.py"), Some(D::Modified));
+        assert_eq!(at("sub"), Some(D::Modified));
+        assert_eq!(at("c.py"), Some(D::Untracked));
+        assert_eq!(at("d.py"), Some(D::Added));
+        assert_eq!(at("b.py"), None, "an unchanged file is not decorated");
     }
 
     /// A new folder lists each of its files (#1279), not one `dir/` row

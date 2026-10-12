@@ -7272,6 +7272,7 @@ fn git_status_spans_clean_branch_is_green() {
         behind: 0,
         head_oid: None,
         ignored: std::sync::Arc::default(),
+        decorations: std::sync::Arc::default(),
         repo_root: None,
         changed_count: 0,
         prepared_message: None,
@@ -7298,6 +7299,7 @@ fn git_status_spans_dirty_branch_is_yellow_not_red() {
         behind: 0,
         head_oid: None,
         ignored: std::sync::Arc::default(),
+        decorations: std::sync::Arc::default(),
         repo_root: None,
         changed_count: 0,
         prepared_message: None,
@@ -7327,6 +7329,7 @@ fn git_status_spans_renders_detached_hash_when_no_branch() {
         behind: 0,
         head_oid: None,
         ignored: std::sync::Arc::default(),
+        decorations: std::sync::Arc::default(),
         repo_root: None,
         changed_count: 0,
         prepared_message: None,
@@ -7348,6 +7351,7 @@ fn git_status_spans_renders_ahead_behind_counts() {
         behind: 1,
         head_oid: None,
         ignored: std::sync::Arc::default(),
+        decorations: std::sync::Arc::default(),
         repo_root: None,
         changed_count: 0,
         prepared_message: None,
@@ -15242,6 +15246,39 @@ fn clicking_source_control_does_not_block_on_git_and_posts_a_changes_request() {
         "the worker must reply with the dirty file's Changes entry; entries = {:?}",
         app.source_control.entries,
     );
+}
+
+#[test]
+fn git_worker_status_response_feeds_the_explorer_decorations() {
+    // #1513 end to end: the worker's Status reply carries the decorations
+    // and drain pushes them into the file tree, so a new file and its
+    // folder are marked untracked in the Explorer.
+    let tmp = tempfile::tempdir().unwrap();
+    let _ = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(tmp.path())
+        .args(["init", "-q", "-b", "main"])
+        .output();
+    std::fs::create_dir(tmp.path().join("pkg")).unwrap();
+    std::fs::write(tmp.path().join("pkg/new.py"), "x = 1\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while app.tree.git_decorations.is_empty() && std::time::Instant::now() < deadline {
+        let _ = app.drain_git_responses();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    use crate::git::GitDecoration as D;
+    assert_eq!(
+        app.tree.git_decoration(&tmp.path().join("pkg/new.py")),
+        Some(D::Untracked),
+        "decorations must reach the tree; map = {:?}",
+        app.tree.git_decorations,
+    );
+    assert_eq!(
+        app.tree.git_decoration(&tmp.path().join("pkg")),
+        Some(D::Untracked)
+    );
+    assert_eq!(app.tree.git_decoration(tmp.path()), None);
 }
 
 #[test]
@@ -78812,6 +78849,7 @@ fn diag_on_line(line: u32, message: &str) -> crate::lsp::manager::Diagnostic {
         end_char: 1,
         severity: crate::lsp::manager::DiagnosticSeverity::Warning,
         message: String::from(message),
+        tags: Default::default(),
     }
 }
 
