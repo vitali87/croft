@@ -269,6 +269,7 @@ mod tests {
                     scroll_col: 0,
                     dirty: true,
                     unsaved_text: Some(String::from("xalpha")),
+                    sheet_cells: Vec::new(),
                 },
                 disk_stamp: Some((SystemTime::UNIX_EPOCH, 6)),
             }],

@@ -2048,6 +2048,10 @@ struct ExpandStack {
     pos: usize,
 }
 
+/// An xlsx grid's edited cell as hot exit keeps it (#1593):
+/// `(sheet, row, col, value)`.
+pub type SheetCellEdit = (usize, usize, usize, String);
+
 /// A single text replacement in char-indexed `(row, col)` coordinates, as
 /// produced by an LSP rename `WorkspaceEdit`. Applied by
 /// [`apply_span_edits_to_lines`] and [`Editor::apply_span_edits`].
@@ -2091,6 +2095,14 @@ pub fn apply_span_edits_to_lines(lines: &mut Vec<String>, edits: &[TextSpanEdit]
         }
     }
     applied
+}
+
+/// The delimiter a CSV or TSV grid was read and is written with.
+fn sheet_delim(kind: crate::sheet::SheetKind) -> u8 {
+    match kind {
+        crate::sheet::SheetKind::Tsv => b'\t',
+        _ => b',',
+    }
 }
 
 fn replace_span(lines: &mut Vec<String>, e: &TextSpanEdit) -> bool {
@@ -6157,6 +6169,80 @@ impl Editor {
         self.disk_conflict = false;
         self.dirty = still_dirty;
         Ok(SaveOutcome::Saved)
+    }
+
+    /// What hot exit and the update relaunch keep of a grid's unsaved
+    /// edits (#1593), `None` when it has none: a CSV/TSV grid as the text a
+    /// save would write, an xlsx as its edited cells `(sheet, row, col,
+    /// value)`, the cells its save applies.
+    pub fn sheet_backup(&self) -> Option<(Option<String>, Vec<SheetCellEdit>)> {
+        let view = self.sheet.as_ref().filter(|v| v.dirty)?;
+        match view.kind {
+            crate::sheet::SheetKind::Csv | crate::sheet::SheetKind::Tsv => {
+                let data = view.sheets.get(view.current_sheet)?;
+                let bytes =
+                    crate::sheet::serialize_delimited(data, sheet_delim(view.kind), false, &[]);
+                Some((
+                    Some(String::from_utf8_lossy(&bytes).into_owned()),
+                    Vec::new(),
+                ))
+            }
+            crate::sheet::SheetKind::Xlsx => {
+                let cells: Vec<_> = view
+                    .cell_edits
+                    .iter()
+                    .filter_map(|&(s, r, c)| {
+                        Some((s, r, c, view.sheets.get(s)?.cell(r, c).to_string()))
+                    })
+                    .collect();
+                (!cells.is_empty()).then_some((None, cells))
+            }
+            _ => None,
+        }
+    }
+
+    /// Put a grid's backed-up edits (#1593) over the file just opened in
+    /// it, as unsaved edits: a CSV/TSV's text re-read into the grid, an
+    /// xlsx's cells set again and queued for its save. False when this tab
+    /// is no grid that takes them.
+    pub fn restore_sheet_edits(
+        &mut self,
+        text: Option<&str>,
+        cells: &[(usize, usize, usize, String)],
+    ) -> bool {
+        let Some(view) = self.sheet.as_mut() else {
+            return false;
+        };
+        match (view.kind, text) {
+            (crate::sheet::SheetKind::Csv | crate::sheet::SheetKind::Tsv, Some(text)) => {
+                let name = view
+                    .sheets
+                    .first()
+                    .map_or_else(|| String::from("Sheet1"), |d| d.name.clone());
+                let Ok(data) =
+                    crate::sheet::parse_delimited(text.as_bytes(), sheet_delim(view.kind), &name)
+                else {
+                    return false;
+                };
+                view.sheets = vec![data];
+                view.current_sheet = 0;
+            }
+            (crate::sheet::SheetKind::Xlsx, _) if !cells.is_empty() => {
+                for (s, r, c, value) in cells {
+                    let Some(data) = view.sheets.get_mut(*s) else {
+                        continue;
+                    };
+                    data.set_cell(*r, *c, value.clone());
+                    if !view.cell_edits.contains(&(*s, *r, *c)) {
+                        view.cell_edits.push((*s, *r, *c));
+                    }
+                }
+            }
+            _ => return false,
+        }
+        view.dirty = true;
+        self.dirty = true;
+        true
     }
 
     /// The page an open PDF preview is showing, if this tab is one.

@@ -12298,6 +12298,7 @@ fn a_backup_at_this_crofts_own_path_is_moved_aside_before_restoring() {
             scroll: 0,
             scroll_col: 0,
             unsaved_text: Some(String::from("zbravo\n")),
+            sheet_cells: Vec::new(),
         },
         disk_stamp: None,
     };
@@ -12723,6 +12724,7 @@ fn hot_exit_restores_the_rest_of_a_backup_that_also_held_a_second_copy() {
             scroll: 0,
             scroll_col: 0,
             unsaved_text: Some(String::from("zbravo\n")),
+            sheet_cells: Vec::new(),
         },
         disk_stamp: None,
     };
@@ -79434,4 +79436,194 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     app.watch_published_panes.insert(pane);
     assert!(!app.apply_build_scan(pane, Some(&cwd), "tsc --watch", "a.c:1:1: error: old\n"));
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
+}
+
+/// A CSV of widgets open in the grid, with hot exit backing up to `cache`.
+fn csv_grid_app(root: &std::path::Path, cache: &std::path::Path) -> (App, PathBuf) {
+    let p = root.join("d.csv");
+    std::fs::write(&p, "name,qty\nwidget,3\ngadget,5\n").unwrap();
+    let mut app = with_hot_exit(App::new(root.to_path_buf()).unwrap(), cache);
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.sheet.is_some(), "the CSV opens in the grid");
+    (app, p)
+}
+
+/// Type `value` into the grid's selected cell and commit it with Enter.
+fn type_into_cell(app: &mut App, value: &str) {
+    for c in value.chars() {
+        app.handle_sheet_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    app.handle_sheet_key(key(KeyCode::Enter, KeyModifiers::NONE));
+}
+
+/// The tab holding `path` after a relaunch, by path.
+fn tab_for<'a>(app: &'a App, path: &std::path::Path) -> &'a Editor {
+    app.editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(path))
+        .expect("the file's tab is back")
+}
+
+/// #1593: an unsaved cell edit in a CSV grid survives a kill: the next
+/// croft reopens the grid with the edited value, dirty, and the file is
+/// untouched until saved.
+#[test]
+fn hot_exit_restores_a_csv_grid_s_unsaved_cell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (mut app, p) = csv_grid_app(tmp.path(), cache.path());
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_cell(&mut app, "99");
+    assert!(app.editor.dirty);
+    settle_hot_exit(&mut app);
+    assert_eq!(
+        hot_exit_files(cache.path(), tmp.path()).len(),
+        1,
+        "backed up"
+    );
+    drop(app);
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    let ed = tab_for(&next, &p);
+    let view = ed.sheet.as_ref().expect("reopened in the grid");
+    assert_eq!(view.sheets[0].cell(0, 1), "99");
+    assert_eq!(view.sheets[0].cell(1, 1), "5");
+    assert!(ed.dirty && view.dirty, "restored as unsaved");
+    assert!(
+        next.status.contains("restored 1 unsaved tab"),
+        "{}",
+        next.status
+    );
+    assert_eq!(
+        std::fs::read_to_string(&p).unwrap(),
+        "name,qty\nwidget,3\ngadget,5\n",
+        "nothing is written to the file"
+    );
+    let idx = next
+        .editor
+        .editors
+        .iter()
+        .position(|e| e.path.as_deref() == Some(p.as_path()))
+        .unwrap();
+    next.editor.select(idx);
+    next.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&p).unwrap(),
+        "name,qty\nwidget,99\ngadget,5\n",
+        "{}",
+        next.status
+    );
+}
+
+/// #1593: a later edit to the same grid rewrites the backup, though the
+/// grid's edits never touch its text.
+#[test]
+fn a_second_grid_edit_rewrites_the_backup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (mut app, p) = csv_grid_app(tmp.path(), cache.path());
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_cell(&mut app, "99");
+    settle_hot_exit(&mut app);
+    type_into_cell(&mut app, "7");
+    settle_hot_exit(&mut app);
+    drop(app);
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    let view = tab_for(&next, &p).sheet.as_ref().unwrap();
+    assert_eq!(
+        (view.sheets[0].cell(0, 1), view.sheets[0].cell(1, 1)),
+        ("99", "7")
+    );
+}
+
+/// #1593: an xlsx grid keeps its edited cells, applied over the workbook
+/// as it reopens and saved through the workbook's own save.
+#[test]
+fn hot_exit_restores_an_xlsx_grid_s_unsaved_cell() {
+    let (tmp, p, app) = prices_xlsx_app();
+    let cache = tempfile::tempdir().unwrap();
+    let mut app = with_hot_exit(app, cache.path());
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_cell(&mut app, "5");
+    settle_hot_exit(&mut app);
+    drop(app);
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    let ed = tab_for(&next, &p);
+    let view = ed.sheet.as_ref().expect("reopened in the grid");
+    assert_eq!(view.sheets[0].cell(0, 1), "5");
+    assert!(ed.dirty && view.dirty);
+    assert_eq!(view.cell_edits, vec![(0, 0, 1)], "queued for the save");
+    assert_eq!(xlsx_value(&p, 2, 2), "4", "the workbook is untouched");
+    let idx = next
+        .editor
+        .editors
+        .iter()
+        .position(|e| e.path.as_deref() == Some(p.as_path()))
+        .unwrap();
+    next.editor.select(idx);
+    next.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(xlsx_value(&p, 2, 2), "5", "{}", next.status);
+}
+
+/// #1593: the update relaunch carries a TSV grid's edits the same way.
+#[test]
+fn a_relaunch_keeps_a_tsv_grid_s_unsaved_cell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("t.tsv");
+    std::fs::write(&p, "name\tqty\nwidget\t3\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_cell(&mut app, "12");
+    let state = app.capture_session_state();
+
+    let mut next = App::new(tmp.path().to_path_buf()).unwrap();
+    next.apply_session_state(&state);
+    let ed = tab_for(&next, &p);
+    let view = ed.sheet.as_ref().expect("reopened in the grid");
+    assert_eq!(view.sheets[0].cell(0, 1), "12");
+    assert!(ed.dirty);
+}
+
+/// Negative (#1593): a grid with no unsaved edits leaves no backup, and
+/// one saved after its backup was written takes the backup away.
+#[test]
+fn a_clean_or_saved_grid_leaves_no_backup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (mut app, p) = csv_grid_app(tmp.path(), cache.path());
+    settle_hot_exit(&mut app);
+    assert!(hot_exit_files(cache.path(), tmp.path()).is_empty());
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_cell(&mut app, "99");
+    settle_hot_exit(&mut app);
+    assert_eq!(hot_exit_files(cache.path(), tmp.path()).len(), 1);
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(!app.editor.dirty, "{}", app.status);
+    settle_hot_exit(&mut app);
+    assert!(hot_exit_files(cache.path(), tmp.path()).is_empty());
+    assert!(std::fs::read_to_string(&p).unwrap().contains("widget,99"));
+}
+
+/// Negative (#1593): a text tab's backup is unchanged: its text, no cells.
+#[test]
+fn a_text_tab_s_backup_carries_no_sheet_cells() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    let backup = the_hot_exit_backup(cache.path(), tmp.path());
+    assert!(backup.buffers[0].tab.sheet_cells.is_empty());
+    let raw = std::fs::read_to_string(&hot_exit_files(cache.path(), tmp.path())[0]).unwrap();
+    assert!(!raw.contains("sheet_cells"), "{raw}");
 }

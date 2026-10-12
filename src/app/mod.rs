@@ -41913,8 +41913,16 @@ impl App {
         let mut active_path: Option<PathBuf> = None;
         for (idx, ed) in self.editor.editors.iter().enumerate() {
             // Only plain text file tabs survive a re-exec; diff / sheet /
-            // image tabs are derived views with no path to reopen from.
+            // image tabs are derived views with no path to reopen from. A
+            // grid with unsaved edits is the exception (#1593): its edits
+            // are kept, and the file reopens in the grid under them.
             if ed.has_non_text_view() {
+                if let Some(tab) = sheet_tab_state(ed) {
+                    if idx == self.editor.active_index() {
+                        active_tab = tabs.len();
+                    }
+                    tabs.push(tab);
+                }
                 continue;
             }
             // An untitled buffer has no file to reopen, so it is carried only
@@ -41953,6 +41961,7 @@ impl App {
                 scroll_col: ed.scroll_col,
                 dirty: ed.dirty,
                 unsaved_text,
+                sheet_cells: Vec::new(),
             });
         }
         // The other editor groups too: their tabs are not in `self.editor`,
@@ -41961,6 +41970,12 @@ impl App {
         // (the same file open in two splits) keeps the dirty copy.
         for group in self.editor_layout.inactive_groups() {
             for ed in &group.editors {
+                if let Some(tab) = sheet_tab_state(ed) {
+                    if !tabs.iter().any(|t| t.path == tab.path) {
+                        tabs.push(tab);
+                    }
+                    continue;
+                }
                 if ed.has_non_text_view() || !ed.dirty {
                     continue;
                 }
@@ -41984,6 +41999,7 @@ impl App {
                     scroll_col: ed.scroll_col,
                     dirty: true,
                     unsaved_text: unsaved,
+                    sheet_cells: Vec::new(),
                 });
             }
         }
@@ -42054,6 +42070,12 @@ impl App {
         } else {
             return None;
         };
+        if ed.sheet.is_some() {
+            // A grid's edits go back into the grid (#1593); the text side
+            // of a sheet tab is never its content.
+            ed.restore_sheet_edits(unsaved, &tab.sheet_cells);
+            return Some(ed);
+        }
         if let Some(text) = unsaved {
             // As an edit, not a bare assignment: the text is re-highlighted
             // (it kept the disk file's colours) and the LSP and the rest
@@ -61115,6 +61137,12 @@ impl App {
             any = true;
             ed.path.hash(&mut h);
             ed.edit_seq.hash(&mut h);
+            // A grid's edits leave the text untouched (#1593).
+            if let Some(view) = &ed.sheet {
+                for data in &view.sheets {
+                    data.revision.hash(&mut h);
+                }
+            }
         }
         any.then(|| h.finish())
     }
@@ -61238,9 +61266,10 @@ impl App {
             .into_iter()
             .filter(|t| {
                 t.dirty
-                    && t.unsaved_text
-                        .as_deref()
-                        .is_some_and(|text| t.path.is_some() || !text.is_empty())
+                    && (!t.sheet_cells.is_empty()
+                        || t.unsaved_text
+                            .as_deref()
+                            .is_some_and(|text| t.path.is_some() || !text.is_empty()))
             })
             .map(|tab| {
                 let disk_stamp = tab.path.as_deref().and_then(|p| {
@@ -70734,6 +70763,23 @@ fn moved_path(path: &Path, renames: &[crate::lsp::manager::FileRenameOp]) -> Pat
         .find_map(|r| path.strip_prefix(&r.old).ok().map(|rest| r.new.join(rest)))
         .map(|p| p.components().collect())
         .unwrap_or_else(|| path.to_path_buf())
+}
+
+/// A grid tab with unsaved edits as a session tab (#1593): its file, with
+/// the edits [`Editor::sheet_backup`] keeps. `None` for any other tab.
+fn sheet_tab_state(ed: &Editor) -> Option<crate::session_state::OpenTabState> {
+    let path = ed.path.clone()?;
+    let (unsaved_text, sheet_cells) = ed.sheet_backup()?;
+    Some(crate::session_state::OpenTabState {
+        path: Some(path),
+        cursor_row: 0,
+        cursor_col: 0,
+        scroll: 0,
+        scroll_col: 0,
+        dirty: true,
+        unsaved_text,
+        sheet_cells,
+    })
 }
 
 fn sidebar_view_label(view: SidebarView) -> &'static str {
