@@ -78812,6 +78812,7 @@ fn diag_on_line(line: u32, message: &str) -> crate::lsp::manager::Diagnostic {
         end_char: 1,
         severity: crate::lsp::manager::DiagnosticSeverity::Warning,
         message: String::from(message),
+        tags: Default::default(),
     }
 }
 
@@ -80325,4 +80326,138 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     app.watch_published_panes.insert(pane);
     assert!(!app.apply_build_scan(pane, Some(&cwd), "tsc --watch", "a.c:1:1: error: old\n"));
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
+}
+
+fn written_settings(cfg: &std::path::Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(cfg.join("config.json")).unwrap()).unwrap()
+}
+
+/// #1555: Enter on the unset UI language picks a language in place; it used
+/// to close the editor and open `config.json` at line 1.
+#[test]
+fn enter_on_the_unset_language_picks_one_in_the_editor() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "locale");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.settings_editor.is_some(), "still in the editor");
+    let lang = written_settings(cfg.path())["locale"].clone();
+    assert!(lang.is_string(), "a language was set: {lang}");
+    let row = app
+        .settings_editor
+        .as_ref()
+        .unwrap()
+        .selected_row()
+        .cloned()
+        .unwrap();
+    assert_eq!(row.value, lang, "and the row shows it");
+}
+
+/// #1555: an unset number setting asks for a number, saves it as one, and
+/// an empty entry unsets it again.
+#[test]
+fn an_unset_number_setting_takes_a_number_and_an_empty_entry_unsets_it() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "terminal rewind");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(matches!(
+        app.input_prompt.as_ref().map(|p| &p.purpose),
+        Some(crate::widgets::input_prompt::InputPurpose::SettingValue { key }) if key == "terminal_rewind_mb"
+    ));
+    assert_eq!(
+        app.input_prompt.as_ref().unwrap().value,
+        "",
+        "an unset setting's prompt opens empty, not on (default)"
+    );
+    app.close_input_prompt();
+    app.submit_setting_value("terminal_rewind_mb", "500");
+    assert_eq!(
+        written_settings(cfg.path())["terminal_rewind_mb"],
+        serde_json::json!(500)
+    );
+    app.submit_setting_value("terminal_rewind_mb", "");
+    let written = written_settings(cfg.path());
+    assert!(
+        written.get("terminal_rewind_mb").is_none(),
+        "unset, so its default applies: {written}"
+    );
+}
+
+/// #1555: a value the setting can't hold is refused and nothing is
+/// written; `code_scanning` took `enabled`, said it was saved, and
+/// ignored it.
+#[test]
+fn a_value_the_setting_cannot_hold_is_refused() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    app.write_setting("code_scanning", serde_json::json!("enabled"));
+    assert!(app.status.contains("can't be enabled"), "{}", app.status);
+    assert!(!cfg.path().join("config.json").exists());
+    type_query(&mut app, "code scanning");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.input_prompt.is_none(), "a choice: no free text to type");
+    assert_eq!(
+        written_settings(cfg.path())["code_scanning"],
+        serde_json::json!("on")
+    );
+}
+
+/// #1555: a list setting opens the chosen layer's file with the caret on
+/// its key, the workspace's when Tab has chosen it.
+#[test]
+fn a_list_setting_opens_its_layer_file_at_the_key() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    let ws_file = tmp.path().join(".croft/config.json");
+    std::fs::write(
+        &ws_file,
+        "{\n  \"auto_save\": true,\n  \"files_exclude\": [\"target\"]\n}\n",
+    )
+    .unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    type_query(&mut app, "files_exclude");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.settings_editor.is_none());
+    let opened = app.editor.path.clone().unwrap();
+    assert!(
+        opened.ends_with(".croft/config.json"),
+        "{}",
+        opened.display()
+    );
+    assert_eq!(app.editor.cursor_row, 2, "on the key's line");
+    assert!(app.status.contains("files exclude"), "{}", app.status);
+}
+
+/// #1555 negative: with the user layer chosen, a list setting opens the
+/// user's file, at its key too.
+#[test]
+fn a_list_setting_in_the_user_layer_opens_the_user_file_at_the_key() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        cfg.path().join("config.json"),
+        "{\n  \"theme\": \"dark\",\n  \"auto_save\": true,\n  \"search_exclude\": []\n}\n",
+    )
+    .unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "search exclude");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let opened = app.editor.path.clone().unwrap();
+    assert_eq!(opened.file_name().unwrap(), "config.json");
+    assert!(
+        opened.starts_with(cfg.path()) || opened.starts_with(cfg.path().canonicalize().unwrap())
+    );
+    assert_eq!(app.editor.cursor_row, 3);
 }

@@ -36,10 +36,17 @@ pub struct Row {
 
 /// The string settings whose values come from a fixed set. An empty
 /// (default) value counts as the first choice, so Enter moves it to the
-/// second.
+/// second. An optional setting's first choice is the empty one, its
+/// default, which Enter writes as no value at all (#1555).
 pub fn choices(key: &str) -> Option<Vec<String>> {
     let fixed: &[&str] = match key {
         "problems_scope" => &["whole_project", "open_files"],
+        // An enum: free text such as `enabled` was saved and then ignored.
+        "code_scanning" => &["off", "on", "prompt"],
+        "locale" => {
+            let langs = crate::i18n::languages(&crate::prefs::config_dir());
+            return Some(std::iter::once(String::new()).chain(langs).collect());
+        }
         "problems_project_scope" => &["auto", "on", "off"],
         "diff_ignore_whitespace" => &["off", "leading", "all"],
         "render_whitespace" => &["selection", "all", "none"],
@@ -56,6 +63,33 @@ pub fn choices(key: &str) -> Option<Vec<String>> {
     Some(fixed.iter().map(|c| c.to_string()).collect())
 }
 
+/// The optional settings (#1555): unset, their value is `null`, which says
+/// nothing of their type, so it is declared here. Text and Number rows of
+/// these take an empty entry as unset.
+const OPTIONAL_TEXT: &[&str] = &[
+    "codeql_cli_path",
+    "lane_agent",
+    "review_ai_prefix",
+    "screen_reader_command",
+];
+const OPTIONAL_NUMBER: &[&str] = &["terminal_rewind_mb"];
+
+fn is_optional(key: &str) -> bool {
+    OPTIONAL_TEXT.contains(&key) || OPTIONAL_NUMBER.contains(&key) || key == "locale"
+}
+
+/// How an unset (`null`) setting is edited: its declared kind, or, for a
+/// setting with no declaration, the JSON file.
+fn unset_kind(key: &str) -> Kind {
+    if OPTIONAL_TEXT.contains(&key) {
+        Kind::Text
+    } else if OPTIONAL_NUMBER.contains(&key) {
+        Kind::Number
+    } else {
+        choices(key).map_or(Kind::Json, Kind::Choice)
+    }
+}
+
 /// Every top-level setting of `prefs` in key order, with the layer
 /// `provenance` says set it.
 pub fn rows(prefs: &crate::prefs::Prefs, provenance: &BTreeMap<String, LayerKind>) -> Vec<Row> {
@@ -69,6 +103,7 @@ pub fn rows(prefs: &crate::prefs::Prefs, provenance: &BTreeMap<String, LayerKind
                 Value::Bool(_) => Kind::Bool,
                 Value::Number(_) => Kind::Number,
                 Value::String(_) => choices(&key).map(Kind::Choice).unwrap_or(Kind::Text),
+                Value::Null => unset_kind(&key),
                 _ => Kind::Json,
             };
             let layer = crate::config_layers::layer_of(provenance, &key);
@@ -84,11 +119,16 @@ pub fn rows(prefs: &crate::prefs::Prefs, provenance: &BTreeMap<String, LayerKind
     out
 }
 
-/// A value as one line: strings bare, `(default)` for an empty one,
-/// objects and arrays as compact JSON.
+/// What a row shows for a setting at its default: an empty string, or an
+/// optional setting that is unset.
+pub const DEFAULT_LABEL: &str = "(default)";
+
+/// A value as one line: strings bare, `(default)` for an empty one or an
+/// unset optional one, objects and arrays as compact JSON.
 pub fn display(value: &Value) -> String {
     match value {
-        Value::String(s) if s.is_empty() => String::from("(default)"),
+        Value::String(s) if s.is_empty() => String::from(DEFAULT_LABEL),
+        Value::Null => String::from(DEFAULT_LABEL),
         Value::String(s) => s.clone(),
         other => other.to_string(),
     }
@@ -116,16 +156,73 @@ pub fn next_value(row: &Row) -> Option<Value> {
         (Kind::Choice(c), v) if !c.is_empty() => {
             let now = v.as_str().unwrap_or_default();
             let at = c.iter().position(|x| x == now).unwrap_or(0);
-            Some(Value::String(c[(at + 1) % c.len()].clone()))
+            let next = &c[(at + 1) % c.len()];
+            Some(if next.is_empty() && is_optional(&row.key) {
+                Value::Null
+            } else {
+                Value::String(next.clone())
+            })
         }
         _ => None,
     }
 }
 
+/// The value typed into a Number or Text row's prompt (#1555). A Number
+/// must be a whole number. An optional setting left empty, or given back
+/// `(default)`, is unset, except `review_ai_prefix`, whose empty value is
+/// itself a setting (no marker); any other text setting's `(default)` is
+/// its empty default.
+pub fn typed_value(row: &Row, text: &str) -> Result<Value, String> {
+    let t = text.trim();
+    let optional = is_optional(&row.key);
+    if t == DEFAULT_LABEL {
+        return Ok(if optional {
+            Value::Null
+        } else {
+            Value::from("")
+        });
+    }
+    match row.kind {
+        Kind::Number if t.is_empty() && optional => Ok(Value::Null),
+        Kind::Number => t
+            .parse::<u64>()
+            .map(Value::from)
+            .map_err(|_| format!("{} needs a whole number, not \"{t}\"", row.key)),
+        _ if t.is_empty() && optional && row.key != "review_ai_prefix" => Ok(Value::Null),
+        _ => Ok(Value::from(t)),
+    }
+}
+
+/// Whether `key` may be set to `value` (#1555): the settings, with it set,
+/// still read back as croft's settings. A value of the wrong type, or a
+/// word an enum setting doesn't know, would otherwise be saved, reported as
+/// saved, and then ignored.
+pub fn check(prefs: &crate::prefs::Prefs, key: &str, value: &Value) -> Result<(), String> {
+    let Ok(Value::Object(mut map)) = serde_json::to_value(prefs) else {
+        return Ok(());
+    };
+    map.insert(key.to_string(), value.clone());
+    serde_json::from_value::<crate::prefs::Prefs>(Value::Object(map))
+        .map(|_| ())
+        .map_err(|_| format!("{key} can't be {}", display(value)))
+}
+
+/// The 0-based line of top-level `key` in a layer file's `text`, for
+/// opening a JSON-only setting where it is written (#1555).
+pub fn key_line(text: &str, key: &str) -> Option<usize> {
+    let quoted = format!("\"{key}\"");
+    text.lines().position(|l| {
+        l.trim_start()
+            .strip_prefix(&quoted)
+            .is_some_and(|rest| rest.trim_start().starts_with(':'))
+    })
+}
+
 /// `text` (a layer file's JSON object, or empty) with `key` set to `value`,
 /// pretty-printed; every other key keeps its value and its place (croft's
-/// serde_json preserves order), and a new key goes last. An error when the
-/// text is not a JSON object.
+/// serde_json preserves order), and a new key goes last. A `null` value
+/// takes the key out instead, so the setting falls back to its default
+/// (#1555). An error when the text is not a JSON object.
 pub fn set_key(text: &str, key: &str, value: Value) -> Result<String, String> {
     let mut map = if text.trim().is_empty() {
         serde_json::Map::new()
@@ -136,7 +233,11 @@ pub fn set_key(text: &str, key: &str, value: Value) -> Result<String, String> {
             Err(e) => return Err(format!("the settings file does not parse: {e}")),
         }
     };
-    map.insert(key.to_string(), value);
+    if value.is_null() {
+        map.remove(key);
+    } else {
+        map.insert(key.to_string(), value);
+    }
     serde_json::to_string_pretty(&Value::Object(map))
         .map(|s| s + "\n")
         .map_err(|e| e.to_string())
@@ -186,6 +287,117 @@ mod tests {
         assert_eq!(display(&json!(true)), "true");
         assert_eq!(display(&json!(12)), "12");
         assert_eq!(display(&json!({"a": 1})), "{\"a\":1}");
+        assert_eq!(display(&Value::Null), "(default)", "#1555: not `null`");
+    }
+
+    /// #1555: an unset optional setting is edited as what it is, not sent
+    /// to the JSON file because its value, `null`, says nothing of its type.
+    #[test]
+    fn unset_optional_settings_get_their_real_kind() {
+        let all = rows(&crate::prefs::Prefs::default(), &BTreeMap::new());
+        let get = |k: &str| all.iter().find(|r| r.key == k).unwrap().kind.clone();
+        let Kind::Choice(langs) = get("locale") else {
+            panic!("locale is a choice: {:?}", get("locale"));
+        };
+        assert_eq!(langs[0], "", "the first choice is the system's language");
+        for lang in ["en", "de", "es"] {
+            assert!(langs.iter().any(|l| l == lang), "{lang} in {langs:?}");
+        }
+        assert_eq!(get("terminal_rewind_mb"), Kind::Number);
+        for key in [
+            "codeql_cli_path",
+            "lane_agent",
+            "review_ai_prefix",
+            "screen_reader_command",
+        ] {
+            assert_eq!(get(key), Kind::Text, "{key}");
+        }
+        assert_eq!(
+            get("code_scanning"),
+            Kind::Choice(vec!["off".into(), "on".into(), "prompt".into()])
+        );
+    }
+
+    /// #1555 negative: objects and lists are still edited in the JSON file.
+    #[test]
+    fn objects_and_lists_stay_json_rows() {
+        let all = rows(&crate::prefs::Prefs::default(), &BTreeMap::new());
+        let get = |k: &str| all.iter().find(|r| r.key == k).unwrap().kind.clone();
+        assert_eq!(get("files_exclude"), Kind::Json);
+        assert_eq!(get("explorer_views"), Kind::Json);
+    }
+
+    /// #1555: stepping an optional choice past its last value unsets it.
+    #[test]
+    fn an_optional_choice_steps_back_to_unset() {
+        let langs = Kind::Choice(vec!["".into(), "de".into(), "es".into()]);
+        let locale = |v: Value| row("locale", v, langs.clone());
+        assert_eq!(next_value(&locale(Value::Null)), Some(json!("de")));
+        assert_eq!(next_value(&locale(json!("es"))), Some(Value::Null));
+    }
+
+    /// #1555: a typed value is a number for a number row, and an optional
+    /// setting left empty, or given `(default)`, is unset.
+    #[test]
+    fn a_typed_value_parses_or_unsets_an_optional_setting() {
+        let rewind = row("terminal_rewind_mb", Value::Null, Kind::Number);
+        assert_eq!(typed_value(&rewind, " 500 "), Ok(json!(500)));
+        assert_eq!(typed_value(&rewind, ""), Ok(Value::Null));
+        assert_eq!(typed_value(&rewind, "(default)"), Ok(Value::Null));
+        assert!(typed_value(&rewind, "lots").unwrap_err().contains("number"));
+        let codeql = row("codeql_cli_path", Value::Null, Kind::Text);
+        assert_eq!(
+            typed_value(&codeql, "/opt/codeql"),
+            Ok(json!("/opt/codeql"))
+        );
+        assert_eq!(typed_value(&codeql, "  "), Ok(Value::Null));
+    }
+
+    /// #1555 negative: a required number still needs one, an empty AI
+    /// review prefix is its own setting (no marker), and a plain text
+    /// setting's `(default)` is its empty default, not unset.
+    #[test]
+    fn empty_entries_unset_only_what_may_be_unset() {
+        let scrollback = row("terminal_scrollback", json!(1000), Kind::Number);
+        assert!(typed_value(&scrollback, "").is_err());
+        let prefix = row("review_ai_prefix", Value::Null, Kind::Text);
+        assert_eq!(typed_value(&prefix, ""), Ok(json!("")));
+        assert_eq!(typed_value(&prefix, "(default)"), Ok(Value::Null));
+        let font = row("a_text_setting", json!(""), Kind::Text);
+        assert_eq!(typed_value(&font, "(default)"), Ok(json!("")));
+    }
+
+    /// #1555: a value the setting can't hold is refused; one it can, and
+    /// unsetting an optional setting, are not.
+    #[test]
+    fn check_refuses_a_value_the_setting_cannot_hold() {
+        let prefs = crate::prefs::Prefs::default();
+        assert!(check(&prefs, "code_scanning", &json!("enabled")).is_err());
+        assert!(check(&prefs, "auto_save", &json!("yes")).is_err());
+        assert_eq!(check(&prefs, "code_scanning", &json!("prompt")), Ok(()));
+        assert_eq!(check(&prefs, "terminal_rewind_mb", &json!(500)), Ok(()));
+        assert_eq!(check(&prefs, "locale", &Value::Null), Ok(()));
+    }
+
+    /// #1555: a `null` value takes the key out of the layer file.
+    #[test]
+    fn set_key_with_null_removes_the_key() {
+        let out = set_key(
+            "{\"locale\": \"de\", \"auto_save\": true}",
+            "locale",
+            Value::Null,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v, json!({"auto_save": true}));
+    }
+
+    #[test]
+    fn key_line_finds_a_top_level_key() {
+        let text = "{\n  \"files\": 1,\n  \"files_exclude\" : [],\n  \"x\": \"files_exclude\"\n}";
+        assert_eq!(key_line(text, "files_exclude"), Some(2));
+        assert_eq!(key_line(text, "files"), Some(1));
+        assert_eq!(key_line(text, "search_exclude"), None);
     }
 
     fn row(key: &str, value: Value, kind: Kind) -> Row {

@@ -125,6 +125,25 @@ pub fn catalog_for(lang: &str, user_file: Option<&str>) -> Catalog {
     c
 }
 
+/// Every language croft can be shown in, for the Settings editor's
+/// `locale` row (#1555): English, the built-in catalogs and the user's
+/// `<config>/locales/<lang>.json`, sorted.
+pub fn languages(config_dir: &std::path::Path) -> Vec<String> {
+    let mut out: Vec<String> = std::iter::once("en")
+        .chain(BUILT_IN.iter().map(|(lang, _)| *lang))
+        .map(String::from)
+        .collect();
+    if let Ok(dir) = std::fs::read_dir(config_dir.join("locales")) {
+        out.extend(dir.flatten().filter_map(|e| {
+            let path = e.path();
+            (path.extension()? == "json").then_some(path.file_stem()?.to_str()?.to_string())
+        }));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Load the catalog once at startup. Later calls are no-ops.
 pub fn init(setting: Option<&str>) {
     let Some(lang) = pick_language(setting, &|k| std::env::var(k).ok()) else {
