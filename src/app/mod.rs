@@ -69297,11 +69297,6 @@ fn just_installed_covers_path(installed: &[crate::lsp::Language], path: &Path) -
         .any(|&i| lsp_server_family(i) == lsp_server_family(lang))
 }
 
-/// Editor-pane Change All Occurrences: `Cmd+F2` (macOS) or `Ctrl+F2` (Linux),
-/// matching VS Code on each platform so local and remote behave identically.
-/// iTerm2 may deliver Cmd folded onto the Meta/ALT bit (the same reason
-/// Cmd+click arrives as ALT for go-to-definition), so any of SUPER / CONTROL /
-/// ALT alongside F2 counts. Plain F2 (no modifiers) stays Rename Symbol.
 /// `Cmd+Shift+L` (`Ctrl+Shift+L` off macOS): Select All Occurrences of Find
 /// Match (#1558), VS Code's chord. On a remote session Drop to Local takes
 /// it first.
@@ -69319,6 +69314,11 @@ fn is_add_cursors_to_line_ends_key(key: KeyEvent) -> bool {
             .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
 }
 
+/// Editor-pane Change All Occurrences: `Cmd+F2` (macOS) or `Ctrl+F2` (Linux),
+/// matching VS Code on each platform so local and remote behave identically.
+/// iTerm2 may deliver Cmd folded onto the Meta/ALT bit (the same reason
+/// Cmd+click arrives as ALT for go-to-definition), so any of SUPER / CONTROL /
+/// ALT alongside F2 counts. Plain F2 (no modifiers) stays Rename Symbol.
 fn is_change_all_occurrences_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::F(2))
         && (key.modifiers.contains(KeyModifiers::SUPER)
