@@ -51,6 +51,8 @@ impl HoverPopup {
         self.scroll = (i32::from(self.scroll) + delta).clamp(0, i32::from(max)) as u16;
     }
 
+    /// The body, wrapped as it is drawn; `area_for` measures this same
+    /// paragraph, so the box always has the rows the text takes.
     fn paragraph(&self) -> Paragraph<'_> {
         let text = Text::from(
             self.lines
