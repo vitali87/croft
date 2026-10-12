@@ -1152,6 +1152,14 @@ fn update_spinner_frame(elapsed_ms: u128) -> &'static str {
     UPDATE_SPINNER_FRAMES[((elapsed_ms / UPDATE_SPINNER_FRAME_MS) % n) as usize]
 }
 
+/// What a share-link command does with the link (#1610).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShareLink {
+    CopyPermalink,
+    CopyHeadLink,
+    OpenOnRemote,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum MenuAction {
     Create(CreateKind),
@@ -1263,6 +1271,10 @@ enum MenuAction {
         row: usize,
         col: usize,
     },
+    /// Editor body: "Copy Permalink" / "Open on Remote" (#1610) for the
+    /// selected lines, else the caret's.
+    CopyPermalink,
+    OpenOnRemote,
     /// Editor body: "Change All Occurrences" of the word at buffer `(row,
     /// col)` (multi-cursor select within the current file).
     ChangeAllOccurrencesAt {
@@ -50619,6 +50631,9 @@ impl App {
             Cmd::GitUndoLastCommit => {
                 self.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::UndoLastCommit)
             }
+            Cmd::GitCopyPermalink => self.share_link(ShareLink::CopyPermalink),
+            Cmd::GitCopyHeadLink => self.share_link(ShareLink::CopyHeadLink),
+            Cmd::GitOpenOnRemote => self.share_link(ShareLink::OpenOnRemote),
             Cmd::ToggleFold => {
                 let row = self.editor.cursor_row;
                 self.editor.toggle_fold(row);
@@ -54981,6 +54996,12 @@ impl App {
                         String::from("Change All Occurrences"),
                         MenuAction::ChangeAllOccurrencesAt { row, col },
                     ));
+                    // Sharing the lines (#1610), for a file on disk; why a
+                    // link cannot be made is said when it is asked for.
+                    if self.editor.path.is_some() {
+                        items.push((String::from("Copy Permalink"), MenuAction::CopyPermalink));
+                        items.push((String::from("Open on Remote"), MenuAction::OpenOnRemote));
+                    }
                     if self.editor_language_supports_code_action() {
                         items.push((
                             String::from("Quick Fix"),
@@ -60544,6 +60565,8 @@ impl App {
                 self.focus_pane(Pane::Editor);
                 self.start_rename_symbol();
             }
+            MenuAction::CopyPermalink => self.share_link(ShareLink::CopyPermalink),
+            MenuAction::OpenOnRemote => self.share_link(ShareLink::OpenOnRemote),
             MenuAction::ChangeAllOccurrencesAt { row, col } => {
                 self.editor.collapse_carets();
                 self.editor.cursor_row = row;
@@ -61655,6 +61678,56 @@ impl App {
                 None => format!("untitled ({why})"),
             })
             .collect()
+    }
+
+    /// Git: Copy Permalink / Copy Head Link / Open on Remote (#1610): the
+    /// active file's selected lines, else the caret's line, on its remote's
+    /// web page. The status line says the link, or why there is none.
+    fn share_link(&mut self, how: ShareLink) {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Open a file to link to its lines");
+            return;
+        };
+        let rev = match how {
+            ShareLink::CopyHeadLink => crate::git::LinkRev::Branch,
+            ShareLink::CopyPermalink | ShareLink::OpenOnRemote => crate::git::LinkRev::Commit,
+        };
+        let url = match crate::git::share_link(&path, Some(self.share_link_lines()), rev) {
+            Ok(url) => url,
+            Err(why) => {
+                self.status = format!("No link: {why}");
+                return;
+            }
+        };
+        if how == ShareLink::OpenOnRemote {
+            self.open_url_for_user(&url);
+            return;
+        }
+        // The clipboard the user pastes from, as any copy reaches it: the
+        // local one over the relay, else this machine's, else OSC 52.
+        let via_relay = self.is_relay_session && self.push_clipboard_via_relay(&url);
+        self.status = if via_relay || copy_to_clipboard(&url) {
+            format!("Copied {url}")
+        } else {
+            format!("Copied {url} via OSC 52 (the host terminal decides)")
+        };
+    }
+
+    /// The 1-based lines a shared link points at: the selection's, less a
+    /// last line it only reaches the start of (whole lines selected with
+    /// Shift+Down), else the caret's.
+    fn share_link_lines(&self) -> (usize, usize) {
+        let caret = self.editor.cursor_row + 1;
+        let Some(sel) = self.editor.selection.filter(|s| s.has_area()) else {
+            return (caret, caret);
+        };
+        let ((start, _), (end, end_col)) = sel.normalised();
+        let end = if end_col == 0 && end > start {
+            end - 1
+        } else {
+            end
+        };
+        (start + 1, end + 1)
     }
 
     /// Copy `path` (an editor tab's absolute path) to the system clipboard via

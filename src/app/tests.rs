@@ -79435,3 +79435,129 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     assert!(!app.apply_build_scan(pane, Some(&cwd), "tsc --watch", "a.c:1:1: error: old\n"));
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
 }
+
+/// A repository whose `src/main.rs` is committed and on `origin`
+/// (`git@github.com:acme/widgets.git`), opened in the editor (#1610).
+fn app_on_a_pushed_github_file() -> (App, tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(p)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::create_dir(p.join("src")).unwrap();
+    std::fs::write(
+        p.join("src/main.rs"),
+        "fn main() {\n    println!(\"hi\");\n    println!(\"there\");\n}\n",
+    )
+    .unwrap();
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "init",
+    ]);
+    git(&["remote", "add", "origin", "git@github.com:acme/widgets.git"]);
+    git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    let sha = git(&["rev-parse", "HEAD"]);
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.editor.open_pinned(&p.join("src/main.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    (app, tmp, sha)
+}
+
+/// #1610: Git: Copy Permalink copies the selected lines' link at HEAD's
+/// commit; whole lines selected with Shift+Down end on the last full line.
+/// Copy Head Link names the branch, and the caret alone links its line.
+#[test]
+fn copy_permalink_puts_the_selected_lines_link_on_the_clipboard() {
+    use crate::widgets::command_palette::Command;
+    let (mut app, _tmp, sha) = app_on_a_pushed_github_file();
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (1, 0),
+        head: (3, 0),
+    });
+    app.run_command(Command::GitCopyPermalink);
+    let want = format!("https://github.com/acme/widgets/blob/{sha}/src/main.rs#L2-L3");
+    assert_eq!(app.status, format!("Copied {want}"));
+    assert_eq!(
+        crate::clipboard::test_clip::mock_read().as_deref(),
+        Some(want.as_str())
+    );
+    app.editor.selection = None;
+    app.editor.cursor_row = 3;
+    app.run_command(Command::GitCopyHeadLink);
+    assert_eq!(
+        app.status,
+        "Copied https://github.com/acme/widgets/blob/main/src/main.rs#L4"
+    );
+    app.run_command(Command::GitOpenOnRemote);
+    assert_eq!(
+        app.status,
+        format!("Open https://github.com/acme/widgets/blob/{sha}/src/main.rs#L4")
+    );
+}
+
+/// #1610 negatives: a commit not on the remote yet copies nothing and says
+/// to push; with no file open there is nothing to link.
+#[test]
+fn copy_permalink_refuses_an_unpushed_commit() {
+    use crate::widgets::command_palette::Command;
+    let (mut app, tmp, sha) = app_on_a_pushed_github_file();
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp.path())
+        .args(["update-ref", "-d", "refs/remotes/origin/main"])
+        .status();
+    crate::clipboard::test_clip::mock_write("before");
+    app.run_command(Command::GitCopyPermalink);
+    assert_eq!(
+        app.status,
+        format!(
+            "No link: commit {} is not on origin yet, so the link would not open: push it first",
+            &sha[..7]
+        )
+    );
+    assert_eq!(
+        crate::clipboard::test_clip::mock_read().as_deref(),
+        Some("before")
+    );
+    let mut empty = App::new(tmp.path().to_path_buf()).unwrap();
+    empty.run_command(Command::GitCopyPermalink);
+    assert_eq!(empty.status, "Open a file to link to its lines");
+}
+
+/// #1610: the palette finds the share commands by "permalink" and by the
+/// host's name, and the editor's right-click menu carries them.
+#[test]
+fn the_share_commands_are_in_the_palette_and_the_editor_menu() {
+    use crate::widgets::command_palette::{ALL_COMMANDS, Command};
+    for cmd in [
+        Command::GitCopyPermalink,
+        Command::GitCopyHeadLink,
+        Command::GitOpenOnRemote,
+    ] {
+        assert!(ALL_COMMANDS.contains(&cmd), "{cmd:?}");
+        assert!(cmd.keyword().contains("github"), "{cmd:?}");
+        assert_eq!(Command::from_id(cmd.id()), Some(cmd));
+    }
+    let (mut app, _tmp, _) = app_on_a_pushed_github_file();
+    draw(&mut app, 100, 30);
+    let x = app.editor.last_inner.x + app.editor.last_gutter_width + 2;
+    let y = app.editor.last_inner.y + 1;
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), x, y));
+    let labels = menu_labels(&app.context_menu.as_ref().unwrap().items);
+    assert!(labels.contains(&"Copy Permalink"), "{labels:?}");
+    assert!(labels.contains(&"Open on Remote"), "{labels:?}");
+}
