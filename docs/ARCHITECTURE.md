@@ -129,7 +129,7 @@ src/
 │   ├── locate.rs             test-name → source location: `find_test_source` walks the workspace grepping `fn <leaf>` and ranks by module path, while pytest and JS node IDs grep just their own file; run on a background thread so a big workspace cannot freeze the render loop
 │   ├── model.rs         TestStatus (NotRun/Running/Passed/Failed/Skipped) + TestCase; suite_and_leaf splits a `module::name` path for the tree
 │   ├── registry.rs           data-driven test-runner registry: maps a workspace root to a Runner from the `[[test_runners]]` blocks in bundled + user manifests, skipping runners whose extension is disabled in the Extensions panel
-│   ├── parse.rs              per-tool output parsers — libtest, pytest, vitest, jest — with all node IDs normalised to `::` separators so one panel tree serves every runner
+│   ├── parse.rs              per-tool output parsers — libtest, pytest (plain `-v` lines and pytest-xdist's outcome-first `[gwN]` lines), vitest, jest — with all node IDs normalised to `::` separators so one panel tree serves every runner
 │   └── worker.rs             the test-runner command layer: RunAll / RunOne / RunFilter / RunSuite / Discover per runner, building each tool's argv and streaming cases over an mpsc channel
 ├── mcp/                 MCP sidecar host (Tier-1 extensions): croft is a DETERMINISTIC MCP host — a human invokes a contributed palette command and croft calls one pre-known tool on one vetted local server (no LLM picks tools), which removes MCP's whole prompt-injection/tool-poisoning attack family
 │   ├── mod.rs           module overview + McpOutcome (the off-thread worker's result)
@@ -573,7 +573,7 @@ On-screen keyboard for Termux, needed because mouse tracking blocks the native s
 
 ### scrubber.rs
 
-Moves through a branch's history. This is the cursor behind "Source Control: Scrub History": arrows step between commits, Home returns to the working tree. At a commit, Enter ("Open Scrubbed File Here") opens that version as a tab with no file behind it, and "Diff Scrubbed File to Working Tree" diffs it against the file on disk. Both leave the scrubber.
+Moves through a branch's history. This is the cursor behind "Source Control: Scrub History": arrows step between commits, Home returns to the working tree. At a commit, Enter ("Open Scrubbed File Here") opens that version as a tab with no file behind it, and "Diff Scrubbed File to Working Tree" diffs it against the working copy: its open tab's unsaved edits, else the file on disk. Both leave the scrubber.
 
 **Enter opens here only at a commit.** There, the edit guard already refuses typing into the live buffer hidden under the historical view. At the working tree, Enter is ordinary typing. The diff is a palette command.
 
@@ -1006,7 +1006,7 @@ The proactive-look detector, pure text-in and row-out. Tree-sitter judges whethe
 
 Per-tool output parsers. All node IDs are normalised to `::` separators so one panel tree serves every runner.
 
-**The runners covered.** libtest (`parse_test_line` for run lines, `parse_list_line` for discovery), pytest (`-v` result lines, `--collect-only` node IDs), vitest (`parse_vitest_list_line` for `vitest list`, `parse_vitest_tap_line` for the streaming `--reporter=tap-flat` run lines, whose `file > describe > test` IDs are complete per line), and jest (`parse_jest_json`).
+**The runners covered.** libtest (`parse_test_line` for run lines, `parse_list_line` for discovery), pytest (`<id> PASSED` result lines at `--verbosity=1`, `--collect-only` node IDs at `--verbosity=-1`, both set outright so a project's `addopts` `-q` cannot shift them), vitest (`parse_vitest_list_line` for `vitest list`, `parse_vitest_tap_line` for the streaming `--reporter=tap-flat` run lines, whose `file > describe > test` IDs are complete per line), and jest (`parse_jest_json`).
 
 **Why jest is different.** jest prints one `--json` document to stdout at run end, with human output going to stderr, yielding every assertion with its describe chain and treating `pending`/`todo` as the skip family.
 
