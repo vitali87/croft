@@ -314,6 +314,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Ctrl`+`A` / `Ctrl`+`E` | Move to start / end of line |
 | `Ctrl`+`K` / `Ctrl`+`U` | Kill to end / start of line (yanks to clipboard). On Linux (outside vim mode) and Termux `Ctrl`+`K` is the `Cmd+K` leader instead; the Command Palette's "Kill to End of Line" kills there, or bind `ctrl+k` to `kill_to_end_of_line` in `keybindings.json` |
 | `Cmd`+`o` / `Cmd`+`Shift`+`Enter` | Open a new line below / above, inheriting indent |
+| `Enter` in a Markdown list or quote, or a doc comment | Continue it on the new line: a `-`, `*` or `+` bullet repeats, a numbered item counts up (`1.` then `2.`), a task box comes back unticked (`- [ ] `), and `>` quotes carry over; `Enter` on an empty item ends the list instead. In Rust, JS/TS, C/C++, Java and C#, `Enter` after `/**` opens the block with ` * ` and closes it with ` */` when nothing below does, `Enter` on a ` * ` line adds the next one, and Rust `///` / `//!` lines continue. Plain `//` comments and lines inside a fenced code block are left alone |
 | `Ctrl`+`Shift`+`o` / `Cmd`+`Shift`+`O` | Go to Symbol in Editor: fuzzy-search the file's symbols and jump (type `:` then a number to go to a line) |
 | `Cmd`+`g` `g` | Go to the top of the file (`Cmd`+`N` `Cmd`+`g` `g` for line N) |
 | `Cmd`+`Shift`+`G` | Go to the bottom of the file (with a leading count, that line) |
