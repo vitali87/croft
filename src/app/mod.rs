@@ -10489,7 +10489,7 @@ impl App {
                     base.join(p)
                 }
             };
-            if crate::build_matchers::needs_existing_file(&d.source) && !path.is_file() {
+            if d.needs_file && !path.is_file() {
                 continue;
             }
             let entry = self.build_diagnostics.entry(path.clone()).or_default();

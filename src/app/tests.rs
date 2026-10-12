@@ -80328,6 +80328,27 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
 }
 
+/// #1594: a user matcher named `go` is not one of the loose built-in rows,
+/// so its rows are kept even for a file not on disk.
+#[test]
+fn a_custom_matcher_named_go_keeps_rows_for_missing_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.matchers = std::sync::Arc::new(crate::problem_matchers::MatcherSet::from_json(
+        r##"[ { "name": "go",
+               "pattern": "^(?P<file>\\S+):(?P<line>\\d+):(?P<col>\\d+) (?P<severity>\\w+) (?P<message>.+)$",
+               "applies_to": "mygo*" } ]"##,
+    ));
+    let out = "gen/missing.go:3:1 error generated file absent\n";
+    assert!(app.apply_build_scan(0, Some(tmp.path()), "mygo build", out));
+    let groups = app.problems.groups().to_vec();
+    let g = groups
+        .iter()
+        .find(|g| g.path == tmp.path().join("gen/missing.go"))
+        .expect("a user matcher's row must not need an existing file");
+    assert_eq!(g.items[0].source, "go");
+}
+
 /// #1594: a `go build` error and a flake8 row land in PROBLEMS for files
 /// that exist; the same shapes naming no file are not problems.
 #[test]
@@ -80358,7 +80379,7 @@ fn go_and_lint_rows_reach_problems_only_for_real_files() {
         rows,
         [
             (String::from("app.py"), 0, String::from("lint")),
-            (String::from("app.py"), 1, String::from("build")),
+            (String::from("app.py"), 1, String::from("no-column")),
             (String::from("main.go"), 3, String::from("go")),
         ]
     );

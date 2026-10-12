@@ -19,7 +19,7 @@
 //! - MSBuild / msCompile: `file(line,col): error CODE: msg`
 //!
 //! The go and `CODE msg` rows are loose enough to match other text, so the
-//! caller keeps them only for a file that exists ([`needs_existing_file`]).
+//! caller keeps them only for a file that exists ([`BuildDiag::needs_file`]).
 
 use std::sync::LazyLock;
 
@@ -40,6 +40,12 @@ pub struct BuildDiag {
     /// Which matcher produced it: a built-in tag (`rustc`, `tsc`, …) or a
     /// user matcher's name (#252).
     pub source: String,
+    /// Kept only when its file exists (#1594): set by the loose built-in go
+    /// and lint rows (`file.go:1:2: text`, `file:1:2: X1 text`), shapes
+    /// other output can take where every other built-in row needs a
+    /// severity word. A flag rather than a check on `source`, which a user
+    /// matcher may also name `go` or `lint`.
+    pub needs_file: bool,
 }
 
 fn severity(word: &str) -> DiagnosticSeverity {
@@ -48,13 +54,6 @@ fn severity(word: &str) -> DiagnosticSeverity {
         "warning" => DiagnosticSeverity::Warning,
         _ => DiagnosticSeverity::Information,
     }
-}
-
-/// Whether a row from matcher `source` is kept only when its file exists
-/// (#1594): `file.go:1:2: text` and `file:1:2: X1 text` are shapes other
-/// output can take, where every other built-in row needs a severity word.
-pub fn needs_existing_file(source: &str) -> bool {
-    matches!(source, "go" | "lint")
 }
 
 static RUSTC_HEAD: LazyLock<Regex> =
@@ -69,7 +68,7 @@ static GENERIC: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(.+?):(\d+):(\d+):\s*(error|warning|fatal error):\s*(.+)$").unwrap()
 });
 static NO_COLUMN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(\S+?\.[A-Za-z0-9]+):(\d+): (error|warning|note): (.+)$").unwrap()
+    Regex::new(r"^(.+?\.[A-Za-z0-9]+):(\d+): (error|warning|note): (.+)$").unwrap()
 });
 static GO: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(\S+\.go):(\d+):(\d+): (.+)$").unwrap());
@@ -125,6 +124,7 @@ pub fn scan(output: &str) -> Vec<BuildDiag> {
                     severity: DiagnosticSeverity::Warning,
                     message: msg,
                     source: String::from("ruff"),
+                    needs_file: false,
                 });
                 continue;
             }
@@ -136,6 +136,7 @@ pub fn scan(output: &str) -> Vec<BuildDiag> {
                     severity: sev,
                     message: msg,
                     source: String::from("rustc"),
+                    needs_file: false,
                 });
             }
             continue;
@@ -151,6 +152,7 @@ pub fn scan(output: &str) -> Vec<BuildDiag> {
                 severity: severity(&c[4]),
                 message: format!("{}: {}", &c[5], &c[6]),
                 source: String::from("tsc"),
+                needs_file: false,
             });
             continue;
         }
@@ -167,6 +169,7 @@ pub fn scan(output: &str) -> Vec<BuildDiag> {
                     severity: DiagnosticSeverity::Error,
                     message: line.trim().to_string(),
                     source: String::from("python"),
+                    needs_file: false,
                 });
             }
             continue;
@@ -184,6 +187,7 @@ pub fn scan(output: &str) -> Vec<BuildDiag> {
                     severity: severity(&c[3]),
                     message: c[4].trim().to_string(),
                     source: String::from("eslint"),
+                    needs_file: false,
                 });
             }
             continue;
@@ -196,6 +200,7 @@ pub fn scan(output: &str) -> Vec<BuildDiag> {
                 severity: severity(&c[4]),
                 message: c[5].to_string(),
                 source: String::from("build"),
+                needs_file: false,
             });
             continue;
         }
@@ -207,6 +212,7 @@ pub fn scan(output: &str) -> Vec<BuildDiag> {
                 severity: severity(&c[4]),
                 message: format!("{}: {}", &c[5], &c[6]),
                 source: String::from("msCompile"),
+                needs_file: false,
             });
             continue;
         }
@@ -218,6 +224,7 @@ pub fn scan(output: &str) -> Vec<BuildDiag> {
                 severity: severity(&c[4]),
                 message: c[5].to_string(),
                 source: String::from("eslint-compact"),
+                needs_file: false,
             });
             continue;
         }
@@ -228,7 +235,8 @@ pub fn scan(output: &str) -> Vec<BuildDiag> {
                 col: 0,
                 severity: severity(&c[3]),
                 message: c[4].to_string(),
-                source: String::from("build"),
+                source: String::from("no-column"),
+                needs_file: false,
             });
             continue;
         }
@@ -240,6 +248,7 @@ pub fn scan(output: &str) -> Vec<BuildDiag> {
                 severity: DiagnosticSeverity::Warning,
                 message: format!("{} {}", &c[4], &c[5]),
                 source: String::from("lint"),
+                needs_file: true,
             });
             continue;
         }
@@ -251,6 +260,7 @@ pub fn scan(output: &str) -> Vec<BuildDiag> {
                 severity: DiagnosticSeverity::Error,
                 message: c[4].to_string(),
                 source: String::from("go"),
+                needs_file: true,
             });
             continue;
         }
@@ -375,8 +385,8 @@ csrc/c.c:1:20: error: 'y' undeclared (first use in this function)\n";
         assert_eq!(
             rows,
             [
-                ("app.py", 1, 0, "build"),
-                ("Main.java", 0, 0, "build"),
+                ("app.py", 1, 0, "no-column"),
+                ("Main.java", 0, 0, "no-column"),
                 ("./main.go", 3, 5, "go"),
                 ("app.py", 0, 7, "lint"),
                 ("app.py", 0, 0, "lint"),
@@ -407,6 +417,16 @@ csrc/c.c:1:20: error: 'y' undeclared (first use in this function)\n";
             out[2].message,
             "C0114 Missing module docstring (missing-module-docstring)"
         );
+    }
+
+    /// #1594: a mypy or javac path under a directory with a space still
+    /// matches, whole.
+    #[test]
+    fn a_no_column_path_may_contain_spaces() {
+        let out = scan("/tmp/my project/app.py:2: error: Incompatible types\n");
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].file, "/tmp/my project/app.py");
+        assert_eq!(out[0].line, 1);
     }
 
     /// #1594: ruff's default output puts the place on the arrow line under
@@ -462,7 +482,5 @@ csrc/c.c:1:20: error: 'y' undeclared (first use in this function)\n";
              E501 line too long\n",
         );
         assert!(out.is_empty(), "{out:?}");
-        assert!(needs_existing_file("go") && needs_existing_file("lint"));
-        assert!(!needs_existing_file("build") && !needs_existing_file("ruff"));
     }
 }

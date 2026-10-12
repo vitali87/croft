@@ -257,6 +257,7 @@ impl CompiledMatcher {
                 severity,
                 message,
                 source: self.name.clone(),
+                needs_file: false,
             });
             true
         };
@@ -882,14 +883,17 @@ mod tests {
     }
 
     /// #1594: VS Code's `$go`, `$eslint-compact` and `$msCompile` are known,
-    /// each reporting its own tool's rows only.
+    /// each reporting its own tool's rows only, and `$gcc` does not pick up
+    /// mypy's column-less row.
     #[test]
     fn go_eslint_compact_and_ms_compile_are_well_known() {
         let mixed = "./main.go:4:6: declared and not used: unused\n\
                      web/a.js: line 2, col 1, Warning - Missing semicolon. (semi)\n\
                      Program.cs(3,1): error CS0103: The name 'x' does not exist\n\
-                     main.c:7:3: error: expected ';'\n";
+                     main.c:7:3: error: expected ';'\n\
+                     app.py:2: error: Incompatible types in assignment\n";
         for (name, file) in [
+            ("$gcc", "main.c"),
             ("$go", "./main.go"),
             ("$eslint-compact", "web/a.js"),
             ("$msCompile", "Program.cs"),
