@@ -52881,6 +52881,15 @@ impl App {
             self.open_editor_find();
             return;
         }
+        // The cursor starts in Replace only when the query is already the
+        // user's choice, as in VS Code: the bar was open (they typed or took
+        // the find text there) or the text came from a one-line selection.
+        // A word merely under the caret is a guess: starting in Replace put
+        // what they typed to find into Replace, and Replace All then made
+        // the opposite edit (#1592).
+        let selection = self.editor.selection_text();
+        let chosen =
+            self.editor_find.is_some() || (!selection.is_empty() && !selection.contains('\n'));
         if self.editor_find.is_none() {
             self.open_editor_find();
         }
@@ -52888,7 +52897,7 @@ impl App {
             return;
         };
         state.replace_visible = !state.replace_visible;
-        state.focus = if state.replace_visible && !state.query.is_empty() {
+        state.focus = if state.replace_visible && !state.query.is_empty() && chosen {
             crate::widgets::editor_find::FindField::Replace
         } else {
             crate::widgets::editor_find::FindField::Query
