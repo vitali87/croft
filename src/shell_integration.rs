@@ -5,7 +5,9 @@
 //! command-aware features on FinalTerm's OSC 133 semantic prompt marks:
 //! `133;A` prompt start, `133;B` prompt end, `133;C` command output start,
 //! `133;D;<exit>` command finished. OSC 7 reports the shell's cwd, OSC 9
-//! carries a desktop-notification payload.
+//! carries a desktop-notification payload, and so do the urxvt form
+//! (`777;notify;title;body`, also Ghostty's, foot's and WezTerm's) and
+//! kitty's (`99;metadata;payload`).
 //!
 //! `alacritty_terminal` drops unknown OSC sequences before they reach any
 //! handler (they are parsed and logged internally), so croft cannot observe
@@ -39,7 +41,9 @@ pub enum OscEvent {
     /// OSC 7;file://host/path — the shell's current working directory plus
     /// the reporting host (None for an empty authority or a bare path).
     Cwd(PathBuf, Option<String>),
-    /// OSC 9;<message> — a notification payload.
+    /// OSC 9;<message> — a notification payload. OSC 777 `notify` and
+    /// OSC 99 notifications arrive here too, as `title: body` when they
+    /// carry both.
     Notify(String),
     /// OSC 9;4;<state>;<percent> — ConEmu progress (systemd, winget, cargo
     /// wrappers; Ghostty/WezTerm render it natively): state 0 clears,
@@ -61,6 +65,17 @@ pub struct OscSniffer {
     /// Bytes of an OSC sequence that started near the end of the previous
     /// chunk but has not terminated yet (capped, see [`CARRY_MAX`]).
     carry: Vec<u8>,
+    /// A kitty notification whose earlier chunks (`d=0`) arrived and whose
+    /// last one has not.
+    kitty: Option<KittyNote>,
+}
+
+/// The chunks of one kitty OSC 99 notification gathered so far.
+#[derive(Default)]
+struct KittyNote {
+    id: String,
+    title: String,
+    body: String,
 }
 
 /// A sniffed event plus the offset *just past* its terminator, in the
@@ -87,6 +102,8 @@ enum OscKind {
     SemanticPrompt, // 133
     Cwd,            // 7
     Notify,         // 9
+    UrxvtNotify,    // 777;notify
+    KittyNotify,    // 99
     ITerm2File,     // 1337 File= (inline images)
 }
 
@@ -115,9 +132,21 @@ const OSC_PREFIXES: &[(&[u8], OscKind)] = &[
     // contains — `]133;` would otherwise claim it and misparse the body.
     (b"]1337;", OscKind::ITerm2File),
     (b"]133;", OscKind::SemanticPrompt),
+    (b"]777;", OscKind::UrxvtNotify),
     (b"]7;", OscKind::Cwd),
+    (b"]99;", OscKind::KittyNotify),
     (b"]9;", OscKind::Notify),
 ];
+
+/// A notification's text: `title: body`, or whichever of the two is there.
+fn note_text(title: &str, body: &str) -> Option<String> {
+    match (title.trim().is_empty(), body.trim().is_empty()) {
+        (true, true) => None,
+        (false, true) => Some(title.to_string()),
+        (true, false) => Some(body.to_string()),
+        (false, false) => Some(format!("{title}: {body}")),
+    }
+}
 
 fn classify(bytes: &[u8]) -> Classify {
     // bytes[0] is the ESC.
@@ -233,6 +262,15 @@ fn parse_event(kind: OscKind, body: &[u8]) -> Option<OscEvent> {
             }
             Some(OscEvent::Notify(String::from_utf8_lossy(body).into_owned()))
         }
+        OscKind::UrxvtNotify => {
+            // `777;notify;title;body`. The other urxvt 777 commands
+            // (`preexec`, `precmd`, …) are none of ours.
+            let rest = String::from_utf8_lossy(body.strip_prefix(b"notify;")?).into_owned();
+            let (title, text) = rest.split_once(';').unwrap_or((rest.as_str(), ""));
+            note_text(title, text).map(OscEvent::Notify)
+        }
+        // Chunked across sequences: `OscSniffer::kitty_chunk` keeps the state.
+        OscKind::KittyNotify => None,
         OscKind::ITerm2File => {
             let rest = body.strip_prefix(b"File=")?;
             let colon = rest.iter().position(|&b| b == b':')?;
@@ -288,9 +326,13 @@ impl OscSniffer {
                 Classify::Ours(kind, body_start) => {
                     match find_terminator(&buf[esc..], body_start) {
                         Terminator::Done(body_end, seq_end) => {
-                            if let Some(ev) =
-                                parse_event(kind, &buf[esc + body_start..esc + body_end])
-                            {
+                            let body = &buf[esc + body_start..esc + body_end];
+                            let ev = if kind == OscKind::KittyNotify {
+                                self.kitty_chunk(body)
+                            } else {
+                                parse_event(kind, body)
+                            };
+                            if let Some(ev) = ev {
                                 out.push((esc + seq_end - base, ev));
                             }
                             i = esc + seq_end;
@@ -305,6 +347,57 @@ impl OscSniffer {
             }
         }
         out
+    }
+
+    /// One kitty `99;metadata;payload` sequence. Metadata is `key=value`
+    /// pairs split by `:`: `i` names the notification, `d=0` says more
+    /// chunks follow, `p` says what the payload is (`title`, the default,
+    /// or `body`; icons, buttons and queries are not shown), `e=1` that it
+    /// is base64. The notification goes out with its last chunk.
+    fn kitty_chunk(&mut self, body: &[u8]) -> Option<OscEvent> {
+        let body = String::from_utf8_lossy(body);
+        let (meta, payload) = body.split_once(';')?;
+        let (mut id, mut done, mut kind, mut b64) = ("", true, "title", false);
+        for pair in meta.split(':') {
+            match pair.split_once('=') {
+                Some(("i", v)) => id = v,
+                Some(("d", v)) => done = v != "0",
+                Some(("p", v)) => kind = v,
+                Some(("e", v)) => b64 = v == "1",
+                _ => {}
+            }
+        }
+        let payload = if b64 {
+            use base64::Engine;
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(payload.trim())
+                .ok()?;
+            String::from_utf8_lossy(&raw).into_owned()
+        } else {
+            payload.to_string()
+        };
+        let mut note = match self.kitty.take() {
+            Some(n) if n.id == id => n,
+            _ => KittyNote {
+                id: id.to_string(),
+                ..KittyNote::default()
+            },
+        };
+        let field = match kind {
+            "title" => Some(&mut note.title),
+            "body" => Some(&mut note.body),
+            _ => None,
+        };
+        if let Some(field) = field
+            && field.len() + payload.len() <= CARRY_MAX
+        {
+            field.push_str(&payload);
+        }
+        if !done {
+            self.kitty = Some(note);
+            return None;
+        }
+        note_text(&note.title, &note.body).map(OscEvent::Notify)
     }
 
     /// Carry a partial sequence to the next chunk, abandoning runaway ones.
@@ -804,6 +897,92 @@ mod tests {
         assert_eq!(
             events,
             vec![OscEvent::Notify(String::from("Build finished"))]
+        );
+    }
+
+    #[test]
+    fn urxvt_osc_777_notify_carries_its_title_and_body() {
+        let mut s = OscSniffer::default();
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]777;notify;Build;finished OK\x07"]),
+            vec![OscEvent::Notify(String::from("Build: finished OK"))]
+        );
+        // A body keeps its own semicolons; a title alone or a body alone
+        // stands by itself; a split across chunks still lands.
+        assert_eq!(
+            scan_all(
+                &mut s,
+                &[b"\x1b]777;notify;Tests;3 passed; 1 failed\x1b\\\x1b]777;notify;Only title\x07"]
+            ),
+            vec![
+                OscEvent::Notify(String::from("Tests: 3 passed; 1 failed")),
+                OscEvent::Notify(String::from("Only title")),
+            ]
+        );
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]77", b"7;notify;;just a body\x07"]),
+            vec![OscEvent::Notify(String::from("just a body"))]
+        );
+    }
+
+    #[test]
+    fn other_osc_777_commands_and_an_empty_notify_are_not_notifications() {
+        let mut s = OscSniffer::default();
+        let events = scan_all(
+            &mut s,
+            &[b"\x1b]777;preexec\x07\x1b]777;precmd\x07\x1b]777;notify;;\x07\x1b]777;notify\x07"],
+        );
+        assert!(events.is_empty(), "got: {events:?}");
+        // OSC 7 is still the cwd, not swallowed by the 777 prefix.
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]7;/srv\x07"]),
+            vec![OscEvent::Cwd(PathBuf::from("/srv"), None)]
+        );
+    }
+
+    #[test]
+    fn kitty_osc_99_notifications_are_read() {
+        let mut s = OscSniffer::default();
+        // The simplest form: no metadata, the payload is the title.
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]99;;kitty-style note\x1b\\"]),
+            vec![OscEvent::Notify(String::from("kitty-style note"))]
+        );
+        // A title chunk (d=0) then a body chunk with the same id: one
+        // notification, sent with the last chunk.
+        assert_eq!(scan_all(&mut s, &[b"\x1b]99;i=7:d=0;Build\x1b\\"]), vec![]);
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]99;i=7:p=body;finished OK\x1b\\"]),
+            vec![OscEvent::Notify(String::from("Build: finished OK"))]
+        );
+        // A base64 payload is decoded.
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]99;e=1:p=body;aGkgdGhlcmU=\x07"]),
+            vec![OscEvent::Notify(String::from("hi there"))]
+        );
+        // OSC 9 is still OSC 9, not swallowed by the 99 prefix.
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]9;plain\x07"]),
+            vec![OscEvent::Notify(String::from("plain"))]
+        );
+    }
+
+    #[test]
+    fn kitty_chunks_croft_does_not_show_send_nothing() {
+        let mut s = OscSniffer::default();
+        // Icons, buttons, queries and close requests are not notifications,
+        // nor is an empty payload or a broken base64 one.
+        let events = scan_all(
+            &mut s,
+            &[b"\x1b]99;i=1:p=icon;abc\x07\x1b]99;i=1:p=?;\x07\x1b]99;i=1:p=close;\x07\x1b]99;;\x07\x1b]99;e=1;@@@\x07\x1b]99;no-semicolon\x07"],
+        );
+        assert!(events.is_empty(), "got: {events:?}");
+        // An unfinished notification is dropped when a different one
+        // starts; its title does not leak into the new one.
+        assert!(scan_all(&mut s, &[b"\x1b]99;i=a:d=0;stale\x07"]).is_empty());
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]99;i=b;fresh\x07"]),
+            vec![OscEvent::Notify(String::from("fresh"))]
         );
     }
 

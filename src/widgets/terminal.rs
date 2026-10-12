@@ -7854,6 +7854,26 @@ mod tests {
     }
 
     #[test]
+    fn osc777_and_osc99_notifications_drain_like_osc9() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "printf '\\033]777;notify;Build;finished OK\\007\\033]99;;kitty-style note\\033\\\\\\033]9;iTerm2-style note\\007ok\\n'";
+        let term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
+                .unwrap();
+        wait_for_grid(&term, |ls| {
+            ls.iter().any(|l| l.contains("ok") && !l.contains("printf"))
+        });
+        assert_eq!(
+            term.drain_notifications(),
+            vec![
+                String::from("Build: finished OK"),
+                String::from("kitty-style note"),
+                String::from("iTerm2-style note"),
+            ]
+        );
+    }
+
+    #[test]
     fn notify_triggers_fire_on_completed_output_lines() {
         let tmp = tempfile::tempdir().unwrap();
         // The shell waits for a line of input, so the trigger set is in
