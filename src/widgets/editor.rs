@@ -2050,13 +2050,22 @@ struct ExpandStack {
 
 /// A keyboard column selection (#1560): its corners as `(row, col)`, the
 /// head's column free to run past a short line's end as VS Code's does,
-/// and what it left, to tell whether the carets are still its own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// and the carets and selections it left, to tell whether they are still
+/// its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ColumnBox {
     anchor: (usize, usize),
     head: (usize, usize),
-    left: ((usize, usize), usize),
+    left: ColumnBoxCarets,
 }
+
+/// The primary caret, primary selection and secondary carets a keyboard
+/// column selection left behind.
+type ColumnBoxCarets = (
+    (usize, usize),
+    Option<EditorSelection>,
+    Vec<EditorSelection>,
+);
 
 /// A single text replacement in char-indexed `(row, col)` coordinates, as
 /// produced by an LSP rename `WorkspaceEdit`. Applied by
@@ -11776,8 +11785,8 @@ impl Editor {
     /// like VS Code's, may sit past a short line's end, up to the longest
     /// line in the box.
     pub fn column_select(&mut self, rows: isize, cols: isize) {
-        let current = ((self.cursor_row, self.cursor_col), self.carets.len());
-        let (anchor, head) = match self.column_box {
+        let current = self.column_box_carets();
+        let (anchor, head) = match &self.column_box {
             Some(b) if b.left == current => (b.anchor, b.head),
             _ => {
                 let caret = (self.cursor_row, self.cursor_col);
@@ -11799,13 +11808,24 @@ impl Editor {
         self.column_box = Some(ColumnBox {
             anchor,
             head: (row, col),
-            left: ((self.cursor_row, self.cursor_col), self.carets.len()),
+            left: self.column_box_carets(),
         });
     }
 
-    /// Rows a column-select PageUp/PageDown moves: one screen.
+    /// The carets and selections a keyboard column selection compares
+    /// against what it left, so any edit or move starts a fresh box.
+    fn column_box_carets(&self) -> ColumnBoxCarets {
+        (
+            (self.cursor_row, self.cursor_col),
+            self.selection,
+            self.carets.clone(),
+        )
+    }
+
+    /// Rows a column-select PageUp/PageDown moves: one screen of text rows,
+    /// as the plain page motions use.
     pub fn column_select_page(&self) -> isize {
-        self.last_inner.height.max(1) as isize
+        self.page_size().max(1) as isize
     }
 
     /// VS Code "Add Cursor Above" (Cmd+Alt+Up): mirror of `add_cursor_below`.
@@ -30926,6 +30946,50 @@ mod tests {
         e.column_select(e.column_select_page(), 0);
         assert_eq!(e.cursor_row, 10);
         assert_eq!(e.carets.len(), 10);
+    }
+
+    /// Negative (#1560): typing over a one-column box leaves the primary
+    /// position and caret count unchanged, but the next column-select key
+    /// must grow from the new carets, not restore the old box.
+    #[test]
+    fn typing_over_a_column_box_starts_a_new_box() {
+        let mut e = editor_with("abcd\nabcd\nabcd");
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        e.column_select(0, 1);
+        e.column_select(2, 0);
+        assert_eq!(e.selection.unwrap().normalised(), ((2, 0), (2, 1)));
+        e.multi_insert_char('x');
+        assert_eq!((e.cursor_row, e.cursor_col), (2, 1));
+        assert_eq!(e.carets.len(), 2);
+        e.column_select(0, 1);
+        assert_eq!(e.selection.unwrap().normalised(), ((2, 1), (2, 2)));
+        assert_eq!(e.carets.len(), 0);
+    }
+
+    /// Negative (#1560): with a horizontal scrollbar taking the bottom row,
+    /// PageDown moves only the rows that show text.
+    #[test]
+    fn column_select_page_skips_the_horizontal_scrollbar_row() {
+        let mut text: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
+        text[0] = "a".repeat(500);
+        let mut e = editor_with(&text.join("\n"));
+        e.focused = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        assert!(e.last_hscrollbar.height == 1, "the long line overflows");
+        let rows = e.text_rows();
+        assert_eq!(rows, e.last_inner.height as usize - 1);
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        e.column_select(e.column_select_page(), 0);
+        assert_eq!(e.cursor_row, rows);
     }
 
     #[test]
