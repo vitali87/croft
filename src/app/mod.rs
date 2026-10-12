@@ -10425,7 +10425,9 @@ impl App {
     /// entries because the fresh scan is empty. Relative tool paths resolve
     /// against the command's cwd (falling back to the workspace root);
     /// resolution is lexical, no filesystem probe, so a path the tool
-    /// printed oddly still gets a row even if navigation later misses.
+    /// printed oddly still gets a row even if navigation later misses. The
+    /// exception is the loose go and lint rows (#1594), kept only for a
+    /// file that exists, so other `name:1:2: text` output is not a problem.
     pub(crate) fn apply_build_scan(
         &mut self,
         pane: u64,
@@ -10487,6 +10489,9 @@ impl App {
                     base.join(p)
                 }
             };
+            if crate::build_matchers::needs_existing_file(&d.source) && !path.is_file() {
+                continue;
+            }
             let entry = self.build_diagnostics.entry(path.clone()).or_default();
             // Unconditionally: recording only when the entry was empty meant
             // the SECOND producer to reach a file never listed it, so its

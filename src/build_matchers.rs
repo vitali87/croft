@@ -11,6 +11,15 @@
 //!   the final `SomethingError: …` line
 //! - eslint (stylish): the indented `line:col  severity  msg  rule` rows
 //!   under their file-path header line
+//! - mypy, javac: `file:line: error|warning|note: msg`, with no column (#1594)
+//! - go build / go vet: `file.go:line:col: msg`, with no severity word
+//! - flake8, pylint, ruff (concise): `file:line:col: CODE msg`
+//! - ruff (default): `CODE msg` + ` --> file:line:col`
+//! - eslint (compact): `file: line N, col N, Error - msg (rule)`
+//! - MSBuild / msCompile: `file(line,col): error CODE: msg`
+//!
+//! The go and `CODE msg` rows are loose enough to match other text, so the
+//! caller keeps them only for a file that exists ([`needs_existing_file`]).
 
 use std::sync::LazyLock;
 
@@ -34,11 +43,18 @@ pub struct BuildDiag {
 }
 
 fn severity(word: &str) -> DiagnosticSeverity {
-    match word {
+    match word.to_ascii_lowercase().as_str() {
         "error" | "fatal error" => DiagnosticSeverity::Error,
         "warning" => DiagnosticSeverity::Warning,
         _ => DiagnosticSeverity::Information,
     }
+}
+
+/// Whether a row from matcher `source` is kept only when its file exists
+/// (#1594): `file.go:1:2: text` and `file:1:2: X1 text` are shapes other
+/// output can take, where every other built-in row needs a severity word.
+pub fn needs_existing_file(source: &str) -> bool {
+    matches!(source, "go" | "lint")
 }
 
 static RUSTC_HEAD: LazyLock<Regex> =
@@ -51,6 +67,22 @@ static TSC_PRETTY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(.+?):(\d+):(\d+) - (error|warning) (TS\d+): (.+)$").unwrap());
 static GENERIC: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(.+?):(\d+):(\d+):\s*(error|warning|fatal error):\s*(.+)$").unwrap()
+});
+static NO_COLUMN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(\S+?\.[A-Za-z0-9]+):(\d+): (error|warning|note): (.+)$").unwrap()
+});
+static GO: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\S+\.go):(\d+):(\d+): (.+)$").unwrap());
+static LINT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\S+?):(\d+):(\d+): ([A-Z]+\d+):? (?:\[\*\] )?(.+)$").unwrap());
+static RUFF_HEAD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^([A-Z]+\d+) (?:\[\*\] )?(.+)$").unwrap());
+static ESLINT_COMPACT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(.+?): line (\d+), col (\d+), (Error|Warning) - (.+)$").unwrap()
+});
+static MS_COMPILE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*(.+?)\((\d+)(?:,(\d+))?\)\s*: (error|warning) ([A-Za-z]+\d+)\s*: (.+)$")
+        .unwrap()
 });
 static PY_FRAME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^\s*File "(.+?)", line (\d+)"#).unwrap());
@@ -72,14 +104,30 @@ pub fn scan(output: &str) -> Vec<BuildDiag> {
     let mut py_frame: Option<(String, u32)> = None;
     // eslint: the file-path header the indented rows belong to.
     let mut eslint_file: Option<String> = None;
+    // ruff: a `CODE msg` line, which counts only when the very next line
+    // is its ` --> file:line:col` arrow.
+    let mut ruff_pending: Option<(usize, String)> = None;
 
     let zero = |n: &str| n.parse::<u32>().unwrap_or(1).saturating_sub(1);
-    for line in output.lines() {
+    for (i, line) in output.lines().enumerate() {
         if let Some(c) = RUSTC_HEAD.captures(line) {
             rustc_pending = Some((severity(&c[1]), c[3].to_string()));
             continue;
         }
         if let Some(c) = RUSTC_ARROW.captures(line) {
+            if let Some((at, msg)) = ruff_pending.take()
+                && at + 1 == i
+            {
+                out.push(BuildDiag {
+                    file: c[1].to_string(),
+                    line: zero(&c[2]),
+                    col: zero(&c[3]),
+                    severity: DiagnosticSeverity::Warning,
+                    message: msg,
+                    source: String::from("ruff"),
+                });
+                continue;
+            }
             if let Some((sev, msg)) = rustc_pending.take() {
                 out.push(BuildDiag {
                     file: c[1].to_string(),
@@ -149,6 +197,65 @@ pub fn scan(output: &str) -> Vec<BuildDiag> {
                 message: c[5].to_string(),
                 source: String::from("build"),
             });
+            continue;
+        }
+        if let Some(c) = MS_COMPILE.captures(line) {
+            out.push(BuildDiag {
+                file: c[1].trim().to_string(),
+                line: zero(&c[2]),
+                col: c.get(3).map_or(0, |m| zero(m.as_str())),
+                severity: severity(&c[4]),
+                message: format!("{}: {}", &c[5], &c[6]),
+                source: String::from("msCompile"),
+            });
+            continue;
+        }
+        if let Some(c) = ESLINT_COMPACT.captures(line) {
+            out.push(BuildDiag {
+                file: c[1].to_string(),
+                line: zero(&c[2]),
+                col: zero(&c[3]),
+                severity: severity(&c[4]),
+                message: c[5].to_string(),
+                source: String::from("eslint-compact"),
+            });
+            continue;
+        }
+        if let Some(c) = NO_COLUMN.captures(line) {
+            out.push(BuildDiag {
+                file: c[1].to_string(),
+                line: zero(&c[2]),
+                col: 0,
+                severity: severity(&c[3]),
+                message: c[4].to_string(),
+                source: String::from("build"),
+            });
+            continue;
+        }
+        if let Some(c) = LINT.captures(line) {
+            out.push(BuildDiag {
+                file: c[1].to_string(),
+                line: zero(&c[2]),
+                col: zero(&c[3]),
+                severity: DiagnosticSeverity::Warning,
+                message: format!("{} {}", &c[4], &c[5]),
+                source: String::from("lint"),
+            });
+            continue;
+        }
+        if let Some(c) = GO.captures(line) {
+            out.push(BuildDiag {
+                file: c[1].to_string(),
+                line: zero(&c[2]),
+                col: zero(&c[3]),
+                severity: DiagnosticSeverity::Error,
+                message: c[4].to_string(),
+                source: String::from("go"),
+            });
+            continue;
+        }
+        if let Some(c) = RUFF_HEAD.captures(line) {
+            ruff_pending = Some((i, format!("{} {}", &c[1], &c[2])));
             continue;
         }
         if line.trim().is_empty() {
@@ -246,5 +353,116 @@ mod tests {
     #[test]
     fn clean_output_yields_nothing() {
         assert!(scan("   Compiling demo\n    Finished dev profile\n").is_empty());
+    }
+
+    /// The issue's sample lines (#1594), one per tool.
+    const TOOLS: &str = "app.py:2: error: Incompatible types in assignment (expression has type \"str\", variable has type \"int\")  [assignment]\n\
+Main.java:1: error: incompatible types: String cannot be converted to int\n\
+./main.go:4:6: declared and not used: unused\n\
+app.py:1:8: F401 [*] `os` imported but unused\n\
+app.py:1:1: F401 'os' imported but unused\n\
+csrc/c.c:1:20: error: 'y' undeclared (first use in this function)\n";
+
+    /// #1594: mypy, javac, go, ruff (concise), flake8 and gcc each yield
+    /// their one row, at the tool's file, line and column.
+    #[test]
+    fn mypy_javac_go_ruff_flake8_and_gcc_rows_all_match() {
+        let out = scan(TOOLS);
+        let rows: Vec<(&str, u32, u32, &str)> = out
+            .iter()
+            .map(|d| (d.file.as_str(), d.line, d.col, d.source.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("app.py", 1, 0, "build"),
+                ("Main.java", 0, 0, "build"),
+                ("./main.go", 3, 5, "go"),
+                ("app.py", 0, 7, "lint"),
+                ("app.py", 0, 0, "lint"),
+                ("csrc/c.c", 0, 19, "build"),
+            ]
+        );
+        assert_eq!(out[0].severity, DiagnosticSeverity::Error);
+        assert!(out[0].message.starts_with("Incompatible types"));
+        assert_eq!(out[2].severity, DiagnosticSeverity::Error);
+        assert_eq!(out[2].message, "declared and not used: unused");
+        assert_eq!(out[3].message, "F401 `os` imported but unused");
+        assert_eq!(out[3].severity, DiagnosticSeverity::Warning);
+    }
+
+    /// #1594: a mypy note is information, a warning a warning, and pylint's
+    /// `CODE:` form reads like flake8's.
+    #[test]
+    fn notes_warnings_and_pylint_codes_keep_their_meaning() {
+        let out = scan(
+            "app.py:3: note: Revealed type is \"builtins.int\"\n\
+             Main.java:5: warning: [removal] Integer(int) has been deprecated\n\
+             app.py:1:0: C0114: Missing module docstring (missing-module-docstring)\n",
+        );
+        assert_eq!(out.len(), 3, "{out:?}");
+        assert_eq!(out[0].severity, DiagnosticSeverity::Information);
+        assert_eq!(out[1].severity, DiagnosticSeverity::Warning);
+        assert_eq!(
+            out[2].message,
+            "C0114 Missing module docstring (missing-module-docstring)"
+        );
+    }
+
+    /// #1594: ruff's default output puts the place on the arrow line under
+    /// the code and message.
+    #[test]
+    fn ruff_default_pairs_the_code_with_its_arrow() {
+        let out = scan(
+            "F401 [*] `os` imported but unused\n\
+             \x20--> app.py:1:8\n\
+             \x20 |\n\
+             1 | import os\n\
+             \x20 |        ^^\n\
+             \n\
+             Found 1 error.\n",
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(
+            (out[0].file.as_str(), out[0].line, out[0].col),
+            ("app.py", 0, 7)
+        );
+        assert_eq!(out[0].message, "F401 `os` imported but unused");
+        assert_eq!(out[0].source, "ruff");
+    }
+
+    /// #1594: eslint's compact format and MSBuild's.
+    #[test]
+    fn eslint_compact_and_ms_compile_rows_match() {
+        let out = scan(
+            "/w/web/app.js: line 1, col 5, Error - 'a' is assigned a value but never used. (no-unused-vars)\n\
+             Program.cs(12,9): error CS1002: ; expected\n",
+        );
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!((out[0].line, out[0].col), (0, 4));
+        assert_eq!(out[0].severity, DiagnosticSeverity::Error);
+        assert_eq!(out[0].source, "eslint-compact");
+        assert_eq!(
+            (out[1].file.as_str(), out[1].line, out[1].col),
+            ("Program.cs", 11, 8)
+        );
+        assert_eq!(out[1].message, "CS1002: ; expected");
+    }
+
+    /// Negative (#1594): `grep -rn` output, a version banner that looks like
+    /// a code and a code line with no arrow after it yield nothing; only the
+    /// loose go and lint rows need an existing file.
+    #[test]
+    fn grep_output_and_loose_text_are_not_problems() {
+        let out = scan(
+            "./app.py:2:x: int = \"a\"\n\
+             ./main.go:4:\tvar unused int\n\
+             HTTP2 support enabled\n\
+             see above\n\
+             E501 line too long\n",
+        );
+        assert!(out.is_empty(), "{out:?}");
+        assert!(needs_existing_file("go") && needs_existing_file("lint"));
+        assert!(!needs_existing_file("build") && !needs_existing_file("ruff"));
     }
 }
