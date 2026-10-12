@@ -3066,6 +3066,10 @@ pub struct Editor {
     /// severity)`, recomputed from `diagnostics` whenever they or the buffer
     /// change. The render loop paints a coloured underline over each run.
     diagnostic_spans: Vec<Vec<(usize, usize, crate::lsp::manager::DiagnosticSeverity)>>,
+    /// Per-logical-line runs of tagged diagnostics `(start_char, end_char,
+    /// tags)` (#1522): Unnecessary code is drawn faded and Deprecated code
+    /// struck through, on top of (or, for a hint, instead of) an underline.
+    diagnostic_tag_spans: Vec<Vec<(usize, usize, crate::lsp::manager::DiagnosticTags)>>,
     /// Inlay hints for the loaded file, retained with their raw LSP UTF-16
     /// positions so `inlay_spans` can be re-decoded against the buffer after
     /// each edit. `inlay_path` guards a stale batch from annotating the wrong
@@ -3157,6 +3161,11 @@ pub struct Editor {
     /// [`crate::hex`], so a multi-gigabyte log opens instantly. Read-only;
     /// "Reopen as Text" (`force_text`) shows the raw bytes.
     pub log: Option<crate::log_view::LogView>,
+    /// The top line a reload of the log is restoring (#1538), `usize::MAX`
+    /// for "the end", while the reloaded view is still indexing: the line
+    /// may lie past what the head pass reached, so it is settled again as
+    /// the index grows. Dropped when the reader scrolls.
+    log_reload_top: Option<usize>,
     /// Archive browser (#179): the member list of a zip/jar/whl/tar
     /// archive; Enter extracts one member to scratch and opens it
     /// through the normal dispatch. Read-only.
@@ -3360,6 +3369,7 @@ impl Editor {
             diagnostics: Vec::new(),
             diagnostics_path: None,
             diagnostic_spans: Vec::new(),
+            diagnostic_tag_spans: Vec::new(),
             inlay_hints: Vec::new(),
             inlay_path: None,
             step_marks: Vec::new(),
@@ -3383,6 +3393,7 @@ impl Editor {
             diff: None,
             hex: None,
             log: None,
+            log_reload_top: None,
             archive: None,
             pr_review: None,
             fleet: None,
@@ -5801,6 +5812,7 @@ impl Editor {
         self.sarif = None;
         self.hex = None;
         self.log = Some(view);
+        self.log_reload_top = None;
         self.status = format!("Opened {} as a rendered log", path.display());
         Ok(())
     }
@@ -6857,23 +6869,34 @@ impl Editor {
     /// switch. A zero-width diagnostic (e.g. a "missing token" pointing between
     /// two characters) is widened to one cell so it is still visible, matching
     /// VS Code drawing a squiggle under at least one character.
+    ///
+    /// Hints follow VS Code (#1522): a tagged hint (unused, unreachable,
+    /// deprecated) gets no underline, only its tag's look over the text, and
+    /// a plain hint is marked under its first two characters rather than
+    /// underlined end to end like a real problem.
     fn recompute_diagnostic_spans(&mut self) {
+        use crate::lsp::manager::DiagnosticSeverity;
         let same_file = self.diagnostics_path.as_deref() == self.path.as_deref();
         if !same_file || self.diagnostics.is_empty() {
             self.diagnostic_spans = Vec::new();
+            self.diagnostic_tag_spans = Vec::new();
             return;
         }
-        let mut spans: Vec<Vec<(usize, usize, crate::lsp::manager::DiagnosticSeverity)>> =
+        let mut spans: Vec<Vec<(usize, usize, DiagnosticSeverity)>> =
+            vec![Vec::new(); self.lines.len()];
+        let mut tag_spans: Vec<Vec<(usize, usize, crate::lsp::manager::DiagnosticTags)>> =
             vec![Vec::new(); self.lines.len()];
         for d in &self.diagnostics {
+            let hint = d.severity == DiagnosticSeverity::Hint;
             let start_line = d.start_line as usize;
             let end_line = d.end_line as usize;
             // Zip bounds the walk to the buffer, replacing the per-line
             // `lines.get` check a stale diagnostic range would otherwise need.
-            for (line, (text, line_spans)) in self
+            for (line, ((text, line_spans), line_tags)) in self
                 .lines
                 .iter()
                 .zip(spans.iter_mut())
+                .zip(tag_spans.iter_mut())
                 .enumerate()
                 .take(end_line + 1)
                 .skip(start_line)
@@ -6889,12 +6912,36 @@ impl Editor {
                 } else {
                     line_chars
                 };
+                // A zero-width tagged diagnostic gets its look on one
+                // character, like the one-cell squiggle below, so a tagged
+                // point hint is never left unmarked. At the end of a line
+                // there is no character to fade, so a hint falls through
+                // to its short underline instead.
+                let point = start_line == end_line && from == to;
+                let tag_to = if point {
+                    (from + 1).min(line_chars)
+                } else {
+                    to
+                };
+                if d.tags.any() && tag_to > from {
+                    line_tags.push((from, tag_to, d.tags));
+                }
+                if hint && d.tags.any() && (!point || tag_to > from) {
+                    continue;
+                }
                 // Widen an empty run to one cell so a point diagnostic is seen.
                 let to = to.max(from + 1);
+                if hint {
+                    if line == start_line {
+                        line_spans.push((from, to.min(from + 2), d.severity));
+                    }
+                    continue;
+                }
                 line_spans.push((from, to, d.severity));
             }
         }
         self.diagnostic_spans = spans;
+        self.diagnostic_tag_spans = tag_spans;
     }
 
     /// Re-decode the retained semantic-token batch against the current
@@ -7466,6 +7513,9 @@ impl Editor {
         // whose new encoding covers the buffer fine.
         self.encoding_loss = false;
         self.lossy_save_armed = false;
+        // The git-gutter baseline was decoded with the old encoding: drop it
+        // so the next sweep refetches HEAD decoded the new way (#1242).
+        self.git_baseline_for = None;
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.sync_bookmarks_to_buffer();
         self.recompute_highlights();
@@ -9543,6 +9593,22 @@ impl Editor {
         // A SARIF viewer keeps the reader's place, and the logs added to
         // it, across a rewrite of its log (#577).
         let old_sarif = self.sarif.take();
+        // A rendered log keeps its place too, and one viewed at its end
+        // follows it, since a log grows while it is read (#1538). A place
+        // an earlier reload is still settling is the one to keep: the scroll
+        // was clamped to that reload's partial index, so it says nothing
+        // about where the reader is, and it would drop the end marker.
+        let pending_top = self.log_reload_top;
+        let log_place = self.log.as_ref().map(|log| {
+            let rows = (self.last_inner.height as usize).saturating_sub(1).max(1);
+            let at_end = !log.indexing() && prev_scroll + rows >= log.len();
+            let top = match pending_top {
+                Some(top) => top,
+                None if at_end => usize::MAX,
+                None => prev_scroll,
+            };
+            (top, log.highlight(), log.selection, log.last_body)
+        });
         // `open` starts a text tab's history afresh. A reload keeps it
         // (#1357): the text from before an agent's or formatter's rewrite is
         // one undo away, with everything typed before that behind it.
@@ -9569,6 +9635,19 @@ impl Editor {
         self.cursor_row = prev_row.min(self.lines.len().saturating_sub(1));
         self.cursor_col = prev_col.min(self.line_char_len(self.cursor_row));
         self.scroll = prev_scroll.min(self.lines.len().saturating_sub(1));
+        if let Some((top, highlight, selection, last_body)) = log_place
+            && let Some(log) = self.log.as_mut()
+        {
+            log.set_highlight(highlight);
+            let (len, indexing) = (log.len(), log.indexing());
+            log.selection = selection.filter(|&(a, b)| indexing || a.0.max(b.0) < len);
+            log.last_body = last_body;
+            if !indexing && self.active_search_match.is_some_and(|(row, ..)| row >= len) {
+                self.active_search_match = None;
+            }
+            self.log_reload_top = Some(top);
+            self.settle_log_reload();
+        }
         result
     }
 
@@ -9633,6 +9712,26 @@ impl Editor {
         self.reload_from_disk()?;
         self.dirty = false;
         Ok(())
+    }
+
+    /// File: Revert File (#1285): [`Self::revert_to_disk`] as one undo
+    /// step. A reload starts a fresh history, so the history from before it
+    /// is carried across with the reverted-away text on top: undo brings
+    /// the edits back, marked unsaved, and redo reverts again.
+    pub fn revert_as_undo_step(&mut self) -> Result<()> {
+        let mut undo = std::mem::take(&mut self.undo_stack);
+        undo.push(self.snapshot());
+        let reverted = self.revert_to_disk();
+        if reverted.is_err() {
+            // Nothing was replaced: the history stays as it was.
+            undo.pop();
+        }
+        self.undo_stack = undo;
+        self.trim_undo_stack();
+        self.redo_stack.clear();
+        self.undo_step_id = next_undo_step_id();
+        self.last_edit_kind = None;
+        reverted
     }
 
     /// FS-sync sweep entry point, applied to every open tab. Compares the
@@ -12327,6 +12426,29 @@ impl Editor {
         self.last_edit_kind = None;
     }
 
+    /// Scroll a reloaded log to the place its reload kept (#1538), clamped
+    /// to what is indexed so far, and keep the request while the index is
+    /// still growing so the place is reached once it covers it.
+    pub fn settle_log_reload(&mut self) {
+        let Some(top) = self.log_reload_top.take() else {
+            return;
+        };
+        if self.log.is_none() {
+            return;
+        }
+        self.scroll_view_to(top);
+        if self.log.as_ref().is_some_and(|log| log.indexing()) {
+            self.log_reload_top = Some(top);
+        }
+    }
+
+    /// Drop the place a log reload is still settling (#1538): the reader
+    /// moved the view some other way, such as a find-bar jump, and the next
+    /// index batch must not take it back.
+    pub fn cancel_log_reload(&mut self) {
+        self.log_reload_top = None;
+    }
+
     fn scroll_view_to(&mut self, top: usize) {
         let viewport = self.last_inner.height as usize;
         // A rendered log's text side is a one-line stub, so clamping against
@@ -12336,6 +12458,9 @@ impl Editor {
         if let Some(log) = self.log.as_ref() {
             let rows = viewport.saturating_sub(1).max(1);
             self.scroll = top.min(log.len().saturating_sub(rows));
+            // Any scroll is the reader's own place now, which a reload still
+            // settling must not take back.
+            self.log_reload_top = None;
             return;
         }
         if viewport == 0 || self.lines.is_empty() {
@@ -13996,6 +14121,23 @@ fn read_file_head(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(head)
 }
 
+/// Decode a file's bytes (a git blob or the working copy) the way its tab
+/// decodes them, for a diff or gutter baseline against that tab (#1242). A
+/// byte-order mark wins, as on open. Under UTF-8 only valid UTF-8 decodes,
+/// as before; under an encoding the user picked, everything but binary does.
+pub fn decode_blob(bytes: &[u8], enc: &'static encoding_rs::Encoding) -> Option<String> {
+    if let Some((bom_enc, _)) = encoding_rs::Encoding::for_bom(bytes) {
+        return Some(bom_enc.decode(bytes).0.into_owned());
+    }
+    if enc == encoding_rs::UTF_8 {
+        return String::from_utf8(bytes.to_vec()).ok();
+    }
+    if is_binary(bytes) {
+        return None;
+    }
+    Some(enc.decode(bytes).0.into_owned())
+}
+
 fn is_binary(data: &[u8]) -> bool {
     let sample = &data[..data.len().min(4096)];
     if sample.contains(&0) {
@@ -15429,6 +15571,18 @@ impl Widget for &mut Editor {
                     paint_diagnostic_underline(
                         buf, text_x, y, row_width, vs, ve, severity, self.theme,
                     );
+                }
+            }
+            let empty_tags: Vec<(usize, usize, crate::lsp::manager::DiagnosticTags)> = Vec::new();
+            for &(sc, ec, tags) in self
+                .diagnostic_tag_spans
+                .get(line_idx)
+                .unwrap_or(&empty_tags)
+            {
+                let vs = (sc + ex(sc)).saturating_sub(row_start);
+                let ve = (ec + ex(ec.saturating_sub(1))).saturating_sub(row_start);
+                if ve > vs {
+                    paint_diagnostic_tags(buf, text_x, y, row_width, vs, ve, tags);
                 }
             }
 
@@ -16905,7 +17059,8 @@ fn paint_selection_band(
 
 /// Paint a coloured underline across `[start_char, end_char)` of a rendered
 /// row to mark an LSP diagnostic. The colour encodes severity, matching VS
-/// Code's palette (red error, yellow warning, teal info/hint). Uses the
+/// Code's palette (red error, yellow warning, blue info, faint grey for a
+/// hint's short marker). Uses the
 /// terminal's separate underline colour so the glyph's foreground (its syntax
 /// or semantic colour) is left untouched, the way VS Code's squiggle sits
 /// under unchanged text.
@@ -16924,9 +17079,8 @@ fn paint_diagnostic_underline(
     let color = match severity {
         DiagnosticSeverity::Error => theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c)),
         DiagnosticSeverity::Warning => theme.ui(Color::Rgb(0xcc, 0xa7, 0x00)),
-        DiagnosticSeverity::Information | DiagnosticSeverity::Hint => {
-            theme.ui(Color::Rgb(0x3b, 0x9e, 0xff))
-        }
+        DiagnosticSeverity::Information => theme.ui(Color::Rgb(0x3b, 0x9e, 0xff)),
+        DiagnosticSeverity::Hint => theme.ui(Color::Rgb(0x80, 0x80, 0x80)),
     };
     let s = start_char.min(text_width as usize);
     let e = end_char.min(text_width as usize);
@@ -16941,6 +17095,34 @@ fn paint_diagnostic_underline(
                 .add_modifier(Modifier::UNDERLINED)
                 .underline_color(color),
         );
+    }
+}
+
+/// Draw a tagged diagnostic's look across `[start_char, end_char)` of a
+/// rendered row (#1522): Unnecessary code (unused, unreachable) faded, as VS
+/// Code draws it at reduced opacity, and Deprecated code struck through. The
+/// glyphs keep their syntax colour.
+fn paint_diagnostic_tags(
+    buf: &mut Buffer,
+    text_x: u16,
+    y: u16,
+    text_width: u16,
+    start_char: usize,
+    end_char: usize,
+    tags: crate::lsp::manager::DiagnosticTags,
+) {
+    let mut look = Modifier::empty();
+    if tags.unnecessary {
+        look |= Modifier::DIM;
+    }
+    if tags.deprecated {
+        look |= Modifier::CROSSED_OUT;
+    }
+    let s = start_char.min(text_width as usize);
+    let e = end_char.min(text_width as usize);
+    for col in s..e {
+        let cell = &mut buf[(text_x + col as u16, y)];
+        cell.set_style(cell.style().add_modifier(look));
     }
 }
 
@@ -17735,6 +17917,19 @@ impl EditorTabs {
     ) -> Result<()> {
         let right_text = std::fs::read_to_string(right)
             .with_context(|| format!("reading {}", right.display()))?;
+        self.open_head_diff_with_texts(left_label, left_text, &right_text, right, left_is_git_head)
+    }
+
+    /// [`Self::open_head_diff_with_text`] with the working side already read
+    /// and decoded, for a file that isn't UTF-8 (#1242).
+    pub fn open_head_diff_with_texts(
+        &mut self,
+        left_label: PathBuf,
+        left_text: &str,
+        right_text: &str,
+        right: &Path,
+        left_is_git_head: bool,
+    ) -> Result<()> {
         let left_lines: Vec<String> = left_text.lines().map(str::to_string).collect();
         let right_lines: Vec<String> = right_text.lines().map(str::to_string).collect();
         let mut data = crate::widgets::diff::DiffData::build_with_byte_check(
@@ -17743,7 +17938,7 @@ impl EditorTabs {
             left_lines,
             right_lines,
             Some(left_text),
-            Some(&right_text),
+            Some(right_text),
         );
         data.set_whitespace_mode(self.diff_ws_default);
         // Park the viewport on the first change hunk so the user lands on
@@ -20653,6 +20848,190 @@ mod tests {
         assert_eq!(e.scroll, 0, "and back to the top");
     }
 
+    /// A rendered log of `n` lines (`line1` .. `line{n}`) behind a colour
+    /// escape, so it routes to the log view, opened and painted once.
+    fn open_rendered_log(dir: &Path, n: usize) -> (Editor, PathBuf, Rect) {
+        let p = dir.join("app.log");
+        let mut body = String::from("\u{1b}[32mINFO\u{1b}[0m start\n");
+        for i in 1..=n {
+            body.push_str(&format!("line{i}\n"));
+        }
+        std::fs::write(&p, body).unwrap();
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+        assert!(e.log.is_some(), "the fixture opens as a rendered log");
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        e.render(area, &mut buf);
+        (e, p, area)
+    }
+
+    fn append_log_lines(p: &Path, from: usize, to: usize) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(p).unwrap();
+        for i in from..=to {
+            writeln!(f, "line{i}").unwrap();
+        }
+    }
+
+    /// The rows the log body shows under its header.
+    fn log_body_rows(e: &Editor) -> usize {
+        (e.last_inner.height as usize).saturating_sub(1).max(1)
+    }
+
+    /// #1538: a log that grew on disk reloaded with the view back on line 1,
+    /// so a reader at line 240 lost their place on every append.
+    #[test]
+    fn a_grown_log_keeps_its_scroll_through_an_external_reload() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut e, p, _) = open_rendered_log(tmp.path(), 2_000);
+        e.scroll_down(240);
+        assert_eq!(e.scroll, 240);
+        append_log_lines(&p, 2_001, 2_010);
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert_eq!(
+            e.log.as_ref().unwrap().len(),
+            2_011,
+            "the reload saw the append"
+        );
+        assert_eq!(e.scroll, 240, "the reader stays where they were");
+    }
+
+    /// #1538: a view at the end of the log follows it, so new lines come into
+    /// view on each reload the way `tail -f` shows them.
+    #[test]
+    fn a_log_viewed_at_its_end_follows_new_lines_on_reload() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut e, p, area) = open_rendered_log(tmp.path(), 2_000);
+        e.scroll_down(usize::MAX / 2);
+        let rows = log_body_rows(&e);
+        assert_eq!(e.scroll + rows, 2_001, "the view is on the last line");
+        append_log_lines(&p, 2_001, 2_005);
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert_eq!(e.scroll + rows, 2_006, "the new last line is in view");
+        let mut buf = Buffer::empty(area);
+        e.render(area, &mut buf);
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("line2005"), "and painted");
+    }
+
+    /// #1538: a log too large to index on open (past the synchronous head)
+    /// still follows its end: the place is settled again as the background
+    /// index catches up, rather than clamped to the head's line count.
+    #[test]
+    fn a_large_log_viewed_at_its_end_follows_it_once_the_index_catches_up() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lines = (crate::log_view::HEAD_INDEX_BYTES as usize) / 9 + 50_000;
+        let (mut e, p, _) = open_rendered_log(tmp.path(), lines);
+        e.log.as_mut().unwrap().finish_index();
+        e.scroll_down(usize::MAX / 2);
+        let rows = log_body_rows(&e);
+        assert_eq!(e.scroll + rows, lines + 1);
+        append_log_lines(&p, lines + 1, lines + 3);
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert!(
+            e.log.as_ref().unwrap().indexing(),
+            "the tail indexes in the background"
+        );
+        e.log.as_mut().unwrap().finish_index();
+        e.settle_log_reload();
+        assert_eq!(e.scroll + rows, lines + 4, "the view lands on the new end");
+    }
+
+    /// Negative: a reader who scrolls while the reload's index is still
+    /// running keeps the place they scrolled to; the settle does not drag
+    /// them back to where the reload left them.
+    #[test]
+    fn scrolling_during_a_reload_index_cancels_the_pending_place() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lines = (crate::log_view::HEAD_INDEX_BYTES as usize) / 9 + 50_000;
+        let (mut e, p, _) = open_rendered_log(tmp.path(), lines);
+        e.log.as_mut().unwrap().finish_index();
+        e.scroll_down(usize::MAX / 2);
+        append_log_lines(&p, lines + 1, lines + 3);
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        e.scroll_view_to(10);
+        e.log.as_mut().unwrap().finish_index();
+        e.settle_log_reload();
+        assert_eq!(e.scroll, 10, "the reader's own scroll wins");
+    }
+
+    /// #1538: a second change to a large log while the first reload is still
+    /// indexing keeps following the end, rather than pinning the view to the
+    /// scroll the first reload's partial index clamped it to.
+    #[test]
+    fn a_second_reload_during_indexing_keeps_following_the_end() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lines = (crate::log_view::HEAD_INDEX_BYTES as usize) / 9 + 50_000;
+        let (mut e, p, _) = open_rendered_log(tmp.path(), lines);
+        e.log.as_mut().unwrap().finish_index();
+        e.scroll_down(usize::MAX / 2);
+        let rows = log_body_rows(&e);
+        append_log_lines(&p, lines + 1, lines + 3);
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert!(e.log.as_ref().unwrap().indexing());
+        append_log_lines(&p, lines + 4, lines + 6);
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert!(e.log.as_ref().unwrap().indexing());
+        e.log.as_mut().unwrap().finish_index();
+        e.settle_log_reload();
+        assert_eq!(
+            e.scroll + rows,
+            lines + 7,
+            "the view lands on the newest end"
+        );
+    }
+
+    /// Negative: a log truncated under the view (rotation, `> app.log`)
+    /// clamps to what is left instead of scrolling into blank rows, and one
+    /// shorter than a screen goes back to the top.
+    #[test]
+    fn a_truncated_log_clamps_its_scroll_on_reload() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut e, p, _) = open_rendered_log(tmp.path(), 2_000);
+        let rows = log_body_rows(&e);
+        e.scroll_down(1_500);
+        let mut body = String::from("\u{1b}[32mINFO\u{1b}[0m start\n");
+        for i in 1..=99 {
+            body.push_str(&format!("line{i}\n"));
+        }
+        std::fs::write(&p, &body).unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert_eq!(e.log.as_ref().unwrap().len(), 100);
+        assert_eq!(e.scroll, 100 - rows, "clamped to the last screen");
+
+        std::fs::write(&p, "\u{1b}[32mINFO\u{1b}[0m rotated\n").unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert_eq!(
+            e.scroll, 0,
+            "a log shorter than a screen shows from the top"
+        );
+    }
+
+    /// A reload keeps the reader's selection and colour toggle, and drops a
+    /// selection that no longer points into the file.
+    #[test]
+    fn a_log_reload_keeps_the_selection_and_highlight_toggle() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut e, p, _) = open_rendered_log(tmp.path(), 2_000);
+        let flipped = !e.log.as_ref().unwrap().highlight();
+        {
+            let log = e.log.as_mut().unwrap();
+            log.set_highlight(flipped);
+            log.selection = Some(((10, 0), (12, 3)));
+        }
+        append_log_lines(&p, 2_001, 2_002);
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        let log = e.log.as_ref().unwrap();
+        assert_eq!(log.highlight(), flipped);
+        assert_eq!(log.selection, Some(((10, 0), (12, 3))));
+
+        e.log.as_mut().unwrap().selection = Some(((1_900, 0), (1_950, 2)));
+        std::fs::write(&p, "\u{1b}[32mINFO\u{1b}[0m rotated\nline1\n").unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert_eq!(e.log.as_ref().unwrap().selection, None, "past the new end");
+    }
+
     /// Colours resolve through the ACTIVE theme's ANSI palette, so a rendered
     /// log matches the terminal panes rather than a hardcoded table.
     #[test]
@@ -21021,6 +21400,7 @@ mod tests {
             end_char,
             severity,
             message: String::from("test diagnostic"),
+            tags: Default::default(),
         }
     }
 
@@ -21425,6 +21805,7 @@ mod tests {
                 end_char: 7,
                 severity: DiagnosticSeverity::Error,
                 message: String::from("Type 'number' is not assignable to type 'string'."),
+                tags: Default::default(),
             }],
         );
         assert_eq!(
@@ -21456,6 +21837,7 @@ mod tests {
                 end_char: 6,
                 severity: DiagnosticSeverity::Warning,
                 message: String::from("missing semicolon"),
+                tags: Default::default(),
             }],
         );
         assert_eq!(
@@ -21484,6 +21866,7 @@ mod tests {
                 end_char: 2,
                 severity: DiagnosticSeverity::Error,
                 message: String::from("unexpected token"),
+                tags: Default::default(),
             }],
         );
         assert_eq!(
@@ -21533,6 +21916,215 @@ mod tests {
             underlined[0].2, "x",
             "the underline must sit under the offending `x` glyph"
         );
+    }
+
+    /// Render `text` with `diags` applied and report, per cell of the first
+    /// text row, its glyph and the modifiers the diagnostics added (#1522).
+    fn diagnostic_looks(
+        text: &str,
+        diags: Vec<crate::lsp::manager::Diagnostic>,
+    ) -> Vec<(String, Modifier, Color)> {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 5,
+        };
+        let draw = |diags: Vec<crate::lsp::manager::Diagnostic>| {
+            let mut e = editor_with(text);
+            let p = std::path::PathBuf::from("/tmp/diag.ts");
+            e.path = Some(p.clone());
+            e.apply_diagnostics(p, diags);
+            e.focused = true;
+            let mut buf = ratatui::buffer::Buffer::empty(area);
+            (&mut e as &mut Editor).render(area, &mut buf);
+            buf
+        };
+        let plain = draw(Vec::new());
+        let marked = draw(diags);
+        let row = (0..area.height)
+            .find(|&y| {
+                let line: String = (0..area.width).map(|x| plain[(x, y)].symbol()).collect();
+                line.contains(text)
+            })
+            .expect("the text row is drawn");
+        (0..area.width)
+            .map(|x| {
+                let (was, now) = (&plain[(x, row)], &marked[(x, row)]);
+                (
+                    now.symbol().to_string(),
+                    now.modifier - was.modifier,
+                    now.underline_color,
+                )
+            })
+            .collect()
+    }
+
+    fn with_tags(
+        d: crate::lsp::manager::Diagnostic,
+        unnecessary: bool,
+        deprecated: bool,
+    ) -> crate::lsp::manager::Diagnostic {
+        crate::lsp::manager::Diagnostic {
+            tags: crate::lsp::manager::DiagnosticTags {
+                unnecessary,
+                deprecated,
+            },
+            ..d
+        }
+    }
+
+    fn glyphs_with(looks: &[(String, Modifier, Color)], m: Modifier) -> String {
+        looks
+            .iter()
+            .filter(|(_, added, _)| added.contains(m))
+            .map(|(g, _, _)| g.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn an_unnecessary_hint_is_faded_and_not_underlined() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let looks = diagnostic_looks(
+            "const tmp = 42;",
+            vec![with_tags(
+                diag(0, 6, 0, 9, DiagnosticSeverity::Hint),
+                true,
+                false,
+            )],
+        );
+        assert_eq!(glyphs_with(&looks, Modifier::DIM), "tmp", "{looks:?}");
+        assert_eq!(
+            glyphs_with(&looks, Modifier::UNDERLINED),
+            "",
+            "unused code is faded, never underlined like a problem"
+        );
+    }
+
+    #[test]
+    fn a_deprecated_warning_is_struck_through_and_keeps_its_underline() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let looks = diagnostic_looks(
+            "old(); fresh();",
+            vec![with_tags(
+                diag(0, 0, 0, 3, DiagnosticSeverity::Warning),
+                false,
+                true,
+            )],
+        );
+        assert_eq!(glyphs_with(&looks, Modifier::CROSSED_OUT), "old");
+        assert_eq!(glyphs_with(&looks, Modifier::UNDERLINED), "old");
+        assert_eq!(
+            glyphs_with(&looks, Modifier::DIM),
+            "",
+            "deprecated is not faded"
+        );
+    }
+
+    #[test]
+    fn a_plain_hint_is_marked_under_its_first_two_characters_in_grey() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let looks = diagnostic_looks(
+            "let total = add(a, b);",
+            vec![diag(0, 4, 0, 9, DiagnosticSeverity::Hint)],
+        );
+        assert_eq!(glyphs_with(&looks, Modifier::UNDERLINED), "to");
+        assert!(
+            looks
+                .iter()
+                .filter(|(_, added, _)| added.contains(Modifier::UNDERLINED))
+                .all(|(_, _, colour)| *colour == Color::Rgb(0x80, 0x80, 0x80)),
+            "a hint's marker is grey, not the information blue: {looks:?}"
+        );
+        assert_eq!(
+            glyphs_with(&looks, Modifier::DIM),
+            "",
+            "an untagged hint is not faded"
+        );
+    }
+
+    #[test]
+    fn errors_warnings_and_information_keep_their_full_underline_and_no_fade() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let looks = diagnostic_looks(
+            "bad; odd; note;",
+            vec![
+                diag(0, 0, 0, 3, DiagnosticSeverity::Error),
+                diag(0, 5, 0, 8, DiagnosticSeverity::Warning),
+                diag(0, 10, 0, 14, DiagnosticSeverity::Information),
+            ],
+        );
+        assert_eq!(glyphs_with(&looks, Modifier::UNDERLINED), "badoddnote");
+        assert_eq!(glyphs_with(&looks, Modifier::DIM), "");
+        assert_eq!(glyphs_with(&looks, Modifier::CROSSED_OUT), "");
+    }
+
+    #[test]
+    fn a_tagged_error_is_both_underlined_and_faded() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let looks = diagnostic_looks(
+            "import os",
+            vec![with_tags(
+                diag(0, 7, 0, 9, DiagnosticSeverity::Error),
+                true,
+                false,
+            )],
+        );
+        assert_eq!(glyphs_with(&looks, Modifier::UNDERLINED), "os");
+        assert_eq!(glyphs_with(&looks, Modifier::DIM), "os");
+    }
+
+    #[test]
+    fn a_zero_width_tagged_hint_is_still_marked() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let looks = diagnostic_looks(
+            "let tmp = 1;",
+            vec![with_tags(
+                diag(0, 4, 0, 4, DiagnosticSeverity::Hint),
+                true,
+                false,
+            )],
+        );
+        assert_eq!(glyphs_with(&looks, Modifier::DIM), "t", "{looks:?}");
+        assert_eq!(glyphs_with(&looks, Modifier::UNDERLINED), "");
+        // At the end of the line there is nothing to fade, so the hint keeps
+        // its short underline rather than vanishing.
+        let mut e = editor_with("let tmp = 1;");
+        let p = std::path::PathBuf::from("/tmp/diag.ts");
+        e.path = Some(p.clone());
+        e.apply_diagnostics(
+            p,
+            vec![with_tags(
+                diag(0, 12, 0, 12, DiagnosticSeverity::Hint),
+                false,
+                true,
+            )],
+        );
+        assert!(e.diagnostic_tag_spans[0].is_empty());
+        assert_eq!(e.diagnostic_spans_for_test()[0].len(), 1);
+    }
+
+    #[test]
+    fn a_multi_line_unnecessary_hint_fades_every_line_it_covers() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = editor_with("return 1;\nlog(\"never\");\ndone();");
+        let p = std::path::PathBuf::from("/tmp/diag.ts");
+        e.path = Some(p.clone());
+        e.apply_diagnostics(
+            p,
+            vec![with_tags(
+                diag(1, 0, 2, 7, DiagnosticSeverity::Hint),
+                true,
+                false,
+            )],
+        );
+        assert!(e.diagnostic_spans_for_test().iter().all(|l| l.is_empty()));
+        let tagged: Vec<_> = e
+            .diagnostic_tag_spans
+            .iter()
+            .map(|l| l.iter().map(|&(s, e, _)| (s, e)).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(tagged, vec![vec![], vec![(0, 13)], vec![(0, 7)]]);
     }
 
     #[test]

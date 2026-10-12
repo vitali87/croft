@@ -3496,6 +3496,14 @@ pub struct App {
     /// it went (a folder's summary file or a gist's URL), how many
     /// repositories it holds, and those whose results failed.
     codeql_variant_export: Option<std::sync::mpsc::Receiver<Result<VariantExport, String>>>,
+    /// The walk for the workspace's queries in flight (#840): opening the
+    /// CodeQL view starts it off the UI thread and the packs land here. It is
+    /// tagged with the root it walks, so a root the workspace has left since
+    /// never lists its queries.
+    codeql_queries_job: Option<(
+        PathBuf,
+        std::sync::mpsc::Receiver<Vec<crate::codeql_query::QueryPack>>,
+    )>,
     /// True when the in-flight refresh was triggered by the user (the ⟳ button),
     /// so its completion reports a status line; the silent startup refresh
     /// doesn't, to avoid clobbering more useful startup messages.
@@ -5942,6 +5950,7 @@ impl App {
             codeql_variant_polled: None,
             codeql_variant_results: None,
             codeql_variant_export: None,
+            codeql_queries_job: None,
             ext_index_manual_refresh: false,
             search_query_tx,
             search_results_rx,
@@ -9033,7 +9042,9 @@ impl App {
                 .and_then(|(_, repo)| repo.clone())
                 .or_else(|| path.parent().and_then(crate::git::repo_toplevel))
         };
-        let mut fetched: std::collections::HashMap<PathBuf, Option<Vec<String>>> =
+        // Keyed by encoding too: the same file open in two tabs under two
+        // encodings needs HEAD decoded each tab's way (#1242).
+        let mut fetched: std::collections::HashMap<(PathBuf, &str), Option<Vec<String>>> =
             std::collections::HashMap::new();
         let groups =
             std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut());
@@ -9047,14 +9058,16 @@ impl App {
             // Untracked files / non-repo dirs yield Err here, so the gutter
             // simply shows nothing; the baseline-for marker still updates so we
             // don't re-shell every tick.
+            let enc = ed.encoding;
             let head = fetched
-                .entry(path.clone())
+                .entry((path.clone(), enc.name()))
                 .or_insert_with(|| {
                     let root = repo_for(&path)?;
                     path.strip_prefix(&root)
                         .ok()
                         .and_then(|rel| rel.to_str())
-                        .and_then(|rel| crate::git::read_file_at_head(&root, rel).ok())
+                        .and_then(|rel| crate::git::read_bytes_at_head(&root, rel).ok())
+                        .and_then(|bytes| crate::widgets::editor::decode_blob(&bytes, enc))
                         .map(|text| text.lines().map(str::to_string).collect())
                 })
                 .clone();
@@ -10604,7 +10617,13 @@ impl App {
             let mut items: Vec<ProblemItem> = Vec::new();
             if let Some(by_server) = self.lsp_diagnostics.get(path) {
                 for (server, diags) in by_server {
-                    for d in diags {
+                    // Hints (unused names, unreachable code) stay in the
+                    // editor and its hover, out of the list and its count,
+                    // as in VS Code (#1522).
+                    let shown = diags
+                        .iter()
+                        .filter(|d| d.severity != crate::lsp::manager::DiagnosticSeverity::Hint);
+                    for d in shown {
                         items.push(ProblemItem {
                             line: d.start_line,
                             col: d.start_char,
@@ -10617,7 +10636,14 @@ impl App {
                 }
             }
             if let Some(build) = self.build_diagnostics.get(path) {
-                items.extend(build.iter().map(|(_, item)| item.clone()));
+                // A task matcher can emit `hint` too; same rule (#1522).
+                items.extend(
+                    build
+                        .iter()
+                        .map(|(_, item)| item)
+                        .filter(|i| i.severity != crate::lsp::manager::DiagnosticSeverity::Hint)
+                        .cloned(),
+                );
             }
             if items.is_empty() {
                 continue;
@@ -10877,6 +10903,7 @@ impl App {
     }
 
     fn go_to_definition(&mut self, path: PathBuf, line: u32, col: u32) {
+        let pinned = self.keep_preview_open_for_navigation_to(&path);
         if let Some(from) = self.editor.path.clone() {
             self.nav.record(NavLoc {
                 path: from,
@@ -10889,7 +10916,10 @@ impl App {
             Ok(()) => {
                 self.status = format!("Jumped to {} line {}", self.status_path(&path), line + 1)
             }
-            Err(e) => self.status = format!("Go to definition failed: {e}"),
+            Err(e) => {
+                self.restore_preview_after_failed_navigation(pinned);
+                self.status = format!("Go to definition failed: {e}")
+            }
         }
     }
 
@@ -13283,18 +13313,58 @@ impl App {
         })
     }
 
+    /// A code navigation that leaves the active tab for another file keeps
+    /// that tab open (#1561), as VS Code does by default
+    /// (`enablePreviewFromCodeNavigation` off): were it the preview, the
+    /// target would take its slot and close the file being read, and Go
+    /// Back would swap them again. A jump within the same file replaces
+    /// nothing, so the tab stays a preview.
+    ///
+    /// The target counts as the same file under the editor's own path
+    /// matching (canonicalized), so a symlinked tab and the canonical path
+    /// a language server answers with are one file. Returns whether the tab
+    /// was promoted, for [`Self::restore_preview_after_failed_navigation`].
+    fn keep_preview_open_for_navigation_to(&mut self, target: &Path) -> bool {
+        let same_file = self.editor.path.as_deref().is_some_and(|p| {
+            p == target
+                || matches!(
+                    (p.canonicalize(), target.canonicalize()),
+                    (Ok(a), Ok(b)) if a == b
+                )
+        });
+        if !same_file && self.editor.is_preview(self.editor.active_index()) {
+            self.editor.pin_active();
+            return true;
+        }
+        false
+    }
+
+    /// A navigation whose target failed to open (a stale language-server
+    /// answer, a file deleted since it entered the history) left the user
+    /// on the tab it started from, so that tab goes back to being the
+    /// preview it was before [`Self::keep_preview_open_for_navigation_to`].
+    fn restore_preview_after_failed_navigation(&mut self, pinned: bool) {
+        if pinned {
+            self.editor.preview = true;
+        }
+    }
+
     fn nav_back(&mut self) {
         let current = self.current_nav_loc();
         let Some(loc) = self.nav.back(current) else {
             self.status = "No previous location".to_string();
             return;
         };
+        let pinned = self.keep_preview_open_for_navigation_to(&loc.path);
         let line = loc.row;
         match self.open_at(&loc.path, loc.row, loc.col) {
             Ok(()) => {
                 self.status = format!("Back to {} line {}", self.status_path(&loc.path), line + 1)
             }
-            Err(e) => self.status = format!("Go back failed: {e}"),
+            Err(e) => {
+                self.restore_preview_after_failed_navigation(pinned);
+                self.status = format!("Go back failed: {e}")
+            }
         }
     }
 
@@ -13306,6 +13376,7 @@ impl App {
             self.status = "No forward location".to_string();
             return;
         };
+        let pinned = self.keep_preview_open_for_navigation_to(&loc.path);
         let line = loc.row;
         match self.open_at(&loc.path, loc.row, loc.col) {
             Ok(()) => {
@@ -13315,7 +13386,10 @@ impl App {
                     line + 1
                 )
             }
-            Err(e) => self.status = format!("Go forward failed: {e}"),
+            Err(e) => {
+                self.restore_preview_after_failed_navigation(pinned);
+                self.status = format!("Go forward failed: {e}")
+            }
         }
     }
 
@@ -13757,6 +13831,11 @@ impl App {
             return false;
         }
         self.prepare_rename_request = None;
+        // The verdict is in, whichever way it went: "Preparing rename…" no
+        // longer describes anything (it stayed up beside the open prompt).
+        if self.status == "Preparing rename…" {
+            self.status.clear();
+        }
         if self.editor.path.as_deref() != Some(path.as_path()) || self.editor.edit_seq != seq {
             // The caret moved on (an edit, or a tab switch — which also
             // bumps edit_seq). Say so: bailing silently would strand
@@ -14570,6 +14649,28 @@ impl App {
         self.status = format!("Conflict {} of {total}", idx + 1);
     }
 
+    /// The range a Quick Fix asks the server about, as UTF-16 `(line, col)`
+    /// start and end, with the diagnostics on its lines as context: the
+    /// selection when there is one (VS Code sends it, so selection-scoped
+    /// refactors like Extract Function are offered), else the caret point.
+    #[allow(clippy::type_complexity)]
+    fn code_action_request(
+        &self,
+    ) -> ((u32, u32), (u32, u32), Vec<crate::lsp::manager::Diagnostic>) {
+        let ((sr, sc), (er, ec)) = match self.editor.selection.filter(|s| s.has_area()) {
+            Some(sel) => sel.normalised(),
+            None => {
+                let caret = (self.editor.cursor_row, self.editor.cursor_col);
+                (caret, caret)
+            }
+        };
+        let start = self.editor.pos_to_utf16(sr, sc);
+        let end = self.editor.pos_to_utf16(er, ec);
+        // Rows are plain line numbers, unaffected by the UTF-16 columns.
+        let diagnostics = self.editor.diagnostics_in_line_range(start.0, end.0);
+        (start, end, diagnostics)
+    }
+
     fn start_code_action(&mut self) {
         if self.editor.has_non_text_view() {
             return;
@@ -14587,17 +14688,12 @@ impl App {
             self.status = String::from("No file open");
             return;
         };
-        // `row`/`col` go to the server, so the column must be UTF-16;
-        // `diagnostics_in_line_range` takes a plain row and is unaffected.
-        let (row, col) = self
-            .editor
-            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
-        let diagnostics = self.editor.diagnostics_in_line_range(row, row);
+        let ((sr, sc), (er, ec), diagnostics) = self.code_action_request();
         let Some(lsp) = self.lsp.as_mut() else {
             self.status = String::from("No language server for this file");
             return;
         };
-        let id = lsp.request_code_action(path, row, col, row, col, diagnostics);
+        let id = lsp.request_code_action(path, sr, sc, er, ec, diagnostics);
         self.code_action_request_id = Some(id);
         self.code_action_pending_resolve = false;
         self.code_action_baseline = self.editor.edit_seqs();
@@ -16368,7 +16464,7 @@ impl App {
             if self.terminal_find.is_some() && self.terminal_find_pane == idx {
                 self.terminal_find_match = None;
                 self.terminals[idx].set_current_match(None, 0);
-                let (lines, _top) = self.terminals[idx].grid_lines();
+                let lines = find_texts(self.terminals[idx].find_lines());
                 if let Some(state) = self.terminal_find.as_mut() {
                     state.set_match_count(
                         crate::widgets::editor_find::count_matches(
@@ -24906,6 +25002,9 @@ impl App {
 
     /// Reveal the CodeQL view (#578): the QL icon and the palette. Refused,
     /// with the reason, while the built-in CodeQL extension is disabled.
+    /// The saved lists it shows are small files read here; the workspace's
+    /// queries take a walk of the tree, which runs off the UI thread so the
+    /// view opens at once (#840).
     fn open_codeql_view(&mut self) {
         if !self.is_extension_enabled("codeql") {
             self.status = String::from(
@@ -24916,7 +25015,7 @@ impl App {
         self.show_tree = true;
         self.refresh_codeql_databases();
         self.refresh_codeql_history();
-        self.refresh_codeql_queries();
+        self.discover_codeql_queries();
         self.refresh_codeql_variant();
         self.set_sidebar_view(SidebarView::CodeQL);
     }
@@ -27410,10 +27509,67 @@ impl App {
         }
     }
 
-    /// Find the workspace's queries for the side bar's Queries section.
-    /// Called when the view opens, not every frame: it walks the tree.
+    /// Find the workspace's queries for the side bar's Queries section now,
+    /// for a caller that needs the list at once (a query just created, Run
+    /// All Queries). It walks the tree, so opening the view does this off
+    /// the UI thread instead. A walk still in flight is dropped: it may
+    /// predate what this one finds.
     fn refresh_codeql_queries(&mut self) {
+        self.codeql_queries_job = None;
+        self.codeql.discovering_queries = false;
         self.codeql.queries = crate::codeql_query::discover(self.workspace_root());
+    }
+
+    /// Find the workspace's queries on a worker thread (#840): the walk can
+    /// take seconds on a large tree, and switching to the CodeQL view must
+    /// not wait for it. [`Self::drain_codeql_queries`] lists what it finds;
+    /// until then the section keeps its last list, or says it is looking.
+    /// A walk of this root already in flight is left to finish rather than
+    /// doubled; one of a root the workspace has since left is replaced.
+    fn discover_codeql_queries(&mut self) {
+        let root = self.workspace_root().to_path_buf();
+        if self
+            .codeql_queries_job
+            .as_ref()
+            .is_some_and(|(walked, _)| *walked == root)
+        {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let walk = root.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::codeql_query::discover(&walk));
+        });
+        self.codeql_queries_job = Some((root, rx));
+        self.codeql.discovering_queries = true;
+    }
+
+    /// List the queries a discovery found, once it lands (#840). True when
+    /// the side bar changed. A walk of a root the workspace has left since
+    /// is dropped unread, landed or not, and the view, if showing, walks
+    /// the root it shows now.
+    pub fn drain_codeql_queries(&mut self) -> bool {
+        let Some((walked, rx)) = self.codeql_queries_job.as_ref() else {
+            return false;
+        };
+        if walked.as_path() != self.workspace_root() {
+            self.codeql_queries_job = None;
+            self.codeql.discovering_queries = false;
+            if self.sidebar_view == SidebarView::CodeQL {
+                self.discover_codeql_queries();
+            }
+            return true;
+        }
+        match rx.try_recv() {
+            Ok(queries) => self.codeql.set_queries(queries),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            // The walk died: stop saying it is looking.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.codeql.discovering_queries = false;
+            }
+        }
+        self.codeql_queries_job = None;
+        true
     }
 
     /// Ask for the name of a new query (#578, VS Code's "CodeQL: Create
@@ -30038,14 +30194,14 @@ impl App {
         let language = match parts.next() {
             Some(l) => l.to_string(),
             None => {
-                let out = std::process::Command::new(gh)
-                    .args([
-                        "api",
-                        &format!("/repos/{repo}/code-scanning/codeql/databases"),
-                        "--jq",
-                        ".[].language",
-                    ])
-                    .output()
+                let mut cmd = std::process::Command::new(gh);
+                cmd.args([
+                    "api",
+                    &format!("/repos/{repo}/code-scanning/codeql/databases"),
+                    "--jq",
+                    ".[].language",
+                ]);
+                let out = crate::review_ops::output_retrying_busy(&mut cmd)
                     .map_err(|e| format!("could not run gh: {e}"))?;
                 if !out.status.success() {
                     return Err(format!(
@@ -30075,11 +30231,13 @@ impl App {
         let tmp = cache.join(format!("{name}.download.zip"));
         std::fs::create_dir_all(cache).map_err(|e| e.to_string())?;
         let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-        let out = std::process::Command::new(gh)
-            .args(crate::codeql_db::github_database_args(&repo, &language))
+        let mut cmd = std::process::Command::new(gh);
+        cmd.args(crate::codeql_db::github_database_args(&repo, &language))
             .stdin(std::process::Stdio::null())
             .stdout(file)
-            .output()
+            .stderr(std::process::Stdio::piped());
+        let out = crate::review_ops::spawn_retrying_busy(&mut cmd)
+            .and_then(std::process::Child::wait_with_output)
             .map_err(|e| format!("could not run gh: {e}"))?;
         if !out.status.success() {
             let _ = std::fs::remove_file(&tmp);
@@ -33246,13 +33404,27 @@ impl App {
                 }
             }
             ChangeKind::Modified | ChangeKind::StagedModified => {
-                match crate::git::read_file_at_head(&scm_root, &entry.path) {
-                    Ok(head_text) => {
+                // Both sides decoded the way the file's open tab decodes it,
+                // so a windows-1252 or UTF-16 file diffs too (#1242).
+                let enc = self.open_tab_encoding(&abs);
+                let texts =
+                    crate::git::read_bytes_at_head(&scm_root, &entry.path).and_then(|head| {
+                        let working = std::fs::read(&abs).map_err(|e| e.to_string())?;
+                        let decode = |b: &[u8]| crate::widgets::editor::decode_blob(b, enc);
+                        decode(&head)
+                            .zip(decode(&working))
+                            .ok_or_else(|| format!("{} is not {}", entry.path, enc.name()))
+                    });
+                match texts {
+                    Ok((head_text, working_text)) => {
                         let label = std::path::PathBuf::from(format!("{} (HEAD)", entry.path));
-                        match self
-                            .editor
-                            .open_head_diff_with_text(label, &head_text, &abs, true)
-                        {
+                        match self.editor.open_head_diff_with_texts(
+                            label,
+                            &head_text,
+                            &working_text,
+                            &abs,
+                            true,
+                        ) {
                             Ok(()) => {
                                 self.tag_open_diff(
                                     crate::widgets::diff::DiffSource::HeadVsWorking {
@@ -33260,6 +33432,9 @@ impl App {
                                         rel: entry.path.clone(),
                                     },
                                 );
+                                if let Some(diff) = self.editor.diff.as_mut() {
+                                    diff.text_encoding = enc;
+                                }
                                 true
                             }
                             Err(e) => {
@@ -38141,14 +38316,20 @@ impl App {
     /// active tab isn't a working-tree diff or no hunk is at the cursor.
     fn diff_hunk_patch_at_caret(&mut self) -> Option<(String, String)> {
         let built = match self.editor.diff.as_ref() {
-            None => self.editor_hunk_patch_at_caret(),
+            None => self.editor_hunk_patch_at_caret().map_err(str::to_string),
             Some(diff) if !diff.left_is_git_head => {
-                Err("Hunk actions need a working-tree diff from Source Control")
+                Err("Hunk actions need a working-tree diff from Source Control".to_string())
             }
+            // The patch is built from the decoded text, which would put UTF-8
+            // bytes into a blob stored in another encoding (#1242).
+            Some(diff) if diff.text_encoding != encoding_rs::UTF_8 => Err(format!(
+                "Hunk actions work on UTF-8 files only; this diff is {}: stage the whole file",
+                diff.text_encoding.name()
+            )),
             Some(diff) => match self.repo_relative_path(&diff.right_path) {
-                None => Err("File is outside the repository"),
+                None => Err("File is outside the repository".to_string()),
                 Some(rel) => match diff.hunk_range_at(diff.action_row()) {
-                    None => Err("No change hunk at the cursor"),
+                    None => Err("No change hunk at the cursor".to_string()),
                     Some(range) => {
                         let patch = diff.hunk_patch(&rel, range);
                         Ok((rel, patch))
@@ -38224,7 +38405,8 @@ impl App {
     /// caller falls back to the whole-hunk action.
     fn diff_selected_lines_patch(&self) -> Option<(String, String)> {
         let diff = self.editor.diff.as_ref()?;
-        if !diff.left_is_git_head {
+        // Not UTF-8: left to the hunk path, which refuses it with a reason.
+        if !diff.left_is_git_head || diff.text_encoding != encoding_rs::UTF_8 {
             return None;
         }
         let sel = diff.selection?;
@@ -44910,14 +45092,20 @@ impl App {
     /// claiming a copy landed would be a claim croft cannot make.
     fn deliver_copied_text(&mut self, text: &str) {
         let n = text.chars().count();
+        self.status = self.copy_where_pasted(text).status(&format!("{n} chars"));
+    }
+
+    /// The copy `deliver_copied_text` makes, without the status line, for a
+    /// caller that words its own. Every terminal copy goes this way (#1667):
+    /// Copy Output, copy mode, quick select and copy on select all wrote
+    /// the remote box's clipboard on a relay session.
+    fn copy_where_pasted(&mut self, text: &str) -> CopyLanding {
         if self.is_relay_session && self.push_clipboard_via_relay(text) {
-            self.status = format!("Copied {n} chars to the local clipboard");
-            return;
-        }
-        if copy_to_clipboard(text) {
-            self.status = format!("Copied {n} chars to clipboard");
+            CopyLanding::Local
+        } else if copy_to_clipboard(text) {
+            CopyLanding::Clipboard
         } else {
-            self.status = format!("Copied {n} chars via OSC 52 (the host terminal decides)");
+            CopyLanding::Osc52
         }
     }
 
@@ -46667,9 +46855,8 @@ impl App {
             }
             // Always drain so completions never pile up unseen.
             for f in t.drain_finished_commands() {
-                if !f.output.is_empty() {
-                    build_scans.push((t.uid(), f.cwd.clone(), f.cmd.clone(), f.output.clone()));
-                }
+                // Empty output included (#1488): see the scan loop below.
+                build_scans.push((t.uid(), f.cwd.clone(), f.cmd.clone(), f.output.clone()));
                 // Durable command history: every finished command with a
                 // known text is recorded (cwd, exit, duration, timestamp)
                 // for the Ctrl+Shift+R cross-session search.
@@ -46800,6 +46987,16 @@ impl App {
             build_changed |= self.install_build_diags(pane, cwd.as_deref(), diags);
         }
         for (pane, cwd, cmd, output) in build_scans {
+            // A command that printed nothing (`cd`, `clear`) says nothing
+            // about the build, so the pane's problems stay. It still ends
+            // the pane's command, so it uses up a watcher's one-shot skip:
+            // a watcher that clears the screen erases its own output, and
+            // with the skip left armed the next build was the one skipped,
+            // leaving the watcher's stale problems in place (#1488).
+            if output.is_empty() {
+                self.watch_published_panes.remove(&pane);
+                continue;
+            }
             build_changed |= self.apply_build_scan(pane, cwd.as_deref(), &cmd, &output);
         }
         // Captures collect silently (iTerm2's model: the panel is the
@@ -46895,12 +47092,12 @@ impl App {
             return;
         }
         let lines = text.lines().count();
-        copy_to_clipboard(&text);
-        self.status = if lines == 1 {
-            String::from("Copied command output (1 line)")
+        let what = if lines == 1 {
+            String::from("command output (1 line)")
         } else {
-            format!("Copied command output ({lines} lines)")
+            format!("command output ({lines} lines)")
         };
+        self.status = self.copy_where_pasted(&text).status(&what);
     }
 
     fn select_command_output(
@@ -50587,6 +50784,7 @@ impl App {
             Cmd::ClearBookmarks => self.clear_bookmarks(),
             Cmd::SaveFile => self.save(),
             Cmd::SaveAs => self.open_save_as_prompt(),
+            Cmd::RevertFile => self.revert_file(),
             Cmd::SaveAll => self.save_all(),
             Cmd::NewFile => {
                 let target = self.palette_create_target_dir();
@@ -52141,7 +52339,7 @@ impl App {
         } else {
             String::new()
         };
-        let (lines, _top) = self.terminal().grid_lines();
+        let lines = find_texts(self.terminal().find_lines());
         let mut state = crate::widgets::editor_find::EditorFind::new(initial.clone(), opts);
         state.set_match_count(
             crate::widgets::editor_find::count_matches(&lines, &initial, opts),
@@ -52218,7 +52416,7 @@ impl App {
     /// re-highlight every occurrence, and re-anchor on the most recent match.
     fn terminal_find_set_query(&mut self, new_query: String) {
         let opts = self.search.opts;
-        let (lines, _top) = self.terminal().grid_lines();
+        let lines = find_texts(self.terminal().find_lines());
         let count = crate::widgets::editor_find::count_matches(&lines, &new_query, opts);
         if let Some(state) = self.terminal_find.as_mut() {
             state.query = new_query.clone();
@@ -52247,10 +52445,14 @@ impl App {
         if needle.is_empty() {
             return;
         }
-        let (lines, top, now) = self.terminal().grid_lines_and_clock();
-        if lines.is_empty() {
+        // Logical lines, soft-wrapped rows joined, so a match the pane's
+        // width cut in two is found (#1275). A match is named by its line's
+        // first row and a char index into the joined text.
+        let (find_lines, now) = self.terminal().find_lines_and_clock();
+        if find_lines.is_empty() {
             return;
         }
+        let lines: Vec<String> = find_lines.iter().map(|l| l.text.clone()).collect();
         let anchor = self.terminal_find_match;
         let (from_row, from_col) = match anchor {
             Some((clock, abs, col, _len)) => {
@@ -52258,7 +52460,7 @@ impl App {
                 // anchored, so navigation walks from the match's TEXT, not
                 // from the viewport row it occupied at anchor time.
                 let abs = abs - (now - clock) as i32;
-                let row = (abs - top).clamp(0, lines.len() as i32 - 1) as usize;
+                let row = find_lines.iter().rposition(|l| l.start <= abs).unwrap_or(0);
                 (row, col)
             }
             // No anchor: start past the last line's end so `prev` lands on the
@@ -52288,11 +52490,12 @@ impl App {
         let Some(m) = m else {
             return;
         };
-        let abs_line = top + m.row as i32;
+        let abs_line = find_lines[m.row].start;
         self.terminal_find_match = Some((now, abs_line, m.col_chars, m.len_chars));
         self.terminal_mut()
             .set_current_match(Some((abs_line, m.col_chars, m.len_chars)), now);
-        self.terminal_mut().scroll_to_line(abs_line);
+        self.terminal_mut()
+            .scroll_to_line(find_lines[m.row].line_of(m.col_chars));
         let idx =
             crate::widgets::editor_find::match_index_at(&lines, &needle, opts, m.row, m.col_chars);
         if let Some(state) = self.terminal_find.as_mut() {
@@ -52592,8 +52795,7 @@ impl App {
                     self.status =
                         String::from("Copy mode: nothing selected (v/V/^V starts a selection)");
                 } else {
-                    copy_to_clipboard(&text);
-                    self.status = format!("Copied {} chars to clipboard", text.chars().count());
+                    self.deliver_copied_text(&text);
                 }
                 return;
             }
@@ -52781,15 +52983,14 @@ impl App {
                     // number); the clipboard rule applies here too (#360).
                     let text = self.terminal_text_for_copy(hit.text.clone());
                     self.close_terminal_quick_select();
-                    copy_to_clipboard(&text);
+                    let copied = self
+                        .copy_where_pasted(&text)
+                        .status(&format!("{} chars", text.chars().count()));
                     if shifted {
                         self.terminal_mut().paste_input(text.as_bytes());
-                        self.status = format!(
-                            "Copied {} chars to clipboard and pasted into the shell",
-                            text.chars().count()
-                        );
+                        self.status = format!("{copied} and pasted into the shell");
                     } else {
-                        self.status = format!("Copied {} chars to clipboard", text.chars().count());
+                        self.status = copied;
                     }
                 } else if state.hints.iter().any(|h| h.label.starts_with(&candidate)) {
                     let Some(state) = self.terminal_quick_select.as_mut() else {
@@ -53095,9 +53296,17 @@ impl App {
             return false;
         }
         let changed = log.poll_index();
-        if log.indexing() {
+        let indexing = log.indexing();
+        // A reload's kept place may lie past what was indexed so far.
+        if changed {
+            self.editor.settle_log_reload();
+        }
+        if indexing {
             return changed;
         }
+        let Some(log) = self.editor.log.as_ref() else {
+            return true;
+        };
         if let Some(state) = self.editor_find.as_ref()
             && !state.query.is_empty()
         {
@@ -53159,6 +53368,9 @@ impl App {
             return;
         };
         self.editor.active_search_match = Some((m.row, m.col_chars, m.len_chars));
+        // The match is the reader's place now; a reload still settling its
+        // own place must not scroll it away on the next index batch.
+        self.editor.cancel_log_reload();
         // The log body starts one row below the header.
         let rows = (self.editor.last_inner.height as usize).saturating_sub(1);
         if rows == 0 {
@@ -56650,7 +56862,7 @@ impl App {
                                 let text = self
                                     .terminal_text_for_copy(self.terminals[idx].selection_text());
                                 if !text.is_empty() {
-                                    copy_to_clipboard(&text);
+                                    self.copy_where_pasted(&text);
                                 }
                             }
                         }
@@ -56675,7 +56887,7 @@ impl App {
                 {
                     let text = self.terminal_text_for_copy(self.terminal().selection_text());
                     if !text.is_empty() {
-                        copy_to_clipboard(&text);
+                        self.copy_where_pasted(&text);
                     }
                 }
                 // A plain click on a redacted span shows the real value in
@@ -64466,10 +64678,9 @@ impl App {
     /// the first line of what it said went wrong: GitHub's own message when
     /// the API sent one, else gh's.
     fn run_gh(&self, args: &[String]) -> Result<String, String> {
-        let out = std::process::Command::new(&self.gh_program)
-            .args(args)
-            .current_dir(self.active_workspace_root())
-            .output()
+        let mut cmd = std::process::Command::new(&self.gh_program);
+        cmd.args(args).current_dir(self.active_workspace_root());
+        let out = crate::review_ops::output_retrying_busy(&mut cmd)
             .map_err(|e| format!("could not run gh: {e}"))?;
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         if out.status.success() {
@@ -64560,11 +64771,11 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let gh_json = |git_ref: Option<&str>| -> Result<String, String> {
-                let out = std::process::Command::new(&gh)
-                    .args(github::analyses_args(git_ref))
+                let mut cmd = std::process::Command::new(&gh);
+                cmd.args(github::analyses_args(git_ref))
                     .current_dir(&root)
-                    .stdin(std::process::Stdio::null())
-                    .output()
+                    .stdin(std::process::Stdio::null());
+                let out = crate::review_ops::output_retrying_busy(&mut cmd)
                     .map_err(|e| format!("could not run gh: {e}"))?;
                 Ok(String::from_utf8_lossy(&out.stdout).into_owned())
             };
@@ -64674,11 +64885,11 @@ impl App {
             let files = chosen
                 .iter()
                 .map(|a| {
-                    let out = std::process::Command::new(&gh)
-                        .args(crate::sarif::github::sarif_args(a.id))
+                    let mut cmd = std::process::Command::new(&gh);
+                    cmd.args(crate::sarif::github::sarif_args(a.id))
                         .current_dir(&root)
-                        .stdin(std::process::Stdio::null())
-                        .output()
+                        .stdin(std::process::Stdio::null());
+                    let out = crate::review_ops::output_retrying_busy(&mut cmd)
                         .map_err(|e| format!("could not run gh: {e}"))?;
                     if !out.status.success() {
                         return Err(format!("analysis #{} could not be downloaded", a.id));
@@ -65950,6 +66161,18 @@ impl App {
         );
     }
 
+    /// The encoding `path`'s open tab decodes it with, in any group; UTF-8
+    /// when it isn't open, which is what opening it would pick: a BOM still
+    /// wins in `decode_blob`, and bytes that are not UTF-8 get the plain
+    /// open rather than an editable diff of replacement characters.
+    fn open_tab_encoding(&self, path: &Path) -> &'static encoding_rs::Encoding {
+        std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .find(|e| e.diff.is_none() && e.path.as_deref() == Some(path))
+            .map_or(encoding_rs::UTF_8, |e| e.encoding)
+    }
+
     /// Re-point the tabs of a renamed or moved path in every editor group,
     /// not just the focused one: a tab in the other split kept the old path,
     /// raised a disk conflict, and a save brought the old file back.
@@ -66401,6 +66624,27 @@ impl App {
             String::from(".")
         } else {
             rel.display().to_string()
+        }
+    }
+
+    /// File: Revert File (#1285): drop the active tab's unsaved edits for
+    /// the text on disk. One undo step, so Ctrl+Z brings the edits back.
+    fn revert_file(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("This tab has no file to revert to");
+            return;
+        };
+        let name = self.status_path(&path);
+        if !self.editor.dirty {
+            self.status = format!("{name} has no unsaved changes");
+            return;
+        }
+        match self.editor.revert_as_undo_step() {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.status = format!("Reverted {name}");
+            }
+            Err(e) => self.status = format!("Revert failed: {e}"),
         }
     }
 
@@ -67310,6 +67554,11 @@ fn is_tree_zoxide_jump_key(key: KeyEvent) -> bool {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// The text terminal find searches: one string per logical line (#1275).
+fn find_texts(lines: Vec<crate::widgets::terminal::FindLine>) -> Vec<String> {
+    lines.into_iter().map(|l| l.text).collect()
 }
 
 /// Explorer-pane shortcut: `Cmd+F` / `Ctrl+F` (no Shift, no Alt) - "New File".
@@ -68683,6 +68932,30 @@ fn copy_to_clipboard(text: &str) -> bool {
     false
 }
 
+/// Where `App::copy_where_pasted` put a copy.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CopyLanding {
+    /// Queued home over the drop relay, to the machine the user types at.
+    /// The relay sends no word back on whether that clipboard took it, so
+    /// the status says it was sent, not that it landed.
+    Local,
+    /// This machine's clipboard.
+    Clipboard,
+    /// Only an OSC 52 sequence, which the host terminal may ignore.
+    Osc52,
+}
+
+impl CopyLanding {
+    /// The status line for copying `what`, saying honestly where it went.
+    fn status(self, what: &str) -> String {
+        match self {
+            CopyLanding::Local => format!("Sent {what} to the local clipboard"),
+            CopyLanding::Clipboard => format!("Copied {what} to clipboard"),
+            CopyLanding::Osc52 => format!("Copied {what} via OSC 52 (the host terminal decides)"),
+        }
+    }
+}
+
 /// Returns true if the given key event should copy the editor's current
 /// selection to the system clipboard. Recognises plain `Ctrl+C` and `Cmd+C`
 /// — there's no SIGINT collision since the editor pane is not a shell.
@@ -69847,8 +70120,11 @@ fn rebuild_diff_view(
             if !head_moved && !written(&old.right_path) && !old.sides_moved_on_disk() {
                 return None;
             }
-            let head = crate::git::read_file_at_head(root, rel).ok()?;
-            let right = std::fs::read_to_string(&old.right_path).ok()?;
+            let enc = old.text_encoding;
+            let head = crate::git::read_bytes_at_head(root, rel).ok()?;
+            let head = crate::widgets::editor::decode_blob(&head, enc)?;
+            let right = std::fs::read(&old.right_path).ok()?;
+            let right = crate::widgets::editor::decode_blob(&right, enc)?;
             two_sided(&head, &right)
         }
         DiffSource::FixedLeft { left_text } => {
@@ -69886,6 +70162,7 @@ fn rebuild_diff_view(
     };
     fresh.source = old.source.clone();
     fresh.left_is_real_file = old.left_is_real_file;
+    fresh.text_encoding = old.text_encoding;
     fresh.stamp_sides();
     Some(fresh)
 }
@@ -72105,7 +72382,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             | app.drain_codeql_variant_submit()
             | app.poll_codeql_variant_runs()
             | app.drain_codeql_variant_results()
-            | app.drain_codeql_variant_export();
+            | app.drain_codeql_variant_export()
+            | app.drain_codeql_queries();
         let search_changed = app.drain_search_results();
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
