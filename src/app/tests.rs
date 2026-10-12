@@ -78812,6 +78812,7 @@ fn diag_on_line(line: u32, message: &str) -> crate::lsp::manager::Diagnostic {
         end_char: 1,
         severity: crate::lsp::manager::DiagnosticSeverity::Warning,
         message: String::from(message),
+        tags: Default::default(),
     }
 }
 
@@ -80325,4 +80326,199 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     app.watch_published_panes.insert(pane);
     assert!(!app.apply_build_scan(pane, Some(&cwd), "tsc --watch", "a.c:1:1: error: old\n"));
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
+}
+
+/// #1379: a file its owner `chmod 444`ed, open in the editor.
+#[cfg(unix)]
+fn app_with_protected_file(tmp: &std::path::Path, body: &str) -> (App, PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = tmp.join("nginx.conf");
+    std::fs::write(&f, body).unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let mut app = App::new(tmp.to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    (app, f)
+}
+
+#[cfg(unix)]
+fn file_mode(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[cfg(unix)]
+#[test]
+fn a_write_protected_file_shows_a_lock_and_read_only_before_any_edit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_protected_file(tmp.path(), "listen 80;\n");
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let screen = screen_text(&term);
+    assert!(screen.contains("nginx.conf \u{f023}"), "{screen}");
+    assert!(screen.contains("Read-only"), "{screen}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_writable_file_shows_no_lock_and_saves_on_the_first_press() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "site.conf", "a\n");
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let screen = screen_text(&term);
+    assert!(!screen.contains('\u{f023}'), "{screen}");
+    assert!(!screen.contains("Read-only"), "{screen}");
+    app.editor.insert_char('b');
+    app.save();
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("site.conf")).unwrap(),
+        "ba\n"
+    );
+    assert!(!app.editor.dirty);
+    assert_eq!(app.sudo_save_armed, None);
+}
+
+#[cfg(unix)]
+#[test]
+fn saving_a_write_protected_file_asks_then_overwrites_it_and_keeps_it_protected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, f) = app_with_protected_file(tmp.path(), "listen 80;\n");
+    app.editor.insert_char('#');
+    app.save();
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "listen 80;\n");
+    assert!(app.editor.dirty);
+    assert!(
+        app.status.contains("write-protected") && app.status.contains("Cmd+S again"),
+        "{}",
+        app.status
+    );
+    app.save();
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "#listen 80;\n");
+    assert_eq!(file_mode(&f), 0o444, "its permissions are put back");
+    assert!(!app.editor.dirty);
+}
+
+#[cfg(unix)]
+#[test]
+fn auto_save_never_writes_a_write_protected_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, f) = app_with_protected_file(tmp.path(), "listen 80;\n");
+    app.auto_save = true;
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    age_last_edit(&mut app.editor);
+    app.tick_auto_save();
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "listen 80;\n");
+    assert!(app.editor.dirty);
+    assert!(
+        !app.editor.overwrite_protected_armed,
+        "only an explicit save may consent"
+    );
+}
+
+#[test]
+fn a_save_refused_for_permission_offers_sudo_and_the_next_press_stages_it() {
+    // Root may write anything, so the kernel's refusal is handed in as the
+    // save would have reported it.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "hosts", "127.0.0.1 localhost\n");
+    let f = tmp.path().join("hosts");
+    app.editor.insert_char('#');
+    app.report_save_error(anyhow::Error::from(std::io::Error::from(
+        std::io::ErrorKind::PermissionDenied,
+    )));
+    assert!(
+        app.status.contains("Cmd+S again to save it with sudo"),
+        "{}",
+        app.status
+    );
+    assert_eq!(app.sudo_save_armed.as_ref(), Some(&f));
+    let panes = app.terminals.len();
+    app.save();
+    assert_eq!(app.terminals.len(), panes + 1, "sudo runs in its own pane");
+    assert_eq!(app.terminal().label(), "sudo save");
+    assert!(
+        app.focus == Pane::Terminal,
+        "sudo's password prompt has the keys"
+    );
+    assert_eq!(
+        app.pending_sudo_saves,
+        vec![(f.clone(), b"#127.0.0.1 localhost\n".to_vec())]
+    );
+    assert!(
+        app.editor.dirty,
+        "nothing is saved until tee has written it"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        "127.0.0.1 localhost\n"
+    );
+    // tee lands the bytes: the tab is saved, not in conflict with disk.
+    std::fs::write(&f, b"#127.0.0.1 localhost\n").unwrap();
+    assert!(app.reload_open_file_after_external_change());
+    assert!(!app.editor.dirty);
+    assert!(!app.editor.disk_conflict);
+    assert!(app.pending_sudo_saves.is_empty());
+    assert_eq!(app.status, "Saved hosts with sudo");
+}
+
+#[test]
+fn a_sudo_save_waits_while_the_file_holds_anything_else() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "hosts", "a\n");
+    let f = tmp.path().join("hosts");
+    app.editor.insert_char('b');
+    app.run_command(crate::widgets::command_palette::Command::SaveWithSudo);
+    assert_eq!(app.pending_sudo_saves.len(), 1);
+    std::fs::write(&f, "someone else\n").unwrap();
+    app.reload_open_file_after_external_change();
+    assert!(app.editor.dirty, "another write is not this save");
+    assert_eq!(app.pending_sudo_saves.len(), 1, "still waiting on tee");
+}
+
+#[test]
+fn a_save_that_fails_for_another_reason_offers_no_sudo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "a\n");
+    app.editor.insert_char('b');
+    app.report_save_error(anyhow::Error::from(std::io::Error::from(
+        std::io::ErrorKind::StorageFull,
+    )));
+    assert!(app.status.starts_with("Save failed: "), "{}", app.status);
+    assert!(!app.status.contains("sudo"), "{}", app.status);
+    assert_eq!(app.sudo_save_armed, None);
+    let panes = app.terminals.len();
+    app.save();
+    assert_eq!(app.terminals.len(), panes, "a plain save, no terminal");
+    assert!(!app.editor.dirty);
+}
+
+#[test]
+fn save_with_sudo_needs_a_file_on_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.insert_char('a');
+    let panes = app.terminals.len();
+    app.run_command(crate::widgets::command_palette::Command::SaveWithSudo);
+    assert_eq!(app.terminals.len(), panes);
+    assert!(app.pending_sudo_saves.is_empty());
+    assert!(app.status.contains("Save As"), "{}", app.status);
+}
+
+#[test]
+fn the_sudo_save_command_quotes_both_paths() {
+    assert_eq!(
+        sudo_save_command("/etc/it's here.conf", "/tmp/croft-sudo-save-1"),
+        "sudo tee -- '/etc/it'\\''s here.conf' < '/tmp/croft-sudo-save-1' > /dev/null; rm -f -- '/tmp/croft-sudo-save-1'"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_sudo_save_is_staged_where_only_this_user_can_read_it() {
+    let staged = stage_sudo_save(b"secret\n").unwrap();
+    assert_eq!(std::fs::read(&staged).unwrap(), b"secret\n");
+    assert_eq!(file_mode(&staged), 0o600);
+    std::fs::remove_file(&staged).unwrap();
 }
