@@ -16,11 +16,13 @@ pub enum Forge {
     Bitbucket,
 }
 
-/// A remote read as a web repository: `https://<host>/<path>`.
+/// A remote read as a web repository: `<scheme>://<host>/<path>`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WebRepo {
     pub forge: Forge,
-    /// The host, with an `https` port kept (an ssh port is not the web's).
+    /// `http` for an explicit `http://` remote, else `https`.
+    pub scheme: &'static str,
+    /// The host, with an http(s) port kept (an ssh port is not the web's).
     pub host: String,
     /// `owner/repo`, or `group/subgroup/repo` on GitLab; no `.git`.
     pub path: String,
@@ -33,11 +35,16 @@ pub struct WebRepo {
 /// GitLab or Bitbucket: croft cannot know another host's link shape.
 pub fn web_repo(url: &str) -> Option<WebRepo> {
     let url = url.trim();
+    let mut web_scheme = "https";
     let (host, path) = if let Some((scheme, rest)) = url.split_once("://") {
         let (authority, path) = rest.split_once('/')?;
         let authority = authority.rsplit('@').next()?;
         let host = match scheme {
-            "https" | "http" => authority,
+            "https" => authority,
+            "http" => {
+                web_scheme = "http";
+                authority
+            }
             "ssh" | "git" | "git+ssh" | "ssh+git" => authority.split(':').next()?,
             _ => return None,
         };
@@ -72,6 +79,7 @@ pub fn web_repo(url: &str) -> Option<WebRepo> {
     };
     Some(WebRepo {
         forge,
+        scheme: web_scheme,
         host,
         path: path.to_string(),
     })
@@ -100,7 +108,8 @@ pub fn file_url(repo: &WebRepo, rev: &str, rel: &str, lines: Option<(usize, usiz
         },
     };
     format!(
-        "https://{}/{}/{blob}/{}/{}{fragment}",
+        "{}://{}/{}/{blob}/{}/{}{fragment}",
+        repo.scheme,
         repo.host,
         repo.path,
         encode_path(rev),
@@ -130,6 +139,7 @@ mod tests {
     fn github(path: &str) -> WebRepo {
         WebRepo {
             forge: Forge::GitHub,
+            scheme: "https",
             host: String::from("github.com"),
             path: path.to_string(),
         }
@@ -216,6 +226,17 @@ mod tests {
         assert_eq!(
             file_url(&bb, "abc123", "a.rs", Some((7, 7))),
             "https://bitbucket.org/acme/widgets/src/abc123/a.rs#lines-7"
+        );
+    }
+
+    /// An explicit `http://` remote (an HTTP-only self-hosted GitLab) keeps
+    /// its scheme rather than being rewritten to `https`.
+    #[test]
+    fn an_http_remote_keeps_its_scheme() {
+        let own = web_repo("http://gitlab.example.com:8080/team/app.git").unwrap();
+        assert_eq!(
+            file_url(&own, "main", "a.rs", Some((3, 3))),
+            "http://gitlab.example.com:8080/team/app/-/blob/main/a.rs#L3"
         );
     }
 

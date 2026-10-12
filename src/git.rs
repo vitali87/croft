@@ -3389,7 +3389,9 @@ pub fn share_link(
         .map_err(|_| format!("remote {remote} has no URL"))?;
     let repo = crate::permalink::web_repo(&url)
         .ok_or_else(|| format!("{remote} ({url}) is not a GitHub, GitLab or Bitbucket remote"))?;
-    if run_git(&top, &["ls-files", "--error-unmatch", "--", &rel]).is_err() {
+    // The file must be in HEAD's tree, which the linked commit or branch
+    // contains; being staged is not enough for the remote to show it.
+    if run_git(&top, &["cat-file", "-e", &format!("HEAD:{rel}")]).is_err() {
         return Err(format!(
             "{rel} is not committed, so {remote} has no page for it"
         ));
@@ -3423,6 +3425,12 @@ pub fn share_link(
             if run_git(&top, &["rev-parse", "--verify", "--quiet", &tracking]).is_err() {
                 return Err(format!(
                     "branch {name} is not on {remote} yet, so the link would not open: push it first"
+                ));
+            }
+            // A tracking branch behind HEAD would show older lines.
+            if run_git(&top, &["merge-base", "--is-ancestor", "HEAD", &tracking]).is_err() {
+                return Err(format!(
+                    "branch {name} on {remote} is behind your commits, so the link would show older lines: push it first"
                 ));
             }
             name
@@ -6783,6 +6791,25 @@ git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' README.md >
             .status();
         let err = share_link(&tmp.path().join("src/new.rs"), None, LinkRev::Commit).unwrap_err();
         assert!(err.contains("src/new.rs is not committed"), "{err}");
+        // Staged but not committed is still not on the remote.
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(tmp.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["add", "src/new.rs"]);
+        let err = share_link(&tmp.path().join("src/new.rs"), None, LinkRev::Commit).unwrap_err();
+        assert!(err.contains("src/new.rs is not committed"), "{err}");
+        // A local commit the tracking branch does not have yet.
+        git(&["commit", "-q", "-m", "local"]);
+        let err = share_link(&file, None, LinkRev::Branch).unwrap_err();
+        assert!(err.contains("branch main on origin is behind"), "{err}");
         let (_t, file, _) = share_repo("git@git.example.com:acme/widgets.git", true);
         let err = share_link(&file, None, LinkRev::Commit).unwrap_err();
         assert!(
