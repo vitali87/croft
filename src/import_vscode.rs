@@ -243,6 +243,9 @@ const SETTINGS: &[SettingMap] = &[
 /// it now maps to the caret-driven `go_to_definition` (#1212).
 const COMMANDS: &[(&str, &str)] = &[
     ("workbench.action.files.save", "save_file"),
+    ("git.createTag", "git_create_tag"),
+    ("git.pushTags", "git_push_tags"),
+    ("git.deleteRemoteTag", "git_delete_remote_tag"),
     ("workbench.action.files.saveAll", "save_all"),
     ("explorer.newFile", "new_file"),
     ("explorer.newFolder", "new_folder"),

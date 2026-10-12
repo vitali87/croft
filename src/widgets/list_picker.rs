@@ -30,6 +30,9 @@ pub enum ListPurpose {
     StashDrop,
     RemoveRemote,
     DeleteTag,
+    /// A tag on the push remote to delete there (#1582); each row's id is
+    /// `<remote>\t<tag>`, a tab being no part of a ref name.
+    DeleteRemoteTag,
     PushToRemote,
     /// LSP Quick Fix: the rows are the code actions at the cursor; the App
     /// reads back the chosen row's `id` as an index into its pending actions.

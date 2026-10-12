@@ -65,6 +65,10 @@ pub enum ScmAction {
     // Tags submenu.
     CreateTag,
     DeleteTag,
+    /// Push every local tag to the push remote (#1582).
+    PushTags,
+    /// Pick a tag on the push remote and delete it there (#1582).
+    DeleteRemoteTag,
     // The operation in progress (#1356), listed first while there is one.
     ContinueOperation,
     SkipOperation,
@@ -191,6 +195,8 @@ const STASH_ITEMS: &[Leaf] = &[
 const TAGS_ITEMS: &[Leaf] = &[
     leaf(ScmAction::CreateTag, "Create Tag", ICON_TAG),
     leaf(ScmAction::DeleteTag, "Delete Tag", ICON_TRASH),
+    leaf(ScmAction::PushTags, "Push Tags", ICON_ARROW_UP),
+    leaf(ScmAction::DeleteRemoteTag, "Delete Remote Tag", ICON_TRASH),
 ];
 
 /// The rows a stopped operation adds (#1356): its way forward, then its
@@ -389,12 +395,14 @@ fn action_color(action: ScmAction) -> Color {
     use ScmAction::*;
     match action {
         Pull | Push | Fetch | Clone | Sync | PullRebase | PushTo | PushForce | PublishBranch
-        | CommitAndPush | CommitAndSync => ACCENT_BLUE,
+        | CommitAndPush | CommitAndSync | PushTags => ACCENT_BLUE,
         CheckoutTo | CreateBranch | CreateBranchFrom => ACCENT_CYAN,
         Commit | CommitStaged | CommitAll | StageAll | AddRemote => ACCENT_GREEN,
         CommitAmend | UndoLastCommit | RenameBranch => ACCENT_AMBER,
         Merge | Rebase => ACCENT_PURPLE,
-        DiscardAll | DeleteBranch | RemoveRemote | DropStash | DeleteTag => ACCENT_RED,
+        DiscardAll | DeleteBranch | RemoveRemote | DropStash | DeleteTag | DeleteRemoteTag => {
+            ACCENT_RED
+        }
         Stash
         | StashIncludeUntracked
         | StashStaged
