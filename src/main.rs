@@ -114,6 +114,7 @@ mod termux;
 #[cfg(test)]
 mod test_budget;
 mod testing;
+mod tex_text;
 mod theme;
 mod tour;
 mod triggers;
