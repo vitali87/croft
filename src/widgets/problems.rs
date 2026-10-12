@@ -56,6 +56,9 @@ pub struct ProblemItem {
     /// The server that produced it (e.g. `rust-analyzer`, `ruff`), shown dim
     /// at the end of the row like VS Code's diagnostic source.
     pub source: String,
+    /// The rule it reports (#1540), shown as `source(code)` after the
+    /// message so it can be silenced or looked up.
+    pub code: Option<crate::lsp::manager::DiagnosticCode>,
 }
 
 /// All diagnostics for one file, the unit the Problems view groups by.
@@ -562,8 +565,13 @@ pub fn fix_prompt(item: &ProblemItem, rel_path: &str, hints: &[String]) -> Strin
     } else {
         item.source.clone()
     };
+    let rule = item
+        .code
+        .as_ref()
+        .map(|c| format!(" (rule {})", c.value))
+        .unwrap_or_default();
     let mut text = format!(
-        "Fix the {kind} reported by {source} at {rel_path}:{}:{}: {}",
+        "Fix the {kind} reported by {source}{rule} at {rel_path}:{}:{}: {}",
         item.line + 1,
         item.col + 1,
         item.message.trim().replace('\n', " ")
@@ -862,9 +870,13 @@ impl ProblemsPanel {
             lead,
             Span::styled(message, Style::default().fg(self.theme.ui(COLOR_MSG))),
         ];
-        if !item.source.is_empty() {
+        let source = match &item.code {
+            Some(code) => code.label(&item.source),
+            None => item.source.clone(),
+        };
+        if !source.is_empty() {
             spans.push(Span::styled(
-                format!(" {} ", item.source),
+                format!(" {source} "),
                 Style::default().fg(self.theme.ui(COLOR_DIM)),
             ));
         }
@@ -897,6 +909,7 @@ mod tests {
             severity,
             message: msg.to_string(),
             source: "rustc".to_string(),
+            code: None,
         }
     }
 
@@ -1160,6 +1173,61 @@ mod tests {
             utf16_of(p.hit_at(3)),
             Some(false),
             "the build tool's identical column is NOT UTF-16"
+        );
+    }
+
+    /// #1540: a row shows its rule as `source(code)`, with the diagnostic's
+    /// own source when it named one and the server's otherwise.
+    #[test]
+    fn a_row_shows_the_rule_code_after_the_message() {
+        let code = |source: Option<&str>| crate::lsp::manager::DiagnosticCode {
+            value: String::from("F401"),
+            source: source.map(String::from),
+            href: Some(String::from(
+                "https://docs.astral.sh/ruff/rules/unused-import",
+            )),
+        };
+        let mut named = diag(0, DiagnosticSeverity::Warning, "`os` imported but unused");
+        named.source = String::from("ruff");
+        named.code = Some(code(Some("Ruff")));
+        let mut unnamed = diag(1, DiagnosticSeverity::Error, "bad argument");
+        unnamed.source = String::from("ty");
+        unnamed.code = Some(crate::lsp::manager::DiagnosticCode {
+            value: String::from("invalid-argument-type"),
+            source: None,
+            href: None,
+        });
+        let plain = diag(2, DiagnosticSeverity::Error, "no code here");
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![group("app.py", vec![named, unnamed, plain])]);
+        let screen = render(&mut p, 120, 8);
+        assert!(
+            screen.contains("`os` imported but unused Ruff(F401) [Ln 1"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("bad argument ty(invalid-argument-type) [Ln 2"),
+            "{screen}"
+        );
+        // Negative: without a code the row is as before.
+        assert!(screen.contains("no code here rustc [Ln 3"), "{screen}");
+        assert!(!screen.contains("rustc("), "{screen}");
+    }
+
+    /// #1540: Fix with Navigator names the rule too.
+    #[test]
+    fn the_fix_prompt_names_the_rule() {
+        let mut item = diag(0, DiagnosticSeverity::Warning, "`os` imported but unused");
+        item.source = String::from("ruff");
+        assert!(!fix_prompt(&item, "app.py", &[]).contains("rule"));
+        item.code = Some(crate::lsp::manager::DiagnosticCode {
+            value: String::from("F401"),
+            source: Some(String::from("Ruff")),
+            href: None,
+        });
+        assert!(
+            fix_prompt(&item, "app.py", &[])
+                .starts_with("Fix the warning reported by ruff (rule F401) at app.py:1:1")
         );
     }
 

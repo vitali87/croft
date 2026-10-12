@@ -653,6 +653,35 @@ pub struct Diagnostic {
     pub severity: DiagnosticSeverity,
     pub message: String,
     pub tags: DiagnosticTags,
+    /// The rule the diagnostic reports (#1540): ruff's `F401`, ty's
+    /// `invalid-argument-type`, TypeScript's `2322`.
+    pub code: Option<DiagnosticCode>,
+}
+
+/// A diagnostic's rule code with the server's `source` and the rule's
+/// documentation link, what a user needs to silence the rule or look it up
+/// (#1540).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticCode {
+    pub value: String,
+    /// The diagnostic's own `source` (`Ruff`, `ty`, `ts`), if it named one.
+    pub source: Option<String>,
+    /// `codeDescription.href`, the rule's page.
+    pub href: Option<String>,
+}
+
+impl DiagnosticCode {
+    /// `source(code)` as VS Code writes it after the message, with `source`
+    /// standing in when the diagnostic named none; just the code without
+    /// either.
+    pub fn label(&self, fallback_source: &str) -> String {
+        let source = self.source.as_deref().unwrap_or(fallback_source);
+        if source.is_empty() {
+            self.value.clone()
+        } else {
+            format!("{source}({})", self.value)
+        }
+    }
 }
 
 /// The LSP `DiagnosticTag`s croft draws (#1522). Servers tag unused names
@@ -7348,6 +7377,8 @@ fn build_client_capabilities() -> ClientCapabilities {
             // unused or deprecated code would otherwise leave the tag out.
             publish_diagnostics: Some(PublishDiagnosticsClientCapabilities {
                 related_information: Some(true),
+                // Servers may leave the rule's link out otherwise (#1540).
+                code_description_support: Some(true),
                 tag_support: Some(lsp_types::TagSupport {
                     value_set: vec![
                         lsp_types::DiagnosticTag::UNNECESSARY,
@@ -8901,6 +8932,11 @@ while True:
             ]),
             "a server that checks tagSupport would otherwise leave the tags out"
         );
+        assert_eq!(
+            publish.code_description_support,
+            Some(true),
+            "#1540: a server may leave a rule's link out otherwise"
+        );
     }
 
     #[test]
@@ -8913,6 +8949,7 @@ while True:
             severity: DiagnosticSeverity::Hint,
             message: "`tmp` is declared but its value is never read.".into(),
             tags,
+            code: None,
         };
         let unused = to_lsp_diagnostic(&d(DiagnosticTags {
             unnecessary: true,

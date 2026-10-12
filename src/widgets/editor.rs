@@ -12869,7 +12869,9 @@ impl Editor {
     }
 
     /// Severities and messages of every diagnostic whose range covers the
-    /// character position `(line, ch)`. Decoded on demand from the retained
+    /// character position, each message followed by its rule as
+    /// `source(code)` and the rule's link on a line of its own (#1540).
+    /// The position is `(line, ch)`. Decoded on demand from the retained
     /// `diagnostics` (UTF-16 positions) rather than the per-line span cache so
     /// the messages don't have to be duplicated into the render-time cache.
     /// Only runs on a hover dwell, never per frame. A zero-width diagnostic is
@@ -12906,7 +12908,7 @@ impl Editor {
             };
             let to = to.max(from + 1);
             if ch >= from && ch < to {
-                out.push((d.severity, d.message.clone()));
+                out.push((d.severity, message_with_code(d)));
             }
         }
         out
@@ -17270,6 +17272,21 @@ fn paint_diagnostic_underline(
     }
 }
 
+/// A diagnostic's message for its hover (#1540): VS Code's `source(code)`
+/// after it, and the rule's documentation link below, when the server sent
+/// them.
+fn message_with_code(d: &crate::lsp::manager::Diagnostic) -> String {
+    let Some(code) = &d.code else {
+        return d.message.clone();
+    };
+    let mut text = format!("{}  {}", d.message, code.label(""));
+    if let Some(href) = &code.href {
+        text.push('\n');
+        text.push_str(href);
+    }
+    text
+}
+
 /// Draw a tagged diagnostic's look across `[start_char, end_char)` of a
 /// rendered row (#1522): Unnecessary code (unused, unreachable) faded, as VS
 /// Code draws it at reduced opacity, and Deprecated code struck through. The
@@ -21573,6 +21590,7 @@ mod tests {
             severity,
             message: String::from("test diagnostic"),
             tags: Default::default(),
+            code: None,
         }
     }
 
@@ -21978,6 +21996,7 @@ mod tests {
                 severity: DiagnosticSeverity::Error,
                 message: String::from("Type 'number' is not assignable to type 'string'."),
                 tags: Default::default(),
+                code: None,
             }],
         );
         assert_eq!(
@@ -21991,6 +22010,58 @@ mod tests {
         assert!(
             e.diagnostics_at(0, 0).is_empty(),
             "a point outside every diagnostic range must surface nothing"
+        );
+    }
+
+    /// #1540: the hover message carries the rule as `source(code)` and its
+    /// link on the next line; a diagnostic without a code reads as before.
+    #[test]
+    fn diagnostics_at_adds_the_rule_code_and_its_link() {
+        let mut e = editor_with("import os, json");
+        e.path = Some(PathBuf::from("/tmp/app.py"));
+        let diag = |start: u32, end: u32, message: &str, code| crate::lsp::manager::Diagnostic {
+            start_line: 0,
+            start_char: start,
+            end_line: 0,
+            end_char: end,
+            severity: crate::lsp::manager::DiagnosticSeverity::Warning,
+            message: message.into(),
+            tags: Default::default(),
+            code,
+        };
+        e.apply_diagnostics(
+            PathBuf::from("/tmp/app.py"),
+            vec![
+                diag(
+                    7,
+                    9,
+                    "`os` imported but unused",
+                    Some(crate::lsp::manager::DiagnosticCode {
+                        value: String::from("F401"),
+                        source: Some(String::from("Ruff")),
+                        href: Some(String::from(
+                            "https://docs.astral.sh/ruff/rules/unused-import",
+                        )),
+                    }),
+                ),
+                diag(11, 15, "`json` is unused", None),
+            ],
+        );
+        assert_eq!(
+            e.diagnostics_at(0, 8),
+            vec![(
+                crate::lsp::manager::DiagnosticSeverity::Warning,
+                String::from(
+                    "`os` imported but unused  Ruff(F401)\nhttps://docs.astral.sh/ruff/rules/unused-import"
+                )
+            )]
+        );
+        assert_eq!(
+            e.diagnostics_at(0, 12),
+            vec![(
+                crate::lsp::manager::DiagnosticSeverity::Warning,
+                String::from("`json` is unused")
+            )]
         );
     }
 
@@ -22010,6 +22081,7 @@ mod tests {
                 severity: DiagnosticSeverity::Warning,
                 message: String::from("missing semicolon"),
                 tags: Default::default(),
+                code: None,
             }],
         );
         assert_eq!(
@@ -22039,6 +22111,7 @@ mod tests {
                 severity: DiagnosticSeverity::Error,
                 message: String::from("unexpected token"),
                 tags: Default::default(),
+                code: None,
             }],
         );
         assert_eq!(

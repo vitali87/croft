@@ -10511,6 +10511,7 @@ impl App {
                     severity: d.severity,
                     message: d.message,
                     source: d.source.to_string(),
+                    code: None,
                 },
             ));
         }
@@ -10628,6 +10629,7 @@ impl App {
                             severity: d.severity,
                             message: d.message.clone(),
                             source: server.clone(),
+                            code: d.code.clone(),
                         });
                     }
                 }
@@ -48363,6 +48365,7 @@ impl App {
                 severity: d.severity,
                 message: d.message,
                 source,
+                code: d.code,
             },
         ))
     }
