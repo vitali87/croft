@@ -1,0 +1,1 @@
+fix: Search now runs look-ahead, look-behind and backreference patterns, such as `\d+ (?!USD)`, `(?<=@)\w+` and `(\w+) \1`, which it refused as invalid. They match, highlight, count and replace like any other pattern, with the case and whole-word toggles applied (#1552).
