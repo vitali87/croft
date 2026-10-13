@@ -5835,10 +5835,13 @@ impl App {
         let view_listener = Self::bind_view_socket();
         // A second croft on the same workspace finds the socket live and
         // leaves it to the first: one editor answers a workspace's agents.
-        let hook_listener = if cfg!(test) {
-            None
+        let (hook_listener, hook_bind_error) = if cfg!(test) {
+            (None, None)
         } else {
-            crate::agent_approval::bind(&root).ok()
+            match crate::agent_approval::bind(&root) {
+                Ok(listener) => (Some(listener), None),
+                Err(e) => (None, hook_bind_status(&e)),
+            }
         };
         let view_bind_error = VIEW_BIND_ERROR.lock().unwrap().take();
         let term = PtyTerminal::new(&root).context("spawning terminal")?;
@@ -6051,7 +6054,10 @@ impl App {
             sidebar_dwell: SidebarDwell::default(),
             pre_zen: None,
             layout_icon_areas: LayoutIconAreas::default(),
-            status: view_status(view_bind_error.as_deref()),
+            status: match hook_bind_error {
+                Some(hook) if view_bind_error.is_none() => hook,
+                _ => view_status(view_bind_error.as_deref()),
+            },
             persistence_warning: remote_persistence_status(
                 is_remote_session(),
                 std::env::var_os("CROFT_SESSION_PERSISTENT").is_some(),
@@ -72084,6 +72090,15 @@ fn view_status(view_bind_error: Option<&str>) -> String {
         Some(e) => format!("croft view is unavailable: {e}"),
         None => String::from("Ready"),
     }
+}
+
+/// What the startup status says when the agent hook socket could not be
+/// bound (#1368), so a hook that is never answered is not a mystery.
+/// `None` when another croft already serves this workspace: that one
+/// answers its agents, by design.
+fn hook_bind_status(e: &std::io::Error) -> Option<String> {
+    (e.kind() != std::io::ErrorKind::AddrInUse)
+        .then(|| format!("Agent edit approvals are unavailable: {e}"))
 }
 
 /// Remove `view-<pid>-<nonce>.sock` files whose croft is gone (#362).
