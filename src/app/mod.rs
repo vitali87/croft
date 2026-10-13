@@ -8970,9 +8970,6 @@ impl App {
             .unwrap_or(ws)
     }
 
-    /// The workspace root the focus-following surfaces resolve against:
-    /// the root owning the focused editor's file, else the primary
-    /// (#149 git, #151 testing/tasks/run).
     /// The folder the Testing view follows for workspace folder `root`
     /// (#1520): `root`, or in a monorepo whose root no runner claims, the
     /// package of the focused file that one does. Resolved again only when
@@ -8989,6 +8986,9 @@ impl App {
         found
     }
 
+    /// The workspace root the focus-following surfaces resolve against:
+    /// the root owning the focused editor's file, else the primary
+    /// (#149 git, #151 testing/tasks/run).
     fn active_workspace_root(&self) -> PathBuf {
         self.editor
             .path
