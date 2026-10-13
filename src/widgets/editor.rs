@@ -6501,21 +6501,21 @@ impl Editor {
 
     /// Hand the buffer's text to a worker thread for a syntax pass as `kind`.
     fn start_highlight_pass(&mut self, kind: LangKind) {
-        let text = self.lines.join("\n");
+        let lines = self.lines.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name(String::from("croft-highlight"))
             .spawn(move || {
                 // Nobody listening (the tab closed, or a newer pass replaced
                 // this one) is fine: the result is simply dropped.
-                let _ = tx.send(run_highlight_pass(kind, text));
+                let _ = tx.send(run_highlight_pass(kind, lines));
             });
         let request = self.highlight_requests;
         match spawned {
             Ok(_) => self.highlight_job = Some(HighlightJob { kind, request, rx }),
             // No thread to be had: highlight here, as before #850.
             Err(_) => {
-                let pass = run_highlight_pass(kind, self.lines.join("\n"));
+                let pass = run_highlight_pass(kind, self.lines.clone());
                 self.land_highlight_pass(pass, request);
             }
         }
@@ -13514,19 +13514,49 @@ struct HighlightPass {
     cost: std::time::Duration,
 }
 
-/// Highlight `text` as `kind` and scan its brackets outside the strings and
+/// Highlight `lines` as `kind` and scan its brackets outside the strings and
 /// comments the grammar found: everything `recompute_highlights` used to do
 /// inline, now run on a worker thread (#850).
-fn run_highlight_pass(kind: LangKind, text: String) -> HighlightPass {
+fn run_highlight_pass(kind: LangKind, lines: Vec<String>) -> HighlightPass {
     let started = std::time::Instant::now();
+    let text = lines.join("\n");
     let line_starts = compute_line_starts(text.as_bytes());
-    let (spans, protected) = crate::highlight::highlight_text_with_protected(
+    let (mut spans, protected) = crate::highlight::highlight_text_with_protected(
         &mut LangRegistry::new(),
         kind,
         text.as_bytes(),
         &line_starts,
     );
-    let lines: Vec<String> = text.split('\n').map(String::from).collect();
+    // A line can hold a `\n` of its own (one typed as a character), which
+    // the grammar reads as a line break. Fold those pieces' spans back onto
+    // their line, so the pass describes `lines` exactly: a pass over text
+    // that has not changed since then lands as is, instead of being carried
+    // through a line diff whose time budget makes the result vary run to run.
+    if spans.len() != lines.len() {
+        let mut pieces = spans.into_iter();
+        spans = lines
+            .iter()
+            .map(|line| {
+                let mut out = Vec::new();
+                let mut offset = 0;
+                for piece in line.split('\n') {
+                    out.extend(
+                        pieces
+                            .next()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|s| HiSpan {
+                                start: s.start + offset,
+                                end: s.end + offset,
+                                style: s.style,
+                            }),
+                    );
+                    offset += piece.len() + 1;
+                }
+                out
+            })
+            .collect();
+    }
     let brackets = scan_bracket_colors(&lines, &protected);
     HighlightPass {
         kind,
@@ -32425,7 +32455,7 @@ mod tests {
         let cpp = "// greet the user (politely\n#include <string>\nint main() {\n    std::string s = \"smile :)\";\n    char c = '(';\n    return s.size() + c;\n}\n";
         let c = "int main() {\n    char c = '(';\n    int v[] = {1};\n    return c;\n}\n";
         for (kind, src) in [(LangKind::Cpp, cpp), (LangKind::C, c)] {
-            let pass = run_highlight_pass(kind, src.to_string());
+            let pass = run_highlight_pass(kind, src.split('\n').map(String::from).collect());
             let red: Vec<(usize, usize)> = pass
                 .brackets
                 .iter()
@@ -32449,7 +32479,10 @@ mod tests {
     fn an_unmatched_cpp_brace_in_code_is_still_marked() {
         let pass = run_highlight_pass(
             LangKind::Cpp,
-            String::from("int f() {\n    return 0;\n}}\n"),
+            "int f() {\n    return 0;\n}}\n"
+                .split('\n')
+                .map(String::from)
+                .collect(),
         );
         assert_eq!(pass.brackets[2], vec![(0, 0), (1, UNEXPECTED_BRACKET)]);
     }
