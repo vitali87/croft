@@ -876,7 +876,11 @@ pub fn resolve(cfg: &DebugConfig, ctx: &SubstCtx) -> Result<ResolvedConfig, Stri
         module: get_str("module"),
         args,
         env,
-        cwd: get_str("cwd").map(|c| absolute_in(&c, &ctx.workspace_folder)),
+        // A member from another workspace folder (#1425) runs there when it
+        // names no cwd, not in the active folder the launch would default to.
+        cwd: get_str("cwd")
+            .map(|c| absolute_in(&c, &ctx.workspace_folder))
+            .or_else(|| cfg.root.clone()),
         pre_launch_task: get_str("preLaunchTask"),
         post_debug_task: get_str("postDebugTask"),
         stop_on_entry: obj
@@ -2654,8 +2658,6 @@ mod tests {
         assert!(by("Hid").presentation.is_some_and(|p| p.hidden));
     }
 
-    /// A compound resolves to its members in the order written, so the picker
-    /// and the launch sequence agree with the file.
     /// #1425: a multi-root workspace, `api` and `web`, each with its own
     /// launch.json.
     fn multi_root() -> (tempfile::TempDir, Vec<(String, PathBuf)>) {
@@ -2715,6 +2717,11 @@ mod tests {
             rc.program.as_deref(),
             Some(web.join("main.py").to_string_lossy().as_ref())
         );
+        assert_eq!(
+            rc.cwd.as_deref(),
+            Some(web.as_path()),
+            "a foreign member with no cwd runs in its own folder"
+        );
     }
 
     /// #1425, negative: a folder the workspace does not have, or a name
@@ -2768,6 +2775,8 @@ mod tests {
         );
     }
 
+    /// A compound resolves to its members in the order written, so the picker
+    /// and the launch sequence agree with the file.
     #[test]
     fn a_resolved_compound_yields_its_members_in_declaration_order() {
         let text = r#"{

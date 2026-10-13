@@ -32053,9 +32053,9 @@ impl App {
                 return;
             };
             let command = self
-                .task_command_line(&task)
+                .task_command_line_in(&task, root.clone())
                 .unwrap_or_else(|_| task.command.clone());
-            let Some(pane) = self.run_project_task(task) else {
+            let Some(pane) = self.run_project_task_in(task, root) else {
                 // run_project_task already reported why the pane failed.
                 return;
             };
@@ -38118,8 +38118,19 @@ impl App {
     /// expanded against the active workspace and file. The preLaunchTask
     /// gate matches the pane's finished command against this same line.
     fn task_command_line(&self, task: &crate::tasks::Task) -> Result<String, String> {
+        self.task_command_line_in(task, self.active_workspace_root())
+    }
+
+    /// [`Self::task_command_line`] against the workspace folder `root`: a
+    /// compound member's preLaunchTask from another folder (#1425) expands
+    /// `${workspaceFolder}` to that folder, not the active one.
+    fn task_command_line_in(
+        &self,
+        task: &crate::tasks::Task,
+        root: PathBuf,
+    ) -> Result<String, String> {
         task.command_line(&crate::dap::configs::SubstCtx {
-            workspace_folder: self.active_workspace_root(),
+            workspace_folder: root,
             file: self.editor.path.clone(),
             folders: self.workspace_folders(),
         })
@@ -38132,6 +38143,15 @@ impl App {
     /// correlate the task's FinishedCommand (the preLaunchTask gate, #250);
     /// `None` when no pane could be started (already reported in `status`).
     pub fn run_project_task(&mut self, task: crate::tasks::Task) -> Option<u64> {
+        let root = self.active_workspace_root();
+        self.run_project_task_in(task, root)
+    }
+
+    /// [`Self::run_project_task`] in the workspace folder `root`: the pane
+    /// starts there and the task's variables expand against it, so a
+    /// compound member's preLaunchTask from another folder (#1425) builds
+    /// that folder's project.
+    fn run_project_task_in(&mut self, task: crate::tasks::Task, root: PathBuf) -> Option<u64> {
         let pane_name = format!("Task: {}", task.label);
         // The task's problemMatcher (#252), translated up front so both the
         // reuse and fresh-pane paths assign the same thing (or clear a
@@ -38144,7 +38164,7 @@ impl App {
         // Ctrl-E + Ctrl-U first: the idle shell's line editor may hold a
         // half-typed command that would otherwise concatenate and run
         // (same rule `format_cd_command` pins for the cd seed).
-        let line = match self.task_command_line(&task) {
+        let line = match self.task_command_line_in(&task, root.clone()) {
             Ok(line) => line,
             Err(e) => {
                 self.status = format!("Task \u{201c}{}\u{201d} not run: {e}", task.label);
@@ -38159,12 +38179,11 @@ impl App {
         // old one. Shares `pane_is_idle_at` with the runnable-fence path
         // (#430) — this guard existed twice and only one copy was fixed,
         // which is precisely how the two defects survived a green suite.
-        let active = self.active_workspace_root();
-        let root = active.canonicalize().unwrap_or(active);
+        let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
         if let Some(idx) = self
             .terminals
             .iter()
-            .position(|t| pane_is_idle_at(t, &pane_name, &root))
+            .position(|t| pane_is_idle_at(t, &pane_name, &canonical))
         {
             // Reused panes may be folded (#313): the release notes name the
             // build pane as the thing you would fold, and a task written into
@@ -38180,7 +38199,7 @@ impl App {
             self.assign_task_matcher(uid, matcher);
             return Some(uid);
         }
-        match crate::widgets::terminal::PtyTerminal::new(&self.active_workspace_root()) {
+        match crate::widgets::terminal::PtyTerminal::new(&root) {
             Ok(mut term) => {
                 term.set_manual_name(Some(pane_name));
                 term.write_input(command.as_bytes());
