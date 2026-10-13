@@ -2792,6 +2792,8 @@ exit 1"#
             tx: &tx,
             epoch: 0,
             codeql: Path::new("codeql"),
+            control: &RunControl::default(),
+            request: 1,
         };
         run_all(root, &etx);
         let cases: Vec<(String, TestStatus)> = rx
