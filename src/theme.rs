@@ -362,7 +362,21 @@ impl Theme {
         };
         // Light themes take the light adaptation of the dark vocabulary
         // first, so the fill / foreground split below sees light-theme roles.
-        let adapted = if light { light_ui(dark) } else { dark };
+        // A strongly saturated color outside that vocabulary is a status
+        // foreground (the breakpoint red, an error hue): the light fallback
+        // would pale it into a grey fill and so into the background, so it
+        // goes straight to the contrast lift instead.
+        let adapted = match dark {
+            Color::Rgb(r, g, b)
+                if light
+                    && light_vocab((r, g, b)).is_none()
+                    && r.max(g).max(b) - r.min(g).min(b) >= 0x80 =>
+            {
+                return rgb(raise_contrast((r, g, b), bg, fg, 7.0));
+            }
+            _ if light => light_ui(dark),
+            _ => dark,
+        };
         let c = match adapted {
             Color::Rgb(r, g, b) => (r, g, b),
             Color::White | Color::Gray | Color::DarkGray => fg,
@@ -404,7 +418,13 @@ fn light_ui(dark: Color) -> Color {
             other => other,
         };
     };
-    let mapped = match (r, g, b) {
+    rgb(light_vocab((r, g, b)).unwrap_or_else(|| light_fallback((r, g, b))))
+}
+
+/// The recurring dark chrome colors with a hand-picked VS Code Light
+/// Modern counterpart; `None` for any other color.
+fn light_vocab((r, g, b): (u8, u8, u8)) -> Option<(u8, u8, u8)> {
+    Some(match (r, g, b) {
         // -- fills -----------------------------------------------------
         // Popup / widget body -> quickInput.background.
         (0x16, 0x18, 0x1f) => (0xf8, 0xf8, 0xf8),
@@ -472,9 +492,8 @@ fn light_ui(dark: Color) -> Color {
         // foregrounds (review round 1).
         (0xae, 0xc6, 0xff) => (0xad, 0xd6, 0xff),
         (0xff, 0x8c, 0x2a) => (0xff, 0x8c, 0x2a),
-        other => light_fallback(other),
-    };
-    rgb(mapped)
+        _ => return None,
+    })
 }
 
 impl Theme {
@@ -1438,6 +1457,35 @@ mod tests {
             assert_eq!(t.ui(band), kept, "{}", t.id());
             assert_eq!(t.ui(Color::Reset), Color::Reset);
         }
+    }
+
+    /// #1548: on High Contrast Light a saturated status foreground outside
+    /// the light vocabulary (the breakpoint dot's red) stays a readable
+    /// red, not paled by the light fallback into a grey fill and so into
+    /// the white background.
+    #[test]
+    fn high_contrast_light_keeps_unmapped_status_hues_visible() {
+        let light = Theme::from_id("hc-light");
+        for hue in [(0xe5, 0x14, 0x00), (0x00, 0x7a, 0xcc), (0x10, 0xc0, 0x30)] {
+            let Color::Rgb(r, g, b) = light.ui(rgb(hue)) else {
+                panic!("rgb in, rgb out");
+            };
+            assert!(
+                contrast_ratio((r, g, b), (0xff, 0xff, 0xff)) >= 7.0,
+                "{hue:?} -> {:?}",
+                (r, g, b)
+            );
+            assert!(
+                r.max(g).max(b) - r.min(g).min(b) >= 0x30,
+                "{hue:?} keeps its hue"
+            );
+        }
+        // Negative: Croft Light's own fallback is unchanged.
+        let croft = Theme::from_id("light");
+        assert_eq!(
+            croft.ui(rgb((0xe5, 0x14, 0x00))),
+            rgb(light_fallback((0xe5, 0x14, 0x00)))
+        );
     }
 
     /// #1548 negative: high contrast is opt-in per theme. Every other theme
