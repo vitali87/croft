@@ -9152,11 +9152,11 @@ impl App {
     fn sync_blame(&mut self) {
         self.editor.blame_enabled = self.inline_blame_enabled;
         self.editor.provenance_overlay = self.provenance_overlay;
-        self.editor.auto_close_pairs = self.auto_close_pairs_for(self.editor.scope_id());
+        self.editor.auto_close_pairs = self.auto_close_pairs_for(editor_scope_id(&self.editor));
         self.editor.whitespace_mode = whitespace_mode_in(
             &self.language_prefs,
             self.whitespace_mode,
-            self.editor.scope_id(),
+            editor_scope_id(&self.editor),
         );
         if !self.inline_blame_enabled {
             return;
@@ -12120,7 +12120,7 @@ impl App {
         let Some((ch, seq)) = taken else {
             return;
         };
-        if !self.format_on_type_for(self.editor.scope_id()) || !self.editor_is_text() {
+        if !self.format_on_type_for(editor_scope_id(&self.editor)) || !self.editor_is_text() {
             return;
         }
         if seq != self.editor.edit_seq {
@@ -18500,7 +18500,7 @@ impl App {
             ed.show_indent_guides = self.indent_guides_enabled;
             ed.show_bracket_colors = self.bracket_colors_enabled;
             ed.provenance_overlay = self.provenance_overlay;
-            ed.whitespace_mode = whitespace_mode_in(langs, ws_global, ed.scope_id());
+            ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
             ed.diff_ws_default = self.diff_ws_default;
         }
         for group in self.editor_layout.inactive_groups_mut() {
@@ -18512,7 +18512,7 @@ impl App {
                 ed.show_indent_guides = self.indent_guides_enabled;
                 ed.show_bracket_colors = self.bracket_colors_enabled;
                 ed.provenance_overlay = self.provenance_overlay;
-                ed.whitespace_mode = whitespace_mode_in(langs, ws_global, ed.scope_id());
+                ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
                 ed.diff_ws_default = self.diff_ws_default;
                 ed.diff_ws_default = self.diff_ws_default;
             }
@@ -57522,9 +57522,7 @@ impl App {
 
     /// Inlay hints for a file in language `scope` (#1440).
     fn inlay_hints_enabled_for(&self, scope: &str) -> bool {
-        self.language_prefs_for(scope)
-            .and_then(|l| l.disable_inlay_hints)
-            .map_or(self.inlay_hints_enabled, |off| !off)
+        inlay_hints_on_in(&self.language_prefs, self.inlay_hints_enabled, scope)
     }
 
     /// Whitespace rendering for a file in language `scope` (#1440).
@@ -57538,7 +57536,7 @@ impl App {
     /// (not a diff/sheet/image preview). `supports_formatting` is passed in so
     /// the decision is pure and unit-testable.
     fn format_on_save_eligible(&self, supports_formatting: bool) -> bool {
-        self.format_on_save_for(self.editor.scope_id())
+        self.format_on_save_for(editor_scope_id(&self.editor))
             && supports_formatting
             && self.editor.path.is_some()
             && self.editor.diff.is_none()
@@ -59683,7 +59681,7 @@ impl App {
         }
         self.format_on_save = p.format_on_save;
         self.format_on_type = p.format_on_type;
-        self.language_prefs = p.languages.clone();
+        let old_languages = std::mem::replace(&mut self.language_prefs, p.languages.clone());
         self.auto_save = p.auto_save;
         self.auto_save_on_focus_change = p.auto_save_on_focus_change;
         self.copy_on_select = p.copy_on_select;
@@ -59767,15 +59765,30 @@ impl App {
         self.whitespace_mode =
             crate::widgets::editor::WhitespaceMode::from_pref(&p.render_whitespace);
         self.editor.whitespace_mode = self.whitespace_mode;
-        if !p.disable_inlay_hints && !self.inlay_hints_enabled {
-            self.inlay_hints_enabled = true;
-            self.request_inlay_hints_for_open_editors();
-        } else if p.disable_inlay_hints && self.inlay_hints_enabled {
-            self.inlay_hints_enabled = false;
-            self.editor.clear_inlay_hints();
-            for group in self.editor_layout.inactive_groups_mut() {
-                group.clear_inlay_hints();
+        // A per-language `disable_inlay_hints` change (#1440) moves a file's
+        // effective setting as surely as the global one does.
+        let hint_overrides =
+            |langs: &std::collections::BTreeMap<String, crate::prefs::LanguagePrefs>| {
+                langs
+                    .iter()
+                    .filter_map(|(k, l)| l.disable_inlay_hints.map(|off| (k.clone(), off)))
+                    .collect::<Vec<_>>()
+            };
+        let hints_were_on = self.inlay_hints_enabled;
+        self.inlay_hints_enabled = !p.disable_inlay_hints;
+        if hints_were_on != self.inlay_hints_enabled
+            || hint_overrides(&old_languages) != hint_overrides(&self.language_prefs)
+        {
+            let (langs, global) = (&self.language_prefs, self.inlay_hints_enabled);
+            if !inlay_hints_on_in(langs, global, editor_scope_id(&self.editor)) {
+                self.editor.clear_inlay_hints();
             }
+            for group in self.editor_layout.inactive_groups_mut() {
+                if !inlay_hints_on_in(langs, global, editor_scope_id(group)) {
+                    group.clear_inlay_hints();
+                }
+            }
+            self.request_inlay_hints_for_open_editors();
         }
         if p.disable_inline_values && self.inline_values_enabled {
             self.inline_values_enabled = false;
@@ -69035,7 +69048,48 @@ fn whitespace_mode_in(
 /// The VS Code language id of the file at `path`, as its tab would have
 /// it (#1440: which `languages` block applies).
 fn path_scope_id(path: &Path) -> &'static str {
-    crate::widgets::editor::language_scope_id(crate::highlight::lang_for_path(path))
+    settings_scope_id(
+        crate::widgets::editor::language_scope_id(crate::highlight::lang_for_path(path)),
+        Some(path),
+    )
+}
+
+/// The VS Code language id of `ed`'s buffer for settings lookup (#1440).
+fn editor_scope_id(ed: &crate::widgets::editor::Editor) -> &'static str {
+    settings_scope_id(ed.scope_id(), ed.path.as_deref())
+}
+
+/// Refines the highlighter's language id `base` to the VS Code id the
+/// file's extension carries where several ids share one grammar (#1440):
+/// `.jsx` is `javascriptreact`, `.jsonc` is `jsonc`, `.scss` is `scss`, so
+/// their `"[…]"` blocks apply. A buffer switched to another language keeps
+/// that language's id.
+fn settings_scope_id(base: &'static str, path: Option<&Path>) -> &'static str {
+    let ext = path
+        .and_then(|p| p.extension())
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match (base, ext.as_deref()) {
+        ("javascript", Some("jsx")) => "javascriptreact",
+        ("json", Some("jsonc")) => "jsonc",
+        ("css", Some("scss")) => "scss",
+        ("css", Some("sass")) => "sass",
+        _ => base,
+    }
+}
+
+/// Inlay hints for a file in language `scope` (#1440): its language
+/// block's `disable_inlay_hints`, else `global`. A free fn so callers can
+/// use it while they hold the editors mutably.
+fn inlay_hints_on_in(
+    langs: &std::collections::BTreeMap<String, crate::prefs::LanguagePrefs>,
+    global: bool,
+    scope: &str,
+) -> bool {
+    langs
+        .get(scope)
+        .and_then(|l| l.disable_inlay_hints)
+        .map_or(global, |off| !off)
 }
 
 /// Returns true if the given key event should trigger "Save".

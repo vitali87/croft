@@ -34662,6 +34662,68 @@ fn the_active_editor_takes_its_language_s_settings() {
     assert_eq!(app.editor.whitespace_mode, app.whitespace_mode);
 }
 
+/// #1440: files whose grammar is shared take their own VS Code language
+/// id's block: `[javascriptreact]` for `.jsx`, `[jsonc]` for `.jsonc`,
+/// `[scss]` for `.scss`, not the `javascript`/`json`/`css` they highlight as.
+#[test]
+fn a_language_block_applies_to_files_that_share_another_language_s_grammar() {
+    let (tmp, mut app) = app_with_vscode_settings(
+        r#"{
+            "[javascriptreact]": { "editor.formatOnSave": true },
+            "[jsonc]": { "editor.formatOnSave": true },
+            "[scss]": { "editor.formatOnSave": true }
+        }"#,
+    );
+    for name in ["a.jsx", "a.jsonc", "a.scss"] {
+        std::fs::write(tmp.path().join(name), "x\n").unwrap();
+        app.editor.open(&tmp.path().join(name)).unwrap();
+        assert!(
+            app.format_on_save_eligible(true),
+            "{name} takes its own block"
+        );
+    }
+    // Negative: the plain-grammar files keep the global off.
+    for name in ["a.js", "a.json", "a.css"] {
+        std::fs::write(tmp.path().join(name), "x\n").unwrap();
+        app.editor.open(&tmp.path().join(name)).unwrap();
+        assert!(
+            !app.format_on_save_eligible(true),
+            "{name} keeps the global"
+        );
+    }
+}
+
+/// #1440: a settings reload that changes only a language block's inlay
+/// hints clears that language's cached hints, as the global toggle would.
+#[test]
+fn a_reload_disabling_a_language_s_inlay_hints_clears_its_cached_hints() {
+    let (tmp, mut app) = app_with_vscode_settings("{}");
+    app.editor.open(&tmp.path().join("m.py")).unwrap();
+    let py = app.editor.path.clone().unwrap();
+    app.editor.apply_inlay_hints(
+        py,
+        vec![crate::lsp::manager::InlayHintItem {
+            line: 0,
+            character: 1,
+            label: String::from(": int"),
+        }],
+    );
+    assert!(!app.editor.inlay_spans_for_test(0).is_empty());
+
+    let mut prefs = app.merged_settings_here().prefs;
+    prefs
+        .languages
+        .entry(String::from("python"))
+        .or_default()
+        .disable_inlay_hints = Some(true);
+    app.apply_merged_settings(&prefs);
+    assert!(app.inlay_hints_enabled, "the global setting stays on");
+    assert!(
+        app.editor.inlay_spans_for_test(0).is_empty(),
+        "the Python tab's hints go with its language's setting"
+    );
+}
+
 #[test]
 fn a_second_save_while_a_format_is_in_flight_still_writes_the_first_file() {
     // The latch holds ONE path and the manager tracks one format request id,
