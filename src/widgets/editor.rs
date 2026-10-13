@@ -7261,6 +7261,14 @@ impl Editor {
             return false;
         }
         let byte = self.byte_index(self.cursor_row, self.cursor_col);
+        // A Vue or Svelte component's `<script>` and `<style>` blocks are
+        // script and CSS, not markup: a `>` there is a comparison, a generic
+        // or a child combinator, never the end of a tag.
+        if matches!(self.lang, Some(LangKind::Vue | LangKind::Svelte))
+            && in_sfc_script_or_style(&self.lines, self.cursor_row, byte)
+        {
+            return false;
+        }
         let name = match self.lines.get(self.cursor_row) {
             Some(line) => tag_auto_close_name(line, byte, self.lang).map(str::to_owned),
             None => None,
@@ -17168,6 +17176,48 @@ fn lang_auto_closes_tags(lang: Option<LangKind>) -> bool {
                 | LangKind::Svelte
         )
     )
+}
+
+/// Whether the caret at (`row`, `byte`) of a Vue or Svelte component sits
+/// inside a `<script>` or `<style>` block: some earlier opening tag of one,
+/// with its `>` typed, has no matching closing tag before the caret. A
+/// lexical scan, like the rest of tag auto-close, so it errs toward "inside"
+/// only where markup is unlikely anyway.
+fn in_sfc_script_or_style(lines: &[String], row: usize, byte: usize) -> bool {
+    let mut inside = false;
+    for (r, line) in lines.iter().enumerate().take(row + 1) {
+        let text = if r == row {
+            line.get(..byte).unwrap_or(line)
+        } else {
+            line.as_str()
+        };
+        let lower = text.to_ascii_lowercase();
+        let mut from = 0;
+        while let Some(off) = lower[from..].find('<') {
+            let at = from + off;
+            let tail = &lower[at + 1..];
+            let (closing, name_part) = match tail.strip_prefix('/') {
+                Some(t) => (true, t),
+                None => (false, tail),
+            };
+            let named = ["script", "style"].iter().any(|n| {
+                name_part.strip_prefix(n).is_some_and(|after| {
+                    after.is_empty() || after.starts_with(|c: char| c == '>' || c.is_whitespace())
+                })
+            });
+            if named {
+                if closing {
+                    inside = false;
+                } else if tail.contains('>') {
+                    // Only a finished opening tag starts the block; the one
+                    // still being typed (`<script lang="ts"`) does not.
+                    inside = true;
+                }
+            }
+            from = at + 1;
+        }
+    }
+    inside
 }
 
 /// The tag name a `>` typed at `byte` in `line` should close, or `None` when
@@ -35229,6 +35279,38 @@ mod tests {
             let mut e = tag_editor("<div", lang);
             e.insert_char('>');
             assert_eq!(e.lines[0], "<div>", "{lang:?} must not auto-close tags");
+        }
+    }
+
+    /// #1632: a Vue or Svelte component's template closes tags like HTML,
+    /// but its `<script>` and `<style>` blocks are code, where a `>` after
+    /// a generic or inside a string must stay a single `>`.
+    #[test]
+    fn sfc_script_and_style_blocks_never_auto_close_tags() {
+        for lang in [LangKind::Vue, LangKind::Svelte] {
+            for (open, line) in [
+                ("<script lang=\"ts\">", "const f = <T extends unknown"),
+                ("<script>", "const s = \"<div"),
+                ("<style>", "a <b"),
+            ] {
+                let mut e = editor_with(&format!("{open}\n{line}"));
+                e.lang = Some(lang);
+                e.cursor_row = 1;
+                e.cursor_col = e.lines[1].chars().count();
+                e.insert_char('>');
+                assert_eq!(e.lines[1], format!("{line}>"), "{lang:?} {open} {line}");
+            }
+            // After the block ends, the template closes tags again.
+            let mut e = editor_with("<script>\nlet n = 1;\n</script>\n<div");
+            e.lang = Some(lang);
+            e.cursor_row = 3;
+            e.cursor_col = 4;
+            e.insert_char('>');
+            assert_eq!(e.lines[3], "<div></div>", "{lang:?}");
+            // Typing the `<script>` tag itself still closes it.
+            let mut e = tag_editor("<script lang=\"ts\"", lang);
+            e.insert_char('>');
+            assert_eq!(e.lines[0], "<script lang=\"ts\"></script>", "{lang:?}");
         }
     }
 
