@@ -17222,6 +17222,42 @@ fn opening_a_config_file_keeps_the_active_tabs_unsaved_edits() {
     assert_eq!(kept.lines, vec![String::from("unsaved")]);
 }
 
+/// #1617: Open Settings (JSON) on a fresh install creates a `config.json`
+/// with no settings in it. Seeding every default made each one a user
+/// setting, over an `extends` base and over later default changes.
+#[test]
+fn open_settings_json_seeds_a_config_with_no_settings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let path = tmp.path().join("user").join("config.json");
+    app.open_config_file_in_editor(path.clone(), ConfigFileSeed::Settings);
+    assert_eq!(app.editor.path.as_deref(), Some(path.as_path()));
+    let written = std::fs::read_to_string(&path).unwrap();
+    let doc: serde_json::Value =
+        serde_json::from_str(&crate::tasks::strip_jsonc(&written)).unwrap();
+    assert_eq!(doc, serde_json::json!({}), "{written}");
+    assert!(written.contains("docs/SETTINGS.md"), "{written}");
+    assert_eq!(
+        crate::prefs::Prefs::load(&path).unwrap(),
+        crate::prefs::Prefs::default()
+    );
+}
+
+/// #1617 negative: an existing `config.json` opens as it is.
+#[test]
+fn open_settings_json_leaves_an_existing_config_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, "{ \"vim_mode\": true }\n").unwrap();
+    app.open_config_file_in_editor(path.clone(), ConfigFileSeed::Settings);
+    assert_eq!(app.editor.path.as_deref(), Some(path.as_path()));
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "{ \"vim_mode\": true }\n"
+    );
+}
+
 #[test]
 fn bounded_output_gives_up_on_a_command_that_hangs() {
     let started = std::time::Instant::now();
@@ -33667,6 +33703,53 @@ fn open_line_above_relocated_from_cmd_shift_o_to_cmd_shift_enter() {
         KeyCode::Char('o'),
         KeyModifiers::SUPER | KeyModifiers::SHIFT
     )));
+}
+
+/// #1181: Ctrl+/ in a file with no comment syntax says so, as the palette
+/// command does, instead of doing nothing silently; in a file croft has no
+/// grammar for but knows the comment of, it comments.
+#[test]
+fn ctrl_slash_reports_a_file_with_no_comment_and_comments_one_by_extension() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("notes.unknownext");
+    std::fs::write(&plain, "hello\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&plain).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "hello");
+    assert_eq!(
+        app.status,
+        "Toggle Line Comment: no comment for this language"
+    );
+    let kt = tmp.path().join("App.kt");
+    std::fs::write(&kt, "class App\n").unwrap();
+    app.editor.open_pinned(&kt).unwrap();
+    app.status.clear();
+    app.handle_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "// class App");
+    assert!(app.status.is_empty(), "{}", app.status);
+}
+
+/// #1181 negative: Ctrl+/ on a blank line of a language that has a comment
+/// does nothing, without claiming the language has no comment.
+#[test]
+fn ctrl_slash_on_a_blank_line_does_not_report_no_comment() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (name, text) in [("main.rs", "   \n"), ("index.html", "\n")] {
+        let path = tmp.path().join(name);
+        std::fs::write(&path, text).unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open_pinned(&path).unwrap();
+        app.focus_pane(Pane::Editor);
+        app.status.clear();
+        app.handle_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(app.editor.lines[0], text.trim_end_matches('\n'), "{name}");
+        assert!(app.status.is_empty(), "{name}: {}", app.status);
+    }
 }
 
 #[test]
