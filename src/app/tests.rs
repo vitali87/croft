@@ -33791,6 +33791,77 @@ fn switch_header_source_says_when_there_is_no_counterpart() {
     );
 }
 
+/// #1360: switching to the counterpart keeps unsaved edits in the source,
+/// which is still there, dirty, when Alt+O comes back to it.
+#[test]
+fn alt_o_keeps_unsaved_edits_in_the_current_buffer() {
+    let (tmp, mut app) = c_workspace(&["src/geom.cpp", "include/geom.hpp"], "src/geom.cpp");
+    app.editor.lines[0] = String::from("int unsaved;");
+    app.editor.dirty = true;
+    app.handle_key(key(KeyCode::Char('o'), KeyModifiers::ALT))
+        .unwrap();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("include/geom.hpp").as_path()),
+        "{}",
+        app.status
+    );
+    app.handle_key(key(KeyCode::Char('o'), KeyModifiers::ALT))
+        .unwrap();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("src/geom.cpp").as_path())
+    );
+    assert_eq!(app.editor.lines[0], "int unsaved;");
+    assert!(app.editor.dirty);
+}
+
+/// #1360: a file in a secondary root of a multi-root workspace finds its
+/// counterpart across that root's `include/` and `src/` split.
+#[test]
+fn alt_o_resolves_against_the_root_that_owns_the_file() {
+    let primary = tempfile::tempdir().unwrap();
+    let secondary = tempfile::tempdir().unwrap();
+    for f in ["src/foo.cpp", "include/foo.hpp"] {
+        let p = secondary.path().join(f);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, format!("// {f}\n")).unwrap();
+    }
+    let mut app = App::new(primary.path().to_path_buf()).unwrap();
+    app.roots.add(secondary.path().to_path_buf());
+    app.file_finder_index = Some(std::sync::Arc::new(Vec::new()));
+    app.file_finder_index_rx = None;
+    app.editor
+        .open(&secondary.path().join("src/foo.cpp"))
+        .unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('o'), KeyModifiers::ALT))
+        .unwrap();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(secondary.path().join("include/foo.hpp").as_path()),
+        "{}",
+        app.status
+    );
+}
+
+/// #1360: Alt+O before the background index lands still finds a
+/// counterpart that only the anywhere-in-the-workspace search reaches.
+#[test]
+fn alt_o_builds_the_index_when_it_has_not_landed() {
+    let (tmp, mut app) = c_workspace(&["lib/geom.cpp", "api/geom.hpp"], "lib/geom.cpp");
+    app.file_finder_index = None;
+    app.file_finder_index_rx = None;
+    app.handle_key(key(KeyCode::Char('o'), KeyModifiers::ALT))
+        .unwrap();
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("api/geom.hpp").as_path()),
+        "{}",
+        app.status
+    );
+}
+
 /// #1360, negative: in a file that is not C-family, Alt+O switches
 /// nothing, and the palette command says what it works on.
 #[test]

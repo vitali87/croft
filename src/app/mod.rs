@@ -49297,22 +49297,43 @@ impl App {
             return;
         }
         self.poll_file_finder_index();
-        let index: Vec<PathBuf> = self
-            .file_finder_index
-            .as_ref()
-            .map(|entries| entries.iter().map(|e| e.path.clone()).collect())
-            .unwrap_or_default();
-        let root = self.workspace_root().to_path_buf();
+        // The root that owns the file, so a file in a secondary root of a
+        // multi-root workspace finds its counterpart in that root.
+        let root = self
+            .roots
+            .owning_root(&path)
+            .unwrap_or_else(|| self.roots.primary())
+            .to_path_buf();
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let Some(found) = crate::header_source::counterpart(&path, &root, &index, &|p| p.is_file())
-        else {
+        let index_paths = |app: &Self| -> Vec<PathBuf> {
+            app.file_finder_index
+                .as_ref()
+                .map(|entries| entries.iter().map(|e| e.path.clone()).collect())
+                .unwrap_or_default()
+        };
+        let is_file = |p: &Path| p.is_file();
+        let mut found =
+            crate::header_source::counterpart(&path, &root, &index_paths(self), &is_file);
+        // The background index has not landed yet: walk the workspace
+        // synchronously this once, as Go to File does, so the
+        // anywhere-in-the-workspace fallback is not answered from nothing.
+        if found.is_none() && self.file_finder_index.is_none() {
+            let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
+            let entries = crate::widgets::file_finder::build_multi_file_index(&roots);
+            self.file_finder_index = Some(std::sync::Arc::new(entries));
+            self.file_finder_index_rx = None;
+            found = crate::header_source::counterpart(&path, &root, &index_paths(self), &is_file);
+        }
+        let Some(found) = found else {
             self.status = format!("No header/source counterpart for {name}");
             return;
         };
-        match self.editor.open(&found) {
+        // A tab-aware open: the counterpart gets its own tab (or its
+        // existing one), so unsaved edits in the current buffer survive.
+        match self.editor.open_pinned(&found) {
             Ok(()) => {
                 self.sync_open_file_poll_mtime();
                 self.focus_pane(Pane::Editor);
