@@ -10923,6 +10923,7 @@ impl App {
                     severity: d.severity,
                     message: d.message,
                     source: d.source.to_string(),
+                    code: None,
                 },
             ));
         }
@@ -11040,6 +11041,7 @@ impl App {
                             severity: d.severity,
                             message: d.message.clone(),
                             source: server.clone(),
+                            code: d.code.clone(),
                         });
                     }
                 }
@@ -49639,6 +49641,7 @@ impl App {
                 severity: d.severity,
                 message: d.message,
                 source,
+                code: d.code,
             },
         ))
     }
@@ -59622,10 +59625,14 @@ impl App {
                     counts.join(", ")
                 };
                 let item = self.problems.top_diagnostic().map(|(group, it)| {
-                    let source = if it.source.is_empty() {
+                    let source = match &it.code {
+                        Some(code) => code.label(&it.source),
+                        None => it.source.clone(),
+                    };
+                    let source = if source.is_empty() {
                         String::new()
                     } else {
-                        format!(" ({})", it.source)
+                        format!(" ({source})")
                     };
                     format!(
                         "{} line {}: {}{source}",

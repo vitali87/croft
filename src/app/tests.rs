@@ -1727,6 +1727,7 @@ fn hovering_a_diagnostic_on_punctuation_shows_its_message_synchronously() {
             severity: DiagnosticSeverity::Error,
             message: String::from("unexpected token"),
             tags: Default::default(),
+            code: None,
         }],
     );
     // text_x = x(0) + gutter(2) + 1 = 3, so cell col 4 is char 1 (the `.`).
@@ -31926,6 +31927,7 @@ fn diag(
         severity,
         message: String::from("test"),
         tags: Default::default(),
+        code: None,
     }
 }
 
@@ -33525,6 +33527,7 @@ fn typing_in_the_problems_panel_filters_and_esc_clears_before_leaving() {
                 severity: DiagnosticSeverity::Error,
                 message: String::from("mismatched types"),
                 tags: Default::default(),
+                code: None,
             },
             Diagnostic {
                 start_line: 2,
@@ -33534,6 +33537,7 @@ fn typing_in_the_problems_panel_filters_and_esc_clears_before_leaving() {
                 severity: DiagnosticSeverity::Warning,
                 message: String::from("function `run` is never used"),
                 tags: Default::default(),
+                code: None,
             },
         ],
     );
@@ -33585,6 +33589,7 @@ fn clicking_a_problem_row_opens_that_file_at_the_line() {
             severity: DiagnosticSeverity::Warning,
             message: String::from("function `run` is never used"),
             tags: Default::default(),
+            code: None,
         }],
     );
     app.lsp_diagnostics.insert(file.clone(), by_server);
@@ -33671,6 +33676,7 @@ fn task_matcher_hints_stay_out_of_the_problems_list_and_its_count() {
         severity,
         message: String::from("m"),
         source: String::from("task"),
+        code: None,
     };
     app.build_diagnostics.insert(
         a.clone(),
@@ -53221,6 +53227,7 @@ fn fix_with_navigator_lands_on_the_diagnostic_and_refuses_without_a_seat() {
             severity: DiagnosticSeverity::Warning,
             message: String::from("unused import: `std::io`"),
             tags: Default::default(),
+            code: None,
         }],
     );
     app.lsp_diagnostics.insert(file.clone(), by_server);
@@ -66468,6 +66475,7 @@ fn a_proposals_diagnostics_show_in_the_popup_not_the_buffer() {
             severity: crate::lsp::manager::DiagnosticSeverity::Error,
             message: "Undefined name `nope_undefined`".into(),
             tags: Default::default(),
+            code: None,
         }],
     }]);
     assert!(
@@ -82944,6 +82952,7 @@ fn diag_on_line(line: u32, message: &str) -> crate::lsp::manager::Diagnostic {
         severity: crate::lsp::manager::DiagnosticSeverity::Warning,
         message: String::from(message),
         tags: Default::default(),
+        code: None,
     }
 }
 
@@ -84478,6 +84487,7 @@ fn problem(
         severity,
         message: message.into(),
         source: "ruff".into(),
+        code: None,
     }
 }
 
@@ -84507,6 +84517,24 @@ fn the_problems_tab_is_announced_with_its_counts_and_top_entry() {
     assert_eq!(
         snap.item.as_deref(),
         Some("app.py line 4: Undefined name `totl` (ruff)")
+    );
+    // #1540: a diagnostic with a rule announces it as the row shows it.
+    let mut coded = problem(0, Error, "`os` imported but unused");
+    coded.code = Some(crate::lsp::manager::DiagnosticCode {
+        value: String::from("F401"),
+        source: Some(String::from("Ruff")),
+        href: None,
+    });
+    app.problems
+        .set_groups(vec![crate::widgets::problems::ProblemGroup {
+            path: tmp.path().join("app.py"),
+            name: "app.py".into(),
+            rel_dir: String::new(),
+            items: vec![coded],
+        }]);
+    assert_eq!(
+        app.a11y_snapshot().item.as_deref(),
+        Some("app.py line 1: `os` imported but unused (Ruff(F401))")
     );
 }
 

@@ -301,6 +301,17 @@ pub(crate) fn convert_diagnostic(d: &lsp_types::Diagnostic) -> Diagnostic {
             unnecessary: tagged(lsp_types::DiagnosticTag::UNNECESSARY),
             deprecated: tagged(lsp_types::DiagnosticTag::DEPRECATED),
         },
+        code: d
+            .code
+            .as_ref()
+            .map(|code| crate::lsp::manager::DiagnosticCode {
+                value: match code {
+                    lsp_types::NumberOrString::Number(n) => n.to_string(),
+                    lsp_types::NumberOrString::String(s) => s.clone(),
+                },
+                source: d.source.clone().filter(|s| !s.is_empty()),
+                href: d.code_description.as_ref().map(|c| c.href.to_string()),
+            }),
     }
 }
 
@@ -1737,6 +1748,62 @@ mod tests {
         let unknown: lsp_types::DiagnosticTag =
             serde_json::from_value(serde_json::json!(7)).unwrap();
         assert!(!convert_diagnostic(&wire(Some(vec![unknown]))).tags.any());
+    }
+
+    /// #1540: the rule code survives the conversion, a string (ruff, ty)
+    /// or a number (TypeScript), with the diagnostic's source and its link.
+    #[test]
+    fn convert_diagnostic_keeps_the_rule_code_source_and_link() {
+        let wire: lsp_types::Diagnostic = serde_json::from_value(json!({
+            "range": { "start": { "line": 0, "character": 7 }, "end": { "line": 0, "character": 9 } },
+            "severity": 2,
+            "code": "F401",
+            "codeDescription": { "href": "https://docs.astral.sh/ruff/rules/unused-import" },
+            "source": "Ruff",
+            "message": "`os` imported but unused"
+        }))
+        .unwrap();
+        let code = convert_diagnostic(&wire).code.expect("the code is kept");
+        assert_eq!(code.value, "F401");
+        assert_eq!(code.source.as_deref(), Some("Ruff"));
+        assert_eq!(
+            code.href.as_deref(),
+            Some("https://docs.astral.sh/ruff/rules/unused-import")
+        );
+        assert_eq!(code.label("ruff"), "Ruff(F401)");
+
+        let ts: lsp_types::Diagnostic = serde_json::from_value(json!({
+            "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 1 } },
+            "code": 2322,
+            "message": "Type 'string' is not assignable to type 'number'."
+        }))
+        .unwrap();
+        let code = convert_diagnostic(&ts).code.unwrap();
+        assert_eq!(
+            (code.value.as_str(), code.source, code.href),
+            ("2322", None, None)
+        );
+        assert_eq!(
+            convert_diagnostic(&ts).code.unwrap().label("typescript"),
+            "typescript(2322)"
+        );
+    }
+
+    /// #1540 negative: no code, no label; an empty source is no source.
+    #[test]
+    fn convert_diagnostic_without_a_code_has_none() {
+        let wire = lsp_types::Diagnostic {
+            message: "unclassified".into(),
+            source: Some(String::from("rustc")),
+            ..Default::default()
+        };
+        assert_eq!(convert_diagnostic(&wire).code, None);
+        let blank: lsp_types::Diagnostic = serde_json::from_value(json!({
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } },
+            "code": "E1", "source": "", "message": "m"
+        }))
+        .unwrap();
+        assert_eq!(convert_diagnostic(&blank).code.unwrap().label(""), "E1");
     }
 
     #[test]
