@@ -230,15 +230,6 @@ pub fn load_merged_from(
         };
         let Some(doc) = doc else { continue };
         for (key, value) in doc {
-            // A key no setting reads was dropped without a word, so a VS
-            // Code name or a typo just did nothing (#1607). The VS Code
-            // layer is already the mapped subset.
-            if kind != LayerKind::VsCodeWorkspace
-                && let Some(warning) = unknown_key_warning(&path, &key)
-            {
-                warnings.push(warning);
-                continue;
-            }
             if kind.is_allowlisted() && !WORKSPACE_ALLOWED_KEYS.contains(&key.as_str()) {
                 warnings.push(format!(
                     "{}: \"{key}\" is user-config only and was ignored ({} layers may set: appearance and editor toggles)",
@@ -391,6 +382,14 @@ fn load_layer_document_inner(
             scoped = block;
         }
     }
+    // A key no setting reads was dropped without a word, so a VS Code name
+    // or a typo just did nothing (#1607). Checked here, per file, so a key
+    // from an `extends` base names that base rather than the file extending
+    // it.
+    drop_unknown_keys(&mut doc, path, warnings);
+    if let Some(Value::Object(block)) = scoped.as_mut() {
+        drop_unknown_keys(block, path, warnings);
+    }
     for (k, v) in doc {
         deep_merge(acc.entry(k).or_insert(Value::Null), &v);
     }
@@ -491,6 +490,18 @@ fn known_setting_keys() -> &'static std::collections::BTreeSet<String> {
     })
 }
 
+/// Remove from `doc` (a settings file at `path`) each key no setting reads,
+/// warning about each one.
+fn drop_unknown_keys(doc: &mut Map<String, Value>, path: &Path, warnings: &mut Vec<String>) {
+    doc.retain(|key, _| match unknown_key_warning(path, key) {
+        Some(warning) => {
+            warnings.push(warning);
+            false
+        }
+        None => true,
+    });
+}
+
 /// The warning for `key` in the layer at `path` when no setting reads it,
 /// naming the croft key a VS Code name maps to, or the closest setting a
 /// typo was meant to be. `None` for a known key, and for a `$`-key such as
@@ -500,8 +511,16 @@ fn unknown_key_warning(path: &Path, key: &str) -> Option<String> {
     if known.contains(key) || key.starts_with('$') {
         return None;
     }
-    let hint = match crate::import_vscode::croft_key_for(key) {
-        Some(croft) => format!(" (a VS Code setting; croft's is \"{croft}\")"),
+    let hint = match crate::import_vscode::croft_keys_for(key) {
+        Some([croft]) => format!(" (a VS Code setting; croft's is \"{croft}\")"),
+        Some(croft) => format!(
+            " (a VS Code setting; croft's are {})",
+            croft
+                .iter()
+                .map(|k| format!("\"{k}\""))
+                .collect::<Vec<_>>()
+                .join(" and ")
+        ),
         None => closest_setting(key, known)
             .map(|k| format!(" (did you mean \"{k}\"?)"))
             .unwrap_or_default(),
@@ -1187,7 +1206,9 @@ mod tests {
             "{joined}"
         );
         assert!(
-            joined.contains("\"files.autoSave\"") && joined.contains("croft's is \"auto_save\""),
+            joined.contains(
+                "unknown setting \"files.autoSave\" was ignored (a VS Code setting; croft's are \"auto_save\" and \"auto_save_on_focus_change\")"
+            ),
             "{joined}"
         );
         assert_eq!(m.warnings.len(), 2, "{joined}");
@@ -1242,6 +1263,25 @@ mod tests {
         let m = load_merged_from(&user, Some(&root), "macos");
         assert!(m.warnings.is_empty(), "{:?}", m.warnings);
         assert!(m.prefs.format_on_save);
+    }
+
+    /// #1607: an unknown key in an `extends` base names the base, not the
+    /// file extending it.
+    #[test]
+    fn an_unknown_key_in_an_extends_base_names_the_base() {
+        let (_tmp, user, root) = setup();
+        write(&user.join("base.json"), r#"{"fromat_on_save":true}"#);
+        write(
+            &user.join("config.json"),
+            r#"{"extends":"base.json","theme":"nord"}"#,
+        );
+        let m = load_merged_from(&user, Some(&root), "macos");
+        assert_eq!(m.warnings.len(), 1, "{:?}", m.warnings);
+        let w = &m.warnings[0];
+        assert!(w.contains("unknown setting \"fromat_on_save\""), "{w}");
+        assert!(w.contains("base.json"), "names the base: {w}");
+        assert!(!w.contains("config.json"), "not the extending file: {w}");
+        assert_eq!(m.prefs.theme, "nord");
     }
 
     /// #1607 negative: a word nowhere near any setting warns without a guess.
