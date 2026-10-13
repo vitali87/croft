@@ -10594,6 +10594,96 @@ mod tests {
         (f.cmd.clone(), term.command_input_text(&deco))
     }
 
+    /// The `printf` formats fish runs in `func` of croft's fish hooks, in
+    /// order, rewritten for `/bin/sh`'s printf (which spells ESC `\033`).
+    fn fish_hook_printfs(script: &str, func: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut lines = script.lines();
+        let Some(head) = lines.find(|l| {
+            l.trim_start().starts_with(&format!("function {func} "))
+                || l.trim() == format!("function {func}")
+        }) else {
+            return out;
+        };
+        let indent = head.len() - head.trim_start().len();
+        for line in lines {
+            let t = line.trim_start();
+            if t == "end" && line.len() - t.len() == indent {
+                break;
+            }
+            if let Some(rest) = t.strip_prefix("printf '") {
+                let fmt = &rest[..rest.find('\'').unwrap()];
+                out.push(fmt.replace("\\e", "\\033"));
+            }
+        }
+        out
+    }
+
+    /// #1514: replay what croft's fish 3 hooks print around one command
+    /// (the prompt event, the user's prompt, the wrapped prompt's end mark,
+    /// the typed line, preexec, postexec) through a real pane, and the
+    /// command is recorded with its text. Without an end-of-prompt mark it
+    /// was recorded empty, so the history never got it.
+    #[test]
+    fn a_fish_3_pane_records_the_typed_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crate::shell_integration::ensure_fish_integration(tmp.path()).unwrap();
+        let script = std::fs::read_to_string(dir.join("fish/vendor_conf.d/croft.fish")).unwrap();
+        let fmts = |func: &str| {
+            fish_hook_printfs(&script, func)
+                .into_iter()
+                .filter(|f| !f.contains("]7;"))
+                .map(|f| f.replace("%s", "0"))
+                .collect::<String>()
+        };
+        // The prompt event's own `133;D` closes a cycle a command left
+        // open; with none open here, it does not fire.
+        let prompt_start = fmts("_croft_mark_prompt").replace("\\033]133;D\\a", "");
+        assert!(prompt_start.contains("133;A"), "{prompt_start:?}");
+        let stream = format!(
+            "{prompt_start}~> {}ls -d /tmp\\n{}/tmp\\n{}",
+            fmts("_croft_prompt_end"),
+            fmts("_croft_mark_output_start"),
+            fmts("_croft_mark_output_end"),
+        );
+        let term = PtyTerminal::new_running(
+            "/bin/sh",
+            &[String::from("-c"), format!("printf '{stream}'")],
+            tmp.path(),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut finished = Vec::new();
+        while std::time::Instant::now() < deadline {
+            finished.extend(term.drain_finished_commands());
+            if !finished.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        let f = finished.first().expect("the hooks' 133;D ends a command");
+        assert_eq!(f.cmd, "ls -d /tmp", "stream {stream:?}");
+    }
+
+    /// #1514 negative: fish 4 marks prompts itself, so croft's hooks, the
+    /// prompt wrap among them, stay behind the old-fish check and never
+    /// add a second set of marks.
+    #[test]
+    fn the_fish_prompt_wrap_is_only_for_old_fish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crate::shell_integration::ensure_fish_integration(tmp.path()).unwrap();
+        let script = std::fs::read_to_string(dir.join("fish/vendor_conf.d/croft.fish")).unwrap();
+        let gate = script.find("forward-char-passive").unwrap();
+        let wrap = script.find("function _croft_wrap_prompt").unwrap();
+        let end_mark = script.find("133;B").unwrap();
+        assert!(gate < wrap && gate < end_mark);
+        // The wrap leaves an already wrapped prompt alone, so a redrawn
+        // prompt does not stack wrappers or print the mark twice.
+        let body = &script[wrap..];
+        let body = &body[..body.find("\n        end\n").unwrap()];
+        assert!(body.contains("string match -q '*_croft_prompt_end*'; and return"));
+    }
+
     #[test]
     fn a_multi_line_command_is_recorded_without_its_continuation_prompt() {
         // #1250: bash's PS2 `> ` was stored as typed input, and recalling

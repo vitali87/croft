@@ -590,6 +590,27 @@ if status is-interactive
             set --global _croft_prompt_state prompt
             printf '\e]7;file://%s%s\a' "$hostname" (string escape --style=url -- "$PWD")
             printf '\e]133;A\a'
+            _croft_wrap_prompt
+        end
+        # The end of the prompt (133;B) is where the typed command starts;
+        # without it croft cannot tell the command from the prompt, and
+        # records nothing (#1514). fish has no event for it, so croft wraps
+        # the user's fish_prompt. That is defined after this file runs (by
+        # config.fish or a prompt plugin, maybe redefined later), so the
+        # wrap happens on each fish_prompt event, which fires just before
+        # fish draws the prompt, whenever fish_prompt is not croft's wrapper.
+        function _croft_prompt_end
+            printf '\e]133;B\a'
+        end
+        function _croft_wrap_prompt
+            functions -q fish_prompt; or return
+            functions fish_prompt | string match -q '*_croft_prompt_end*'; and return
+            functions --erase _croft_user_prompt
+            functions --copy fish_prompt _croft_user_prompt
+            function fish_prompt
+                _croft_user_prompt
+                _croft_prompt_end
+            end
         end
         function _croft_mark_output_start --on-event fish_preexec
             set --global _croft_prompt_state command
@@ -979,7 +1000,9 @@ mod tests {
             "forward-char-passive",
             "fish_preexec",
             "fish_postexec",
+            "functions --copy fish_prompt",
             "133;A",
+            "133;B",
             "133;C",
             "133;D",
             "]7;file://",
