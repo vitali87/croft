@@ -1299,11 +1299,7 @@ impl Widget for &mut SourceControlPanel {
             "\u{ea68} ",
             Style::default().fg(self.theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
         ));
-        let label = match (&self.status.branch, &self.status.detached_hash) {
-            (Some(b), _) => b.clone(),
-            (None, Some(h)) => h.clone(),
-            (None, None) => "(no head)".to_string(),
-        };
+        let label = self.status.head_label().to_string();
         // The glyph (2 cells) plus the name is the clickable target that
         // opens the branch picker, clamped to the panel width.
         let branch_w = (2 + label.chars().count() as u16).min(inner.width);
@@ -2098,6 +2094,7 @@ mod tests {
             changed_count: 0,
             prepared_message: None,
             operation: None,
+            rebasing_branch: None,
         }
     }
 
