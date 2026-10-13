@@ -1,0 +1,1 @@
+fix: With several carets or Ctrl+D selections, typing a bracket or quote now follows the same auto-closing rules as one caret: it wraps each selection, closes the pair at each caret, steps over a closer already there, and a Backspace straight after takes both sides of each empty pair. Before, a quote replaced every selected word and `)` doubled the closer.
