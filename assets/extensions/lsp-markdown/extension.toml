@@ -20,6 +20,12 @@
 # for it (`termux_pkg = false`), so on Android it is used only from PATH
 # (`cargo install rumdl`). While it runs, the built-in lint
 # (src/markdown_lint.rs, four of those same rules) stands down.
+#
+# Prose is not wrapped at a column, so rumdl's line-length rule (MD013) is
+# off unless the project asks for it (#1158): croft sends a global line length
+# of 0, rumdl's "no limit", with the files on disk winning. A `.rumdl.toml`
+# or `.markdownlint.*` that sets a line length (globally or for MD013) keeps
+# its own.
 id = "lsp-markdown"
 name = "Markdown (marksman, rumdl)"
 description = "Markdown language support via marksman, with rumdl for linting and formatting."
@@ -46,3 +52,4 @@ args = ["server"]
 language = "markdown"
 priority = 1
 provision = { kind = "uv", package = "rumdl", version = "0.2.77", bin = "rumdl", termux_pkg = false }
+initialization_options = { configurationPreference = "filesystemFirst", settings = { lineLength = 0 } }
