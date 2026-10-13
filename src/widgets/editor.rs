@@ -7978,7 +7978,7 @@ impl Editor {
         }
     }
 
-    /// Carry out a per-language Enter rule (#1495, #1443). The text after
+    /// Carry out a Markdown Enter rule (#1495). The text after
     /// the caret moves to the new line behind the continuation, without the
     /// blanks that separated it from the caret.
     fn apply_on_enter(&mut self, rule: OnEnter) {
@@ -7996,26 +7996,6 @@ impl Editor {
                     .to_string();
                 self.lines[row + 1] = format!("{text}{rest}");
                 self.cursor_col = text.chars().count();
-                self.mark_buffer_changed();
-            }
-            OnEnter::OpenDoc { indent, close } => {
-                self.insert_newline_raw();
-                let opener = self.lines[row].trim_end().len();
-                self.lines[row].truncate(opener);
-                let rest = self.lines[row + 1]
-                    .trim_start_matches([' ', '\t'])
-                    .to_string();
-                let inner = format!("{indent} * ");
-                if rest.starts_with("*/") {
-                    self.lines[row + 1] = inner.clone();
-                    self.lines.insert(row + 2, format!("{indent} {rest}"));
-                } else {
-                    self.lines[row + 1] = format!("{inner}{rest}");
-                    if close {
-                        self.lines.insert(row + 2, format!("{indent} */"));
-                    }
-                }
-                self.cursor_col = inner.chars().count();
                 self.mark_buffer_changed();
             }
         }
@@ -14499,16 +14479,13 @@ fn extra_indent_triggered(lang: Option<LangKind>, last_non_ws: Option<char>) -> 
 }
 
 /// What Enter does on a line a per-language rule recognises, in place of
-/// copying the indent (#1495, #1443), as VS Code's `onEnterRules` and the
-/// Markdown editors people come from do.
+/// copying the indent (#1495), as the Markdown editors people come from do.
+/// Doc comments (#1443) go through `comment_on_enter`.
 #[derive(Debug, PartialEq, Eq)]
 enum OnEnter {
     /// Open a new line starting with this text: the indent plus the list
-    /// marker, quote or comment leader that continues the line.
+    /// marker or quote that continues the line.
     Continue(String),
-    /// Enter after a `/**` opener: a ` * ` line, and when nothing below
-    /// closes the comment yet, a ` */` line after it.
-    OpenDoc { indent: String, close: bool },
     /// Enter on a list item or quote that holds only its marker: clear the
     /// marker, which ends the list.
     EndList,
@@ -14524,30 +14501,31 @@ fn on_enter_rule(
     let line = lines.get(row)?;
     match lang? {
         LangKind::Markdown if !in_markdown_fence(lines, row) => markdown_on_enter(line, col),
-        LangKind::Rust
-        | LangKind::JavaScript
-        | LangKind::TypeScript
-        | LangKind::Tsx
-        | LangKind::C
-        | LangKind::Cpp
-        | LangKind::Java
-        | LangKind::CSharp => doc_comment_on_enter(lang?, lines, row, col),
         _ => None,
     }
 }
 
-/// True when `row` sits inside a fenced code block: an odd number of
-/// ```` ``` ```` / `~~~` fence lines above it.
+/// True when `row` sits inside a fenced code block opened above it. A fence
+/// opens with three or more `` ` `` or `~` and closes only on a line of the
+/// same character, at least as long, with nothing after it.
 fn in_markdown_fence(lines: &[String], row: usize) -> bool {
-    lines[..row]
-        .iter()
-        .filter(|l| {
-            let t = l.trim_start();
-            t.starts_with("```") || t.starts_with("~~~")
-        })
-        .count()
-        % 2
-        == 1
+    let mut open: Option<(char, usize)> = None;
+    for l in &lines[..row] {
+        let t = l.trim_start();
+        let Some(ch) = t.chars().next().filter(|c| matches!(c, '`' | '~')) else {
+            continue;
+        };
+        let width = t.len() - t.trim_start_matches(ch).len();
+        if width < 3 {
+            continue;
+        }
+        match open {
+            None => open = Some((ch, width)),
+            Some((c, w)) if c == ch && width >= w && t[width..].trim().is_empty() => open = None,
+            Some(_) => {}
+        }
+    }
+    open.is_some()
 }
 
 /// Enter on a Markdown list item, task item or blockquote (#1495): the next
@@ -14614,83 +14592,6 @@ fn markdown_on_enter(line: &str, col: usize) -> Option<OnEnter> {
         return Some(OnEnter::EndList);
     }
     Some(OnEnter::Continue(next))
-}
-
-/// Enter in a doc comment (#1443): after a `/**` opener, on a ` * ` line
-/// inside a block comment, and in Rust on a `///` or `//!` line. A `*` that
-/// is not a comment leader (`x = a *`) and a caret right before `*/` keep
-/// the plain newline.
-fn doc_comment_on_enter(
-    lang: LangKind,
-    lines: &[String],
-    row: usize,
-    col: usize,
-) -> Option<OnEnter> {
-    let line = &lines[row];
-    let (prefix, suffix) = line.split_at(col);
-    let indent_len = prefix.len() - prefix.trim_start_matches([' ', '\t']).len();
-    let indent = &prefix[..indent_len];
-    let text = &prefix[indent_len..];
-    if lang == LangKind::Rust {
-        for leader in ["//!", "///"] {
-            if text.starts_with(leader) && !text.starts_with("////") {
-                return Some(OnEnter::Continue(format!("{indent}{leader} ")));
-            }
-        }
-        if text.starts_with("//") {
-            return None;
-        }
-    }
-    if let Some(after) = text.strip_prefix("/**")
-        && !after.starts_with('/')
-        && !after.contains("*/")
-    {
-        let closed = suffix.contains("*/") || block_comment_closed_below(lines, row);
-        return Some(OnEnter::OpenDoc {
-            indent: indent.to_string(),
-            close: !closed,
-        });
-    }
-    if (text == "*" || text.starts_with("* "))
-        && !text.contains("*/")
-        && !suffix.trim_start().starts_with("*/")
-        && inside_block_comment(lines, row)
-    {
-        return Some(OnEnter::Continue(format!("{indent}* ")));
-    }
-    None
-}
-
-/// True when the lines above `row` are ` * ` leaders back to a `/*` opener
-/// that nothing has closed.
-fn inside_block_comment(lines: &[String], row: usize) -> bool {
-    for l in lines[..row].iter().rev() {
-        let t = l.trim_start();
-        if l.contains("*/") {
-            return false;
-        }
-        if t.starts_with("/*") {
-            return true;
-        }
-        if !t.starts_with('*') {
-            return false;
-        }
-    }
-    false
-}
-
-/// True when the lines below `row` close the block comment opened on it:
-/// ` * ` leaders down to a line holding `*/`.
-fn block_comment_closed_below(lines: &[String], row: usize) -> bool {
-    for l in &lines[row + 1..] {
-        if l.contains("*/") {
-            return true;
-        }
-        if !l.trim_start().starts_with('*') {
-            return false;
-        }
-    }
-    false
 }
 
 /// The indent for the line Enter opens after `prefix` in YAML (#1309).
@@ -25436,6 +25337,20 @@ mod tests {
         assert_eq!(lines, ["```", "- a", ""], "inside a code fence");
         let (lines, _) = enter_in(LangKind::Markdown, "```\nx\n```\n- a", 3, 3);
         assert_eq!(lines[4], "- ", "after a closed fence");
+        let (lines, _) = enter_in(LangKind::Markdown, "```\n~~~\n- a", 2, 3);
+        assert_eq!(
+            lines,
+            ["```", "~~~", "- a", ""],
+            "an unlike fence closes nothing"
+        );
+        let (lines, _) = enter_in(LangKind::Markdown, "````\n```\n- a", 2, 3);
+        assert_eq!(
+            lines,
+            ["````", "```", "- a", ""],
+            "a shorter fence closes nothing"
+        );
+        let (lines, _) = enter_in(LangKind::Markdown, "```rust\nx\n````\n- a", 3, 3);
+        assert_eq!(lines[4], "- ", "a longer fence of the same kind closes");
         let (lines, _) = enter_in(LangKind::Rust, "- a", 0, 3);
         assert_eq!(lines, ["- a", ""], "Markdown only");
     }
@@ -25451,7 +25366,7 @@ mod tests {
         let (lines, caret) = enter_in(LangKind::Java, "  /**\n  void f();", 0, 5);
         assert_eq!(lines, ["  /**", "   * ", "   */", "  void f();"]);
         assert_eq!(caret, (1, 5));
-        let (lines, caret) = enter_in(LangKind::TypeScript, "/** */", 0, 4);
+        let (lines, caret) = enter_in(LangKind::TypeScript, "/** */", 0, 3);
         assert_eq!(lines, ["/**", " * ", " */"]);
         assert_eq!(caret, (1, 3));
         // Already closed below: no second closer.
@@ -25460,6 +25375,18 @@ mod tests {
         let (lines, caret) = enter_in(LangKind::Tsx, "/**\n * Adds two.\n */", 1, 12);
         assert_eq!(lines, ["/**", " * Adds two.", " * ", " */"]);
         assert_eq!(caret, (2, 3));
+        let (lines, _) = enter_in(LangKind::Java, "/**\ndescription\n\n */", 0, 3);
+        assert_eq!(
+            lines,
+            ["/**", " * ", "description", "", " */"],
+            "a plain body line"
+        );
+        let (lines, _) = enter_in(LangKind::C, "/**\nint f();\n/** g */", 0, 3);
+        assert_eq!(
+            lines,
+            ["/**", " * ", " */", "int f();", "/** g */"],
+            "a later comment"
+        );
         let (lines, _) = enter_in(LangKind::Cpp, "/*\n * plain block", 1, 14);
         assert_eq!(lines[2], " * ");
         let (lines, caret) = enter_in(LangKind::Rust, "/// Adds two numbers.", 0, 21);
@@ -25482,11 +25409,6 @@ mod tests {
         assert_eq!(
             plain(LangKind::Rust, "//// banner", 0, 11),
             ["//// banner", ""]
-        );
-        assert_eq!(
-            plain(LangKind::JavaScript, "let x = 1\n * 2", 1, 4),
-            ["let x = 1", " * 2", " "],
-            "a `*` line after code is not a comment"
         );
         assert_eq!(
             plain(LangKind::C, "/*\n * text */", 1, 8),
