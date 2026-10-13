@@ -67,7 +67,6 @@ pub struct CompletionResult {
 #[derive(Debug)]
 pub struct HoverResult {
     pub request_id: u64,
-    pub path: PathBuf,
     pub text: Option<String>,
 }
 
@@ -92,7 +91,6 @@ pub struct SignatureHelpResult {
 #[derive(Debug)]
 pub struct DefinitionResult {
     pub request_id: u64,
-    pub path: PathBuf,
     pub target: Option<(PathBuf, u32, u32)>,
 }
 
@@ -202,7 +200,6 @@ pub struct DocumentSymbolsResult {
 #[derive(Debug)]
 pub struct DeclarationResult {
     pub request_id: u64,
-    pub path: PathBuf,
     pub target: Option<(PathBuf, u32, u32)>,
     /// True when no spawned server advertises a usable `declarationProvider`
     /// (e.g. vtsls, which sends `declarationProvider: false`). Lets the app
@@ -213,7 +210,6 @@ pub struct DeclarationResult {
 #[derive(Debug)]
 pub struct TypeDefinitionResult {
     pub request_id: u64,
-    pub path: PathBuf,
     pub target: Option<(PathBuf, u32, u32)>,
     /// True when no spawned server advertises a usable `typeDefinitionProvider`.
     /// Mirrors `DeclarationResult::unsupported` so the app can report it plainly
@@ -224,7 +220,6 @@ pub struct TypeDefinitionResult {
 #[derive(Debug)]
 pub struct ImplementationResult {
     pub request_id: u64,
-    pub path: PathBuf,
     /// Every implementation location the server returned. `textDocument/
     /// implementation` is the 1:many goto (one abstraction, several
     /// implementors), so all of them are carried through; the app jumps
@@ -256,7 +251,6 @@ pub struct WorkspaceSymbolsResult {
 #[derive(Debug)]
 pub struct ReferencesResult {
     pub request_id: u64,
-    pub path: PathBuf,
     /// Every reference location the server returned. `textDocument/references`
     /// is inherently 1:many (a symbol used in many places), so all of them are
     /// carried through; the app jumps directly when there is one and shows a
@@ -269,7 +263,6 @@ pub struct ReferencesResult {
 #[derive(Debug)]
 pub struct RenameResult {
     pub request_id: u64,
-    pub path: PathBuf,
     /// `None` when the server declined or returned no edits. Otherwise the
     /// per-file, char-indexed spans to apply across the workspace.
     pub edits: Option<Vec<(PathBuf, Vec<TextSpanEdit>)>>,
@@ -301,7 +294,6 @@ pub struct WillRenameFilesResult {
 #[derive(Debug)]
 pub struct PrepareRenameResult {
     pub request_id: u64,
-    pub path: PathBuf,
     pub unsupported: bool,
     pub error: Option<String>,
     /// `((start_line, start_char, end_line, end_char), placeholder)`.
@@ -348,7 +340,6 @@ pub struct CodeActionItem {
 #[derive(Debug)]
 pub struct CodeActionResult {
     pub request_id: u64,
-    pub path: PathBuf,
     /// The available actions. `None` means the request errored; `Some(vec![])`
     /// means the server ran but offered nothing here. The same shape is reused
     /// for a `codeAction/resolve` reply (a single, now-resolved item).
@@ -526,7 +517,6 @@ pub struct DocumentColorsUpdate {
 #[derive(Debug)]
 pub struct ColorPresentationsResult {
     pub request_id: u64,
-    pub path: PathBuf,
     pub presentations: Vec<(String, Vec<TextSpanEdit>)>,
 }
 
@@ -596,7 +586,6 @@ pub struct OccurrenceItem {
 #[derive(Debug)]
 pub struct DocumentHighlightsResult {
     pub request_id: u64,
-    pub path: PathBuf,
     pub items: Vec<OccurrenceItem>,
 }
 
@@ -608,7 +597,6 @@ pub struct DocumentHighlightsResult {
 #[derive(Debug)]
 pub struct LinkedEditingResult {
     pub request_id: u64,
-    pub path: PathBuf,
     /// `(start_line, start_char, end_line, end_char)` per span.
     pub ranges: Vec<(u32, u32, u32, u32)>,
 }
@@ -622,7 +610,6 @@ pub struct LinkedEditingResult {
 #[derive(Debug)]
 pub struct SelectionRangesResult {
     pub request_id: u64,
-    pub path: PathBuf,
     pub unsupported: bool,
     /// Per cursor: `(start_line, start_char, end_line, end_char)`.
     pub chains: Vec<Vec<(u32, u32, u32, u32)>>,
@@ -941,8 +928,6 @@ struct LangCapabilitySupport {
     formatting: HashMap<Language, bool>,
     code_action: HashMap<Language, bool>,
     call_hierarchy: HashMap<Language, bool>,
-    /// Whether a server for the language answers type hierarchy (#613).
-    type_hierarchy: HashMap<Language, bool>,
     /// Whether a server for the language wants `willRenameFiles` (#610).
     will_rename: HashMap<Language, bool>,
     /// Concatenated on-type trigger characters per language (#254);
@@ -1017,6 +1002,8 @@ pub struct LspManager {
     /// (#694); see [`LspManager::take_servers_restarted`].
     servers_restarted: Arc<AtomicBool>,
     next_request_id: u64,
+    /// Read by the app tests, to prove the servers follow a workspace change.
+    #[cfg_attr(not(test), allow(dead_code))]
     workspace_root: PathBuf,
     _runtime: LspRuntime,
 }
@@ -1185,6 +1172,7 @@ impl LspManager {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
     }
@@ -1711,17 +1699,6 @@ impl LspManager {
         self.calls_rx.try_recv().ok()
     }
 
-    /// Whether the server for `lang` answers type hierarchy (#613). `None`
-    /// means no server has reported yet.
-    pub fn language_supports_type_hierarchy(&self, lang: Language) -> Option<bool> {
-        self.capability_support
-            .lock()
-            .ok()?
-            .type_hierarchy
-            .get(&lang)
-            .copied()
-    }
-
     /// The supertypes or subtypes of the type at a position (#613); the
     /// reply arrives on the call-hierarchy drain with its [`HierarchyKind`].
     pub fn request_type_hierarchy(
@@ -2186,7 +2163,7 @@ struct WorkerState {
     workspace_root: PathBuf,
     /// Secondary workspace roots (multi-root, #147). Servers stay one
     /// instance per (language, project root); these only widen the bound
-    /// `project_root_for` walks within, so a file under a secondary root
+    /// `project_root_for_roots` walks within, so a file under a secondary root
     /// spawns its servers AT that root instead of falling back to the
     /// primary — the per-root-instance model every server supports.
     extra_roots: Vec<PathBuf>,
@@ -3141,9 +3118,6 @@ impl WorkerState {
                 support.code_action.insert(lang, supports_code_action);
                 support.call_hierarchy.insert(lang, supports_call_hierarchy);
                 support
-                    .type_hierarchy
-                    .insert(lang, spawned.iter().any(|c| c.supports_type_hierarchy));
-                support
                     .will_rename
                     .insert(lang, spawned.iter().any(|c| c.will_rename.is_some()));
             }
@@ -3602,7 +3576,6 @@ impl WorkerState {
         let Some((server_name, client_arc)) = picked else {
             let _ = tx.send(HoverResult {
                 request_id,
-                path,
                 text: None,
             });
             return;
@@ -3611,7 +3584,6 @@ impl WorkerState {
             return;
         };
         let tx = tx.clone();
-        let path_clone = path.clone();
         log_file::log(&format!(
             "hover request id={request_id} server={server_name} path={} line={line} char={character}",
             path.display()
@@ -3632,11 +3604,7 @@ impl WorkerState {
                 "hover response id={request_id} server={server_name} has_text={}",
                 text.is_some()
             ));
-            let _ = tx.send(HoverResult {
-                request_id,
-                path: path_clone,
-                text,
-            });
+            let _ = tx.send(HoverResult { request_id, text });
         });
     }
 
@@ -4049,22 +4017,21 @@ impl WorkerState {
         end: (u32, u32),
         tx: &std_mpsc::Sender<ColorPresentationsResult>,
     ) {
-        let empty = |tx: &std_mpsc::Sender<ColorPresentationsResult>, path: PathBuf| {
+        let empty = |tx: &std_mpsc::Sender<ColorPresentationsResult>| {
             let _ = tx.send(ColorPresentationsResult {
                 request_id,
-                path,
                 presentations: Vec::new(),
             });
         };
         let Some(doc) = self.docs.get(&path) else {
-            empty(tx, path);
+            empty(tx);
             return;
         };
         let lang = doc.language;
         let root = doc.project_root.clone();
         self.ensure_clients(lang, &root).await;
         let Some(clients) = self.clients.get(&(lang, root)) else {
-            empty(tx, path);
+            empty(tx);
             return;
         };
         let picked = clients
@@ -4072,11 +4039,11 @@ impl WorkerState {
             .find(|c| c.supports_document_color)
             .map(|c| (c.name.clone(), c.client.clone()));
         let Some((server_name, client_arc)) = picked else {
-            empty(tx, path);
+            empty(tx);
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
-            empty(tx, path);
+            empty(tx);
             return;
         };
         let lsp_color = lsp_types::Color {
@@ -4086,7 +4053,6 @@ impl WorkerState {
             alpha: color.3,
         };
         let tx = tx.clone();
-        let path_clone = path.clone();
         tokio::spawn(async move {
             let mut client = client_arc.lock().await.requests();
             let resp = client.color_presentations(uri, lsp_color, start, end).await;
@@ -4122,7 +4088,6 @@ impl WorkerState {
             };
             let _ = tx.send(ColorPresentationsResult {
                 request_id,
-                path: path_clone,
                 presentations,
             });
         });
@@ -4225,7 +4190,6 @@ impl WorkerState {
         let Some((server_name, client_arc)) = picked else {
             let _ = tx.send(DefinitionResult {
                 request_id,
-                path,
                 target: None,
             });
             return;
@@ -4234,7 +4198,6 @@ impl WorkerState {
             return;
         };
         let tx = tx.clone();
-        let path_clone = path.clone();
         log_file::log(&format!(
             "definition request id={request_id} server={server_name} path={} line={line} char={character}",
             path.display()
@@ -4255,11 +4218,7 @@ impl WorkerState {
                 "definition response id={request_id} server={server_name} has_target={}",
                 target.is_some()
             ));
-            let _ = tx.send(DefinitionResult {
-                request_id,
-                path: path_clone,
-                target,
-            });
+            let _ = tx.send(DefinitionResult { request_id, target });
         });
     }
 
@@ -4348,7 +4307,6 @@ impl WorkerState {
         let Some((server_name, client_arc)) = picked else {
             let _ = tx.send(DeclarationResult {
                 request_id,
-                path,
                 target: None,
                 unsupported: true,
             });
@@ -4358,7 +4316,6 @@ impl WorkerState {
             return;
         };
         let tx = tx.clone();
-        let path_clone = path.clone();
         log_file::log(&format!(
             "declaration request id={request_id} server={server_name} path={} line={line} char={character}",
             path.display()
@@ -4383,7 +4340,6 @@ impl WorkerState {
             ));
             let _ = tx.send(DeclarationResult {
                 request_id,
-                path: path_clone,
                 target,
                 unsupported: false,
             });
@@ -4417,7 +4373,6 @@ impl WorkerState {
         let Some((server_name, client_arc)) = picked else {
             let _ = tx.send(TypeDefinitionResult {
                 request_id,
-                path,
                 target: None,
                 unsupported: true,
             });
@@ -4427,7 +4382,6 @@ impl WorkerState {
             return;
         };
         let tx = tx.clone();
-        let path_clone = path.clone();
         log_file::log(&format!(
             "type_definition request id={request_id} server={server_name} path={} line={line} char={character}",
             path.display()
@@ -4452,7 +4406,6 @@ impl WorkerState {
             ));
             let _ = tx.send(TypeDefinitionResult {
                 request_id,
-                path: path_clone,
                 target,
                 unsupported: false,
             });
@@ -4486,7 +4439,6 @@ impl WorkerState {
         let Some((server_name, client_arc)) = picked else {
             let _ = tx.send(ImplementationResult {
                 request_id,
-                path,
                 targets: Vec::new(),
                 unsupported: true,
             });
@@ -4496,7 +4448,6 @@ impl WorkerState {
             return;
         };
         let tx = tx.clone();
-        let path_clone = path.clone();
         log_file::log(&format!(
             "implementation request id={request_id} server={server_name} path={} line={line} char={character}",
             path.display()
@@ -4521,7 +4472,6 @@ impl WorkerState {
             ));
             let _ = tx.send(ImplementationResult {
                 request_id,
-                path: path_clone,
                 targets,
                 unsupported: false,
             });
@@ -4641,7 +4591,6 @@ impl WorkerState {
         let Some((server_name, client_arc)) = picked else {
             let _ = tx.send(ReferencesResult {
                 request_id,
-                path,
                 targets: Vec::new(),
                 unsupported: true,
             });
@@ -4651,7 +4600,6 @@ impl WorkerState {
             return;
         };
         let tx = tx.clone();
-        let path_clone = path.clone();
         log_file::log(&format!(
             "references request id={request_id} server={server_name} path={} line={line} char={character}",
             path.display()
@@ -4676,7 +4624,6 @@ impl WorkerState {
             ));
             let _ = tx.send(ReferencesResult {
                 request_id,
-                path: path_clone,
                 targets,
                 unsupported: false,
             });
@@ -4714,7 +4661,6 @@ impl WorkerState {
             return;
         };
         let tx = tx.clone();
-        let path_clone = path.clone();
         tokio::spawn(async move {
             let mut client = client_arc.lock().await.requests();
             let resp = client.document_highlight(uri, line, character).await;
@@ -4729,11 +4675,7 @@ impl WorkerState {
                     Vec::new()
                 }
             };
-            let _ = tx.send(DocumentHighlightsResult {
-                request_id,
-                path: path_clone,
-                items,
-            });
+            let _ = tx.send(DocumentHighlightsResult { request_id, items });
         });
     }
 
@@ -4768,7 +4710,6 @@ impl WorkerState {
             return;
         };
         let tx = tx.clone();
-        let path_clone = path.clone();
         tokio::spawn(async move {
             let mut client = client_arc.lock().await.requests();
             let resp = client.linked_editing_range(uri, line, character).await;
@@ -4787,11 +4728,7 @@ impl WorkerState {
                     Vec::new()
                 }
             };
-            let _ = tx.send(LinkedEditingResult {
-                request_id,
-                path: path_clone,
-                ranges,
-            });
+            let _ = tx.send(LinkedEditingResult { request_id, ranges });
         });
     }
 
@@ -4806,23 +4743,22 @@ impl WorkerState {
         positions: Vec<(u32, u32)>,
         tx: &std_mpsc::Sender<SelectionRangesResult>,
     ) {
-        let unsupported = |tx: &std_mpsc::Sender<SelectionRangesResult>, path: PathBuf| {
+        let unsupported = |tx: &std_mpsc::Sender<SelectionRangesResult>| {
             let _ = tx.send(SelectionRangesResult {
                 request_id,
-                path,
                 unsupported: true,
                 chains: Vec::new(),
             });
         };
         let Some(doc) = self.docs.get(&path) else {
-            unsupported(tx, path);
+            unsupported(tx);
             return;
         };
         let lang = doc.language;
         let root = doc.project_root.clone();
         self.ensure_clients(lang, &root).await;
         let Some(clients) = self.clients.get(&(lang, root)) else {
-            unsupported(tx, path);
+            unsupported(tx);
             return;
         };
         let picked = clients
@@ -4830,11 +4766,11 @@ impl WorkerState {
             .find(|c| c.supports_selection_range)
             .map(|c| (c.name.clone(), c.client.clone()));
         let Some((server_name, client_arc)) = picked else {
-            unsupported(tx, path);
+            unsupported(tx);
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
-            unsupported(tx, path);
+            unsupported(tx);
             return;
         };
         let lsp_positions: Vec<lsp_types::Position> = positions
@@ -4842,7 +4778,6 @@ impl WorkerState {
             .map(|&(line, character)| lsp_types::Position { line, character })
             .collect();
         let tx = tx.clone();
-        let path_clone = path.clone();
         tokio::spawn(async move {
             let mut client = client_arc.lock().await.requests();
             let resp = client.selection_ranges(uri, lsp_positions).await;
@@ -4860,7 +4795,6 @@ impl WorkerState {
             };
             let _ = tx.send(SelectionRangesResult {
                 request_id,
-                path: path_clone,
                 unsupported,
                 chains,
             });
@@ -5067,7 +5001,6 @@ impl WorkerState {
         if servers.is_empty() {
             let _ = tx.send(CodeActionResult {
                 request_id,
-                path,
                 items: None,
                 unsupported: true,
             });
@@ -5088,7 +5021,6 @@ impl WorkerState {
         };
         let diags: Vec<lsp_types::Diagnostic> = diagnostics.iter().map(to_lsp_diagnostic).collect();
         let tx = tx.clone();
-        let path_clone = path.clone();
         log_file::log(&format!(
             "code_action request id={request_id} servers={} path={} line={start_line}",
             servers.len(),
@@ -5121,7 +5053,6 @@ impl WorkerState {
             ));
             let _ = tx.send(CodeActionResult {
                 request_id,
-                path: path_clone,
                 // `None` only when every server errored; an empty Vec means a
                 // server answered with nothing.
                 items: if any_ran { Some(combined) } else { None },
@@ -5143,7 +5074,6 @@ impl WorkerState {
         let Ok(action) = serde_json::from_value::<lsp_types::CodeAction>(action) else {
             let _ = tx.send(CodeActionResult {
                 request_id,
-                path,
                 items: None,
                 unsupported: false,
             });
@@ -5168,14 +5098,12 @@ impl WorkerState {
         let Some((server_name, client_arc)) = picked else {
             let _ = tx.send(CodeActionResult {
                 request_id,
-                path,
                 items: None,
                 unsupported: true,
             });
             return;
         };
         let tx = tx.clone();
-        let path_clone = path.clone();
         tokio::spawn(async move {
             let mut client = client_arc.lock().await.requests();
             let resolved = client.code_action_resolve(action).await;
@@ -5194,7 +5122,6 @@ impl WorkerState {
             };
             let _ = tx.send(CodeActionResult {
                 request_id,
-                path: path_clone,
                 items,
                 unsupported: false,
             });
@@ -5242,15 +5169,14 @@ impl WorkerState {
     ) {
         // Every early exit answers with no edits, so the caller's "Renaming
         // symbol" always resolves (#1193).
-        let unanswerable = |path: PathBuf| {
+        let unanswerable = || {
             let _ = tx.send(RenameResult {
                 request_id,
-                path,
                 edits: None,
             });
         };
         let Some(doc) = self.docs.get(&path) else {
-            unanswerable(path);
+            unanswerable();
             return;
         };
         let lang = doc.language;
@@ -5260,7 +5186,7 @@ impl WorkerState {
         // without reopening the file. Cheap once the list is non-empty.
         self.ensure_clients(lang, &root).await;
         let Some(clients) = self.clients.get(&(lang, root)) else {
-            unanswerable(path);
+            unanswerable();
             return;
         };
         let picked = clients
@@ -5268,15 +5194,14 @@ impl WorkerState {
             .find(|c| c.supports_rename)
             .map(|c| (c.name.clone(), c.client.clone()));
         let Some((server_name, client_arc)) = picked else {
-            unanswerable(path);
+            unanswerable();
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
-            unanswerable(path);
+            unanswerable();
             return;
         };
         let tx = tx.clone();
-        let path_clone = path.clone();
         log_file::log(&format!(
             "rename request id={request_id} server={server_name} path={} line={line} char={character} new_name={new_name}",
             path.display()
@@ -5297,11 +5222,7 @@ impl WorkerState {
                 "rename response id={request_id} server={server_name} files={}",
                 edits.as_ref().map(Vec::len).unwrap_or(0)
             ));
-            let _ = tx.send(RenameResult {
-                request_id,
-                path: path_clone,
-                edits,
-            });
+            let _ = tx.send(RenameResult { request_id, edits });
         });
     }
 
@@ -5389,24 +5310,23 @@ impl WorkerState {
         character: u32,
         tx: &std_mpsc::Sender<PrepareRenameResult>,
     ) {
-        let unsupported = |tx: &std_mpsc::Sender<PrepareRenameResult>, path: PathBuf| {
+        let unsupported = |tx: &std_mpsc::Sender<PrepareRenameResult>| {
             let _ = tx.send(PrepareRenameResult {
                 request_id,
-                path,
                 unsupported: true,
                 error: None,
                 target: None,
             });
         };
         let Some(doc) = self.docs.get(&path) else {
-            unsupported(tx, path);
+            unsupported(tx);
             return;
         };
         let lang = doc.language;
         let root = doc.project_root.clone();
         self.ensure_clients(lang, &root).await;
         let Some(clients) = self.clients.get(&(lang, root)) else {
-            unsupported(tx, path);
+            unsupported(tx);
             return;
         };
         let picked = clients.iter().find(|c| c.supports_prepare_rename).map(|c| {
@@ -5417,17 +5337,16 @@ impl WorkerState {
             )
         });
         let Some((server_name, client_arc, stalled)) = picked else {
-            unsupported(tx, path);
+            unsupported(tx);
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
-            unsupported(tx, path);
+            unsupported(tx);
             return;
         };
         spawn_prepare_rename(
             PrepareRenameAsk {
                 request_id,
-                path,
                 server_name,
                 client: client_arc,
                 uri,
@@ -6196,11 +6115,6 @@ impl DiagnosticResultIds {
         }
     }
 
-    /// Drop everything, for when the server restarts or the workspace moves.
-    pub fn clear(&mut self) {
-        self.by_uri.clear();
-    }
-
     /// How many files carry an id, so a caller can tell a cold cache from a
     /// warm one without reaching inside.
     pub fn len(&self) -> usize {
@@ -6208,6 +6122,7 @@ impl DiagnosticResultIds {
     }
 
     /// Whether the cache is cold.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_empty(&self) -> bool {
         self.by_uri.is_empty()
     }
@@ -6235,7 +6150,6 @@ const PREPARE_RENAME_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// caret is.
 struct PrepareRenameAsk {
     request_id: u64,
-    path: PathBuf,
     server_name: String,
     client: Arc<TokioMutex<LspClient>>,
     uri: Url,
@@ -6258,7 +6172,6 @@ fn spawn_prepare_rename(
     tokio::spawn(async move {
         let PrepareRenameAsk {
             request_id,
-            path,
             server_name,
             client,
             uri,
@@ -6266,15 +6179,14 @@ fn spawn_prepare_rename(
             character,
             stalled,
         } = ask;
-        let unsupported = |request_id, path| PrepareRenameResult {
+        let unsupported = |request_id| PrepareRenameResult {
             request_id,
-            path,
             unsupported: true,
             error: None,
             target: None,
         };
         if stalled.load(Ordering::Relaxed) {
-            let _ = tx.send(unsupported(request_id, path));
+            let _ = tx.send(unsupported(request_id));
             return;
         }
         // Only a request that actually went out can leak, so only then does
@@ -6299,7 +6211,7 @@ fn spawn_prepare_rename(
                     ""
                 }
             ));
-            let _ = tx.send(unsupported(request_id, path));
+            let _ = tx.send(unsupported(request_id));
             return;
         };
         let (error, target, fallback) = match resp {
@@ -6334,7 +6246,6 @@ fn spawn_prepare_rename(
         };
         let _ = tx.send(PrepareRenameResult {
             request_id,
-            path,
             unsupported: fallback,
             error,
             target,
@@ -7478,16 +7389,7 @@ fn manifest_names(lang: Language) -> &'static [&'static str] {
     lang.root_markers()
 }
 
-/// The project root a file's language server should be anchored at: the nearest
-/// ancestor holding a language manifest (e.g. `pyproject.toml`, `Cargo.toml`,
-/// `go.mod`, `package.json`), bounded by croft's workspace root. Falls back to
-/// the workspace root when none is found, so a plain single-project workspace
-/// behaves exactly as before.
-fn project_root_for(path: &Path, lang: Language, workspace_root: &Path) -> PathBuf {
-    project_root_within(path, lang, workspace_root)
-}
-
-/// [`project_root_for`] with the multi-root bound (#147): the walk stays
+/// [`project_root_within`] with the multi-root bound (#147): the walk stays
 /// inside the workspace root OWNING the file (longest prefix over all
 /// roots), and the fallback is that owning root — so a file under a
 /// secondary root roots its servers there, never at the primary. A file
@@ -7506,6 +7408,11 @@ fn project_root_for_roots(
     project_root_within(path, lang, owner)
 }
 
+/// The project root a file's language server should be anchored at: the nearest
+/// ancestor holding a language manifest (e.g. `pyproject.toml`, `Cargo.toml`,
+/// `go.mod`, `package.json`), bounded by the workspace root `bound`. Falls back
+/// to `bound` when none is found, so a plain single-project workspace behaves
+/// exactly as before.
 fn project_root_within(path: &Path, lang: Language, bound: &Path) -> PathBuf {
     let manifests = manifest_names(lang);
     if !manifests.is_empty() {
@@ -9172,7 +9079,7 @@ while True:
         std::fs::create_dir_all(svc.join("src/pkg")).unwrap();
         std::fs::write(svc.join("pyproject.toml"), b"[project]\n").unwrap();
         let file = svc.join("src/pkg/mod.py");
-        assert_eq!(project_root_for(&file, Language::PYTHON, root), svc);
+        assert_eq!(project_root_within(&file, Language::PYTHON, root), svc);
     }
 
     #[test]
@@ -9182,7 +9089,7 @@ while True:
         let file = root.join("a/b/loose.py");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         // No pyproject anywhere up the tree → workspace root.
-        assert_eq!(project_root_for(&file, Language::PYTHON, root), root);
+        assert_eq!(project_root_within(&file, Language::PYTHON, root), root);
     }
 
     #[test]
@@ -9194,11 +9101,11 @@ while True:
         // A Cargo.toml must not anchor a Python file; Python keeps walking to root.
         std::fs::write(sub.join("Cargo.toml"), b"[package]\n").unwrap();
         let file = sub.join("script.py");
-        assert_eq!(project_root_for(&file, Language::PYTHON, root), root);
+        assert_eq!(project_root_within(&file, Language::PYTHON, root), root);
         // ...but it does anchor a Rust file.
         let rs = sub.join("src/main.rs");
         std::fs::create_dir_all(rs.parent().unwrap()).unwrap();
-        assert_eq!(project_root_for(&rs, Language::RUST, root), sub);
+        assert_eq!(project_root_within(&rs, Language::RUST, root), sub);
     }
 
     #[test]
@@ -9267,9 +9174,6 @@ while True:
             Some(String::from("v2")),
             "the newest id is what goes back"
         );
-
-        ids.clear();
-        assert!(ids.is_empty(), "a restart drops everything");
     }
 
     /// A server that pulls per-document but NOT per-workspace advertises
@@ -9685,7 +9589,6 @@ while True:
         let result =
             drain_hover_blocking(&manager, Duration::from_secs(30)).expect("hover arrived");
         assert_eq!(result.request_id, id);
-        assert_eq!(result.path, file);
         let hover = result.text.expect("hover text for the greet call");
         assert!(
             hover.contains("greet"),
@@ -10149,7 +10052,6 @@ while True:
             spawn_prepare_rename(
                 PrepareRenameAsk {
                     request_id: 7,
-                    path: file.clone(),
                     server_name: String::from("prepare-rename"),
                     client: Arc::new(TokioMutex::new(client)),
                     uri: Url::from_file_path(&file).unwrap(),
@@ -11750,7 +11652,6 @@ while True:
             .recv_timeout(Duration::from_secs(30))
             .expect("a document-highlight reply must reach the drain channel");
         assert_eq!(result.request_id, 7, "the reply must echo the request id");
-        assert_eq!(result.path, file);
         assert_eq!(
             result.items,
             vec![
