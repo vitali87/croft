@@ -697,6 +697,10 @@ pub struct ResolvedConfig {
     /// process at launch, so `process_id` is `None` until they have.
     pub pick_process: bool,
     pub extra: Map<String, Value>,
+    /// The cppdbg keys lldb-dap ignores (#1394), carried with the resolved
+    /// config so every launch path (a preLaunchTask resume, a compound
+    /// member) can say so in the debug console once the session starts.
+    pub ignored_keys: Vec<&'static str>,
 }
 
 /// The fields [`resolve`] consumes; everything else lands in `extra`.
@@ -863,6 +867,7 @@ pub fn resolve(cfg: &DebugConfig, ctx: &SubstCtx) -> Result<ResolvedConfig, Stri
         process_id,
         pick_process,
         extra,
+        ignored_keys: ignored_cppdbg_keys(cfg),
     })
 }
 
@@ -1906,6 +1911,12 @@ mod tests {
     fn a_cppdbg_config_names_the_keys_lldb_dap_ignores() {
         assert_eq!(
             ignored_cppdbg_keys(&config(CPPDBG)),
+            ["MIMode", "setupCommands", "externalConsole"]
+        );
+        // Carried on the resolved config, which is all a preLaunchTask
+        // resume or a compound member launch has to go on.
+        assert_eq!(
+            resolve(&config(CPPDBG), &ctx()).unwrap().ignored_keys,
             ["MIMode", "setupCommands", "externalConsole"]
         );
     }

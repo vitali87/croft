@@ -32058,16 +32058,6 @@ impl App {
             return;
         }
         self.launch_resolved_config(rc);
-        // A cppdbg configuration runs under lldb-dap (#1394): say which of
-        // its gdb settings have no effect there.
-        let ignored = configs::ignored_cppdbg_keys(cfg);
-        if !ignored.is_empty() {
-            self.debug_console_push(format!(
-                "config \"{}\" runs under lldb-dap, which ignores its {}",
-                cfg.name,
-                ignored.join(", ")
-            ));
-        }
     }
 
     /// Where the last run of `name` failed, if the runner named a place in
@@ -32382,6 +32372,16 @@ impl App {
                 self.reveal_debug_view();
                 if python_note.is_some() {
                     self.debug_console_push(lead);
+                }
+                // A cppdbg configuration runs under lldb-dap (#1394): say
+                // which of its gdb settings have no effect there. Here, not
+                // at the call site, so a preLaunchTask resume and a compound
+                // member say it too.
+                if !rc.ignored_keys.is_empty() {
+                    self.debug_console_push(format!(
+                        "config \"{name}\" runs under lldb-dap, which ignores its {}",
+                        rc.ignored_keys.join(", ")
+                    ));
                 }
             }
             Err(e) => self.debug_error(format!("Failed to start debugger: {e}")),
