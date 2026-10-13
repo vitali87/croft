@@ -559,6 +559,8 @@ fn go_tasks(root: &Path) -> Vec<Task> {
 }
 
 /// Whether the module root holds a `package main` (a test file aside).
+/// The package clause is the first token outside comments, and a file
+/// marked `//go:build ignore` is not part of the package.
 fn root_is_go_main(root: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(root) else {
         return false;
@@ -567,13 +569,38 @@ fn root_is_go_main(root: &Path) -> bool {
         let name = e.file_name().to_string_lossy().into_owned();
         name.ends_with(".go")
             && !name.ends_with("_test.go")
-            && std::fs::read_to_string(e.path()).is_ok_and(|text| {
-                text.lines()
-                    .map(str::trim)
-                    .find(|l| l.starts_with("package "))
-                    .is_some_and(|l| l.split_whitespace().nth(1) == Some("main"))
-            })
+            && std::fs::read_to_string(e.path())
+                .is_ok_and(|text| go_package_name(&text).as_deref() == Some("main"))
     })
+}
+
+/// The package a Go source file declares, or `None` when it has none or
+/// a `//go:build ignore` constraint keeps the Go tool from building it.
+fn go_package_name(text: &str) -> Option<String> {
+    let mut rest = text;
+    loop {
+        rest = rest.trim_start();
+        if let Some(after) = rest.strip_prefix("//") {
+            let (line, tail) = after.split_once('\n').unwrap_or((after, ""));
+            if let Some(expr) = line.strip_prefix("go:build") {
+                if expr
+                    .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '!')
+                    .any(|w| w == "ignore")
+                {
+                    return None;
+                }
+            }
+            rest = tail;
+        } else if let Some(after) = rest.strip_prefix("/*") {
+            rest = after.split_once("*/")?.1;
+        } else {
+            let mut words = rest.split_whitespace();
+            return (words.next()? == "package")
+                .then(|| words.next())
+                .flatten()
+                .map(|w| w.trim_end_matches(';').to_string());
+        }
+    }
 }
 
 /// Tasks for a CMake project (#1361): configure, build (the build task)
@@ -605,6 +632,15 @@ fn cmake_tasks(root: &Path) -> Vec<Task> {
         let build = match &presets.build {
             Some(b) => format!("cmake --build --preset {}", word(b)),
             None => format!("cmake --build {dir}"),
+        };
+        let build = if root
+            .join(&presets.binary_dir)
+            .join("CMakeCache.txt")
+            .is_file()
+        {
+            build
+        } else {
+            format!("{} && {build}", out[0].command)
         };
         out.push(convention_task(build, SOURCE, true, Some("$gcc")));
         out.push(convention_task(
@@ -656,9 +692,9 @@ fn cmake_build_dir(root: &Path) -> String {
         .unwrap_or_else(|| String::from("build"))
 }
 
-/// What `CMakePresets.json` names: its first configure preset, that
-/// preset's build folder, and the first build and test presets made for
-/// it.
+/// What `CMakePresets.json` names: its first enabled configure preset,
+/// that preset's build folder, and the first build and test presets made
+/// for it.
 struct CmakePresets {
     configure: String,
     binary_dir: String,
@@ -669,24 +705,32 @@ struct CmakePresets {
 fn cmake_presets(root: &Path) -> Option<CmakePresets> {
     let text = std::fs::read_to_string(root.join("CMakePresets.json")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let visible = |kind: &str| -> Vec<serde_json::Value> {
+    let all = |kind: &str| -> Vec<serde_json::Value> {
         v.get(kind)
             .and_then(|p| p.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter(|p| p.get("hidden").and_then(|h| h.as_bool()) != Some(true))
-                    .filter(|p| p.get("name").and_then(|n| n.as_str()).is_some())
-                    .cloned()
-                    .collect()
-            })
+            .cloned()
             .unwrap_or_default()
     };
     let name = |p: &serde_json::Value| p["name"].as_str().unwrap_or_default().to_string();
-    let configure = visible("configurePresets").into_iter().next()?;
+    // Presets a user can pick: named, not hidden, and not disabled by
+    // their (possibly inherited) condition on this host.
+    let visible = |presets: &[serde_json::Value]| -> Vec<serde_json::Value> {
+        presets
+            .iter()
+            .filter(|p| p.get("hidden").and_then(|h| h.as_bool()) != Some(true))
+            .filter(|p| p.get("name").and_then(|n| n.as_str()).is_some())
+            .filter(|p| {
+                preset_field(presets, p, "condition", 0)
+                    .is_none_or(|c| cmake_condition_holds(&c, &name(p)))
+            })
+            .cloned()
+            .collect()
+    };
+    let configures = all("configurePresets");
+    let configure = visible(&configures).into_iter().next()?;
     let configure_name = name(&configure);
-    let binary_dir = configure
-        .get("binaryDir")
-        .and_then(|b| b.as_str())
+    let binary_dir = preset_field(&configures, &configure, "binaryDir", 0)
+        .and_then(|b| b.as_str().map(str::to_string))
         .map(|b| {
             b.replace("${sourceDir}/", "")
                 .replace("${presetName}", &configure_name)
@@ -694,9 +738,13 @@ fn cmake_presets(root: &Path) -> Option<CmakePresets> {
         .filter(|b| !b.contains("${") && !b.is_empty())
         .unwrap_or_else(|| String::from("build"));
     let for_configure = |kind: &str| {
-        visible(kind)
+        let presets = all(kind);
+        visible(&presets)
             .iter()
-            .find(|p| p.get("configurePreset").and_then(|c| c.as_str()) == Some(&configure_name))
+            .find(|p| {
+                preset_field(&presets, p, "configurePreset", 0)
+                    .is_some_and(|c| c.as_str() == Some(&configure_name))
+            })
             .map(name)
     };
     Some(CmakePresets {
@@ -705,6 +753,95 @@ fn cmake_presets(root: &Path) -> Option<CmakePresets> {
         configure: configure_name,
         binary_dir,
     })
+}
+
+/// A preset's `key`, its own or the first one its `inherits` chain gives.
+fn preset_field(
+    presets: &[serde_json::Value],
+    preset: &serde_json::Value,
+    key: &str,
+    depth: usize,
+) -> Option<serde_json::Value> {
+    if let Some(value) = preset.get(key) {
+        return Some(value.clone());
+    }
+    if depth > 16 {
+        return None;
+    }
+    let parents: Vec<&str> = match preset.get("inherits")? {
+        serde_json::Value::String(s) => vec![s.as_str()],
+        serde_json::Value::Array(a) => a.iter().filter_map(|p| p.as_str()).collect(),
+        _ => Vec::new(),
+    };
+    parents.into_iter().find_map(|parent| {
+        let p = presets
+            .iter()
+            .find(|p| p.get("name").and_then(|n| n.as_str()) == Some(parent))?;
+        preset_field(presets, p, key, depth + 1)
+    })
+}
+
+/// Whether a preset `condition` holds on this host. A kind this does not
+/// know counts as true, so an unfamiliar preset is still offered.
+fn cmake_condition_holds(c: &serde_json::Value, preset_name: &str) -> bool {
+    let expand = |s: &serde_json::Value| -> String {
+        let host = match std::env::consts::OS {
+            "linux" => "Linux",
+            "macos" => "Darwin",
+            "windows" => "Windows",
+            other => other,
+        };
+        let s = s
+            .as_str()
+            .unwrap_or_default()
+            .replace("${hostSystemName}", host)
+            .replace("${presetName}", preset_name);
+        regex::Regex::new(r"\$p?env\{([^}]*)\}")
+            .map(|re| {
+                re.replace_all(&s, |m: &regex::Captures| {
+                    std::env::var(&m[1]).unwrap_or_default()
+                })
+                .into_owned()
+            })
+            .unwrap_or(s)
+    };
+    let list = |key: &str| -> Vec<String> {
+        c.get(key)
+            .and_then(|l| l.as_array())
+            .map(|a| a.iter().map(expand).collect())
+            .unwrap_or_default()
+    };
+    let conditions = |key: &str| -> Vec<serde_json::Value> {
+        c.get(key)
+            .and_then(|l| l.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let matches = || {
+        regex::Regex::new(&expand(&c["regex"])).is_ok_and(|re| re.is_match(&expand(&c["string"])))
+    };
+    match c {
+        serde_json::Value::Null => return true,
+        serde_json::Value::Bool(b) => return *b,
+        _ => {}
+    }
+    match c.get("type").and_then(|t| t.as_str()) {
+        Some("const") => c.get("value").and_then(|v| v.as_bool()).unwrap_or(true),
+        Some("equals") => expand(&c["lhs"]) == expand(&c["rhs"]),
+        Some("notEquals") => expand(&c["lhs"]) != expand(&c["rhs"]),
+        Some("inList") => list("list").contains(&expand(&c["string"])),
+        Some("notInList") => !list("list").contains(&expand(&c["string"])),
+        Some("matches") => matches(),
+        Some("notMatches") => !matches(),
+        Some("anyOf") => conditions("conditions")
+            .iter()
+            .any(|c| cmake_condition_holds(c, preset_name)),
+        Some("allOf") => conditions("conditions")
+            .iter()
+            .all(|c| cmake_condition_holds(c, preset_name)),
+        Some("not") => !cmake_condition_holds(&c["condition"], preset_name),
+        _ => true,
+    }
 }
 
 fn pyproject_tasks(root: &Path) -> Vec<Task> {
@@ -1164,6 +1301,17 @@ mod tests {
         std::fs::write(tmp.path().join("go.mod"), "module example.com/lib\n").unwrap();
         std::fs::write(tmp.path().join("lib.go"), "package lib\n").unwrap();
         std::fs::write(tmp.path().join("main_test.go"), "package main\n").unwrap();
+        // Comment text and an ignored generator file do not count either.
+        std::fs::write(
+            tmp.path().join("doc.go"),
+            "/*\nUsage:\npackage main\n*/\npackage lib\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("gen.go"),
+            "//go:build ignore\n\npackage main\n",
+        )
+        .unwrap();
         let tasks = discover_tasks(tmp.path());
         assert_eq!(
             task_commands(&tasks),
@@ -1246,14 +1394,18 @@ mod tests {
         )
         .unwrap();
         let tasks = discover_tasks(tmp.path());
+        // Not configured yet: the build task configures first.
         assert_eq!(
             task_commands(&tasks),
             [
                 "cmake --preset dev",
-                "cmake --build --preset dev-build",
+                "cmake --preset dev && cmake --build --preset dev-build",
                 "ctest --preset dev-test"
             ]
         );
+        std::fs::create_dir_all(tmp.path().join("out/dev")).unwrap();
+        std::fs::write(tmp.path().join("out/dev/CMakeCache.txt"), "").unwrap();
+        let tasks = discover_tasks(tmp.path());
         assert_eq!(
             default_build_task(&tasks).unwrap().command,
             "cmake --build --preset dev-build"
@@ -1272,6 +1424,53 @@ mod tests {
                 "cmake --build out/dev",
                 "ctest --test-dir out/dev"
             ]
+        );
+    }
+
+    /// #1361: a configure preset's binaryDir may come from the hidden
+    /// base it inherits.
+    #[test]
+    fn cmake_presets_inherit_the_build_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("CMakeLists.txt"), "project(hi)\n").unwrap();
+        std::fs::write(
+            tmp.path().join("CMakePresets.json"),
+            r#"{"version": 3, "configurePresets": [
+                {"name": "base", "hidden": true, "binaryDir": "${sourceDir}/out/${presetName}"},
+                {"name": "dev", "inherits": ["base"]}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            task_commands(&discover_tasks(tmp.path())),
+            [
+                "cmake --preset dev",
+                "cmake --preset dev && cmake --build out/dev",
+                "ctest --test-dir out/dev"
+            ]
+        );
+    }
+
+    /// #1361: a preset its condition disables on this host is skipped for
+    /// the next enabled one.
+    #[test]
+    fn cmake_presets_skip_ones_disabled_on_this_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("CMakeLists.txt"), "project(hi)\n").unwrap();
+        std::fs::write(
+            tmp.path().join("CMakePresets.json"),
+            r#"{"version": 3, "configurePresets": [
+                {"name": "never", "condition": {"type": "equals", "lhs": "${hostSystemName}", "rhs": "Plan9"}},
+                {"name": "off", "condition": {"type": "const", "value": false}},
+                {"name": "base", "hidden": true, "condition": {"type": "not", "condition": {"type": "const", "value": true}}},
+                {"name": "child", "inherits": "base"},
+                {"name": "here", "condition": {"type": "notEquals", "lhs": "${hostSystemName}", "rhs": "Plan9"}}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            task_commands(&discover_tasks(tmp.path()))[0],
+            "cmake --preset here"
         );
     }
 
