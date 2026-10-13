@@ -93,7 +93,7 @@ Workspace files (4–6 above) are repo-controlled input: cloning a repo must
 never change what croft trusts or executes. They are limited to an explicit
 allowlist — appearance and editor/terminal behavior:
 
-`theme`, `format_on_save`, `format_on_type`, `auto_save`, `auto_save_on_focus_change`,
+`theme`, `format_on_save`, `insert_final_newline`, `trim_trailing_whitespace`, `trim_final_newlines`, `format_on_type`, `auto_save`, `auto_save_on_focus_change`,
 `render_whitespace`, `disable_inline_blame`, `disable_auto_close_pairs`,
 `disable_inline_values`, `disable_save_before_debug`, `disable_bracket_colors`, `disable_indent_guides`,
 `disable_inlay_hints`, `copy_on_select`, `disable_secret_redaction`, `disable_log_highlight`, `explorer_views`,
@@ -116,6 +116,9 @@ means the same thing whichever path reads it.
 |---------|-------|
 | `editor.formatOnSave` | `format_on_save` |
 | `editor.formatOnType` | `format_on_type` |
+| `files.insertFinalNewline` | `insert_final_newline` |
+| `files.trimTrailingWhitespace` | `trim_trailing_whitespace` |
+| `files.trimFinalNewlines` | `trim_final_newlines` |
 | `files.autoSave: "afterDelay"` | `auto_save: true` |
 | `files.autoSave: "onFocusChange"` / `"onWindowChange"` | `auto_save_on_focus_change: true` |
 | `files.autoSave: "off"` | both auto-save modes off |
@@ -135,6 +138,22 @@ set them.
 
 The mapped values sit **below** `.croft/config.json` in the chain, so a
 croft-native workspace file always wins over the VS Code one.
+
+## Clean-up on save
+
+Three settings, all off by default as in VS Code, act on every save
+(explicit, auto-save, format-on-save, Save All), with no `.editorconfig`
+needed:
+
+| Setting | Effect |
+|---------|--------|
+| `insert_final_newline` | ends the file with a newline |
+| `trim_trailing_whitespace` | strips trailing spaces and tabs, sparing the lines a caret is on so auto-save never eats a space just typed |
+| `trim_final_newlines` | drops the empty lines after the last line of text, keeping the newline that ends it and any line a caret is on |
+
+A `.editorconfig` `insert_final_newline` or `trim_trailing_whitespace`
+wins over the setting for its files, whether it turns the clean-up on or
+off. All three appear in **Preferences: Open Settings (UI)**.
 
 ## Project exclusions
 

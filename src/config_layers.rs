@@ -102,6 +102,9 @@ pub fn layer_of(provenance: &BTreeMap<String, LayerKind>, key: &str) -> LayerKin
 pub const WORKSPACE_ALLOWED_KEYS: &[&str] = &[
     "theme",
     "format_on_save",
+    "insert_final_newline",
+    "trim_trailing_whitespace",
+    "trim_final_newlines",
     "format_on_type",
     "auto_save",
     "auto_save_on_focus_change",

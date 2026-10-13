@@ -215,6 +215,20 @@ pub struct Prefs {
     /// an older config parses straight to disabled.
     #[serde(default)]
     pub format_on_save: bool,
+    /// When true, every save ends the file with a newline (VS Code's
+    /// `files.insertFinalNewline`, #1657). Off by default, matching VS Code;
+    /// a `.editorconfig` `insert_final_newline` wins for its file.
+    #[serde(default)]
+    pub insert_final_newline: bool,
+    /// When true, every save strips trailing spaces and tabs from the lines
+    /// no caret is on (VS Code's `files.trimTrailingWhitespace`, #1657). Off
+    /// by default; a `.editorconfig` `trim_trailing_whitespace` wins.
+    #[serde(default)]
+    pub trim_trailing_whitespace: bool,
+    /// When true, every save drops the empty lines after the last line of
+    /// text (VS Code's `files.trimFinalNewlines`, #1657). Off by default.
+    #[serde(default)]
+    pub trim_final_newlines: bool,
     /// When true, typing one of the language server's on-type trigger
     /// characters (`}`, `;`, newline, per its capability) runs
     /// `textDocument/onTypeFormatting` on the just-typed spot (VS Code's
