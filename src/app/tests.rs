@@ -59720,18 +59720,24 @@ fn a_relative_path_in_a_request_is_refused_rather_than_resolved_here() {
 /// told "no croft is open".
 #[test]
 fn the_agent_hook_is_served_on_a_machine_with_no_sessions_folder() {
-    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            crate::session_state::CACHE_DIR_FOR_THIS_TEST_THREAD.with(|d| *d.borrow_mut() = None);
+        }
+    }
     let home = tempfile::tempdir().unwrap();
-    with_relay_home(home.path(), || {
-        let ws = home.path().join("w");
-        std::fs::create_dir_all(&ws).unwrap();
-        assert!(!crate::session::sessions_dir().exists());
-        let _listener = crate::agent_approval::bind(&ws).expect("the hook socket binds");
-        assert!(
-            crate::agent_hook::connect_croft(&ws).is_some(),
-            "the hook finds this croft"
-        );
-    });
+    let _restore = Restore;
+    crate::session_state::CACHE_DIR_FOR_THIS_TEST_THREAD
+        .with(|d| *d.borrow_mut() = Some(home.path().join(".cache").join("croft")));
+    let ws = home.path().join("w");
+    std::fs::create_dir_all(&ws).unwrap();
+    assert!(!crate::session::sessions_dir().exists());
+    let _listener = crate::agent_approval::bind(&ws).expect("the hook socket binds");
+    assert!(
+        crate::agent_hook::connect_croft(&ws).is_some(),
+        "the hook finds this croft"
+    );
 }
 
 /// #1368: a hook socket that cannot be bound says so at startup, except
