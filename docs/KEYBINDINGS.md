@@ -82,7 +82,7 @@ Per platform:
 | `Cmd+K` `Shift+O` | Move into New Window: same, and close the file's tab here (macOS only; save a tab with unsaved changes first) |
 | `Cmd+K` `Z` | Toggle Zen Mode: hide the activity bar, both side bars, the panel, and the status bar; press again to restore exactly what was shown before |
 | `Cmd+K` `V` | Toggle Live Run for the active Python file: it re-runs on every pause in typing, and each line shows the values it produced, what it printed or returned, and the exception it died with. Line numbers go green for statements that ran and red for ones that never did. Also in the palette as "Python: Toggle Live Run" |
-| `Cmd+K` `B` | Show the Testing view (beaker icon); it discovers tests on first open (`cargo test` for Rust, `pytest` for Python). In the view: Enter runs all tests, `r` re-discovers, `o` opens OUTPUT on the Test Runner channel (as does clicking the "see OUTPUT › Test Runner" pointer a failed discovery or run shows), click a test's play/status glyph to run just it, click its name to jump to its source, click a suite header's play glyph to run the whole suite, click a row's eye to watch that test or suite (it reruns on every save under the project; the header's eye or `w` watches everything), ↑/↓ scroll or drag the scrollbar |
+| `Cmd+K` `B` | Show the Testing view (beaker icon); it discovers tests on first open (`cargo test` for Rust, `pytest` for Python). In the view: Enter runs all tests, `s` (or the ■ Stop control, or Testing: Cancel Test Run) stops a run or discovery in flight, `r` re-discovers, `o` opens OUTPUT on the Test Runner channel (as does clicking the "see OUTPUT › Test Runner" pointer a failed discovery or run shows), click a test's play/status glyph to run just it, click its name to jump to its source, click a suite header's play glyph to run the whole suite, click a row's eye to watch that test or suite (it reruns on every save under the project; the header's eye or `w` watches everything), ↑/↓ scroll or drag the scrollbar |
 | `Cmd+K` `Enter` | Run the test the editor caret sits in (also in the palette as "Testing: Run Test at Cursor") |
 | `Cmd+K` `Shift+Enter` | Debug the test the editor caret sits in: pytest runs as a debugpy module launch under the project's venv, a cargo test binary launches under lldb-dap with the test name as its filter ("Testing: Debug Test at Cursor"); Alt+click a gutter ▷ does the same for that test. When the last run of that test FAILED and named a place in your own code, croft sets a temporary breakpoint at the assertion first, so the session stops where it broke without you finding the line; that breakpoint is removed when the session ends, and a breakpoint you set yourself on the same line is left alone |
 | `Cmd+K` `P` | Pin / unpin the active editor tab (moved off `Cmd+K` `Shift+Enter`, which now debugs tests; also the palette's "View: Pin Editor" / "View: Unpin Editor") |
@@ -169,7 +169,7 @@ All three live under `~/.config/croft/` (XDG-resolved, so the same paths on macO
 | Command | Opens | Notes |
 |---------|-------|-------|
 | Preferences: Open Settings | a searchable settings hub | Fuzzy-search the toggleable settings; `Enter` flips a toggle and keeps the hub open. Also routes to the Color Theme picker and the JSON files below |
-| Preferences: Open Settings (JSON) | `config.json` | The full preferences document; edits apply on the next launch |
+| Preferences: Open Settings (JSON) | `config.json` | Your settings: only the keys you set, every other setting at its default (a new file starts empty); edits apply on the next launch |
 | Preferences: Open Keyboard Shortcuts (JSON) | `keybindings.json` | Rebind any palette command; **applies on save** |
 | Preferences: Configure User Snippets | `snippets.json` | Define snippets; **applies on save** |
 
@@ -228,7 +228,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | Click the header refresh icon | Re-run the current query |
 | Click the header clear icon | Clear the search query and results |
 | Click the left chevron (`▸`/`▾`), or `Ctrl`/`Cmd`+`Shift`+`H` from anywhere | Expand / collapse the Replace row (expanding focuses it; the chord, "Search: Replace in Files" in the palette, only ever opens it); while a replacement is typed, every result row previews the match crossed out with the expanded replacement beside it |
-| Type in Replace, then `Enter` or click the replace-all icon | Raise the Replace All confirmation — "Replace N occurrence(s) across M file(s)?" — then `Enter`/`Y` rewrites on disk, `Esc` cancels (regex mode honours `$1` capture references, `$&` for the whole match and `$$` for a dollar; any other `$NAME` that names no group in the pattern stays as typed); files open with unsaved changes are skipped and named, and the search re-runs afterward |
+| Type in Replace, then `Enter` or click the replace-all icon | Raise the Replace All confirmation — "Replace N occurrence(s) across M file(s)?" — then `Enter`/`Y` rewrites on disk, `Esc` cancels (regex mode honours `$1` capture references, `$&` for the whole match and `$$` for a dollar; any other `$NAME` or `$N` that names no group in the pattern stays as typed, and `$10` with fewer than ten groups is `$1` then `0`); files open with unsaved changes are skipped and named, and the search re-runs afterward |
 | Click the `...` icon, or `Alt`+`D` in a Search input | Expand / collapse the "files to include" and "files to exclude" glob inputs (also the palette's "Search: Toggle Search Details"; VS Code's `Ctrl+Shift+J` is croft's maximize-terminal) |
 | Type globs into include / exclude | Restrict the search to / from matching files (comma-separated, VS Code style; a bare `*.rs` matches at any depth, and brace alternates like `*.{ts,tsx}` are one glob). A glob that doesn't compile shows as `invalid glob: …` in red above its box, and an include box with no valid glob matches nothing. Editing re-runs the search live |
 | `Tab` | Cycle focus through the visible inputs (search → replace → include → exclude) |
@@ -244,7 +244,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Home` / `End` | Start / end of the caret's line in the commit message; with `Ctrl`, the start / end of the whole message |
 | `Enter` | Commit all tracked changes with the message. The commit runs in the background, so croft keeps responding while the repository's hooks run; the message stays in the box until the commit lands, and a hook's rejection shows below it. If a tab under the repository has unsaved edits, every commit and stash variant first asks, as VS Code does: `S`/`Enter` Save All & Commit (or Stash), which saves the tabs and goes ahead only once all of them are saved; `C` Commit (or Stash) Anyway, with the files as they are on disk; `Esc` cancels |
 | Click ✓ Commit | Same as `Enter` |
-| Click a change row | Open that file's diff against HEAD in a read-only editor tab |
+| Click a change row | Open that file's diff against HEAD in a read-only editor tab, reused on the next click. With unsaved edits the diff shows them; hunk actions then ask for a save first |
 | `S` in a diff tab | Stage only the change hunk under the cursor (click a row or `F7` to pick the hunk). With a selection dragged across rows, stages only the SELECTED lines instead (VS Code's Stage Selected Ranges): unselected additions stay out of the index and unselected deletions stay in it |
 | `U` in a diff tab | Unstage only the change hunk under the cursor, or only the selected lines when a selection spans rows |
 | `R` in a diff tab | Revert only the change hunk under the cursor after a `Y`/`N` confirm modal |
@@ -268,7 +268,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 
 | Keys | Action |
 |------|--------|
-| Arrows, Home, End | Navigate (clears any selection) |
+| Arrows, Home, End | Navigate (clears any selection). `Down` on the last line goes to its end and `Up` on the first line to its start, so `Shift`+`Down` / `Shift`+`Up` select through the ends of the file |
 | `Shift`+arrows / `Home` / `End` / `PageUp` / `PageDown` | Extend the selection by the same motion |
 | `Shift`+`Alt`+`→` / `Shift`+`Alt`+`←` | Expand / Shrink Selection (VS Code's smart select): grow every cursor to the next semantically meaningful range and retrace back exactly. Ranges come from the language server (`textDocument/selectionRange`, one request covering all cursors) when it advertises the capability, else from tree-sitter node ancestry — so the gesture works with no LSP at all; a plain-text file grows line → buffer. Any edit, click, or caret change restarts the gesture |
 | `PageUp` / `PageDown` (`fn`+`↑` / `fn`+`↓` on Mac) | Scroll one viewport |
