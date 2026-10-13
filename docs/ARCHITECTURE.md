@@ -1115,9 +1115,9 @@ Auto-detected project tasks. It reads the manifests the repo already has — `.v
 
 ### update_check.rs
 
-A release-availability check plus a staged upgrade. Once a day, tracked by the cache file `~/.cache/croft/update-check.json`, a local croft asks GitHub's latest-release endpoint off-thread; a newer, undismissed version raises a click-only popup at bottom-left offering Update or Later.
+A release-availability check plus a staged upgrade. Once a day, tracked by the cache file `~/.cache/croft/update-check.json`, a local croft asks GitHub's latest-release endpoint off-thread; a newer, undismissed version raises a click-only popup at bottom-left offering Update or Later. A release is offered only when this install can stage it: the release carries the archive for this machine's target (the Linux musl and macOS builds), or crates.io has that version for `cargo install`. A tag that is neither is never offered, so Update cannot be a guaranteed failure.
 
-**Update stages, it does not replace.** Update runs `cargo install croft-software --version X --root ~/.cache/croft/staged` in the background, so the binary on PATH is untouched and a fresh launch stays on the current version. The popup then offers Relaunch, which copies the staged binary over the installed one and re-execs — the same path the updater chord (`Ctrl+Shift+F9`) takes.
+**Update stages, it does not replace.** A croft that is itself a release (from crates.io or a release archive) on Linux or macOS copies in the release's own archive binary, checked against its signed `SHA256SUMS`; otherwise, or when that fails, Update runs `cargo install croft-software --version X --root ~/.cache/croft/staged`. Either way it runs in the background, so the binary on PATH is untouched and a fresh launch stays on the current version. The popup then offers Relaunch, which copies the staged binary over the installed one and re-execs — the same path the updater chord (`Ctrl+Shift+F9`) takes.
 
 **Never automatic.** Later remembers the version so it is not offered again, and `CROFT_NO_UPDATE_CHECK` disables the check entirely.
 
