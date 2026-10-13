@@ -582,13 +582,12 @@ fn go_package_name(text: &str) -> Option<String> {
         rest = rest.trim_start();
         if let Some(after) = rest.strip_prefix("//") {
             let (line, tail) = after.split_once('\n').unwrap_or((after, ""));
-            if let Some(expr) = line.strip_prefix("go:build") {
-                if expr
+            if let Some(expr) = line.strip_prefix("go:build")
+                && expr
                     .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '!')
                     .any(|w| w == "ignore")
-                {
-                    return None;
-                }
+            {
+                return None;
             }
             rest = tail;
         } else if let Some(after) = rest.strip_prefix("/*") {
