@@ -673,6 +673,9 @@ pub struct StackFrame {
 pub struct Scope {
     pub name: String,
     pub variables_ref: i64,
+    /// The adapter marked it `expensive` (js-debug's Global, #1421): its
+    /// variables are fetched only once the user opens it.
+    pub expensive: bool,
 }
 
 /// A single variable. `variables_ref > 0` means it is expandable (its children
@@ -728,6 +731,7 @@ pub fn parse_scopes(scopes_response: &Value) -> Vec<Scope> {
                     Some(Scope {
                         name: s.get("name")?.as_str()?.to_string(),
                         variables_ref: s.get("variablesReference")?.as_i64()?,
+                        expensive: s.get("expensive").and_then(Value::as_bool) == Some(true),
                     })
                 })
                 .collect()
@@ -1054,6 +1058,11 @@ pub struct DapSession {
     pub stack_frames: Vec<StackFrame>,
     /// Scopes (Locals / Globals) of the selected frame.
     pub scopes: Vec<Scope>,
+    /// The expensive scopes the user opened (#1421), each keyed by its name
+    /// and its ordinal among the scopes of that name, so two scopes sharing
+    /// a name open separately. They stay open, and are fetched, at every
+    /// later stop, as in VS Code; the others stay collapsed and cost nothing.
+    pub open_expensive_scopes: std::collections::BTreeSet<(String, usize)>,
     /// Variables keyed by `variablesReference`: the entry for a scope's ref holds
     /// that scope's members; expanding a variable adds its ref's children here.
     pub variables: BTreeMap<i64, Vec<Variable>>,
@@ -1223,6 +1232,27 @@ impl DapSession {
         Ok(session)
     }
 
+    /// Attach to a headless delve that already serves DAP at `host:port`
+    /// (#1418, the Go extension's "Connect to server"): no dlv is started,
+    /// `initialize` and the `mode: "remote"` attach go straight to the
+    /// socket, and stopping disconnects with `terminateDebuggee: false`.
+    /// Delve keeps the remote program running only when it was started
+    /// with `--accept-multiclient`; a single-client server shuts down with
+    /// its debuggee on disconnect.
+    pub fn attach_delve_server(
+        host: &str,
+        port: u16,
+        attach_request: Value,
+        breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
+    ) -> Result<DapSession> {
+        let transport = DapTransport::connect_tcp(host, port)?;
+        transport.send(initialize_request())?;
+        transport.send(attach_request)?;
+        let mut session = Self::new_with_transport(transport, breakpoints, None);
+        session.attached = true;
+        Ok(session)
+    }
+
     /// Assemble a fresh session around its (parent) `transport`. `js_server` is
     /// set only for vscode-js-debug, marking the session multi-session and
     /// carrying the address its child connection reuses.
@@ -1244,6 +1274,7 @@ impl DapSession {
             unverified_breakpoints: BTreeMap::new(),
             stack_frames: Vec::new(),
             scopes: Vec::new(),
+            open_expensive_scopes: std::collections::BTreeSet::new(),
             variables: BTreeMap::new(),
             selected_frame: None,
             pending_var_refs: std::collections::HashMap::new(),
@@ -1346,6 +1377,43 @@ impl DapSession {
             .filter_map(|s| self.variables.get(&s.variables_ref))
             .flatten()
             .find(|v| v.name == name)
+    }
+
+    /// The persistent identity of the scope at `index`: its name and how
+    /// many earlier scopes share that name (#1421). A `variablesReference`
+    /// changes at every stop, so it cannot keep a scope open across stops.
+    fn scope_key(&self, index: usize) -> Option<(String, usize)> {
+        let scope = self.scopes.get(index)?;
+        let nth = self.scopes[..index]
+            .iter()
+            .filter(|s| s.name == scope.name)
+            .count();
+        Some((scope.name.clone(), nth))
+    }
+
+    /// Whether the variables of the scope at `index` are shown: always,
+    /// unless it is an expensive one the user has not opened (#1421).
+    pub fn scope_open(&self, index: usize) -> bool {
+        match self.scopes.get(index) {
+            Some(scope) if scope.expensive => self
+                .scope_key(index)
+                .is_some_and(|k| self.open_expensive_scopes.contains(&k)),
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    /// Open or close the expensive scope at `index` (#1421), fetching its
+    /// variables when it opens.
+    pub fn toggle_expensive_scope(&mut self, index: usize) {
+        let Some(key) = self.scope_key(index) else {
+            return;
+        };
+        if !self.open_expensive_scopes.remove(&key) {
+            self.open_expensive_scopes.insert(key);
+            let r = self.scopes[index].variables_ref;
+            self.expand_variable(r);
+        }
     }
 
     /// Request the children of an expandable variable (its `variablesReference`)
@@ -1453,7 +1521,13 @@ impl DapSession {
                 }
                 Some("scopes") => {
                     self.scopes = parse_scopes(&msg);
-                    let refs: Vec<i64> = self.scopes.iter().map(|s| s.variables_ref).collect();
+                    // An expensive scope (a whole Global object) waits until
+                    // the user opens it (#1421), or every step would wait
+                    // for it.
+                    let refs: Vec<i64> = (0..self.scopes.len())
+                        .filter(|&i| self.scope_open(i))
+                        .map(|i| self.scopes[i].variables_ref)
+                        .collect();
                     for r in refs {
                         self.request_variables(r);
                     }
@@ -2054,7 +2128,7 @@ fn with_run_to(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     /// #264: an adapter that refuses `launch` (delve rejecting a Go too old
     /// for it, with its real payload) ends the session with the reason, on
     /// the console and in `launch_error`, instead of leaving it Initializing.
@@ -2668,10 +2742,12 @@ while True:
             Scope {
                 name: String::from("Globals"),
                 variables_ref: 1,
+                expensive: false,
             },
             Scope {
                 name: String::from("Locals"),
                 variables_ref: 2,
+                expensive: false,
             },
         ];
         assert_eq!(
@@ -2682,6 +2758,7 @@ while True:
         let unnamed = vec![Scope {
             name: String::from("Registers"),
             variables_ref: 1,
+            expensive: false,
         }];
         assert_eq!(
             inline_locals(&unnamed, &vars),
@@ -3154,6 +3231,94 @@ while True:
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("timed out; requests so far: {:?}", requests(log));
+    }
+
+    /// #1421 against a fake adapter whose Global scope is `expensive`: a
+    /// stop fetches only the Local scope; opening Global fetches it, and it
+    /// stays open (and fetched) at the next stop until it is closed.
+    #[test]
+    fn an_expensive_scope_is_fetched_only_once_opened() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let script = FAKE_DAP.replace(
+            "    elif c == \"disconnect\":",
+            r#"    elif c == "stackTrace":
+        reply(req, {"stackFrames": [{"id": 5, "name": "work", "line": 4,
+                    "source": {"path": "/w/big.js"}}]})
+    elif c == "scopes":
+        reply(req, {"scopes": [
+            {"name": "Local: work", "variablesReference": 10, "expensive": False},
+            {"name": "Global", "variablesReference": 20, "expensive": True}]})
+    elif c == "variables":
+        ref = req["arguments"]["variablesReference"]
+        reply(req, {"variables": [{"name": "v%d" % ref, "value": "1", "variablesReference": 0}]})
+    elif c == "disconnect":"#,
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fake_dap.py");
+        std::fs::write(&path, script).unwrap();
+        let log = tmp.path().join("requests.jsonl");
+        let mut session = DapSession::launch_with(
+            "python3",
+            &[path.display().to_string(), log.display().to_string()],
+            tmp.path(),
+            json!({"type": "request", "command": "launch", "arguments": {}}),
+            BTreeMap::new(),
+        )
+        .expect("fake adapter spawns");
+        let fetched = |log: &Path| -> Vec<i64> {
+            requests(log)
+                .iter()
+                .filter(|q| q["command"] == "variables")
+                .filter_map(|q| q["arguments"]["variablesReference"].as_i64())
+                .collect()
+        };
+        let scopes_asked = |log: &Path| {
+            requests(log)
+                .iter()
+                .filter(|q| q["command"] == "scopes")
+                .count()
+        };
+        poll_until(&mut session, &log, |_| fetched(&log).len() == 1);
+        // Let any late request land before asserting it never went out.
+        for _ in 0..20 {
+            session.poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(fetched(&log), vec![10], "only the Local scope");
+        let global = session
+            .scopes
+            .iter()
+            .position(|s| s.name == "Global")
+            .unwrap();
+        assert!(session.scopes[global].expensive);
+        assert!(!session.scope_open(global));
+
+        session.toggle_expensive_scope(global);
+        poll_until(&mut session, &log, |_| fetched(&log) == vec![10, 20]);
+        assert!(session.scope_open(global));
+
+        // The next stop fetches both: Global stays open.
+        session.continue_execution();
+        poll_until(&mut session, &log, |_| fetched(&log).len() == 4);
+        assert_eq!(fetched(&log), vec![10, 20, 10, 20]);
+
+        // Closed again, the stop after that skips it.
+        session.toggle_expensive_scope(global);
+        session.continue_execution();
+        poll_until(&mut session, &log, |_| {
+            scopes_asked(&log) == 3 && fetched(&log).len() == 5
+        });
+        for _ in 0..20 {
+            session.poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(fetched(&log), vec![10, 20, 10, 20, 10]);
     }
 
     /// #264 against a fake adapter with two goroutines: a stop lists both,
@@ -3796,6 +3961,18 @@ def stopped():"#,
         assert_eq!(scopes.len(), 2);
         assert_eq!(scopes[0].name, "Locals");
         assert_eq!(scopes[0].variables_ref, 7);
+        assert!(!scopes[0].expensive && !scopes[1].expensive);
+        // #1421: js-debug marks its Global scope `expensive`.
+        let scopes = parse_scopes(&json!({
+            "body": { "scopes": [
+                { "name": "Local: work", "variablesReference": 7, "expensive": false },
+                { "name": "Global", "variablesReference": 8, "expensive": true }
+            ]}
+        }));
+        assert_eq!(
+            scopes.iter().map(|s| s.expensive).collect::<Vec<_>>(),
+            vec![false, true]
+        );
 
         let vars = parse_variables(&json!({
             "body": { "variables": [
@@ -4203,5 +4380,59 @@ def stopped():"#,
             std::thread::sleep(std::time::Duration::from_millis(300));
             assert!(leftovers().is_empty(), "left behind: {:?}", leftovers());
         }
+    }
+
+    /// The first `n` DAP messages a client sends to a socket listening on a
+    /// free port (#1418): a stand-in for `dlv --headless --listen`.
+    pub(crate) fn headless_delve(n: usize) -> (u16, std::thread::JoinHandle<Vec<Value>>) {
+        use std::io::{BufRead, Read};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut out = Vec::new();
+            while out.len() < n {
+                let mut len = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        return out;
+                    }
+                    if let Some(v) = line.trim().strip_prefix("Content-Length:") {
+                        len = v.trim().parse().unwrap();
+                    }
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                }
+                let mut body = vec![0; len];
+                reader.read_exact(&mut body).unwrap();
+                out.push(serde_json::from_slice(&body).unwrap());
+            }
+            out
+        });
+        (port, handle)
+    }
+
+    /// #1418: a remote Go attach connects to the headless delve's own port
+    /// and sends it `initialize` and the `mode: "remote"` attach; no dlv is
+    /// started, and the session is an attach (stopping sends
+    /// `terminateDebuggee: false`).
+    #[test]
+    fn attach_delve_server_talks_to_the_headless_delve_directly() {
+        let (port, server) = headless_delve(2);
+        let attach = json!({"type": "request", "command": "attach",
+            "arguments": {"mode": "remote"}});
+        let session = DapSession::attach_delve_server("127.0.0.1", port, attach, BTreeMap::new())
+            .expect("connects");
+        let got = server.join().unwrap();
+        assert_eq!(got[0]["command"], "initialize");
+        assert_eq!(got[1]["command"], "attach");
+        assert_eq!(got[1]["arguments"]["mode"], "remote");
+        assert!(session.attached);
     }
 }

@@ -51,7 +51,6 @@ impl Scrubber {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn position(&self) -> Position {
         self.position
     }
