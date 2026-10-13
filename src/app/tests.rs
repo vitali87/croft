@@ -4296,6 +4296,31 @@ fn side_by_side_diff_link_records_one_go_back_entry() {
     );
 }
 
+/// #1157: `croft notes.md` for a file not written yet opens a tab for it
+/// that says the save creates it; the save does.
+#[test]
+fn a_file_not_written_yet_opens_at_launch_and_its_save_creates_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("notes.md");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_file_at_launch(&path);
+    assert_eq!(app.editor.path.as_deref(), Some(path.as_path()));
+    assert!(app.status.contains("saving creates it"), "{}", app.status);
+    assert!(!path.exists());
+    app.editor.insert_str("# Notes");
+    app.write_current_to_disk();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap().trim_end(),
+        "# Notes"
+    );
+
+    // Negative: a missing folder opens nothing and says why.
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_file_at_launch(&tmp.path().join("gone/new.md"));
+    assert!(app.editor.path.is_none());
+    assert!(app.status.contains("Couldn't open"), "{}", app.status);
+}
+
 /// #31: navigate-back rested entirely on the Ctrl+Shift+click mouse chord.
 /// The VS Code keyboard chord (Ctrl+-) and the palette command are the
 /// fallbacks that work when the host terminal never delivers that chord.

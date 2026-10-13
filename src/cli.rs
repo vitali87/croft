@@ -2037,16 +2037,51 @@ fn resolve_open_file(open_file: PathBuf, root: &Path, cwd: &Path) -> PathBuf {
         .unwrap_or_else(|| candidates[candidates.len() - 1].clone())
 }
 
+/// The canonical folder and file name of `path` when `err` (its
+/// canonicalize failure) says only its last component is missing: a file
+/// not written yet. `None` for a path written as a folder (`new/`), one with
+/// no name (`..`), or one whose folder is missing too.
+fn new_file_in_existing_dir(
+    path: &Path,
+    err: &std::io::Error,
+) -> Option<(PathBuf, std::ffi::OsString)> {
+    if err.kind() != std::io::ErrorKind::NotFound
+        || path.as_os_str().as_encoded_bytes().ends_with(b"/")
+    {
+        return None;
+    }
+    let name = match path.components().next_back()? {
+        std::path::Component::Normal(name) => name.to_os_string(),
+        _ => return None,
+    };
+    let parent = path.parent()?.canonicalize().ok()?;
+    parent.is_dir().then_some((parent, name))
+}
+
 /// [`resolve_workspace`] with the directory croft was launched from.
 fn resolve_workspace_from(
     path: &Path,
     open_file: Option<PathBuf>,
     cwd: &Path,
 ) -> Result<(PathBuf, Option<PathBuf>, Vec<PathBuf>)> {
-    let path = cwd
-        .join(path)
-        .canonicalize()
-        .with_context(|| format!("resolving workspace path {}", path.display()))?;
+    let joined = cwd.join(path);
+    let path = match joined.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            // A file not written yet, in a folder that exists: root at the
+            // folder and open the file as a new buffer, as `code new.md` and
+            // `vim new.md` do (#1157). A missing folder is still an error.
+            if let Some((parent, name)) = new_file_in_existing_dir(&joined, &e) {
+                let open_file = open_file.map(|f| resolve_open_file(f, &parent, cwd));
+                return Ok((
+                    parent.clone(),
+                    open_file.or(Some(parent.join(name))),
+                    Vec::new(),
+                ));
+            }
+            return Err(e).with_context(|| format!("resolving workspace path {}", path.display()));
+        }
+    };
     if path.is_dir() {
         let open_file = open_file.map(|f| resolve_open_file(f, &path, cwd));
         return Ok((path, open_file, Vec::new()));
@@ -2499,12 +2534,52 @@ mod tests {
     #[test]
     fn a_missing_workspace_path_is_named_in_the_error() {
         let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("missing-dir");
+        // Its folder is missing too: a new file there has nowhere to go.
+        let missing = dir.path().join("missing-dir/notes.md");
         let err = resolve_workspace(&missing, None).unwrap_err();
         assert!(
             format!("{err:#}").contains(&missing.display().to_string()),
             "{err:#}"
         );
+    }
+
+    /// #1157: `croft notes.md` for a file not written yet roots at its
+    /// folder and opens it, as `code notes.md` and `vim notes.md` do, from
+    /// the cwd or by absolute path.
+    #[test]
+    fn a_file_not_written_yet_roots_at_its_folder_and_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let canon = dir.path().canonicalize().unwrap();
+        let (root, open, folders) =
+            resolve_workspace_from(Path::new("notes.md"), None, dir.path()).unwrap();
+        assert_eq!(root, canon);
+        assert_eq!(open, Some(canon.join("notes.md")));
+        assert!(folders.is_empty());
+        let (root, open, _) = resolve_workspace(&dir.path().join("todo.txt"), None).unwrap();
+        assert_eq!(root, canon);
+        assert_eq!(open, Some(canon.join("todo.txt")));
+        assert!(
+            !canon.join("notes.md").exists(),
+            "nothing is created on disk"
+        );
+        assert!(
+            !canon.join("todo.txt").exists(),
+            "nothing is created on disk"
+        );
+    }
+
+    /// #1157, negative: a missing folder, a path written as a folder, and a
+    /// path that ends in `..` are still refused.
+    #[test]
+    fn a_new_file_needs_an_existing_folder_and_a_name() {
+        let dir = tempfile::tempdir().unwrap();
+        for typed in ["no-such-dir/notes.md", "new-dir/", "no-such-dir/.."] {
+            let err = resolve_workspace_from(Path::new(typed), None, dir.path()).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("resolving workspace path"),
+                "{typed}: {err:#}"
+            );
+        }
     }
 
     #[test]

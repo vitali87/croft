@@ -33698,16 +33698,24 @@ impl App {
     }
 
     /// Open `path` as a pinned editor tab and focus the editor. Used at launch
-    /// for `croft <root> --open-file <path>` (the new window spawned by Move /
-    /// Copy into New Window opens the handed-off file this way). Best-effort: a
-    /// missing / unreadable file just leaves the editor on the welcome screen.
+    /// for `croft <file>` and `croft <root> --open-file <path>` (the new
+    /// window spawned by Move / Copy into New Window opens the handed-off file
+    /// this way). Best-effort: an unreadable file, or a missing one whose
+    /// folder is missing too, leaves the editor on the welcome screen.
     /// A relative `path` is taken under the workspace root, so the tab gets
     /// the absolute path its language server is keyed by; a file that can't
     /// be opened says why instead of opening nothing (#1193).
     pub fn open_file_at_launch(&mut self, path: &Path) {
         let path = self.workspace_root().join(path);
-        match self.editor.open_pinned(&path) {
+        // `croft new.md` for a file not written yet opens an empty buffer
+        // that the first save creates (#1157).
+        let new = std::fs::symlink_metadata(&path).is_err();
+        match self.editor.open_new_pinned(&path) {
             Ok(_) => {
+                if new {
+                    self.status =
+                        format!("New file {}: saving creates it", self.status_path(&path));
+                }
                 // Launch is not a user focus gesture: collapsing here would
                 // hide the sidebar before the user has interacted at all
                 // (#260).

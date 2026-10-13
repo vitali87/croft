@@ -5151,9 +5151,39 @@ impl Editor {
             }
             _ => {}
         }
+        self.load_text(path, &bytes, sarif_refusal)
+    }
+
+    /// A file that does not exist yet, in a folder that does: an empty text
+    /// buffer bound to `path`, written on the first save, as `code new.md`
+    /// and `vim new.md` start one (#1157). An existing file opens as usual.
+    pub fn open_new_file(&mut self, path: &Path) -> Result<()> {
+        if std::fs::symlink_metadata(path).is_ok() {
+            return self.open(path);
+        }
+        let dir = path.parent().unwrap_or(Path::new(""));
+        if !dir.is_dir() {
+            anyhow::bail!("no such directory {}", dir.display());
+        }
+        if self.path.as_deref() != Some(path) {
+            self.force_text = false;
+        }
+        self.load_text(path, &[], None)?;
+        self.status = format!("New file {}: saving creates it", path.display());
+        Ok(())
+    }
+
+    /// Load `bytes`, the contents of `path`, as the buffer's text: the end
+    /// of [`Self::open`] once no viewer claimed the file.
+    fn load_text(
+        &mut self,
+        path: &Path,
+        bytes: &[u8],
+        sarif_refusal: Option<String>,
+    ) -> Result<()> {
         // Decode with the file's BOM-declared encoding if it has one, else
         // UTF-8. A later "Reopen with Encoding" overrides this.
-        let sniffed = encoding_rs::Encoding::for_bom(&bytes);
+        let sniffed = encoding_rs::Encoding::for_bom(bytes);
         let enc = sniffed.map(|(e, _)| e).unwrap_or(encoding_rs::UTF_8);
         // The BOM sniff comes FIRST: UTF-16 text is half NUL bytes, so the
         // binary heuristic would reject every UTF-16 file — including the ones
@@ -5161,7 +5191,7 @@ impl Editor {
         // menu. A byte-order mark is a positive declaration of text, so it
         // settles the question the heuristic is only guessing at.
         let bom_declares_text = enc == encoding_rs::UTF_16LE || enc == encoding_rs::UTF_16BE;
-        if !bom_declares_text && is_binary(&bytes) {
+        if !bom_declares_text && is_binary(bytes) {
             // Never a dead-end: binary files open in the hex viewer
             // instead of failing with "Binary file" (#172).
             return self.open_hex(path);
@@ -5180,7 +5210,7 @@ impl Editor {
         self.encoding = enc;
         // `decode` strips the BOM, so remember it or the next save drops it.
         self.bom = sniffed.is_some();
-        let (decoded, _, decode_lossy) = enc.decode(&bytes);
+        let (decoded, _, decode_lossy) = enc.decode(bytes);
         let text = decoded.into_owned();
         self.decode_lossy = decode_lossy;
         self.final_newline = text.ends_with(['\n', '\r']);
@@ -18652,6 +18682,20 @@ impl EditorTabs {
     /// to it. Otherwise create a fresh pinned tab next to the active one.
     /// Used by double-click in the explorer and Ctrl+Enter on a tree row.
     pub fn open_pinned(&mut self, path: &Path) -> Result<()> {
+        self.open_pinned_with(path, Editor::open)
+    }
+
+    /// [`Self::open_pinned`] for a file that may not exist yet: a missing
+    /// one opens as an empty buffer that its first save creates (#1157).
+    pub fn open_new_pinned(&mut self, path: &Path) -> Result<()> {
+        self.open_pinned_with(path, Editor::open_new_file)
+    }
+
+    fn open_pinned_with(
+        &mut self,
+        path: &Path,
+        open: fn(&mut Editor, &Path) -> Result<()>,
+    ) -> Result<()> {
         // A diff tab can carry the working file's `path` yet is not an
         // editable view of it, so skip diffs here: Enter on a diff (or a
         // double-click) opens the real file beside the diff rather than just
@@ -18665,7 +18709,7 @@ impl EditorTabs {
         }
         if self.is_blank_initial() {
             let active = self.active;
-            self.editors[active].open(path)?;
+            open(&mut self.editors[active], path)?;
             self.editors[active].preview = false;
             self.editors[active].search_highlight = self.search_highlight_term.clone();
             self.editors[active].search_highlight_opts = self.search_highlight_opts;
@@ -18673,7 +18717,7 @@ impl EditorTabs {
         }
         let mut e = Editor::new();
         e.focused = self.editors[self.active].focused;
-        e.open(path)?;
+        open(&mut e, path)?;
         e.preview = false;
         e.search_highlight = self.search_highlight_term.clone();
         e.search_highlight_opts = self.search_highlight_opts;
@@ -30689,6 +30733,45 @@ mod tests {
         e.lang = None;
         assert!(!e.toggle_line_comment());
         assert_eq!(e.lines, vec!["x = 1"]);
+    }
+
+    /// #1157: a file not written yet opens as an empty, clean buffer bound
+    /// to its path, with its language, and the first save creates it.
+    #[test]
+    fn a_new_file_opens_empty_and_its_first_save_creates_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("notes.py");
+        let mut e = Editor::new();
+        e.open_new_file(&path).unwrap();
+        assert_eq!(e.path.as_deref(), Some(path.as_path()));
+        assert_eq!(e.lines, vec![String::new()]);
+        assert!(!e.dirty);
+        assert_eq!(e.language_label(), "Python");
+        assert!(e.status.contains("saving creates it"), "{}", e.status);
+        assert!(!path.exists(), "opening creates nothing");
+        assert!(!e.disk_changed_externally());
+        e.insert_str("x = 1");
+        assert!(matches!(e.save_to_disk().unwrap(), SaveOutcome::Saved));
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim_end(), "x = 1");
+    }
+
+    /// #1157, negative: an existing file opens with its text, and a new file
+    /// in a missing folder is refused rather than bound to a path no save
+    /// could write.
+    #[test]
+    fn a_new_file_keeps_existing_text_and_needs_its_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old.txt");
+        std::fs::write(&path, "kept\n").unwrap();
+        let mut e = Editor::new();
+        e.open_new_file(&path).unwrap();
+        assert_eq!(e.lines[0], "kept");
+        let mut e = Editor::new();
+        let err = e
+            .open_new_file(&tmp.path().join("gone/new.txt"))
+            .unwrap_err();
+        assert!(err.to_string().contains("no such directory"), "{err}");
+        assert!(e.path.is_none());
     }
 
     // ---- Toggle Block Comment (Shift+Alt+A) ----
