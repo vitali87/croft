@@ -11063,6 +11063,11 @@ impl Editor {
                 };
                 for &r in &rows {
                     if jsx.contains(&r) {
+                        // Already `{/* … */}`: wrapping it again would nest
+                        // the comment, and its `*/}` would end the outer one.
+                        if is_jsx_comment(self.lines[r].trim()) {
+                            continue;
+                        }
                         let end = self.lines[r].trim_end().len();
                         self.lines[r].truncate(end);
                         self.lines[r].push_str(&format!(" {JSX_COMMENT_CLOSE}"));
@@ -11145,7 +11150,11 @@ impl Editor {
                 text_end(start, &lead)
             })
             .collect();
-        let jsx = self.jsx_children_at(&jsx_starts);
+        let standalone: Vec<bool> = merged
+            .iter()
+            .map(|&(start, end, _)| is_jsx_comment(self.char_range_text(start, end).trim()))
+            .collect();
+        let jsx = self.jsx_children_at(&jsx_starts, &standalone);
         // From the bottom up, so an edit never moves a range still to come.
         let mut placed: Vec<(bool, (usize, usize))> = Vec::with_capacity(merged.len());
         for (i, &(start, end, primary)) in merged.iter().enumerate().rev() {
@@ -11200,15 +11209,13 @@ impl Editor {
                 (r, line.chars().take_while(|c| c.is_whitespace()).count())
             })
             .collect();
-        // A line that is one `{/* … */}` is a commented JSX child even once
-        // commenting out a closing tag has left the markup unparseable, so
-        // a second Ctrl+/ still takes it off.
-        let js = matches!(self.lang, Some(LangKind::JavaScript) | Some(LangKind::Tsx));
+        let standalone: Vec<bool> = rows
+            .iter()
+            .map(|&r| is_jsx_comment(self.lines[r].trim()))
+            .collect();
         rows.iter()
-            .zip(self.jsx_children_at(&points))
-            .filter_map(|(&r, jsx)| {
-                (jsx || js && is_jsx_comment(self.lines[r].trim())).then_some(r)
-            })
+            .zip(self.jsx_children_at(&points, &standalone))
+            .filter_map(|(&r, jsx)| jsx.then_some(r))
             .collect()
     }
 
@@ -11216,7 +11223,13 @@ impl Editor {
     /// children, an element, a closing tag, text or a `{…}`, where a
     /// comment must be written `{/* … */}` (#1623). Always false outside
     /// the JSX-capable grammars, and on a line of plain code or attributes.
-    fn jsx_children_at(&self, points: &[(usize, usize)]) -> Vec<bool> {
+    ///
+    /// Where `standalone[i]` says the text at `points[i]` is one whole
+    /// `{/* … */}`, that point also counts when it sits in JSX or in a parse
+    /// error: commenting out a closing tag leaves the markup unparseable, and
+    /// a second toggle must still take the comment off. In well-formed plain
+    /// code such a line is a block holding a comment, and stays code.
+    fn jsx_children_at(&self, points: &[(usize, usize)], standalone: &[bool]) -> Vec<bool> {
         let none = vec![false; points.len()];
         if !matches!(self.lang, Some(LangKind::JavaScript) | Some(LangKind::Tsx)) {
             return none;
@@ -11233,7 +11246,12 @@ impl Editor {
         };
         points
             .iter()
-            .map(|&p| jsx_child_starts_at(tree.root_node(), self.char_pos_to_byte(p)))
+            .zip(standalone)
+            .map(|(&p, &standalone)| {
+                let byte = self.char_pos_to_byte(p);
+                jsx_child_starts_at(tree.root_node(), byte)
+                    || standalone && in_jsx_or_error(tree.root_node(), byte)
+            })
             .collect()
     }
 
@@ -13358,6 +13376,19 @@ fn jsx_child_starts_at(root: tree_sitter::Node, byte: usize) -> bool {
         }
         node = parent;
     }
+}
+
+/// Whether the node at `byte`, or any node around it, is JSX or a parse
+/// error.
+fn in_jsx_or_error(root: tree_sitter::Node, byte: usize) -> bool {
+    let mut node = root.descendant_for_byte_range(byte, byte);
+    while let Some(n) = node {
+        if n.is_error() || n.kind().starts_with("jsx") {
+            return true;
+        }
+        node = n.parent();
+    }
+    false
 }
 
 /// The line-comment marker for a language (VS Code `lineComment`), or `None`
@@ -30888,6 +30919,51 @@ mod tests {
         e.cursor_row = 4;
         assert!(e.toggle_line_comment());
         assert_eq!(e.lines[4], "      <p>Welcome</p>");
+    }
+
+    /// #1623: commenting a selection that already holds a JSX comment
+    /// leaves that comment as it is instead of nesting it.
+    #[test]
+    fn toggle_line_comment_on_a_mixed_jsx_selection_does_not_nest() {
+        let mut e = jsx_editor(LangKind::Tsx);
+        e.cursor_row = 3;
+        assert!(e.toggle_line_comment());
+        e.selection = Some(EditorSelection {
+            anchor: (3, 0),
+            head: (4, 3),
+        });
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[3], "      {/* <h1>Hello {name}</h1> */}");
+        assert_eq!(e.lines[4], "      {/* <p>Welcome</p> */}");
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[3], "      <h1>Hello {name}</h1>");
+        assert_eq!(e.lines[4], "      <p>Welcome</p>");
+    }
+
+    /// #1623: Toggle Block Comment twice on a closing tag restores it, though
+    /// the first toggle left the markup unparseable.
+    #[test]
+    fn toggle_block_comment_on_a_closing_tag_toggles_back() {
+        let mut e = jsx_editor(LangKind::Tsx);
+        e.cursor_row = 5;
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines[5], "    {/* </div> */}");
+        e.cursor_row = 5;
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines[5], "    </div>");
+    }
+
+    /// #1623: in plain code, `{/* TODO */}` is a block holding a comment;
+    /// Ctrl+/ comments it out with `//` rather than unwrapping it.
+    #[test]
+    fn a_braced_comment_in_plain_code_is_not_a_jsx_comment() {
+        for lang in [LangKind::Tsx, LangKind::JavaScript] {
+            let mut e = editor_with("function f() {\n  {/* TODO */}\n}");
+            e.lang = Some(lang);
+            e.cursor_row = 1;
+            assert!(e.toggle_line_comment());
+            assert_eq!(e.lines[1], "  // {/* TODO */}", "{lang:?}");
+        }
     }
 
     /// #1623: Toggle Block Comment in JSX children wraps in braces too.
