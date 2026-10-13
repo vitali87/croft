@@ -520,7 +520,13 @@ fn package_json_tasks(root: &Path) -> Vec<Task> {
                 problem_matcher: None,
                 vscode: Some(VscodeCommand {
                     command: runner.to_string(),
-                    args: vec![name.clone()],
+                    // A script name can hold shell syntax (`check;false`);
+                    // it goes to the runner as one word.
+                    args: vec![if needs_quote(name) {
+                        quote_word(name)
+                    } else {
+                        name.clone()
+                    }],
                     cwd: Some(format!("${{workspaceFolder}}/{rel}")),
                     env: Vec::new(),
                     unrunnable: None,
@@ -536,24 +542,25 @@ fn package_json_tasks(root: &Path) -> Vec<Task> {
 const WORKSPACE_GLOB_DEPTH: usize = 4;
 
 /// The member packages of a JS workspaces monorepo at `root`, as sorted
-/// `/`-separated paths relative to it (#1515): the root package.json's
-/// `workspaces` globs (an array, or yarn's `{ "packages": [...] }`), or
-/// else `pnpm-workspace.yaml`'s `packages:` list. A `!` glob excludes.
+/// `/`-separated paths relative to it (#1515): `pnpm-workspace.yaml`'s
+/// `packages:` list when that file exists (pnpm reads only it), or else the
+/// root package.json's `workspaces` globs (an array, or yarn's
+/// `{ "packages": [...] }`). A `!` glob excludes.
 /// Only folders holding a package.json count, and `node_modules` and
 /// dot folders are never entered.
 fn workspace_packages(root: &Path, manifest: &serde_json::Value) -> Vec<String> {
-    let declared = manifest.get("workspaces").and_then(|w| {
-        w.as_array()
-            .or_else(|| w.get("packages").and_then(|p| p.as_array()))
-    });
-    let globs: Vec<String> = match declared {
-        Some(list) => list
-            .iter()
+    let globs: Vec<String> = match std::fs::read_to_string(root.join("pnpm-workspace.yaml")) {
+        Ok(yaml) => pnpm_workspace_globs(&yaml),
+        Err(_) => manifest
+            .get("workspaces")
+            .and_then(|w| {
+                w.as_array()
+                    .or_else(|| w.get("packages").and_then(|p| p.as_array()))
+            })
+            .into_iter()
+            .flatten()
             .filter_map(|g| g.as_str().map(str::to_string))
             .collect(),
-        None => std::fs::read_to_string(root.join("pnpm-workspace.yaml"))
-            .map(|y| pnpm_workspace_globs(&y))
-            .unwrap_or_default(),
     };
     let build = |neg: bool| {
         let mut b = globset::GlobSetBuilder::new();
@@ -1509,6 +1516,57 @@ mod tests {
                 .command_line(&ctx_at(pnpm.path()))
                 .unwrap()
                 .ends_with(" && pnpm run start)")
+        );
+    }
+
+    /// #1515: pnpm reads only `pnpm-workspace.yaml`, so a stale root
+    /// `workspaces` field left from a yarn/npm migration is ignored when
+    /// the YAML exists.
+    #[test]
+    fn pnpm_workspace_yaml_wins_over_a_stale_workspaces_field() {
+        let tmp = js_monorepo(
+            r#"{ "private": true, "workspaces": ["packages/web"] }"#,
+            &[
+                ("pnpm-workspace.yaml", "packages:\n  - packages/api\n"),
+                ("pnpm-lock.yaml", ""),
+            ],
+        );
+        assert_eq!(
+            labels(&discover_tasks(tmp.path())),
+            ["npm: start - packages/api", "npm: test - packages/api"]
+        );
+    }
+
+    /// #1515: a package script name holding shell syntax reaches the
+    /// runner as one word, never as shell commands.
+    #[test]
+    fn a_package_script_name_is_quoted_on_the_command_line() {
+        let tmp = js_monorepo(
+            r#"{ "workspaces": ["packages/*"] }"#,
+            &[(
+                "packages/web/package.json",
+                r#"{ "scripts": { "check;false": "echo x", "build$(id)": "echo y" } }"#,
+            )],
+        );
+        let tasks = discover_tasks(tmp.path());
+        let ctx = ctx_at(tmp.path());
+        let line = |label: &str| {
+            tasks
+                .iter()
+                .find(|t| t.label == label)
+                .unwrap()
+                .command_line(&ctx)
+                .unwrap()
+        };
+        assert!(
+            line("npm: check;false - packages/web").ends_with(" && npm run 'check;false')"),
+            "{}",
+            line("npm: check;false - packages/web")
+        );
+        assert!(
+            line("npm: build$(id) - packages/web").ends_with(" && npm run 'build$(id)')"),
+            "{}",
+            line("npm: build$(id) - packages/web")
         );
     }
 
