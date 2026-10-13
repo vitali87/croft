@@ -24966,13 +24966,7 @@ impl App {
                     .to_path_buf();
                 let project_py =
                     debuggee_python(&test_dir, &root, std::env::var_os("PATH").as_deref());
-                let note = match project_py.as_deref().map_or(Ok(None), debuggee_python_note) {
-                    Ok(note) => note,
-                    Err(refusal) => {
-                        self.debug_error(refusal);
-                        return;
-                    }
-                };
+                let project_found = project_py.is_some();
                 let adapter_py = match crate::dap::install::ensure_debug_venv() {
                     Ok(py) => py,
                     Err(e) => {
@@ -25003,6 +24997,19 @@ impl App {
                         }
                     }
                 }
+                // Checked once the config has had its say, so a `python`
+                // it names is the one validated (#1398).
+                let note = match debug_test_python(&request, &root, &adapter_py, project_found)
+                    .as_deref()
+                    .map_or(Ok(None), debuggee_python_note)
+                {
+                    Ok(note) => note,
+                    Err(refusal) => {
+                        self.disarm_failure_breakpoint();
+                        self.debug_error(refusal);
+                        return;
+                    }
+                };
                 let using = test_config
                     .map(|c| format!(" with \"{}\"", c.name))
                     .unwrap_or_default();
@@ -70793,6 +70800,19 @@ fn launch_request_python(request: &serde_json::Value, adapter_dir: &Path) -> Opt
         None => program_dir.map_or_else(|| adapter_dir.to_path_buf(), |d| adapter_dir.join(d)),
     };
     Some(launch_dir.join(python))
+}
+
+/// The interpreter Debug Test's pytest runs under once any debug-test
+/// config is applied (#1398): the request's own `python`, a config's
+/// included, but not the debug venv's stand-in for a project that has no
+/// interpreter of its own, which was never the project's to report on.
+fn debug_test_python(
+    request: &serde_json::Value,
+    root: &Path,
+    adapter_py: &Path,
+    project_found: bool,
+) -> Option<PathBuf> {
+    launch_request_python(request, root).filter(|py| project_found || py != adapter_py)
 }
 
 /// The interpreter a launch.json Python config's program runs under when
