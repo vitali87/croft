@@ -2969,6 +2969,9 @@ pub struct Editor {
     /// double-click / Ctrl+Enter / typing into the buffer pin the tab
     /// (preview = false) so subsequent previews don't overwrite it.
     pub preview: bool,
+    /// `Some(n)` for a tab made by File: New Untitled Text File (#1580),
+    /// shown as `Untitled-n` until Save As gives it a path.
+    pub untitled: Option<usize>,
     /// True when the user has pinned this tab (VS Code "Pin"). Pinned tabs are
     /// kept leftmost in the strip, survive Close Others / Close to the Right,
     /// and show a thumb-tack glyph in place of the close `\u{2715}`. A pinned
@@ -3408,6 +3411,7 @@ impl Editor {
             fallback_kind_folds: Vec::new(),
             fallback_folds_seq: None,
             preview: false,
+            untitled: None,
             pinned: false,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -10098,6 +10102,8 @@ impl Editor {
         self.disk_conflict = false;
         let outcome = self.write_buffer_to_disk();
         if matches!(outcome, Ok(SaveOutcome::Saved)) {
+            // Named now: its `Untitled-n` is free for the next one (#1580).
+            self.untitled = None;
             let lang = crate::highlight::lang_for_path(path);
             if lang != self.lang {
                 self.set_language(lang);
@@ -18589,8 +18595,35 @@ impl EditorTabs {
     pub fn is_blank_initial(&self) -> bool {
         self.editors.len() == 1
             && self.editors[0].path.is_none()
+            && self.editors[0].untitled.is_none()
             && !self.editors[0].dirty
             && self.editors[0].lines.iter().all(|l| l.is_empty())
+    }
+
+    /// File: New Untitled Text File (#1580): a pinned, empty tab with no
+    /// path next to the active one, numbered with the lowest `Untitled-n`
+    /// no open tab holds. The blank startup tab becomes it rather than
+    /// staying behind. Returns `n`.
+    pub fn new_untitled(&mut self) -> usize {
+        let n = (1..)
+            .find(|n| !self.editors.iter().any(|e| e.untitled == Some(*n)))
+            .unwrap_or(1);
+        if self.is_blank_initial() {
+            let active = self.active;
+            self.editors[active].untitled = Some(n);
+            self.editors[active].preview = false;
+            return n;
+        }
+        let mut e = Editor::new();
+        e.focused = self.editors[self.active].focused;
+        e.untitled = Some(n);
+        e.search_highlight = self.search_highlight_term.clone();
+        e.search_highlight_opts = self.search_highlight_opts;
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
+        n
     }
 
     /// Test-only helper that mirrors `open_preview` without going through
@@ -19033,7 +19066,10 @@ fn tab_label(e: &Editor) -> String {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| String::from("untitled")),
-        None => String::from("untitled"),
+        None => match e.untitled {
+            Some(n) => format!("Untitled-{n}"),
+            None => String::from("untitled"),
+        },
     };
     // The merge editor is text underneath (dirty dot still applies), but
     // the tab says which flavour of the file it is showing.

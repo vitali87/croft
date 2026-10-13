@@ -13644,6 +13644,7 @@ fn every_cmd_chord_is_ctrl_off_macos_unless_linux_md_lists_it() {
         is_delete_node_key,
         is_completion_trigger_key,
         is_save_all_key,
+        is_new_untitled_file_key,
         is_replace_in_files_key,
         is_search_details_key,
         is_show_output_key,
@@ -77640,6 +77641,169 @@ fn save_as(app: &mut App, answer: &str) {
     let prompt = app.prompt.as_mut().expect("Save As asks for a path");
     prompt.buffer = answer.to_string();
     app.commit_prompt();
+}
+
+/// The modifier for File: New Untitled Text File: `Cmd` everywhere, and
+/// `Ctrl` off macOS.
+fn new_untitled_chords() -> Vec<KeyModifiers> {
+    if cfg!(target_os = "macos") {
+        vec![KeyModifiers::SUPER]
+    } else {
+        vec![KeyModifiers::CONTROL, KeyModifiers::SUPER]
+    }
+}
+
+/// #1580: `Ctrl`+`N` (`Cmd`+`N`) opens a focused `Untitled-1` tab with no
+/// path beside the open file, and the next one is `Untitled-2`. It used to
+/// do nothing.
+#[test]
+fn ctrl_n_opens_numbered_untitled_tabs() {
+    for mods in new_untitled_chords() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_open_file(tmp.path(), "b.txt", "keep\n");
+        app.handle_key(key(KeyCode::Char('n'), mods)).unwrap();
+        assert_eq!(app.editor.tab_count(), 2, "{mods:?}");
+        assert_eq!(app.editor.path, None);
+        assert!(app.focus == Pane::Editor);
+        let first = app.editor.active_index();
+        assert_eq!(app.editor.tab_display_label(first), "Untitled-1");
+        type_str(&mut app, "trace");
+        assert_eq!(app.editor.lines[0], "trace");
+        app.handle_key(key(KeyCode::Char('n'), mods)).unwrap();
+        assert_eq!(app.editor.tab_count(), 3);
+        assert_eq!(
+            app.editor.tab_display_label(app.editor.active_index()),
+            "Untitled-2"
+        );
+        assert_eq!(
+            app.editor.tab_display_label(first),
+            "● Untitled-1",
+            "typed into"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("b.txt")).unwrap(),
+            "keep\n"
+        );
+        assert_eq!(
+            std::fs::read_dir(tmp.path()).unwrap().count(),
+            1,
+            "no file is created on disk"
+        );
+    }
+}
+
+/// #1580: the palette has the command, and from the blank startup tab it
+/// turns that tab into `Untitled-1` (the welcome screen gives way) rather
+/// than stacking a second tab.
+#[test]
+fn the_palette_turns_the_startup_tab_into_untitled_1() {
+    use crate::widgets::command_palette::Command;
+    assert_eq!(
+        Command::from_id("new_untitled_file"),
+        Some(Command::NewUntitledFile)
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.editor.is_blank_initial());
+    assert!(run_from_palette(&mut app, "File: New Untitled Text File"));
+    assert_eq!(app.editor.tab_count(), 1);
+    assert_eq!(app.editor.tab_display_label(0), "Untitled-1");
+    assert!(!app.editor.is_blank_initial(), "no welcome screen over it");
+    assert!(app.focus == Pane::Editor);
+}
+
+/// #1580: text typed into an untitled tab is unsaved work: quitting asks,
+/// naming the tab.
+#[test]
+fn quitting_with_text_in_an_untitled_tab_asks_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "b.txt", "keep\n");
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::SUPER))
+        .unwrap();
+    type_str(&mut app, "draft");
+    press_ctrl_q(&mut app);
+    assert!(!app.quit);
+    assert_eq!(app.pending_unsaved, Some(UnsavedExit::Quit));
+    let screen = draw_screen(&mut app);
+    assert!(screen.contains("Untitled-1"), "{screen}");
+}
+
+/// #1580: saving an untitled tab asks where (Save As); the tab then takes
+/// the path and its language, and its number is free for the next one.
+#[test]
+fn saving_an_untitled_tab_asks_where_and_names_the_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "b.txt", "keep\n");
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::SUPER))
+        .unwrap();
+    type_str(&mut app, "x = 1");
+    app.save();
+    let prompt = app.prompt.as_mut().expect("Save asks where");
+    assert!(matches!(prompt.kind, PromptKind::SaveAs));
+    assert_eq!(prompt.buffer, "");
+    prompt.buffer = String::from("scratch.py");
+    app.commit_prompt();
+    let saved = tmp.path().join("scratch.py");
+    assert_eq!(app.editor.path.as_deref(), Some(saved.as_path()));
+    assert!(
+        std::fs::read_to_string(&saved)
+            .unwrap()
+            .starts_with("x = 1")
+    );
+    assert!(!app.editor.dirty);
+    assert!(app.editor.language().is_some(), "a .py file is Python");
+    let idx = app.editor.active_index();
+    assert_eq!(app.editor.tab_display_label(idx), "scratch.py");
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(
+        app.editor.tab_display_label(app.editor.active_index()),
+        "Untitled-1"
+    );
+}
+
+/// Negatives (#1580): Esc on the Save As prompt keeps the tab untitled with
+/// its text; `Ctrl`+`N` in a terminal is the shell's and in vim mode is
+/// vim's, so neither opens a tab; `Ctrl`+`Shift`+`N` is still not it.
+#[test]
+fn ctrl_n_leaves_terminals_vim_and_shifted_chords_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "b.txt", "keep\n");
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::SUPER))
+        .unwrap();
+    type_str(&mut app, "note");
+    app.save();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.prompt.is_none());
+    assert_eq!(app.editor.path, None);
+    assert_eq!(app.editor.lines[0], "note");
+    assert!(app.editor.dirty);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "b.txt", "keep\n");
+    app.handle_key(key(
+        KeyCode::Char('n'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    app.handle_key(key(
+        KeyCode::Char('n'),
+        KeyModifiers::SUPER | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    app.focus = Pane::Terminal;
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::CONTROL))
+        .unwrap();
+    app.focus_pane(Pane::Editor);
+    app.vim.enabled = true;
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.editor.tab_count(), 1, "no untitled tab opened");
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("b.txt").as_path())
+    );
 }
 
 #[test]

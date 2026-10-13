@@ -115,6 +115,7 @@ pub enum Command {
     /// File: New File… / New Folder… (#852): the Explorer's create prompt
     /// from any pane, beside the active file or in the Explorer selection.
     NewFile,
+    NewUntitledFile,
     NewFolder,
     Undo,
     Redo,
@@ -565,6 +566,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::RevertFile,
     Command::SaveAll,
     Command::NewFile,
+    Command::NewUntitledFile,
     Command::NewFolder,
     Command::Undo,
     Command::Redo,
@@ -959,6 +961,7 @@ impl Command {
             Command::RevertFile => "File: Revert File",
             Command::SaveAll => "File: Save All",
             Command::NewFile => "File: New File…",
+            Command::NewUntitledFile => "File: New Untitled Text File",
             Command::NewFolder => "File: New Folder…",
             Command::Undo => "Undo",
             Command::Redo => "Redo",
@@ -1368,6 +1371,7 @@ impl Command {
             // Palette-only: the Explorer's `Cmd+F` / `Cmd+Shift+N` are Find
             // and unbound outside it, so neither is the command's chord.
             Command::NewFile => "",
+            Command::NewUntitledFile => "Cmd+N",
             Command::NewFolder => "",
             Command::Undo => "Cmd+Z",
             Command::Redo => "Shift+Cmd+Z",
@@ -1747,6 +1751,7 @@ impl Command {
             Command::RevertFile => "revert_file",
             Command::SaveAll => "save_all",
             Command::NewFile => "new_file",
+            Command::NewUntitledFile => "new_untitled_file",
             Command::NewFolder => "new_folder",
             Command::Undo => "undo",
             Command::Redo => "redo",

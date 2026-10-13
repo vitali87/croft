@@ -151,6 +151,7 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | Go to Implementations | `Cmd`+`F12` | Go to the concrete implementors of the trait / interface at the caret: the Linux route, where `Ctrl`+`F12` is Go to Type Definition |
 | Explorer: Jump to Directory (zoxide) | `Cmd`+`Z` in the Explorer | Open the zoxide jump popup from any pane: the Linux route, where `Ctrl`+`Z` is kept out of the Explorer |
 | Session: Detach | `Cmd`+`K` `Shift`+`Q` | Detach this client from the persistent session; the session keeps running. Run the same `croft attach` / `croft remote` command to reattach |
+| File: New Untitled Text File | `Cmd`+`N` (from the editor or the side bar) | A scratch tab, `Untitled-1`, `Untitled-2`, …, with no file behind it; saving it asks where to write it |
 | File: New File… / File: New Folder… | palette only (`Cmd`+`F` / `Cmd`+`Shift`+`N` while the Explorer is focused) | The Explorer's create prompt from any pane: beside the active file, or in the Explorer selection while the Explorer has focus (or no file is open) |
 | Select All | `Cmd`+`A` | Select the whole active editor buffer. The palette is the Linux route: there `Ctrl`+`A` is line start |
 | View: Show Ports / View: Show Captures | palette only | Show the PORTS / CAPTURES tab of the bottom panel and focus it, so its keys (`↑`/`↓`, `⏎`, …) work at once |

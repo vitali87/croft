@@ -152,6 +152,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_save_all_key",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+N",
+                description: "New Untitled Text File: an empty editor tab to type in",
+                handler: "is_new_untitled_file_key",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+Shift+H",
                 description: "Replace in Files: the Search sidebar with its Replace row open and focused (in the terminal, Ctrl+Shift+H is command history)",
                 handler: "is_replace_in_files_key",
