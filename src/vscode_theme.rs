@@ -29,7 +29,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// How deep an `include` chain may go. Themes legitimately extend a base
 /// (`dark_plus` includes `dark_vs`), and a cycle would otherwise hang.
@@ -62,6 +62,11 @@ struct RawTheme {
     /// say so rather than quietly colouring less than the theme asked for.
     #[serde(skip)]
     dropped_rules: usize,
+    /// `tokenColors` given as a path to a TextMate `.tmTheme` (or JSON)
+    /// file beside the theme rather than inline rules (#1177), read by
+    /// [`load_chain`] relative to the theme.
+    #[serde(skip)]
+    token_colors_file: Option<String>,
 }
 
 /// One `tokenColors` rule. `scope` is a string or a list of them, and both
@@ -201,32 +206,88 @@ fn load_chain(path: &Path, depth: usize, out: &mut Vec<RawTheme>) -> Result<()> 
     }
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let theme = parse_theme(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    let mut theme = parse_theme(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    if let Some(file) = theme.token_colors_file.take() {
+        let file = beside(path, &file, "tokenColors")?;
+        let (rules, dropped) = read_token_colors_file(&file)
+            .with_context(|| format!("reading tokenColors file {}", file.display()))?;
+        theme.token_colors = rules;
+        theme.dropped_rules += dropped;
+    }
     if let Some(inc) = theme.include.clone() {
-        // Relative to the including file, and relative ONLY: an absolute
-        // path in a downloaded theme has no business being read, and a
-        // theme that needs one is broken rather than unsupported.
-        let inc_path = Path::new(&inc);
-        if inc_path.is_absolute()
-            || inc_path
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            // A theme extends a sibling base, never something outside its own
-            // directory. Refusing traversal keeps a downloaded theme file
-            // from naming a path it has no business reading.
-            return Err(anyhow!(
-                "include must be a relative path inside the theme's directory, got {inc}"
-            ));
-        }
-        let base = path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(inc_path);
+        let base = beside(path, &inc, "include")?;
         load_chain(&base, depth + 1, out)?;
     }
     out.push(theme);
     Ok(())
+}
+
+/// `rel`, a file the theme at `theme` names in its `field`, resolved
+/// beside it. Relative to the theme, and relative ONLY: an absolute path in
+/// a downloaded theme has no business being read, and a theme that needs
+/// one is broken rather than unsupported.
+fn beside(theme: &Path, rel: &str, field: &str) -> Result<PathBuf> {
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute()
+        || rel_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        // A theme extends a sibling base, never something outside its own
+        // directory. Refusing traversal keeps a downloaded theme file from
+        // naming a path it has no business reading.
+        return Err(anyhow!(
+            "{field} must be a relative path inside the theme's directory, got {rel}"
+        ));
+    }
+    Ok(theme
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(rel_path))
+}
+
+/// The rules of a `tokenColors` file (#1177): a TextMate `.tmTheme` plist,
+/// whose `settings` array has the same shape as `tokenColors`, or a JSON
+/// file holding the array (bare or under `tokenColors`), with the count of
+/// rules croft could not read.
+fn read_token_colors_file(path: &Path) -> Result<(Vec<TokenColor>, usize)> {
+    let bytes = std::fs::read(path)?;
+    let is_json = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("json"));
+    let doc: Value = if is_json {
+        serde_json::from_str(&crate::tasks::strip_jsonc(&String::from_utf8_lossy(&bytes)))?
+    } else {
+        plist::from_bytes(&bytes)?
+    };
+    let rules = if doc.is_array() {
+        doc
+    } else {
+        doc.get("tokenColors")
+            .or_else(|| doc.get("settings"))
+            .cloned()
+            .ok_or_else(|| anyhow!("it has no settings or tokenColors rules"))?
+    };
+    Ok(read_rules(rules))
+}
+
+/// `tokens`, a `tokenColors` array, as the rules croft can read and the
+/// count of those it could not.
+fn read_rules(tokens: Value) -> (Vec<TokenColor>, usize) {
+    // Per RULE, not all-or-nothing. Deserialising the whole array at once
+    // means one rule croft cannot read (`{"scope": null}` appears in real
+    // themes) drops EVERY token colour, and `unwrap_or_default` turns that
+    // into an empty list with no diagnostic: the theme imports looking fine
+    // and renders with croft's Base16 palette throughout.
+    let rules: Vec<Value> = serde_json::from_value(tokens).unwrap_or_default();
+    let total = rules.len();
+    let read: Vec<TokenColor> = rules
+        .into_iter()
+        .filter_map(|r| serde_json::from_value::<TokenColor>(r).ok())
+        .collect();
+    let dropped = total - read.len();
+    (read, dropped)
 }
 
 /// Parse one theme document, tolerating VS Code's JSONC extras.
@@ -255,18 +316,12 @@ fn parse_theme(raw: &str) -> Result<RawTheme> {
         .or_else(|| value.get("settings"))
         .cloned()
         .unwrap_or(serde_json::Value::Array(Vec::new()));
-    // Per RULE, not all-or-nothing. Deserialising the whole array at once
-    // means one rule croft cannot read (`{"scope": null}` appears in real
-    // themes) drops EVERY token colour, and `unwrap_or_default` turns that
-    // into an empty list with no diagnostic: the theme imports looking fine
-    // and renders with croft's Base16 palette throughout.
-    let rules: Vec<Value> = serde_json::from_value(tokens).unwrap_or_default();
-    let total = rules.len();
-    theme.token_colors = rules
-        .into_iter()
-        .filter_map(|r| serde_json::from_value::<TokenColor>(r).ok())
-        .collect();
-    theme.dropped_rules = total - theme.token_colors.len();
+    // A path names a TextMate theme file beside this one (#1177).
+    if let Some(file) = tokens.as_str() {
+        theme.token_colors_file = Some(file.to_string());
+        return Ok(theme);
+    }
+    (theme.token_colors, theme.dropped_rules) = read_rules(tokens);
     Ok(theme)
 }
 
@@ -287,6 +342,7 @@ fn merge(base: RawTheme, over: RawTheme) -> RawTheme {
         token_colors,
         semantic,
         dropped_rules: base.dropped_rules + over.dropped_rules,
+        token_colors_file: None,
     }
 }
 
@@ -1166,6 +1222,92 @@ mod tests {
         assert_eq!(t.background, "#101010", "the base fills what the top omits");
         assert_eq!(t.syn_fg, "#ffffff", "the including file wins");
         assert_eq!(t.syn_comment, "#555555", "base token rules carry over");
+    }
+
+    const TM_THEME: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>settings</key><array>
+<dict><key>settings</key><dict><key>background</key><string>#1e1e1e</string></dict></dict>
+<dict><key>scope</key><string>comment</string><key>settings</key><dict><key>foreground</key><string>#6A9955</string></dict></dict>
+<dict><key>scope</key><string>keyword</string><key>settings</key><dict><key>foreground</key><string>#569CD6</string></dict></dict>
+</array></dict></plist>
+"##;
+
+    fn theme_with_token_colors(dir: &Path, token_colors: &str) -> PathBuf {
+        let top = dir.join("mytheme-color-theme.json");
+        std::fs::write(
+            &top,
+            format!(
+                r##"{{
+                "name": "Tm Example",
+                "type": "dark",
+                "colors": {{ "editor.background": "#1e1e1e", "editor.foreground": "#d4d4d4" }},
+                "tokenColors": {token_colors}
+            }}"##
+            ),
+        )
+        .unwrap();
+        top
+    }
+
+    /// #1177: `tokenColors` may name a TextMate `.tmTheme` file beside the
+    /// theme. Its rules colour the code, as VS Code reads them.
+    #[test]
+    fn token_colors_from_a_tm_theme_file_are_imported() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("mytheme.tmTheme"), TM_THEME).unwrap();
+        let top = theme_with_token_colors(dir.path(), r#""./mytheme.tmTheme""#);
+        let converted = convert_file(&top, None).expect("the theme converts");
+        let t = &crate::lsp::manifest::parse(&converted.manifest)
+            .unwrap()
+            .themes[0];
+        assert_eq!(t.syn_comment.to_lowercase(), "#6a9955");
+        assert_eq!(t.syn_keyword.to_lowercase(), "#569cd6");
+        assert!(
+            !converted
+                .notes
+                .iter()
+                .any(|n| n.contains("no colour for comment")),
+            "{:?}",
+            converted.notes
+        );
+    }
+
+    /// #1177: a JSON `tokenColors` file is read the same way.
+    #[test]
+    fn token_colors_from_a_json_file_are_imported() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("tokens.json"),
+            r##"// shared rules
+            { "tokenColors": [{ "scope": "comment", "settings": { "foreground": "#112233" } }] }"##,
+        )
+        .unwrap();
+        let top = theme_with_token_colors(dir.path(), r#""tokens.json""#);
+        let converted = convert_file(&top, None).expect("the theme converts");
+        let t = &crate::lsp::manifest::parse(&converted.manifest)
+            .unwrap()
+            .themes[0];
+        assert_eq!(t.syn_comment, "#112233");
+    }
+
+    /// #1177, negative: a `tokenColors` file that is missing, outside the
+    /// theme's folder, or not a theme fails the import and names the file,
+    /// rather than importing with no code colours and no word about it.
+    #[test]
+    fn a_token_colors_file_that_cannot_be_read_is_named() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("junk.tmTheme"), "not a plist").unwrap();
+        for (field, says) in [
+            (r#""./missing.tmTheme""#, "missing.tmTheme"),
+            (r#""../outside.tmTheme""#, "relative path inside"),
+            (r#""/etc/x.tmTheme""#, "relative path inside"),
+            (r#""junk.tmTheme""#, "junk.tmTheme"),
+        ] {
+            let top = theme_with_token_colors(dir.path(), field);
+            let err = convert_file(&top, None).expect_err(field);
+            assert!(format!("{err:#}").contains(says), "{field}: {err:#}");
+        }
     }
 
     /// An absolute include is refused: a theme file naming a path outside its
