@@ -21,28 +21,62 @@ const INTERVAL: Duration = Duration::from_secs(3);
 /// arena, so it should not run while nothing has piled up.
 pub const THRESHOLD: usize = 8 << 20;
 
+/// The most releases in a row that freed little the wait before the next
+/// one doubles for: past it, they come every 63 ticks (about 3 minutes).
+const MAX_MISSES: u32 = 7;
+
 /// When to release, given one reading of [`measure`] per tick: once the
 /// reading has grown [`THRESHOLD`] past the lowest seen since the last
 /// release. The low-water mark restarts from the reading taken right after
 /// a release that freed something worthwhile, so memory croft still uses
 /// never triggers another. A release that freed little (the parse was still
 /// running, its memory live) keeps the old mark, so the next tick tries
-/// again once the parse has dropped it.
+/// again once the parse has dropped it. Each further one that frees little
+/// waits twice as long before the next: the memory may simply be in use,
+/// and a release locks the allocator while it walks the heap. Growth of
+/// [`THRESHOLD`] past what that release left ends the wait at once: it is
+/// new (another file opened and parsed), not the memory found in use.
 #[derive(Debug, Default)]
 pub struct Policy {
     low: Option<usize>,
+    /// Releases in a row that freed little, up to [`MAX_MISSES`].
+    misses: u32,
+    /// Ticks to sit out before the next release.
+    wait: u32,
+    /// The size the last release that freed little left.
+    missed_at: usize,
 }
 
 impl Policy {
+    /// A policy whose mark starts at `reading`, the size at launch.
+    pub fn starting_at(reading: usize) -> Self {
+        Self {
+            low: Some(reading),
+            ..Self::default()
+        }
+    }
+
     pub fn should_release(&mut self, reading: usize) -> bool {
         let low = self.low.map_or(reading, |low| low.min(reading));
         self.low = Some(low);
+        if self.wait > 0 {
+            if reading < self.missed_at.saturating_add(THRESHOLD) {
+                self.wait -= 1;
+                return false;
+            }
+            self.wait = 0;
+        }
         reading - low >= THRESHOLD
     }
 
     pub fn released(&mut self, before: usize, after: usize) {
         if before.saturating_sub(after) >= THRESHOLD {
             self.low = Some(after);
+            self.misses = 0;
+        } else {
+            self.misses = (self.misses + 1).min(MAX_MISSES);
+            self.wait = (1 << (self.misses - 1)) - 1;
+            self.missed_at = after;
         }
     }
 }
@@ -112,10 +146,14 @@ pub fn start() {
     if !SUPPORTED {
         return;
     }
+    // The mark starts from the size at launch, before any file is open. The
+    // first tick comes later, after a file opened at launch (a restored
+    // tab) has been parsed: taken as the mark, that parse's peak was kept
+    // for as long as croft ran.
+    let mut policy = Policy::starting_at(measure());
     let _ = std::thread::Builder::new()
         .name("croft-mem-relief".into())
-        .spawn(|| {
-            let mut policy = Policy::default();
+        .spawn(move || {
             loop {
                 std::thread::sleep(INTERVAL);
                 let before = measure();
@@ -180,6 +218,88 @@ mod tests {
         assert!(p.should_release(299 * MB), "still far above the old mark");
         p.released(299 * MB, 60 * MB);
         assert!(!p.should_release(60 * MB));
+    }
+
+    /// A file opened at launch is parsed before the first tick: measured
+    /// from launch, its freed peak is released rather than taken as the
+    /// mark.
+    #[test]
+    fn a_peak_reached_before_the_first_tick_is_released() {
+        let mut p = Policy::starting_at(20 * MB);
+        assert!(
+            p.should_release(180 * MB),
+            "the first tick, after the parse"
+        );
+        p.released(180 * MB, 90 * MB);
+        assert!(!p.should_release(90 * MB));
+    }
+
+    /// Memory that is in use frees nothing however often it is asked: each
+    /// release that frees little puts the next off twice as long, up to
+    /// every 63 ticks, rather than locking the allocator every tick.
+    #[test]
+    fn releases_that_keep_freeing_little_back_off() {
+        let mut p = Policy::starting_at(20 * MB);
+        let mut gaps = Vec::new();
+        let mut since = 0;
+        while gaps.len() < 9 {
+            if p.should_release(60 * MB) {
+                gaps.push(since);
+                since = 0;
+                p.released(60 * MB, 59 * MB);
+            } else {
+                since += 1;
+            }
+        }
+        assert_eq!(gaps, [0, 0, 1, 3, 7, 15, 31, 63, 63]);
+    }
+
+    /// New growth during a long wait is checked at once (#1753 review): a
+    /// file opened then must not keep its freed parse for minutes, while a
+    /// reading that has not moved keeps waiting.
+    #[test]
+    fn growth_during_a_backoff_is_released_at_once() {
+        let mut p = Policy::starting_at(20 * MB);
+        for _ in 0..MAX_MISSES {
+            while !p.should_release(60 * MB) {}
+            p.released(60 * MB, 59 * MB);
+        }
+        assert!(
+            !p.should_release(59 * MB),
+            "an unchanged reading still waits"
+        );
+        assert!(
+            !p.should_release(59 * MB + THRESHOLD - 1),
+            "and so does growth short of the threshold"
+        );
+        assert!(
+            p.should_release(59 * MB + THRESHOLD),
+            "a file opened during the wait is released without waiting it out"
+        );
+        p.released(59 * MB + THRESHOLD, 59 * MB);
+        assert!(!p.should_release(60 * MB), "what is left is the mark");
+    }
+
+    /// A parse that outlasts several ticks is still released once it ends:
+    /// the backoff delays the release, it never gives it up.
+    #[test]
+    fn a_long_parse_is_released_once_it_ends() {
+        let mut p = Policy::starting_at(20 * MB);
+        let mut tick = 0;
+        loop {
+            tick += 1;
+            let parsing = tick < 40;
+            if p.should_release(300 * MB) {
+                if parsing {
+                    p.released(300 * MB, 299 * MB);
+                } else {
+                    p.released(300 * MB, 60 * MB);
+                    break;
+                }
+            }
+            assert!(tick < 80, "released by twice the parse's length");
+        }
+        assert!(!p.should_release(60 * MB), "what is left is the mark");
     }
 
     /// Free 32 MB of small blocks that a live block keeps from the top of
