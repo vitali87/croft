@@ -33,7 +33,9 @@ const MAX_MISSES: u32 = 7;
 /// running, its memory live) keeps the old mark, so the next tick tries
 /// again once the parse has dropped it. Each further one that frees little
 /// waits twice as long before the next: the memory may simply be in use,
-/// and a release locks the allocator while it walks the heap.
+/// and a release locks the allocator while it walks the heap. Growth of
+/// [`THRESHOLD`] past what that release left ends the wait at once: it is
+/// new (another file opened and parsed), not the memory found in use.
 #[derive(Debug, Default)]
 pub struct Policy {
     low: Option<usize>,
@@ -41,6 +43,8 @@ pub struct Policy {
     misses: u32,
     /// Ticks to sit out before the next release.
     wait: u32,
+    /// The size the last release that freed little left.
+    missed_at: usize,
 }
 
 impl Policy {
@@ -56,8 +60,11 @@ impl Policy {
         let low = self.low.map_or(reading, |low| low.min(reading));
         self.low = Some(low);
         if self.wait > 0 {
-            self.wait -= 1;
-            return false;
+            if reading < self.missed_at.saturating_add(THRESHOLD) {
+                self.wait -= 1;
+                return false;
+            }
+            self.wait = 0;
         }
         reading - low >= THRESHOLD
     }
@@ -69,6 +76,7 @@ impl Policy {
         } else {
             self.misses = (self.misses + 1).min(MAX_MISSES);
             self.wait = (1 << (self.misses - 1)) - 1;
+            self.missed_at = after;
         }
     }
 }
@@ -244,6 +252,32 @@ mod tests {
             }
         }
         assert_eq!(gaps, [0, 0, 1, 3, 7, 15, 31, 63, 63]);
+    }
+
+    /// New growth during a long wait is checked at once (#1753 review): a
+    /// file opened then must not keep its freed parse for minutes, while a
+    /// reading that has not moved keeps waiting.
+    #[test]
+    fn growth_during_a_backoff_is_released_at_once() {
+        let mut p = Policy::starting_at(20 * MB);
+        for _ in 0..MAX_MISSES {
+            while !p.should_release(60 * MB) {}
+            p.released(60 * MB, 59 * MB);
+        }
+        assert!(
+            !p.should_release(59 * MB),
+            "an unchanged reading still waits"
+        );
+        assert!(
+            !p.should_release(59 * MB + THRESHOLD - 1),
+            "and so does growth short of the threshold"
+        );
+        assert!(
+            p.should_release(59 * MB + THRESHOLD),
+            "a file opened during the wait is released without waiting it out"
+        );
+        p.released(59 * MB + THRESHOLD, 59 * MB);
+        assert!(!p.should_release(60 * MB), "what is left is the mark");
     }
 
     /// A parse that outlasts several ticks is still released once it ends:
