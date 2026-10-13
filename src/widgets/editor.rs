@@ -7573,6 +7573,23 @@ impl Editor {
 
     /// Human label for the buffer's language mode, for the status bar.
     pub fn language_label(&self) -> &'static str {
+        // SCSS, Less and Sass share the CSS grammar but are their own
+        // languages to the reader and to the CSS server (#1532), so the
+        // status bar names them the way VS Code does.
+        if self.lang == Some(LangKind::Css) {
+            let ext = self
+                .path
+                .as_deref()
+                .and_then(|p| p.extension())
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase);
+            match ext.as_deref() {
+                Some("scss") => return "SCSS",
+                Some("less") => return "Less",
+                Some("sass") => return "Sass",
+                _ => {}
+            }
+        }
         language_label(self.lang)
     }
 
@@ -25565,6 +25582,32 @@ mod tests {
         e.open(&path).unwrap();
         assert_eq!(e.language_label(), "Plain Text");
         assert!(!e.toggle_line_comment());
+    }
+
+    /// #1532: the status bar names SCSS, Less and Sass the way VS Code does
+    /// (they share the CSS grammar), and plain CSS stays CSS.
+    #[test]
+    fn style_sheet_dialects_get_their_own_labels() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for (name, label) in [
+            ("app.scss", "SCSS"),
+            ("theme.less", "Less"),
+            ("old.sass", "Sass"),
+            ("plain.css", "CSS"),
+        ] {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, ".a { color: red; }\n").unwrap();
+            let mut e = Editor::new();
+            e.open(&path).unwrap();
+            assert_eq!(e.language_label(), label, "{name}");
+        }
+        // A hand-picked language wins over the extension.
+        let path = tmp.path().join("x.scss");
+        std::fs::write(&path, "x = 1\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        e.set_language(Some(crate::highlight::LangKind::Python));
+        assert_eq!(e.language_label(), "Python");
     }
 
     #[test]

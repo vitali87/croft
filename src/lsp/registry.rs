@@ -241,6 +241,32 @@ mod tests {
         assert_eq!(r.for_extension("yml")[0].name, "yaml-language-server");
     }
 
+    /// #1532: the CSS server parses SCSS and LESS too, so `.scss` and
+    /// `.less` files get it (lint, outline, colours), from the same managed
+    /// process as CSS. `.sass` is indented syntax it cannot parse: no server.
+    #[test]
+    fn the_css_server_serves_scss_and_less_but_not_sass() {
+        let r = ServerRegistry::with_defaults();
+        for ext in ["scss", "less"] {
+            let servers = r.for_extension(ext);
+            assert_eq!(servers.len(), 1, "one server for .{ext}");
+            assert_eq!(servers[0].name, "vscode-css-language-server", ".{ext}");
+            let lang = Language::from_extension(ext).unwrap();
+            assert_eq!(
+                lang.lsp_id(),
+                ext,
+                "didOpen says {ext}, so the server picks its parser"
+            );
+            assert_eq!(
+                lang.server_family(),
+                Language::CSS,
+                ".{ext} shares the CSS process"
+            );
+        }
+        assert!(r.for_extension("sass").is_empty(), ".sass gets no server");
+        assert_eq!(Language::CSS.server_family(), Language::CSS);
+    }
+
     #[test]
     fn bundled_manifests_register_json_html_css_language_servers() {
         // JSON, HTML and CSS each get their own extension/server, all three

@@ -261,7 +261,7 @@ Which server runs per language:
 | Python | Astral's `ty` as the primary, `basedpyright` as a fallback for the few capabilities `ty` does not yet advertise, and `ruff` for lint |
 | TypeScript / JavaScript | `vtsls` |
 | YAML | `yaml-language-server` |
-| JSON / HTML / CSS | the VS Code servers (`vscode-json-language-server`, `vscode-html-language-server`, `vscode-css-language-server`) |
+| JSON / HTML / CSS, SCSS, Less | the VS Code servers (`vscode-json-language-server`, `vscode-html-language-server`, `vscode-css-language-server`, which also serves `.scss` and `.less`; `.sass` is highlighted only) |
 | Bash | `bash-language-server` |
 | TOML | `taplo` |
 | C / C++ | `clangd` |

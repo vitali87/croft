@@ -7658,6 +7658,25 @@ mod tests {
     };
     use std::time::{Duration, Instant};
 
+    /// #1532: a `.scss` or `.less` file resolves to its own language, which
+    /// the CSS server is started for; `.sass` resolves to none.
+    #[test]
+    fn scss_and_less_files_resolve_to_css_server_languages() {
+        assert_eq!(
+            path_to_language(Path::new("src/app.scss")).map(|l| l.lsp_id()),
+            Some("scss")
+        );
+        assert_eq!(
+            path_to_language(Path::new("src/theme.less")).map(|l| l.lsp_id()),
+            Some("less")
+        );
+        assert_eq!(path_to_language(Path::new("old.sass")), None);
+        assert_eq!(
+            path_to_language(Path::new("plain.css")),
+            Some(Language::CSS)
+        );
+    }
+
     impl LspManager {
         /// Test seam for App-level completion tests: swap the completion
         /// reply channel for one the test holds, so a reply lands in
