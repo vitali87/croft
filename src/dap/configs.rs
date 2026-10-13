@@ -573,8 +573,60 @@ pub fn adapter_for_type(type_name: &str) -> Option<AdapterKind> {
         "lldb" | "lldb-dap" | "cppdbg" | "codelldb" => Some(AdapterKind::LldbDap),
         "go" => Some(AdapterKind::Delve),
         "node" | "pwa-node" | "node-terminal" | "javascript" => Some(AdapterKind::JsDebug),
+        // js-debug drives Chrome and Edge itself (#1410).
+        t if browser_type(t).is_some() => Some(AdapterKind::JsDebug),
         _ => None,
     }
+}
+
+/// The js-debug type for a browser launch.json `type` (#1410): `chrome` and
+/// `msedge` are VS Code's names for js-debug's `pwa-chrome` and `pwa-msedge`.
+/// `None` for every type that is not a browser.
+pub fn browser_type(type_name: &str) -> Option<&'static str> {
+    match type_name {
+        "chrome" | "pwa-chrome" => Some("pwa-chrome"),
+        "msedge" | "pwa-msedge" => Some("pwa-msedge"),
+        _ => None,
+    }
+}
+
+/// The port js-debug attaches to a browser on when the config names none:
+/// Chrome's and Edge's default remote debugging port, as in VS Code.
+pub const BROWSER_DEBUG_PORT: u16 = 9222;
+
+/// What a js-debug config is missing before it can start, if anything. A
+/// Node launch runs a `program` and a Node attach needs the inspector's
+/// `port`; a browser needs neither (#1410): with no `url` or `file` it opens
+/// a blank page, and it attaches on port 9222 by default.
+pub fn js_config_error(rc: &ResolvedConfig) -> Option<&'static str> {
+    if browser_type(&rc.type_name).is_some() {
+        return None;
+    }
+    match rc.request {
+        RequestKind::Launch if rc.program.is_none() => Some("a node launch needs a \"program\""),
+        RequestKind::Attach if rc.port.is_none() => Some("a node attach needs a \"port\""),
+        _ => None,
+    }
+}
+
+/// Launch the browser with no window (#1410), for a croft with no display
+/// to show one on: `--headless=new` joins the config's `runtimeArgs` unless
+/// they already choose a headless mode.
+pub fn with_headless_browser(mut request: Value) -> Value {
+    if let Some(args) = request["arguments"].as_object_mut() {
+        let runtime = args
+            .entry("runtimeArgs")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(list) = runtime.as_array_mut() {
+            let headless = list
+                .iter()
+                .any(|a| a.as_str().is_some_and(|a| a.starts_with("--headless")));
+            if !headless {
+                list.push(json!("--headless=new"));
+            }
+        }
+    }
+    request
 }
 
 /// The editor state `${...}` variables resolve against.
@@ -678,6 +730,8 @@ fn substitute_value(v: &Value, ctx: &SubstCtx) -> Result<Value, String> {
 pub struct ResolvedConfig {
     pub name: String,
     pub kind: AdapterKind,
+    /// The launch.json `type` as written, which picks js-debug's own type.
+    pub type_name: String,
     pub request: RequestKind,
     pub program: Option<String>,
     /// debugpy `module` (`"module": "pytest"` style launches).
@@ -727,7 +781,7 @@ const MAPPED_KEYS: &[&str] = &[
 pub fn resolve(cfg: &DebugConfig, ctx: &SubstCtx) -> Result<ResolvedConfig, String> {
     let kind = adapter_for_type(&cfg.type_name).ok_or_else(|| {
         format!(
-            "config \"{}\": unsupported type \"{}\" (python, lldb, node and go families are supported)",
+            "config \"{}\": unsupported type \"{}\" (python, lldb, node, go, chrome and msedge families are supported)",
             cfg.name, cfg.type_name
         )
     })?;
@@ -786,14 +840,23 @@ pub fn resolve(cfg: &DebugConfig, ctx: &SubstCtx) -> Result<ResolvedConfig, Stri
         Some(Value::String(s)) => s.trim().parse::<i64>().ok(),
         _ => None,
     };
-    let extra: Map<String, Value> = obj
+    let mut extra: Map<String, Value> = obj
         .iter()
         .filter(|(k, _)| !MAPPED_KEYS.contains(&k.as_str()))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    // A browser config maps its URLs onto files under `webRoot`, which VS
+    // Code defaults to the workspace folder (#1410).
+    if browser_type(&cfg.type_name).is_some() && !extra.contains_key("webRoot") {
+        extra.insert(
+            "webRoot".into(),
+            json!(ctx.workspace_folder.to_string_lossy()),
+        );
+    }
     Ok(ResolvedConfig {
         name: cfg.name.clone(),
         kind,
+        type_name: cfg.type_name.clone(),
         request: cfg.request,
         program: get_str("program"),
         module: get_str("module"),
@@ -986,16 +1049,22 @@ pub fn delve_request(rc: &ResolvedConfig) -> Value {
 
 /// Build the vscode-js-debug `launch`/`attach` request (`pwa-node`, the
 /// canonical Node type — croft already normalises onto it for zero-config).
+/// A browser config becomes `pwa-chrome` or `pwa-msedge` (#1410), its `url`,
+/// `file`, `webRoot` and the rest passed through as written.
 pub fn js_request(rc: &ResolvedConfig) -> Value {
+    let browser = browser_type(&rc.type_name);
     let mut args = base_arguments(rc);
-    args.insert("type".into(), json!("pwa-node"));
+    args.insert("type".into(), json!(browser.unwrap_or("pwa-node")));
     if !rc.env.is_empty() {
         args.insert("env".into(), json!(rc.env));
     }
     match rc.request {
         RequestKind::Launch => {
             args.insert("request".into(), json!("launch"));
-            args.insert("console".into(), json!("internalConsole"));
+            // A browser's console is its own; only Node has a choice.
+            if browser.is_none() {
+                args.insert("console".into(), json!("internalConsole"));
+            }
             if !args.contains_key("sourceMaps") {
                 args.insert("sourceMaps".into(), json!(true));
             }
@@ -1003,7 +1072,8 @@ pub fn js_request(rc: &ResolvedConfig) -> Value {
         }
         RequestKind::Attach => {
             args.insert("request".into(), json!("attach"));
-            if let Some(port) = rc.port {
+            let port = rc.port.or(browser.map(|_| BROWSER_DEBUG_PORT));
+            if let Some(port) = port {
                 args.insert("port".into(), json!(port));
             }
             if !args.contains_key("address") {
@@ -1809,6 +1879,130 @@ mod tests {
         assert_eq!(req["command"], "attach");
         assert_eq!(req["arguments"]["port"], 9229);
         assert_eq!(req["arguments"]["address"], "127.0.0.1");
+    }
+
+    /// #1410: VS Code's browser types run on js-debug, which croft already
+    /// bundles.
+    #[test]
+    fn chrome_and_edge_types_resolve_to_js_debug() {
+        for (t, js) in [
+            ("chrome", "pwa-chrome"),
+            ("pwa-chrome", "pwa-chrome"),
+            ("msedge", "pwa-msedge"),
+            ("pwa-msedge", "pwa-msedge"),
+        ] {
+            assert_eq!(adapter_for_type(t), Some(AdapterKind::JsDebug), "{t}");
+            assert_eq!(browser_type(t), Some(js), "{t}");
+        }
+    }
+
+    /// #1410, negative: Node stays Node, and a browser js-debug does not
+    /// drive is still refused.
+    #[test]
+    fn node_is_not_a_browser_and_firefox_is_still_refused() {
+        for t in ["node", "pwa-node", "node-terminal", "python"] {
+            assert_eq!(browser_type(t), None, "{t}");
+        }
+        assert_eq!(adapter_for_type("firefox"), None);
+        let cfg = config(r#"[{ "name": "F", "type": "firefox", "url": "http://localhost" }]"#);
+        let err = resolve(&cfg, &ctx()).unwrap_err();
+        assert!(err.contains("unsupported type \"firefox\""), "{err}");
+    }
+
+    /// #1410: a browser config needs no `program` or `port`, which a Node
+    /// one still does.
+    #[test]
+    fn a_browser_config_needs_no_program_or_port() {
+        for json in [
+            r#"[{ "name": "C", "type": "chrome", "url": "http://localhost:3000" }]"#,
+            r#"[{ "name": "C", "type": "msedge", "request": "attach" }]"#,
+        ] {
+            let rc = resolve(&config(json), &ctx()).unwrap();
+            assert_eq!(js_config_error(&rc), None, "{json}");
+        }
+        let rc = resolve(&config(r#"[{ "name": "N", "type": "node" }]"#), &ctx()).unwrap();
+        assert_eq!(
+            js_config_error(&rc),
+            Some("a node launch needs a \"program\"")
+        );
+        let rc = resolve(
+            &config(r#"[{ "name": "N", "type": "node", "request": "attach" }]"#),
+            &ctx(),
+        )
+        .unwrap();
+        assert_eq!(js_config_error(&rc), Some("a node attach needs a \"port\""));
+    }
+
+    /// #1410: a chrome launch is a `pwa-chrome` request carrying the
+    /// config's own browser fields, with no Node console setting.
+    #[test]
+    fn a_chrome_launch_is_a_pwa_chrome_request() {
+        let cfg = config(
+            r#"[{ "name": "C", "type": "chrome", "request": "launch",
+                  "url": "http://localhost:5173", "webRoot": "${workspaceFolder}/web",
+                  "runtimeExecutable": "/usr/bin/chromium", "userDataDir": false }]"#,
+        );
+        let rc = resolve(&cfg, &ctx()).unwrap();
+        let req = js_request(&rc);
+        let a = &req["arguments"];
+        assert_eq!(req["command"], "launch");
+        assert_eq!(a["type"], "pwa-chrome");
+        assert_eq!(a["url"], "http://localhost:5173");
+        assert_eq!(a["webRoot"], "/work/proj/web");
+        assert_eq!(a["runtimeExecutable"], "/usr/bin/chromium");
+        assert_eq!(a["userDataDir"], false);
+        assert!(a.get("console").is_none(), "{a}");
+        assert!(a.get("program").is_none(), "{a}");
+    }
+
+    /// #1410: with no `webRoot`, a browser config maps onto the workspace
+    /// folder, as VS Code's default does; a Node config gets none.
+    #[test]
+    fn a_browser_config_without_a_web_root_uses_the_workspace_folder() {
+        let cfg = config(
+            r#"[{ "name": "E", "type": "msedge", "file": "${workspaceFolder}/index.html" }]"#,
+        );
+        let req = js_request(&resolve(&cfg, &ctx()).unwrap());
+        assert_eq!(req["arguments"]["type"], "pwa-msedge");
+        assert_eq!(req["arguments"]["webRoot"], "/work/proj");
+        assert_eq!(req["arguments"]["file"], "/work/proj/index.html");
+
+        let cfg = config(r#"[{ "name": "N", "type": "node", "program": "/p/a.js" }]"#);
+        let req = js_request(&resolve(&cfg, &ctx()).unwrap());
+        assert!(req["arguments"].get("webRoot").is_none());
+    }
+
+    /// #1410: a browser attach with no port uses 9222, the browsers' own
+    /// default; a port the config names wins.
+    #[test]
+    fn a_browser_attach_defaults_to_port_9222() {
+        let cfg = config(r#"[{ "name": "A", "type": "chrome", "request": "attach" }]"#);
+        let req = js_request(&resolve(&cfg, &ctx()).unwrap());
+        assert_eq!(req["command"], "attach");
+        assert_eq!(req["arguments"]["type"], "pwa-chrome");
+        assert_eq!(req["arguments"]["port"], 9222);
+
+        let cfg =
+            config(r#"[{ "name": "A", "type": "msedge", "request": "attach", "port": 9333 }]"#);
+        let req = js_request(&resolve(&cfg, &ctx()).unwrap());
+        assert_eq!(req["arguments"]["port"], 9333);
+    }
+
+    /// #1410: with no display, the browser launches headless; a config that
+    /// already picks a headless mode keeps its own.
+    #[test]
+    fn a_headless_browser_adds_its_flag_once() {
+        let cfg = config(
+            r#"[{ "name": "C", "type": "chrome", "url": "http://x", "runtimeArgs": ["--incognito"] }]"#,
+        );
+        let req = with_headless_browser(js_request(&resolve(&cfg, &ctx()).unwrap()));
+        assert_eq!(
+            req["arguments"]["runtimeArgs"],
+            json!(["--incognito", "--headless=new"])
+        );
+        let cfg = config(r#"[{ "name": "C", "type": "chrome", "runtimeArgs": ["--headless"] }]"#);
+        let req = with_headless_browser(js_request(&resolve(&cfg, &ctx()).unwrap()));
+        assert_eq!(req["arguments"]["runtimeArgs"], json!(["--headless"]));
     }
 
     #[test]

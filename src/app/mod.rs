@@ -32207,8 +32207,9 @@ impl App {
             .clone()
             .unwrap_or_else(|| self.active_workspace_root());
         let name = rc.name.clone();
-        // The debuggee interpreter's note (#864), for a Python launch.
-        let mut python_note = None;
+        // A note for the status: the debuggee interpreter's (#864) for a
+        // Python launch, or a browser run headless (#1410).
+        let mut launch_note = None;
         let result = match rc.kind {
             AdapterKind::Debugpy => {
                 if rc.request == RequestKind::Launch && rc.program.is_none() && rc.module.is_none()
@@ -32232,7 +32233,7 @@ impl App {
                                 .as_deref()
                                 .map_or(Ok(None), debuggee_python_note)
                             {
-                                Ok(note) => python_note = note,
+                                Ok(note) => launch_note = note,
                                 Err(refusal) => {
                                     self.debug_error(format!("config \"{name}\": {refusal}"));
                                     return;
@@ -32320,16 +32321,11 @@ impl App {
                 }
             }
             AdapterKind::JsDebug => {
-                if rc.request == RequestKind::Launch && rc.program.is_none() {
-                    self.debug_error(format!(
-                        "config \"{name}\": a node launch needs a \"program\""
-                    ));
+                if let Some(e) = configs::js_config_error(&rc) {
+                    self.debug_error(format!("config \"{name}\": {e}"));
                     return;
                 }
-                if rc.request == RequestKind::Attach && rc.port.is_none() {
-                    self.debug_error(format!("config \"{name}\": a node attach needs a \"port\""));
-                    return;
-                }
+                let browser = configs::browser_type(&rc.type_name).is_some();
                 let node = match crate::dap::install::node_program() {
                     Ok(n) => n,
                     Err(e) => {
@@ -32344,11 +32340,20 @@ impl App {
                         return;
                     }
                 };
+                let mut request = configs::js_request(&rc);
+                // A browser croft has no screen for would open where no one
+                // sees it (#1410): it runs headless, and the status says so.
+                if browser && rc.request == RequestKind::Launch && no_display_for_a_browser() {
+                    request = configs::with_headless_browser(request);
+                    launch_note = Some(String::from(
+                        "(no display here, so the browser runs headless)",
+                    ));
+                }
                 crate::dap::session::DapSession::launch_js_with(
                     &node,
                     &server,
                     &cwd,
-                    configs::js_request(&rc),
+                    request,
                     breakpoints,
                 )
             }
@@ -32367,10 +32372,10 @@ impl App {
                 };
                 self.run_debug.feedback = Some(format!("{verb} {name}"));
                 self.run_debug.feedback_is_error = false;
-                let lead = with_python_note(format!("{verb} {name}"), python_note.as_deref());
+                let lead = with_python_note(format!("{verb} {name}"), launch_note.as_deref());
                 self.status = format!("{lead} — F5 continue · F10 step over · Shift+F5 stop");
                 self.reveal_debug_view();
-                if python_note.is_some() {
+                if launch_note.is_some() {
                     self.debug_console_push(lead);
                 }
             }
@@ -70738,6 +70743,21 @@ fn debuggee_python_note(python: &Path) -> Result<Option<String>, String> {
 }
 
 /// `lead` followed by the note on the debuggee's interpreter, if any (#864).
+/// Whether a browser croft launches would have no screen to open on
+/// (#1410): croft is reached over SSH, or on Linux no X or Wayland display
+/// is set. macOS and Windows always have one locally.
+fn no_display_for_a_browser() -> bool {
+    no_display(
+        crate::remote::running_over_ssh(),
+        cfg!(target_os = "linux"),
+        |k| std::env::var_os(k).is_some_and(|v| !v.is_empty()),
+    )
+}
+
+pub(crate) fn no_display(over_ssh: bool, linux: bool, set: impl Fn(&str) -> bool) -> bool {
+    over_ssh || (linux && !set("DISPLAY") && !set("WAYLAND_DISPLAY"))
+}
+
 fn with_python_note(lead: String, note: Option<&str>) -> String {
     match note {
         Some(note) => format!("{lead} {note}"),
