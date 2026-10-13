@@ -56402,6 +56402,21 @@ impl App {
                         self.poke_cursor();
                         return;
                     }
+                    // Breakpoint lane (#1544): a click in the sign cell
+                    // toggles a breakpoint on that line, as a click in VS
+                    // Code's glyph margin does, and leaves the caret where
+                    // it is. It used to move the caret to column 1 and set
+                    // nothing. After the play glyph and the chevron, which
+                    // own their cells; Shift and Alt keep their selections.
+                    if !m
+                        .modifiers
+                        .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
+                        && let Some(line0) = self.editor.breakpoint_lane_line_at(m.column, m.row)
+                    {
+                        self.debug_toggle_breakpoint_line(line0 + 1);
+                        self.poke_cursor();
+                        return;
+                    }
                     // VS Code Shift+Alt+drag: start a column (box) selection.
                     // Checked before the plain Alt+click caret so the two
                     // modifiers don't both fire.
