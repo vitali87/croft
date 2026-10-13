@@ -18006,6 +18006,196 @@ fn completion_reply(
     }
 }
 
+/// #1566: an app with `files` written and opened in order (the last one
+/// active), the caret at the end of the active file's last line, drawn once
+/// so a popup has somewhere to open.
+fn word_completion_app(files: &[(&str, &str)]) -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for (name, text) in files {
+        let path = tmp.path().join(name);
+        std::fs::write(&path, text).unwrap();
+        app.editor.open_pinned(&path).unwrap();
+    }
+    app.focus_pane(Pane::Editor);
+    let row = app.editor.lines.len() - 1;
+    app.editor.cursor_row = row;
+    app.editor.cursor_col = app.editor.lines[row].chars().count();
+    draw(&mut app, 100, 30);
+    (tmp, app)
+}
+
+fn popup_labels(app: &App) -> Vec<String> {
+    app.completion_popup.as_ref().map_or_else(Vec::new, |p| {
+        p.visible_indices()
+            .into_iter()
+            .map(|i| p.items[i].label.clone())
+            .collect()
+    })
+}
+
+#[test]
+fn ctrl_space_in_a_file_no_server_takes_offers_the_words_already_in_it() {
+    let (_tmp, mut app) = word_completion_app(&[("notes.txt", "configuration loader\nconfigu")]);
+    app.handle_key(key(KeyCode::Char(' '), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(
+        popup_labels(&app),
+        ["configuration"],
+        "not `configu` itself"
+    );
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines, ["configuration loader", "configuration"]);
+}
+
+#[test]
+fn a_makefile_variable_completes_from_its_definition() {
+    let (_tmp, mut app) = word_completion_app(&[(
+        "Makefile",
+        "BUILD_DIRECTORY := out\n\nall:\n\tmkdir -p $(BUILD_DIRECTORY)\n\techo $(BUI",
+    )]);
+    app.trigger_completion();
+    assert_eq!(popup_labels(&app), ["BUILD_DIRECTORY"]);
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[4], "\techo $(BUILD_DIRECTORY");
+}
+
+#[test]
+fn word_suggestions_draw_on_the_open_documents_the_setting_names() {
+    use crate::word_suggest::WordSuggestions;
+    let (_tmp, mut app) = word_completion_app(&[
+        ("animals.txt", "elephant"),
+        ("lift.py", "elevator = 1\n"),
+        ("todo.txt", "elegant\nele"),
+    ]);
+    let mut offered = |mode| {
+        app.word_suggestions = mode;
+        app.completion_popup = None;
+        app.trigger_completion();
+        popup_labels(&app)
+    };
+    assert_eq!(
+        offered(WordSuggestions::MatchingDocuments),
+        ["elegant", "elephant"],
+        "the other plain-text file, not the Python one"
+    );
+    assert_eq!(offered(WordSuggestions::CurrentDocument), ["elegant"]);
+    assert_eq!(
+        offered(WordSuggestions::AllDocuments),
+        ["elegant", "elephant", "elevator"]
+    );
+    assert!(offered(WordSuggestions::Off).is_empty());
+}
+
+#[test]
+fn word_suggestions_draw_on_documents_open_in_other_split_groups() {
+    let (tmp, mut app) = word_completion_app(&[("animals.txt", "elephant")]);
+    app.split_editor();
+    let todo = tmp.path().join("todo.txt");
+    std::fs::write(&todo, "elegant\nele").unwrap();
+    app.editor.open_pinned(&todo).unwrap();
+    let active = app.editor.active_index();
+    app.editor.close_others(active);
+    assert!(
+        app.editor
+            .editors
+            .iter()
+            .all(|e| e.path.as_deref() == Some(todo.as_path())),
+        "animals.txt is open only in the other group"
+    );
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 3;
+    app.focus_pane(Pane::Editor);
+    draw(&mut app, 100, 30);
+    app.trigger_completion();
+    assert_eq!(popup_labels(&app), ["elegant", "elephant"]);
+}
+
+#[test]
+fn with_word_suggestions_off_ctrl_space_offers_nothing() {
+    let (_tmp, mut app) = word_completion_app(&[("notes.txt", "configuration loader\nconfigu")]);
+    app.word_suggestions = crate::word_suggest::WordSuggestions::Off;
+    app.trigger_completion();
+    assert!(app.completion_popup.is_none());
+    assert_ne!(app.status, "No suggestions");
+}
+
+#[test]
+fn ctrl_space_with_no_word_to_offer_says_so() {
+    let (_tmp, mut app) = word_completion_app(&[("notes.txt", "alpha\nzz")]);
+    app.trigger_completion();
+    assert!(app.completion_popup.is_none());
+    assert_eq!(app.status, "No suggestions");
+}
+
+#[test]
+fn a_typed_full_stop_does_not_open_the_word_list() {
+    // `.` asks a server for members; with none, a word list on every full
+    // stop of a note would only get in the way.
+    let (_tmp, mut app) = word_completion_app(&[("notes.txt", "configuration\nconfig")]);
+    app.handle_key(key(KeyCode::Char('.'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.completion_popup.is_none());
+    assert_eq!(app.editor.lines[1], "config.");
+}
+
+#[test]
+fn a_server_s_own_items_are_not_mixed_with_words() {
+    let (_tmp, mut app) = word_completion_app(&[("notes.txt", "load_words\nlo")]);
+    let path = app.editor.path.clone().unwrap();
+    let lsp = app.lsp.as_mut().unwrap();
+    let tx = lsp.completion_reply_sender_for_test();
+    lsp.set_document_servers_for_test(&path, &["srv"]);
+    app.trigger_completion();
+    assert!(
+        app.completion_popup.is_none(),
+        "a file a server has waits for the server's answer"
+    );
+    let id = app.completion_request_id.expect("the server was asked");
+    tx.send(completion_reply(id, &path, &["load_from_server"]))
+        .unwrap();
+    assert!(app.drain_lsp_completion());
+    assert_eq!(popup_labels(&app), ["load_from_server"]);
+}
+
+#[test]
+fn a_server_with_nothing_to_offer_leaves_the_words() {
+    let (_tmp, mut app) = word_completion_app(&[("notes.txt", "load_words\nlo")]);
+    let path = app.editor.path.clone().unwrap();
+    let lsp = app.lsp.as_mut().unwrap();
+    let tx = lsp.completion_reply_sender_for_test();
+    lsp.set_document_servers_for_test(&path, &["srv"]);
+    app.trigger_completion();
+    let id = app.completion_request_id.unwrap();
+    tx.send(completion_reply(id, &path, &[])).unwrap();
+    assert!(app.drain_lsp_completion());
+    assert_eq!(popup_labels(&app), ["load_words"]);
+}
+
+#[test]
+fn a_late_server_list_replaces_the_words_and_an_empty_one_keeps_them() {
+    // No server had the file when Ctrl+Space was pressed (one still
+    // starting, say): the words open at once. An empty reply then keeps the
+    // user's place in them; a real list replaces them.
+    let (_tmp, mut app) = word_completion_app(&[("notes.txt", "load_a load_b\nlo")]);
+    let path = app.editor.path.clone().unwrap();
+    let tx = app.lsp.as_mut().unwrap().completion_reply_sender_for_test();
+    app.trigger_completion();
+    assert_eq!(popup_labels(&app), ["load_a", "load_b"]);
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    let id = app.completion_request_id.unwrap();
+    tx.send(completion_reply(id, &path, &[])).unwrap();
+    app.drain_lsp_completion();
+    assert_eq!(app.completion_popup.as_ref().unwrap().selected, 1);
+    tx.send(completion_reply(id, &path, &["load_server"]))
+        .unwrap();
+    assert!(app.drain_lsp_completion());
+    assert_eq!(popup_labels(&app), ["load_server"]);
+}
+
 /// #842 through the path a real reply takes: asked at `import lo|`, Enter
 /// pressed before the reply landed. The reply must not open a popup on the
 /// new line, where the next Enter accepted its first item (`load`) instead

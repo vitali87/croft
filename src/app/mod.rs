@@ -4198,6 +4198,17 @@ pub struct App {
     /// A word edit in an incomplete session is waiting to re-ask the server;
     /// sent after `sync_lsp` so the request follows the edit's `didChange`.
     completion_reask_due: bool,
+    /// The pending completion was asked for (Ctrl+Space), so the words of
+    /// the open documents fill in when no server offers anything (#1566).
+    /// A `.` typed asks the server alone: a word list there would open on
+    /// every full stop of a plain-text note.
+    completion_words: bool,
+    /// Ids for completions answered here rather than by a server (#1566),
+    /// counting down from the top so they never meet the manager's.
+    local_completion_seq: u64,
+    /// `word_based_suggestions`: which open documents word completion
+    /// draws on (#1566).
+    pub word_suggestions: crate::word_suggest::WordSuggestions,
     /// Signature Help (parameter hints) popup, anchored to the caret while the
     /// user is inside a call. Populated by `drain_lsp_signature_help`.
     pub signature_help_popup: Option<crate::widgets::signature_help_popup::SignatureHelpPopup>,
@@ -6456,6 +6467,11 @@ impl App {
             completion_origin: None,
             completion_incomplete: false,
             completion_reask_due: false,
+            completion_words: false,
+            local_completion_seq: u64::MAX,
+            word_suggestions: crate::word_suggest::WordSuggestions::from_pref(
+                &loaded_prefs.word_based_suggestions,
+            ),
             signature_help_popup: None,
             signature_help_request_id: None,
             signature_help_anchor: None,
@@ -9301,11 +9317,31 @@ impl App {
         // suggestion list (VS Code shows snippets in the suggest widget);
         // the popup's own prefix filter narrows them further.
         let mut items = result.items;
+        // A server with nothing to offer, or none at all, leaves the words
+        // of the open documents, as VS Code's word-based suggestions do
+        // (#1566). A server's own list is never mixed with them.
+        let words = self.completion_words && items.is_empty();
+        if words {
+            // An empty reply to an ask already showing its words (the
+            // manager answering for a file no server took) changes nothing:
+            // rebuilding would only drop the user's place in the list.
+            if self
+                .completion_popup
+                .as_ref()
+                .is_some_and(|p| p.request_id == result.request_id)
+            {
+                return false;
+            }
+            items = self.word_completion_items(&prefix);
+        }
         let lang = self.editor.scope_id();
         for snip in self.snippets.matching(&prefix, lang) {
             items.push(snippet_completion_item(snip));
         }
         if items.is_empty() {
+            if words {
+                self.status = String::from("No suggestions");
+            }
             return self.completion_popup.take().is_some();
         }
         let popup = crate::widgets::completion_popup::CompletionPopup::new(
@@ -9337,8 +9373,9 @@ impl App {
             return false;
         };
         let caret = self.editor.cursor_col;
-        if self.editor.path.as_deref() != Some(path) || self.editor.cursor_row != row || caret < col
-        {
+        // An untitled buffer's words are asked for with an empty path.
+        let here = self.editor.path.as_deref().unwrap_or(Path::new(""));
+        if here != path || self.editor.cursor_row != row || caret < col {
             return false;
         }
         self.editor.lines.get(row).is_some_and(|line| {
@@ -9388,23 +9425,95 @@ impl App {
     }
 
     pub fn trigger_completion(&mut self) {
+        self.request_completion_at_caret(true);
+    }
+
+    /// Ask for completions at the caret. The server is asked when the file
+    /// has a path and a manager runs. When no server reports on the file
+    /// (a Makefile, a `.env`, a plain-text note), an explicit ask (`words`)
+    /// opens at once on the words of the open documents (#1566); a server
+    /// that answers later still replaces them with its own list.
+    fn request_completion_at_caret(&mut self, words: bool) {
         if self.editor.has_non_text_view() {
             return;
         }
-        let Some(path) = self.editor.path.clone() else {
-            return;
-        };
+        let path = self.editor.path.clone();
         let (line, character) = self
             .editor
             .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
-        let Some(lsp) = self.lsp.as_mut() else {
-            return;
+        let asked = match (path.clone(), self.lsp.as_mut()) {
+            (Some(path), Some(lsp)) => Some(lsp.request_completion(path, line, character)),
+            _ => None,
         };
-        let id = lsp.request_completion(path, line, character);
+        let served = path
+            .as_deref()
+            .is_some_and(|p| self.lsp.as_ref().is_some_and(|l| l.document_has_server(p)));
+        let words = words && self.word_suggestions != crate::word_suggest::WordSuggestions::Off;
+        if asked.is_none() && !words {
+            return;
+        }
+        let id = asked.unwrap_or_else(|| {
+            self.local_completion_seq -= 1;
+            self.local_completion_seq
+        });
         self.completion_request_id = Some(id);
         self.completion_origin = Some((self.editor.cursor_row, self.editor.cursor_col));
         self.completion_incomplete = false;
         self.completion_reask_due = false;
+        self.completion_words = words;
+        if words && !served {
+            self.apply_completion_result(crate::lsp::manager::CompletionResult {
+                request_id: id,
+                path: path.unwrap_or_default(),
+                items: Vec::new(),
+                is_incomplete: false,
+            });
+        }
+    }
+
+    /// The words of the open documents for a completion at the caret, as
+    /// `word_suggestions` picks them (#1566).
+    fn word_completion_items(&self, prefix: &str) -> Vec<crate::lsp::CompletionItem> {
+        use crate::word_suggest::WordSuggestions;
+        let mode = self.word_suggestions;
+        if mode == WordSuggestions::Off {
+            return Vec::new();
+        }
+        let active = self.editor.active_index();
+        let lang = self.editor.scope_id();
+        let current_path = self.editor.path.as_deref();
+        // Every open document, the other split groups' too, but not the one
+        // being edited, nor a copy of it open in another group, whose words
+        // would include the one being typed.
+        let others: Vec<&[String]> = match mode {
+            WordSuggestions::Off | WordSuggestions::CurrentDocument => Vec::new(),
+            WordSuggestions::MatchingDocuments | WordSuggestions::AllDocuments => self
+                .editor
+                .editors
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != active)
+                .map(|(_, e)| e)
+                .chain(
+                    self.editor_layout
+                        .inactive_groups()
+                        .into_iter()
+                        .flat_map(|g| g.editors.iter()),
+                )
+                .filter(|e| current_path.is_none() || e.path.as_deref() != current_path)
+                .filter(|e| mode == WordSuggestions::AllDocuments || e.scope_id() == lang)
+                .map(|e| e.lines.as_slice())
+                .collect(),
+        };
+        crate::word_suggest::collect(
+            &self.editor.lines,
+            (self.editor.cursor_row, self.editor.cursor_col),
+            &others,
+            prefix,
+        )
+        .into_iter()
+        .map(crate::word_suggest::item)
+        .collect()
     }
 
     /// Ask the server for parameter hints at the caret (typing `(` or `,`).
@@ -44170,7 +44279,7 @@ impl App {
                 // popup when this char arrived, so the new request just
                 // populates a fresh popup when the response lands.
                 if c == '.' {
-                    self.trigger_completion();
+                    self.request_completion_at_caret(false);
                 }
                 // Parameter hints: `(` / `,` open or advance a call. Closing
                 // (typing `)`, moving away, deleting) is handled by the tick's
@@ -60236,6 +60345,8 @@ impl App {
         self.whitespace_mode =
             crate::widgets::editor::WhitespaceMode::from_pref(&p.render_whitespace);
         self.editor.whitespace_mode = self.whitespace_mode;
+        self.word_suggestions =
+            crate::word_suggest::WordSuggestions::from_pref(&p.word_based_suggestions);
         if !p.disable_inlay_hints && !self.inlay_hints_enabled {
             self.inlay_hints_enabled = true;
             self.request_inlay_hints_for_open_editors();

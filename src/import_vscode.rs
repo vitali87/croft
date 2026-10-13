@@ -108,6 +108,21 @@ fn none_means_disabled(v: &Value) -> Option<Value> {
     v.as_str().map(|s| Value::from(s == "none"))
 }
 
+fn as_word_suggestions(v: &Value) -> Option<Value> {
+    // VS Code took a boolean before 1.84 (`true` was matching documents) and
+    // takes one of four ids since; croft keeps the ids.
+    let mapped = match v {
+        Value::Bool(true) => "matchingDocuments",
+        Value::Bool(false) => "off",
+        Value::String(s) => match s.as_str() {
+            "off" | "currentDocument" | "matchingDocuments" | "allDocuments" => s.as_str(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(Value::String(mapped.to_string()))
+}
+
 fn as_whitespace_mode(v: &Value) -> Option<Value> {
     // VS Code has five whitespace modes; croft has three (WhitespaceMode:
     // none, selection, all). Only ids croft can actually represent are
@@ -222,6 +237,11 @@ const SETTINGS: &[SettingMap] = &[
         vscode: "editor.renderWhitespace",
         croft: "render_whitespace",
         convert: as_whitespace_mode,
+    },
+    SettingMap {
+        vscode: "editor.wordBasedSuggestions",
+        croft: "word_based_suggestions",
+        convert: as_word_suggestions,
     },
     SettingMap {
         vscode: "terminal.integrated.scrollback",
@@ -1190,6 +1210,32 @@ fn write_json(path: &Path, value: &Value) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn word_based_suggestions_import_as_vs_code_s_ids() {
+        // #1566: the four ids carry over; the boolean older VS Code wrote
+        // means the default or off; an id croft does not know is left out.
+        for (vscode, croft) in [
+            (json!("off"), Some(json!("off"))),
+            (json!("currentDocument"), Some(json!("currentDocument"))),
+            (json!("allDocuments"), Some(json!("allDocuments"))),
+            (json!(true), Some(json!("matchingDocuments"))),
+            (json!(false), Some(json!("off"))),
+            (json!("everywhere"), None),
+        ] {
+            let mut report = Report::default();
+            convert_settings(
+                &json!({ "editor.wordBasedSuggestions": vscode }),
+                &mut report,
+            );
+            assert_eq!(
+                report.settings.get("word_based_suggestions"),
+                croft.as_ref(),
+                "{vscode}"
+            );
+        }
+        assert!(crate::config_layers::WORKSPACE_ALLOWED_KEYS.contains(&"word_based_suggestions"));
+    }
 
     #[test]
     fn settings_map_only_where_croft_has_a_real_equivalent() {

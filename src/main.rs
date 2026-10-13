@@ -130,6 +130,7 @@ mod vscode_extensions;
 mod vscode_theme;
 mod web;
 mod widgets;
+mod word_suggest;
 mod workspace;
 mod zoxide;
 
