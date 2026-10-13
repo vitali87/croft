@@ -305,21 +305,28 @@ fn scratch_picture(scratch: &Path, bytes: &[u8], ext: &str) -> Option<PathBuf> {
     write_scratch_no_follow(scratch, &path, bytes).then_some(path)
 }
 
-/// A Markdown cell's `source` with each `attachment:name` it can show
-/// pointing at the attachment's decoded picture in `scratch` (#1478):
-/// PNG and JPEG as stored, SVG rasterized. Names it cannot decode stay as
-/// written, so they keep the missing-image placeholder.
+/// A Markdown cell's `source` with each image destination `attachment:name`
+/// it can show pointing at the attachment's decoded picture in `scratch`
+/// (#1478): PNG and JPEG as stored, SVG rasterized. Only parsed image
+/// destinations are rewritten, so code spans, fences, links and prose keep
+/// their text, and only attachments an image names are decoded and written,
+/// after the same size and dimension caps the Markdown renderer applies.
+/// Names it cannot decode stay as written, so they keep the missing-image
+/// placeholder.
 fn with_attachments(
     source: &str,
     attachments: Option<&serde_json::Value>,
     scratch: &Path,
 ) -> String {
     use base64::Engine as _;
+    use pulldown_cmark::{Event, Options, Parser, Tag};
     let Some(attachments) = attachments.and_then(|a| a.as_object()) else {
         return source.to_string();
     };
-    let mut out = source.to_string();
-    for (name, bundle) in attachments {
+    let picture_for = |name: &str| -> Option<PathBuf> {
+        let bundle = attachments
+            .get(name)
+            .or_else(|| attachments.get(&name.replace("%20", " ")))?;
         let data = |mime: &str| bundle.get(mime).map(joined);
         let decoded = |b64: String| {
             let compact: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
@@ -327,7 +334,7 @@ fn with_attachments(
                 .decode(compact)
                 .ok()
         };
-        let picture = [("image/png", "png"), ("image/jpeg", "jpg")]
+        let (bytes, ext) = [("image/png", "png"), ("image/jpeg", "jpg")]
             .into_iter()
             .find_map(|(mime, ext)| Some((data(mime).and_then(decoded)?, ext)))
             .or_else(|| {
@@ -335,15 +342,51 @@ fn with_attachments(
                 crate::svg::rasterize(svg.as_bytes())
                     .ok()
                     .map(|(png, _, _)| (png, "png"))
-            });
-        let Some(path) = picture.and_then(|(bytes, ext)| scratch_picture(scratch, &bytes, ext))
-        else {
+            })?;
+        // The renderer would refuse these anyway; do not leave them in
+        // scratch.
+        if bytes.len() > 25 * 1024 * 1024 {
+            return None;
+        }
+        let (w, h) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+            .with_guessed_format()
+            .ok()?
+            .into_dimensions()
+            .ok()?;
+        if u64::from(w) * u64::from(h) > 64_000_000 {
+            return None;
+        }
+        scratch_picture(scratch, &bytes, ext)
+    };
+    let options =
+        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let mut resolved: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
+        let Event::Start(Tag::Image { dest_url, .. }) = event else {
             continue;
         };
-        let target = path.display().to_string().replace(' ', "%20");
-        for spelled in [name.clone(), name.replace(' ', "%20")] {
-            out = out.replace(&format!("(attachment:{spelled})"), &format!("({target})"));
+        let Some(name) = dest_url.strip_prefix("attachment:") else {
+            continue;
+        };
+        // The destination as spelled inside this image's own text; a
+        // reference-style image whose definition sits elsewhere is left.
+        let spelled = format!("(attachment:{name}");
+        let Some(at) = source[range.clone()].rfind(&spelled) else {
+            continue;
+        };
+        let target = resolved.entry(name.to_string()).or_insert_with(|| {
+            picture_for(name).map(|p| p.display().to_string().replace(' ', "%20"))
+        });
+        if let Some(target) = target {
+            let start = range.start + at + 1;
+            edits.push((start..start + spelled.len() - 1, target.clone()));
         }
+    }
+    let mut out = source.to_string();
+    for (range, target) in edits.into_iter().rev() {
+        out.replace_range(range, &target);
     }
     out
 }
@@ -839,6 +882,33 @@ mod tests {
         assert!(text.contains("(attachment:notes.txt)"), "{text}");
         assert!(text.contains("(attachment:missing.png)"), "{text}");
         assert!(text.contains("(attachment:shot.png)"), "{text}");
+    }
+
+    /// #1478 review: only image destinations are rewritten, so the same
+    /// `attachment:` text in a code span, a fence or a plain link stays as
+    /// written, and an attachment no image names is never written to
+    /// scratch.
+    #[test]
+    fn only_image_destinations_use_attachments() {
+        let source = "![s](attachment:shot.png)\n\n\
+                      Write `![s](attachment:shot.png)` or [see](attachment:shot.png).\n\n\
+                      ```\n![s](attachment:shot.png)\n```\n";
+        let attachments: serde_json::Value = serde_json::from_str(&format!(
+            "{{\"shot.png\":{{\"image/png\":\"{}\"}},\"unused.png\":{{\"image/png\":\"{}\"}}}}",
+            png_b64(20, 10),
+            png_b64(30, 30)
+        ))
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let out = with_attachments(source, Some(&attachments), tmp.path());
+        assert!(!out.starts_with("![s](attachment:"), "{out}");
+        assert_eq!(
+            out.matches("(attachment:shot.png)").count(),
+            3,
+            "code span, link and fence keep their text: {out}"
+        );
+        let written = std::fs::read_dir(tmp.path()).unwrap().count();
+        assert_eq!(written, 1, "the unused attachment is not written");
     }
 
     /// One code cell whose single output carries `data`.
