@@ -162,6 +162,20 @@ fn as_enabled_globs(v: &Value) -> Option<Value> {
     ))
 }
 
+/// The croft setting a VS Code `settings.json` key maps to, for telling a
+/// user who wrote the VS Code name in croft's config which key to use
+/// (#1607).
+pub fn croft_key_for(vscode_key: &str) -> Option<&'static str> {
+    match vscode_key {
+        "files.autoSave" => Some("auto_save"),
+        "workbench.colorTheme" => Some("theme"),
+        _ => SETTINGS
+            .iter()
+            .find(|m| m.vscode == vscode_key)
+            .map(|m| m.croft),
+    }
+}
+
 const SETTINGS: &[SettingMap] = &[
     SettingMap {
         vscode: "editor.formatOnSave",
