@@ -45,6 +45,9 @@ pub enum TestRequest {
     /// Run every test whose name contains the string (run-at-cursor by
     /// function name). cargo's name filter is a substring match.
     RunFilter(String),
+    /// Run each of these tests by its exact name, one after another, as one
+    /// run (#1535: Rerun Failed Tests). Ends once, failed if any failed.
+    RunMany(Vec<String>),
     /// Run a whole suite by its unanchored name (a header click). The cargo
     /// arm anchors it with [`super::suite_pattern`] so `parse` cannot sweep
     /// `parse_utils::b`; pytest gets it positionally as a node-ID prefix.
@@ -169,6 +172,10 @@ impl TestWorker {
         let _ = self.request_tx.send(TestRequest::RunOne(name));
     }
 
+    pub fn run_many(&self, names: Vec<String>) {
+        let _ = self.request_tx.send(TestRequest::RunMany(names));
+    }
+
     pub fn run_filter(&self, pattern: String) {
         let _ = self.request_tx.send(TestRequest::RunFilter(pattern));
     }
@@ -263,6 +270,7 @@ fn worker_loop(mut root: PathBuf, rx: Receiver<TestRequest>, tx: Sender<(u64, Te
             TestRequest::RunAll => run_all(&root, &etx),
             TestRequest::RunCoverage(scope) => run_coverage(&root, &etx, scope.as_ref()),
             TestRequest::RunOne(name) => run_one(&root, &etx, &name),
+            TestRequest::RunMany(names) => run_many(&root, &etx, &names),
             TestRequest::RunFilter(pattern) => run_filter(&root, &etx, &pattern, false),
             TestRequest::RunSuite(suite) => run_filter(&root, &etx, &suite, true),
             TestRequest::Discover => discover(&root, &etx),
@@ -1267,7 +1275,30 @@ fn run_one(root: &Path, tx: &EpochTx, name: &str) {
         tx.send(TestResponse::Refused);
         return;
     };
-    let ok = match runner {
+    let ok = run_one_case(root, tx, runner, name);
+    tx.send(TestResponse::Finished { ok: Some(ok) });
+}
+
+/// Run each of `names` exactly, one after another, as a single run (#1535):
+/// every runner can run one test by name, which no shared multi-name filter
+/// spans. All are run whatever an earlier one did, and the run fails if any
+/// of them did.
+fn run_many(root: &Path, tx: &EpochTx, names: &[String]) {
+    let Some(runner) = runner_for(root) else {
+        tx.send(TestResponse::Refused);
+        return;
+    };
+    let mut ok = true;
+    for name in names {
+        ok &= run_one_case(root, tx, runner, name);
+    }
+    tx.send(TestResponse::Finished { ok: Some(ok) });
+}
+
+/// One test by its exact name under `runner`, its result streamed; true
+/// when the runner exited cleanly.
+fn run_one_case(root: &Path, tx: &EpochTx, runner: Runner, name: &str) -> bool {
+    match runner {
         Runner::Pytest => {
             let cmd = pytest_cmd(root, &["-v", "--color=no", name]);
             run_streaming(tx, cmd, one(parse_pytest_line))
@@ -1287,8 +1318,7 @@ fn run_one(root: &Path, tx: &EpochTx, name: &str) {
         Runner::Go => run_go(tx, root, &super::gotest::one_args(name)),
         Runner::Codeql => run_codeql(tx, root, &super::codeqltest::select_args(name)),
     }
-    .unwrap_or(false);
-    tx.send(TestResponse::Finished { ok: Some(ok) });
+    .unwrap_or(false)
 }
 
 /// Run every test matching a name filter. `suite` marks a header click: the
@@ -2166,6 +2196,56 @@ mod tests {
             std::fs::write(&p, format!("#!/bin/sh\n{text}\n")).unwrap();
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+    }
+
+    /// #1535: Rerun Failed Tests runs each name exactly, all of them even
+    /// after one fails, and the run ends once: failed if any failed, passed
+    /// only when every one did.
+    #[cfg(unix)]
+    #[test]
+    fn run_many_runs_every_name_and_fails_if_any_did() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("pyproject.toml"), "[project]\nname = \"g\"\n").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let etx = EpochTx {
+            tx: &tx,
+            epoch: 0,
+            codeql: Path::new("codeql"),
+        };
+        let log = root.join(".venv/bin/python.log");
+        let ran = |names: &[&str]| {
+            let _ = std::fs::remove_file(&log);
+            let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            run_many(root, &etx, &names);
+            let finished: Vec<Option<bool>> = rx
+                .try_iter()
+                .filter_map(|(_, r)| match r {
+                    TestResponse::Finished { ok } => Some(ok),
+                    _ => None,
+                })
+                .collect();
+            let calls = std::fs::read_to_string(&log).unwrap_or_default();
+            (calls.lines().count(), finished)
+        };
+
+        fake_venv(
+            root,
+            ".venv",
+            "echo \"$*\" >> \"$0.log\"\ncase \"$*\" in *test_b*) exit 1;; esac\nexit 0",
+        );
+        assert_eq!(
+            ran(&["t.py::test_a", "t.py::test_b", "t.py::test_c"]),
+            (3, vec![Some(false)]),
+            "test_c still runs after test_b fails, and the run ends once, failed"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(calls.contains("t.py::test_a") && calls.contains("t.py::test_c"));
+        assert_eq!(
+            ran(&["t.py::test_a", "t.py::test_c"]),
+            (2, vec![Some(true)]),
+            "every one passing is a passed run"
+        );
     }
 
     /// #845: `pytest --collect-only` exits 2 on a collection error, having

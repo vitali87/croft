@@ -42370,6 +42370,231 @@ fn running_a_suite_never_sweeps_prefix_sharing_siblings() {
     );
 }
 
+/// A cargo workspace whose Testing tree holds `cases`, each with its status.
+fn testing_app(cases: &[(&str, crate::testing::model::TestStatus)]) -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"t\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for (name, status) in cases {
+        app.testing.apply_case(crate::testing::model::TestCase {
+            name: (*name).into(),
+            status: *status,
+        });
+    }
+    (tmp, app)
+}
+
+/// #1535: Testing: Rerun Failed Tests runs exactly the failed cases, by
+/// their full names, and leaves the passing ones alone.
+#[test]
+fn rerun_failed_tests_runs_only_the_failed_cases() {
+    use crate::testing::model::TestStatus;
+    let (_tmp, mut app) = testing_app(&[
+        ("parse::a", TestStatus::Failed),
+        ("parse::b", TestStatus::Passed),
+        ("lex::c", TestStatus::Failed),
+    ]);
+
+    app.run_command(crate::widgets::command_palette::Command::TestingRerunFailed);
+
+    assert_eq!(app.testing.status_of("parse::a"), Some(TestStatus::Running));
+    assert_eq!(app.testing.status_of("lex::c"), Some(TestStatus::Running));
+    assert_eq!(
+        app.testing.status_of("parse::b"),
+        Some(TestStatus::Passed),
+        "a passing test is not rerun"
+    );
+    assert_eq!(app.status, "Running 2 tests");
+    assert_eq!(
+        app.last_test_run,
+        Some(LastTestRun::Many(vec!["lex::c".into(), "parse::a".into()])),
+        "both failed tests, in the tree's order"
+    );
+}
+
+/// #1535 negative: with nothing failed, Rerun Failed Tests says so and
+/// starts no run at all (not a run of everything).
+#[test]
+fn rerun_failed_tests_with_no_failure_says_so_and_runs_nothing() {
+    use crate::testing::model::TestStatus;
+    let (_tmp, mut app) = testing_app(&[("parse::a", TestStatus::Passed)]);
+
+    app.run_command(crate::widgets::command_palette::Command::TestingRerunFailed);
+
+    assert_eq!(app.status, "Rerun Failed Tests: no test has failed");
+    assert!(!app.testing.is_busy());
+    assert_eq!(app.testing.status_of("parse::a"), Some(TestStatus::Passed));
+    assert_eq!(app.last_test_run, None);
+}
+
+/// #1535 negative: before any run, Rerun Last Run says so.
+#[test]
+fn rerun_last_run_before_any_run_says_so() {
+    use crate::testing::model::TestStatus;
+    let (_tmp, mut app) = testing_app(&[("parse::a", TestStatus::NotRun)]);
+
+    app.run_command(crate::widgets::command_palette::Command::TestingRerunLast);
+
+    assert_eq!(app.status, "Rerun Last Run: no test has run yet");
+    assert!(!app.testing.is_busy());
+}
+
+/// #1535: Rerun Last Run repeats the last run as it was asked: a suite
+/// reruns that suite, not every test.
+#[test]
+fn rerun_last_run_repeats_the_last_suite() {
+    use crate::testing::model::TestStatus;
+    let (_tmp, mut app) = testing_app(&[
+        ("parse::a", TestStatus::NotRun),
+        ("lex::b", TestStatus::NotRun),
+    ]);
+    app.run_suite(String::from("parse"));
+    app.testing.apply_case(crate::testing::model::TestCase {
+        name: "parse::a".into(),
+        status: TestStatus::Passed,
+    });
+    app.testing.on_finished(Some(true));
+    assert_eq!(app.testing.status_of("parse::a"), Some(TestStatus::Passed));
+
+    app.run_command(crate::widgets::command_palette::Command::TestingRerunLast);
+
+    assert_eq!(app.testing.status_of("parse::a"), Some(TestStatus::Running));
+    assert_eq!(
+        app.testing.status_of("lex::b"),
+        Some(TestStatus::NotRun),
+        "a test outside the last run stays untouched"
+    );
+}
+
+/// #1535 negative: while a run is going, each new command says so instead
+/// of starting a second run over it.
+#[test]
+fn testing_commands_while_a_run_is_going_say_so() {
+    use crate::testing::model::TestStatus;
+    use crate::widgets::command_palette::Command;
+    let (_tmp, mut app) = testing_app(&[
+        ("parse::a", TestStatus::Failed),
+        ("lex::b", TestStatus::NotRun),
+    ]);
+    app.run_suite(String::from("parse"));
+    assert!(app.testing.is_busy());
+
+    for cmd in [
+        Command::TestingRunAll,
+        Command::TestingRunFile,
+        Command::TestingRerunFailed,
+        Command::TestingRerunLast,
+    ] {
+        app.status.clear();
+        app.run_command(cmd);
+        assert_eq!(app.status, "Tests are already running", "{cmd:?}");
+    }
+    assert_eq!(
+        app.testing.status_of("lex::b"),
+        Some(TestStatus::NotRun),
+        "no second run started"
+    );
+    assert_eq!(app.last_test_run, Some(LastTestRun::Suite("parse".into())));
+}
+
+/// #1535: Run Tests in Current File runs the file's own module.
+#[test]
+fn run_tests_in_current_file_runs_that_module() {
+    use crate::testing::model::TestStatus;
+    let (tmp, mut app) = testing_app(&[
+        ("parse::a", TestStatus::NotRun),
+        ("parse_utils::b", TestStatus::NotRun),
+    ]);
+    let file = tmp.path().join("src/parse.rs");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "#[test]\nfn a() {}\n").unwrap();
+    app.open_file_at_launch(&file);
+
+    app.run_command(crate::widgets::command_palette::Command::TestingRunFile);
+
+    assert_eq!(app.status, "Running tests in parse");
+    assert_eq!(app.testing.status_of("parse::a"), Some(TestStatus::Running));
+    assert_eq!(
+        app.testing.status_of("parse_utils::b"),
+        Some(TestStatus::NotRun),
+        "another file's tests do not run"
+    );
+}
+
+/// #1535 negative: a crate root has no module to filter on, so the command
+/// says so rather than running a filter that sweeps other files' tests.
+#[test]
+fn run_tests_in_current_file_refuses_a_crate_root() {
+    use crate::testing::model::TestStatus;
+    let (tmp, mut app) = testing_app(&[("parse::tests::a", TestStatus::NotRun)]);
+    let file = tmp.path().join("src/main.rs");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "fn main() {}\n").unwrap();
+    app.open_file_at_launch(&file);
+
+    app.run_command(crate::widgets::command_palette::Command::TestingRunFile);
+
+    assert_eq!(
+        app.status,
+        "Run Tests in Current File: the runner cannot pick out this file's tests; use Run All Tests"
+    );
+    assert!(!app.testing.is_busy());
+}
+
+/// #1535: each runner's name for a file's own tests, and `None` where the
+/// runner cannot select a file alone.
+#[test]
+fn file_test_suite_names_a_file_s_tests_per_runner() {
+    use crate::testing::worker::Runner;
+    let root = Path::new("/w");
+    let at = |r, p: &str| super::file_test_suite(r, root, &root.join(p));
+    assert_eq!(at(Runner::Cargo, "src/parse.rs").as_deref(), Some("parse"));
+    assert_eq!(at(Runner::Cargo, "src/a/b.rs").as_deref(), Some("a::b"));
+    assert_eq!(at(Runner::Cargo, "src/a/b/mod.rs").as_deref(), Some("a::b"));
+    assert_eq!(at(Runner::Cargo, "src/main.rs"), None);
+    assert_eq!(at(Runner::Cargo, "src/lib.rs"), None);
+    assert_eq!(at(Runner::Cargo, "src/bin/tool.rs"), None);
+    assert_eq!(at(Runner::Cargo, "tests/it.rs"), None);
+    assert_eq!(at(Runner::Cargo, "README.md"), None);
+    assert_eq!(
+        at(Runner::Pytest, "tests/test_x.py").as_deref(),
+        Some("tests/test_x.py")
+    );
+    assert_eq!(
+        at(Runner::Go, "pkg/a/a_test.go").as_deref(),
+        Some("./pkg/a")
+    );
+    assert_eq!(at(Runner::Go, "a_test.go").as_deref(), Some("."));
+    assert_eq!(at(Runner::Jest, "src/a.test.ts"), None);
+    assert_eq!(at(Runner::Vitest, "src/a.test.ts"), None);
+    assert_eq!(
+        super::file_test_suite(Runner::Pytest, root, Path::new("/elsewhere/t.py")),
+        None,
+        "a file outside the workspace"
+    );
+}
+
+/// #1535: the four everyday Testing commands are in the palette.
+#[test]
+fn the_everyday_testing_commands_are_in_the_palette() {
+    let titles: Vec<&str> = crate::widgets::command_palette::ALL_COMMANDS
+        .iter()
+        .map(|c| c.title())
+        .collect();
+    for t in [
+        "Testing: Run All Tests",
+        "Testing: Run Tests in Current File",
+        "Testing: Rerun Failed Tests",
+        "Testing: Rerun Last Run",
+    ] {
+        assert!(titles.contains(&t), "{t} missing");
+    }
+}
+
 /// Run-at-cursor knows only the fn's leaf name. When the discovered tree
 /// holds exactly one case with that leaf, the run must target it exactly
 /// instead of handing cargo a bare substring that also matches `run_fast`.
@@ -78812,6 +79037,7 @@ fn diag_on_line(line: u32, message: &str) -> crate::lsp::manager::Diagnostic {
         end_char: 1,
         severity: crate::lsp::manager::DiagnosticSeverity::Warning,
         message: String::from(message),
+        tags: Default::default(),
     }
 }
 

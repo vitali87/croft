@@ -384,6 +384,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("workbench.action.tasks.build", "run_build_task"),
     ("workbench.action.tasks.runTask", "run_task"),
     ("workbench.action.tasks.reRunTask", "rerun_last_task"),
+    ("testing.runAll", "testing_run_all"),
+    ("testing.runCurrentFile", "testing_run_file"),
+    ("testing.reRunFailTests", "testing_rerun_failed"),
+    ("testing.reRunLastRun", "testing_rerun_last"),
     ("workbench.action.debug.start", "start_debugging"),
     ("workbench.action.debug.stop", "stop_debugging"),
     ("workbench.action.debug.restart", "restart_debugging"),
@@ -1957,6 +1961,36 @@ mod tests {
             "{:?}",
             report.dropped_keybindings
         );
+    }
+
+    /// #1535: VS Code's Run All Tests / Run Tests in Current File / Rerun
+    /// Failed Tests / Rerun Last Run chords import.
+    #[test]
+    fn testing_run_keybindings_import() {
+        let mut report = Report::default();
+        convert_keybindings(
+            &json!([
+                { "key": "ctrl+alt+a", "command": "testing.runAll" },
+                { "key": "ctrl+alt+f", "command": "testing.runCurrentFile" },
+                { "key": "ctrl+alt+e", "command": "testing.reRunFailTests" },
+                { "key": "ctrl+alt+l", "command": "testing.reRunLastRun" }
+            ]),
+            &mut report,
+        );
+        let mut got: Vec<&str> = report.keybindings.iter().map(|(_, c)| c.as_str()).collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "testing_rerun_failed",
+                "testing_rerun_last",
+                "testing_run_all",
+                "testing_run_file"
+            ]
+        );
+        for id in got {
+            assert!(crate::widgets::command_palette::Command::from_id(id).is_some());
+        }
     }
 
     /// #1292: VS Code's Run Selected Text keybinding imports instead of
