@@ -13403,7 +13403,7 @@ pub struct SaveCleanup {
 }
 
 impl SaveCleanup {
-    pub fn from_prefs(p: &crate::prefs::Prefs) -> Self {
+    pub(crate) fn from_prefs(p: &crate::prefs::Prefs) -> Self {
         Self {
             insert_final_newline: p.insert_final_newline,
             trim_trailing_whitespace: p.trim_trailing_whitespace,
