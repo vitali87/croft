@@ -16,7 +16,7 @@ use crate::markdown::{MdImage, MdRunnable};
 use crate::theme::Theme;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const DIM: Color = Color::Rgb(0x80, 0x84, 0x90);
 const ERR: Color = Color::Rgb(0xe0, 0x6c, 0x75);
@@ -216,8 +216,15 @@ pub fn render(
         let source = cell.get("source").map(joined).unwrap_or_default();
         match kind {
             "markdown" => {
+                // Pasted images live in the cell (#1478): `attachment:name`
+                // points at its decoded copy in scratch, which resolves
+                // with or without the notebook's own folder.
+                let source = with_attachments(&source, cell.get("attachments"), scratch);
                 let (mut md_lines, md_images) = crate::markdown::render_markdown_with_images(
-                    &source, theme, registry, base_dir,
+                    &source,
+                    theme,
+                    registry,
+                    Some(base_dir.unwrap_or(scratch)),
                 );
                 let base = lines.len();
                 for mut img in md_images {
@@ -272,10 +279,73 @@ pub fn render(
                 }
                 lines.push(Line::default());
             }
+            // Raw cells (nbconvert snippets, front matter) show their text
+            // as typed, as Jupyter shows them (#1478).
+            "raw" => {
+                lines.extend(
+                    source
+                        .lines()
+                        .map(|l| Line::from(Span::styled(l.to_string(), dim))),
+                );
+                lines.push(Line::default());
+            }
             _ => {}
         }
     }
     Some((lines, images, runnables))
+}
+
+/// `bytes` written to scratch under a name hashed from them, so a rebuild
+/// reuses the file. None when it cannot be written.
+fn scratch_picture(scratch: &Path, bytes: &[u8], ext: &str) -> Option<PathBuf> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::{Hash as _, Hasher as _};
+    bytes.hash(&mut hasher);
+    let path = scratch.join(format!("nb-{:016x}.{ext}", hasher.finish()));
+    write_scratch_no_follow(scratch, &path, bytes).then_some(path)
+}
+
+/// A Markdown cell's `source` with each `attachment:name` it can show
+/// pointing at the attachment's decoded picture in `scratch` (#1478):
+/// PNG and JPEG as stored, SVG rasterized. Names it cannot decode stay as
+/// written, so they keep the missing-image placeholder.
+fn with_attachments(
+    source: &str,
+    attachments: Option<&serde_json::Value>,
+    scratch: &Path,
+) -> String {
+    use base64::Engine as _;
+    let Some(attachments) = attachments.and_then(|a| a.as_object()) else {
+        return source.to_string();
+    };
+    let mut out = source.to_string();
+    for (name, bundle) in attachments {
+        let data = |mime: &str| bundle.get(mime).map(joined);
+        let decoded = |b64: String| {
+            let compact: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+            base64::engine::general_purpose::STANDARD
+                .decode(compact)
+                .ok()
+        };
+        let picture = [("image/png", "png"), ("image/jpeg", "jpg")]
+            .into_iter()
+            .find_map(|(mime, ext)| Some((data(mime).and_then(decoded)?, ext)))
+            .or_else(|| {
+                let svg = data("image/svg+xml")?;
+                crate::svg::rasterize(svg.as_bytes())
+                    .ok()
+                    .map(|(png, _, _)| (png, "png"))
+            });
+        let Some(path) = picture.and_then(|(bytes, ext)| scratch_picture(scratch, &bytes, ext))
+        else {
+            continue;
+        };
+        let target = path.display().to_string().replace(' ', "%20");
+        for spelled in [name.clone(), name.replace(' ', "%20")] {
+            out = out.replace(&format!("(attachment:{spelled})"), &format!("({target})"));
+        }
+    }
+    out
 }
 
 /// Where an output's lines and pictures go, and what a Markdown output
@@ -301,14 +371,9 @@ impl OutputSink<'_> {
         if (px_w as u64) * (px_h as u64) > 64_000_000 {
             return false;
         }
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        use std::hash::{Hash as _, Hasher as _};
-        bytes.hash(&mut hasher);
-        let name = format!("nb-{:016x}.{ext}", hasher.finish());
-        let path = self.scratch.join(name);
-        if !write_scratch_no_follow(self.scratch, &path, bytes) {
+        let Some(path) = scratch_picture(self.scratch, bytes, ext) else {
             return false;
-        }
+        };
         let rows = ((px_h as f32 / px_w.max(1) as f32) * 72.0 / 2.0)
             .round()
             .clamp(3.0, 18.0) as u16;
@@ -680,6 +745,100 @@ mod tests {
         // Rebuild reuses the SAME hash-named file.
         let (_, again, _) = render(&doc, Theme::BLACK, &mut reg, None, tmp.path(), &[]).unwrap();
         assert_eq!(again[0].path, images[0].path);
+    }
+
+    fn png_b64(w: u32, h: u32) -> String {
+        use base64::Engine as _;
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::new(w, h)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(png.into_inner())
+    }
+
+    fn all_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// #1478: an image pasted into a Markdown cell (stored in its
+    /// `attachments`) is drawn, whether or not the notebook has a folder.
+    #[test]
+    fn a_pasted_image_attachment_is_drawn() {
+        let b64 = png_b64(100, 50);
+        let doc = nb(&format!(
+            "{{\"cell_type\":\"markdown\",\"source\":[\"Pasted:\\n\\n\",\"![shot.png](attachment:shot.png)\\n\\n\",\"![two](attachment:Screen%20Shot.png)\"],\
+              \"attachments\":{{\"shot.png\":{{\"image/png\":\"{b64}\"}},\"Screen Shot.png\":{{\"image/png\":\"{}\"}}}}}}",
+            png_b64(40, 40)
+        ));
+        let scratch = tempfile::tempdir().unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let mut reg = crate::highlight::LangRegistry::default();
+        for base in [None, Some(folder.path())] {
+            let (lines, images, _) =
+                render(&doc, Theme::BLACK, &mut reg, base, scratch.path(), &[]).expect("parses");
+            assert_eq!(images.len(), 2, "{base:?}: {}", all_text(&lines));
+            for img in &images {
+                assert!(img.path.starts_with(scratch.path()), "{:?}", img.path);
+                assert!(img.path.is_file());
+            }
+            assert_ne!(images[0].path, images[1].path);
+            assert!(
+                !all_text(&lines).contains("attachment:"),
+                "{}",
+                all_text(&lines)
+            );
+        }
+    }
+
+    /// #1478: a raw cell shows its text where it sits, between the cells
+    /// around it.
+    #[test]
+    fn a_raw_cell_shows_its_text() {
+        let doc = nb("{\"cell_type\":\"markdown\",\"source\":\"above\"},\
+             {\"cell_type\":\"raw\",\"source\":[\"raw cell text\\n\",\"\\\\section{Intro}\"]},\
+             {\"cell_type\":\"code\",\"execution_count\":null,\"source\":\"x = 1\",\"outputs\":[]}");
+        let tmp = tempfile::tempdir().unwrap();
+        let mut reg = crate::highlight::LangRegistry::default();
+        let (lines, _, runnables) =
+            render(&doc, Theme::BLACK, &mut reg, None, tmp.path(), &[]).expect("parses");
+        let text = all_text(&lines);
+        let raw = text.find("raw cell text").expect(&text);
+        assert!(text.find("above").unwrap() < raw, "{text}");
+        assert!(text.contains("\\section{Intro}"), "shown as typed: {text}");
+        assert!(raw < text.find("In [ ]:").unwrap(), "{text}");
+        assert_eq!(runnables.len(), 1, "a raw cell does not run");
+    }
+
+    /// #1478 negative: an attachment croft cannot draw, or a name the cell
+    /// does not carry, keeps the placeholder, and a code cell's text is
+    /// never rewritten.
+    #[test]
+    fn an_attachment_that_is_not_a_picture_keeps_its_placeholder() {
+        let doc = nb(&format!(
+            "{{\"cell_type\":\"markdown\",\"source\":\"![n](attachment:notes.txt) ![m](attachment:missing.png)\",\
+              \"attachments\":{{\"notes.txt\":{{\"text/plain\":\"hi\"}},\"bad.png\":{{\"image/png\":\"not base64!\"}}}}}},\
+             {{\"cell_type\":\"code\",\"execution_count\":1,\"source\":\"s = '(attachment:shot.png)'\",\"outputs\":[],\
+              \"attachments\":{{\"shot.png\":{{\"image/png\":\"{}\"}}}}}}",
+            png_b64(10, 10)
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let mut reg = crate::highlight::LangRegistry::default();
+        let (lines, images, _) =
+            render(&doc, Theme::BLACK, &mut reg, None, tmp.path(), &[]).expect("parses");
+        let text = all_text(&lines);
+        assert!(images.is_empty(), "{images:?}");
+        assert!(text.contains("(attachment:notes.txt)"), "{text}");
+        assert!(text.contains("(attachment:missing.png)"), "{text}");
+        assert!(text.contains("(attachment:shot.png)"), "{text}");
     }
 
     /// One code cell whose single output carries `data`.
