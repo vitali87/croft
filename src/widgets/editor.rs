@@ -25,6 +25,9 @@ use crate::widgets::scrollbar;
 /// PDF / spreadsheet branches in `open`, so larger media keep their
 /// own per-format limits.
 const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
+/// The most a single gzipped file may decompress to and still open as text
+/// (#1469); past it the file stays a hex dump of its gzip bytes.
+const MAX_GUNZIP_BYTES: u64 = 256 * 1024 * 1024;
 /// The colour of a SARIF analysis step drawn after its line (#577).
 const STEP_MARK_COLOR: Color = Color::Rgb(0x4f, 0xc1, 0xff);
 const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
@@ -5043,7 +5046,16 @@ impl Editor {
                     Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
                         self.route_note = Some((path.to_path_buf(), e.to_string()));
                     }
-                    Err(_) => {}
+                    // Not a tar: one compressed file, such as a rotated
+                    // `app.log.1.gz` (#1469). Its text opens; binary, or
+                    // too large once decompressed, stays hex.
+                    Err(_) => match self.open_gunzipped(path) {
+                        Ok(()) => return Ok(()),
+                        Err(e) if e.to_string().contains("too large") => {
+                            self.route_note = Some((path.to_path_buf(), e.to_string()));
+                        }
+                        Err(_) => {}
+                    },
                 }
             }
             Some(crate::magic::Magic::Sqlite) => {
@@ -5768,6 +5780,62 @@ impl Editor {
             return crate::provenance::Provenance::new();
         }
         self.provenance.clone()
+    }
+
+    /// A gzip of one file (#1469), such as logrotate's `app.log.1.gz` or a
+    /// `dump.sql.gz`: its text, decompressed to a scratch copy, in the
+    /// read-only log view, so it reads like the file it was and a save can
+    /// never write the text over the archive. It used to open as a hex dump
+    /// of the gzip bytes. Fails, so the caller falls back to hex, when the
+    /// file does not decompress, holds binary data, or decompresses to more
+    /// than [`MAX_GUNZIP_BYTES`], a bound against a decompression bomb.
+    fn open_gunzipped(&mut self, path: &Path) -> Result<()> {
+        use std::io::{Read, Write};
+        let file = std::fs::File::open(path)?;
+        let mut decoder = flate2::read::MultiGzDecoder::new(std::io::BufReader::new(file))
+            .take(MAX_GUNZIP_BYTES + 1);
+        let mut head = vec![0u8; 8192];
+        let mut filled = 0;
+        while filled < head.len() {
+            match decoder.read(&mut head[filled..])? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        head.truncate(filled);
+        if encoding_rs::Encoding::for_bom(&head).is_none() && is_binary(&head) {
+            anyhow::bail!("not text once decompressed");
+        }
+        let inner = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.strip_suffix(".gz").unwrap_or(n).to_string())
+            .unwrap_or_default();
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            path.hash(&mut h);
+            h.finish()
+        };
+        let dir = std::env::temp_dir().join("croft-gunzip");
+        std::fs::create_dir_all(&dir)?;
+        let scratch = dir.join(format!("{key:016x}-{inner}"));
+        let mut out = std::fs::File::create(&scratch)?;
+        out.write_all(&head)?;
+        let written = head.len() as u64 + std::io::copy(&mut decoder, &mut out)?;
+        drop(out);
+        if written > MAX_GUNZIP_BYTES {
+            let _ = std::fs::remove_file(&scratch);
+            anyhow::bail!(
+                "Decompressed file too large to show (over {} MiB)",
+                MAX_GUNZIP_BYTES / (1024 * 1024)
+            );
+        }
+        self.open_log(&scratch)?;
+        self.path = Some(path.to_path_buf());
+        self.disk_stamp = Self::disk_stamp_of(path);
+        self.status = format!("Opened {} decompressed, read-only", path.display());
+        Ok(())
     }
 
     /// Open `path` as a rendered ANSI log (#257): colours paint through the
@@ -21245,6 +21313,101 @@ mod tests {
             "a non-workbook zip lands in the archive browser (#179)"
         );
         assert!(e.sheet.is_none() && e.hex.is_none());
+    }
+
+    fn gzip_to(path: &Path, data: &[u8]) {
+        use std::io::Write as _;
+        let mut gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(path).unwrap(),
+            flate2::Compression::fast(),
+        );
+        gz.write_all(data).unwrap();
+        gz.finish().unwrap();
+    }
+
+    fn log_lines(e: &mut Editor, n: usize) -> Vec<String> {
+        let view = e.log.as_mut().expect("the log view");
+        view.ensure(0, n).unwrap();
+        (0..n)
+            .filter_map(|i| view.visible_text(i).map(str::to_string))
+            .collect()
+    }
+
+    /// #1469: a rotated log, gzipped alone, opens as its text, read-only,
+    /// under its own name; it opened as a hex dump of the gzip bytes.
+    #[test]
+    fn a_gzipped_log_opens_as_its_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gz = tmp.path().join("app.log.1.gz");
+        gzip_to(&gz, b"2026-10-04 INFO request id=1\n2026-10-04 WARN slow\n");
+        let mut e = Editor::new();
+        e.open(&gz).unwrap();
+        assert!(e.hex.is_none(), "not hex");
+        assert_eq!(e.path.as_deref(), Some(gz.as_path()), "the tab is the .gz");
+        assert_eq!(
+            log_lines(&mut e, 2),
+            ["2026-10-04 INFO request id=1", "2026-10-04 WARN slow"]
+        );
+        assert!(e.status.contains("read-only"), "{}", e.status);
+    }
+
+    /// #1469: any text compresses the same way: a `data.json.gz` opens as
+    /// its JSON.
+    #[test]
+    fn a_gzipped_json_file_opens_as_its_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gz = tmp.path().join("data.json.gz");
+        gzip_to(&gz, b"{\"a\": 1}\n");
+        let mut e = Editor::new();
+        e.open(&gz).unwrap();
+        assert_eq!(log_lines(&mut e, 1), ["{\"a\": 1}"]);
+    }
+
+    /// #1469 negative: the decompressed text is never saved over the
+    /// archive, and the .gz on disk is unchanged.
+    #[test]
+    fn a_gunzipped_tab_is_never_saved_over_the_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gz = tmp.path().join("dump.sql.gz");
+        gzip_to(&gz, b"select 1;\n");
+        let before = std::fs::read(&gz).unwrap();
+        let mut e = Editor::new();
+        e.open(&gz).unwrap();
+        assert!(
+            e.save_to_disk_force().is_err(),
+            "a read-only view saves nothing"
+        );
+        assert_eq!(std::fs::read(&gz).unwrap(), before);
+    }
+
+    /// #1469 negative: a gzip of binary data stays a hex dump, and a tar.gz
+    /// still opens the archive browser.
+    #[test]
+    fn binary_gzip_stays_hex_and_a_tar_gz_stays_an_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("blob.bin.gz");
+        gzip_to(&bin, &[0u8, 1, 2, 3, 0, 0, 0xff, 0xfe, 0, 7]);
+        let mut e = Editor::new();
+        e.open(&bin).unwrap();
+        assert!(e.hex.is_some() && e.log.is_none());
+
+        let tgz = tmp.path().join("bundle.gz");
+        let gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(&tgz).unwrap(),
+            flate2::Compression::fast(),
+        );
+        let mut t = tar::Builder::new(gz);
+        let data = b"tar payload";
+        let mut hdr = tar::Header::new_gnu();
+        hdr.set_size(data.len() as u64);
+        hdr.set_mode(0o644);
+        hdr.set_cksum();
+        t.append_data(&mut hdr, "inner/file.txt", &data[..])
+            .unwrap();
+        t.into_inner().unwrap().finish().unwrap();
+        let mut e = Editor::new();
+        e.open(&tgz).unwrap();
+        assert!(e.archive.is_some() && e.log.is_none());
     }
 
     #[test]
