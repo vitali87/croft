@@ -548,6 +548,8 @@ pub struct Report {
     pub refusals: Vec<String>,
     /// Anything that went wrong short of failing the import.
     pub warnings: Vec<String>,
+    /// For each key in `snippets`, the VS Code name and scope it came from.
+    snippet_origins: BTreeMap<String, (String, String)>,
 }
 
 impl Report {
@@ -754,35 +756,56 @@ fn snippet_scope(snippet: &serde_json::Map<String, Value>) -> String {
 /// `main` in python.json and in rust.json are two snippets: when another
 /// scope already holds the name, both are keyed `name (scope)`. A second
 /// one for the same scope replaces the first, and the report says so.
+/// Which name and scope each key came from is tracked rather than read back
+/// from the key's text, so a snippet literally named `main (python)` is never
+/// taken for a generated key and overwritten.
 fn snippet_key(
     name: &str,
     snippet: &serde_json::Map<String, Value>,
     report: &mut Report,
 ) -> String {
     let scope = snippet_scope(snippet);
-    let qualified = format!("{name} ({scope})");
-    let same_name = |k: &String| k == name || k.starts_with(&format!("{name} ("));
-    if !report.snippets.keys().any(same_name) {
-        return name.to_string();
-    }
-    if let Some(prev) = report.snippets.get(name) {
-        let prev_scope = prev.as_object().map(snippet_scope).unwrap_or_default();
-        if prev_scope == scope {
-            report.warnings.push(format!(
-                "snippet {name:?} is defined twice for {scope}; kept the later one"
-            ));
-            return name.to_string();
-        }
-        let prev = report.snippets.remove(name).expect("just read");
-        report
-            .snippets
-            .insert(format!("{name} ({prev_scope})"), prev);
-    } else if report.snippets.contains_key(&qualified) {
+    let origin = (name.to_string(), scope.clone());
+    if let Some(key) = report
+        .snippet_origins
+        .iter()
+        .find(|(_, o)| **o == origin)
+        .map(|(k, _)| k.clone())
+    {
         report.warnings.push(format!(
             "snippet {name:?} is defined twice for {scope}; kept the later one"
         ));
+        return key;
     }
-    qualified
+    let shared = report.snippet_origins.values().any(|(n, _)| n == name);
+    let key = if shared {
+        // The one still under the bare name moves to its own qualified key.
+        if let Some((_, prev_scope)) = report.snippet_origins.remove(name) {
+            let prev = report.snippets.remove(name).expect("origin tracks a key");
+            let moved = free_snippet_key(report, format!("{name} ({prev_scope})"));
+            report.snippets.insert(moved.clone(), prev);
+            report
+                .snippet_origins
+                .insert(moved, (name.to_string(), prev_scope));
+        }
+        free_snippet_key(report, format!("{name} ({scope})"))
+    } else {
+        free_snippet_key(report, name.to_string())
+    };
+    report.snippet_origins.insert(key.clone(), origin);
+    key
+}
+
+/// `base`, or `base 2`, `base 3`, ... when a snippet with another name or
+/// scope already holds it.
+fn free_snippet_key(report: &Report, base: String) -> String {
+    if !report.snippets.contains_key(&base) {
+        return base;
+    }
+    (2..)
+        .map(|n| format!("{base} {n}"))
+        .find(|k| !report.snippets.contains_key(k))
+        .expect("an unused key exists")
 }
 
 /// Turn `workbench.colorTheme` into a croft theme, when it can be.
@@ -1984,6 +2007,37 @@ mod tests {
             "{:?}",
             report.warnings
         );
+    }
+
+    /// #1178: a snippet literally named `foo (python)` is not a generated
+    /// key, so a later `foo` in python.json must not overwrite it.
+    #[test]
+    fn a_literal_parenthesized_snippet_name_is_not_taken_for_a_generated_key() {
+        let mut report = Report::default();
+        let literal = json!({ "foo (python)": { "prefix": "lit", "body": "literal" } });
+        convert_snippets(&literal, Some("python"), &mut report);
+        let foo = json!({ "foo": { "prefix": "foo", "body": "foo" } });
+        convert_snippets(&foo, Some("python"), &mut report);
+        assert_eq!(report.snippets.len(), 2, "{:?}", report.snippets);
+        assert_eq!(report.snippets["foo (python)"]["prefix"], "lit");
+        assert_eq!(report.snippets["foo"]["prefix"], "foo");
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+        // A `foo` for another language now qualifies both, and the python one
+        // steps around the literal key instead of replacing it.
+        let rust = json!({ "foo": { "prefix": "rs", "body": "rs" } });
+        convert_snippets(&rust, Some("rust"), &mut report);
+        assert_eq!(report.snippets.len(), 3, "{:?}", report.snippets);
+        assert_eq!(report.snippets["foo (python)"]["prefix"], "lit");
+        assert_eq!(report.snippets["foo (python) 2"]["prefix"], "foo");
+        assert_eq!(report.snippets["foo (rust)"]["prefix"], "rs");
+
+        // A repeat of python's `foo` still replaces its own snippet only.
+        let again = json!({ "foo": { "prefix": "foo2", "body": "foo2" } });
+        convert_snippets(&again, Some("python"), &mut report);
+        assert_eq!(report.snippets.len(), 3);
+        assert_eq!(report.snippets["foo (python)"]["prefix"], "lit");
+        assert_eq!(report.snippets["foo (python) 2"]["prefix"], "foo2");
     }
 
     #[test]
