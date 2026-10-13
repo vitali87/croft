@@ -7860,9 +7860,9 @@ mod tests {
         let term =
             PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
                 .unwrap();
-        wait_for_grid(&term, |ls| {
-            ls.iter().any(|l| l.contains("ok") && !l.contains("printf"))
-        });
+        // The echoed command wraps past the pane's width, so a wrapped half
+        // of it can hold "ok" without "printf": wait for the output line.
+        wait_for_grid(&term, |ls| ls.iter().any(|l| l.trim() == "ok"));
         assert_eq!(
             term.drain_notifications(),
             vec![
