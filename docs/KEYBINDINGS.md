@@ -738,6 +738,12 @@ Three commands read the click position and are meaningless from the keyboard:
 `mouse_open_link_at_click`. Invoked from the palette they report that they
 need a mouse binding rather than guessing at the caret.
 
+In `tab_strip`, the tab commands act on the tab under the click rather than
+the active tab, as VS Code's tab menu does: `close_editor`,
+`close_other_editors`, `close_editors_to_the_right` and `keep_editor`. With no
+binding, a `middle_click` on a tab closes that tab, asking first if it has
+unsaved edits.
+
 ### What croft refuses, and why
 
 A refused row is reported in **OUTPUT · Keybindings** and, on a live reload,
