@@ -118,6 +118,7 @@ pub const WORKSPACE_ALLOWED_KEYS: &[&str] = &[
     "explorer_views",
     "files_exclude",
     "search_exclude",
+    "files_encoding",
 ];
 
 /// The synced layer's file name (#262). Config sync pushes the projection
