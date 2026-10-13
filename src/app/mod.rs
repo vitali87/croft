@@ -834,11 +834,7 @@ fn git_status_spans<'a>(status: &'a crate::git::GitStatus) -> Vec<Span<'a>> {
     // activity-bar Source Control icon, so the status-bar branch indicator
     // and the SCM panel share the same visual mark.
     spans.push(Span::styled("\u{ea68} ", Style::default().fg(pill_color)));
-    let label: &str = match (&status.branch, &status.detached_hash) {
-        (Some(b), _) => b.as_str(),
-        (None, Some(h)) => h.as_str(),
-        (None, None) => "(no head)",
-    };
+    let label = status.head_label();
     spans.push(Span::styled(
         label,
         Style::default().fg(pill_color).add_modifier(Modifier::BOLD),
@@ -3600,6 +3596,15 @@ pub struct App {
     /// is waiting for the next bake (see [`MINIMAP_EDIT_REBAKE`]).
     minimap_baked_at: Option<std::time::Instant>,
     minimap_edit_pending: bool,
+    /// The strip was last drawn as braille text, where the terminal cannot
+    /// draw images (#1231); `minimap_content_h` then counts dot rows.
+    minimap_text: bool,
+    /// The braille cells for the text strip, rebuilt only when the same
+    /// signature the image bake keys on changes.
+    minimap_text_cache: Option<(MinimapSig, Vec<BrailleCell>)>,
+    /// Whether the editor was wide enough for the strip on the last frame,
+    /// so turning the minimap on can say why it does not show.
+    minimap_room: bool,
     /// The buffer ratatui drew last, and what each small chrome image (the
     /// PROBLEMS badge, Run and Debug icon, sidebar illustrations) was sent
     /// over, keyed by overlay, for [`App::chrome_image_due`]. Keys not
@@ -5099,6 +5104,59 @@ const MINIMAP_EDIT_REBAKE: std::time::Duration = std::time::Duration::from_milli
 /// exactly as a plain whole-file fit would, so normal files are unaffected.
 const MINIMAP_MAX_LINE_PX: u32 = 6;
 
+/// Source characters folded into one braille dot column of the text minimap,
+/// so the 6-cell strip spans 48 columns of code, like the image's 1px a char.
+const MINIMAP_TEXT_CHARS_PER_DOT: u32 = 4;
+
+/// One cell of the text minimap: its braille glyph and ink colour, or `None`
+/// for a blank cell.
+type BrailleCell = Option<(char, (u8, u8, u8))>;
+
+/// Fold a minimap raster into braille cells for terminals that cannot draw
+/// images (#1231): each cell is 2x4 dots, each dot `MINIMAP_TEXT_CHARS_PER_DOT`
+/// raster columns wide and one raster row tall, lit when any of its pixels is
+/// ink (not `bg`). A cell takes the colour of its first lit pixel. Cells come
+/// back row-major, `cell_w` to a row.
+fn braille_minimap(
+    rgba: &[u8],
+    w: u32,
+    h: u32,
+    bg: (u8, u8, u8),
+    cell_w: u16,
+    cell_h: u16,
+) -> Vec<BrailleCell> {
+    // Braille dot bits by (dot column, dot row), U+2800 + bits.
+    const BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
+    let xs = MINIMAP_TEXT_CHARS_PER_DOT;
+    let ink = |x: u32, y: u32| -> Option<(u8, u8, u8)> {
+        if x >= w || y >= h {
+            return None;
+        }
+        let i = ((y * w + x) * 4) as usize;
+        let px = (rgba[i], rgba[i + 1], rgba[i + 2]);
+        (px != bg).then_some(px)
+    };
+    let mut cells = Vec::with_capacity(cell_w as usize * cell_h as usize);
+    for cy in 0..cell_h as u32 {
+        for cx in 0..cell_w as u32 {
+            let mut bits = 0u8;
+            let mut colour = None;
+            for (dx, column) in BITS.iter().enumerate() {
+                for (dy, bit) in column.iter().enumerate() {
+                    let y = cy * 4 + dy as u32;
+                    let x0 = (cx * 2 + dx as u32) * xs;
+                    if let Some(px) = (x0..x0 + xs).find_map(|x| ink(x, y)) {
+                        bits |= bit;
+                        colour.get_or_insert(px);
+                    }
+                }
+            }
+            cells.push(colour.map(|c| (char::from_u32(0x2800 + bits as u32).unwrap_or(' '), c)));
+        }
+    }
+    cells
+}
+
 /// Cached full-document raster for the minimap. The expensive part (walking
 /// every line's syntax spans) runs only when `sig` changes; scrolling reuses
 /// `rgba` and just re-composites the viewport box on top.
@@ -5978,6 +6036,9 @@ impl App {
             minimap_content_h: 0,
             minimap_baked_at: None,
             minimap_edit_pending: false,
+            minimap_text: false,
+            minimap_text_cache: None,
+            minimap_room: true,
             drawn_buffer: None,
             chrome_sent: std::collections::HashMap::new(),
             chrome_seen: std::collections::HashSet::new(),
@@ -9548,6 +9609,15 @@ impl App {
     }
 
     fn on_mouse_moved(&mut self, col: u16, row: u16, in_editor: bool) {
+        // Crossing onto the hover keeps it, so the wheel can reach it.
+        if self
+            .hover_popup
+            .as_ref()
+            .is_some_and(|p| rect_contains(p.last_area, col, row))
+        {
+            self.hover.clear();
+            return;
+        }
         // Activity-bar hover: brighten the icon under the pointer. Re-emit the
         // swapped pre-baked image only when the hovered icon actually changes,
         // so a pointer drifting within one icon (or anywhere else) costs
@@ -11389,9 +11459,10 @@ impl App {
                 .unwrap_or(encoding_rs::UTF_8);
             let text = enc.decode(&content).0.into_owned();
             let label = std::path::PathBuf::from(format!("{rel} (local snapshot)"));
+            let unsaved = self.unsaved_text_in_any_group(&path);
             if let Err(e) = self
                 .editor
-                .open_head_diff_with_text(label, &text, &path, false)
+                .open_head_diff_with_text_resolved(label, &text, &path, false, unsaved)
             {
                 self.status = format!("Could not open snapshot diff: {e}");
                 return;
@@ -19486,6 +19557,17 @@ impl App {
             let paint_history = self.scrub_view.is_some();
             let active_idx = self.editor_layout.active_dfs_index();
             let focused_area = if self.editor_layout.is_split() {
+                let mut rects = rects;
+                // The active group carries the minimap (#1231).
+                let minimap = self.carve_minimap(rects[active_idx]);
+                if let Some((ed_rect, full_strip, _)) = minimap {
+                    frame.render_widget(
+                        ratatui::widgets::Block::default()
+                            .style(Style::default().bg(self.theme.editor_bg())),
+                        full_strip,
+                    );
+                    rects[active_idx] = ed_rect;
+                }
                 let active_area = rects[active_idx];
                 frame.render_widget(&mut self.editor, active_area);
                 let inactive_rects: Vec<Rect> = rects
@@ -19514,9 +19596,10 @@ impl App {
                     self.update_editor_image_overlay(0, active_area);
                     self.disable_editor_image(1);
                 }
-                // ponytail: no minimap while the editor is split; per-group
-                // minimaps when someone asks for them.
-                self.disable_minimap_image();
+                match minimap {
+                    Some((_, _, img_rect)) => self.paint_minimap(frame, img_rect),
+                    None => self.disable_minimap_image(),
+                }
                 active_area
             } else if let Some((ed_rect, full_strip, img_rect)) = self.carve_minimap(editor_area) {
                 // Bg-fill the whole strip column so no stale cells show
@@ -19531,7 +19614,7 @@ impl App {
                 self.editor_seams.clear();
                 self.update_editor_image_overlay(0, ed_rect);
                 self.disable_editor_image(1);
-                self.update_minimap_overlay(img_rect);
+                self.paint_minimap(frame, img_rect);
                 ed_rect
             } else {
                 frame.render_widget(&mut self.editor, editor_area);
@@ -20560,6 +20643,7 @@ impl App {
         if let Some(popup) = self.hover_popup.as_mut() {
             popup.theme = self.theme;
             let area = popup.area_for(frame.area());
+            popup.last_area = area;
             if area.width > 0 && area.height > 0 {
                 frame.render_widget(&*popup, area);
             }
@@ -22423,23 +22507,25 @@ impl App {
             // Cmd+K C: diff the active file against the compare anchor.
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'c') => {
                 match (self.compare_anchor.clone(), self.editor.path.clone()) {
-                    (Some(anchor), Some(other)) => match self.editor.open_diff(&anchor, &other) {
-                        Ok(()) => {
-                            self.focus_pane(Pane::Editor);
-                            self.compare_anchor = None;
-                            self.sync_open_file_poll_mtime();
-                            let l = anchor
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| anchor.display().to_string());
-                            let r = other
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| other.display().to_string());
-                            self.status = format!("Diff: {l} \u{2194} {r}");
+                    (Some(anchor), Some(other)) => {
+                        match self.open_diff_across_groups(&anchor, &other) {
+                            Ok(()) => {
+                                self.focus_pane(Pane::Editor);
+                                self.compare_anchor = None;
+                                self.sync_open_file_poll_mtime();
+                                let l = anchor
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| anchor.display().to_string());
+                                let r = other
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| other.display().to_string());
+                                self.status = format!("Diff: {l} \u{2194} {r}");
+                            }
+                            Err(e) => self.status = format!("Diff failed: {e}"),
                         }
-                        Err(e) => self.status = format!("Diff failed: {e}"),
-                    },
+                    }
                     (None, _) => {
                         self.status = String::from("Compare with Selected: nothing selected yet")
                     }
@@ -24118,6 +24204,7 @@ impl App {
         match key.code {
             KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
             KeyCode::Enter => self.run_all_tests(),
+            KeyCode::Char('s' | 'S') if self.testing.is_busy() => self.cancel_test_run(),
             KeyCode::Char('r' | 'R') => self.discover_tests(),
             KeyCode::Char('w' | 'W') => {
                 self.toggle_test_watch(crate::testing::watch::WatchScope::All)
@@ -24141,6 +24228,33 @@ impl App {
             self.status = String::from("The test runner has not written any output yet");
         }
         self.set_bottom_panel_tab(BottomPanelTab::Output);
+    }
+
+    /// A new run while one is in flight is refused with the way out
+    /// (#1534): it used to be dropped without a word, and a hung test left
+    /// the view refusing every run until croft quit.
+    fn refuse_test_run_while_busy(&mut self) -> bool {
+        if !self.testing.is_busy() {
+            return false;
+        }
+        self.status = String::from(TEST_RUN_IN_PROGRESS);
+        // The run in flight still reports its outcome over this (#856).
+        if let Some(run) = self.test_run_status.as_mut() {
+            run.shown = self.status.clone();
+        }
+        true
+    }
+
+    /// Testing: Cancel Test Run, `s` in the Testing view, or its Stop
+    /// control (#1534): kill the run or discovery in flight. The panel
+    /// settles when the worker reports the run's end.
+    fn cancel_test_run(&mut self) {
+        if !self.testing.is_busy() {
+            self.status = String::from("No test run in progress");
+            return;
+        }
+        self.test_worker.cancel();
+        self.status = String::from("Cancelling test run");
     }
 
     /// Whether an enabled runner extension claims this workspace. When none
@@ -24180,7 +24294,7 @@ impl App {
     /// stream into the tree as usual; the report lands in the editor's
     /// gutter, the status bar and the Testing summary.
     fn run_all_tests_with_coverage(&mut self) {
-        if self.testing.is_busy() || !self.testing_runner_available() {
+        if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
         self.test_run_with_unsaved_saved(|app| {
@@ -24508,8 +24622,7 @@ impl App {
             );
             return;
         }
-        if self.testing.is_busy() {
-            self.status = String::from("Tests are already running");
+        if self.refuse_test_run_while_busy() {
             return;
         }
         self.run_all_tests();
@@ -24590,7 +24703,7 @@ impl App {
     /// Kick off a full test run on the worker (no-op if a run/discovery is
     /// already in flight) and reveal the Testing view so results stream in.
     fn run_all_tests(&mut self) {
-        if self.testing.is_busy() || !self.testing_runner_available() {
+        if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
         self.test_run_with_unsaved_saved(|app| {
@@ -24602,7 +24715,7 @@ impl App {
     /// Run a single test by exact name (click-to-run from the tree). Marks just
     /// that case Running and keeps the rest of the discovered list intact.
     fn run_test(&mut self, name: String) {
-        if self.testing.is_busy() || !self.testing_runner_available() {
+        if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
         self.test_run_with_unsaved_saved(|app| {
@@ -24630,7 +24743,7 @@ impl App {
     /// filter and the panel's marking are substring matches, so the pattern is
     /// anchored (`parse::`) to keep `parse` from sweeping `parse_utils::b`.
     fn run_suite(&mut self, suite: String) {
-        if self.testing.is_busy() || !self.testing_runner_available() {
+        if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
         self.test_run_with_unsaved_saved(|app| {
@@ -24659,7 +24772,7 @@ impl App {
     /// A leaf unique in the discovered tree resolves to its full name for an
     /// exact run; otherwise cargo's substring filter is the best available.
     fn run_named_test(&mut self, name: String) {
-        if self.testing.is_busy() || !self.testing_runner_available() {
+        if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
         self.test_run_with_unsaved_saved(|app| app.run_named_test_now(name));
@@ -24739,7 +24852,7 @@ impl App {
                 String::from("Run Test at Cursor with Coverage: no function at the caret");
             return;
         };
-        if self.testing.is_busy() || !self.testing_runner_available() {
+        if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
         self.test_run_with_unsaved_saved(|app| app.run_test_at_cursor_with_coverage_now(name));
@@ -24770,7 +24883,7 @@ impl App {
     /// suite, under the coverage tool, marked in the tree as a plain run of
     /// it would be. The report replaces the last one.
     fn run_scope_with_coverage(&mut self, name: String, suite: bool) {
-        if self.testing.is_busy() || !self.testing_runner_available() {
+        if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
         self.test_run_with_unsaved_saved(|app| app.run_scope_with_coverage_now(name, suite));
@@ -33502,12 +33615,16 @@ impl App {
                 match texts {
                     Ok((head_text, working_text)) => {
                         let label = std::path::PathBuf::from(format!("{} (HEAD)", entry.path));
+                        // The working side is the open tab's unsaved text
+                        // when it has edits, in any split group.
+                        let unsaved = self.unsaved_text_in_any_group(&abs);
                         match self.editor.open_head_diff_with_texts(
                             label,
                             &head_text,
-                            &working_text,
+                            unsaved.as_deref().unwrap_or(&working_text),
                             &abs,
                             true,
+                            unsaved.is_some(),
                         ) {
                             Ok(()) => {
                                 self.tag_open_diff(
@@ -38408,6 +38525,9 @@ impl App {
             Some(diff) if !diff.left_is_git_head => {
                 Err("Hunk actions need a working-tree diff from Source Control".to_string())
             }
+            Some(diff) if diff.right_is_unsaved => {
+                Err("Save the file first: hunk actions apply to the file on disk".to_string())
+            }
             // The patch is built from the decoded text, which would put UTF-8
             // bytes into a blob stored in another encoding (#1242).
             Some(diff) if diff.text_encoding != encoding_rs::UTF_8 => Err(format!(
@@ -38494,7 +38614,10 @@ impl App {
     fn diff_selected_lines_patch(&self) -> Option<(String, String)> {
         let diff = self.editor.diff.as_ref()?;
         // Not UTF-8: left to the hunk path, which refuses it with a reason.
-        if !diff.left_is_git_head || diff.text_encoding != encoding_rs::UTF_8 {
+        if !diff.left_is_git_head
+            || diff.right_is_unsaved
+            || diff.text_encoding != encoding_rs::UTF_8
+        {
             return None;
         }
         let sel = diff.selection?;
@@ -38561,6 +38684,11 @@ impl App {
         if !diff.left_is_git_head {
             self.status =
                 String::from("Group by seat applies to a Source Control diff of the working tree");
+            return;
+        }
+        if diff.right_is_unsaved {
+            // The seat map is keyed on the saved file's lines (#1572).
+            self.status = String::from("Save the file first: group by seat reads the saved file");
             return;
         }
         diff.group_by_seat = !diff.group_by_seat;
@@ -38764,6 +38892,24 @@ impl App {
         }
     }
 
+    /// The unsaved text of `path` in whichever editor group holds it dirty
+    /// (#1572): a split shows the same file in several groups, and the dirty
+    /// copy may sit in an inactive one while the active group's is clean.
+    fn unsaved_text_in_any_group(&self, path: &Path) -> Option<String> {
+        std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .find_map(|group| group.unsaved_text_of(path))
+    }
+
+    /// Open a two-file diff in the active group, each side's unsaved text
+    /// resolved across every editor group.
+    fn open_diff_across_groups(&mut self, left: &Path, right: &Path) -> anyhow::Result<()> {
+        let left_unsaved = self.unsaved_text_in_any_group(left);
+        let right_unsaved = self.unsaved_text_in_any_group(right);
+        self.editor
+            .open_diff_resolved(left, right, left_unsaved, right_unsaved)
+    }
+
     /// Rebuild every open diff view, in every split group, whose sides may
     /// have moved (#471), keeping each reader's viewport. Returns true when
     /// any view's content actually changed, so the caller owes a redraw.
@@ -38823,6 +38969,10 @@ impl App {
                     if let Some(cur) = ed.diff.as_mut() {
                         cur.left_stamp = fresh.left_stamp;
                         cur.right_stamp = fresh.right_stamp;
+                        // A rebuild reads the right side from disk: rows
+                        // identical to an unsaved view mean the save landed,
+                        // so hunk actions apply again (#1572).
+                        cur.right_is_unsaved = fresh.right_is_unsaved;
                     }
                     continue;
                 }
@@ -41057,18 +41207,20 @@ impl App {
     }
 
     /// **Diff to working tree** (#371): the scrubbed version against the
-    /// file on disk, in the side-by-side diff.
+    /// working copy (its open tab's unsaved edits, else the file on disk),
+    /// in the side-by-side diff.
     fn scrub_diff_to_working_tree(&mut self) {
         let Some((path, rel, commit, text)) = self.scrubbed_file() else {
             return;
         };
         let label = PathBuf::from(format!("{rel} @ {}", commit.short_hash));
+        let unsaved = self.unsaved_text_in_any_group(&path);
         // A file the commit predates diffs as all added, which is what
         // happened to it since.
         let text = text.unwrap_or_default();
         if let Err(e) = self
             .editor
-            .open_head_diff_with_text(label, &text, &path, false)
+            .open_head_diff_with_text_resolved(label, &text, &path, false, unsaved)
         {
             self.status = format!("Could not diff {rel}: {e}");
             return;
@@ -43562,8 +43714,8 @@ impl App {
                 self.editor.start_selection_at_cursor();
             }
             match key.code {
-                KeyCode::Up => self.editor.move_up(),
-                KeyCode::Down => self.editor.move_down(),
+                KeyCode::Up => self.editor.arrow_up(),
+                KeyCode::Down => self.editor.arrow_down(),
                 KeyCode::Left if alt => self.editor.move_word_left(),
                 KeyCode::Right if alt => self.editor.move_word_right(),
                 KeyCode::Left => self.editor.move_left(),
@@ -43585,8 +43737,8 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Up => self.editor.move_up(),
-            KeyCode::Down => self.editor.move_down(),
+            KeyCode::Up => self.editor.arrow_up(),
+            KeyCode::Down => self.editor.arrow_down(),
             KeyCode::Left if alt => self.editor.move_word_left(),
             KeyCode::Right if alt => self.editor.move_word_right(),
             KeyCode::Left => self.editor.move_left(),
@@ -47822,9 +47974,10 @@ impl App {
             Err(_) => path.display().to_string(),
         };
         let label = std::path::PathBuf::from(format!("{rel} (reviewed)"));
+        let unsaved = self.unsaved_text_in_any_group(path);
         if let Err(e) = self
             .editor
-            .open_head_diff_with_text(label, &text, path, false)
+            .open_head_diff_with_text_resolved(label, &text, path, false, unsaved)
         {
             self.status = format!("Could not open the reviewed diff: {e}");
             return;
@@ -51088,6 +51241,7 @@ impl App {
                 self.toggle_test_watch(crate::testing::watch::WatchScope::All)
             }
             Cmd::TestingGoToFirstFailure => self.go_to_first_failed_test(),
+            Cmd::TestingCancelRun => self.cancel_test_run(),
             Cmd::ReopenAsText => match self.editor.path.clone() {
                 // Merge editor (#253): back to the in-buffer marker flow.
                 // The Result buffer is deliberately discarded — it was
@@ -54719,6 +54873,23 @@ impl App {
         let in_editor_scrollbar = rect_contains(self.editor.last_scrollbar, m.column, m.row);
         let in_editor_hscrollbar = rect_contains(self.editor.last_hscrollbar, m.column, m.row);
 
+        // The wheel over a hover scrolls its text rather than dismissing it
+        // (#1254): a long docstring's Returns/Raises sit below the box.
+        if let Some(popup) = self.hover_popup.as_mut()
+            && rect_contains(popup.last_area, m.column, m.row)
+        {
+            match m.kind {
+                MouseEventKind::ScrollDown => {
+                    popup.scroll_by(3);
+                    return;
+                }
+                MouseEventKind::ScrollUp => {
+                    popup.scroll_by(-3);
+                    return;
+                }
+                _ => {}
+            }
+        }
         if matches!(m.kind, MouseEventKind::Moved) {
             self.pointer_cell = Some((m.column, m.row));
             self.on_mouse_moved(m.column, m.row, in_editor);
@@ -56076,6 +56247,8 @@ impl App {
                         self.run_all_tests_with_coverage();
                     } else if rect_contains(self.testing.last_output_hint, m.column, m.row) {
                         self.show_test_runner_output();
+                    } else if rect_contains(self.testing.last_stop, m.column, m.row) {
+                        self.cancel_test_run();
                     } else {
                         match self.testing.hit_at(m.column, m.row) {
                             Some(crate::widgets::testing::RowHit::ToggleWatch(scope)) => {
@@ -60782,7 +60955,7 @@ impl App {
             MenuAction::MoveIntoNewWindow(idx) => self.move_into_new_window(idx),
             MenuAction::CopyIntoNewWindow(idx) => self.copy_into_new_window(idx),
             MenuAction::CompareWithSelected { anchor, other } => {
-                match self.editor.open_diff(&anchor, &other) {
+                match self.open_diff_across_groups(&anchor, &other) {
                     Ok(()) => {
                         self.focus_pane(Pane::Editor);
                         self.compare_anchor = None;
@@ -62832,6 +63005,88 @@ impl App {
     fn disable_minimap_image(&mut self) {
         self.overlays.minimap.disable();
         self.minimap_img_rect = Rect::default();
+        self.minimap_text = false;
+    }
+
+    /// Draw the minimap into `strip`: the raster where the terminal draws
+    /// images, else braille text (#1231), so it shows in tmux, Alacritty,
+    /// GNOME Terminal and plain xterm too.
+    fn paint_minimap(&mut self, frame: &mut ratatui::Frame, strip: Rect) {
+        if self.inline_images_enabled() && self.cell_pixel.is_some() {
+            self.minimap_text = false;
+            self.update_minimap_overlay(strip);
+        } else {
+            self.overlays.minimap.disable();
+            self.render_text_minimap(frame.buffer_mut(), strip);
+        }
+    }
+
+    /// The braille minimap (#1231): the same raster the image path bakes, at
+    /// one dot row a line (folded to fit a longer file), with the visible
+    /// lines tinted like the image's viewport box.
+    fn render_text_minimap(&mut self, buf: &mut ratatui::buffer::Buffer, strip: Rect) {
+        self.minimap_img_rect = strip;
+        self.minimap_text = true;
+        if strip.width == 0 || strip.height == 0 {
+            return;
+        }
+        let (first, end) = self.editor.minimap_span();
+        let total = end - first;
+        let w = strip.width as u32 * 2 * MINIMAP_TEXT_CHARS_PER_DOT;
+        let h = strip.height as u32 * 4;
+        let content_h = (total as u32).clamp(1, h);
+        self.minimap_content_h = content_h;
+        let bg = self.theme.editor_bg_rgb();
+        let light = 0.299 * bg.0 as f32 + 0.587 * bg.1 as f32 + 0.114 * bg.2 as f32 > 140.0;
+        let fg = if light {
+            (0x38, 0x3a, 0x41)
+        } else {
+            (0xc5, 0xcd, 0xd9)
+        };
+        let sig = (
+            self.editor.path.clone(),
+            self.editor.edit_seq,
+            w,
+            h,
+            bg,
+            (first, end),
+            self.editor.highlight_generation(),
+        );
+        if self.minimap_text_cache.as_ref().map(|(k, _)| k) != Some(&sig) {
+            let rgba = self.editor.minimap_rgba(w, h, content_h, bg, fg);
+            let cells = braille_minimap(&rgba, w, h, bg, strip.width, strip.height);
+            self.minimap_text_cache = Some((sig, cells));
+        }
+        let Some((_, cells)) = self.minimap_text_cache.as_ref() else {
+            return;
+        };
+        // The visible lines, in cell rows, get a faint wash of the text colour.
+        let top = self.editor.scroll.saturating_sub(first);
+        let rows = self.editor.visible_rows();
+        let to_cell = |line: usize| line * content_h as usize / total.max(1) / 4;
+        let (view_top, view_end) = (to_cell(top), to_cell(top + rows.max(1) - 1));
+        let mix = |a: u8, b: u8| ((a as u16 * 85 + b as u16 * 15) / 100) as u8;
+        let wash = Color::Rgb(mix(bg.0, fg.0), mix(bg.1, fg.1), mix(bg.2, fg.2));
+        for (i, cell) in cells.iter().enumerate() {
+            let (cx, cy) = (i % strip.width as usize, i / strip.width as usize);
+            let back = if total > 0 && (view_top..=view_end).contains(&cy) {
+                wash
+            } else {
+                Color::Rgb(bg.0, bg.1, bg.2)
+            };
+            let Some(out) = buf.cell_mut((strip.x + cx as u16, strip.y + cy as u16)) else {
+                continue;
+            };
+            match cell {
+                Some((glyph, (r, g, b))) => {
+                    out.set_char(*glyph).set_fg(Color::Rgb(*r, *g, *b));
+                }
+                None => {
+                    out.set_char(' ');
+                }
+            }
+            out.set_bg(back);
+        }
     }
 
     /// Show/hide the editor minimap (⌥⌘M, the minimap right-click menu, the
@@ -62842,25 +63097,26 @@ impl App {
         if !self.minimap_visible {
             self.disable_minimap_image();
         }
-        self.status = if self.minimap_visible {
+        self.status = if self.minimap_visible && !self.minimap_room {
+            format!(
+                "Minimap on: it shows once the editor is {} columns wide",
+                MINIMAP_WIDTH_CELLS + MINIMAP_MIN_EDITOR_WIDTH
+            )
+        } else if self.minimap_visible {
             String::from("Minimap on")
         } else {
             String::from("Minimap off")
         };
     }
 
-    /// Carve the minimap strip off `editor_area` when the minimap is on (v1:
-    /// unsplit, image-capable terminals, enough width). Returns
+    /// Carve the minimap strip off `editor_area` (the active group's rect in a
+    /// split) when the minimap is on and the editor has room. Returns
     /// `(editor_rect, full_strip, image_rect)`: the editor renders into
     /// `editor_rect`, the whole `full_strip` column is bg-filled, and the
     /// raster image occupies `image_rect` (aligned to the editor's text rows).
-    fn carve_minimap(&self, editor_area: Rect) -> Option<(Rect, Rect, Rect)> {
-        if !self.minimap_visible
-            || self.editor_layout.is_split()
-            || !self.inline_images_enabled()
-            || self.cell_pixel.is_none()
-            || editor_area.width < MINIMAP_WIDTH_CELLS + MINIMAP_MIN_EDITOR_WIDTH
-        {
+    fn carve_minimap(&mut self, editor_area: Rect) -> Option<(Rect, Rect, Rect)> {
+        self.minimap_room = editor_area.width >= MINIMAP_WIDTH_CELLS + MINIMAP_MIN_EDITOR_WIDTH;
+        if !self.minimap_visible || !self.minimap_room {
             return None;
         }
         let w = MINIMAP_WIDTH_CELLS;
@@ -62947,7 +63203,12 @@ impl App {
         if r.height == 0 || total == 0 {
             return;
         }
-        let ch_px = self.cell_pixel.map(|(_, h)| h).unwrap_or(1).max(1);
+        // The text strip maps four dot rows to a cell (#1231).
+        let ch_px = if self.minimap_text {
+            4
+        } else {
+            self.cell_pixel.map(|(_, h)| h).unwrap_or(1).max(1)
+        };
         let dy_px = (row.saturating_sub(r.y)) as u32 * ch_px;
         let content_h = self.minimap_content_h.max(1);
         let line = first + (dy_px as usize * total / content_h as usize).min(total - 1);
@@ -66409,7 +66670,7 @@ impl App {
             }
             Some(anchor) => {
                 let anchor_clone = anchor.clone();
-                match self.editor.open_diff(&anchor_clone, &path) {
+                match self.open_diff_across_groups(&anchor_clone, &path) {
                     Ok(()) => {
                         self.focus_pane(Pane::Editor);
                         self.compare_anchor = None;
@@ -71823,6 +72084,9 @@ impl std::io::Write for CountingWriter {
 
 type CroftTerminal = Terminal<CrosstermBackend<CountingWriter>>;
 
+/// The status a run gesture gets while another run is in flight (#1534).
+const TEST_RUN_IN_PROGRESS: &str = "A test run is in progress (s in Testing stops it)";
+
 pub fn run(
     root: PathBuf,
     restore_session: Option<PathBuf>,
@@ -72022,6 +72286,12 @@ pub fn run(
     // Snapshot the terminal panel for the next launch (cwds are read live
     // here, so plain `cd`s during the session are captured at quit).
     app.save_terminal_session();
+    // A test run still in flight ends with croft (#1534): its runner was
+    // left running under PID 1.
+    if app.testing.is_busy() {
+        app.test_worker.cancel();
+    }
+
     // Quitting mid-debug ends the program as Stop Debugging does (#1536):
     // nothing sent `disconnect` here, and the debuggee outlived croft.
     // The teardowns run while the terminal is restored and are joined
@@ -72688,6 +72958,9 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         // check) rolled its cases back in the drain; say why nothing ran.
         if app.testing.take_refusal() {
             app.status = String::from(crate::testing::NO_RUNNER_STATUS);
+        }
+        if app.testing.take_cancelled() {
+            app.status = String::from("Test run cancelled");
         }
         // One notification per red run (#358), from the latch the panel
         // sets when a run ends, never per test case.
