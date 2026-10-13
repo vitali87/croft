@@ -2067,10 +2067,21 @@ pub struct TextSpanEdit {
 /// earlier replacement never shifts the coordinates of a later one. Returns
 /// the number of edits applied. Out-of-range edits are skipped.
 pub fn apply_span_edits_to_lines(lines: &mut Vec<String>, edits: &[TextSpanEdit]) -> usize {
-    // Every edit names the ORIGINAL text, so its UTF-16 columns convert
-    // against the lines as they are before any edit lands.
+    let mut applied = 0;
+    for (e, count) in in_application_order(char_span_edits(lines, edits)) {
+        if replace_span(lines, &e) {
+            applied += count;
+        }
+    }
+    applied
+}
+
+/// `edits` with their UTF-16 columns read as chars. Every edit names the
+/// ORIGINAL text, so the columns convert against `lines` as they are before
+/// any edit lands.
+fn char_span_edits(lines: &[String], edits: &[TextSpanEdit]) -> Vec<TextSpanEdit> {
     let col = |row: usize, c: usize| lines.get(row).map_or(c, |l| utf16_to_char_col(l, c as u32));
-    let converted: Vec<TextSpanEdit> = edits
+    edits
         .iter()
         .map(|e| match e.utf16 {
             true => TextSpanEdit {
@@ -2081,16 +2092,59 @@ pub fn apply_span_edits_to_lines(lines: &mut Vec<String>, edits: &[TextSpanEdit]
             },
             false => e.clone(),
         })
-        .collect();
-    let mut order: Vec<&TextSpanEdit> = converted.iter().collect();
-    order.sort_by_key(|e| std::cmp::Reverse(e.start));
-    let mut applied = 0;
-    for e in order {
-        if replace_span(lines, e) {
-            applied += 1;
+        .collect()
+}
+
+/// `edits` bottom-up, the order they apply in, each with the number of edits
+/// it stands for. Edits that start at one position are joined into one, their
+/// texts in the order sent: the LSP spec puts them in array order, and
+/// applying them one by one bottom-up reversed them, so vtsls's `"\n"` then
+/// `"  "` landed as trailing spaces above an unindented line (#1633).
+fn in_application_order(mut edits: Vec<TextSpanEdit>) -> Vec<(TextSpanEdit, usize)> {
+    edits.sort_by_key(|e| e.start);
+    let mut joined: Vec<(TextSpanEdit, usize)> = Vec::with_capacity(edits.len());
+    for e in edits {
+        match joined.last_mut() {
+            Some((last, count)) if last.start == e.start => {
+                last.end = last.end.max(e.end);
+                last.new_text.push_str(&e.new_text);
+                *count += 1;
+            }
+            _ => joined.push((e, 1)),
         }
     }
-    applied
+    joined.reverse();
+    joined
+}
+
+/// Where `pos` (char columns) lands once `edits` apply to `lines`: moved by
+/// the text every edit before it adds or removes. A position inside an edit
+/// lands at the end of its new text.
+pub fn position_after_span_edits(
+    lines: &[String],
+    pos: (usize, usize),
+    edits: &[TextSpanEdit],
+) -> (usize, usize) {
+    let mut pos = pos;
+    for (e, _) in in_application_order(char_span_edits(lines, edits)) {
+        if pos < e.start || (pos == e.start && e.start != e.end) {
+            continue;
+        }
+        let rows = e.new_text.matches('\n').count();
+        let last = e.new_text.rsplit('\n').next().unwrap_or("").chars().count();
+        let new_end = match rows {
+            0 => (e.start.0, e.start.1 + last),
+            _ => (e.start.0 + rows, last),
+        };
+        pos = if pos < e.end {
+            new_end
+        } else if pos.0 == e.end.0 {
+            (new_end.0, new_end.1 + pos.1 - e.end.1)
+        } else {
+            (pos.0 + new_end.0 - e.end.0, pos.1)
+        };
+    }
+    pos
 }
 
 fn replace_span(lines: &mut Vec<String>, e: &TextSpanEdit) -> bool {
@@ -2185,6 +2239,24 @@ enum CaretEdit {
     DeleteForward,
 }
 
+/// Caret places, `(row, col)` each.
+type CaretPlaces = Vec<(usize, usize)>;
+
+/// What the auto-closing-pairs rules (#121) make of one typed character at
+/// one caret, decided apart from doing it so a single caret and every caret
+/// of a multi-cursor edit follow the same rules (#1597).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PairAction {
+    /// Wrap the caret's selection in the opener or quote and this closer.
+    Surround(char),
+    /// Step over the same closer or quote already at the caret.
+    TypeOver,
+    /// Insert the opener with this closer after it, the caret between.
+    InsertPair(char),
+    /// An ordinary insert.
+    Plain,
+}
+
 #[derive(Clone, Debug)]
 struct Snapshot {
     lines: Vec<String>,
@@ -2202,6 +2274,11 @@ struct Snapshot {
     /// with it, so a cycle never credits lines to whoever wrote a different
     /// buffer.
     provenance: crate::provenance::Provenance,
+    /// The server's fold spans as they stood over this text, with the line
+    /// count they were checked against: a line move rewrites them, so an
+    /// undo must bring back the ones that described the restored text.
+    lsp_folds: Option<Vec<crate::lsp::manager::FoldingRangeItem>>,
+    lsp_folds_lines: usize,
     /// The text this step holds, each line's `String` header included,
     /// measured once when it is taken (see [`UNDO_BYTES_LIMIT`]).
     bytes: usize,
@@ -2670,6 +2747,13 @@ pub struct Editor {
     /// there with no edits since — a pre-existing `()` in the file must
     /// never lose both sides to one backspace (#122 review).
     auto_pair_at: Option<(usize, usize, u64)>,
+    /// The `edit_seq` and caret places after the last multi-cursor
+    /// keystroke that inserted pairs (#1597): while nothing has edited or
+    /// moved since, a multi-cursor Backspace inside an empty pair takes both
+    /// sides, at every caret that inserted one (the last list). A
+    /// pre-existing `()` keeps its closer, as with one caret (#122 review),
+    /// even when another caret of the same keystroke paired.
+    multi_auto_pair: Option<(u64, CaretPlaces, CaretPlaces)>,
     /// Merge-conflict blocks in the buffer, lazily recomputed whenever
     /// `edit_seq` moves (same pattern as the git-gutter marks).
     conflicts: Vec<crate::merge::ConflictBlock>,
@@ -2975,8 +3059,8 @@ pub struct Editor {
     /// ranges are not carried through edits the way spans are (#850), so an
     /// edit leaves them stale until the next pass over the edited text lands.
     protected_current: bool,
-    /// Inline color-literal decorations (the "no colour-swatch decorations"
-    /// gap in `vscode_extensions.rs`, matching `naumovs.color-highlight`):
+    /// Inline color-literal decorations (`naumovs.color-highlight`'s row in
+    /// `vscode_extensions.rs`):
     /// per line, the `(start char col, end char col, background, foreground)`
     /// of every recognized `#hex` / `rgb()` / `hsl()` color literal, painted
     /// as a background tint over the literal's own text. Language-agnostic
@@ -3271,6 +3355,7 @@ impl Editor {
             auto_close_pairs: true,
             auto_close_tags: true,
             auto_pair_at: None,
+            multi_auto_pair: None,
             conflicts: Vec::new(),
             merge_action_spans: Vec::new(),
             code_lenses: Vec::new(),
@@ -5039,6 +5124,17 @@ impl Editor {
             // so its reason rides to the hex fallback rather than vanishing.
             Some(crate::magic::Magic::Gzip) => {
                 match self.open_archive(path, crate::archive::ArchiveKind::TarGz) {
+                    Ok(()) => return Ok(()),
+                    Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
+                        self.route_note = Some((path.to_path_buf(), e.to_string()));
+                    }
+                    Err(_) => {}
+                }
+            }
+            // A `.tar.xz` under another name (#1645); a plain xz file is not
+            // a tar and falls through to hex.
+            Some(crate::magic::Magic::Xz) => {
+                match self.open_archive(path, crate::archive::ArchiveKind::TarXz) {
                     Ok(()) => return Ok(()),
                     Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
                         self.route_note = Some((path.to_path_buf(), e.to_string()));
@@ -7197,50 +7293,57 @@ impl Editor {
         if self.lines.is_empty() {
             self.lines.push(String::new());
         }
+        match self.pair_action(c) {
+            PairAction::Plain => false,
+            PairAction::TypeOver => {
+                self.cursor_col += 1;
+                self.ensure_cursor_col_visible();
+                true
+            }
+            PairAction::Surround(close) => {
+                self.pin_on_edit();
+                self.push_undo(EditKind::Paste);
+                self.surround_selection_raw(c, close);
+                self.recompute_highlights();
+                true
+            }
+            PairAction::InsertPair(close) => {
+                self.pin_on_edit();
+                self.push_undo(EditKind::InsertChar);
+                self.insert_pair_raw(c, close);
+                self.recompute_highlights();
+                self.auto_pair_at = Some((self.cursor_row, self.cursor_col, self.edit_seq));
+                true
+            }
+        }
+    }
+
+    /// The pair rules' decision for `c` typed at the caret and its
+    /// selection, changing nothing.
+    fn pair_action(&self, c: char) -> PairAction {
+        let Some(line) = self.lines.get(self.cursor_row) else {
+            return PairAction::Plain;
+        };
         let close = auto_close_partner(c);
         let has_sel = self.selection.map(|s| s.has_area()).unwrap_or(false);
         // Selection surround: openers and quotes wrap, closers fall through
         // to the ordinary replace-selection insert.
         if has_sel {
-            let Some(close) = close else {
-                return false;
+            return match close {
+                Some(close) if !is_pair_closer(c) => PairAction::Surround(close),
+                _ => PairAction::Plain,
             };
-            if is_pair_closer(c) {
-                return false;
-            }
-            self.pin_on_edit();
-            self.push_undo(EditKind::Paste);
-            let ((sr, sc), (er, ec)) = self.selection.unwrap().normalised();
-            let close_byte = self.byte_index(er, ec);
-            self.lines[er].insert(close_byte, close);
-            let open_byte = self.byte_index(sr, sc);
-            self.lines[sr].insert(open_byte, c);
-            let inner_end = if sr == er { ec + 1 } else { ec };
-            self.selection = Some(EditorSelection {
-                anchor: (sr, sc + 1),
-                head: (er, inner_end),
-            });
-            self.cursor_row = er;
-            self.cursor_col = inner_end;
-            self.mark_buffer_changed();
-            self.recompute_highlights();
-            return true;
         }
-        let next = self
-            .lines
-            .get(self.cursor_row)
-            .and_then(|l| l.chars().nth(self.cursor_col));
+        let next = line.chars().nth(self.cursor_col);
         // Type-over: the exact closer/quote already sits at the caret.
         if (is_pair_closer(c) || is_pair_quote(c)) && next == Some(c) {
-            self.cursor_col += 1;
-            self.ensure_cursor_col_visible();
-            return true;
+            return PairAction::TypeOver;
         }
         let Some(close) = close else {
-            return false;
+            return PairAction::Plain;
         };
         if is_pair_closer(c) {
-            return false;
+            return PairAction::Plain;
         }
         // Opener guard: VS Code's `autoCloseBefore`, so only before
         // whitespace, a closer or punctuation. Anything else, a string's
@@ -7253,8 +7356,7 @@ impl Editor {
             true => next.is_none_or(|n| !n.is_alphanumeric() && n != '_' && n != c),
             false => next.is_none_or(|n| AUTO_CLOSE_BEFORE.contains(n)),
         };
-        let before =
-            &self.lines[self.cursor_row][..self.byte_index(self.cursor_row, self.cursor_col)];
+        let before = &line[..self.byte_index(self.cursor_row, self.cursor_col)];
         let prev_ok = !is_pair_quote(c)
             || before
                 .chars()
@@ -7263,7 +7365,7 @@ impl Editor {
             || (self.lang == Some(LangKind::Python)
                 && is_python_string_prefix(trailing_word(before)));
         if !next_ok || !prev_ok {
-            return false;
+            return PairAction::Plain;
         }
         // A quote typed inside a string or comment is text there, or that
         // string's closing quote, never an opener: pairing the closing `"`
@@ -7272,23 +7374,45 @@ impl Editor {
         // highlight pass; the line scan starts where it closes.
         if is_pair_quote(c) {
             let Some(from) = self.earlier_construct_end(self.cursor_row, before.len()) else {
-                return false;
+                return PairAction::Plain;
             };
             if ends_in_string_or_comment(&before[from..], self.lang) {
-                return false;
+                return PairAction::Plain;
             }
         }
-        self.pin_on_edit();
-        self.push_undo(EditKind::InsertChar);
+        PairAction::InsertPair(close)
+    }
+
+    /// Wrap the selection in `open` and `close`, keeping the text inside
+    /// selected and the caret at its end. No undo step, no re-highlight.
+    fn surround_selection_raw(&mut self, open: char, close: char) {
+        let Some(sel) = self.selection else {
+            return;
+        };
+        let ((sr, sc), (er, ec)) = sel.normalised();
+        let close_byte = self.byte_index(er, ec);
+        self.lines[er].insert(close_byte, close);
+        let open_byte = self.byte_index(sr, sc);
+        self.lines[sr].insert(open_byte, open);
+        let inner_end = if sr == er { ec + 1 } else { ec };
+        self.selection = Some(EditorSelection {
+            anchor: (sr, sc + 1),
+            head: (er, inner_end),
+        });
+        self.cursor_row = er;
+        self.cursor_col = inner_end;
+        self.mark_buffer_changed();
+    }
+
+    /// Insert `open` and `close` at the caret, the caret between them. No
+    /// undo step, no re-highlight.
+    fn insert_pair_raw(&mut self, open: char, close: char) {
         let row = self.cursor_row;
         let byte = self.byte_index(row, self.cursor_col);
         self.lines[row].insert(byte, close);
-        self.lines[row].insert(byte, c);
+        self.lines[row].insert(byte, open);
         self.cursor_col += 1;
         self.mark_buffer_changed();
-        self.recompute_highlights();
-        self.auto_pair_at = Some((self.cursor_row, self.cursor_col, self.edit_seq));
-        true
     }
 
     /// Where line `row` leaves a string or comment that an earlier line
@@ -7334,9 +7458,7 @@ impl Editor {
         self.push_undo(EditKind::Paste);
         let n = apply_span_edits_to_lines(&mut self.lines, edits);
         if n > 0 {
-            let mut order: Vec<&TextSpanEdit> = edits.iter().collect();
-            order.sort_by_key(|e| std::cmp::Reverse(e.start));
-            for e in order {
+            for (e, _) in in_application_order(edits.to_vec()) {
                 let removed = e.end.0.saturating_sub(e.start.0) + 1;
                 let added = e.new_text.matches('\n').count() + 1;
                 self.provenance.splice(e.start.0, removed, added);
@@ -7347,6 +7469,20 @@ impl Editor {
             self.mark_buffer_changed();
             self.recompute_highlights();
         }
+        n
+    }
+
+    /// [`Self::apply_span_edits`], the caret carried through the edits so it
+    /// stays beside the same text: format on type rewrites the line just
+    /// typed, and a clamp left the caret on the row above the `;` (#1633).
+    pub fn apply_span_edits_moving_caret(&mut self, edits: &[TextSpanEdit]) -> usize {
+        let caret = (self.cursor_row, self.cursor_col);
+        let moved = position_after_span_edits(&self.lines, caret, edits);
+        let n = self.apply_span_edits(edits);
+        if n > 0 {
+            (self.cursor_row, self.cursor_col) = moved;
+        }
+        self.clamp_cursor();
         n
     }
 
@@ -7792,6 +7928,13 @@ impl Editor {
         let col = self.cursor_col;
         let line = self.lines[row].clone();
 
+        // Inside a doc comment the new line continues it (#1443).
+        let below = self.lines.get(row + 1..).unwrap_or(&[]);
+        if let Some(enter) = comment_on_enter(self.lang, &line, col, below) {
+            self.continue_comment(enter);
+            return;
+        }
+
         let leading: String = line
             .chars()
             .take(col)
@@ -7833,6 +7976,49 @@ impl Editor {
             }
             self.cursor_row -= 1;
             self.cursor_col = new_indent.chars().count();
+        }
+    }
+
+    /// Break the line at the caret into a comment's next line (#1443): the
+    /// new line starts with `enter.start`, and a `/**` just opened is closed
+    /// on a line below, the caret staying on the line between.
+    fn continue_comment(&mut self, enter: CommentEnter) {
+        let start_len = enter.start.chars().count();
+        if let CommentBelow::MoveCloser(_) = &enter.below {
+            // The `*/` right after the caret goes to the closing line, so
+            // the space before it goes with the break.
+            while self.lines[self.cursor_row]
+                .chars()
+                .nth(self.cursor_col)
+                .is_some_and(|c| c == ' ' || c == '\t')
+            {
+                self.delete_forward_raw();
+            }
+        }
+        self.insert_newline_raw();
+        for c in enter.start.chars() {
+            self.insert_char_raw(c);
+        }
+        match enter.below {
+            CommentBelow::Nothing => {}
+            CommentBelow::MoveCloser(indent) => {
+                self.insert_newline_raw();
+                for c in indent.chars() {
+                    self.insert_char_raw(c);
+                }
+                self.cursor_row -= 1;
+                self.cursor_col = start_len;
+            }
+            CommentBelow::AddCloser(closer) => {
+                let (row, col) = (self.cursor_row, self.cursor_col);
+                self.cursor_col = self.line_char_len(row);
+                self.insert_newline_raw();
+                for c in closer.chars() {
+                    self.insert_char_raw(c);
+                }
+                self.cursor_row = row;
+                self.cursor_col = col;
+            }
         }
     }
 
@@ -8099,6 +8285,34 @@ impl Editor {
     /// single undo step. Carets are processed bottom-to-top so an edit never
     /// shifts the coordinates of a caret still to be processed.
     fn multi_apply(&mut self, edit: CaretEdit) {
+        // A Backspace right after a keystroke that paired at every caret
+        // takes both sides of each empty pair, as one caret's does (#1597).
+        let armed: Vec<(usize, usize)> = match self.multi_auto_pair.take() {
+            Some((seq, places, paired))
+                if self.auto_close_pairs
+                    && edit == CaretEdit::Backspace
+                    && seq == self.edit_seq
+                    && places == self.caret_places() =>
+            {
+                paired
+            }
+            _ => Vec::new(),
+        };
+        // A closer or quote stepped over at every caret edits nothing, so it
+        // records no undo step, as one caret's type-over does.
+        if let CaretEdit::Insert(c) = edit
+            && self.auto_close_pairs
+            && self.types_over_at_every_caret(c)
+        {
+            self.selection = None;
+            self.cursor_col += 1;
+            for s in &mut self.carets {
+                s.head.1 += 1;
+                s.anchor = s.head;
+            }
+            self.ensure_cursor_col_visible();
+            return;
+        }
         self.pin_on_edit();
         self.push_undo(EditKind::MultiEdit);
 
@@ -8120,7 +8334,10 @@ impl Editor {
         // leave everything after it untouched, so those two stay true where a
         // plain (row, col) goes stale on its row (`abcd` with carets at 1 and
         // 3, typing X then Y, gave `aXYbcYXd`).
-        let mut placed: Vec<(bool, usize, usize)> = Vec::new();
+        // A selection a surround kept (#1597) has its anchor placed the same
+        // way: it sits after the later edits too.
+        type Place = (usize, usize);
+        let mut placed: Vec<(bool, Place, Option<Place>, bool)> = Vec::new();
         for (is_primary, sel) in items {
             if sel.has_area() {
                 self.selection = Some(sel);
@@ -8130,57 +8347,144 @@ impl Editor {
             let last = self.lines.len().saturating_sub(1);
             self.cursor_row = sel.head.0.min(last);
             self.cursor_col = sel.head.1.min(self.line_char_len(self.cursor_row));
-            self.apply_caret_edit_raw(edit);
-            let from_bottom = self.lines.len().saturating_sub(1) - self.cursor_row;
-            let from_end = self
-                .line_char_len(self.cursor_row)
-                .saturating_sub(self.cursor_col);
-            placed.push((is_primary, from_bottom, from_end));
+            let paired = self.apply_caret_edit_raw(edit, armed.contains(&sel.head));
+            let place = |this: &Self, (row, col): (usize, usize)| {
+                (
+                    this.lines.len().saturating_sub(1) - row,
+                    this.line_char_len(row).saturating_sub(col),
+                )
+            };
+            let anchor = self
+                .selection
+                .filter(|s| s.has_area())
+                .map(|s| place(self, s.anchor));
+            placed.push((
+                is_primary,
+                place(self, (self.cursor_row, self.cursor_col)),
+                anchor,
+                paired,
+            ));
         }
 
         self.selection = None;
         let last = self.lines.len().saturating_sub(1);
-        let resolve = |this: &Self, from_bottom: usize, from_end: usize| {
+        let resolve = |this: &Self, (from_bottom, from_end): (usize, usize)| {
             let row = last.saturating_sub(from_bottom);
             (row, this.line_char_len(row).saturating_sub(from_end))
         };
-        let mut new_primary = (self.cursor_row, self.cursor_col);
-        let mut new_secondary: Vec<(usize, usize)> = Vec::new();
-        for (is_primary, from_bottom, from_end) in placed {
-            let pos = resolve(self, from_bottom, from_end);
+        let mut new_primary = EditorSelection::new(self.cursor_row, self.cursor_col);
+        let mut primary_kept = false;
+        let mut new_secondary: Vec<EditorSelection> = Vec::new();
+        let mut paired_places: Vec<(usize, usize)> = Vec::new();
+        for (is_primary, head, anchor, paired) in placed {
+            let head = resolve(self, head);
+            if paired {
+                paired_places.push(head);
+            }
+            let sel = EditorSelection {
+                anchor: anchor.map_or(head, |a| resolve(self, a)),
+                head,
+            };
             if is_primary {
-                new_primary = pos;
+                new_primary = sel;
+                primary_kept = anchor.is_some();
             } else {
-                new_secondary.push(pos);
+                new_secondary.push(sel);
             }
         }
-        self.cursor_row = new_primary.0.min(last);
-        self.cursor_col = new_primary.1.min(self.line_char_len(self.cursor_row));
+        self.cursor_row = new_primary.head.0.min(last);
+        self.cursor_col = new_primary.head.1.min(self.line_char_len(self.cursor_row));
+        if primary_kept {
+            self.selection = Some(new_primary);
+        }
         // Carets an edit brought together are one caret from here on: kept
         // apart, the next key edited the same spot twice (one Backspace
         // deleting two line breaks).
         let primary = (self.cursor_row, self.cursor_col);
-        new_secondary.sort_unstable();
+        new_secondary.sort_unstable_by_key(|s| (s.head, s.anchor));
         new_secondary.dedup();
-        new_secondary.retain(|&p| p != primary);
-        self.carets = new_secondary
-            .into_iter()
-            .map(|(r, c)| EditorSelection::new(r, c))
-            .collect();
+        new_secondary.retain(|s| s.head != primary);
+        self.carets = new_secondary;
         self.recompute_highlights();
+        if !paired_places.is_empty() {
+            self.multi_auto_pair = Some((self.edit_seq, self.caret_places(), paired_places));
+        }
+    }
+
+    /// True when `c` typed at every caret only steps over the same closer
+    /// or quote: no caret has a selection and each sits right before `c`.
+    fn types_over_at_every_caret(&self, c: char) -> bool {
+        if !(is_pair_closer(c) || is_pair_quote(c)) {
+            return false;
+        }
+        let primary_sel = self.selection.is_some_and(|s| s.has_area());
+        !primary_sel
+            && self.carets.iter().all(|s| !s.has_area())
+            && self
+                .caret_places()
+                .into_iter()
+                .all(|(row, col)| self.lines.get(row).and_then(|l| l.chars().nth(col)) == Some(c))
+    }
+
+    /// Every caret's place, the primary first, the extra carets in order.
+    fn caret_places(&self) -> Vec<(usize, usize)> {
+        std::iter::once((self.cursor_row, self.cursor_col))
+            .chain(self.carets.iter().map(|c| c.head))
+            .collect()
     }
 
     /// One caret's worth of a multi-edit: no snapshot, no re-highlight (the
     /// batching caller in `multi_apply` does both once).
-    fn apply_caret_edit_raw(&mut self, edit: CaretEdit) {
+    ///
+    /// A typed character follows the same pair rules as one caret's
+    /// (#1597): surround, type-over and auto-close; with them skipped, a
+    /// quote replaced every Ctrl+D selection and `)` doubled the closer.
+    /// `pairs_armed` lets Backspace take both sides of an empty pair the
+    /// last keystroke inserted. Returns true when a pair was inserted.
+    fn apply_caret_edit_raw(&mut self, edit: CaretEdit, pairs_armed: bool) -> bool {
         match edit {
             CaretEdit::Insert(c) => {
-                self.delete_selection_inner();
-                self.insert_char_raw(c);
+                if self.lines.is_empty() {
+                    self.lines.push(String::new());
+                }
+                let action = match self.auto_close_pairs {
+                    true => self.pair_action(c),
+                    false => PairAction::Plain,
+                };
+                match action {
+                    PairAction::Surround(close) => self.surround_selection_raw(c, close),
+                    PairAction::TypeOver => self.cursor_col += 1,
+                    PairAction::InsertPair(close) => {
+                        self.insert_pair_raw(c, close);
+                        return true;
+                    }
+                    PairAction::Plain => {
+                        self.delete_selection_inner();
+                        self.insert_char_raw(c);
+                    }
+                }
             }
-            CaretEdit::Backspace => self.backspace_raw(),
+            CaretEdit::Backspace => {
+                if pairs_armed
+                    && !self.selection.is_some_and(|s| s.has_area())
+                    && self.cursor_col > 0
+                {
+                    let line = self.lines.get(self.cursor_row).cloned().unwrap_or_default();
+                    let prev = line.chars().nth(self.cursor_col - 1);
+                    let next = line.chars().nth(self.cursor_col);
+                    if let (Some(p), Some(n)) = (prev, next)
+                        && auto_close_partner(p) == Some(n)
+                        && !is_pair_closer(p)
+                    {
+                        let byte = self.byte_index(self.cursor_row, self.cursor_col);
+                        self.lines[self.cursor_row].remove(byte);
+                    }
+                }
+                self.backspace_raw();
+            }
             CaretEdit::DeleteForward => self.delete_forward_raw(),
         }
+        false
     }
 
     pub fn start_selection_at_cursor(&mut self) {
@@ -9360,6 +9664,8 @@ impl Editor {
             dirty: self.dirty,
             save_seq: self.save_seq,
             provenance: self.provenance.clone(),
+            lsp_folds: self.lsp_folds.clone(),
+            lsp_folds_lines: self.lsp_folds_lines,
         }
     }
 
@@ -9462,6 +9768,8 @@ impl Editor {
             self.lines.push(String::new());
         }
         self.provenance.truncate(self.lines.len());
+        self.lsp_folds = snap.lsp_folds;
+        self.lsp_folds_lines = snap.lsp_folds_lines;
         self.cursor_row = snap.cursor_row.min(self.lines.len().saturating_sub(1));
         self.cursor_col = snap.cursor_col.min(self.line_char_len(self.cursor_row));
         self.selection = snap.selection;
@@ -9987,6 +10295,31 @@ impl Editor {
         self.last_edit_kind = None;
     }
 
+    /// The Up arrow: [`Self::move_up`], and on the first line (or wrapped
+    /// row) the caret goes to the start of the line, as in VS Code, so
+    /// Shift+Up selects to the start of the file (#1563). Vim's `k` keeps
+    /// `move_up`, which stops on the first line as Vim does.
+    pub fn arrow_up(&mut self) {
+        let before = (self.cursor_row, self.cursor_col);
+        self.move_up();
+        if (self.cursor_row, self.cursor_col) == before {
+            self.cursor_col = 0;
+            self.ensure_cursor_col_visible();
+        }
+    }
+
+    /// The Down arrow: [`Self::move_down`], and on the last line (or
+    /// wrapped row) the caret goes to the end of the line, so Shift+Down
+    /// selects through it instead of stopping at its start (#1563).
+    pub fn arrow_down(&mut self) {
+        let before = (self.cursor_row, self.cursor_col);
+        self.move_down();
+        if (self.cursor_row, self.cursor_col) == before {
+            self.cursor_col = self.line_char_len(self.cursor_row);
+            self.ensure_cursor_col_visible();
+        }
+    }
+
     pub fn goto_top(&mut self) {
         self.clear_selection();
         self.cursor_row = 0;
@@ -10436,7 +10769,7 @@ impl Editor {
     /// `EditKind::DuplicateLines`.
     pub fn duplicate_lines_down(&mut self) {
         self.push_undo(EditKind::DuplicateLines);
-        let blocks = self.selected_row_blocks();
+        let blocks = self.selected_row_blocks_over_folds();
         for &(start, end) in blocks.iter().rev() {
             let block: Vec<String> = self.lines[start..=end].to_vec();
             self.lines.splice(end + 1..end + 1, block);
@@ -10455,7 +10788,7 @@ impl Editor {
     /// it started at (the original is pushed down by `block_len`).
     pub fn duplicate_lines_up(&mut self) {
         self.push_undo(EditKind::DuplicateLines);
-        let blocks = self.selected_row_blocks();
+        let blocks = self.selected_row_blocks_over_folds();
         for &(start, end) in blocks.iter().rev() {
             let block: Vec<String> = self.lines[start..=end].to_vec();
             self.lines.splice(start..start, block);
@@ -10503,6 +10836,59 @@ impl Editor {
             })
             .collect();
         merge_row_blocks(rows, true)
+    }
+
+    /// [`Self::selected_row_blocks`], with a block that ends on a folded
+    /// header widened over the lines the fold hides, so Move Line and Copy
+    /// Line take a folded region whole instead of its header alone (#1611).
+    fn selected_row_blocks_over_folds(&self) -> Vec<(usize, usize)> {
+        let rows = self
+            .selected_row_blocks()
+            .into_iter()
+            .map(|(start, end)| (start, self.folded_end(end).unwrap_or(end)))
+            .collect();
+        merge_row_blocks(rows, true)
+    }
+
+    /// The last line `row`'s fold hides, when `row` is a folded header.
+    fn folded_end(&self, row: usize) -> Option<usize> {
+        self.hidden_ranges
+            .iter()
+            .find(|&&(header, _)| header == row)
+            .map(|&(_, end)| end)
+    }
+
+    /// The header of the fold hiding `row`, when a fold hides it.
+    fn folded_header_hiding(&self, row: usize) -> Option<usize> {
+        self.hidden_ranges
+            .iter()
+            .find(|&&(header, end)| header < row && row <= end)
+            .map(|&(header, _)| header)
+    }
+
+    /// Carry the folds through a line move that sent each row `r` to
+    /// `map(r)`: a moved fold stays folded over the same text. `before` is
+    /// the fold set ahead of the move. It replaces what the edit's own fold
+    /// sync made of the move, which follows a header by its text and so
+    /// loses one whose text repeats. The server's spans move too, since a
+    /// move keeps the line count they are checked against; one the move
+    /// split apart is dropped until the next reply.
+    fn move_folds(
+        &mut self,
+        before: std::collections::BTreeSet<usize>,
+        map: impl Fn(usize) -> usize,
+    ) {
+        self.folded = before.into_iter().map(&map).collect();
+        if let Some(spans) = self.lsp_folds.as_mut() {
+            for span in spans.iter_mut() {
+                span.start_line = map(span.start_line);
+                span.end_line = map(span.end_line);
+            }
+            spans.retain(|span| span.start_line < span.end_line);
+        }
+        // The marker and comment table is rebuilt from the moved text.
+        self.refresh_fold_tables();
+        self.rebuild_hidden_ranges();
     }
 
     /// Move the primary caret and selection and every extra caret through
@@ -10607,55 +10993,99 @@ impl Editor {
     /// block with the line below it, carrying the cursor and selection along.
     /// With several carets every caret's block moves. No-op when a block
     /// already touches the last line: all of them move or none does.
+    ///
+    /// A folded region moves as one line and stays folded (#1611): a block
+    /// on a folded header takes the hidden lines with it, and a block above
+    /// a folded header moves below its whole region, never into its body.
     pub fn move_lines_down(&mut self) {
-        let blocks = self.selected_row_blocks();
+        let blocks = self.selected_row_blocks_over_folds();
+        // What each block swaps with: the line below it, or all of a folded
+        // region that starts there.
+        let below: Vec<(usize, usize)> = blocks
+            .iter()
+            .map(|&(_, end)| (end + 1, self.folded_end(end + 1).unwrap_or(end + 1)))
+            .collect();
         // A symbol tab's block stops at the symbol's last line.
         let limit = self.symbol_clip().map_or(self.lines.len(), |(_, e)| e);
-        if blocks.last().is_none_or(|&(_, end)| end + 1 >= limit) {
+        if below.last().is_none_or(|&(_, last)| last >= limit)
+            || below
+                .iter()
+                .zip(blocks.iter().skip(1))
+                .any(|(b, next)| b.1 >= next.0)
+        {
             return;
         }
         self.push_undo(EditKind::MoveLines);
-        for &(start, end) in blocks.iter().rev() {
-            self.forget_folds_in(start, end + 1);
-            self.lines[start..=end + 1].rotate_right(1);
+        let folds = self.folded.clone();
+        for (&(start, end), &(_, last)) in blocks.iter().zip(&below).rev() {
+            self.lines[start..=last].rotate_right(last - end);
         }
-        self.remap_carets(|(r, c)| {
-            let row = match blocks.iter().find(|b| b.0 <= r && r <= b.1 + 1) {
-                // The line below a block swaps up over it.
-                Some(&(start, end)) if r == end + 1 => start,
-                Some(_) => r + 1,
-                None => r,
-            };
-            (row, c)
-        });
+        let map = |r: usize| {
+            for (&(start, end), &(first, last)) in blocks.iter().zip(&below) {
+                if (start..=end).contains(&r) {
+                    return r + (last - end);
+                }
+                // The lines below a block swap up over it.
+                if (first..=last).contains(&r) {
+                    return r - (end - start + 1);
+                }
+            }
+            r
+        };
+        self.remap_carets(|(r, c)| (map(r), c));
         self.mark_buffer_changed();
+        self.move_folds(folds, map);
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
     }
 
     /// VS Code "Move Line Up" (Alt+Up): mirror of `move_lines_down`. No-op
-    /// when a block already touches the first line.
+    /// when a block already touches the first line. A block below a folded
+    /// region moves above all of it (#1611).
     pub fn move_lines_up(&mut self) {
-        let blocks = self.selected_row_blocks();
+        let blocks = self.selected_row_blocks_over_folds();
         let first = self.symbol_clip().map_or(0, |(first, _)| first);
         if blocks.first().is_none_or(|&(start, _)| start <= first) {
             return;
         }
-        self.push_undo(EditKind::MoveLines);
-        for &(start, end) in &blocks {
-            self.forget_folds_in(start - 1, end);
-            self.lines[start - 1..=end].rotate_left(1);
+        // What each block swaps with: the line above it, or all of the
+        // folded region whose hidden lines end there.
+        let above: Vec<(usize, usize)> = blocks
+            .iter()
+            .map(|&(start, _)| {
+                let row = start - 1;
+                (self.folded_header_hiding(row).unwrap_or(row), row)
+            })
+            .collect();
+        if above.first().is_some_and(|&(top, _)| top < first)
+            || above
+                .iter()
+                .skip(1)
+                .zip(&blocks)
+                .any(|(a, prev)| a.0 <= prev.1)
+        {
+            return;
         }
-        self.remap_carets(|(r, c)| {
-            let row = match blocks.iter().find(|b| b.0 <= r + 1 && r <= b.1) {
-                // The line above a block swaps down under it.
-                Some(&(start, end)) if r + 1 == start => end,
-                Some(_) => r - 1,
-                None => r,
-            };
-            (row, c)
-        });
+        self.push_undo(EditKind::MoveLines);
+        let folds = self.folded.clone();
+        for (&(start, end), &(top, _)) in blocks.iter().zip(&above) {
+            self.lines[top..=end].rotate_left(start - top);
+        }
+        let map = |r: usize| {
+            for (&(start, end), &(top, bottom)) in blocks.iter().zip(&above) {
+                if (start..=end).contains(&r) {
+                    return r - (start - top);
+                }
+                // The lines above a block swap down under it.
+                if (top..=bottom).contains(&r) {
+                    return r + (end - start + 1);
+                }
+            }
+            r
+        };
+        self.remap_carets(|(r, c)| (map(r), c));
         self.mark_buffer_changed();
+        self.move_folds(folds, map);
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
     }
@@ -10669,8 +11099,13 @@ impl Editor {
     /// what it did. Returns false (a no-op) for languages with no line
     /// comment.
     pub fn toggle_line_comment(&mut self) -> bool {
-        let Some(token) = line_comment_token(self.lang) else {
-            return false;
+        let Some(token) = self.line_comment_marker() else {
+            // VS Code's fallback for a language with only block comments
+            // (HTML, CSS, Markdown, XML): wrap the lines in one (#1181).
+            return match block_comment_tokens(self.lang) {
+                Some((open, close)) => self.toggle_lines_in_block_comment(open, close),
+                None => false,
+            };
         };
         let blocks = self.selected_row_blocks();
         let non_blank: Vec<usize> = blocks
@@ -10684,7 +11119,7 @@ impl Editor {
         self.push_undo(EditKind::ToggleComment);
         let all_commented = non_blank
             .iter()
-            .all(|&r| self.lines[r].trim_start().starts_with(token));
+            .all(|&r| line_comment_prefix_len(self.lines[r].trim_start(), token).is_some());
         // Each changed row with the char column of its edit and the chars it
         // added (negative: removed), to carry the carets on it along.
         let mut edits: Vec<(usize, usize, isize)> = Vec::with_capacity(non_blank.len());
@@ -10693,8 +11128,9 @@ impl Editor {
                 let line = self.lines[r].clone();
                 let off = line.len() - line.trim_start().len();
                 let mut rest = line[off..].to_string();
-                rest.drain(..token.len());
-                let mut removed = token.chars().count();
+                let len = line_comment_prefix_len(&rest, token).unwrap_or(0);
+                let mut removed = rest[..len].chars().count();
+                rest.drain(..len);
                 if rest.starts_with(' ') {
                     rest.drain(..1);
                     removed += 1;
@@ -10730,6 +11166,104 @@ impl Editor {
         self.remap_carets(|(r, c)| match edits.iter().find(|e| e.0 == r) {
             Some(&(_, at, delta)) => (r, shift_col(c, at, delta)),
             None => (r, c),
+        });
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        self.ensure_cursor_col_visible();
+        true
+    }
+
+    /// This buffer's line-comment marker: its language's, or for a file
+    /// croft has no grammar for, the one its name or extension uses
+    /// (#1181).
+    fn line_comment_marker(&self) -> Option<&'static str> {
+        match self.lang {
+            // SCSS and Sass share the CSS grammar but, unlike CSS, have a
+            // `//` line comment, so the file's extension decides.
+            Some(LangKind::Css) | None => {
+                self.path.as_deref().and_then(line_comment_token_for_path)
+            }
+            Some(_) => line_comment_token(self.lang),
+        }
+    }
+
+    /// Whether Toggle Line Comment has any comment to use in this buffer: a
+    /// line comment, or a block comment to wrap the lines in.
+    pub fn has_line_comment_syntax(&self) -> bool {
+        self.line_comment_marker().is_some() || block_comment_tokens(self.lang).is_some()
+    }
+
+    /// Toggle Line Comment where the language has only block comments: each
+    /// block of lines is wrapped in one `open … close` pair, from its first
+    /// non-blank character to its last, or unwrapped when every block
+    /// already is one, as VS Code does (#1181).
+    fn toggle_lines_in_block_comment(&mut self, open: &str, close: &str) -> bool {
+        // Each block's first and last non-blank rows.
+        let spans: Vec<(usize, usize)> = self
+            .selected_row_blocks()
+            .into_iter()
+            .filter_map(|(start, end)| {
+                let blank = |r: &usize| self.lines[*r].trim().is_empty();
+                let first = (start..=end).find(|r| !blank(r))?;
+                let last = (start..=end).rev().find(|r| !blank(r))?;
+                Some((first, last))
+            })
+            .collect();
+        if spans.is_empty() {
+            return false;
+        }
+        let commented = spans.iter().all(|&(first, last)| {
+            let (head, tail) = (self.lines[first].trim_start(), self.lines[last].trim_end());
+            head.starts_with(open)
+                && tail.ends_with(close)
+                && (first != last || head.len() >= open.len() + close.len())
+        });
+        self.push_undo(EditKind::ToggleComment);
+        // Each edit as (row, char column, chars added or, negative, removed),
+        // in the order made: a row's closing edit comes before its opening
+        // one, so each column is still true when its edit is applied.
+        let mut edits: Vec<(usize, usize, isize)> = Vec::with_capacity(spans.len() * 2);
+        for &(first, last) in &spans {
+            let line = &self.lines[last];
+            let end = line.trim_end().len();
+            if commented {
+                let mut cut = end - close.len();
+                if line[..cut].ends_with(' ') {
+                    cut -= 1;
+                }
+                let at = line[..cut].chars().count();
+                let removed = line[cut..end].chars().count();
+                self.lines[last].replace_range(cut..end, "");
+                edits.push((last, at, -(removed as isize)));
+            } else {
+                let at = line[..end].chars().count();
+                let marker = format!(" {close}");
+                self.lines[last].insert_str(end, &marker);
+                edits.push((last, at, marker.chars().count() as isize));
+            }
+            let line = &self.lines[first];
+            let indent = line.len() - line.trim_start().len();
+            let at = line[..indent].chars().count();
+            if commented {
+                let mut cut = indent + open.len();
+                if line[cut..].starts_with(' ') {
+                    cut += 1;
+                }
+                let removed = line[indent..cut].chars().count();
+                self.lines[first].replace_range(indent..cut, "");
+                edits.push((first, at, -(removed as isize)));
+            } else {
+                let marker = format!("{open} ");
+                self.lines[first].insert_str(indent, &marker);
+                edits.push((first, at, marker.chars().count() as isize));
+            }
+        }
+        self.remap_carets(|(r, c)| {
+            let c = edits
+                .iter()
+                .filter(|e| e.0 == r)
+                .fold(c, |c, &(_, at, delta)| shift_col(c, at, delta));
+            (r, c)
         });
         self.mark_buffer_changed();
         self.recompute_highlights();
@@ -12924,8 +13458,68 @@ fn line_comment_token(lang: Option<LangKind>) -> Option<&'static str> {
         | Some(LangKind::Dockerfile) => Some("#"),
         Some(LangKind::Java) | Some(LangKind::CSharp) => Some("//"),
         Some(LangKind::Lua) | Some(LangKind::Sql) => Some("--"),
+        // JSONC, which croft's and VS Code's own settings files are: VS
+        // Code's JSON language comments with `//` too.
+        Some(LangKind::Json) => Some("//"),
         _ => None,
     }
+}
+
+/// The line comment of a file croft has no grammar for, by its file name or
+/// extension, as VS Code's language configurations give them (#1181).
+fn line_comment_token_for_path(path: &Path) -> Option<&'static str> {
+    let name = path.file_name()?.to_str()?;
+    if name.starts_with(".env")
+        || matches!(
+            name,
+            ".gitignore"
+                | ".dockerignore"
+                | ".npmignore"
+                | ".prettierignore"
+                | ".gitattributes"
+                | ".editorconfig"
+                | "CODEOWNERS"
+        )
+    {
+        return Some("#");
+    }
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "kt" | "kts" | "swift" | "scala" | "sc" | "dart" | "php" | "groovy" | "gradle"
+        | "jsonc" | "json5" | "proto" | "zig" | "v" | "sv" | "fs" | "fsx" | "scss" | "sass"
+        | "less" => Some("//"),
+        "pl" | "pm" | "r" | "ps1" | "psm1" | "mk" | "conf" | "cfg" | "properties" | "env"
+        | "tf" | "hcl" | "nix" | "jl" | "ex" | "exs" | "cmake" | "gitignore" | "zsh" | "fish"
+        | "awk" | "tcl" | "nim" | "cr" | "graphql" | "gql" => Some("#"),
+        "hs" | "elm" | "ada" | "adb" | "ads" | "vhd" | "vhdl" => Some("--"),
+        "ini" | "clj" | "cljs" | "edn" | "lisp" | "el" | "scm" | "rkt" | "asm" => Some(";"),
+        "tex" | "sty" | "erl" | "hrl" => Some("%"),
+        "vim" => Some("\""),
+        "bat" | "cmd" => Some("@REM"),
+        _ => None,
+    }
+}
+
+/// The byte length of the line comment `token` that `text` (a line with its
+/// indentation trimmed) starts with, or `None` when it is not commented. A
+/// word token (batch's `@REM`) must end at whitespace or the line's end, so
+/// `REMOTE.EXE` is not a comment, and batch's plain `REM` counts too.
+fn line_comment_prefix_len(text: &str, token: &str) -> Option<usize> {
+    let word = |t: &str| {
+        text.starts_with(t)
+            && text[t.len()..]
+                .chars()
+                .next()
+                .is_none_or(char::is_whitespace)
+    };
+    if !token.ends_with(|c: char| c.is_ascii_alphabetic()) {
+        return text.starts_with(token).then_some(token.len());
+    }
+    if word(token) {
+        return Some(token.len());
+    }
+    let plain = token.trim_start_matches('@');
+    (plain != token && word(plain)).then_some(plain.len())
 }
 
 /// The block-comment delimiters for a language (VS Code `blockComment`), or
@@ -12944,7 +13538,9 @@ fn block_comment_tokens(lang: Option<LangKind>) -> Option<(&'static str, &'stati
         | Some(LangKind::Css)
         | Some(LangKind::Ql)
         | Some(LangKind::Dbscheme) => Some(("/*", "*/")),
-        Some(LangKind::Html) | Some(LangKind::Markdown) => Some(("<!--", "-->")),
+        Some(LangKind::Html) | Some(LangKind::Markdown) | Some(LangKind::Xml) => {
+            Some(("<!--", "-->"))
+        }
         Some(LangKind::Lua) => Some(("--[[", "]]")),
         Some(LangKind::Java) | Some(LangKind::CSharp) | Some(LangKind::Sql) => Some(("/*", "*/")),
         // Python has no true block comment; VS Code's language config maps
@@ -13978,6 +14574,131 @@ fn leading_outdent_chars(line: &str, unit_w: usize) -> usize {
     } else {
         ((spaces - 1) % unit_w) + 1
     }
+}
+
+/// What Enter types inside a doc comment (#1443), after VS Code's
+/// `onEnterRules`.
+#[derive(Debug, PartialEq)]
+struct CommentEnter {
+    /// The new line's text, ahead of whatever followed the caret.
+    start: String,
+    /// What happens on the line below the new one.
+    below: CommentBelow,
+}
+
+#[derive(Debug, PartialEq)]
+enum CommentBelow {
+    Nothing,
+    /// A `/**` was just opened with nothing closing it: this line closes it.
+    AddCloser(String),
+    /// The caret sat right before the `*/` of `/** */`: that `*/` moves to
+    /// a line of its own, indented by this.
+    MoveCloser(String),
+}
+
+/// The languages whose doc comments are `/** … */` blocks.
+fn has_block_doc_comments(lang: Option<LangKind>) -> bool {
+    matches!(
+        lang,
+        Some(
+            LangKind::JavaScript
+                | LangKind::TypeScript
+                | LangKind::Tsx
+                | LangKind::C
+                | LangKind::Cpp
+                | LangKind::Java
+                | LangKind::CSharp
+                | LangKind::Rust
+        )
+    )
+}
+
+/// How Enter at char `col` of `line` continues a doc comment (#1443), or
+/// None where it is a plain line break:
+/// - `/**` opening a block gives ` * `, closing the block below when
+///   nothing does yet;
+/// - a ` * …` line inside the block gives the next ` * ` at the same
+///   column;
+/// - a ` */` line steps back to the column of its `/**`;
+/// - in Rust, a `///` or `//!` line gives the next `/// ` or `//! `.
+///
+/// A plain `//` comment, as in VS Code, is not continued.
+fn comment_on_enter(
+    lang: Option<LangKind>,
+    line: &str,
+    col: usize,
+    below: &[String],
+) -> Option<CommentEnter> {
+    let before: String = line.chars().take(col).collect();
+    let after: String = line.chars().skip(col).collect();
+    let indent: String = before
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect();
+    let body = &before[indent.len()..];
+    let nothing = |start: String| {
+        Some(CommentEnter {
+            start,
+            below: CommentBelow::Nothing,
+        })
+    };
+    if lang == Some(LangKind::Rust) && !body.starts_with("////") {
+        for intro in ["///", "//!"] {
+            if body.starts_with(intro) {
+                return nothing(format!("{indent}{intro} "));
+            }
+        }
+    }
+    if !has_block_doc_comments(lang) {
+        return None;
+    }
+    let closer_next = after.trim_start().starts_with("*/");
+    if let Some(rest) = body.strip_prefix("/**")
+        && !rest.starts_with('/')
+        && !rest.contains("*/")
+    {
+        let below = if closer_next {
+            CommentBelow::MoveCloser(format!("{indent} "))
+        } else if after.contains("*/") || block_closed_below(below) {
+            // Already closed, on this line or further down.
+            CommentBelow::Nothing
+        } else {
+            CommentBelow::AddCloser(format!("{indent} */"))
+        };
+        return Some(CommentEnter {
+            start: format!("{indent} * "),
+            below,
+        });
+    }
+    // Only a `*` set in from its line's start is a block's continuation, as
+    // VS Code's rule has it.
+    if !indent.ends_with(' ') {
+        return None;
+    }
+    if let Some(rest) = body.strip_prefix('*')
+        && (rest.is_empty() || rest.starts_with(' '))
+        && !rest.contains("*/")
+        && !closer_next
+    {
+        return nothing(format!("{indent}* "));
+    }
+    if body.trim_end() == "*/" && after.trim().is_empty() {
+        return nothing(indent[..indent.len() - 1].to_string());
+    }
+    None
+}
+
+/// Whether the lines below an opened block comment close it: a `*/`
+/// comes before any further `/*` would open another block.
+fn block_closed_below(below: &[String]) -> bool {
+    for line in below {
+        match (line.find("/*"), line.find("*/")) {
+            (open, Some(close)) if open.is_none_or(|open| close < open) => return true,
+            (Some(_), _) => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn extra_indent_triggered(lang: Option<LangKind>, last_non_ws: Option<char>) -> bool {
@@ -17861,15 +18582,52 @@ impl EditorTabs {
         Ok(())
     }
 
+    /// The text a diff should show for `path` (#1572): an open tab's unsaved
+    /// edits, as a save would write them, since that is the version the user
+    /// is looking at; the file on disk when no tab has unsaved edits to it.
+    fn text_to_diff(unsaved: Option<String>, path: &Path) -> Result<String> {
+        match unsaved {
+            Some(text) => Ok(text),
+            None => {
+                std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
+            }
+        }
+    }
+
+    /// The text a save of `path`'s open tab would write, when that tab has
+    /// unsaved edits; `None` otherwise. Searches this group only: the app
+    /// resolves it across every split group before calling the `_resolved`
+    /// openers.
+    pub fn unsaved_text_of(&self, path: &Path) -> Option<String> {
+        let idx = self.find_tab_matching(path, |e| {
+            e.dirty && e.symbol_view.is_none() && !e.has_non_text_view()
+        })?;
+        Some(self.editors[idx].content_for_disk())
+    }
+
     /// Open a side-by-side diff of two files in a fresh pinned tab next
-    /// to the active one. The new tab is read-only: edits, save, and the
+    /// to the active one, each side read the way [`Self::text_to_diff`]
+    /// says. The new tab is read-only: edits, save, and the
     /// text-rendering path are all bypassed via the `diff: Some(...)` flag
     /// on the underlying Editor.
+    #[cfg(test)]
     pub fn open_diff(&mut self, left: &Path, right: &Path) -> Result<()> {
-        let left_text =
-            std::fs::read_to_string(left).with_context(|| format!("reading {}", left.display()))?;
-        let right_text = std::fs::read_to_string(right)
-            .with_context(|| format!("reading {}", right.display()))?;
+        let left_unsaved = self.unsaved_text_of(left);
+        let right_unsaved = self.unsaved_text_of(right);
+        self.open_diff_resolved(left, right, left_unsaved, right_unsaved)
+    }
+
+    /// [`Self::open_diff`] with each side's unsaved text already resolved by
+    /// the caller (across every split group); `None` reads the disk.
+    pub fn open_diff_resolved(
+        &mut self,
+        left: &Path,
+        right: &Path,
+        left_unsaved: Option<String>,
+        right_unsaved: Option<String>,
+    ) -> Result<()> {
+        let left_text = Self::text_to_diff(left_unsaved, left)?;
+        let right_text = Self::text_to_diff(right_unsaved, right)?;
         let left_lines: Vec<String> = left_text.lines().map(str::to_string).collect();
         let right_lines: Vec<String> = right_text.lines().map(str::to_string).collect();
         let mut data = crate::widgets::diff::DiffData::build(
@@ -17904,10 +18662,12 @@ impl EditorTabs {
     }
 
     /// Open a side-by-side diff between an in-memory `left_text` (e.g.
-    /// the HEAD version of a file) and the working-tree file at `right`.
-    /// The left "path" is purely a label; nothing reads from it on disk.
+    /// the HEAD version of a file) and `right` as the user sees it: its open
+    /// tab's unsaved edits, else the file on disk. The left "path" is purely
+    /// a label; nothing reads from it on disk.
     /// Used by the Source Control panel to show working-tree-vs-HEAD
     /// diffs when the user clicks a Modified entry.
+    #[cfg(test)]
     pub fn open_head_diff_with_text(
         &mut self,
         left_label: PathBuf,
@@ -17915,13 +18675,46 @@ impl EditorTabs {
         right: &Path,
         left_is_git_head: bool,
     ) -> Result<()> {
-        let right_text = std::fs::read_to_string(right)
-            .with_context(|| format!("reading {}", right.display()))?;
-        self.open_head_diff_with_texts(left_label, left_text, &right_text, right, left_is_git_head)
+        let unsaved = self.unsaved_text_of(right);
+        self.open_head_diff_with_text_resolved(
+            left_label,
+            left_text,
+            right,
+            left_is_git_head,
+            unsaved,
+        )
+    }
+
+    /// [`Self::open_head_diff_with_text`] with `right`'s unsaved text already
+    /// resolved by the caller (across every split group); `None` reads the
+    /// disk.
+    pub fn open_head_diff_with_text_resolved(
+        &mut self,
+        left_label: PathBuf,
+        left_text: &str,
+        right: &Path,
+        left_is_git_head: bool,
+        unsaved: Option<String>,
+    ) -> Result<()> {
+        let right_is_unsaved = unsaved.is_some();
+        let right_text = match unsaved {
+            Some(text) => text,
+            None => std::fs::read_to_string(right)
+                .with_context(|| format!("reading {}", right.display()))?,
+        };
+        self.open_head_diff_with_texts(
+            left_label,
+            left_text,
+            &right_text,
+            right,
+            left_is_git_head,
+            right_is_unsaved,
+        )
     }
 
     /// [`Self::open_head_diff_with_text`] with the working side already read
-    /// and decoded, for a file that isn't UTF-8 (#1242).
+    /// and decoded, for a file that isn't UTF-8 (#1242). `right_is_unsaved`
+    /// says `right_text` is the open tab's unsaved buffer, not the disk.
     pub fn open_head_diff_with_texts(
         &mut self,
         left_label: PathBuf,
@@ -17929,6 +18722,7 @@ impl EditorTabs {
         right_text: &str,
         right: &Path,
         left_is_git_head: bool,
+        right_is_unsaved: bool,
     ) -> Result<()> {
         let left_lines: Vec<String> = left_text.lines().map(str::to_string).collect();
         let right_lines: Vec<String> = right_text.lines().map(str::to_string).collect();
@@ -17948,6 +18742,7 @@ impl EditorTabs {
             data.scroll_to_row(row);
         }
         data.left_is_git_head = left_is_git_head;
+        data.right_is_unsaved = right_is_unsaved;
         let mut e = Editor::new();
         e.focused = self.editors[self.active].focused;
         e.preview = false;
@@ -17960,8 +18755,12 @@ impl EditorTabs {
         // If a tab is already showing this path (as a plain file or a
         // diff), reuse it so we don't pile up duplicate tabs as the
         // user clicks through the change list — unless it holds unsaved
-        // edits, which replacing wholesale would silently destroy.
-        if let Some(idx) = self.find_tab_with_path(right)
+        // edits, which replacing wholesale would silently destroy. A diff
+        // tab of the path comes first: with the file's own tab dirty, it
+        // is the only one to reuse (#1572).
+        if let Some(idx) = self
+            .find_tab_matching(right, |e| e.diff.is_some())
+            .or_else(|| self.find_tab_with_path(right))
             && !self.editors[idx].dirty
         {
             self.editors[idx] = e;
@@ -23231,6 +24030,153 @@ mod tests {
         assert_eq!(e.lines, vec!["  ".to_string()]);
     }
 
+    fn three_foos() -> Editor {
+        editor_with("foo = 1\nfoo = 2\nfoo = 3")
+    }
+
+    fn carets_after_foo(e: &mut Editor) {
+        e.cursor_row = 0;
+        e.cursor_col = 3;
+        e.carets = vec![EditorSelection::new(1, 3), EditorSelection::new(2, 3)];
+    }
+
+    /// #1597: a quote typed over several Ctrl+D selections wraps each one
+    /// and keeps it selected, in one undo step, instead of replacing them.
+    #[test]
+    fn a_quote_wraps_every_selection() {
+        let mut e = three_foos();
+        e.cursor_col = 0;
+        assert_eq!(e.select_all_occurrences_of_word_at_cursor(), 3);
+        e.multi_insert_char('"');
+        assert_eq!(e.lines, vec!["\"foo\" = 1", "\"foo\" = 2", "\"foo\" = 3"]);
+        let selected: Vec<String> = e
+            .selection
+            .iter()
+            .chain(e.carets.iter())
+            .filter(|s| s.has_area())
+            .map(|s| {
+                let ((r, a), (_, b)) = s.normalised();
+                e.lines[r].chars().skip(a).take(b - a).collect()
+            })
+            .collect();
+        assert_eq!(selected, vec!["foo", "foo", "foo"], "still selected");
+        e.multi_insert_char('(');
+        assert_eq!(e.lines[2], "\"(foo)\" = 3", "and wrap again");
+        assert!(e.undo());
+        assert!(e.undo());
+        assert_eq!(e.lines, vec!["foo = 1", "foo = 2", "foo = 3"]);
+    }
+
+    /// #1597: an opener typed at several carets closes at each, the carets
+    /// between the pairs.
+    #[test]
+    fn an_opener_closes_at_every_caret() {
+        let mut e = three_foos();
+        carets_after_foo(&mut e);
+        e.multi_insert_char('[');
+        assert_eq!(e.lines, vec!["foo[] = 1", "foo[] = 2", "foo[] = 3"]);
+        e.multi_insert_char('0');
+        assert_eq!(e.lines, vec!["foo[0] = 1", "foo[0] = 2", "foo[0] = 3"]);
+    }
+
+    /// #1597: a closer typed before the same closer steps over it at every
+    /// caret.
+    #[test]
+    fn a_closer_types_over_at_every_caret() {
+        let mut e = editor_with("print(x)\nprint(y)");
+        e.cursor_col = 7;
+        e.carets = vec![EditorSelection::new(1, 7)];
+        e.multi_insert_char(')');
+        assert_eq!(e.lines, vec!["print(x)", "print(y)"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 8));
+        assert_eq!(e.carets, vec![EditorSelection::new(1, 8)]);
+    }
+
+    /// #1597: Backspace right after pairing at several carets takes both
+    /// sides of every empty pair.
+    #[test]
+    fn backspace_after_pairing_at_every_caret_takes_both_sides() {
+        let mut e = three_foos();
+        carets_after_foo(&mut e);
+        e.multi_insert_char('(');
+        e.multi_backspace();
+        assert_eq!(e.lines, vec!["foo = 1", "foo = 2", "foo = 3"]);
+    }
+
+    /// Negative (#1597): a pair already in the file keeps its closer when
+    /// Backspace runs at several carets inside it.
+    #[test]
+    fn backspace_at_every_caret_keeps_a_pair_already_there() {
+        let mut e = editor_with("f()\ng()");
+        e.cursor_col = 2;
+        e.carets = vec![EditorSelection::new(1, 2)];
+        e.multi_backspace();
+        assert_eq!(e.lines, vec!["f)", "g)"]);
+    }
+
+    /// Negative (#1597): a quote that pairs at one caret but steps over a
+    /// quote already in the file at another arms only the caret that
+    /// paired; the next Backspace keeps the other's pre-existing quote.
+    #[test]
+    fn backspace_after_mixed_pairing_keeps_the_pair_already_there() {
+        let mut e = editor_with("\n\"\"");
+        e.cursor_col = 0;
+        e.carets = vec![EditorSelection::new(1, 0)];
+        e.multi_insert_char('"');
+        assert_eq!(e.lines, vec!["\"\"", "\"\""]);
+        e.multi_backspace();
+        assert_eq!(e.lines, vec!["", "\""]);
+    }
+
+    /// #1597: stepping over the closer at every caret records no undo step,
+    /// so one Undo reverts the edit before it.
+    #[test]
+    fn type_over_at_every_caret_records_no_undo_step() {
+        let mut e = editor_with("print(x)\nprint(y)");
+        e.cursor_col = 7;
+        e.carets = vec![EditorSelection::new(1, 7)];
+        e.multi_insert_char('z');
+        e.multi_insert_char(')');
+        assert_eq!(e.lines, vec!["print(xz)", "print(yz)"]);
+        assert!(e.undo());
+        assert_eq!(e.lines, vec!["print(x)", "print(y)"]);
+    }
+
+    /// Negative (#1597): carets moved after the pairing disarm the pair
+    /// Backspace, so it deletes one character as usual.
+    #[test]
+    fn carets_moved_after_pairing_backspace_one_character() {
+        let mut e = three_foos();
+        carets_after_foo(&mut e);
+        e.multi_insert_char('(');
+        e.cursor_col = 6;
+        e.carets = vec![EditorSelection::new(1, 6), EditorSelection::new(2, 6)];
+        e.multi_backspace();
+        assert_eq!(e.lines, vec!["foo()= 1", "foo()= 2", "foo()= 3"]);
+    }
+
+    /// Negative (#1597): with auto-closing pairs off, several carets type
+    /// the plain character.
+    #[test]
+    fn without_auto_close_every_caret_types_the_plain_character() {
+        let mut e = three_foos();
+        e.auto_close_pairs = false;
+        carets_after_foo(&mut e);
+        e.multi_insert_char('[');
+        assert_eq!(e.lines, vec!["foo[ = 1", "foo[ = 2", "foo[ = 3"]);
+    }
+
+    /// Negative (#1597): a closer typed over several selections replaces
+    /// them, as it does one selection.
+    #[test]
+    fn a_closer_replaces_every_selection() {
+        let mut e = three_foos();
+        e.cursor_col = 0;
+        e.select_all_occurrences_of_word_at_cursor();
+        e.multi_insert_char(')');
+        assert_eq!(e.lines, vec![") = 1", ") = 2", ") = 3"]);
+    }
+
     #[test]
     fn collapse_carets_drops_secondary_cursors() {
         let mut e = editor_with("x x x");
@@ -23261,6 +24207,117 @@ mod tests {
         ];
         assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 2);
         assert_eq!(lines, vec!["baz bar baz".to_string()]);
+    }
+
+    /// An insert of `text` at `(row, col)`, in UTF-16 columns as a
+    /// language server sends it.
+    fn lsp_insert(row: usize, col: usize, text: &str) -> TextSpanEdit {
+        TextSpanEdit {
+            start: (row, col),
+            end: (row, col),
+            new_text: text.to_string(),
+            utf16: true,
+        }
+    }
+
+    /// vtsls 0.3.0's Format Document reply for
+    /// `export function f(a: number) {if(a>1){return  0;}`, captured with a
+    /// minimal LSP client (#1633). The first two edits share a position.
+    fn vtsls_format_reply() -> Vec<TextSpanEdit> {
+        let mut edits = vec![
+            lsp_insert(0, 30, "\n"),
+            lsp_insert(0, 30, "  "),
+            lsp_insert(0, 32, " "),
+            lsp_insert(0, 34, " "),
+            lsp_insert(0, 35, " "),
+            lsp_insert(0, 37, " "),
+            lsp_insert(0, 38, " "),
+        ];
+        edits.push(TextSpanEdit {
+            start: (0, 44),
+            end: (0, 46),
+            new_text: " ".to_string(),
+            utf16: true,
+        });
+        edits.push(lsp_insert(0, 48, " "));
+        edits
+    }
+
+    /// #1633: edits that start at one position land in the order the server
+    /// sent them, as the LSP spec says.
+    #[test]
+    fn inserts_at_one_position_land_in_the_order_sent() {
+        let mut lines = vec!["ab".to_string()];
+        let edits = vec![lsp_insert(0, 1, "\n"), lsp_insert(0, 1, "  ")];
+        assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 2);
+        assert_eq!(lines, vec!["a".to_string(), "  b".to_string()]);
+        // An insert sent before a replacement of the text after it.
+        let mut lines = vec!["foobar".to_string()];
+        let edits = vec![
+            lsp_insert(0, 0, "X"),
+            TextSpanEdit {
+                start: (0, 0),
+                end: (0, 3),
+                new_text: String::new(),
+                utf16: true,
+            },
+        ];
+        assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 2);
+        assert_eq!(lines, vec!["Xbar".to_string()]);
+    }
+
+    /// #1633: the issue's TypeScript sample formats to an indented line with
+    /// no trailing spaces.
+    #[test]
+    fn a_vtsls_format_reply_indents_the_line_it_breaks() {
+        let mut lines: Vec<String> = [
+            "export function f(a: number) {if(a>1){return  0;}",
+            "  return a;",
+            "}",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            apply_span_edits_to_lines(&mut lines, &vtsls_format_reply()),
+            9
+        );
+        assert_eq!(
+            lines,
+            [
+                "export function f(a: number) {",
+                "  if (a > 1) { return 0; }",
+                "  return a;",
+                "}"
+            ]
+            .map(String::from)
+            .to_vec()
+        );
+    }
+
+    /// #1633 negative: edits at different positions, and a replacement sent
+    /// before an insert at its start, keep their meaning.
+    #[test]
+    fn edits_at_different_positions_keep_their_places() {
+        let mut lines = vec!["a b c".to_string()];
+        let edits = vec![
+            lsp_insert(0, 4, "Z"),
+            lsp_insert(0, 0, "X"),
+            lsp_insert(0, 2, "Y"),
+        ];
+        assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 3);
+        assert_eq!(lines, vec!["Xa Yb Zc".to_string()]);
+        let mut lines = vec!["foobar".to_string()];
+        let edits = vec![
+            TextSpanEdit {
+                start: (0, 0),
+                end: (0, 3),
+                new_text: String::new(),
+                utf16: true,
+            },
+            lsp_insert(0, 0, "X"),
+        ];
+        assert_eq!(apply_span_edits_to_lines(&mut lines, &edits), 2);
+        assert_eq!(lines, vec!["Xbar".to_string()]);
     }
 
     #[test]
@@ -23716,6 +24773,205 @@ mod tests {
         assert_eq!(e.lines, vec!["    abc".to_string(), "    ".to_string()]);
         assert_eq!(e.cursor_row, 1);
         assert_eq!(e.cursor_col, 4);
+    }
+
+    /// #1443: `text` with the caret at `|`, in `lang`, after one Enter.
+    fn enter_at(lang: LangKind, text: &str) -> (Vec<String>, (usize, usize)) {
+        let (row, line) = text
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains('|'))
+            .unwrap();
+        let mut e = editor_with(&text.replace('|', ""));
+        e.lang = Some(lang);
+        e.cursor_row = row;
+        e.cursor_col = line.chars().position(|c| c == '|').unwrap();
+        e.insert_newline();
+        (e.lines.clone(), (e.cursor_row, e.cursor_col))
+    }
+
+    #[test]
+    fn enter_after_a_doc_opener_starts_the_block_and_closes_it() {
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "/**|"),
+            (vec!["/**".into(), " * ".into(), " */".into()], (1, 3))
+        );
+        assert_eq!(
+            enter_at(LangKind::Java, "    /**|"),
+            (
+                vec!["    /**".into(), "     * ".into(), "     */".into()],
+                (1, 7)
+            )
+        );
+    }
+
+    #[test]
+    fn enter_between_a_doc_opener_and_its_closer_splits_them() {
+        assert_eq!(
+            enter_at(LangKind::TypeScript, "  /**| */"),
+            (vec!["  /**".into(), "   * ".into(), "   */".into()], (1, 5))
+        );
+    }
+
+    #[test]
+    fn enter_after_an_opener_already_closed_below_adds_no_closer() {
+        assert_eq!(
+            enter_at(LangKind::C, "/**|\n * Adds.\n */"),
+            (
+                vec!["/**".into(), " * ".into(), " * Adds.".into(), " */".into()],
+                (1, 3)
+            )
+        );
+    }
+
+    #[test]
+    fn enter_after_an_opener_closed_further_down_adds_no_closer() {
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "/**|\nDescription.\n */"),
+            (
+                vec![
+                    "/**".into(),
+                    " * ".into(),
+                    "Description.".into(),
+                    " */".into()
+                ],
+                (1, 3)
+            )
+        );
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "/**|\n\nf();\n/** g */"),
+            (
+                vec![
+                    "/**".into(),
+                    " * ".into(),
+                    " */".into(),
+                    "".into(),
+                    "f();".into(),
+                    "/** g */".into()
+                ],
+                (1, 3)
+            )
+        );
+    }
+
+    #[test]
+    fn enter_on_a_star_line_continues_it_at_the_same_column() {
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "/**\n * Adds two numbers.|\n */"),
+            (
+                vec![
+                    "/**".into(),
+                    " * Adds two numbers.".into(),
+                    " * ".into(),
+                    " */".into()
+                ],
+                (2, 3)
+            )
+        );
+        assert_eq!(
+            enter_at(LangKind::Cpp, "    * a|b"),
+            (vec!["    * a".into(), "    * b".into()], (1, 6))
+        );
+    }
+
+    #[test]
+    fn enter_after_a_closer_steps_back_to_the_opener_column() {
+        assert_eq!(
+            enter_at(LangKind::CSharp, "    /**\n     * x\n     */|"),
+            (
+                vec![
+                    "    /**".into(),
+                    "     * x".into(),
+                    "     */".into(),
+                    "    ".into()
+                ],
+                (3, 4)
+            )
+        );
+    }
+
+    #[test]
+    fn enter_on_a_rust_doc_line_continues_it() {
+        assert_eq!(
+            enter_at(LangKind::Rust, "/// Adds two numbers.|"),
+            (vec!["/// Adds two numbers.".into(), "/// ".into()], (1, 4))
+        );
+        assert_eq!(
+            enter_at(LangKind::Rust, "    //! Crate docs.|"),
+            (
+                vec!["    //! Crate docs.".into(), "    //! ".into()],
+                (1, 8)
+            )
+        );
+        assert_eq!(
+            enter_at(LangKind::Rust, "/// Adds| two"),
+            (vec!["/// Adds".into(), "///  two".into()], (1, 4))
+        );
+    }
+
+    #[test]
+    fn enter_leaves_code_and_plain_comments_alone() {
+        // Multiplication, a plain `//`, a four-slash rule, `/*` and the caret
+        // just before a `*/`.
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "x = a *|"),
+            (vec!["x = a *".into(), String::new()], (1, 0))
+        );
+        assert_eq!(
+            enter_at(LangKind::Rust, "// a|"),
+            (vec!["// a".into(), String::new()], (1, 0))
+        );
+        assert_eq!(
+            enter_at(LangKind::Rust, "//// a|"),
+            (vec!["//// a".into(), String::new()], (1, 0))
+        );
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "/*|"),
+            (vec!["/*".into(), String::new()], (1, 0))
+        );
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "/** a */|"),
+            (vec!["/** a */".into(), String::new()], (1, 0))
+        );
+        assert_eq!(
+            enter_at(LangKind::JavaScript, " * text |*/"),
+            (vec![" * text ".into(), " */".into()], (1, 1))
+        );
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "*|"),
+            (vec!["*".into(), String::new()], (1, 0))
+        );
+    }
+
+    #[test]
+    fn enter_in_languages_without_these_comments_is_unchanged() {
+        assert_eq!(
+            enter_at(LangKind::Python, "/**|"),
+            (vec!["/**".into(), String::new()], (1, 0))
+        );
+        assert_eq!(
+            enter_at(LangKind::Python, " * a|"),
+            (vec![" * a".into(), " ".into()], (1, 1))
+        );
+        assert_eq!(
+            enter_at(LangKind::Markdown, "/// a|"),
+            (vec!["/// a".into(), String::new()], (1, 0))
+        );
+        assert_eq!(
+            enter_at(LangKind::JavaScript, "/// a|"),
+            (vec!["/// a".into(), String::new()], (1, 0))
+        );
+    }
+
+    #[test]
+    fn a_comment_continuation_undoes_in_one_step() {
+        let mut e = editor_with("/**");
+        e.lang = Some(LangKind::JavaScript);
+        e.cursor_col = 3;
+        e.insert_newline();
+        assert_eq!(e.lines, vec!["/**", " * ", " */"]);
+        assert!(e.undo());
+        assert_eq!(e.lines, vec!["/**"]);
     }
 
     #[test]
@@ -25469,6 +26725,91 @@ mod tests {
         let mut e = Editor::new();
         e.open(std::path::Path::new(&f)).unwrap();
         e.insert_str("# A new entry at the top\n");
+        assert!(
+            e.save_to_disk().is_err(),
+            "the write must fail past the limit"
+        );
+        assert!(e.dirty, "the edits are still only in the buffer");
+        assert!(
+            !e.disk_changed_externally(),
+            "croft's own failed write must not read as an external change"
+        );
+    }
+
+    /// Make the save path's copy aside fail as a full disk does, for the
+    /// rest of this thread.
+    #[cfg(target_os = "linux")]
+    fn fill_the_disk_for_copies() {
+        crate::prefs::test_hooks::ASIDE_OUT_OF_SPACE.set(true);
+    }
+
+    /// #1614: with no room for a second copy of the file, a save writes the
+    /// file in place instead of failing with "No space left on device".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_save_with_no_room_for_a_copy_writes_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("notes.md");
+        let original: String = (0..2000)
+            .map(|i| format!("line {i} of the notes\n"))
+            .collect();
+        std::fs::write(&f, &original).unwrap();
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.insert_str("X");
+        fill_the_disk_for_copies();
+        let saved = e.save_to_disk();
+        crate::prefs::test_hooks::ASIDE_OUT_OF_SPACE.set(false);
+        assert_eq!(saved.unwrap(), SaveOutcome::Saved);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), format!("X{original}"));
+        assert!(!e.dirty);
+        assert!(!e.disk_changed_externally());
+        let stray: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "notes.md")
+            .collect();
+        assert!(stray.is_empty(), "temp files left behind: {stray:?}");
+    }
+
+    /// #1614 negative: when the new contents don't fit in place either, the
+    /// save fails and the file is left whole (#1124).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_save_that_fits_neither_aside_nor_in_place_leaves_the_file_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("notes.md");
+        let original: String = (0..400).map(|i| format!("- entry {i:04}\n")).collect();
+        std::fs::write(&f, &original).unwrap();
+        run_with_file_size_limit(
+            "widgets::editor::tests::child_saves_in_place_under_a_file_size_limit",
+            &f,
+            4096,
+        );
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            original,
+            "the failed save cut the file short"
+        );
+        let stray: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "notes.md")
+            .collect();
+        assert!(stray.is_empty(), "temp files left behind: {stray:?}");
+    }
+
+    /// The child half of the test above; a no-op unless run by it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_saves_in_place_under_a_file_size_limit() {
+        let Some(f) = std::env::var_os("CROFT_TEST_FSIZE_FILE") else {
+            return;
+        };
+        let mut e = Editor::new();
+        e.open(std::path::Path::new(&f)).unwrap();
+        e.insert_str("# A new entry at the top\n");
+        fill_the_disk_for_copies();
         assert!(
             e.save_to_disk().is_err(),
             "the write must fail past the limit"
@@ -28111,6 +29452,41 @@ mod tests {
         );
     }
 
+    /// #1563: the edge arrows' line-end and line-start landings scroll the
+    /// view sideways to keep the caret on screen in a narrow pane.
+    #[test]
+    fn edge_arrows_keep_the_caret_horizontally_visible() {
+        let mut e = editor_with(&format!("short\n{}", "b".repeat(200)));
+        e.focused = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 6,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        e.cursor_row = 1;
+        e.cursor_col = 0;
+        e.arrow_down();
+        assert_eq!(e.cursor_col, 200);
+        assert!(
+            e.scroll_col > 0,
+            "the view follows the caret to the line end"
+        );
+        let width = e.visible_text_width();
+        assert!(
+            e.cursor_col < e.scroll_col + width,
+            "the caret is on screen"
+        );
+        e.cursor_row = 0;
+        e.cursor_col = 3;
+        e.scroll_col = 100;
+        e.arrow_up();
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 0));
+        assert_eq!(e.scroll_col, 0, "the view comes back to the line start");
+    }
+
     #[test]
     fn scroll_to_bar_x_jumps_horizontal_offset() {
         let mut e = editor_with("a".repeat(500).as_str());
@@ -29672,6 +31048,142 @@ mod tests {
         assert_eq!(e.lines, vec!["x = 1"]);
     }
 
+    /// #1181: where the language has only block comments, Toggle Line
+    /// Comment wraps the lines in one, as VS Code does, and unwraps them.
+    #[test]
+    fn toggle_line_comment_wraps_lines_in_a_block_comment_where_there_is_no_line_comment() {
+        for (lang, text, commented) in [
+            (LangKind::Html, "  <ul>", "  <!-- <ul> -->"),
+            (LangKind::Css, "body {", "/* body { */"),
+            (LangKind::Markdown, "# Title", "<!-- # Title -->"),
+            (LangKind::Xml, "<a/>", "<!-- <a/> -->"),
+        ] {
+            let mut e = editor_with(text);
+            e.lang = Some(lang);
+            e.cursor_col = text.chars().count() - 1;
+            assert!(e.toggle_line_comment(), "{lang:?}");
+            assert_eq!(e.lines, vec![commented], "{lang:?}");
+            assert!(e.toggle_line_comment(), "{lang:?}");
+            assert_eq!(e.lines, vec![text], "{lang:?} unwraps");
+            assert_eq!(e.cursor_col, text.chars().count() - 1, "{lang:?} caret");
+        }
+        // A selection of lines gets one pair, from the first line's text to
+        // the last one's, and blank lines around it are left out.
+        let mut e = editor_with("<ul>\n  <li>one</li>\n</ul>\n\n");
+        e.lang = Some(LangKind::Html);
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (3, 0),
+        });
+        assert!(e.toggle_line_comment());
+        assert_eq!(
+            e.lines,
+            vec!["<!-- <ul>", "  <li>one</li>", "</ul> -->", ""]
+        );
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["<ul>", "  <li>one</li>", "</ul>", ""]);
+    }
+
+    /// #1181: JSON(C) comments with `//`, and a file croft has no grammar
+    /// for comments by its name or extension.
+    #[test]
+    fn toggle_line_comment_covers_json_and_files_without_a_grammar() {
+        let mut e = editor_with("  \"a\": 1,");
+        e.lang = Some(LangKind::Json);
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["  // \"a\": 1,"]);
+        for (name, text, commented) in [
+            ("App.kt", "class App {", "// class App {"),
+            ("main.swift", "let x = 1", "// let x = 1"),
+            (".gitignore", "target/", "# target/"),
+            (".env.local", "KEY=1", "# KEY=1"),
+            ("run.ps1", "Write-Host hi", "# Write-Host hi"),
+            ("Main.hs", "main = pure ()", "-- main = pure ()"),
+            ("setup.ini", "[core]", "; [core]"),
+            ("paper.tex", "\\section{A}", "% \\section{A}"),
+        ] {
+            let mut e = editor_with(text);
+            e.lang = None;
+            e.path = Some(PathBuf::from("/tmp/x").join(name));
+            assert!(e.toggle_line_comment(), "{name}");
+            assert_eq!(e.lines, vec![commented], "{name}");
+            assert!(e.toggle_line_comment(), "{name}");
+            assert_eq!(e.lines, vec![text], "{name} uncomments");
+        }
+    }
+
+    /// #1181: SCSS, Sass and Less comment with `//`, though SCSS and Sass
+    /// share the CSS grammar, which still wraps in `/* */`.
+    #[test]
+    fn toggle_line_comment_uses_slashes_in_scss_sass_and_less() {
+        for (name, lang) in [
+            ("a.scss", Some(LangKind::Css)),
+            ("a.sass", Some(LangKind::Css)),
+            ("a.less", None),
+        ] {
+            let mut e = editor_with("  color: red;");
+            e.lang = lang;
+            e.path = Some(PathBuf::from("/tmp/x").join(name));
+            assert!(e.toggle_line_comment(), "{name}");
+            assert_eq!(e.lines, vec!["  // color: red;"], "{name}");
+            assert!(e.toggle_line_comment(), "{name}");
+            assert_eq!(e.lines, vec!["  color: red;"], "{name} uncomments");
+        }
+        let mut e = editor_with("body {");
+        e.lang = Some(LangKind::Css);
+        e.path = Some(PathBuf::from("/tmp/x/a.css"));
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["/* body { */"]);
+    }
+
+    /// #1181: batch files comment with `@REM`, as VS Code does, and
+    /// uncomment `@REM` or `REM` only as a whole word, so `REMOTE.EXE` is
+    /// a command, not a comment.
+    #[test]
+    fn toggle_line_comment_in_batch_files_uses_at_rem_as_a_word() {
+        let bat = |text: &str| {
+            let mut e = editor_with(text);
+            e.lang = None;
+            e.path = Some(PathBuf::from("/tmp/x/run.bat"));
+            e
+        };
+        let mut e = bat("echo hi");
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["@REM echo hi"]);
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["echo hi"]);
+        let mut e = bat("REM note");
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["note"], "plain REM uncomments");
+        let mut e = bat("REM");
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec![""]);
+        for text in ["REMOTE.EXE --sync", "@REMOTE.EXE --sync"] {
+            let mut e = bat(text);
+            assert!(e.toggle_line_comment());
+            assert_eq!(e.lines, vec![format!("@REM {text}")], "{text}");
+        }
+    }
+
+    /// #1181 negative: a file of an unknown kind, or a language with no
+    /// comment of either kind, is still left alone, as are blank lines.
+    #[test]
+    fn toggle_line_comment_still_skips_what_has_no_comment() {
+        let mut e = editor_with("x = 1");
+        e.lang = None;
+        e.path = Some(PathBuf::from("/tmp/x/notes.unknownext"));
+        assert!(!e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["x = 1"]);
+        let mut e = editor_with("   ");
+        e.lang = Some(LangKind::Html);
+        assert!(!e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["   "]);
+        let mut e = editor_with("x: 1");
+        e.lang = Some(LangKind::Yaml);
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["# x: 1"], "a line comment still wins");
+    }
+
     // ---- Toggle Block Comment (Shift+Alt+A) ----
 
     #[test]
@@ -30268,6 +31780,132 @@ mod tests {
         assert_eq!(folded_rows(&e), vec![2, 8]);
         assert_eq!(e.lines[2], "def alpha():");
         assert!(e.is_line_hidden(3) && !e.is_line_hidden(2));
+    }
+
+    /// The #1611 file, with `def b()` (row 4, body rows 5-6) folded.
+    fn folded_b() -> Editor {
+        let mut e =
+            editor_with("def a():\n    return 1\n\n\ndef b():\n    x = 1\n    return x\nlast = 3");
+        e.toggle_fold(4);
+        assert_eq!(folded_rows(&e), vec![4]);
+        assert!(e.is_line_hidden(5) && e.is_line_hidden(6));
+        e
+    }
+
+    /// #1611: Move Line Up below a folded function moves the line above the
+    /// whole function, not into its hidden body, and the fold stays closed.
+    #[test]
+    fn move_line_up_below_a_folded_function_moves_above_it() {
+        let mut e = folded_b();
+        (e.cursor_row, e.cursor_col) = (7, 0);
+        e.move_lines_up();
+        assert_eq!(
+            e.lines[3..],
+            ["", "last = 3", "def b():", "    x = 1", "    return x"]
+        );
+        assert_eq!(e.cursor_row, 4);
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![5], "the fold moved with its text");
+        assert!(e.is_line_hidden(6) && e.is_line_hidden(7));
+        assert!(e.undo());
+        assert_eq!(e.lines[7], "last = 3");
+    }
+
+    /// #1611: Move Line Down on a folded header moves the header and its
+    /// body together, and a line above a fold moves below all of it.
+    #[test]
+    fn move_line_down_moves_a_folded_function_whole() {
+        let mut e = folded_b();
+        (e.cursor_row, e.cursor_col) = (4, 0);
+        e.move_lines_down();
+        assert_eq!(
+            e.lines[3..],
+            ["", "last = 3", "def b():", "    x = 1", "    return x"]
+        );
+        assert_eq!(e.cursor_row, 5, "the caret stays on the header");
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![5]);
+        assert!(e.is_line_hidden(6) && e.is_line_hidden(7));
+
+        let mut e = folded_b();
+        (e.cursor_row, e.cursor_col) = (3, 0);
+        e.move_lines_down();
+        assert_eq!(
+            e.lines[3..],
+            ["def b():", "    x = 1", "    return x", "", "last = 3"]
+        );
+        assert_eq!(e.cursor_row, 6);
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![3]);
+        assert!(e.is_line_hidden(4) && e.is_line_hidden(5));
+    }
+
+    /// #1611: a fold from the language server stays closed over its text
+    /// through a Move Line and its undo: the undo brings back the spans that
+    /// described the restored text, not the ones the move rewrote.
+    #[test]
+    fn undoing_a_move_keeps_a_server_fold_closed() {
+        use crate::lsp::manager::{FoldRangeKind, FoldingRangeItem};
+        let mut e = editor_with("a\nb {\nc\nd\n}\ne");
+        e.set_lsp_folds(vec![FoldingRangeItem {
+            start_line: 1,
+            end_line: 3,
+            kind: FoldRangeKind::Other,
+        }]);
+        e.toggle_fold(1);
+        assert!(e.is_line_hidden(2) && e.is_line_hidden(3));
+        (e.cursor_row, e.cursor_col) = (1, 0);
+        e.move_lines_down();
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![2], "{:?}", e.lines);
+        assert!(e.undo());
+        paint(&mut e);
+        assert_eq!(e.lines[1], "b {");
+        assert_eq!(folded_rows(&e), vec![1]);
+        assert!(
+            e.is_line_hidden(2) && e.is_line_hidden(3),
+            "the server's fold is closed again over its rows"
+        );
+    }
+
+    /// #1611: Copy Line Down on a folded header copies the whole function.
+    #[test]
+    fn copy_line_down_on_a_folded_header_copies_its_body_too() {
+        let mut e = folded_b();
+        (e.cursor_row, e.cursor_col) = (4, 0);
+        e.duplicate_lines_down();
+        assert_eq!(
+            e.lines[4..],
+            [
+                "def b():",
+                "    x = 1",
+                "    return x",
+                "def b():",
+                "    x = 1",
+                "    return x",
+                "last = 3"
+            ]
+        );
+        assert_eq!(e.cursor_row, 7, "the caret is on the copy's header");
+    }
+
+    /// #1611 negative: with no fold, or with the fold open, Move Line swaps
+    /// one line as before.
+    #[test]
+    fn move_line_without_a_closed_fold_swaps_one_line() {
+        let mut e =
+            editor_with("def a():\n    return 1\n\n\ndef b():\n    x = 1\n    return x\nlast = 3");
+        (e.cursor_row, e.cursor_col) = (7, 0);
+        e.move_lines_up();
+        assert_eq!(e.lines[6..], ["last = 3", "    return x"]);
+        let mut e = folded_b();
+        e.toggle_fold(4);
+        assert!(e.folded.is_empty());
+        (e.cursor_row, e.cursor_col) = (4, 0);
+        e.move_lines_down();
+        assert_eq!(e.lines[4..6], ["    x = 1", "def b():"]);
+        e.duplicate_lines_down();
+        assert_eq!(e.lines[5..7], ["def b():", "def b():"]);
     }
 
     /// An untitled buffer has no path, and its folds follow edits too.
