@@ -4527,6 +4527,17 @@ pub struct App {
     /// the bar is hidden or the segment doesn't fit. Diagnostics → PROBLEMS;
     /// encoding / EOL / language → their respective "change" pickers.
     status_diag_rect: Rect,
+    /// The status message's own cells; a click opens the Messages output
+    /// channel, where every message is kept in full (#1609).
+    status_message_rect: Rect,
+    /// The last status message logged to the Messages channel, so each one
+    /// is logged once, when it first shows (#1609).
+    status_logged: String,
+    /// A new status message is showing and nothing has been pressed since,
+    /// so a message too long for the room left by the right-hand cluster
+    /// (Ln/Col, encoding, language) takes the whole bar (#1609). The next
+    /// key or click hands the room back.
+    status_wide: bool,
     /// The running CodeQL query's status-bar chip; a click cancels it (#578).
     status_codeql_rect: Rect,
     /// The croft update pills ("Update ready", the drift rebuild hint); a
@@ -6162,6 +6173,9 @@ impl App {
             settings_editor: None,
             shortcuts_hit_rect: None,
             status_diag_rect: Rect::default(),
+            status_message_rect: Rect::default(),
+            status_logged: String::new(),
+            status_wide: false,
             status_codeql_rect: Rect::default(),
             status_update_rect: Rect::default(),
             status_indent_rect: Rect::default(),
@@ -18695,6 +18709,14 @@ impl App {
         self.focus_pane(Pane::Terminal);
     }
 
+    /// The OUTPUT tab on the Messages channel (#1609): every status message
+    /// croft has shown, in full, newest last.
+    fn show_status_messages(&mut self) {
+        self.output.sync();
+        self.output.select_by_name(crate::output::CHANNEL_MESSAGES);
+        self.set_bottom_panel_tab(BottomPanelTab::Output);
+    }
+
     /// Output: Select Channel… (#852): the OUTPUT toolbar's channel dropdown
     /// as a keyboard picker, opened on the channel shown now. Choosing one
     /// shows it in the OUTPUT tab.
@@ -20284,10 +20306,28 @@ impl App {
         } else {
             crate::i18n::tr(&self.status).into_owned()
         };
+        // A message seen for the first time is kept, in full, in the Messages
+        // output channel, and may take the whole bar until the next key or
+        // click (#1609): elided to fit, its middle was gone for good.
+        if self.status != self.status_logged {
+            self.status_logged = self.status.clone();
+            // The idle "Ready" says nothing worth the cluster's room.
+            self.status_wide = !self.status.is_empty() && self.status != "Ready";
+            if !self.status.is_empty() {
+                crate::output::push(
+                    crate::output::CHANNEL_MESSAGES,
+                    crate::output::OutputLevel::Info,
+                    &crate::i18n::tr(&self.status),
+                );
+            }
+        }
         self.announce_pos = None;
+        self.status_message_rect = Rect::default();
+        let mut status_x: u16 = 0;
         if !status_text.is_empty() {
             spans.push(Span::styled("\u{2502} ", zone_div));
             let x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+            status_x = x;
             if status_h > 0 && x < outer[2].width {
                 self.announce_pos = Some((outer[2].x + x, outer[2].y));
             }
@@ -20419,7 +20459,7 @@ impl App {
             seg_texts.push(format!(" \u{25c6} {joined} "));
         }
         let widths: Vec<u16> = seg_texts.iter().map(|s| s.chars().count() as u16).collect();
-        let right_total: u16 = widths.iter().sum::<u16>() + (seg_texts.len() as u16 - 1);
+        let mut right_total: u16 = widths.iter().sum::<u16>() + (seg_texts.len() as u16 - 1);
         // The right cluster paints OVER the left paragraph, so an over-long
         // transient loses exactly its tail — for "Opened <deep path>" that
         // was the filename, the one informative part (#100). Middle-elide
@@ -20430,17 +20470,34 @@ impl App {
                 .take(spans.len().saturating_sub(1))
                 .map(|s| s.content.chars().count() as u16)
                 .sum();
-            let avail = status_rect
-                .width
-                .saturating_sub(right_total)
-                .saturating_sub(left_fixed)
-                .saturating_sub(1);
+            let fits_beside = |right: u16| {
+                status_rect
+                    .width
+                    .saturating_sub(right)
+                    .saturating_sub(left_fixed)
+                    .saturating_sub(1)
+            };
+            // A fresh message that does not fit beside the cluster takes the
+            // cluster's room until the next key or click (#1609).
+            if self.status_wide && status_text.chars().count() as u16 > fits_beside(right_total) {
+                right_total = 0;
+            }
+            let avail = fits_beside(right_total);
             if let Some(last) = spans.last_mut()
                 && last.content.chars().count() as u16 > avail
             {
                 // Keep the message's dim style through the elision so a
                 // truncated transient doesn't suddenly brighten.
                 *last = Span::styled(elide_middle(&status_text, avail as usize), last.style);
+            }
+            if status_h > 0 && status_x < status_rect.width {
+                let shown = spans.last().map_or(0, |l| l.content.chars().count() as u16);
+                self.status_message_rect = Rect {
+                    x: status_rect.x + status_x,
+                    y: status_rect.y,
+                    width: shown.min(status_rect.width - status_x),
+                    height: 1,
+                };
             }
         }
 
@@ -20466,6 +20523,9 @@ impl App {
         self.status_agents_rect = Rect::default();
         if status_h > 0 && right_total > 0 && right_total <= status_rect.width {
             let rx = status_rect.right() - right_total;
+            if self.status_message_rect.right() > rx {
+                self.status_message_rect.width = rx.saturating_sub(self.status_message_rect.x);
+            }
             // The right cluster paints OVER the left paragraph, so the
             // diagnostics hit rect must stop where it starts. Clipped only to
             // the frame edge, it went on answering for cells that now read
@@ -22712,6 +22772,11 @@ impl App {
     /// built-in defaults call their app methods directly, so a command-level
     /// recorder would miss most of what a user does.
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        // A key press means the status message has been seen: the right-hand
+        // cluster takes its room back (#1609).
+        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            self.status_wide = false;
+        }
         // Esc dismisses an open ssh-pane offer (#364) without being consumed:
         // the offer is a status-bar hint, not a modal, so whatever Esc meant
         // to the focused pane still happens.
@@ -54097,6 +54162,12 @@ impl App {
     }
 
     fn handle_mouse_inner(&mut self, m: MouseEvent) {
+        // So does a click (#1609), except on the message itself, which opens
+        // its full text below.
+        let on_message = rect_contains(self.status_message_rect, m.column, m.row);
+        if matches!(m.kind, MouseEventKind::Down(_)) && !on_message {
+            self.status_wide = false;
+        }
         // A click means the user moved on from a pending shortcut prompt.
         if matches!(m.kind, MouseEventKind::Down(_)) && self.recording_shortcut.take().is_some() {
             self.status = String::from("Shortcut unchanged");
@@ -54270,6 +54341,10 @@ impl App {
             }
             if rect_contains(self.status_diag_rect, m.column, m.row) {
                 self.set_bottom_panel_tab(BottomPanelTab::Problems);
+                return;
+            }
+            if on_message {
+                self.show_status_messages();
                 return;
             }
             if rect_contains(self.status_agents_rect, m.column, m.row) {

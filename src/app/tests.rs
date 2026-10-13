@@ -33247,9 +33247,144 @@ fn status_transient_keeps_its_tail_when_longer_than_the_bar() {
         "an over-long status transient must middle-elide so its tail stays \
          visible; the bar showed: {last_row:?}"
     );
+    // Once a key has been pressed the right cluster is back (#1609), and the
+    // message still keeps its tail beside it.
+    app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+        .unwrap();
+    app.status = format!("Opened /{deep}main.rs");
+    app.status_logged = app.status.clone();
+    term.draw(|f| app.render(f)).unwrap();
+    let last_row = status_row(&term);
+    assert!(last_row.contains("main.rs"), "{last_row:?}");
     assert!(
         last_row.contains("Ln 1, Col 1"),
         "the right cluster must still paint: {last_row:?}"
+    );
+}
+
+/// The recorder's prompt from Preferences: Open Keyboard Shortcuts, which
+/// is longer than the room the right-hand cluster leaves at 140 columns.
+fn recorder_prompt() -> String {
+    String::from(
+        "Press the new shortcut for \u{201c}Sort Lines Ascending\u{201d} (a function key or a chord with Cmd/Ctrl/Alt; Esc cancels)",
+    )
+}
+
+/// #1609: a new message too long for the room beside Ln/Col, encoding and
+/// language takes the whole bar, so its middle is not cut away; the next key
+/// hands the room back.
+#[test]
+fn a_new_long_status_message_takes_the_whole_bar_until_a_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(140, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    app.status = recorder_prompt();
+    term.draw(|f| app.render(f)).unwrap();
+    let row = status_row(&term);
+    assert!(
+        row.contains(&recorder_prompt()),
+        "the whole message shows at 140 columns: {row:?}"
+    );
+    assert!(
+        !row.contains("Ln 1, Col 1"),
+        "the cluster made room: {row:?}"
+    );
+    // Redrawing without input keeps it whole.
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(status_row(&term).contains(&recorder_prompt()));
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 60,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    });
+    app.status = recorder_prompt();
+    term.draw(|f| app.render(f)).unwrap();
+    let row = status_row(&term);
+    assert!(
+        row.contains("Ln 1, Col 1"),
+        "a click brings the cluster back: {row:?}"
+    );
+    assert!(
+        row.contains('\u{2026}'),
+        "and the old message elides beside it: {row:?}"
+    );
+}
+
+/// #1609: every message shown is kept, in full, in the Messages output
+/// channel, and a click on the message opens it there.
+#[test]
+fn status_messages_are_kept_in_the_messages_channel() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    let first = format!("{} #{}", recorder_prompt(), std::process::id());
+    let second = format!("Fleet: no host named web1 #{}", std::process::id());
+    app.status = first.clone();
+    term.draw(|f| app.render(f)).unwrap();
+    app.status = second.clone();
+    term.draw(|f| app.render(f)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let lines: Vec<String> = crate::output::snapshot(crate::output::CHANNEL_MESSAGES)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|l| l.text)
+        .collect();
+    assert_eq!(
+        lines.iter().filter(|l| **l == first).count(),
+        1,
+        "{lines:?}"
+    );
+    assert_eq!(
+        lines.iter().filter(|l| **l == second).count(),
+        1,
+        "logged once"
+    );
+
+    let r = app.status_message_rect;
+    assert!(r.width > 0, "the message has a click target");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: r.x + 1,
+        row: r.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Output);
+    assert_eq!(
+        app.output.selected_name().as_deref(),
+        Some(crate::output::CHANNEL_MESSAGES)
+    );
+}
+
+/// Negative: a message that fits beside the cluster leaves it in place, and
+/// an empty status logs nothing.
+#[test]
+fn a_status_message_that_fits_keeps_the_cluster() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    app.status = String::from("Saved");
+    term.draw(|f| app.render(f)).unwrap();
+    let row = status_row(&term);
+    assert!(
+        row.contains("Saved") && row.contains("Ln 1, Col 1"),
+        "{row:?}"
+    );
+    app.status.clear();
+    term.draw(|f| app.render(f)).unwrap();
+    let lines = crate::output::snapshot(crate::output::CHANNEL_MESSAGES).unwrap_or_default();
+    assert!(
+        lines.iter().all(|l| !l.text.is_empty()),
+        "an empty status is not logged"
+    );
+    assert_eq!(
+        app.status_message_rect.width, 0,
+        "no message, no click target"
     );
 }
 
