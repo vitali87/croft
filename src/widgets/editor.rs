@@ -10994,7 +10994,9 @@ impl Editor {
     /// comment.
     pub fn toggle_line_comment(&mut self) -> bool {
         let Some(token) = line_comment_token(self.lang) else {
-            return false;
+            // A language with only block comments (XML, HTML, CSS) comments
+            // its whole lines with them, as VS Code does (#1161).
+            return self.toggle_block_comment_over(true);
         };
         let blocks = self.selected_row_blocks();
         let non_blank: Vec<usize> = blocks
@@ -11068,6 +11070,14 @@ impl Editor {
     /// each on its own. Returns false for languages with no block comment
     /// (e.g. YAML).
     pub fn toggle_block_comment(&mut self) -> bool {
+        self.toggle_block_comment_over(false)
+    }
+
+    /// Toggle Block Comment on each selection, or with `whole_lines` on
+    /// every line a selection touches (Toggle Line Comment in a language
+    /// with no line comment). A selection ending at the start of a line
+    /// leaves that line out, as a line comment does.
+    fn toggle_block_comment_over(&mut self, whole_lines: bool) -> bool {
         let Some((open, close)) = block_comment_tokens(self.lang) else {
             return false;
         };
@@ -11077,7 +11087,16 @@ impl Editor {
             .iter()
             .enumerate()
             .map(|(i, s)| {
-                let (start, end) = if s.has_area() {
+                let (start, end) = if whole_lines {
+                    let (a, b) = s.normalised();
+                    let end_row = if s.has_area() && b.1 == 0 && b.0 > a.0 {
+                        b.0 - 1
+                    } else {
+                        b.0
+                    }
+                    .min(last);
+                    ((a.0.min(last), 0), (end_row, self.line_char_len(end_row)))
+                } else if s.has_area() {
                     s.normalised()
                 } else {
                     let row = s.head.0.min(last);
@@ -13268,7 +13287,9 @@ fn block_comment_tokens(lang: Option<LangKind>) -> Option<(&'static str, &'stati
         | Some(LangKind::Css)
         | Some(LangKind::Ql)
         | Some(LangKind::Dbscheme) => Some(("/*", "*/")),
-        Some(LangKind::Html) | Some(LangKind::Markdown) => Some(("<!--", "-->")),
+        Some(LangKind::Html) | Some(LangKind::Markdown) | Some(LangKind::Xml) => {
+            Some(("<!--", "-->"))
+        }
         Some(LangKind::Lua) => Some(("--[[", "]]")),
         Some(LangKind::Java) | Some(LangKind::CSharp) | Some(LangKind::Sql) => Some(("/*", "*/")),
         // Python has no true block comment; VS Code's language config maps
@@ -30689,6 +30710,79 @@ mod tests {
         e.lang = None;
         assert!(!e.toggle_line_comment());
         assert_eq!(e.lines, vec!["x = 1"]);
+    }
+
+    /// #1161: XML comments are `<!-- -->`, so Toggle Block Comment wraps
+    /// the caret's line in them and a second toggle takes them off.
+    #[test]
+    fn toggle_block_comment_wraps_an_xml_line() {
+        let mut e = editor_with("<root>\n  <item id=\"1\">hello</item>\n</root>");
+        e.lang = Some(LangKind::Xml);
+        e.cursor_row = 1;
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines[1], "  <!-- <item id=\"1\">hello</item> -->");
+        assert_eq!(e.lines[0], "<root>");
+        assert_eq!(e.lines[2], "</root>");
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines[1], "  <item id=\"1\">hello</item>");
+    }
+
+    /// #1161: Toggle Line Comment in a language with only block comments
+    /// (XML, HTML) wraps the lines a selection touches, whole, as VS Code
+    /// does, and toggles back.
+    #[test]
+    fn toggle_line_comment_wraps_whole_lines_where_only_block_comments_exist() {
+        let mut e = editor_with("<root>\n  <item id=\"1\">hello</item>\n</root>");
+        e.lang = Some(LangKind::Xml);
+        e.cursor_row = 1;
+        e.cursor_col = 5;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[1], "  <!-- <item id=\"1\">hello</item> -->");
+        e.cursor_row = 1;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[1], "  <item id=\"1\">hello</item>");
+
+        let mut e = editor_with("<ul>\n  <li>a</li>\n  <li>b</li>\n</ul>");
+        e.lang = Some(LangKind::Html);
+        e.selection = Some(EditorSelection {
+            anchor: (1, 5),
+            head: (2, 3),
+        });
+        assert!(e.toggle_line_comment());
+        assert_eq!(
+            e.lines,
+            vec!["<ul>", "  <!-- <li>a</li>", "  <li>b</li> -->", "</ul>"]
+        );
+    }
+
+    /// #1161, negative: a selection ending at the start of a line leaves
+    /// that line out, a language with a line comment keeps it, and one with
+    /// neither (JSON, Plain Text) still does nothing.
+    #[test]
+    fn toggle_line_comment_falls_back_only_without_a_line_comment() {
+        let mut e = editor_with("<a/>\n<b/>\n<c/>");
+        e.lang = Some(LangKind::Xml);
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (1, 0),
+        });
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["<!-- <a/> -->", "<b/>", "<c/>"]);
+
+        let mut e = editor_with("let x = 1;");
+        e.lang = Some(LangKind::Rust);
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["// let x = 1;"]);
+
+        for lang in [Some(LangKind::Json), Some(LangKind::Yaml), None] {
+            let mut e = editor_with("{}");
+            e.lang = lang;
+            let changed = e.toggle_line_comment();
+            assert_eq!(changed, lang == Some(LangKind::Yaml), "{lang:?}");
+            if lang != Some(LangKind::Yaml) {
+                assert_eq!(e.lines, vec!["{}"], "{lang:?}");
+            }
+        }
     }
 
     // ---- Toggle Block Comment (Shift+Alt+A) ----
