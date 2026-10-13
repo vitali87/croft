@@ -291,6 +291,16 @@ impl DapTransport {
         Self::from_stream(stream, None)
     }
 
+    /// Connect to a DAP server something else already started (#1417), once
+    /// and without the spawn-window retry: nothing is coming up behind it, so
+    /// a refused or silent endpoint fails fast instead of holding the caller.
+    /// Every resolved address is tried, so a `localhost` that resolves to
+    /// `::1` first still reaches an IPv4-only listener.
+    pub fn connect_tcp_once(host: &str, port: u16) -> Result<DapTransport> {
+        let stream = connect_once(host, port)?;
+        Self::from_stream(stream, None)
+    }
+
     /// Wire a connected TCP stream into a transport: a reader thread frames the
     /// read half into `incoming`, the write half is the boxed writer.
     fn from_stream(stream: std::net::TcpStream, child: Option<Child>) -> Result<DapTransport> {
@@ -460,6 +470,31 @@ fn connect_with_retry(host: &str, port: u16) -> Result<std::net::TcpStream> {
     ))
 }
 
+/// One connect attempt per resolved address of `host:port`, each bounded by
+/// a short timeout; the first that answers wins, else the last error.
+fn connect_once(host: &str, port: u16) -> Result<std::net::TcpStream> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("resolving {host}:{port}"))?;
+    let mut last_err = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(1000)) {
+            Ok(stream) => {
+                let _ = stream.set_nodelay(true);
+                return Ok(stream);
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(anyhow::anyhow!(
+        "could not connect to debug server at {host}:{port}: {}",
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| String::from("no address"))
+    ))
+}
+
 /// Pick a currently-free TCP port on localhost by binding to port 0 and reading
 /// back the assigned port. There is a tiny race between releasing it here and
 /// the debug server binding it, but it is the standard way editors hand a port
@@ -562,6 +597,25 @@ fn reader_loop<R: Read>(source: R, tx: Sender<Value>, teardown: &(Mutex<Teardown
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// #1417: a direct attach to a port nobody serves fails at once rather
+    /// than sitting out the spawn-retry window with the UI held.
+    #[test]
+    fn connect_once_fails_fast_when_nothing_listens() {
+        let port = free_port().unwrap();
+        let started = std::time::Instant::now();
+        assert!(connect_once("127.0.0.1", port).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    /// #1417: every resolved address is tried, so `localhost` reaches an
+    /// IPv4-only listener even where it resolves to `::1` first.
+    #[test]
+    fn connect_once_tries_every_resolved_address() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(connect_once("localhost", port).is_ok());
+    }
 
     #[test]
     fn encode_prepends_content_length_header() {

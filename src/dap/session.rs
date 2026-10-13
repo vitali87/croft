@@ -1148,7 +1148,7 @@ impl DapSession {
         attach_request: Value,
         breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
     ) -> Result<DapSession> {
-        let transport = DapTransport::connect_tcp(host, port)?;
+        let transport = DapTransport::connect_tcp_once(host, port)?;
         transport.send(initialize_request())?;
         transport.send(attach_request)?;
         let mut session = Self::new_with_transport(transport, breakpoints, None);
