@@ -52,6 +52,7 @@ mod inline_complete;
 mod install_session;
 mod iterm2;
 mod iterm2_inline;
+mod jsonc_edit;
 mod keymap;
 mod launcher;
 mod live_run;
