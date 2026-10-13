@@ -56175,6 +56175,7 @@ fn a_folded_strips_menu_offers_nothing_that_acts_on_the_active_pane() {
         "Open Scrollback in Editor",
         "Exclude from Broadcast",
         "Include in Broadcast",
+        "Split Terminal",
     ] {
         assert!(
             !folded.iter().any(|l| l == entry),
@@ -56183,7 +56184,8 @@ fn a_folded_strips_menu_offers_nothing_that_acts_on_the_active_pane() {
     }
     assert!(
         folded.iter().any(|l| l == "Rename Terminal")
-            && folded.iter().any(|l| l == "Expand Terminal"),
+            && folded.iter().any(|l| l == "Expand Terminal")
+            && folded.iter().any(|l| l == "Kill Terminal"),
         "the entries that carry their own index stay: {folded:?}"
     );
 
@@ -56200,6 +56202,7 @@ fn a_folded_strips_menu_offers_nothing_that_acts_on_the_active_pane() {
     let expanded = labels(&app);
     for entry in [
         "Paste",
+        "Split Terminal",
         "Quick Select",
         "Copy Mode",
         "Command History",
@@ -81117,5 +81120,127 @@ fn go_and_lint_rows_reach_problems_only_for_real_files() {
             (String::from("app.py"), 1, String::from("no-column")),
             (String::from("main.go"), 3, String::from("go")),
         ]
+    );
+}
+
+/// #1598: GNOME Terminal and Konsole keep Ctrl+Shift+T / W for their own New
+/// Tab and Close Tab, so the pane menu carries Split Terminal and Kill
+/// Terminal, as VS Code's does. Kill closes the pane that was right-clicked,
+/// not whichever one had focus.
+#[test]
+fn the_pane_menu_splits_and_kills_terminals() {
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(2);
+    let right_click = |app: &mut App, term: &mut ratatui::Terminal<_>, idx: usize| {
+        term.draw(|f| app.render(f)).unwrap();
+        app.context_menu = None;
+        let area = app.terminals[idx].last_area;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            area.x + 1,
+            area.y + 1,
+        ));
+        app.context_menu
+            .as_ref()
+            .expect("a right-click opens the pane menu")
+            .items
+            .iter()
+            .filter_map(|e| match e {
+                MenuEntry::Item { label, action } => Some((label.clone(), action.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let pick = |items: &[(String, MenuAction)], label: &str| {
+        items
+            .iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, a)| a.clone())
+            .unwrap_or_else(|| panic!("no {label:?} in {items:?}"))
+    };
+    let tmp_root = app.tree.root.clone();
+
+    let items = right_click(&mut app, &mut term, 1);
+    assert_eq!(shortcut_for(&pick(&items, "Split Terminal")), Some("⌘T"));
+    assert_eq!(shortcut_for(&pick(&items, "Kill Terminal")), Some("⌘W"));
+    app.dispatch_menu_action(pick(&items, "Split Terminal"), tmp_root.clone());
+    assert_eq!(app.terminals.len(), 3, "{}", app.status);
+    assert!(
+        app.status.contains("Split terminal: 3 active"),
+        "{}",
+        app.status
+    );
+
+    // Kill acts on the pane right-clicked even when another has focus.
+    let doomed = app.terminals[0].uid();
+    let items = right_click(&mut app, &mut term, 0);
+    app.active_terminal = 2;
+    app.dispatch_menu_action(pick(&items, "Kill Terminal"), tmp_root.clone());
+    assert_eq!(app.terminals.len(), 2);
+    assert!(
+        app.terminals.iter().all(|t| t.uid() != doomed),
+        "the right-clicked pane is the one that closed"
+    );
+    assert!(
+        app.status.contains("Closed terminal: 2 remaining"),
+        "{}",
+        app.status
+    );
+}
+
+/// #1598 negative: a lone pane cannot be closed (`Cmd+W` refuses the last
+/// terminal), so its menu offers no Kill Terminal that would do nothing;
+/// Split is still there.
+#[test]
+fn a_lone_terminals_menu_offers_split_but_no_kill() {
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(1);
+    term.draw(|f| app.render(f)).unwrap();
+    let area = app.terminals[0].last_area;
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        area.x + 1,
+        area.y + 1,
+    ));
+    let labels = menu_labels(&app.context_menu.as_ref().expect("the pane menu").items);
+    assert!(labels.contains(&"Split Terminal"), "{labels:?}");
+    assert!(!labels.contains(&"Kill Terminal"), "{labels:?}");
+}
+
+/// #1598: LINUX.md's way to copy, close and split terminal panes without
+/// `Super` must work in GNOME Terminal and Konsole, which keep
+/// `Ctrl`+`Shift`+`C` / `W` / `T` for themselves: each row names the pane
+/// menu entry, and the Ctrl+Shift chords are no longer the whole answer.
+#[test]
+fn linux_terminal_pane_fallbacks_name_the_pane_menu() {
+    let doc = include_str!("../../docs/LINUX.md");
+    let row = |first: &str| -> &str {
+        doc.lines()
+            .find(|l| l.starts_with(&format!("| {first} |")))
+            .unwrap_or_else(|| panic!("no LINUX.md row {first:?}"))
+            .trim_matches('|')
+            .split(" | ")
+            .nth(2)
+            .unwrap()
+            .trim()
+    };
+    let copy_close = row(
+        "`Cmd`+`C` / `Cmd`+`W` copy the selection / close the active terminal, in the terminal pane",
+    );
+    let split = row("`Cmd`+`T` split terminal");
+    for (cell, entries) in [
+        (copy_close, &["Copy", "Kill Terminal"][..]),
+        (split, &["Split Terminal"][..]),
+    ] {
+        assert!(cell.contains("right-click menu"), "{cell}");
+        for entry in entries {
+            assert!(cell.contains(entry), "{entry} missing from {cell}");
+        }
+        assert!(
+            !cell.starts_with("`Ctrl`+`Shift`"),
+            "the host terminal's own chord is not the fallback: {cell}"
+        );
+    }
+    assert!(
+        doc.contains("GNOME Terminal and Konsole keep `Ctrl`+`Shift`+`C`, `W` and `T`"),
+        "LINUX.md says why the Ctrl+Shift chords do not reach croft there"
     );
 }
