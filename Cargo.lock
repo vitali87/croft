@@ -621,6 +621,7 @@ dependencies = [
  "crossterm",
  "csv",
  "encoding_rs",
+ "fancy-regex 0.18.0",
  "flate2",
  "futures",
  "globset",
