@@ -834,11 +834,7 @@ fn git_status_spans<'a>(status: &'a crate::git::GitStatus) -> Vec<Span<'a>> {
     // activity-bar Source Control icon, so the status-bar branch indicator
     // and the SCM panel share the same visual mark.
     spans.push(Span::styled("\u{ea68} ", Style::default().fg(pill_color)));
-    let label: &str = match (&status.branch, &status.detached_hash) {
-        (Some(b), _) => b.as_str(),
-        (None, Some(h)) => h.as_str(),
-        (None, None) => "(no head)",
-    };
+    let label = status.head_label();
     spans.push(Span::styled(
         label,
         Style::default().fg(pill_color).add_modifier(Modifier::BOLD),
@@ -3599,6 +3595,15 @@ pub struct App {
     /// is waiting for the next bake (see [`MINIMAP_EDIT_REBAKE`]).
     minimap_baked_at: Option<std::time::Instant>,
     minimap_edit_pending: bool,
+    /// The strip was last drawn as braille text, where the terminal cannot
+    /// draw images (#1231); `minimap_content_h` then counts dot rows.
+    minimap_text: bool,
+    /// The braille cells for the text strip, rebuilt only when the same
+    /// signature the image bake keys on changes.
+    minimap_text_cache: Option<(MinimapSig, Vec<BrailleCell>)>,
+    /// Whether the editor was wide enough for the strip on the last frame,
+    /// so turning the minimap on can say why it does not show.
+    minimap_room: bool,
     /// The buffer ratatui drew last, and what each small chrome image (the
     /// PROBLEMS badge, Run and Debug icon, sidebar illustrations) was sent
     /// over, keyed by overlay, for [`App::chrome_image_due`]. Keys not
@@ -3661,6 +3666,10 @@ pub struct App {
     /// The `agents.json` row a new worktree lane starts in its pane (#348);
     /// `None` opens a plain shell. From `lane_agent` in settings.json.
     lane_agent: Option<String>,
+    /// The colour depth each frame is fitted to before it is written
+    /// (#1433): the `color_depth` setting, else what the terminal's
+    /// environment advertises.
+    pub(crate) color_depth: crate::color_depth::ColorDepth,
     /// Which panes are worktree lanes' (#348), by pane uid: saved with the
     /// terminal session so a relaunch seats the agent again, and consulted
     /// when a lane closes so its pane goes with it.
@@ -3777,7 +3786,8 @@ pub struct App {
     /// nothing has changed since.
     remote_handoff_ok: Option<u64>,
     /// Hot exit (#862): the directory this croft backs its unsaved buffers
-    /// up under (`~/.cache/croft/hot-exit`). `None` keeps no backups, as
+    /// up under (`~/.local/state/croft/hot-exit`, see [`user_data_dir`]).
+    /// `None` keeps no backups, as
     /// under test unless a test points it at a tempdir.
     pub hot_exit_dir: Option<PathBuf>,
     /// The [`App::unsaved_stamp`] this croft's backup on disk was written
@@ -5095,6 +5105,59 @@ const MINIMAP_EDIT_REBAKE: std::time::Duration = std::time::Duration::from_milli
 /// exactly as a plain whole-file fit would, so normal files are unaffected.
 const MINIMAP_MAX_LINE_PX: u32 = 6;
 
+/// Source characters folded into one braille dot column of the text minimap,
+/// so the 6-cell strip spans 48 columns of code, like the image's 1px a char.
+const MINIMAP_TEXT_CHARS_PER_DOT: u32 = 4;
+
+/// One cell of the text minimap: its braille glyph and ink colour, or `None`
+/// for a blank cell.
+type BrailleCell = Option<(char, (u8, u8, u8))>;
+
+/// Fold a minimap raster into braille cells for terminals that cannot draw
+/// images (#1231): each cell is 2x4 dots, each dot `MINIMAP_TEXT_CHARS_PER_DOT`
+/// raster columns wide and one raster row tall, lit when any of its pixels is
+/// ink (not `bg`). A cell takes the colour of its first lit pixel. Cells come
+/// back row-major, `cell_w` to a row.
+fn braille_minimap(
+    rgba: &[u8],
+    w: u32,
+    h: u32,
+    bg: (u8, u8, u8),
+    cell_w: u16,
+    cell_h: u16,
+) -> Vec<BrailleCell> {
+    // Braille dot bits by (dot column, dot row), U+2800 + bits.
+    const BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
+    let xs = MINIMAP_TEXT_CHARS_PER_DOT;
+    let ink = |x: u32, y: u32| -> Option<(u8, u8, u8)> {
+        if x >= w || y >= h {
+            return None;
+        }
+        let i = ((y * w + x) * 4) as usize;
+        let px = (rgba[i], rgba[i + 1], rgba[i + 2]);
+        (px != bg).then_some(px)
+    };
+    let mut cells = Vec::with_capacity(cell_w as usize * cell_h as usize);
+    for cy in 0..cell_h as u32 {
+        for cx in 0..cell_w as u32 {
+            let mut bits = 0u8;
+            let mut colour = None;
+            for (dx, column) in BITS.iter().enumerate() {
+                for (dy, bit) in column.iter().enumerate() {
+                    let y = cy * 4 + dy as u32;
+                    let x0 = (cx * 2 + dx as u32) * xs;
+                    if let Some(px) = (x0..x0 + xs).find_map(|x| ink(x, y)) {
+                        bits |= bit;
+                        colour.get_or_insert(px);
+                    }
+                }
+            }
+            cells.push(colour.map(|c| (char::from_u32(0x2800 + bits as u32).unwrap_or(' '), c)));
+        }
+    }
+    cells
+}
+
 /// Cached full-document raster for the minimap. The expensive part (walking
 /// every line's syntax spans) runs only when `sig` changes; scrolling reuses
 /// `rgba` and just re-composites the viewport box on top.
@@ -5597,8 +5660,11 @@ impl App {
         }
         let loaded_prefs = merged_settings.prefs.clone();
         let (review_tx, review_rx) = std::sync::mpsc::channel();
-        let notes_path = (!cfg!(test))
-            .then(|| crate::sticky_notes::Notes::store_path(&croft_cache_dir(), &root));
+        let data_dir =
+            (!cfg!(test)).then(|| user_data_dir(&croft_cache_dir(), &crate::prefs::state_dir()));
+        let notes_path = data_dir
+            .as_deref()
+            .map(|dir| crate::sticky_notes::Notes::store_path(dir, &root));
         if !cfg!(test) {
             crate::i18n::init(loaded_prefs.locale.as_deref());
         }
@@ -5971,6 +6037,9 @@ impl App {
             minimap_content_h: 0,
             minimap_baked_at: None,
             minimap_edit_pending: false,
+            minimap_text: false,
+            minimap_text_cache: None,
+            minimap_room: true,
             drawn_buffer: None,
             chrome_sent: std::collections::HashMap::new(),
             chrome_seen: std::collections::HashSet::new(),
@@ -5996,6 +6065,13 @@ impl App {
                 std::time::SystemTime::now(),
             ),
             lane_agent: loaded_prefs.lane_agent.clone(),
+            color_depth: loaded_prefs
+                .color_depth
+                .as_deref()
+                .and_then(crate::color_depth::ColorDepth::from_setting)
+                .unwrap_or_else(|| {
+                    crate::color_depth::ColorDepth::detect(|name| std::env::var(name).ok())
+                }),
             lane_panes: std::collections::BTreeMap::new(),
             tree_clipboard: None,
             tree_typeahead: None,
@@ -6026,11 +6102,7 @@ impl App {
             pending_revert_hunk: None,
             pending_unsaved: None,
             remote_handoff_ok: None,
-            hot_exit_dir: if cfg!(test) {
-                None
-            } else {
-                Some(croft_cache_dir().join("hot-exit"))
-            },
+            hot_exit_dir: data_dir.as_deref().map(|dir| dir.join("hot-exit")),
             hot_exit_written: None,
             hot_exit_retry_at: None,
             hot_exit_consumed: Vec::new(),
@@ -9538,6 +9610,15 @@ impl App {
     }
 
     fn on_mouse_moved(&mut self, col: u16, row: u16, in_editor: bool) {
+        // Crossing onto the hover keeps it, so the wheel can reach it.
+        if self
+            .hover_popup
+            .as_ref()
+            .is_some_and(|p| rect_contains(p.last_area, col, row))
+        {
+            self.hover.clear();
+            return;
+        }
         // Activity-bar hover: brighten the icon under the pointer. Re-emit the
         // swapped pre-baked image only when the hovered icon actually changes,
         // so a pointer drifting within one icon (or anywhere else) costs
@@ -10427,7 +10508,9 @@ impl App {
     /// entries because the fresh scan is empty. Relative tool paths resolve
     /// against the command's cwd (falling back to the workspace root);
     /// resolution is lexical, no filesystem probe, so a path the tool
-    /// printed oddly still gets a row even if navigation later misses.
+    /// printed oddly still gets a row even if navigation later misses. The
+    /// exception is the loose go and lint rows (#1594), kept only for a
+    /// file that exists, so other `name:1:2: text` output is not a problem.
     pub(crate) fn apply_build_scan(
         &mut self,
         pane: u64,
@@ -10489,6 +10572,9 @@ impl App {
                     base.join(p)
                 }
             };
+            if d.needs_file && !path.is_file() {
+                continue;
+            }
             let entry = self.build_diagnostics.entry(path.clone()).or_default();
             // Unconditionally: recording only when the entry was empty meant
             // the SECOND producer to reach a file never listed it, so its
@@ -10611,7 +10697,13 @@ impl App {
             let mut items: Vec<ProblemItem> = Vec::new();
             if let Some(by_server) = self.lsp_diagnostics.get(path) {
                 for (server, diags) in by_server {
-                    for d in diags {
+                    // Hints (unused names, unreachable code) stay in the
+                    // editor and its hover, out of the list and its count,
+                    // as in VS Code (#1522).
+                    let shown = diags
+                        .iter()
+                        .filter(|d| d.severity != crate::lsp::manager::DiagnosticSeverity::Hint);
+                    for d in shown {
                         items.push(ProblemItem {
                             line: d.start_line,
                             col: d.start_char,
@@ -10624,7 +10716,14 @@ impl App {
                 }
             }
             if let Some(build) = self.build_diagnostics.get(path) {
-                items.extend(build.iter().map(|(_, item)| item.clone()));
+                // A task matcher can emit `hint` too; same rule (#1522).
+                items.extend(
+                    build
+                        .iter()
+                        .map(|(_, item)| item)
+                        .filter(|i| i.severity != crate::lsp::manager::DiagnosticSeverity::Hint)
+                        .cloned(),
+                );
             }
             if items.is_empty() {
                 continue;
@@ -10884,6 +10983,7 @@ impl App {
     }
 
     fn go_to_definition(&mut self, path: PathBuf, line: u32, col: u32) {
+        let pinned = self.keep_preview_open_for_navigation_to(&path);
         if let Some(from) = self.editor.path.clone() {
             self.nav.record(NavLoc {
                 path: from,
@@ -10896,7 +10996,10 @@ impl App {
             Ok(()) => {
                 self.status = format!("Jumped to {} line {}", self.status_path(&path), line + 1)
             }
-            Err(e) => self.status = format!("Go to definition failed: {e}"),
+            Err(e) => {
+                self.restore_preview_after_failed_navigation(pinned);
+                self.status = format!("Go to definition failed: {e}")
+            }
         }
     }
 
@@ -11357,9 +11460,10 @@ impl App {
                 .unwrap_or(encoding_rs::UTF_8);
             let text = enc.decode(&content).0.into_owned();
             let label = std::path::PathBuf::from(format!("{rel} (local snapshot)"));
+            let unsaved = self.unsaved_text_in_any_group(&path);
             if let Err(e) = self
                 .editor
-                .open_head_diff_with_text(label, &text, &path, false)
+                .open_head_diff_with_text_resolved(label, &text, &path, false, unsaved)
             {
                 self.status = format!("Could not open snapshot diff: {e}");
                 return;
@@ -12102,16 +12206,28 @@ impl App {
                 OnTypeReply::Apply => self.on_type_request = None,
             }
             if let Some(edits) = result.edits.filter(|e| !e.is_empty())
-                && self
-                    .editor
-                    .apply_rename_to_open_tab(&result.path, &edits)
-                    .is_some()
+                && self.apply_on_type_edits(&result.path, &edits)
             {
-                self.editor.clamp_cursor();
                 changed = true;
             }
         }
         changed
+    }
+
+    /// Apply an on-type formatting reply for `path`, the active tab's file
+    /// (the reply's disposition checked that), keeping the caret beside the
+    /// text that was just typed.
+    pub(crate) fn apply_on_type_edits(
+        &mut self,
+        path: &std::path::Path,
+        edits: &[crate::widgets::editor::TextSpanEdit],
+    ) -> bool {
+        if self.editor.path.as_deref() == Some(path) {
+            return self.editor.apply_span_edits_moving_caret(edits) > 0;
+        }
+        let applied = self.editor.apply_rename_to_open_tab(path, edits).is_some();
+        self.editor.clamp_cursor();
+        applied
     }
 
     /// Linked editing (#254): replay the last keystroke across the
@@ -13290,18 +13406,91 @@ impl App {
         })
     }
 
+    /// Run one key or mouse gesture, and when it moved the editor to
+    /// another file without going through the navigation history itself
+    /// (Quick Open, a Search result, the Explorer, a tab), record where the
+    /// user left (#1635): Go Back knew only the jumps that recorded
+    /// themselves, so the usual way of changing file left nothing to go
+    /// back to. A gesture that recorded or walked the history (Go to
+    /// Definition, Go Back itself) is left as it did it, and so is one that
+    /// moved focus to another editor group: a history entry holds no group,
+    /// so Go Back would reopen that group's file in the focused one.
+    fn recording_file_switches<R>(&mut self, gesture: impl FnOnce(&mut Self) -> R) -> R {
+        let left = self.current_nav_loc();
+        let changes = self.nav.changes();
+        let group = self.editor_group_identity();
+        let result = gesture(self);
+        if let Some(left) = left
+            && self.nav.changes() == changes
+            && self.editor_group_identity() == group
+            && self.editor.path.as_ref() != Some(&left.path)
+        {
+            self.nav.record(left);
+        }
+        result
+    }
+
+    /// Which editor group has focus, as the split's leaf count and the
+    /// focused leaf's position: a change in either is a group change.
+    fn editor_group_identity(&self) -> (usize, usize) {
+        (
+            self.editor_layout.leaf_count(),
+            self.editor_layout.active_dfs_index(),
+        )
+    }
+
+    /// A code navigation that leaves the active tab for another file keeps
+    /// that tab open (#1561), as VS Code does by default
+    /// (`enablePreviewFromCodeNavigation` off): were it the preview, the
+    /// target would take its slot and close the file being read, and Go
+    /// Back would swap them again. A jump within the same file replaces
+    /// nothing, so the tab stays a preview.
+    ///
+    /// The target counts as the same file under the editor's own path
+    /// matching (canonicalized), so a symlinked tab and the canonical path
+    /// a language server answers with are one file. Returns whether the tab
+    /// was promoted, for [`Self::restore_preview_after_failed_navigation`].
+    fn keep_preview_open_for_navigation_to(&mut self, target: &Path) -> bool {
+        let same_file = self.editor.path.as_deref().is_some_and(|p| {
+            p == target
+                || matches!(
+                    (p.canonicalize(), target.canonicalize()),
+                    (Ok(a), Ok(b)) if a == b
+                )
+        });
+        if !same_file && self.editor.is_preview(self.editor.active_index()) {
+            self.editor.pin_active();
+            return true;
+        }
+        false
+    }
+
+    /// A navigation whose target failed to open (a stale language-server
+    /// answer, a file deleted since it entered the history) left the user
+    /// on the tab it started from, so that tab goes back to being the
+    /// preview it was before [`Self::keep_preview_open_for_navigation_to`].
+    fn restore_preview_after_failed_navigation(&mut self, pinned: bool) {
+        if pinned {
+            self.editor.preview = true;
+        }
+    }
+
     fn nav_back(&mut self) {
         let current = self.current_nav_loc();
         let Some(loc) = self.nav.back(current) else {
             self.status = "No previous location".to_string();
             return;
         };
+        let pinned = self.keep_preview_open_for_navigation_to(&loc.path);
         let line = loc.row;
         match self.open_at(&loc.path, loc.row, loc.col) {
             Ok(()) => {
                 self.status = format!("Back to {} line {}", self.status_path(&loc.path), line + 1)
             }
-            Err(e) => self.status = format!("Go back failed: {e}"),
+            Err(e) => {
+                self.restore_preview_after_failed_navigation(pinned);
+                self.status = format!("Go back failed: {e}")
+            }
         }
     }
 
@@ -13313,6 +13502,7 @@ impl App {
             self.status = "No forward location".to_string();
             return;
         };
+        let pinned = self.keep_preview_open_for_navigation_to(&loc.path);
         let line = loc.row;
         match self.open_at(&loc.path, loc.row, loc.col) {
             Ok(()) => {
@@ -13322,7 +13512,10 @@ impl App {
                     line + 1
                 )
             }
-            Err(e) => self.status = format!("Go forward failed: {e}"),
+            Err(e) => {
+                self.restore_preview_after_failed_navigation(pinned);
+                self.status = format!("Go forward failed: {e}")
+            }
         }
     }
 
@@ -13764,6 +13957,11 @@ impl App {
             return false;
         }
         self.prepare_rename_request = None;
+        // The verdict is in, whichever way it went: "Preparing rename…" no
+        // longer describes anything (it stayed up beside the open prompt).
+        if self.status == "Preparing rename…" {
+            self.status.clear();
+        }
         if self.editor.path.as_deref() != Some(path.as_path()) || self.editor.edit_seq != seq {
             // The caret moved on (an edit, or a tab switch — which also
             // bumps edit_seq). Say so: bailing silently would strand
@@ -14577,6 +14775,28 @@ impl App {
         self.status = format!("Conflict {} of {total}", idx + 1);
     }
 
+    /// The range a Quick Fix asks the server about, as UTF-16 `(line, col)`
+    /// start and end, with the diagnostics on its lines as context: the
+    /// selection when there is one (VS Code sends it, so selection-scoped
+    /// refactors like Extract Function are offered), else the caret point.
+    #[allow(clippy::type_complexity)]
+    fn code_action_request(
+        &self,
+    ) -> ((u32, u32), (u32, u32), Vec<crate::lsp::manager::Diagnostic>) {
+        let ((sr, sc), (er, ec)) = match self.editor.selection.filter(|s| s.has_area()) {
+            Some(sel) => sel.normalised(),
+            None => {
+                let caret = (self.editor.cursor_row, self.editor.cursor_col);
+                (caret, caret)
+            }
+        };
+        let start = self.editor.pos_to_utf16(sr, sc);
+        let end = self.editor.pos_to_utf16(er, ec);
+        // Rows are plain line numbers, unaffected by the UTF-16 columns.
+        let diagnostics = self.editor.diagnostics_in_line_range(start.0, end.0);
+        (start, end, diagnostics)
+    }
+
     fn start_code_action(&mut self) {
         if self.editor.has_non_text_view() {
             return;
@@ -14594,17 +14814,12 @@ impl App {
             self.status = String::from("No file open");
             return;
         };
-        // `row`/`col` go to the server, so the column must be UTF-16;
-        // `diagnostics_in_line_range` takes a plain row and is unaffected.
-        let (row, col) = self
-            .editor
-            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
-        let diagnostics = self.editor.diagnostics_in_line_range(row, row);
+        let ((sr, sc), (er, ec), diagnostics) = self.code_action_request();
         let Some(lsp) = self.lsp.as_mut() else {
             self.status = String::from("No language server for this file");
             return;
         };
-        let id = lsp.request_code_action(path, row, col, row, col, diagnostics);
+        let id = lsp.request_code_action(path, sr, sc, er, ec, diagnostics);
         self.code_action_request_id = Some(id);
         self.code_action_pending_resolve = false;
         self.code_action_baseline = self.editor.edit_seqs();
@@ -16343,7 +16558,7 @@ impl App {
             if self.terminal_find.is_some() && self.terminal_find_pane == idx {
                 self.terminal_find_match = None;
                 self.terminals[idx].set_current_match(None, 0);
-                let (lines, _top) = self.terminals[idx].grid_lines();
+                let lines = find_texts(self.terminals[idx].find_lines());
                 if let Some(state) = self.terminal_find.as_mut() {
                     state.set_match_count(
                         crate::widgets::editor_find::count_matches(
@@ -18805,6 +19020,13 @@ impl App {
         }
     }
 
+    /// Render the frame the terminal is sent: [`Self::render`], with every
+    /// colour fitted to the terminal's depth (#1433).
+    fn render_for_terminal(&mut self, frame: &mut ratatui::Frame) {
+        self.render(frame);
+        self.color_depth.fit_buffer(frame.buffer_mut());
+    }
+
     fn render(&mut self, frame: &mut ratatui::Frame) {
         // Set again by the welcome panel when it paints the button.
         self.welcome_tour_button = Rect::default();
@@ -19334,6 +19556,17 @@ impl App {
             let paint_history = self.scrub_view.is_some();
             let active_idx = self.editor_layout.active_dfs_index();
             let focused_area = if self.editor_layout.is_split() {
+                let mut rects = rects;
+                // The active group carries the minimap (#1231).
+                let minimap = self.carve_minimap(rects[active_idx]);
+                if let Some((ed_rect, full_strip, _)) = minimap {
+                    frame.render_widget(
+                        ratatui::widgets::Block::default()
+                            .style(Style::default().bg(self.theme.editor_bg())),
+                        full_strip,
+                    );
+                    rects[active_idx] = ed_rect;
+                }
                 let active_area = rects[active_idx];
                 frame.render_widget(&mut self.editor, active_area);
                 let inactive_rects: Vec<Rect> = rects
@@ -19362,9 +19595,10 @@ impl App {
                     self.update_editor_image_overlay(0, active_area);
                     self.disable_editor_image(1);
                 }
-                // ponytail: no minimap while the editor is split; per-group
-                // minimaps when someone asks for them.
-                self.disable_minimap_image();
+                match minimap {
+                    Some((_, _, img_rect)) => self.paint_minimap(frame, img_rect),
+                    None => self.disable_minimap_image(),
+                }
                 active_area
             } else if let Some((ed_rect, full_strip, img_rect)) = self.carve_minimap(editor_area) {
                 // Bg-fill the whole strip column so no stale cells show
@@ -19379,7 +19613,7 @@ impl App {
                 self.editor_seams.clear();
                 self.update_editor_image_overlay(0, ed_rect);
                 self.disable_editor_image(1);
-                self.update_minimap_overlay(img_rect);
+                self.paint_minimap(frame, img_rect);
                 ed_rect
             } else {
                 frame.render_widget(&mut self.editor, editor_area);
@@ -20408,6 +20642,7 @@ impl App {
         if let Some(popup) = self.hover_popup.as_mut() {
             popup.theme = self.theme;
             let area = popup.area_for(frame.area());
+            popup.last_area = area;
             if area.width > 0 && area.height > 0 {
                 frame.render_widget(&*popup, area);
             }
@@ -22271,23 +22506,25 @@ impl App {
             // Cmd+K C: diff the active file against the compare anchor.
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'c') => {
                 match (self.compare_anchor.clone(), self.editor.path.clone()) {
-                    (Some(anchor), Some(other)) => match self.editor.open_diff(&anchor, &other) {
-                        Ok(()) => {
-                            self.focus_pane(Pane::Editor);
-                            self.compare_anchor = None;
-                            self.sync_open_file_poll_mtime();
-                            let l = anchor
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| anchor.display().to_string());
-                            let r = other
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| other.display().to_string());
-                            self.status = format!("Diff: {l} \u{2194} {r}");
+                    (Some(anchor), Some(other)) => {
+                        match self.open_diff_across_groups(&anchor, &other) {
+                            Ok(()) => {
+                                self.focus_pane(Pane::Editor);
+                                self.compare_anchor = None;
+                                self.sync_open_file_poll_mtime();
+                                let l = anchor
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| anchor.display().to_string());
+                                let r = other
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| other.display().to_string());
+                                self.status = format!("Diff: {l} \u{2194} {r}");
+                            }
+                            Err(e) => self.status = format!("Diff failed: {e}"),
                         }
-                        Err(e) => self.status = format!("Diff failed: {e}"),
-                    },
+                    }
                     (None, _) => {
                         self.status = String::from("Compare with Selected: nothing selected yet")
                     }
@@ -22573,7 +22810,7 @@ impl App {
         }
         let capture =
             self.macro_recording.is_some() && !self.macro_replaying && self.focus == Pane::Editor;
-        let result = self.handle_key_inner(key);
+        let result = self.recording_file_switches(|app| app.handle_key_inner(key));
         // Focus is re-checked after dispatch too: a key that hands focus to
         // the terminal would otherwise be recorded while everything after it
         // is dropped, producing a macro that replays a focus change and then
@@ -23966,6 +24203,7 @@ impl App {
         match key.code {
             KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
             KeyCode::Enter => self.run_all_tests(),
+            KeyCode::Char('s' | 'S') if self.testing.is_busy() => self.cancel_test_run(),
             KeyCode::Char('r' | 'R') => self.discover_tests(),
             KeyCode::Char('w' | 'W') => {
                 self.toggle_test_watch(crate::testing::watch::WatchScope::All)
@@ -23989,6 +24227,33 @@ impl App {
             self.status = String::from("The test runner has not written any output yet");
         }
         self.set_bottom_panel_tab(BottomPanelTab::Output);
+    }
+
+    /// A new run while one is in flight is refused with the way out
+    /// (#1534): it used to be dropped without a word, and a hung test left
+    /// the view refusing every run until croft quit.
+    fn refuse_test_run_while_busy(&mut self) -> bool {
+        if !self.testing.is_busy() {
+            return false;
+        }
+        self.status = String::from(TEST_RUN_IN_PROGRESS);
+        // The run in flight still reports its outcome over this (#856).
+        if let Some(run) = self.test_run_status.as_mut() {
+            run.shown = self.status.clone();
+        }
+        true
+    }
+
+    /// Testing: Cancel Test Run, `s` in the Testing view, or its Stop
+    /// control (#1534): kill the run or discovery in flight. The panel
+    /// settles when the worker reports the run's end.
+    fn cancel_test_run(&mut self) {
+        if !self.testing.is_busy() {
+            self.status = String::from("No test run in progress");
+            return;
+        }
+        self.test_worker.cancel();
+        self.status = String::from("Cancelling test run");
     }
 
     /// Whether an enabled runner extension claims this workspace. When none
@@ -24028,12 +24293,14 @@ impl App {
     /// stream into the tree as usual; the report lands in the editor's
     /// gutter, the status bar and the Testing summary.
     fn run_all_tests_with_coverage(&mut self) {
-        if self.testing.is_busy() || !self.testing_runner_available() {
+        if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
-        self.test_worker.run_coverage();
-        self.set_sidebar_view(SidebarView::Testing);
-        self.status = String::from("Running tests with coverage");
+        self.test_run_with_unsaved_saved(|app| {
+            app.test_worker.run_coverage();
+            app.set_sidebar_view(SidebarView::Testing);
+            app.status = String::from("Running tests with coverage");
+        });
     }
 
     /// Fold a finished coverage run into the editor, and keep the active
@@ -24354,8 +24621,7 @@ impl App {
             );
             return;
         }
-        if self.testing.is_busy() {
-            self.status = String::from("Tests are already running");
+        if self.refuse_test_run_while_busy() {
             return;
         }
         self.run_all_tests();
@@ -24436,22 +24702,26 @@ impl App {
     /// Kick off a full test run on the worker (no-op if a run/discovery is
     /// already in flight) and reveal the Testing view so results stream in.
     fn run_all_tests(&mut self) {
-        if self.testing.is_busy() || !self.testing_runner_available() {
+        if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
-        self.test_worker.run_all();
-        self.set_sidebar_view(SidebarView::Testing);
+        self.test_run_with_unsaved_saved(|app| {
+            app.test_worker.run_all();
+            app.set_sidebar_view(SidebarView::Testing);
+        });
     }
 
     /// Run a single test by exact name (click-to-run from the tree). Marks just
     /// that case Running and keeps the rest of the discovered list intact.
     fn run_test(&mut self, name: String) {
-        if self.testing.is_busy() || !self.testing_runner_available() {
+        if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
-        self.testing.start_single(&name);
-        self.test_worker.run_one(name);
-        self.set_sidebar_view(SidebarView::Testing);
+        self.test_run_with_unsaved_saved(|app| {
+            app.testing.start_single(&name);
+            app.test_worker.run_one(name);
+            app.set_sidebar_view(SidebarView::Testing);
+        });
     }
 
     /// Jump the editor to a test's `fn` definition (Cmd/Opt+click in the tree).
@@ -24472,13 +24742,15 @@ impl App {
     /// filter and the panel's marking are substring matches, so the pattern is
     /// anchored (`parse::`) to keep `parse` from sweeping `parse_utils::b`.
     fn run_suite(&mut self, suite: String) {
-        if self.testing.is_busy() || !self.testing_runner_available() {
+        if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
-        self.testing
-            .start_filter(&crate::testing::suite_pattern(&suite));
-        self.test_worker.run_suite(suite);
-        self.set_sidebar_view(SidebarView::Testing);
+        self.test_run_with_unsaved_saved(|app| {
+            app.testing
+                .start_filter(&crate::testing::suite_pattern(&suite));
+            app.test_worker.run_suite(suite);
+            app.set_sidebar_view(SidebarView::Testing);
+        });
     }
 
     /// Run the test the editor caret sits in (Cmd+K Enter / palette). Finds the
@@ -24499,9 +24771,13 @@ impl App {
     /// A leaf unique in the discovered tree resolves to its full name for an
     /// exact run; otherwise cargo's substring filter is the best available.
     fn run_named_test(&mut self, name: String) {
-        if self.testing.is_busy() || !self.testing_runner_available() {
+        if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
+        self.test_run_with_unsaved_saved(|app| app.run_named_test_now(name));
+    }
+
+    fn run_named_test_now(&mut self, name: String) {
         let (run, exact) = match self.testing.sole_case_with_leaf(&name) {
             Some(full) => (full, true),
             None => (name, false),
@@ -24575,9 +24851,13 @@ impl App {
                 String::from("Run Test at Cursor with Coverage: no function at the caret");
             return;
         };
-        if self.testing.is_busy() || !self.testing_runner_available() {
+        if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
+        self.test_run_with_unsaved_saved(|app| app.run_test_at_cursor_with_coverage_now(name));
+    }
+
+    fn run_test_at_cursor_with_coverage_now(&mut self, name: String) {
         let (run, exact) = match self.testing.sole_case_with_leaf(&name) {
             Some(full) => (full, true),
             None => (name, false),
@@ -24602,9 +24882,13 @@ impl App {
     /// suite, under the coverage tool, marked in the tree as a plain run of
     /// it would be. The report replaces the last one.
     fn run_scope_with_coverage(&mut self, name: String, suite: bool) {
-        if self.testing.is_busy() || !self.testing_runner_available() {
+        if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
+        self.test_run_with_unsaved_saved(|app| app.run_scope_with_coverage_now(name, suite));
+    }
+
+    fn run_scope_with_coverage_now(&mut self, name: String, suite: bool) {
         if suite {
             self.testing
                 .start_filter(&crate::testing::suite_pattern(&name));
@@ -30073,14 +30357,14 @@ impl App {
         let language = match parts.next() {
             Some(l) => l.to_string(),
             None => {
-                let out = std::process::Command::new(gh)
-                    .args([
-                        "api",
-                        &format!("/repos/{repo}/code-scanning/codeql/databases"),
-                        "--jq",
-                        ".[].language",
-                    ])
-                    .output()
+                let mut cmd = std::process::Command::new(gh);
+                cmd.args([
+                    "api",
+                    &format!("/repos/{repo}/code-scanning/codeql/databases"),
+                    "--jq",
+                    ".[].language",
+                ]);
+                let out = crate::review_ops::output_retrying_busy(&mut cmd)
                     .map_err(|e| format!("could not run gh: {e}"))?;
                 if !out.status.success() {
                     return Err(format!(
@@ -30110,11 +30394,13 @@ impl App {
         let tmp = cache.join(format!("{name}.download.zip"));
         std::fs::create_dir_all(cache).map_err(|e| e.to_string())?;
         let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-        let out = std::process::Command::new(gh)
-            .args(crate::codeql_db::github_database_args(&repo, &language))
+        let mut cmd = std::process::Command::new(gh);
+        cmd.args(crate::codeql_db::github_database_args(&repo, &language))
             .stdin(std::process::Stdio::null())
             .stdout(file)
-            .output()
+            .stderr(std::process::Stdio::piped());
+        let out = crate::review_ops::spawn_retrying_busy(&mut cmd)
+            .and_then(std::process::Child::wait_with_output)
             .map_err(|e| format!("could not run gh: {e}"))?;
         if !out.status.success() {
             let _ = std::fs::remove_file(&tmp);
@@ -31043,6 +31329,15 @@ impl App {
     /// with `disable_save_before_debug`, is named in front of the launch's
     /// own status.
     fn launch_with_unsaved_saved(&mut self, launch: impl FnOnce(&mut Self)) {
+        self.run_with_unsaved_saved("the launch", launch);
+    }
+
+    /// [`Self::launch_with_unsaved_saved`] for anything that runs the
+    /// project's files: a task, a Testing run (#1639). VS Code saves before
+    /// a task by default (`task.saveBeforeRun`); without it a build or test
+    /// run reported on code the editor had already changed. `what` names
+    /// the run in the warning.
+    fn run_with_unsaved_saved(&mut self, what: &str, launch: impl FnOnce(&mut Self)) {
         if self.save_before_debug && self.unsaved_count() > 0 {
             self.sweep_dirty_buffers(false, false);
         }
@@ -31057,12 +31352,36 @@ impl App {
             [first, rest @ ..] => (format!("{first} and {} more", rest.len()), "have"),
             [] => unreachable!("checked above"),
         };
-        let warning = format!("{names} {verb} unsaved changes: the launch uses the file on disk");
-        self.status = if self.status.is_empty() {
+        let warning = format!("{names} {verb} unsaved changes: {what} uses the file on disk");
+        let running = std::mem::take(&mut self.status);
+        self.status = if running.is_empty() {
             warning
         } else {
-            format!("{warning} - {}", self.status)
+            format!("{warning} - {running}")
         };
+        // The run registered its "Running …" status for its outcome to
+        // replace; that status now carries the warning, so the tracked text
+        // follows it, or the outcome would never land.
+        let tracked = self
+            .test_run_status
+            .iter_mut()
+            .chain(self.pane_run_statuses.iter_mut().map(|(_, run)| run));
+        for run in tracked {
+            if run.shown == running {
+                run.shown = self.status.clone();
+            }
+        }
+    }
+
+    /// [`Self::run_with_unsaved_saved`] for a Testing run: the saves it
+    /// makes are for this run, so a watched scope does not also hear
+    /// about them and rerun after it.
+    fn test_run_with_unsaved_saved(&mut self, launch: impl FnOnce(&mut Self)) {
+        let due = self.testing.watch.due_at();
+        self.run_with_unsaved_saved("the test run", |app| {
+            app.testing.watch.set_due_at(due);
+            launch(app);
+        });
     }
 
     /// File names of the editors with unsaved edits, deduped, the active
@@ -33319,12 +33638,16 @@ impl App {
                 match texts {
                     Ok((head_text, working_text)) => {
                         let label = std::path::PathBuf::from(format!("{} (HEAD)", entry.path));
+                        // The working side is the open tab's unsaved text
+                        // when it has edits, in any split group.
+                        let unsaved = self.unsaved_text_in_any_group(&abs);
                         match self.editor.open_head_diff_with_texts(
                             label,
                             &head_text,
-                            &working_text,
+                            unsaved.as_deref().unwrap_or(&working_text),
                             &abs,
                             true,
+                            unsaved.is_some(),
                         ) {
                             Ok(()) => {
                                 self.tag_open_diff(
@@ -37295,7 +37618,7 @@ impl App {
             }
             ListPurpose::RunTask => {
                 if let Some(task) = self.run_tasks.get(index).cloned() {
-                    self.run_project_task(task);
+                    self.start_project_task(task);
                 }
             }
             ListPurpose::ReviewPullRequest => {
@@ -37917,9 +38240,7 @@ impl App {
     pub fn run_build_task(&mut self) {
         let tasks = crate::tasks::discover_tasks(&self.active_workspace_root());
         match crate::tasks::default_build_task(&tasks).cloned() {
-            Some(task) => {
-                self.run_project_task(task);
-            }
+            Some(task) => self.start_project_task(task),
             None => {
                 self.open_run_task_picker();
                 self.status = "No build task detected; pick one".to_string();
@@ -37930,11 +38251,17 @@ impl App {
     /// Tasks: Rerun Last Task.
     pub fn rerun_last_task(&mut self) {
         match self.last_task.clone() {
-            Some(task) => {
-                self.run_project_task(task);
-            }
+            Some(task) => self.start_project_task(task),
             None => self.status = "No task has run yet".to_string(),
         }
+    }
+
+    /// Run `task` as the user asked for it (Run Task, the build task, Rerun
+    /// Last Task), unsaved tabs written first (#1639).
+    fn start_project_task(&mut self, task: crate::tasks::Task) {
+        self.run_with_unsaved_saved("the task", |app| {
+            app.run_project_task(task);
+        });
     }
 
     /// Resolve the branch-picker selection per its open purpose.
@@ -38221,6 +38548,9 @@ impl App {
             Some(diff) if !diff.left_is_git_head => {
                 Err("Hunk actions need a working-tree diff from Source Control".to_string())
             }
+            Some(diff) if diff.right_is_unsaved => {
+                Err("Save the file first: hunk actions apply to the file on disk".to_string())
+            }
             // The patch is built from the decoded text, which would put UTF-8
             // bytes into a blob stored in another encoding (#1242).
             Some(diff) if diff.text_encoding != encoding_rs::UTF_8 => Err(format!(
@@ -38307,7 +38637,10 @@ impl App {
     fn diff_selected_lines_patch(&self) -> Option<(String, String)> {
         let diff = self.editor.diff.as_ref()?;
         // Not UTF-8: left to the hunk path, which refuses it with a reason.
-        if !diff.left_is_git_head || diff.text_encoding != encoding_rs::UTF_8 {
+        if !diff.left_is_git_head
+            || diff.right_is_unsaved
+            || diff.text_encoding != encoding_rs::UTF_8
+        {
             return None;
         }
         let sel = diff.selection?;
@@ -38374,6 +38707,11 @@ impl App {
         if !diff.left_is_git_head {
             self.status =
                 String::from("Group by seat applies to a Source Control diff of the working tree");
+            return;
+        }
+        if diff.right_is_unsaved {
+            // The seat map is keyed on the saved file's lines (#1572).
+            self.status = String::from("Save the file first: group by seat reads the saved file");
             return;
         }
         diff.group_by_seat = !diff.group_by_seat;
@@ -38577,6 +38915,24 @@ impl App {
         }
     }
 
+    /// The unsaved text of `path` in whichever editor group holds it dirty
+    /// (#1572): a split shows the same file in several groups, and the dirty
+    /// copy may sit in an inactive one while the active group's is clean.
+    fn unsaved_text_in_any_group(&self, path: &Path) -> Option<String> {
+        std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .find_map(|group| group.unsaved_text_of(path))
+    }
+
+    /// Open a two-file diff in the active group, each side's unsaved text
+    /// resolved across every editor group.
+    fn open_diff_across_groups(&mut self, left: &Path, right: &Path) -> anyhow::Result<()> {
+        let left_unsaved = self.unsaved_text_in_any_group(left);
+        let right_unsaved = self.unsaved_text_in_any_group(right);
+        self.editor
+            .open_diff_resolved(left, right, left_unsaved, right_unsaved)
+    }
+
     /// Rebuild every open diff view, in every split group, whose sides may
     /// have moved (#471), keeping each reader's viewport. Returns true when
     /// any view's content actually changed, so the caller owes a redraw.
@@ -38636,6 +38992,10 @@ impl App {
                     if let Some(cur) = ed.diff.as_mut() {
                         cur.left_stamp = fresh.left_stamp;
                         cur.right_stamp = fresh.right_stamp;
+                        // A rebuild reads the right side from disk: rows
+                        // identical to an unsaved view mean the save landed,
+                        // so hunk actions apply again (#1572).
+                        cur.right_is_unsaved = fresh.right_is_unsaved;
                     }
                     continue;
                 }
@@ -40870,18 +41230,20 @@ impl App {
     }
 
     /// **Diff to working tree** (#371): the scrubbed version against the
-    /// file on disk, in the side-by-side diff.
+    /// working copy (its open tab's unsaved edits, else the file on disk),
+    /// in the side-by-side diff.
     fn scrub_diff_to_working_tree(&mut self) {
         let Some((path, rel, commit, text)) = self.scrubbed_file() else {
             return;
         };
         let label = PathBuf::from(format!("{rel} @ {}", commit.short_hash));
+        let unsaved = self.unsaved_text_in_any_group(&path);
         // A file the commit predates diffs as all added, which is what
         // happened to it since.
         let text = text.unwrap_or_default();
         if let Err(e) = self
             .editor
-            .open_head_diff_with_text(label, &text, &path, false)
+            .open_head_diff_with_text_resolved(label, &text, &path, false, unsaved)
         {
             self.status = format!("Could not diff {rel}: {e}");
             return;
@@ -41933,7 +42295,20 @@ impl App {
         self.quit = true;
     }
 
+    /// The session an update relaunch hands to the new process: every
+    /// unsaved buffer, a merge editor's Result included, since the
+    /// relaunch exits at once and the Result exists nowhere else.
     pub fn capture_session_state(&self) -> crate::session_state::SessionState {
+        self.capture_session_state_with(true)
+    }
+
+    /// `keep_merge_results` false leaves a merge editor's unsaved Result
+    /// out (#1588), for hot exit, whose backup outlives the conflict it was
+    /// taken from.
+    fn capture_session_state_with(
+        &self,
+        keep_merge_results: bool,
+    ) -> crate::session_state::SessionState {
         let mut tabs = Vec::new();
         let mut active_tab = 0;
         let mut active_path: Option<PathBuf> = None;
@@ -41966,7 +42341,13 @@ impl App {
             if idx == self.editor.active_index() {
                 active_tab = tabs.len();
             }
-            let unsaved_text = if ed.dirty {
+            // A merge editor's buffer is its Result pane, not an edit of the
+            // file (#1588): kept in a hot-exit backup it came back as a plain
+            // tab whose Ctrl+S wrote the Result over the user's own
+            // resolution, so there the tab reopens on the file as it is on
+            // disk. A relaunch carries it, or the Result would be lost.
+            let dirty = ed.dirty && (keep_merge_results || ed.merge.is_none());
+            let unsaved_text = if dirty {
                 Some(ed.lines.join("\n"))
             } else {
                 None
@@ -41977,7 +42358,7 @@ impl App {
                 cursor_col: ed.cursor_col,
                 scroll: ed.scroll,
                 scroll_col: ed.scroll_col,
-                dirty: ed.dirty,
+                dirty,
                 unsaved_text,
             });
         }
@@ -41987,7 +42368,10 @@ impl App {
         // (the same file open in two splits) keeps the dirty copy.
         for group in self.editor_layout.inactive_groups() {
             for ed in &group.editors {
-                if ed.has_non_text_view() || !ed.dirty {
+                if ed.has_non_text_view()
+                    || !ed.dirty
+                    || (!keep_merge_results && ed.merge.is_some())
+                {
                     continue;
                 }
                 let unsaved = Some(ed.lines.join("\n"));
@@ -43353,8 +43737,8 @@ impl App {
                 self.editor.start_selection_at_cursor();
             }
             match key.code {
-                KeyCode::Up => self.editor.move_up(),
-                KeyCode::Down => self.editor.move_down(),
+                KeyCode::Up => self.editor.arrow_up(),
+                KeyCode::Down => self.editor.arrow_down(),
                 KeyCode::Left if alt => self.editor.move_word_left(),
                 KeyCode::Right if alt => self.editor.move_word_right(),
                 KeyCode::Left => self.editor.move_left(),
@@ -43366,6 +43750,7 @@ impl App {
                 _ => {}
             }
             self.editor.extend_selection_to_cursor();
+            self.editor.ensure_cursor_col_visible();
             return;
         }
         if is_motion {
@@ -43375,8 +43760,8 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Up => self.editor.move_up(),
-            KeyCode::Down => self.editor.move_down(),
+            KeyCode::Up => self.editor.arrow_up(),
+            KeyCode::Down => self.editor.arrow_down(),
             KeyCode::Left if alt => self.editor.move_word_left(),
             KeyCode::Right if alt => self.editor.move_word_right(),
             KeyCode::Left => self.editor.move_left(),
@@ -43425,6 +43810,10 @@ impl App {
             }
             _ => {}
         }
+        // Home, End, typing, Backspace, Delete and Enter move the caret
+        // sideways too; only ←/→ pulled the view along, so End on a wide
+        // line or typing past the edge left the caret off-screen (#1215).
+        self.editor.ensure_cursor_col_visible();
     }
 
     /// Vim-style chord layer for the editor: `cmd+gg` jumps to top, `cmd+G`
@@ -44993,14 +45382,20 @@ impl App {
     /// claiming a copy landed would be a claim croft cannot make.
     fn deliver_copied_text(&mut self, text: &str) {
         let n = text.chars().count();
+        self.status = self.copy_where_pasted(text).status(&format!("{n} chars"));
+    }
+
+    /// The copy `deliver_copied_text` makes, without the status line, for a
+    /// caller that words its own. Every terminal copy goes this way (#1667):
+    /// Copy Output, copy mode, quick select and copy on select all wrote
+    /// the remote box's clipboard on a relay session.
+    fn copy_where_pasted(&mut self, text: &str) -> CopyLanding {
         if self.is_relay_session && self.push_clipboard_via_relay(text) {
-            self.status = format!("Copied {n} chars to the local clipboard");
-            return;
-        }
-        if copy_to_clipboard(text) {
-            self.status = format!("Copied {n} chars to clipboard");
+            CopyLanding::Local
+        } else if copy_to_clipboard(text) {
+            CopyLanding::Clipboard
         } else {
-            self.status = format!("Copied {n} chars via OSC 52 (the host terminal decides)");
+            CopyLanding::Osc52
         }
     }
 
@@ -45269,7 +45664,7 @@ impl App {
         PendingRunBlock {
             pane_name: format!("{file}:{}", idx + 1),
             cwd,
-            command: fence_command(block.interpreter, &block.code),
+            command: fence_command(block.interpreter, &block.code, &block_script_dir()),
             code: block.code.clone(),
             destructive: block.destructive,
             doc: doc.clone(),
@@ -46987,12 +47382,12 @@ impl App {
             return;
         }
         let lines = text.lines().count();
-        copy_to_clipboard(&text);
-        self.status = if lines == 1 {
-            String::from("Copied command output (1 line)")
+        let what = if lines == 1 {
+            String::from("command output (1 line)")
         } else {
-            format!("Copied command output ({lines} lines)")
+            format!("command output ({lines} lines)")
         };
+        self.status = self.copy_where_pasted(&text).status(&what);
     }
 
     fn select_command_output(
@@ -47602,9 +47997,10 @@ impl App {
             Err(_) => path.display().to_string(),
         };
         let label = std::path::PathBuf::from(format!("{rel} (reviewed)"));
+        let unsaved = self.unsaved_text_in_any_group(path);
         if let Err(e) = self
             .editor
-            .open_head_diff_with_text(label, &text, path, false)
+            .open_head_diff_with_text_resolved(label, &text, path, false, unsaved)
         {
             self.status = format!("Could not open the reviewed diff: {e}");
             return;
@@ -50679,6 +51075,7 @@ impl App {
             Cmd::ClearBookmarks => self.clear_bookmarks(),
             Cmd::SaveFile => self.save(),
             Cmd::SaveAs => self.open_save_as_prompt(),
+            Cmd::RevertFile => self.revert_file(),
             Cmd::SaveAll => self.save_all(),
             Cmd::NewFile => {
                 let target = self.palette_create_target_dir();
@@ -50867,6 +51264,7 @@ impl App {
                 self.toggle_test_watch(crate::testing::watch::WatchScope::All)
             }
             Cmd::TestingGoToFirstFailure => self.go_to_first_failed_test(),
+            Cmd::TestingCancelRun => self.cancel_test_run(),
             Cmd::ReopenAsText => match self.editor.path.clone() {
                 // Merge editor (#253): back to the in-buffer marker flow.
                 // The Result buffer is deliberately discarded — it was
@@ -52233,7 +52631,7 @@ impl App {
         } else {
             String::new()
         };
-        let (lines, _top) = self.terminal().grid_lines();
+        let lines = find_texts(self.terminal().find_lines());
         let mut state = crate::widgets::editor_find::EditorFind::new(initial.clone(), opts);
         state.set_match_count(
             crate::widgets::editor_find::count_matches(&lines, &initial, opts),
@@ -52310,7 +52708,7 @@ impl App {
     /// re-highlight every occurrence, and re-anchor on the most recent match.
     fn terminal_find_set_query(&mut self, new_query: String) {
         let opts = self.search.opts;
-        let (lines, _top) = self.terminal().grid_lines();
+        let lines = find_texts(self.terminal().find_lines());
         let count = crate::widgets::editor_find::count_matches(&lines, &new_query, opts);
         if let Some(state) = self.terminal_find.as_mut() {
             state.query = new_query.clone();
@@ -52339,10 +52737,14 @@ impl App {
         if needle.is_empty() {
             return;
         }
-        let (lines, top, now) = self.terminal().grid_lines_and_clock();
-        if lines.is_empty() {
+        // Logical lines, soft-wrapped rows joined, so a match the pane's
+        // width cut in two is found (#1275). A match is named by its line's
+        // first row and a char index into the joined text.
+        let (find_lines, now) = self.terminal().find_lines_and_clock();
+        if find_lines.is_empty() {
             return;
         }
+        let lines: Vec<String> = find_lines.iter().map(|l| l.text.clone()).collect();
         let anchor = self.terminal_find_match;
         let (from_row, from_col) = match anchor {
             Some((clock, abs, col, _len)) => {
@@ -52350,7 +52752,7 @@ impl App {
                 // anchored, so navigation walks from the match's TEXT, not
                 // from the viewport row it occupied at anchor time.
                 let abs = abs - (now - clock) as i32;
-                let row = (abs - top).clamp(0, lines.len() as i32 - 1) as usize;
+                let row = find_lines.iter().rposition(|l| l.start <= abs).unwrap_or(0);
                 (row, col)
             }
             // No anchor: start past the last line's end so `prev` lands on the
@@ -52380,11 +52782,12 @@ impl App {
         let Some(m) = m else {
             return;
         };
-        let abs_line = top + m.row as i32;
+        let abs_line = find_lines[m.row].start;
         self.terminal_find_match = Some((now, abs_line, m.col_chars, m.len_chars));
         self.terminal_mut()
             .set_current_match(Some((abs_line, m.col_chars, m.len_chars)), now);
-        self.terminal_mut().scroll_to_line(abs_line);
+        self.terminal_mut()
+            .scroll_to_line(find_lines[m.row].line_of(m.col_chars));
         let idx =
             crate::widgets::editor_find::match_index_at(&lines, &needle, opts, m.row, m.col_chars);
         if let Some(state) = self.terminal_find.as_mut() {
@@ -52684,8 +53087,7 @@ impl App {
                     self.status =
                         String::from("Copy mode: nothing selected (v/V/^V starts a selection)");
                 } else {
-                    copy_to_clipboard(&text);
-                    self.status = format!("Copied {} chars to clipboard", text.chars().count());
+                    self.deliver_copied_text(&text);
                 }
                 return;
             }
@@ -52873,15 +53275,14 @@ impl App {
                     // number); the clipboard rule applies here too (#360).
                     let text = self.terminal_text_for_copy(hit.text.clone());
                     self.close_terminal_quick_select();
-                    copy_to_clipboard(&text);
+                    let copied = self
+                        .copy_where_pasted(&text)
+                        .status(&format!("{} chars", text.chars().count()));
                     if shifted {
                         self.terminal_mut().paste_input(text.as_bytes());
-                        self.status = format!(
-                            "Copied {} chars to clipboard and pasted into the shell",
-                            text.chars().count()
-                        );
+                        self.status = format!("{copied} and pasted into the shell");
                     } else {
-                        self.status = format!("Copied {} chars to clipboard", text.chars().count());
+                        self.status = copied;
                     }
                 } else if state.hints.iter().any(|h| h.label.starts_with(&candidate)) {
                     let Some(state) = self.terminal_quick_select.as_mut() else {
@@ -53187,9 +53588,17 @@ impl App {
             return false;
         }
         let changed = log.poll_index();
-        if log.indexing() {
+        let indexing = log.indexing();
+        // A reload's kept place may lie past what was indexed so far.
+        if changed {
+            self.editor.settle_log_reload();
+        }
+        if indexing {
             return changed;
         }
+        let Some(log) = self.editor.log.as_ref() else {
+            return true;
+        };
         if let Some(state) = self.editor_find.as_ref()
             && !state.query.is_empty()
         {
@@ -53251,6 +53660,9 @@ impl App {
             return;
         };
         self.editor.active_search_match = Some((m.row, m.col_chars, m.len_chars));
+        // The match is the reader's place now; a reload still settling its
+        // own place must not scroll it away on the next index batch.
+        self.editor.cancel_log_reload();
         // The log body starts one row below the header.
         let rows = (self.editor.last_inner.height as usize).saturating_sub(1);
         if rows == 0 {
@@ -53861,6 +54273,10 @@ impl App {
     }
 
     fn handle_mouse(&mut self, m: MouseEvent) {
+        self.recording_file_switches(|app| app.handle_mouse_inner(m));
+    }
+
+    fn handle_mouse_inner(&mut self, m: MouseEvent) {
         // A click means the user moved on from a pending shortcut prompt.
         if matches!(m.kind, MouseEventKind::Down(_)) && self.recording_shortcut.take().is_some() {
             self.status = String::from("Shortcut unchanged");
@@ -54480,6 +54896,23 @@ impl App {
         let in_editor_scrollbar = rect_contains(self.editor.last_scrollbar, m.column, m.row);
         let in_editor_hscrollbar = rect_contains(self.editor.last_hscrollbar, m.column, m.row);
 
+        // The wheel over a hover scrolls its text rather than dismissing it
+        // (#1254): a long docstring's Returns/Raises sit below the box.
+        if let Some(popup) = self.hover_popup.as_mut()
+            && rect_contains(popup.last_area, m.column, m.row)
+        {
+            match m.kind {
+                MouseEventKind::ScrollDown => {
+                    popup.scroll_by(3);
+                    return;
+                }
+                MouseEventKind::ScrollUp => {
+                    popup.scroll_by(-3);
+                    return;
+                }
+                _ => {}
+            }
+        }
         if matches!(m.kind, MouseEventKind::Moved) {
             self.pointer_cell = Some((m.column, m.row));
             self.on_mouse_moved(m.column, m.row, in_editor);
@@ -55837,6 +56270,8 @@ impl App {
                         self.run_all_tests_with_coverage();
                     } else if rect_contains(self.testing.last_output_hint, m.column, m.row) {
                         self.show_test_runner_output();
+                    } else if rect_contains(self.testing.last_stop, m.column, m.row) {
+                        self.cancel_test_run();
                     } else {
                         match self.testing.hit_at(m.column, m.row) {
                             Some(crate::widgets::testing::RowHit::ToggleWatch(scope)) => {
@@ -56732,7 +57167,7 @@ impl App {
                                 let text = self
                                     .terminal_text_for_copy(self.terminals[idx].selection_text());
                                 if !text.is_empty() {
-                                    copy_to_clipboard(&text);
+                                    self.copy_where_pasted(&text);
                                 }
                             }
                         }
@@ -56757,7 +57192,7 @@ impl App {
                 {
                     let text = self.terminal_text_for_copy(self.terminal().selection_text());
                     if !text.is_empty() {
-                        copy_to_clipboard(&text);
+                        self.copy_where_pasted(&text);
                     }
                 }
                 // A plain click on a redacted span shows the real value in
@@ -58417,7 +58852,7 @@ impl App {
                 }
             }
             crate::code_lens::LensAction::RunInTerminal { label, command } => {
-                self.run_project_task(crate::tasks::Task {
+                self.start_project_task(crate::tasks::Task {
                     label,
                     command,
                     source: String::from("code lens"),
@@ -60543,7 +60978,7 @@ impl App {
             MenuAction::MoveIntoNewWindow(idx) => self.move_into_new_window(idx),
             MenuAction::CopyIntoNewWindow(idx) => self.copy_into_new_window(idx),
             MenuAction::CompareWithSelected { anchor, other } => {
-                match self.editor.open_diff(&anchor, &other) {
+                match self.open_diff_across_groups(&anchor, &other) {
                     Ok(()) => {
                         self.focus_pane(Pane::Editor);
                         self.compare_anchor = None;
@@ -61259,7 +61694,7 @@ impl App {
             .flat_map(|g| g.editors.iter())
             .collect();
         let buffers = self
-            .capture_session_state()
+            .capture_session_state_with(false)
             .tabs
             .into_iter()
             .filter(|t| {
@@ -62593,6 +63028,88 @@ impl App {
     fn disable_minimap_image(&mut self) {
         self.overlays.minimap.disable();
         self.minimap_img_rect = Rect::default();
+        self.minimap_text = false;
+    }
+
+    /// Draw the minimap into `strip`: the raster where the terminal draws
+    /// images, else braille text (#1231), so it shows in tmux, Alacritty,
+    /// GNOME Terminal and plain xterm too.
+    fn paint_minimap(&mut self, frame: &mut ratatui::Frame, strip: Rect) {
+        if self.inline_images_enabled() && self.cell_pixel.is_some() {
+            self.minimap_text = false;
+            self.update_minimap_overlay(strip);
+        } else {
+            self.overlays.minimap.disable();
+            self.render_text_minimap(frame.buffer_mut(), strip);
+        }
+    }
+
+    /// The braille minimap (#1231): the same raster the image path bakes, at
+    /// one dot row a line (folded to fit a longer file), with the visible
+    /// lines tinted like the image's viewport box.
+    fn render_text_minimap(&mut self, buf: &mut ratatui::buffer::Buffer, strip: Rect) {
+        self.minimap_img_rect = strip;
+        self.minimap_text = true;
+        if strip.width == 0 || strip.height == 0 {
+            return;
+        }
+        let (first, end) = self.editor.minimap_span();
+        let total = end - first;
+        let w = strip.width as u32 * 2 * MINIMAP_TEXT_CHARS_PER_DOT;
+        let h = strip.height as u32 * 4;
+        let content_h = (total as u32).clamp(1, h);
+        self.minimap_content_h = content_h;
+        let bg = self.theme.editor_bg_rgb();
+        let light = 0.299 * bg.0 as f32 + 0.587 * bg.1 as f32 + 0.114 * bg.2 as f32 > 140.0;
+        let fg = if light {
+            (0x38, 0x3a, 0x41)
+        } else {
+            (0xc5, 0xcd, 0xd9)
+        };
+        let sig = (
+            self.editor.path.clone(),
+            self.editor.edit_seq,
+            w,
+            h,
+            bg,
+            (first, end),
+            self.editor.highlight_generation(),
+        );
+        if self.minimap_text_cache.as_ref().map(|(k, _)| k) != Some(&sig) {
+            let rgba = self.editor.minimap_rgba(w, h, content_h, bg, fg);
+            let cells = braille_minimap(&rgba, w, h, bg, strip.width, strip.height);
+            self.minimap_text_cache = Some((sig, cells));
+        }
+        let Some((_, cells)) = self.minimap_text_cache.as_ref() else {
+            return;
+        };
+        // The visible lines, in cell rows, get a faint wash of the text colour.
+        let top = self.editor.scroll.saturating_sub(first);
+        let rows = self.editor.visible_rows();
+        let to_cell = |line: usize| line * content_h as usize / total.max(1) / 4;
+        let (view_top, view_end) = (to_cell(top), to_cell(top + rows.max(1) - 1));
+        let mix = |a: u8, b: u8| ((a as u16 * 85 + b as u16 * 15) / 100) as u8;
+        let wash = Color::Rgb(mix(bg.0, fg.0), mix(bg.1, fg.1), mix(bg.2, fg.2));
+        for (i, cell) in cells.iter().enumerate() {
+            let (cx, cy) = (i % strip.width as usize, i / strip.width as usize);
+            let back = if total > 0 && (view_top..=view_end).contains(&cy) {
+                wash
+            } else {
+                Color::Rgb(bg.0, bg.1, bg.2)
+            };
+            let Some(out) = buf.cell_mut((strip.x + cx as u16, strip.y + cy as u16)) else {
+                continue;
+            };
+            match cell {
+                Some((glyph, (r, g, b))) => {
+                    out.set_char(*glyph).set_fg(Color::Rgb(*r, *g, *b));
+                }
+                None => {
+                    out.set_char(' ');
+                }
+            }
+            out.set_bg(back);
+        }
     }
 
     /// Show/hide the editor minimap (⌥⌘M, the minimap right-click menu, the
@@ -62603,25 +63120,26 @@ impl App {
         if !self.minimap_visible {
             self.disable_minimap_image();
         }
-        self.status = if self.minimap_visible {
+        self.status = if self.minimap_visible && !self.minimap_room {
+            format!(
+                "Minimap on: it shows once the editor is {} columns wide",
+                MINIMAP_WIDTH_CELLS + MINIMAP_MIN_EDITOR_WIDTH
+            )
+        } else if self.minimap_visible {
             String::from("Minimap on")
         } else {
             String::from("Minimap off")
         };
     }
 
-    /// Carve the minimap strip off `editor_area` when the minimap is on (v1:
-    /// unsplit, image-capable terminals, enough width). Returns
+    /// Carve the minimap strip off `editor_area` (the active group's rect in a
+    /// split) when the minimap is on and the editor has room. Returns
     /// `(editor_rect, full_strip, image_rect)`: the editor renders into
     /// `editor_rect`, the whole `full_strip` column is bg-filled, and the
     /// raster image occupies `image_rect` (aligned to the editor's text rows).
-    fn carve_minimap(&self, editor_area: Rect) -> Option<(Rect, Rect, Rect)> {
-        if !self.minimap_visible
-            || self.editor_layout.is_split()
-            || !self.inline_images_enabled()
-            || self.cell_pixel.is_none()
-            || editor_area.width < MINIMAP_WIDTH_CELLS + MINIMAP_MIN_EDITOR_WIDTH
-        {
+    fn carve_minimap(&mut self, editor_area: Rect) -> Option<(Rect, Rect, Rect)> {
+        self.minimap_room = editor_area.width >= MINIMAP_WIDTH_CELLS + MINIMAP_MIN_EDITOR_WIDTH;
+        if !self.minimap_visible || !self.minimap_room {
             return None;
         }
         let w = MINIMAP_WIDTH_CELLS;
@@ -62708,7 +63226,12 @@ impl App {
         if r.height == 0 || total == 0 {
             return;
         }
-        let ch_px = self.cell_pixel.map(|(_, h)| h).unwrap_or(1).max(1);
+        // The text strip maps four dot rows to a cell (#1231).
+        let ch_px = if self.minimap_text {
+            4
+        } else {
+            self.cell_pixel.map(|(_, h)| h).unwrap_or(1).max(1)
+        };
         let dy_px = (row.saturating_sub(r.y)) as u32 * ch_px;
         let content_h = self.minimap_content_h.max(1);
         let line = first + (dy_px as usize * total / content_h as usize).min(total - 1);
@@ -64541,10 +65064,9 @@ impl App {
     /// the first line of what it said went wrong: GitHub's own message when
     /// the API sent one, else gh's.
     fn run_gh(&self, args: &[String]) -> Result<String, String> {
-        let out = std::process::Command::new(&self.gh_program)
-            .args(args)
-            .current_dir(self.active_workspace_root())
-            .output()
+        let mut cmd = std::process::Command::new(&self.gh_program);
+        cmd.args(args).current_dir(self.active_workspace_root());
+        let out = crate::review_ops::output_retrying_busy(&mut cmd)
             .map_err(|e| format!("could not run gh: {e}"))?;
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         if out.status.success() {
@@ -64635,11 +65157,11 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let gh_json = |git_ref: Option<&str>| -> Result<String, String> {
-                let out = std::process::Command::new(&gh)
-                    .args(github::analyses_args(git_ref))
+                let mut cmd = std::process::Command::new(&gh);
+                cmd.args(github::analyses_args(git_ref))
                     .current_dir(&root)
-                    .stdin(std::process::Stdio::null())
-                    .output()
+                    .stdin(std::process::Stdio::null());
+                let out = crate::review_ops::output_retrying_busy(&mut cmd)
                     .map_err(|e| format!("could not run gh: {e}"))?;
                 Ok(String::from_utf8_lossy(&out.stdout).into_owned())
             };
@@ -64749,11 +65271,11 @@ impl App {
             let files = chosen
                 .iter()
                 .map(|a| {
-                    let out = std::process::Command::new(&gh)
-                        .args(crate::sarif::github::sarif_args(a.id))
+                    let mut cmd = std::process::Command::new(&gh);
+                    cmd.args(crate::sarif::github::sarif_args(a.id))
                         .current_dir(&root)
-                        .stdin(std::process::Stdio::null())
-                        .output()
+                        .stdin(std::process::Stdio::null());
+                    let out = crate::review_ops::output_retrying_busy(&mut cmd)
                         .map_err(|e| format!("could not run gh: {e}"))?;
                     if !out.status.success() {
                         return Err(format!("analysis #{} could not be downloaded", a.id));
@@ -66171,7 +66693,7 @@ impl App {
             }
             Some(anchor) => {
                 let anchor_clone = anchor.clone();
-                match self.editor.open_diff(&anchor_clone, &path) {
+                match self.open_diff_across_groups(&anchor_clone, &path) {
                     Ok(()) => {
                         self.focus_pane(Pane::Editor);
                         self.compare_anchor = None;
@@ -66488,6 +67010,27 @@ impl App {
             String::from(".")
         } else {
             rel.display().to_string()
+        }
+    }
+
+    /// File: Revert File (#1285): drop the active tab's unsaved edits for
+    /// the text on disk. One undo step, so Ctrl+Z brings the edits back.
+    fn revert_file(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("This tab has no file to revert to");
+            return;
+        };
+        let name = self.status_path(&path);
+        if !self.editor.dirty {
+            self.status = format!("{name} has no unsaved changes");
+            return;
+        }
+        match self.editor.revert_as_undo_step() {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.status = format!("Reverted {name}");
+            }
+            Err(e) => self.status = format!("Revert failed: {e}"),
         }
     }
 
@@ -67399,6 +67942,11 @@ fn is_tree_zoxide_jump_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
 }
 
+/// The text terminal find searches: one string per logical line (#1275).
+fn find_texts(lines: Vec<crate::widgets::terminal::FindLine>) -> Vec<String> {
+    lines.into_iter().map(|l| l.text).collect()
+}
+
 /// Explorer-pane shortcut: `Cmd+F` / `Ctrl+F` (no Shift, no Alt) - "New File".
 fn is_tree_new_file_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
@@ -67689,18 +68237,35 @@ fn is_run_fence_key(key: KeyEvent) -> bool {
 }
 
 /// The command typed into a pane for a fenced block (#353): a shell block
-/// as written (a trailing newline runs its last line); python and node
-/// through a quoted heredoc so the block runs whole. The terminator is
-/// chosen not to occur in the block, or a line inside it could close the
-/// heredoc early and hand the rest to the shell.
+/// as written (a trailing newline runs its last line). Any other language
+/// is written to a private file under `scripts` and read from it on stdin,
+/// `python3 - < 'file'` (#1630): the heredoc it used to be typed as is
+/// POSIX shell syntax, so with fish as the pane's shell every python or
+/// node block failed. A redirect from a quoted path reads the same in bash,
+/// zsh and fish, and the block reaches the interpreter byte for byte, tabs
+/// and `!` included. The interpreter still reads stdin, so the block runs
+/// with the pane's directory on its import path, as before. Should the file
+/// not be written, the heredoc is the fallback.
 ///
-/// A block holding a tab or `!` goes as one single-quoted `printf '%b'`
-/// argument instead: typed into an interactive shell, a tab is completion
-/// (a python block lost its indentation) and bash expands `!` in a heredoc
-/// body as history, so what ran was not what the confirm popup showed.
-/// Inside single quotes neither happens, and the tab travels as `\t`.
-fn fence_command(interpreter: &str, code: &str) -> String {
+/// A shell block holding a tab or `!` goes as one single-quoted
+/// `printf '%b'` argument instead: typed into an interactive shell, a tab
+/// is completion and bash expands `!` as history, so what ran was not what
+/// the confirm popup showed. Inside single quotes neither happens, and the
+/// tab travels as `\t`.
+fn fence_command(interpreter: &str, code: &str, scripts: &Path) -> String {
     let code = code.trim_end_matches('\n');
+    if interpreter != "sh" {
+        if let Ok(file) = stage_block(scripts, interpreter, code) {
+            return format!("{interpreter} - < '{}'\r", file.display());
+        }
+        let mut end = String::from("CROFT_BLOCK");
+        let mut n = 0u32;
+        while code.contains(&end) {
+            n += 1;
+            end = format!("CROFT_BLOCK_{n}");
+        }
+        return format!("{interpreter} - <<'{end}'\n{code}\n{end}\r");
+    }
     if code.contains(['\t', '!']) {
         let escaped = format!("{code}\n")
             .replace('\\', "\\\\")
@@ -67709,24 +68274,80 @@ fn fence_command(interpreter: &str, code: &str) -> String {
             .replace('\'', "'\\''");
         // A shell block runs IN the pane's shell, as a typed one does (a
         // `cd` or `export` persists, bash-isms still work): `eval` of the
-        // decoded text. Other interpreters read it on stdin.
-        if interpreter == "sh" {
-            return format!("eval \"$(printf '%b' '{escaped}')\"\r");
-        }
-        return format!("printf '%b' '{escaped}' | {interpreter}\r");
+        // decoded text.
+        return format!("eval \"$(printf '%b' '{escaped}')\"\r");
     }
-    match interpreter {
-        "sh" => format!("{code}\r"),
-        other => {
-            let mut end = String::from("CROFT_BLOCK");
-            let mut n = 0u32;
-            while code.contains(&end) {
-                n += 1;
-                end = format!("CROFT_BLOCK_{n}");
+    format!("{code}\r")
+}
+
+/// Where [`fence_command`] writes the blocks it runs (#1630). Always
+/// absolute: the typed command runs in the pane's directory, so a relative
+/// cache (HOME unset or relative) would name a file that is not there.
+fn block_script_dir() -> PathBuf {
+    // Never the user's own cache from a test.
+    let dir = if cfg!(test) {
+        std::env::temp_dir().join(format!("croft-test-blocks-{}", std::process::id()))
+    } else {
+        croft_cache_dir().join("blocks")
+    };
+    absolute_block_dir(dir)
+}
+
+/// `dir` made absolute against croft's own directory, where it was meant.
+fn absolute_block_dir(dir: PathBuf) -> PathBuf {
+    std::path::absolute(&dir).unwrap_or(dir)
+}
+
+/// How long a written block is kept: long enough for its interpreter to
+/// have read it, short enough that the directory never grows.
+const BLOCK_SCRIPT_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Write `code` and a final newline to a new file under `dir` that only the
+/// user can read, for `interpreter` (#1630). Refuses a path the typed
+/// command could not quote in single quotes. Blocks older than
+/// [`BLOCK_SCRIPT_TTL`] are cleared first.
+fn stage_block(dir: &Path, interpreter: &str, code: &str) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > BLOCK_SCRIPT_TTL);
+            if old && entry.file_name().to_string_lossy().starts_with("block-") {
+                let _ = std::fs::remove_file(entry.path());
             }
-            format!("{other} - <<'{end}'\n{code}\n{end}\r")
         }
     }
+    let ext = match interpreter {
+        "python3" => "py",
+        "node" => "js",
+        _ => "txt",
+    };
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = dir.join(format!(
+        "block-{}-{seq}-{}.{ext}",
+        std::process::id(),
+        now_millis()
+    ));
+    if path.to_string_lossy().contains(['\'', '\\', '\n', '\r']) {
+        return Err(std::io::Error::other("the block path cannot be quoted"));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    file.write_all(format!("{code}\n").as_bytes())?;
+    Ok(path)
 }
 
 /// Milliseconds since the Unix epoch, for stamping local-history snapshots
@@ -68768,6 +69389,30 @@ fn copy_to_clipboard(text: &str) -> bool {
     let _ = out.write_all(&bytes);
     let _ = out.flush();
     false
+}
+
+/// Where `App::copy_where_pasted` put a copy.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CopyLanding {
+    /// Queued home over the drop relay, to the machine the user types at.
+    /// The relay sends no word back on whether that clipboard took it, so
+    /// the status says it was sent, not that it landed.
+    Local,
+    /// This machine's clipboard.
+    Clipboard,
+    /// Only an OSC 52 sequence, which the host terminal may ignore.
+    Osc52,
+}
+
+impl CopyLanding {
+    /// The status line for copying `what`, saying honestly where it went.
+    fn status(self, what: &str) -> String {
+        match self {
+            CopyLanding::Local => format!("Sent {what} to the local clipboard"),
+            CopyLanding::Clipboard => format!("Copied {what} to clipboard"),
+            CopyLanding::Osc52 => format!("Copied {what} via OSC 52 (the host terminal decides)"),
+        }
+    }
 }
 
 /// Returns true if the given key event should copy the editor's current
@@ -70702,6 +71347,26 @@ type CodeqlCodeSearch = (
     std::sync::mpsc::Receiver<Result<(Vec<String>, Option<String>), String>>,
 );
 
+/// The directory this croft keeps hot-exit backups and sticky notes under
+/// (#1578): `state`, after moving in what an earlier croft kept under
+/// `cache`, which cache cleaners are free to delete. Run at every launch,
+/// so a backup an older croft still writes to the cache is taken over too,
+/// once that croft is gone (its own exit removes only the cache copy).
+/// Notes are merged note by note into the state store, since an older
+/// window may still be adding to its cache copy; lock files stay.
+pub(crate) fn user_data_dir(cache: &Path, state: &Path) -> PathBuf {
+    crate::hot_exit::move_tree(
+        &cache.join("hot-exit"),
+        &state.join("hot-exit"),
+        &crate::hot_exit::owned_by_a_running_croft,
+    );
+    crate::sticky_notes::merge_stores(&cache.join("notes"), &state.join("notes"));
+    crate::hot_exit::move_tree(&cache.join("notes"), &state.join("notes"), &|p| {
+        p.extension().is_some_and(|x| x == "lock")
+    });
+    state.to_path_buf()
+}
+
 pub(crate) fn croft_cache_dir() -> PathBuf {
     #[cfg(test)]
     if let Some(dir) = CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap().clone() {
@@ -71442,6 +72107,9 @@ impl std::io::Write for CountingWriter {
 
 type CroftTerminal = Terminal<CrosstermBackend<CountingWriter>>;
 
+/// The status a run gesture gets while another run is in flight (#1534).
+const TEST_RUN_IN_PROGRESS: &str = "A test run is in progress (s in Testing stops it)";
+
 pub fn run(
     root: PathBuf,
     restore_session: Option<PathBuf>,
@@ -71468,6 +72136,9 @@ pub fn run(
     // the finished build straight out of it on first open (or builds on demand
     // if the user opens a file before the prewarm finishes).
     std::thread::spawn(crate::highlight::prewarm_configs);
+    // Hand the heap a large file's parse passes freed back to the OS
+    // (#1707), so croft doesn't stay resident at the parse's peak.
+    crate::mem_relief::start();
     let title = build_title(&root);
     let mut app = App::new(root.clone())?;
     // Resurrect this workspace's terminal panel from the last session
@@ -71638,6 +72309,12 @@ pub fn run(
     // Snapshot the terminal panel for the next launch (cwds are read live
     // here, so plain `cd`s during the session are captured at quit).
     app.save_terminal_session();
+    // A test run still in flight ends with croft (#1534): its runner was
+    // left running under PID 1.
+    if app.testing.is_busy() {
+        app.test_worker.cancel();
+    }
+
     // Quitting mid-debug ends the program as Stop Debugging does (#1536):
     // nothing sent `disconnect` here, and the debuggee outlived croft.
     // The teardowns run while the terminal is restored and are joined
@@ -72305,6 +72982,9 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         if app.testing.take_refusal() {
             app.status = String::from(crate::testing::NO_RUNNER_STATUS);
         }
+        if app.testing.take_cancelled() {
+            app.status = String::from("Test run cancelled");
+        }
         // One notification per red run (#358), from the latch the panel
         // sets when a run ends, never per test case.
         let coverage_changed = app.sync_coverage();
@@ -72466,9 +73146,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 app.forget_sent_images();
             }
             let draw_start = std::time::Instant::now();
-            let drawn = terminal.draw(|f| {
-                app.render(f);
-            })?;
+            let drawn = terminal.draw(|f| app.render_for_terminal(f))?;
             let mut underlays = app.image_underlays(drawn.buffer);
             app.drawn_buffer = Some(drawn.buffer.clone());
             // Record render+flush time and the bytes ratatui shipped this
@@ -72484,9 +73162,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 app.overlays.welcome.mark_dirty();
                 app.overlays.hero.mark_dirty();
                 app.forget_sent_images();
-                let drawn = terminal.draw(|f| {
-                    app.render(f);
-                })?;
+                let drawn = terminal.draw(|f| app.render_for_terminal(f))?;
                 underlays = app.image_underlays(drawn.buffer);
                 app.drawn_buffer = Some(drawn.buffer.clone());
             }
