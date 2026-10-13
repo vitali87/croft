@@ -345,6 +345,12 @@ pub struct ThemeDecl {
     pub syn_tag: String,
     #[serde(default)]
     pub syn_fg: String,
+    /// A high contrast theme (VS Code's `hc-black` / `hc-light`, #1548):
+    /// croft's own chrome greys resolve to the theme's pure foreground and
+    /// background, and every other chrome color is lifted until it reads
+    /// at 7:1 against the background.
+    #[serde(default)]
+    pub high_contrast: bool,
 }
 
 /// One `[[languages]]` entry: a language identity contributed by an extension.

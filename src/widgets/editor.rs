@@ -555,8 +555,15 @@ fn render_hex(
                 .fg(theme.ui(Color::Rgb(0xe0, 0x9a, 0x4e)))
                 .bg(bg)
                 .add_modifier(Modifier::BOLD);
+            // A high contrast theme's selection may be pale (High Contrast
+            // Light, #1548): its pure foreground keeps selected bytes legible.
+            let selected_fg = if theme.high_contrast() {
+                theme.ui(Color::White)
+            } else {
+                Color::White
+            };
             let base_style = if selected {
-                Style::default().fg(Color::White).bg(theme.selection())
+                Style::default().fg(selected_fg).bg(theme.selection())
             } else if edited {
                 edited_style
             } else if byte_dim {
@@ -19426,6 +19433,22 @@ impl DerefMut for EditorTabs {
 const TAB_INACTIVE_FG: Color = Color::Rgb(0x9d, 0xa5, 0xb4);
 const TAB_ACTIVE_FG: Color = Color::White;
 
+/// Ink for the tab close/pin glyph on its hover pill: white, except that a
+/// high contrast theme (#1548) takes whichever of black or white reads
+/// better on its pill (black on High Contrast's orange).
+fn close_pill_fg(theme: crate::theme::Theme, pill: Color) -> Color {
+    match pill {
+        Color::Rgb(r, g, b)
+            if theme.high_contrast()
+                && crate::theme::contrast_ratio((r, g, b), (0, 0, 0))
+                    > crate::theme::contrast_ratio((r, g, b), (0xff, 0xff, 0xff)) =>
+        {
+            Color::Black
+        }
+        _ => Color::White,
+    }
+}
+
 impl Widget for &mut EditorTabs {
     fn render(self, area: Rect, buf: &mut Buffer) {
         self.last_full_area = area;
@@ -19544,6 +19567,14 @@ impl Widget for &mut EditorTabs {
             } else {
                 TAB_INACTIVE_FG
             };
+            // A high contrast theme resolves the label greys to its pure
+            // foreground (#1548): white on High Contrast Light's pale active
+            // tab would be unreadable.
+            let fg = if theme.high_contrast() {
+                theme.ui(fg)
+            } else {
+                fg
+            };
             let mut modifiers = Modifier::empty();
             if is_active {
                 modifiers |= Modifier::BOLD;
@@ -19567,7 +19598,7 @@ impl Widget for &mut EditorTabs {
                     strip.y,
                     close_glyph,
                     Style::default()
-                        .fg(Color::White)
+                        .fg(close_pill_fg(theme, pill_bg))
                         .bg(pill_bg)
                         .add_modifier(Modifier::BOLD),
                 );
@@ -21747,6 +21778,43 @@ mod tests {
             view.layout.data_rows > 0,
             "layout written back for mouse hit-testing"
         );
+    }
+
+    /// #1548: on High Contrast Light the hex editor's selected bytes are
+    /// black on the pale selection, not white; other themes keep white.
+    #[test]
+    fn hex_selected_bytes_use_a_readable_ink_on_high_contrast_light() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("blob.bin");
+        std::fs::write(&p, (0u8..32).collect::<Vec<_>>()).unwrap();
+        for (id, want) in [
+            ("hc-light", Color::Rgb(0, 0, 0)),
+            ("hc-black", Color::Rgb(0xff, 0xff, 0xff)),
+            ("dark", Color::White),
+        ] {
+            let mut ed = Editor::new();
+            ed.theme = crate::theme::Theme::from_id(id);
+            ed.open(&p).unwrap();
+            {
+                let view = ed.hex.as_mut().unwrap();
+                view.sel_anchor = Some(0);
+                view.cursor = 3;
+            }
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width: 92,
+                height: 12,
+            };
+            let mut buf = ratatui::buffer::Buffer::empty(area);
+            ratatui::widgets::Widget::render(&mut ed, area, &mut buf);
+            let l = ed.hex.as_ref().unwrap().layout;
+            // Byte 1 is selected and is not the cursor.
+            let cell = &buf[(l.hex_x + 3, l.data_top)];
+            assert_eq!(cell.symbol(), "0", "{id}: byte 1's hex cell");
+            assert_eq!(cell.fg, want, "{id}: selected byte ink");
+            assert_eq!(cell.bg, ed.theme.selection(), "{id}: selection fill");
+        }
     }
 
     #[test]
@@ -30761,6 +30829,97 @@ mod tests {
             pill,
             "an un-hovered cross gets no pill"
         );
+    }
+
+    /// #1548: on High Contrast Light the tab labels are black, not the
+    /// dark themes' white and grey, so the active tab reads on its pale
+    /// fill; High Contrast keeps white on its dark blue.
+    #[test]
+    fn high_contrast_tab_labels_use_the_themes_foreground() {
+        use ratatui::buffer::Buffer;
+        for (id, want) in [
+            ("hc-light", Color::Rgb(0, 0, 0)),
+            ("hc-black", Color::Rgb(0xff, 0xff, 0xff)),
+        ] {
+            let theme = crate::theme::Theme::from_id(id);
+            let mut t = EditorTabs::new();
+            t.editors[0].path = Some(std::path::PathBuf::from("/foo.rs"));
+            t.add_tab_with_path(std::path::PathBuf::from("/bar.rs"));
+            for ed in t.editors.iter_mut() {
+                ed.theme = theme;
+            }
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 10,
+            };
+            let mut buf = Buffer::empty(area);
+            (&mut t).render(area, &mut buf);
+            let label_fg = |name: &str| buf[(cell_of(&buf, area.width, name), 0)].fg;
+            assert_eq!(label_fg("bar.rs"), want, "{id}: the active tab's label");
+            assert_eq!(label_fg("foo.rs"), want, "{id}: an inactive tab's label");
+        }
+        // Negative: the ordinary light theme keeps its own tab colours.
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/foo.rs"));
+        t.editors[0].theme = crate::theme::Theme::from_id("light");
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        assert_eq!(
+            buf[(cell_of(&buf, area.width, "foo.rs"), 0)].fg,
+            TAB_ACTIVE_FG
+        );
+    }
+
+    /// The column where `text` starts on row 0, cell by cell (a tab's icon
+    /// may be several bytes wide in one cell).
+    fn cell_of(buf: &ratatui::buffer::Buffer, width: u16, text: &str) -> u16 {
+        let cells: Vec<String> = (0..width)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+        (0..cells.len())
+            .find(|&i| cells[i..].concat().starts_with(text))
+            .unwrap_or_else(|| panic!("{text} is on the tab row: {cells:?}")) as u16
+    }
+
+    /// #1548: the close glyph on High Contrast's orange hover pill is
+    /// black (white reads at about 2.6:1 there); High Contrast Light's dark
+    /// blue pill and the ordinary themes keep white.
+    #[test]
+    fn high_contrast_close_pill_glyph_contrasts_with_the_pill() {
+        use ratatui::buffer::Buffer;
+        for (id, want) in [
+            ("hc-black", Color::Black),
+            ("hc-light", Color::White),
+            ("dark", Color::White),
+        ] {
+            let theme = crate::theme::Theme::from_id(id);
+            let mut t = EditorTabs::new();
+            t.editors[0].path = Some(std::path::PathBuf::from("/foo.rs"));
+            t.editors[0].theme = theme;
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 10,
+            };
+            let mut buf = Buffer::empty(area);
+            (&mut t).render(area, &mut buf);
+            let cx = t.close_screen_x(t.active).expect("a close cross");
+            t.hover_pointer = Some((cx, area.y));
+            let mut buf = Buffer::empty(area);
+            (&mut t).render(area, &mut buf);
+            let cell = &buf[(cx, area.y)];
+            assert_eq!(cell.bg, theme.tab_close_pill_bg(), "{id}: the pill shows");
+            assert_eq!(cell.fg, want, "{id}: the glyph's ink");
+        }
     }
 
     #[test]
