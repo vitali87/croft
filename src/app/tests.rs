@@ -37258,7 +37258,7 @@ fn terminal_session_restores_pane_layout_names_and_focus_across_restarts() {
     // A fresh app on the same workspace resurrects the layout.
     let mut app2 = App::new(tmp.path().to_path_buf()).unwrap();
     app2.terminal_session_path = session_path.clone();
-    app2.restore_terminal_session();
+    app2.restore_terminal_session_with(true);
     assert_eq!(app2.terminals.len(), 2, "both panes come back");
     assert_eq!(app2.terminals[1].label(), "srv", "names survive");
     assert_eq!(
@@ -37301,6 +37301,239 @@ fn terminal_session_restores_pane_layout_names_and_focus_across_restarts() {
         !map.contains_key(&tmp.path().display().to_string()),
         "a trivial session (one unnamed pane at the root) is pruned"
     );
+}
+
+#[test]
+fn a_local_launch_opens_one_terminal_not_the_saved_empty_panes() {
+    // #1458: on this machine the saved panes' shells ended with the last
+    // croft, so bringing them back only gave empty shells cluttering the
+    // panel. A local launch keeps the one default terminal instead.
+    let tmp = tempfile::tempdir().unwrap();
+    let session_path = tmp.path().join("sessions.json");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminal_session_path = session_path.clone();
+    app.split_terminal().unwrap();
+    app.split_terminal().unwrap();
+    app.terminals[1].set_manual_name(Some(String::from("srv")));
+    app.active_terminal = 1;
+    app.save_terminal_session();
+    drop(app);
+
+    let mut app2 = App::new(tmp.path().to_path_buf()).unwrap();
+    app2.terminal_session_path = session_path.clone();
+    let default_pane = app2.terminals[0].uid();
+    app2.restore_terminal_session_with(false);
+    assert_eq!(app2.terminals.len(), 1, "one terminal, not three");
+    assert_eq!(
+        app2.terminals[0].uid(),
+        default_pane,
+        "the default terminal is the one kept"
+    );
+    assert_ne!(app2.terminals[0].label(), "srv");
+    assert_eq!(app2.active_terminal, 0);
+    assert!(
+        !app2.status.contains("Restored terminal session"),
+        "nothing was restored: {}",
+        app2.status
+    );
+}
+
+#[test]
+fn a_local_launch_still_brings_back_an_agent_lane_and_focuses_it() {
+    // A lane is more than a shell: its worktree and agent are still there,
+    // and seating the agent again is the point of restoring it (#348). So
+    // a local launch drops the plain pane beside it but keeps the lane, and
+    // focus follows the lane that had it.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let session = tmp.path().join("sessions.json");
+    let lane_dir = tmp.path().join("repo-fix-login");
+    std::fs::create_dir_all(&lane_dir).unwrap();
+    let root_key = repo.display().to_string();
+    let rec = crate::terminal_session::SessionRecord {
+        panes: vec![
+            crate::terminal_session::PaneRecord {
+                host: None,
+                cwd: root_key.clone(),
+                name: Some(String::from("plain")),
+                transcript: Vec::new(),
+                lane: None,
+            },
+            crate::terminal_session::PaneRecord {
+                host: None,
+                cwd: lane_dir.display().to_string(),
+                name: Some(String::from("Lane: fix-login")),
+                transcript: Vec::new(),
+                lane: Some(crate::terminal_session::LaneRecord {
+                    path: lane_dir.display().to_string(),
+                    branch: String::from("agent/fix-login"),
+                    agent: None,
+                    base: None,
+                }),
+            },
+        ],
+        active: 1,
+    };
+    crate::terminal_session::save_for_root(&session, &root_key, rec).unwrap();
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = session;
+    app.restore_terminal_session_with(false);
+    assert_eq!(app.terminals.len(), 1, "only the lane comes back");
+    assert_eq!(app.terminals[0].manual_name(), Some("Lane: fix-login"));
+    assert_eq!(
+        app.lane_panes
+            .get(&app.terminals[0].uid())
+            .map(|l| l.branch.as_str()),
+        Some("agent/fix-login")
+    );
+    assert_eq!(app.active_terminal, 0, "focus is on the lane");
+}
+
+#[test]
+fn a_local_launch_focuses_the_first_pane_when_the_active_one_is_left_out() {
+    // The saved active pane is a plain pane a local launch drops. Focus
+    // falls back to the first pane brought back, not to the lane that
+    // happened to follow the dropped one.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let session = tmp.path().join("sessions.json");
+    let root_key = repo.display().to_string();
+    let lane = |name: &str| {
+        let dir = tmp.path().join(format!("repo-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::terminal_session::PaneRecord {
+            host: None,
+            cwd: dir.display().to_string(),
+            name: Some(format!("Lane: {name}")),
+            transcript: Vec::new(),
+            lane: Some(crate::terminal_session::LaneRecord {
+                path: dir.display().to_string(),
+                branch: format!("agent/{name}"),
+                agent: None,
+                base: None,
+            }),
+        }
+    };
+    let rec = crate::terminal_session::SessionRecord {
+        panes: vec![
+            lane("one"),
+            crate::terminal_session::PaneRecord {
+                host: None,
+                cwd: root_key.clone(),
+                name: Some(String::from("plain")),
+                transcript: Vec::new(),
+                lane: None,
+            },
+            lane("two"),
+        ],
+        active: 1,
+    };
+    crate::terminal_session::save_for_root(&session, &root_key, rec).unwrap();
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = session;
+    app.restore_terminal_session_with(false);
+    assert_eq!(app.terminals.len(), 2, "both lanes come back");
+    assert_eq!(app.terminals[0].manual_name(), Some("Lane: one"));
+    assert_eq!(app.active_terminal, 0, "focus falls back to the first pane");
+}
+
+#[test]
+fn a_local_launch_drops_a_lane_whose_worktree_is_gone() {
+    // A lane whose worktree was removed is an ordinary pane now, and an
+    // ordinary pane does not come back locally: the default terminal stays.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let session = tmp.path().join("sessions.json");
+    let root_key = repo.display().to_string();
+    let rec = crate::terminal_session::SessionRecord {
+        panes: vec![crate::terminal_session::PaneRecord {
+            host: None,
+            cwd: root_key.clone(),
+            name: Some(String::from("Lane: gone")),
+            transcript: Vec::new(),
+            lane: Some(crate::terminal_session::LaneRecord {
+                path: tmp.path().join("repo-gone").display().to_string(),
+                branch: String::from("agent/gone"),
+                agent: None,
+                base: None,
+            }),
+        }],
+        active: 0,
+    };
+    crate::terminal_session::save_for_root(&session, &root_key, rec).unwrap();
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = session;
+    app.restore_terminal_session_with(false);
+    assert_eq!(app.terminals.len(), 1);
+    assert_eq!(app.terminals[0].manual_name(), None);
+    assert!(app.lane_panes.is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_local_launch_reattaches_a_shell_still_running_in_its_pane_host() {
+    // croft was killed, not quit: the shell is still running in its pane
+    // host, with whatever it was doing on screen. That is not an empty
+    // pane, so a local launch reattaches it, and drops the pane whose host
+    // is gone instead of respawning it.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("ws");
+    std::fs::create_dir_all(&root).unwrap();
+    let spec = crate::pane_host::PaneSpec {
+        socket: tmp.path().join("pane.sock"),
+        cwd: Some(root.clone()),
+        env: Vec::new(),
+        cols: 80,
+        rows: 24,
+        argv: ["sh", "-c", "echo still-$((6*7)); exec sh"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect(),
+    };
+    let socket = spec.socket.clone();
+    let host = std::thread::spawn(move || crate::pane_host::serve(&spec));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !crate::session::is_alive(&socket) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the host never listened"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let root_key = root.display().to_string();
+    let pane = |name: &str, host: Option<String>| crate::terminal_session::PaneRecord {
+        cwd: root_key.clone(),
+        name: Some(String::from(name)),
+        lane: None,
+        transcript: Vec::new(),
+        host,
+    };
+    let session = tmp.path().join("sessions.json");
+    let rec = crate::terminal_session::SessionRecord {
+        panes: vec![
+            pane(
+                "gone",
+                Some(tmp.path().join("dead.sock").display().to_string()),
+            ),
+            pane("kept", Some(socket.display().to_string())),
+        ],
+        active: 1,
+    };
+    crate::terminal_session::save_for_root(&session, &root_key, rec).unwrap();
+
+    let mut app = App::new(root.clone()).unwrap();
+    app.terminal_session_path = session;
+    app.restore_terminal_session_with(false);
+    assert_eq!(app.terminals.len(), 1, "the dead pane is not respawned");
+    assert_eq!(app.terminals[0].host_socket(), Some(socket.as_path()));
+    assert_eq!(app.terminals[0].manual_name(), Some("kept"));
+    assert_eq!(app.active_terminal, 0);
+
+    drop(app);
+    host.join().unwrap().unwrap();
 }
 
 #[test]
@@ -38029,6 +38262,10 @@ fn change_workspace_root_restores_the_incoming_workspaces_layout_when_the_panel_
 
     let mut app = App::new(a.clone()).unwrap();
     app.terminal_session_path = session_path;
+    // As over SSH, where plain panes come back (#1458); locally they stay
+    // closed, which `a_local_re_root_keeps_one_terminal_for_ended_panes`
+    // covers.
+    app.terminal_restore_respawns = true;
     // The default pane is untouched: no input, no name, no launched
     // program — exactly the startup state restore replaces at launch.
     app.change_workspace_root(b.clone());
@@ -38040,6 +38277,41 @@ fn change_workspace_root_restores_the_incoming_workspaces_layout_when_the_panel_
     );
     assert_eq!(app.terminals[1].label(), "srv", "names come back with it");
     assert_eq!(app.active_terminal, 1, "focus lands on the recorded pane");
+}
+
+/// #1458, negative: locally, re-rooting an untouched panel into a workspace
+/// whose saved panes have all ended keeps the one default terminal rather
+/// than bringing them back as empty shells.
+#[test]
+fn a_local_re_root_keeps_one_terminal_for_ended_panes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    let session_path = tmp.path().join("sessions.json");
+    let pane = |name: Option<&str>| crate::terminal_session::PaneRecord {
+        host: None,
+        cwd: b.display().to_string(),
+        name: name.map(String::from),
+        transcript: Vec::new(),
+        lane: None,
+    };
+    crate::terminal_session::save_for_root(
+        &session_path,
+        &b.display().to_string(),
+        crate::terminal_session::SessionRecord {
+            panes: vec![pane(None), pane(Some("srv")), pane(None)],
+            active: 1,
+        },
+    )
+    .unwrap();
+    let mut app = App::new(a.clone()).unwrap();
+    app.terminal_session_path = session_path;
+    app.terminal_restore_respawns = false;
+    app.change_workspace_root(b.clone());
+    assert_eq!(app.terminals.len(), 1);
+    assert_eq!(app.active_terminal, 0);
 }
 
 #[test]
@@ -38077,6 +38349,8 @@ fn restoring_a_workspaces_layout_drops_pane_bound_state_from_the_outgoing_panel(
 
     let mut app = App::new(a.clone()).unwrap();
     app.terminal_session_path = session_path;
+    // As over SSH, where plain panes come back (#1458).
+    app.terminal_restore_respawns = true;
     // Park an undo-close entry (the split writes no input into pane 0, so
     // the panel stays pristine) and open copy mode on the surviving pane:
     // both are bound to the OUTGOING panel and keyed by pane index, which
@@ -47439,7 +47713,7 @@ fn a_restored_terminal_pane_shows_the_output_it_had_before() {
     // A fresh app restores the panel; the marker must be on screen.
     let mut app2 = App::new(tmp.path().to_path_buf()).unwrap();
     app2.terminal_session_path = session_path.clone();
-    app2.restore_terminal_session();
+    app2.restore_terminal_session_with(true);
     app2.terminals[0].resize(80, 24);
     let (lines, _) = app2.terminals[0].grid_lines();
     assert!(
@@ -59226,7 +59500,7 @@ fn a_restore_reattaches_a_shell_still_running_in_its_pane_host() {
 
     let mut app = App::new(root.clone()).unwrap();
     app.terminal_session_path = session.clone();
-    app.restore_terminal_session();
+    app.restore_terminal_session_with(true);
     assert_eq!(app.terminals.len(), 2);
     let kept = &app.terminals[0];
     assert_eq!(kept.host_socket(), Some(socket.as_path()), "reattached");
@@ -59320,7 +59594,7 @@ fn a_restored_lane_pane_is_a_lane_again_with_its_agent_seated() {
     app.agents = crate::agents::AgentTable::from_json(
         r#"[{ "name": "probe", "launch": "printf '%s%s\\n' 'croft-lane' '-back-2'" }]"#,
     );
-    app.restore_terminal_session();
+    app.restore_terminal_session_with(true);
     assert_eq!(app.terminals.len(), 3);
     let uid = app.terminals[1].uid();
     assert_eq!(
@@ -59406,7 +59680,7 @@ fn a_restored_lane_pane_spawns_in_its_worktree_not_where_the_shell_had_wandered(
           { "name": "probe-b", "launch": "printf '%s%s\\n' 'croft-seat' \"-b:$(pwd)\"" }
         ]"#,
     );
-    app.restore_terminal_session();
+    app.restore_terminal_session_with(true);
     assert_eq!(app.terminals.len(), 2);
     let lane_canon = lane_dir.canonicalize().unwrap().display().to_string();
     let budget = crate::test_budget::spawn_budget(crate::test_budget::tests::TERMINAL_PROBE_BASE);

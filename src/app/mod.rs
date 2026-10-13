@@ -4670,6 +4670,11 @@ pub struct App {
     /// Where the terminal-session snapshot lives
     /// (`terminal_sessions.json`); a field so tests point it at a tempdir.
     pub terminal_session_path: PathBuf,
+    /// Whether a restore brings back plain panes whose shells have ended as
+    /// fresh shells (#1458): only over SSH, where a dropped connection should
+    /// come back to its panel. Locally they would return empty, so they stay
+    /// closed.
+    pub terminal_restore_respawns: bool,
     /// The most recent terminal-session persistence failure, latched by
     /// `save_terminal_session` and cleared by a later success; composed
     /// into structural-change statuses by `terminal_status` so a corrupt
@@ -6317,6 +6322,7 @@ impl App {
             command_history_popup: None,
             terminal_session_dirty: false,
             terminal_store_error: None,
+            terminal_restore_respawns: crate::remote::running_over_ssh(),
             terminal_session_path: if cfg!(test) {
                 std::env::temp_dir().join(format!(
                     "croft-test-terminal-sessions-{}.json",
@@ -16486,20 +16492,36 @@ impl App {
                 .err();
     }
 
-    /// Resurrect this workspace's terminal panel from the session store:
-    /// each recorded pane comes back as a fresh shell in its directory
-    /// (with its name), and focus returns to the pane that had it. Called
-    /// once at startup, replacing the default lone pane. A recorded
-    /// directory that no longer exists falls back to the workspace root; a
-    /// pane whose shell fails to spawn is skipped.
+    /// Resurrect this workspace's terminal panel from the session store.
+    /// Called once at startup, replacing the default lone pane.
+    ///
+    /// What comes back depends on where croft runs (#1458). A local launch
+    /// brings back only panes with something still in them: a shell still
+    /// running in its pane host, and an agent lane, whose agent is seated
+    /// again. A plain pane whose shell has ended would come back as an
+    /// empty fresh shell, so it is left out, and a launch with nothing to
+    /// bring back keeps the one default terminal. A remote croft (over
+    /// SSH, as `croft remote` runs it) restores every pane, so a dropped
+    /// connection comes back to the panel it had.
     pub fn restore_terminal_session(&mut self) {
+        self.restore_terminal_session_with(self.terminal_restore_respawns);
+    }
+
+    /// [`Self::restore_terminal_session`], with `respawn` saying whether a
+    /// plain pane whose shell has ended comes back as a fresh shell in its
+    /// directory (with its name and transcript). A recorded directory that
+    /// no longer exists falls back to the workspace root; a pane whose
+    /// shell fails to spawn is skipped. Focus returns to the pane that had
+    /// it, or the first pane when that one was not brought back.
+    fn restore_terminal_session_with(&mut self, respawn: bool) {
         let map = crate::terminal_session::load(&self.terminal_session_path);
         let Some(rec) = map.get(&self.workspace_root().display().to_string()) else {
             return;
         };
         let mut terms = Vec::new();
         let mut lanes = std::collections::BTreeMap::new();
-        for p in &rec.panes {
+        let mut active = 0;
+        for (i, p) in rec.panes.iter().enumerate() {
             // A lane pane belongs in its worktree, whatever cwd its shell
             // had drifted to at save time (#348): the launch line below is
             // typed into THIS shell, so the directory and the lane are
@@ -16534,7 +16556,13 @@ impl App {
                 if let Some(lane) = lane {
                     lanes.insert(t.uid(), lane.clone());
                 }
+                if i == rec.active {
+                    active = terms.len();
+                }
                 terms.push(t);
+                continue;
+            }
+            if !respawn && lane.is_none() {
                 continue;
             }
             // The transcript is painted during the spawn, not after it: a
@@ -16553,6 +16581,12 @@ impl App {
                         t.write_input(lane_launch_input(cmd).as_bytes());
                     }
                     lanes.insert(t.uid(), lane.clone());
+                }
+                // Focus follows the saved active pane only when it is
+                // actually brought back; one left out or failing to spawn
+                // keeps the first-pane fallback, not a neighbour.
+                if i == rec.active {
+                    active = terms.len();
                 }
                 terms.push(t);
             }
@@ -16573,7 +16607,7 @@ impl App {
         self.close_terminal_quick_select();
         self.closed_terminals.clear();
         self.terminals = terms;
-        self.active_terminal = rec.active.min(self.terminals.len() - 1);
+        self.active_terminal = active.min(self.terminals.len() - 1);
         self.sync_focus_flags();
         self.status = format!("Restored terminal session ({} panes)", self.terminals.len());
         self.save_terminal_session_if_hosted();

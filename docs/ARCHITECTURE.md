@@ -698,7 +698,7 @@ Terminal session restore. The panel's layout — pane order, per-pane cwd and ma
 
 **Re-root behavior.** A re-root files the outgoing root's layout under *its* key before the switch. It then restores the incoming root's saved layout the way startup does, but only when the panel is still the untouched startup default: one unnamed shell, no input ever written, no launched program (`PtyTerminal::is_pristine`). A panel with any user state survives the re-root untouched, since navigation must never destroy live shells.
 
-**Restored panes come back at startup as fresh shells in their directories** — running programs are not re-run.
+**What comes back depends on where croft runs (#1458).** Over SSH (`SSH_CONNECTION`/`SSH_CLIENT`, as `croft remote` runs it), every recorded pane comes back, as a fresh shell in its directory when its pane host is gone, so a dropped connection returns to the panel it had; running programs are not re-run. A local launch brings back only panes with something still in them: a shell still running in its pane host, and an agent lane whose worktree exists. A plain pane whose shell ended would only come back empty, so it is left out, and a launch with nothing to bring back keeps the one default terminal. `App::restore_terminal_session_with(respawn)` is the switch the tests drive.
 
 **Pruning the default.** The default single-unnamed-pane-at-root layout prunes its key. Directory equality goes through `canonicalize`, so macOS's `/private` symlink never defeats the prune.
 
