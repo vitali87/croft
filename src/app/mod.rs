@@ -4124,6 +4124,14 @@ pub struct App {
     term_suggestion: Option<(usize, String, String)>,
     /// The command whose new shortcut the next keystroke records (#612).
     recording_shortcut: Option<(crate::widgets::command_palette::Command, std::time::Instant)>,
+    /// A recorded chord another command already has (#1482), waiting for
+    /// Enter to reassign it: the command, the chord, and every command it
+    /// runs now (a built-in chord can be shared by several).
+    confirming_shortcut: Option<(
+        crate::widgets::command_palette::Command,
+        KeyEvent,
+        Vec<crate::widgets::command_palette::Command>,
+    )>,
     /// Inline AI suggestions (#607): off until the user turns them on, since
     /// they send code to a model. The worker, the backend it was started
     /// for, the request in flight (id plus what it answers for), and the
@@ -6222,6 +6230,7 @@ impl App {
             term_suggest_enabled: true,
             term_suggestion: None,
             recording_shortcut: None,
+            confirming_shortcut: None,
             inline_enabled: false,
             inline_worker: None,
             inline_config: None,
@@ -23051,6 +23060,23 @@ impl App {
             && at.elapsed() < SHORTCUT_RECORD_WINDOW
         {
             self.record_shortcut(cmd, key);
+            return Ok(());
+        }
+        // A chord that was taken (#1482): Enter reassigns it, any other key
+        // keeps both shortcuts as they were. The recorded chord's own key
+        // repeat, from holding it a moment too long, is not an answer.
+        if let Some((cmd, chord, owners)) = self.confirming_shortcut.take() {
+            if key.kind == KeyEventKind::Repeat
+                && crate::keymap::Chord::from_event(key) == crate::keymap::Chord::from_event(chord)
+            {
+                self.confirming_shortcut = Some((cmd, chord, owners));
+                return Ok(());
+            }
+            if key.code == KeyCode::Enter && key.modifiers.is_empty() {
+                self.write_shortcut(cmd, chord, &owners);
+            } else {
+                self.status = String::from("Shortcut unchanged");
+            }
             return Ok(());
         }
         self.hover_popup = None;
@@ -49758,6 +49784,18 @@ impl App {
         } else {
             crate::widgets::command_palette::Command::UnpinEditor
         }]);
+        // The chords as keybindings.json leaves them (#1482): a user's own
+        // chord, and no built-in chord a user binding gave to another command.
+        palette.hint_overrides = crate::widgets::command_palette::ALL_COMMANDS
+            .iter()
+            .filter_map(|&cmd| match self.keymap.chord_for(cmd) {
+                Some(user) => Some((cmd, crate::keymap::display_chord(&user))),
+                None => self
+                    .keymap
+                    .shadows_builtin(cmd)
+                    .then(|| (cmd, String::new())),
+            })
+            .collect();
         let count = palette.results.len();
         self.command_palette = Some(palette);
         self.overlays.command_palette_clear.request();
@@ -54462,7 +54500,10 @@ impl App {
             self.status_wide = false;
         }
         // A click means the user moved on from a pending shortcut prompt.
-        if matches!(m.kind, MouseEventKind::Down(_)) && self.recording_shortcut.take().is_some() {
+        if matches!(m.kind, MouseEventKind::Down(_))
+            && (self.recording_shortcut.take().is_some()
+                | self.confirming_shortcut.take().is_some())
+        {
             self.status = String::from("Shortcut unchanged");
         }
         // On-screen keyboard taps outrank every other gate - including the
@@ -58157,6 +58198,8 @@ impl App {
             .map(|&cmd| {
                 let shown = match self.keymap.chord_for(cmd) {
                     Some(user) => format!("{user}  (yours)"),
+                    // Its built-in chord now runs another command (#1482).
+                    None if self.keymap.shadows_builtin(cmd) => String::from("\u{2014}"),
                     None if !cmd.keybinding_hint().is_empty() => {
                         crate::widgets::command_palette::platform_hint(cmd.keybinding_hint())
                             .into_owned()
@@ -58190,8 +58233,43 @@ impl App {
             );
             return;
         }
+        // The command the chord runs now: a user binding, else a built-in
+        // shortcut no user binding has taken (#1482). Taking it from that
+        // command waits for Enter, so a slip of the finger cannot silently
+        // cost a shortcut like Toggle Line Comment's.
+        let chord = crate::keymap::Chord::from_event(key);
+        // A built-in chord can be shared (F7 is both Merge: Next Conflict
+        // and Go to Next Change), and a user binding takes it from all of
+        // them, so every other owner is named.
+        let owners: Vec<_> = match self.keymap.command_for(key) {
+            Some(bound) => vec![bound],
+            None => crate::keymap::builtin_commands_on(chord),
+        }
+        .into_iter()
+        .filter(|c| *c != cmd)
+        .collect();
+        if !owners.is_empty() {
+            self.status = format!(
+                "{} is {}'s shortcut: Enter to give it to \u{201c}{}\u{201d}, Esc to cancel",
+                chord.to_config_string(),
+                quoted_titles(&owners),
+                cmd.title()
+            );
+            self.confirming_shortcut = Some((cmd, key, owners));
+            return;
+        }
+        self.write_shortcut(cmd, key, &[]);
+    }
+
+    /// Write `key` as `cmd`'s shortcut in keybindings.json (#612) and
+    /// reload; `previous` are the other commands the chord ran until now.
+    fn write_shortcut(
+        &mut self,
+        cmd: crate::widgets::command_palette::Command,
+        key: KeyEvent,
+        previous: &[crate::widgets::command_palette::Command],
+    ) {
         let chord = crate::keymap::Chord::from_event(key).to_config_string();
-        let previous = self.keymap.command_for(key).filter(|c| *c != cmd);
         let path = self.keybindings_file.clone();
         // Only a missing file starts fresh: one that exists but cannot be
         // read would otherwise be overwritten with this single binding.
@@ -58219,13 +58297,14 @@ impl App {
         }
         let (map, _) = crate::keymap::Keymap::load_with_warnings(&path);
         self.keymap = map;
-        self.status = match previous {
-            Some(p) => format!(
-                "{chord} now runs \u{201c}{}\u{201d} (it ran \u{201c}{}\u{201d})",
+        self.status = if previous.is_empty() {
+            format!("{chord} now runs \u{201c}{}\u{201d}", cmd.title())
+        } else {
+            format!(
+                "{chord} now runs \u{201c}{}\u{201d} (it ran {})",
                 cmd.title(),
-                p.title()
-            ),
-            None => format!("{chord} now runs \u{201c}{}\u{201d}", cmd.title()),
+                quoted_titles(previous)
+            )
         };
     }
 
@@ -69464,6 +69543,19 @@ fn gesture_for(
         _ => return None,
     };
     Some(Gesture { kind, mods })
+}
+
+/// Command titles in curly quotes, joined for a status line (#1482):
+/// `“A”, “B” and “C”`.
+fn quoted_titles(cmds: &[crate::widgets::command_palette::Command]) -> String {
+    let quoted: Vec<String> = cmds
+        .iter()
+        .map(|c| format!("\u{201c}{}\u{201d}", c.title()))
+        .collect();
+    match quoted.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => quoted.concat(),
+    }
 }
 
 /// A chord eligible for a user rebind: it carries a real modifier

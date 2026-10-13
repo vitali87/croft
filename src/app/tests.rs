@@ -62951,6 +62951,243 @@ fn a_stale_or_clicked_away_shortcut_prompt_records_nothing() {
     );
 }
 
+/// The platform's command modifier: Cmd on macOS, Ctrl elsewhere.
+fn mod_key_1482() -> KeyModifiers {
+    if cfg!(target_os = "macos") {
+        KeyModifiers::SUPER
+    } else {
+        KeyModifiers::CONTROL
+    }
+}
+
+/// An app recording `cmd`'s shortcut into a keybindings.json in `tmp`.
+fn recording_1482(tmp: &std::path::Path, cmd: crate::widgets::command_palette::Command) -> App {
+    let mut app = App::new(tmp.to_path_buf()).unwrap();
+    app.keybindings_file = tmp.join("keybindings.json");
+    app.recording_shortcut = Some((cmd, std::time::Instant::now()));
+    app
+}
+
+/// #1482: a chord a built-in command owns (Ctrl+/ is Toggle Line Comment)
+/// is not taken on the first press: croft names the owner and waits, and
+/// Esc writes nothing.
+#[test]
+fn recording_a_built_in_chord_asks_first_and_esc_writes_nothing() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = recording_1482(tmp.path(), Command::TransformUpper);
+    let slash = key(KeyCode::Char('/'), mod_key_1482());
+    app.handle_key(slash).unwrap();
+    assert!(
+        app.status
+            .contains("\u{201c}Toggle Line Comment\u{201d}'s shortcut")
+            && app
+                .status
+                .contains("Enter to give it to \u{201c}Transform to Uppercase\u{201d}"),
+        "{}",
+        app.status
+    );
+    assert!(!app.keybindings_file.exists(), "nothing is written yet");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.status, "Shortcut unchanged");
+    assert!(!app.keybindings_file.exists());
+    assert_eq!(app.keymap.command_for(slash), None);
+    // Any other key cancels too, and is not typed or run.
+    let mut app = recording_1482(tmp.path(), Command::TransformUpper);
+    app.handle_key(slash).unwrap();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.status, "Shortcut unchanged");
+    assert!(!app.keybindings_file.exists());
+}
+
+/// #1482: Enter gives the chord to the new command, says what it ran, and
+/// the palette and Keyboard Shortcuts stop showing it on the old one.
+#[test]
+fn confirming_a_taken_chord_moves_it_and_its_hint() {
+    use crate::widgets::command_palette::{Command, PaletteItem};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = recording_1482(tmp.path(), Command::TransformUpper);
+    let slash = key(KeyCode::Char('/'), mod_key_1482());
+    app.handle_key(slash).unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.status
+            .ends_with("(it ran \u{201c}Toggle Line Comment\u{201d})"),
+        "{}",
+        app.status
+    );
+    assert_eq!(app.keymap.command_for(slash), Some(Command::TransformUpper));
+    let written = std::fs::read_to_string(&app.keybindings_file).unwrap();
+    assert!(written.contains("\"transform_upper\""), "{written}");
+
+    app.open_command_palette();
+    let palette = app.command_palette.as_ref().unwrap();
+    assert_eq!(
+        palette.hint_for(&PaletteItem::Builtin(Command::ToggleLineComment)),
+        ""
+    );
+    let modifier = if cfg!(target_os = "macos") {
+        "Cmd"
+    } else {
+        "Ctrl"
+    };
+    assert_eq!(
+        palette.hint_for(&PaletteItem::Builtin(Command::TransformUpper)),
+        format!("{modifier}+/")
+    );
+    assert_eq!(
+        palette.hint_for(&PaletteItem::Builtin(Command::ToggleBlockComment)),
+        "Shift+Alt+A",
+        "untouched shortcuts keep their hint"
+    );
+    app.command_palette = None;
+
+    app.open_keyboard_shortcuts();
+    let rows = &app.list_picker.as_ref().unwrap().rows;
+    let row = |id: &str| {
+        rows.iter()
+            .find(|r| r.id == format!("kb:{id}"))
+            .unwrap()
+            .label
+            .clone()
+    };
+    assert!(
+        row("toggle_line_comment").ends_with("\u{2014}"),
+        "{}",
+        row("toggle_line_comment")
+    );
+    assert!(
+        row("transform_upper").ends_with("(yours)"),
+        "{}",
+        row("transform_upper")
+    );
+}
+
+/// #1482 negative: a free chord, or the command's own built-in chord, is
+/// still written on the first press, with no question asked.
+#[test]
+fn a_free_chord_or_the_commands_own_chord_applies_at_once() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = recording_1482(tmp.path(), Command::TransformUpper);
+    app.handle_key(key(
+        KeyCode::Char('j'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert!(app.confirming_shortcut.is_none());
+    assert_eq!(
+        app.status,
+        "ctrl+alt+j now runs \u{201c}Transform to Uppercase\u{201d}"
+    );
+    let comment = recording_1482(tmp.path(), Command::ToggleLineComment);
+    let mut app = comment;
+    app.handle_key(key(KeyCode::Char('/'), mod_key_1482()))
+        .unwrap();
+    assert!(app.confirming_shortcut.is_none(), "{}", app.status);
+    assert_eq!(
+        app.keymap
+            .command_for(key(KeyCode::Char('/'), mod_key_1482())),
+        Some(Command::ToggleLineComment)
+    );
+}
+
+/// #1482 negative: a chord the user's own keybindings.json gave another
+/// command asks too, and a click away cancels the question.
+#[test]
+fn a_users_own_chord_asks_too_and_a_click_cancels() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = recording_1482(tmp.path(), Command::ToggleLiveRun);
+    let chord = key(
+        KeyCode::Char('j'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    app.handle_key(chord).unwrap();
+    let before = std::fs::read_to_string(&app.keybindings_file).unwrap();
+    app.recording_shortcut = Some((Command::TransformUpper, std::time::Instant::now()));
+    app.handle_key(chord).unwrap();
+    assert!(
+        app.status
+            .contains("\u{201c}Python: Toggle Live Run\u{201d}'s shortcut"),
+        "{}",
+        app.status
+    );
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 1,
+        row: 1,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(app.confirming_shortcut.is_none());
+    assert_eq!(app.status, "Shortcut unchanged");
+    assert_eq!(
+        std::fs::read_to_string(&app.keybindings_file).unwrap(),
+        before
+    );
+    assert_eq!(app.keymap.command_for(chord), Some(Command::ToggleLiveRun));
+}
+
+/// #1482: holding the recorded chord long enough to auto-repeat does not
+/// answer the question; Enter afterwards still reassigns it.
+#[test]
+fn a_repeat_of_the_recorded_chord_keeps_the_question_open() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = recording_1482(tmp.path(), Command::TransformUpper);
+    let slash = key(KeyCode::Char('/'), mod_key_1482());
+    app.handle_key(slash).unwrap();
+    let mut repeat = slash;
+    repeat.kind = KeyEventKind::Repeat;
+    app.handle_key(repeat).unwrap();
+    app.handle_key(repeat).unwrap();
+    assert!(app.confirming_shortcut.is_some(), "{}", app.status);
+    assert!(!app.keybindings_file.exists());
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.keymap.command_for(slash), Some(Command::TransformUpper));
+}
+
+/// #1482: a built-in chord several commands share names all of them, since
+/// the new binding takes it from each; a command that is one of them is
+/// asked about the others.
+#[test]
+fn a_shared_built_in_chord_names_every_owner() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let f7 = key(KeyCode::F(7), KeyModifiers::NONE);
+    let mut app = recording_1482(tmp.path(), Command::TransformUpper);
+    app.handle_key(f7).unwrap();
+    assert!(
+        app.status.contains(
+            "\u{201c}Merge Conflict: Next Conflict\u{201d} and \u{201c}Go to Next Change\u{201d}'s shortcut"
+        ),
+        "{}",
+        app.status
+    );
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.status.ends_with(
+            "(it ran \u{201c}Merge Conflict: Next Conflict\u{201d} and \u{201c}Go to Next Change\u{201d})"
+        ),
+        "{}",
+        app.status
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = recording_1482(tmp.path(), Command::GoToNextChange);
+    app.handle_key(f7).unwrap();
+    assert!(
+        app.status
+            .contains(" is \u{201c}Merge Conflict: Next Conflict\u{201d}'s shortcut"),
+        "{}",
+        app.status
+    );
+}
+
 // ---- Profiles (#618) ----
 
 #[test]
