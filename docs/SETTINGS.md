@@ -27,7 +27,10 @@ editable layers) or the palette commands "Preferences: Open Settings (JSON)"
 and "Preferences: Open Workspace Settings (JSON) / — Local (JSON)". Saving a
 layer file applies live: theme, editor toggles, save behavior, and host
 accents re-merge on the spot; the few startup-read settings (layout,
-terminal scrollback) still need a relaunch. The hub shows where a value came
+terminal scrollback) still need a relaunch. A layer, or a file one
+`extends`, changed outside croft (a `git pull`, an edit in the terminal, a
+dotfiles sync, another croft window) applies the same way within about two
+seconds. The hub shows where a value came
 from (`· workspace`, `· user-local`, …) whenever a layer other than your own
 user config decided it.
 
