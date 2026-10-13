@@ -59,6 +59,11 @@ pub struct ViewRequest {
     /// the same to an older croft.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub probe: bool,
+    /// Where to put the caret once the file is open, as a 0-based (line,
+    /// column), from a `path:line[:col]` argument (#1606). Omitted from the
+    /// wire when absent, so an older croft still reads the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<(usize, usize)>,
 }
 
 /// The server's answer. `Err` carries a message the client prints verbatim,
@@ -76,6 +81,15 @@ impl ViewRequest {
         Self {
             path: path.as_os_str().as_bytes().to_vec(),
             probe: false,
+            at: None,
+        }
+    }
+
+    /// Open `path` with the caret at `at`, a 0-based (line, column) (#1606).
+    pub fn at(path: &Path, at: Option<(usize, usize)>) -> Self {
+        Self {
+            at,
+            ..Self::new(path)
         }
     }
 
@@ -160,6 +174,37 @@ pub fn resolve(cwd: &Path, arg: &Path) -> PathBuf {
     } else {
         cwd.join(arg)
     }
+}
+
+/// The file and 0-based (line, column) a `path:line` or `path:line:col`
+/// argument names, as compilers, `grep -n` and stack traces print them
+/// (#1606). `None` unless `arg` names nothing as a whole while the part
+/// before the `:line[:col]` suffix is a file, so a file literally named
+/// `a:1` still opens as itself. The path is resolved against `cwd`; a
+/// column missing or 0 is the line's start, and line 0 is the first line.
+pub fn split_location(cwd: &Path, arg: &Path) -> Option<(PathBuf, (usize, usize))> {
+    let number = |s: &str| {
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<usize>().ok())
+            .flatten()
+    };
+    if std::fs::symlink_metadata(resolve(cwd, arg)).is_ok() {
+        return None;
+    }
+    let text = arg.to_str()?;
+    let (rest, last) = text.rsplit_once(':')?;
+    let last = number(last)?;
+    let file = |p: &str| {
+        let path = resolve(cwd, Path::new(p));
+        (!p.is_empty() && path.is_file()).then_some(path)
+    };
+    if let Some((head, line)) = rest.rsplit_once(':')
+        && let Some(line) = number(line)
+        && let Some(path) = file(head)
+    {
+        return Some((path, (line.saturating_sub(1), last.saturating_sub(1))));
+    }
+    file(rest).map(|path| (path, (last.saturating_sub(1), 0)))
 }
 
 /// Send one request and wait for the reply, both bounded by a deadline.
@@ -677,7 +722,11 @@ pub fn edit(target: &std::ffi::OsStr, wait: bool, cache_dir: &Path) -> anyhow::R
     let Some(socket) = std::env::var_os(SOCK_ENV).filter(|s| !s.is_empty()) else {
         return Ok(());
     };
-    let path = resolve(&std::env::current_dir()?, Path::new(target));
+    let cwd = std::env::current_dir()?;
+    let path = match split_location(&cwd, Path::new(target)) {
+        Some((path, _)) => path,
+        None => resolve(&cwd, Path::new(target)),
+    };
     let probe = ViewRequest::probe(&path);
     loop {
         std::thread::sleep(WAIT_POLL);
@@ -803,6 +852,22 @@ fn resolve_target(
     }
 }
 
+/// A resolved target, what made it, and the 0-based (line, column) its
+/// `:line[:col]` suffix named, if any (#1606).
+type Located = (PathBuf, Option<Created>, Option<(usize, usize)>);
+
+/// [`resolve_target`] for an argument that may end in `:line[:col]`, with
+/// the 0-based (line, column) that suffix names (#1606). The file before
+/// the suffix is opened rather than `edit` creating an empty file named
+/// `file:line`.
+fn resolve_located(verb: Verb, cwd: &Path, target: &Path) -> anyhow::Result<Located> {
+    if let Some((path, at)) = split_location(cwd, target) {
+        return Ok((path, None, Some(at)));
+    }
+    let (path, created) = resolve_target(verb, cwd, target)?;
+    Ok((path, created, None))
+}
+
 /// `croft view <path>` / `croft view -`, and the opening half of `croft
 /// edit`, with `verb` saying which of the two the user typed.
 pub fn run(
@@ -834,19 +899,19 @@ pub fn run(
         );
     }
 
-    let (path, created) = if target == "-" {
+    let (path, created, at) = if target == "-" {
         let buf = read_capped(std::io::stdin(), MAX_STAGED_STDIN_BYTES)?;
         if buf.is_empty() {
             anyhow::bail!("croft {v} -: nothing arrived on stdin");
         }
-        (stage_stdin(cache_dir, &buf, as_hint)?, None)
+        (stage_stdin(cache_dir, &buf, as_hint)?, None, None)
     } else {
         // After the socket check, so `croft edit` run outside croft leaves
         // no empty file behind.
-        resolve_target(verb, &std::env::current_dir()?, Path::new(target))?
+        resolve_located(verb, &std::env::current_dir()?, Path::new(target))?
     };
 
-    let opened = open_in_croft(v, &socket, &path);
+    let opened = open_in_croft(v, &socket, &path, at);
     // Nor does one whose croft cannot open it: a stale socket (the croft
     // that set it has exited) or a refusal takes back the empty file created
     // just above, and never a file that was already there (#848).
@@ -886,8 +951,13 @@ fn take_back(path: &Path, created: Created) {
 
 /// Ask the croft listening on `socket` to open `path`, naming the command
 /// `v` in every refusal.
-fn open_in_croft(v: &str, socket: &Path, path: &Path) -> anyhow::Result<()> {
-    match send(socket, &ViewRequest::new(path)) {
+fn open_in_croft(
+    v: &str,
+    socket: &Path,
+    path: &Path,
+    at: Option<(usize, usize)>,
+) -> anyhow::Result<()> {
+    match send(socket, &ViewRequest::at(path, at)) {
         Ok(ViewReply::Ok) => Ok(()),
         Ok(ViewReply::Err { message }) => anyhow::bail!("croft {v}: {message}"),
         Err(e)
@@ -976,6 +1046,98 @@ mod tests {
     /// #848: `croft edit TODO.md` on a file not yet on disk was refused, so
     /// `EDITOR="croft edit --wait"` broke for any tool that names a file it
     /// has not written, where `vim` or `code --wait` start one.
+    /// A 300-line `big.txt` in a fresh dir, as in #1606's repro.
+    fn big_txt() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let text: String = (1..=300).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(dir.path().join("big.txt"), text).unwrap();
+        dir
+    }
+
+    /// #1606: `file:line` and `file:line:col` name the file and a 0-based
+    /// caret position, relative or absolute.
+    #[test]
+    fn a_file_line_argument_names_the_file_and_the_line() {
+        let dir = big_txt();
+        let big = dir.path().join("big.txt");
+        assert_eq!(
+            split_location(dir.path(), Path::new("big.txt:150")),
+            Some((big.clone(), (149, 0)))
+        );
+        assert_eq!(
+            split_location(dir.path(), Path::new("big.txt:150:3")),
+            Some((big.clone(), (149, 2)))
+        );
+        let absolute = format!("{}:7", big.display());
+        assert_eq!(
+            split_location(Path::new("/"), Path::new(&absolute)),
+            Some((big, (6, 0)))
+        );
+    }
+
+    /// #1606: `croft edit big.txt:150` opens big.txt at line 150 and creates
+    /// nothing; `croft view` takes the same argument.
+    #[test]
+    fn edit_and_view_of_file_line_open_the_file_and_create_nothing() {
+        let dir = big_txt();
+        for verb in [Verb::Edit, Verb::View] {
+            let (path, created, at) =
+                resolve_located(verb, dir.path(), Path::new("big.txt:150:3")).unwrap();
+            assert_eq!(path, dir.path().join("big.txt"));
+            assert_eq!(created, None);
+            assert_eq!(at, Some((149, 2)));
+        }
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["big.txt"], "no file named big.txt:150 appeared");
+    }
+
+    /// The request carries the location to croft, and a request without one
+    /// reads as before.
+    #[test]
+    fn the_location_travels_in_the_request_only_when_there_is_one() {
+        let path = Path::new("/w/big.txt");
+        let line = serde_json::to_string(&ViewRequest::at(path, Some((149, 2)))).unwrap();
+        let back: ViewRequest = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.at, Some((149, 2)));
+        let plain = serde_json::to_string(&ViewRequest::new(path)).unwrap();
+        assert!(!plain.contains("\"at\""), "{plain}");
+        let old: ViewRequest = serde_json::from_str(r#"{"path":[47]}"#).unwrap();
+        assert_eq!(old.at, None);
+    }
+
+    /// Negative (#1606): a file literally named `a:1` is itself, and a suffix
+    /// whose prefix is no file, or is not a number, is no location.
+    #[test]
+    fn a_name_that_exists_or_has_no_file_before_the_suffix_is_not_split() {
+        let dir = big_txt();
+        std::fs::write(dir.path().join("a:1"), "x").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        for arg in [
+            "a:1",
+            "big.txt",
+            "nope.txt:3",
+            "big.txt:abc",
+            "big.txt:",
+            "big.txt:-3",
+            "big.txt:3:x",
+            "sub:3",
+            ":3",
+        ] {
+            assert_eq!(split_location(dir.path(), Path::new(arg)), None, "{arg}");
+        }
+        // `croft edit` of a new name ending in a number still creates it.
+        let (path, created, at) =
+            resolve_located(Verb::Edit, dir.path(), Path::new("notes:2")).unwrap();
+        assert_eq!(path, dir.path().join("notes:2"));
+        assert!(created.is_some() && at.is_none());
+        let (path, created, at) =
+            resolve_located(Verb::Edit, dir.path(), Path::new("a:1")).unwrap();
+        assert_eq!((path, created, at), (dir.path().join("a:1"), None, None));
+    }
+
     #[test]
     fn edit_creates_a_missing_file_in_an_existing_directory() {
         let dir = tempfile::tempdir().unwrap();

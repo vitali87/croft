@@ -610,7 +610,7 @@ impl Cli {
                 match crate::remote::launch_croft(&host, path.as_deref(), solo)? {
                     crate::remote::RemoteOutcome::ReturnToLocal => {
                         let cwd = std::env::current_dir().context("resolving workspace path")?;
-                        crate::app::run(cwd, None, None, false, Vec::new())
+                        crate::app::run(cwd, None, None, None, false, Vec::new())
                     }
                     crate::remote::RemoteOutcome::Exited => Ok(()),
                 }
@@ -726,7 +726,7 @@ impl Cli {
                 };
                 crate::pr_review::set_startup_pr(selector);
                 let cwd = std::env::current_dir()?;
-                crate::app::run(cwd, None, None, false, Vec::new())
+                crate::app::run(cwd, None, None, None, false, Vec::new())
             }
             Some(CliCommand::Demo { tour }) => {
                 if let Some(path) = tour {
@@ -740,7 +740,7 @@ impl Cli {
                 }
                 crate::tour::request_startup_demo();
                 let cwd = std::env::current_dir()?;
-                crate::app::run(cwd, None, None, false, Vec::new())
+                crate::app::run(cwd, None, None, None, false, Vec::new())
             }
             Some(CliCommand::View { path, as_ext }) => {
                 // Printed and exited here rather than returned: an `Err` out
@@ -1053,8 +1053,17 @@ impl Cli {
                 let path = self
                     .path
                     .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
-                let (path, open_file, folders) = resolve_workspace(&path, self.open_file)?;
-                crate::app::run(path, self.restore_session, open_file, self.zen, folders)
+                let cwd = std::env::current_dir().context("reading the current directory")?;
+                let (path, open_file, open_at) = split_launch_location(&path, self.open_file, &cwd);
+                let (path, open_file, folders) = resolve_workspace(&path, open_file)?;
+                crate::app::run(
+                    path,
+                    self.restore_session,
+                    open_file,
+                    open_at,
+                    self.zen,
+                    folders,
+                )
             }
         }
     }
@@ -2021,6 +2030,35 @@ fn resolve_workspace(
     resolve_workspace_from(path, open_file, &cwd)
 }
 
+/// `croft file:line[:col]` and `--open-file file:line[:col]` (#1606): the
+/// `PATH` and `--open-file` arguments with a location suffix taken off, and
+/// the 0-based (line, column) for the caret in the file that opens. An
+/// explicit `--open-file` wins, its location with it. A relative one is
+/// looked for under `cwd`, then under the workspace, as it is opened.
+fn split_launch_location(
+    path: &Path,
+    open_file: Option<PathBuf>,
+    cwd: &Path,
+) -> (PathBuf, Option<PathBuf>, Option<(usize, usize)>) {
+    let (path, path_at) = match crate::view_ipc::split_location(cwd, path) {
+        Some((file, at)) => (file, Some(at)),
+        None => (path.to_path_buf(), None),
+    };
+    let Some(file) = open_file else {
+        return (path, None, path_at);
+    };
+    let root = cwd.join(&path);
+    let split = crate::view_ipc::split_location(cwd, &file).or_else(|| {
+        root.is_dir()
+            .then(|| crate::view_ipc::split_location(&root, &file))
+            .flatten()
+    });
+    match split {
+        Some((file, at)) => (path, Some(file), Some(at)),
+        None => (path, Some(file), None),
+    }
+}
+
 /// An `--open-file` path made absolute: a relative one names a file under
 /// `cwd` (as the shell typed it), else under the workspace `root`, so the
 /// tab is keyed by the absolute path its language server tracks (#1193).
@@ -2543,6 +2581,64 @@ mod tests {
         let bad = dir.path().join("bad.code-workspace");
         std::fs::write(&bad, "{ nope").unwrap();
         assert!(resolve_workspace(&bad, None).is_err());
+    }
+
+    /// #1606: `croft big.txt:150` roots the workspace at big.txt's folder and
+    /// opens it at line 150; `--open-file big.txt:150:3` adds the column.
+    #[test]
+    fn a_file_line_launch_argument_opens_the_file_at_that_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("big.txt"), "a\nb\n").unwrap();
+        let (path, open_file, at) = split_launch_location(Path::new("big.txt:150"), None, &root);
+        assert_eq!(at, Some((149, 0)));
+        let (ws, open_file, _) = resolve_workspace_from(&path, open_file, &root).unwrap();
+        assert_eq!(ws, root);
+        assert_eq!(open_file, Some(root.join("big.txt")));
+
+        let (path, open_file, at) =
+            split_launch_location(Path::new("."), Some(PathBuf::from("big.txt:150:3")), &root);
+        assert_eq!(at, Some((149, 2)));
+        let (ws, open_file, _) = resolve_workspace_from(&path, open_file, &root).unwrap();
+        assert_eq!(ws, root);
+        assert_eq!(open_file, Some(root.join("big.txt")));
+    }
+
+    /// #1606: a relative `--open-file` location under the workspace, launched
+    /// from elsewhere, is found there.
+    #[test]
+    fn an_open_file_location_is_found_under_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let (_, open_file, at) =
+            split_launch_location(&root, Some(PathBuf::from("src/main.rs:1:4")), dir.path());
+        assert_eq!(open_file, Some(root.join("src/main.rs")));
+        assert_eq!(at, Some((0, 3)));
+    }
+
+    /// Negative (#1606): a path that exists, even one named like `a:1`, is
+    /// left alone and carries no location; an explicit `--open-file` wins
+    /// over the PATH argument's location.
+    #[test]
+    fn an_existing_path_or_an_explicit_open_file_keeps_its_meaning() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("a:1"), "x\n").unwrap();
+        std::fs::write(root.join("big.txt"), "a\n").unwrap();
+        assert_eq!(
+            split_launch_location(Path::new("a:1"), None, &root),
+            (PathBuf::from("a:1"), None, None)
+        );
+        assert_eq!(
+            split_launch_location(Path::new("."), None, &root),
+            (PathBuf::from("."), None, None)
+        );
+        let (_, open_file, at) =
+            split_launch_location(Path::new("big.txt:9"), Some(PathBuf::from("a:1")), &root);
+        assert_eq!((open_file, at), (Some(PathBuf::from("a:1")), None));
+        assert!(resolve_workspace_from(Path::new("nope.txt:9"), None, &root).is_err());
     }
 
     #[test]
