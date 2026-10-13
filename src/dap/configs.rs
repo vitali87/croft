@@ -1123,6 +1123,25 @@ pub fn build_cargo_program(spec: &CargoSpec, cwd: &Path) -> Result<PathBuf, Stri
     cargo_artifact(&stdout, spec)
 }
 
+/// Where a Go "Connect to server" attach finds its headless delve (#1418):
+/// `"mode": "remote"` with a `port`, at `host` (default `127.0.0.1`). `None`
+/// for a launch, a local attach, or a remote one with no port.
+pub fn delve_remote_address(rc: &ResolvedConfig) -> Option<(String, u16)> {
+    if rc.request != RequestKind::Attach
+        || rc.extra.get("mode").and_then(Value::as_str) != Some("remote")
+    {
+        return None;
+    }
+    let host = rc
+        .extra
+        .get("host")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .unwrap_or("127.0.0.1");
+    Some((host.to_string(), rc.port?))
+}
+
 /// Build the delve `launch`/`attach` request (#264). `mode` passes through
 /// from the config and defaults to delve's own defaults: `debug` to launch
 /// (build and run the package at `program`), `local` to attach to `processId`.
@@ -1660,6 +1679,58 @@ mod tests {
         assert_eq!(req["arguments"]["mode"], "local");
         assert_eq!(req["arguments"]["processId"], 77);
         assert!(req["arguments"].get("stopOnEntry").is_none());
+    }
+
+    /// #1418: the Go extension's "Connect to server" config (attach, mode
+    /// remote, host and port) targets that headless delve, and its request
+    /// keeps `mode: "remote"`.
+    #[test]
+    fn a_go_remote_attach_targets_the_headless_delve() {
+        let rc = resolve(
+            &config(
+                r#"[{ "name": "Connect to server", "type": "go", "request": "attach",
+                      "mode": "remote", "port": 2345, "host": "10.0.0.5",
+                      "substitutePath": [{ "from": "${workspaceFolder}", "to": "/app" }] }]"#,
+            ),
+            &ctx(),
+        )
+        .unwrap();
+        assert_eq!(
+            delve_remote_address(&rc),
+            Some((String::from("10.0.0.5"), 2345))
+        );
+        let req = delve_request(&rc);
+        assert_eq!(req["command"], "attach");
+        assert_eq!(req["arguments"]["mode"], "remote");
+        assert_eq!(
+            req["arguments"]["substitutePath"][0]["from"], "/work/proj",
+            "path mapping passes through"
+        );
+        assert!(req["arguments"].get("processId").is_none());
+
+        let local_host = resolve(
+            &config(r#"[{ "name": "C", "type": "go", "request": "attach", "mode": "remote", "port": 2345 }]"#),
+            &ctx(),
+        )
+        .unwrap();
+        assert_eq!(
+            delve_remote_address(&local_host),
+            Some((String::from("127.0.0.1"), 2345))
+        );
+    }
+
+    /// #1418, negative: a remote attach with no port, a local attach and a
+    /// launch have no headless delve to connect to.
+    #[test]
+    fn only_a_remote_go_attach_with_a_port_connects_to_a_server() {
+        for text in [
+            r#"[{ "name": "A", "type": "go", "request": "attach", "mode": "remote" }]"#,
+            r#"[{ "name": "A", "type": "go", "request": "attach", "processId": 77, "port": 2345 }]"#,
+            r#"[{ "name": "A", "type": "go", "request": "launch", "mode": "remote", "port": 2345, "program": "." }]"#,
+        ] {
+            let rc = resolve(&config(text), &ctx()).unwrap();
+            assert_eq!(delve_remote_address(&rc), None, "{text}");
+        }
     }
 
     #[test]

@@ -19,7 +19,6 @@ pub const EXTENSIONS_SRC_SVG: &[u8] = include_bytes!("../assets/icons/extensions
 pub const TESTING_SRC_SVG: &[u8] = include_bytes!("../assets/icons/beaker.svg");
 /// The QL mark (#578): the letters QL in a rounded square, croft's own
 /// drawing in the codicon outline style, for the CodeQL activity icon.
-#[allow(dead_code)] // baked once the activity bar gains the icon
 pub const CODEQL_SRC_SVG: &[u8] = include_bytes!("../assets/icons/ql.svg");
 /// Codicon `gear`, the bottom-anchored "Manage" button (Color Theme picker).
 pub const SETTINGS_GEAR_SRC_SVG: &[u8] = include_bytes!("../assets/icons/settings_gear.svg");
@@ -404,7 +403,6 @@ fn tint_rgba(src: &RgbaImage, tint: Rgba<u8>) -> RgbaImage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum InlineImageProtocol {
     ITerm2,
     Kitty,
@@ -419,7 +417,6 @@ pub enum InlineImageProtocol {
     None,
 }
 
-#[allow(dead_code)]
 pub fn inline_image_protocol_for(
     term_program: Option<&str>,
     term: Option<&str>,
@@ -451,7 +448,6 @@ pub fn terminal_warrants_switch_warning(protocol: InlineImageProtocol, termux: b
     protocol == InlineImageProtocol::None && !termux
 }
 
-#[allow(dead_code)]
 pub fn detect_inline_image_protocol() -> InlineImageProtocol {
     let term_program = std::env::var("TERM_PROGRAM").ok();
     let term = std::env::var("TERM").ok();
@@ -1088,7 +1084,6 @@ pub const KITTY_ID_MARKDOWN: u32 = KITTY_ID_BASE + 26;
 /// distinct from the editor's own images should both share a terminal.
 pub const KITTY_ID_PLOT: u32 = KITTY_ID_BASE + 27;
 /// The CodeQL (QL) activity-bar icon (#578).
-#[cfg_attr(not(test), allow(dead_code))]
 pub const KITTY_ID_CODEQL: u32 = KITTY_ID_BASE + 28;
 
 /// Apply tmux DCS passthrough wrapping to an inline-image escape when needed.
