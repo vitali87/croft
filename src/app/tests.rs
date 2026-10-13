@@ -62542,6 +62542,63 @@ fn a_users_own_chord_asks_too_and_a_click_cancels() {
     assert_eq!(app.keymap.command_for(chord), Some(Command::ToggleLiveRun));
 }
 
+/// #1482: holding the recorded chord long enough to auto-repeat does not
+/// answer the question; Enter afterwards still reassigns it.
+#[test]
+fn a_repeat_of_the_recorded_chord_keeps_the_question_open() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = recording_1482(tmp.path(), Command::TransformUpper);
+    let slash = key(KeyCode::Char('/'), mod_key_1482());
+    app.handle_key(slash).unwrap();
+    let mut repeat = slash;
+    repeat.kind = KeyEventKind::Repeat;
+    app.handle_key(repeat).unwrap();
+    app.handle_key(repeat).unwrap();
+    assert!(app.confirming_shortcut.is_some(), "{}", app.status);
+    assert!(!app.keybindings_file.exists());
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.keymap.command_for(slash), Some(Command::TransformUpper));
+}
+
+/// #1482: a built-in chord several commands share names all of them, since
+/// the new binding takes it from each; a command that is one of them is
+/// asked about the others.
+#[test]
+fn a_shared_built_in_chord_names_every_owner() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let f7 = key(KeyCode::F(7), KeyModifiers::NONE);
+    let mut app = recording_1482(tmp.path(), Command::TransformUpper);
+    app.handle_key(f7).unwrap();
+    assert!(
+        app.status.contains(
+            "\u{201c}Merge Conflict: Next Conflict\u{201d} and \u{201c}Go to Next Change\u{201d}'s shortcut"
+        ),
+        "{}",
+        app.status
+    );
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.status.ends_with(
+            "(it ran \u{201c}Merge Conflict: Next Conflict\u{201d} and \u{201c}Go to Next Change\u{201d})"
+        ),
+        "{}",
+        app.status
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = recording_1482(tmp.path(), Command::GoToNextChange);
+    app.handle_key(f7).unwrap();
+    assert!(
+        app.status
+            .contains(" is \u{201c}Merge Conflict: Next Conflict\u{201d}'s shortcut"),
+        "{}",
+        app.status
+    );
+}
+
 // ---- Profiles (#618) ----
 
 #[test]
