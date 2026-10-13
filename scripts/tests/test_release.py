@@ -449,6 +449,107 @@ class Cut(unittest.TestCase):
             self.assertTrue(repo.exists("src/release_notes/unreleased/847-plot.md"))
 
 
+class Notes(unittest.TestCase):
+    """The GitHub release body: every version's notes since the last release.
+
+    A release goes out every 50 versions, so publishing only the released
+    version's own notes would leave 49 versions' changes out of it."""
+
+    def notes_dir(self, tmp: str, **versions: str) -> Path:
+        root = Path(tmp)
+        (root / "src" / "release_notes").mkdir(parents=True)
+        for version, text in versions.items():
+            (root / "src" / "release_notes" / f"{version.replace('_', '.')}.md").write_text(text)
+        return root
+
+    def test_every_version_since_the_last_release_newest_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(
+                tmp,
+                **{"0_2_28": "fix: Old.\n", "0_2_29": "fix: A.\n", "0_2_30": "feature: B.\nfix: C.\n"},
+            )
+            self.assertEqual(
+                release.release_notes(root, "0.2.30", ["v0.2.28", "v0.1.942"]),
+                "## 0.2.30\n\nfeature: B.\nfix: C.\n\n## 0.2.29\n\nfix: A.\n",
+            )
+
+    def test_the_next_version_after_a_release_is_its_own_notes(self):
+        """What every release body was when every version was released."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(tmp, **{"0_2_28": "fix: Old.\n", "0_2_29": "fix: A.\n"})
+            self.assertEqual(release.release_notes(root, "0.2.29", ["v0.2.28"]), "fix: A.\n")
+
+    def test_with_no_earlier_release_only_its_own_notes(self):
+        """Not the whole history: nothing says where the last release was."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(tmp, **{"0_2_28": "fix: Old.\n", "0_2_29": "fix: A.\n"})
+            self.assertEqual(release.release_notes(root, "0.2.29", []), "fix: A.\n")
+
+    def test_versions_compare_as_numbers_not_text(self):
+        """0.2.10 is above 0.2.9, and 0.1.999 below 0.2.0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(
+                tmp,
+                **{"0_1_999": "fix: Old.\n", "0_2_0": "fix: A.\n", "0_2_9": "fix: B.\n", "0_2_10": "fix: C.\n"},
+            )
+            self.assertEqual(
+                release.release_notes(root, "0.2.10", ["v0.1.999"]),
+                "## 0.2.10\n\nfix: C.\n\n## 0.2.9\n\nfix: B.\n\n## 0.2.0\n\nfix: A.\n",
+            )
+
+    def test_a_release_above_this_version_and_other_tags_are_ignored(self):
+        """Re-running an older tag's release must not shrink its range to
+        nothing because a newer release exists; a tag that is not a version
+        names no release."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(
+                tmp, **{"0_2_28": "fix: Old.\n", "0_2_29": "fix: A.\n", "0_2_30": "fix: B.\n"}
+            )
+            self.assertEqual(
+                release.release_notes(root, "0.2.30", ["v0.2.31", "nightly", "v0.2", "", "v0.2.28"]),
+                "## 0.2.30\n\nfix: B.\n\n## 0.2.29\n\nfix: A.\n",
+            )
+
+    def test_unreleased_fragments_are_not_notes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(tmp, **{"0_2_28": "fix: Old.\n", "0_2_29": "fix: A.\n"})
+            (root / "src" / "release_notes" / "unreleased").mkdir()
+            (root / "src" / "release_notes" / "unreleased" / "9-x.md").write_text("fix: Pending.\n")
+            (root / "src" / "release_notes" / "README.md").write_text("# Notes\n")
+            self.assertEqual(release.release_notes(root, "0.2.29", ["v0.2.28"]), "fix: A.\n")
+
+    def test_a_version_without_notes_is_refused(self):
+        """A tag that matches no version: say so rather than invent a body."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(tmp, **{"0_2_28": "fix: Old.\n"})
+            with self.assertRaises(release.ReleaseError):
+                release.release_notes(root, "0.2.29", ["v0.2.28"])
+
+    def test_the_cli_reads_released_tags_on_stdin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(tmp, **{"0_2_28": "fix: Old.\n", "0_2_29": "fix: A.\n", "0_2_30": "fix: B.\n"})
+            done = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "release.py"), "notes", "0.2.30"],
+                cwd=root,
+                input="v0.2.28\n",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(done.stdout, "## 0.2.30\n\nfix: B.\n\n## 0.2.29\n\nfix: A.\n")
+            missing = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "release.py"), "notes", "0.2.31"],
+                cwd=root,
+                input="v0.2.28\n",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(missing.returncode, 1)
+            self.assertEqual(missing.stdout, "")
+
+
 def step_script(workflow: Path, name: str) -> str:
     """A step's `run:` block, exactly as the workflow file has it."""
     lines = workflow.read_text().splitlines()

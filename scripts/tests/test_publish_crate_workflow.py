@@ -5,7 +5,8 @@ A cadence nothing enforces is a suggestion, so this reads the workflow
 itself: it runs on every push to main, publishes every 50 bumps, gates its
 publish job on the script's verdict, hands the one write-capable token only
 to that job, and dispatches release.yml on the tag, which release.yml must
-therefore accept.
+therefore accept. It is the only workflow that starts a release, so crates.io
+and the GitHub releases hold the same versions (#1579).
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "publish-crate.yml"
 RELEASE = ROOT / ".github" / "workflows" / "release.yml"
+TAG = ROOT / ".github" / "workflows" / "tag.yml"
 
 
 class WorkflowContract(unittest.TestCase):
@@ -51,11 +53,14 @@ class WorkflowContract(unittest.TestCase):
         # publish that branch's code under the crate's identity.
         self.assertIn("if: github.ref != 'refs/heads/main'", self.text)
 
-    def test_decide_tells_the_script_whether_the_tag_exists(self):
-        # Without it, a head that was uploaded but never tagged counts 0
+    def test_decide_tells_the_script_whether_the_release_exists(self):
+        # Without it, a head that was uploaded but never released counts 0
         # bumps and the publish job never runs again to finish the handoff.
-        self.assertIn('flags+=(--tagged)', self.text)
+        # The tag is no evidence: tag.yml tags every version.
+        self.assertIn('flags+=(--released)', self.text)
+        self.assertIn('/releases/tags/v$head', self.text)
         self.assertIn('"${flags[@]}"', self.text)
+        self.assertNotIn("--tagged", self.text)
 
     def test_upload_is_skipped_on_a_fresh_index_check(self):
         # decide's already_published goes stale when only the publish job is
@@ -73,16 +78,45 @@ class WorkflowContract(unittest.TestCase):
         self.assertIn('"refs/tags/$tag^{}"', self.text)
         self.assertIn('if [ "$target" != "$commit" ]; then', self.text)
 
-    def test_a_handoff_after_an_earlier_upload_tags_the_commit_that_set_the_version(self):
-        # The head can move on without a bump between an upload and a
-        # handoff retry; the tag goes on the commit that introduced the
-        # version, which is what crates.io holds, not on the newer head.
+    def test_the_commit_that_set_the_version_is_published_and_tagged(self):
+        # The run's own commit can be a merge that landed after the version
+        # was cut, whose code is not that version yet. tag.yml tags the
+        # release commit, so publishing anything else would put code on
+        # crates.io that the tag, and the binaries built from it, do not
+        # have, and the tag step would then refuse the mismatch after the
+        # upload.
         _, publish = re.split(r"(?m)^  publish:$", self.text)
-        self.assertIn("UPLOADED_EARLIER: ${{ steps.index.outputs.uploaded }}", publish)
-        self.assertIn('commit="$GITHUB_SHA"', publish)
-        self.assertIn("git log --first-parent -1 --format=%H -G", publish)
-        self.assertIn('git tag -a "$tag" -m "croft $VERSION" "$commit"', publish)
         self.assertIn("fetch-depth: 0", publish)
+        lookup = publish.index("git log --first-parent -1 --format=%H -G")
+        checkout = publish.index('git checkout -q --detach "$commit"')
+        upload = publish.index("run: cargo publish --locked")
+        self.assertLess(lookup, checkout)
+        self.assertLess(checkout, upload)
+        self.assertIn("COMMIT: ${{ steps.source.outputs.commit }}", publish)
+        self.assertIn('git tag -a "$tag" -m "croft $VERSION" "$commit"', publish)
+        self.assertNotIn("GITHUB_SHA", publish)
+
+    def test_tag_yml_tags_but_starts_no_release(self):
+        # When tag.yml also dispatched release.yml, every version got a
+        # GitHub release and only every fiftieth reached crates.io (#1579).
+        tag = TAG.read_text()
+        self.assertIn("refs/tags/$tag", tag)
+        self.assertNotIn("release.yml/dispatches", tag)
+        self.assertNotIn("workflow run", tag)
+        self.assertNotIn("actions: write", tag)
+
+    def test_queued_tag_runs_are_kept(self):
+        # A group keeps one pending run by default and a newer one replaces
+        # it, so a release commit's tag run could be cancelled and its
+        # version left untagged.
+        self.assertRegex(TAG.read_text(), r"(?m)^concurrency:\n(  .*\n)*  queue: max$")
+
+    def test_the_release_body_covers_every_version_since_the_last_release(self):
+        # One release per 50 versions: its body must carry all of their
+        # notes, not only the released version's own.
+        release = RELEASE.read_text()
+        self.assertIn("gh release list", release)
+        self.assertIn('python3 scripts/release.py notes "$version"', release)
 
     def test_release_workflow_can_be_dispatched_on_the_tag(self):
         # The tag is pushed with the workflow token, which never triggers
