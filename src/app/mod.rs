@@ -69018,11 +69018,6 @@ fn is_delete_node_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Delete | KeyCode::Backspace)
 }
 
-/// Returns true if the given key event should trigger "Save".
-/// Recognises Ctrl+S (cross-platform) and Cmd/Super+S (macOS-style).
-/// Case-insensitive on the letter so Shift+Ctrl+S also works.
-/// The VS Code language id of the file at `path`, as its tab would have
-/// it (#1440: which `languages` block applies).
 /// Whitespace rendering for a file in language `scope` (#1440): its
 /// language block's `editor.renderWhitespace`, else `global`. A free fn so
 /// the render loops can call it while they hold the editors mutably.
@@ -69037,10 +69032,15 @@ fn whitespace_mode_in(
         .map_or(global, crate::widgets::editor::WhitespaceMode::from_pref)
 }
 
+/// The VS Code language id of the file at `path`, as its tab would have
+/// it (#1440: which `languages` block applies).
 fn path_scope_id(path: &Path) -> &'static str {
     crate::widgets::editor::language_scope_id(crate::highlight::lang_for_path(path))
 }
 
+/// Returns true if the given key event should trigger "Save".
+/// Recognises Ctrl+S (cross-platform) and Cmd/Super+S (macOS-style).
+/// Case-insensitive on the letter so Shift+Ctrl+S also works.
 fn is_word_continuation(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
