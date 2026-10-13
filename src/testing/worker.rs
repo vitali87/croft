@@ -884,16 +884,18 @@ const VITEST_CONFIG_STEMS: [&str; 2] = ["vitest.config", "vite.config"];
 const VITEST_CONFIG_EXTS: [&str; 6] = ["ts", "mts", "cts", "js", "mjs", "cjs"];
 
 /// Whether `root` runs vitest projects (#1504), formerly workspaces: a
-/// `vitest.workspace.*` file, or a config declaring `projects` (or the older
-/// `workspace`). There tap-flat names a test by its file relative to its
+/// `vitest.workspace.*` or `vitest.projects.*` file, or a config declaring
+/// `projects` (or the older `workspace`). There tap-flat names a test by its file relative to its
 /// PROJECT, without the project, so two packages' `x.test.ts` collapse into
 /// one suite and same-named tests overwrite each other. A false positive
 /// costs only the live tree updates: the run is read from its JSON report.
 fn vitest_has_projects(root: &Path) -> bool {
-    let ws_file = VITEST_CONFIG_EXTS
-        .iter()
-        .chain(&["json"])
-        .any(|ext| root.join(format!("vitest.workspace.{ext}")).is_file());
+    let ws_file = ["vitest.workspace", "vitest.projects"].iter().any(|stem| {
+        VITEST_CONFIG_EXTS
+            .iter()
+            .chain(&["json"])
+            .any(|ext| root.join(format!("{stem}.{ext}")).is_file())
+    });
     ws_file
         || VITEST_CONFIG_STEMS.iter().any(|stem| {
             VITEST_CONFIG_EXTS.iter().any(|ext| {
@@ -3203,6 +3205,9 @@ exit 1"#
             "export default []\n",
         )
         .unwrap();
+        assert!(vitest_has_projects(tmp.path()));
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("vitest.projects.json"), "[]\n").unwrap();
         assert!(vitest_has_projects(tmp.path()));
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("vite.config.mts"), "test: { projects: [] }").unwrap();
