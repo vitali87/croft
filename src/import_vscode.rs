@@ -315,6 +315,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     ("workbench.action.customizeLayout", "customize_layout"),
     ("workbench.view.explorer", "show_explorer"),
+    ("breadcrumbs.focusAndSelect", "breadcrumbs_focus_and_select"),
     ("workbench.view.search", "show_search"),
     ("workbench.action.replaceInFiles", "replace_in_files"),
     ("toggleSearchCaseSensitive", "search_toggle_match_case"),

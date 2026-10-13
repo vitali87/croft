@@ -175,6 +175,8 @@ pub enum Command {
     MacroReplayTimes,
     // --- View / navigation ---
     ShowExplorer,
+    /// View: Focus and Select Breadcrumbs (#1608): the last crumb's picker.
+    FocusBreadcrumbs,
     ShowSearch,
     /// Search: Replace in Files (#860): the Search side bar with its Replace
     /// row expanded and focused.
@@ -608,6 +610,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::MacroReplayLast,
     Command::MacroReplayTimes,
     Command::ShowExplorer,
+    Command::FocusBreadcrumbs,
     Command::ShowSearch,
     Command::ReplaceInFiles,
     Command::SearchToggleMatchCase,
@@ -1001,6 +1004,7 @@ impl Command {
             Command::MacroReplayLast => "Macro: Replay Last",
             Command::MacroReplayTimes => "Macro: Replay N Times…",
             Command::ShowExplorer => "View: Show Explorer",
+            Command::FocusBreadcrumbs => "View: Focus and Select Breadcrumbs",
             Command::ShowSearch => "View: Show Search",
             Command::ReplaceInFiles => "Search: Replace in Files",
             Command::SearchToggleMatchCase => "Search: Toggle Match Case",
@@ -1399,6 +1403,7 @@ impl Command {
             Command::MacroReplayLast => "",
             Command::MacroReplayTimes => "",
             Command::ShowExplorer => "Cmd+Shift+E",
+            Command::FocusBreadcrumbs => "Cmd+Shift+.",
             Command::ShowSearch => "Cmd+Shift+F",
             Command::ReplaceInFiles => "Cmd+Shift+H",
             // VS Code's search-input keys, live while a Search input has
@@ -1787,6 +1792,7 @@ impl Command {
             Command::MacroReplayLast => "macro_replay_last",
             Command::MacroReplayTimes => "macro_replay_times",
             Command::ShowExplorer => "show_explorer",
+            Command::FocusBreadcrumbs => "breadcrumbs_focus_and_select",
             Command::ShowSearch => "show_search",
             Command::ReplaceInFiles => "replace_in_files",
             Command::SearchToggleMatchCase => "search_toggle_match_case",

@@ -13228,6 +13228,7 @@ fn every_cmd_chord_is_ctrl_off_macos_unless_linux_md_lists_it() {
         is_file_finder_key,
         is_command_palette_key,
         is_go_to_symbol_key,
+        is_focus_breadcrumbs_key,
         is_toggle_line_comment_key,
         is_toggle_block_comment_key,
         is_toggle_wrap_key,
@@ -27049,6 +27050,7 @@ fn open_tab_menu_on_split_and_move(app: &mut App) {
         .position(|e| menu_label(e) == "Split & Move")
         .unwrap();
     app.context_menu = Some(ContextMenu {
+        crumb: None,
         origin: (0, 0),
         items,
         selected: sub_idx,
@@ -33433,6 +33435,177 @@ fn build_breadcrumbs_lists_path_segments_then_the_symbol_chain() {
         Some((1, 0)),
         "symbol crumb jumps to itself"
     );
+}
+
+/// `src/f1.rs`, `src/f2.rs` (open), `src/f3.rs` and an empty `src/sub/`,
+/// drawn so the breadcrumb bar `src › f2.rs` is on screen (#1608).
+fn app_on_src_f2(f2: &str) -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    for f in ["f1.rs", "f3.rs"] {
+        std::fs::write(src.join(f), format!("// {f}\n")).unwrap();
+    }
+    std::fs::write(src.join("f2.rs"), f2).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&src.join("f2.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    draw(&mut app, 100, 30);
+    (app, tmp)
+}
+
+/// Click crumb `i` of the drawn breadcrumb bar.
+fn click_crumb(app: &mut App, i: usize) {
+    let (x, below) = app.editor.breadcrumb_anchor(i).expect("crumb on screen");
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, below - 1));
+}
+
+/// #1608: clicking the `src` crumb lists the folder, folders first, and
+/// Enter on `f3.rs` opens it.
+#[test]
+fn clicking_a_folder_crumb_lists_it_and_enter_opens_a_file() {
+    let (mut app, tmp) = app_on_src_f2("// f2.rs\n");
+    click_crumb(&mut app, 0);
+    let menu = app.context_menu.as_ref().expect("the src picker");
+    assert_eq!(
+        menu_labels(&menu.items),
+        vec!["sub/", "f1.rs", "f2.rs", "f3.rs"]
+    );
+    assert_eq!(menu.selected, 0);
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.context_menu.is_none());
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(tmp.path().join("src/f3.rs").as_path())
+    );
+}
+
+/// #1608: the file crumb lists its folder with the file selected; a folder
+/// row drills in, and an empty folder says so instead of an empty picker.
+#[test]
+fn the_file_crumb_lists_its_folder_and_folders_drill_in() {
+    let (mut app, _tmp) = app_on_src_f2("// f2.rs\n");
+    click_crumb(&mut app, 1);
+    let menu = app.context_menu.as_ref().expect("the f2.rs picker");
+    assert_eq!(menu_labels(&menu.items)[menu.selected], "f2.rs");
+    let menu = app.context_menu.as_mut().unwrap();
+    menu.selected = 0;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.context_menu.is_none(),
+        "an empty folder opens no picker"
+    );
+    assert!(app.status.ends_with("sub is empty"), "{}", app.status);
+    assert!(app.editor.path.as_deref().unwrap().ends_with("src/f2.rs"));
+}
+
+/// #1608: a symbol crumb lists the symbols beside it, itself selected, and
+/// not those of another parent.
+#[test]
+fn a_symbol_crumb_lists_its_siblings() {
+    use crate::lsp::manager::OutlineKind;
+    let (mut app, tmp) = app_on_src_f2(
+        "struct S;\nimpl S {\n    fn a() {}\n    fn b() {\n    }\n    fn c() {}\n}\nfn free() {}\n",
+    );
+    let f = tmp.path().join("src/f2.rs");
+    app.outline.set_symbols(
+        f.clone(),
+        vec![
+            sym("S", OutlineKind::Struct, 0, 1, 6),
+            sym("a", OutlineKind::Method, 1, 2, 2),
+            sym("b", OutlineKind::Method, 1, 3, 4),
+            sym("c", OutlineKind::Method, 1, 5, 5),
+            sym("free", OutlineKind::Function, 0, 7, 7),
+        ],
+    );
+    app.editor.cursor_row = 3;
+    draw(&mut app, 100, 30);
+    let labels: Vec<String> = app
+        .editor
+        .breadcrumbs
+        .iter()
+        .map(|c| c.label.clone())
+        .collect();
+    assert_eq!(labels, vec!["src", "f2.rs", "S", "b"]);
+    click_crumb(&mut app, 3);
+    let menu = app.context_menu.as_ref().expect("the b picker");
+    assert_eq!(menu_labels(&menu.items), vec!["a", "b", "c"]);
+    assert_eq!(menu.selected, 1);
+    // A click outside an open menu only closes it.
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    click_crumb(&mut app, 2);
+    let menu = app.context_menu.as_ref().expect("the S picker");
+    assert_eq!(menu_labels(&menu.items), vec!["S", "free"]);
+    assert_eq!(menu.selected, 0);
+}
+
+/// #1608: Ctrl+Shift+. opens the last crumb's picker; Left and Right walk
+/// the bar, stopping at its ends. Ctrl+. (no Shift) is still Quick Fix.
+#[test]
+fn focus_and_select_breadcrumbs_walks_the_bar_from_the_keyboard() {
+    use crate::widgets::command_palette::Command;
+    let (mut app, _tmp) = app_on_src_f2("// f2.rs\n");
+    app.handle_key(key(KeyCode::Char('.'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(
+        app.context_menu.as_ref().is_none_or(|m| m.crumb.is_none()),
+        "Ctrl+. is not the breadcrumbs chord"
+    );
+    app.context_menu = None;
+    app.handle_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    let crumb = |app: &App| app.context_menu.as_ref().and_then(|m| m.crumb);
+    assert_eq!(crumb(&app), Some(1), "the last crumb, f2.rs");
+    app.handle_key(key(KeyCode::Left, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(crumb(&app), Some(0));
+    app.handle_key(key(KeyCode::Left, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(crumb(&app), Some(0), "Left stops at the first crumb");
+    app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(crumb(&app), Some(1), "Right stops at the last crumb");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.context_menu.is_none());
+    assert_eq!(
+        Command::from_id("breadcrumbs_focus_and_select"),
+        Some(Command::FocusBreadcrumbs)
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let mut empty = App::new(tmp.path().to_path_buf()).unwrap();
+    empty.run_command(Command::FocusBreadcrumbs);
+    assert!(empty.context_menu.is_none());
+    assert_eq!(empty.status, "No breadcrumbs to focus");
+}
+
+#[test]
+fn sibling_symbols_stay_under_one_parent() {
+    use crate::lsp::manager::OutlineKind::{Function, Method, Struct};
+    let symbols = vec![
+        sym("S", Struct, 0, 0, 9),
+        sym("a", Method, 1, 1, 1),
+        sym("b", Method, 1, 2, 2),
+        sym("T", Struct, 0, 10, 19),
+        sym("c", Method, 1, 11, 11),
+        sym("free", Function, 0, 20, 20),
+    ];
+    assert_eq!(sibling_symbols(&symbols, 2), vec![1, 2]);
+    assert_eq!(sibling_symbols(&symbols, 4), vec![4]);
+    assert_eq!(sibling_symbols(&symbols, 0), vec![0, 3, 5]);
+    assert!(sibling_symbols(&symbols, 9).is_empty());
 }
 
 #[test]
@@ -42165,6 +42338,7 @@ fn the_terminal_image_yields_to_an_open_context_menu() {
     let l = app.overlays.terminal_image.layout().unwrap().clone();
     // The pane's right-click menu, opened on the picture itself.
     app.context_menu = Some(ContextMenu {
+        crumb: None,
         origin: (l.cell_x, l.cell_y),
         items: vec![
             MenuEntry::Item {

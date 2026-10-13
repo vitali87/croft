@@ -18287,6 +18287,26 @@ impl EditorTabs {
             .find(|&&(x, w, _)| col >= x && col < x + w)
             .and_then(|&(_, _, target)| target)
     }
+
+    /// The index in `breadcrumbs` of the crumb drawn under `(col, row)`,
+    /// path or symbol alike (#1608).
+    pub fn breadcrumb_index_at(&self, col: u16, row: u16) -> Option<usize> {
+        if self.breadcrumb_y != Some(row) {
+            return None;
+        }
+        self.breadcrumb_ranges
+            .iter()
+            .position(|&(x, w, _)| col >= x && col < x + w)
+    }
+
+    /// Where crumb `i`'s picker opens: the row under the bar, at the
+    /// crumb's first cell. `None` while the bar is hidden or the crumb did
+    /// not fit on it.
+    pub fn breadcrumb_anchor(&self, i: usize) -> Option<(u16, u16)> {
+        let y = self.breadcrumb_y?;
+        let &(x, _, _) = self.breadcrumb_ranges.get(i)?;
+        Some((x, y + 1))
+    }
 }
 
 /// Tab titles for a strip, with VS Code's labelFormat disambiguation
