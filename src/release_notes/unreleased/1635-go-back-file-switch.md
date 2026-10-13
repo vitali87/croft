@@ -1,0 +1,1 @@
+fix: Go Back now returns to the file and line you left after switching files with Quick Open, a Search result, the Explorer or a tab, instead of saying "No previous location" or skipping to an older jump.
