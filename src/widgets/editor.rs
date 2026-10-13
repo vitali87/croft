@@ -13351,6 +13351,21 @@ fn title_case(s: &str) -> String {
     out
 }
 
+/// Most rulers kept (#1524). A repository's `.croft/config.json` may set
+/// `rulers`, and the painter walks them for every visible row, so the list
+/// is bounded before it reaches an editor.
+pub const MAX_RULERS: usize = 16;
+
+/// The `rulers` setting as an editor keeps it: ascending, without
+/// duplicates, and at most `MAX_RULERS` columns.
+pub fn normalize_rulers(rulers: &[u16]) -> Vec<u16> {
+    let mut out = rulers.to_vec();
+    out.sort_unstable();
+    out.dedup();
+    out.truncate(MAX_RULERS);
+    out
+}
+
 /// Whitespace rendering (#133, VS Code `editor.renderWhitespace`): which
 /// spaces/tabs paint a visible glyph (`·` / `→`). `Selection` — VS Code's
 /// default — shows them only inside selected text; `All` across the whole
@@ -32471,6 +32486,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A repository config can list any number of rulers; an editor keeps
+    /// them sorted, deduplicated, and at most `MAX_RULERS`.
+    #[test]
+    fn ruler_lists_are_sorted_deduplicated_and_capped() {
+        assert_eq!(normalize_rulers(&[100, 80, 100, 80]), vec![80, 100]);
+        let huge: Vec<u16> = (0..50_000u32).map(|i| (i % 4000) as u16).collect();
+        let kept = normalize_rulers(&huge);
+        assert_eq!(kept.len(), MAX_RULERS);
+        assert!(kept.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]

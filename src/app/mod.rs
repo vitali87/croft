@@ -5886,7 +5886,7 @@ impl App {
             whitespace_mode: crate::widgets::editor::WhitespaceMode::from_pref(
                 &loaded_prefs.render_whitespace,
             ),
-            rulers: loaded_prefs.rulers.clone(),
+            rulers: crate::widgets::editor::normalize_rulers(&loaded_prefs.rulers),
             diff_ws_default: crate::widgets::diff::DiffWhitespace::from_config(
                 &loaded_prefs.diff_ignore_whitespace,
             ),
@@ -59720,7 +59720,18 @@ impl App {
         self.whitespace_mode =
             crate::widgets::editor::WhitespaceMode::from_pref(&p.render_whitespace);
         self.editor.whitespace_mode = self.whitespace_mode;
-        self.rulers.clone_from(&p.rulers);
+        self.rulers = crate::widgets::editor::normalize_rulers(&p.rulers);
+        // Straight onto every open editor: the focus sync that otherwise
+        // carries it does not run per frame, so a reload would leave open
+        // tabs on the old rulers until an unrelated focus change.
+        for ed in self.editor.editors.iter_mut() {
+            ed.rulers.clone_from(&self.rulers);
+        }
+        for group in self.editor_layout.inactive_groups_mut() {
+            for ed in group.editors.iter_mut() {
+                ed.rulers.clone_from(&self.rulers);
+            }
+        }
         if !p.disable_inlay_hints && !self.inlay_hints_enabled {
             self.inlay_hints_enabled = true;
             self.request_inlay_hints_for_open_editors();
