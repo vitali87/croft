@@ -94,6 +94,15 @@ pub fn handoff_path() -> PathBuf {
 }
 
 pub(crate) fn dirs_cache_croft() -> PathBuf {
+    // A test that redirects croft's cache must not reach the real one.
+    #[cfg(test)]
+    if let Some(dir) = crate::app::CACHE_DIR_OVERRIDE_FOR_TEST
+        .lock()
+        .unwrap()
+        .clone()
+    {
+        return dir;
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
