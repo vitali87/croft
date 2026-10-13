@@ -242,8 +242,8 @@ mod tests {
     }
 
     /// #1532: the CSS server parses SCSS and LESS too, so `.scss` and
-    /// `.less` files get it (lint, outline, colours), from the same managed
-    /// process as CSS. `.sass` is indented syntax it cannot parse: no server.
+    /// `.less` files get it (lint, outline, colours), the same managed
+    /// install as CSS. `.sass` is indented syntax it cannot parse: no server.
     #[test]
     fn the_css_server_serves_scss_and_less_but_not_sass() {
         let r = ServerRegistry::with_defaults();
@@ -260,7 +260,7 @@ mod tests {
             assert_eq!(
                 lang.server_family(),
                 Language::CSS,
-                ".{ext} shares the CSS process"
+                ".{ext} is in the CSS server's family"
             );
         }
         assert!(r.for_extension("sass").is_empty(), ".sass gets no server");

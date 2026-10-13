@@ -18,7 +18,7 @@ extensions = ["css"]
 
 # The same server parses SCSS and LESS, choosing the parser from the
 # `languageId` sent in `didOpen` (VS Code's ids, `scss` and `less`), so both
-# share the CSS server process. `.sass` (indented syntax) is not one it
+# use the CSS server's managed install. `.sass` (indented syntax) is not one it
 # parses and stays on highlighting only.
 [[languages]]
 id = "scss"
