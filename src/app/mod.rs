@@ -834,11 +834,7 @@ fn git_status_spans<'a>(status: &'a crate::git::GitStatus) -> Vec<Span<'a>> {
     // activity-bar Source Control icon, so the status-bar branch indicator
     // and the SCM panel share the same visual mark.
     spans.push(Span::styled("\u{ea68} ", Style::default().fg(pill_color)));
-    let label: &str = match (&status.branch, &status.detached_hash) {
-        (Some(b), _) => b.as_str(),
-        (None, Some(h)) => h.as_str(),
-        (None, None) => "(no head)",
-    };
+    let label = status.head_label();
     spans.push(Span::styled(
         label,
         Style::default().fg(pill_color).add_modifier(Modifier::BOLD),
@@ -11462,9 +11458,10 @@ impl App {
                 .unwrap_or(encoding_rs::UTF_8);
             let text = enc.decode(&content).0.into_owned();
             let label = std::path::PathBuf::from(format!("{rel} (local snapshot)"));
+            let unsaved = self.unsaved_text_in_any_group(&path);
             if let Err(e) = self
                 .editor
-                .open_head_diff_with_text(label, &text, &path, false)
+                .open_head_diff_with_text_resolved(label, &text, &path, false, unsaved)
             {
                 self.status = format!("Could not open snapshot diff: {e}");
                 return;
@@ -22507,23 +22504,25 @@ impl App {
             // Cmd+K C: diff the active file against the compare anchor.
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'c') => {
                 match (self.compare_anchor.clone(), self.editor.path.clone()) {
-                    (Some(anchor), Some(other)) => match self.editor.open_diff(&anchor, &other) {
-                        Ok(()) => {
-                            self.focus_pane(Pane::Editor);
-                            self.compare_anchor = None;
-                            self.sync_open_file_poll_mtime();
-                            let l = anchor
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| anchor.display().to_string());
-                            let r = other
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| other.display().to_string());
-                            self.status = format!("Diff: {l} \u{2194} {r}");
+                    (Some(anchor), Some(other)) => {
+                        match self.open_diff_across_groups(&anchor, &other) {
+                            Ok(()) => {
+                                self.focus_pane(Pane::Editor);
+                                self.compare_anchor = None;
+                                self.sync_open_file_poll_mtime();
+                                let l = anchor
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| anchor.display().to_string());
+                                let r = other
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| other.display().to_string());
+                                self.status = format!("Diff: {l} \u{2194} {r}");
+                            }
+                            Err(e) => self.status = format!("Diff failed: {e}"),
                         }
-                        Err(e) => self.status = format!("Diff failed: {e}"),
-                    },
+                    }
                     (None, _) => {
                         self.status = String::from("Compare with Selected: nothing selected yet")
                     }
@@ -33613,12 +33612,16 @@ impl App {
                 match texts {
                     Ok((head_text, working_text)) => {
                         let label = std::path::PathBuf::from(format!("{} (HEAD)", entry.path));
+                        // The working side is the open tab's unsaved text
+                        // when it has edits, in any split group.
+                        let unsaved = self.unsaved_text_in_any_group(&abs);
                         match self.editor.open_head_diff_with_texts(
                             label,
                             &head_text,
-                            &working_text,
+                            unsaved.as_deref().unwrap_or(&working_text),
                             &abs,
                             true,
+                            unsaved.is_some(),
                         ) {
                             Ok(()) => {
                                 self.tag_open_diff(
@@ -38519,6 +38522,9 @@ impl App {
             Some(diff) if !diff.left_is_git_head => {
                 Err("Hunk actions need a working-tree diff from Source Control".to_string())
             }
+            Some(diff) if diff.right_is_unsaved => {
+                Err("Save the file first: hunk actions apply to the file on disk".to_string())
+            }
             // The patch is built from the decoded text, which would put UTF-8
             // bytes into a blob stored in another encoding (#1242).
             Some(diff) if diff.text_encoding != encoding_rs::UTF_8 => Err(format!(
@@ -38605,7 +38611,10 @@ impl App {
     fn diff_selected_lines_patch(&self) -> Option<(String, String)> {
         let diff = self.editor.diff.as_ref()?;
         // Not UTF-8: left to the hunk path, which refuses it with a reason.
-        if !diff.left_is_git_head || diff.text_encoding != encoding_rs::UTF_8 {
+        if !diff.left_is_git_head
+            || diff.right_is_unsaved
+            || diff.text_encoding != encoding_rs::UTF_8
+        {
             return None;
         }
         let sel = diff.selection?;
@@ -38672,6 +38681,11 @@ impl App {
         if !diff.left_is_git_head {
             self.status =
                 String::from("Group by seat applies to a Source Control diff of the working tree");
+            return;
+        }
+        if diff.right_is_unsaved {
+            // The seat map is keyed on the saved file's lines (#1572).
+            self.status = String::from("Save the file first: group by seat reads the saved file");
             return;
         }
         diff.group_by_seat = !diff.group_by_seat;
@@ -38875,6 +38889,24 @@ impl App {
         }
     }
 
+    /// The unsaved text of `path` in whichever editor group holds it dirty
+    /// (#1572): a split shows the same file in several groups, and the dirty
+    /// copy may sit in an inactive one while the active group's is clean.
+    fn unsaved_text_in_any_group(&self, path: &Path) -> Option<String> {
+        std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .find_map(|group| group.unsaved_text_of(path))
+    }
+
+    /// Open a two-file diff in the active group, each side's unsaved text
+    /// resolved across every editor group.
+    fn open_diff_across_groups(&mut self, left: &Path, right: &Path) -> anyhow::Result<()> {
+        let left_unsaved = self.unsaved_text_in_any_group(left);
+        let right_unsaved = self.unsaved_text_in_any_group(right);
+        self.editor
+            .open_diff_resolved(left, right, left_unsaved, right_unsaved)
+    }
+
     /// Rebuild every open diff view, in every split group, whose sides may
     /// have moved (#471), keeping each reader's viewport. Returns true when
     /// any view's content actually changed, so the caller owes a redraw.
@@ -38934,6 +38966,10 @@ impl App {
                     if let Some(cur) = ed.diff.as_mut() {
                         cur.left_stamp = fresh.left_stamp;
                         cur.right_stamp = fresh.right_stamp;
+                        // A rebuild reads the right side from disk: rows
+                        // identical to an unsaved view mean the save landed,
+                        // so hunk actions apply again (#1572).
+                        cur.right_is_unsaved = fresh.right_is_unsaved;
                     }
                     continue;
                 }
@@ -41168,18 +41204,20 @@ impl App {
     }
 
     /// **Diff to working tree** (#371): the scrubbed version against the
-    /// file on disk, in the side-by-side diff.
+    /// working copy (its open tab's unsaved edits, else the file on disk),
+    /// in the side-by-side diff.
     fn scrub_diff_to_working_tree(&mut self) {
         let Some((path, rel, commit, text)) = self.scrubbed_file() else {
             return;
         };
         let label = PathBuf::from(format!("{rel} @ {}", commit.short_hash));
+        let unsaved = self.unsaved_text_in_any_group(&path);
         // A file the commit predates diffs as all added, which is what
         // happened to it since.
         let text = text.unwrap_or_default();
         if let Err(e) = self
             .editor
-            .open_head_diff_with_text(label, &text, &path, false)
+            .open_head_diff_with_text_resolved(label, &text, &path, false, unsaved)
         {
             self.status = format!("Could not diff {rel}: {e}");
             return;
@@ -43127,8 +43165,9 @@ impl App {
         }
         // Rename Symbol (F2) and Change All Occurrences (Cmd/Ctrl+F2) are only
         // meaningful on a text buffer, so they sit above the read-only diff /
-        // sheet / image guards below.
-        if is_rename_symbol_key(key) {
+        // sheet / image guards below. The sheet grid is editable and F2 is its
+        // own "edit this cell" key (#1618), so there F2 falls through to it.
+        if is_rename_symbol_key(key) && self.editor.sheet.is_none() {
             self.start_rename_symbol();
             return;
         }
@@ -43179,8 +43218,14 @@ impl App {
         // reachable from the Command Palette, which guarantees parity on
         // terminals that don't deliver the Alt+letter chords.
         if is_toggle_line_comment_key(key) {
-            if self.editor_is_text() {
-                self.editor.toggle_line_comment();
+            // The palette's message too: a key that does nothing because the
+            // language has no comment must say so (#1181); a blank line in
+            // one that has does nothing quietly.
+            if self.editor_is_text()
+                && !self.editor.toggle_line_comment()
+                && !self.editor.has_line_comment_syntax()
+            {
+                self.status = String::from("Toggle Line Comment: no comment for this language");
             }
             return;
         }
@@ -47933,9 +47978,10 @@ impl App {
             Err(_) => path.display().to_string(),
         };
         let label = std::path::PathBuf::from(format!("{rel} (reviewed)"));
+        let unsaved = self.unsaved_text_in_any_group(path);
         if let Err(e) = self
             .editor
-            .open_head_diff_with_text(label, &text, path, false)
+            .open_head_diff_with_text_resolved(label, &text, path, false, unsaved)
         {
             self.status = format!("Could not open the reviewed diff: {e}");
             return;
@@ -50650,7 +50696,7 @@ impl App {
             Cmd::MoveLineUp => self.editor.move_lines_up(),
             Cmd::MoveLineDown => self.editor.move_lines_down(),
             Cmd::ToggleLineComment => {
-                if !self.editor.toggle_line_comment() {
+                if !self.editor.toggle_line_comment() && !self.editor.has_line_comment_syntax() {
                     self.status = String::from("Toggle Line Comment: no comment for this language");
                 }
             }
@@ -51902,10 +51948,7 @@ impl App {
                 let _ = std::fs::create_dir_all(parent);
             }
             let contents = match seed {
-                ConfigFileSeed::Settings => {
-                    let prefs = crate::prefs::Prefs::load_or_default();
-                    serde_json::to_string_pretty(&prefs).unwrap_or_else(|_| String::from("{}\n"))
-                }
+                ConfigFileSeed::Settings => SETTINGS_TEMPLATE.to_string(),
                 ConfigFileSeed::SettingsLayer => SETTINGS_LAYER_TEMPLATE.to_string(),
                 ConfigFileSeed::Keybindings => crate::keymap::TEMPLATE.to_string(),
                 ConfigFileSeed::Snippets => crate::snippets::TEMPLATE.to_string(),
@@ -60913,7 +60956,7 @@ impl App {
             MenuAction::MoveIntoNewWindow(idx) => self.move_into_new_window(idx),
             MenuAction::CopyIntoNewWindow(idx) => self.copy_into_new_window(idx),
             MenuAction::CompareWithSelected { anchor, other } => {
-                match self.editor.open_diff(&anchor, &other) {
+                match self.open_diff_across_groups(&anchor, &other) {
                     Ok(()) => {
                         self.focus_pane(Pane::Editor);
                         self.compare_anchor = None;
@@ -66628,7 +66671,7 @@ impl App {
             }
             Some(anchor) => {
                 let anchor_clone = anchor.clone();
-                match self.editor.open_diff(&anchor_clone, &path) {
+                match self.open_diff_across_groups(&anchor_clone, &path) {
                     Ok(()) => {
                         self.focus_pane(Pane::Editor);
                         self.compare_anchor = None;
@@ -66665,8 +66708,10 @@ impl App {
             self.status = String::from("Explorer clipboard is empty");
             return;
         };
-        self.move_or_copy_in_explorer(&dest_dir, &clip.paths, clip.mode);
-        if matches!(clip.mode, ExplorerClipMode::Cut) {
+        let moved = self.move_or_copy_in_explorer(&dest_dir, &clip.paths, clip.mode);
+        // A cut pasted back where it already is moved nothing, so it stays
+        // on the clipboard for the paste into the folder it was meant for.
+        if moved && matches!(clip.mode, ExplorerClipMode::Cut) {
             self.tree_clipboard = None;
         }
     }
@@ -66679,10 +66724,22 @@ impl App {
         dest_dir: &Path,
         paths: &[PathBuf],
         mode: ExplorerClipMode,
-    ) {
+    ) -> bool {
         if matches!(mode, ExplorerClipMode::Copy) {
             let _ = self.apply_paste_or_drop(dest_dir, paths, mode);
-            return;
+            return true;
+        }
+        // An item already in `dest_dir` stays as it is: moving it there is
+        // no move, and a fresh name for it renamed the file to "<name> copy"
+        // on disk, retargeting its tabs and the servers' imports (#1174).
+        let paths: Vec<PathBuf> = paths
+            .iter()
+            .filter(|p| !crate::widgets::file_tree::is_directly_in(dest_dir, p))
+            .cloned()
+            .collect();
+        if paths.is_empty() {
+            self.status = String::from("Already in this folder: nothing to move");
+            return false;
         }
         let renames = paths
             .iter()
@@ -66694,9 +66751,10 @@ impl App {
             .collect();
         let op = FileMove::Paste {
             dest_dir: dest_dir.to_path_buf(),
-            paths: paths.to_vec(),
+            paths,
         };
         self.start_file_move(op, renames);
+        true
     }
 
     /// Ask the servers about `renames`, then run `op` once they answer (or
@@ -69003,6 +69061,17 @@ const SETTINGS_LAYER_TEMPLATE: &str = r#"{
   // blocks). Workspace files may set appearance and editor/terminal
   // behavior keys only; trust-related settings are user-config only and
   // warn in OUTPUT · Settings.
+}
+"#;
+
+/// What Open Settings (JSON) creates when there is no `config.json` yet: an
+/// object with no keys, like VS Code's settings.json. Seeding every default
+/// made each one a user setting, over an `extends` base and over defaults a
+/// later release changes (#1617).
+const SETTINGS_TEMPLATE: &str = r#"{
+  // Your croft settings: add only the keys you want to change, and every
+  // other setting keeps its default. docs/SETTINGS.md lists the keys and
+  // explains "extends" and platform blocks.
 }
 "#;
 
