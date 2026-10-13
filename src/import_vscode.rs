@@ -389,6 +389,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("editor.action.goToImplementation", "go_to_implementations"),
     ("editor.action.rename", "rename_symbol"),
     ("editor.action.startFindReplaceAction", "replace_in_file"),
+    ("toggleFindInSelection", "toggle_find_in_selection"),
     ("editor.action.moveLinesUpAction", "move_line_up"),
     ("editor.action.moveLinesDownAction", "move_line_down"),
     ("editor.action.deleteLines", "delete_line"),
@@ -2550,5 +2551,22 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let report = scan_profile(dir.path()).expect("an empty profile is fine");
         assert!(report.is_empty());
+    }
+
+    /// #1577: VS Code's Find in Selection toggle chord imports onto croft's.
+    #[test]
+    fn toggle_find_in_selection_imports() {
+        let doc = json!([
+            { "key": "ctrl+alt+i", "command": "toggleFindInSelection" }
+        ]);
+        let mut report = Report::default();
+        convert_keybindings(&doc, &mut report);
+        assert_eq!(
+            report.keybindings,
+            [(
+                String::from("ctrl+alt+i"),
+                String::from("toggle_find_in_selection")
+            )]
+        );
     }
 }

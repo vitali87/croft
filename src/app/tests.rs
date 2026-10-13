@@ -36787,6 +36787,277 @@ fn replace_all_chord_replaces_every_match_in_one_undo_step() {
     assert_eq!(app.editor.lines[1], "gamma alpha");
 }
 
+/// The issue's file (#1577): three functions, each using `x` twice.
+const FIND_IN_SELECTION_SRC: &str =
+    "def a(x):\n    return x + 1\n\ndef b(x):\n    return x * 2\n\ndef c(x):\n    return x - 3";
+
+/// `f.py` open with `def b` (lines 4-5) selected and the replace bar open
+/// on the query `x`.
+fn find_in_selection_app(tmp: &Path) -> App {
+    let mut app = app_with_open_file(tmp, "f.py", FIND_IN_SELECTION_SRC);
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (3, 0),
+        head: (5, 0),
+    });
+    (app.editor.cursor_row, app.editor.cursor_col) = (5, 0);
+    app.handle_key(replace_chord()).unwrap();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    app
+}
+
+fn alt_l(app: &mut App) {
+    app.handle_key(key(KeyCode::Char('l'), KeyModifiers::ALT))
+        .unwrap();
+}
+
+fn find_count(app: &App) -> usize {
+    app.editor_find
+        .as_ref()
+        .expect("the bar is open")
+        .match_count
+}
+
+/// #1577: with Find in Selection on, the count and Replace All cover the
+/// selected function only. Replace All used to rewrite all three.
+#[test]
+fn find_in_selection_limits_the_count_and_replace_all() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = find_in_selection_app(tmp.path());
+    assert_eq!(find_count(&app), 6, "the whole file before the toggle");
+    alt_l(&mut app);
+    assert_eq!(find_count(&app), 2);
+    assert_eq!(app.editor.find_range, Some(((3, 0), (5, 0))));
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::ALT | KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines,
+        [
+            "def a(x):",
+            "    return x + 1",
+            "",
+            "def b(n):",
+            "    return n * 2",
+            "",
+            "def c(x):",
+            "    return x - 3",
+        ]
+    );
+    assert_eq!(app.status, "Replaced 2 occurrences");
+}
+
+/// #1577: Enter steps through the selection's matches only, wrapping
+/// inside it, and the bar says which of its two it is on.
+#[test]
+fn find_in_selection_steps_only_through_the_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = find_in_selection_app(tmp.path());
+    alt_l(&mut app);
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        seen.push(app.editor.active_search_match);
+        let index = app.editor_find.as_ref().unwrap().match_index;
+        assert!(matches!(index, Some(1 | 2)), "{index:?}");
+    }
+    assert_eq!(
+        seen,
+        [
+            Some((4, 11, 1)),
+            Some((3, 6, 1)),
+            Some((4, 11, 1)),
+            Some((3, 6, 1)),
+        ]
+    );
+}
+
+/// #1577: a replacement longer than the needle moves the range's end with
+/// it, so a range ending mid-line still holds every replaced match and
+/// nothing past it.
+#[test]
+fn the_range_follows_a_longer_replacement() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "f.py", FIND_IN_SELECTION_SRC);
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (3, 0),
+        head: (4, 12),
+    });
+    // Off any word, so nothing is seeded and the query is typed.
+    (app.editor.cursor_row, app.editor.cursor_col) = (5, 0);
+    app.handle_key(replace_chord()).unwrap();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    alt_l(&mut app);
+    assert_eq!(find_count(&app), 2);
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::ALT | KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.editor.lines[3], "def b(xx):");
+    assert_eq!(app.editor.lines[4], "    return xx * 2");
+    assert_eq!(app.editor.find_range, Some(((3, 0), (4, 13))));
+    assert_eq!(find_count(&app), 4, "both doubled matches, still in range");
+    assert_eq!(app.editor.lines[0], "def a(x):");
+    assert_eq!(app.editor.lines[7], "    return x - 3");
+
+    // One at a time too: each Enter in the replace row moves the end on.
+    let mut app = app_with_open_file(tmp.path(), "g.py", FIND_IN_SELECTION_SRC);
+    (app.editor.cursor_row, app.editor.cursor_col) = (5, 0);
+    app.handle_key(replace_chord()).unwrap();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    // Selected after the bar opened, so the one-line selection does not
+    // seed the query.
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (4, 0),
+        head: (4, 12),
+    });
+    alt_l(&mut app);
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    for c in "value".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(app.editor.lines[4], "    return value * 2");
+    assert_eq!(app.editor.find_range, Some(((4, 0), (4, 16))));
+    assert_eq!(app.editor.lines[7], "    return x - 3", "past the range");
+}
+
+/// #1577: with no selection, Find in Selection takes the caret's line; the
+/// palette has the command, and it opens the bar.
+#[test]
+fn find_in_selection_without_a_selection_takes_the_caret_line() {
+    use crate::widgets::command_palette::Command;
+    assert_eq!(
+        Command::from_id("toggle_find_in_selection"),
+        Some(Command::ToggleFindInSelection)
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "f.py", FIND_IN_SELECTION_SRC);
+    (app.editor.cursor_row, app.editor.cursor_col) = (7, 0);
+    assert!(run_from_palette(&mut app, "Find: Toggle Find in Selection"));
+    let state = app.editor_find.as_ref().expect("the bar opened");
+    assert_eq!(state.in_selection, Some(((7, 0), (7, 16))));
+    for c in "x".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(find_count(&app), 1);
+}
+
+/// Negatives (#1577): toggling off counts the whole file again, closing
+/// the bar drops the range, and the next bar starts without it.
+#[test]
+fn find_in_selection_off_and_closed_is_the_whole_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = find_in_selection_app(tmp.path());
+    alt_l(&mut app);
+    assert_eq!(find_count(&app), 2);
+    alt_l(&mut app);
+    assert_eq!(find_count(&app), 6);
+    assert_eq!(app.editor.find_range, None);
+    alt_l(&mut app);
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor_find.is_none());
+    assert_eq!(app.editor.find_range, None);
+    app.handle_key(replace_chord()).unwrap();
+    assert_eq!(app.editor_find.as_ref().unwrap().in_selection, None);
+    // A typed `l` with no modifier is text, not the toggle.
+    app.handle_key(key(KeyCode::Char('l'), KeyModifiers::NONE))
+        .unwrap();
+    let state = app.editor_find.as_ref().unwrap();
+    assert!(state.query.ends_with('l') || state.replace.ends_with('l'));
+    assert_eq!(state.in_selection, None);
+}
+
+/// #1577: the range belongs to the tab it was taken in. Another tab under
+/// the same bar searches and replaces whole instead of by the first tab's
+/// coordinates, and closing the bar from it still drops the first tab's
+/// range.
+#[test]
+fn find_in_selection_stays_with_its_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = find_in_selection_app(tmp.path());
+    alt_l(&mut app);
+    assert_eq!(find_count(&app), 2);
+    let g = tmp.path().join("g.py");
+    std::fs::write(&g, FIND_IN_SELECTION_SRC).unwrap();
+    app.editor.open_pinned(&g).unwrap();
+    assert_eq!(app.editor.find_range, None);
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::ALT | KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.status, "Replaced 6 occurrences");
+    assert!(app.editor.lines.iter().all(|l| !l.contains('x')));
+    assert_eq!(app.editor.editors[0].find_range, Some(((3, 0), (5, 0))));
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor_find.is_none());
+    assert_eq!(app.editor.editors[0].find_range, None);
+}
+
+/// #1577: `Alt+L` on a query seeded from a one-line selection keeps the
+/// query, rather than clearing it as a typed character would.
+#[test]
+fn alt_l_keeps_a_seeded_query() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "f.py", FIND_IN_SELECTION_SRC);
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (1, 4),
+        head: (1, 10),
+    });
+    (app.editor.cursor_row, app.editor.cursor_col) = (1, 10);
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.editor_find.as_ref().unwrap().query_selected);
+    alt_l(&mut app);
+    let state = app.editor_find.as_ref().unwrap();
+    assert_eq!(state.query, "return");
+    assert_eq!(state.in_selection, Some(((1, 4), (1, 10))));
+    assert_eq!(find_count(&app), 1);
+}
+
+/// #1577: a regex replacement's `\r` breaks the line, and the range's end
+/// moves down with it, so the selection's later matches stay in it.
+#[test]
+fn the_range_follows_a_carriage_return_replacement() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = find_in_selection_app(tmp.path());
+    app.editor_find.as_mut().unwrap().opts.use_regex = true;
+    alt_l(&mut app);
+    assert_eq!(app.editor.active_search_match, Some((3, 6, 1)));
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    for c in "a\\rb".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[3], "def b(a");
+    assert_eq!(app.editor.lines[4], "b):");
+    assert_eq!(app.editor.find_range, Some(((3, 0), (6, 0))));
+    assert_eq!(find_count(&app), 1, "the `x` the break pushed down");
+}
+
 // --- Merge conflict resolution ---------------------------------------------
 
 const CONFLICTED_BODY: &str =
