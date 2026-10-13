@@ -81921,3 +81921,58 @@ fn go_and_lint_rows_reach_problems_only_for_real_files() {
         ]
     );
 }
+
+/// #1408: in a maturin crate (Cargo.toml and pyproject.toml), Debug Test
+/// at Cursor in a pytest file debugs under pytest, and in a Rust file as a
+/// cargo test; it used to build a cargo test binary for the `.py` file.
+#[test]
+fn debug_test_in_a_maturin_crate_follows_the_files_language() {
+    use crate::testing::worker::Runner;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"fastmath\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pyproject.toml"),
+        "[project]\nname = \"fastmath\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/lib.rs"), "#[test]\nfn adds() {}\n").unwrap();
+    std::fs::write(
+        root.join("tests/test_api.py"),
+        "def test_python_side():\n    assert 1 + 2 == 3\n",
+    )
+    .unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor
+        .open_pinned(&root.join("tests/test_api.py"))
+        .unwrap();
+    assert_eq!(
+        app.test_runner_for_focused_file(&root),
+        Some(Runner::Pytest)
+    );
+    app.editor.open_pinned(&root.join("src/lib.rs")).unwrap();
+    assert_eq!(app.test_runner_for_focused_file(&root), Some(Runner::Cargo));
+}
+
+/// #1408, negative: a one-language folder keeps its one runner whatever
+/// file is focused.
+#[test]
+fn a_one_language_folder_keeps_its_runner_for_any_file() {
+    use crate::testing::worker::Runner;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(root.join("pyproject.toml"), "[project]\nname = \"p\"\n").unwrap();
+    std::fs::write(root.join("notes.rs"), "fn main() {}\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open_pinned(&root.join("notes.rs")).unwrap();
+    assert_eq!(
+        app.test_runner_for_focused_file(&root),
+        Some(Runner::Pytest)
+    );
+}

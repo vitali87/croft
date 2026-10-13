@@ -5,6 +5,8 @@
 //! populate the tree without running); per-test granularity and other
 //! ecosystems come in later milestones.
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -40,13 +42,75 @@ pub fn runner_for(root: &Path) -> Option<Runner> {
     super::registry::runner_for(root)
 }
 
+/// Every runner that claims `root` (#1408): a folder with two languages'
+/// tests has a runner for each, and the Testing view lists both.
+pub fn runners_for(root: &Path) -> Vec<Runner> {
+    super::registry::runners_for(root)
+}
+
+/// The runners whose tests a file of this kind holds, by its extension.
+fn runners_of_file(file: &Path) -> &'static [Runner] {
+    let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+    match ext {
+        "rs" => &[Runner::Cargo],
+        "py" => &[Runner::Pytest],
+        "go" => &[Runner::Go],
+        "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts" => {
+            &[Runner::Vitest, Runner::Jest]
+        }
+        "ql" | "qlref" | "expected" => &[Runner::Codeql],
+        _ => &[],
+    }
+}
+
+/// The runner of `runners` that runs the tests in `file` (#1408): the one
+/// for the file's language, else the folder's first. A pytest file in a
+/// maturin crate is pytest's, not Cargo's.
+pub fn runner_for_file(runners: &[Runner], file: Option<&Path>) -> Option<Runner> {
+    file.map(runners_of_file)
+        .unwrap_or(&[])
+        .iter()
+        .copied()
+        .find(|r| runners.contains(r))
+        .or_else(|| runners.first().copied())
+}
+
+/// The runner a run of `name` goes to (#1408): the file's language when the
+/// run came from a file, else the runner that listed `name` (or, for a
+/// suite, a test under it), else the folder's first.
+fn choose_runner(
+    runners: &[Runner],
+    owners: &BTreeMap<String, Runner>,
+    name: &str,
+    file: Option<&Path>,
+) -> Option<Runner> {
+    let by_file = file
+        .map(runners_of_file)
+        .unwrap_or(&[])
+        .iter()
+        .copied()
+        .find(|r| runners.contains(r));
+    let by_name = owners
+        .get(name)
+        .or_else(|| {
+            owners
+                .iter()
+                .find(|(listed, _)| listed.starts_with(name))
+                .map(|(_, r)| r)
+        })
+        .copied()
+        .filter(|r| runners.contains(r));
+    by_file.or(by_name).or_else(|| runners.first().copied())
+}
+
 pub enum TestRequest {
     RunAll,
     /// Run a single test by its exact name (click-to-run from the tree).
     RunOne(String),
     /// Run every test whose name contains the string (run-at-cursor by
-    /// function name). cargo's name filter is a substring match.
-    RunFilter(String),
+    /// function name). cargo's name filter is a substring match. The file
+    /// the run came from, if any, picks the runner (#1408).
+    RunFilter(String, Option<PathBuf>),
     /// Run a whole suite by its unanchored name (a header click). The cargo
     /// arm anchors it with [`super::suite_pattern`] so `parse` cannot sweep
     /// `parse_utils::b`; pytest gets it positionally as a node-ID prefix.
@@ -251,8 +315,10 @@ impl TestWorker {
         self.send(TestRequest::RunOne(name));
     }
 
-    pub fn run_filter(&mut self, pattern: String) {
-        self.send(TestRequest::RunFilter(pattern));
+    /// Run the tests matching `pattern`, with the runner for `file`'s
+    /// language when the run came from one (#1408).
+    pub fn run_filter(&mut self, pattern: String, file: Option<PathBuf>) {
+        self.send(TestRequest::RunFilter(pattern, file));
     }
 
     pub fn run_suite(&mut self, suite: String) {
@@ -342,11 +408,38 @@ struct EpochTx<'a> {
     /// number of the request being served.
     control: &'a RunControl,
     request: u64,
+    /// Which runner listed or ran each test (#1408), so a later run of one
+    /// goes back to it; `tag` is the runner whose cases this sender
+    /// carries.
+    owners: Option<&'a RefCell<BTreeMap<String, Runner>>>,
+    tag: Option<Runner>,
 }
 
-impl EpochTx<'_> {
+impl<'a> EpochTx<'a> {
     fn send(&self, resp: TestResponse) {
+        if let (Some(owners), Some(runner), TestResponse::Case(case)) =
+            (self.owners, self.tag, &resp)
+        {
+            owners.borrow_mut().insert(case.name.clone(), runner);
+        }
         let _ = self.tx.send((self.epoch, resp));
+    }
+
+    /// This sender, recording what it carries as `runner`'s.
+    fn tagged(&self, runner: Runner) -> EpochTx<'a> {
+        EpochTx {
+            tag: Some(runner),
+            ..*self
+        }
+    }
+
+    /// The runner a run of `name` goes to, among `runners`.
+    fn choose(&self, runners: &[Runner], name: &str, file: Option<&Path>) -> Option<Runner> {
+        let empty = BTreeMap::new();
+        match self.owners {
+            Some(owners) => choose_runner(runners, &owners.borrow(), name, file),
+            None => choose_runner(runners, &empty, name, file),
+        }
     }
 
     /// An owned clone for the stderr tee thread.
@@ -366,6 +459,7 @@ fn worker_loop(
     // otherwise.
     let mut codeql = PathBuf::from("codeql");
     let mut request = 0u64;
+    let owners = RefCell::new(BTreeMap::new());
     while let Ok(req) = rx.recv() {
         request += 1;
         let etx = EpochTx {
@@ -374,17 +468,22 @@ fn worker_loop(
             codeql: &codeql,
             control,
             request,
+            owners: Some(&owners),
+            tag: None,
         };
         match req {
             TestRequest::RunAll => run_all(&root, &etx),
             TestRequest::RunCoverage(scope) => run_coverage(&root, &etx, scope.as_ref()),
             TestRequest::RunOne(name) => run_one(&root, &etx, &name),
-            TestRequest::RunFilter(pattern) => run_filter(&root, &etx, &pattern, false),
+            TestRequest::RunFilter(pattern, file) => {
+                run_filter_in(&root, &etx, &pattern, false, file.as_deref())
+            }
             TestRequest::RunSuite(suite) => run_filter(&root, &etx, &suite, true),
             TestRequest::Discover => discover(&root, &etx),
             TestRequest::SetRoot(p) => {
                 root = p;
                 epoch += 1;
+                owners.borrow_mut().clear();
             }
             TestRequest::SetCodeqlProgram(p) => codeql = p,
         }
@@ -1087,12 +1186,23 @@ fn run_all(root: &Path, tx: &EpochTx) {
     // discovered tree — a refusal keeps the panel exactly as it was.
     // Exhaustive matches below, no `_` arm, so a future Runner variant is a
     // compile error here instead of silently cargo.
-    let Some(runner) = runner_for(root) else {
+    let runners = runners_for(root);
+    if runners.is_empty() {
         tx.send(TestResponse::Refused);
         return;
-    };
+    }
     tx.send(TestResponse::Started(Activity::Running));
-    let ok = match runner {
+    // Every runner runs, even after one fails (#1408).
+    let mut ok = true;
+    for runner in runners {
+        ok &= run_all_with(runner, root, &tx.tagged(runner));
+    }
+    tx.send(TestResponse::Finished { ok: Some(ok) });
+}
+
+/// Run everything `runner` runs; whether it all passed.
+fn run_all_with(runner: Runner, root: &Path, tx: &EpochTx) -> bool {
+    match runner {
         Runner::Pytest => {
             let cmd = pytest_cmd(root, &[PYTEST_RUN_VERBOSITY, "--color=no"]);
             run_streaming(tx, cmd, one(parse_pytest_line))
@@ -1119,8 +1229,7 @@ fn run_all(root: &Path, tx: &EpochTx) {
             }
         }
     }
-    .unwrap_or(false);
-    tx.send(TestResponse::Finished { ok: Some(ok) });
+    .unwrap_or(false)
 }
 
 /// The pack files the bundled CodeQL runner looks for. A run needs the test
@@ -1399,7 +1508,7 @@ fn run_coverage(root: &Path, tx: &EpochTx, scope: Option<&CoverageScope>) {
 fn run_one(root: &Path, tx: &EpochTx, name: &str) {
     // See run_all: `None` refuses instead of falling through to cargo, and
     // `Refused` (not a bare Finished) rolls back this case's Running mark.
-    let Some(runner) = runner_for(root) else {
+    let Some(runner) = tx.choose(&runners_for(root), name, None) else {
         tx.send(TestResponse::Refused);
         return;
     };
@@ -1438,9 +1547,15 @@ fn run_one(root: &Path, tx: &EpochTx, name: &str) {
 /// the app has already marked the affected cases and shown the busy state,
 /// so no `Started` is sent.
 fn run_filter(root: &Path, tx: &EpochTx, pattern: &str, suite: bool) {
+    run_filter_in(root, tx, pattern, suite, None);
+}
+
+/// [`run_filter`] for a run that came from `file`, whose language picks
+/// the runner (#1408).
+fn run_filter_in(root: &Path, tx: &EpochTx, pattern: &str, suite: bool, file: Option<&Path>) {
     // See run_all: `None` refuses instead of falling through to cargo, and
     // `Refused` (not a bare Finished) rolls back the filtered Running marks.
-    let Some(runner) = runner_for(root) else {
+    let Some(runner) = tx.choose(&runners_for(root), pattern, file) else {
         tx.send(TestResponse::Refused);
         return;
     };
@@ -1491,16 +1606,27 @@ fn run_filter(root: &Path, tx: &EpochTx, pattern: &str, suite: bool) {
 /// discovery rather than a project with no tests (#845).
 fn discover(root: &Path, tx: &EpochTx) {
     // See run_all: refuse before `Started` so the panel keeps its tree.
-    let Some(runner) = runner_for(root) else {
+    let runners = runners_for(root);
+    if runners.is_empty() {
         tx.send(TestResponse::Refused);
         return;
-    };
+    }
     tx.send(TestResponse::Started(Activity::Discovering));
+    // Each runner lists its own tests into the one tree (#1408).
+    let mut ok = true;
+    for runner in runners {
+        ok &= discover_with(runner, root, &tx.tagged(runner));
+    }
+    tx.send(TestResponse::Finished { ok: Some(ok) });
+}
+
+/// List `runner`'s tests; whether its lister succeeded.
+fn discover_with(runner: Runner, root: &Path, tx: &EpochTx) -> bool {
     let not_run = |name: String| TestCase {
         name,
         status: TestStatus::NotRun,
     };
-    let ok = match runner {
+    match runner {
         Runner::Pytest => {
             let cmd = pytest_cmd(root, &["--collect-only", PYTEST_COLLECT_VERBOSITY, "--color=no"]);
             let show = |line: &str| Some(line.to_string());
@@ -1569,8 +1695,7 @@ fn discover(root: &Path, tx: &EpochTx) {
         }
     }
     // A lister that never spawned (pytest not installed) failed too.
-    .unwrap_or(false);
-    tx.send(TestResponse::Finished { ok: Some(ok) });
+    .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1592,6 +1717,8 @@ mod tests {
             codeql: Path::new("codeql"),
             control: &RunControl::default(),
             request: 1,
+            owners: None,
+            tag: None,
         };
         run_all(tmp.path(), &etx);
         run_one(tmp.path(), &etx, "a::b");
@@ -1794,6 +1921,8 @@ mod tests {
             codeql: &codeql,
             control: &RunControl::default(),
             request: 1,
+            owners: None,
+            tag: None,
         };
         let drain = |rx: &Receiver<(u64, TestResponse)>| {
             let mut cases = Vec::new();
@@ -1889,6 +2018,8 @@ mod tests {
             codeql: Path::new("codeql"),
             control: &RunControl::default(),
             request: 1,
+            owners: None,
+            tag: None,
         };
         let cases = |rx: &Receiver<(u64, TestResponse)>| {
             let mut v: Vec<(String, TestStatus)> = rx
@@ -2527,6 +2658,8 @@ exit 1"#
             codeql: Path::new("codeql"),
             control: &RunControl::default(),
             request: 1,
+            owners: None,
+            tag: None,
         };
         f(root, &etx);
         let mut cases = Vec::new();
@@ -2539,6 +2672,180 @@ exit 1"#
             }
         }
         (cases, finished)
+    }
+
+    /// The issue's maturin layout (#1408): a crate with one Rust test, and a
+    /// pytest project beside it whose venv python answers as pytest does.
+    #[cfg(unix)]
+    fn maturin_project(root: &Path) {
+        pytest_project_with_addopts(root, "");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"fastmath\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() {}\n}\n",
+        )
+        .unwrap();
+    }
+
+    /// What `f` sends through a sender that records which runner listed
+    /// each test, as the worker loop's does.
+    fn collect_with_owners(
+        root: &Path,
+        owners: &RefCell<BTreeMap<String, Runner>>,
+        f: impl Fn(&Path, &EpochTx),
+    ) -> (Vec<(String, TestStatus)>, Option<Option<bool>>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let etx = EpochTx {
+            tx: &tx,
+            epoch: 0,
+            codeql: Path::new("codeql"),
+            control: &RunControl::default(),
+            request: 1,
+            owners: Some(owners),
+            tag: None,
+        };
+        f(root, &etx);
+        let mut cases = Vec::new();
+        let mut finished = None;
+        for (_, r) in rx.try_iter() {
+            match r {
+                TestResponse::Case(c) => cases.push((c.name, c.status)),
+                TestResponse::Finished { ok } => finished = Some(ok),
+                _ => {}
+            }
+        }
+        (cases, finished)
+    }
+
+    /// #1408: a maturin crate's Testing view lists its Rust test and its
+    /// pytest tests together, and Run All runs both runners.
+    #[cfg(unix)]
+    #[test]
+    fn a_maturin_crate_lists_and_runs_its_rust_and_python_tests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        maturin_project(root);
+        let owners = RefCell::new(BTreeMap::new());
+        let (cases, finished) = collect_with_owners(root, &owners, discover);
+        let names: Vec<&str> = cases.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "tests::adds",
+                "tests/test_x.py::test_a",
+                "tests/test_x.py::test_b"
+            ],
+        );
+        assert_eq!(finished, Some(Some(true)));
+        assert_eq!(owners.borrow()["tests::adds"], Runner::Cargo);
+        assert_eq!(owners.borrow()["tests/test_x.py::test_a"], Runner::Pytest);
+
+        let (cases, finished) = collect_with_owners(root, &owners, run_all);
+        assert!(
+            cases.contains(&(String::from("tests::adds"), TestStatus::Passed)),
+            "{cases:?}"
+        );
+        assert!(
+            cases.contains(&(String::from("tests/test_x.py::test_b"), TestStatus::Failed)),
+            "{cases:?}"
+        );
+        assert_eq!(
+            finished,
+            Some(Some(false)),
+            "pytest's failure fails the run"
+        );
+    }
+
+    /// #1408: a run from a `.py` file, or of a test pytest listed, goes to
+    /// pytest in a maturin crate; it used to run `cargo test` and report
+    /// that no test ran.
+    #[cfg(unix)]
+    #[test]
+    fn a_python_test_in_a_maturin_crate_runs_under_pytest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        maturin_project(root);
+        let py = root.join("tests/test_x.py");
+        let owners = RefCell::new(BTreeMap::new());
+        let (cases, _) = collect_with_owners(root, &owners, |r, t| {
+            run_filter_in(r, t, "test_a", false, Some(&py))
+        });
+        assert!(
+            cases.contains(&(String::from("tests/test_x.py::test_a"), TestStatus::Passed)),
+            "{cases:?}"
+        );
+        collect_with_owners(root, &owners, discover);
+        let (cases, _) = collect_with_owners(root, &owners, |r, t| {
+            run_one(r, t, "tests/test_x.py::test_a")
+        });
+        assert!(
+            cases.contains(&(String::from("tests/test_x.py::test_a"), TestStatus::Passed)),
+            "{cases:?}"
+        );
+    }
+
+    /// #1408: the runner for a run is the file's language, then whichever
+    /// runner listed the test (or a test in the suite), then the folder's
+    /// first.
+    #[test]
+    fn a_run_goes_to_its_files_runner_then_the_one_that_listed_it() {
+        let both = [Runner::Cargo, Runner::Pytest];
+        let owners = BTreeMap::from([
+            (String::from("tests/test_api.py::test_py"), Runner::Pytest),
+            (String::from("tests::adds"), Runner::Cargo),
+        ]);
+        let py = Path::new("/w/tests/test_api.py");
+        let rs = Path::new("/w/src/lib.rs");
+        assert_eq!(
+            choose_runner(&both, &owners, "test_py", Some(py)),
+            Some(Runner::Pytest)
+        );
+        assert_eq!(
+            choose_runner(&both, &owners, "adds", Some(rs)),
+            Some(Runner::Cargo)
+        );
+        assert_eq!(
+            choose_runner(&both, &owners, "tests/test_api.py::test_py", None),
+            Some(Runner::Pytest)
+        );
+        assert_eq!(
+            choose_runner(&both, &owners, "tests/test_api.py", None),
+            Some(Runner::Pytest),
+            "a suite goes to the runner of a test under it"
+        );
+        assert_eq!(runner_for_file(&both, Some(py)), Some(Runner::Pytest));
+        let web = [Runner::Pytest, Runner::Jest];
+        assert_eq!(
+            runner_for_file(&web, Some(Path::new("/w/ui/a.test.tsx"))),
+            Some(Runner::Jest)
+        );
+    }
+
+    /// #1408, negative: a file in a language the folder has no runner for,
+    /// a name no runner listed, or a listing by a runner no longer there
+    /// falls back to the folder's first runner; no runner at all is none.
+    #[test]
+    fn a_run_nothing_claims_goes_to_the_folders_first_runner() {
+        let both = [Runner::Cargo, Runner::Pytest];
+        let stale = BTreeMap::from([(String::from("x"), Runner::Go)]);
+        let md = Path::new("/w/README.md");
+        let go = Path::new("/w/main_test.go");
+        assert_eq!(
+            choose_runner(&both, &stale, "y", Some(md)),
+            Some(Runner::Cargo)
+        );
+        assert_eq!(
+            choose_runner(&both, &stale, "x", Some(go)),
+            Some(Runner::Cargo)
+        );
+        assert_eq!(runner_for_file(&both, None), Some(Runner::Cargo));
+        assert_eq!(runner_for_file(&[], Some(md)), None);
+        assert_eq!(choose_runner(&[], &stale, "x", None), None);
     }
 
     /// #1502: a project with `-q` in its pytest `addopts` (the pytest docs'
@@ -2605,6 +2912,8 @@ exit 1"#
             codeql: Path::new("codeql"),
             control: &RunControl::default(),
             request: 1,
+            owners: None,
+            tag: None,
         };
         let discovered = || {
             discover(root, &etx);
@@ -2676,6 +2985,8 @@ exit 1"#
             codeql: Path::new("codeql"),
             control: &RunControl::default(),
             request: 1,
+            owners: None,
+            tag: None,
         };
         run_all(root, &etx);
         let cases: Vec<(String, TestStatus)> = rx
@@ -2752,6 +3063,8 @@ exit 1"#
             codeql: Path::new("codeql"),
             control: &RunControl::default(),
             request: 1,
+            owners: None,
+            tag: None,
         };
         let finished = || {
             discover(root, &etx);
@@ -2921,6 +3234,8 @@ exit 1"#
             codeql: Path::new("codeql"),
             control: &RunControl::default(),
             request: 1,
+            owners: None,
+            tag: None,
         };
         discover(root, &etx);
         let mut cases = Vec::new();

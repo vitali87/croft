@@ -24785,7 +24785,10 @@ impl App {
             self.test_worker.run_one(run.clone());
         } else {
             self.testing.start_filter(&run);
-            self.test_worker.run_filter(run.clone());
+            // The caret's file picks the runner where two languages'
+            // tests share the folder (#1408).
+            self.test_worker
+                .run_filter(run.clone(), self.editor.path.clone());
         }
         self.set_sidebar_view(SidebarView::Testing);
         self.status = format!("Running test {run}");
@@ -24927,6 +24930,14 @@ impl App {
     /// debugpy module launch under the PROJECT's interpreter, a cargo test
     /// binary launches under lldb-dap with the name as its libtest filter.
     /// Shared by debug-at-cursor and Alt+click on the gutter play glyph.
+    /// The runner for a test in the focused file under `root` (#1408): the
+    /// one for the file's language, so a pytest test in a maturin crate
+    /// debugs under debugpy, not as a cargo test binary.
+    fn test_runner_for_focused_file(&self, root: &Path) -> Option<crate::testing::worker::Runner> {
+        let runners = crate::testing::worker::runners_for(root);
+        crate::testing::worker::runner_for_file(&runners, self.editor.path.as_deref())
+    }
+
     fn debug_named_test(&mut self, name: String) {
         if !self.debug_sessions.is_empty() {
             self.status = String::from("A debug session is already running (Shift+F5 stops it)");
@@ -24951,7 +24962,7 @@ impl App {
             .iter()
             .map(|(p, lines)| (p.clone(), self.editor.source_breakpoints(p, lines)))
             .collect();
-        match crate::testing::worker::runner_for(&root) {
+        match self.test_runner_for_focused_file(&root) {
             Some(crate::testing::worker::Runner::Pytest) => {
                 // The interpreter F5 and Live Run pick, from the test file's
                 // folder up (#864), not only a root `.venv`; refused before
