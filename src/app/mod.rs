@@ -4795,6 +4795,13 @@ pub struct App {
     /// (non-zero) when the matching command completes. Replaced by a newer
     /// F5, so only one launch can be pending.
     pending_debug_launch: Option<PendingDebugLaunch>,
+    /// F5's C/C++ build running off the UI thread (#1359): the source it
+    /// debugs and where the build's result arrives. `poll_debug_build`
+    /// launches lldb-dap on the program once it is built.
+    debug_build: Option<(
+        PathBuf,
+        std::sync::mpsc::Receiver<Result<crate::cpp_build::Built, crate::cpp_build::Failed>>,
+    )>,
     /// An attach launch waiting for the user to pick its process (#250):
     /// the resolved config and where it launches once `processId` is known.
     pending_attach: Option<(crate::dap::configs::ResolvedConfig, LaunchSlot)>,
@@ -6333,6 +6340,7 @@ impl App {
             debug_post_tasks: Vec::new(),
             debug_compound: None,
             pending_debug_launch: None,
+            debug_build: None,
             pending_attach: None,
             pending_test_debug: None,
             debug_expanded: std::collections::HashSet::new(),
@@ -32350,6 +32358,7 @@ impl App {
         // Same as every other launch path: a parked older launch must not
         // fire later and replace this one (#567).
         self.pending_debug_launch = None;
+        self.debug_build = None;
         // Zero-config "Debug active file" declares no postDebugTask.
         self.debug_post_tasks.clear();
         let Some(path) = self.editor.path.clone() else {
@@ -32609,6 +32618,13 @@ impl App {
             self.debug_error(lldb_dap_missing_message());
             return;
         }
+        let is_rust = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("rs"));
+        if !is_rust {
+            self.begin_debug_build(path);
+            return;
+        }
         // Compiled source: build a debuggable binary first, then debug it.
         let binary = match self.build_debuggable_binary(path) {
             Ok(b) => b,
@@ -32618,6 +32634,83 @@ impl App {
             }
         };
         self.launch_lldb(&binary, path);
+    }
+
+    /// Start building the program F5 on the C/C++ file `path` debugs
+    /// (#1359): the project's CMake target, else the file with its
+    /// `compile_commands.json` flags, else the file alone. The build runs
+    /// on its own thread so a long one leaves the UI live; F5 again
+    /// replaces it.
+    fn begin_debug_build(&mut self, path: &Path) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let workspace = self.workspace_root().to_path_buf();
+        let source = path.to_path_buf();
+        let cache = croft_cache_dir().join("debug-builds");
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::cpp_build::build_for_debug(
+                &workspace, &source, &cache,
+            ));
+        });
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let msg = format!("Building {name} for debugging…");
+        self.run_debug.feedback = Some(msg.clone());
+        self.run_debug.feedback_is_error = false;
+        self.status = msg;
+        self.debug_build = Some((path.to_path_buf(), rx));
+    }
+
+    /// F5's C/C++ build, once it is done: the source it debugs and the
+    /// build's result. `None` while it runs or when none was started.
+    fn take_debug_build(
+        &mut self,
+    ) -> Option<(
+        PathBuf,
+        Result<crate::cpp_build::Built, crate::cpp_build::Failed>,
+    )> {
+        let (_, rx) = self.debug_build.as_ref()?;
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(crate::cpp_build::Failed {
+                summary: String::from("the build stopped without a result"),
+                output: String::new(),
+            }),
+        };
+        let (source, _) = self.debug_build.take()?;
+        Some((source, result))
+    }
+
+    /// Launch lldb-dap once F5's C/C++ build is done, or report why it
+    /// failed with the build's whole output in OUTPUT's "Debug Build"
+    /// channel. True when the build finished this tick.
+    fn poll_debug_build(&mut self) -> bool {
+        let Some((source, result)) = self.take_debug_build() else {
+            return false;
+        };
+        match result {
+            Ok(built) => {
+                self.launch_lldb(&built.binary, &source);
+                if !self.run_debug.feedback_is_error {
+                    let line = self.run_debug.feedback.take().unwrap_or_default();
+                    self.run_debug.feedback = Some(format!("{line}, built by {}", built.how));
+                }
+            }
+            Err(failed) => {
+                const CHANNEL: &str = "Debug Build";
+                crate::output::clear(CHANNEL);
+                for line in failed.output.lines() {
+                    crate::output::push(CHANNEL, crate::output::OutputLevel::Error, line);
+                }
+                self.debug_error(format!(
+                    "Build for debug failed: {} (full output in OUTPUT › {CHANNEL})",
+                    failed.summary
+                ));
+            }
+        }
+        true
     }
 
     /// Launch lldb-dap on an already-built `binary`, attributing status to
@@ -32659,56 +32752,24 @@ impl App {
         }
     }
 
-    /// Compile `path` to a debuggable binary (with debug info, no optimisation)
-    /// and return the binary path. C via `cc`, C++ via `c++`, Rust via `rustc`
-    /// for a single file. The binary lands next to the source as `<stem>.dbg`.
+    /// Compile the single Rust file `path` with debug info and return the
+    /// binary, next to the source as `<stem>.dbg`. C and C++ build through
+    /// their project instead (`begin_debug_build`, #1359).
     fn build_debuggable_binary(&self, path: &Path) -> std::io::Result<PathBuf> {
-        use std::process::Command;
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
         let out = path.with_extension("dbg");
-        let (program, args): (&str, Vec<String>) = match ext.as_str() {
-            "rs" => (
-                "rustc",
-                vec![
-                    String::from("-g"),
-                    String::from("-o"),
-                    out.to_string_lossy().into_owned(),
-                    path.to_string_lossy().into_owned(),
-                ],
-            ),
-            "c" | "h" | "m" => (
-                "cc",
-                vec![
-                    String::from("-g"),
-                    String::from("-O0"),
-                    path.to_string_lossy().into_owned(),
-                    String::from("-o"),
-                    out.to_string_lossy().into_owned(),
-                ],
-            ),
-            _ => (
-                "c++",
-                vec![
-                    String::from("-g"),
-                    String::from("-O0"),
-                    path.to_string_lossy().into_owned(),
-                    String::from("-o"),
-                    out.to_string_lossy().into_owned(),
-                ],
-            ),
-        };
         // .output(), never .status(): the compiler must not inherit croft's
         // TTY - a compile error would spray its diagnostics over the UI
         // (same class as the pdftoppm trailer-dictionary spray).
-        let cmd_out = Command::new(program).args(&args).output()?;
+        let cmd_out = std::process::Command::new("rustc")
+            .arg("-g")
+            .arg("-o")
+            .arg(&out)
+            .arg(path)
+            .output()?;
         if !cmd_out.status.success() {
             let stderr = String::from_utf8_lossy(&cmd_out.stderr);
             return Err(std::io::Error::other(format!(
-                "{program} exited with {}: {}",
+                "rustc exited with {}: {}",
                 cmd_out.status,
                 stderr.trim()
             )));
@@ -72843,7 +72904,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let color_pres_changed = app.drain_lsp_color_presentations();
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let progress_changed = app.drain_lsp_progress();
-        let dap_changed = app.poll_dap();
+        let dap_changed = app.poll_dap() | app.poll_debug_build();
         let tests_changed =
             app.test_worker.drain(&mut app.testing) | app.drain_pending_test_debug();
         // A queued run the worker refused (runner disabled after the entry

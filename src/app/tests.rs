@@ -81542,3 +81542,145 @@ fn go_and_lint_rows_reach_problems_only_for_real_files() {
         ]
     );
 }
+
+/// A CMake project whose `main.cpp` needs its include folder and a second
+/// translation unit (#1359), as the issue's fixture.
+fn cmake_debug_project(root: &Path) -> PathBuf {
+    for (rel, text) in [
+        (
+            "include/geom.hpp",
+            "#pragma once\nnamespace geom { double twice(double); }\n",
+        ),
+        (
+            "src/geom.cpp",
+            "#include \"geom.hpp\"\nnamespace geom { double twice(double x) { return 2*x; } }\n",
+        ),
+        (
+            "src/main.cpp",
+            "#include <cstdio>\n#include \"geom.hpp\"\nint main() { std::printf(\"%f\\n\", geom::twice(2)); }\n",
+        ),
+        (
+            "CMakeLists.txt",
+            "cmake_minimum_required(VERSION 3.10)\nproject(cp CXX)\nset(CMAKE_EXPORT_COMPILE_COMMANDS ON)\nadd_executable(app src/main.cpp src/geom.cpp)\ntarget_include_directories(app PRIVATE include)\n",
+        ),
+    ] {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, text).unwrap();
+    }
+    root.join("src/main.cpp")
+}
+
+/// Wait out F5's C/C++ build (#1359).
+fn finished_debug_build(
+    app: &mut App,
+) -> (
+    PathBuf,
+    Result<crate::cpp_build::Built, crate::cpp_build::Failed>,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        if let Some(done) = app.take_debug_build() {
+            return done;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the debug build never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// #1359: F5 on `src/main.cpp` in a configured CMake project builds the
+/// project's target, off the UI thread, and debugs that program; it no
+/// longer compiles `main.cpp` alone (which cannot find `geom.hpp`) or
+/// leaves a `main.dbg` in `src/`.
+#[test]
+fn f5_in_a_cmake_project_debugs_the_target_that_builds_the_file() {
+    use crate::lsp::manager::is_on_path;
+    if !(is_on_path("cmake") && is_on_path("c++")) {
+        return;
+    }
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    let main = cmake_debug_project(&root);
+    let configured = std::process::Command::new("cmake")
+        .arg("-S")
+        .arg(&root)
+        .arg("-B")
+        .arg(root.join("build"))
+        .output()
+        .unwrap();
+    assert!(configured.status.success(), "{configured:?}");
+    with_relay_home(tmp.path(), || {
+        let mut app = App::new(root.clone()).unwrap();
+        app.begin_debug_build(&main);
+        assert_eq!(app.status, "Building main.cpp for debugging…");
+        let (source, built) = finished_debug_build(&mut app);
+        assert_eq!(source, main);
+        let built = built.unwrap_or_else(|f| panic!("{}\n{}", f.summary, f.output));
+        assert_eq!(
+            built.binary.canonicalize().unwrap(),
+            root.join("build/app").canonicalize().unwrap()
+        );
+        assert!(built.how.starts_with("cmake --build"), "{}", built.how);
+        assert!(built.how.ends_with("(target app)"), "{}", built.how);
+        let ran = std::process::Command::new(&built.binary).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), "4.000000");
+        assert!(!root.join("src/main.dbg").exists(), "nothing lands in src/");
+    });
+}
+
+/// #1359, negative: a build that fails says so on the status line and keeps
+/// the compiler's whole output in OUTPUT, and a new F5 drops a build still
+/// running rather than launching it later.
+#[test]
+fn a_failed_debug_build_says_why_and_keeps_its_output() {
+    use crate::lsp::manager::is_on_path;
+    if !is_on_path("c++") {
+        return;
+    }
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    // Not configured: no build folder, so main.cpp builds alone and
+    // cannot find geom.hpp.
+    let main = cmake_debug_project(&root);
+    with_relay_home(tmp.path(), || {
+        let mut app = App::new(root.clone()).unwrap();
+        app.begin_debug_build(&main);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !app.poll_debug_build() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the build never ended"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            app.status.starts_with("Build for debug failed: c++ failed"),
+            "{}",
+            app.status
+        );
+        assert!(app.status.contains("geom.hpp"), "{}", app.status);
+        assert!(
+            app.status
+                .ends_with("(full output in OUTPUT › Debug Build)")
+        );
+        assert!(app.run_debug.feedback_is_error);
+        let lines = crate::output::snapshot("Debug Build").expect("the build's output is kept");
+        assert!(lines.iter().any(|l| l.text.contains("geom.hpp")));
+        assert!(!root.join("src/main.dbg").exists());
+        assert!(!app.poll_debug_build(), "a finished build reports once");
+
+        app.begin_debug_build(&main);
+        app.editor.path = None;
+        app.start_debug_session();
+        assert!(
+            app.debug_build.is_none(),
+            "a new F5 drops the running build"
+        );
+        assert_eq!(app.status, "Open a file to debug");
+    });
+}

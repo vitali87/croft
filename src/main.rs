@@ -28,6 +28,7 @@ mod color_depth;
 mod command_history;
 mod config_layers;
 mod config_sync;
+mod cpp_build;
 mod dap;
 mod deep_link;
 mod devcontainer;
