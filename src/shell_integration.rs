@@ -74,8 +74,70 @@ pub struct OscSniffer {
 #[derive(Default)]
 struct KittyNote {
     id: String,
-    title: String,
-    body: String,
+    title: KittyField,
+    body: KittyField,
+}
+
+/// One field (title or body) of a kitty notification. Base64 chunks are
+/// one continuous stream: a chunk may end mid-quantum and leave its
+/// padding to a later one, so undecoded tail bytes wait in `pending`, and
+/// the decoded bytes become text only once the notification is complete
+/// (a multibyte character may straddle two chunks).
+#[derive(Default, Clone)]
+struct KittyField {
+    bytes: Vec<u8>,
+    pending: Vec<u8>,
+}
+
+/// Base64 for kitty payloads: the protocol allows the padding to be left
+/// off, so it is accepted either way.
+const KITTY_B64: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+    &base64::alphabet::STANDARD,
+    base64::engine::GeneralPurposeConfig::new()
+        .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+);
+
+impl KittyField {
+    /// Append one chunk's payload; `None` if it is not valid base64.
+    fn push(&mut self, payload: &str, b64: bool) -> Option<()> {
+        use base64::Engine;
+        if !b64 {
+            self.finish()?;
+            self.bytes.extend_from_slice(payload.as_bytes());
+            return Some(());
+        }
+        self.pending.extend_from_slice(payload.trim().as_bytes());
+        // Padding ends a stream segment; otherwise decode whole quanta and
+        // keep the remainder for the next chunk.
+        let n = if self.pending.contains(&b'=') {
+            self.pending.len()
+        } else {
+            self.pending.len() / 4 * 4
+        };
+        let raw = KITTY_B64.decode(&self.pending[..n]).ok()?;
+        self.bytes.extend_from_slice(&raw);
+        self.pending.drain(..n);
+        Some(())
+    }
+
+    /// Decode whatever tail is still pending (an unpadded final chunk).
+    fn finish(&mut self) -> Option<()> {
+        use base64::Engine;
+        if !self.pending.is_empty() {
+            let raw = KITTY_B64.decode(&self.pending).ok()?;
+            self.bytes.extend_from_slice(&raw);
+            self.pending.clear();
+        }
+        Some(())
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len() + self.pending.len()
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes).into_owned()
+    }
 }
 
 /// A sniffed event plus the offset *just past* its terminator, in the
@@ -87,6 +149,10 @@ pub type SniffedEvent = (usize, OscEvent);
 /// Longest partial sequence carried across chunks before giving up (a
 /// legitimate OSC 133/7/9 is far shorter; this bounds a hostile stream).
 const CARRY_MAX: usize = 4096;
+
+/// Carry cap for kitty OSC 99 sequences: the protocol allows a 4096-byte
+/// payload on its own, plus the prefix, metadata and terminator around it.
+const KITTY_CARRY_MAX: usize = CARRY_MAX + 1024;
 
 /// Carry cap for OSC 1337 inline-image sequences, whose base64 body is
 /// legitimately megabytes. Bounds memory against a hostile or runaway
@@ -367,15 +433,6 @@ impl OscSniffer {
                 _ => {}
             }
         }
-        let payload = if b64 {
-            use base64::Engine;
-            let raw = base64::engine::general_purpose::STANDARD
-                .decode(payload.trim())
-                .ok()?;
-            String::from_utf8_lossy(&raw).into_owned()
-        } else {
-            payload.to_string()
-        };
         let mut note = match self.kitty.take() {
             Some(n) if n.id == id => n,
             _ => KittyNote {
@@ -391,13 +448,24 @@ impl OscSniffer {
         if let Some(field) = field
             && field.len() + payload.len() <= CARRY_MAX
         {
-            field.push_str(&payload);
+            // Work on a copy so a broken chunk leaves the note untouched.
+            let mut next = field.clone();
+            if next.push(payload, b64).is_none() {
+                if !done {
+                    self.kitty = Some(note);
+                }
+                return None;
+            }
+            *field = next;
         }
         if !done {
             self.kitty = Some(note);
             return None;
         }
-        note_text(&note.title, &note.body).map(OscEvent::Notify)
+        if note.title.finish().is_none() || note.body.finish().is_none() {
+            return None;
+        }
+        note_text(&note.title.text(), &note.body.text()).map(OscEvent::Notify)
     }
 
     /// Carry a partial sequence to the next chunk, abandoning runaway ones.
@@ -408,6 +476,7 @@ impl OscSniffer {
     fn hold(&mut self, partial: &[u8]) {
         let cap = match classify(partial) {
             Classify::Ours(OscKind::ITerm2File, _) => IMAGE_CARRY_MAX,
+            Classify::Ours(OscKind::KittyNotify, _) => KITTY_CARRY_MAX,
             _ => CARRY_MAX,
         };
         if partial.len() > cap {
@@ -964,6 +1033,39 @@ mod tests {
         assert_eq!(
             scan_all(&mut s, &[b"\x1b]9;plain\x07"]),
             vec![OscEvent::Notify(String::from("plain"))]
+        );
+    }
+
+    #[test]
+    fn kitty_base64_is_one_stream_across_chunks() {
+        let mut s = OscSniffer::default();
+        // "héllo" is aMOpbGxv: split mid-quantum (and mid-"é"), the last
+        // chunk unpadded.
+        assert!(scan_all(&mut s, &[b"\x1b]99;i=1:d=0:e=1;aM\x07"]).is_empty());
+        assert!(scan_all(&mut s, &[b"\x1b]99;i=1:d=0:e=1;Op\x07"]).is_empty());
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]99;i=1:e=1;bGxv\x07"]),
+            vec![OscEvent::Notify(String::from("h\u{e9}llo"))]
+        );
+        // Each chunk padded on its own, and an unpadded single chunk.
+        assert!(scan_all(&mut s, &[b"\x1b]99;i=2:d=0:e=1;aA==\x07"]).is_empty());
+        assert_eq!(
+            scan_all(&mut s, &[b"\x1b]99;i=2:e=1;aQ\x07"]),
+            vec![OscEvent::Notify(String::from("hi"))]
+        );
+    }
+
+    #[test]
+    fn kitty_full_size_payload_survives_a_split_read() {
+        use base64::Engine;
+        let mut s = OscSniffer::default();
+        let text = "n".repeat(3072);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&text);
+        assert_eq!(b64.len(), 4096);
+        let seq = format!("\x1b]99;i=long:p=title:e=1;{b64}");
+        assert_eq!(
+            scan_all(&mut s, &[seq.as_bytes(), b"\x1b\\"]),
+            vec![OscEvent::Notify(text)]
         );
     }
 
