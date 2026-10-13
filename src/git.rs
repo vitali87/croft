@@ -3262,19 +3262,44 @@ pub fn unpublished_branch(root: &Path) -> Option<String> {
 /// set, else `origin`, else the only remote. With several remotes and
 /// none of those, picking one would be a guess, so it is an error.
 fn publish_remote(root: &Path) -> Result<String, String> {
+    match default_push_remote(root)? {
+        Some(remote) => Ok(remote),
+        None if run_git(root, &["remote"]).is_ok_and(|r| r.is_empty()) => {
+            Err(String::from("no remote to publish this branch to"))
+        }
+        None => Err(String::from(
+            "branch has no upstream and several remotes, none of them origin: set remote.pushDefault to pick one",
+        )),
+    }
+}
+
+/// `remote.pushDefault`, else the only remote, else `origin` among
+/// several; `None` when there is no remote or several and none of those.
+fn default_push_remote(root: &Path) -> Result<Option<String>, String> {
     if let Ok(remote) = run_git(root, &["config", "--get", "remote.pushDefault"])
         && !remote.is_empty()
     {
-        return Ok(remote);
+        return Ok(Some(remote));
     }
     let listed = run_git(root, &["remote"]).map_err(|e| e.to_string())?;
     let remotes: Vec<&str> = listed.lines().filter(|l| !l.is_empty()).collect();
-    match remotes.as_slice() {
-        [] => Err(String::from("no remote to publish this branch to")),
-        [only] => Ok((*only).to_string()),
-        several if several.contains(&"origin") => Ok(String::from("origin")),
-        _ => Err(String::from(
-            "branch has no upstream and several remotes, none of them origin: set remote.pushDefault to pick one",
+    Ok(match remotes.as_slice() {
+        [only] => Some((*only).to_string()),
+        several if several.contains(&"origin") => Some(String::from("origin")),
+        _ => None,
+    })
+}
+
+/// The remote tags are pushed to and deleted from (#1582): the one a new
+/// branch is published to, by the same rules.
+pub fn tag_remote(root: &Path) -> Result<String, String> {
+    match default_push_remote(root)? {
+        Some(remote) => Ok(remote),
+        None if run_git(root, &["remote"]).is_ok_and(|r| r.is_empty()) => {
+            Err(String::from("no remote to push tags to"))
+        }
+        None => Err(String::from(
+            "several remotes, none of them origin: set remote.pushDefault to pick one",
         )),
     }
 }
@@ -3534,9 +3559,45 @@ pub fn list_tags(root: &Path) -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// Create a lightweight tag at HEAD (`git tag <name>`).
-pub fn create_tag(root: &Path, name: &str) -> Result<String, String> {
-    run_mutation(root, &["tag", name])
+/// Create a tag at HEAD: annotated (`git tag -a <name> -m <message>`)
+/// when there is a message, as VS Code's Create Tag makes one (#1582),
+/// else lightweight (`git tag <name>`).
+pub fn create_tag(root: &Path, name: &str, message: Option<&str>) -> Result<String, String> {
+    match message.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(message) => run_mutation(root, &["tag", "-a", name, "-m", message]),
+        None => run_mutation(root, &["tag", name]),
+    }
+}
+
+/// Push every local tag to `remote` (`git push <remote> --tags`, #1582).
+/// A plain push sends none, so a tag made here stayed local.
+pub fn push_tags(root: &Path, remote: &str) -> Result<String, String> {
+    run_mutation(root, &["push", remote, "--tags"])
+}
+
+/// The tags on `remote` (`git ls-remote --tags --refs`), by name (#1582).
+pub fn list_remote_tags(root: &Path, remote: &str) -> Result<Vec<String>, String> {
+    let raw = run_mutation(root, &["ls-remote", "--tags", "--refs", remote])?;
+    Ok(parse_remote_tags(&raw))
+}
+
+/// The tag names in `git ls-remote --tags --refs` output; a peeled
+/// `^{}` line, which `--refs` already drops, is the same tag again.
+fn parse_remote_tags(raw: &str) -> Vec<String> {
+    raw.lines()
+        .filter_map(|line| line.split_once('\t')?.1.strip_prefix("refs/tags/"))
+        .filter(|tag| !tag.ends_with("^{}"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Delete tag `name` from `remote` (`git push <remote> --delete
+/// refs/tags/<name>`, #1582); the local tag stays.
+pub fn delete_remote_tag(root: &Path, remote: &str, name: &str) -> Result<String, String> {
+    run_mutation(
+        root,
+        &["push", remote, "--delete", &format!("refs/tags/{name}")],
+    )
 }
 
 /// Delete a tag (`git tag -d <name>`).
@@ -5239,6 +5300,77 @@ mod tests {
         assert!(err.contains("no commit"), "{err}");
     }
 
+    /// #1582: a message makes an annotated tag; without one (or a blank
+    /// one) the tag is lightweight, as before.
+    #[test]
+    fn create_tag_with_a_message_is_annotated() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        create_tag(p, "v1", Some("Release 1")).unwrap();
+        assert_eq!(git_in(p, &["cat-file", "-t", "v1"]), "tag");
+        assert_eq!(
+            git_in(p, &["tag", "-l", "--format=%(contents:subject)", "v1"]),
+            "Release 1"
+        );
+        create_tag(p, "v0", None).unwrap();
+        create_tag(p, "v0b", Some("   ")).unwrap();
+        assert_eq!(git_in(p, &["cat-file", "-t", "v0"]), "commit");
+        assert_eq!(git_in(p, &["cat-file", "-t", "v0b"]), "commit");
+    }
+
+    /// #1582: Push Tags sends local tags to the remote, the remote's tags
+    /// list by name, and Delete Remote Tag removes one there only.
+    #[test]
+    fn tags_push_list_and_delete_on_the_remote() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        let remote = TempDir::new().unwrap();
+        git_in(remote.path(), &["init", "-q", "--bare"]);
+        git_in(
+            p,
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        );
+        git_in(p, &["tag", "v1"]);
+        git_in(p, &["tag", "-a", "v2", "-m", "two"]);
+        assert_eq!(tag_remote(p).as_deref(), Ok("origin"));
+        assert_eq!(list_remote_tags(p, "origin"), Ok(Vec::new()));
+        push_tags(p, "origin").unwrap();
+        assert_eq!(
+            list_remote_tags(p, "origin"),
+            Ok(vec![String::from("v1"), String::from("v2")])
+        );
+        delete_remote_tag(p, "origin", "v1").unwrap();
+        assert_eq!(list_remote_tags(p, "origin"), Ok(vec![String::from("v2")]));
+        assert_eq!(git_in(p, &["tag"]), "v1\nv2", "local tags stay");
+    }
+
+    /// #1582, negative: no remote, or several with none of them origin and
+    /// no `remote.pushDefault`, is no remote to guess; `pushDefault` wins.
+    /// ls-remote's peeled and non-tag lines are not tags.
+    #[test]
+    fn the_tag_remote_is_never_a_guess() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        assert_eq!(
+            tag_remote(p),
+            Err(String::from("no remote to push tags to"))
+        );
+        git_in(p, &["remote", "add", "a", "/nowhere/a"]);
+        git_in(p, &["remote", "add", "b", "/nowhere/b"]);
+        assert!(tag_remote(p).unwrap_err().contains("remote.pushDefault"));
+        git_in(p, &["config", "remote.pushDefault", "b"]);
+        assert_eq!(tag_remote(p).as_deref(), Ok("b"));
+        assert_eq!(
+            parse_remote_tags(
+                "abc\trefs/tags/v1\ndef\trefs/heads/main\nfff\trefs/tags/v2^{}\nnoise"
+            ),
+            ["v1"]
+        );
+    }
+
     /// #1350: whether HEAD is already on its upstream, so the app can warn
     /// that undoing it means a force push later. No upstream is not pushed.
     #[test]
@@ -6703,7 +6835,7 @@ filename seed.txt
         let tmp = TempDir::new().unwrap();
         let p = tmp.path();
         init_repo_with_commit(p);
-        create_tag(p, "v1.0.0").expect("create_tag");
+        create_tag(p, "v1.0.0", None).expect("create_tag");
         assert!(list_tags(p).unwrap().contains(&"v1.0.0".to_string()));
         delete_tag(p, "v1.0.0").expect("delete_tag");
         assert!(!list_tags(p).unwrap().contains(&"v1.0.0".to_string()));

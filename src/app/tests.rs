@@ -16865,12 +16865,179 @@ fn create_tag_via_the_menu_opens_an_input_then_creates_the_tag() {
         app.input_prompt.as_mut().unwrap().push_char(c);
     }
     app.submit_input_prompt();
+    // #1582: then the optional message; Enter on a blank one makes a
+    // lightweight tag.
+    assert_eq!(
+        app.input_prompt.as_ref().map(|p| p.purpose.clone()),
+        Some(InputPurpose::CreateTagMessage {
+            name: String::from("v9.9.9")
+        })
+    );
+    app.submit_input_prompt();
     assert!(app.input_prompt.is_none(), "submitting closes the prompt");
     assert!(
         crate::git::list_tags(tmp.path())
             .unwrap()
             .contains(&"v9.9.9".to_string()),
         "the tag must exist after submitting the Create Tag input"
+    );
+    assert_eq!(
+        git_stdout(tmp.path(), &["cat-file", "-t", "v9.9.9"]),
+        "commit"
+    );
+}
+
+/// A committed repo with a bare `origin` it has pushed `main` to (#1582).
+fn repo_with_bare_origin() -> (tempfile::TempDir, tempfile::TempDir) {
+    let tmp = make_committed_repo();
+    let bare = tempfile::tempdir().unwrap();
+    git_stdout(bare.path(), &["init", "-q", "--bare"]);
+    git_stdout(
+        tmp.path(),
+        &["remote", "add", "origin", bare.path().to_str().unwrap()],
+    );
+    git_stdout(tmp.path(), &["push", "-q", "-u", "origin", "main"]);
+    (tmp, bare)
+}
+
+fn type_and_submit(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.input_prompt.as_mut().unwrap().push_char(c);
+    }
+    app.submit_input_prompt();
+}
+
+/// #1582: the Tags menu makes an annotated tag from a message, pushes it,
+/// and deletes it from the remote after a confirmation, keeping the local
+/// tag.
+#[test]
+fn the_tags_menu_annotates_pushes_and_deletes_a_remote_tag() {
+    use crate::widgets::input_prompt::InputPurpose;
+    use crate::widgets::scm_menu::ScmAction;
+    let (tmp, bare) = repo_with_bare_origin();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.dispatch_scm_action(ScmAction::CreateTag);
+    type_and_submit(&mut app, "v1.0");
+    type_and_submit(&mut app, "Release 1.0");
+    assert_eq!(git_stdout(tmp.path(), &["cat-file", "-t", "v1.0"]), "tag");
+    assert_eq!(
+        git_stdout(
+            tmp.path(),
+            &["tag", "-l", "--format=%(contents:subject)", "v1.0"]
+        ),
+        "Release 1.0"
+    );
+
+    app.run_command(crate::widgets::command_palette::Command::GitPushTags);
+    wait_for_git_net(&mut app);
+    assert!(app.status.starts_with("Pushed tags"), "{}", app.status);
+    assert_eq!(git_stdout(bare.path(), &["tag"]), "v1.0");
+
+    app.dispatch_scm_action(ScmAction::DeleteRemoteTag);
+    wait_for_git_net(&mut app);
+    let picker = app.list_picker.as_ref().expect("the remote's tags");
+    assert_eq!(picker.title, "Delete Remote Tag from origin");
+    app.confirm_list_picker();
+    assert_eq!(
+        app.input_prompt.as_ref().map(|p| p.purpose.clone()),
+        Some(InputPurpose::DeleteRemoteTag {
+            root: app.scm_root(),
+            remote: String::from("origin"),
+            name: String::from("v1.0"),
+        }),
+        "deleting from the remote is confirmed first"
+    );
+    assert_eq!(
+        git_stdout(bare.path(), &["tag"]),
+        "v1.0",
+        "not before Enter"
+    );
+    app.submit_input_prompt();
+    wait_for_git_net(&mut app);
+    assert_eq!(
+        git_stdout(bare.path(), &["tag"]),
+        "",
+        "gone from the remote"
+    );
+    assert_eq!(git_stdout(tmp.path(), &["tag"]), "v1.0", "kept locally");
+}
+
+/// #1582, negative: Esc on the confirmation keeps the remote tag, a
+/// remote with no tags says so, and with no remote nothing runs.
+#[test]
+fn remote_tags_stay_without_a_confirmation_or_a_remote() {
+    use crate::widgets::scm_menu::ScmAction;
+    let (tmp, bare) = repo_with_bare_origin();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.dispatch_scm_action(ScmAction::DeleteRemoteTag);
+    wait_for_git_net(&mut app);
+    assert!(app.list_picker.is_none());
+    assert_eq!(app.status, "No tags on origin");
+
+    git_stdout(tmp.path(), &["tag", "v2"]);
+    git_stdout(tmp.path(), &["push", "-q", "origin", "v2"]);
+    app.dispatch_scm_action(ScmAction::DeleteRemoteTag);
+    wait_for_git_net(&mut app);
+    app.confirm_list_picker();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.input_prompt.is_none() && app.git_net_job.is_none());
+    assert_eq!(git_stdout(bare.path(), &["tag"]), "v2", "Esc keeps it");
+
+    let lone = make_committed_repo();
+    let mut app = App::new(lone.path().to_path_buf()).unwrap();
+    app.dispatch_scm_action(ScmAction::PushTags);
+    assert!(app.git_net_job.is_none());
+    assert_eq!(app.status, "Push tags: no remote to push tags to");
+    app.dispatch_scm_action(ScmAction::DeleteRemoteTag);
+    assert!(app.git_net_job.is_none());
+    assert_eq!(app.status, "Delete remote tag: no remote to push tags to");
+}
+
+/// #1582: the remote-tag deletion stays bound to the repository whose
+/// remote was listed. When Source Control has moved to another root by
+/// the time the listing lands, the picker is chosen from, or the
+/// confirmation is submitted, nothing is deleted.
+#[test]
+fn a_remote_tag_is_not_deleted_after_source_control_moved_repos() {
+    use crate::widgets::input_prompt::InputPurpose;
+    use crate::widgets::scm_menu::ScmAction;
+    let (tmp, bare) = repo_with_bare_origin();
+    git_stdout(tmp.path(), &["tag", "v3"]);
+    git_stdout(tmp.path(), &["push", "-q", "origin", "v3"]);
+    let other = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let moved = "Delete remote tag cancelled: Source Control moved to another repository";
+
+    // The listing lands after the move: no picker.
+    app.show_remote_tags(other.path(), "origin", Ok(vec![String::from("v3")]));
+    assert!(app.list_picker.is_none());
+    assert_eq!(app.status, moved);
+
+    // The picker was listed for another root: no confirmation.
+    app.dispatch_scm_action(ScmAction::DeleteRemoteTag);
+    wait_for_git_net(&mut app);
+    assert!(app.list_picker.is_some());
+    app.remote_tag_root = Some(other.path().to_path_buf());
+    app.confirm_list_picker();
+    assert!(app.input_prompt.is_none());
+    assert_eq!(app.status, moved);
+
+    // The confirmation was for another root: nothing runs.
+    app.dispatch_scm_action(ScmAction::DeleteRemoteTag);
+    wait_for_git_net(&mut app);
+    app.confirm_list_picker();
+    match &mut app.input_prompt.as_mut().expect("the confirmation").purpose {
+        InputPurpose::DeleteRemoteTag { root, .. } => *root = other.path().to_path_buf(),
+        other => panic!("unexpected prompt {other:?}"),
+    }
+    app.submit_input_prompt();
+    assert!(app.input_prompt.is_none() && app.git_net_job.is_none());
+    assert_eq!(app.status, moved);
+    assert_eq!(
+        git_stdout(bare.path(), &["tag"]),
+        "v3",
+        "kept on the remote"
     );
 }
 
@@ -79789,11 +79956,13 @@ fn a_failed_scm_op_names_the_operation_and_git_s_error_line() {
     );
     one_line(&app);
 
-    crate::git::create_tag(tmp.path(), "v1").unwrap();
+    crate::git::create_tag(tmp.path(), "v1", None).unwrap();
     app.dispatch_scm_action(ScmAction::CreateTag);
     for c in "v1".chars() {
         app.input_prompt.as_mut().unwrap().push_char(c);
     }
+    app.submit_input_prompt();
+    // The optional message (#1582), left blank.
     app.submit_input_prompt();
     assert_eq!(
         app.status,

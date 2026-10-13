@@ -175,6 +175,20 @@ pub enum InputPurpose {
         name: String,
     },
     CreateTag,
+    /// The optional message for tag `name` (#1582): one makes an annotated
+    /// tag, none (Enter on a blank field) a lightweight one.
+    CreateTagMessage {
+        name: String,
+    },
+    /// Confirm deleting tag `name` from `remote` (#1582). Submitting (Enter)
+    /// deletes it there; Esc keeps it. The value is a sentinel. `root` is
+    /// the repository whose remote was listed: the deletion is dropped if
+    /// Source Control has moved to another one by then.
+    DeleteRemoteTag {
+        root: std::path::PathBuf,
+        remote: String,
+        name: String,
+    },
     /// Add a debugger watch expression (#112): submitting appends it to the
     /// App's watch list and re-evaluates at the current stop.
     AddWatch,

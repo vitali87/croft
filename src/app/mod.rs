@@ -3841,6 +3841,9 @@ pub struct App {
     /// unsaved edits (#1438). The write records the files on disk, so the
     /// modal asks first: save them all, go ahead without them, or cancel.
     pending_unsaved_scm: Option<PendingUnsavedScm>,
+    /// The repository the open Delete Remote Tag picker listed (#1582),
+    /// so the deletion stays bound to it if Source Control moves.
+    remote_tag_root: Option<PathBuf>,
     /// Set for the one call that runs a write the prompt already cleared.
     scm_unsaved_cleared: bool,
     /// A write waiting on a format-on-save reply: Save All armed the
@@ -6212,6 +6215,7 @@ impl App {
             pending_local_open: None,
             pending_discard: None,
             pending_unsaved_scm: None,
+            remote_tag_root: None,
             scm_unsaved_cleared: false,
             scm_after_format_save: None,
             pending_revert_hunk: None,
@@ -35719,7 +35723,86 @@ impl App {
                 "Tag name (e.g. v1.0.0)",
             )),
             ScmAction::DeleteTag => self.open_tag_picker(),
+            ScmAction::PushTags => self.push_tags_source_control(),
+            ScmAction::DeleteRemoteTag => self.open_remote_tag_picker(),
         }
+    }
+
+    /// Source Control > Tags > Push Tags (#1582): every local tag to the
+    /// remote a new branch would be published to.
+    fn push_tags_source_control(&mut self) {
+        let remote = match crate::git::tag_remote(&self.scm_root()) {
+            Ok(remote) => remote,
+            Err(err) => {
+                self.status = format!("Push tags: {err}");
+                return;
+            }
+        };
+        self.spawn_scm_op("push --tags", "Pushed tags", "Push tags", move |root| {
+            crate::git::push_tags(root, &remote)
+        });
+    }
+
+    /// Source Control > Tags > Delete Remote Tag (#1582): list the push
+    /// remote's tags off the UI thread, then pick one to delete there.
+    fn open_remote_tag_picker(&mut self) {
+        let root = self.scm_root();
+        let remote = match crate::git::tag_remote(&root) {
+            Ok(remote) => remote,
+            Err(err) => {
+                self.status = format!("Delete remote tag: {err}");
+                return;
+            }
+        };
+        self.spawn_git_net("ls-remote --tags", move || {
+            let tags = crate::git::list_remote_tags(&root, &remote);
+            Box::new(move |app: &mut App| app.show_remote_tags(&root, &remote, tags))
+        });
+    }
+
+    /// Whether Source Control now points at a repository other than
+    /// `root`, the one whose remote tags were listed (#1582). The deletion
+    /// is then dropped rather than sent to another repository's remote of
+    /// the same name, and the status says so.
+    fn remote_tag_root_moved(&mut self, root: &Path) -> bool {
+        if self.scm_root() == root {
+            return false;
+        }
+        self.status =
+            String::from("Delete remote tag cancelled: Source Control moved to another repository");
+        true
+    }
+
+    /// The picker over `remote`'s tags in `root`, once listed (#1582).
+    fn show_remote_tags(&mut self, root: &Path, remote: &str, tags: Result<Vec<String>, String>) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        if self.remote_tag_root_moved(root) {
+            return;
+        }
+        let tags = match tags {
+            Ok(tags) => tags,
+            Err(err) => {
+                self.status = format!("Remote tags: {}", crate::git::result_line(&err));
+                return;
+            }
+        };
+        self.status.clear();
+        self.remote_tag_root = Some(root.to_path_buf());
+        let rows = tags
+            .into_iter()
+            .map(|tag| ListRow {
+                id: format!("{remote}\t{tag}"),
+                label: tag,
+            })
+            .collect();
+        self.open_list_picker(
+            ListPicker::new(
+                ListPurpose::DeleteRemoteTag,
+                format!("Delete Remote Tag from {remote}"),
+                rows,
+            ),
+            &format!("No tags on {remote}"),
+        );
     }
 
     fn open_stash_picker(&mut self, purpose: crate::widgets::list_picker::ListPurpose) {
@@ -36068,9 +36151,40 @@ impl App {
                 self.run_scm_op("remote add", r, "Added remote", "Add remote");
             }
             InputPurpose::CreateTag => {
+                // Then the message, as VS Code asks (#1582): one makes an
+                // annotated tag, a blank field a lightweight one.
                 self.close_input_prompt();
-                let r = crate::git::create_tag(&self.scm_root(), &value);
+                self.open_input_prompt(
+                    InputPrompt::new(
+                        InputPurpose::CreateTagMessage {
+                            name: value.clone(),
+                        },
+                        format!("Create Tag '{value}'"),
+                        "Message (optional)",
+                    )
+                    .allowing_blank()
+                    .with_hint(
+                        "Enter with a message makes an annotated tag · blank, a lightweight one",
+                    ),
+                );
+            }
+            InputPurpose::CreateTagMessage { name } => {
+                self.close_input_prompt();
+                let message = (!value.is_empty()).then_some(value.as_str());
+                let r = crate::git::create_tag(&self.scm_root(), &name, message);
                 self.run_scm_op("tag", r, "Created tag", "Create tag");
+            }
+            InputPurpose::DeleteRemoteTag { root, remote, name } => {
+                self.close_input_prompt();
+                if self.remote_tag_root_moved(&root) {
+                    return;
+                }
+                self.spawn_scm_op(
+                    "push --delete",
+                    "Deleted remote tag",
+                    "Delete remote tag",
+                    move |root| crate::git::delete_remote_tag(root, &remote, &name),
+                );
             }
             InputPurpose::ViewerConsent { key, path } => {
                 // The user allowed the viewer's extension; record it and
@@ -38325,6 +38439,31 @@ impl App {
             ListPurpose::DeleteTag => {
                 let r = crate::git::delete_tag(&self.scm_root(), &row.id);
                 self.run_scm_op("tag -d", r, "Deleted tag", "Delete tag");
+            }
+            ListPurpose::DeleteRemoteTag => {
+                // Deleting from a remote reaches everyone who fetches it,
+                // so it is confirmed first (#1582).
+                let Some(root) = self.remote_tag_root.take() else {
+                    return;
+                };
+                if self.remote_tag_root_moved(&root) {
+                    return;
+                }
+                if let Some((remote, name)) = row.id.split_once('\t') {
+                    use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+                    self.open_input_prompt(
+                        InputPrompt::new(
+                            InputPurpose::DeleteRemoteTag {
+                                root,
+                                remote: remote.to_string(),
+                                name: name.to_string(),
+                            },
+                            format!("Delete tag '{name}' from {remote}?"),
+                            "Enter to delete · Esc to keep",
+                        )
+                        .with_value("delete"),
+                    );
+                }
             }
             ListPurpose::PushToRemote => {
                 let remote = row.id.clone();
@@ -52673,6 +52812,15 @@ impl App {
             Cmd::GitContinueOperation => self.continue_git_operation(),
             Cmd::GitSkipOperation => self.skip_git_operation(),
             Cmd::GitAbortOperation => self.abort_git_operation(),
+            Cmd::GitCreateTag => {
+                self.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::CreateTag)
+            }
+            Cmd::GitPushTags => {
+                self.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::PushTags)
+            }
+            Cmd::GitDeleteRemoteTag => {
+                self.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::DeleteRemoteTag)
+            }
             Cmd::ToggleTerminalSuggestions => self.toggle_terminal_suggestions(),
             Cmd::ToggleScreenReader => self.toggle_screen_reader(),
             Cmd::OpenKeyboardShortcuts => self.open_keyboard_shortcuts(),
