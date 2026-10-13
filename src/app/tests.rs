@@ -17755,6 +17755,30 @@ fn word_suggestions_draw_on_the_open_documents_the_setting_names() {
 }
 
 #[test]
+fn word_suggestions_draw_on_documents_open_in_other_split_groups() {
+    let (tmp, mut app) = word_completion_app(&[("animals.txt", "elephant")]);
+    app.split_editor();
+    let todo = tmp.path().join("todo.txt");
+    std::fs::write(&todo, "elegant\nele").unwrap();
+    app.editor.open_pinned(&todo).unwrap();
+    let active = app.editor.active_index();
+    app.editor.close_others(active);
+    assert!(
+        app.editor
+            .editors
+            .iter()
+            .all(|e| e.path.as_deref() == Some(todo.as_path())),
+        "animals.txt is open only in the other group"
+    );
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 3;
+    app.focus_pane(Pane::Editor);
+    draw(&mut app, 100, 30);
+    app.trigger_completion();
+    assert_eq!(popup_labels(&app), ["elegant", "elephant"]);
+}
+
+#[test]
 fn with_word_suggestions_off_ctrl_space_offers_nothing() {
     let (_tmp, mut app) = word_completion_app(&[("notes.txt", "configuration loader\nconfigu")]);
     app.word_suggestions = crate::word_suggest::WordSuggestions::Off;

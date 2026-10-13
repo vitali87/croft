@@ -9416,6 +9416,10 @@ impl App {
         }
         let active = self.editor.active_index();
         let lang = self.editor.scope_id();
+        let current_path = self.editor.path.as_deref();
+        // Every open document, the other split groups' too, but not the one
+        // being edited, nor a copy of it open in another group, whose words
+        // would include the one being typed.
         let others: Vec<&[String]> = match mode {
             WordSuggestions::Off | WordSuggestions::CurrentDocument => Vec::new(),
             WordSuggestions::MatchingDocuments | WordSuggestions::AllDocuments => self
@@ -9423,10 +9427,17 @@ impl App {
                 .editors
                 .iter()
                 .enumerate()
-                .filter(|(i, e)| {
-                    *i != active && (mode == WordSuggestions::AllDocuments || e.scope_id() == lang)
-                })
-                .map(|(_, e)| e.lines.as_slice())
+                .filter(|&(i, _)| i != active)
+                .map(|(_, e)| e)
+                .chain(
+                    self.editor_layout
+                        .inactive_groups()
+                        .into_iter()
+                        .flat_map(|g| g.editors.iter()),
+                )
+                .filter(|e| current_path.is_none() || e.path.as_deref() != current_path)
+                .filter(|e| mode == WordSuggestions::AllDocuments || e.scope_id() == lang)
+                .map(|e| e.lines.as_slice())
                 .collect(),
         };
         crate::word_suggest::collect(

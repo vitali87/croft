@@ -104,6 +104,7 @@ pub fn collect(
     let mut seen: std::collections::HashSet<String> =
         ranked.iter().map(|(_, w)| w.clone()).collect();
     let mut out: Vec<String> = ranked.into_iter().map(|(_, w)| w).collect();
+    out.truncate(MAX_WORDS);
     for doc in others {
         for line in doc.iter() {
             for (_, _, word) in words_of(line) {
@@ -176,6 +177,13 @@ mod tests {
     fn a_huge_file_is_capped() {
         let doc: Vec<String> = (0..MAX_WORDS + 50).map(|i| format!("w{i}")).collect();
         assert_eq!(collect(&doc, (0, 0), &[], "w").len(), MAX_WORDS);
+    }
+
+    #[test]
+    fn a_huge_file_is_capped_when_other_documents_match_too() {
+        let doc: Vec<String> = (0..MAX_WORDS + 50).map(|i| format!("w{i}")).collect();
+        let other = lines("wother");
+        assert_eq!(collect(&doc, (0, 0), &[&other], "w").len(), MAX_WORDS);
     }
 
     #[test]
