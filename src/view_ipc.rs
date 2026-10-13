@@ -1047,9 +1047,6 @@ mod tests {
         );
     }
 
-    /// #848: `croft edit TODO.md` on a file not yet on disk was refused, so
-    /// `EDITOR="croft edit --wait"` broke for any tool that names a file it
-    /// has not written, where `vim` or `code --wait` start one.
     /// A 300-line `big.txt` in a fresh dir, as in #1606's repro.
     fn big_txt() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -1142,6 +1139,9 @@ mod tests {
         assert_eq!((path, created, at), (dir.path().join("a:1"), None, None));
     }
 
+    /// #848: `croft edit TODO.md` on a file not yet on disk was refused, so
+    /// `EDITOR="croft edit --wait"` broke for any tool that names a file it
+    /// has not written, where `vim` or `code --wait` start one.
     #[test]
     fn edit_creates_a_missing_file_in_an_existing_directory() {
         let dir = tempfile::tempdir().unwrap();
