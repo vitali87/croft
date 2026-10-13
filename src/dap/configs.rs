@@ -820,18 +820,19 @@ pub fn resolve(cfg: &DebugConfig, ctx: &SubstCtx) -> Result<ResolvedConfig, Stri
 /// starts: croft runs debuggees in its own console, not a terminal, so
 /// `"command": "npm run dev"` becomes `runtimeExecutable: "npm"` and
 /// `runtimeArgs: ["run", "dev"]`, and a command with shell syntax (`&&`,
-/// `|`, `$VAR`) runs under `sh -c`. js-debug attaches to the Node processes
-/// it starts either way. An explicit `runtimeExecutable` wins.
+/// `|`, `$VAR`) or a leading `NAME=value` assignment runs under `sh -c`.
+/// js-debug attaches to the Node processes it starts either way. An
+/// explicit `runtimeExecutable` wins.
 fn node_terminal_command(extra: &mut Map<String, Value>) {
     let Some(Value::String(command)) = extra.remove("command") else {
         return;
     };
-    if extra.contains_key("runtimeExecutable") || command.trim().is_empty() {
+    if names_runtime_executable(extra) || command.trim().is_empty() {
         return;
     }
     let shell_syntax = command.contains(['&', '|', ';', '<', '>', '$', '`', '(', ')', '*', '?']);
     let words = match shlex::split(&command) {
-        Some(words) if !shell_syntax && !words.is_empty() => words,
+        Some(words) if !shell_syntax && !words.is_empty() && !is_assignment(&words[0]) => words,
         _ => vec![String::from("sh"), String::from("-c"), command],
     };
     let mut words = words.into_iter().map(Value::String);
@@ -843,13 +844,28 @@ fn node_terminal_command(extra: &mut Map<String, Value>) {
     extra.insert("runtimeArgs".into(), Value::Array(runtime_args));
 }
 
+/// Whether a shell word is a variable assignment (`NODE_ENV=production`),
+/// which a shell applies to the command after it rather than running.
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// Whether `runtimeExecutable` names something to run: a nonempty string,
+/// not `null` or `""`.
+fn names_runtime_executable(extra: &Map<String, Value>) -> bool {
+    matches!(extra.get("runtimeExecutable"), Some(Value::String(s)) if !s.trim().is_empty())
+}
+
 /// Whether a node launch names something to run (#1391): a `program`, or
 /// a `runtimeExecutable` / `runtimeArgs` (an npm script, `node-terminal`'s
 /// `command`), which js-debug starts on its own.
 pub fn js_launch_has_target(rc: &ResolvedConfig) -> bool {
     rc.program.is_some()
-        || rc.extra.contains_key("runtimeExecutable")
-        || rc.extra.contains_key("runtimeArgs")
+        || names_runtime_executable(&rc.extra)
+        || matches!(rc.extra.get("runtimeArgs"), Some(Value::Array(a)) if !a.is_empty())
 }
 
 /// The current user's processes as `(pid, command name)` from
@@ -2888,6 +2904,14 @@ mod tests {
             chained["arguments"]["runtimeArgs"],
             json!(["-c", "npm run build && npm start"])
         );
+        let env = js_request(&rc("NODE_ENV=production npm start"));
+        assert_eq!(env["arguments"]["runtimeExecutable"], "sh");
+        assert_eq!(
+            env["arguments"]["runtimeArgs"],
+            json!(["-c", "NODE_ENV=production npm start"])
+        );
+        let flag = js_request(&rc("node --max-old-space-size=4096 app.js"));
+        assert_eq!(flag["arguments"]["runtimeExecutable"], "node");
     }
 
     /// #1391 negatives: a node launch with nothing to run still has no
@@ -2914,5 +2938,10 @@ mod tests {
         assert!(!explicit.extra.contains_key("command"));
         let empty = one(r#"[{ "name": "t", "type": "node-terminal", "command": "  " }]"#);
         assert!(!js_launch_has_target(&empty));
+        let hollow = one(r#"[{ "name": "n", "type": "node", "request": "launch",
+                 "runtimeExecutable": null, "runtimeArgs": [] }]"#);
+        assert!(!js_launch_has_target(&hollow));
+        let blank = one(r#"[{ "name": "n", "type": "node", "runtimeExecutable": "" }]"#);
+        assert!(!js_launch_has_target(&blank));
     }
 }
