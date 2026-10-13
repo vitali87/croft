@@ -149,8 +149,13 @@ pub enum DebugRowKind {
     },
     /// A scope container row ("Locals", "Globals"). `open` is `Some` for an
     /// expensive scope (#1421), which opens on click and shows a chevron;
-    /// `None` for one that is always open.
-    Scope { name: String, open: Option<bool> },
+    /// `None` for one that is always open. `index` is its position in the
+    /// session's scopes.
+    Scope {
+        name: String,
+        index: usize,
+        open: Option<bool>,
+    },
     /// A variable. `reference > 0` means expandable; `value`/`type_name` are
     /// coloured by type.
     Variable {
@@ -600,7 +605,7 @@ impl RunDebugPanel {
                     };
                     put(buf, inner.x + 1, row_y, right, &text, style);
                 }
-                DebugRowKind::Scope { name, open } => {
+                DebugRowKind::Scope { name, open, .. } => {
                     let text = match open {
                         Some(true) => format!("\u{25be} {name}"),
                         Some(false) => format!("\u{25b8} {name}"),
@@ -1209,6 +1214,7 @@ mod tests {
                 indent: 1,
                 kind: DebugRowKind::Scope {
                     name: "Locals".into(),
+                    index: 0,
                     open: None,
                 },
             },

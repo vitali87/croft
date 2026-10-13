@@ -1054,10 +1054,11 @@ pub struct DapSession {
     pub stack_frames: Vec<StackFrame>,
     /// Scopes (Locals / Globals) of the selected frame.
     pub scopes: Vec<Scope>,
-    /// Names of the expensive scopes the user opened (#1421). They stay
-    /// open, and are fetched, at every later stop, as in VS Code; the
-    /// others stay collapsed and cost nothing.
-    pub open_expensive_scopes: std::collections::BTreeSet<String>,
+    /// The expensive scopes the user opened (#1421), each keyed by its name
+    /// and its ordinal among the scopes of that name, so two scopes sharing
+    /// a name open separately. They stay open, and are fetched, at every
+    /// later stop, as in VS Code; the others stay collapsed and cost nothing.
+    pub open_expensive_scopes: std::collections::BTreeSet<(String, usize)>,
     /// Variables keyed by `variablesReference`: the entry for a scope's ref holds
     /// that scope's members; expanding a variable adds its ref's children here.
     pub variables: BTreeMap<i64, Vec<Variable>>,
@@ -1353,25 +1354,40 @@ impl DapSession {
             .find(|v| v.name == name)
     }
 
-    /// Whether `scope`'s variables are shown: always, unless it is an
-    /// expensive one the user has not opened (#1421).
-    pub fn scope_open(&self, scope: &Scope) -> bool {
-        !scope.expensive || self.open_expensive_scopes.contains(&scope.name)
+    /// The persistent identity of the scope at `index`: its name and how
+    /// many earlier scopes share that name (#1421). A `variablesReference`
+    /// changes at every stop, so it cannot keep a scope open across stops.
+    fn scope_key(&self, index: usize) -> Option<(String, usize)> {
+        let scope = self.scopes.get(index)?;
+        let nth = self.scopes[..index]
+            .iter()
+            .filter(|s| s.name == scope.name)
+            .count();
+        Some((scope.name.clone(), nth))
     }
 
-    /// Open or close the expensive scope `name` (#1421), fetching its
+    /// Whether the variables of the scope at `index` are shown: always,
+    /// unless it is an expensive one the user has not opened (#1421).
+    pub fn scope_open(&self, index: usize) -> bool {
+        match self.scopes.get(index) {
+            Some(scope) if scope.expensive => self
+                .scope_key(index)
+                .is_some_and(|k| self.open_expensive_scopes.contains(&k)),
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    /// Open or close the expensive scope at `index` (#1421), fetching its
     /// variables when it opens.
-    pub fn toggle_expensive_scope(&mut self, name: &str) {
-        if !self.open_expensive_scopes.remove(name) {
-            self.open_expensive_scopes.insert(name.to_string());
-            if let Some(r) = self
-                .scopes
-                .iter()
-                .find(|s| s.name == name)
-                .map(|s| s.variables_ref)
-            {
-                self.expand_variable(r);
-            }
+    pub fn toggle_expensive_scope(&mut self, index: usize) {
+        let Some(key) = self.scope_key(index) else {
+            return;
+        };
+        if !self.open_expensive_scopes.remove(&key) {
+            self.open_expensive_scopes.insert(key);
+            let r = self.scopes[index].variables_ref;
+            self.expand_variable(r);
         }
     }
 
@@ -1483,11 +1499,9 @@ impl DapSession {
                     // An expensive scope (a whole Global object) waits until
                     // the user opens it (#1421), or every step would wait
                     // for it.
-                    let refs: Vec<i64> = self
-                        .scopes
-                        .iter()
-                        .filter(|s| self.scope_open(s))
-                        .map(|s| s.variables_ref)
+                    let refs: Vec<i64> = (0..self.scopes.len())
+                        .filter(|&i| self.scope_open(i))
+                        .map(|i| self.scopes[i].variables_ref)
                         .collect();
                     for r in refs {
                         self.request_variables(r);
@@ -3250,13 +3264,16 @@ while True:
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(fetched(&log), vec![10], "only the Local scope");
-        let global = session.scopes.iter().find(|s| s.name == "Global").unwrap();
-        assert!(global.expensive);
+        let global = session
+            .scopes
+            .iter()
+            .position(|s| s.name == "Global")
+            .unwrap();
+        assert!(session.scopes[global].expensive);
         assert!(!session.scope_open(global));
 
-        session.toggle_expensive_scope("Global");
+        session.toggle_expensive_scope(global);
         poll_until(&mut session, &log, |_| fetched(&log) == vec![10, 20]);
-        let global = session.scopes.iter().find(|s| s.name == "Global").unwrap();
         assert!(session.scope_open(global));
 
         // The next stop fetches both: Global stays open.
@@ -3265,7 +3282,7 @@ while True:
         assert_eq!(fetched(&log), vec![10, 20, 10, 20]);
 
         // Closed again, the stop after that skips it.
-        session.toggle_expensive_scope("Global");
+        session.toggle_expensive_scope(global);
         session.continue_execution();
         poll_until(&mut session, &log, |_| {
             scopes_asked(&log) == 3 && fetched(&log).len() == 5

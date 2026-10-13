@@ -60639,7 +60639,7 @@ fn an_expensive_scope_shows_collapsed_and_opens_on_click() {
             .debug_rows
             .iter()
             .filter_map(|r| match &r.kind {
-                DebugRowKind::Scope { name, open } => Some((name.clone(), *open)),
+                DebugRowKind::Scope { name, open, .. } => Some((name.clone(), *open)),
                 _ => None,
             })
             .collect()
@@ -60670,7 +60670,7 @@ fn an_expensive_scope_shows_collapsed_and_opens_on_click() {
             .focused()
             .unwrap()
             .open_expensive_scopes
-            .contains("Global")
+            .contains(&(String::from("Global"), 0))
     );
     // A second click closes it again; a click on the cheap scope does nothing.
     app.debug_panel_click(global);
@@ -60683,6 +60683,47 @@ fn an_expensive_scope_shows_collapsed_and_opens_on_click() {
         .unwrap();
     app.debug_panel_click(local);
     assert_eq!(scope_rows(&app)[0], (String::from("Local: work"), None));
+}
+
+/// #1421: two expensive scopes sharing a name open separately; opening
+/// the second leaves the first collapsed.
+#[test]
+fn expensive_scopes_sharing_a_name_open_separately() {
+    use crate::widgets::run_debug::DebugRowKind;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push(
+        "Node",
+        stub_emitting(&[
+            r#"{"seq":1,"type":"event","event":"stopped","body":{"reason":"breakpoint","threadId":1}}"#,
+            r#"{"seq":2,"type":"response","request_seq":9,"success":true,"command":"scopes","body":{"scopes":[{"name":"Global","variablesReference":20,"expensive":true},{"name":"Global","variablesReference":30,"expensive":true}]}}"#,
+        ]),
+    );
+    poll_until(&mut app, |a| {
+        a.debug_sessions
+            .focused()
+            .is_some_and(|s| s.scopes.len() == 2)
+    });
+    app.refresh_debug_panel();
+    let scope_rows = |app: &App| -> Vec<Option<bool>> {
+        app.run_debug
+            .debug_rows
+            .iter()
+            .filter_map(|r| match &r.kind {
+                DebugRowKind::Scope { open, .. } => Some(*open),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(scope_rows(&app), vec![Some(false), Some(false)]);
+    let second = app
+        .run_debug
+        .debug_rows
+        .iter()
+        .position(|r| matches!(&r.kind, DebugRowKind::Scope { index: 1, .. }))
+        .unwrap();
+    app.debug_panel_click(second);
+    assert_eq!(scope_rows(&app), vec![Some(false), Some(true)]);
 }
 
 /// #567 item 1: a background member's program output used to be drained and
