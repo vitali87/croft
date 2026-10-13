@@ -3292,6 +3292,10 @@ pub struct Editor {
     /// whether an external process changed the file underneath us. `None`
     /// for a tab with no file (the blank initial buffer).
     disk_stamp: Option<(SystemTime, u64)>,
+    /// Set for a new file opened before it exists (#1157): its `None`
+    /// stamp means "expected absent", so the file appearing on disk is an
+    /// external change rather than a phantom one.
+    disk_expect_absent: bool,
     /// Set when an external on-disk change is detected while this buffer has
     /// unsaved edits. Reloading would discard the user's edits and saving
     /// would clobber the external change, so neither happens automatically:
@@ -3486,6 +3490,7 @@ impl Editor {
             diff_prev_arrow: Rect::default(),
             diff_next_arrow: Rect::default(),
             disk_stamp: None,
+            disk_expect_absent: false,
             disk_conflict: false,
             encoding_loss: false,
             lossy_save_armed: false,
@@ -5169,6 +5174,7 @@ impl Editor {
             self.force_text = false;
         }
         self.load_text(path, &[], None)?;
+        self.disk_expect_absent = self.disk_stamp.is_none();
         self.status = format!("New file {}: saving creates it", path.display());
         Ok(())
     }
@@ -5249,6 +5255,7 @@ impl Editor {
         self.scroll_sub = 0;
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_expect_absent = false;
         self.disk_conflict = false;
         // A whole-buffer swap: whatever the previous contents could not be
         // encoded as is no longer this tab's problem.
@@ -5373,6 +5380,7 @@ impl Editor {
         let format_label = image_format_label_from_ext(ext);
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_expect_absent = false;
         self.disk_conflict = false;
         // A whole-buffer swap: whatever the previous contents could not be
         // encoded as is no longer this tab's problem.
@@ -5639,6 +5647,7 @@ impl Editor {
             crate::svg::rasterize(&src).map_err(|e| anyhow::anyhow!("SVG render failed: {e}"))?;
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_expect_absent = false;
         self.disk_conflict = false;
         // A whole-buffer swap: whatever the previous contents could not be
         // encoded as is no longer this tab's problem.
@@ -5699,6 +5708,7 @@ impl Editor {
     fn install_sheet_view(&mut self, path: &Path, view: crate::sheet::SheetView) {
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_expect_absent = false;
         self.disk_conflict = false;
         // A whole-buffer swap: whatever the previous contents could not be
         // encoded as is no longer this tab's problem.
@@ -5763,6 +5773,7 @@ impl Editor {
             .ok_or_else(|| anyhow::anyhow!("Could not decode rasterised PDF"))?;
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_expect_absent = false;
         self.disk_conflict = false;
         // A whole-buffer swap: whatever the previous contents could not be
         // encoded as is no longer this tab's problem.
@@ -6096,6 +6107,7 @@ impl Editor {
             crate::hex::HexView::open(path).map_err(|e| anyhow::anyhow!("Hex open failed: {e}"))?;
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_expect_absent = false;
         self.disk_conflict = false;
         // A whole-buffer swap: whatever the previous contents could not be
         // encoded as is no longer this tab's problem.
@@ -9886,7 +9898,9 @@ impl Editor {
         };
         match self.disk_stamp {
             Some(known) => Self::disk_stamp_of(path) != Some(known),
-            None => false,
+            // A new file not written yet: another process creating it is
+            // a change, or the first save would clobber what it wrote.
+            None => self.disk_expect_absent && Self::disk_stamp_of(path).is_some(),
         }
     }
 
@@ -30753,6 +30767,36 @@ mod tests {
         e.insert_str("x = 1");
         assert!(matches!(e.save_to_disk().unwrap(), SaveOutcome::Saved));
         assert_eq!(std::fs::read_to_string(&path).unwrap().trim_end(), "x = 1");
+        assert!(!e.disk_changed_externally());
+    }
+
+    /// #1157: a new file that another process creates before the first
+    /// save is an external change: the save refuses to clobber it and a
+    /// clean buffer reloads it.
+    #[test]
+    fn a_new_file_created_elsewhere_before_saving_is_detected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("notes.txt");
+        let mut e = Editor::new();
+        e.open_new_file(&path).unwrap();
+        std::fs::write(&path, "theirs\n").unwrap();
+        assert!(e.disk_changed_externally());
+        e.insert_str("mine");
+        assert!(matches!(
+            e.save_to_disk().unwrap(),
+            SaveOutcome::DiskConflict
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs\n");
+        let mut e = Editor::new();
+        std::fs::remove_file(&path).unwrap();
+        e.open_new_file(&path).unwrap();
+        std::fs::write(&path, "theirs\n").unwrap();
+        assert!(matches!(
+            e.reload_or_flag_conflict(),
+            ExternalChange::Reloaded
+        ));
+        assert_eq!(e.lines[0], "theirs");
+        assert!(!e.disk_changed_externally());
     }
 
     /// #1157, negative: an existing file opens with its text, and a new file
