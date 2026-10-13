@@ -16,10 +16,24 @@ api_version = 1
 id = "css"
 extensions = ["css"]
 
+# The same server parses SCSS and LESS, choosing the parser from the
+# `languageId` sent in `didOpen` (VS Code's ids, `scss` and `less`), so both
+# use the CSS server's managed install. `.sass` (indented syntax) is not one it
+# parses and stays on highlighting only.
+[[languages]]
+id = "scss"
+extensions = ["scss"]
+family = "css"
+
+[[languages]]
+id = "less"
+extensions = ["less"]
+family = "css"
+
 [[language_servers]]
 name = "vscode-css-language-server"
 command = "vscode-css-language-server"
 args = ["--stdio"]
-language = "css"
+languages = ["css", "scss", "less"]
 priority = 0
 provision = { kind = "npm", package = "@t1ckbase/vscode-langservers-extracted", version = "2.0.1", bin = "vscode-css-language-server" }
