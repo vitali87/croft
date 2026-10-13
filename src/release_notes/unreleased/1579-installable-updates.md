@@ -1,0 +1,1 @@
+fix: The in-app update is offered only for a release this install can actually stage: one with a release archive for this machine, or one published on crates.io. On macOS, Update now installs the release's own verified archive instead of building from crates.io, so a release tag that crates.io does not have yet no longer leads to an Update that can only fail.
