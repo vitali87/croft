@@ -664,6 +664,8 @@ The Testing sidebar widget: the test suite tree, grouped by module or pytest fil
 
 **A failure during a run is never downgraded by a later pass for the same name.** Two harnesses in one `cargo test --no-fail-fast` can report the same test path, and stdout carries no harness identity to separate them (cargo's "Running unittests …" banner is on stderr, read by another thread). The row they share is honest only when it shows the worst outcome. The `Running` run-start mark is exempt, since `start_single` paints it through the same call and a fixed test must be able to go green on a re-run.
 
+**A scoped run's skips land only on the rows it marked Running.** vitest and jest run one test, or a suite, as the whole file under a `-t` filter, and report every test the filter left out as skipped (`# SKIP`, `pending`). That is the filter, not a result (#1371), so while a `start_single` or `start_filter` run is in flight a skip for any other known row is ignored: the rest of the file keeps its last pass or failure, and the header tally with it. A full run takes every skip.
+
 **Rollback on finish.** A finished run rolls back marked cases it never reported, the same as a worker refusal, so a compile error cannot strand Running dots.
 
 **Run at cursor** resolves a leaf that is unique in the tree to its full name, for an exact run.

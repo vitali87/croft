@@ -115,6 +115,9 @@ pub struct TestingPanel {
     /// Passed/Failed/Skipped results come back instead of demoting to
     /// NotRun. Cleared when the run actually starts answering.
     prerun: Vec<(String, Option<TestStatus>)>,
+    /// A single-test or filtered run is in flight (#1371): the rest of the
+    /// tree keeps its results, whatever the runner says about it.
+    scoped: bool,
     scroll: usize,
 
     pub focus_gradient: bool,
@@ -140,6 +143,7 @@ impl TestingPanel {
             discovery_failed: false,
             last_output_hint: Rect::default(),
             run_tally: (0, 0, 0),
+            scoped: false,
             coverage: None,
             coverage_error: None,
             coverage_fresh: false,
@@ -169,6 +173,7 @@ impl TestingPanel {
     pub fn on_busy_started(&mut self, activity: Activity) {
         self.cases.clear();
         self.prerun.clear();
+        self.scoped = false;
         self.activity = activity;
         self.last_run_ok = None;
         self.run_reported_failed = false;
@@ -197,6 +202,7 @@ impl TestingPanel {
         // no-runner status or restore cases into the new project's tree.
         self.refused = false;
         self.prerun.clear();
+        self.scoped = false;
         self.scroll = 0;
         self.finished = None;
         // The watched names described the old project.
@@ -222,6 +228,7 @@ impl TestingPanel {
         // worker refusal can put the tree back exactly.
         let old = self.cases.iter().find(|c| c.name == name).map(|c| c.status);
         self.prerun = vec![(name.to_string(), old)];
+        self.scoped = true;
         self.apply_case(TestCase {
             name: name.to_string(),
             status: TestStatus::Running,
@@ -241,6 +248,7 @@ impl TestingPanel {
         self.run_tally = (0, 0, 0);
         // Snapshot each selected case's pre-run status for a refusal rollback.
         self.prerun = Vec::new();
+        self.scoped = true;
         for c in &mut self.cases {
             if c.name.contains(pattern) {
                 self.prerun.push((c.name.clone(), Some(c.status)));
@@ -252,6 +260,20 @@ impl TestingPanel {
     /// Apply one streamed result: update the matching case in place, or insert
     /// it (kept sorted by name so the tree is stable).
     pub fn apply_case(&mut self, case: TestCase) {
+        // vitest and jest run one test, or a suite, as the whole file under
+        // a `-t` filter and report every test it left out as skipped (`#
+        // SKIP`, `pending`). That is the filter, not a result (#1371): in a
+        // scoped run a skip lands only on a row the run marked Running, so
+        // the rest of the file keeps its last pass or failure, and the tally.
+        if self.scoped
+            && case.status == TestStatus::Skipped
+            && self
+                .cases
+                .iter()
+                .any(|c| c.name == case.name && c.status != TestStatus::Running)
+        {
+            return;
+        }
         if case.status == TestStatus::Failed {
             self.run_reported_failed = true;
         }
@@ -301,6 +323,7 @@ impl TestingPanel {
     /// Running dot forever.
     pub fn on_finished(&mut self, ok: Option<bool>) {
         let discovery = self.activity == Activity::Discovering;
+        self.scoped = false;
         self.activity = Activity::Idle;
         self.progress = None;
         if discovery {
@@ -441,6 +464,7 @@ impl TestingPanel {
     /// (A bare finish would have stranded the marks Running forever.)
     pub fn on_refused(&mut self) {
         self.activity = Activity::Idle;
+        self.scoped = false;
         self.progress = None;
         for (name, old) in std::mem::take(&mut self.prerun) {
             match old {
@@ -964,6 +988,112 @@ mod tests {
         });
         assert_eq!(p.failed_count(), 2);
         assert_eq!(p.cases.len(), 4);
+    }
+
+    /// A tree after Run All: `add::one` and `add::two` passed, `sub::x` failed.
+    fn ran_file() -> TestingPanel {
+        let mut p = TestingPanel::new();
+        p.on_busy_started(Activity::Running);
+        for (name, status) in [
+            ("m.test.js::add::one", TestStatus::Passed),
+            ("m.test.js::add::two", TestStatus::Passed),
+            ("m.test.js::sub::x", TestStatus::Failed),
+        ] {
+            p.apply_case(TestCase {
+                name: name.into(),
+                status,
+            });
+        }
+        p.on_finished(Some(false));
+        p
+    }
+
+    fn statuses(p: &TestingPanel) -> Vec<(&str, TestStatus)> {
+        p.cases
+            .iter()
+            .map(|c| (c.name.as_str(), c.status))
+            .collect()
+    }
+
+    /// #1371: vitest runs one test as its whole file under `-t` and reports
+    /// the rest `# SKIP` (jest: `pending`). Those rows keep their results.
+    #[test]
+    fn running_one_js_test_keeps_the_rest_of_its_files_results() {
+        let mut p = ran_file();
+        p.start_single("m.test.js::add::one");
+        for (name, status) in [
+            ("m.test.js::add::one", TestStatus::Passed),
+            ("m.test.js::add::two", TestStatus::Skipped),
+            ("m.test.js::sub::x", TestStatus::Skipped),
+        ] {
+            p.apply_case(TestCase {
+                name: name.into(),
+                status,
+            });
+        }
+        p.on_finished(Some(true));
+        assert_eq!(
+            statuses(&p),
+            vec![
+                ("m.test.js::add::one", TestStatus::Passed),
+                ("m.test.js::add::two", TestStatus::Passed),
+                ("m.test.js::sub::x", TestStatus::Failed),
+            ]
+        );
+        assert_eq!(p.counts(), (2, 1, 0), "the header tally is unchanged");
+    }
+
+    /// #1371, a suite: tests outside it keep their results, while a test
+    /// inside it that really is skipped (`test.skip`) still shows skipped.
+    #[test]
+    fn a_suite_run_skips_only_inside_the_suite() {
+        let mut p = ran_file();
+        p.start_filter("m.test.js::add");
+        for (name, status) in [
+            ("m.test.js::add::one", TestStatus::Passed),
+            ("m.test.js::add::two", TestStatus::Skipped),
+            ("m.test.js::sub::x", TestStatus::Skipped),
+        ] {
+            p.apply_case(TestCase {
+                name: name.into(),
+                status,
+            });
+        }
+        p.on_finished(Some(true));
+        assert_eq!(
+            statuses(&p),
+            vec![
+                ("m.test.js::add::one", TestStatus::Passed),
+                ("m.test.js::add::two", TestStatus::Skipped),
+                ("m.test.js::sub::x", TestStatus::Failed),
+            ]
+        );
+    }
+
+    /// #1371 negative: Run All still takes every skip the runner reports,
+    /// and once a scoped run ends the next full run is not filtered.
+    #[test]
+    fn a_full_run_after_a_scoped_one_still_records_skips() {
+        let mut p = ran_file();
+        p.start_single("m.test.js::add::one");
+        p.on_finished(Some(true));
+        p.on_busy_started(Activity::Running);
+        p.apply_case(TestCase {
+            name: "m.test.js::add::two".into(),
+            status: TestStatus::Skipped,
+        });
+        assert_eq!(
+            statuses(&p),
+            vec![("m.test.js::add::two", TestStatus::Skipped)]
+        );
+        // A skip for a row the panel has never seen is a result too.
+        let mut p = ran_file();
+        p.start_single("m.test.js::add::one");
+        p.apply_case(TestCase {
+            name: "m.test.js::new::later".into(),
+            status: TestStatus::Skipped,
+        });
+        assert!(statuses(&p).contains(&("m.test.js::new::later", TestStatus::Skipped)));
     }
 
     /// libtest prints only `test <path> ... <outcome>` on stdout; the harness
