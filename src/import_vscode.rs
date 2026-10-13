@@ -131,6 +131,13 @@ fn as_whitespace_mode(v: &Value) -> Option<Value> {
     Some(Value::from(mapped))
 }
 
+/// `editor.lineNumbers` (#1576): VS Code's four modes are croft's.
+fn as_line_numbers(v: &Value) -> Option<Value> {
+    v.as_str()
+        .filter(|s| matches!(*s, "on" | "off" | "relative" | "interval"))
+        .map(Value::from)
+}
+
 fn as_scrollback(v: &Value) -> Option<Value> {
     v.as_u64().map(Value::from)
 }
@@ -182,6 +189,11 @@ const SETTINGS: &[SettingMap] = &[
         vscode: "editor.guides.indentation",
         croft: "disable_indent_guides",
         convert: negated,
+    },
+    SettingMap {
+        vscode: "editor.lineNumbers",
+        croft: "line_numbers",
+        convert: as_line_numbers,
     },
     SettingMap {
         vscode: "editor.inlayHints.enabled",
@@ -2279,5 +2291,23 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let report = scan_profile(dir.path()).expect("an empty profile is fine");
         assert!(report.is_empty());
+    }
+    /// #1576: `editor.lineNumbers` maps onto `line_numbers`; a value croft
+    /// has no mode for is reported, not mapped.
+    #[test]
+    fn line_numbers_import_with_their_mode() {
+        for mode in ["on", "off", "relative", "interval"] {
+            let (settings, unmapped, _) =
+                map_settings(json!({ "editor.lineNumbers": mode }).as_object().unwrap());
+            assert_eq!(settings["line_numbers"], json!(mode));
+            assert!(unmapped.is_empty());
+        }
+        let (settings, unmapped, _) = map_settings(
+            json!({ "editor.lineNumbers": "sideways" })
+                .as_object()
+                .unwrap(),
+        );
+        assert!(settings.is_empty());
+        assert_eq!(unmapped.len(), 1, "{unmapped:?}");
     }
 }

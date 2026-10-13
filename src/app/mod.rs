@@ -3165,6 +3165,8 @@ pub struct App {
     /// Whitespace rendering mode (#133), frame-synced to every editor;
     /// "selection" by default, the palette command cycles it.
     whitespace_mode: crate::widgets::editor::WhitespaceMode,
+    /// Gutter line numbers (#1576): on, relative, interval or off.
+    line_numbers: crate::widgets::editor::LineNumbers,
     /// Default ignore-whitespace mode applied to newly opened diffs (#258).
     diff_ws_default: crate::widgets::diff::DiffWhitespace,
     /// Debugger inline values (#135): on by default; rebuilt on every
@@ -5824,6 +5826,9 @@ impl App {
             bracket_colors_enabled: !loaded_prefs.disable_bracket_colors,
             whitespace_mode: crate::widgets::editor::WhitespaceMode::from_pref(
                 &loaded_prefs.render_whitespace,
+            ),
+            line_numbers: crate::widgets::editor::LineNumbers::from_pref(
+                &loaded_prefs.line_numbers,
             ),
             diff_ws_default: crate::widgets::diff::DiffWhitespace::from_config(
                 &loaded_prefs.diff_ignore_whitespace,
@@ -18418,6 +18423,7 @@ impl App {
             ed.show_bracket_colors = self.bracket_colors_enabled;
             ed.provenance_overlay = self.provenance_overlay;
             ed.whitespace_mode = self.whitespace_mode;
+            ed.line_numbers = self.line_numbers;
             ed.diff_ws_default = self.diff_ws_default;
         }
         for group in self.editor_layout.inactive_groups_mut() {
@@ -18430,7 +18436,7 @@ impl App {
                 ed.show_bracket_colors = self.bracket_colors_enabled;
                 ed.provenance_overlay = self.provenance_overlay;
                 ed.whitespace_mode = self.whitespace_mode;
-                ed.diff_ws_default = self.diff_ws_default;
+                ed.line_numbers = self.line_numbers;
                 ed.diff_ws_default = self.diff_ws_default;
             }
         }
@@ -37685,6 +37691,7 @@ impl App {
                     "toggle:indent_guides" => self.toggle_indent_guides(),
                     "toggle:bracket_colors" => self.toggle_bracket_colors(),
                     "toggle:render_whitespace" => self.toggle_render_whitespace(),
+                    "toggle:line_numbers" => self.cycle_line_numbers(),
                     "toggle:vim_mode" => self.toggle_vim_mode(),
                     "toggle:inline_values" => self.toggle_inline_values(),
                     "toggle:inlay_hints" => self.toggle_inlay_hints(),
@@ -37824,6 +37831,14 @@ impl App {
                     "Editor: Render Whitespace: {}{}",
                     self.whitespace_mode.label(),
                     prov("render_whitespace")
+                ),
+            },
+            ListRow {
+                id: String::from("toggle:line_numbers"),
+                label: format!(
+                    "Editor: Line Numbers: {}{}",
+                    self.line_numbers.pref_id(),
+                    prov("line_numbers")
                 ),
             },
             ListRow {
@@ -50608,6 +50623,7 @@ impl App {
             Cmd::ToggleIndentGuides => self.toggle_indent_guides(),
             Cmd::ToggleBracketColors => self.toggle_bracket_colors(),
             Cmd::ToggleRenderWhitespace => self.toggle_render_whitespace(),
+            Cmd::CycleLineNumbers => self.cycle_line_numbers(),
             Cmd::ToggleInlineValues => self.toggle_inline_values(),
             Cmd::ToggleInlayHints => self.toggle_inlay_hints(),
             Cmd::ToggleMarkdownPreview => self.toggle_markdown_preview(),
@@ -58888,6 +58904,17 @@ impl App {
         changed
     }
 
+    /// Step the gutter's line numbers through on, relative, interval and
+    /// off (#1576), on every editor, and save the choice.
+    fn cycle_line_numbers(&mut self) {
+        self.line_numbers = self.line_numbers.next();
+        self.editor.line_numbers = self.line_numbers;
+        if !cfg!(test) {
+            let _ = crate::prefs::save_line_numbers(self.line_numbers.pref_id());
+        }
+        self.status = format!("Line Numbers: {}", self.line_numbers.pref_id());
+    }
+
     fn toggle_render_whitespace(&mut self) {
         self.whitespace_mode = self.whitespace_mode.next();
         self.editor.whitespace_mode = self.whitespace_mode;
@@ -59541,6 +59568,8 @@ impl App {
         self.whitespace_mode =
             crate::widgets::editor::WhitespaceMode::from_pref(&p.render_whitespace);
         self.editor.whitespace_mode = self.whitespace_mode;
+        self.line_numbers = crate::widgets::editor::LineNumbers::from_pref(&p.line_numbers);
+        self.editor.line_numbers = self.line_numbers;
         if !p.disable_inlay_hints && !self.inlay_hints_enabled {
             self.inlay_hints_enabled = true;
             self.request_inlay_hints_for_open_editors();

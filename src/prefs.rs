@@ -274,6 +274,11 @@ pub struct Prefs {
     /// the derived `Default` and an older config both mean "guides shown".
     #[serde(default)]
     pub disable_indent_guides: bool,
+    /// Gutter line numbers (#1576, VS Code's `editor.lineNumbers`): "on"
+    /// (also what the empty string an older config deserializes to means),
+    /// "relative", "interval" or "off". Parsed by `LineNumbers::from_pref`.
+    #[serde(default)]
+    pub line_numbers: String,
     /// Opt-out for LSP inlay hints (inline type / parameter annotations),
     /// which are on by default like VS Code's `editor.inlayHints.enabled`.
     /// Stored as the disable flag so the derived `Default` and an older
@@ -1175,6 +1180,14 @@ pub fn save_render_whitespace(mode: &str) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load_for_update(&path)?;
     prefs.render_whitespace = mode.to_string();
+    prefs.save(&path)
+}
+
+/// Persist the gutter's line number mode (#1576).
+pub fn save_line_numbers(mode: &str) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load_for_update(&path)?;
+    prefs.line_numbers = mode.to_string();
     prefs.save(&path)
 }
 

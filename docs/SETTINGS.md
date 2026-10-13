@@ -95,7 +95,7 @@ allowlist — appearance and editor/terminal behavior:
 
 `theme`, `format_on_save`, `format_on_type`, `auto_save`, `auto_save_on_focus_change`,
 `render_whitespace`, `disable_inline_blame`, `disable_auto_close_pairs`,
-`disable_inline_values`, `disable_save_before_debug`, `disable_bracket_colors`, `disable_indent_guides`,
+`disable_inline_values`, `disable_save_before_debug`, `disable_bracket_colors`, `disable_indent_guides`, `line_numbers`,
 `disable_inlay_hints`, `copy_on_select`, `disable_secret_redaction`, `disable_log_highlight`, `explorer_views`,
 `files_exclude`, `search_exclude`.
 
@@ -122,6 +122,7 @@ means the same thing whichever path reads it.
 | `editor.renderWhitespace` | `render_whitespace` (`none` / `selection` / `all`; VS Code's `boundary` and `trailing` have no croft mode and map to `none`) |
 | `editor.bracketPairColorization.enabled` | `disable_bracket_colors` (negated) |
 | `editor.guides.indentation` | `disable_indent_guides` (negated) |
+| `editor.lineNumbers` | `line_numbers` (`on` / `relative` / `interval` / `off`) |
 | `editor.inlayHints.enabled` | `disable_inlay_hints` (negated) |
 | `editor.autoClosingBrackets: "never"` | `disable_auto_close_pairs` |
 | `debug.saveBeforeStart: "none"` | `disable_save_before_debug` (every other value saves before a launch, a task or a Testing run) |
