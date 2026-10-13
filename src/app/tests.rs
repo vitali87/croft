@@ -7416,6 +7416,7 @@ fn git_status_spans_clean_branch_is_green() {
         changed_count: 0,
         prepared_message: None,
         operation: None,
+        rebasing_branch: None,
     };
     let spans = git_status_spans(&st);
     let main_span = spans
@@ -7442,6 +7443,7 @@ fn git_status_spans_dirty_branch_is_yellow_not_red() {
         changed_count: 0,
         prepared_message: None,
         operation: None,
+        rebasing_branch: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -7471,6 +7473,7 @@ fn git_status_spans_renders_detached_hash_when_no_branch() {
         changed_count: 0,
         prepared_message: None,
         operation: None,
+        rebasing_branch: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -7492,6 +7495,7 @@ fn git_status_spans_renders_ahead_behind_counts() {
         changed_count: 0,
         prepared_message: None,
         operation: None,
+        rebasing_branch: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -11251,6 +11255,83 @@ fn tree_context_menu_on_subfolder_offers_new_file_new_folder_then_cut_copy_renam
             "Delete"
         ],
     );
+}
+
+/// #1174: Cut then Paste with the selection still in the cut file's folder
+/// leaves the file alone and keeps the cut, so pasting on the folder it was
+/// meant for still moves it there.
+#[test]
+fn cut_then_paste_in_the_same_folder_leaves_the_file_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("notes.txt"), "notes\n").unwrap();
+    std::fs::create_dir(tmp.path().join("sub")).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Explorer);
+    app.focus_pane(Pane::Tree);
+    let select = |app: &mut App, name: &str| {
+        app.tree.selected = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.path.file_name().is_some_and(|f| f == name))
+            .unwrap_or_else(|| panic!("{name} in the tree"));
+    };
+    select(&mut app, "notes.txt");
+    let notes = app.tree.nodes[app.tree.selected].path.clone();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::CONTROL))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(notes.exists(), "the file keeps its name");
+    assert!(!notes.with_file_name("notes copy.txt").exists());
+    assert_eq!(app.status, "Already in this folder: nothing to move");
+    assert!(app.tree_clipboard.is_some(), "the cut is kept");
+
+    select(&mut app, "sub");
+    let sub = app.tree.nodes[app.tree.selected].path.clone();
+    app.handle_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(sub.join("notes.txt").exists(), "{}", app.status);
+    assert!(!notes.exists());
+    assert!(app.tree_clipboard.is_none());
+}
+
+/// Negative (#1174): a cut pasted into another folder still moves the
+/// file there, and a copy pasted into its own folder still makes
+/// "<name> copy", as before.
+#[test]
+fn cut_to_another_folder_moves_and_copy_in_place_still_duplicates() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("notes.txt"), "notes\n").unwrap();
+    std::fs::write(tmp.path().join("todo.txt"), "todo\n").unwrap();
+    std::fs::create_dir(tmp.path().join("sub")).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Explorer);
+    app.focus_pane(Pane::Tree);
+    let select = |app: &mut App, name: &str| {
+        app.tree.selected = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.path.file_name().is_some_and(|f| f == name))
+            .unwrap_or_else(|| panic!("{name} in the tree"));
+    };
+    select(&mut app, "notes.txt");
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::CONTROL))
+        .unwrap();
+    select(&mut app, "sub");
+    app.handle_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(tmp.path().join("sub/notes.txt").exists(), "{}", app.status);
+    assert!(!tmp.path().join("notes.txt").exists());
+    assert!(app.tree_clipboard.is_none(), "a done move clears the cut");
+    select(&mut app, "todo.txt");
+    app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(tmp.path().join("todo copy.txt").exists(), "{}", app.status);
+    assert!(tmp.path().join("todo.txt").exists());
 }
 
 #[test]
@@ -16818,6 +16899,57 @@ fn continue_rebase_finishes_it_on_the_branch() {
     );
 }
 
+/// #1647: mid-rebase HEAD is detached on the commit being replayed onto,
+/// yet the status bar and Source Control name the branch being rebased,
+/// for a merge-backend and an apply-backend rebase alike.
+#[test]
+fn a_rebase_names_the_branch_being_rebased() {
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    assert!(git_succeeds(p, &["checkout", "-q", "feat"]));
+    for rebase in [&["rebase", "main"][..], &["rebase", "--apply", "main"][..]] {
+        assert!(!git_succeeds(p, rebase), "the rebase must conflict");
+        let st = crate::git::query(p);
+        assert_eq!(st.head_label(), "feat", "{rebase:?}");
+        let pill: String = git_status_spans(&st)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(pill.contains("feat | REBASING 1/1"), "{rebase:?}: {pill}");
+        let mut panel = crate::widgets::source_control::SourceControlPanel::new();
+        panel.set_status(st, Vec::new());
+        let area = ratatui::layout::Rect::new(0, 0, 60, 12);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let panel_text: String = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .map(|xy| buf[xy].symbol())
+            .collect();
+        assert!(panel_text.contains("feat"), "{rebase:?}: {panel_text}");
+        assert!(git_succeeds(p, &["rebase", "--abort"]));
+    }
+}
+
+/// #1647 negative: a plain detached checkout, and a rebase of a detached
+/// HEAD (git's `head-name` is then "detached HEAD"), still show the hash.
+#[test]
+fn a_detached_head_still_shows_its_hash() {
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    assert!(git_succeeds(p, &["checkout", "-q", "--detach", "feat"]));
+    let short = git_stdout(p, &["rev-parse", "--short", "HEAD"]);
+    assert_eq!(crate::git::query(p).head_label(), short);
+    assert!(
+        !git_succeeds(p, &["rebase", "main"]),
+        "the rebase must conflict"
+    );
+    let onto = git_stdout(p, &["rev-parse", "--short", "HEAD"]);
+    assert_eq!(crate::git::query(p).head_label(), onto);
+    assert!(git_succeeds(p, &["rebase", "--abort"]));
+    assert!(git_succeeds(p, &["checkout", "-q", "main"]));
+    assert_eq!(crate::git::query(p).head_label(), "main");
+}
+
 /// #1356 (the #989 path): committing from Source Control mid-rebase
 /// carries on with the rebase instead of leaving HEAD detached.
 #[test]
@@ -17165,6 +17297,42 @@ fn opening_a_config_file_keeps_the_active_tabs_unsaved_edits() {
         .expect("a.txt still has its tab");
     assert!(kept.dirty);
     assert_eq!(kept.lines, vec![String::from("unsaved")]);
+}
+
+/// #1617: Open Settings (JSON) on a fresh install creates a `config.json`
+/// with no settings in it. Seeding every default made each one a user
+/// setting, over an `extends` base and over later default changes.
+#[test]
+fn open_settings_json_seeds_a_config_with_no_settings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let path = tmp.path().join("user").join("config.json");
+    app.open_config_file_in_editor(path.clone(), ConfigFileSeed::Settings);
+    assert_eq!(app.editor.path.as_deref(), Some(path.as_path()));
+    let written = std::fs::read_to_string(&path).unwrap();
+    let doc: serde_json::Value =
+        serde_json::from_str(&crate::tasks::strip_jsonc(&written)).unwrap();
+    assert_eq!(doc, serde_json::json!({}), "{written}");
+    assert!(written.contains("docs/SETTINGS.md"), "{written}");
+    assert_eq!(
+        crate::prefs::Prefs::load(&path).unwrap(),
+        crate::prefs::Prefs::default()
+    );
+}
+
+/// #1617 negative: an existing `config.json` opens as it is.
+#[test]
+fn open_settings_json_leaves_an_existing_config_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, "{ \"vim_mode\": true }\n").unwrap();
+    app.open_config_file_in_editor(path.clone(), ConfigFileSeed::Settings);
+    assert_eq!(app.editor.path.as_deref(), Some(path.as_path()));
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "{ \"vim_mode\": true }\n"
+    );
 }
 
 #[test]
@@ -33612,6 +33780,53 @@ fn open_line_above_relocated_from_cmd_shift_o_to_cmd_shift_enter() {
         KeyCode::Char('o'),
         KeyModifiers::SUPER | KeyModifiers::SHIFT
     )));
+}
+
+/// #1181: Ctrl+/ in a file with no comment syntax says so, as the palette
+/// command does, instead of doing nothing silently; in a file croft has no
+/// grammar for but knows the comment of, it comments.
+#[test]
+fn ctrl_slash_reports_a_file_with_no_comment_and_comments_one_by_extension() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("notes.unknownext");
+    std::fs::write(&plain, "hello\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&plain).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "hello");
+    assert_eq!(
+        app.status,
+        "Toggle Line Comment: no comment for this language"
+    );
+    let kt = tmp.path().join("App.kt");
+    std::fs::write(&kt, "class App\n").unwrap();
+    app.editor.open_pinned(&kt).unwrap();
+    app.status.clear();
+    app.handle_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "// class App");
+    assert!(app.status.is_empty(), "{}", app.status);
+}
+
+/// #1181 negative: Ctrl+/ on a blank line of a language that has a comment
+/// does nothing, without claiming the language has no comment.
+#[test]
+fn ctrl_slash_on_a_blank_line_does_not_report_no_comment() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (name, text) in [("main.rs", "   \n"), ("index.html", "\n")] {
+        let path = tmp.path().join(name);
+        std::fs::write(&path, text).unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open_pinned(&path).unwrap();
+        app.focus_pane(Pane::Editor);
+        app.status.clear();
+        app.handle_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(app.editor.lines[0], text.trim_end_matches('\n'), "{name}");
+        assert!(app.status.is_empty(), "{name}: {}", app.status);
+    }
 }
 
 #[test]
@@ -65055,15 +65270,17 @@ impl CodeqlStandIn {
 
 /// #856 guard: a run-at-cursor asked for while a run is in flight is
 /// turned away, and does not take over the first run's pending outcome:
-/// the status still names the first run when it ends.
+/// the status names the first run when it ends. Turned away with the way
+/// to stop the first (#1534), not silently.
 #[cfg(unix)]
 #[test]
 fn a_run_asked_for_mid_run_does_not_take_over_the_first_runs_outcome() {
     let mut s = CodeqlStandIn::new();
     s.will(STAND_IN_PASS, 0);
     s.app.run_named_test(String::from("Find.qlref"));
-    s.app.run_named_test(String::from("Other.qlref"));
     assert_eq!(s.app.status, "Running test test/Find::Find.qlref");
+    s.app.run_named_test(String::from("Other.qlref"));
+    assert_eq!(s.app.status, TEST_RUN_IN_PROGRESS);
     s.finish();
     assert!(
         s.app.status.starts_with("Find.qlref passed ("),
@@ -72472,8 +72689,8 @@ fn the_scrubber_opens_a_commits_version_here_or_diffs_it_to_the_working_tree() {
     assert_eq!(diff.left_lines, vec!["v1", "v2"]);
     assert_eq!(
         diff.right_lines,
-        vec!["v1", "v2", "v3", "v4"],
-        "the file on disk"
+        vec!["v1", "v2", "v3", "v4", "unsaved"],
+        "the working copy as the user has it, unsaved edit included (#1572)"
     );
 
     // With no scrubbed commit, the commands say so rather than guess.
@@ -79494,6 +79711,77 @@ fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
     assert_eq!(app.status, "Tab is already kept open");
 }
 
+// --- #1254: long hovers scroll ---------------------------------------------------
+
+fn app_with_long_hover() -> (
+    App,
+    tempfile::TempDir,
+    ratatui::Terminal<ratatui::backend::TestBackend>,
+) {
+    let (mut app, tmp, col, row) = app_with_open_file_and_editor_cell();
+    let doc = (1..=40)
+        .map(|i| format!("doc line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+        doc,
+        (col, row),
+    ));
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    (app, tmp, term)
+}
+
+#[test]
+fn the_wheel_over_a_hover_popup_scrolls_it_instead_of_closing_it() {
+    use crossterm::event::MouseEventKind;
+    let (mut app, _tmp, mut term) = app_with_long_hover();
+    let area = app.hover_popup.as_ref().unwrap().last_area;
+    assert!(area.height > 2, "the popup painted");
+    let (x, y) = (area.x + 3, area.y + 2);
+    app.handle_mouse(mouse(MouseEventKind::ScrollDown, x, y));
+    let popup = app
+        .hover_popup
+        .as_ref()
+        .expect("the wheel keeps the popup open");
+    assert!(popup.scroll > 0, "and scrolls it");
+    let after_down = popup.scroll;
+    app.handle_mouse(mouse(MouseEventKind::ScrollUp, x, y));
+    assert!(app.hover_popup.as_ref().unwrap().scroll < after_down);
+    term.draw(|frame| app.render(frame)).unwrap();
+    assert!(app.hover_popup.is_some());
+}
+
+#[test]
+fn moving_the_pointer_onto_the_hover_popup_keeps_it_open() {
+    use crossterm::event::MouseEventKind;
+    let (mut app, _tmp, _term) = app_with_long_hover();
+    let area = app.hover_popup.as_ref().unwrap().last_area;
+    app.handle_mouse(mouse(MouseEventKind::Moved, area.x + 3, area.y + 2));
+    assert!(
+        app.hover_popup.is_some(),
+        "the pointer has to cross onto the popup to scroll it"
+    );
+}
+
+#[test]
+fn the_wheel_away_from_the_hover_popup_still_closes_it() {
+    use crossterm::event::MouseEventKind;
+    let (mut app, _tmp, _term) = app_with_long_hover();
+    let area = app.hover_popup.as_ref().unwrap().last_area;
+    let x = if area.x > 2 {
+        area.x - 2
+    } else {
+        area.right() + 2
+    };
+    app.handle_mouse(mouse(MouseEventKind::ScrollDown, x, area.y + 1));
+    assert!(
+        app.hover_popup.is_none(),
+        "scrolling the editor dismisses the hover"
+    );
+}
+
 // --- #1215: keys that move the caret sideways scroll the view to it -----------
 
 fn wide_line_app(tmp: &std::path::Path) -> (App, ratatui::Terminal<ratatui::backend::TestBackend>) {
@@ -80358,6 +80646,36 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     let _ = render_buf(&mut app);
     assert!(app.source_control.nested_repos.is_empty());
     assert!(app.source_control.last_init_repo_button_area.width > 0);
+}
+
+/// #1534: a run asked for while another is in flight says why nothing
+/// happened and how to stop the one running, instead of doing nothing.
+#[test]
+fn a_test_run_while_one_is_in_flight_says_how_to_stop_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname = \"t\"\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.testing
+        .on_busy_started(crate::testing::model::Activity::Running);
+    app.run_all_tests();
+    assert_eq!(app.status, TEST_RUN_IN_PROGRESS);
+    app.status.clear();
+    app.run_test(String::from("m::a"));
+    assert_eq!(app.status, TEST_RUN_IN_PROGRESS);
+}
+
+/// #1534: `s` in the Testing view cancels a run in flight; with nothing
+/// running, Testing: Cancel Test Run says so.
+#[test]
+fn cancel_test_run_stops_a_run_and_says_so_when_idle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.cancel_test_run();
+    assert_eq!(app.status, "No test run in progress");
+    app.testing
+        .on_busy_started(crate::testing::model::Activity::Running);
+    app.handle_testing_key(key(KeyCode::Char('s'), KeyModifiers::NONE));
+    assert_eq!(app.status, "Cancelling test run");
 }
 
 // --- Minimap without inline images (#1231) --------------------------------
@@ -81292,6 +81610,227 @@ fn save_all_does_not_report_a_file_waiting_on_its_formatter_as_saved() {
         save_all_summary(1, 0, None, String::new()),
         "Saved 1 editor"
     );
+}
+
+/// A modified file whose tab has unsaved edits, opened from Source Control
+/// (#1572): `seed.txt` is `a = 2` on disk against `a = 1` at HEAD, and its
+/// open tab reads `# a = 2`.
+fn scm_app_with_an_unsaved_modified_file() -> (tempfile::TempDir, std::path::PathBuf, App, usize) {
+    let (tmp, f) = repo_with_seed("a = 1\n");
+    std::fs::write(&f, "a = 2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    type_str(&mut app, "# ");
+    assert!(
+        app.editor.dirty,
+        "staging: the file's tab has unsaved edits"
+    );
+    assert!(wait_for_changes(&mut app, |a| {
+        a.source_control
+            .entries
+            .iter()
+            .any(|e| e.path == "seed.txt")
+    }));
+    let idx = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "seed.txt")
+        .unwrap();
+    (tmp, f, app, idx)
+}
+
+fn diff_tab_count(app: &App) -> usize {
+    app.editor.iter_tabs().filter(|e| e.diff.is_some()).count()
+}
+
+#[test]
+fn reopening_the_source_control_diff_of_an_unsaved_file_reuses_its_diff_tab() {
+    let (_tmp, _f, mut app, idx) = scm_app_with_an_unsaved_modified_file();
+    app.open_source_control_entry(idx);
+    app.open_source_control_entry(idx);
+    app.open_source_control_entry(idx);
+    assert_eq!(
+        diff_tab_count(&app),
+        1,
+        "every click on the row must land on the one diff tab"
+    );
+    assert_eq!(app.editor.tab_count(), 2, "the file's tab and its diff");
+}
+
+#[test]
+fn the_source_control_diff_of_an_unsaved_file_shows_the_unsaved_text() {
+    let (_tmp, _f, mut app, idx) = scm_app_with_an_unsaved_modified_file();
+    app.open_source_control_entry(idx);
+    let diff = app.editor.diff.as_ref().expect("a diff view is open");
+    assert_eq!(
+        diff.left_lines,
+        vec!["a = 1".to_string()],
+        "HEAD on the left"
+    );
+    assert_eq!(
+        diff.right_lines,
+        vec!["# a = 2".to_string()],
+        "the right side is the buffer the user is editing, not the disk"
+    );
+}
+
+#[test]
+fn the_source_control_diff_leaves_the_unsaved_tab_alone() {
+    let (_tmp, f, mut app, idx) = scm_app_with_an_unsaved_modified_file();
+    app.open_source_control_entry(idx);
+    app.open_source_control_entry(idx);
+    let tab = app
+        .editor
+        .iter_tabs()
+        .find(|e| e.diff.is_none() && e.path.as_deref() == Some(f.as_path()))
+        .expect("the file's own tab is still open");
+    assert!(tab.dirty, "its unsaved edits are kept");
+    assert_eq!(tab.lines[0], "# a = 2");
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        "a = 2\n",
+        "nothing saved"
+    );
+}
+
+#[test]
+fn the_source_control_diff_of_a_clean_file_reuses_its_tab_and_reads_the_disk() {
+    let (tmp, f) = repo_with_seed("a = 1\n");
+    std::fs::write(&f, "a = 2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    assert!(wait_for_changes(&mut app, |a| {
+        a.source_control
+            .entries
+            .iter()
+            .any(|e| e.path == "seed.txt")
+    }));
+    let idx = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "seed.txt")
+        .unwrap();
+    app.open_source_control_entry(idx);
+    app.open_source_control_entry(idx);
+    assert_eq!(app.editor.tab_count(), 1, "the clean tab becomes the diff");
+    let diff = app.editor.diff.as_ref().expect("a diff view is open");
+    assert_eq!(diff.right_lines, vec!["a = 2".to_string()]);
+}
+
+#[test]
+fn compare_with_selected_diffs_an_unsaved_buffer_as_it_stands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "x\n").unwrap();
+    std::fs::write(&b, "y\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    type_str(&mut app, "z");
+    app.dispatch_menu_action(
+        MenuAction::CompareWithSelected {
+            anchor: a.clone(),
+            other: b.clone(),
+        },
+        tmp.path().to_path_buf(),
+    );
+    let diff = app.editor.diff.as_ref().expect("a diff view is open");
+    assert_eq!(
+        diff.left_lines,
+        vec!["zx".to_string()],
+        "the unsaved buffer, not the disk"
+    );
+    assert_eq!(
+        diff.right_lines,
+        vec!["y".to_string()],
+        "a closed file reads the disk"
+    );
+}
+
+#[test]
+fn hunk_actions_refuse_a_source_control_diff_of_unsaved_text() {
+    let (tmp, _f, mut app, idx) = scm_app_with_an_unsaved_modified_file();
+    app.open_source_control_entry(idx);
+    app.stage_hunk_at_caret();
+    assert_eq!(
+        app.status,
+        "Save the file first: hunk actions apply to the file on disk"
+    );
+    let staged = std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp.path())
+        .args(["diff", "--cached", "--name-only"])
+        .output()
+        .unwrap();
+    assert!(
+        staged.stdout.is_empty(),
+        "unsaved text must never reach the index: {}",
+        String::from_utf8_lossy(&staged.stdout)
+    );
+}
+
+#[test]
+fn the_source_control_diff_finds_the_unsaved_copy_in_an_inactive_split_group() {
+    let (_tmp, _f, mut app, idx) = scm_app_with_an_unsaved_modified_file();
+    // The new active group opens seed.txt clean from disk; the dirty copy
+    // now sits in the inactive group.
+    app.split_editor();
+    assert!(
+        !app.editor.dirty,
+        "staging: the active group's copy is clean"
+    );
+    app.open_source_control_entry(idx);
+    let diff = app.editor.diff.as_ref().expect("a diff view is open");
+    assert_eq!(
+        diff.right_lines,
+        vec!["# a = 2".to_string()],
+        "the unsaved text from the other split, not the disk"
+    );
+    assert!(diff.right_is_unsaved, "hunk actions must refuse this view");
+}
+
+#[test]
+fn saving_the_file_lets_hunk_actions_run_on_its_unsaved_source_control_diff() {
+    let (_tmp, f, mut app, idx) = scm_app_with_an_unsaved_modified_file();
+    app.open_source_control_entry(idx);
+    assert!(app.editor.diff.as_ref().unwrap().right_is_unsaved);
+    // The save writes exactly the text the view already shows, so the
+    // rebuilt rows are identical to the rendered ones.
+    std::fs::write(&f, "# a = 2\n").unwrap();
+    let touched = std::collections::BTreeSet::from([f.clone()]);
+    app.refresh_open_diff_views(false, &[], &touched);
+    assert!(
+        !app.editor.diff.as_ref().unwrap().right_is_unsaved,
+        "the saved transition clears the marker even with identical rows"
+    );
+    app.stage_hunk_at_caret();
+    assert_eq!(app.status, "Staged hunk in seed.txt");
+}
+
+#[test]
+fn hunk_actions_still_stage_from_a_source_control_diff_of_a_saved_file() {
+    let (tmp, f) = repo_with_seed("a = 1\n");
+    std::fs::write(&f, "a = 2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(wait_for_changes(&mut app, |a| {
+        a.source_control
+            .entries
+            .iter()
+            .any(|e| e.path == "seed.txt")
+    }));
+    let idx = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "seed.txt")
+        .unwrap();
+    app.open_source_control_entry(idx);
+    app.stage_hunk_at_caret();
+    assert_eq!(app.status, "Staged hunk in seed.txt");
 }
 
 /// #1488: a watcher that clears the screen (`tsc --watch`, `cargo watch -c`)
