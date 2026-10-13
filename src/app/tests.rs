@@ -61183,6 +61183,42 @@ fn resolved_attach(json: &str) -> crate::dap::configs::ResolvedConfig {
     crate::dap::configs::resolve(&cfg, &ctx).expect("resolves")
 }
 
+/// #1419: an lldb attach with only a `program` (or `attachCommands`) is
+/// started, not refused for lacking a pid; one with none of the three
+/// names all of them.
+#[test]
+fn an_lldb_attach_needs_a_pid_a_program_or_attach_commands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let rc = resolved_attach(
+        r#"{ "configurations": [ { "name": "Nothing", "type": "lldb", "request": "attach" } ] }"#,
+    );
+    app.launch_resolved_config(rc);
+    if lldb_dap_path().is_none() {
+        assert!(app.debug_sessions.is_empty());
+        return;
+    }
+    assert!(
+        app.status.contains(
+            r#"config "Nothing": an lldb attach needs a numeric "processId", a "program" or "attachCommands""#
+        ),
+        "{}",
+        app.status
+    );
+    assert!(app.debug_sessions.is_empty());
+
+    for config in [
+        r#"{ "name": "By name", "type": "lldb", "request": "attach", "program": "/no/such/app", "waitFor": true }"#,
+        r#"{ "name": "Remote", "type": "lldb", "request": "attach", "attachCommands": ["gdb-remote 127.0.0.1:9"] }"#,
+    ] {
+        let rc = resolved_attach(&format!(r#"{{ "configurations": [ {config} ] }}"#));
+        app.launch_resolved_config(rc);
+        assert!(!app.status.contains("needs a numeric"), "{}", app.status);
+        assert!(!app.debug_sessions.is_empty(), "{config} starts a session");
+        app.debug_stop();
+    }
+}
+
 /// #250: an lldb attach whose `processId` is `${command:pickProcess}` opens
 /// a process picker instead of failing, and the chosen pid resumes it.
 #[test]

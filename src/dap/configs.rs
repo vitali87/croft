@@ -960,6 +960,20 @@ pub fn lldb_request(rc: &ResolvedConfig) -> Value {
     }
 }
 
+/// Whether an lldb `attach` names something to attach to (#1419): a
+/// `processId`, a `program` (lldb finds the running process by its
+/// executable, or waits for it with `waitFor`), or `attachCommands` (such as
+/// `gdb-remote host:port` for gdbserver, QEMU or an embedded probe).
+pub fn lldb_attach_has_target(rc: &ResolvedConfig) -> bool {
+    rc.process_id.is_some()
+        || rc.program.as_deref().is_some_and(|p| !p.trim().is_empty())
+        || rc
+            .extra
+            .get("attachCommands")
+            .and_then(Value::as_array)
+            .is_some_and(|c| !c.is_empty())
+}
+
 /// Build the delve `launch`/`attach` request (#264). `mode` passes through
 /// from the config and defaults to delve's own defaults: `debug` to launch
 /// (build and run the package at `program`), `local` to attach to `processId`.
@@ -1786,6 +1800,60 @@ mod tests {
         assert_eq!(req["command"], "attach");
         assert_eq!(req["arguments"]["pid"], 4242);
         assert!(req["arguments"].get("stopOnEntry").is_none());
+    }
+
+    /// #1419: an lldb attach by program name (with `waitFor`) or through
+    /// `attachCommands` (gdbserver, QEMU, an embedded probe) has a target and
+    /// goes out as written, with no `pid`.
+    #[test]
+    fn an_lldb_attach_by_program_or_attach_commands_has_a_target() {
+        let cfg = config(
+            r#"[{ "name": "By name", "type": "lldb", "request": "attach",
+                  "program": "${workspaceFolder}/app", "waitFor": true }]"#,
+        );
+        let rc = resolve(&cfg, &ctx()).unwrap();
+        assert!(lldb_attach_has_target(&rc));
+        let req = lldb_request(&rc);
+        assert_eq!(req["command"], "attach");
+        assert_eq!(req["arguments"]["program"], "/work/proj/app");
+        assert_eq!(req["arguments"]["waitFor"], true);
+        assert!(req["arguments"].get("pid").is_none());
+        assert!(req["arguments"].get("stopOnEntry").is_none());
+
+        let cfg = config(
+            r#"[{ "name": "gdbserver", "type": "lldb", "request": "attach",
+                  "program": "${workspaceFolder}/app",
+                  "attachCommands": ["target create ${workspaceFolder}/app", "gdb-remote localhost:1234"] }]"#,
+        );
+        let rc = resolve(&cfg, &ctx()).unwrap();
+        assert!(lldb_attach_has_target(&rc));
+        let req = lldb_request(&rc);
+        assert_eq!(
+            req["arguments"]["attachCommands"],
+            json!(["target create /work/proj/app", "gdb-remote localhost:1234"])
+        );
+        assert!(req["arguments"].get("pid").is_none());
+
+        // attachCommands alone is enough.
+        let cfg = config(
+            r#"[{ "name": "Remote", "type": "lldb", "request": "attach",
+                  "attachCommands": ["gdb-remote 10.0.0.2:3333"] }]"#,
+        );
+        assert!(lldb_attach_has_target(&resolve(&cfg, &ctx()).unwrap()));
+    }
+
+    /// #1419, negative: an lldb attach with no pid, no program and no (or
+    /// empty) attachCommands has nothing to attach to.
+    #[test]
+    fn an_lldb_attach_with_nothing_to_attach_to_has_no_target() {
+        for text in [
+            r#"[{ "name": "A", "type": "lldb", "request": "attach" }]"#,
+            r#"[{ "name": "A", "type": "lldb", "request": "attach", "attachCommands": [] }]"#,
+            r#"[{ "name": "A", "type": "lldb", "request": "attach", "program": "  " }]"#,
+        ] {
+            let rc = resolve(&config(text), &ctx()).unwrap();
+            assert!(!lldb_attach_has_target(&rc), "{text}");
+        }
     }
 
     #[test]
