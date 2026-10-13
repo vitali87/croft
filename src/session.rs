@@ -506,6 +506,15 @@ pub fn bind_socket_0600(socket: &Path) -> std::io::Result<std::os::unix::net::Un
     // stranded session host invisible to every future client. The loser now
     // finds the winner alive under the lock and is told to attach instead
     // (`AddrInUse`). The flock releases on drop (or on crash, by the OS).
+    // The socket's folder, owner-only, on a machine that has never had one
+    // (#1368): without it the lock file cannot open, and a plain `croft .`
+    // never serves its agent hook.
+    if let Some(parent) = socket.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -698,6 +707,34 @@ mod tests {
         let _c = std::os::unix::net::UnixStream::connect(&sock)
             .expect("the surviving pathname must reach the winning listener");
         drop(l);
+    }
+
+    /// #1368: on a machine where croft never made its sessions folder, the
+    /// first bind makes it, owner-only, instead of failing on the lock.
+    #[test]
+    fn a_socket_in_a_folder_that_does_not_exist_yet_binds() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join(".cache/croft/sessions");
+        let sock = sessions.join("w.hook.sock");
+        let _l = bind_socket_0600(&sock).expect("the folder is made, then bound");
+        std::os::unix::net::UnixStream::connect(&sock).expect("the listener answers");
+        let mode = std::fs::metadata(&sessions).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+    }
+
+    /// #1368, negative: a sessions folder that already exists is used as
+    /// it is; making it is not a reason to change its mode.
+    #[test]
+    fn an_existing_socket_folder_is_left_as_it_is() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let _l = bind_socket_0600(&sessions.join("w.sock")).unwrap();
+        let mode = std::fs::metadata(&sessions).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o750, "{mode:o}");
     }
 
     /// A stale socket file (its owner crashed; nobody accepts) must not block
