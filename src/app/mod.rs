@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-        MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -1148,6 +1148,15 @@ fn update_spinner_frame(elapsed_ms: u128) -> &'static str {
     UPDATE_SPINNER_FRAMES[((elapsed_ms / UPDATE_SPINNER_FRAME_MS) % n) as usize]
 }
 
+/// What a breadcrumb crumb stands for (#1608).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CrumbTarget {
+    Folder(PathBuf),
+    File(PathBuf),
+    /// An index into the outline's symbols.
+    Symbol(usize),
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum MenuAction {
     Create(CreateKind),
@@ -1310,6 +1319,14 @@ enum MenuAction {
         row: usize,
         col: usize,
     },
+    /// A breadcrumb picker's file (#1608): open it as Quick Open would.
+    OpenCrumbFile(PathBuf),
+    /// A breadcrumb picker's folder (#1608): list it in the picker of
+    /// `crumb`, where the listing started.
+    BrowseCrumbFolder {
+        dir: PathBuf,
+        crumb: usize,
+    },
     /// Jump straight to an already-resolved location (LSP line/character). Used
     /// for the entries of the multi-result "Go to Implementations" / "Go to
     /// References" pickers, where each row is one location; selecting it records
@@ -1446,6 +1463,12 @@ enum MenuAction {
     /// Terminal pane right-click: restore the most recently closed pane
     /// while it is still inside the undo-close grace window.
     UndoCloseTerminal,
+    /// Terminal pane right-click: open another terminal next to the active
+    /// one, as `Cmd+T` does (#1598).
+    SplitTerminal,
+    /// Terminal pane right-click: close the pane at `idx`, as `Cmd+W` does
+    /// for the active one (#1598).
+    KillTerminal(usize),
     /// Command decoration menu: copy the command's output span to the
     /// clipboard (pane `idx`, the clicked decoration embedded).
     CopyCommandOutput(usize, crate::widgets::terminal::CommandDecoration),
@@ -1558,6 +1581,8 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::ToggleBroadcastInput => Some("⌘K I"),
         MenuAction::ToggleBroadcastExclusion => Some("⌘K ⇧I"),
         MenuAction::UndoCloseTerminal => Some("⌘K ⇧T"),
+        MenuAction::SplitTerminal => Some("⌘T"),
+        MenuAction::KillTerminal(_) => Some("⌘W"),
         MenuAction::CopyCommandOutput(..) => Some("⌘K ⇧C"),
         MenuAction::SelectCommandOutput(..) => Some("⌘K ⇧S"),
         MenuAction::RerunCommand(..) => Some("⌘K ⇧R"),
@@ -2406,6 +2431,13 @@ struct ContextMenu {
     submenu_selected: usize,
     /// Where any New File / New Folder should be created.
     target_dir: PathBuf,
+    /// The breadcrumb whose picker this is (#1608): Left / Right step to
+    /// the neighbouring crumb's picker.
+    crumb: Option<usize>,
+    /// The first top-level row on screen: a menu taller than the terminal
+    /// (a big folder's breadcrumb picker) scrolls to keep the highlight in
+    /// view. Kept by [`scroll_for`](Self::scroll_for).
+    scroll: std::cell::Cell<usize>,
 }
 
 impl ContextMenu {
@@ -2418,6 +2450,8 @@ impl ContextMenu {
             open_submenu: None,
             submenu_selected: 0,
             target_dir,
+            crumb: None,
+            scroll: Default::default(),
         }
     }
 
@@ -2445,6 +2479,22 @@ impl ContextMenu {
         if crate::i18n::active() {
             walk(&mut self.items);
         }
+    }
+
+    /// The first top-level row shown when `visible` rows fit: the previous
+    /// offset, moved only as far as keeps `selected` on screen.
+    fn scroll_for(&self, visible: usize) -> usize {
+        let mut top = self.scroll.get();
+        if visible > 0 {
+            if self.selected < top {
+                top = self.selected;
+            } else if self.selected >= top + visible {
+                top = self.selected + 1 - visible;
+            }
+            top = top.min(self.items.len().saturating_sub(visible));
+        }
+        self.scroll.set(top);
+        top
     }
 
     /// The entries at the active level: the open submenu's children, or the
@@ -2895,6 +2945,16 @@ type PendingTestDebug = (
     PathBuf,
 );
 
+/// The test run Testing: Rerun Last Run repeats (#1535), as it was asked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LastTestRun {
+    All,
+    One(String),
+    Filter(String),
+    Suite(String),
+    Many(Vec<String>),
+}
+
 /// A "Running …" status an operation put in the status bar (#856), kept
 /// until the operation ends so the bar can say how it went instead of
 /// claiming it still runs: a test run, a task, a runnable fenced block.
@@ -2995,6 +3055,8 @@ pub struct App {
     test_worker: crate::testing::worker::TestWorker,
     /// The run whose "Running test …" status awaits its outcome (#856).
     test_run_status: Option<RunningStatus>,
+    /// The last test run started, for Testing: Rerun Last Run (#1535).
+    last_test_run: Option<LastTestRun>,
     /// Tasks and fenced blocks whose "Running …" status awaits their pane's
     /// command-finished report (#856), by pane uid.
     pane_run_statuses: Vec<(u64, RunningStatus)>,
@@ -3066,6 +3128,12 @@ pub struct App {
     /// `None` everywhere else, so a keyboard invocation of the same command
     /// can never act on a stale click.
     last_mouse_pos: Option<(u16, u16)>,
+    /// The tab a tab-strip mouse binding was clicked on (#1427), set only
+    /// for that dispatch and taken by `run_command` as it starts, so only
+    /// the directly bound command sees it: a command it runs in turn (an
+    /// aborted rebase closing its tab, a replayed macro) acts on the active
+    /// tab as it would from the keyboard.
+    tab_click_target: Option<usize>,
     /// User snippets from `~/.config/croft/snippets.json`. Typing a snippet's
     /// prefix and pressing Tab expands it with tab-stop navigation.
     snippets: crate::snippets::SnippetSet,
@@ -3105,6 +3173,10 @@ pub struct App {
     /// Latch set while a save is waiting on a format reply. `drain_lsp_format`
     /// consumes it to write the (now formatted) buffer to disk.
     save_after_format: Option<PathBuf>,
+    /// The project's Prettier formatting the active file (#1255), whose
+    /// reply completes a deferred save like an LSP format reply does.
+    prettier_job: Option<crate::prettier::Job>,
+
     /// When a format-on-save stops waiting on its formatter and writes the
     /// file unformatted (#1491). Set with `save_after_format`.
     format_save_deadline: Option<std::time::Instant>,
@@ -3128,8 +3200,8 @@ pub struct App {
     nested_repo_scan: Option<(PathBuf, std::time::Instant)>,
     /// Off-thread per-line git blame for the active editor (GitLens-style
     /// inline annotation). Fetched once per (file, HEAD) like the gutter.
-    blame_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<crate::git::BlameLine>)>,
-    blame_tx: std::sync::mpsc::Sender<(PathBuf, Vec<crate::git::BlameLine>)>,
+    blame_rx: std::sync::mpsc::Receiver<(PathBuf, crate::git::Blame)>,
+    blame_tx: std::sync::mpsc::Sender<(PathBuf, crate::git::Blame)>,
     /// The file blame has been fetched (or is in flight) for; reset to `None`
     /// on HEAD move so the annotation refreshes after a commit / checkout.
     blame_fetched: Option<PathBuf>,
@@ -3769,6 +3841,9 @@ pub struct App {
     /// unsaved edits (#1438). The write records the files on disk, so the
     /// modal asks first: save them all, go ahead without them, or cancel.
     pending_unsaved_scm: Option<PendingUnsavedScm>,
+    /// The repository the open Delete Remote Tag picker listed (#1582),
+    /// so the deletion stays bound to it if Source Control moves.
+    remote_tag_root: Option<PathBuf>,
     /// Set for the one call that runs a write the prompt already cleared.
     scm_unsaved_cleared: bool,
     /// A write waiting on a format-on-save reply: Save All armed the
@@ -4106,6 +4181,14 @@ pub struct App {
     term_suggestion: Option<(usize, String, String)>,
     /// The command whose new shortcut the next keystroke records (#612).
     recording_shortcut: Option<(crate::widgets::command_palette::Command, std::time::Instant)>,
+    /// A recorded chord another command already has (#1482), waiting for
+    /// Enter to reassign it: the command, the chord, and every command it
+    /// runs now (a built-in chord can be shared by several).
+    confirming_shortcut: Option<(
+        crate::widgets::command_palette::Command,
+        KeyEvent,
+        Vec<crate::widgets::command_palette::Command>,
+    )>,
     /// Inline AI suggestions (#607): off until the user turns them on, since
     /// they send code to a model. The worker, the backend it was started
     /// for, the request in flight (id plus what it answers for), and the
@@ -4160,6 +4243,17 @@ pub struct App {
     /// A word edit in an incomplete session is waiting to re-ask the server;
     /// sent after `sync_lsp` so the request follows the edit's `didChange`.
     completion_reask_due: bool,
+    /// The pending completion was asked for (Ctrl+Space), so the words of
+    /// the open documents fill in when no server offers anything (#1566).
+    /// A `.` typed asks the server alone: a word list there would open on
+    /// every full stop of a plain-text note.
+    completion_words: bool,
+    /// Ids for completions answered here rather than by a server (#1566),
+    /// counting down from the top so they never meet the manager's.
+    local_completion_seq: u64,
+    /// `word_based_suggestions`: which open documents word completion
+    /// draws on (#1566).
+    pub word_suggestions: crate::word_suggest::WordSuggestions,
     /// Signature Help (parameter hints) popup, anchored to the caret while the
     /// user is inside a call. Populated by `drain_lsp_signature_help`.
     pub signature_help_popup: Option<crate::widgets::signature_help_popup::SignatureHelpPopup>,
@@ -4532,6 +4626,17 @@ pub struct App {
     /// the bar is hidden or the segment doesn't fit. Diagnostics → PROBLEMS;
     /// encoding / EOL / language → their respective "change" pickers.
     status_diag_rect: Rect,
+    /// The status message's own cells; a click opens the Messages output
+    /// channel, where every message is kept in full (#1609).
+    status_message_rect: Rect,
+    /// The last status message logged to the Messages channel, so each one
+    /// is logged once, when it first shows (#1609).
+    status_logged: String,
+    /// A new status message is showing and nothing has been pressed since,
+    /// so a message too long for the room left by the right-hand cluster
+    /// (Ln/Col, encoding, language) takes the whole bar (#1609). The next
+    /// key or click hands the room back.
+    status_wide: bool,
     /// The running CodeQL query's status-bar chip; a click cancels it (#578).
     status_codeql_rect: Rect,
     /// The croft update pills ("Update ready", the drift rebuild hint); a
@@ -4633,6 +4738,11 @@ pub struct App {
     /// Where the terminal-session snapshot lives
     /// (`terminal_sessions.json`); a field so tests point it at a tempdir.
     pub terminal_session_path: PathBuf,
+    /// Whether a restore brings back plain panes whose shells have ended as
+    /// fresh shells (#1458): only over SSH, where a dropped connection should
+    /// come back to its panel. Locally they would return empty, so they stay
+    /// closed.
+    pub terminal_restore_respawns: bool,
     /// The most recent terminal-session persistence failure, latched by
     /// `save_terminal_session` and cleared by a later success; composed
     /// into structural-change statuses by `terminal_status` so a corrupt
@@ -5619,6 +5729,29 @@ fn plan_port_open(entry: &crate::widgets::ports::PortEntry, relay_active: bool) 
     }
 }
 
+/// The config files the [`crate::config_sync::ConfigWatch`] checks for
+/// changes made outside croft: the fixed ones, then every file of the
+/// settings chain (#1435), so a `git pull` of `.croft/config.json`, an edit
+/// in vim, or a dotfiles sync applies like a save from inside croft.
+fn config_watch_paths(settings_chain: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths = vec![
+        crate::keymap::keybindings_path(),
+        crate::snippets::snippets_path(),
+        crate::triggers::triggers_path(),
+        crate::problem_matchers::matchers_path(),
+        crate::macros::macros_path(),
+        // The settings layer config sync brings from the connecting
+        // machine (#262): applied on arrival like the files above.
+        crate::config_layers::synced_config_path(),
+    ];
+    for path in settings_chain {
+        if !paths.contains(path) {
+            paths.push(path.clone());
+        }
+    }
+    paths
+}
+
 impl App {
     pub fn new(root: PathBuf) -> Result<Self> {
         // Reap any js-debug adapter tree a previous croft left orphaned (a
@@ -5728,10 +5861,13 @@ impl App {
         let view_listener = Self::bind_view_socket();
         // A second croft on the same workspace finds the socket live and
         // leaves it to the first: one editor answers a workspace's agents.
-        let hook_listener = if cfg!(test) {
-            None
+        let (hook_listener, hook_bind_error) = if cfg!(test) {
+            (None, None)
         } else {
-            crate::agent_approval::bind(&root).ok()
+            match crate::agent_approval::bind(&root) {
+                Ok(listener) => (Some(listener), None),
+                Err(e) => (None, hook_bind_status(&e)),
+            }
         };
         let view_bind_error = VIEW_BIND_ERROR.lock().unwrap().take();
         let term = PtyTerminal::new(&root).context("spawning terminal")?;
@@ -5799,6 +5935,7 @@ impl App {
             codeql: crate::widgets::codeql::CodeqlPanel::new(),
             test_worker: crate::testing::worker::TestWorker::spawn(root.clone()),
             test_run_status: None,
+            last_test_run: None,
             pane_run_statuses: Vec::new(),
             extensions,
             vscode_listed: Vec::new(),
@@ -5810,21 +5947,15 @@ impl App {
             // reported once, in OUTPUT · Keybindings.
             keymap: loaded_keymap,
             last_mouse_pos: None,
+            tab_click_target: None,
             macro_recording: None,
             macro_last: None,
             macro_registers: crate::macros::load(&crate::macros::macros_path()),
             macro_replaying: false,
             macros_path: crate::macros::macros_path(),
-            config_watch: crate::config_sync::ConfigWatch::new(vec![
-                crate::keymap::keybindings_path(),
-                crate::snippets::snippets_path(),
-                crate::triggers::triggers_path(),
-                crate::problem_matchers::matchers_path(),
-                crate::macros::macros_path(),
-                // The settings layer config sync brings from the connecting
-                // machine (#262): applied on arrival like the files above.
-                crate::config_layers::synced_config_path(),
-            ]),
+            config_watch: crate::config_sync::ConfigWatch::new(config_watch_paths(
+                &merged_settings.chain,
+            )),
             snippets: load_snippets(&crate::snippets::snippets_path()),
             format_on_save: loaded_prefs.format_on_save,
             copy_on_select: loaded_prefs.copy_on_select,
@@ -5836,6 +5967,8 @@ impl App {
             auto_save_on_focus_change: loaded_prefs.auto_save_on_focus_change,
             last_focus_signature: None,
             save_after_format: None,
+            prettier_job: None,
+
             format_save_deadline: None,
             outline,
             open_editors,
@@ -5940,7 +6073,10 @@ impl App {
             sidebar_dwell: SidebarDwell::default(),
             pre_zen: None,
             layout_icon_areas: LayoutIconAreas::default(),
-            status: view_status(view_bind_error.as_deref()),
+            status: match hook_bind_error {
+                Some(hook) if view_bind_error.is_none() => hook,
+                _ => view_status(view_bind_error.as_deref()),
+            },
             persistence_warning: remote_persistence_status(
                 is_remote_session(),
                 std::env::var_os("CROFT_SESSION_PERSISTENT").is_some(),
@@ -6095,6 +6231,7 @@ impl App {
             pending_local_open: None,
             pending_discard: None,
             pending_unsaved_scm: None,
+            remote_tag_root: None,
             scm_unsaved_cleared: false,
             scm_after_format_save: None,
             pending_revert_hunk: None,
@@ -6190,6 +6327,7 @@ impl App {
             term_suggest_enabled: true,
             term_suggestion: None,
             recording_shortcut: None,
+            confirming_shortcut: None,
             inline_enabled: false,
             inline_worker: None,
             inline_config: None,
@@ -6223,6 +6361,9 @@ impl App {
             settings_editor: None,
             shortcuts_hit_rect: None,
             status_diag_rect: Rect::default(),
+            status_message_rect: Rect::default(),
+            status_logged: String::new(),
+            status_wide: false,
             status_codeql_rect: Rect::default(),
             status_update_rect: Rect::default(),
             status_indent_rect: Rect::default(),
@@ -6273,6 +6414,7 @@ impl App {
             command_history_popup: None,
             terminal_session_dirty: false,
             terminal_store_error: None,
+            terminal_restore_respawns: crate::remote::running_over_ssh(),
             terminal_session_path: if cfg!(test) {
                 std::env::temp_dir().join(format!(
                     "croft-test-terminal-sessions-{}.json",
@@ -6393,6 +6535,11 @@ impl App {
             completion_origin: None,
             completion_incomplete: false,
             completion_reask_due: false,
+            completion_words: false,
+            local_completion_seq: u64::MAX,
+            word_suggestions: crate::word_suggest::WordSuggestions::from_pref(
+                &loaded_prefs.word_based_suggestions,
+            ),
             signature_help_popup: None,
             signature_help_request_id: None,
             signature_help_anchor: None,
@@ -8082,13 +8229,22 @@ impl App {
             // is exact. Single-root keeps the Arc clone (no set copy).
             if self.git_extra.is_empty() {
                 self.tree.ignored = self.git.status().ignored.clone();
+                self.tree.git_decorations = self.git.status().decorations.clone();
             } else {
                 let mut union: std::collections::HashSet<PathBuf> =
                     self.git.status().ignored.as_ref().clone();
+                let mut decorations = self.git.status().decorations.as_ref().clone();
                 for (_, w) in &self.git_extra {
                     union.extend(w.status().ignored.iter().cloned());
+                    // Roots can nest (a repo folder inside another root's
+                    // tree), so a shared path keeps its strongest status.
+                    for (path, &dec) in w.status().decorations.iter() {
+                        let slot = decorations.entry(path.clone()).or_insert(dec);
+                        *slot = (*slot).max(dec);
+                    }
                 }
                 self.tree.ignored = std::sync::Arc::new(union);
+                self.tree.git_decorations = std::sync::Arc::new(decorations);
             }
         }
         // A completed status refresh means HEAD or the index may have moved:
@@ -9108,8 +9264,10 @@ impl App {
         };
         // Keyed by encoding too: the same file open in two tabs under two
         // encodings needs HEAD decoded each tab's way (#1242).
-        let mut fetched: std::collections::HashMap<(PathBuf, &str), Option<Vec<String>>> =
-            std::collections::HashMap::new();
+        let mut fetched: std::collections::HashMap<
+            (PathBuf, &str),
+            Option<crate::packed_lines::PackedLines>,
+        > = std::collections::HashMap::new();
         let groups =
             std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut());
         for ed in groups.flat_map(|g| g.editors.iter_mut()) {
@@ -9132,7 +9290,7 @@ impl App {
                         .and_then(|rel| rel.to_str())
                         .and_then(|rel| crate::git::read_bytes_at_head(&root, rel).ok())
                         .and_then(|bytes| crate::widgets::editor::decode_blob(&bytes, enc))
-                        .map(|text| text.lines().map(str::to_string).collect())
+                        .map(|text| text.lines().collect())
                 })
                 .clone();
             ed.set_git_head_lines(path, head);
@@ -9236,11 +9394,31 @@ impl App {
         // suggestion list (VS Code shows snippets in the suggest widget);
         // the popup's own prefix filter narrows them further.
         let mut items = result.items;
+        // A server with nothing to offer, or none at all, leaves the words
+        // of the open documents, as VS Code's word-based suggestions do
+        // (#1566). A server's own list is never mixed with them.
+        let words = self.completion_words && items.is_empty();
+        if words {
+            // An empty reply to an ask already showing its words (the
+            // manager answering for a file no server took) changes nothing:
+            // rebuilding would only drop the user's place in the list.
+            if self
+                .completion_popup
+                .as_ref()
+                .is_some_and(|p| p.request_id == result.request_id)
+            {
+                return false;
+            }
+            items = self.word_completion_items(&prefix);
+        }
         let lang = self.editor.scope_id();
         for snip in self.snippets.matching(&prefix, lang) {
             items.push(snippet_completion_item(snip));
         }
         if items.is_empty() {
+            if words {
+                self.status = String::from("No suggestions");
+            }
             return self.completion_popup.take().is_some();
         }
         let popup = crate::widgets::completion_popup::CompletionPopup::new(
@@ -9272,8 +9450,9 @@ impl App {
             return false;
         };
         let caret = self.editor.cursor_col;
-        if self.editor.path.as_deref() != Some(path) || self.editor.cursor_row != row || caret < col
-        {
+        // An untitled buffer's words are asked for with an empty path.
+        let here = self.editor.path.as_deref().unwrap_or(Path::new(""));
+        if here != path || self.editor.cursor_row != row || caret < col {
             return false;
         }
         self.editor.lines.get(row).is_some_and(|line| {
@@ -9323,23 +9502,95 @@ impl App {
     }
 
     pub fn trigger_completion(&mut self) {
+        self.request_completion_at_caret(true);
+    }
+
+    /// Ask for completions at the caret. The server is asked when the file
+    /// has a path and a manager runs. When no server reports on the file
+    /// (a Makefile, a `.env`, a plain-text note), an explicit ask (`words`)
+    /// opens at once on the words of the open documents (#1566); a server
+    /// that answers later still replaces them with its own list.
+    fn request_completion_at_caret(&mut self, words: bool) {
         if self.editor.has_non_text_view() {
             return;
         }
-        let Some(path) = self.editor.path.clone() else {
-            return;
-        };
+        let path = self.editor.path.clone();
         let (line, character) = self
             .editor
             .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
-        let Some(lsp) = self.lsp.as_mut() else {
-            return;
+        let asked = match (path.clone(), self.lsp.as_mut()) {
+            (Some(path), Some(lsp)) => Some(lsp.request_completion(path, line, character)),
+            _ => None,
         };
-        let id = lsp.request_completion(path, line, character);
+        let served = path
+            .as_deref()
+            .is_some_and(|p| self.lsp.as_ref().is_some_and(|l| l.document_has_server(p)));
+        let words = words && self.word_suggestions != crate::word_suggest::WordSuggestions::Off;
+        if asked.is_none() && !words {
+            return;
+        }
+        let id = asked.unwrap_or_else(|| {
+            self.local_completion_seq -= 1;
+            self.local_completion_seq
+        });
         self.completion_request_id = Some(id);
         self.completion_origin = Some((self.editor.cursor_row, self.editor.cursor_col));
         self.completion_incomplete = false;
         self.completion_reask_due = false;
+        self.completion_words = words;
+        if words && !served {
+            self.apply_completion_result(crate::lsp::manager::CompletionResult {
+                request_id: id,
+                path: path.unwrap_or_default(),
+                items: Vec::new(),
+                is_incomplete: false,
+            });
+        }
+    }
+
+    /// The words of the open documents for a completion at the caret, as
+    /// `word_suggestions` picks them (#1566).
+    fn word_completion_items(&self, prefix: &str) -> Vec<crate::lsp::CompletionItem> {
+        use crate::word_suggest::WordSuggestions;
+        let mode = self.word_suggestions;
+        if mode == WordSuggestions::Off {
+            return Vec::new();
+        }
+        let active = self.editor.active_index();
+        let lang = self.editor.scope_id();
+        let current_path = self.editor.path.as_deref();
+        // Every open document, the other split groups' too, but not the one
+        // being edited, nor a copy of it open in another group, whose words
+        // would include the one being typed.
+        let others: Vec<&[String]> = match mode {
+            WordSuggestions::Off | WordSuggestions::CurrentDocument => Vec::new(),
+            WordSuggestions::MatchingDocuments | WordSuggestions::AllDocuments => self
+                .editor
+                .editors
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != active)
+                .map(|(_, e)| e)
+                .chain(
+                    self.editor_layout
+                        .inactive_groups()
+                        .into_iter()
+                        .flat_map(|g| g.editors.iter()),
+                )
+                .filter(|e| current_path.is_none() || e.path.as_deref() != current_path)
+                .filter(|e| mode == WordSuggestions::AllDocuments || e.scope_id() == lang)
+                .map(|e| e.lines.as_slice())
+                .collect(),
+        };
+        crate::word_suggest::collect(
+            &self.editor.lines,
+            (self.editor.cursor_row, self.editor.cursor_col),
+            &others,
+            prefix,
+        )
+        .into_iter()
+        .map(crate::word_suggest::item)
+        .collect()
     }
 
     /// Ask the server for parameter hints at the caret (typing `(` or `,`).
@@ -9949,22 +10200,40 @@ impl App {
         }
         let mut changed = false;
         for u in updates {
-            if self.lsp_last_seen.get(&u.path) != Some(&u.seq) {
-                continue;
-            }
-            if self.editor.path.as_deref() == Some(u.path.as_path()) {
-                self.editor
-                    .apply_inlay_hints(u.path.clone(), u.hints.clone());
-                changed = true;
-            }
-            for group in self.editor_layout.inactive_groups_mut() {
-                if group.path.as_deref() == Some(u.path.as_path()) {
-                    group.apply_inlay_hints(u.path.clone(), u.hints.clone());
-                    changed = true;
-                }
-            }
+            changed |= self.fan_out_batch(&u.path, u.seq, |e| {
+                e.apply_inlay_hints(u.path.clone(), u.hints.clone())
+            });
         }
         changed
+    }
+
+    /// Hand a seq-stamped batch for `path` to every editor showing the file,
+    /// the active one and each inactive group, through `apply`. A batch whose
+    /// `seq` no longer matches the buffer's last-synced edit seq is dropped:
+    /// its anchors were computed against older text, and the request fired
+    /// for the current seq is still in flight. Returns whether any editor
+    /// took it.
+    fn fan_out_batch(
+        &mut self,
+        path: &Path,
+        seq: u64,
+        mut apply: impl FnMut(&mut EditorTabs),
+    ) -> bool {
+        if self.lsp_last_seen.get(path) != Some(&seq) {
+            return false;
+        }
+        let mut applied = false;
+        if self.editor.path.as_deref() == Some(path) {
+            apply(&mut self.editor);
+            applied = true;
+        }
+        for group in self.editor_layout.inactive_groups_mut() {
+            if group.path.as_deref() == Some(path) {
+                apply(group);
+                applied = true;
+            }
+        }
+        applied
     }
 
     /// Drain document-link batches (#254) into every editor showing the
@@ -9979,18 +10248,9 @@ impl App {
             updates.push(u);
         }
         for u in updates {
-            if self.lsp_last_seen.get(&u.path) != Some(&u.seq) {
-                continue;
-            }
-            if self.editor.path.as_deref() == Some(u.path.as_path()) {
-                self.editor
-                    .apply_document_links(u.path.clone(), u.links.clone());
-            }
-            for group in self.editor_layout.inactive_groups_mut() {
-                if group.path.as_deref() == Some(u.path.as_path()) {
-                    group.apply_document_links(u.path.clone(), u.links.clone());
-                }
-            }
+            self.fan_out_batch(&u.path, u.seq, |e| {
+                e.apply_document_links(u.path.clone(), u.links.clone())
+            });
         }
     }
 
@@ -10114,20 +10374,9 @@ impl App {
         }
         let mut changed = false;
         for u in updates {
-            if self.lsp_last_seen.get(&u.path) != Some(&u.seq) {
-                continue;
-            }
-            if self.editor.path.as_deref() == Some(u.path.as_path()) {
-                self.editor
-                    .apply_document_colors(u.path.clone(), u.colors.clone());
-                changed = true;
-            }
-            for group in self.editor_layout.inactive_groups_mut() {
-                if group.path.as_deref() == Some(u.path.as_path()) {
-                    group.apply_document_colors(u.path.clone(), u.colors.clone());
-                    changed = true;
-                }
-            }
+            changed |= self.fan_out_batch(&u.path, u.seq, |e| {
+                e.apply_document_colors(u.path.clone(), u.colors.clone())
+            });
         }
         changed
     }
@@ -10471,18 +10720,116 @@ impl App {
     /// terminal-control tool, and runs THAT against the user's source. The
     /// `--no-install` flag turns a missing compiler into an error, which is
     /// the honest outcome.
-    fn project_check_command(root: &Path) -> Option<(std::ffi::OsString, Vec<&'static str>)> {
-        if !root.join("tsconfig.json").is_file() {
-            return None;
+    ///
+    /// A solution-style root tsconfig (`"files": []` plus `references`, the
+    /// layout Vite's TypeScript templates and most monorepos use) compiles
+    /// nothing on its own: plain `tsc --noEmit` exits 0 having checked no
+    /// file, which read as a clean project (#1291). Each referenced project
+    /// is checked instead, `tsc -p <ref> --noEmit`, which writes nothing (no
+    /// `.tsbuildinfo`, unlike `tsc -b`); nested solution configs are followed
+    /// to their leaves, and a root that also owns files is checked too. A
+    /// root that names no files and no references is `ProjectCheck::Empty`,
+    /// never run and never "clean". Because nothing is emitted, a project
+    /// importing another referenced project whose declarations were never
+    /// built gets tsc's TS6305 error: reported as a problem, not hidden.
+    fn project_check_command(root: &Path) -> Option<ProjectCheck> {
+        let text = std::fs::read_to_string(root.join("tsconfig.json")).ok()?;
+        let mut runs: Vec<Vec<String>> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let root_config = root.join("tsconfig.json");
+        seen.insert(std::fs::canonicalize(&root_config).unwrap_or(root_config));
+        Self::collect_tsc_runs(root, None, &text, &mut seen, &mut runs);
+        if runs.is_empty() {
+            return Some(ProjectCheck::Empty);
         }
         let local = root.join("node_modules").join(".bin").join("tsc");
-        if local.is_file() {
-            return Some((local.into_os_string(), vec!["--noEmit"]));
-        }
-        Some((
-            std::ffi::OsString::from("npx"),
-            vec!["--no-install", "tsc", "--noEmit"],
+        let (program, prefix): (std::ffi::OsString, &[&str]) = if local.is_file() {
+            (local.into_os_string(), &[])
+        } else {
+            (std::ffi::OsString::from("npx"), &["--no-install", "tsc"])
+        };
+        Some(ProjectCheck::Run(
+            runs.into_iter()
+                .map(|args| {
+                    let mut all: Vec<String> = prefix.iter().map(|a| a.to_string()).collect();
+                    all.extend(args);
+                    (program.clone(), all)
+                })
+                .collect(),
         ))
+    }
+
+    /// The `tsc` runs that check the tsconfig at `rel` (`None` = the root
+    /// `tsconfig.json`), whose contents are `text` (#1291).
+    ///
+    /// A config that owns files gets its own `--noEmit` run, even when it
+    /// also has `references`: tsc does not check references during a plain
+    /// project check, and skipping the root would hide its own files'
+    /// errors. Each reference is then followed, so a referenced
+    /// solution-style config is checked through its leaves rather than run
+    /// on its own and compiling nothing. A reference that can't be read
+    /// is still run, so tsc reports it. `seen` stops a reference cycle.
+    fn collect_tsc_runs(
+        root: &Path,
+        rel: Option<&str>,
+        text: &str,
+        seen: &mut std::collections::HashSet<PathBuf>,
+        runs: &mut Vec<Vec<String>>,
+    ) {
+        let config: serde_json::Value =
+            serde_json::from_str(&crate::tasks::strip_jsonc(text)).unwrap_or_default();
+        let names_no_files = config
+            .get("files")
+            .and_then(|f| f.as_array())
+            .is_some_and(|f| f.is_empty())
+            && config.get("include").is_none()
+            // An `extends` base may supply the files.
+            && config.get("extends").is_none();
+        if !names_no_files {
+            runs.push(match rel {
+                None => vec![String::from("--noEmit")],
+                Some(rel) => vec![
+                    String::from("-p"),
+                    rel.to_string(),
+                    String::from("--noEmit"),
+                ],
+            });
+        }
+        // References resolve against the directory of the config naming them.
+        let base = rel.map(|rel| {
+            let p = Path::new(rel);
+            if root.join(p).is_dir() {
+                p.to_path_buf()
+            } else {
+                p.parent().map(Path::to_path_buf).unwrap_or_default()
+            }
+        });
+        let references = config
+            .get("references")
+            .and_then(|r| r.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r.get("path")?.as_str());
+        for reference in references {
+            let child = match &base {
+                None => reference.to_string(),
+                Some(base) => base.join(reference).to_string_lossy().into_owned(),
+            };
+            let on_disk = root.join(&child);
+            let file = if on_disk.is_dir() {
+                on_disk.join("tsconfig.json")
+            } else {
+                on_disk
+            };
+            let key = std::fs::canonicalize(&file).unwrap_or(file.clone());
+            if !seen.insert(key) {
+                continue;
+            }
+            match std::fs::read_to_string(&file) {
+                Ok(text) => Self::collect_tsc_runs(root, Some(&child), &text, seen, runs),
+                Err(_) => runs.push(vec![String::from("-p"), child, String::from("--noEmit")]),
+            }
+        }
     }
 
     /// How many rows the last project check contributed (#256).
@@ -10597,6 +10944,7 @@ impl App {
                     severity: d.severity,
                     message: d.message,
                     source: d.source.to_string(),
+                    code: None,
                 },
             ));
         }
@@ -10714,6 +11062,7 @@ impl App {
                             severity: d.severity,
                             message: d.message.clone(),
                             source: server.clone(),
+                            code: d.code.clone(),
                         });
                     }
                 }
@@ -11059,6 +11408,187 @@ impl App {
             }
         }
         crumbs
+    }
+
+    /// What each crumb [`build_breadcrumbs`](Self::build_breadcrumbs) makes
+    /// stands for, in the same order (#1608).
+    fn breadcrumb_targets(&self) -> Vec<CrumbTarget> {
+        let Some(path) = self.editor.path.as_deref() else {
+            return Vec::new();
+        };
+        if self.editor.has_non_text_view() {
+            return Vec::new();
+        }
+        let root = self.roots.owning_root(path);
+        let rel = root.and_then(|r| path.strip_prefix(r).ok()).unwrap_or(path);
+        let mut at = root.map(Path::to_path_buf).unwrap_or_default();
+        let names: Vec<_> = rel
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(os) => Some(os.to_os_string()),
+                _ => None,
+            })
+            .collect();
+        if root.is_none() {
+            // An absolute path outside every root: its crumbs start at `/`.
+            at = path
+                .ancestors()
+                .last()
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
+        }
+        let mut targets = Vec::new();
+        for (k, name) in names.iter().enumerate() {
+            at.push(name);
+            targets.push(if k + 1 == names.len() {
+                CrumbTarget::File(at.clone())
+            } else {
+                CrumbTarget::Folder(at.clone())
+            });
+        }
+        if self.outline.path() == Some(path) {
+            let line = self
+                .scrub_view
+                .as_ref()
+                .map_or(self.editor.cursor_row, |v| v.cursor_row) as u32;
+            let col = self
+                .scrub_view
+                .as_ref()
+                .map_or(self.editor.cursor_col, |v| v.cursor_col) as u32;
+            targets.extend(
+                breadcrumb_symbol_chain(self.outline.symbols(), line, col)
+                    .into_iter()
+                    .map(CrumbTarget::Symbol),
+            );
+        }
+        targets
+    }
+
+    /// Open crumb `i`'s picker under it (#1608): a folder crumb lists the
+    /// folder, the file crumb lists its folder with the file selected, and a
+    /// symbol crumb lists the symbols beside it with it selected.
+    fn open_breadcrumb_picker(&mut self, i: usize) {
+        let Some(target) = self.breadcrumb_targets().into_iter().nth(i) else {
+            return;
+        };
+        match target {
+            CrumbTarget::Folder(dir) => self.open_crumb_folder_picker(&dir, i, None),
+            CrumbTarget::File(path) => {
+                let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+                self.open_crumb_folder_picker(&dir, i, Some(&path));
+            }
+            CrumbTarget::Symbol(s) => {
+                let Some(path) = self.editor.path.clone() else {
+                    return;
+                };
+                let symbols = self.outline.symbols();
+                let siblings = sibling_symbols(symbols, s);
+                let selected = siblings.iter().position(|&k| k == s).unwrap_or(0);
+                let items = siblings
+                    .into_iter()
+                    .map(|k| {
+                        let sym = &symbols[k];
+                        (
+                            sym.name.clone(),
+                            MenuAction::GoToLocation {
+                                path: path.clone(),
+                                line: sym.line,
+                                col: sym.character,
+                            },
+                        )
+                    })
+                    .collect();
+                self.show_crumb_picker(i, items, selected);
+            }
+        }
+    }
+
+    /// The picker of crumb `i` listing `dir`: folders first, then files,
+    /// each by name; `select` is the row to start on.
+    fn open_crumb_folder_picker(&mut self, dir: &Path, i: usize, select: Option<&Path>) {
+        let mut entries: Vec<(bool, String, PathBuf)> = std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .filter(|e| e.file_name() != ".git")
+                    .map(|e| {
+                        let path = e.path();
+                        (
+                            path.is_dir(),
+                            e.file_name().to_string_lossy().into_owned(),
+                            path,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        entries.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+        });
+        if entries.is_empty() {
+            self.status = format!("{} is empty", dir.display());
+            return;
+        }
+        let selected = select
+            .and_then(|p| entries.iter().position(|e| e.2 == p))
+            .unwrap_or(0);
+        let items = entries
+            .into_iter()
+            .map(|(is_dir, name, path)| {
+                if is_dir {
+                    (
+                        format!("{name}/"),
+                        MenuAction::BrowseCrumbFolder {
+                            dir: path,
+                            crumb: i,
+                        },
+                    )
+                } else {
+                    (name, MenuAction::OpenCrumbFile(path))
+                }
+            })
+            .collect();
+        self.show_crumb_picker(i, items, selected);
+    }
+
+    fn show_crumb_picker(&mut self, i: usize, items: Vec<(String, MenuAction)>, selected: usize) {
+        let Some(origin) = self.editor.breadcrumb_anchor(i) else {
+            return;
+        };
+        let mut menu = ContextMenu::flat(origin, items, self.tree.root.clone());
+        menu.selected = selected;
+        menu.crumb = Some(i);
+        self.context_menu = Some(menu);
+    }
+
+    /// A file picked from a breadcrumb picker opens as a Quick Open pick does.
+    fn open_crumb_file(&mut self, path: &Path) {
+        match self.editor.open_preview(path) {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.tree.reveal_path(path);
+                self.focus_pane(Pane::Editor);
+                self.status = format!("Opened {}", self.status_path(path));
+            }
+            Err(e) => self.status = format!("Error: {e}"),
+        }
+    }
+
+    /// View: Focus and Select Breadcrumbs (#1608): the last crumb's picker,
+    /// from which Left / Right walk the bar.
+    fn focus_breadcrumbs(&mut self) {
+        // A row too narrow for the whole chain focuses the last crumb that
+        // fit on it.
+        let n = self.editor.breadcrumbs.len();
+        let Some(last) = (0..n)
+            .rev()
+            .find(|&i| self.editor.breadcrumb_anchor(i).is_some())
+        else {
+            self.status = String::from("No breadcrumbs to focus");
+            return;
+        };
+        self.focus_pane(Pane::Editor);
+        self.open_breadcrumb_picker(last);
     }
 
     /// The scope-header lines to pin as sticky scroll: the enclosing symbols of
@@ -11790,86 +12320,65 @@ impl App {
     }
 
     pub fn drain_lsp_declaration(&mut self) -> bool {
-        let mut target = None;
-        let mut unsupported = false;
-        let mut replied = false;
-        {
-            let Some(lsp) = self.lsp.as_ref() else {
-                return false;
-            };
-            while let Some(result) = lsp.drain_declaration() {
-                if Some(result.request_id) != self.declaration_request_id {
-                    continue;
-                }
-                replied = true;
-                target = result.target;
-                unsupported = result.unsupported;
+        let Some(lsp) = self.lsp.as_ref() else {
+            return false;
+        };
+        let mut reply = None;
+        while let Some(result) = lsp.drain_declaration() {
+            if Some(result.request_id) == self.declaration_request_id {
+                reply = Some((result.target, result.unsupported));
             }
         }
-        if replied {
-            self.declaration_request_id = None;
-        }
-        match target {
-            // The jump itself is identical to definition: open the target file,
-            // move the caret, record nav history.
-            Some((path, line, col)) => {
-                self.go_to_definition(path, line, col);
-                true
-            }
-            // Be explicit rather than silently no-op: say when the language
-            // server has no declaration provider (e.g. TypeScript's vtsls) and
-            // when it simply found nothing at this position.
-            None if unsupported => {
-                self.status =
-                    String::from("Go to Declaration: not supported by this file's language server");
-                true
-            }
-            None if replied => {
-                self.status = String::from("No declaration found");
-                true
-            }
-            None => false,
-        }
+        let Some((target, unsupported)) = reply else {
+            return false;
+        };
+        self.declaration_request_id = None;
+        self.finish_jump(target, unsupported, "Go to Declaration", "declaration");
+        true
     }
 
     pub fn drain_lsp_type_definition(&mut self) -> bool {
-        let mut target = None;
-        let mut unsupported = false;
-        let mut replied = false;
-        {
-            let Some(lsp) = self.lsp.as_ref() else {
-                return false;
-            };
-            while let Some(result) = lsp.drain_type_definition() {
-                if Some(result.request_id) != self.type_definition_request_id {
-                    continue;
-                }
-                replied = true;
-                target = result.target;
-                unsupported = result.unsupported;
+        let Some(lsp) = self.lsp.as_ref() else {
+            return false;
+        };
+        let mut reply = None;
+        while let Some(result) = lsp.drain_type_definition() {
+            if Some(result.request_id) == self.type_definition_request_id {
+                reply = Some((result.target, result.unsupported));
             }
         }
-        if replied {
-            self.type_definition_request_id = None;
-        }
+        let Some((target, unsupported)) = reply else {
+            return false;
+        };
+        self.type_definition_request_id = None;
+        self.finish_jump(
+            target,
+            unsupported,
+            "Go to Type Definition",
+            "type definition",
+        );
+        true
+    }
+
+    /// Act on the reply to a go-to request: jump to its target the way Go to
+    /// Definition does (open the file, move the caret, record nav history),
+    /// or say so rather than silently doing nothing, both when the language
+    /// server has no `feature` provider (`unsupported`, e.g. TypeScript's
+    /// vtsls has no declarations) and when it found no `noun` at this
+    /// position.
+    fn finish_jump(
+        &mut self,
+        target: Option<(PathBuf, u32, u32)>,
+        unsupported: bool,
+        feature: &str,
+        noun: &str,
+    ) {
         match target {
-            // The jump itself is identical to definition: open the target file,
-            // move the caret, record nav history.
-            Some((path, line, col)) => {
-                self.go_to_definition(path, line, col);
-                true
-            }
+            Some((path, line, col)) => self.go_to_definition(path, line, col),
             None if unsupported => {
-                self.status = String::from(
-                    "Go to Type Definition: not supported by this file's language server",
-                );
-                true
+                self.status = format!("{feature}: not supported by this file's language server");
             }
-            None if replied => {
-                self.status = String::from("No type definition found");
-                true
-            }
-            None => false,
+            None => self.status = format!("No {noun} found"),
         }
     }
 
@@ -12074,19 +12583,34 @@ impl App {
     /// Whether the current file's language server implements call hierarchy;
     /// drives the right-click menu rows, like the other capability gates.
     fn editor_language_supports_call_hierarchy(&self) -> bool {
-        let Some(lang) = self
-            .editor
+        self.editor_language_supports(crate::lsp::LspManager::language_supports_call_hierarchy)
+    }
+
+    /// The language the current editor file's extension maps to, if any.
+    fn editor_language(&self) -> Option<crate::lsp::Language> {
+        self.editor
             .path
             .as_deref()
             .and_then(|p| p.extension())
             .and_then(|e| e.to_str())
             .and_then(crate::lsp::Language::from_extension)
-        else {
+    }
+
+    /// Whether the current editor file's language server reports support
+    /// through `supports`, one of the `language_supports_*` getters on
+    /// [`crate::lsp::LspManager`]. Unknown (server not yet spawned) or no
+    /// server counts as unsupported, so a gated row only appears once support
+    /// is confirmed.
+    fn editor_language_supports(
+        &self,
+        supports: fn(&crate::lsp::LspManager, crate::lsp::Language) -> Option<bool>,
+    ) -> bool {
+        let Some(lang) = self.editor_language() else {
             return false;
         };
         self.lsp
             .as_ref()
-            .and_then(|lsp| lsp.language_supports_call_hierarchy(lang))
+            .and_then(|lsp| supports(lsp, lang))
             .unwrap_or(false)
     }
 
@@ -12324,14 +12848,7 @@ impl App {
         if self.editor.expand_selection_from_stack() {
             return;
         }
-        let lang_known = self
-            .editor
-            .path
-            .as_deref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
-            .is_some();
+        let lang_known = self.editor_language().is_some();
         if lang_known
             && self.lsp.is_some()
             && let Some(path) = self.editor.path.clone()
@@ -12713,6 +13230,8 @@ impl App {
     fn open_customize_layout_menu_at(&mut self, selected: usize) {
         let origin = self.customize_layout_origin();
         self.context_menu = Some(ContextMenu {
+            crumb: None,
+            scroll: Default::default(),
             origin,
             items: self.customize_layout_items(),
             selected,
@@ -12971,6 +13490,8 @@ impl App {
             .position(|&t| t == active)
             .unwrap_or(0);
         self.context_menu = Some(ContextMenu {
+            crumb: None,
+            scroll: Default::default(),
             origin,
             items: items.into_iter().map(MenuEntry::from).collect(),
             selected,
@@ -13614,17 +14135,24 @@ impl App {
     /// position. Used by the editor right-click "Go to Definition" item, where
     /// the cursor has already been moved to the click point.
     fn request_definition_at_cursor(&mut self) {
+        if let Some(id) = self.request_at_cursor(crate::lsp::LspManager::request_definition) {
+            self.definition_request_id = Some(id);
+        }
+    }
+
+    /// Send `request` for the symbol at the editor caret, as the UTF-16
+    /// position LSP speaks, and return the id its reply will echo; `None`
+    /// when the buffer has no file or no language server runs.
+    fn request_at_cursor(
+        &mut self,
+        request: fn(&mut crate::lsp::LspManager, PathBuf, u32, u32) -> u64,
+    ) -> Option<u64> {
         let (line, character) = self
             .editor
             .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
-        let Some(path) = self.editor.path.clone() else {
-            return;
-        };
-        let Some(lsp) = self.lsp.as_mut() else {
-            return;
-        };
-        let id = lsp.request_definition(path, line, character);
-        self.definition_request_id = Some(id);
+        let path = self.editor.path.clone()?;
+        let lsp = self.lsp.as_mut()?;
+        Some(request(lsp, path, line, character))
     }
 
     /// Request the LSP declaration of the symbol at the current cursor (buffer)
@@ -13633,17 +14161,9 @@ impl App {
     /// no separate declaration site (e.g. Python); they diverge for C/C++ (header
     /// prototype) and TypeScript (`.d.ts`).
     fn request_declaration_at_cursor(&mut self) {
-        let (line, character) = self
-            .editor
-            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
-        let Some(path) = self.editor.path.clone() else {
-            return;
-        };
-        let Some(lsp) = self.lsp.as_mut() else {
-            return;
-        };
-        let id = lsp.request_declaration(path, line, character);
-        self.declaration_request_id = Some(id);
+        if let Some(id) = self.request_at_cursor(crate::lsp::LspManager::request_declaration) {
+            self.declaration_request_id = Some(id);
+        }
     }
 
     /// Request the LSP type definition of the symbol at the current cursor
@@ -13651,17 +14171,9 @@ impl App {
     /// item and the `⌃F12` keybinding. Jumps to where the *type* of the
     /// expression is defined, as opposed to the symbol itself (definition).
     fn request_type_definition_at_cursor(&mut self) {
-        let (line, character) = self
-            .editor
-            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
-        let Some(path) = self.editor.path.clone() else {
-            return;
-        };
-        let Some(lsp) = self.lsp.as_mut() else {
-            return;
-        };
-        let id = lsp.request_type_definition(path, line, character);
-        self.type_definition_request_id = Some(id);
+        if let Some(id) = self.request_at_cursor(crate::lsp::LspManager::request_type_definition) {
+            self.type_definition_request_id = Some(id);
+        }
     }
 
     /// Request the LSP implementations of the abstraction at the current cursor
@@ -13669,17 +14181,9 @@ impl App {
     /// item and the `⌘F12` keybinding. Meaningful on traits / interfaces /
     /// abstract methods; the server may return many, and croft jumps to the first.
     fn request_implementation_at_cursor(&mut self) {
-        let (line, character) = self
-            .editor
-            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
-        let Some(path) = self.editor.path.clone() else {
-            return;
-        };
-        let Some(lsp) = self.lsp.as_mut() else {
-            return;
-        };
-        let id = lsp.request_implementation(path, line, character);
-        self.implementation_request_id = Some(id);
+        if let Some(id) = self.request_at_cursor(crate::lsp::LspManager::request_implementation) {
+            self.implementation_request_id = Some(id);
+        }
     }
 
     /// Request the LSP references of the symbol at the current cursor (buffer)
@@ -13692,17 +14196,9 @@ impl App {
         // References would open in the peek popup.
         self.references_request_id = None;
         self.references_want_peek = false;
-        let (line, character) = self
-            .editor
-            .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
-        let Some(path) = self.editor.path.clone() else {
-            return;
-        };
-        let Some(lsp) = self.lsp.as_mut() else {
-            return;
-        };
-        let id = lsp.request_references(path, line, character);
-        self.references_request_id = Some(id);
+        if let Some(id) = self.request_at_cursor(crate::lsp::LspManager::request_references) {
+            self.references_request_id = Some(id);
+        }
     }
 
     /// Whether the current editor file's language server implements
@@ -13710,20 +14206,7 @@ impl App {
     /// "Go to Declaration" row. Unknown (server not yet spawned) or no server is
     /// treated as unsupported, so the row only appears once support is confirmed.
     fn editor_language_supports_declaration(&self) -> bool {
-        let Some(lang) = self
-            .editor
-            .path
-            .as_deref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
-        else {
-            return false;
-        };
-        self.lsp
-            .as_ref()
-            .and_then(|lsp| lsp.language_supports_declaration(lang))
-            .unwrap_or(false)
+        self.editor_language_supports(crate::lsp::LspManager::language_supports_declaration)
     }
 
     /// Whether the current editor file's language server implements
@@ -13732,20 +14215,7 @@ impl App {
     /// server is treated as unsupported, so the row only appears once support is
     /// confirmed.
     fn editor_language_supports_type_definition(&self) -> bool {
-        let Some(lang) = self
-            .editor
-            .path
-            .as_deref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
-        else {
-            return false;
-        };
-        self.lsp
-            .as_ref()
-            .and_then(|lsp| lsp.language_supports_type_definition(lang))
-            .unwrap_or(false)
+        self.editor_language_supports(crate::lsp::LspManager::language_supports_type_definition)
     }
 
     /// Whether the current editor file's language server implements
@@ -13754,20 +14224,7 @@ impl App {
     /// server is treated as unsupported, so the row only appears once support is
     /// confirmed.
     fn editor_language_supports_implementation(&self) -> bool {
-        let Some(lang) = self
-            .editor
-            .path
-            .as_deref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
-        else {
-            return false;
-        };
-        self.lsp
-            .as_ref()
-            .and_then(|lsp| lsp.language_supports_implementation(lang))
-            .unwrap_or(false)
+        self.editor_language_supports(crate::lsp::LspManager::language_supports_implementation)
     }
 
     /// Whether the current editor file's language server implements
@@ -13775,37 +14232,11 @@ impl App {
     /// "Go to References" row. Unknown (server not yet spawned) or no server is
     /// treated as unsupported, so the row only appears once support is confirmed.
     fn editor_language_supports_references(&self) -> bool {
-        let Some(lang) = self
-            .editor
-            .path
-            .as_deref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
-        else {
-            return false;
-        };
-        self.lsp
-            .as_ref()
-            .and_then(|lsp| lsp.language_supports_references(lang))
-            .unwrap_or(false)
+        self.editor_language_supports(crate::lsp::LspManager::language_supports_references)
     }
 
     fn editor_language_supports_code_action(&self) -> bool {
-        let Some(lang) = self
-            .editor
-            .path
-            .as_deref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
-        else {
-            return false;
-        };
-        self.lsp
-            .as_ref()
-            .and_then(|lsp| lsp.language_supports_code_action(lang))
-            .unwrap_or(false)
+        self.editor_language_supports(crate::lsp::LspManager::language_supports_code_action)
     }
 
     /// VS Code "Change All Occurrences" (Cmd/Ctrl+F2): select every textual
@@ -14127,12 +14558,21 @@ impl App {
             self.status = String::from("No file open");
             return;
         };
+        // A Prettier project formats with its own Prettier and config, as
+        // VS Code's Prettier extension does; tsserver's formatter knows
+        // neither (#1255).
+        if let Some(bin) = crate::prettier::for_file(&path) {
+            let sent = self.editor.text_for_formatter();
+            self.prettier_job = Some(crate::prettier::Job::spawn(bin, path, sent));
+            self.status = String::from("Formatting document with Prettier");
+            return;
+        }
         if self.lsp.is_none() {
             self.status = String::from("No language server for this file");
             return;
         }
         // Mirror the editor's indentation preference; servers that carry their
-        // own config (rustfmt, ruff, prettier) ignore these but the fields are
+        // own config (rustfmt, ruff) ignore these but the fields are
         // required by the LSP request.
         let (tab_size, insert_spaces) = self.editor.indent_preference();
         let seq = self.format_target_seq(&path);
@@ -14185,6 +14625,70 @@ impl App {
         self.format_request_seq = seq;
         self.format_request_selection = true;
         self.status = String::from("Formatting selection");
+    }
+
+    /// Apply a finished Prettier run to the tab it formatted, then let the
+    /// save it held go ahead. A buffer edited while Prettier ran keeps the
+    /// edit: the result only fits the text that was sent.
+    pub fn drain_prettier_format(&mut self) -> bool {
+        let Some(reply) = self
+            .prettier_job
+            .as_ref()
+            .and_then(|job| job.poll(std::time::Instant::now()))
+        else {
+            return false;
+        };
+        let Some(job) = self.prettier_job.take() else {
+            return false;
+        };
+        let formatted = match reply {
+            Ok(formatted) => formatted,
+            Err(e) => {
+                // Said after the save, which would otherwise cover it with
+                // "Saved".
+                let saving = self.save_after_format.is_some();
+                self.complete_pending_save();
+                self.status = match saving {
+                    true => format!("Prettier failed: {e}; saved without formatting"),
+                    false => format!("Prettier failed: {e}"),
+                };
+                return true;
+            }
+        };
+        let tab = self
+            .editor
+            .find_tab_with_path(&job.path)
+            .or_else(|| self.editor.find_any_tab_with_path(&job.path));
+        let buffer = tab.map(|i| &self.editor.editors[i]).map(|e| {
+            (
+                e.text_for_formatter(),
+                e.lines.clone(),
+                e.has_final_newline(),
+            )
+        });
+        self.status = match buffer {
+            Some((text, lines, final_newline)) if text == job.sent => {
+                if formatted == job.sent {
+                    String::from("Document already formatted")
+                } else {
+                    // The buffer keeps no line for a final newline it already
+                    // has; one Prettier adds becomes the empty last line that
+                    // writes it.
+                    let body = match final_newline {
+                        true => formatted.strip_suffix('\n').unwrap_or(&formatted),
+                        false => &formatted,
+                    };
+                    let edits = crate::prettier::edits_for(&lines, body);
+                    self.editor.apply_rename_to_open_tab(&job.path, &edits);
+                    self.editor.clamp_cursor();
+                    String::from("Formatted document with Prettier")
+                }
+            }
+            Some(_) => String::from("Prettier result dropped: the file changed while it ran"),
+            None => String::from("Format failed: document not open"),
+        };
+        self.complete_pending_save();
+        true
     }
 
     pub fn drain_lsp_format(&mut self) -> bool {
@@ -16379,20 +16883,36 @@ impl App {
                 .err();
     }
 
-    /// Resurrect this workspace's terminal panel from the session store:
-    /// each recorded pane comes back as a fresh shell in its directory
-    /// (with its name), and focus returns to the pane that had it. Called
-    /// once at startup, replacing the default lone pane. A recorded
-    /// directory that no longer exists falls back to the workspace root; a
-    /// pane whose shell fails to spawn is skipped.
+    /// Resurrect this workspace's terminal panel from the session store.
+    /// Called once at startup, replacing the default lone pane.
+    ///
+    /// What comes back depends on where croft runs (#1458). A local launch
+    /// brings back only panes with something still in them: a shell still
+    /// running in its pane host, and an agent lane, whose agent is seated
+    /// again. A plain pane whose shell has ended would come back as an
+    /// empty fresh shell, so it is left out, and a launch with nothing to
+    /// bring back keeps the one default terminal. A remote croft (over
+    /// SSH, as `croft remote` runs it) restores every pane, so a dropped
+    /// connection comes back to the panel it had.
     pub fn restore_terminal_session(&mut self) {
+        self.restore_terminal_session_with(self.terminal_restore_respawns);
+    }
+
+    /// [`Self::restore_terminal_session`], with `respawn` saying whether a
+    /// plain pane whose shell has ended comes back as a fresh shell in its
+    /// directory (with its name and transcript). A recorded directory that
+    /// no longer exists falls back to the workspace root; a pane whose
+    /// shell fails to spawn is skipped. Focus returns to the pane that had
+    /// it, or the first pane when that one was not brought back.
+    fn restore_terminal_session_with(&mut self, respawn: bool) {
         let map = crate::terminal_session::load(&self.terminal_session_path);
         let Some(rec) = map.get(&self.workspace_root().display().to_string()) else {
             return;
         };
         let mut terms = Vec::new();
         let mut lanes = std::collections::BTreeMap::new();
-        for p in &rec.panes {
+        let mut active = 0;
+        for (i, p) in rec.panes.iter().enumerate() {
             // A lane pane belongs in its worktree, whatever cwd its shell
             // had drifted to at save time (#348): the launch line below is
             // typed into THIS shell, so the directory and the lane are
@@ -16427,7 +16947,13 @@ impl App {
                 if let Some(lane) = lane {
                     lanes.insert(t.uid(), lane.clone());
                 }
+                if i == rec.active {
+                    active = terms.len();
+                }
                 terms.push(t);
+                continue;
+            }
+            if !respawn && lane.is_none() {
                 continue;
             }
             // The transcript is painted during the spawn, not after it: a
@@ -16446,6 +16972,12 @@ impl App {
                         t.write_input(lane_launch_input(cmd).as_bytes());
                     }
                     lanes.insert(t.uid(), lane.clone());
+                }
+                // Focus follows the saved active pane only when it is
+                // actually brought back; one left out or failing to spawn
+                // keeps the first-pane fallback, not a neighbour.
+                if i == rec.active {
+                    active = terms.len();
                 }
                 terms.push(t);
             }
@@ -16466,7 +16998,7 @@ impl App {
         self.close_terminal_quick_select();
         self.closed_terminals.clear();
         self.terminals = terms;
-        self.active_terminal = rec.active.min(self.terminals.len() - 1);
+        self.active_terminal = active.min(self.terminals.len() - 1);
         self.sync_focus_flags();
         self.status = format!("Restored terminal session ({} panes)", self.terminals.len());
         self.save_terminal_session_if_hosted();
@@ -16541,6 +17073,8 @@ impl App {
         // is left intact rather than evicted (evicting it left the logo
         // blank, since the welcome emit is gated off while a menu is open).
         self.context_menu = Some(ContextMenu {
+            crumb: None,
+            scroll: Default::default(),
             origin,
             items,
             selected: 0,
@@ -17127,10 +17661,37 @@ impl App {
         }
     }
 
-    /// Drop the currently-active terminal. Thin wrapper kept for the
-    /// keyboard shortcut and existing callers.
+    /// Drop the currently-active terminal. The shortcut and the pane menu
+    /// go through [`Self::close_terminal_reporting`]; tests use this.
+    #[cfg(test)]
     pub fn close_active_terminal(&mut self) -> bool {
         self.close_terminal_at(self.active_terminal)
+    }
+
+    /// Open another terminal beside the active one and say so: the `Cmd+T`
+    /// chord and the pane menu's Split Terminal (#1598).
+    fn split_terminal_reporting(&mut self) {
+        match self.split_terminal() {
+            Ok(()) => {
+                self.terminal_status(format!("Split terminal: {} active", self.terminals.len()));
+            }
+            Err(e) => {
+                self.status = format!("Split terminal failed: {e}");
+            }
+        }
+    }
+
+    /// Close the pane at `idx` and say so, or say why not: the `Cmd+W` chord
+    /// (on the active pane) and the pane menu's Kill Terminal (#1598).
+    fn close_terminal_reporting(&mut self, idx: usize) {
+        if self.close_terminal_at(idx) {
+            self.terminal_status(format!(
+                "Closed terminal: {} remaining",
+                self.terminals.len()
+            ));
+        } else {
+            self.status = String::from("Cannot close the last terminal; press Ctrl+J to hide");
+        }
     }
 
     /// Cmd+K ⇧T: bring back the most recently closed terminal pane while it
@@ -18771,6 +19332,14 @@ impl App {
         self.focus_pane(Pane::Terminal);
     }
 
+    /// The OUTPUT tab on the Messages channel (#1609): every status message
+    /// croft has shown, in full, newest last.
+    fn show_status_messages(&mut self) {
+        self.output.sync();
+        self.output.select_by_name(crate::output::CHANNEL_MESSAGES);
+        self.set_bottom_panel_tab(BottomPanelTab::Output);
+    }
+
     /// Output: Select Channel… (#852): the OUTPUT toolbar's channel dropdown
     /// as a keyboard picker, opened on the channel shown now. Choosing one
     /// shows it in the OUTPUT tab.
@@ -19380,6 +19949,13 @@ impl App {
             // mirroring the terminal pane buttons' hover affordance.
             let pointer = self.pointer_cell;
             self.editor.hover_pointer = pointer;
+            // Without an inline-image protocol an image tab draws itself in
+            // half blocks (#1591).
+            let cell_images = !self.inline_images_enabled();
+            self.editor.cell_images = cell_images;
+            for group in self.editor_layout.inactive_groups_mut() {
+                group.cell_images = cell_images;
+            }
             // Breadcrumb bar: recompute the path + symbol trail for the active
             // file each frame so it tracks caret moves and outline updates.
             self.editor.breadcrumbs = self.build_breadcrumbs();
@@ -19660,6 +20236,10 @@ impl App {
                 let area = popup_ref.area_for(focused_area);
                 if area.width > 0 && area.height > 0 {
                     frame.render_widget(popup_ref, area);
+                    // The selected item's signature and documentation (#1527).
+                    if let Some(details) = popup_ref.details_area_for(area, focused_area) {
+                        frame.render_widget(popup_ref.details(), details);
+                    }
                 }
             }
             // Parameter hints sit ABOVE the caret, so they coexist with the
@@ -20372,10 +20952,28 @@ impl App {
         } else {
             crate::i18n::tr(&self.status).into_owned()
         };
+        // A message seen for the first time is kept, in full, in the Messages
+        // output channel, and may take the whole bar until the next key or
+        // click (#1609): elided to fit, its middle was gone for good.
+        if self.status != self.status_logged {
+            self.status_logged = self.status.clone();
+            // The idle "Ready" says nothing worth the cluster's room.
+            self.status_wide = !self.status.is_empty() && self.status != "Ready";
+            if !self.status.is_empty() {
+                crate::output::push(
+                    crate::output::CHANNEL_MESSAGES,
+                    crate::output::OutputLevel::Info,
+                    &crate::i18n::tr(&self.status),
+                );
+            }
+        }
         self.announce_pos = None;
+        self.status_message_rect = Rect::default();
+        let mut status_x: u16 = 0;
         if !status_text.is_empty() {
             spans.push(Span::styled("\u{2502} ", zone_div));
             let x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+            status_x = x;
             if status_h > 0 && x < outer[2].width {
                 self.announce_pos = Some((outer[2].x + x, outer[2].y));
             }
@@ -20507,7 +21105,7 @@ impl App {
             seg_texts.push(format!(" \u{25c6} {joined} "));
         }
         let widths: Vec<u16> = seg_texts.iter().map(|s| s.chars().count() as u16).collect();
-        let right_total: u16 = widths.iter().sum::<u16>() + (seg_texts.len() as u16 - 1);
+        let mut right_total: u16 = widths.iter().sum::<u16>() + (seg_texts.len() as u16 - 1);
         // The right cluster paints OVER the left paragraph, so an over-long
         // transient loses exactly its tail — for "Opened <deep path>" that
         // was the filename, the one informative part (#100). Middle-elide
@@ -20518,17 +21116,35 @@ impl App {
                 .take(spans.len().saturating_sub(1))
                 .map(|s| s.content.chars().count() as u16)
                 .sum();
-            let avail = status_rect
-                .width
-                .saturating_sub(right_total)
-                .saturating_sub(left_fixed)
-                .saturating_sub(1);
+            let fits_beside = |right: u16| {
+                status_rect
+                    .width
+                    .saturating_sub(right)
+                    .saturating_sub(left_fixed)
+                    .saturating_sub(1)
+            };
+            // A fresh message that does not fit beside the cluster takes the
+            // cluster's room until the next key or click (#1609).
+            let text_cells = |t: &str| unicode_width::UnicodeWidthStr::width(t) as u16;
+            if self.status_wide && text_cells(&status_text) > fits_beside(right_total) {
+                right_total = 0;
+            }
+            let avail = fits_beside(right_total);
             if let Some(last) = spans.last_mut()
-                && last.content.chars().count() as u16 > avail
+                && text_cells(&last.content) > avail
             {
                 // Keep the message's dim style through the elision so a
                 // truncated transient doesn't suddenly brighten.
                 *last = Span::styled(elide_middle(&status_text, avail as usize), last.style);
+            }
+            if status_h > 0 && status_x < status_rect.width {
+                let shown = spans.last().map_or(0, |l| text_cells(&l.content));
+                self.status_message_rect = Rect {
+                    x: status_rect.x + status_x,
+                    y: status_rect.y,
+                    width: shown.min(status_rect.width - status_x),
+                    height: 1,
+                };
             }
         }
 
@@ -20554,6 +21170,9 @@ impl App {
         self.status_agents_rect = Rect::default();
         if status_h > 0 && right_total > 0 && right_total <= status_rect.width {
             let rx = status_rect.right() - right_total;
+            if self.status_message_rect.right() > rx {
+                self.status_message_rect.width = rx.saturating_sub(self.status_message_rect.x);
+            }
             // The right cluster paints OVER the left paragraph, so the
             // diagnostics hit rect must stop where it starts. Clipped only to
             // the frame edge, it went on answering for cells that now read
@@ -20798,18 +21417,19 @@ impl App {
         };
         let grad = self.popup_gradient();
         // The top-level panel; the open submenu's parent row stays highlighted.
-        self.render_menu_panel(frame, clipped, &menu.items, menu.selected, grad);
+        let top = menu.scroll_for(clipped.height.saturating_sub(2) as usize);
+        self.render_menu_panel(frame, clipped, &menu.items, menu.selected, top, grad);
         // Float the open submenu's panel beside its parent.
         if let Some(sub_rect) = self.submenu_rect()
             && let Some(MenuEntry::Submenu { items, .. }) =
                 menu.open_submenu.and_then(|p| menu.items.get(p))
         {
-            self.render_menu_panel(frame, sub_rect, items, menu.submenu_selected, grad);
+            self.render_menu_panel(frame, sub_rect, items, menu.submenu_selected, 0, grad);
         }
     }
 
-    /// Paint one bordered menu panel of `entries` into `rect`, highlighting row
-    /// `selected`. Items show a right-aligned shortcut hint, submenu parents a
+    /// Paint one bordered menu panel of `entries` into `rect`, from entry
+    /// `top` on, highlighting row `selected`. Items show a right-aligned shortcut hint, submenu parents a
     /// `▸`, and separators a divider rule. Shared by the main menu and the
     /// floating submenu.
     fn render_menu_panel(
@@ -20818,6 +21438,7 @@ impl App {
         rect: Rect,
         entries: &[MenuEntry],
         selected: usize,
+        top: usize,
         grad: bool,
     ) {
         // Black theme: orange→green gradient border + muted dark-teal
@@ -20848,13 +21469,13 @@ impl App {
             width: rect.width.saturating_sub(2),
             height: rect.height.saturating_sub(2),
         };
-        for (i, entry) in entries.iter().enumerate() {
-            if i as u16 >= inner.height {
+        for (i, entry) in entries.iter().enumerate().skip(top) {
+            if (i - top) as u16 >= inner.height {
                 break;
             }
             let row = Rect {
                 x: inner.x,
-                y: inner.y + i as u16,
+                y: inner.y + (i - top) as u16,
                 width: inner.width,
                 height: 1,
             };
@@ -22803,6 +23424,11 @@ impl App {
     /// built-in defaults call their app methods directly, so a command-level
     /// recorder would miss most of what a user does.
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        // A key press means the status message has been seen: the right-hand
+        // cluster takes its room back (#1609).
+        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            self.status_wide = false;
+        }
         // Esc dismisses an open ssh-pane offer (#364) without being consumed:
         // the offer is a status-bar hint, not a modal, so whatever Esc meant
         // to the focused pane still happens.
@@ -22874,6 +23500,23 @@ impl App {
             && at.elapsed() < SHORTCUT_RECORD_WINDOW
         {
             self.record_shortcut(cmd, key);
+            return Ok(());
+        }
+        // A chord that was taken (#1482): Enter reassigns it, any other key
+        // keeps both shortcuts as they were. The recorded chord's own key
+        // repeat, from holding it a moment too long, is not an answer.
+        if let Some((cmd, chord, owners)) = self.confirming_shortcut.take() {
+            if key.kind == KeyEventKind::Repeat
+                && crate::keymap::Chord::from_event(key) == crate::keymap::Chord::from_event(chord)
+            {
+                self.confirming_shortcut = Some((cmd, chord, owners));
+                return Ok(());
+            }
+            if key.code == KeyCode::Enter && key.modifiers.is_empty() {
+                self.write_shortcut(cmd, chord, &owners);
+            } else {
+                self.status = String::from("Shortcut unchanged");
+            }
             return Ok(());
         }
         self.hover_popup = None;
@@ -23435,6 +24078,15 @@ impl App {
             self.save_all();
             return Ok(());
         }
+        // VS Code "Focus and Select Breadcrumbs" (Cmd/Ctrl+Shift+., #1608),
+        // claimed from any pane; the live shell keeps its Ctrl form.
+        let terminal_owns_ctrl_shift_dot = self.focus == Pane::Terminal
+            && self.bottom_panel_tab == BottomPanelTab::Terminal
+            && key.modifiers.contains(KeyModifiers::CONTROL);
+        if is_focus_breadcrumbs_key(key) && !terminal_owns_ctrl_shift_dot {
+            self.focus_breadcrumbs();
+            return Ok(());
+        }
         // Ctrl+Shift+H in the live shell stays its command history; Cmd+Shift+H
         // and every other pane's Ctrl+Shift+H are Replace in Files (#860).
         let terminal_owns_ctrl_shift_h = self.focus == Pane::Terminal
@@ -23984,6 +24636,29 @@ impl App {
         });
     }
 
+    /// View Stash (#1581): stash `index`'s changes against the commit it
+    /// was made on, untracked files included, in a read-only scratch tab
+    /// like a commit's patch.
+    fn open_stash_patch(&mut self, index: usize) {
+        let root = self.scm_root();
+        let label = format!("stash@{{{index}}}");
+        self.status = format!("Loading {label}\u{2026}");
+        self.spawn_git_view(move || {
+            let result = crate::git::show_stash(&root, index);
+            Box::new(move |app: &mut App| match result {
+                Ok(text) => match app.editor.open_text_buffer(Path::new(&label), &text) {
+                    Ok(()) => {
+                        app.focus_pane(Pane::Editor);
+                        app.sync_open_file_poll_mtime();
+                        app.status = format!("Opened {label}");
+                    }
+                    Err(e) => app.status = format!("Open stash failed: {e}"),
+                },
+                Err(e) => app.status = format!("Show stash failed: {e}"),
+            })
+        });
+    }
+
     /// Open a commit's full patch (header, message, diffstat, diff) in a
     /// read-only scratch tab — the graph's click-through, tig's enter key.
     fn open_commit_patch(&mut self, hash: &str, short_hash: &str) {
@@ -24287,6 +24962,8 @@ impl App {
         // The build this armed for is being dropped (#373).
         self.disarm_failure_breakpoint();
         self.pending_test_debug = None;
+        // Its names belong to the old project (#1535).
+        self.last_test_run = None;
         if self.sidebar_view == SidebarView::Testing {
             self.discover_tests();
         }
@@ -24708,6 +25385,7 @@ impl App {
         if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
+        self.last_test_run = Some(LastTestRun::All);
         self.test_run_with_unsaved_saved(|app| {
             app.test_worker.run_all();
             app.set_sidebar_view(SidebarView::Testing);
@@ -24720,6 +25398,7 @@ impl App {
         if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
+        self.last_test_run = Some(LastTestRun::One(name.clone()));
         self.test_run_with_unsaved_saved(|app| {
             app.testing.start_single(&name);
             app.test_worker.run_one(name);
@@ -24748,6 +25427,7 @@ impl App {
         if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
+        self.last_test_run = Some(LastTestRun::Suite(suite.clone()));
         self.test_run_with_unsaved_saved(|app| {
             app.testing
                 .start_filter(&crate::testing::suite_pattern(&suite));
@@ -24787,14 +25467,103 @@ impl App {
         };
         if exact {
             self.testing.start_single(&run);
+            self.last_test_run = Some(LastTestRun::One(run.clone()));
             self.test_worker.run_one(run.clone());
         } else {
             self.testing.start_filter(&run);
+            self.last_test_run = Some(LastTestRun::Filter(run.clone()));
             self.test_worker.run_filter(run.clone());
         }
         self.set_sidebar_view(SidebarView::Testing);
         self.status = format!("Running test {run}");
         self.await_test_run_outcome(crate::testing::leaf_name(&run).to_string());
+    }
+
+    /// When a test run is already going, say so (#1535) rather than let a
+    /// palette command do nothing; true when it was.
+    fn testing_busy_says_so(&mut self) -> bool {
+        if self.testing.is_busy() {
+            self.status = String::from("Tests are already running");
+            return true;
+        }
+        false
+    }
+
+    /// Testing: Run Tests in Current File (#1535): the suite the active
+    /// file is, in the runner's own naming (see [`file_test_suite`]). A file
+    /// the runner cannot select by itself says so.
+    fn run_tests_in_current_file(&mut self) {
+        if self.testing_busy_says_so() || !self.testing_runner_available() {
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Run Tests in Current File: open a test file first");
+            return;
+        };
+        let root = self.active_test_root.clone();
+        let suite = crate::testing::worker::runner_for(&root)
+            .and_then(|runner| file_test_suite(runner, &root, &path));
+        let Some(suite) = suite else {
+            self.status = String::from(
+                "Run Tests in Current File: the runner cannot pick out this file's tests; use Run All Tests",
+            );
+            return;
+        };
+        self.run_suite(suite.clone());
+        self.status = format!("Running tests in {suite}");
+        self.await_test_run_outcome(suite);
+    }
+
+    /// Testing: Rerun Failed Tests (#1535): each test the tree shows failed,
+    /// by its exact name.
+    fn rerun_failed_tests(&mut self) {
+        if self.testing_busy_says_so() || !self.testing_runner_available() {
+            return;
+        }
+        let failed = self.testing.failed_names();
+        if failed.is_empty() {
+            self.status = String::from("Rerun Failed Tests: no test has failed");
+            return;
+        }
+        self.start_many_tests(failed);
+    }
+
+    /// Run `names` exactly, one after another, as one run.
+    fn start_many_tests(&mut self, names: Vec<String>) {
+        self.testing.start_many(&names);
+        self.last_test_run = Some(LastTestRun::Many(names.clone()));
+        let label = format!("{} tests", names.len());
+        self.test_worker.run_many(names);
+        self.set_sidebar_view(SidebarView::Testing);
+        self.status = format!("Running {label}");
+        self.await_test_run_outcome(label);
+    }
+
+    /// Testing: Rerun Last Run (#1535): the last run started, as it was
+    /// asked (everything, one test, a filter, a suite or a set).
+    fn rerun_last_test_run(&mut self) {
+        if self.testing_busy_says_so() {
+            return;
+        }
+        let Some(last) = self.last_test_run.clone() else {
+            self.status = String::from("Rerun Last Run: no test has run yet");
+            return;
+        };
+        if !self.testing_runner_available() {
+            return;
+        }
+        match last {
+            LastTestRun::All => self.run_all_tests(),
+            LastTestRun::One(name) => self.run_test(name),
+            LastTestRun::Suite(suite) => self.run_suite(suite),
+            LastTestRun::Filter(pattern) => {
+                self.testing.start_filter(&pattern);
+                self.last_test_run = Some(LastTestRun::Filter(pattern.clone()));
+                self.test_worker.run_filter(pattern);
+                self.set_sidebar_view(SidebarView::Testing);
+            }
+            LastTestRun::Many(names) => self.start_many_tests(names),
+        }
     }
 
     /// Keep the "Running …" status a test run just set until the run ends,
@@ -31028,13 +31797,19 @@ impl App {
                 title: String::from("VARIABLES"),
             },
         });
-        for scope in &session.scopes {
+        for (index, scope) in session.scopes.iter().enumerate() {
+            let open = session.scope_open(index);
             rows.push(DebugRow {
                 indent: 1,
                 kind: DebugRowKind::Scope {
                     name: scope.name.clone(),
+                    index,
+                    open: scope.expensive.then_some(open),
                 },
             });
+            if !open {
+                continue;
+            }
             if let Some(vars) = session.variables.get(&scope.variables_ref) {
                 push_variable_rows(&mut rows, session, &self.debug_expanded, vars, 2);
             }
@@ -31225,6 +32000,16 @@ impl App {
             }
             DebugRowKind::WatchAdd => {
                 self.open_add_watch_prompt();
+            }
+            // An expensive scope opens (and is fetched) on click (#1421).
+            DebugRowKind::Scope {
+                index,
+                open: Some(_),
+                ..
+            } => {
+                if let Some(session) = self.debug_sessions.focused_mut() {
+                    session.toggle_expensive_scope(index);
+                }
             }
             _ => {}
         }
@@ -32309,22 +33094,47 @@ impl App {
                     ));
                     return;
                 }
-                if rc.request == RequestKind::Attach && rc.process_id.is_none() {
-                    self.debug_error(format!(
-                        "config \"{name}\": a go attach needs a \"processId\""
-                    ));
+                // "Connect to server" (#1418): a headless delve already
+                // serves DAP at host:port, so croft connects to it rather
+                // than starting a dlv of its own.
+                let remote = configs::delve_remote_address(&rc);
+                if rc.request == RequestKind::Attach && rc.process_id.is_none() && remote.is_none()
+                {
+                    let remote_mode =
+                        rc.extra.get("mode").and_then(serde_json::Value::as_str) == Some("remote");
+                    self.debug_error(if remote_mode {
+                        format!("config \"{name}\": a go remote attach needs a \"port\"")
+                    } else {
+                        format!(
+                            "config \"{name}\": a go attach needs a \"processId\", or \"mode\": \"remote\" with a \"port\""
+                        )
+                    });
                     return;
                 }
-                match crate::dap::install::dlv_program() {
-                    Ok(dlv) => crate::dap::session::DapSession::launch_delve(
-                        &dlv,
-                        &cwd,
+                if let Some((host, port)) = remote {
+                    crate::dap::session::DapSession::attach_delve_server(
+                        &host,
+                        port,
                         configs::delve_request(&rc),
                         breakpoints,
-                    ),
-                    Err(e) => {
-                        self.debug_error(format!("{e}"));
-                        return;
+                    )
+                    .with_context(|| {
+                        format!(
+                            "nothing answered on {host}:{port}; start it first, e.g. `dlv debug <package> --headless --listen=:{port} --api-version=2 --accept-multiclient`"
+                        )
+                    })
+                } else {
+                    match crate::dap::install::dlv_program() {
+                        Ok(dlv) => crate::dap::session::DapSession::launch_delve(
+                            &dlv,
+                            &cwd,
+                            configs::delve_request(&rc),
+                            breakpoints,
+                        ),
+                        Err(e) => {
+                            self.debug_error(format!("{e}"));
+                            return;
+                        }
                     }
                 }
             }
@@ -33985,7 +34795,62 @@ impl App {
         if self.hold_for_unsaved(ScmWrite::Stash) {
             return;
         }
-        let stashed = crate::git::stash_push(&self.scm_root());
+        self.ask_stash_message(crate::git::StashKind::Tracked);
+    }
+
+    /// Ask what to call the stash before making it (#1581), as VS Code's
+    /// Git: Stash does, seeded with the commit box's first line. Without a
+    /// name every stash on a commit read `WIP on <branch>: <commit>`, and
+    /// the Apply / Pop / Drop pickers chose between identical rows.
+    fn ask_stash_message(&mut self, kind: crate::git::StashKind) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let title = match kind {
+            crate::git::StashKind::Tracked => "Stash",
+            crate::git::StashKind::IncludeUntracked => "Stash (Include Untracked)",
+            crate::git::StashKind::Staged => "Stash Staged",
+        };
+        let seed = self
+            .source_control
+            .message
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::StashMessage { kind },
+                title,
+                "Message (optional)",
+            )
+            .allowing_blank()
+            .with_hint("Enter names the stash \u{b7} left blank, git names it WIP on <branch>")
+            .with_value(seed),
+        );
+    }
+
+    /// Make the stash the prompt asked about, named `message` when given.
+    fn perform_stash(&mut self, kind: crate::git::StashKind, message: Option<&str>) {
+        match kind {
+            crate::git::StashKind::Tracked => self.stash_tracked(message),
+            crate::git::StashKind::IncludeUntracked => {
+                let r = crate::git::stash_push_untracked(&self.scm_root(), message);
+                self.run_scm_op(
+                    "stash push -u",
+                    r,
+                    "Stashed (incl. untracked)",
+                    "Stash (incl. untracked)",
+                );
+            }
+            crate::git::StashKind::Staged => {
+                let r = crate::git::stash_push_staged(&self.scm_root(), message);
+                self.run_scm_op("stash push --staged", r, "Stashed staged", "Stash staged");
+            }
+        }
+    }
+
+    fn stash_tracked(&mut self, message: Option<&str>) {
+        let stashed = crate::git::stash_push(&self.scm_root(), message);
         self.log_git("stash push", &stashed);
         match stashed {
             Ok(summary) => {
@@ -34400,13 +35265,7 @@ impl App {
         if self.hold_for_unsaved(ScmWrite::StashIncludeUntracked) {
             return;
         }
-        let r = crate::git::stash_push_untracked(&self.scm_root());
-        self.run_scm_op(
-            "stash push -u",
-            r,
-            "Stashed (incl. untracked)",
-            "Stash (incl. untracked)",
-        );
+        self.ask_stash_message(crate::git::StashKind::IncludeUntracked);
     }
 
     /// `git stash push --staged` from the commit dropdown.
@@ -34414,8 +35273,7 @@ impl App {
         if self.hold_for_unsaved(ScmWrite::StashStaged) {
             return;
         }
-        let r = crate::git::stash_push_staged(&self.scm_root());
-        self.run_scm_op("stash push --staged", r, "Stashed staged", "Stash staged");
+        self.ask_stash_message(crate::git::StashKind::Staged);
     }
 
     /// The files of tabs with unsaved edits under the repository, each
@@ -34912,13 +35770,93 @@ impl App {
             ScmAction::PopStashLatest => self.stash_pop_source_control(),
             ScmAction::PopStashPick => self.open_stash_picker(ListPurpose::StashPop),
             ScmAction::DropStash => self.open_stash_picker(ListPurpose::StashDrop),
+            ScmAction::ViewStash => self.open_stash_picker(ListPurpose::StashView),
             ScmAction::CreateTag => self.open_input_prompt(InputPrompt::new(
                 InputPurpose::CreateTag,
                 "Create Tag",
                 "Tag name (e.g. v1.0.0)",
             )),
             ScmAction::DeleteTag => self.open_tag_picker(),
+            ScmAction::PushTags => self.push_tags_source_control(),
+            ScmAction::DeleteRemoteTag => self.open_remote_tag_picker(),
         }
+    }
+
+    /// Source Control > Tags > Push Tags (#1582): every local tag to the
+    /// remote a new branch would be published to.
+    fn push_tags_source_control(&mut self) {
+        let remote = match crate::git::tag_remote(&self.scm_root()) {
+            Ok(remote) => remote,
+            Err(err) => {
+                self.status = format!("Push tags: {err}");
+                return;
+            }
+        };
+        self.spawn_scm_op("push --tags", "Pushed tags", "Push tags", move |root| {
+            crate::git::push_tags(root, &remote)
+        });
+    }
+
+    /// Source Control > Tags > Delete Remote Tag (#1582): list the push
+    /// remote's tags off the UI thread, then pick one to delete there.
+    fn open_remote_tag_picker(&mut self) {
+        let root = self.scm_root();
+        let remote = match crate::git::tag_remote(&root) {
+            Ok(remote) => remote,
+            Err(err) => {
+                self.status = format!("Delete remote tag: {err}");
+                return;
+            }
+        };
+        self.spawn_git_net("ls-remote --tags", move || {
+            let tags = crate::git::list_remote_tags(&root, &remote);
+            Box::new(move |app: &mut App| app.show_remote_tags(&root, &remote, tags))
+        });
+    }
+
+    /// Whether Source Control now points at a repository other than
+    /// `root`, the one whose remote tags were listed (#1582). The deletion
+    /// is then dropped rather than sent to another repository's remote of
+    /// the same name, and the status says so.
+    fn remote_tag_root_moved(&mut self, root: &Path) -> bool {
+        if self.scm_root() == root {
+            return false;
+        }
+        self.status =
+            String::from("Delete remote tag cancelled: Source Control moved to another repository");
+        true
+    }
+
+    /// The picker over `remote`'s tags in `root`, once listed (#1582).
+    fn show_remote_tags(&mut self, root: &Path, remote: &str, tags: Result<Vec<String>, String>) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        if self.remote_tag_root_moved(root) {
+            return;
+        }
+        let tags = match tags {
+            Ok(tags) => tags,
+            Err(err) => {
+                self.status = format!("Remote tags: {}", crate::git::result_line(&err));
+                return;
+            }
+        };
+        self.status.clear();
+        self.remote_tag_root = Some(root.to_path_buf());
+        let rows = tags
+            .into_iter()
+            .map(|tag| ListRow {
+                id: format!("{remote}\t{tag}"),
+                label: tag,
+            })
+            .collect();
+        self.open_list_picker(
+            ListPicker::new(
+                ListPurpose::DeleteRemoteTag,
+                format!("Delete Remote Tag from {remote}"),
+                rows,
+            ),
+            &format!("No tags on {remote}"),
+        );
     }
 
     fn open_stash_picker(&mut self, purpose: crate::widgets::list_picker::ListPurpose) {
@@ -34928,7 +35866,7 @@ impl App {
                 .into_iter()
                 .map(|s| ListRow {
                     id: s.index.to_string(),
-                    label: format!("stash@{{{}}}: {}", s.index, s.message),
+                    label: s.label(),
                 })
                 .collect(),
             Err(err) => {
@@ -34939,6 +35877,7 @@ impl App {
         let title = match purpose {
             crate::widgets::list_picker::ListPurpose::StashApply => "Apply Stash",
             crate::widgets::list_picker::ListPurpose::StashDrop => "Drop Stash",
+            crate::widgets::list_picker::ListPurpose::StashView => "View Stash",
             _ => "Pop Stash",
         };
         self.open_list_picker(
@@ -35024,6 +35963,11 @@ impl App {
             InputPurpose::AddWatch => {
                 self.close_input_prompt();
                 self.add_watch_expression(value);
+            }
+            InputPurpose::StashMessage { kind } => {
+                self.close_input_prompt();
+                let message = (!value.is_empty()).then_some(value.as_str());
+                self.perform_stash(kind, message);
             }
             InputPurpose::MacroReplayCount => {
                 self.close_input_prompt();
@@ -35261,9 +36205,40 @@ impl App {
                 self.run_scm_op("remote add", r, "Added remote", "Add remote");
             }
             InputPurpose::CreateTag => {
+                // Then the message, as VS Code asks (#1582): one makes an
+                // annotated tag, a blank field a lightweight one.
                 self.close_input_prompt();
-                let r = crate::git::create_tag(&self.scm_root(), &value);
+                self.open_input_prompt(
+                    InputPrompt::new(
+                        InputPurpose::CreateTagMessage {
+                            name: value.clone(),
+                        },
+                        format!("Create Tag '{value}'"),
+                        "Message (optional)",
+                    )
+                    .allowing_blank()
+                    .with_hint(
+                        "Enter with a message makes an annotated tag · blank, a lightweight one",
+                    ),
+                );
+            }
+            InputPurpose::CreateTagMessage { name } => {
+                self.close_input_prompt();
+                let message = (!value.is_empty()).then_some(value.as_str());
+                let r = crate::git::create_tag(&self.scm_root(), &name, message);
                 self.run_scm_op("tag", r, "Created tag", "Create tag");
+            }
+            InputPurpose::DeleteRemoteTag { root, remote, name } => {
+                self.close_input_prompt();
+                if self.remote_tag_root_moved(&root) {
+                    return;
+                }
+                self.spawn_scm_op(
+                    "push --delete",
+                    "Deleted remote tag",
+                    "Delete remote tag",
+                    move |root| crate::git::delete_remote_tag(root, &remote, &name),
+                );
             }
             InputPurpose::ViewerConsent { key, path } => {
                 // The user allowed the viewer's extension; record it and
@@ -37506,6 +38481,7 @@ impl App {
                 let r = crate::git::stash_pop_at(&self.scm_root(), index);
                 self.run_scm_op("stash pop", r, "Popped stash", "Pop stash");
             }
+            ListPurpose::StashView => self.open_stash_patch(index),
             ListPurpose::StashDrop => {
                 let r = crate::git::stash_drop(&self.scm_root(), index);
                 self.run_scm_op("stash drop", r, "Dropped stash", "Drop stash");
@@ -37517,6 +38493,31 @@ impl App {
             ListPurpose::DeleteTag => {
                 let r = crate::git::delete_tag(&self.scm_root(), &row.id);
                 self.run_scm_op("tag -d", r, "Deleted tag", "Delete tag");
+            }
+            ListPurpose::DeleteRemoteTag => {
+                // Deleting from a remote reaches everyone who fetches it,
+                // so it is confirmed first (#1582).
+                let Some(root) = self.remote_tag_root.take() else {
+                    return;
+                };
+                if self.remote_tag_root_moved(&root) {
+                    return;
+                }
+                if let Some((remote, name)) = row.id.split_once('\t') {
+                    use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+                    self.open_input_prompt(
+                        InputPrompt::new(
+                            InputPurpose::DeleteRemoteTag {
+                                root,
+                                remote: remote.to_string(),
+                                name: name.to_string(),
+                            },
+                            format!("Delete tag '{name}' from {remote}?"),
+                            "Enter to delete · Esc to keep",
+                        )
+                        .with_value("delete"),
+                    );
+                }
             }
             ListPurpose::PushToRemote => {
                 let remote = row.id.clone();
@@ -39150,7 +40151,7 @@ impl App {
             let r = commit();
             Box::new(move |app: &mut App| {
                 if r.is_ok() && app.source_control.message.trim() == message.trim() {
-                    app.source_control.clear_message();
+                    app.source_control.clear_after_commit();
                 }
                 done(app, r)
             })
@@ -43190,8 +44191,9 @@ impl App {
         }
         // Rename Symbol (F2) and Change All Occurrences (Cmd/Ctrl+F2) are only
         // meaningful on a text buffer, so they sit above the read-only diff /
-        // sheet / image guards below.
-        if is_rename_symbol_key(key) {
+        // sheet / image guards below. The sheet grid is editable and F2 is its
+        // own "edit this cell" key (#1618), so there F2 falls through to it.
+        if is_rename_symbol_key(key) && self.editor.sheet.is_none() {
             self.start_rename_symbol();
             return;
         }
@@ -43242,8 +44244,14 @@ impl App {
         // reachable from the Command Palette, which guarantees parity on
         // terminals that don't deliver the Alt+letter chords.
         if is_toggle_line_comment_key(key) {
-            if self.editor_is_text() {
-                self.editor.toggle_line_comment();
+            // The palette's message too: a key that does nothing because the
+            // language has no comment must say so (#1181); a blank line in
+            // one that has does nothing quietly.
+            if self.editor_is_text()
+                && !self.editor.toggle_line_comment()
+                && !self.editor.has_line_comment_syntax()
+            {
+                self.status = String::from("Toggle Line Comment: no comment for this language");
             }
             return;
         }
@@ -43257,6 +44265,18 @@ impl App {
             if self.editor_is_text() {
                 self.editor.toggle_wrap();
             }
+            return;
+        }
+        // Alt+O: C/C++: Switch Header/Source (#1360), as VS Code's clangd
+        // extension binds it. Other files keep the chord.
+        if is_switch_header_source_key(key)
+            && self
+                .editor
+                .path
+                .as_deref()
+                .is_some_and(crate::header_source::is_c_family)
+        {
+            self.switch_header_source();
             return;
         }
         // VS Code "Go to Bracket" (Cmd+Shift+\): jump the cursor to the
@@ -43742,8 +44762,8 @@ impl App {
                 KeyCode::Right if alt => self.editor.move_word_right(),
                 KeyCode::Left => self.editor.move_left(),
                 KeyCode::Right => self.editor.move_right(),
-                KeyCode::Home => self.editor.home_line(),
-                KeyCode::End => self.editor.end_line(),
+                KeyCode::Home => self.editor.home_key(),
+                KeyCode::End => self.editor.end_key(),
                 KeyCode::PageUp => self.editor.page_up_one_screen(),
                 KeyCode::PageDown => self.editor.page_down_one_screen(),
                 _ => {}
@@ -43767,8 +44787,8 @@ impl App {
             KeyCode::Right => self.editor.move_right(),
             KeyCode::PageUp => self.editor.page_up_one_screen(),
             KeyCode::PageDown => self.editor.page_down_one_screen(),
-            KeyCode::Home => self.editor.home_line(),
-            KeyCode::End => self.editor.end_line(),
+            KeyCode::Home => self.editor.home_key(),
+            KeyCode::End => self.editor.end_key(),
             KeyCode::Backspace => {
                 self.editor.backspace();
                 self.note_incomplete_completion_edit();
@@ -43798,7 +44818,7 @@ impl App {
                 // popup when this char arrived, so the new request just
                 // populates a fresh popup when the response lands.
                 if c == '.' {
-                    self.trigger_completion();
+                    self.request_completion_at_caret(false);
                 }
                 // Parameter hints: `(` / `,` open or advance a call. Closing
                 // (typing `)`, moving away, deleting) is handled by the tick's
@@ -45204,30 +46224,13 @@ impl App {
         }
         // Ctrl+Shift+T: open another terminal next to the active one.
         if is_terminal_split_key(key) {
-            match self.split_terminal() {
-                Ok(()) => {
-                    self.terminal_status(format!(
-                        "Split terminal: {} active",
-                        self.terminals.len()
-                    ));
-                }
-                Err(e) => {
-                    self.status = format!("Split terminal failed: {e}");
-                }
-            }
+            self.split_terminal_reporting();
             return;
         }
         // Cmd+W (or legacy Ctrl+Shift+W): close the active terminal (no-op when
         // only one is left).
         if is_terminal_close_key(key) {
-            if self.close_active_terminal() {
-                self.terminal_status(format!(
-                    "Closed terminal: {} remaining",
-                    self.terminals.len()
-                ));
-            } else {
-                self.status = String::from("Cannot close the last terminal; press Ctrl+J to hide");
-            }
+            self.close_terminal_reporting(self.active_terminal);
             return;
         }
         // Cmd+]: next terminal. Cmd+[: previous terminal.
@@ -47435,6 +48438,8 @@ impl App {
             None => format!("exit {code}"),
         };
         self.context_menu = Some(ContextMenu {
+            crumb: None,
+            scroll: Default::default(),
             origin,
             items: vec![
                 MenuEntry::header(header),
@@ -48688,6 +49693,7 @@ impl App {
                 severity: d.severity,
                 message: d.message,
                 source,
+                code: d.code,
             },
         ))
     }
@@ -49099,6 +50105,8 @@ impl App {
             self.status = format!("{}: {e}", path.display());
             return;
         }
+        // Applied just below, so the settings watch must not apply it again.
+        self.config_watch.note(&path);
         let merged = self.merged_settings_here();
         for w in &merged.warnings {
             crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
@@ -49294,6 +50302,67 @@ impl App {
         });
         self.file_finder_index_rx = Some(rx);
         self.file_finder_index_dirty = false;
+    }
+
+    /// C/C++: Switch Header/Source (#1360): open the header of the source
+    /// in the editor, or the source of the header, found beside it, across
+    /// an `include/` ↔ `src/` split, or anywhere in the workspace.
+    fn switch_header_source(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("No file in the active tab");
+            return;
+        };
+        if !crate::header_source::is_c_family(&path) {
+            self.status =
+                String::from("Switch Header/Source works on C, C++ and Objective-C files");
+            return;
+        }
+        self.poll_file_finder_index();
+        // The root that owns the file, so a file in a secondary root of a
+        // multi-root workspace finds its counterpart in that root.
+        let root = self
+            .roots
+            .owning_root(&path)
+            .unwrap_or_else(|| self.roots.primary())
+            .to_path_buf();
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let index_paths = |app: &Self| -> Vec<PathBuf> {
+            app.file_finder_index
+                .as_ref()
+                .map(|entries| entries.iter().map(|e| e.path.clone()).collect())
+                .unwrap_or_default()
+        };
+        let is_file = |p: &Path| p.is_file();
+        let mut found =
+            crate::header_source::counterpart(&path, &root, &index_paths(self), &is_file);
+        // The background index has not landed yet: walk the workspace
+        // synchronously this once, as Go to File does, so the
+        // anywhere-in-the-workspace fallback is not answered from nothing.
+        if found.is_none() && self.file_finder_index.is_none() {
+            let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
+            let entries = crate::widgets::file_finder::build_multi_file_index(&roots);
+            self.file_finder_index = Some(std::sync::Arc::new(entries));
+            self.file_finder_index_rx = None;
+            found = crate::header_source::counterpart(&path, &root, &index_paths(self), &is_file);
+        }
+        let Some(found) = found else {
+            self.status = format!("No header/source counterpart for {name}");
+            return;
+        };
+        // A tab-aware open: the counterpart gets its own tab (or its
+        // existing one), so unsaved edits in the current buffer survive.
+        match self.editor.open_pinned(&found) {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.focus_pane(Pane::Editor);
+                let shown = found.strip_prefix(&root).unwrap_or(&found);
+                self.status = format!("{name} \u{2194} {}", shown.display());
+            }
+            Err(e) => self.status = format!("Could not open {}: {e}", found.display()),
+        }
     }
 
     fn open_file_finder(&mut self) {
@@ -49611,6 +50680,18 @@ impl App {
         } else {
             crate::widgets::command_palette::Command::UnpinEditor
         }]);
+        // The chords as keybindings.json leaves them (#1482): a user's own
+        // chord, and no built-in chord a user binding gave to another command.
+        palette.hint_overrides = crate::widgets::command_palette::ALL_COMMANDS
+            .iter()
+            .filter_map(|&cmd| match self.keymap.chord_for(cmd) {
+                Some(user) => Some((cmd, crate::keymap::display_chord(&user))),
+                None => self
+                    .keymap
+                    .shadows_builtin(cmd)
+                    .then(|| (cmd, String::new())),
+            })
+            .collect();
         let count = palette.results.len();
         self.command_palette = Some(palette);
         self.overlays.command_palette_clear.request();
@@ -50710,11 +51791,19 @@ impl App {
     pub(crate) fn run_command(&mut self, cmd: crate::widgets::command_palette::Command) {
         use crate::widgets::command_palette::Command as Cmd;
         use crate::widgets::editor::CaseTransform;
+        // The tab a tab command acts on (#1427): the clicked tab when a
+        // tab-strip mouse binding runs it directly, as VS Code's tab commands
+        // act on the clicked tab, else the active tab. Taken here so a
+        // command this one runs in turn never sees it.
+        let tab_target = self
+            .tab_click_target
+            .take()
+            .unwrap_or_else(|| self.editor.active_index());
         match cmd {
             Cmd::MoveLineUp => self.editor.move_lines_up(),
             Cmd::MoveLineDown => self.editor.move_lines_down(),
             Cmd::ToggleLineComment => {
-                if !self.editor.toggle_line_comment() {
+                if !self.editor.toggle_line_comment() && !self.editor.has_line_comment_syntax() {
                     self.status = String::from("Toggle Line Comment: no comment for this language");
                 }
             }
@@ -50742,6 +51831,7 @@ impl App {
             Cmd::EmmetExpandAbbreviation => self.expand_emmet_abbreviation(),
             Cmd::ExpandSelection => self.expand_selection(),
             Cmd::ShrinkSelection => self.shrink_selection(),
+            Cmd::SwitchHeaderSource => self.switch_header_source(),
             Cmd::ToggleWordWrap => {
                 self.editor.toggle_wrap();
                 self.status = if self.editor.wrap_enabled() {
@@ -50807,6 +51897,7 @@ impl App {
             Cmd::RestoreSnapshot => self.restore_history_snapshot(),
             Cmd::QuickFix => self.start_code_action(),
             Cmd::ReplaceInFile => self.open_editor_replace(),
+            Cmd::ToggleFindInSelection => self.toggle_editor_find_in_selection(),
             // The accept/navigate commands serve both merge flows: the
             // three-way merge editor when its view is up (#253), the
             // in-buffer marker flow otherwise.
@@ -51037,6 +52128,9 @@ impl App {
             Cmd::StageHunk => self.stage_hunk_at_caret(),
             Cmd::UnstageHunk => self.unstage_hunk_at_caret(),
             Cmd::RevertHunk => self.request_revert_hunk_at_caret(),
+            Cmd::GitViewStash => {
+                self.open_stash_picker(crate::widgets::list_picker::ListPurpose::StashView)
+            }
             Cmd::GitUndoLastCommit => {
                 self.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::UndoLastCommit)
             }
@@ -51108,19 +52202,19 @@ impl App {
                     self.editor.selection_text().chars().count()
                 );
             }
-            Cmd::CloseEditor => self.request_close_tab(self.editor.active_index()),
+            Cmd::CloseEditor => self.request_close_tab(tab_target),
             Cmd::ReopenClosedEditor => self.reopen_closed_tab(),
             // The Explorer's Cmd+Z (#843), which has no `Ctrl` form.
             Cmd::ZoxideJump => self.open_zoxide_jump(),
             // The tab menu's rows (#852), on the active tab and through the
             // same methods its clicks and the Cmd+K chords use.
-            Cmd::CloseOtherEditors => self.close_other_tabs(self.editor.active_index()),
-            Cmd::CloseEditorsToTheRight => self.close_tabs_to_right(self.editor.active_index()),
+            Cmd::CloseOtherEditors => self.close_other_tabs(tab_target),
+            Cmd::CloseEditorsToTheRight => self.close_tabs_to_right(tab_target),
             Cmd::CloseSavedEditors => self.close_saved_tabs(),
             Cmd::CloseAllEditors => self.close_all_tabs(),
             Cmd::PinEditor => self.set_active_tab_pinned(true),
             Cmd::UnpinEditor => self.set_active_tab_pinned(false),
-            Cmd::KeepEditor => self.keep_tab_open(self.editor.active_index()),
+            Cmd::KeepEditor => self.keep_tab_open(tab_target),
             Cmd::SplitEditor => self.split_editor(),
             // The chords' own moves (#843): Cmd+Opt+Left / Right have no
             // `Ctrl` form off macOS.
@@ -51166,6 +52260,7 @@ impl App {
                 ));
             }
             Cmd::ShowExplorer => self.set_sidebar_view(SidebarView::Explorer),
+            Cmd::FocusBreadcrumbs => self.focus_breadcrumbs(),
             Cmd::ShowSearch => self.set_sidebar_view(SidebarView::Search),
             Cmd::ReplaceInFiles => self.open_replace_in_files(),
             // Run from the palette the side bar may be hidden, so it is
@@ -51562,6 +52657,14 @@ impl App {
             Cmd::CodeqlOpenResultsDirectory => self.open_codeql_results_directory(),
             Cmd::ShowCodeQL => self.open_codeql_view(),
             Cmd::RunTestAtCursor => self.run_test_at_cursor(),
+            Cmd::TestingRunAll => {
+                if !self.testing_busy_says_so() {
+                    self.run_all_tests();
+                }
+            }
+            Cmd::TestingRunFile => self.run_tests_in_current_file(),
+            Cmd::TestingRerunFailed => self.rerun_failed_tests(),
+            Cmd::TestingRerunLast => self.rerun_last_test_run(),
             Cmd::DebugTestAtCursor => self.debug_test_at_cursor(),
             Cmd::ToggleSideBar => self.toggle_side_bar(),
             Cmd::ToggleAutoHideSideBar => self.toggle_sidebar_auto_hide(),
@@ -51635,10 +52738,14 @@ impl App {
                             "No whole-project checker for this workspace (expected tsconfig.json)",
                         );
                     }
+                    Some(ProjectCheck::Empty) => {
+                        self.status =
+                            String::from("Whole-project check: tsconfig.json includes no files");
+                    }
                     Some(_) if self.project_check_running => {
                         self.status = String::from("A whole-project check is already running");
                     }
-                    Some((program, args)) => {
+                    Some(ProjectCheck::Run(runs)) => {
                         // Off the main loop: tsc on a large project takes tens
                         // of seconds, and running it inline froze input and
                         // redraw for the duration - the "Checking..." status
@@ -51676,12 +52783,35 @@ impl App {
                             }
                             // .output(), never .status(): the checker must not
                             // inherit croft's TTY, or its diagnostics spray
-                            // over the UI.
-                            let done = std::process::Command::new(&program)
-                                .args(&args)
-                                .current_dir(&root_for_thread)
-                                .output();
-                            let _ = tx.send((root_for_thread, done));
+                            // over the UI. One run per referenced project,
+                            // merged: both streams concatenated, and the
+                            // last failing status kept, so one failing
+                            // project fails the sweep.
+                            let mut done: Option<std::io::Result<std::process::Output>> = None;
+                            for (program, args) in runs {
+                                let out = std::process::Command::new(&program)
+                                    .args(&args)
+                                    .current_dir(&root_for_thread)
+                                    .output();
+                                done = Some(match (done, out) {
+                                    (Some(Ok(mut acc)), Ok(o)) => {
+                                        acc.stdout.extend(o.stdout);
+                                        acc.stderr.extend(o.stderr);
+                                        if !o.status.success() {
+                                            acc.status = o.status;
+                                        }
+                                        Ok(acc)
+                                    }
+                                    (Some(Err(e)), _) | (_, Err(e)) => Err(e),
+                                    (None, Ok(o)) => Ok(o),
+                                });
+                                if matches!(done, Some(Err(_))) {
+                                    break;
+                                }
+                            }
+                            if let Some(done) = done {
+                                let _ = tx.send((root_for_thread, done));
+                            }
                         });
                         self.project_check_running = true;
                         self.status = String::from("Checking the whole project...");
@@ -51739,6 +52869,15 @@ impl App {
             Cmd::GitContinueOperation => self.continue_git_operation(),
             Cmd::GitSkipOperation => self.skip_git_operation(),
             Cmd::GitAbortOperation => self.abort_git_operation(),
+            Cmd::GitCreateTag => {
+                self.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::CreateTag)
+            }
+            Cmd::GitPushTags => {
+                self.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::PushTags)
+            }
+            Cmd::GitDeleteRemoteTag => {
+                self.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::DeleteRemoteTag)
+            }
             Cmd::ToggleTerminalSuggestions => self.toggle_terminal_suggestions(),
             Cmd::ToggleScreenReader => self.toggle_screen_reader(),
             Cmd::OpenKeyboardShortcuts => self.open_keyboard_shortcuts(),
@@ -51966,10 +53105,7 @@ impl App {
                 let _ = std::fs::create_dir_all(parent);
             }
             let contents = match seed {
-                ConfigFileSeed::Settings => {
-                    let prefs = crate::prefs::Prefs::load_or_default();
-                    serde_json::to_string_pretty(&prefs).unwrap_or_else(|_| String::from("{}\n"))
-                }
+                ConfigFileSeed::Settings => SETTINGS_TEMPLATE.to_string(),
                 ConfigFileSeed::SettingsLayer => SETTINGS_LAYER_TEMPLATE.to_string(),
                 ConfigFileSeed::Keybindings => crate::keymap::TEMPLATE.to_string(),
                 ConfigFileSeed::Snippets => crate::snippets::TEMPLATE.to_string(),
@@ -53328,6 +54464,16 @@ impl App {
 
     fn close_editor_find(&mut self) {
         if self.editor_find.take().is_some() {
+            // Every tab's: a range taken in one tab and left there when the
+            // bar closes from another would clip that tab's next find.
+            for tab in self.editor.editors.iter_mut() {
+                tab.find_range = None;
+            }
+            for group in self.editor_layout.inactive_groups_mut() {
+                for tab in group.editors.iter_mut() {
+                    tab.find_range = None;
+                }
+            }
             self.editor.set_search_highlight(None, self.search.opts);
             if let Some(diff) = self.editor.diff.as_mut() {
                 diff.find.needle = None;
@@ -53433,17 +54579,15 @@ impl App {
             self.log_find_set_query(new_query);
             return;
         }
+        let range = self.editor_find_range();
+        let (scope, _, window) = editor_find_lines(&self.editor, range);
         let Some(state) = self.editor_find.as_mut() else {
             return;
         };
         state.query = new_query;
         let opts = state.opts;
         state.set_match_count(
-            crate::widgets::editor_find::count_matches(
-                self.editor.find_scope().0,
-                &state.query,
-                opts,
-            ),
+            crate::widgets::editor_find::count_matches_in(scope, &state.query, opts, window),
             false,
         );
         if state.query.is_empty() {
@@ -53699,32 +54843,115 @@ impl App {
         col: usize,
         skip_current: bool,
     ) -> Option<crate::widgets::editor_find::MatchPos> {
-        let (scope, first) = self.editor.find_scope();
-        let row = row.saturating_sub(first).min(scope.len().saturating_sub(1));
+        let range = self.editor_find_range();
+        let (scope, first, window) = editor_find_lines(&self.editor, range);
+        let (row, col) = editor_find_scope_pos(scope, first, window, (row, col))?;
         let step = if forward {
-            crate::widgets::editor_find::find_next_match
+            crate::widgets::editor_find::find_next_match_in
         } else {
-            crate::widgets::editor_find::find_prev_match
+            crate::widgets::editor_find::find_prev_match_in
         };
-        let mut m = step(scope, needle, opts, row, col, skip_current)?;
+        let mut m = step(scope, needle, opts, window, row, col, skip_current)?;
         m.row += first;
         Some(m)
     }
 
     fn refresh_editor_find_index(&mut self) {
+        let range = self.editor_find_range();
+        let (scope, first, window) = editor_find_lines(&self.editor, range);
+        let caret = (self.editor.cursor_row, self.editor.cursor_col);
+        // A caret outside the selection is on none of its matches.
+        let outside = range.is_some_and(|(a, b)| caret < a || caret > b);
+        let at = editor_find_scope_pos(scope, first, window, caret);
         let Some(state) = self.editor_find.as_mut() else {
             return;
         };
         let opts = state.opts;
-        let needle = state.query.clone();
-        let (scope, first) = self.editor.find_scope();
-        state.match_index = crate::widgets::editor_find::match_index_at(
-            scope,
-            &needle,
-            opts,
-            self.editor.cursor_row.saturating_sub(first),
-            self.editor.cursor_col,
+        state.match_index = at.filter(|_| !outside).and_then(|(row, col)| {
+            crate::widgets::editor_find::match_index_at_in(
+                scope,
+                &state.query,
+                opts,
+                window,
+                row,
+                col,
+            )
+        });
+    }
+
+    /// The range Find in Selection limits the open find bar to: the active
+    /// tab's own (#1577), so another tab never searches by its coordinates.
+    fn editor_find_range(&self) -> Option<crate::widgets::editor_find::FindRange> {
+        self.editor_find.as_ref()?;
+        self.editor.find_range
+    }
+
+    /// Find in Selection (#1577, `Alt+L` in the find bar, VS Code's `≡`):
+    /// limit the matches, the count and Replace All to the selection (the
+    /// caret's line with none), or lift the limit again. From outside the
+    /// find bar it opens it first.
+    fn toggle_editor_find_in_selection(&mut self) {
+        if !self.editor_is_text() || self.editor.diff.is_some() {
+            self.status = String::from("Find in Selection works on text tabs");
+            return;
+        }
+        let range = self
+            .editor
+            .selection
+            .as_ref()
+            .filter(|s| s.anchor != s.head)
+            .map(|s| s.normalised())
+            .unwrap_or_else(|| {
+                let row = self.editor.cursor_row;
+                (
+                    (row, 0),
+                    (
+                        row,
+                        self.editor.lines.get(row).map_or(0, |l| l.chars().count()),
+                    ),
+                )
+            });
+        if self.editor_find.is_none() {
+            self.open_editor_find();
+        }
+        let Some(state) = self.editor_find.as_mut() else {
+            return;
+        };
+        // The range belongs to the tab it was taken in (#1577): another
+        // tab under the same find bar searches whole until it gets its own.
+        let on = self.editor.find_range.is_none();
+        self.editor.find_range = on.then_some(range);
+        state.in_selection = self.editor.find_range;
+        self.status = String::from(if on {
+            "Find in Selection: on"
+        } else {
+            "Find in Selection: off"
+        });
+        self.editor_find_recount();
+    }
+
+    /// Recount the find bar's matches and re-place the active one, after
+    /// its scope changed under an unchanged query.
+    fn editor_find_recount(&mut self) {
+        let range = self.editor_find_range();
+        let (scope, _, window) = editor_find_lines(&self.editor, range);
+        let Some(state) = self.editor_find.as_mut() else {
+            return;
+        };
+        let (needle, opts) = (state.query.clone(), state.opts);
+        state.set_match_count(
+            crate::widgets::editor_find::count_matches_in(scope, &needle, opts, window),
+            false,
         );
+        self.editor.active_search_match = None;
+        if needle.is_empty() {
+            return;
+        }
+        let (row, col) = (self.editor.cursor_row, self.editor.cursor_col);
+        if let Some(m) = self.editor_find_step(true, &needle, opts, row, col, false) {
+            self.jump_editor_to_match(m);
+        }
+        self.refresh_editor_find_index();
     }
 
     /// True when the replace row is shown and owns the keyboard.
@@ -53793,6 +55020,13 @@ impl App {
         }
         if is_editor_find_key(key) {
             self.reselect_editor_find();
+            return;
+        }
+        // Find in Selection (#1577): VS Code's `Alt+L`. A bare Alt only, so
+        // a macOS keyboard typing `¬` with Option keeps it.
+        // Ahead of the selected query below, which `Alt+L` must not clear.
+        if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('l' | 'L')) {
+            self.toggle_editor_find_in_selection();
             return;
         }
         // A selected query (#1278) is replaced by what is typed or pasted
@@ -53962,15 +55196,34 @@ impl App {
             return;
         };
         self.editor.replace_find_match(row, col, len, &text);
+        // The selected range ends further on (or sooner) by what the
+        // replacement added (#1577).
+        if let Some(s) = self.editor_find.as_mut()
+            && let Some((start, end)) = self.editor.find_range.as_mut()
+        {
+            // As `replace_find_match` put it in: a `\r` is a line break too.
+            let text = crate::widgets::editor::normalize_newlines(&text);
+            let breaks = text.matches('\n').count();
+            if row == end.0 {
+                let after = end.1.saturating_sub(col + len);
+                end.1 = match text.rfind('\n') {
+                    Some(i) => text[i + 1..].chars().count() + after,
+                    None => col + text.chars().count() + after,
+                };
+            }
+            if row <= end.0 {
+                end.0 += breaks;
+            }
+            debug_assert!(*start <= *end);
+            s.in_selection = self.editor.find_range;
+        }
         self.editor.active_search_match = None;
         self.editor.set_search_highlight(Some(needle.clone()), opts);
+        let range = self.editor_find_range();
+        let (scope, _, window) = editor_find_lines(&self.editor, range);
         if let Some(s) = self.editor_find.as_mut() {
             s.set_match_count(
-                crate::widgets::editor_find::count_matches(
-                    self.editor.find_scope().0,
-                    &needle,
-                    opts,
-                ),
+                crate::widgets::editor_find::count_matches_in(scope, &needle, opts, window),
                 false,
             );
         }
@@ -54000,33 +55253,57 @@ impl App {
             return;
         }
         let (needle, replacement, opts) = (state.query.clone(), state.replace.clone(), state.opts);
-        // A symbol tab replaces within its symbol only (#369).
-        let (scope, first) = self.editor.find_scope();
+        // A symbol tab replaces within its symbol only (#369), and Find in
+        // Selection within the selected range (#1577).
+        let range = self.editor_find_range();
+        let (scope, first, window) = editor_find_lines(&self.editor, range);
         let scope_end = first + scope.len();
-        let Some((replaced, n)) =
-            crate::widgets::editor_find::replace_all_in_lines(scope, &needle, &replacement, opts)
-        else {
+        let Some((replaced, n)) = crate::widgets::editor_find::replace_all_in_lines_in(
+            scope,
+            &needle,
+            &replacement,
+            opts,
+            window,
+        ) else {
             return;
         };
-        let mut new_lines = self.editor.lines[..first].to_vec();
-        new_lines.extend(replaced);
-        new_lines.extend_from_slice(&self.editor.lines[scope_end..]);
         if n == 0 {
             self.status = String::from("Replace All: no matches");
             return;
         }
+        // Text after the range's end is untouched, so the end keeps its
+        // distance from the end of its (now last replaced) line.
+        let new_range = window.map(|(start, (_, c1))| {
+            let tail = scope
+                .last()
+                .map_or(0, |l| l.chars().count().saturating_sub(c1));
+            let last = replaced.last().map_or(0, |l| l.chars().count());
+            (
+                (first + start.0, start.1),
+                (
+                    first + replaced.len().saturating_sub(1),
+                    last.saturating_sub(tail),
+                ),
+            )
+        });
+        let mut new_lines = self.editor.lines[..first].to_vec();
+        new_lines.extend(replaced);
+        new_lines.extend_from_slice(&self.editor.lines[scope_end..]);
         self.editor.replace_all_lines(new_lines);
         self.editor.active_search_match = None;
+        if range.is_some() {
+            self.editor.find_range = new_range;
+            if let Some(s) = self.editor_find.as_mut() {
+                s.in_selection = new_range;
+            }
+        }
+        let (scope, _, window) = editor_find_lines(&self.editor, new_range);
         if let Some(s) = self.editor_find.as_mut() {
             // Recount against the new buffer: `a` -> `aa` doubles the
             // matches, and a hard zero would read "No results" over a body
             // still painted full of highlights.
             s.set_match_count(
-                crate::widgets::editor_find::count_matches(
-                    self.editor.find_scope().0,
-                    &needle,
-                    opts,
-                ),
+                crate::widgets::editor_find::count_matches_in(scope, &needle, opts, window),
                 false,
             );
             s.match_index = None;
@@ -54044,6 +55321,8 @@ impl App {
         let Some(state) = self.editor_find.as_mut() else {
             return;
         };
+        // The chip shows the active tab's range, not one left in another.
+        state.in_selection = self.editor.find_range;
         let area = self.editor.last_full_area;
         if area.width == 0 || area.height == 0 {
             return;
@@ -54276,8 +55555,17 @@ impl App {
     }
 
     fn handle_mouse_inner(&mut self, m: MouseEvent) {
+        // So does a click (#1609), except on the message itself, which opens
+        // its full text below.
+        let on_message = rect_contains(self.status_message_rect, m.column, m.row);
+        if matches!(m.kind, MouseEventKind::Down(_)) && !on_message {
+            self.status_wide = false;
+        }
         // A click means the user moved on from a pending shortcut prompt.
-        if matches!(m.kind, MouseEventKind::Down(_)) && self.recording_shortcut.take().is_some() {
+        if matches!(m.kind, MouseEventKind::Down(_))
+            && (self.recording_shortcut.take().is_some()
+                | self.confirming_shortcut.take().is_some())
+        {
             self.status = String::from("Shortcut unchanged");
         }
         // On-screen keyboard taps outrank every other gate - including the
@@ -54449,6 +55737,10 @@ impl App {
             }
             if rect_contains(self.status_diag_rect, m.column, m.row) {
                 self.set_bottom_panel_tab(BottomPanelTab::Problems);
+                return;
+            }
+            if on_message {
+                self.show_status_messages();
                 return;
             }
             if rect_contains(self.status_agents_rect, m.column, m.row) {
@@ -54877,10 +56169,24 @@ impl App {
                 // set before dispatch and cleared after so a keyboard
                 // invocation of the same command never sees a stale click.
                 self.last_mouse_pos = Some((m.column, m.row));
+                self.tab_click_target = self.editor.tab_at(m.column, m.row);
                 self.run_command(cmd);
                 self.last_mouse_pos = None;
+                self.tab_click_target = None;
                 return;
             }
+        }
+        // A middle-click on a tab closes that tab (#1427), as in VS Code and
+        // browsers, asking about unsaved edits first as Ctrl+W does. The
+        // active tab stays active. A `middle_click` binding in `tab_strip`
+        // has already run above instead.
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Middle))
+            && let Some(idx) = self.editor.tab_at(m.column, m.row)
+        {
+            self.dismiss_click_overlays(m);
+            self.focus_pane(Pane::Editor);
+            self.request_close_tab(idx);
+            return;
         }
         let in_problems = self.bottom_panel_tab == BottomPanelTab::Problems
             && rect_contains(self.problems.last_area, m.column, m.row);
@@ -55086,6 +56392,8 @@ impl App {
                         self.editor.is_pinned(tab_idx),
                     );
                     self.context_menu = Some(ContextMenu {
+                        crumb: None,
+                        scroll: Default::default(),
                         origin: (m.column, m.row),
                         items,
                         selected: 0,
@@ -55157,6 +56465,25 @@ impl App {
                         label: String::from("Clear"),
                         action: MenuAction::ClearTerminal(idx),
                     });
+                    // Split and Kill, as in VS Code's terminal menu (#1598):
+                    // GNOME Terminal and Konsole keep Ctrl+Shift+T / W for
+                    // their own New Tab and Close Tab, so off the kitty
+                    // protocol this menu is the keyboard-free route. Split
+                    // opens beside the ACTIVE pane, so a folded one offers
+                    // only Kill, which carries its own index; a lone pane
+                    // cannot be closed, so it offers no Kill.
+                    if !folded {
+                        items.push(MenuEntry::Item {
+                            label: String::from("Split Terminal"),
+                            action: MenuAction::SplitTerminal,
+                        });
+                    }
+                    if self.terminals.len() > 1 {
+                        items.push(MenuEntry::Item {
+                            label: String::from("Kill Terminal"),
+                            action: MenuAction::KillTerminal(idx),
+                        });
+                    }
                     if !folded {
                         items.extend([
                             MenuEntry::Item {
@@ -55229,6 +56556,8 @@ impl App {
                         }
                     }
                     self.context_menu = Some(ContextMenu {
+                        crumb: None,
+                        scroll: Default::default(),
                         origin: (m.column, m.row),
                         items,
                         selected: 0,
@@ -56489,9 +57818,18 @@ impl App {
                         }
                     }
                 } else if in_editor_pane && !in_editor {
-                    if let Some((line, col)) = self.editor.breadcrumb_target_at(m.column, m.row) {
-                        // A click on a symbol crumb jumps to that symbol (same
-                        // file); path crumbs return None and fall through.
+                    let crumb = self.editor.breadcrumb_index_at(m.column, m.row);
+                    if let Some(i) = crumb.filter(|_| self.scrub_view.is_none()) {
+                        // A crumb opens its picker (#1608): a folder's
+                        // entries, the file's folder, or the symbol's
+                        // siblings.
+                        self.focus_pane(Pane::Editor);
+                        self.open_breadcrumb_picker(i);
+                    } else if let Some((line, col)) =
+                        self.editor.breadcrumb_target_at(m.column, m.row)
+                    {
+                        // While scrubbing a symbol crumb jumps in the
+                        // commit's view, as before.
                         self.focus_pane(Pane::Editor);
                         if !self.jump_in_scrub_view(line)
                             && let Some(path) = self.editor.path.clone()
@@ -57492,20 +58830,7 @@ impl App {
     /// Gates format-on-save so a file whose server advertises no formatter is
     /// saved directly rather than waiting on a reply that never mutates it.
     fn editor_language_supports_formatting(&self) -> bool {
-        let Some(lang) = self
-            .editor
-            .path
-            .as_deref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
-        else {
-            return false;
-        };
-        self.lsp
-            .as_ref()
-            .and_then(|lsp| lsp.language_supports_formatting(lang))
-            .unwrap_or(false)
+        self.editor_language_supports(crate::lsp::LspManager::language_supports_formatting)
     }
 
     /// Whether `Cmd+S` should format before writing: the pref is on, a
@@ -57585,6 +58910,18 @@ impl App {
             changed |= self.sweep_auto_save(true);
         }
         changed
+    }
+
+    /// The terminal window croft runs in lost focus (#1622): alt-tab to the
+    /// browser, another tmux window. With auto save "onWindowChange" (or
+    /// `onFocusChange`) every dirty buffer is written now, the one being
+    /// edited included, since the whole window is what lost focus; VS Code
+    /// does the same. Returns true when anything changed on screen.
+    pub fn on_window_focus_lost(&mut self) -> bool {
+        if !self.auto_save_on_focus_change {
+            return false;
+        }
+        self.sweep_dirty_buffers(false, false)
     }
 
     /// Sample the current focus (pane, active tab, active path) and report
@@ -57938,6 +59275,8 @@ impl App {
             .map(|&cmd| {
                 let shown = match self.keymap.chord_for(cmd) {
                     Some(user) => format!("{user}  (yours)"),
+                    // Its built-in chord now runs another command (#1482).
+                    None if self.keymap.shadows_builtin(cmd) => String::from("\u{2014}"),
                     None if !cmd.keybinding_hint().is_empty() => {
                         crate::widgets::command_palette::platform_hint(cmd.keybinding_hint())
                             .into_owned()
@@ -57971,8 +59310,43 @@ impl App {
             );
             return;
         }
+        // The command the chord runs now: a user binding, else a built-in
+        // shortcut no user binding has taken (#1482). Taking it from that
+        // command waits for Enter, so a slip of the finger cannot silently
+        // cost a shortcut like Toggle Line Comment's.
+        let chord = crate::keymap::Chord::from_event(key);
+        // A built-in chord can be shared (F7 is both Merge: Next Conflict
+        // and Go to Next Change), and a user binding takes it from all of
+        // them, so every other owner is named.
+        let owners: Vec<_> = match self.keymap.command_for(key) {
+            Some(bound) => vec![bound],
+            None => crate::keymap::builtin_commands_on(chord),
+        }
+        .into_iter()
+        .filter(|c| *c != cmd)
+        .collect();
+        if !owners.is_empty() {
+            self.status = format!(
+                "{} is {}'s shortcut: Enter to give it to \u{201c}{}\u{201d}, Esc to cancel",
+                chord.to_config_string(),
+                quoted_titles(&owners),
+                cmd.title()
+            );
+            self.confirming_shortcut = Some((cmd, key, owners));
+            return;
+        }
+        self.write_shortcut(cmd, key, &[]);
+    }
+
+    /// Write `key` as `cmd`'s shortcut in keybindings.json (#612) and
+    /// reload; `previous` are the other commands the chord ran until now.
+    fn write_shortcut(
+        &mut self,
+        cmd: crate::widgets::command_palette::Command,
+        key: KeyEvent,
+        previous: &[crate::widgets::command_palette::Command],
+    ) {
         let chord = crate::keymap::Chord::from_event(key).to_config_string();
-        let previous = self.keymap.command_for(key).filter(|c| *c != cmd);
         let path = self.keybindings_file.clone();
         // Only a missing file starts fresh: one that exists but cannot be
         // read would otherwise be overwritten with this single binding.
@@ -58000,13 +59374,14 @@ impl App {
         }
         let (map, _) = crate::keymap::Keymap::load_with_warnings(&path);
         self.keymap = map;
-        self.status = match previous {
-            Some(p) => format!(
-                "{chord} now runs \u{201c}{}\u{201d} (it ran \u{201c}{}\u{201d})",
+        self.status = if previous.is_empty() {
+            format!("{chord} now runs \u{201c}{}\u{201d}", cmd.title())
+        } else {
+            format!(
+                "{chord} now runs \u{201c}{}\u{201d} (it ran {})",
                 cmd.title(),
-                p.title()
-            ),
-            None => format!("{chord} now runs \u{201c}{}\u{201d}", cmd.title()),
+                quoted_titles(previous)
+            )
         };
     }
 
@@ -58306,10 +59681,14 @@ impl App {
                     counts.join(", ")
                 };
                 let item = self.problems.top_diagnostic().map(|(group, it)| {
-                    let source = if it.source.is_empty() {
+                    let source = match &it.code {
+                        Some(code) => code.label(&it.source),
+                        None => it.source.clone(),
+                    };
+                    let source = if source.is_empty() {
                         String::new()
                     } else {
-                        format!(" ({})", it.source)
+                        format!(" ({source})")
                     };
                     format!(
                         "{} line {}: {}{source}",
@@ -59460,8 +60839,15 @@ impl App {
             return;
         }
         // Format-on-save: defer the write until the format reply arrives, then
-        // `drain_lsp_format` calls `complete_pending_save`.
-        if self.format_on_save_eligible(self.editor_language_supports_formatting()) {
+        // `drain_lsp_format` (or `drain_prettier_format`) calls
+        // `complete_pending_save`.
+        let prettier = self
+            .editor
+            .path
+            .as_deref()
+            .and_then(crate::prettier::for_file)
+            .is_some();
+        if self.format_on_save_eligible(prettier || self.editor_language_supports_formatting()) {
             self.arm_deferred_save();
             self.start_format_document();
             return;
@@ -59624,7 +61010,8 @@ impl App {
 
     /// Re-run the layered settings merge (#251) and apply everything that can
     /// apply live: theme, editor toggles, save behavior, host accents. Called
-    /// when any file of the chain is saved in the editor; layout and other
+    /// when any file of the chain is saved in the editor or changes on disk
+    /// outside croft (#1435); layout and other
     /// startup-read settings still say "next launch".
     fn remerge_settings(&mut self) {
         let merged = crate::config_layers::load_merged(Some(self.roots.primary()));
@@ -59632,6 +61019,10 @@ impl App {
             crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
         }
         self.settings_chain = merged.chain;
+        // The chain follows the primary root and the `extends` targets, so
+        // the watch follows the chain (#1435).
+        self.config_watch
+            .set_paths(config_watch_paths(&self.settings_chain));
         self.settings_provenance = merged.provenance;
         self.apply_merged_settings(&merged.prefs);
         self.status = if merged.warnings.is_empty() {
@@ -59741,6 +61132,8 @@ impl App {
         self.whitespace_mode =
             crate::widgets::editor::WhitespaceMode::from_pref(&p.render_whitespace);
         self.editor.whitespace_mode = self.whitespace_mode;
+        self.word_suggestions =
+            crate::word_suggest::WordSuggestions::from_pref(&p.word_based_suggestions);
         if !p.disable_inlay_hints && !self.inlay_hints_enabled {
             self.inlay_hints_enabled = true;
             self.request_inlay_hints_for_open_editors();
@@ -60170,7 +61563,8 @@ impl App {
             x = main.x.saturating_sub(width);
         }
         // Align the submenu's top border so its first row sits on the parent row.
-        let y = (main.y + 1 + parent as u16).saturating_sub(1);
+        let shown = parent.saturating_sub(menu.scroll.get());
+        let y = (main.y + 1 + shown as u16).saturating_sub(1);
         let y = if area.height > 0 {
             y.min(area.height.saturating_sub(height))
         } else {
@@ -60193,7 +61587,8 @@ impl App {
         // Items live inside the 1-cell border.
         let inner_y = y.checked_sub(r.y + 1)?;
         let menu = self.context_menu.as_ref()?;
-        let idx = inner_y as usize;
+        let top = menu.scroll_for(r.height.saturating_sub(2) as usize);
+        let idx = top + inner_y as usize;
         (idx < menu.items.len()).then_some(idx)
     }
 
@@ -60234,6 +61629,26 @@ impl App {
             KeyCode::Down => {
                 if let Some(menu) = self.context_menu.as_mut() {
                     menu.move_cursor(true);
+                }
+            }
+            KeyCode::Left | KeyCode::Right
+                if self
+                    .context_menu
+                    .as_ref()
+                    .is_some_and(|m| m.crumb.is_some() && m.open_submenu.is_none()) =>
+            {
+                // A breadcrumb picker steps to the neighbouring crumb's
+                // (#1608), VS Code's Left / Right in the focused bar.
+                let Some(i) = self.context_menu.as_ref().and_then(|m| m.crumb) else {
+                    return;
+                };
+                let next = if key.code == KeyCode::Left {
+                    i.checked_sub(1)
+                } else {
+                    Some(i + 1).filter(|&n| n < self.editor.breadcrumbs.len())
+                };
+                if let Some(n) = next {
+                    self.open_breadcrumb_picker(n);
                 }
             }
             KeyCode::Left => {
@@ -61052,6 +62467,10 @@ impl App {
                 self.focus_pane(Pane::Editor);
                 self.request_references_at_cursor();
             }
+            MenuAction::OpenCrumbFile(path) => self.open_crumb_file(&path),
+            MenuAction::BrowseCrumbFolder { dir, crumb } => {
+                self.open_crumb_folder_picker(&dir, crumb, None);
+            }
             MenuAction::GoToLocation { path, line, col } => {
                 self.go_to_definition(path, line, col);
             }
@@ -61156,6 +62575,8 @@ impl App {
             MenuAction::ToggleBroadcastInput => self.toggle_broadcast_input(),
             MenuAction::ToggleBroadcastExclusion => self.toggle_broadcast_exclusion(),
             MenuAction::UndoCloseTerminal => self.undo_close_terminal(),
+            MenuAction::SplitTerminal => self.split_terminal_reporting(),
+            MenuAction::KillTerminal(idx) => self.close_terminal_reporting(idx),
             MenuAction::CopyCommandOutput(idx, d) => self.copy_command_output(idx, d),
             MenuAction::SelectCommandOutput(idx, d) => self.select_command_output(idx, d),
             MenuAction::RerunCommand(idx, d) => self.rerun_command(idx, d),
@@ -63246,6 +64667,8 @@ impl App {
     /// to fit, so opening at the bottom status row renders above the bar.
     fn open_status_menu(&mut self, col: u16, row: u16, items: Vec<MenuEntry>) {
         self.context_menu = Some(ContextMenu {
+            crumb: None,
+            scroll: Default::default(),
             origin: (col, row),
             items,
             selected: 0,
@@ -63395,6 +64818,8 @@ impl App {
             },
         ];
         self.context_menu = Some(ContextMenu {
+            crumb: None,
+            scroll: Default::default(),
             origin: (col, row),
             items,
             selected: 0,
@@ -64740,17 +66165,20 @@ impl App {
     /// instead of replacing the list the user is working through.
     fn open_selected_sarif_result(&mut self) {
         use crate::sarif::region::ColumnKind;
-        let Some(crate::sarif::view::SelectedPlace {
-            path,
-            line,
-            column,
-            kind,
-            uri,
-            region: place,
-            embedded,
-            remote,
-            ..
-        }) = self.sarif_selected_place()
+        let Some((
+            crate::sarif::view::SelectedPlace {
+                path,
+                line,
+                column,
+                kind,
+                uri,
+                region: place,
+                embedded,
+                remote,
+                ..
+            },
+            archived,
+        )) = self.sarif_selected_place_and_origin()
         else {
             self.status = String::from("This result has no location to open");
             return;
@@ -64760,10 +66188,22 @@ impl App {
         let path = match (path, embedded) {
             (Some(p), _) => Some(p),
             (None, Some(contents)) => {
-                if let Err(e) =
-                    self.open_sarif_embedded(&uri, &contents, line as usize, column as usize)
-                {
-                    self.status = format!("Could not open the log's copy of {uri}: {e}");
+                // The copy has no buffer yet to convert in, so UTF-16
+                // columns are turned into characters against its own line.
+                let column = match (&contents, kind) {
+                    (crate::sarif::resolve::Embedded::Text(t), ColumnKind::Utf16CodeUnits) => {
+                        utf16_col_to_char_in(t.lines().nth(line as usize).unwrap_or(""), column)
+                    }
+                    _ => column as usize,
+                };
+                match self.open_sarif_embedded(&uri, &contents, line as usize, column) {
+                    Err(e) => self.status = format!("Could not open the log's copy of {uri}: {e}"),
+                    Ok(()) if archived => {
+                        self.status = format!(
+                            "Opened {uri} from the CodeQL database's source archive (read-only)"
+                        );
+                    }
+                    Ok(()) => {}
                 }
                 return;
             }
@@ -64915,17 +66355,57 @@ impl App {
 
     /// Where the selected SARIF result points, looked up in the workspace,
     /// the learned prefixes, the open files and the log's folder.
-    fn sarif_selected_place(&self) -> Option<crate::sarif::view::SelectedPlace> {
+    /// Also whether its file was read from the source archive of the
+    /// CodeQL database the log came from (#1369).
+    fn sarif_selected_place_and_origin(&self) -> Option<(crate::sarif::view::SelectedPlace, bool)> {
+        let view = self.editor.sarif.as_ref()?;
+        // A CodeQL run's SARIF says `%SRCROOT%` and leaves its meaning to
+        // the database (#1369): the folder it was created from.
+        let database = self.sarif_codeql_database();
+        let mut base_overrides = std::collections::BTreeMap::new();
+        if let Some(prefix) = database
+            .as_deref()
+            .and_then(crate::codeql_db::source_location_prefix)
+            .filter(|p| p.is_dir())
+        {
+            base_overrides.insert(String::from("%SRCROOT%"), prefix);
+        }
         let resolver = crate::sarif::resolve::Resolver {
             roots: vec![self.workspace_root().to_path_buf()],
+            base_overrides,
             learned: crate::sarif::resolve::saved_prefixes(self.workspace_root()),
             open: self.open_file_paths(),
             ..Default::default()
         };
-        self.editor
-            .sarif
-            .as_ref()?
-            .selected_place(resolver, &|p| p.is_file())
+        let mut place = view.selected_place(resolver, &|p| p.is_file())?;
+        // Not on this machine: the database keeps a copy of its source.
+        if place.path.is_none()
+            && place.embedded.is_none()
+            && let Some(text) = database
+                .as_deref()
+                .and_then(|db| crate::codeql_db::archived_source(db, &place.uri))
+        {
+            place.embedded = Some(crate::sarif::resolve::Embedded::Text(text));
+            return Some((place, true));
+        }
+        Some((place, false))
+    }
+
+    /// The CodeQL database whose query run wrote the SARIF log in the
+    /// editor, when it is one (#1369).
+    /// The log is the one holding the selected result, which may be a log
+    /// added to the viewer rather than the tab's own.
+    fn sarif_codeql_database(&self) -> Option<PathBuf> {
+        let view = self.editor.sarif.as_ref()?;
+        let log = &view.logs.get(view.selected_entry()?.log)?.path;
+        let history = crate::codeql_query::History::load(&Self::codeql_history_path());
+        let entry = history.entries.iter().find(|e| {
+            e.output == *log
+                || e.output
+                    .canonicalize()
+                    .is_ok_and(|o| log.canonicalize().is_ok_and(|l| l == o))
+        })?;
+        Self::codeql_run_database(entry)
     }
 
     /// `path`'s text as the editor has it when it is open (it may be
@@ -64953,11 +66433,15 @@ impl App {
             target: 0,
             lines: Vec::new(),
         };
-        let preview = match self.sarif_selected_place() {
+        let preview = match self.sarif_selected_place_and_origin() {
             None => empty(String::from("This result has no location to preview.")),
-            Some(p) => {
+            Some((p, archived)) => {
                 let (title, text) = match (&p.path, &p.embedded) {
                     (Some(path), _) => (path.display().to_string(), self.sarif_file_text(path)),
+                    (None, Some(Embedded::Text(t))) if archived => (
+                        format!("{} (the database's source archive)", p.uri),
+                        Some(t.clone()),
+                    ),
                     (None, Some(Embedded::Text(t))) => {
                         (format!("{} (the log's copy)", p.uri), Some(t.clone()))
                     }
@@ -66731,8 +68215,10 @@ impl App {
             self.status = String::from("Explorer clipboard is empty");
             return;
         };
-        self.move_or_copy_in_explorer(&dest_dir, &clip.paths, clip.mode);
-        if matches!(clip.mode, ExplorerClipMode::Cut) {
+        let moved = self.move_or_copy_in_explorer(&dest_dir, &clip.paths, clip.mode);
+        // A cut pasted back where it already is moved nothing, so it stays
+        // on the clipboard for the paste into the folder it was meant for.
+        if moved && matches!(clip.mode, ExplorerClipMode::Cut) {
             self.tree_clipboard = None;
         }
     }
@@ -66745,10 +68231,22 @@ impl App {
         dest_dir: &Path,
         paths: &[PathBuf],
         mode: ExplorerClipMode,
-    ) {
+    ) -> bool {
         if matches!(mode, ExplorerClipMode::Copy) {
             let _ = self.apply_paste_or_drop(dest_dir, paths, mode);
-            return;
+            return true;
+        }
+        // An item already in `dest_dir` stays as it is: moving it there is
+        // no move, and a fresh name for it renamed the file to "<name> copy"
+        // on disk, retargeting its tabs and the servers' imports (#1174).
+        let paths: Vec<PathBuf> = paths
+            .iter()
+            .filter(|p| !crate::widgets::file_tree::is_directly_in(dest_dir, p))
+            .cloned()
+            .collect();
+        if paths.is_empty() {
+            self.status = String::from("Already in this folder: nothing to move");
+            return false;
         }
         let renames = paths
             .iter()
@@ -66760,9 +68258,10 @@ impl App {
             .collect();
         let op = FileMove::Paste {
             dest_dir: dest_dir.to_path_buf(),
-            paths: paths.to_vec(),
+            paths,
         };
         self.start_file_move(op, renames);
+        true
     }
 
     /// Ask the servers about `renames`, then run `op` once they answer (or
@@ -67392,6 +68891,10 @@ fn takeover_mode_seq() -> Vec<u8> {
         EnterAlternateScreen,
         EnableMouseCapture,
         EnableBracketedPaste,
+        // Focus in/out reports (#1622): auto save "onWindowChange" saves
+        // when the croft window loses focus, which croft only learns from
+        // the terminal.
+        EnableFocusChange,
         crossterm::cursor::SetCursorStyle::SteadyBar,
     );
     seq
@@ -67415,25 +68918,31 @@ fn mode_reassert_seq() -> Vec<u8> {
     seq
 }
 
-/// Shrink `s` to at most `max` chars by cutting the middle, keeping roughly
-/// a third of the head and two thirds of the tail — for path-shaped
-/// messages the tail carries the filename, the part worth keeping. Never
-/// appends a trailing ellipsis (the cut is interior by construction).
+/// Shrink `s` to at most `max` terminal cells by cutting the middle,
+/// keeping roughly a third of the head and two thirds of the tail — for
+/// path-shaped messages the tail carries the filename, the part worth
+/// keeping. Never appends a trailing ellipsis (the cut is interior by
+/// construction). Measured in cells, not chars, so a CJK name is not
+/// overdrawn by the status bar's right cluster.
 fn elide_middle(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if s.width() <= max {
         return s.to_string();
     }
     if max < 3 {
-        return chars.iter().take(max).collect();
+        let mut out = String::new();
+        let mut used = 0;
+        for c in s.chars() {
+            let w = c.width().unwrap_or(0);
+            if used + w > max {
+                break;
+            }
+            used += w;
+            out.push(c);
+        }
+        return out;
     }
-    let keep = max - 1; // one cell for the ellipsis
-    let head = keep / 3;
-    let tail = keep - head;
-    let mut out: String = chars[..head].iter().collect();
-    out.push('\u{2026}');
-    out.extend(&chars[chars.len() - tail..]);
-    out
+    crate::widgets::process_picker::elide_middle_cols(s, max)
 }
 
 /// The excerpt window for a Peek popup: up to `total` lines, at most
@@ -67716,8 +69225,10 @@ fn build_title(workspace: &std::path::Path) -> String {
 
 /// Returns true if the given key event should copy the terminal pane's
 /// current selection to the clipboard.  Recognises:
-///   * `Ctrl+Shift+C` — universal Linux terminal copy convention; doesn't
-///     collide with `Ctrl+C` (SIGINT).
+///   * `Ctrl+Shift+C` — doesn't collide with `Ctrl+C` (SIGINT). It is also
+///     the host terminal's own Copy in GNOME Terminal and Konsole, which
+///     keep it, and without the kitty protocol it arrives as `Ctrl+C`; the
+///     pane menu's Copy and "Copy on Selection" reach croft there (#1598).
 ///   * `Cmd+C`        — for terminals that deliver Super via the kitty
 ///     keyboard protocol.
 fn is_terminal_copy_key(key: KeyEvent) -> bool {
@@ -67904,6 +69415,19 @@ fn is_toggle_block_comment_key(key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+/// `Alt+O`: C/C++: Switch Header/Source (#1360), the clangd extension's
+/// chord in VS Code. Rejects Shift and the other modifiers.
+fn is_switch_header_source_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    c.eq_ignore_ascii_case(&'o')
+        && key.modifiers.contains(KeyModifiers::ALT)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+        && !key.modifiers.contains(KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
 /// `Alt+Z`: View: Toggle Word Wrap (the VS Code default). Rejects Shift and
 /// the command modifier. Also reachable from the Command Palette.
 fn is_toggle_wrap_key(key: KeyEvent) -> bool {
@@ -67941,6 +69465,15 @@ fn is_tree_zoxide_jump_key(key: KeyEvent) -> bool {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// What Problems: Check Whole Project runs (#256, #1291).
+enum ProjectCheck {
+    /// Each `(program, args)` in turn, with their output merged.
+    Run(Vec<(std::ffi::OsString, Vec<String>)>),
+    /// The root tsconfig names no files and no references: tsc would
+    /// compile nothing and exit clean.
+    Empty,
 }
 
 /// The text terminal find searches: one string per logical line (#1275).
@@ -68122,6 +69655,48 @@ fn is_show_output_key(key: KeyEvent) -> bool {
 /// dispatcher checks that before this.
 fn is_replace_in_files_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'h')
+}
+
+/// The lines the find bar searches, the buffer row the first of them is,
+/// and the part of them it searches: with Find in Selection the whole rows
+/// the `range` spans and the range relative to them (#1577), so matches
+/// are found on the real lines and kept when wholly inside; else a symbol
+/// tab's symbol (#369) or the whole buffer.
+fn editor_find_lines(
+    editor: &crate::widgets::editor::Editor,
+    range: Option<crate::widgets::editor_find::FindRange>,
+) -> (
+    &[String],
+    usize,
+    Option<crate::widgets::editor_find::FindRange>,
+) {
+    if let Some(range) = range {
+        let ((r0, c0), (r1, c1)) = crate::widgets::editor_find::clamp_range(&editor.lines, range);
+        let lines = editor.lines.get(r0..=r1).unwrap_or(&[]);
+        return (lines, r0, Some(((0, c0), (r1 - r0, c1))));
+    }
+    let (scope, first) = editor.find_scope();
+    (scope, first, None)
+}
+
+/// Buffer position `(row, col)` as a position in the lines
+/// [`editor_find_lines`] returned. Outside a selected `window` it goes to
+/// the window's nearer edge, so the next match from a caret above the
+/// selection is its first, and from below it wraps to it.
+fn editor_find_scope_pos(
+    scope: &[String],
+    first: usize,
+    window: Option<crate::widgets::editor_find::FindRange>,
+    (row, col): (usize, usize),
+) -> Option<(usize, usize)> {
+    let last = scope.len().checked_sub(1)?;
+    let Some((start, end)) = window else {
+        return Some((row.saturating_sub(first).min(last), col));
+    };
+    let Some(r) = row.checked_sub(first) else {
+        return Some(start);
+    };
+    Some((r, col).clamp(start, end))
 }
 
 /// `Alt+C` / `Alt+W` / `Alt+R` while a Search side bar input has focus: the
@@ -68866,6 +70441,39 @@ fn breadcrumb_symbol_chain(
     hits
 }
 
+/// VS Code "Focus and Select Breadcrumbs": `Cmd+Shift+.` / `Ctrl+Shift+.`
+/// (#1608). A terminal that applies the shift itself sends `>`.
+fn is_focus_breadcrumbs_key(key: KeyEvent) -> bool {
+    let shifted = match key.code {
+        KeyCode::Char('.') => key.modifiers.contains(KeyModifiers::SHIFT),
+        KeyCode::Char('>') => true,
+        _ => false,
+    };
+    shifted
+        && (key.modifiers.contains(KeyModifiers::SUPER)
+            || key.modifiers.contains(KeyModifiers::CONTROL))
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+/// The symbols at `i`'s level under its parent, `i` among them, in outline
+/// order (#1608): the outline is a pre-order walk, so they are the symbols
+/// of `i`'s depth between the parent and the next symbol shallower than `i`.
+fn sibling_symbols(symbols: &[crate::lsp::manager::OutlineSymbol], i: usize) -> Vec<usize> {
+    let Some(depth) = symbols.get(i).map(|s| s.depth) else {
+        return Vec::new();
+    };
+    let start = (0..i)
+        .rev()
+        .find(|&k| symbols[k].depth < depth)
+        .map_or(0, |parent| parent + 1);
+    let end = (i + 1..symbols.len())
+        .find(|&k| symbols[k].depth < depth)
+        .unwrap_or(symbols.len());
+    (start..end)
+        .filter(|&k| symbols[k].depth == depth)
+        .collect()
+}
+
 /// VS Code "Quick Fix": `Cmd+.` on macOS (delivered as `Char('.')` + SUPER by
 /// the iTerm2 / Ghostty CSI-u forwarder) and `Ctrl+.` on Linux / Termux. Plain
 /// `.`, `Shift+.` ('>'), and `Alt+.` (the shell's last-argument) are excluded.
@@ -68992,6 +70600,77 @@ fn is_delete_node_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Delete | KeyCode::Backspace)
 }
 
+/// The suite that is the file `path` for `runner` (#1535: Run Tests in
+/// Current File), in the runner's own naming: pytest takes the file's path
+/// as a node-ID prefix; cargo a source file's module path (`src/a/b.rs` and
+/// `src/a/b/mod.rs` are `a::b`); go the
+/// file's package directory; CodeQL the test file itself. `None` for a file
+/// the runner cannot select alone: a cargo crate root (its tests carry no
+/// module prefix to filter on), a binary under `src/bin` or an integration
+/// test (each its own test binary, which the name filter cannot pick), any
+/// jest or vitest file
+/// (their suites are describe titles, not files), and a file outside `root`.
+fn file_test_suite(
+    runner: crate::testing::worker::Runner,
+    root: &Path,
+    path: &Path,
+) -> Option<String> {
+    use crate::testing::worker::Runner;
+    let rel = path.strip_prefix(root).ok()?;
+    let rel_str = rel.to_str()?.replace('\\', "/");
+    match runner {
+        Runner::Pytest | Runner::Codeql => Some(rel_str),
+        Runner::Go => {
+            let dir = rel.parent().and_then(Path::to_str).unwrap_or("");
+            Some(if dir.is_empty() {
+                String::from(".")
+            } else {
+                format!("./{}", dir.replace('\\', "/"))
+            })
+        }
+        Runner::Cargo => {
+            // Relative to the package the file belongs to: in a workspace,
+            // `crates/foo/src/parse.rs` is module `parse`.
+            let in_package = cargo_package_relative(root, path)?;
+            let in_src = in_package.strip_prefix("src/")?.strip_suffix(".rs")?;
+            let module = in_src.strip_suffix("/mod").unwrap_or(in_src);
+            // A crate root's tests have no module prefix to filter on: a
+            // `tests::` filter is a substring, and would sweep every
+            // module's `tests` too.
+            match module {
+                "main" | "lib" => None,
+                _ if module.starts_with("bin/") => None,
+                _ => Some(module.replace('/', "::")),
+            }
+        }
+        Runner::Vitest | Runner::Jest => None,
+    }
+}
+
+/// `path` relative to the nearest package directory above it, up to
+/// `root`: the closest ancestor holding a `Cargo.toml` with the file under
+/// its `src/`, or `root` itself.
+fn cargo_package_relative(root: &Path, path: &Path) -> Option<String> {
+    let rel_to = |dir: &Path| {
+        path.strip_prefix(dir)
+            .ok()
+            .and_then(Path::to_str)
+            .map(|s| s.replace('\\', "/"))
+    };
+    for dir in path.ancestors().skip(1) {
+        if dir == root || !dir.starts_with(root) {
+            break;
+        }
+        if let Some(rel) = rel_to(dir)
+            && rel.starts_with("src/")
+            && dir.join("Cargo.toml").is_file()
+        {
+            return Some(rel);
+        }
+    }
+    rel_to(root)
+}
+
 /// Returns true if the given key event should trigger "Save".
 /// Recognises Ctrl+S (cross-platform) and Cmd/Super+S (macOS-style).
 /// Case-insensitive on the letter so Shift+Ctrl+S also works.
@@ -69069,6 +70748,17 @@ const SETTINGS_LAYER_TEMPLATE: &str = r#"{
   // blocks). Workspace files may set appearance and editor/terminal
   // behavior keys only; trust-related settings are user-config only and
   // warn in OUTPUT · Settings.
+}
+"#;
+
+/// What Open Settings (JSON) creates when there is no `config.json` yet: an
+/// object with no keys, like VS Code's settings.json. Seeding every default
+/// made each one a user setting, over an `extends` base and over defaults a
+/// later release changes (#1617).
+const SETTINGS_TEMPLATE: &str = r#"{
+  // Your croft settings: add only the keys you want to change, and every
+  // other setting keeps its default. docs/SETTINGS.md lists the keys and
+  // explains "extends" and platform blocks.
 }
 "#;
 
@@ -69189,6 +70879,19 @@ fn gesture_for(
         _ => return None,
     };
     Some(Gesture { kind, mods })
+}
+
+/// Command titles in curly quotes, joined for a status line (#1482):
+/// `“A”, “B” and “C”`.
+fn quoted_titles(cmds: &[crate::widgets::command_palette::Command]) -> String {
+    let quoted: Vec<String> = cmds
+        .iter()
+        .map(|c| format!("\u{201c}{}\u{201d}", c.title()))
+        .collect();
+    match quoted.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => quoted.concat(),
+    }
 }
 
 /// A chord eligible for a user rebind: it carries a real modifier
@@ -71028,6 +72731,15 @@ fn view_status(view_bind_error: Option<&str>) -> String {
     }
 }
 
+/// What the startup status says when the agent hook socket could not be
+/// bound (#1368), so a hook that is never answered is not a mystery.
+/// `None` when another croft already serves this workspace: that one
+/// answers its agents, by design.
+fn hook_bind_status(e: &std::io::Error) -> Option<String> {
+    (e.kind() != std::io::ErrorKind::AddrInUse)
+        .then(|| format!("Agent edit approvals are unavailable: {e}"))
+}
+
 /// Remove `view-<pid>-<nonce>.sock` files whose croft is gone (#362).
 ///
 /// A Unix socket is not auto-unlinked, so every croft that dies leaves its
@@ -71366,6 +73078,18 @@ pub(crate) fn user_data_dir(cache: &Path, state: &Path) -> PathBuf {
         p.extension().is_some_and(|x| x == "lock")
     });
     state.to_path_buf()
+}
+
+/// The character index in `line` at which `units` UTF-16 code units have
+/// passed; past the end it is the line's length.
+fn utf16_col_to_char_in(line: &str, units: i64) -> usize {
+    let mut seen = 0i64;
+    line.chars()
+        .take_while(|c| {
+            seen += c.len_utf16() as i64;
+            seen <= units
+        })
+        .count()
 }
 
 pub(crate) fn croft_cache_dir() -> PathBuf {
@@ -72347,6 +74071,7 @@ pub fn run(
         LeaveAlternateScreen,
         DisableMouseCapture,
         DisableBracketedPaste,
+        DisableFocusChange,
     )
     .ok();
     terminal.show_cursor().ok();
@@ -72442,15 +74167,15 @@ fn restore_host_terminal_state() {
 
 // Disable every mouse-tracking mode crossterm knows about (1000/1002/1003
 // normal+button+any-motion, 1015/1006 urxvt+SGR encodings), bracketed
-// paste (2004), exit any leftover alt-screen (1049l), reset the cursor
-// style, and reset the host's default fg/bg (OSC 110/111, undoing the
-// theme's dynamic colors). Written as raw bytes because the callers that
+// paste (2004) and focus reports (1004), exit any leftover alt-screen
+// (1049l), reset the cursor style, and reset the host's default fg/bg
+// (OSC 110/111, undoing the theme's dynamic colors). Written as raw bytes because the callers that
 // need it (the panic hook, the post-remote-ssh restore) no longer hold a
 // crossterm Backend handle for `execute!`. Both callers are done with the
 // tty (a return from remote re-enters `run`, which re-applies the theme's
 // host colors), so the color reset can't strand a live session.
 const TERMINAL_RESTORE_SEQ: &[u8] =
-    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1049l\x1b[ q\x1b]110\x07\x1b]111\x07";
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[ q\x1b]110\x07\x1b]111\x07";
 
 fn install_terminal_restore_panic_hook() {
     static HOOK: std::sync::Once = std::sync::Once::new();
@@ -72529,6 +74254,7 @@ fn run_pending_scp_uploads(app: &mut App, terminal: &mut CroftTerminal) -> Resul
         LeaveAlternateScreen,
         DisableMouseCapture,
         DisableBracketedPaste,
+        DisableFocusChange,
         crossterm::cursor::SetCursorStyle::DefaultUserShape,
     )
     .ok();
@@ -72964,7 +74690,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let prepare_rename_changed = app.drain_lsp_prepare_rename();
         let occurrences_changed = app.drain_lsp_document_highlights();
         let rename_changed = app.drain_lsp_rename() | app.tick_file_moves();
-        let format_changed = app.drain_lsp_format();
+        let format_changed = app.drain_lsp_format() | app.drain_prettier_format();
         let code_action_changed = app.drain_lsp_code_actions();
         let semantic_changed = app.drain_lsp_semantic_tokens();
         let inlay_changed = app.drain_lsp_inlay_hints();
@@ -73369,6 +75095,9 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                     }
                     Event::Mouse(m) => app.handle_mouse(m),
                     Event::Paste(s) => app.handle_paste(&s),
+                    Event::FocusLost => {
+                        app.on_window_focus_lost();
+                    }
                     Event::Resize(_, _) => {
                         // Alt-screen reflow blanks the activity bar's SGR cells
                         // but iTerm2's OSC-1337 image layer survives, so a plain
