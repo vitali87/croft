@@ -712,6 +712,30 @@ impl Theme {
         (0xf8, 0x51, 0x49)
     }
 
+    /// Explorer name and badge colour for a changed path (#1513): VS Code's
+    /// `gitDecoration.*ResourceForeground` defaults, the dark-theme set on
+    /// dark backgrounds and the light-theme set on light ones.
+    pub fn git_decoration_fg(self, dec: crate::git::GitDecoration) -> Color {
+        use crate::git::GitDecoration as D;
+        let (r, g, b) = if self.is_light() {
+            match dec {
+                D::Modified => (0x89, 0x55, 0x03),
+                D::Untracked | D::Renamed => (0x00, 0x71, 0x00),
+                D::Added => (0x58, 0x7c, 0x0c),
+                D::Deleted | D::Conflicted => (0xad, 0x07, 0x07),
+            }
+        } else {
+            match dec {
+                D::Modified => (0xe2, 0xc0, 0x8d),
+                D::Untracked | D::Renamed => (0x73, 0xc9, 0x91),
+                D::Added => (0x81, 0xb8, 0x8b),
+                D::Deleted => (0xc7, 0x4e, 0x39),
+                D::Conflicted => (0xe4, 0x67, 0x6b),
+            }
+        };
+        Color::Rgb(r, g, b)
+    }
+
     /// Explorer name foreground for a git-ignored file or directory (VS Code
     /// `gitDecoration.ignoredResourceForeground`, #8C8C8C on dark themes).
     /// White at 55% over the theme background lands exactly on that grey for

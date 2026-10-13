@@ -8209,13 +8209,22 @@ impl App {
             // is exact. Single-root keeps the Arc clone (no set copy).
             if self.git_extra.is_empty() {
                 self.tree.ignored = self.git.status().ignored.clone();
+                self.tree.git_decorations = self.git.status().decorations.clone();
             } else {
                 let mut union: std::collections::HashSet<PathBuf> =
                     self.git.status().ignored.as_ref().clone();
+                let mut decorations = self.git.status().decorations.as_ref().clone();
                 for (_, w) in &self.git_extra {
                     union.extend(w.status().ignored.iter().cloned());
+                    // Roots can nest (a repo folder inside another root's
+                    // tree), so a shared path keeps its strongest status.
+                    for (path, &dec) in w.status().decorations.iter() {
+                        let slot = decorations.entry(path.clone()).or_insert(dec);
+                        *slot = (*slot).max(dec);
+                    }
                 }
                 self.tree.ignored = std::sync::Arc::new(union);
+                self.tree.git_decorations = std::sync::Arc::new(decorations);
             }
         }
         // A completed status refresh means HEAD or the index may have moved:

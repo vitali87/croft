@@ -38,6 +38,11 @@ pub struct FileTree {
     /// in the set — or under a dir in the set — render their name in the
     /// theme's dimmed foreground, VS Code's ignored-resource decoration.
     pub ignored: Arc<HashSet<PathBuf>>,
+    /// Git status decorations (#1513), fed from the same status refresh as
+    /// `ignored`: each changed file and each folder above one, absolute,
+    /// with the status it wears. Rows colour their name by it and show its
+    /// letter (files) or a dot (folders) at the right edge, as VS Code does.
+    pub git_decorations: Arc<HashMap<PathBuf, crate::git::GitDecoration>>,
     /// While the history scrubber sits on a commit (#371): the directory
     /// the listing covers and every path in that commit's tree under it,
     /// absolute, folders included. A row under that directory and absent
@@ -127,6 +132,7 @@ impl FileTree {
             focus_gradient: false,
             theme: crate::theme::Theme::default(),
             ignored: Arc::default(),
+            git_decorations: Arc::default(),
             scrub_tree: None,
             agent_touched: Arc::default(),
             exclude: Default::default(),
@@ -170,6 +176,7 @@ impl FileTree {
         // The old workspace's ignore set is meaningless under the new root;
         // the git worker re-queries after its SetRoot and repopulates.
         self.ignored = Arc::default();
+        self.git_decorations = Arc::default();
         self.scrub_tree = None;
         // Same reasoning for the lane badges (#348): keyed by absolute root
         // path, so a re-root would otherwise carry the old roots' entries
@@ -262,6 +269,29 @@ impl FileTree {
     /// ancestor walk and the guards that protect root rows stop here.
     fn is_root_path(&self, path: &Path) -> bool {
         self.root_paths().any(|r| r == path)
+    }
+
+    /// The git decoration `path`'s row wears (#1513). None on a workspace
+    /// root row, and none while the history scrubber shows a commit: the
+    /// working tree's changes are not that commit's.
+    pub fn git_decoration(&self, path: &Path) -> Option<crate::git::GitDecoration> {
+        if self.scrub_tree.is_some() || self.is_root_path(path) {
+            return None;
+        }
+        self.git_decorations.get(path).copied()
+    }
+
+    /// A row's name colour: dimmed when git ignores it (or it is absent at
+    /// the scrubbed commit), its git decoration's colour when it changed,
+    /// the plain foreground otherwise.
+    fn name_fg(&self, path: &Path) -> Color {
+        if self.is_ignored(path) || self.is_absent_at_scrub(path) {
+            self.theme.ignored_fg()
+        } else if let Some(dec) = self.git_decoration(path) {
+            self.theme.git_decoration_fg(dec)
+        } else {
+            self.theme.ui(Color::White)
+        }
     }
 
     /// True when `path` is git-ignored: either listed in the ignored set
@@ -1623,13 +1653,9 @@ impl Widget for &mut FileTree {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| node.path.display().to_string());
 
-            // Git-ignored rows dim the *name* only — icons keep their color,
-            // matching VS Code's ignored-resource decoration.
-            let name_fg = if self.is_ignored(&node.path) || self.is_absent_at_scrub(&node.path) {
-                self.theme.ignored_fg()
-            } else {
-                self.theme.ui(Color::White)
-            };
+            // Git-ignored and changed rows colour the *name* only — icons
+            // keep their color, matching VS Code's git decorations.
+            let name_fg = self.name_fg(&node.path);
 
             if node.is_dir {
                 let chev = if node.expanded {
@@ -1749,7 +1775,31 @@ impl Widget for &mut FileTree {
                 Style::default()
             };
             buf.set_style(row_rect, line_style);
-            buf.set_line(inner.x, y, &line, row_width);
+            // A changed row's status sits at the right edge (#1513): the
+            // file's letter, or a dot on a folder with changes inside. The
+            // name is clipped short of it so a long name never covers it.
+            let badge = self
+                .git_decoration(&node.path)
+                .filter(|_| row_width >= 8 && !self.is_ignored(&node.path));
+            match badge {
+                Some(dec) => {
+                    let glyph = if node.is_dir {
+                        '\u{25cf}'
+                    } else {
+                        dec.letter()
+                    };
+                    buf.set_line(inner.x, y, &line, row_width - 3);
+                    buf.set_string(
+                        inner.x + row_width - 2,
+                        y,
+                        glyph.to_string(),
+                        Style::default().fg(self.theme.git_decoration_fg(dec)),
+                    );
+                }
+                None => {
+                    buf.set_line(inner.x, y, &line, row_width);
+                }
+            }
         }
         // Explorer header toolbar: New File / New Folder / Refresh / Collapse
         // Folders, right-aligned on the root folder row (the "croft" header),
@@ -1832,12 +1882,7 @@ impl Widget for &mut FileTree {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| node.path.display().to_string());
-                let name_fg = if self.is_ignored(&node.path) || self.is_absent_at_scrub(&node.path)
-                {
-                    self.theme.ignored_fg()
-                } else {
-                    self.theme.ui(Color::White)
-                };
+                let name_fg = self.name_fg(&node.path);
                 let spans = vec![
                     Span::raw("  ".repeat(node.depth)),
                     Span::styled(
@@ -2593,6 +2638,107 @@ mod tests {
         );
         assert!(!tree.is_ignored(&root.join("main.rs")));
         assert!(!tree.is_ignored(&root));
+    }
+
+    /// Render `tree` into a 40x10 buffer and find `needle`'s row: its y, the
+    /// colour of its first cell, and the cell at the badge column (the
+    /// border takes the last column and one blank column sits before it).
+    fn row_with_badge(tree: &mut FileTree, needle: &str) -> (Color, String, Color) {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        let mut buf = Buffer::empty(area);
+        tree.render(area, &mut buf);
+        let badge_x = area.width - 3;
+        for y in 0..area.height {
+            let cells: Vec<String> = (0..area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            let joined = cells.concat();
+            let Some(target) = joined.find(needle) else {
+                continue;
+            };
+            let mut acc = 0usize;
+            for (x, s) in cells.iter().enumerate() {
+                if acc == target {
+                    let badge = &buf[(badge_x, y)];
+                    return (buf[(x as u16, y)].fg, badge.symbol().to_string(), badge.fg);
+                }
+                acc += s.len();
+            }
+        }
+        panic!("{needle} not on screen");
+    }
+
+    /// #1513: a changed file's name takes its status colour and its letter
+    /// sits at the row's right edge; a folder with changes inside takes the
+    /// colour and a dot.
+    #[test]
+    fn changed_rows_wear_their_git_status_colour_and_letter() {
+        use crate::git::GitDecoration as D;
+        let (_tmp, mut tree) = fixture();
+        let root = tree.root.clone();
+        tree.git_decorations = Arc::new(HashMap::from([
+            (root.join("main.rs"), D::Modified),
+            (root.join("README.md"), D::Added),
+            (root.join("src"), D::Untracked),
+            (root.join("src/lib.rs"), D::Untracked),
+        ]));
+        let theme = tree.theme;
+        let (fg, badge, badge_fg) = row_with_badge(&mut tree, "main.rs");
+        assert_eq!(fg, theme.git_decoration_fg(D::Modified));
+        assert_eq!(badge, "M", "a modified file shows M at the right edge");
+        assert_eq!(badge_fg, theme.git_decoration_fg(D::Modified));
+        let (fg, badge, _) = row_with_badge(&mut tree, "README.md");
+        assert_eq!(fg, theme.git_decoration_fg(D::Added));
+        assert_eq!(badge, "A", "a staged new file shows A");
+        let (fg, badge, badge_fg) = row_with_badge(&mut tree, "src");
+        assert_eq!(fg, theme.git_decoration_fg(D::Untracked));
+        assert_eq!(
+            badge, "\u{25cf}",
+            "a folder with changes inside shows a dot"
+        );
+        assert_eq!(badge_fg, theme.git_decoration_fg(D::Untracked));
+    }
+
+    /// #1513 negatives: an unchanged file, a git-ignored file, the workspace
+    /// root row and every row while the history scrubber shows a commit
+    /// carry no status colour or badge, whatever the map says.
+    #[test]
+    fn unchanged_ignored_root_and_scrubbed_rows_wear_no_git_status() {
+        use crate::git::GitDecoration as D;
+        let (_tmp, mut tree) = fixture();
+        tree.focused = false;
+        let root = tree.root.clone();
+        let root_name = root.file_name().unwrap().to_string_lossy().into_owned();
+        tree.git_decorations = Arc::new(HashMap::from([
+            (root.clone(), D::Modified),
+            (root.join("README.md"), D::Untracked),
+            (root.join("src/lib.rs"), D::Modified),
+        ]));
+        tree.ignored = Arc::new(HashSet::from([root.join("README.md")]));
+        let theme = tree.theme;
+        let (fg, badge, _) = row_with_badge(&mut tree, "main.rs");
+        assert_eq!((fg, badge.as_str()), (Color::White, " "), "unchanged");
+        let (fg, badge, _) = row_with_badge(&mut tree, "README.md");
+        assert_eq!(
+            (fg, badge.as_str()),
+            (theme.ignored_fg(), " "),
+            "an ignored row stays dimmed and unbadged"
+        );
+        let (_, badge, _) = row_with_badge(&mut tree, &root_name);
+        assert_eq!(badge, " ", "the workspace root row wears no badge");
+        assert_eq!(tree.git_decoration(&root), None);
+        tree.ignored = Arc::default();
+        tree.scrub_tree = Some((root.clone(), Arc::default()));
+        assert_eq!(
+            tree.git_decoration(&root.join("README.md")),
+            None,
+            "the working tree's changes are not the scrubbed commit's"
+        );
     }
 
     #[test]

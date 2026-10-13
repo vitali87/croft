@@ -6,7 +6,7 @@ croft is a three pane workspace in the VS Code arrangement: an Explorer sidebar,
 
 ### Left pane (sidebar)
 
-Explorer with multi-select, cut / copy / paste, drag-and-drop moves, and VS Code style icons. Renaming or moving a file asks the language servers first, so imports that name it are updated to match (rust-analyzer, TypeScript and any server that supports `willRenameFiles`). Git-ignored files and folders render their names in dimmed grey (VS Code's ignored-resource decoration); a fully ignored folder dims along with everything under it, and the shading follows `.gitignore` edits via the same debounced refresh that feeds the status bar.
+Explorer with multi-select, cut / copy / paste, drag-and-drop moves, and VS Code style icons. Renaming or moving a file asks the language servers first, so imports that name it are updated to match (rust-analyzer, TypeScript and any server that supports `willRenameFiles`). Git-ignored files and folders render their names in dimmed grey (VS Code's ignored-resource decoration); a fully ignored folder dims along with everything under it, and the shading follows `.gitignore` edits via the same debounced refresh that feeds the status bar. Changed files wear VS Code's git decorations: the name takes the status colour and its letter sits at the right edge of the row (`M` modified, `U` untracked, `A` added, `R` renamed, `D` deleted, `!` conflicted), and a folder with changes inside takes the strongest of their colours with a `●`, so a collapsed folder shows where your work is.
 
 A `⋯` "Views and More Actions" button on the EXPLORER title line toggles which sub-views stack in the panel, mirroring VS Code. The toggles persist across launches (Open Editors hidden by default, the rest shown):
 
