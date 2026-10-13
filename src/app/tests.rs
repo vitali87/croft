@@ -60663,6 +60663,32 @@ fn the_raised_exceptions_toggle_follows_the_adapters_filters() {
     );
 }
 
+/// #1426: Alt+F9 pressed before the adapter answers `initialize` is kept
+/// and translated into that adapter's own ids once it does, instead of
+/// sending debugpy's `raised`, which lldb-dap would then drop.
+#[test]
+fn the_raised_exceptions_toggle_before_initialize_uses_the_adapters_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push(
+        "LLDB",
+        stub_emitting(&[
+            r#"{"seq":1,"type":"response","request_seq":1,"success":true,"command":"initialize","body":{"exceptionBreakpointFilters":[{"filter":"cpp_catch","label":"C++ Catch"},{"filter":"cpp_throw","label":"C++ Throw"},{"filter":"objc_catch","label":"Objective-C Catch"},{"filter":"objc_throw","label":"Objective-C Throw"}]}}"#,
+        ]),
+    );
+    app.debug_toggle_raised_exceptions();
+    assert!(app.status.starts_with("Breaking on raised exceptions"));
+    poll_until(&mut app, |a| {
+        a.debug_sessions
+            .focused()
+            .is_some_and(|s| !s.capabilities.is_null())
+    });
+    assert_eq!(
+        app.debug_sessions.focused().unwrap().exception_filters,
+        vec![String::from("cpp_throw"), String::from("objc_throw")]
+    );
+}
+
 /// #567 item 1: a background member's program output used to be drained and
 /// dropped. It reaches the debug console, tagged with the member's name.
 #[test]

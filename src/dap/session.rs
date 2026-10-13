@@ -524,8 +524,28 @@ pub fn configuration_done_request() -> Value {
 
 /// The ids adapters give their "break where an exception is thrown, caught
 /// or not" filter (#1426): debugpy `raised`, js-debug and netcoredbg `all`,
-/// java `caught`, lldb-dap and CodeLLDB `cpp_throw`. First offered wins.
-const RAISED_FILTER_IDS: &[&str] = &["raised", "all", "caught", "cpp_throw"];
+/// java `caught`. First offered wins.
+const RAISED_FILTER_IDS: &[&str] = &["raised", "all", "caught"];
+
+/// lldb-dap and CodeLLDB split "break on throw" per language: C++
+/// `cpp_throw`, Objective-C `objc_throw`, Swift `swift_throw`. Every one
+/// offered is turned on, so Objective-C(++) `@throw` stops too.
+const THROW_FILTER_IDS: &[&str] = &["cpp_throw", "objc_throw", "swift_throw"];
+
+/// The filter ids that mean "break on raised exceptions" among those an
+/// adapter offers; `None` when it offers none of them.
+fn raised_filter_ids(offered: &[(String, bool)]) -> Option<Vec<String>> {
+    let has = |id: &str| offered.iter().any(|(o, _)| o == id);
+    if let Some(id) = RAISED_FILTER_IDS.iter().find(|id| has(id)) {
+        return Some(vec![id.to_string()]);
+    }
+    let throws: Vec<String> = THROW_FILTER_IDS
+        .iter()
+        .filter(|id| has(id))
+        .map(|id| id.to_string())
+        .collect();
+    (!throws.is_empty()).then_some(throws)
+}
 
 /// The exception filters an adapter's `initialize` reply offers, as
 /// `(id, default)`. `None` when the reply lists none.
@@ -1093,6 +1113,10 @@ pub struct DapSession {
     /// once the adapter lists its own filters (#1426) only the ones it
     /// offers are kept, plus those it turns on by default.
     pub exception_filters: Vec<String>,
+    /// Break on Raised Exceptions toggled before the adapter answered
+    /// `initialize` (#1426): the filter ids are not known yet, so the wanted
+    /// state waits here and is translated once the capabilities arrive.
+    pending_raised: Option<bool>,
     /// Most recently seen thread id (from `thread`/`stopped` events). Used to
     /// target `pause` while the program is running and `stopped_thread` is None.
     known_thread: Option<i64>,
@@ -1268,6 +1292,7 @@ impl DapSession {
             pending_evals: std::collections::HashMap::new(),
             exception_info_seq: None,
             exception_filters: vec![String::from("uncaught")],
+            pending_raised: None,
             known_thread: None,
             capabilities: Value::Null,
             function_breakpoints: Vec::new(),
@@ -1305,35 +1330,35 @@ impl DapSession {
             .send(set_exception_breakpoints_request(&self.exception_filters));
     }
 
-    /// This adapter's id for "break on raised exceptions" (#1426): debugpy's
-    /// `raised`, js-debug's `all`, lldb-dap's `cpp_throw`. Before the
-    /// adapter answers `initialize` it is debugpy's `raised`; `None` when the
-    /// adapter answered and offers no such filter (Delve).
-    pub fn raised_exception_filter(&self) -> Option<String> {
-        if self.capabilities.is_null() {
-            return Some(String::from("raised"));
-        }
-        let offered = offered_exception_filters(&self.capabilities)?;
-        RAISED_FILTER_IDS
-            .iter()
-            .find(|id| offered.iter().any(|(o, _)| o == *id))
-            .map(|id| id.to_string())
+    /// This adapter's ids for "break on raised exceptions" (#1426):
+    /// debugpy's `raised`, js-debug's `all`, lldb-dap's `cpp_throw` and
+    /// `objc_throw`. `None` before the adapter answers `initialize`, or when
+    /// it offers no such filter (Delve).
+    pub fn raised_exception_filters(&self) -> Option<Vec<String>> {
+        raised_filter_ids(&offered_exception_filters(&self.capabilities)?)
     }
 
-    /// Turn the adapter's raised-exceptions filter on or off, keeping the
+    /// Turn the adapter's raised-exceptions filters on or off, keeping the
     /// other active filters (`uncaught`), and resend. `Some(on)` says which
     /// way it went; `None` (nothing sent) when the adapter has no such filter.
+    /// Before the adapter answers `initialize` the wanted state is kept and
+    /// applied with its own ids once it does.
     pub fn toggle_raised_exceptions(&mut self) -> Option<bool> {
-        let raised = self.raised_exception_filter()?;
-        let on = !self.has_exception_filter(&raised);
+        if self.capabilities.is_null() {
+            let on = !self.pending_raised.unwrap_or(false);
+            self.pending_raised = Some(on);
+            return Some(on);
+        }
+        let raised = self.raised_exception_filters()?;
+        let on = !raised.iter().any(|r| self.has_exception_filter(r));
         let mut filters: Vec<String> = self
             .exception_filters
             .iter()
-            .filter(|f| **f != raised)
+            .filter(|f| !raised.contains(f))
             .cloned()
             .collect();
         if on {
-            filters.push(raised);
+            filters.extend(raised);
         }
         self.set_exception_filters(filters);
         Some(on)
@@ -1557,13 +1582,23 @@ impl DapSession {
                                 .filter(|f| offered.iter().any(|(id, _)| id == *f))
                                 .cloned()
                                 .collect();
-                            for (id, default) in offered {
-                                if default && !keep.contains(&id) {
-                                    keep.push(id);
+                            for (id, default) in &offered {
+                                if *default && !keep.contains(id) {
+                                    keep.push(id.clone());
+                                }
+                            }
+                            // A toggle made before this reply, in this
+                            // adapter's own ids.
+                            if self.pending_raised == Some(true) {
+                                for id in raised_filter_ids(&offered).unwrap_or_default() {
+                                    if !keep.contains(&id) {
+                                        keep.push(id);
+                                    }
                                 }
                             }
                             self.exception_filters = keep;
                         }
+                        self.pending_raised = None;
                     }
                 }
                 Some("launch" | "attach")
@@ -3277,7 +3312,10 @@ while True:
         ) else {
             return;
         };
-        assert_eq!(session.raised_exception_filter().as_deref(), Some("all"));
+        assert_eq!(
+            session.raised_exception_filters(),
+            Some(vec![String::from("all")])
+        );
         assert_eq!(session.toggle_raised_exceptions(), Some(true));
         poll_until(&mut session, &log, |_| {
             sent_exception_filters(&log).len() >= 2
@@ -3309,8 +3347,8 @@ while True:
             return;
         };
         assert_eq!(
-            session.raised_exception_filter().as_deref(),
-            Some("cpp_throw")
+            session.raised_exception_filters(),
+            Some(vec![String::from("cpp_throw")])
         );
         assert_eq!(session.toggle_raised_exceptions(), Some(true));
         poll_until(&mut session, &log, |_| {
@@ -3322,6 +3360,32 @@ while True:
         );
     }
 
+    /// #1426: lldb-dap offers `cpp_throw` and `objc_throw` side by side; the
+    /// toggle turns both on so Objective-C(++) `@throw` stops too.
+    #[test]
+    fn lldb_dap_raised_toggle_covers_objective_c_throws() {
+        let Some((mut session, _tmp, log)) = exception_filter_session(
+            r#"[{"filter": "cpp_catch", "label": "C++ Catch", "default": False},
+                {"filter": "cpp_throw", "label": "C++ Throw", "default": False},
+                {"filter": "objc_catch", "label": "Objective-C Catch", "default": False},
+                {"filter": "objc_throw", "label": "Objective-C Throw", "default": False}]"#,
+        ) else {
+            return;
+        };
+        assert_eq!(session.toggle_raised_exceptions(), Some(true));
+        poll_until(&mut session, &log, |_| {
+            sent_exception_filters(&log).len() >= 2
+        });
+        assert_eq!(session.toggle_raised_exceptions(), Some(false));
+        poll_until(&mut session, &log, |_| {
+            sent_exception_filters(&log).len() >= 3
+        });
+        assert_eq!(
+            sent_exception_filters(&log),
+            vec![json!([]), json!(["cpp_throw", "objc_throw"]), json!([])]
+        );
+    }
+
     /// #1426: an adapter with no exception filters (Delve) has nothing to
     /// toggle; nothing is sent beyond the startup request, and debugpy's
     /// own filter list still maps to `raised`.
@@ -3330,7 +3394,7 @@ while True:
         let Some((mut session, _tmp, log)) = exception_filter_session("") else {
             return;
         };
-        assert_eq!(session.raised_exception_filter(), None);
+        assert_eq!(session.raised_exception_filters(), None);
         assert_eq!(session.toggle_raised_exceptions(), None);
         session.poll();
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -3344,7 +3408,10 @@ while True:
         ) else {
             return;
         };
-        assert_eq!(session.raised_exception_filter().as_deref(), Some("raised"));
+        assert_eq!(
+            session.raised_exception_filters(),
+            Some(vec![String::from("raised")])
+        );
         assert_eq!(session.exception_filters, vec![String::from("uncaught")]);
     }
 
