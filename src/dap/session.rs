@@ -19,7 +19,6 @@ use serde_json::{Value, json};
 
 use super::transport::DapTransport;
 
-/// Where a session is in its lifecycle.
 /// What [`DapSession::request_step_in_targets`] did (#1543).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepInTargetsAsk {
@@ -31,6 +30,7 @@ pub enum StepInTargetsAsk {
     NoFrame,
 }
 
+/// Where a session is in its lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionPhase {
     /// `initialize` sent, awaiting the `initialized` event.
