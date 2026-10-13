@@ -81921,3 +81921,96 @@ fn go_and_lint_rows_reach_problems_only_for_real_files() {
         ]
     );
 }
+
+/// #1117 fixture: `a.rs` open and drawn, `name` selected when `select`,
+/// then a right-click on the word `value`.
+fn editor_menu_1117(select: bool) -> (tempfile::TempDir, App) {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("a.rs");
+    std::fs::write(&f, "let name = value;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    if select {
+        app.editor.cursor_col = 4;
+        app.editor.start_selection_at_cursor();
+        app.editor.cursor_col = 8;
+        app.editor.extend_selection_to_cursor();
+    }
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let (x, y) = (0..buf.area.height)
+        .find_map(|y| {
+            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            let at = row.find("let name = value;")?;
+            Some((row[..at].chars().count() as u16 + 12, y))
+        })
+        .expect("the line is on screen");
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), x, y));
+    (tmp, app)
+}
+
+fn run_menu_item_1117(app: &mut App, label: &str) {
+    let menu = app.context_menu.take().expect("a context menu");
+    let action = menu_action_of(&menu.items, label)
+        .unwrap_or_else(|| panic!("no {label}: {:?}", menu_labels(&menu.items)))
+        .clone();
+    app.dispatch_menu_action(action, menu.target_dir.clone());
+}
+
+/// #1117: with text selected, the editor's right-click menu ends with Cut,
+/// Copy, Paste and Command Palette, and each does what its key does.
+#[test]
+fn the_editor_menu_offers_cut_copy_paste_and_the_palette() {
+    let (_tmp, mut app) = editor_menu_1117(true);
+    let labels: Vec<String> = menu_labels(&app.context_menu.as_ref().unwrap().items)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let tail: Vec<&str> = labels
+        .iter()
+        .rev()
+        .take(4)
+        .rev()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        tail,
+        ["Copy", "Paste", "---", "Command Palette"],
+        "{labels:?}"
+    );
+    assert!(labels.contains(&String::from("Cut")), "{labels:?}");
+    run_menu_item_1117(&mut app, "Copy");
+    assert_eq!(app.status, "Copied 4 chars to clipboard");
+    assert_eq!(app.editor.lines[0], "let name = value;");
+
+    let (_tmp, mut app) = editor_menu_1117(true);
+    run_menu_item_1117(&mut app, "Cut");
+    assert_eq!(app.editor.lines[0], "let  = value;");
+    assert_eq!(app.status, "Cut 4 chars to clipboard");
+
+    let (_tmp, mut app) = editor_menu_1117(true);
+    app.clipboard_reader = || Some(String::from("label"));
+    run_menu_item_1117(&mut app, "Paste");
+    assert_eq!(app.editor.lines[0], "let label = value;");
+
+    let (_tmp, mut app) = editor_menu_1117(false);
+    run_menu_item_1117(&mut app, "Command Palette");
+    assert!(app.command_palette.is_some());
+}
+
+/// #1117 negative: with nothing selected there is nothing to cut or copy,
+/// so only Paste is offered; the symbol actions stay where they were.
+#[test]
+fn the_editor_menu_without_a_selection_offers_only_paste() {
+    let (_tmp, app) = editor_menu_1117(false);
+    let labels = menu_labels(&app.context_menu.as_ref().unwrap().items);
+    assert_eq!(labels.first(), Some(&"Go to Definition"), "{labels:?}");
+    assert!(labels.contains(&"Paste"), "{labels:?}");
+    assert!(
+        !labels.contains(&"Cut") && !labels.contains(&"Copy"),
+        "{labels:?}"
+    );
+}

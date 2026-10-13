@@ -1427,6 +1427,13 @@ enum MenuAction {
     TerminalCopySelection,
     /// Terminal pane right-click: paste the host clipboard into the pane.
     TerminalPaste,
+    /// Editor right-click (#1117): the editor's own Cut, Copy and Paste, as
+    /// its keys do them. Cut and Copy are offered only with a selection.
+    EditorCut,
+    EditorCopy,
+    EditorPaste,
+    /// Editor right-click (#1117): open the Command Palette.
+    ShowCommandPalette,
     /// Terminal pane right-click: enter quick-select hint mode on the pane.
     TerminalQuickSelect,
     /// Terminal pane right-click: enter copy mode (keyboard selection with
@@ -1551,6 +1558,10 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::ToggleCollapseTerminal(_) => None,
         MenuAction::TerminalCopySelection => Some("⌘C"),
         MenuAction::TerminalPaste => Some("⌘V"),
+        MenuAction::EditorCut => Some("⌘X"),
+        MenuAction::EditorCopy => Some("⌘C"),
+        MenuAction::EditorPaste => Some("⌘V"),
+        MenuAction::ShowCommandPalette => Some("⌘⇧P"),
         MenuAction::TerminalQuickSelect => Some("⌃⇧Space"),
         MenuAction::TerminalCopyMode => Some("⌃⇧Y"),
         MenuAction::TerminalCommandHistory => Some("⌃⇧H"),
@@ -55430,11 +55441,26 @@ impl App {
                             MenuAction::AskNavigatorSelection { start, end },
                         ));
                     }
-                    self.context_menu = Some(ContextMenu::flat(
-                        (m.column, m.row),
-                        items,
-                        self.tree.root.clone(),
+                    let mut menu =
+                        ContextMenu::flat((m.column, m.row), items, self.tree.root.clone());
+                    // Then the clipboard and the palette, as VS Code's editor
+                    // menu ends (#1117): the way to copy where the keys are
+                    // awkward (Linux terminals, the `croft web` canvas).
+                    menu.items.push(MenuEntry::Separator);
+                    if self.editor.selection.is_some_and(|s| s.has_area()) {
+                        menu.items
+                            .push(MenuEntry::item("Cut", MenuAction::EditorCut));
+                        menu.items
+                            .push(MenuEntry::item("Copy", MenuAction::EditorCopy));
+                    }
+                    menu.items
+                        .push(MenuEntry::item("Paste", MenuAction::EditorPaste));
+                    menu.items.push(MenuEntry::Separator);
+                    menu.items.push(MenuEntry::item(
+                        "Command Palette",
+                        MenuAction::ShowCommandPalette,
                     ));
+                    self.context_menu = Some(menu);
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -61122,6 +61148,13 @@ impl App {
             MenuAction::ClearTerminal(idx) => self.clear_terminal_at(idx),
             MenuAction::TerminalCopySelection => self.copy_terminal_selection(),
             MenuAction::TerminalPaste => self.paste_clipboard_into_terminal(),
+            MenuAction::EditorCut => self.cut_editor_selection(),
+            MenuAction::EditorCopy => self.copy_editor_selection(),
+            MenuAction::EditorPaste => {
+                let text = (self.clipboard_reader)();
+                self.paste_clipboard_into_editor(text.as_deref());
+            }
+            MenuAction::ShowCommandPalette => self.open_command_palette(),
             MenuAction::TerminalQuickSelect => self.open_terminal_quick_select(),
             MenuAction::TerminalCopyMode => self.open_terminal_copy_mode(),
             MenuAction::TerminalCommandHistory => self.open_command_history(),
