@@ -1148,6 +1148,15 @@ fn update_spinner_frame(elapsed_ms: u128) -> &'static str {
     UPDATE_SPINNER_FRAMES[((elapsed_ms / UPDATE_SPINNER_FRAME_MS) % n) as usize]
 }
 
+/// What a breadcrumb crumb stands for (#1608).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CrumbTarget {
+    Folder(PathBuf),
+    File(PathBuf),
+    /// An index into the outline's symbols.
+    Symbol(usize),
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum MenuAction {
     Create(CreateKind),
@@ -1309,6 +1318,14 @@ enum MenuAction {
     QuickFixAt {
         row: usize,
         col: usize,
+    },
+    /// A breadcrumb picker's file (#1608): open it as Quick Open would.
+    OpenCrumbFile(PathBuf),
+    /// A breadcrumb picker's folder (#1608): list it in the picker of
+    /// `crumb`, where the listing started.
+    BrowseCrumbFolder {
+        dir: PathBuf,
+        crumb: usize,
     },
     /// Jump straight to an already-resolved location (LSP line/character). Used
     /// for the entries of the multi-result "Go to Implementations" / "Go to
@@ -2414,6 +2431,13 @@ struct ContextMenu {
     submenu_selected: usize,
     /// Where any New File / New Folder should be created.
     target_dir: PathBuf,
+    /// The breadcrumb whose picker this is (#1608): Left / Right step to
+    /// the neighbouring crumb's picker.
+    crumb: Option<usize>,
+    /// The first top-level row on screen: a menu taller than the terminal
+    /// (a big folder's breadcrumb picker) scrolls to keep the highlight in
+    /// view. Kept by [`scroll_for`](Self::scroll_for).
+    scroll: std::cell::Cell<usize>,
 }
 
 impl ContextMenu {
@@ -2426,6 +2450,8 @@ impl ContextMenu {
             open_submenu: None,
             submenu_selected: 0,
             target_dir,
+            crumb: None,
+            scroll: Default::default(),
         }
     }
 
@@ -2453,6 +2479,22 @@ impl ContextMenu {
         if crate::i18n::active() {
             walk(&mut self.items);
         }
+    }
+
+    /// The first top-level row shown when `visible` rows fit: the previous
+    /// offset, moved only as far as keeps `selected` on screen.
+    fn scroll_for(&self, visible: usize) -> usize {
+        let mut top = self.scroll.get();
+        if visible > 0 {
+            if self.selected < top {
+                top = self.selected;
+            } else if self.selected >= top + visible {
+                top = self.selected + 1 - visible;
+            }
+            top = top.min(self.items.len().saturating_sub(visible));
+        }
+        self.scroll.set(top);
+        top
     }
 
     /// The entries at the active level: the open submenu's children, or the
@@ -11326,6 +11368,187 @@ impl App {
         crumbs
     }
 
+    /// What each crumb [`build_breadcrumbs`](Self::build_breadcrumbs) makes
+    /// stands for, in the same order (#1608).
+    fn breadcrumb_targets(&self) -> Vec<CrumbTarget> {
+        let Some(path) = self.editor.path.as_deref() else {
+            return Vec::new();
+        };
+        if self.editor.has_non_text_view() {
+            return Vec::new();
+        }
+        let root = self.roots.owning_root(path);
+        let rel = root.and_then(|r| path.strip_prefix(r).ok()).unwrap_or(path);
+        let mut at = root.map(Path::to_path_buf).unwrap_or_default();
+        let names: Vec<_> = rel
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(os) => Some(os.to_os_string()),
+                _ => None,
+            })
+            .collect();
+        if root.is_none() {
+            // An absolute path outside every root: its crumbs start at `/`.
+            at = path
+                .ancestors()
+                .last()
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
+        }
+        let mut targets = Vec::new();
+        for (k, name) in names.iter().enumerate() {
+            at.push(name);
+            targets.push(if k + 1 == names.len() {
+                CrumbTarget::File(at.clone())
+            } else {
+                CrumbTarget::Folder(at.clone())
+            });
+        }
+        if self.outline.path() == Some(path) {
+            let line = self
+                .scrub_view
+                .as_ref()
+                .map_or(self.editor.cursor_row, |v| v.cursor_row) as u32;
+            let col = self
+                .scrub_view
+                .as_ref()
+                .map_or(self.editor.cursor_col, |v| v.cursor_col) as u32;
+            targets.extend(
+                breadcrumb_symbol_chain(self.outline.symbols(), line, col)
+                    .into_iter()
+                    .map(CrumbTarget::Symbol),
+            );
+        }
+        targets
+    }
+
+    /// Open crumb `i`'s picker under it (#1608): a folder crumb lists the
+    /// folder, the file crumb lists its folder with the file selected, and a
+    /// symbol crumb lists the symbols beside it with it selected.
+    fn open_breadcrumb_picker(&mut self, i: usize) {
+        let Some(target) = self.breadcrumb_targets().into_iter().nth(i) else {
+            return;
+        };
+        match target {
+            CrumbTarget::Folder(dir) => self.open_crumb_folder_picker(&dir, i, None),
+            CrumbTarget::File(path) => {
+                let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+                self.open_crumb_folder_picker(&dir, i, Some(&path));
+            }
+            CrumbTarget::Symbol(s) => {
+                let Some(path) = self.editor.path.clone() else {
+                    return;
+                };
+                let symbols = self.outline.symbols();
+                let siblings = sibling_symbols(symbols, s);
+                let selected = siblings.iter().position(|&k| k == s).unwrap_or(0);
+                let items = siblings
+                    .into_iter()
+                    .map(|k| {
+                        let sym = &symbols[k];
+                        (
+                            sym.name.clone(),
+                            MenuAction::GoToLocation {
+                                path: path.clone(),
+                                line: sym.line,
+                                col: sym.character,
+                            },
+                        )
+                    })
+                    .collect();
+                self.show_crumb_picker(i, items, selected);
+            }
+        }
+    }
+
+    /// The picker of crumb `i` listing `dir`: folders first, then files,
+    /// each by name; `select` is the row to start on.
+    fn open_crumb_folder_picker(&mut self, dir: &Path, i: usize, select: Option<&Path>) {
+        let mut entries: Vec<(bool, String, PathBuf)> = std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .filter(|e| e.file_name() != ".git")
+                    .map(|e| {
+                        let path = e.path();
+                        (
+                            path.is_dir(),
+                            e.file_name().to_string_lossy().into_owned(),
+                            path,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        entries.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+        });
+        if entries.is_empty() {
+            self.status = format!("{} is empty", dir.display());
+            return;
+        }
+        let selected = select
+            .and_then(|p| entries.iter().position(|e| e.2 == p))
+            .unwrap_or(0);
+        let items = entries
+            .into_iter()
+            .map(|(is_dir, name, path)| {
+                if is_dir {
+                    (
+                        format!("{name}/"),
+                        MenuAction::BrowseCrumbFolder {
+                            dir: path,
+                            crumb: i,
+                        },
+                    )
+                } else {
+                    (name, MenuAction::OpenCrumbFile(path))
+                }
+            })
+            .collect();
+        self.show_crumb_picker(i, items, selected);
+    }
+
+    fn show_crumb_picker(&mut self, i: usize, items: Vec<(String, MenuAction)>, selected: usize) {
+        let Some(origin) = self.editor.breadcrumb_anchor(i) else {
+            return;
+        };
+        let mut menu = ContextMenu::flat(origin, items, self.tree.root.clone());
+        menu.selected = selected;
+        menu.crumb = Some(i);
+        self.context_menu = Some(menu);
+    }
+
+    /// A file picked from a breadcrumb picker opens as a Quick Open pick does.
+    fn open_crumb_file(&mut self, path: &Path) {
+        match self.editor.open_preview(path) {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.tree.reveal_path(path);
+                self.focus_pane(Pane::Editor);
+                self.status = format!("Opened {}", self.status_path(path));
+            }
+            Err(e) => self.status = format!("Error: {e}"),
+        }
+    }
+
+    /// View: Focus and Select Breadcrumbs (#1608): the last crumb's picker,
+    /// from which Left / Right walk the bar.
+    fn focus_breadcrumbs(&mut self) {
+        // A row too narrow for the whole chain focuses the last crumb that
+        // fit on it.
+        let n = self.editor.breadcrumbs.len();
+        let Some(last) = (0..n)
+            .rev()
+            .find(|&i| self.editor.breadcrumb_anchor(i).is_some())
+        else {
+            self.status = String::from("No breadcrumbs to focus");
+            return;
+        };
+        self.focus_pane(Pane::Editor);
+        self.open_breadcrumb_picker(last);
+    }
+
     /// The scope-header lines to pin as sticky scroll: the enclosing symbols of
     /// the top visible line whose header has scrolled above the viewport,
     /// outermost first, capped. Empty when the feature does not apply (welcome
@@ -12965,6 +13188,8 @@ impl App {
     fn open_customize_layout_menu_at(&mut self, selected: usize) {
         let origin = self.customize_layout_origin();
         self.context_menu = Some(ContextMenu {
+            crumb: None,
+            scroll: Default::default(),
             origin,
             items: self.customize_layout_items(),
             selected,
@@ -13223,6 +13448,8 @@ impl App {
             .position(|&t| t == active)
             .unwrap_or(0);
         self.context_menu = Some(ContextMenu {
+            crumb: None,
+            scroll: Default::default(),
             origin,
             items: items.into_iter().map(MenuEntry::from).collect(),
             selected,
@@ -16804,6 +17031,8 @@ impl App {
         // is left intact rather than evicted (evicting it left the logo
         // blank, since the welcome emit is gated off while a menu is open).
         self.context_menu = Some(ContextMenu {
+            crumb: None,
+            scroll: Default::default(),
             origin,
             items,
             selected: 0,
@@ -21135,18 +21364,19 @@ impl App {
         };
         let grad = self.popup_gradient();
         // The top-level panel; the open submenu's parent row stays highlighted.
-        self.render_menu_panel(frame, clipped, &menu.items, menu.selected, grad);
+        let top = menu.scroll_for(clipped.height.saturating_sub(2) as usize);
+        self.render_menu_panel(frame, clipped, &menu.items, menu.selected, top, grad);
         // Float the open submenu's panel beside its parent.
         if let Some(sub_rect) = self.submenu_rect()
             && let Some(MenuEntry::Submenu { items, .. }) =
                 menu.open_submenu.and_then(|p| menu.items.get(p))
         {
-            self.render_menu_panel(frame, sub_rect, items, menu.submenu_selected, grad);
+            self.render_menu_panel(frame, sub_rect, items, menu.submenu_selected, 0, grad);
         }
     }
 
-    /// Paint one bordered menu panel of `entries` into `rect`, highlighting row
-    /// `selected`. Items show a right-aligned shortcut hint, submenu parents a
+    /// Paint one bordered menu panel of `entries` into `rect`, from entry
+    /// `top` on, highlighting row `selected`. Items show a right-aligned shortcut hint, submenu parents a
     /// `▸`, and separators a divider rule. Shared by the main menu and the
     /// floating submenu.
     fn render_menu_panel(
@@ -21155,6 +21385,7 @@ impl App {
         rect: Rect,
         entries: &[MenuEntry],
         selected: usize,
+        top: usize,
         grad: bool,
     ) {
         // Black theme: orange→green gradient border + muted dark-teal
@@ -21185,13 +21416,13 @@ impl App {
             width: rect.width.saturating_sub(2),
             height: rect.height.saturating_sub(2),
         };
-        for (i, entry) in entries.iter().enumerate() {
-            if i as u16 >= inner.height {
+        for (i, entry) in entries.iter().enumerate().skip(top) {
+            if (i - top) as u16 >= inner.height {
                 break;
             }
             let row = Rect {
                 x: inner.x,
-                y: inner.y + i as u16,
+                y: inner.y + (i - top) as u16,
                 width: inner.width,
                 height: 1,
             };
@@ -23792,6 +24023,15 @@ impl App {
         }
         if is_save_all_key(key) {
             self.save_all();
+            return Ok(());
+        }
+        // VS Code "Focus and Select Breadcrumbs" (Cmd/Ctrl+Shift+., #1608),
+        // claimed from any pane; the live shell keeps its Ctrl form.
+        let terminal_owns_ctrl_shift_dot = self.focus == Pane::Terminal
+            && self.bottom_panel_tab == BottomPanelTab::Terminal
+            && key.modifiers.contains(KeyModifiers::CONTROL);
+        if is_focus_breadcrumbs_key(key) && !terminal_owns_ctrl_shift_dot {
+            self.focus_breadcrumbs();
             return Ok(());
         }
         // Ctrl+Shift+H in the live shell stays its command history; Cmd+Shift+H
@@ -47899,6 +48139,8 @@ impl App {
             None => format!("exit {code}"),
         };
         self.context_menu = Some(ContextMenu {
+            crumb: None,
+            scroll: Default::default(),
             origin,
             items: vec![
                 MenuEntry::header(header),
@@ -51650,6 +51892,7 @@ impl App {
                 ));
             }
             Cmd::ShowExplorer => self.set_sidebar_view(SidebarView::Explorer),
+            Cmd::FocusBreadcrumbs => self.focus_breadcrumbs(),
             Cmd::ShowSearch => self.set_sidebar_view(SidebarView::Search),
             Cmd::ReplaceInFiles => self.open_replace_in_files(),
             // Run from the palette the side bar may be hidden, so it is
@@ -55629,6 +55872,8 @@ impl App {
                         self.editor.is_pinned(tab_idx),
                     );
                     self.context_menu = Some(ContextMenu {
+                        crumb: None,
+                        scroll: Default::default(),
                         origin: (m.column, m.row),
                         items,
                         selected: 0,
@@ -55791,6 +56036,8 @@ impl App {
                         }
                     }
                     self.context_menu = Some(ContextMenu {
+                        crumb: None,
+                        scroll: Default::default(),
                         origin: (m.column, m.row),
                         items,
                         selected: 0,
@@ -57049,9 +57296,18 @@ impl App {
                         }
                     }
                 } else if in_editor_pane && !in_editor {
-                    if let Some((line, col)) = self.editor.breadcrumb_target_at(m.column, m.row) {
-                        // A click on a symbol crumb jumps to that symbol (same
-                        // file); path crumbs return None and fall through.
+                    let crumb = self.editor.breadcrumb_index_at(m.column, m.row);
+                    if let Some(i) = crumb.filter(|_| self.scrub_view.is_none()) {
+                        // A crumb opens its picker (#1608): a folder's
+                        // entries, the file's folder, or the symbol's
+                        // siblings.
+                        self.focus_pane(Pane::Editor);
+                        self.open_breadcrumb_picker(i);
+                    } else if let Some((line, col)) =
+                        self.editor.breadcrumb_target_at(m.column, m.row)
+                    {
+                        // While scrubbing a symbol crumb jumps in the
+                        // commit's view, as before.
                         self.focus_pane(Pane::Editor);
                         if !self.jump_in_scrub_view(line)
                             && let Some(path) = self.editor.path.clone()
@@ -60776,7 +61032,8 @@ impl App {
             x = main.x.saturating_sub(width);
         }
         // Align the submenu's top border so its first row sits on the parent row.
-        let y = (main.y + 1 + parent as u16).saturating_sub(1);
+        let shown = parent.saturating_sub(menu.scroll.get());
+        let y = (main.y + 1 + shown as u16).saturating_sub(1);
         let y = if area.height > 0 {
             y.min(area.height.saturating_sub(height))
         } else {
@@ -60799,7 +61056,8 @@ impl App {
         // Items live inside the 1-cell border.
         let inner_y = y.checked_sub(r.y + 1)?;
         let menu = self.context_menu.as_ref()?;
-        let idx = inner_y as usize;
+        let top = menu.scroll_for(r.height.saturating_sub(2) as usize);
+        let idx = top + inner_y as usize;
         (idx < menu.items.len()).then_some(idx)
     }
 
@@ -60840,6 +61098,26 @@ impl App {
             KeyCode::Down => {
                 if let Some(menu) = self.context_menu.as_mut() {
                     menu.move_cursor(true);
+                }
+            }
+            KeyCode::Left | KeyCode::Right
+                if self
+                    .context_menu
+                    .as_ref()
+                    .is_some_and(|m| m.crumb.is_some() && m.open_submenu.is_none()) =>
+            {
+                // A breadcrumb picker steps to the neighbouring crumb's
+                // (#1608), VS Code's Left / Right in the focused bar.
+                let Some(i) = self.context_menu.as_ref().and_then(|m| m.crumb) else {
+                    return;
+                };
+                let next = if key.code == KeyCode::Left {
+                    i.checked_sub(1)
+                } else {
+                    Some(i + 1).filter(|&n| n < self.editor.breadcrumbs.len())
+                };
+                if let Some(n) = next {
+                    self.open_breadcrumb_picker(n);
                 }
             }
             KeyCode::Left => {
@@ -61657,6 +61935,10 @@ impl App {
                 self.editor.cursor_col = col;
                 self.focus_pane(Pane::Editor);
                 self.request_references_at_cursor();
+            }
+            MenuAction::OpenCrumbFile(path) => self.open_crumb_file(&path),
+            MenuAction::BrowseCrumbFolder { dir, crumb } => {
+                self.open_crumb_folder_picker(&dir, crumb, None);
             }
             MenuAction::GoToLocation { path, line, col } => {
                 self.go_to_definition(path, line, col);
@@ -63854,6 +64136,8 @@ impl App {
     /// to fit, so opening at the bottom status row renders above the bar.
     fn open_status_menu(&mut self, col: u16, row: u16, items: Vec<MenuEntry>) {
         self.context_menu = Some(ContextMenu {
+            crumb: None,
+            scroll: Default::default(),
             origin: (col, row),
             items,
             selected: 0,
@@ -64003,6 +64287,8 @@ impl App {
             },
         ];
         self.context_menu = Some(ContextMenu {
+            crumb: None,
+            scroll: Default::default(),
             origin: (col, row),
             items,
             selected: 0,
@@ -69508,6 +69794,39 @@ fn breadcrumb_symbol_chain(
             .then(end(&symbols[b]).cmp(&end(&symbols[a])))
     });
     hits
+}
+
+/// VS Code "Focus and Select Breadcrumbs": `Cmd+Shift+.` / `Ctrl+Shift+.`
+/// (#1608). A terminal that applies the shift itself sends `>`.
+fn is_focus_breadcrumbs_key(key: KeyEvent) -> bool {
+    let shifted = match key.code {
+        KeyCode::Char('.') => key.modifiers.contains(KeyModifiers::SHIFT),
+        KeyCode::Char('>') => true,
+        _ => false,
+    };
+    shifted
+        && (key.modifiers.contains(KeyModifiers::SUPER)
+            || key.modifiers.contains(KeyModifiers::CONTROL))
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+/// The symbols at `i`'s level under its parent, `i` among them, in outline
+/// order (#1608): the outline is a pre-order walk, so they are the symbols
+/// of `i`'s depth between the parent and the next symbol shallower than `i`.
+fn sibling_symbols(symbols: &[crate::lsp::manager::OutlineSymbol], i: usize) -> Vec<usize> {
+    let Some(depth) = symbols.get(i).map(|s| s.depth) else {
+        return Vec::new();
+    };
+    let start = (0..i)
+        .rev()
+        .find(|&k| symbols[k].depth < depth)
+        .map_or(0, |parent| parent + 1);
+    let end = (i + 1..symbols.len())
+        .find(|&k| symbols[k].depth < depth)
+        .unwrap_or(symbols.len());
+    (start..end)
+        .filter(|&k| symbols[k].depth == depth)
+        .collect()
 }
 
 /// VS Code "Quick Fix": `Cmd+.` on macOS (delivered as `Char('.')` + SUPER by

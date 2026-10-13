@@ -87,6 +87,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_go_to_symbol_key",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+.",
+                description: "Focus Breadcrumbs: pick a folder, file or symbol from the path above the editor",
+                handler: "is_focus_breadcrumbs_key",
+            },
+            ShortcutEntry {
                 keys: "Opt+Cmd/Ctrl+M",
                 description: "Toggle the editor minimap",
                 handler: "is_minimap_toggle_key",
