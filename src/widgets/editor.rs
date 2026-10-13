@@ -14965,7 +14965,15 @@ fn yaml_newline_indent(prefix: &str, unit: &str) -> String {
     let Some(colon) = yaml_key_colon(content) else {
         return leading;
     };
-    let value = content[colon + 1..].trim();
+    let mut value = content[colon + 1..].trim();
+    // An anchor or tag (`&defaults`, `!!map`) comes before the node it names,
+    // so `.defaults: &defaults` still opens the mapping below it, as shared
+    // blocks in GitLab CI, compose and Helm values are written.
+    while let Some(prop) = value.split_whitespace().next()
+        && prop.starts_with(['&', '!'])
+    {
+        value = value[prop.len()..].trim_start();
+    }
     let opens_block = value.is_empty()
         || value.ends_with('[')
         || value.ends_with('{')
@@ -25584,6 +25592,27 @@ mod tests {
         assert_eq!(yaml_enter("  script: >-"), "    ");
         assert_eq!(yaml_enter("\"quoted key\":"), "  ");
         assert_eq!(yaml_enter("args: ["), "  ");
+    }
+
+    #[test]
+    fn yaml_enter_after_an_anchored_or_tagged_key_indents_one_step() {
+        // #1309: the anchor names the mapping typed below it.
+        assert_eq!(yaml_enter(".defaults: &defaults"), "  ");
+        assert_eq!(yaml_enter("x-common: &common  # shared"), "  ");
+        assert_eq!(yaml_enter("  data: !!map"), "    ");
+        assert_eq!(yaml_enter("base: &a !!map"), "  ");
+        assert_eq!(yaml_enter("script: &steps |"), "  ");
+        assert_eq!(yaml_enter("- step: &s"), "    ");
+    }
+
+    #[test]
+    fn yaml_enter_after_an_anchored_or_tagged_value_keeps_the_indent() {
+        // Negative: the anchor or tag is on a value already written, and an
+        // alias is a value.
+        assert_eq!(yaml_enter("image: &img python:3.12"), "");
+        assert_eq!(yaml_enter("  port: !!int 80"), "  ");
+        assert_eq!(yaml_enter("<<: *defaults"), "");
+        assert_eq!(yaml_enter("name: a&b"), "");
     }
 
     #[test]
