@@ -97,6 +97,7 @@ pub fn diagnostic_for(
             severity: severity(sem::effective_level(result, rule)),
             message,
             tags: Default::default(),
+            code: None,
         },
     ))
 }
