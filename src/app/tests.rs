@@ -4045,6 +4045,53 @@ fn a_left_click_in_the_breakpoint_lane_toggles_a_breakpoint_on_that_line() {
     assert_eq!(app.editor.cursor_row, 0);
 }
 
+/// #1544: drags after a breakpoint-lane press belong to the lane, so the
+/// caret stays put and no selection is drawn from it to the clicked line,
+/// even when the terminal sends a drag at the press cell. The next gesture
+/// in the text selects as usual.
+#[test]
+fn drags_after_a_breakpoint_lane_press_neither_move_the_caret_nor_select() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, f) = app_with_painted_file("l1\nl2\nl3\nl4\nl5\n");
+    let lane = app.editor.last_inner.x;
+    let y = app.editor.last_inner.y;
+    let text_x = lane + app.editor.last_gutter_width + 1;
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), lane, y + 2));
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), lane, y + 2));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        text_x,
+        y + 3,
+    ));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), text_x, y + 3));
+    assert_eq!(app.editor.breakpoint_lines(&f), vec![3u32]);
+    assert_eq!(app.editor.cursor_row, 0, "the caret stays on line 1");
+    assert!(
+        app.editor.selection.is_none_or(|s| !s.has_area()),
+        "no selection from the caret to the clicked line"
+    );
+    app.editor_click.clear();
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        text_x,
+        y + 1,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        text_x + 1,
+        y + 1,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        text_x + 1,
+        y + 1,
+    ));
+    assert!(
+        app.editor.selection.is_some_and(|s| s.has_area()),
+        "a text drag after the lane gesture still selects"
+    );
+}
+
 /// #1544 negative: the line number and the text body keep their clicks:
 /// they move the caret and set no breakpoint.
 #[test]

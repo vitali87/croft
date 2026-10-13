@@ -3451,6 +3451,13 @@ pub struct App {
     /// True while the editor's horizontal scrollbar thumb is being dragged.
     /// Only the editor has a horizontal bar, so a bool suffices.
     editor_hscrollbar_drag: bool,
+    /// A left press in the editor's breakpoint lane toggled a breakpoint
+    /// (#1544), so the rest of that gesture belongs to the lane: drags are
+    /// dropped until the release. Without it the first drag (some terminals
+    /// send one at the press cell) would anchor a selection at the caret and
+    /// walk the caret to the clicked line, undoing the caret-preserving
+    /// click. Cleared on the release and on the next press.
+    breakpoint_lane_press: bool,
     /// A left-drag is moving the OUTLINE panel's scrollbar thumb. The outline
     /// is not a focusable `Pane`, so it gets its own drag latch rather than
     /// riding `scrollbar_drag`.
@@ -6105,6 +6112,7 @@ impl App {
             terminal_select_autoscroll: None,
             scrollbar_drag: None,
             editor_hscrollbar_drag: false,
+            breakpoint_lane_press: false,
             outline_scrollbar_drag: false,
             open_editors_scrollbar_drag: false,
             timeline_scrollbar_drag: false,
@@ -56767,6 +56775,9 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                // A new press starts a new gesture, even if the release of a
+                // breakpoint-lane press never arrived.
+                self.breakpoint_lane_press = false;
                 // Markdown/rendered preview selection (#215): a press inside
                 // the rendered view starts a drag-selection over what the
                 // user can SEE, not the source buffer beneath it.
@@ -58081,6 +58092,7 @@ impl App {
                         && let Some(line0) = self.editor.breakpoint_lane_line_at(m.column, m.row)
                     {
                         self.debug_toggle_breakpoint_line(line0 + 1);
+                        self.breakpoint_lane_press = true;
                         self.poke_cursor();
                         return;
                     }
@@ -58240,6 +58252,10 @@ impl App {
                 if self.editor_hscrollbar_drag {
                     self.editor.scroll_to_bar_x(m.column);
                     self.poke_cursor();
+                    return;
+                }
+                // The lane press owns its gesture: no selection drag (#1544).
+                if self.breakpoint_lane_press {
                     return;
                 }
                 if self.outline_scrollbar_drag {
@@ -58595,6 +58611,9 @@ impl App {
                     return;
                 }
                 if std::mem::take(&mut self.editor_hscrollbar_drag) {
+                    return;
+                }
+                if std::mem::take(&mut self.breakpoint_lane_press) {
                     return;
                 }
                 if std::mem::take(&mut self.outline_scrollbar_drag) {
