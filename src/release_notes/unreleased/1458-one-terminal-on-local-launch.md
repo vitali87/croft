@@ -1,0 +1,1 @@
+fix: A local croft now opens with one terminal instead of bringing back every saved pane as an empty shell. Shells still running in their pane host and agent lanes still come back; over SSH (`croft remote`) every pane is restored as before, so a dropped connection returns to its panel.

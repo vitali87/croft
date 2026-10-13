@@ -16,7 +16,7 @@ use crate::markdown::{MdImage, MdRunnable};
 use crate::theme::Theme;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const DIM: Color = Color::Rgb(0x80, 0x84, 0x90);
 const ERR: Color = Color::Rgb(0xe0, 0x6c, 0x75);
@@ -216,8 +216,15 @@ pub fn render(
         let source = cell.get("source").map(joined).unwrap_or_default();
         match kind {
             "markdown" => {
+                // Pasted images live in the cell (#1478): `attachment:name`
+                // points at its decoded copy in scratch, which resolves
+                // with or without the notebook's own folder.
+                let source = with_attachments(&source, cell.get("attachments"), scratch);
                 let (mut md_lines, md_images) = crate::markdown::render_markdown_with_images(
-                    &source, theme, registry, base_dir,
+                    &source,
+                    theme,
+                    registry,
+                    Some(base_dir.unwrap_or(scratch)),
                 );
                 let base = lines.len();
                 for mut img in md_images {
@@ -272,10 +279,116 @@ pub fn render(
                 }
                 lines.push(Line::default());
             }
+            // Raw cells (nbconvert snippets, front matter) show their text
+            // as typed, as Jupyter shows them (#1478).
+            "raw" => {
+                lines.extend(
+                    source
+                        .lines()
+                        .map(|l| Line::from(Span::styled(l.to_string(), dim))),
+                );
+                lines.push(Line::default());
+            }
             _ => {}
         }
     }
     Some((lines, images, runnables))
+}
+
+/// `bytes` written to scratch under a name hashed from them, so a rebuild
+/// reuses the file. None when it cannot be written.
+fn scratch_picture(scratch: &Path, bytes: &[u8], ext: &str) -> Option<PathBuf> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::{Hash as _, Hasher as _};
+    bytes.hash(&mut hasher);
+    let path = scratch.join(format!("nb-{:016x}.{ext}", hasher.finish()));
+    write_scratch_no_follow(scratch, &path, bytes).then_some(path)
+}
+
+/// A Markdown cell's `source` with each image destination `attachment:name`
+/// it can show pointing at the attachment's decoded picture in `scratch`
+/// (#1478): PNG and JPEG as stored, SVG rasterized. Only parsed image
+/// destinations are rewritten, so code spans, fences, links and prose keep
+/// their text, and only attachments an image names are decoded and written,
+/// after the same size and dimension caps the Markdown renderer applies.
+/// Names it cannot decode stay as written, so they keep the missing-image
+/// placeholder.
+fn with_attachments(
+    source: &str,
+    attachments: Option<&serde_json::Value>,
+    scratch: &Path,
+) -> String {
+    use base64::Engine as _;
+    use pulldown_cmark::{Event, Options, Parser, Tag};
+    let Some(attachments) = attachments.and_then(|a| a.as_object()) else {
+        return source.to_string();
+    };
+    let picture_for = |name: &str| -> Option<PathBuf> {
+        let bundle = attachments
+            .get(name)
+            .or_else(|| attachments.get(&name.replace("%20", " ")))?;
+        let data = |mime: &str| bundle.get(mime).map(joined);
+        let decoded = |b64: String| {
+            let compact: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+            base64::engine::general_purpose::STANDARD
+                .decode(compact)
+                .ok()
+        };
+        let (bytes, ext) = [("image/png", "png"), ("image/jpeg", "jpg")]
+            .into_iter()
+            .find_map(|(mime, ext)| Some((data(mime).and_then(decoded)?, ext)))
+            .or_else(|| {
+                let svg = data("image/svg+xml")?;
+                crate::svg::rasterize(svg.as_bytes())
+                    .ok()
+                    .map(|(png, _, _)| (png, "png"))
+            })?;
+        // The renderer would refuse these anyway; do not leave them in
+        // scratch.
+        if bytes.len() > 25 * 1024 * 1024 {
+            return None;
+        }
+        let (w, h) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+            .with_guessed_format()
+            .ok()?
+            .into_dimensions()
+            .ok()?;
+        if u64::from(w) * u64::from(h) > 64_000_000 {
+            return None;
+        }
+        scratch_picture(scratch, &bytes, ext)
+    };
+    let options =
+        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let mut resolved: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
+        let Event::Start(Tag::Image { dest_url, .. }) = event else {
+            continue;
+        };
+        let Some(name) = dest_url.strip_prefix("attachment:") else {
+            continue;
+        };
+        // The destination as spelled inside this image's own text; a
+        // reference-style image whose definition sits elsewhere is left.
+        let spelled = format!("(attachment:{name}");
+        let Some(at) = source[range.clone()].rfind(&spelled) else {
+            continue;
+        };
+        let target = resolved.entry(name.to_string()).or_insert_with(|| {
+            picture_for(name).map(|p| p.display().to_string().replace(' ', "%20"))
+        });
+        if let Some(target) = target {
+            let start = range.start + at + 1;
+            edits.push((start..start + spelled.len() - 1, target.clone()));
+        }
+    }
+    let mut out = source.to_string();
+    for (range, target) in edits.into_iter().rev() {
+        out.replace_range(range, &target);
+    }
+    out
 }
 
 /// Where an output's lines and pictures go, and what a Markdown output
@@ -301,14 +414,9 @@ impl OutputSink<'_> {
         if (px_w as u64) * (px_h as u64) > 64_000_000 {
             return false;
         }
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        use std::hash::{Hash as _, Hasher as _};
-        bytes.hash(&mut hasher);
-        let name = format!("nb-{:016x}.{ext}", hasher.finish());
-        let path = self.scratch.join(name);
-        if !write_scratch_no_follow(self.scratch, &path, bytes) {
+        let Some(path) = scratch_picture(self.scratch, bytes, ext) else {
             return false;
-        }
+        };
         let rows = ((px_h as f32 / px_w.max(1) as f32) * 72.0 / 2.0)
             .round()
             .clamp(3.0, 18.0) as u16;
@@ -416,19 +524,15 @@ const HTML_HIDDEN: &[&str] = &["style", "script", "head", "title", "template"];
 /// dropped, and `<style>` / `<script>` contents never show.
 fn html_to_markdown(html: &str) -> String {
     let mut md = String::new();
-    // Rows and cells of the open table, if any.
-    let mut table: Option<Vec<Vec<String>>> = None;
+    // The open table, if any.
+    let mut table: Option<HtmlTable> = None;
     let mut hidden = 0usize;
     let mut rest = html;
-    let push = |md: &mut String, table: &mut Option<Vec<Vec<String>>>, text: &str| match table {
+    let push = |md: &mut String, table: &mut Option<HtmlTable>, text: &str| match table {
         None => md.push_str(text),
         // A cell is one line of a pipe table; text between a table's cells
         // is whitespace or junk.
-        Some(t) => {
-            if let Some(cell) = t.last_mut().and_then(|r| r.last_mut()) {
-                cell.push_str(&text.replace('\n', " "));
-            }
-        }
+        Some(t) => t.push_text(&text.replace('\n', " ")),
     };
     while !rest.is_empty() {
         let Some(lt) = rest.find('<') else {
@@ -466,28 +570,49 @@ fn html_to_markdown(html: &str) -> String {
         if hidden > 0 {
             continue;
         }
+        // Preformatted text keeps its lines and spacing (#1615): a fenced
+        // block of the element's text, verbatim, rather than a paragraph
+        // that collapses it onto one line.
+        if name == "pre" && !closing && table.is_none() {
+            let (inner, after) = match find_ascii_ci(rest, "</pre") {
+                Some(end) => (
+                    &rest[..end],
+                    rest[end..].find('>').map_or("", |gt| &rest[end + gt + 1..]),
+                ),
+                None => (rest, ""),
+            };
+            rest = after;
+            md.push_str(&fenced_pre(inner));
+            continue;
+        }
         let mark = match (name.as_str(), closing) {
             ("table", false) => {
-                table = Some(Vec::new());
+                table = Some(HtmlTable::default());
                 ""
             }
             ("table", true) => {
-                if let Some(rows) = table.take() {
+                if let Some(t) = table.take() {
                     md.push_str("\n\n");
-                    md.push_str(&pipe_table(rows));
+                    md.push_str(&t.into_pipe_table());
                     md.push('\n');
+                }
+                ""
+            }
+            ("thead", closing) => {
+                if let Some(t) = table.as_mut() {
+                    t.in_head = !closing;
                 }
                 ""
             }
             ("tr", false) => {
                 if let Some(t) = table.as_mut() {
-                    t.push(Vec::new());
+                    t.start_row();
                 }
                 ""
             }
             ("td" | "th", false) => {
-                if let Some(row) = table.as_mut().and_then(|t| t.last_mut()) {
-                    row.push(String::new());
+                if let Some(t) = table.as_mut() {
+                    t.start_cell(span_attr(tag, "colspan"), span_attr(tag, "rowspan"));
                 }
                 ""
             }
@@ -507,11 +632,218 @@ fn html_to_markdown(html: &str) -> String {
         };
         push(&mut md, &mut table, mark);
     }
-    if let Some(rows) = table.take() {
+    if let Some(t) = table.take() {
         md.push_str("\n\n");
-        md.push_str(&pipe_table(rows));
+        md.push_str(&t.into_pipe_table());
     }
     md.trim().to_string()
+}
+
+/// The most columns or rows one cell may span. pandas never comes close;
+/// the cap keeps a corrupt `colspan="99999999"` from building a huge row.
+const MAX_CELL_SPAN: usize = 1000;
+
+/// Past this many cells in one table, spans are read as 1, so a handful of
+/// spanning tags cannot grow the grid a cell per column they claim.
+const MAX_SPANNED_CELLS: usize = 100_000;
+
+/// A `colspan` / `rowspan` attribute's value, 1 when absent or unreadable.
+fn span_attr(tag: &str, attr: &str) -> usize {
+    let lower = tag.to_ascii_lowercase();
+    // The attribute by its whole name: `data-colspan` and `aria-colspan`
+    // are metadata, not a span.
+    let Some(at) = lower.match_indices(attr).map(|(i, _)| i).find(|&i| {
+        lower[..i]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace)
+            && !lower[i + attr.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    }) else {
+        return 1;
+    };
+    let value = lower[at + attr.len()..]
+        .trim_start()
+        .strip_prefix('=')
+        .map(|v| v.trim_start().trim_start_matches(['"', '\'']))
+        .unwrap_or("");
+    let digits: String = value.chars().take_while(char::is_ascii_digit).collect();
+    digits
+        .parse::<usize>()
+        .ok()
+        .filter(|&n| n >= 1)
+        .map_or(1, |n| n.min(MAX_CELL_SPAN))
+}
+
+/// The byte index of `needle` (ASCII) in `hay`, ignoring ASCII case.
+fn find_ascii_ci(hay: &str, needle: &str) -> Option<usize> {
+    hay.as_bytes()
+        .windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+/// A `<pre>` element's content as a fenced block: tags dropped, entities
+/// decoded, every space and line kept.
+fn fenced_pre(inner: &str) -> String {
+    let mut raw = String::new();
+    let mut rest = inner;
+    while let Some(lt) = rest.find('<') {
+        raw.push_str(&rest[..lt]);
+        let Some(gt) = rest[lt..].find('>') else {
+            rest = "";
+            break;
+        };
+        // A `<br>` is a line break of the output; other tags just go.
+        let tag = rest[lt + 1..lt + gt].trim_end_matches('/');
+        let name = tag.split_whitespace().next().unwrap_or("");
+        if name.eq_ignore_ascii_case("br") {
+            raw.push('\n');
+        }
+        rest = &rest[lt + gt + 1..];
+    }
+    raw.push_str(rest);
+    let text = decode_entities(&raw);
+    let text = text.strip_prefix('\n').unwrap_or(&text).trim_end();
+    if text.trim().is_empty() {
+        return String::new();
+    }
+    let longest_run = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest_run.max(2) + 1);
+    format!("\n\n{fence}\n{text}\n{fence}\n\n")
+}
+
+/// One cell of an HTML table as it is laid out on the grid.
+#[derive(Default)]
+struct HtmlCell {
+    text: String,
+    /// A column a `colspan` cell to the left covers: shown as that cell's
+    /// text in a header, empty in the body.
+    spanned: bool,
+}
+
+/// An HTML table laid out on a grid, honouring `colspan` and `rowspan`
+/// (#1615): pandas writes both for every MultiIndex, and dropping them
+/// slid each later value under the wrong column.
+#[derive(Default)]
+struct HtmlTable {
+    rows: Vec<Vec<HtmlCell>>,
+    /// How many of the first rows are header rows (`<thead>`).
+    head_rows: usize,
+    in_head: bool,
+    /// The cell text goes into: its column in the last row.
+    current: Option<usize>,
+    /// Per column, how many more rows a `rowspan` cell above still covers.
+    covered: Vec<usize>,
+    /// Cells laid out so far, fillers included.
+    cells: usize,
+}
+
+impl HtmlTable {
+    fn start_row(&mut self) {
+        self.finish_row();
+        self.rows.push(Vec::new());
+        if self.in_head {
+            self.head_rows += 1;
+        }
+        self.current = None;
+    }
+
+    /// Fill the columns a `rowspan` from above still covers at the end of
+    /// the last row, so the next row's spans line up.
+    fn finish_row(&mut self) {
+        let Some(row) = self.rows.last_mut() else {
+            return;
+        };
+        for col in row.len()..self.covered.len() {
+            if self.covered[col] > 0 {
+                self.covered[col] -= 1;
+                while row.len() <= col {
+                    row.push(HtmlCell::default());
+                }
+            }
+        }
+    }
+
+    fn start_cell(&mut self, colspan: usize, rowspan: usize) {
+        let (colspan, rowspan) = if self.cells.saturating_add(colspan * rowspan) > MAX_SPANNED_CELLS
+        {
+            (1, 1)
+        } else {
+            (colspan, rowspan)
+        };
+        self.cells += colspan * rowspan;
+        if self.rows.is_empty() {
+            self.rows.push(Vec::new());
+        }
+        let row = self.rows.last_mut().expect("a row");
+        // Skip the columns a `rowspan` cell above still covers.
+        while self.covered.get(row.len()).is_some_and(|&n| n > 0) {
+            self.covered[row.len()] -= 1;
+            row.push(HtmlCell::default());
+        }
+        let col = row.len();
+        row.push(HtmlCell::default());
+        for _ in 1..colspan {
+            row.push(HtmlCell {
+                text: String::new(),
+                spanned: true,
+            });
+        }
+        if self.covered.len() < col + colspan {
+            self.covered.resize(col + colspan, 0);
+        }
+        for c in col..col + colspan {
+            self.covered[c] = rowspan - 1;
+        }
+        self.current = Some(col);
+    }
+
+    fn push_text(&mut self, text: &str) {
+        let Some(col) = self.current else { return };
+        if let Some(cell) = self.rows.last_mut().and_then(|r| r.get_mut(col)) {
+            cell.text.push_str(text);
+        }
+    }
+
+    /// The grid as a pipe table. Several header rows (pandas' MultiIndex
+    /// columns, or a named index under them) become one, each column's
+    /// labels joined top to bottom, since a pipe table has one header row.
+    fn into_pipe_table(mut self) -> String {
+        self.finish_row();
+        let head_rows = self.head_rows.min(self.rows.len()).max(1);
+        let cols = self.rows.iter().map(Vec::len).max().unwrap_or(0);
+        if cols == 0 {
+            return String::new();
+        }
+        let mut body = self.rows.split_off(head_rows.min(self.rows.len()));
+        let head = self.rows;
+        let mut header = vec![String::new(); cols];
+        for row in &head {
+            let mut left = String::new();
+            for (c, cell) in row.iter().enumerate() {
+                let text = if cell.spanned {
+                    left.clone()
+                } else {
+                    cell.text.trim().to_string()
+                };
+                left = text.clone();
+                if !text.is_empty() {
+                    if !header[c].is_empty() {
+                        header[c].push(' ');
+                    }
+                    header[c].push_str(&text);
+                }
+            }
+        }
+        let mut rows = vec![header];
+        rows.extend(
+            body.drain(..)
+                .map(|r| r.into_iter().map(|cell| cell.text).collect()),
+        );
+        pipe_table(rows)
+    }
 }
 
 /// The level of a heading tag name (`h1`..`h6`).
@@ -522,9 +854,8 @@ fn heading_level(name: &str) -> Option<usize> {
     }
 }
 
-/// An HTML text run as Markdown text: entities decoded, whitespace
-/// collapsed as a browser does, Markdown's own characters escaped.
-fn html_text(raw: &str) -> String {
+/// HTML entities decoded; everything else, whitespace included, as is.
+fn decode_entities(raw: &str) -> String {
     let mut text = String::new();
     let mut rest = raw;
     while let Some(amp) = rest.find('&') {
@@ -556,6 +887,13 @@ fn html_text(raw: &str) -> String {
         }
     }
     text.push_str(rest);
+    text
+}
+
+/// An HTML text run as Markdown text: entities decoded, whitespace
+/// collapsed as a browser does, Markdown's own characters escaped.
+fn html_text(raw: &str) -> String {
+    let text = decode_entities(raw);
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.is_empty() {
         // Whitespace between two tags still separates their text.
@@ -682,6 +1020,127 @@ mod tests {
         assert_eq!(again[0].path, images[0].path);
     }
 
+    fn png_b64(w: u32, h: u32) -> String {
+        use base64::Engine as _;
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::new(w, h)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(png.into_inner())
+    }
+
+    fn all_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// #1478: an image pasted into a Markdown cell (stored in its
+    /// `attachments`) is drawn, whether or not the notebook has a folder.
+    #[test]
+    fn a_pasted_image_attachment_is_drawn() {
+        let b64 = png_b64(100, 50);
+        let doc = nb(&format!(
+            "{{\"cell_type\":\"markdown\",\"source\":[\"Pasted:\\n\\n\",\"![shot.png](attachment:shot.png)\\n\\n\",\"![two](attachment:Screen%20Shot.png)\"],\
+              \"attachments\":{{\"shot.png\":{{\"image/png\":\"{b64}\"}},\"Screen Shot.png\":{{\"image/png\":\"{}\"}}}}}}",
+            png_b64(40, 40)
+        ));
+        let scratch = tempfile::tempdir().unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let mut reg = crate::highlight::LangRegistry::default();
+        for base in [None, Some(folder.path())] {
+            let (lines, images, _) =
+                render(&doc, Theme::BLACK, &mut reg, base, scratch.path(), &[]).expect("parses");
+            assert_eq!(images.len(), 2, "{base:?}: {}", all_text(&lines));
+            for img in &images {
+                assert!(img.path.starts_with(scratch.path()), "{:?}", img.path);
+                assert!(img.path.is_file());
+            }
+            assert_ne!(images[0].path, images[1].path);
+            assert!(
+                !all_text(&lines).contains("attachment:"),
+                "{}",
+                all_text(&lines)
+            );
+        }
+    }
+
+    /// #1478: a raw cell shows its text where it sits, between the cells
+    /// around it.
+    #[test]
+    fn a_raw_cell_shows_its_text() {
+        let doc = nb("{\"cell_type\":\"markdown\",\"source\":\"above\"},\
+             {\"cell_type\":\"raw\",\"source\":[\"raw cell text\\n\",\"\\\\section{Intro}\"]},\
+             {\"cell_type\":\"code\",\"execution_count\":null,\"source\":\"x = 1\",\"outputs\":[]}");
+        let tmp = tempfile::tempdir().unwrap();
+        let mut reg = crate::highlight::LangRegistry::default();
+        let (lines, _, runnables) =
+            render(&doc, Theme::BLACK, &mut reg, None, tmp.path(), &[]).expect("parses");
+        let text = all_text(&lines);
+        let raw = text.find("raw cell text").expect(&text);
+        assert!(text.find("above").unwrap() < raw, "{text}");
+        assert!(text.contains("\\section{Intro}"), "shown as typed: {text}");
+        assert!(raw < text.find("In [ ]:").unwrap(), "{text}");
+        assert_eq!(runnables.len(), 1, "a raw cell does not run");
+    }
+
+    /// #1478 negative: an attachment croft cannot draw, or a name the cell
+    /// does not carry, keeps the placeholder, and a code cell's text is
+    /// never rewritten.
+    #[test]
+    fn an_attachment_that_is_not_a_picture_keeps_its_placeholder() {
+        let doc = nb(&format!(
+            "{{\"cell_type\":\"markdown\",\"source\":\"![n](attachment:notes.txt) ![m](attachment:missing.png)\",\
+              \"attachments\":{{\"notes.txt\":{{\"text/plain\":\"hi\"}},\"bad.png\":{{\"image/png\":\"not base64!\"}}}}}},\
+             {{\"cell_type\":\"code\",\"execution_count\":1,\"source\":\"s = '(attachment:shot.png)'\",\"outputs\":[],\
+              \"attachments\":{{\"shot.png\":{{\"image/png\":\"{}\"}}}}}}",
+            png_b64(10, 10)
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let mut reg = crate::highlight::LangRegistry::default();
+        let (lines, images, _) =
+            render(&doc, Theme::BLACK, &mut reg, None, tmp.path(), &[]).expect("parses");
+        let text = all_text(&lines);
+        assert!(images.is_empty(), "{images:?}");
+        assert!(text.contains("(attachment:notes.txt)"), "{text}");
+        assert!(text.contains("(attachment:missing.png)"), "{text}");
+        assert!(text.contains("(attachment:shot.png)"), "{text}");
+    }
+
+    /// #1478 review: only image destinations are rewritten, so the same
+    /// `attachment:` text in a code span, a fence or a plain link stays as
+    /// written, and an attachment no image names is never written to
+    /// scratch.
+    #[test]
+    fn only_image_destinations_use_attachments() {
+        let source = "![s](attachment:shot.png)\n\n\
+                      Write `![s](attachment:shot.png)` or [see](attachment:shot.png).\n\n\
+                      ```\n![s](attachment:shot.png)\n```\n";
+        let attachments: serde_json::Value = serde_json::from_str(&format!(
+            "{{\"shot.png\":{{\"image/png\":\"{}\"}},\"unused.png\":{{\"image/png\":\"{}\"}}}}",
+            png_b64(20, 10),
+            png_b64(30, 30)
+        ))
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let out = with_attachments(source, Some(&attachments), tmp.path());
+        assert!(!out.starts_with("![s](attachment:"), "{out}");
+        assert_eq!(
+            out.matches("(attachment:shot.png)").count(),
+            3,
+            "code span, link and fence keep their text: {out}"
+        );
+        let written = std::fs::read_dir(tmp.path()).unwrap().count();
+        assert_eq!(written, 1, "the unused attachment is not written");
+    }
+
     /// One code cell whose single output carries `data`.
     fn rich_output(data: &str) -> (tempfile::TempDir, Vec<Line<'static>>, Vec<MdImage>, String) {
         let doc = nb(&format!(
@@ -767,6 +1226,200 @@ mod tests {
         let row = text.lines().find(|l| l.contains("apple")).expect(&text);
         assert!(row.contains('│') && row.contains('3'), "{text}");
         assert!(text.contains("pear <ripe>"), "{text}");
+    }
+
+    /// pandas' `groupby("region").agg({"units": ["sum", "mean"], "price":
+    /// ["min", "max"]})._repr_html_()`, trimmed of its style block.
+    const GROUPBY_HTML: &str = r#"<table border="1" class="dataframe">
+  <thead>
+    <tr>
+      <th></th>
+      <th colspan="2" halign="left">units</th>
+      <th colspan="2" halign="left">price</th>
+    </tr>
+    <tr>
+      <th></th>
+      <th>sum</th>
+      <th>mean</th>
+      <th>min</th>
+      <th>max</th>
+    </tr>
+    <tr>
+      <th>region</th>
+      <th></th>
+      <th></th>
+      <th></th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th>north</th>
+      <td>255</td>
+      <td>127</td>
+      <td>9</td>
+      <td>10</td>
+    </tr>
+    <tr>
+      <th>south</th>
+      <td>175</td>
+      <td>87</td>
+      <td>10</td>
+      <td>11</td>
+    </tr>
+  </tbody>
+</table>"#;
+
+    /// pandas' `set_index(["region", "year"])._repr_html_()`: the shared
+    /// `region` cell spans two rows.
+    const SET_INDEX_HTML: &str = r#"<table border="1" class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th></th>
+      <th></th>
+      <th>units</th>
+      <th>price</th>
+    </tr>
+    <tr>
+      <th>region</th>
+      <th>year</th>
+      <th></th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th rowspan="2" valign="top">north</th>
+      <th>2024</th>
+      <td>120</td>
+      <td>9</td>
+    </tr>
+    <tr>
+      <th>2025</th>
+      <td>135</td>
+      <td>10</td>
+    </tr>
+    <tr>
+      <th rowspan="2" valign="top">south</th>
+      <th>2024</th>
+      <td>80</td>
+      <td>11</td>
+    </tr>
+    <tr>
+      <th>2025</th>
+      <td>95</td>
+      <td>12</td>
+    </tr>
+  </tbody>
+</table>"#;
+
+    /// #1615: a column header spanning two columns labels both of them, and
+    /// pandas' three header rows become one, so every value sits under its
+    /// own column.
+    #[test]
+    fn a_colspan_header_labels_every_column_it_spans() {
+        assert_eq!(
+            html_to_markdown(GROUPBY_HTML),
+            "| region | units sum | units mean | price min | price max |\n\
+             |---|---|---|---|---|\n\
+             | north | 255 | 127 | 9 | 10 |\n\
+             | south | 175 | 87 | 10 | 11 |"
+        );
+    }
+
+    /// #1615: the rows under a `rowspan` cell keep that column empty instead
+    /// of sliding their values left into it.
+    #[test]
+    fn a_rowspan_cell_keeps_the_rows_below_it_aligned() {
+        assert_eq!(
+            html_to_markdown(SET_INDEX_HTML),
+            "| region | year | units | price |\n\
+             |---|---|---|---|\n\
+             | north | 2024 | 120 | 9 |\n\
+             |  | 2025 | 135 | 10 |\n\
+             | south | 2024 | 80 | 11 |\n\
+             |  | 2025 | 95 | 12 |"
+        );
+    }
+
+    /// The issue's notebook, rendered: 135 is in the units column of 2025's
+    /// row, not under year.
+    #[test]
+    fn a_multiindex_table_renders_values_under_their_headers() {
+        let html = SET_INDEX_HTML.replace('"', "\\\"").replace('\n', "\\n");
+        let (_tmp, _, _, text) =
+            rich_output(&format!(r##"{{"text/html":"{html}","text/plain":"x"}}"##));
+        let cells = |needle: &str| -> Vec<String> {
+            let row = text.lines().find(|l| l.contains(needle)).expect(&text);
+            row.split('│').map(|c| c.trim().to_string()).collect()
+        };
+        let header = cells("units");
+        let row = cells("135");
+        let col = |cells: &[String], v: &str| cells.iter().position(|c| c == v);
+        assert_eq!(col(&row, "135"), col(&header, "units"), "{text}");
+        assert_eq!(col(&row, "2025"), col(&header, "year"), "{text}");
+    }
+
+    /// #1615: `<pre>` output keeps its lines and spacing.
+    #[test]
+    fn preformatted_html_keeps_its_lines() {
+        let md = html_to_markdown("<pre>step  loss\n   1  0.912\n   2  0.640</pre>");
+        assert_eq!(md, "```\nstep  loss\n   1  0.912\n   2  0.640\n```");
+        let (_tmp, _, _, text) = rich_output(
+            r##"{"text/html":"<pre>step  loss\n   1  0.912\n   2  &lt;0.640&gt;</pre>","text/plain":"<HTML>"}"##,
+        );
+        assert!(text.contains("step  loss"), "{text}");
+        assert!(text.contains("   1  0.912"), "{text}");
+        assert!(text.contains("<0.640>"), "entities decoded: {text}");
+        assert!(!text.contains("loss 1"), "not joined onto one line: {text}");
+        // A `<br>` inside it is a line break too.
+        assert_eq!(
+            html_to_markdown("<pre>a<br>b<br/>c<BR class=\"x\">d</pre>"),
+            "```\na\nb\nc\nd\n```"
+        );
+    }
+
+    /// Negative: a table without spans and inline HTML are unchanged, and a
+    /// corrupt span cannot blow up the grid.
+    #[test]
+    fn plain_tables_and_inline_html_are_unchanged() {
+        assert_eq!(
+            html_to_markdown(
+                "<table><thead><tr><th></th><th>name</th></tr></thead>\
+                 <tbody><tr><th>0</th><td>apple</td></tr></tbody></table>"
+            ),
+            "|  | name |\n|---|---|\n| 0 | apple |"
+        );
+        assert_eq!(
+            html_to_markdown(
+                "<table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>"
+            ),
+            "| a | b |\n|---|---|\n| c | d |",
+            "with no <thead> the first row is still the header"
+        );
+        assert_eq!(
+            html_to_markdown("<b>bold</b> and <code>x</code>"),
+            "**bold** and `x`"
+        );
+        let huge = html_to_markdown(
+            "<table><tr><td colspan=\"99999999\" rowspan=\"99999999\">a</td></tr><tr><td>b</td></tr></table>",
+        );
+        assert!(
+            huge.len() < 10_000,
+            "a corrupt span is capped: {} bytes",
+            huge.len()
+        );
+        assert_eq!(span_attr("td colspan=\"0\"", "colspan"), 1);
+        assert_eq!(span_attr("td colspan='3'", "colspan"), 3);
+        // Only the attribute by its whole name is a span.
+        assert_eq!(span_attr("td data-colspan=\"2\"", "colspan"), 1);
+        assert_eq!(span_attr("td aria-colspan=\"2\"", "colspan"), 1);
+        assert_eq!(
+            span_attr("td data-colspan=\"2\" colspan=\"3\"", "colspan"),
+            3
+        );
+        assert_eq!(span_attr("td ROWSPAN=2", "rowspan"), 2);
+        assert_eq!(span_attr("td", "rowspan"), 1);
     }
 
     /// #1188 negative: an output with only `text/plain` still shows it.
