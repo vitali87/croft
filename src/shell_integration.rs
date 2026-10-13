@@ -612,6 +612,31 @@ if status is-interactive
                 _croft_prompt_end
             end
         end
+        # Saving or editing fish_prompt (funcsave, `fish_config prompt
+        # save`, which calls funcsave, and funced) must act on the user's
+        # prompt, not croft's wrapper: a saved wrapper would call helpers
+        # that exist only under croft, leaving fish elsewhere without a
+        # prompt. Unwrap first; the next prompt event wraps again.
+        function _croft_unwrap_prompt
+            functions -q _croft_user_prompt; or return 0
+            functions fish_prompt 2>/dev/null | string match -q '*_croft_prompt_end*'; or return 0
+            functions --erase fish_prompt
+            functions --copy _croft_user_prompt fish_prompt
+        end
+        if functions -q funcsave; and not functions -q _croft_funcsave
+            functions --copy funcsave _croft_funcsave
+            function funcsave
+                _croft_unwrap_prompt
+                _croft_funcsave $argv
+            end
+        end
+        if functions -q funced; and not functions -q _croft_funced
+            functions --copy funced _croft_funced
+            function funced
+                _croft_unwrap_prompt
+                _croft_funced $argv
+            end
+        end
         function _croft_mark_output_start --on-event fish_preexec
             set --global _croft_prompt_state command
             printf '\e]133;C\a'

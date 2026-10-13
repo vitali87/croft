@@ -10684,6 +10684,37 @@ mod tests {
         assert!(body.contains("string match -q '*_croft_prompt_end*'; and return"));
     }
 
+    /// #1514: `funcsave fish_prompt` (and `fish_config prompt save`, which
+    /// calls it) and `funced` must see the user's prompt, not croft's
+    /// wrapper, or the saved prompt would call croft-only helpers in every
+    /// later fish session. Both are wrapped to unwrap the prompt first, and
+    /// only on old fish, where the prompt wrap exists.
+    #[test]
+    fn saving_the_fish_prompt_saves_the_users_prompt_not_the_wrapper() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crate::shell_integration::ensure_fish_integration(tmp.path()).unwrap();
+        let script = std::fs::read_to_string(dir.join("fish/vendor_conf.d/croft.fish")).unwrap();
+        let gate = script.find("forward-char-passive").unwrap();
+        let unwrap = script.find("function _croft_unwrap_prompt").unwrap();
+        assert!(gate < unwrap);
+        let body = &script[unwrap..];
+        let body = &body[..body.find("\n        end\n").unwrap()];
+        assert!(body.contains("functions --copy _croft_user_prompt fish_prompt"));
+        for cmd in ["funcsave", "funced"] {
+            assert!(script.contains(&format!("functions --copy {cmd} _croft_{cmd}")));
+            let def = format!("function {cmd}\n");
+            let at = script
+                .find(&def)
+                .unwrap_or_else(|| panic!("{cmd} is wrapped"));
+            assert!(gate < at);
+            let wrapper = &script[at..];
+            let wrapper = &wrapper[..wrapper.find("\n            end\n").unwrap()];
+            let un = wrapper.find("_croft_unwrap_prompt").unwrap();
+            let orig = wrapper.find(&format!("_croft_{cmd} $argv")).unwrap();
+            assert!(un < orig, "{wrapper}");
+        }
+    }
+
     #[test]
     fn a_multi_line_command_is_recorded_without_its_continuation_prompt() {
         // #1250: bash's PS2 `> ` was stored as typed input, and recalling
