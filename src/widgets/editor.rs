@@ -11082,7 +11082,10 @@ impl Editor {
             return false;
         };
         let last = self.lines.len().saturating_sub(1);
-        let mut ranges: Vec<(BPos, BPos, bool)> = self
+        // (start, end, primary, keeps a selection): a line-comment toggle
+        // over a selection keeps the lines selected, so toggling again
+        // undoes it.
+        let mut ranges: Vec<(BPos, BPos, bool, bool)> = self
             .selections_with_primary()
             .iter()
             .enumerate()
@@ -11102,31 +11105,35 @@ impl Editor {
                     let row = s.head.0.min(last);
                     ((row, 0), (row, self.line_char_len(row)))
                 };
-                (start, end, i == 0)
+                (start, end, i == 0, whole_lines && s.has_area())
             })
             .collect();
         // Two carets on one line comment it once.
         ranges.sort_unstable();
-        let mut merged: Vec<(BPos, BPos, bool)> = Vec::new();
-        for (start, end, primary) in ranges {
+        let mut merged: Vec<(BPos, BPos, bool, bool)> = Vec::new();
+        for (start, end, primary, select) in ranges {
             match merged.last_mut() {
                 Some(m) if start < m.1 || start == m.0 => {
                     m.1 = m.1.max(end);
                     m.2 |= primary;
+                    m.3 |= select;
                 }
-                _ => merged.push((start, end, primary)),
+                _ => merged.push((start, end, primary, select)),
             }
         }
         if merged
             .iter()
-            .all(|&(start, end, _)| self.char_range_text(start, end).trim().is_empty())
+            .all(|&(start, end, _, _)| self.char_range_text(start, end).trim().is_empty())
         {
             return false;
         }
         self.push_undo(EditKind::ToggleComment);
         // From the bottom up, so an edit never moves a range still to come.
         let mut placed: Vec<(bool, (usize, usize))> = Vec::with_capacity(merged.len());
-        for &(start, end, primary) in merged.iter().rev() {
+        // Whole lines keep the line count, so a range's start row (its
+        // selection's anchor) stays put through the edits below it.
+        let mut anchors: Vec<Option<(usize, usize)>> = Vec::with_capacity(merged.len());
+        for &(start, end, primary, select) in merged.iter().rev() {
             let text = self.char_range_text(start, end);
             let trimmed = text.trim();
             let caret = if trimmed.is_empty() {
@@ -11155,8 +11162,9 @@ impl Editor {
                 text_end(start, &before)
             };
             placed.push((primary, self.pin_from_end(caret)));
+            anchors.push(select.then_some((start.0, 0)));
         }
-        self.place_pinned_carets(&placed);
+        self.place_pinned_selections(&placed, &anchors);
         self.mark_buffer_changed();
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
@@ -11166,11 +11174,25 @@ impl Editor {
     /// Put a bare caret at each pinned position, the one marked primary as
     /// the primary caret.
     fn place_pinned_carets(&mut self, placed: &[(bool, (usize, usize))]) {
+        self.place_pinned_selections(placed, &[]);
+    }
+
+    /// `place_pinned_carets`, with each caret that has an anchor in
+    /// `anchors` (matched by index) selecting from it.
+    fn place_pinned_selections(
+        &mut self,
+        placed: &[(bool, (usize, usize))],
+        anchors: &[Option<(usize, usize)>],
+    ) {
         let mut all: Vec<EditorSelection> = placed
             .iter()
-            .map(|&(_, pin)| {
-                let (r, c) = self.unpin_from_end(pin);
-                EditorSelection::new(r, c)
+            .enumerate()
+            .map(|(i, &(_, pin))| {
+                let head = self.unpin_from_end(pin);
+                match anchors.get(i).copied().flatten() {
+                    Some(anchor) => EditorSelection { anchor, head },
+                    None => EditorSelection::new(head.0, head.1),
+                }
             })
             .collect();
         if let Some(i) = placed.iter().position(|&(primary, _)| primary) {
@@ -30748,6 +30770,18 @@ mod tests {
             anchor: (1, 5),
             head: (2, 3),
         });
+        assert!(e.toggle_line_comment());
+        assert_eq!(
+            e.lines,
+            vec!["<ul>", "  <!-- <li>a</li>", "  <li>b</li> -->", "</ul>"]
+        );
+        // The lines stay selected, so a second toggle uncomments them all.
+        assert!(e.selection.is_some_and(|s| s.has_area()));
+        assert!(e.toggle_line_comment());
+        assert_eq!(
+            e.lines,
+            vec!["<ul>", "  <li>a</li>", "  <li>b</li>", "</ul>"]
+        );
         assert!(e.toggle_line_comment());
         assert_eq!(
             e.lines,
