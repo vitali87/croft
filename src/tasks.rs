@@ -511,13 +511,13 @@ fn package_json_tasks(root: &Path) -> Vec<Task> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
         return Vec::new();
     };
-    let Some(scripts) = v.get("scripts").and_then(|s| s.as_object()) else {
-        return Vec::new();
-    };
     // Pick the runner the repo actually uses, by its lockfile.
     let runner = js_runner(root);
-    scripts
-        .keys()
+    let mut out: Vec<Task> = v
+        .get("scripts")
+        .and_then(|s| s.as_object())
+        .into_iter()
+        .flat_map(|scripts| scripts.keys())
         .map(|name| Task {
             label: format!("{runner} {name}"),
             command: format!("{runner} {name}"),
@@ -527,7 +527,155 @@ fn package_json_tasks(root: &Path) -> Vec<Task> {
             problem_matcher: None,
             vscode: None,
         })
-        .collect()
+        .collect();
+    // A workspaces monorepo keeps most scripts in its packages (#1515).
+    // Each runs from its own folder with the root lockfile's runner, under
+    // the label VS Code's npm task detection gives it, which is also what a
+    // launch.json `preLaunchTask` names. None is a build default: with
+    // several packages, picking one's `build` for Run Build Task would be
+    // a guess.
+    for rel in workspace_packages(root, &v) {
+        let Ok(text) = std::fs::read_to_string(root.join(&rel).join("package.json")) else {
+            continue;
+        };
+        let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(scripts) = pkg.get("scripts").and_then(|s| s.as_object()) else {
+            continue;
+        };
+        for name in scripts.keys() {
+            out.push(Task {
+                label: format!("npm: {name} - {rel}"),
+                command: format!("{runner} {name}"),
+                source: format!("{rel}/package.json"),
+                is_build: false,
+                is_default: false,
+                problem_matcher: None,
+                vscode: Some(VscodeCommand {
+                    command: runner.to_string(),
+                    // A script name can hold shell syntax (`check;false`);
+                    // it goes to the runner as one word.
+                    args: vec![if needs_quote(name) {
+                        quote_word(name)
+                    } else {
+                        name.clone()
+                    }],
+                    cwd: Some(format!("${{workspaceFolder}}/{rel}")),
+                    env: Vec::new(),
+                    unrunnable: None,
+                }),
+            });
+        }
+    }
+    out
+}
+
+/// Deepest folder level a workspace glob is followed to: `packages/*` is
+/// two, a `**` pattern stops here, so a stray glob cannot walk the disk.
+const WORKSPACE_GLOB_DEPTH: usize = 4;
+
+/// The member packages of a JS workspaces monorepo at `root`, as sorted
+/// `/`-separated paths relative to it (#1515): `pnpm-workspace.yaml`'s
+/// `packages:` list when that file exists (pnpm reads only it), or else the
+/// root package.json's `workspaces` globs (an array, or yarn's
+/// `{ "packages": [...] }`). A `!` glob excludes.
+/// Only folders holding a package.json count, and `node_modules` and
+/// dot folders are never entered.
+fn workspace_packages(root: &Path, manifest: &serde_json::Value) -> Vec<String> {
+    let globs: Vec<String> = match std::fs::read_to_string(root.join("pnpm-workspace.yaml")) {
+        Ok(yaml) => pnpm_workspace_globs(&yaml),
+        Err(_) => manifest
+            .get("workspaces")
+            .and_then(|w| {
+                w.as_array()
+                    .or_else(|| w.get("packages").and_then(|p| p.as_array()))
+            })
+            .into_iter()
+            .flatten()
+            .filter_map(|g| g.as_str().map(str::to_string))
+            .collect(),
+    };
+    let build = |neg: bool| {
+        let mut b = globset::GlobSetBuilder::new();
+        for g in &globs {
+            if g.starts_with('!') != neg {
+                continue;
+            }
+            let g = g.trim_start_matches('!').trim_start_matches("./");
+            let g = g.trim_end_matches('/');
+            if let Ok(glob) = globset::GlobBuilder::new(g).literal_separator(true).build() {
+                b.add(glob);
+            }
+        }
+        b.build().ok()
+    };
+    let (Some(include), Some(exclude)) = (build(false), build(true)) else {
+        return Vec::new();
+    };
+    if include.is_empty() {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    let mut stack = vec![(String::new(), 0usize)];
+    while let Some((rel, depth)) = stack.pop() {
+        if depth == WORKSPACE_GLOB_DEPTH {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(root.join(&rel)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == "node_modules" || name.starts_with('.') {
+                continue;
+            }
+            // `file_type` does not follow a symlink: a linked package
+            // (pnpm's) is not walked twice.
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let child = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            if include.is_match(&child)
+                && !exclude.is_match(&child)
+                && root.join(&child).join("package.json").is_file()
+            {
+                found.push(child.clone());
+            }
+            stack.push((child, depth + 1));
+        }
+    }
+    found.sort();
+    found
+}
+
+/// The `packages:` globs of a `pnpm-workspace.yaml`, read as the plain
+/// block list pnpm documents (`  - 'packages/*'`), without a YAML parser.
+fn pnpm_workspace_globs(yaml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in yaml.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if !line.starts_with([' ', '\t', '-']) {
+            inside = trimmed == "packages:";
+            continue;
+        }
+        if inside && let Some(item) = trimmed.strip_prefix('-') {
+            let item = item.split(" #").next().unwrap_or("").trim();
+            let item = item.trim_matches(|c| c == '\'' || c == '"');
+            if !item.is_empty() {
+                out.push(item.to_string());
+            }
+        }
+    }
+    out
 }
 
 fn cargo_tasks(root: &Path) -> Vec<Task> {
@@ -1300,6 +1448,220 @@ mod tests {
             "{line}"
         );
         assert!(line.ends_with(" && pnpm run compile)"), "{line}");
+    }
+
+    /// The #1515 repro: an npm workspaces repo whose scripts live in its
+    /// packages, plus whatever `extra` files a test adds.
+    fn js_monorepo(root_manifest: &str, extra: &[(&str, &str)]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let write = |rel: &str, text: &str| {
+            let p = tmp.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        write("package.json", root_manifest);
+        write(
+            "packages/web/package.json",
+            r#"{ "name": "web", "scripts": { "dev": "echo web-dev", "build": "echo web-build" } }"#,
+        );
+        write(
+            "packages/api/package.json",
+            r#"{ "name": "api", "scripts": { "start": "echo api-start", "test": "echo api-test" } }"#,
+        );
+        for (rel, text) in extra {
+            write(rel, text);
+        }
+        tmp
+    }
+
+    /// The tasks' labels, sorted: script order follows the JSON map's.
+    fn labels(tasks: &[Task]) -> Vec<&str> {
+        let mut out: Vec<&str> = tasks.iter().map(|t| t.label.as_str()).collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// #1515: every package's scripts are listed, labelled as VS Code
+    /// labels them, and each runs from its own package folder.
+    #[test]
+    fn a_workspaces_monorepo_lists_every_packages_scripts() {
+        let tmp = js_monorepo(
+            r#"{ "name": "mono", "private": true, "workspaces": ["packages/*"], "scripts": { "lint": "echo lint-all" } }"#,
+            &[],
+        );
+        let tasks = discover_tasks(tmp.path());
+        assert_eq!(
+            labels(&tasks),
+            [
+                "npm run lint",
+                "npm: build - packages/web",
+                "npm: dev - packages/web",
+                "npm: start - packages/api",
+                "npm: test - packages/api",
+            ]
+        );
+        let build = tasks
+            .iter()
+            .find(|t| t.label == "npm: build - packages/web")
+            .unwrap();
+        assert_eq!(build.source, "packages/web/package.json");
+        let line = build.command_line(&ctx_at(tmp.path())).unwrap();
+        assert!(
+            line.starts_with("(cd ") && line.contains("/packages/web"),
+            "{line}"
+        );
+        assert!(line.ends_with(" && npm run build)"), "{line}");
+    }
+
+    /// #1515: yarn's `{ "packages": [...] }` form and pnpm's
+    /// `pnpm-workspace.yaml` declare packages too, and the root lockfile
+    /// picks the runner.
+    #[test]
+    fn yarn_and_pnpm_workspace_declarations_are_followed() {
+        let yarn = js_monorepo(
+            r#"{ "private": true, "workspaces": { "packages": ["packages/web"] } }"#,
+            &[("yarn.lock", "")],
+        );
+        let tasks = discover_tasks(yarn.path());
+        assert_eq!(
+            labels(&tasks),
+            ["npm: build - packages/web", "npm: dev - packages/web"]
+        );
+        assert!(tasks.iter().any(|t| t.command == "yarn dev"));
+
+        let pnpm = js_monorepo(
+            r#"{ "private": true }"#,
+            &[
+                (
+                    "pnpm-workspace.yaml",
+                    "# the monorepo\npackages:\n  - 'packages/*'   # every package\n  - \"!packages/web\"\ncatalog:\n  react: ^19\n",
+                ),
+                ("pnpm-lock.yaml", ""),
+            ],
+        );
+        let tasks = discover_tasks(pnpm.path());
+        assert_eq!(
+            labels(&tasks),
+            ["npm: start - packages/api", "npm: test - packages/api"]
+        );
+        let start = tasks
+            .iter()
+            .find(|t| t.label.starts_with("npm: start"))
+            .unwrap();
+        assert!(
+            start
+                .command_line(&ctx_at(pnpm.path()))
+                .unwrap()
+                .ends_with(" && pnpm run start)")
+        );
+    }
+
+    /// #1515: pnpm reads only `pnpm-workspace.yaml`, so a stale root
+    /// `workspaces` field left from a yarn/npm migration is ignored when
+    /// the YAML exists.
+    #[test]
+    fn pnpm_workspace_yaml_wins_over_a_stale_workspaces_field() {
+        let tmp = js_monorepo(
+            r#"{ "private": true, "workspaces": ["packages/web"] }"#,
+            &[
+                ("pnpm-workspace.yaml", "packages:\n  - packages/api\n"),
+                ("pnpm-lock.yaml", ""),
+            ],
+        );
+        assert_eq!(
+            labels(&discover_tasks(tmp.path())),
+            ["npm: start - packages/api", "npm: test - packages/api"]
+        );
+    }
+
+    /// #1515: a package script name holding shell syntax reaches the
+    /// runner as one word, never as shell commands.
+    #[test]
+    fn a_package_script_name_is_quoted_on_the_command_line() {
+        let tmp = js_monorepo(
+            r#"{ "workspaces": ["packages/*"] }"#,
+            &[(
+                "packages/web/package.json",
+                r#"{ "scripts": { "check;false": "echo x", "build$(id)": "echo y" } }"#,
+            )],
+        );
+        let tasks = discover_tasks(tmp.path());
+        let ctx = ctx_at(tmp.path());
+        let line = |label: &str| {
+            tasks
+                .iter()
+                .find(|t| t.label == label)
+                .unwrap()
+                .command_line(&ctx)
+                .unwrap()
+        };
+        assert!(
+            line("npm: check;false - packages/web").ends_with(" && npm run 'check;false')"),
+            "{}",
+            line("npm: check;false - packages/web")
+        );
+        assert!(
+            line("npm: build$(id) - packages/web").ends_with(" && npm run 'build$(id)')"),
+            "{}",
+            line("npm: build$(id) - packages/web")
+        );
+    }
+
+    /// #1515 negatives: without a workspaces declaration a nested
+    /// package.json is not a task source; `node_modules`, folders with no
+    /// package.json and `!` globs are skipped; and a package's `build` never
+    /// becomes the build default, which stays the root's.
+    #[test]
+    fn only_declared_workspace_packages_add_tasks() {
+        let plain = js_monorepo(r#"{ "scripts": { "build": "echo root" } }"#, &[]);
+        let tasks = discover_tasks(plain.path());
+        assert_eq!(labels(&tasks), ["npm run build"]);
+
+        let tmp = js_monorepo(
+            r#"{ "workspaces": ["packages/**", "!packages/api"], "scripts": { "build": "echo root" } }"#,
+            &[
+                (
+                    "packages/web/node_modules/dep/package.json",
+                    r#"{ "scripts": { "postinstall": "echo no" } }"#,
+                ),
+                ("packages/empty/README.md", "no package here\n"),
+            ],
+        );
+        let tasks = discover_tasks(tmp.path());
+        assert_eq!(
+            labels(&tasks),
+            [
+                "npm run build",
+                "npm: build - packages/web",
+                "npm: dev - packages/web"
+            ]
+        );
+        assert_eq!(
+            default_build_task(&tasks).unwrap().label,
+            "npm run build",
+            "the root's build stays the default"
+        );
+        assert!(tasks.iter().filter(|t| t.is_build).count() == 1);
+    }
+
+    /// #1515: a tasks.json entry for a package script and the detected one
+    /// are the same task, listed once (tasks.json's, which comes first).
+    #[test]
+    fn a_tasks_json_package_script_is_not_listed_twice() {
+        let tmp = js_monorepo(
+            r#"{ "workspaces": ["packages/*"] }"#,
+            &[(
+                ".vscode/tasks.json",
+                r#"{ "tasks": [ { "type": "npm", "script": "build", "path": "packages/web" } ] }"#,
+            )],
+        );
+        let tasks = discover_tasks(tmp.path());
+        let builds: Vec<&Task> = tasks
+            .iter()
+            .filter(|t| t.label == "npm: build - packages/web")
+            .collect();
+        assert_eq!(builds.len(), 1, "{:?}", labels(&tasks));
+        assert_eq!(builds[0].source, "tasks.json");
     }
 
     /// A provider croft can't run, or a `dependsOn`-only compound task, is

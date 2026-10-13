@@ -1,0 +1,1 @@
+fix: In a vitest monorepo with `projects`, the Testing view keeps each package's tests apart after a run. Before, every package's `x.test.ts` merged into one suite and tests with the same name overwrote each other, so a failure could be hidden.
