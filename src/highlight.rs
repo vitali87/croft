@@ -815,7 +815,7 @@ pub fn lang_for_extension(ext: &str) -> Option<LangKind> {
         "md" | "markdown" => LangKind::Markdown,
         "go" => LangKind::Go,
         "html" | "htm" => LangKind::Html,
-        "css" | "scss" | "sass" => LangKind::Css,
+        "css" | "scss" | "sass" | "less" => LangKind::Css,
         "sh" | "bash" | "zsh" => LangKind::Bash,
         "c" | "h" => LangKind::C,
         "cpp" | "cc" | "cxx" | "c++" | "C" | "hpp" | "hxx" | "h++" => LangKind::Cpp,
@@ -1871,6 +1871,7 @@ def f() -> Config:\n\
         assert_eq!(lang_for_extension("htm"), Some(LangKind::Html));
         assert_eq!(lang_for_extension("css"), Some(LangKind::Css));
         assert_eq!(lang_for_extension("scss"), Some(LangKind::Css));
+        assert_eq!(lang_for_extension("less"), Some(LangKind::Css));
         assert_eq!(lang_for_extension("sh"), Some(LangKind::Bash));
         assert_eq!(lang_for_extension("c"), Some(LangKind::C));
         assert_eq!(lang_for_extension("h"), Some(LangKind::C));
