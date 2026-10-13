@@ -297,6 +297,14 @@ const COMMANDS: &[(&str, &str)] = &[
         "focus_right_editor_group",
     ),
     ("workbench.action.terminal.focus", "focus_terminal"),
+    ("workbench.action.terminal.clear", "terminal_clear"),
+    ("workbench.action.terminal.rename", "terminal_rename"),
+    ("workbench.action.terminal.kill", "terminal_kill"),
+    ("workbench.action.terminal.split", "terminal_split"),
+    (
+        "workbench.action.terminal.newWithProfile",
+        "terminal_new_with_profile",
+    ),
     (
         "workbench.action.terminal.runSelectedText",
         "run_selected_text",
@@ -1957,6 +1965,46 @@ mod tests {
             "{:?}",
             report.dropped_keybindings
         );
+    }
+
+    /// #1562: VS Code's terminal clear / rename / kill / split / new with
+    /// profile chords import, where all were reported as having no croft
+    /// command; a terminal command croft lacks is still reported.
+    #[test]
+    fn terminal_action_keybindings_import() {
+        let mut report = Report::default();
+        convert_keybindings(
+            &json!([
+                { "key": "ctrl+alt+k", "command": "workbench.action.terminal.clear" },
+                { "key": "ctrl+alt+r", "command": "workbench.action.terminal.rename" },
+                { "key": "ctrl+alt+x", "command": "workbench.action.terminal.kill" },
+                { "key": "ctrl+alt+s", "command": "workbench.action.terminal.split" },
+                { "key": "ctrl+alt+p", "command": "workbench.action.terminal.newWithProfile" },
+                { "key": "ctrl+alt+z", "command": "workbench.action.terminal.sizeToContentWidth" }
+            ]),
+            &mut report,
+        );
+        let mut got = report.keybindings.clone();
+        got.sort();
+        let mut want: Vec<(String, String)> = [
+            ("ctrl+alt+k", "terminal_clear"),
+            ("ctrl+alt+r", "terminal_rename"),
+            ("ctrl+alt+x", "terminal_kill"),
+            ("ctrl+alt+s", "terminal_split"),
+            ("ctrl+alt+p", "terminal_new_with_profile"),
+        ]
+        .iter()
+        .map(|(k, c)| (k.to_string(), c.to_string()))
+        .collect();
+        want.sort();
+        assert_eq!(got, want);
+        assert_eq!(report.dropped_keybindings.len(), 1, "sizeToContentWidth");
+        for (_, id) in &want {
+            assert!(
+                crate::widgets::command_palette::Command::from_id(id).is_some(),
+                "{id} is a croft command"
+            );
+        }
     }
 
     /// #1292: VS Code's Run Selected Text keybinding imports instead of

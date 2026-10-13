@@ -13899,6 +13899,165 @@ fn the_palette_focuses_the_next_and_previous_terminal() {
     assert_eq!(app.active_terminal, 2, "it wraps like Cmd+[");
 }
 
+/// #1562: the terminal's own actions are palette commands. Before, each was
+/// a chord or a right-click row only, and the palette found none of them.
+#[test]
+fn the_palette_lists_every_terminal_action() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for title in [
+        "Terminal: Clear",
+        "Terminal: Rename",
+        "Terminal: Kill the Active Terminal Instance",
+        "Terminal: Split Terminal",
+        "Terminal: Create New Terminal (With Profile)",
+        "Terminal: Quick Select",
+        "Terminal: Enter Copy Mode",
+        "Terminal: Show Command History",
+        "Terminal: Open Scrollback in Editor",
+    ] {
+        app.handle_key(key(
+            KeyCode::Char('p'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+        for c in title.chars() {
+            app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+                .unwrap();
+        }
+        let palette = app.command_palette.as_ref().expect("the palette opened");
+        assert!(
+            palette.results.iter().any(|i| i.title() == title),
+            "{title} is in the palette"
+        );
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+#[test]
+fn terminal_clear_from_the_palette_empties_the_active_pane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    app.active_terminal = 1;
+    await_terminal_probe(&mut app, "cleared-1562");
+    app.focus_pane(Pane::Editor);
+    assert!(run_from_palette(&mut app, "Terminal: Clear"));
+    assert!(
+        !app.terminals[1].visible_text().contains("cleared-1562"),
+        "{}",
+        app.terminals[1].visible_text()
+    );
+    assert_eq!(app.status, "Cleared terminal");
+}
+
+#[test]
+fn terminal_rename_split_and_kill_act_on_the_active_pane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    assert!(run_from_palette(&mut app, "Terminal: Split Terminal"));
+    assert_eq!(app.terminals.len(), 2);
+    assert!(app.show_terminal);
+    app.active_terminal = 1;
+    assert!(run_from_palette(&mut app, "Terminal: Rename"));
+    assert!(matches!(
+        app.prompt.as_ref().map(|p| &p.kind),
+        Some(PromptKind::RenameTerminal(1))
+    ));
+    app.prompt = None;
+    assert!(run_from_palette(
+        &mut app,
+        "Terminal: Kill the Active Terminal Instance"
+    ));
+    assert_eq!(app.terminals.len(), 1);
+}
+
+/// #1562 negative: Kill on the last pane keeps it, as Cmd+W does.
+#[test]
+fn terminal_kill_keeps_the_last_pane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::TerminalKill);
+    assert_eq!(app.terminals.len(), 1);
+    assert!(app.status.starts_with("Cannot close the last terminal"));
+}
+
+#[test]
+fn terminal_modes_from_the_palette_focus_the_terminal() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    draw(&mut app, 100, 30);
+    app.focus_pane(Pane::Editor);
+    app.run_command(Command::TerminalCopyMode);
+    assert!(app.terminal_copy_mode.is_some());
+    assert!(app.focus == Pane::Terminal);
+    app.terminal_copy_mode = None;
+    app.focus_pane(Pane::Editor);
+    app.run_command(Command::TerminalCommandHistory);
+    assert!(app.command_history_popup.is_some());
+    assert!(app.focus == Pane::Terminal);
+}
+
+/// #1562: a `keybindings.json` chord for a terminal command works with the
+/// terminal focused, where the shell would otherwise get it; a chord for
+/// any other command still goes to the shell there.
+#[test]
+fn a_user_chord_for_a_terminal_command_works_in_the_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[
+          { "key": "ctrl+alt+k", "command": "terminal_clear" },
+          { "key": "ctrl+alt+b", "command": "toggle_side_bar" }
+        ]"#,
+    );
+    await_terminal_probe(&mut app, "bound-1562");
+    app.focus_pane(Pane::Terminal);
+    let side_bar = app.show_tree;
+    app.handle_key(key(
+        KeyCode::Char('b'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert_eq!(
+        app.show_tree, side_bar,
+        "not a terminal command: the shell's"
+    );
+    app.handle_key(key(
+        KeyCode::Char('k'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert_eq!(app.status, "Cleared terminal");
+    assert!(!app.terminal().visible_text().contains("bound-1562"));
+}
+
+/// #1562: a terminal menu row shows the chord the user bound to its
+/// command, and its built-in one otherwise.
+#[test]
+fn terminal_menu_rows_show_the_user_s_chord() {
+    let none = crate::keymap::Keymap::from_json("[]");
+    assert_eq!(
+        menu_hint(&MenuAction::ClearTerminal(0), &none).as_deref(),
+        Some("⌘K K")
+    );
+    let bound = crate::keymap::Keymap::from_json(
+        r#"[{ "key": "ctrl+alt+k", "command": "terminal_clear" }]"#,
+    );
+    assert_eq!(
+        menu_hint(&MenuAction::ClearTerminal(0), &bound).as_deref(),
+        Some("ctrl+alt+k")
+    );
+    assert_eq!(
+        menu_hint(&MenuAction::RenameTerminal(0), &bound).as_deref(),
+        Some("⌘K R"),
+        "only the rebound row changes"
+    );
+}
+
 /// Guard (#843): with no split, "View: Focus Left/Right Editor Group" change
 /// nothing, as the chords do: focus stays where it was.
 #[test]
@@ -78812,6 +78971,7 @@ fn diag_on_line(line: u32, message: &str) -> crate::lsp::manager::Diagnostic {
         end_char: 1,
         severity: crate::lsp::manager::DiagnosticSeverity::Warning,
         message: String::from(message),
+        tags: Default::default(),
     }
 }
 
