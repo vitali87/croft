@@ -24926,10 +24926,6 @@ impl App {
         self.debug_named_test(name);
     }
 
-    /// Hand the test `name` to the debugger — the M6 wedge: pytest runs as a
-    /// debugpy module launch under the PROJECT's interpreter, a cargo test
-    /// binary launches under lldb-dap with the name as its libtest filter.
-    /// Shared by debug-at-cursor and Alt+click on the gutter play glyph.
     /// The runner for a test in the focused file under `root` (#1408): the
     /// one for the file's language, so a pytest test in a maturin crate
     /// debugs under debugpy, not as a cargo test binary.
@@ -24938,6 +24934,10 @@ impl App {
         crate::testing::worker::runner_for_file(&runners, self.editor.path.as_deref())
     }
 
+    /// Hand the test `name` to the debugger — the M6 wedge: pytest runs as a
+    /// debugpy module launch under the PROJECT's interpreter, a cargo test
+    /// binary launches under lldb-dap with the name as its libtest filter.
+    /// Shared by debug-at-cursor and Alt+click on the gutter play glyph.
     fn debug_named_test(&mut self, name: String) {
         if !self.debug_sessions.is_empty() {
             self.status = String::from("A debug session is already running (Shift+F5 stops it)");

@@ -77,30 +77,63 @@ pub fn runner_for_file(runners: &[Runner], file: Option<&Path>) -> Option<Runner
 
 /// The runner a run of `name` goes to (#1408): the file's language when the
 /// run came from a file, else the runner that listed `name` (or, for a
-/// suite, a test under it), else the folder's first.
+/// suite, a test under it), else the folder's first. Where the file's
+/// language has two runners (Vitest and Jest), the one that listed `name`
+/// or the file's tests decides.
 fn choose_runner(
     runners: &[Runner],
     owners: &BTreeMap<String, Runner>,
     name: &str,
     file: Option<&Path>,
 ) -> Option<Runner> {
-    let by_file = file
+    let of_file: Vec<Runner> = file
         .map(runners_of_file)
         .unwrap_or(&[])
         .iter()
         .copied()
-        .find(|r| runners.contains(r));
+        .filter(|r| runners.contains(r))
+        .collect();
+    // A suite owns what sits under it at the `::` separator, not every
+    // name that starts with its text: Rust's `tests` is not pytest's
+    // `tests/test_x.py`.
+    let suite = super::suite_pattern(name);
     let by_name = owners
         .get(name)
         .or_else(|| {
             owners
                 .iter()
-                .find(|(listed, _)| listed.starts_with(name))
+                .find(|(listed, _)| listed.starts_with(&suite))
                 .map(|(_, r)| r)
         })
         .copied()
         .filter(|r| runners.contains(r));
+    let by_file = match of_file.as_slice() {
+        [] => None,
+        [only] => Some(*only),
+        several => by_name
+            .filter(|r| several.contains(r))
+            .or_else(|| file.and_then(|f| file_owner(owners, f, several)))
+            .or_else(|| several.first().copied()),
+    };
     by_file.or(by_name).or_else(|| runners.first().copied())
+}
+
+/// The runner among `candidates` that listed a test of `file`: JS test
+/// names start with the file's path relative to the root.
+fn file_owner(
+    owners: &BTreeMap<String, Runner>,
+    file: &Path,
+    candidates: &[Runner],
+) -> Option<Runner> {
+    owners
+        .iter()
+        .find(|(listed, r)| {
+            candidates.contains(r)
+                && listed
+                    .split_once("::")
+                    .is_some_and(|(path, _)| !path.is_empty() && file.ends_with(path))
+        })
+        .map(|(_, r)| *r)
 }
 
 pub enum TestRequest {
@@ -1428,7 +1461,13 @@ fn coverage_tool_present(runner: Runner, root: &Path) -> bool {
 /// anything runs, with the command that installs it; the tree is left as
 /// it was.
 fn run_coverage(root: &Path, tx: &EpochTx, scope: Option<&CoverageScope>) {
-    let Some(runner) = runner_for(root) else {
+    // A scoped run goes to the runner that owns its test, as a plain run
+    // of it does (#1408): a pytest case in a maturin crate is pytest-cov's.
+    let runner = match scope {
+        Some(scope) => tx.choose(&runners_for(root), &scope.name, None),
+        None => runner_for(root),
+    };
+    let Some(runner) = runner else {
         tx.send(TestResponse::Refused);
         return;
     };
@@ -2823,6 +2862,52 @@ exit 1"#
         assert_eq!(
             runner_for_file(&web, Some(Path::new("/w/ui/a.test.tsx"))),
             Some(Runner::Jest)
+        );
+    }
+
+    /// #1408: a suite owns only what sits under it at the `::` separator.
+    /// Rust's `tests` suite beside pytest's `tests/...` nodes (which sort
+    /// first) is Cargo's, not pytest's.
+    #[test]
+    fn a_suite_goes_to_the_runner_of_a_test_under_its_separator() {
+        let both = [Runner::Pytest, Runner::Cargo];
+        let owners = BTreeMap::from([
+            (String::from("tests/test_x.py::test_a"), Runner::Pytest),
+            (String::from("tests::adds"), Runner::Cargo),
+        ]);
+        assert_eq!(
+            choose_runner(&both, &owners, "tests", None),
+            Some(Runner::Cargo)
+        );
+    }
+
+    /// #1408: where Vitest and Jest both claim the folder, a JS file goes to
+    /// the runner that listed it, not to whichever comes first; with no
+    /// listing yet it falls back to the extension order.
+    #[test]
+    fn a_js_file_goes_to_the_runner_that_listed_its_tests() {
+        let both = [Runner::Vitest, Runner::Jest];
+        let owners = BTreeMap::from([
+            (String::from("ui/a.test.ts::adds"), Runner::Jest),
+            (String::from("web/b.test.ts::subs"), Runner::Vitest),
+        ]);
+        let jest_file = Path::new("/w/ui/a.test.ts");
+        let vitest_file = Path::new("/w/web/b.test.ts");
+        assert_eq!(
+            choose_runner(&both, &owners, "adds", Some(jest_file)),
+            Some(Runner::Jest)
+        );
+        assert_eq!(
+            choose_runner(&both, &owners, "subs", Some(vitest_file)),
+            Some(Runner::Vitest)
+        );
+        assert_eq!(
+            choose_runner(&both, &owners, "ui/a.test.ts::adds", Some(jest_file)),
+            Some(Runner::Jest)
+        );
+        assert_eq!(
+            choose_runner(&both, &BTreeMap::new(), "adds", Some(jest_file)),
+            Some(Runner::Vitest)
         );
     }
 
