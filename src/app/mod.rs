@@ -71920,6 +71920,8 @@ pub fn run(
     #[cfg(unix)]
     if app.inline_protocol == crate::iterm2_inline::InlineImageProtocol::None {
         app.sixel_supported = crate::iterm2_inline::probe_sixel_support();
+        crate::widgets::terminal::SIXEL_HOST
+            .store(app.sixel_supported, std::sync::atomic::Ordering::Relaxed);
     }
     let mut out = stdout();
     // Alt screen + mouse + bracketed paste + SteadyBar cursor (thin vertical

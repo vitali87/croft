@@ -59656,6 +59656,42 @@ fn a_pane_command_omits_the_view_socket_when_none_is_bound() {
 }
 
 #[test]
+fn a_pane_names_croft_as_its_terminal_not_the_host() {
+    // #1453: croft in Ghostty handed every pane `TERM_PROGRAM=ghostty`, so
+    // `croft plot` there wrote Kitty graphics that croft's emulator drops.
+    // Read through `iter_full_env_as_str`, what the child actually gets.
+    let mut cmd = portable_pty::CommandBuilder::new("/bin/sh");
+    cmd.env("TERM_PROGRAM", "ghostty");
+    cmd.env("KITTY_WINDOW_ID", "1");
+    cmd.env("GHOSTTY_RESOURCES_DIR", "/usr/share/ghostty");
+    cmd.env("LC_TERMINAL", "iTerm2");
+    cmd.env("PATH_PROBE_1453", "kept");
+    crate::widgets::terminal::apply_pane_env(&mut cmd, None);
+    let env: std::collections::HashMap<String, String> = cmd
+        .iter_full_env_as_str()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    assert_eq!(env.get("TERM_PROGRAM").map(String::as_str), Some("croft"));
+    assert_eq!(
+        env.get("TERM_PROGRAM_VERSION").map(String::as_str),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    for host_only in ["KITTY_WINDOW_ID", "GHOSTTY_RESOURCES_DIR", "LC_TERMINAL"] {
+        assert!(!env.contains_key(host_only), "{host_only} leaked: {env:?}");
+    }
+    assert!(
+        matches!(
+            env.get("CROFT_INLINE_IMAGES").map(String::as_str),
+            Some("0" | "1")
+        ),
+        "a pane says whether its images show: {env:?}"
+    );
+    // Only the terminal's identity goes: the rest of the environment stays.
+    assert_eq!(env.get("PATH_PROBE_1453").map(String::as_str), Some("kept"));
+    assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
+}
+
+#[test]
 fn a_client_that_never_sends_a_newline_is_refused_by_the_deadline() {
     // The socket's read timeout does NOT bound `read_request` on its own:
     // SO_RCVTIMEO applies per `recv`, while the read loops until it sees a

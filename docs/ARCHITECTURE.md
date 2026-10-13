@@ -1281,6 +1281,8 @@ The in-process OUTPUT bus behind the panel group's OUTPUT tab. It holds named ch
 
 **Image output, with a text fallback.** An SVG in the theme's colours is rasterised through `svg.rs` and emitted with the previews' inline-image escape. iTerm2/Kitty are detected from the environment; the sixel probe needs a raw tty on stdin, which here is the data pipe. With no image protocol, or with `--text`, the same data renders as braille (line/spark) or block (bar/hist) characters.
 
+**Inside a croft pane.** A pane is croft's emulator, not the host's, so it sets `TERM_PROGRAM=croft` and `TERM_PROGRAM_VERSION`, and drops host-only variables such as `KITTY_WINDOW_ID`, `GHOSTTY_RESOURCES_DIR` and `LC_TERMINAL` (#1453). The pane captures OSC 1337 and draws it through the outer terminal, so `TERM_PROGRAM=croft` means iTerm2 images, but only when the pane's `CROFT_INLINE_IMAGES` is `1`, which croft sets when the outer terminal draws images at all. Otherwise the chart is text, never blank rows.
+
 **Long series are bucketed to the pixel/dot width.** That keeps 10k rows linear.
 
 ### prefs.rs
