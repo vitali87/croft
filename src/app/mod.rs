@@ -14144,10 +14144,7 @@ impl App {
     /// The `edit_seq` of the tab a format reply for `path` lands in (the
     /// one `apply_rename_to_open_tab` picks), or `None` when no tab holds it.
     fn format_target_seq(&self, path: &std::path::Path) -> Option<u64> {
-        let idx = self
-            .editor
-            .find_tab_with_path(path)
-            .or_else(|| self.editor.find_any_tab_with_path(path))?;
+        let idx = self.editor.find_buffer_tab(path)?;
         Some(self.editor.editors[idx].edit_seq)
     }
 

@@ -1,0 +1,1 @@
+fix: Rename Symbol, quick fixes and Format Document no longer skip a file whose Source Control diff or Explorer compare is open. The edits used to go to the diff, which changed nothing, and the file was neither edited nor written. Opening that file (Quick Open, the Explorer, a problem row) now opens the file beside its diff instead of landing on the diff.

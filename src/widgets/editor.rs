@@ -18087,9 +18087,18 @@ impl EditorTabs {
     }
 
     /// Like [`Self::find_tab_with_path`], symbol tabs included: for closing
-    /// every tab of a file, or editing whichever buffer holds it.
+    /// every tab of a file.
     pub fn find_any_tab_with_path(&self, target: &Path) -> Option<usize> {
         self.find_tab_matching(target, |_| true)
+    }
+
+    /// The tab whose buffer holds `target`'s text: its own tab first, else a
+    /// symbol tab over it. A diff tab carries the file's `path` but shows a
+    /// comparison, so an edit sent to it changes nothing (#1113); it never
+    /// counts.
+    pub fn find_buffer_tab(&self, target: &Path) -> Option<usize> {
+        self.find_tab_matching(target, |e| e.diff.is_none() && e.symbol_view.is_none())
+            .or_else(|| self.find_tab_matching(target, |e| e.diff.is_none()))
     }
 
     /// If `path` is open in a tab, apply LSP rename `edits` to that buffer
@@ -18100,9 +18109,7 @@ impl EditorTabs {
         path: &Path,
         edits: &[TextSpanEdit],
     ) -> Option<usize> {
-        let idx = self
-            .find_tab_with_path(path)
-            .or_else(|| self.find_any_tab_with_path(path))?;
+        let idx = self.find_buffer_tab(path)?;
         Some(self.editors[idx].apply_span_edits(edits))
     }
 
@@ -18120,10 +18127,7 @@ impl EditorTabs {
     /// was taken: the edit's positions describe text no longer there. A
     /// file no tab held when `seqs` was taken is never called edited.
     pub fn edited_since(&self, seqs: &[(PathBuf, u64)], path: &Path) -> bool {
-        let Some(idx) = self
-            .find_tab_with_path(path)
-            .or_else(|| self.find_any_tab_with_path(path))
-        else {
+        let Some(idx) = self.find_buffer_tab(path) else {
             return false;
         };
         let e = &self.editors[idx];
@@ -18262,7 +18266,11 @@ impl EditorTabs {
     /// switch to it. Otherwise reuse the existing preview slot, or create a
     /// fresh preview tab next to the active one when none exists.
     pub fn open_preview(&mut self, path: &Path) -> Result<()> {
-        if let Some(idx) = self.find_tab_with_path(path) {
+        // A diff of the file is not the file (#1113): opening it lands on
+        // its own tab, or a new one beside the diff.
+        if let Some(idx) =
+            self.find_tab_matching(path, |e| e.diff.is_none() && e.symbol_view.is_none())
+        {
             // Switching to an already-open file: if a stale preview tab
             // exists for some OTHER file, drop it so the user doesn't
             // accumulate ghost tabs from quick "peek" navigations.
@@ -30479,6 +30487,24 @@ mod tests {
         assert_eq!(t.find_tab_with_path(std::path::Path::new("/b")), Some(1));
         assert_eq!(t.find_tab_with_path(std::path::Path::new("/c")), Some(2));
         assert_eq!(t.find_tab_with_path(std::path::Path::new("/missing")), None);
+    }
+
+    /// #1113: the buffer for a path is its own tab, never a diff tab
+    /// carrying the same path.
+    #[test]
+    fn the_buffer_tab_of_a_file_is_never_its_diff() {
+        let mut t = EditorTabs::new();
+        let file = std::path::PathBuf::from("/a");
+        t.editors[0].path = Some(file.clone());
+        t.editors[0].diff = Some(crate::widgets::diff::DiffData::build_unified_deletion(
+            file.clone(),
+            "x\n",
+        ));
+        assert_eq!(t.find_buffer_tab(&file), None);
+        assert_eq!(t.find_tab_with_path(&file), Some(0), "still found as a tab");
+        t.add_tab_with_path(file.clone());
+        assert_eq!(t.find_buffer_tab(&file), Some(1), "its own tab");
+        assert_eq!(t.find_buffer_tab(std::path::Path::new("/b")), None);
     }
 
     #[test]
