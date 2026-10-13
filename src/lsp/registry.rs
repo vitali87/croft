@@ -3,27 +3,6 @@ use std::collections::HashMap;
 use crate::lsp::config::{Language, ServerConfig};
 use crate::lsp::manifest;
 
-/// Bundled (first-party) extension manifests, embedded so they ship in the
-/// binary and load identically on every host. These are the same declarative
-/// `extension.toml` format a third-party extension uses; the language servers
-/// they declare reproduce the configs `with_defaults` used to hardcode.
-const BUNDLED_MANIFESTS: &[&str] = &[
-    include_str!("../../assets/extensions/lsp-python/extension.toml"),
-    include_str!("../../assets/extensions/lsp-typescript/extension.toml"),
-    include_str!("../../assets/extensions/lsp-rust/extension.toml"),
-    include_str!("../../assets/extensions/lsp-go/extension.toml"),
-    include_str!("../../assets/extensions/lsp-yaml/extension.toml"),
-    include_str!("../../assets/extensions/lsp-json/extension.toml"),
-    include_str!("../../assets/extensions/lsp-html/extension.toml"),
-    include_str!("../../assets/extensions/lsp-css/extension.toml"),
-    include_str!("../../assets/extensions/lsp-bash/extension.toml"),
-    include_str!("../../assets/extensions/lsp-toml/extension.toml"),
-    include_str!("../../assets/extensions/lsp-cpp/extension.toml"),
-    include_str!("../../assets/extensions/lsp-lua/extension.toml"),
-    include_str!("../../assets/extensions/lsp-markdown/extension.toml"),
-    include_str!("../../assets/extensions/codeql/extension.toml"),
-];
-
 pub struct ServerRegistry {
     by_language: HashMap<Language, Vec<ServerConfig>>,
 }
@@ -46,14 +25,16 @@ impl ServerRegistry {
     /// (go-to-implementation, inlay hints); ruff (priority 2) lints. Servers are
     /// registered in ascending priority so the registry's first-registered-wins
     /// rule matches that policy.
+    #[cfg(test)]
     pub fn with_defaults() -> Self {
-        Self::from_manifest_sources(BUNDLED_MANIFESTS)
+        Self::with_user_extensions(&[])
     }
 
     /// Build the registry from the bundled manifests plus user extension
     /// sources (read from `~/.config/croft/extensions`). User servers register
     /// after the bundled ones at equal priority, so a user extension extends
     /// the language coverage without displacing a first-party server.
+    #[cfg(test)]
     pub fn with_user_extensions(user_sources: &[&str]) -> Self {
         let mut sources: Vec<&str> = manifest::BUNDLED_MANIFESTS.to_vec();
         sources.extend_from_slice(user_sources);
@@ -111,15 +92,12 @@ impl ServerRegistry {
             .unwrap_or(&[])
     }
 
+    #[cfg(test)]
     pub fn for_extension(&self, ext: &str) -> &[ServerConfig] {
         match Language::from_extension(ext) {
             Some(lang) => self.for_language(lang),
             None => &[],
         }
-    }
-
-    pub fn languages(&self) -> impl Iterator<Item = Language> + '_ {
-        self.by_language.keys().copied()
     }
 }
 
@@ -239,6 +217,32 @@ mod tests {
         // Resolves by both file extensions.
         assert_eq!(r.for_extension("yaml")[0].name, "yaml-language-server");
         assert_eq!(r.for_extension("yml")[0].name, "yaml-language-server");
+    }
+
+    /// #1532: the CSS server parses SCSS and LESS too, so `.scss` and
+    /// `.less` files get it (lint, outline, colours), the same managed
+    /// install as CSS. `.sass` is indented syntax it cannot parse: no server.
+    #[test]
+    fn the_css_server_serves_scss_and_less_but_not_sass() {
+        let r = ServerRegistry::with_defaults();
+        for ext in ["scss", "less"] {
+            let servers = r.for_extension(ext);
+            assert_eq!(servers.len(), 1, "one server for .{ext}");
+            assert_eq!(servers[0].name, "vscode-css-language-server", ".{ext}");
+            let lang = Language::from_extension(ext).unwrap();
+            assert_eq!(
+                lang.lsp_id(),
+                ext,
+                "didOpen says {ext}, so the server picks its parser"
+            );
+            assert_eq!(
+                lang.server_family(),
+                Language::CSS,
+                ".{ext} is in the CSS server's family"
+            );
+        }
+        assert!(r.for_extension("sass").is_empty(), ".sass gets no server");
+        assert_eq!(Language::CSS.server_family(), Language::CSS);
     }
 
     #[test]
@@ -445,6 +449,33 @@ mod tests {
                 termux_pkg: None,
             })
         );
+    }
+
+    /// #1158: Markdown prose is not held to 80 columns. rumdl is started
+    /// with no global line length (0 is its "no limit"), which turns off
+    /// MD013, and with the files on disk first, so a project's own
+    /// `.rumdl.toml` or `.markdownlint.*` line length still applies.
+    #[test]
+    fn rumdl_starts_with_no_line_length_unless_the_project_sets_one() {
+        let r = ServerRegistry::with_defaults();
+        let servers = r.for_language(Language::MARKDOWN);
+        let rumdl = servers
+            .iter()
+            .find(|s| s.name == "rumdl")
+            .expect("rumdl is registered for markdown");
+        assert_eq!(
+            rumdl.initialization_options,
+            Some(serde_json::json!({
+                "configurationPreference": "filesystemFirst",
+                "settings": { "lineLength": 0 }
+            }))
+        );
+        // Only rumdl's line length changes: marksman starts as before.
+        let marksman = servers
+            .iter()
+            .find(|s| s.name == "marksman")
+            .expect("marksman is registered for markdown");
+        assert_eq!(marksman.initialization_options, None);
     }
 
     #[test]

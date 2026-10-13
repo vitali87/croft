@@ -1,0 +1,1 @@
+fix: In a Prettier project (a Prettier config and node_modules/.bin/prettier), Format Document and Format on Save run the project's Prettier on JS/TS, JSON, CSS, HTML, Markdown and YAML files instead of the language server's formatter, so saved files pass prettier --check.
