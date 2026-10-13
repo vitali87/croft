@@ -405,6 +405,33 @@ mod tests {
         );
     }
 
+    /// #1158: Markdown prose is not held to 80 columns. rumdl is started
+    /// with no global line length (0 is its "no limit"), which turns off
+    /// MD013, and with the files on disk first, so a project's own
+    /// `.rumdl.toml` or `.markdownlint.*` line length still applies.
+    #[test]
+    fn rumdl_starts_with_no_line_length_unless_the_project_sets_one() {
+        let r = ServerRegistry::with_defaults();
+        let servers = r.for_language(Language::MARKDOWN);
+        let rumdl = servers
+            .iter()
+            .find(|s| s.name == "rumdl")
+            .expect("rumdl is registered for markdown");
+        assert_eq!(
+            rumdl.initialization_options,
+            Some(serde_json::json!({
+                "configurationPreference": "filesystemFirst",
+                "settings": { "lineLength": 0 }
+            }))
+        );
+        // Only rumdl's line length changes: marksman starts as before.
+        let marksman = servers
+            .iter()
+            .find(|s| s.name == "marksman")
+            .expect("marksman is registered for markdown");
+        assert_eq!(marksman.initialization_options, None);
+    }
+
     #[test]
     fn bundled_manifest_provisions_rust_analyzer_as_gz_binary_with_termux_fallback() {
         // rust-analyzer used to be PATH-only (provision: None), so on a box
