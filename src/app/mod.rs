@@ -24981,8 +24981,31 @@ impl App {
                     }
                 };
                 let project_py = project_py.unwrap_or_else(|| adapter_py.clone());
-                let request =
+                let mut request =
                     crate::dap::session::pytest_debug_launch_request(&project_py, &root, &name);
+                // A launch.json config for debugging tests (#1398) brings
+                // its env, cwd, args and debugpy settings, as in VS Code.
+                let configs = crate::dap::configs::discover_configs(&root);
+                let test_config = crate::dap::configs::debug_test_config(&configs);
+                if let Some(cfg) = test_config {
+                    let ctx = crate::dap::configs::SubstCtx {
+                        workspace_folder: root.clone(),
+                        file: self.editor.path.clone(),
+                    };
+                    match crate::dap::configs::resolve(cfg, &ctx) {
+                        Ok(rc) => {
+                            request = crate::dap::configs::with_debug_test_config(request, &rc);
+                        }
+                        Err(e) => {
+                            self.disarm_failure_breakpoint();
+                            self.debug_error(e);
+                            return;
+                        }
+                    }
+                }
+                let using = test_config
+                    .map(|c| format!(" with \"{}\"", c.name))
+                    .unwrap_or_default();
                 let adapter_args = vec![String::from("-m"), String::from("debugpy.adapter")];
                 match crate::dap::session::DapSession::launch_with(
                     &adapter_py.to_string_lossy(),
@@ -24993,10 +25016,12 @@ impl App {
                 ) {
                     Ok(session) => {
                         self.debug_sessions.replace_with(name.clone(), session);
-                        self.run_debug.feedback = Some(format!("Debugging test {name}"));
+                        self.run_debug.feedback = Some(format!("Debugging test {name}{using}"));
                         self.run_debug.feedback_is_error = false;
-                        let lead =
-                            with_python_note(format!("Debugging test {name}"), note.as_deref());
+                        let lead = with_python_note(
+                            format!("Debugging test {name}{using}"),
+                            note.as_deref(),
+                        );
                         self.status = self.with_failure_note(format!(
                             "{lead} — F5 continue · F10 step over · Shift+F5 stop"
                         ));
