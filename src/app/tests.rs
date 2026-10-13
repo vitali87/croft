@@ -26589,6 +26589,7 @@ fn a_launch_json_python_config_runs_under_the_project_venv_unless_it_names_one()
     let ctx = SubstCtx {
         workspace_folder: root.to_path_buf(),
         file: None,
+        folders: Vec::new(),
     };
     let python_of = |json: &str| {
         let cfg = parse_launch_json(json, ".vscode/launch.json").remove(0);
@@ -26641,6 +26642,7 @@ fn a_module_launch_that_also_names_a_program_runs_under_its_cwds_venv() {
     let ctx = SubstCtx {
         workspace_folder: root.to_path_buf(),
         file: None,
+        folders: Vec::new(),
     };
     let request_of = |json: &str| {
         let cfg = parse_launch_json(json, ".vscode/launch.json").remove(0);
@@ -61237,6 +61239,7 @@ fn resolved_attach(json: &str) -> crate::dap::configs::ResolvedConfig {
     let ctx = crate::dap::configs::SubstCtx {
         workspace_folder: tmp.path().to_path_buf(),
         file: None,
+        folders: Vec::new(),
     };
     crate::dap::configs::resolve(&cfg, &ctx).expect("resolves")
 }
