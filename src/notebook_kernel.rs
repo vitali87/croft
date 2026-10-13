@@ -42,6 +42,13 @@ pub enum Event {
     Clear {
         id: String,
     },
+    /// An updatable display changed (#1475): output `index` of run `id`,
+    /// which may have finished long ago, is now `output`.
+    Update {
+        id: String,
+        index: usize,
+        output: Value,
+    },
     Done {
         id: String,
         execution_count: Option<u64>,
@@ -195,6 +202,9 @@ fn run_bridge(
 pub struct NotebookRun {
     session: KernelSession,
     pending: Vec<(String, CellRef)>,
+    /// Runs that finished, each cell's latest only, so a display it made
+    /// can still be updated from a later cell (#1475).
+    finished: Vec<(String, CellRef)>,
     backlog: Vec<Event>,
     /// The kernel's display name, once it is up.
     pub kernel: Option<String>,
@@ -206,6 +216,7 @@ impl NotebookRun {
         Self {
             session,
             pending: Vec::new(),
+            finished: Vec::new(),
             backlog: Vec::new(),
             kernel: None,
             sent: 0,
@@ -230,6 +241,9 @@ impl NotebookRun {
     pub fn execute(&mut self, cell: CellRef) {
         self.sent += 1;
         let id = format!("{}-{}", cell.index, self.sent);
+        // The cell's outputs are about to go: an update to a display from
+        // its last run has nothing left to replace.
+        self.finished.retain(|(_, done)| !same_cell(done, &cell));
         self.session.send(Request::Execute {
             id: id.clone(),
             code: cell.source.clone(),
@@ -284,6 +298,21 @@ impl NotebookRun {
                 }
                 Event::Output { id, output } => (id, CellEdit::Output(output)),
                 Event::Clear { id } => (id, CellEdit::Clear),
+                Event::Update { id, index, output } => {
+                    let cell = self
+                        .pending
+                        .iter()
+                        .chain(&self.finished)
+                        .find(|(p, _)| *p == id)
+                        .map(|(_, c)| c.clone());
+                    if let Some(next) =
+                        cell.and_then(|cell| apply(&doc, &cell, CellEdit::Replace(index, output)))
+                    {
+                        doc = next;
+                        changed = true;
+                    }
+                    continue;
+                }
                 Event::Done {
                     id,
                     execution_count,
@@ -294,7 +323,10 @@ impl NotebookRun {
                 continue;
             };
             let cell = if matches!(edit, CellEdit::Done(_)) {
-                self.pending.remove(pos).1
+                let (id, cell) = self.pending.remove(pos);
+                self.finished.retain(|(_, done)| !same_cell(done, &cell));
+                self.finished.push((id, cell.clone()));
+                cell
             } else {
                 self.pending[pos].1.clone()
             };
@@ -403,11 +435,22 @@ fn stored(mut output: Value) -> Value {
     output
 }
 
+/// Whether two runs were of the same cell: by nbformat id when it has one,
+/// else by position.
+fn same_cell(a: &CellRef, b: &CellRef) -> bool {
+    match (&a.cell_id, &b.cell_id) {
+        (Some(x), Some(y)) => x == y,
+        _ => a.index == b.index,
+    }
+}
+
 /// A change a kernel event makes to one cell.
 pub enum CellEdit {
     /// The run is starting: old outputs and count go.
     Begin,
     Output(Value),
+    /// Output `index` becomes this one, when the cell still has it (#1475).
+    Replace(usize, Value),
     Clear,
     Done(Option<u64>),
 }
@@ -437,6 +480,12 @@ pub fn apply(doc_text: &str, cell: &CellRef, edit: CellEdit) -> Option<String> {
             if let Some(list) = outputs.as_array_mut() {
                 list.push(stored(output));
             }
+        }
+        CellEdit::Replace(index, output) => {
+            let slot = outputs
+                .as_array_mut()
+                .and_then(|list| list.get_mut(index))?;
+            *slot = stored(output);
         }
         CellEdit::Clear => *outputs = Value::Array(Vec::new()),
         CellEdit::Done(count) => {
@@ -698,7 +747,7 @@ class Spec:
 class Client:
     def __init__(self):
         self.n = 0
-        self.idle = []
+        self.msgs = []
         self.up = False
         self.restarted = False
 
@@ -719,16 +768,20 @@ class Client:
         self.mark()
         self.n += 1
         mid = "m%d" % self.n
+        # `emit:[[msg_type, content], ...]` plays those iopub messages.
+        if code.startswith("emit:"):
+            for kind, content in json.loads(code[5:]):
+                self.msgs.append({"parent_header": {"msg_id": mid},
+                                  "msg_type": kind, "content": content})
         if "hang" not in code:
-            self.idle.append(mid)
+            self.msgs.append({"parent_header": {"msg_id": mid}, "msg_type": "status",
+                              "content": {"execution_state": "idle"}})
         return mid
 
     def get_iopub_msg(self, timeout=None):
         self.mark()
-        if self.idle:
-            mid = self.idle.pop(0)
-            return {"parent_header": {"msg_id": mid}, "msg_type": "status",
-                    "content": {"execution_state": "idle"}}
+        if self.msgs:
+            return self.msgs.pop(0)
         time.sleep(min(timeout or 0, 0.02))
         raise queue.Empty
 
@@ -900,6 +953,180 @@ class KernelManager:
             !events.iter().any(|e| matches!(e, Event::Error { .. })),
             "{events:?}"
         );
+    }
+
+    /// An iopub message of `kind` for the fake kernel's `emit:` cells.
+    fn iopub(kind: &str, text: &str, display_id: Option<&str>) -> Value {
+        let mut content = serde_json::json!({"data": {"text/plain": text}, "metadata": {}});
+        if let Some(id) = display_id {
+            content["transient"] = serde_json::json!({ "display_id": id });
+        }
+        serde_json::json!([kind, content])
+    }
+
+    fn emitting(id: &str, msgs: &[Value]) -> String {
+        let code = format!("emit:{}", Value::Array(msgs.to_vec()));
+        serde_json::json!({"op": "execute", "id": id, "code": code}).to_string()
+    }
+
+    fn updates(events: &[Event]) -> Vec<(String, usize, String)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Update { id, index, output } => Some((
+                    id.clone(),
+                    *index,
+                    output["data"]["text/plain"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #1475: `display(..., display_id=True)` then `.update()` reaches croft
+    /// as an update of that output, from its own cell or a later one.
+    #[test]
+    fn the_bridge_turns_display_updates_into_replacements() {
+        if !crate::lsp::manager::is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let stream = serde_json::json!(["stream", {"name": "stdout", "text": "done\n"}]);
+        let a = emitting(
+            "a",
+            &[
+                iopub("display_data", "download: 0%", Some("bar")),
+                stream,
+                iopub("update_display_data", "download: 50%", Some("bar")),
+            ],
+        );
+        let b = emitting(
+            "b",
+            &[iopub(
+                "update_display_data",
+                "download: verified",
+                Some("bar"),
+            )],
+        );
+        let (events, _) = bridge_against_fake(&[&a, &b], false);
+        assert_eq!(
+            updates(&events),
+            vec![
+                ("a".to_string(), 0, "download: 50%".to_string()),
+                ("a".to_string(), 0, "download: verified".to_string()),
+            ],
+            "{events:?}"
+        );
+        let first = events.iter().find_map(|e| match e {
+            Event::Output { id, output } if id == "a" => Some(output.clone()),
+            _ => None,
+        });
+        assert_eq!(first.unwrap()["data"]["text/plain"], "download: 0%");
+    }
+
+    /// #1475 negative: an update for a display nobody made, or for one its
+    /// cell has since cleared, changes nothing.
+    #[test]
+    fn an_unknown_or_cleared_display_is_not_updated() {
+        if !crate::lsp::manager::is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let clear = serde_json::json!(["clear_output", {"wait": false}]);
+        let a = emitting(
+            "a",
+            &[
+                iopub("update_display_data", "ghost", Some("nobody")),
+                iopub("display_data", "plain", None),
+                iopub("display_data", "old", Some("gone")),
+                clear,
+                iopub("update_display_data", "new", Some("gone")),
+            ],
+        );
+        let (events, _) = bridge_against_fake(&[&a], false);
+        assert!(updates(&events).is_empty(), "{events:?}");
+        assert_eq!(done_status(&events, "a").as_deref(), Some("ok"));
+    }
+
+    fn display(text: &str) -> Value {
+        serde_json::json!({"output_type": "display_data", "data": {"text/plain": text}, "metadata": {}})
+    }
+
+    /// #1475: an update replaces the output in place, even once its cell
+    /// finished and another cell sent the update, and is saved that way.
+    #[test]
+    fn an_update_replaces_a_finished_cells_display() {
+        let mut run = run_without_kernel();
+        let cell = code_cell(NB, 1).unwrap();
+        let doc = apply(NB, &cell, CellEdit::Begin).unwrap();
+        run.execute(cell);
+        let id = run.pending[0].0.clone();
+        run.backlog = vec![
+            Event::Output {
+                id: id.clone(),
+                output: display("download: 0%"),
+            },
+            Event::Output {
+                id: id.clone(),
+                output: serde_json::json!({"output_type": "stream", "name": "stdout", "text": "done\n"}),
+            },
+            Event::Done {
+                id: id.clone(),
+                execution_count: Some(1),
+                status: "ok".into(),
+            },
+        ];
+        let doc = run.fold(&doc).0.unwrap();
+        // The cell is done; the update comes from a later run.
+        run.backlog = vec![Event::Update {
+            id,
+            index: 0,
+            output: display("download: verified"),
+        }];
+        let doc: Value = serde_json::from_str(&run.fold(&doc).0.unwrap()).unwrap();
+        let outputs = doc["cells"][1]["outputs"].as_array().unwrap();
+        assert_eq!(outputs.len(), 2, "{outputs:?}");
+        assert_eq!(outputs[0]["data"]["text/plain"][0], "download: verified");
+        assert_eq!(outputs[1]["text"][0], "done\n");
+    }
+
+    /// #1475 negative: once the cell runs again its old display is gone, so
+    /// an update to it (or to an output the cell no longer has) is dropped.
+    #[test]
+    fn an_update_after_a_rerun_or_past_the_outputs_changes_nothing() {
+        let mut run = run_without_kernel();
+        let cell = code_cell(NB, 1).unwrap();
+        let doc = apply(NB, &cell, CellEdit::Begin).unwrap();
+        run.execute(cell.clone());
+        let old = run.pending[0].0.clone();
+        run.backlog = vec![
+            Event::Output {
+                id: old.clone(),
+                output: display("first run"),
+            },
+            Event::Done {
+                id: old.clone(),
+                execution_count: Some(1),
+                status: "ok".into(),
+            },
+        ];
+        let doc = run.fold(&doc).0.unwrap();
+        run.backlog = vec![Event::Update {
+            id: old.clone(),
+            index: 5,
+            output: display("nowhere"),
+        }];
+        assert!(run.fold(&doc).0.is_none(), "no output 5 to replace");
+        run.execute(cell);
+        run.backlog = vec![Event::Update {
+            id: old,
+            index: 0,
+            output: display("stale"),
+        }];
+        assert!(run.fold(&doc).0.is_none(), "the rerun owns the cell now");
     }
 
     /// A long Run All behind a silent cell: the bridge must not wait on

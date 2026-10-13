@@ -10,6 +10,7 @@
 #   out: {"ev": "ready", "kernel": "python3", "display": "Python 3 (ipykernel)"}
 #        {"ev": "output", "id": "<cell>", "output": {...nbformat output...}}
 #        {"ev": "clear", "id": "<cell>"}
+#        {"ev": "update", "id": "<cell>", "index": 0, "output": {...}}
 #        {"ev": "done", "id": "<cell>", "execution_count": 3, "status": "ok"|"error"}
 #        {"ev": "error", "message": "..."}
 #
@@ -61,6 +62,19 @@ def ready():
 # the kernel thread below touches it.
 cells = {}
 requests = queue.Queue()
+# Updatable displays (#1475): cell id -> outputs it holds since its run began
+# or was cleared, and display_id -> [(cell id, output index)] of each output
+# a `display(..., display_id=...)` made, so an `update_display_data` from any
+# cell can replace them in place. croft stores one output per output event,
+# so the counts index its list.
+counts = {}
+displays = {}
+
+
+def forget_outputs(cell_id):
+    counts[cell_id] = 0
+    for spots in displays.values():
+        spots[:] = [s for s in spots if s[0] != cell_id]
 
 
 def as_output(kind, c):
@@ -89,16 +103,32 @@ def as_output(kind, c):
     return None
 
 
+def on_update(c):
+    # Whichever cell sent it, it replaces the outputs that display made.
+    display_id = c.get("transient", {}).get("display_id")
+    out = {
+        "output_type": "display_data",
+        "data": c.get("data", {}),
+        "metadata": c.get("metadata", {}),
+    }
+    for cell_id, index in displays.get(display_id, []):
+        emit({"ev": "update", "id": cell_id, "index": index, "output": out})
+
+
 def on_iopub(msg):
+    kind = msg["msg_type"]
+    c = msg["content"]
+    if kind == "update_display_data":
+        on_update(c)
+        return
     parent = msg.get("parent_header", {}).get("msg_id")
     cell = cells.get(parent)
     if cell is None:
         return
-    kind = msg["msg_type"]
-    c = msg["content"]
     if kind == "execute_input":
         cell[1] = c.get("execution_count")
     elif kind == "clear_output":
+        forget_outputs(cell[0])
         emit({"ev": "clear", "id": cell[0]})
     elif kind == "status" and c.get("execution_state") == "idle":
         cells.pop(parent, None)
@@ -108,6 +138,11 @@ def on_iopub(msg):
         if out is not None:
             if kind == "error":
                 cell[2] = "error"
+            index = counts.get(cell[0], 0)
+            counts[cell[0]] = index + 1
+            display_id = c.get("transient", {}).get("display_id")
+            if display_id and kind in ("display_data", "execute_result"):
+                displays.setdefault(display_id, []).append((cell[0], index))
             emit({"ev": "output", "id": cell[0], "output": out})
 
 
