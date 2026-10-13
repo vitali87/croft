@@ -7369,7 +7369,9 @@ impl Editor {
                 .is_none_or(|p| !p.is_alphanumeric() && p != '_' && p != c)
             || (self.lang == Some(LangKind::Python)
                 && is_python_string_prefix(trailing_word(before)));
-        if !next_ok || !prev_ok {
+        // A Rust lifetime or loop label has no closing quote (#1163).
+        let lifetime = c == '\'' && self.lang == Some(LangKind::Rust) && rust_lifetime_at(before);
+        if !next_ok || !prev_ok || lifetime {
             return PairAction::Plain;
         }
         // A quote typed inside a string or comment is text there, or that
@@ -17867,6 +17869,47 @@ fn quote_opens_string(before: &str, rest: &str, lang: Option<LangKind>) -> bool 
         );
     }
     true
+}
+
+/// Whether a `'` typed after `before` on a Rust line starts a lifetime or a
+/// loop label, which take no closing quote (#1163): after `<` or `&`
+/// (`impl<'a>`, `&'a str`), `+` (`T + 'static`), `break`, `continue` or
+/// `where`, or after a `,` inside an unclosed `<` (`<'a, 'b>`). Anywhere
+/// else it may open a char literal (`f('x')`, `['a', 'b']`), so it pairs.
+fn rust_lifetime_at(before: &str) -> bool {
+    let before = before.trim_end();
+    match before.chars().next_back() {
+        Some('<') => before[..before.len() - 1]
+            .chars()
+            .next_back()
+            .is_some_and(opens_generics_after),
+        Some('&' | '+') => true,
+        Some(',') => inside_angle_brackets(before),
+        _ => matches!(trailing_word(before), "break" | "continue" | "where"),
+    }
+}
+
+/// Whether a `<` right after `prev` opens generics (`foo<`, `impl<`,
+/// `Vec::<`) rather than comparing (`a < b`): a generic `<` sits right
+/// against a name or `::`.
+fn opens_generics_after(prev: char) -> bool {
+    prev.is_alphanumeric() || prev == '_' || prev == ':'
+}
+
+/// Whether `s` ends inside an unclosed generic `<`, counting `->` and `=>`
+/// as arrows rather than closers and a spaced-out `<` as a comparison.
+fn inside_angle_brackets(s: &str) -> bool {
+    let mut depth = 0i32;
+    let mut prev = ' ';
+    for c in s.chars() {
+        match c {
+            '<' if opens_generics_after(prev) => depth += 1,
+            '>' if prev != '-' && prev != '=' => depth = (depth - 1).max(0),
+            _ => {}
+        }
+        prev = c;
+    }
+    depth > 0
 }
 
 /// Whether a backslash escapes the next character inside a `q`-quoted string
@@ -35919,6 +35962,52 @@ mod tests {
                 format!("{head}\"\"{tail}"),
                 "{lang:?}: {text:?}"
             );
+        }
+    }
+
+    /// #1163: in Rust, a `'` that starts a lifetime or a loop label gets no
+    /// closing quote, so `fn foo<'a>` types as written.
+    #[test]
+    fn a_rust_lifetime_or_label_quote_does_not_pair() {
+        for text in [
+            "fn foo<|",
+            "impl<|",
+            "fn f(s: &|",
+            "fn f<'a, |",
+            "struct S<T: Clone + |",
+            "        break |",
+            "    continue |",
+            "fn f<'a, 'b>() where |",
+        ] {
+            let (mut e, head, tail) = with_caret(Some(LangKind::Rust), text);
+            e.insert_char('\'');
+            assert_eq!(e.lines[0], format!("{head}'{tail}"), "{text:?}");
+        }
+        let (mut e, _, _) = with_caret(Some(LangKind::Rust), "fn foo|");
+        for c in "<'a>".chars() {
+            e.insert_char(c);
+        }
+        assert_eq!(e.lines[0], "fn foo<'a>");
+    }
+
+    /// #1163, negative: a Rust char literal still pairs, and so does a
+    /// `'` after `<` in a language without lifetimes.
+    #[test]
+    fn a_rust_char_literal_and_other_languages_still_pair_quotes() {
+        for (lang, text) in [
+            (Some(LangKind::Rust), "s.push(|"),
+            (Some(LangKind::Rust), "let v = vec!['a', |"),
+            (Some(LangKind::Rust), "let c = |"),
+            (Some(LangKind::Rust), "match c { 'a' => |"),
+            (Some(LangKind::Rust), "let t = (Vec::<u8>::new(), |"),
+            (Some(LangKind::Rust), "if a < b { f(x, |"),
+            (Some(LangKind::Rust), "if c < |"),
+            (Some(LangKind::Python), "x = a < |"),
+            (Some(LangKind::JavaScript), "f(a & |"),
+        ] {
+            let (mut e, head, tail) = with_caret(lang, text);
+            e.insert_char('\'');
+            assert_eq!(e.lines[0], format!("{head}''{tail}"), "{lang:?}: {text:?}");
         }
     }
 
