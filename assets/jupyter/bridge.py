@@ -6,6 +6,7 @@
 # so croft stores them in the notebook exactly as they arrive.
 #
 #   in:  {"op": "execute", "id": "<cell>", "code": "..."}
+#        {"op": "forget", "ids": ["<cell>", ...]}
 #        {"op": "interrupt"} | {"op": "restart"} | {"op": "shutdown"}
 #   out: {"ev": "ready", "kernel": "python3", "display": "Python 3 (ipykernel)"}
 #        {"ev": "output", "id": "<cell>", "output": {...nbformat output...}}
@@ -71,10 +72,15 @@ counts = {}
 displays = {}
 
 
-def forget_outputs(cell_id):
-    counts[cell_id] = 0
-    for spots in displays.values():
-        spots[:] = [s for s in spots if s[0] != cell_id]
+def forget_outputs(cell_ids):
+    for cell_id in cell_ids:
+        counts.pop(cell_id, None)
+    for display_id in list(displays):
+        spots = [s for s in displays[display_id] if s[0] not in cell_ids]
+        if spots:
+            displays[display_id] = spots
+        else:
+            del displays[display_id]
 
 
 def as_output(kind, c):
@@ -128,7 +134,7 @@ def on_iopub(msg):
     if kind == "execute_input":
         cell[1] = c.get("execution_count")
     elif kind == "clear_output":
-        forget_outputs(cell[0])
+        forget_outputs({cell[0]})
         emit({"ev": "clear", "id": cell[0]})
     elif kind == "status" and c.get("execution_state") == "idle":
         cells.pop(parent, None)
@@ -162,6 +168,10 @@ def handle(req):
         if op == "execute":
             msg_id = kc.execute(req.get("code", ""), store_history=True)
             cells[msg_id] = [req.get("id", ""), None, "ok"]
+        elif op == "forget":
+            # croft dropped these runs' outputs (the cell ran again), so an
+            # update has nothing of theirs left to replace.
+            forget_outputs(set(req.get("ids", [])))
         elif op == "interrupt":
             km.interrupt_kernel()
         elif op == "restart":

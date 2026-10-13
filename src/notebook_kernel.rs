@@ -21,7 +21,15 @@ const BRIDGE: &str = include_str!("../assets/jupyter/bridge.py");
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum Request {
-    Execute { id: String, code: String },
+    Execute {
+        id: String,
+        code: String,
+    },
+    /// Runs whose outputs croft no longer keeps, so the bridge can drop
+    /// what it tracks for them (#1475).
+    Forget {
+        ids: Vec<String>,
+    },
     Interrupt,
     Restart,
     Shutdown,
@@ -243,7 +251,7 @@ impl NotebookRun {
         let id = format!("{}-{}", cell.index, self.sent);
         // The cell's outputs are about to go: an update to a display from
         // its last run has nothing left to replace.
-        self.finished.retain(|(_, done)| !same_cell(done, &cell));
+        self.forget_finished(&cell);
         self.session.send(Request::Execute {
             id: id.clone(),
             code: cell.source.clone(),
@@ -253,6 +261,19 @@ impl NotebookRun {
 
     pub fn send(&self, request: Request) {
         self.session.send(request);
+    }
+
+    /// Drop `cell`'s earlier finished runs, and tell the bridge, so its
+    /// display registrations do not pile up across reruns.
+    fn forget_finished(&mut self, cell: &CellRef) {
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.finished)
+            .into_iter()
+            .partition(|(_, done)| same_cell(done, cell));
+        self.finished = kept;
+        let ids: Vec<String> = gone.into_iter().map(|(id, _)| id).collect();
+        if !ids.is_empty() {
+            self.session.send(Request::Forget { ids });
+        }
     }
 
     /// Cells running or queued, for the `In [*]` marks.
@@ -324,7 +345,7 @@ impl NotebookRun {
             };
             let cell = if matches!(edit, CellEdit::Done(_)) {
                 let (id, cell) = self.pending.remove(pos);
-                self.finished.retain(|(_, done)| !same_cell(done, &cell));
+                self.forget_finished(&cell);
                 self.finished.push((id, cell.clone()));
                 cell
             } else {
@@ -449,7 +470,8 @@ pub enum CellEdit {
     /// The run is starting: old outputs and count go.
     Begin,
     Output(Value),
-    /// Output `index` becomes this one, when the cell still has it (#1475).
+    /// Output `index` takes this one's data and metadata, when the cell
+    /// still has it (#1475).
     Replace(usize, Value),
     Clear,
     Done(Option<u64>),
@@ -482,10 +504,16 @@ pub fn apply(doc_text: &str, cell: &CellRef, edit: CellEdit) -> Option<String> {
             }
         }
         CellEdit::Replace(index, output) => {
+            // Only the display's data and metadata change, as in Jupyter:
+            // an `execute_result` keeps its type and execution count.
             let slot = outputs
                 .as_array_mut()
-                .and_then(|list| list.get_mut(index))?;
-            *slot = stored(output);
+                .and_then(|list| list.get_mut(index))
+                .and_then(Value::as_object_mut)?;
+            let mut output = stored(output);
+            for field in ["data", "metadata"] {
+                slot.insert(field.into(), output[field].take());
+            }
         }
         CellEdit::Clear => *outputs = Value::Array(Vec::new()),
         CellEdit::Done(count) => {
@@ -1127,6 +1155,81 @@ class KernelManager:
             output: display("stale"),
         }];
         assert!(run.fold(&doc).0.is_none(), "the rerun owns the cell now");
+    }
+
+    /// #1475: an update to an `execute_result` changes its data and
+    /// metadata only; it stays an `execute_result` with its count.
+    #[test]
+    fn an_update_keeps_an_execute_results_type_and_count() {
+        let mut run = run_without_kernel();
+        let cell = code_cell(NB, 1).unwrap();
+        let doc = apply(NB, &cell, CellEdit::Begin).unwrap();
+        run.execute(cell);
+        let id = run.pending[0].0.clone();
+        run.backlog = vec![
+            Event::Output {
+                id: id.clone(),
+                output: serde_json::json!({"output_type": "execute_result", "execution_count": 4,
+                    "data": {"text/plain": "0%"}, "metadata": {}}),
+            },
+            Event::Update {
+                id,
+                index: 0,
+                output: serde_json::json!({"output_type": "display_data",
+                    "data": {"text/plain": "100%"}, "metadata": {"done": true}}),
+            },
+        ];
+        let doc: Value = serde_json::from_str(&run.fold(&doc).0.unwrap()).unwrap();
+        let out = &doc["cells"][1]["outputs"][0];
+        assert_eq!(out["output_type"], "execute_result", "{out}");
+        assert_eq!(out["execution_count"], 4, "{out}");
+        assert_eq!(out["data"]["text/plain"][0], "100%");
+        assert_eq!(out["metadata"]["done"], true);
+    }
+
+    /// #1475: rerunning a cell tells the bridge to forget its last run, so
+    /// display registrations do not pile up across reruns.
+    #[test]
+    fn a_rerun_tells_the_bridge_to_forget_the_last_run() {
+        let (mut run, _events, requests) = NotebookRun::for_test();
+        let cell = code_cell(NB, 1).unwrap();
+        run.execute(cell.clone());
+        let old = run.pending[0].0.clone();
+        run.backlog = vec![Event::Done {
+            id: old.clone(),
+            execution_count: Some(1),
+            status: "ok".into(),
+        }];
+        run.fold(NB);
+        run.execute(cell);
+        let forgets: Vec<_> = requests
+            .try_iter()
+            .filter_map(|r| match r {
+                Request::Forget { ids } => Some(ids),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(forgets, vec![vec![old]]);
+    }
+
+    /// #1475: once croft forgets a run, the bridge stops sending updates
+    /// for its displays, while other runs' displays still update.
+    #[test]
+    fn the_bridge_drops_displays_of_forgotten_runs() {
+        if !crate::lsp::manager::is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let a = emitting("a", &[iopub("display_data", "a", Some("bar"))]);
+        let b = emitting("b", &[iopub("display_data", "b", Some("bar"))]);
+        let forget = r#"{"op":"forget","ids":["a"]}"#;
+        let c = emitting("c", &[iopub("update_display_data", "new", Some("bar"))]);
+        let (events, _) = bridge_against_fake(&[&a, &b, forget, &c], false);
+        assert_eq!(
+            updates(&events),
+            vec![("b".to_string(), 0, "new".to_string())],
+            "{events:?}"
+        );
     }
 
     /// A long Run All behind a silent cell: the bridge must not wait on
