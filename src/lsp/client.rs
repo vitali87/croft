@@ -666,6 +666,25 @@ impl LspClient {
     }
 }
 
+/// The document and position a positional request is about.
+fn position_params(uri: Url, line: u32, character: u32) -> TextDocumentPositionParams {
+    TextDocumentPositionParams {
+        text_document: TextDocumentIdentifier { uri },
+        position: Position { line, character },
+    }
+}
+
+/// The params of every go-to request. lsp-types aliases the declaration,
+/// type-definition and implementation params and responses to the definition
+/// ones, so the same params serve all four; only the wire method differs.
+fn goto_params(uri: Url, line: u32, character: u32) -> GotoDefinitionParams {
+    GotoDefinitionParams {
+        text_document_position_params: position_params(uri, line, character),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    }
+}
+
 /// The request half of an [`LspClient`]: a clone of its server socket,
 /// cheap to take while the client's lock is held and awaited after it is
 /// released. A server may take long to answer, or never answer, and holding
@@ -688,10 +707,7 @@ impl LspRequests {
     ) -> Result<Option<CompletionResponse>> {
         self.server
             .completion(CompletionParams {
-                text_document_position: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
+                text_document_position: position_params(uri, line, character),
                 work_done_progress_params: WorkDoneProgressParams::default(),
                 partial_result_params: PartialResultParams::default(),
                 context: Some(CompletionContext {
@@ -716,10 +732,7 @@ impl LspRequests {
         self.server
             .signature_help(lsp_types::SignatureHelpParams {
                 context: None,
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
+                text_document_position_params: position_params(uri, line, character),
                 work_done_progress_params: WorkDoneProgressParams::default(),
             })
             .await
@@ -729,10 +742,7 @@ impl LspRequests {
     pub async fn hover(&mut self, uri: Url, line: u32, character: u32) -> Result<Option<Hover>> {
         self.server
             .hover(HoverParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
+                text_document_position_params: position_params(uri, line, character),
                 work_done_progress_params: WorkDoneProgressParams::default(),
             })
             .await
@@ -746,14 +756,7 @@ impl LspRequests {
         character: u32,
     ) -> Result<Option<GotoDefinitionResponse>> {
         self.server
-            .definition(GotoDefinitionParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: PartialResultParams::default(),
-            })
+            .definition(goto_params(uri, line, character))
             .await
             .context("definition")
     }
@@ -779,18 +782,8 @@ impl LspRequests {
         line: u32,
         character: u32,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        // `GotoDeclarationParams`/`GotoDeclarationResponse` are type aliases for
-        // the definition variants in lsp-types, so the same params and the same
-        // `def_location` parser are reused; only the wire method differs.
         self.server
-            .declaration(GotoDefinitionParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: PartialResultParams::default(),
-            })
+            .declaration(goto_params(uri, line, character))
             .await
             .context("declaration")
     }
@@ -801,19 +794,8 @@ impl LspRequests {
         line: u32,
         character: u32,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        // `GotoTypeDefinitionParams`/`GotoTypeDefinitionResponse` are type aliases
-        // for the definition variants in lsp-types, so the same params and the
-        // same `def_location` parser are reused; only the wire method differs
-        // (`textDocument/typeDefinition`).
         self.server
-            .type_definition(GotoDefinitionParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: PartialResultParams::default(),
-            })
+            .type_definition(goto_params(uri, line, character))
             .await
             .context("type_definition")
     }
@@ -824,21 +806,10 @@ impl LspRequests {
         line: u32,
         character: u32,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        // `GotoImplementationParams`/`GotoImplementationResponse` are type aliases
-        // for the definition variants in lsp-types, so the same params and the
-        // same `def_location` parser are reused; only the wire method differs
-        // (`textDocument/implementation`). Note this commonly returns an Array of
-        // locations (one abstraction, many implementors); `def_location` jumps to
-        // the first.
+        // This commonly returns an Array of locations (one abstraction, many
+        // implementors), which the manager keeps whole (`def_locations`).
         self.server
-            .implementation(GotoDefinitionParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: PartialResultParams::default(),
-            })
+            .implementation(goto_params(uri, line, character))
             .await
             .context("implementation")
     }
@@ -933,10 +904,7 @@ impl LspRequests {
         // peek list includes the declaration site alongside every use.
         self.server
             .references(ReferenceParams {
-                text_document_position: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
+                text_document_position: position_params(uri, line, character),
                 work_done_progress_params: WorkDoneProgressParams::default(),
                 partial_result_params: PartialResultParams::default(),
                 context: ReferenceContext {
@@ -957,10 +925,7 @@ impl LspRequests {
     ) -> Result<Option<Vec<lsp_types::CallHierarchyItem>>> {
         self.server
             .prepare_call_hierarchy(lsp_types::CallHierarchyPrepareParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
+                text_document_position_params: position_params(uri, line, character),
                 work_done_progress_params: WorkDoneProgressParams::default(),
             })
             .await
@@ -977,10 +942,7 @@ impl LspRequests {
     ) -> Result<Option<Vec<lsp_types::TypeHierarchyItem>>> {
         self.server
             .prepare_type_hierarchy(lsp_types::TypeHierarchyPrepareParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
+                text_document_position_params: position_params(uri, line, character),
                 work_done_progress_params: WorkDoneProgressParams::default(),
             })
             .await
@@ -1055,10 +1017,7 @@ impl LspRequests {
     ) -> Result<Option<Vec<lsp_types::DocumentHighlight>>> {
         self.server
             .document_highlight(lsp_types::DocumentHighlightParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
+                text_document_position_params: position_params(uri, line, character),
                 work_done_progress_params: WorkDoneProgressParams::default(),
                 partial_result_params: PartialResultParams::default(),
             })
@@ -1077,10 +1036,7 @@ impl LspRequests {
     ) -> Result<Option<lsp_types::LinkedEditingRanges>> {
         self.server
             .linked_editing_range(lsp_types::LinkedEditingRangeParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
+                text_document_position_params: position_params(uri, line, character),
                 work_done_progress_params: WorkDoneProgressParams::default(),
             })
             .await
@@ -1223,10 +1179,7 @@ impl LspRequests {
     ) -> Result<Option<WorkspaceEdit>> {
         self.server
             .rename(RenameParams {
-                text_document_position: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
+                text_document_position: position_params(uri, line, character),
                 new_name,
                 work_done_progress_params: WorkDoneProgressParams::default(),
             })
@@ -1257,10 +1210,7 @@ impl LspRequests {
         character: u32,
     ) -> Result<Option<lsp_types::PrepareRenameResponse>> {
         self.server
-            .prepare_rename(TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri },
-                position: Position { line, character },
-            })
+            .prepare_rename(position_params(uri, line, character))
             .await
             .context("prepare_rename")
     }
@@ -1396,10 +1346,7 @@ impl LspRequests {
     ) -> Result<Option<Vec<TextEdit>>> {
         self.server
             .on_type_formatting(lsp_types::DocumentOnTypeFormattingParams {
-                text_document_position: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
+                text_document_position: position_params(uri, line, character),
                 ch,
                 options: FormattingOptions {
                     tab_size,
