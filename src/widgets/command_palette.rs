@@ -2158,6 +2158,9 @@ pub struct CommandPalette {
     /// tab). They stay commands: keybindings.json and the Keyboard
     /// Shortcuts editor still reach them.
     pub hidden: Vec<Command>,
+    /// Shortcuts that differ from a command's built-in hint (#1482): the
+    /// user's own chord, or empty where a user binding took the chord.
+    pub hint_overrides: Vec<(Command, String)>,
     pub selected: usize,
     pub scroll: usize,
     pub last_rect: Rect,
@@ -2172,6 +2175,7 @@ impl CommandPalette {
             results: Vec::new(),
             extensions: Vec::new(),
             hidden: Vec::new(),
+            hint_overrides: Vec::new(),
             selected: 0,
             scroll: 0,
             last_rect: Rect::default(),
@@ -2179,6 +2183,17 @@ impl CommandPalette {
         };
         me.refresh_results();
         me
+    }
+
+    /// The shortcut shown beside `item`: an override from the user's
+    /// keybindings (#1482), else the built-in hint as this platform spells it.
+    pub fn hint_for(&self, item: &PaletteItem) -> std::borrow::Cow<'static, str> {
+        if let PaletteItem::Builtin(cmd) = item
+            && let Some((_, hint)) = self.hint_overrides.iter().find(|(c, _)| c == cmd)
+        {
+            return std::borrow::Cow::Owned(hint.clone());
+        }
+        platform_hint(item.keybinding_hint())
     }
 
     /// Inject the extension-contributed commands to interleave into the list,
@@ -2500,7 +2515,7 @@ pub fn render_command_palette(
         };
         let prefix = if is_selected { "> " } else { "  " };
         let title = crate::i18n::tr(cmd.title());
-        let hint = platform_hint(cmd.keybinding_hint());
+        let hint = palette.hint_for(cmd);
         // Right-align the keybinding hint: pad between the title and the hint
         // so the chord sits at the row's right edge, like VS Code.
         let used = 2 + title.chars().count() + hint.chars().count();
