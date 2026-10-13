@@ -62031,6 +62031,48 @@ fn the_tree_breakpoint_section_follows_changes_without_duplicating() {
     ));
 }
 
+/// #1418: a Go "Connect to server" config connects to the headless delve at
+/// its port instead of being refused for lacking a processId; a Go attach
+/// with neither says what it needs.
+#[test]
+fn a_go_connect_to_server_attach_reaches_the_headless_delve() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let rc = resolved_attach(
+        r#"{ "configurations": [ { "name": "Bare", "type": "go", "request": "attach" } ] }"#,
+    );
+    app.launch_resolved_config(rc);
+    assert!(
+        app.status.contains(
+            r#"config "Bare": a go attach needs a "processId", or "mode": "remote" with a "port""#
+        ),
+        "{}",
+        app.status
+    );
+    let rc = resolved_attach(
+        r#"{ "configurations": [ { "name": "No port", "type": "go", "request": "attach", "mode": "remote" } ] }"#,
+    );
+    app.launch_resolved_config(rc);
+    assert!(
+        app.status
+            .contains(r#"config "No port": a go remote attach needs a "port""#),
+        "{}",
+        app.status
+    );
+    assert!(app.debug_sessions.is_empty());
+
+    let (port, server) = crate::dap::session::tests::headless_delve(2);
+    let rc = resolved_attach(&format!(
+        r#"{{ "configurations": [ {{ "name": "Connect to server", "type": "go", "request": "attach",
+             "mode": "remote", "host": "127.0.0.1", "port": {port} }} ] }}"#
+    ));
+    app.launch_resolved_config(rc);
+    let got = server.join().unwrap();
+    assert_eq!(got[1]["command"], "attach");
+    assert_eq!(got[1]["arguments"]["mode"], "remote");
+    assert!(!app.debug_sessions.is_empty(), "{}", app.status);
+}
+
 fn resolved_attach(json: &str) -> crate::dap::configs::ResolvedConfig {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();

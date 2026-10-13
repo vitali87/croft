@@ -32542,22 +32542,47 @@ impl App {
                     ));
                     return;
                 }
-                if rc.request == RequestKind::Attach && rc.process_id.is_none() {
-                    self.debug_error(format!(
-                        "config \"{name}\": a go attach needs a \"processId\""
-                    ));
+                // "Connect to server" (#1418): a headless delve already
+                // serves DAP at host:port, so croft connects to it rather
+                // than starting a dlv of its own.
+                let remote = configs::delve_remote_address(&rc);
+                if rc.request == RequestKind::Attach && rc.process_id.is_none() && remote.is_none()
+                {
+                    let remote_mode =
+                        rc.extra.get("mode").and_then(serde_json::Value::as_str) == Some("remote");
+                    self.debug_error(if remote_mode {
+                        format!("config \"{name}\": a go remote attach needs a \"port\"")
+                    } else {
+                        format!(
+                            "config \"{name}\": a go attach needs a \"processId\", or \"mode\": \"remote\" with a \"port\""
+                        )
+                    });
                     return;
                 }
-                match crate::dap::install::dlv_program() {
-                    Ok(dlv) => crate::dap::session::DapSession::launch_delve(
-                        &dlv,
-                        &cwd,
+                if let Some((host, port)) = remote {
+                    crate::dap::session::DapSession::attach_delve_server(
+                        &host,
+                        port,
                         configs::delve_request(&rc),
                         breakpoints,
-                    ),
-                    Err(e) => {
-                        self.debug_error(format!("{e}"));
-                        return;
+                    )
+                    .with_context(|| {
+                        format!(
+                            "nothing answered on {host}:{port}; start it first, e.g. `dlv debug <package> --headless --listen=:{port} --api-version=2 --accept-multiclient`"
+                        )
+                    })
+                } else {
+                    match crate::dap::install::dlv_program() {
+                        Ok(dlv) => crate::dap::session::DapSession::launch_delve(
+                            &dlv,
+                            &cwd,
+                            configs::delve_request(&rc),
+                            breakpoints,
+                        ),
+                        Err(e) => {
+                            self.debug_error(format!("{e}"));
+                            return;
+                        }
                     }
                 }
             }
