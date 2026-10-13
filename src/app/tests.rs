@@ -36800,6 +36800,55 @@ fn a_local_launch_still_brings_back_an_agent_lane_and_focuses_it() {
 }
 
 #[test]
+fn a_local_launch_focuses_the_first_pane_when_the_active_one_is_left_out() {
+    // The saved active pane is a plain pane a local launch drops. Focus
+    // falls back to the first pane brought back, not to the lane that
+    // happened to follow the dropped one.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let session = tmp.path().join("sessions.json");
+    let root_key = repo.display().to_string();
+    let lane = |name: &str| {
+        let dir = tmp.path().join(format!("repo-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::terminal_session::PaneRecord {
+            host: None,
+            cwd: dir.display().to_string(),
+            name: Some(format!("Lane: {name}")),
+            transcript: Vec::new(),
+            lane: Some(crate::terminal_session::LaneRecord {
+                path: dir.display().to_string(),
+                branch: format!("agent/{name}"),
+                agent: None,
+                base: None,
+            }),
+        }
+    };
+    let rec = crate::terminal_session::SessionRecord {
+        panes: vec![
+            lane("one"),
+            crate::terminal_session::PaneRecord {
+                host: None,
+                cwd: root_key.clone(),
+                name: Some(String::from("plain")),
+                transcript: Vec::new(),
+                lane: None,
+            },
+            lane("two"),
+        ],
+        active: 1,
+    };
+    crate::terminal_session::save_for_root(&session, &root_key, rec).unwrap();
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = session;
+    app.restore_terminal_session_with(false);
+    assert_eq!(app.terminals.len(), 2, "both lanes come back");
+    assert_eq!(app.terminals[0].manual_name(), Some("Lane: one"));
+    assert_eq!(app.active_terminal, 0, "focus falls back to the first pane");
+}
+
+#[test]
 fn a_local_launch_drops_a_lane_whose_worktree_is_gone() {
     // A lane whose worktree was removed is an ordinary pane now, and an
     // ordinary pane does not come back locally: the default terminal stays.

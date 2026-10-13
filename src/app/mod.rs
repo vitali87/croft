@@ -16410,9 +16410,6 @@ impl App {
         let mut lanes = std::collections::BTreeMap::new();
         let mut active = 0;
         for (i, p) in rec.panes.iter().enumerate() {
-            if i == rec.active {
-                active = terms.len();
-            }
             // A lane pane belongs in its worktree, whatever cwd its shell
             // had drifted to at save time (#348): the launch line below is
             // typed into THIS shell, so the directory and the lane are
@@ -16447,6 +16444,9 @@ impl App {
                 if let Some(lane) = lane {
                     lanes.insert(t.uid(), lane.clone());
                 }
+                if i == rec.active {
+                    active = terms.len();
+                }
                 terms.push(t);
                 continue;
             }
@@ -16469,6 +16469,12 @@ impl App {
                         t.write_input(lane_launch_input(cmd).as_bytes());
                     }
                     lanes.insert(t.uid(), lane.clone());
+                }
+                // Focus follows the saved active pane only when it is
+                // actually brought back; one left out or failing to spawn
+                // keeps the first-pane fallback, not a neighbour.
+                if i == rec.active {
+                    active = terms.len();
                 }
                 terms.push(t);
             }
