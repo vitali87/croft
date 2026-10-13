@@ -6491,7 +6491,10 @@ impl Editor {
         } else {
             scan_color_swatches(
                 &self.lines,
-                matches!(self.lang, Some(LangKind::Css | LangKind::Html)),
+                matches!(
+                    self.lang,
+                    Some(LangKind::Css | LangKind::Html | LangKind::Vue | LangKind::Svelte)
+                ),
             )
         };
         self.recompute_semantic_overlay();
@@ -13268,7 +13271,10 @@ fn block_comment_tokens(lang: Option<LangKind>) -> Option<(&'static str, &'stati
         | Some(LangKind::Css)
         | Some(LangKind::Ql)
         | Some(LangKind::Dbscheme) => Some(("/*", "*/")),
-        Some(LangKind::Html) | Some(LangKind::Markdown) => Some(("<!--", "-->")),
+        Some(LangKind::Html)
+        | Some(LangKind::Markdown)
+        | Some(LangKind::Vue)
+        | Some(LangKind::Svelte) => Some(("<!--", "-->")),
         Some(LangKind::Lua) => Some(("--[[", "]]")),
         Some(LangKind::Java) | Some(LangKind::CSharp) | Some(LangKind::Sql) => Some(("/*", "*/")),
         // Python has no true block comment; VS Code's language config maps
@@ -14173,7 +14179,7 @@ fn emmet_profile_for(
 ) -> Option<crate::emmet::Profile> {
     use crate::emmet::Profile;
     match lang {
-        Some(LangKind::Html) => Some(Profile::Html),
+        Some(LangKind::Html | LangKind::Vue | LangKind::Svelte) => Some(Profile::Html),
         Some(LangKind::Xml) => Some(Profile::Xml),
         Some(LangKind::Tsx) => Some(Profile::Jsx),
         Some(LangKind::JavaScript)
@@ -14217,6 +14223,8 @@ pub fn language_label(lang: Option<LangKind>) -> &'static str {
         Some(LangKind::Sql) => "SQL",
         Some(LangKind::Make) => "Makefile",
         Some(LangKind::Dockerfile) => "Dockerfile",
+        Some(LangKind::Vue) => "Vue",
+        Some(LangKind::Svelte) => "Svelte",
     }
 }
 
@@ -14251,6 +14259,8 @@ pub fn language_scope_id(lang: Option<LangKind>) -> &'static str {
         Some(LangKind::Sql) => "sql",
         Some(LangKind::Make) => "makefile",
         Some(LangKind::Dockerfile) => "dockerfile",
+        Some(LangKind::Vue) => "vue",
+        Some(LangKind::Svelte) => "svelte",
     }
 }
 
@@ -14281,6 +14291,8 @@ pub const SELECTABLE_LANGUAGES: &[LangKind] = &[
     LangKind::Sql,
     LangKind::Make,
     LangKind::Dockerfile,
+    LangKind::Vue,
+    LangKind::Svelte,
 ];
 
 /// Number of leading whitespace bytes to strip for one outdent step, matching
@@ -17147,7 +17159,14 @@ const VOID_ELEMENTS: &[&str] = &[
 fn lang_auto_closes_tags(lang: Option<LangKind>) -> bool {
     matches!(
         lang,
-        Some(LangKind::Html | LangKind::Xml | LangKind::Tsx | LangKind::JavaScript)
+        Some(
+            LangKind::Html
+                | LangKind::Xml
+                | LangKind::Tsx
+                | LangKind::JavaScript
+                | LangKind::Vue
+                | LangKind::Svelte
+        )
     )
 }
 
@@ -17258,8 +17277,10 @@ fn tag_auto_close_name(line: &str, byte: usize, lang: Option<LangKind>) -> Optio
     if rest.contains('>') {
         return None;
     }
-    if matches!(lang, Some(LangKind::Html))
-        && VOID_ELEMENTS.iter().any(|v| v.eq_ignore_ascii_case(name))
+    if matches!(
+        lang,
+        Some(LangKind::Html | LangKind::Vue | LangKind::Svelte)
+    ) && VOID_ELEMENTS.iter().any(|v| v.eq_ignore_ascii_case(name))
     {
         return None;
     }
@@ -25933,6 +25954,27 @@ mod tests {
         let out = std::fs::read(tmp.path()).unwrap();
         assert_eq!(&out[..3], &[0xEF, 0xBB, 0xBF], "the UTF-8 BOM must survive");
         assert_eq!(&out[3..6], b"hi!");
+    }
+
+    /// #1632: a Vue or Svelte component opens as that language, coloured,
+    /// with HTML's block comment.
+    #[test]
+    fn vue_and_svelte_components_open_in_their_language() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, label) in [("App.vue", "Vue"), ("Counter.svelte", "Svelte")] {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, "<script>\nlet n = 1;\n</script>\n<p>{n}</p>\n").unwrap();
+            let mut e = Editor::new();
+            e.open(&path).unwrap();
+            assert_eq!(e.language_label(), label, "{name}");
+            assert!(
+                !e.highlights[1].is_empty(),
+                "{name}: the script is coloured"
+            );
+            e.cursor_row = 3;
+            assert!(e.toggle_block_comment(), "{name}");
+            assert_eq!(e.lines[3], "<!-- <p>{n}</p> -->", "{name}");
+        }
     }
 
     /// #1226: a Dockerfile, a Makefile, SQL and Java open in their own
