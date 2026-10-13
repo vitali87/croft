@@ -1763,6 +1763,17 @@ impl LspManager {
         })
     }
 
+    /// Whether any running server has the open document `path` (#1566):
+    /// one that does answers its completions, and word completion waits for
+    /// that answer instead of opening on the document's words at once.
+    pub fn document_has_server(&self, path: &Path) -> bool {
+        self.capability_support.lock().is_ok_and(|s| {
+            s.document_servers
+                .get(path)
+                .is_some_and(|names| !names.is_empty())
+        })
+    }
+
     /// Test hook: record `names` as the servers reporting on `path`, as an
     /// open would, without starting any.
     #[cfg(test)]

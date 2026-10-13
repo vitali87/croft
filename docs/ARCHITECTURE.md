@@ -78,6 +78,7 @@ src/
 ├── session_state.rs     captures open tabs / layout so a self-update re-exec can restore them
 ├── sheet.rs             CSV / TSV / XLSX / XLS / XLSB / ODS parsing via the csv and calamine crates
 ├── shell_integration.rs  OSC 133 / 7 / 9 shell integration: `OscSniffer` intercepts the marks alacritty drops, plus the per-shell rc shims that emit them
+├── word_suggest.rs       word-based completion (#1566, VS Code's `editor.wordBasedSuggestions`): the words of the open documents, nearest the caret first, offered on Ctrl+Space when no language server reports on the file (at once) or a server answers with nothing; `word_based_suggestions` picks the documents (current, same language, all, or off), and a `.` typed never opens them
 ├── snippets.rs           user snippets from `~/.config/croft/snippets.json` (VS Code format); `parse_body` turns tab-stop syntax into insert text plus ordered stops, and matches are injected into the completion popup; reloads on save
 ├── sqlite_view.rs        read-only SQLite browser: each table becomes a worksheet in the existing sheet grid, rows capped at 500 with the true count in the name, opened `SQLITE_OPEN_READONLY` over bundled sqlite3 so a live database is never locked or mutated
 ├── svg.rs                SVG file-preview rasterisation: `usvg` parse plus resvg render into a PNG the standard image-overlay pipeline consumes; the vector render happens once per open, resizes refit the stored PNG, and a parse failure falls through to the XML source

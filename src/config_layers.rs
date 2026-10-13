@@ -106,6 +106,7 @@ pub const WORKSPACE_ALLOWED_KEYS: &[&str] = &[
     "auto_save",
     "auto_save_on_focus_change",
     "render_whitespace",
+    "word_based_suggestions",
     "disable_inline_blame",
     "disable_auto_close_pairs",
     "disable_inline_values",
