@@ -1780,8 +1780,6 @@ fn list_user_processes() -> Vec<(i64, String)> {
     }
 }
 
-/// A launch.json config launch parked behind its `preLaunchTask` (#250): the
-/// task runs in a terminal pane, and the FinishedCommand sweep decides.
 /// `${input:…}` questions waiting on the user (#1424): asked one at a
 /// time, then `then` runs with the answers.
 struct InputRun {
@@ -1790,12 +1788,15 @@ struct InputRun {
     then: InputThen,
 }
 
+/// What an [`InputRun`] does once every question is answered (#1424).
 enum InputThen {
     Launch(Box<crate::dap::configs::DebugConfig>),
     Compound(Box<crate::dap::configs::Compound>),
     Task(Box<crate::tasks::Task>),
 }
 
+/// A launch.json config launch parked behind its `preLaunchTask` (#250): the
+/// task runs in a terminal pane, and the FinishedCommand sweep decides.
 struct PendingDebugLaunch {
     /// Uid of the pane the task command was written to.
     pane: u64,
@@ -31799,7 +31800,7 @@ impl App {
         let ctx = crate::dap::configs::SubstCtx {
             workspace_folder: root,
             file: self.editor.path.clone(),
-            inputs: Default::default(),
+            inputs: cfg.answers.clone(),
         };
         let rc = match crate::dap::configs::resolve(cfg, &ctx) {
             Ok(rc) => rc,
@@ -32013,19 +32014,6 @@ impl App {
         }
     }
 
-    /// Run a COMPOUND's own `preLaunchTask`, then launch its single member
-    /// (#318).
-    ///
-    /// Deliberately not folded into [`Self::launch_debug_config`]: that runs
-    /// the *config's* task as the last step before the adapter, while this one
-    /// runs before the member is even resolved. Keeping them separate is what
-    /// lets both fire for a compound whose member also declares a task, which
-    /// is what VS Code does.
-    ///
-    /// Same failure contract as a config's task, because a user cannot tell
-    /// the two apart from the outside: a task the workspace does not declare
-    /// is an error rather than a silent skip, and a non-zero exit aborts the
-    /// launch instead of debugging whatever the build left behind.
     /// The `${input:…}` ids the task labelled `label` uses, added to
     /// `refs`, and its file's `inputs` to `defs` (#1424).
     fn task_inputs(
@@ -32153,6 +32141,19 @@ impl App {
         self.ask_next_input();
     }
 
+    /// Run a COMPOUND's own `preLaunchTask`, then launch its single member
+    /// (#318).
+    ///
+    /// Deliberately not folded into [`Self::launch_debug_config`]: that runs
+    /// the *config's* task as the last step before the adapter, while this one
+    /// runs before the member is even resolved. Keeping them separate is what
+    /// lets both fire for a compound whose member also declares a task, which
+    /// is what VS Code does.
+    ///
+    /// Same failure contract as a config's task, because a user cannot tell
+    /// the two apart from the outside: a task the workspace does not declare
+    /// is an error rather than a silent skip, and a non-zero exit aborts the
+    /// launch instead of debugging whatever the build left behind.
     fn launch_after_compound_task(
         &mut self,
         task_label: &str,
@@ -38465,7 +38466,14 @@ impl App {
     /// Tasks: Rerun Last Task.
     pub fn rerun_last_task(&mut self) {
         match self.last_task.clone() {
-            Some(task) => self.start_project_task(task),
+            Some(mut task) => {
+                // The last run's `${input:…}` answers are asked again rather
+                // than reused, as VS Code does (#1424).
+                if let Some(v) = task.vscode.as_mut() {
+                    v.answers.clear();
+                }
+                self.start_project_task(task)
+            }
             None => self.status = "No task has run yet".to_string(),
         }
     }
@@ -72685,8 +72693,6 @@ fn install_terminal_restore_panic_hook() {
     });
 }
 
-/// Append a panic record (version, thread, location, message, backtrace) to
-/// `~/.cache/croft/panic.log`. Best-effort and silent on any I/O failure.
 /// `task` with `answers` for its `${input:…}` variables (#1424).
 fn with_answers(
     mut task: crate::tasks::Task,
@@ -72699,6 +72705,8 @@ fn with_answers(
     task
 }
 
+/// Append a panic record (version, thread, location, message, backtrace) to
+/// `~/.cache/croft/panic.log`. Best-effort and silent on any I/O failure.
 fn log_panic_to_file(info: &std::panic::PanicHookInfo<'_>) {
     use std::io::Write;
     let Some(home) = std::env::var_os("HOME") else {

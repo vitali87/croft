@@ -82083,3 +82083,48 @@ fn a_task_asks_its_input_and_quotes_the_answer() {
         app.status
     );
 }
+
+/// #1424: Rerun Last Task asks a task's inputs again instead of reusing the
+/// last run's answers.
+#[test]
+fn rerunning_a_task_asks_its_inputs_again() {
+    let tmp = inputs_workspace_1424();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let task = crate::tasks::discover_tasks(tmp.path())
+        .into_iter()
+        .find(|t| t.label == "greet")
+        .unwrap();
+    app.run_project_task(task);
+    app.input_prompt.as_mut().unwrap().value = String::from("first");
+    app.submit_input_prompt();
+    assert!(app.last_task.is_some(), "precondition: the task ran");
+    app.rerun_last_task();
+    assert_eq!(
+        app.input_prompt.as_ref().map(|p| p.value.as_str()),
+        Some("world"),
+        "asked again, prefilled with the default: {}",
+        app.status
+    );
+}
+
+/// #1424: a several-member compound passes the answers it collected to each
+/// member, rather than resolving them with none.
+#[test]
+fn compound_members_resolve_with_the_compound_answers() {
+    let tmp = inputs_workspace_1424();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut cfg = crate::dap::configs::discover_configs(tmp.path())
+        .into_iter()
+        .find(|c| c.name == "Run with args")
+        .unwrap();
+    cfg.answers
+        .insert(String::from("envName"), String::from("dev"));
+    cfg.answers
+        .insert(String::from("userName"), String::from("bob"));
+    // It resolves, then stops at its preLaunchTask, which a set cannot run.
+    assert!(
+        matches!(app.launch_member_into_set(&cfg), MemberOutcome::TaskUnrun),
+        "the member saw its answers: {}",
+        app.status
+    );
+}
