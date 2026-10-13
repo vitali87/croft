@@ -8068,6 +8068,10 @@ impl Editor {
         }
         let row = self.cursor_row;
         let col = self.cursor_col;
+        if let Some(rule) = on_enter_rule(self.lang, &self.lines, row, self.byte_index(row, col)) {
+            self.apply_on_enter(rule);
+            return;
+        }
         let line = self.lines[row].clone();
 
         // Inside a doc comment the new line continues it (#1443).
@@ -8118,6 +8122,29 @@ impl Editor {
             }
             self.cursor_row -= 1;
             self.cursor_col = new_indent.chars().count();
+        }
+    }
+
+    /// Carry out a Markdown Enter rule (#1495). The text after
+    /// the caret moves to the new line behind the continuation, without the
+    /// blanks that separated it from the caret.
+    fn apply_on_enter(&mut self, rule: OnEnter) {
+        let row = self.cursor_row;
+        match rule {
+            OnEnter::EndList => {
+                self.lines[row].clear();
+                self.cursor_col = 0;
+                self.mark_buffer_changed();
+            }
+            OnEnter::Continue(text) => {
+                self.insert_newline_raw();
+                let rest = self.lines[row + 1]
+                    .trim_start_matches([' ', '\t'])
+                    .to_string();
+                self.lines[row + 1] = format!("{text}{rest}");
+                self.cursor_col = text.chars().count();
+                self.mark_buffer_changed();
+            }
         }
     }
 
@@ -15077,6 +15104,122 @@ fn extra_indent_triggered(lang: Option<LangKind>, last_non_ws: Option<char>) -> 
         | Some(LangKind::CSharp) => matches!(last, '(' | '[' | '{'),
         _ => false,
     }
+}
+
+/// What Enter does on a line a per-language rule recognises, in place of
+/// copying the indent (#1495), as the Markdown editors people come from do.
+/// Doc comments (#1443) go through `comment_on_enter`.
+#[derive(Debug, PartialEq, Eq)]
+enum OnEnter {
+    /// Open a new line starting with this text: the indent plus the list
+    /// marker or quote that continues the line.
+    Continue(String),
+    /// Enter on a list item or quote that holds only its marker: clear the
+    /// marker, which ends the list.
+    EndList,
+}
+
+/// The Enter rule for the caret at byte `col` of `lines[row]`, if any.
+fn on_enter_rule(
+    lang: Option<LangKind>,
+    lines: &[String],
+    row: usize,
+    col: usize,
+) -> Option<OnEnter> {
+    let line = lines.get(row)?;
+    match lang? {
+        LangKind::Markdown if !in_markdown_fence(lines, row) => markdown_on_enter(line, col),
+        _ => None,
+    }
+}
+
+/// True when `row` sits inside a fenced code block opened above it. A fence
+/// opens with three or more `` ` `` or `~` and closes only on a line of the
+/// same character, at least as long, with nothing after it.
+fn in_markdown_fence(lines: &[String], row: usize) -> bool {
+    let mut open: Option<(char, usize)> = None;
+    for l in &lines[..row] {
+        let t = l.trim_start();
+        let Some(ch) = t.chars().next().filter(|c| matches!(c, '`' | '~')) else {
+            continue;
+        };
+        let width = t.len() - t.trim_start_matches(ch).len();
+        if width < 3 {
+            continue;
+        }
+        match open {
+            None => open = Some((ch, width)),
+            Some((c, w)) if c == ch && width >= w && t[width..].trim().is_empty() => open = None,
+            Some(_) => {}
+        }
+    }
+    open.is_some()
+}
+
+/// Enter on a Markdown list item, task item or blockquote (#1495): the next
+/// line repeats the indent, the `>` quotes and the marker, with an ordered
+/// number counted on and a task box left unticked. An item that is only its
+/// marker ends the list instead. A caret inside the marker, a thematic break
+/// (`* * *`) or emphasis (`**bold**`) is no list.
+fn markdown_on_enter(line: &str, col: usize) -> Option<OnEnter> {
+    let trimmed = line.trim();
+    if trimmed.len() >= 3
+        && let Some(first) = trimmed.chars().next()
+        && matches!(first, '-' | '*' | '_')
+        && trimmed.chars().all(|c| c == first || c == ' ' || c == '\t')
+    {
+        return None;
+    }
+    let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+    let mut i = indent;
+    let mut quote = String::new();
+    while line[i..].starts_with('>') {
+        quote.push('>');
+        i += 1;
+        if line[i..].starts_with(' ') {
+            quote.push(' ');
+            i += 1;
+        }
+    }
+    let spaced = |at: usize| line[at..].starts_with([' ', '\t']);
+    let rest = &line[i..];
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let mut marker = None;
+    if rest.starts_with(['-', '*', '+']) && spaced(i + 1) {
+        marker = Some(rest[..1].to_string());
+        i += 1;
+    } else if (1..=9).contains(&digits)
+        && rest[digits..].starts_with(['.', ')'])
+        && spaced(i + digits + 1)
+    {
+        let n: u64 = rest[..digits].parse().ok()?;
+        marker = Some(format!("{}{}", n + 1, &rest[digits..=digits]));
+        i += digits + 1;
+    }
+    let mut next = format!("{}{quote}", &line[..indent]);
+    if let Some(marker) = marker {
+        let gap = line[i..].len() - line[i..].trim_start_matches([' ', '\t']).len();
+        next.push_str(&marker);
+        next.push_str(&line[i..i + gap]);
+        i += gap;
+        let after = &line[i..];
+        if matches!(after.get(..3), Some("[ ]" | "[x]" | "[X]"))
+            && (after.len() == 3 || spaced(i + 3))
+        {
+            next.push_str("[ ] ");
+            i += 3;
+            i += line[i..].len() - line[i..].trim_start_matches([' ', '\t']).len();
+        }
+    } else if quote.is_empty() {
+        return None;
+    }
+    if col < i.min(line.trim_end().len()) {
+        return None;
+    }
+    if line[i.min(line.len())..].trim().is_empty() {
+        return Some(OnEnter::EndList);
+    }
+    Some(OnEnter::Continue(next))
 }
 
 /// The indent for the line Enter opens after `prefix` in YAML (#1309).
@@ -26103,6 +26246,183 @@ mod tests {
         assert_eq!(yaml_enter("  note: 'ends with a colon:'"), "  ");
         assert_eq!(yaml_enter("# todo:"), "");
         assert_eq!(yaml_enter("cmd: echo hi # really:"), "");
+    }
+
+    /// Enter at byte-and-char column `col` of row `row` in `text`; returns
+    /// the lines and the caret.
+    fn enter_in(
+        lang: LangKind,
+        text: &str,
+        row: usize,
+        col: usize,
+    ) -> (Vec<String>, (usize, usize)) {
+        let mut e = editor_with(text);
+        e.lang = Some(lang);
+        e.cursor_row = row;
+        e.cursor_col = col;
+        e.insert_newline();
+        (e.lines.clone(), (e.cursor_row, e.cursor_col))
+    }
+
+    /// Enter at the end of a one-line Markdown buffer; returns the new line
+    /// and checks the caret ends it.
+    fn md_enter(line: &str) -> String {
+        let (lines, caret) = enter_in(LangKind::Markdown, line, 0, line.chars().count());
+        assert_eq!(lines.len(), 2, "one new line for {line:?}: {lines:?}");
+        assert_eq!(lines[0], line);
+        assert_eq!(caret, (1, lines[1].chars().count()), "{line:?}");
+        lines[1].clone()
+    }
+
+    // #1495: Enter after a Markdown list item, task item or quote starts the
+    // next one, as GitHub, Obsidian and VS Code's Markdown All in One do.
+    #[test]
+    fn markdown_enter_continues_bullets_numbers_tasks_and_quotes() {
+        assert_eq!(md_enter("- first"), "- ");
+        assert_eq!(md_enter("* a"), "* ");
+        assert_eq!(md_enter("  + nested"), "  + ");
+        assert_eq!(md_enter("1. one"), "2. ");
+        assert_eq!(md_enter("9) nine"), "10) ");
+        assert_eq!(md_enter("3.  wide gap"), "4.  ");
+        assert_eq!(md_enter("- [x] done"), "- [ ] ");
+        assert_eq!(md_enter("- [ ] todo"), "- [ ] ");
+        assert_eq!(md_enter("> quoted"), "> ");
+        assert_eq!(md_enter("> - in a quote"), "> - ");
+        assert_eq!(md_enter("- caf\u{e9}"), "- ");
+        // Mid-item, the rest of the item moves to the new one.
+        let (lines, caret) = enter_in(LangKind::Markdown, "- foo bar", 0, 5);
+        assert_eq!(lines, ["- foo", "- bar"]);
+        assert_eq!(caret, (1, 2));
+        // One undo takes the whole continuation back.
+        let mut e = editor_with("- first");
+        e.lang = Some(LangKind::Markdown);
+        e.cursor_col = 7;
+        e.insert_newline();
+        assert!(e.undo());
+        assert_eq!(e.lines, ["- first"]);
+    }
+
+    // #1495: Enter on an item that is only its marker ends the list: the
+    // marker goes and the line is left blank.
+    #[test]
+    fn markdown_enter_on_an_empty_item_ends_the_list() {
+        for line in ["- ", "3. ", "- [ ] ", "- [ ]", "> ", ">"] {
+            let (lines, caret) = enter_in(LangKind::Markdown, line, 0, line.len());
+            assert_eq!(lines, [""], "{line:?}");
+            assert_eq!(caret, (0, 0), "{line:?}");
+        }
+        let (lines, caret) = enter_in(LangKind::Markdown, "- a\n- ", 1, 2);
+        assert_eq!(lines, ["- a", ""]);
+        assert_eq!(caret, (1, 0));
+    }
+
+    // Negatives (#1495): lines that are not list items, a caret before the
+    // marker, a fenced code block and other languages keep the plain Enter.
+    #[test]
+    fn markdown_enter_leaves_other_lines_alone() {
+        for line in [
+            "plain",
+            "**bold**",
+            "---",
+            "* * *",
+            "1.5 apples",
+            "-dash",
+            "#1 fan",
+        ] {
+            assert_eq!(md_enter(line), "", "{line:?}");
+        }
+        let (lines, _) = enter_in(LangKind::Markdown, "- a", 0, 0);
+        assert_eq!(lines, ["", "- a"], "a caret before the marker");
+        let (lines, _) = enter_in(LangKind::Markdown, "```\n- a", 1, 3);
+        assert_eq!(lines, ["```", "- a", ""], "inside a code fence");
+        let (lines, _) = enter_in(LangKind::Markdown, "```\nx\n```\n- a", 3, 3);
+        assert_eq!(lines[4], "- ", "after a closed fence");
+        let (lines, _) = enter_in(LangKind::Markdown, "```\n~~~\n- a", 2, 3);
+        assert_eq!(
+            lines,
+            ["```", "~~~", "- a", ""],
+            "an unlike fence closes nothing"
+        );
+        let (lines, _) = enter_in(LangKind::Markdown, "````\n```\n- a", 2, 3);
+        assert_eq!(
+            lines,
+            ["````", "```", "- a", ""],
+            "a shorter fence closes nothing"
+        );
+        let (lines, _) = enter_in(LangKind::Markdown, "```rust\nx\n````\n- a", 3, 3);
+        assert_eq!(lines[4], "- ", "a longer fence of the same kind closes");
+        let (lines, _) = enter_in(LangKind::Rust, "- a", 0, 3);
+        assert_eq!(lines, ["- a", ""], "Markdown only");
+    }
+
+    // #1443: `/**` then Enter opens a JSDoc / Doxygen block and closes it;
+    // a ` * ` line inside a block comment continues; Rust `///` and `//!`
+    // lines continue.
+    #[test]
+    fn enter_continues_doc_comments() {
+        let (lines, caret) = enter_in(LangKind::JavaScript, "/**", 0, 3);
+        assert_eq!(lines, ["/**", " * ", " */"]);
+        assert_eq!(caret, (1, 3));
+        let (lines, caret) = enter_in(LangKind::Java, "  /**\n  void f();", 0, 5);
+        assert_eq!(lines, ["  /**", "   * ", "   */", "  void f();"]);
+        assert_eq!(caret, (1, 5));
+        let (lines, caret) = enter_in(LangKind::TypeScript, "/** */", 0, 3);
+        assert_eq!(lines, ["/**", " * ", " */"]);
+        assert_eq!(caret, (1, 3));
+        // Already closed below: no second closer.
+        let (lines, _) = enter_in(LangKind::C, "/**\n * Adds.\n */", 0, 3);
+        assert_eq!(lines, ["/**", " * ", " * Adds.", " */"]);
+        let (lines, caret) = enter_in(LangKind::Tsx, "/**\n * Adds two.\n */", 1, 12);
+        assert_eq!(lines, ["/**", " * Adds two.", " * ", " */"]);
+        assert_eq!(caret, (2, 3));
+        let (lines, _) = enter_in(LangKind::Java, "/**\ndescription\n\n */", 0, 3);
+        assert_eq!(
+            lines,
+            ["/**", " * ", "description", "", " */"],
+            "a plain body line"
+        );
+        let (lines, _) = enter_in(LangKind::C, "/**\nint f();\n/** g */", 0, 3);
+        assert_eq!(
+            lines,
+            ["/**", " * ", " */", "int f();", "/** g */"],
+            "a later comment"
+        );
+        let (lines, _) = enter_in(LangKind::Cpp, "/*\n * plain block", 1, 14);
+        assert_eq!(lines[2], " * ");
+        let (lines, caret) = enter_in(LangKind::Rust, "/// Adds two numbers.", 0, 21);
+        assert_eq!(lines, ["/// Adds two numbers.", "/// "]);
+        assert_eq!(caret, (1, 4));
+        let (lines, _) = enter_in(LangKind::Rust, "    //! crate docs", 0, 18);
+        assert_eq!(lines[1], "    //! ");
+    }
+
+    // Negatives (#1443): a `*` in code, plain `//` comments, a caret before
+    // `*/`, a closed one-line doc and other languages keep the plain Enter.
+    #[test]
+    fn enter_outside_a_doc_comment_adds_no_leader() {
+        let plain = |lang, text: &str, row, col| enter_in(lang, text, row, col).0;
+        assert_eq!(
+            plain(LangKind::JavaScript, "x = a *", 0, 7),
+            ["x = a *", ""]
+        );
+        assert_eq!(plain(LangKind::Rust, "// a", 0, 4), ["// a", ""]);
+        assert_eq!(
+            plain(LangKind::Rust, "//// banner", 0, 11),
+            ["//// banner", ""]
+        );
+        assert_eq!(
+            plain(LangKind::C, "/*\n * text */", 1, 8),
+            ["/*", " * text ", " */"],
+            "a caret before the closer"
+        );
+        assert_eq!(
+            plain(LangKind::Java, "/** done */", 0, 11),
+            ["/** done */", ""]
+        );
+        assert_eq!(plain(LangKind::Java, "/**/", 0, 4), ["/**/", ""]);
+        assert_eq!(plain(LangKind::Python, "/**", 0, 3), ["/**", ""]);
+        assert_eq!(plain(LangKind::Markdown, "/**", 0, 3), ["/**", ""]);
+        assert_eq!(plain(LangKind::Go, "/// x", 0, 5), ["/// x", ""]);
     }
 
     #[test]
