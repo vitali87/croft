@@ -3066,6 +3066,12 @@ pub struct App {
     /// `None` everywhere else, so a keyboard invocation of the same command
     /// can never act on a stale click.
     last_mouse_pos: Option<(u16, u16)>,
+    /// The tab a tab-strip mouse binding was clicked on (#1427), set only
+    /// for that dispatch and taken by `run_command` as it starts, so only
+    /// the directly bound command sees it: a command it runs in turn (an
+    /// aborted rebase closing its tab, a replayed macro) acts on the active
+    /// tab as it would from the keyboard.
+    tab_click_target: Option<usize>,
     /// User snippets from `~/.config/croft/snippets.json`. Typing a snippet's
     /// prefix and pressing Tab expands it with tab-stop navigation.
     snippets: crate::snippets::SnippetSet,
@@ -5810,6 +5816,7 @@ impl App {
             // reported once, in OUTPUT · Keybindings.
             keymap: loaded_keymap,
             last_mouse_pos: None,
+            tab_click_target: None,
             macro_recording: None,
             macro_last: None,
             macro_registers: crate::macros::load(&crate::macros::macros_path()),
@@ -50685,6 +50692,14 @@ impl App {
     pub(crate) fn run_command(&mut self, cmd: crate::widgets::command_palette::Command) {
         use crate::widgets::command_palette::Command as Cmd;
         use crate::widgets::editor::CaseTransform;
+        // The tab a tab command acts on (#1427): the clicked tab when a
+        // tab-strip mouse binding runs it directly, as VS Code's tab commands
+        // act on the clicked tab, else the active tab. Taken here so a
+        // command this one runs in turn never sees it.
+        let tab_target = self
+            .tab_click_target
+            .take()
+            .unwrap_or_else(|| self.editor.active_index());
         match cmd {
             Cmd::MoveLineUp => self.editor.move_lines_up(),
             Cmd::MoveLineDown => self.editor.move_lines_down(),
@@ -51083,19 +51098,19 @@ impl App {
                     self.editor.selection_text().chars().count()
                 );
             }
-            Cmd::CloseEditor => self.request_close_tab(self.tab_command_target()),
+            Cmd::CloseEditor => self.request_close_tab(tab_target),
             Cmd::ReopenClosedEditor => self.reopen_closed_tab(),
             // The Explorer's Cmd+Z (#843), which has no `Ctrl` form.
             Cmd::ZoxideJump => self.open_zoxide_jump(),
             // The tab menu's rows (#852), on the active tab and through the
             // same methods its clicks and the Cmd+K chords use.
-            Cmd::CloseOtherEditors => self.close_other_tabs(self.tab_command_target()),
-            Cmd::CloseEditorsToTheRight => self.close_tabs_to_right(self.tab_command_target()),
+            Cmd::CloseOtherEditors => self.close_other_tabs(tab_target),
+            Cmd::CloseEditorsToTheRight => self.close_tabs_to_right(tab_target),
             Cmd::CloseSavedEditors => self.close_saved_tabs(),
             Cmd::CloseAllEditors => self.close_all_tabs(),
             Cmd::PinEditor => self.set_active_tab_pinned(true),
             Cmd::UnpinEditor => self.set_active_tab_pinned(false),
-            Cmd::KeepEditor => self.keep_tab_open(self.tab_command_target()),
+            Cmd::KeepEditor => self.keep_tab_open(tab_target),
             Cmd::SplitEditor => self.split_editor(),
             // The chords' own moves (#843): Cmd+Opt+Left / Right have no
             // `Ctrl` form off macOS.
@@ -54852,8 +54867,10 @@ impl App {
                 // set before dispatch and cleared after so a keyboard
                 // invocation of the same command never sees a stale click.
                 self.last_mouse_pos = Some((m.column, m.row));
+                self.tab_click_target = self.editor.tab_at(m.column, m.row);
                 self.run_command(cmd);
                 self.last_mouse_pos = None;
+                self.tab_click_target = None;
                 return;
             }
         }
@@ -61479,17 +61496,6 @@ impl App {
             self.remote_launch = None;
             self.tear_down_connect_auth();
         }
-    }
-
-    /// The tab a tab command acts on (#1427): the tab under the click when
-    /// a mouse binding in the tab strip runs it, as VS Code's tab commands
-    /// act on the clicked tab, else the active tab. A `close_editor` bound to
-    /// a middle-click on a background tab used to close the file being
-    /// edited instead.
-    fn tab_command_target(&self) -> usize {
-        self.last_mouse_pos
-            .and_then(|(col, row)| self.editor.tab_at(col, row))
-            .unwrap_or_else(|| self.editor.active_index())
     }
 
     /// Close the focused group's tab at `idx` without asking: the shared end

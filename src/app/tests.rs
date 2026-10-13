@@ -2821,6 +2821,35 @@ fn a_tab_strip_close_binding_closes_the_clicked_tab() {
     );
 }
 
+/// #1427: only the command a tab-strip gesture is bound to acts on the
+/// clicked tab. `rebase_abort` closes its own plan tab through Close Editor,
+/// and that nested close used to take the clicked background tab instead.
+#[test]
+fn a_tab_strip_binding_leaves_nested_tab_commands_on_the_active_tab() {
+    use crossterm::event::MouseButton;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for (name, text) in [
+        ("a.py", "a\n"),
+        ("b.txt", "b\n"),
+        ("git-rebase-todo", "pick a b\n"),
+    ] {
+        let f = tmp.path().join(name);
+        std::fs::write(&f, text).unwrap();
+        app.editor.open_pinned(&f).unwrap();
+    }
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "middle_click", "command": "rebase_abort", "when": "tab_strip"}]"#,
+    );
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let a = tab_cell(&app, 0);
+    press(&mut app, MouseButton::Middle, a);
+    assert_eq!(tab_names(&app), ["a.py", "b.txt"], "the plan tab closed");
+    assert_eq!(app.tab_click_target, None);
+}
+
 /// #1427 negative: outside the strip, the tab commands keep acting on the
 /// active tab, from a binding in the editor or from the keyboard, and a
 /// middle-click in the text closes nothing.
