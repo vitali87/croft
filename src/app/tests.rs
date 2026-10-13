@@ -7416,6 +7416,7 @@ fn git_status_spans_clean_branch_is_green() {
         changed_count: 0,
         prepared_message: None,
         operation: None,
+        rebasing_branch: None,
     };
     let spans = git_status_spans(&st);
     let main_span = spans
@@ -7442,6 +7443,7 @@ fn git_status_spans_dirty_branch_is_yellow_not_red() {
         changed_count: 0,
         prepared_message: None,
         operation: None,
+        rebasing_branch: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -7471,6 +7473,7 @@ fn git_status_spans_renders_detached_hash_when_no_branch() {
         changed_count: 0,
         prepared_message: None,
         operation: None,
+        rebasing_branch: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -7492,6 +7495,7 @@ fn git_status_spans_renders_ahead_behind_counts() {
         changed_count: 0,
         prepared_message: None,
         operation: None,
+        rebasing_branch: None,
     };
     let spans = git_status_spans(&st);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -13544,6 +13548,136 @@ fn ctrl_k_chords_reach_croft_off_macos_but_not_from_the_shell_or_vim() {
     );
 }
 
+/// The shell script from #1563, open in the editor with the caret at 1:1.
+fn app_with_run_script() -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("r.sh");
+    std::fs::write(
+        &p,
+        "echo one\necho two\nfor i in 1 2; do\n  echo loop $i\ndone\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&p).unwrap();
+    app.focus_pane(Pane::Editor);
+    (tmp, app)
+}
+
+/// #1563: Shift+Down from line 1 stopped at the start of the last line, so
+/// the selection, and Run Selected Text on it, dropped the script's `done`.
+/// Down on the last line now goes to its end, as in VS Code, so Shift+Down
+/// selects through it.
+#[test]
+fn shift_down_selects_through_the_end_of_the_last_line() {
+    let (_tmp, mut app) = app_with_run_script();
+    let last = app.editor.lines.len() - 1;
+    assert_eq!(app.editor.lines[last], "done");
+    for _ in 0..6 {
+        app.handle_key(key(KeyCode::Down, KeyModifiers::SHIFT))
+            .unwrap();
+    }
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (last, 4));
+    assert_eq!(
+        app.editor.selection_text(),
+        "echo one\necho two\nfor i in 1 2; do\n  echo loop $i\ndone"
+    );
+}
+
+/// #1563: Down on the last line goes to its end; Up on the first line goes
+/// to its start, and Shift+Up selects back to the start of the file.
+#[test]
+fn down_on_the_last_line_and_up_on_the_first_reach_the_line_ends() {
+    let (_tmp, mut app) = app_with_run_script();
+    let last = app.editor.lines.len() - 1;
+    app.editor.cursor_row = last;
+    app.editor.cursor_col = 1;
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (last, 4));
+
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 8;
+    app.handle_key(key(KeyCode::Up, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
+
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 4;
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Up, KeyModifiers::SHIFT))
+            .unwrap();
+    }
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
+    assert_eq!(app.editor.selection_text(), "echo one\necho");
+}
+
+/// #1563: with word wrap on, the edges are the first and last wrapped rows:
+/// Down on the last row goes to the end of the line, Up on the first row to
+/// its start.
+#[test]
+fn wrapped_arrows_reach_the_ends_of_the_first_and_last_rows() {
+    use ratatui::widgets::Widget as _;
+    let (_tmp, mut app) = app_with_run_script();
+    let last = app.editor.lines.len() - 1;
+    let long = "done # ".to_string() + &"word ".repeat(30);
+    app.editor.lines[last] = long.clone();
+    app.editor.toggle_wrap();
+    assert!(app.editor.wrap_enabled());
+    let area = Rect::new(0, 0, 40, 20);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    (&mut *app.editor).render(area, &mut buf);
+
+    app.editor.cursor_row = last;
+    app.editor.cursor_col = 2;
+    for _ in 0..10 {
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        (app.editor.cursor_row, app.editor.cursor_col),
+        (last, long.chars().count())
+    );
+
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 6;
+    app.handle_key(key(KeyCode::Up, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
+}
+
+/// Negative: Down between lines keeps the caret's column rather than
+/// jumping to the line end; only the last line has the new edge.
+#[test]
+fn down_between_lines_keeps_the_column() {
+    let (_tmp, mut app) = app_with_run_script();
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 5));
+    app.handle_key(key(KeyCode::Up, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 5));
+}
+
+/// Negative: Vim's `j` and `k` stop at the last and first line without
+/// moving along it, as in Vim; the edge belongs to the arrow keys.
+#[test]
+fn vim_j_and_k_do_not_move_along_the_edge_lines() {
+    let (_tmp, mut app) = app_with_run_script();
+    app.vim.enabled = true;
+    let last = app.editor.lines.len() - 1;
+    app.editor.cursor_row = last;
+    app.editor.cursor_col = 1;
+    app.handle_key(key(KeyCode::Char('j'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (last, 1));
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 3;
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 3));
+}
+
 /// #843: LINUX.md promises that off macOS a `Cmd` chord "works as the same
 /// chord with `Ctrl`", except the chords its table lists. This walks every
 /// `is_*_key` predicate over every `Cmd` chord it takes and checks the `Ctrl`
@@ -16687,6 +16821,57 @@ fn continue_rebase_finishes_it_on_the_branch() {
         "feat\nmain",
         "feat replays on top of main"
     );
+}
+
+/// #1647: mid-rebase HEAD is detached on the commit being replayed onto,
+/// yet the status bar and Source Control name the branch being rebased,
+/// for a merge-backend and an apply-backend rebase alike.
+#[test]
+fn a_rebase_names_the_branch_being_rebased() {
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    assert!(git_succeeds(p, &["checkout", "-q", "feat"]));
+    for rebase in [&["rebase", "main"][..], &["rebase", "--apply", "main"][..]] {
+        assert!(!git_succeeds(p, rebase), "the rebase must conflict");
+        let st = crate::git::query(p);
+        assert_eq!(st.head_label(), "feat", "{rebase:?}");
+        let pill: String = git_status_spans(&st)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(pill.contains("feat | REBASING 1/1"), "{rebase:?}: {pill}");
+        let mut panel = crate::widgets::source_control::SourceControlPanel::new();
+        panel.set_status(st, Vec::new());
+        let area = ratatui::layout::Rect::new(0, 0, 60, 12);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut panel, area, &mut buf);
+        let panel_text: String = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .map(|xy| buf[xy].symbol())
+            .collect();
+        assert!(panel_text.contains("feat"), "{rebase:?}: {panel_text}");
+        assert!(git_succeeds(p, &["rebase", "--abort"]));
+    }
+}
+
+/// #1647 negative: a plain detached checkout, and a rebase of a detached
+/// HEAD (git's `head-name` is then "detached HEAD"), still show the hash.
+#[test]
+fn a_detached_head_still_shows_its_hash() {
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    assert!(git_succeeds(p, &["checkout", "-q", "--detach", "feat"]));
+    let short = git_stdout(p, &["rev-parse", "--short", "HEAD"]);
+    assert_eq!(crate::git::query(p).head_label(), short);
+    assert!(
+        !git_succeeds(p, &["rebase", "main"]),
+        "the rebase must conflict"
+    );
+    let onto = git_stdout(p, &["rev-parse", "--short", "HEAD"]);
+    assert_eq!(crate::git::query(p).head_label(), onto);
+    assert!(git_succeeds(p, &["rebase", "--abort"]));
+    assert!(git_succeeds(p, &["checkout", "-q", "main"]));
+    assert_eq!(crate::git::query(p).head_label(), "main");
 }
 
 /// #1356 (the #989 path): committing from Source Control mid-rebase
@@ -64926,15 +65111,17 @@ impl CodeqlStandIn {
 
 /// #856 guard: a run-at-cursor asked for while a run is in flight is
 /// turned away, and does not take over the first run's pending outcome:
-/// the status still names the first run when it ends.
+/// the status names the first run when it ends. Turned away with the way
+/// to stop the first (#1534), not silently.
 #[cfg(unix)]
 #[test]
 fn a_run_asked_for_mid_run_does_not_take_over_the_first_runs_outcome() {
     let mut s = CodeqlStandIn::new();
     s.will(STAND_IN_PASS, 0);
     s.app.run_named_test(String::from("Find.qlref"));
-    s.app.run_named_test(String::from("Other.qlref"));
     assert_eq!(s.app.status, "Running test test/Find::Find.qlref");
+    s.app.run_named_test(String::from("Other.qlref"));
+    assert_eq!(s.app.status, TEST_RUN_IN_PROGRESS);
     s.finish();
     assert!(
         s.app.status.starts_with("Find.qlref passed ("),
@@ -65448,6 +65635,9 @@ fn sarif_columns_are_chosen_with_c_shown_on_rows_and_remembered() {
         let (tmp, log) = sarif_fixture();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.editor.open(&log).unwrap();
+        // The row is read at a fixed width; the minimap strip, drawn in
+        // every terminal since #1231, would take six of its columns.
+        app.minimap_visible = false;
         assert!(
             app.editor.sarif.as_ref().unwrap().columns.is_empty(),
             "none by default"
@@ -72340,8 +72530,8 @@ fn the_scrubber_opens_a_commits_version_here_or_diffs_it_to_the_working_tree() {
     assert_eq!(diff.left_lines, vec!["v1", "v2"]);
     assert_eq!(
         diff.right_lines,
-        vec!["v1", "v2", "v3", "v4"],
-        "the file on disk"
+        vec!["v1", "v2", "v3", "v4", "unsaved"],
+        "the working copy as the user has it, unsaved edit included (#1572)"
     );
 
     // With no scrubbed commit, the commands say so rather than guess.
@@ -79525,6 +79715,77 @@ fn pin_editor_never_unpins_and_unpin_editor_never_pins() {
     assert_eq!(app.status, "Tab is already kept open");
 }
 
+// --- #1254: long hovers scroll ---------------------------------------------------
+
+fn app_with_long_hover() -> (
+    App,
+    tempfile::TempDir,
+    ratatui::Terminal<ratatui::backend::TestBackend>,
+) {
+    let (mut app, tmp, col, row) = app_with_open_file_and_editor_cell();
+    let doc = (1..=40)
+        .map(|i| format!("doc line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+        doc,
+        (col, row),
+    ));
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    (app, tmp, term)
+}
+
+#[test]
+fn the_wheel_over_a_hover_popup_scrolls_it_instead_of_closing_it() {
+    use crossterm::event::MouseEventKind;
+    let (mut app, _tmp, mut term) = app_with_long_hover();
+    let area = app.hover_popup.as_ref().unwrap().last_area;
+    assert!(area.height > 2, "the popup painted");
+    let (x, y) = (area.x + 3, area.y + 2);
+    app.handle_mouse(mouse(MouseEventKind::ScrollDown, x, y));
+    let popup = app
+        .hover_popup
+        .as_ref()
+        .expect("the wheel keeps the popup open");
+    assert!(popup.scroll > 0, "and scrolls it");
+    let after_down = popup.scroll;
+    app.handle_mouse(mouse(MouseEventKind::ScrollUp, x, y));
+    assert!(app.hover_popup.as_ref().unwrap().scroll < after_down);
+    term.draw(|frame| app.render(frame)).unwrap();
+    assert!(app.hover_popup.is_some());
+}
+
+#[test]
+fn moving_the_pointer_onto_the_hover_popup_keeps_it_open() {
+    use crossterm::event::MouseEventKind;
+    let (mut app, _tmp, _term) = app_with_long_hover();
+    let area = app.hover_popup.as_ref().unwrap().last_area;
+    app.handle_mouse(mouse(MouseEventKind::Moved, area.x + 3, area.y + 2));
+    assert!(
+        app.hover_popup.is_some(),
+        "the pointer has to cross onto the popup to scroll it"
+    );
+}
+
+#[test]
+fn the_wheel_away_from_the_hover_popup_still_closes_it() {
+    use crossterm::event::MouseEventKind;
+    let (mut app, _tmp, _term) = app_with_long_hover();
+    let area = app.hover_popup.as_ref().unwrap().last_area;
+    let x = if area.x > 2 {
+        area.x - 2
+    } else {
+        area.right() + 2
+    };
+    app.handle_mouse(mouse(MouseEventKind::ScrollDown, x, area.y + 1));
+    assert!(
+        app.hover_popup.is_none(),
+        "scrolling the editor dismisses the hover"
+    );
+}
+
 // --- #1215: keys that move the caret sideways scroll the view to it -----------
 
 fn wide_line_app(tmp: &std::path::Path) -> (App, ratatui::Terminal<ratatui::backend::TestBackend>) {
@@ -80391,6 +80652,190 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     assert!(app.source_control.last_init_repo_button_area.width > 0);
 }
 
+/// #1534: a run asked for while another is in flight says why nothing
+/// happened and how to stop the one running, instead of doing nothing.
+#[test]
+fn a_test_run_while_one_is_in_flight_says_how_to_stop_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname = \"t\"\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.testing
+        .on_busy_started(crate::testing::model::Activity::Running);
+    app.run_all_tests();
+    assert_eq!(app.status, TEST_RUN_IN_PROGRESS);
+    app.status.clear();
+    app.run_test(String::from("m::a"));
+    assert_eq!(app.status, TEST_RUN_IN_PROGRESS);
+}
+
+/// #1534: `s` in the Testing view cancels a run in flight; with nothing
+/// running, Testing: Cancel Test Run says so.
+#[test]
+fn cancel_test_run_stops_a_run_and_says_so_when_idle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.cancel_test_run();
+    assert_eq!(app.status, "No test run in progress");
+    app.testing
+        .on_busy_started(crate::testing::model::Activity::Running);
+    app.handle_testing_key(key(KeyCode::Char('s'), KeyModifiers::NONE));
+    assert_eq!(app.status, "Cancelling test run");
+}
+
+// --- Minimap without inline images (#1231) --------------------------------
+
+/// An app with a 300-line Rust file open, in a terminal that cannot draw
+/// inline images (tmux, Alacritty, GNOME Terminal, plain xterm).
+fn text_minimap_app() -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("long.rs");
+    let body: String = (0..300)
+        .map(|i| format!("fn f{i}() {{ let value = {i}; }}\n"))
+        .collect();
+    std::fs::write(&path, body).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::None;
+    app.cell_pixel = None;
+    app.editor.open(&path).unwrap();
+    (tmp, app)
+}
+
+fn is_braille(s: &str) -> bool {
+    s.chars()
+        .next()
+        .is_some_and(|c| ('\u{2801}'..='\u{28ff}').contains(&c))
+}
+
+/// The braille cells drawn inside `r`.
+fn braille_in(term: &ratatui::Terminal<ratatui::backend::TestBackend>, r: Rect) -> usize {
+    let buf = term.backend().buffer();
+    let mut n = 0;
+    for y in r.y..r.y + r.height {
+        for x in r.x..r.x + r.width {
+            if is_braille(buf[(x, y)].symbol()) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+#[test]
+fn the_minimap_draws_as_braille_without_inline_images() {
+    let (_tmp, mut app) = text_minimap_app();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let strip = app.minimap_img_rect;
+    assert_eq!(strip.width, 6, "the strip is carved: {strip:?}");
+    assert!(
+        braille_in(&term, strip) > 0,
+        "the strip shows the file's shape:\n{}",
+        screen_text(&term)
+    );
+    let text = app.editor.last_full_area;
+    assert_eq!(
+        strip.x,
+        text.x + text.width,
+        "the strip sits right of the text"
+    );
+}
+
+#[test]
+fn a_click_on_the_text_minimap_jumps_to_that_part_of_the_file() {
+    let (_tmp, mut app) = text_minimap_app();
+    draw(&mut app, 160, 40);
+    let strip = app.minimap_img_rect;
+    assert!(strip.height > 0);
+    assert_eq!(app.editor.scroll, 0);
+    // 300 lines at one dot row each fill 75 cell rows; the strip is shorter,
+    // so the whole file is folded into it and the bottom row is the end.
+    left_click(&mut app, strip.x + 2, strip.y + strip.height - 1);
+    assert!(
+        app.editor.cursor_row > 250,
+        "the bottom of the strip is the end of the file: row {}",
+        app.editor.cursor_row
+    );
+}
+
+#[test]
+fn the_minimap_stays_on_the_active_group_in_a_split() {
+    let (_tmp, mut app) = text_minimap_app();
+    app.split_editor();
+    assert!(app.editor_layout.is_split());
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let strip = app.minimap_img_rect;
+    let active = app.editor.last_full_area;
+    assert_eq!(strip.width, 6, "a split keeps the minimap: {strip:?}");
+    assert!(braille_in(&term, strip) > 0, "{}", screen_text(&term));
+    assert!(
+        strip.x == active.x + active.width || strip.x + strip.width == active.x,
+        "the strip is beside the active group: strip {strip:?}, group {active:?}"
+    );
+}
+
+#[test]
+fn the_minimap_off_draws_no_strip() {
+    let (_tmp, mut app) = text_minimap_app();
+    app.toggle_minimap();
+    assert_eq!(app.status, "Minimap off");
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.minimap_img_rect, Rect::default());
+    let screen = screen_text(&term);
+    assert!(
+        !screen.chars().any(|c| is_braille(&c.to_string())),
+        "{screen}"
+    );
+}
+
+#[test]
+fn turning_the_minimap_on_in_a_narrow_editor_says_why_it_is_hidden() {
+    let (_tmp, mut app) = text_minimap_app();
+    app.toggle_minimap();
+    draw(&mut app, 70, 30);
+    app.toggle_minimap();
+    assert!(
+        app.status.starts_with("Minimap on") && app.status.contains("wide"),
+        "{}",
+        app.status
+    );
+    // With room, the toggle just says it is on.
+    app.toggle_minimap();
+    draw(&mut app, 160, 40);
+    app.toggle_minimap();
+    assert_eq!(app.status, "Minimap on");
+}
+
+#[test]
+fn braille_minimap_folds_each_two_by_four_dot_block_into_a_cell() {
+    let bg = (0, 0, 0);
+    let ink = (200, 100, 50);
+    // One cell: 2 dot columns of 4 source chars each, 4 dot rows.
+    let (w, h) = (2 * MINIMAP_TEXT_CHARS_PER_DOT, 4);
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    for px in rgba.chunks_exact_mut(4) {
+        px[3] = 0xff;
+    }
+    let cells = braille_minimap(&rgba, w, h, bg, 1, 1);
+    assert_eq!(cells, vec![None], "a blank block is a blank cell");
+    // Ink in the second char of the first dot column, top row: dot 1.
+    let idx = 4;
+    rgba[idx..idx + 3].copy_from_slice(&[ink.0, ink.1, ink.2]);
+    assert_eq!(
+        braille_minimap(&rgba, w, h, bg, 1, 1),
+        vec![Some(('\u{2801}', ink))]
+    );
+    // Every dot lit is the full cell.
+    for px in rgba.chunks_exact_mut(4) {
+        px[..3].copy_from_slice(&[ink.0, ink.1, ink.2]);
+    }
+    assert_eq!(
+        braille_minimap(&rgba, w, h, bg, 1, 1),
+        vec![Some(('\u{28ff}', ink))]
+    );
+}
+
 /// #1433: the bytes croft writes for one frame, through the real crossterm
 /// backend, at `depth`.
 fn frame_bytes_at(depth: crate::color_depth::ColorDepth) -> String {
@@ -81169,6 +81614,227 @@ fn save_all_does_not_report_a_file_waiting_on_its_formatter_as_saved() {
         save_all_summary(1, 0, None, String::new()),
         "Saved 1 editor"
     );
+}
+
+/// A modified file whose tab has unsaved edits, opened from Source Control
+/// (#1572): `seed.txt` is `a = 2` on disk against `a = 1` at HEAD, and its
+/// open tab reads `# a = 2`.
+fn scm_app_with_an_unsaved_modified_file() -> (tempfile::TempDir, std::path::PathBuf, App, usize) {
+    let (tmp, f) = repo_with_seed("a = 1\n");
+    std::fs::write(&f, "a = 2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    type_str(&mut app, "# ");
+    assert!(
+        app.editor.dirty,
+        "staging: the file's tab has unsaved edits"
+    );
+    assert!(wait_for_changes(&mut app, |a| {
+        a.source_control
+            .entries
+            .iter()
+            .any(|e| e.path == "seed.txt")
+    }));
+    let idx = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "seed.txt")
+        .unwrap();
+    (tmp, f, app, idx)
+}
+
+fn diff_tab_count(app: &App) -> usize {
+    app.editor.iter_tabs().filter(|e| e.diff.is_some()).count()
+}
+
+#[test]
+fn reopening_the_source_control_diff_of_an_unsaved_file_reuses_its_diff_tab() {
+    let (_tmp, _f, mut app, idx) = scm_app_with_an_unsaved_modified_file();
+    app.open_source_control_entry(idx);
+    app.open_source_control_entry(idx);
+    app.open_source_control_entry(idx);
+    assert_eq!(
+        diff_tab_count(&app),
+        1,
+        "every click on the row must land on the one diff tab"
+    );
+    assert_eq!(app.editor.tab_count(), 2, "the file's tab and its diff");
+}
+
+#[test]
+fn the_source_control_diff_of_an_unsaved_file_shows_the_unsaved_text() {
+    let (_tmp, _f, mut app, idx) = scm_app_with_an_unsaved_modified_file();
+    app.open_source_control_entry(idx);
+    let diff = app.editor.diff.as_ref().expect("a diff view is open");
+    assert_eq!(
+        diff.left_lines,
+        vec!["a = 1".to_string()],
+        "HEAD on the left"
+    );
+    assert_eq!(
+        diff.right_lines,
+        vec!["# a = 2".to_string()],
+        "the right side is the buffer the user is editing, not the disk"
+    );
+}
+
+#[test]
+fn the_source_control_diff_leaves_the_unsaved_tab_alone() {
+    let (_tmp, f, mut app, idx) = scm_app_with_an_unsaved_modified_file();
+    app.open_source_control_entry(idx);
+    app.open_source_control_entry(idx);
+    let tab = app
+        .editor
+        .iter_tabs()
+        .find(|e| e.diff.is_none() && e.path.as_deref() == Some(f.as_path()))
+        .expect("the file's own tab is still open");
+    assert!(tab.dirty, "its unsaved edits are kept");
+    assert_eq!(tab.lines[0], "# a = 2");
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        "a = 2\n",
+        "nothing saved"
+    );
+}
+
+#[test]
+fn the_source_control_diff_of_a_clean_file_reuses_its_tab_and_reads_the_disk() {
+    let (tmp, f) = repo_with_seed("a = 1\n");
+    std::fs::write(&f, "a = 2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    assert!(wait_for_changes(&mut app, |a| {
+        a.source_control
+            .entries
+            .iter()
+            .any(|e| e.path == "seed.txt")
+    }));
+    let idx = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "seed.txt")
+        .unwrap();
+    app.open_source_control_entry(idx);
+    app.open_source_control_entry(idx);
+    assert_eq!(app.editor.tab_count(), 1, "the clean tab becomes the diff");
+    let diff = app.editor.diff.as_ref().expect("a diff view is open");
+    assert_eq!(diff.right_lines, vec!["a = 2".to_string()]);
+}
+
+#[test]
+fn compare_with_selected_diffs_an_unsaved_buffer_as_it_stands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "x\n").unwrap();
+    std::fs::write(&b, "y\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    type_str(&mut app, "z");
+    app.dispatch_menu_action(
+        MenuAction::CompareWithSelected {
+            anchor: a.clone(),
+            other: b.clone(),
+        },
+        tmp.path().to_path_buf(),
+    );
+    let diff = app.editor.diff.as_ref().expect("a diff view is open");
+    assert_eq!(
+        diff.left_lines,
+        vec!["zx".to_string()],
+        "the unsaved buffer, not the disk"
+    );
+    assert_eq!(
+        diff.right_lines,
+        vec!["y".to_string()],
+        "a closed file reads the disk"
+    );
+}
+
+#[test]
+fn hunk_actions_refuse_a_source_control_diff_of_unsaved_text() {
+    let (tmp, _f, mut app, idx) = scm_app_with_an_unsaved_modified_file();
+    app.open_source_control_entry(idx);
+    app.stage_hunk_at_caret();
+    assert_eq!(
+        app.status,
+        "Save the file first: hunk actions apply to the file on disk"
+    );
+    let staged = std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp.path())
+        .args(["diff", "--cached", "--name-only"])
+        .output()
+        .unwrap();
+    assert!(
+        staged.stdout.is_empty(),
+        "unsaved text must never reach the index: {}",
+        String::from_utf8_lossy(&staged.stdout)
+    );
+}
+
+#[test]
+fn the_source_control_diff_finds_the_unsaved_copy_in_an_inactive_split_group() {
+    let (_tmp, _f, mut app, idx) = scm_app_with_an_unsaved_modified_file();
+    // The new active group opens seed.txt clean from disk; the dirty copy
+    // now sits in the inactive group.
+    app.split_editor();
+    assert!(
+        !app.editor.dirty,
+        "staging: the active group's copy is clean"
+    );
+    app.open_source_control_entry(idx);
+    let diff = app.editor.diff.as_ref().expect("a diff view is open");
+    assert_eq!(
+        diff.right_lines,
+        vec!["# a = 2".to_string()],
+        "the unsaved text from the other split, not the disk"
+    );
+    assert!(diff.right_is_unsaved, "hunk actions must refuse this view");
+}
+
+#[test]
+fn saving_the_file_lets_hunk_actions_run_on_its_unsaved_source_control_diff() {
+    let (_tmp, f, mut app, idx) = scm_app_with_an_unsaved_modified_file();
+    app.open_source_control_entry(idx);
+    assert!(app.editor.diff.as_ref().unwrap().right_is_unsaved);
+    // The save writes exactly the text the view already shows, so the
+    // rebuilt rows are identical to the rendered ones.
+    std::fs::write(&f, "# a = 2\n").unwrap();
+    let touched = std::collections::BTreeSet::from([f.clone()]);
+    app.refresh_open_diff_views(false, &[], &touched);
+    assert!(
+        !app.editor.diff.as_ref().unwrap().right_is_unsaved,
+        "the saved transition clears the marker even with identical rows"
+    );
+    app.stage_hunk_at_caret();
+    assert_eq!(app.status, "Staged hunk in seed.txt");
+}
+
+#[test]
+fn hunk_actions_still_stage_from_a_source_control_diff_of_a_saved_file() {
+    let (tmp, f) = repo_with_seed("a = 1\n");
+    std::fs::write(&f, "a = 2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(wait_for_changes(&mut app, |a| {
+        a.source_control
+            .entries
+            .iter()
+            .any(|e| e.path == "seed.txt")
+    }));
+    let idx = app
+        .source_control
+        .entries
+        .iter()
+        .position(|e| e.path == "seed.txt")
+        .unwrap();
+    app.open_source_control_entry(idx);
+    app.stage_hunk_at_caret();
+    assert_eq!(app.status, "Staged hunk in seed.txt");
 }
 
 /// #1488: a watcher that clears the screen (`tsc --watch`, `cargo watch -c`)
