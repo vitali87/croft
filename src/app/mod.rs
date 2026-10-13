@@ -3132,8 +3132,8 @@ pub struct App {
     nested_repo_scan: Option<(PathBuf, std::time::Instant)>,
     /// Off-thread per-line git blame for the active editor (GitLens-style
     /// inline annotation). Fetched once per (file, HEAD) like the gutter.
-    blame_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<crate::git::BlameLine>)>,
-    blame_tx: std::sync::mpsc::Sender<(PathBuf, Vec<crate::git::BlameLine>)>,
+    blame_rx: std::sync::mpsc::Receiver<(PathBuf, crate::git::Blame)>,
+    blame_tx: std::sync::mpsc::Sender<(PathBuf, crate::git::Blame)>,
     /// The file blame has been fetched (or is in flight) for; reset to `None`
     /// on HEAD move so the annotation refreshes after a commit / checkout.
     blame_fetched: Option<PathBuf>,
@@ -9128,8 +9128,10 @@ impl App {
         };
         // Keyed by encoding too: the same file open in two tabs under two
         // encodings needs HEAD decoded each tab's way (#1242).
-        let mut fetched: std::collections::HashMap<(PathBuf, &str), Option<Vec<String>>> =
-            std::collections::HashMap::new();
+        let mut fetched: std::collections::HashMap<
+            (PathBuf, &str),
+            Option<crate::packed_lines::PackedLines>,
+        > = std::collections::HashMap::new();
         let groups =
             std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut());
         for ed in groups.flat_map(|g| g.editors.iter_mut()) {
@@ -9152,7 +9154,7 @@ impl App {
                         .and_then(|rel| rel.to_str())
                         .and_then(|rel| crate::git::read_bytes_at_head(&root, rel).ok())
                         .and_then(|bytes| crate::widgets::editor::decode_blob(&bytes, enc))
-                        .map(|text| text.lines().map(str::to_string).collect())
+                        .map(|text| text.lines().collect())
                 })
                 .clone();
             ed.set_git_head_lines(path, head);

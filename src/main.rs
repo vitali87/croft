@@ -73,6 +73,7 @@ mod notifications;
 mod oom;
 mod outline_syntax;
 mod output;
+mod packed_lines;
 mod pair;
 mod pair_host;
 mod pane_host;

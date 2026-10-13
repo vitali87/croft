@@ -719,8 +719,8 @@ fn code_line_spans(line: &str, spans: &[HiSpan], code_fg: Color) -> Vec<Span<'st
     let mut out = Vec::new();
     let mut cursor = 0usize;
     for sp in spans {
-        let start = sp.start.min(line.len());
-        let end = sp.end.min(line.len());
+        let start = sp.range().start.min(line.len());
+        let end = sp.range().end.min(line.len());
         if start > cursor {
             out.push(Span::styled(
                 line[cursor..start].to_string(),

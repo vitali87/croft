@@ -19557,24 +19557,25 @@ fn inline_blame_annotation_paints_on_the_cursor_line() {
     app.editor.cursor_row = 0;
     app.editor.set_blame(
         f.clone(),
-        Some(vec![
-            crate::git::BlameLine {
-                short_hash: "abc12345".into(),
-                summary: "init".into(),
-                author: "Vitali".into(),
-                age_secs: 3600,
-                uncommitted: false,
-                text: None,
-            },
-            crate::git::BlameLine {
-                short_hash: "abc12345".into(),
-                summary: "add x".into(),
-                author: "Alice".into(),
-                age_secs: 60,
-                uncommitted: false,
-                text: None,
-            },
-        ]),
+        Some(crate::git::Blame::new(
+            vec![
+                std::sync::Arc::new(crate::git::BlameCommit {
+                    short_hash: "abc12345".into(),
+                    summary: "init".into(),
+                    author: "Vitali".into(),
+                    age_secs: 3600,
+                    uncommitted: false,
+                }),
+                std::sync::Arc::new(crate::git::BlameCommit {
+                    short_hash: "abc12345".into(),
+                    summary: "add x".into(),
+                    author: "Alice".into(),
+                    age_secs: 60,
+                    uncommitted: false,
+                }),
+            ],
+            None,
+        )),
     );
     let backend = ratatui::backend::TestBackend::new(120, 30);
     let mut term = ratatui::Terminal::new(backend).unwrap();
@@ -80480,8 +80481,10 @@ fn a_windows_1252_file_gets_gutter_marks_after_reopen_with_encoding() {
         .unwrap();
     app.sync_git_gutters();
     assert_eq!(
-        app.editor.git_head_lines.as_deref(),
-        Some(&["name;city", "Müller;Köln", "José;Málaga"].map(String::from)[..])
+        app.editor.git_head_lines,
+        Some(crate::packed_lines::PackedLines::from(
+            &["name;city", "Müller;Köln", "José;Málaga"][..]
+        ))
     );
     draw(&mut app, 100, 30);
     assert_eq!(
@@ -80501,8 +80504,8 @@ fn a_utf16_file_gets_gutter_marks() {
     app.editor.open_pinned(&f).unwrap();
     app.sync_git_gutters();
     assert_eq!(
-        app.editor.git_head_lines.as_deref(),
-        Some(&["one", "two"].map(String::from)[..])
+        app.editor.git_head_lines,
+        Some(crate::packed_lines::PackedLines::from(&["one", "two"][..]))
     );
     draw(&mut app, 100, 30);
     assert_eq!(
@@ -81034,7 +81037,7 @@ fn git_gutter_baseline_comes_from_a_repo_below_the_workspace_root() {
     app.sync_git_gutters();
     assert_eq!(
         app.editor.git_head_lines,
-        Some(vec!["one".to_string(), "two".to_string()]),
+        Some(crate::packed_lines::PackedLines::from(&["one", "two"][..])),
         "the committed text of sub/plain.txt is the gutter baseline"
     );
 }
