@@ -70742,7 +70742,6 @@ fn debuggee_python_note(python: &Path) -> Result<Option<String>, String> {
     Ok(None)
 }
 
-/// `lead` followed by the note on the debuggee's interpreter, if any (#864).
 /// Whether a browser croft launches would have no screen to open on
 /// (#1410): croft is reached over SSH, or on Linux no X or Wayland display
 /// is set. macOS and Windows always have one locally.
@@ -70754,10 +70753,13 @@ fn no_display_for_a_browser() -> bool {
     )
 }
 
+/// Whether there is no display, given whether croft runs over SSH, whether
+/// it is on Linux, and which environment variables are `set` (#1410).
 pub(crate) fn no_display(over_ssh: bool, linux: bool, set: impl Fn(&str) -> bool) -> bool {
     over_ssh || (linux && !set("DISPLAY") && !set("WAYLAND_DISPLAY"))
 }
 
+/// `lead` followed by the note on the debuggee's interpreter, if any (#864).
 fn with_python_note(lead: String, note: Option<&str>) -> String {
     match note {
         Some(note) => format!("{lead} {note}"),

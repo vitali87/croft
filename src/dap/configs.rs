@@ -617,6 +617,10 @@ pub fn with_headless_browser(mut request: Value) -> Value {
         let runtime = args
             .entry("runtimeArgs")
             .or_insert_with(|| Value::Array(Vec::new()));
+        // js-debug accepts `"runtimeArgs": null`, which means no arguments.
+        if runtime.is_null() {
+            *runtime = Value::Array(Vec::new());
+        }
         if let Some(list) = runtime.as_array_mut() {
             let headless = list
                 .iter()
@@ -2003,6 +2007,9 @@ mod tests {
         let cfg = config(r#"[{ "name": "C", "type": "chrome", "runtimeArgs": ["--headless"] }]"#);
         let req = with_headless_browser(js_request(&resolve(&cfg, &ctx()).unwrap()));
         assert_eq!(req["arguments"]["runtimeArgs"], json!(["--headless"]));
+        let cfg = config(r#"[{ "name": "C", "type": "chrome", "runtimeArgs": null }]"#);
+        let req = with_headless_browser(js_request(&resolve(&cfg, &ctx()).unwrap()));
+        assert_eq!(req["arguments"]["runtimeArgs"], json!(["--headless=new"]));
     }
 
     #[test]
