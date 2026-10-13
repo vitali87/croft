@@ -1446,6 +1446,12 @@ enum MenuAction {
     /// Terminal pane right-click: restore the most recently closed pane
     /// while it is still inside the undo-close grace window.
     UndoCloseTerminal,
+    /// Terminal pane right-click: open another terminal next to the active
+    /// one, as `Cmd+T` does (#1598).
+    SplitTerminal,
+    /// Terminal pane right-click: close the pane at `idx`, as `Cmd+W` does
+    /// for the active one (#1598).
+    KillTerminal(usize),
     /// Command decoration menu: copy the command's output span to the
     /// clipboard (pane `idx`, the clicked decoration embedded).
     CopyCommandOutput(usize, crate::widgets::terminal::CommandDecoration),
@@ -1558,6 +1564,8 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::ToggleBroadcastInput => Some("⌘K I"),
         MenuAction::ToggleBroadcastExclusion => Some("⌘K ⇧I"),
         MenuAction::UndoCloseTerminal => Some("⌘K ⇧T"),
+        MenuAction::SplitTerminal => Some("⌘T"),
+        MenuAction::KillTerminal(_) => Some("⌘W"),
         MenuAction::CopyCommandOutput(..) => Some("⌘K ⇧C"),
         MenuAction::SelectCommandOutput(..) => Some("⌘K ⇧S"),
         MenuAction::RerunCommand(..) => Some("⌘K ⇧R"),
@@ -17210,10 +17218,37 @@ impl App {
         }
     }
 
-    /// Drop the currently-active terminal. Thin wrapper kept for the
-    /// keyboard shortcut and existing callers.
+    /// Drop the currently-active terminal. The shortcut and the pane menu
+    /// go through [`Self::close_terminal_reporting`]; tests use this.
+    #[cfg(test)]
     pub fn close_active_terminal(&mut self) -> bool {
         self.close_terminal_at(self.active_terminal)
+    }
+
+    /// Open another terminal beside the active one and say so: the `Cmd+T`
+    /// chord and the pane menu's Split Terminal (#1598).
+    fn split_terminal_reporting(&mut self) {
+        match self.split_terminal() {
+            Ok(()) => {
+                self.terminal_status(format!("Split terminal: {} active", self.terminals.len()));
+            }
+            Err(e) => {
+                self.status = format!("Split terminal failed: {e}");
+            }
+        }
+    }
+
+    /// Close the pane at `idx` and say so, or say why not: the `Cmd+W` chord
+    /// (on the active pane) and the pane menu's Kill Terminal (#1598).
+    fn close_terminal_reporting(&mut self, idx: usize) {
+        if self.close_terminal_at(idx) {
+            self.terminal_status(format!(
+                "Closed terminal: {} remaining",
+                self.terminals.len()
+            ));
+        } else {
+            self.status = String::from("Cannot close the last terminal; press Ctrl+J to hide");
+        }
     }
 
     /// Cmd+K ⇧T: bring back the most recently closed terminal pane while it
@@ -45326,30 +45361,13 @@ impl App {
         }
         // Ctrl+Shift+T: open another terminal next to the active one.
         if is_terminal_split_key(key) {
-            match self.split_terminal() {
-                Ok(()) => {
-                    self.terminal_status(format!(
-                        "Split terminal: {} active",
-                        self.terminals.len()
-                    ));
-                }
-                Err(e) => {
-                    self.status = format!("Split terminal failed: {e}");
-                }
-            }
+            self.split_terminal_reporting();
             return;
         }
         // Cmd+W (or legacy Ctrl+Shift+W): close the active terminal (no-op when
         // only one is left).
         if is_terminal_close_key(key) {
-            if self.close_active_terminal() {
-                self.terminal_status(format!(
-                    "Closed terminal: {} remaining",
-                    self.terminals.len()
-                ));
-            } else {
-                self.status = String::from("Cannot close the last terminal; press Ctrl+J to hide");
-            }
+            self.close_terminal_reporting(self.active_terminal);
             return;
         }
         // Cmd+]: next terminal. Cmd+[: previous terminal.
@@ -55313,6 +55331,25 @@ impl App {
                         label: String::from("Clear"),
                         action: MenuAction::ClearTerminal(idx),
                     });
+                    // Split and Kill, as in VS Code's terminal menu (#1598):
+                    // GNOME Terminal and Konsole keep Ctrl+Shift+T / W for
+                    // their own New Tab and Close Tab, so off the kitty
+                    // protocol this menu is the keyboard-free route. Split
+                    // opens beside the ACTIVE pane, so a folded one offers
+                    // only Kill, which carries its own index; a lone pane
+                    // cannot be closed, so it offers no Kill.
+                    if !folded {
+                        items.push(MenuEntry::Item {
+                            label: String::from("Split Terminal"),
+                            action: MenuAction::SplitTerminal,
+                        });
+                    }
+                    if self.terminals.len() > 1 {
+                        items.push(MenuEntry::Item {
+                            label: String::from("Kill Terminal"),
+                            action: MenuAction::KillTerminal(idx),
+                        });
+                    }
                     if !folded {
                         items.extend([
                             MenuEntry::Item {
@@ -61316,6 +61353,8 @@ impl App {
             MenuAction::ToggleBroadcastInput => self.toggle_broadcast_input(),
             MenuAction::ToggleBroadcastExclusion => self.toggle_broadcast_exclusion(),
             MenuAction::UndoCloseTerminal => self.undo_close_terminal(),
+            MenuAction::SplitTerminal => self.split_terminal_reporting(),
+            MenuAction::KillTerminal(idx) => self.close_terminal_reporting(idx),
             MenuAction::CopyCommandOutput(idx, d) => self.copy_command_output(idx, d),
             MenuAction::SelectCommandOutput(idx, d) => self.select_command_output(idx, d),
             MenuAction::RerunCommand(idx, d) => self.rerun_command(idx, d),
@@ -67901,8 +67940,10 @@ fn build_title(workspace: &std::path::Path) -> String {
 
 /// Returns true if the given key event should copy the terminal pane's
 /// current selection to the clipboard.  Recognises:
-///   * `Ctrl+Shift+C` — universal Linux terminal copy convention; doesn't
-///     collide with `Ctrl+C` (SIGINT).
+///   * `Ctrl+Shift+C` — doesn't collide with `Ctrl+C` (SIGINT). It is also
+///     the host terminal's own Copy in GNOME Terminal and Konsole, which
+///     keep it, and without the kitty protocol it arrives as `Ctrl+C`; the
+///     pane menu's Copy and "Copy on Selection" reach croft there (#1598).
 ///   * `Cmd+C`        — for terminals that deliver Super via the kitty
 ///     keyboard protocol.
 fn is_terminal_copy_key(key: KeyEvent) -> bool {
