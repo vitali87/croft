@@ -2426,6 +2426,10 @@ struct ContextMenu {
     /// The breadcrumb whose picker this is (#1608): Left / Right step to
     /// the neighbouring crumb's picker.
     crumb: Option<usize>,
+    /// The first top-level row on screen: a menu taller than the terminal
+    /// (a big folder's breadcrumb picker) scrolls to keep the highlight in
+    /// view. Kept by [`scroll_for`](Self::scroll_for).
+    scroll: std::cell::Cell<usize>,
 }
 
 impl ContextMenu {
@@ -2439,6 +2443,7 @@ impl ContextMenu {
             submenu_selected: 0,
             target_dir,
             crumb: None,
+            scroll: Default::default(),
         }
     }
 
@@ -2466,6 +2471,22 @@ impl ContextMenu {
         if crate::i18n::active() {
             walk(&mut self.items);
         }
+    }
+
+    /// The first top-level row shown when `visible` rows fit: the previous
+    /// offset, moved only as far as keeps `selected` on screen.
+    fn scroll_for(&self, visible: usize) -> usize {
+        let mut top = self.scroll.get();
+        if visible > 0 {
+            if self.selected < top {
+                top = self.selected;
+            } else if self.selected >= top + visible {
+                top = self.selected + 1 - visible;
+            }
+            top = top.min(self.items.len().saturating_sub(visible));
+        }
+        self.scroll.set(top);
+        top
     }
 
     /// The entries at the active level: the open submenu's children, or the
@@ -11244,13 +11265,18 @@ impl App {
     /// View: Focus and Select Breadcrumbs (#1608): the last crumb's picker,
     /// from which Left / Right walk the bar.
     fn focus_breadcrumbs(&mut self) {
+        // A row too narrow for the whole chain focuses the last crumb that
+        // fit on it.
         let n = self.editor.breadcrumbs.len();
-        if n == 0 || self.editor.breadcrumb_anchor(n - 1).is_none() {
+        let Some(last) = (0..n)
+            .rev()
+            .find(|&i| self.editor.breadcrumb_anchor(i).is_some())
+        else {
             self.status = String::from("No breadcrumbs to focus");
             return;
-        }
+        };
         self.focus_pane(Pane::Editor);
-        self.open_breadcrumb_picker(n - 1);
+        self.open_breadcrumb_picker(last);
     }
 
     /// The scope-header lines to pin as sticky scroll: the enclosing symbols of
@@ -12906,6 +12932,7 @@ impl App {
         let origin = self.customize_layout_origin();
         self.context_menu = Some(ContextMenu {
             crumb: None,
+            scroll: Default::default(),
             origin,
             items: self.customize_layout_items(),
             selected,
@@ -13165,6 +13192,7 @@ impl App {
             .unwrap_or(0);
         self.context_menu = Some(ContextMenu {
             crumb: None,
+            scroll: Default::default(),
             origin,
             items: items.into_iter().map(MenuEntry::from).collect(),
             selected,
@@ -16736,6 +16764,7 @@ impl App {
         // blank, since the welcome emit is gated off while a menu is open).
         self.context_menu = Some(ContextMenu {
             crumb: None,
+            scroll: Default::default(),
             origin,
             items,
             selected: 0,
@@ -20993,18 +21022,19 @@ impl App {
         };
         let grad = self.popup_gradient();
         // The top-level panel; the open submenu's parent row stays highlighted.
-        self.render_menu_panel(frame, clipped, &menu.items, menu.selected, grad);
+        let top = menu.scroll_for(clipped.height.saturating_sub(2) as usize);
+        self.render_menu_panel(frame, clipped, &menu.items, menu.selected, top, grad);
         // Float the open submenu's panel beside its parent.
         if let Some(sub_rect) = self.submenu_rect()
             && let Some(MenuEntry::Submenu { items, .. }) =
                 menu.open_submenu.and_then(|p| menu.items.get(p))
         {
-            self.render_menu_panel(frame, sub_rect, items, menu.submenu_selected, grad);
+            self.render_menu_panel(frame, sub_rect, items, menu.submenu_selected, 0, grad);
         }
     }
 
-    /// Paint one bordered menu panel of `entries` into `rect`, highlighting row
-    /// `selected`. Items show a right-aligned shortcut hint, submenu parents a
+    /// Paint one bordered menu panel of `entries` into `rect`, from entry
+    /// `top` on, highlighting row `selected`. Items show a right-aligned shortcut hint, submenu parents a
     /// `▸`, and separators a divider rule. Shared by the main menu and the
     /// floating submenu.
     fn render_menu_panel(
@@ -21013,6 +21043,7 @@ impl App {
         rect: Rect,
         entries: &[MenuEntry],
         selected: usize,
+        top: usize,
         grad: bool,
     ) {
         // Black theme: orange→green gradient border + muted dark-teal
@@ -21043,13 +21074,13 @@ impl App {
             width: rect.width.saturating_sub(2),
             height: rect.height.saturating_sub(2),
         };
-        for (i, entry) in entries.iter().enumerate() {
-            if i as u16 >= inner.height {
+        for (i, entry) in entries.iter().enumerate().skip(top) {
+            if (i - top) as u16 >= inner.height {
                 break;
             }
             let row = Rect {
                 x: inner.x,
-                y: inner.y + i as u16,
+                y: inner.y + (i - top) as u16,
                 width: inner.width,
                 height: 1,
             };
@@ -23628,6 +23659,15 @@ impl App {
         }
         if is_save_all_key(key) {
             self.save_all();
+            return Ok(());
+        }
+        // VS Code "Focus and Select Breadcrumbs" (Cmd/Ctrl+Shift+., #1608),
+        // claimed from any pane; the live shell keeps its Ctrl form.
+        let terminal_owns_ctrl_shift_dot = self.focus == Pane::Terminal
+            && self.bottom_panel_tab == BottomPanelTab::Terminal
+            && key.modifiers.contains(KeyModifiers::CONTROL);
+        if is_focus_breadcrumbs_key(key) && !terminal_owns_ctrl_shift_dot {
+            self.focus_breadcrumbs();
             return Ok(());
         }
         // Ctrl+Shift+H in the live shell stays its command history; Cmd+Shift+H
@@ -43569,11 +43609,6 @@ impl App {
             }
             return;
         }
-        // VS Code "Focus and Select Breadcrumbs" (Cmd/Ctrl+Shift+., #1608).
-        if is_focus_breadcrumbs_key(key) {
-            self.focus_breadcrumbs();
-            return;
-        }
         // VS Code "Quick Fix" (Cmd+. / Ctrl+.): code actions at the cursor.
         if is_quick_fix_key(key) {
             if self.editor_is_text() {
@@ -47616,6 +47651,7 @@ impl App {
         };
         self.context_menu = Some(ContextMenu {
             crumb: None,
+            scroll: Default::default(),
             origin,
             items: vec![
                 MenuEntry::header(header),
@@ -55269,6 +55305,7 @@ impl App {
                     );
                     self.context_menu = Some(ContextMenu {
                         crumb: None,
+                        scroll: Default::default(),
                         origin: (m.column, m.row),
                         items,
                         selected: 0,
@@ -55413,6 +55450,7 @@ impl App {
                     }
                     self.context_menu = Some(ContextMenu {
                         crumb: None,
+                        scroll: Default::default(),
                         origin: (m.column, m.row),
                         items,
                         selected: 0,
@@ -60361,7 +60399,8 @@ impl App {
             x = main.x.saturating_sub(width);
         }
         // Align the submenu's top border so its first row sits on the parent row.
-        let y = (main.y + 1 + parent as u16).saturating_sub(1);
+        let shown = parent.saturating_sub(menu.scroll.get());
+        let y = (main.y + 1 + shown as u16).saturating_sub(1);
         let y = if area.height > 0 {
             y.min(area.height.saturating_sub(height))
         } else {
@@ -60384,7 +60423,8 @@ impl App {
         // Items live inside the 1-cell border.
         let inner_y = y.checked_sub(r.y + 1)?;
         let menu = self.context_menu.as_ref()?;
-        let idx = inner_y as usize;
+        let top = menu.scroll_for(r.height.saturating_sub(2) as usize);
+        let idx = top + inner_y as usize;
         (idx < menu.items.len()).then_some(idx)
     }
 
@@ -63462,6 +63502,7 @@ impl App {
     fn open_status_menu(&mut self, col: u16, row: u16, items: Vec<MenuEntry>) {
         self.context_menu = Some(ContextMenu {
             crumb: None,
+            scroll: Default::default(),
             origin: (col, row),
             items,
             selected: 0,
@@ -63612,6 +63653,7 @@ impl App {
         ];
         self.context_menu = Some(ContextMenu {
             crumb: None,
+            scroll: Default::default(),
             origin: (col, row),
             items,
             selected: 0,

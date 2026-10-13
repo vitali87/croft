@@ -27904,6 +27904,7 @@ fn open_tab_menu_on_split_and_move(app: &mut App) {
         .unwrap();
     app.context_menu = Some(ContextMenu {
         crumb: None,
+        scroll: Default::default(),
         origin: (0, 0),
         items,
         selected: sub_idx,
@@ -34682,6 +34683,105 @@ fn focus_and_select_breadcrumbs_walks_the_bar_from_the_keyboard() {
     empty.run_command(Command::FocusBreadcrumbs);
     assert!(empty.context_menu.is_none());
     assert_eq!(empty.status, "No breadcrumbs to focus");
+}
+
+/// #1608: the breadcrumb chord works from any pane, not only the editor.
+#[test]
+fn focus_and_select_breadcrumbs_works_from_the_explorer() {
+    let (mut app, _tmp) = app_on_src_f2("// f2.rs\n");
+    app.focus_pane(Pane::Tree);
+    app.handle_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert_eq!(app.context_menu.as_ref().and_then(|m| m.crumb), Some(1));
+    assert!(app.focus == Pane::Editor);
+}
+
+/// #1608: on a bar too narrow for the whole chain the chord focuses the
+/// last crumb that fit instead of reporting no breadcrumbs.
+#[test]
+fn focus_and_select_breadcrumbs_takes_the_last_crumb_that_fit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut dir = tmp.path().to_path_buf();
+    for name in [
+        "alpha_folder",
+        "beta_folder",
+        "gamma_folder",
+        "delta_folder",
+    ] {
+        dir.push(name);
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("the_file_at_the_end.rs");
+    std::fs::write(&file, "// end\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.show_tree = false;
+    app.editor.open(&file).unwrap();
+    app.focus_pane(Pane::Editor);
+    draw(&mut app, 50, 20);
+    let n = app.editor.breadcrumbs.len();
+    assert!(
+        app.editor.breadcrumb_anchor(n - 1).is_none(),
+        "last crumb clipped"
+    );
+    let last = (0..n)
+        .rev()
+        .find(|&i| app.editor.breadcrumb_anchor(i).is_some())
+        .expect("some crumb on screen");
+    app.handle_key(key(
+        KeyCode::Char('.'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert_eq!(app.context_menu.as_ref().and_then(|m| m.crumb), Some(last));
+}
+
+/// #1608: a folder picker taller than the terminal scrolls with its
+/// highlight, and clicks hit the row drawn under them.
+#[test]
+fn a_long_crumb_picker_keeps_its_highlight_on_screen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    for k in 0..40 {
+        std::fs::write(src.join(format!("f{k:02}.rs")), "\n").unwrap();
+    }
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&src.join("f35.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    draw(&mut app, 100, 20);
+    click_crumb(&mut app, 1);
+    // The row the highlight is drawn on, with its label there.
+    let shown = |app: &mut App| {
+        let screen = screen_text_863(app, 100, 20);
+        let r = app.menu_rect().unwrap();
+        let sel = app.context_menu.as_ref().unwrap().selected;
+        let y = (r.y + 1..r.y + r.height - 1)
+            .find(|&y| app.menu_item_at(r.x + 2, y) == Some(sel))
+            .expect("highlight on screen");
+        let line = screen.lines().nth(y as usize).unwrap().to_string();
+        assert!(line.contains(&format!("f{sel:02}.rs")), "{line}");
+        y
+    };
+    assert_eq!(app.context_menu.as_ref().unwrap().selected, 35);
+    shown(&mut app);
+    for _ in 0..10 {
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(app.context_menu.as_ref().unwrap().selected, 39);
+    let bottom = shown(&mut app);
+    app.handle_key(key(KeyCode::Up, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(shown(&mut app), bottom - 1, "Up moves within the window");
+    for _ in 0..40 {
+        app.handle_key(key(KeyCode::Up, KeyModifiers::NONE))
+            .unwrap();
+    }
+    let top = shown(&mut app);
+    assert_eq!(top, app.menu_rect().unwrap().y + 1);
 }
 
 #[test]
@@ -43432,6 +43532,7 @@ fn the_terminal_image_yields_to_an_open_context_menu() {
     // The pane's right-click menu, opened on the picture itself.
     app.context_menu = Some(ContextMenu {
         crumb: None,
+        scroll: Default::default(),
         origin: (l.cell_x, l.cell_y),
         items: vec![
             MenuEntry::Item {
