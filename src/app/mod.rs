@@ -32058,6 +32058,16 @@ impl App {
             return;
         }
         self.launch_resolved_config(rc);
+        // A cppdbg configuration runs under lldb-dap (#1394): say which of
+        // its gdb settings have no effect there.
+        let ignored = configs::ignored_cppdbg_keys(cfg);
+        if !ignored.is_empty() {
+            self.debug_console_push(format!(
+                "config \"{}\" runs under lldb-dap, which ignores its {}",
+                cfg.name,
+                ignored.join(", ")
+            ));
+        }
     }
 
     /// Where the last run of `name` failed, if the runner named a place in
