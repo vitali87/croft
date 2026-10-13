@@ -122,6 +122,11 @@ pub struct TestingPanel {
     /// A single-test or filtered run is in flight (#1371): the rest of the
     /// tree keeps its results, whatever the runner says about it.
     scoped: bool,
+    /// The name filter of a scoped filtered run (`None` for a single-test
+    /// run): a skip for a row the panel has not seen yet counts only when
+    /// the filter selects it, since jest/vitest report every test the filter
+    /// left out as skipped too.
+    scope_filter: Option<String>,
     scroll: usize,
 
     pub focus_gradient: bool,
@@ -148,6 +153,7 @@ impl TestingPanel {
             last_output_hint: Rect::default(),
             run_tally: (0, 0, 0),
             scoped: false,
+            scope_filter: None,
             coverage: None,
             coverage_error: None,
             coverage_fresh: false,
@@ -180,6 +186,7 @@ impl TestingPanel {
         self.cases.clear();
         self.prerun.clear();
         self.scoped = false;
+        self.scope_filter = None;
         self.activity = activity;
         self.last_run_ok = None;
         self.run_reported_failed = false;
@@ -209,6 +216,7 @@ impl TestingPanel {
         self.refused = false;
         self.prerun.clear();
         self.scoped = false;
+        self.scope_filter = None;
         self.scroll = 0;
         self.finished = None;
         // The watched names described the old project.
@@ -235,6 +243,7 @@ impl TestingPanel {
         let old = self.cases.iter().find(|c| c.name == name).map(|c| c.status);
         self.prerun = vec![(name.to_string(), old)];
         self.scoped = true;
+        self.scope_filter = None;
         self.apply_case(TestCase {
             name: name.to_string(),
             status: TestStatus::Running,
@@ -255,6 +264,7 @@ impl TestingPanel {
         // Snapshot each selected case's pre-run status for a refusal rollback.
         self.prerun = Vec::new();
         self.scoped = true;
+        self.scope_filter = Some(pattern.to_string());
         for c in &mut self.cases {
             if c.name.contains(pattern) {
                 self.prerun.push((c.name.clone(), Some(c.status)));
@@ -271,14 +281,19 @@ impl TestingPanel {
         // SKIP`, `pending`). That is the filter, not a result (#1371): in a
         // scoped run a skip lands only on a row the run marked Running, so
         // the rest of the file keeps its last pass or failure, and the tally.
-        if self.scoped
-            && case.status == TestStatus::Skipped
-            && self
-                .cases
-                .iter()
-                .any(|c| c.name == case.name && c.status != TestStatus::Running)
-        {
-            return;
+        // A skip for a name the panel has not seen (discovery listed only the
+        // files) counts only when the run's filter selects it.
+        if self.scoped && case.status == TestStatus::Skipped {
+            let keep = match self.cases.iter().find(|c| c.name == case.name) {
+                Some(c) => c.status == TestStatus::Running,
+                None => self
+                    .scope_filter
+                    .as_deref()
+                    .is_some_and(|f| case.name.contains(f)),
+            };
+            if !keep {
+                return;
+            }
         }
         if case.status == TestStatus::Failed {
             self.run_reported_failed = true;
@@ -330,6 +345,7 @@ impl TestingPanel {
     pub fn on_finished(&mut self, ok: Option<bool>) {
         let discovery = self.activity == Activity::Discovering;
         self.scoped = false;
+        self.scope_filter = None;
         self.activity = Activity::Idle;
         self.progress = None;
         if discovery {
@@ -471,6 +487,7 @@ impl TestingPanel {
     pub fn on_refused(&mut self) {
         self.activity = Activity::Idle;
         self.scoped = false;
+        self.scope_filter = None;
         self.progress = None;
         for (name, old) in std::mem::take(&mut self.prerun) {
             match old {
@@ -1133,14 +1150,43 @@ mod tests {
             statuses(&p),
             vec![("m.test.js::add::two", TestStatus::Skipped)]
         );
-        // A skip for a row the panel has never seen is a result too.
+    }
+
+    /// #1371, a run at the cursor right after a discovery that listed only
+    /// the file: jest reports every test outside the filter as `pending`,
+    /// none of them known yet. Only a skip the filter selects is a result.
+    #[test]
+    fn a_filtered_run_drops_unknown_skips_outside_the_filter() {
+        let mut p = TestingPanel::new();
+        p.start_filter("one");
+        for (name, status) in [
+            ("m.test.js::add::one", TestStatus::Passed),
+            ("m.test.js::add::two", TestStatus::Skipped),
+            ("m.test.js::sub::x", TestStatus::Skipped),
+            ("m.test.js::sub::one_more", TestStatus::Skipped),
+        ] {
+            p.apply_case(TestCase {
+                name: name.into(),
+                status,
+            });
+        }
+        p.on_finished(Some(true));
+        assert_eq!(
+            statuses(&p),
+            vec![
+                ("m.test.js::add::one", TestStatus::Passed),
+                ("m.test.js::sub::one_more", TestStatus::Skipped),
+            ]
+        );
+        assert_eq!(p.counts(), (1, 0, 1));
+        // A single-test run takes no skip for a name it never marked.
         let mut p = ran_file();
         p.start_single("m.test.js::add::one");
         p.apply_case(TestCase {
             name: "m.test.js::new::later".into(),
             status: TestStatus::Skipped,
         });
-        assert!(statuses(&p).contains(&("m.test.js::new::later", TestStatus::Skipped)));
+        assert!(!p.cases.iter().any(|c| c.name == "m.test.js::new::later"));
     }
 
     /// libtest prints only `test <path> ... <outcome>` on stdout; the harness
