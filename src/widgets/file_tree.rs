@@ -488,7 +488,7 @@ impl FileTree {
         entries.sort_by(|a, b| match (a.1, b.1) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
-            _ => a.0.file_name().cmp(&b.0.file_name()),
+            _ => explorer_name_cmp(&a.0, &b.0),
         });
         let new_nodes: Vec<Node> = entries
             .into_iter()
@@ -1938,6 +1938,59 @@ pub(crate) fn sticky_ancestors(nodes: &[Node], top_idx: usize, max: usize) -> Ve
     chain.split_off(skip)
 }
 
+/// Explorer order of two sibling paths: [`natural_cmp`] on their names,
+/// then the raw `OsStr` names, so non-UTF-8 names whose lossy renderings
+/// match still keep a fixed order.
+fn explorer_name_cmp(a: &Path, b: &Path) -> std::cmp::Ordering {
+    let (a, b) = (
+        a.file_name().unwrap_or_default(),
+        b.file_name().unwrap_or_default(),
+    );
+    natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()).then_with(|| a.cmp(b))
+}
+
+/// Explorer order (#1365), VS Code's default: digit runs compare by their
+/// value, so `chapter2` comes before `chapter10`, and text compares without
+/// case, so `apple.py` comes before `Makefile`. Names equal that way fall
+/// back to the shorter first (`v1` before `v01`, as VS Code does), then
+/// their bytes (`A` before `a`), so the order is total and stable.
+pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (mut x, mut y) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (x.peek().copied(), y.peek().copied()) {
+            (None, None) => return a.len().cmp(&b.len()).then_with(|| a.cmp(b)),
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(c), Some(d)) if c.is_ascii_digit() && d.is_ascii_digit() => {
+                let take = |it: &mut std::iter::Peekable<std::str::Chars>| {
+                    let mut run = String::new();
+                    while let Some(c) = it.next_if(char::is_ascii_digit) {
+                        run.push(c);
+                    }
+                    run
+                };
+                let (m, n) = (take(&mut x), take(&mut y));
+                // By value without parsing, so a 30-digit run can't
+                // overflow: fewer significant digits is smaller.
+                let (m, n) = (m.trim_start_matches('0'), n.trim_start_matches('0'));
+                let by_value = m.len().cmp(&n.len()).then_with(|| m.cmp(n));
+                if by_value != Ordering::Equal {
+                    return by_value;
+                }
+            }
+            (Some(c), Some(d)) => {
+                let by_text = c.to_lowercase().cmp(d.to_lowercase());
+                if by_text != Ordering::Equal {
+                    return by_text;
+                }
+                x.next();
+                y.next();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2859,6 +2912,101 @@ mod tests {
         assert!(tree.nodes[1].is_dir);
         assert!(!tree.nodes[2].is_dir);
         assert!(!tree.nodes[3].is_dir);
+    }
+
+    fn sorted(names: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        v.sort_by(|a, b| natural_cmp(a, b));
+        v
+    }
+
+    /// #1365: numbers by value, text without case, as VS Code lists them.
+    #[test]
+    fn names_sort_naturally() {
+        assert_eq!(
+            sorted(&["chapter10", "chapter2", "chapter1"]),
+            ["chapter1", "chapter2", "chapter10"]
+        );
+        assert_eq!(
+            sorted(&["step10.sql", "step2.sql", "step11.sql", "step1.sql"]),
+            ["step1.sql", "step2.sql", "step10.sql", "step11.sql"]
+        );
+        assert_eq!(
+            sorted(&["Zeta.py", "apple.py", "README.md", "Makefile", "banana.py"]),
+            ["apple.py", "banana.py", "Makefile", "README.md", "Zeta.py"]
+        );
+        assert_eq!(
+            sorted(&["img12.png", "img1.png", "img3.png"])[2],
+            "img12.png"
+        );
+    }
+
+    #[test]
+    fn natural_order_is_total_for_ties_zeros_and_huge_numbers() {
+        use std::cmp::Ordering;
+        // Equal ignoring case: still a fixed order, the bytes'.
+        assert_eq!(natural_cmp("A.txt", "a.txt"), Ordering::Less);
+        assert_eq!(natural_cmp("a.txt", "A.txt"), Ordering::Greater);
+        // Numerically equal: the shorter first, as VS Code does.
+        assert_eq!(natural_cmp("v1", "v01"), Ordering::Less);
+        assert_eq!(natural_cmp("v01", "v1"), Ordering::Greater);
+        assert_eq!(natural_cmp("v01", "v001"), Ordering::Less);
+        assert_eq!(natural_cmp("v1", "v002"), Ordering::Less);
+        let huge = "x123456789012345678901234567890";
+        let huger = "x1234567890123456789012345678901";
+        assert_eq!(natural_cmp(huge, huger), Ordering::Less);
+        assert_eq!(natural_cmp(huge, huge), Ordering::Equal);
+        assert_eq!(natural_cmp("", "a"), Ordering::Less);
+        assert_eq!(natural_cmp("a1", "a"), Ordering::Greater);
+        assert_eq!(natural_cmp("_init.py", "apple.py"), Ordering::Less);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_names_with_the_same_lossy_rendering_keep_a_fixed_order() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let fe = Path::new("/d").join(OsStr::from_bytes(&[0xFE]));
+        let ff = Path::new("/d").join(OsStr::from_bytes(&[0xFF]));
+        assert_eq!(explorer_name_cmp(&fe, &ff), std::cmp::Ordering::Less);
+        assert_eq!(explorer_name_cmp(&ff, &fe), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn the_explorer_lists_numbered_and_capitalised_names_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        for d in ["chapter1", "chapter10", "chapter2", "assets"] {
+            std::fs::create_dir(tmp.path().join(d)).unwrap();
+        }
+        for f in [
+            "README.md",
+            "Makefile",
+            "apple.py",
+            "step10.sql",
+            "step2.sql",
+        ] {
+            std::fs::write(tmp.path().join(f), "").unwrap();
+        }
+        let tree = FileTree::new(tmp.path().to_path_buf());
+        let names: Vec<String> = tree.nodes[1..]
+            .iter()
+            .map(|n| n.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "assets",
+                "chapter1",
+                "chapter2",
+                "chapter10",
+                "apple.py",
+                "Makefile",
+                "README.md",
+                "step2.sql",
+                "step10.sql"
+            ],
+            "folders first, each group in natural order"
+        );
     }
 
     #[test]
