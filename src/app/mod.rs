@@ -10215,7 +10215,11 @@ impl App {
     fn merged_diagnostics(&self, path: &Path) -> Vec<crate::lsp::manager::Diagnostic> {
         self.lsp_diagnostics
             .get(path)
-            .map(|by_server| by_server.values().flatten().cloned().collect())
+            .map(|by_server| {
+                diagnostics_by_source(by_server)
+                    .map(|(_, d)| d.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -10694,23 +10698,20 @@ impl App {
             }
             let mut items: Vec<ProblemItem> = Vec::new();
             if let Some(by_server) = self.lsp_diagnostics.get(path) {
-                for (server, diags) in by_server {
-                    // Hints (unused names, unreachable code) stay in the
-                    // editor and its hover, out of the list and its count,
-                    // as in VS Code (#1522).
-                    let shown = diags
-                        .iter()
-                        .filter(|d| d.severity != crate::lsp::manager::DiagnosticSeverity::Hint);
-                    for d in shown {
-                        items.push(ProblemItem {
-                            line: d.start_line,
-                            col: d.start_char,
-                            col_utf16: true,
-                            severity: d.severity,
-                            message: d.message.clone(),
-                            source: server.clone(),
-                        });
-                    }
+                // Hints (unused names, unreachable code) stay in the editor
+                // and its hover, out of the list and its count, as in VS
+                // Code (#1522).
+                let shown = diagnostics_by_source(by_server)
+                    .filter(|(_, d)| d.severity != crate::lsp::manager::DiagnosticSeverity::Hint);
+                for (source, d) in shown {
+                    items.push(ProblemItem {
+                        line: d.start_line,
+                        col: d.start_char,
+                        col_utf16: true,
+                        severity: d.severity,
+                        message: d.message.clone(),
+                        source: source.to_string(),
+                    });
                 }
             }
             if let Some(build) = self.build_diagnostics.get(path) {
@@ -10777,7 +10778,9 @@ impl App {
             if let Some(check) = self.approval_check.as_mut()
                 && check.path == u.path
             {
-                check.by_server.insert(u.server, u.diagnostics);
+                check
+                    .by_server
+                    .insert(diagnostics_store_key(&u), u.diagnostics);
                 changed = true;
                 continue;
             }
@@ -24429,13 +24432,18 @@ impl App {
             .collect();
         let mut servers: std::collections::BTreeMap<&str, ServerMem> = Default::default();
         for by_server in self.lsp_diagnostics.values() {
-            for (server, diags) in by_server {
+            // A server's pushed and pulled entries are one file (#1102).
+            let mut counted = std::collections::HashSet::new();
+            for (key, diags) in by_server {
+                let server = diagnostics_source(key);
                 let entry = servers.entry(server).or_insert_with(|| ServerMem {
-                    name: server.clone(),
+                    name: server.to_string(),
                     files: 0,
                     diagnostics: 0,
                 });
-                entry.files += 1;
+                if counted.insert(server) {
+                    entry.files += 1;
+                }
                 entry.diagnostics += diags.len();
             }
         }
@@ -48650,7 +48658,7 @@ impl App {
                                 && x.start_char == d.start_char
                                 && x.message == d.message
                         })
-                        .then(|| server.clone())
+                        .then(|| diagnostics_source(server).to_string())
                 })
             })
             .unwrap_or_default();
@@ -71533,19 +71541,58 @@ fn store_diagnostics_update(
     >,
     u: crate::lsp::manager::DiagnosticsUpdate,
 ) {
+    let key = diagnostics_store_key(&u);
     if u.diagnostics.is_empty() {
         if let Some(by_server) = store.get_mut(&u.path) {
-            by_server.remove(&u.server);
+            by_server.remove(&key);
             if by_server.is_empty() {
                 store.remove(&u.path);
             }
         }
     } else {
-        store
-            .entry(u.path)
-            .or_default()
-            .insert(u.server, u.diagnostics);
+        store.entry(u.path).or_default().insert(key, u.diagnostics);
     }
+}
+
+/// Marks the store entry holding what a server answered to a pull, beside
+/// the entry of what it pushed (#1102). rust-analyzer answers a pull with
+/// its own analysis and pushes the `cargo check` results; one entry per
+/// server let each empty the other, so an open file showed no compile
+/// errors. A server name never holds a NUL.
+const PULLED_DIAGNOSTICS: &str = "\u{0}pulled";
+
+/// The diagnostics store key for an update: its server's name, marked
+/// when the update answers a pull.
+fn diagnostics_store_key(u: &crate::lsp::manager::DiagnosticsUpdate) -> String {
+    if u.pulled {
+        format!("{}{PULLED_DIAGNOSTICS}", u.server)
+    } else {
+        u.server.clone()
+    }
+}
+
+/// The server (or other source) a diagnostics store key names.
+fn diagnostics_source(key: &str) -> &str {
+    key.strip_suffix(PULLED_DIAGNOSTICS).unwrap_or(key)
+}
+
+/// One path's stored diagnostics, each with the source that reported it.
+/// A server's pulled findings leave out any its push already carries, so a
+/// server that reports the same finding both ways shows it once.
+fn diagnostics_by_source(
+    by_server: &std::collections::HashMap<String, Vec<crate::lsp::manager::Diagnostic>>,
+) -> impl Iterator<Item = (&str, &crate::lsp::manager::Diagnostic)> {
+    by_server.iter().flat_map(move |(key, diags)| {
+        let source = diagnostics_source(key);
+        let pushed = key
+            .ends_with(PULLED_DIAGNOSTICS)
+            .then(|| by_server.get(source))
+            .flatten();
+        diags
+            .iter()
+            .filter(move |d| !pushed.is_some_and(|p| p.contains(d)))
+            .map(move |d| (source, d))
+    })
 }
 
 /// Run a resolved MCP command to completion on a worker thread: provision +

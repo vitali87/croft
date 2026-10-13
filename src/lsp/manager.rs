@@ -682,6 +682,12 @@ pub struct DiagnosticsUpdate {
     pub path: PathBuf,
     pub server: String,
     pub diagnostics: Vec<Diagnostic>,
+    /// The batch answers a pull (`textDocument/diagnostic` or
+    /// `workspace/diagnostic`) rather than a `publishDiagnostics` push. A
+    /// server can do both with different findings, rust-analyzer pulling
+    /// its own analysis and pushing `cargo check`, so the two are kept
+    /// apart and neither replaces the other (#1102).
+    pub pulled: bool,
 }
 
 /// A server's work-done progress update, forwarded from a `$/progress`
@@ -3392,6 +3398,7 @@ impl WorkerState {
                     path: path.clone(),
                     server: managed.name.clone(),
                     diagnostics: Vec::new(),
+                    pulled: true,
                 });
             }
         }
@@ -6553,6 +6560,7 @@ fn apply_workspace_report(
                     path,
                     server: server.to_string(),
                     diagnostics,
+                    pulled: true,
                 });
                 forwarded += 1;
             }
@@ -6632,6 +6640,7 @@ impl DocumentPull {
                 path,
                 server: self.name.clone(),
                 diagnostics: Vec::new(),
+                pulled: true,
             });
         }
     }
@@ -6755,6 +6764,7 @@ fn spawn_document_pulls_within(
                     .iter()
                     .map(crate::lsp::client::convert_diagnostic)
                     .collect(),
+                pulled: true,
             });
         });
     }

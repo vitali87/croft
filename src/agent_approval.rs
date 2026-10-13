@@ -533,7 +533,14 @@ impl ProposalCheck {
 
     /// Every server's diagnostics, worst first, then by line.
     pub fn diagnostics(&self) -> Vec<crate::lsp::manager::Diagnostic> {
-        let mut all: Vec<_> = self.by_server.values().flatten().cloned().collect();
+        // A server can both push and answer a pull with the same finding
+        // (#1102): count it once.
+        let mut all: Vec<crate::lsp::manager::Diagnostic> = Vec::new();
+        for d in self.by_server.values().flatten() {
+            if !all.contains(d) {
+                all.push(d.clone());
+            }
+        }
         all.sort_by_key(|d| (severity_rank(d.severity), d.start_line, d.start_char));
         all
     }
