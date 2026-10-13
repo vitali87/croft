@@ -55,6 +55,36 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color {
     Color::Rgb(r, g, b)
 }
 
+/// What an HTML file embeds (#1649): `<style>` is CSS, and `<script>` is
+/// JavaScript when its `type` is absent, empty, or a JavaScript MIME type
+/// (parameters allowed), as a browser runs it. Not the bundled
+/// query, which calls every script JavaScript and would colour a JSON-LD
+/// block or a `<script type="text/template">` as code it is not: JSON
+/// types get JSON, and any other non-JavaScript type stays raw text.
+const HTML_INJECTIONS_QUERY: &str = r#"
+((style_element
+  (raw_text) @injection.content)
+ (#set! injection.language "css"))
+
+((script_element
+  (start_tag) @_start
+  (raw_text) @injection.content)
+ (#not-match? @_start "(?i)\\stype\\s*=")
+ (#set! injection.language "javascript"))
+
+((script_element
+  (start_tag) @_start
+  (raw_text) @injection.content)
+ (#match? @_start "(?i)\\stype\\s*=\\s*(\"\\s*((module|(text|application)/(x-)?(java|ecma)script|text/javascript1\\.[0-5]|text/(jscript|livescript))\\s*(;[^\"]*)?)?\"|'\\s*((module|(text|application)/(x-)?(java|ecma)script|text/javascript1\\.[0-5]|text/(jscript|livescript))\\s*(;[^']*)?)?'|(module|(text|application)/(x-)?(java|ecma)script|text/javascript1\\.[0-5]|text/(jscript|livescript))(;[^\\s>]*)?[\\s/>])")
+ (#set! injection.language "javascript"))
+
+((script_element
+  (start_tag) @_start
+  (raw_text) @injection.content)
+ (#match? @_start "(?i)\\stype\\s*=\\s*[\"']?(importmap|speculationrules|application/(ld\\+)?json)[\"'\\s>]")
+ (#set! injection.language "json"))
+"#;
+
 /// JSX-specific captures appended onto the shared TypeScript/TSX
 /// highlights query. The bundled query has none of these, so JSX
 /// tags and attribute names land in default foreground without it.
@@ -848,7 +878,8 @@ pub fn lang_for_fence(info: &str) -> Option<LangKind> {
 /// Rename the older nvim-treesitter capture names some bundled queries use
 /// (`@conditional`, `@repeat`, `@field`, ...) to the ones in
 /// [`HIGHLIGHT_NAMES`], so their keywords and fields colour like every
-/// other language's (#1226).
+/// other language's (#1226), and drop the spell-check tags that would
+/// otherwise blank the colour before them (#1465).
 fn standard_captures(query: &str) -> String {
     static RENAMES: std::sync::OnceLock<[(regex::Regex, &str); 6]> = std::sync::OnceLock::new();
     let renames = RENAMES.get_or_init(|| {
@@ -869,7 +900,13 @@ fn standard_captures(query: &str) -> String {
     for (re, to) in renames {
         out = re.replace_all(&out, *to).into_owned();
     }
-    out
+    // Spell-check tags carry no colour, and a later capture on the same
+    // node wins: `(comment) @comment @spell` drew comments as plain code
+    // (#1465). Drop them where they follow another capture.
+    static SPELL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let spell =
+        SPELL.get_or_init(|| regex::Regex::new(r"(@[\w.]+)\s+@(?:no)?spell\b").expect("static"));
+    spell.replace_all(&out, "$1").into_owned()
 }
 
 /// A C or C++ char literal is a string, as VS Code colours it, not the
@@ -1075,7 +1112,7 @@ fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
             tree_sitter_html::LANGUAGE.into(),
             "html",
             tree_sitter_html::HIGHLIGHTS_QUERY,
-            tree_sitter_html::INJECTIONS_QUERY,
+            HTML_INJECTIONS_QUERY,
             "",
         )
         .ok()?,
@@ -1193,7 +1230,7 @@ fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
         LangKind::Dockerfile => HighlightConfiguration::new(
             tree_sitter_containerfile::LANGUAGE.into(),
             "dockerfile",
-            tree_sitter_containerfile::HIGHLIGHTS_QUERY,
+            &standard_captures(tree_sitter_containerfile::HIGHLIGHTS_QUERY),
             "",
             "",
         )
@@ -1281,6 +1318,18 @@ fn markdown_injection(name: &str) -> Option<&'static HighlightConfiguration> {
     shared_config(lang_for_fence(name)?)
 }
 
+/// The languages an HTML file embeds (#1649), and only those: the injected
+/// JavaScript names a tagged template's language after its tag, and
+/// `html\`...\`` inside a script must not start another HTML layer.
+fn html_injection(name: &str) -> Option<&'static HighlightConfiguration> {
+    shared_config(match name {
+        "javascript" => LangKind::JavaScript,
+        "css" => LangKind::Css,
+        "json" => LangKind::Json,
+        _ => return None,
+    })
+}
+
 /// Pre-build the tree-sitter highlight configurations so the first file open
 /// does not pay the query-compilation cost on the paint path. Safe to call from
 /// any thread (the cache is process-wide); call once at startup off the UI
@@ -1364,11 +1413,14 @@ fn highlight_text_with_palette(
         None => return (per_line, protected),
     };
     let mut hl = Highlighter::new();
-    // Only Markdown resolves its injections (inline text, fenced code, front
-    // matter): elsewhere they stay off, as they always have been.
-    let injects = kind == LangKind::Markdown;
-    let events = match hl.highlight(cfg, text, None, |name| {
-        injects.then(|| markdown_injection(name)).flatten()
+    // Markdown resolves its injections (inline text, fenced code, front
+    // matter) and HTML its `<script>` and `<style>` bodies (#1649).
+    // Elsewhere they stay off: other grammars' queries inject by whatever a
+    // template tag or macro happens to be called.
+    let events = match hl.highlight(cfg, text, None, |name| match kind {
+        LangKind::Markdown => markdown_injection(name),
+        LangKind::Html => html_injection(name),
+        _ => None,
     }) {
         Ok(e) => e,
         Err(_) => return (per_line, protected),
@@ -2887,18 +2939,101 @@ def f() -> Config:\n\
 
     /// Only Markdown resolves injections: an HTML `<script>` stays as it was
     /// (uninjected), so enabling Markdown's fences changes no other language.
-    #[test]
-    fn injections_stay_off_outside_markdown() {
+    /// The style `needle` gets on line `row` of `src` highlighted as `kind`.
+    fn embedded_style(kind: LangKind, src: &str, row: usize, needle: &str) -> Option<Style> {
         let mut reg = LangRegistry::new();
-        let src = "<script>const x = 1;</script>\n";
         let ls = compute_line_starts(src.as_bytes());
         let p = SyntaxPalette::BASE16;
-        let h = highlight_text_with_palette(&mut reg, LangKind::Html, src.as_bytes(), &ls, &p).0;
-        let line = src.lines().next().unwrap();
-        let konst = span_at(&h[0], line, "const");
-        assert!(
-            konst.is_none_or(|sp| sp.style != palette_style_for_name(&p, "keyword")),
-            "the script body is not highlighted as JavaScript: {konst:?}"
+        let h = highlight_text_with_palette(&mut reg, kind, src.as_bytes(), &ls, &p).0;
+        let line = src.lines().nth(row)?;
+        span_at(&h[row], line, needle).map(|sp| sp.style)
+    }
+
+    const PAGE: &str = "<style>\n  body { color: red; }\n</style>\n<script>\n  const greeting = \"hello\";\n</script>\n";
+
+    /// #1649: a `<script>` body is highlighted as JavaScript, the way the
+    /// same line is in a `.js` file.
+    #[test]
+    fn a_script_body_in_html_is_highlighted_as_javascript() {
+        let js = "const greeting = \"hello\";\n";
+        let keyword = embedded_style(LangKind::JavaScript, js, 0, "const");
+        assert!(keyword.is_some());
+        assert_eq!(embedded_style(LangKind::Html, PAGE, 4, "const"), keyword);
+        assert_eq!(
+            embedded_style(LangKind::Html, PAGE, 4, "\"hello\""),
+            embedded_style(LangKind::JavaScript, js, 0, "\"hello\"")
+        );
+        // The tags around it are still HTML's.
+        assert_eq!(
+            embedded_style(LangKind::Html, PAGE, 3, "script"),
+            embedded_style(LangKind::Html, "<p>\n", 0, "p")
+        );
+    }
+
+    /// #1649: a `<style>` body is highlighted as CSS.
+    #[test]
+    fn a_style_body_in_html_is_highlighted_as_css() {
+        let css = "  body { color: red; }\n";
+        let property = embedded_style(LangKind::Css, css, 0, "color");
+        assert!(property.is_some());
+        assert_eq!(embedded_style(LangKind::Html, PAGE, 1, "color"), property);
+        assert_eq!(
+            embedded_style(LangKind::Html, PAGE, 1, "body"),
+            embedded_style(LangKind::Css, css, 0, "body")
+        );
+    }
+
+    /// #1649: a script whose `type` says JavaScript (or is empty, or has
+    /// MIME parameters) is JavaScript, a JSON type is JSON, and anything
+    /// else (a template) is left alone.
+    #[test]
+    fn a_scripts_type_decides_what_its_body_is_highlighted_as() {
+        let keyword = embedded_style(LangKind::JavaScript, "const x = 1;\n", 0, "const");
+        let module = "<script type=\"module\">\nconst x = 1;\n</script>\n";
+        assert_eq!(embedded_style(LangKind::Html, module, 1, "const"), keyword);
+        let json = r#"{ "name": "croft" }"#;
+        let ld = format!("<script type=\"application/ld+json\">\n{json}\n</script>\n");
+        let key = embedded_style(LangKind::Json, &format!("{json}\n"), 0, "\"name\"");
+        assert!(key.is_some());
+        assert_eq!(embedded_style(LangKind::Html, &ld, 1, "\"name\""), key);
+        for classic in [
+            "<script type=\"\">",
+            "<script type=\"  \">",
+            "<script type=''>",
+            "<script type=\"text/javascript; charset=utf-8\">",
+            "<script type=\" Text/JavaScript \">",
+            "<script type=application/x-javascript>",
+            "<script type=\"text/jscript\">",
+        ] {
+            let page = format!("{classic}\nconst x = 1;\n</script>\n");
+            assert_eq!(
+                embedded_style(LangKind::Html, &page, 1, "const"),
+                keyword,
+                "{classic} runs as a classic script"
+            );
+        }
+        let template = "<script type=\"text/template\">\nconst x = 1;\n</script>\n";
+        assert_ne!(
+            embedded_style(LangKind::Html, template, 1, "const"),
+            keyword,
+            "a template is not JavaScript"
+        );
+    }
+
+    /// Negative (#1649): an empty script, and HTML with neither block,
+    /// highlight as before; and other grammars still resolve no
+    /// injections, so a JavaScript `css` tagged template stays a string.
+    #[test]
+    fn html_without_a_body_to_embed_and_other_languages_are_unchanged() {
+        let empty = "<script></script>\n<h1>Title</h1>\n";
+        assert_eq!(
+            embedded_style(LangKind::Html, empty, 1, "h1"),
+            embedded_style(LangKind::Html, "<h1>Title</h1>\n", 0, "h1")
+        );
+        let tagged = "const s = css`a { color: red }`;\n";
+        assert_ne!(
+            embedded_style(LangKind::JavaScript, tagged, 0, "color"),
+            embedded_style(LangKind::Css, "a { color: red }\n", 0, "color"),
         );
     }
 
@@ -2955,6 +3090,77 @@ def f() -> Config:\n\
         assert_eq!(
             standard_captures("(a) @fieldset (b) @keyword"),
             "(a) @fieldset (b) @keyword"
+        );
+    }
+
+    /// #1465: a line comment in SQL and in a Dockerfile is coloured as a
+    /// comment. Both queries tag it `@comment @spell`, and the later,
+    /// colourless `@spell` replaced the comment colour.
+    #[test]
+    fn sql_and_dockerfile_line_comments_are_comments() {
+        let cases = [
+            (
+                LangKind::Sql,
+                "-- line comment\nSELECT 1; -- trailing comment\n/* block comment */\nSELECT 2;\n",
+                vec![
+                    (0, "-- line comment"),
+                    (1, "-- trailing comment"),
+                    (2, "/* block comment */"),
+                ],
+            ),
+            (
+                LangKind::Dockerfile,
+                "# line comment\nFROM alpine:3.20\n# install curl\nRUN apk add curl\n",
+                vec![(0, "# line comment"), (2, "# install curl")],
+            ),
+        ];
+        let p = SyntaxPalette::BASE16;
+        let comment = palette_style_for_name(&p, "comment");
+        for (kind, src, comments) in cases {
+            let mut reg = LangRegistry::new();
+            let ls = compute_line_starts(src.as_bytes());
+            let h = highlight_text_with_palette(&mut reg, kind, src.as_bytes(), &ls, &p).0;
+            for (row, text) in comments {
+                let line = src.lines().nth(row).unwrap();
+                let span = span_at(&h[row], line, text)
+                    .unwrap_or_else(|| panic!("{kind:?}: no span on {text:?}"));
+                assert_eq!(span.style, comment, "{kind:?}: {text:?} is a comment");
+            }
+        }
+    }
+
+    /// #1465 negative: the code beside those comments keeps its own colour.
+    /// Only the comments change.
+    #[test]
+    fn code_beside_sql_and_dockerfile_comments_keeps_its_colour() {
+        let p = SyntaxPalette::BASE16;
+        let keyword = palette_style_for_name(&p, "keyword");
+        for (kind, src, row, word) in [
+            (LangKind::Sql, "-- c\nSELECT 1; -- c\n", 1, "SELECT"),
+            (LangKind::Dockerfile, "# c\nFROM alpine:3.20\n", 1, "FROM"),
+        ] {
+            let mut reg = LangRegistry::new();
+            let ls = compute_line_starts(src.as_bytes());
+            let h = highlight_text_with_palette(&mut reg, kind, src.as_bytes(), &ls, &p).0;
+            let line = src.lines().nth(row).unwrap();
+            let span = span_at(&h[row], line, word)
+                .unwrap_or_else(|| panic!("{kind:?}: no span on {word:?}"));
+            assert_eq!(span.style, keyword, "{kind:?}: {word:?}");
+        }
+    }
+
+    /// #1465: a spell-check tag that follows a colour capture is dropped,
+    /// so it cannot replace the colour. Names that only start like it, and
+    /// captures in a predicate, are left alone.
+    #[test]
+    fn spell_check_tags_never_replace_a_colour_capture() {
+        assert_eq!(
+            standard_captures("(comment) @comment @spell\n(x) @keyword.directive @nospell"),
+            "(comment) @comment\n(x) @keyword.directive"
+        );
+        assert_eq!(
+            standard_captures("(a) @comment @spelling (b) @spell"),
+            "(a) @comment @spelling (b) @spell"
         );
     }
 
