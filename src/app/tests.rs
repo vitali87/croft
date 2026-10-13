@@ -14322,6 +14322,49 @@ fn terminal_modes_from_the_palette_focus_the_terminal() {
     assert!(app.focus == Pane::Terminal);
 }
 
+/// #1562: a terminal mode opened from the palette while another
+/// bottom-panel tab is in front brings the Terminal tab forward, or the
+/// mode would be hidden and its keys would go to that tab.
+#[test]
+fn terminal_modes_from_the_palette_bring_the_terminal_tab_forward() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    draw(&mut app, 100, 30);
+    for cmd in [
+        Command::TerminalCopyMode,
+        Command::TerminalQuickSelect,
+        Command::TerminalCommandHistory,
+    ] {
+        app.terminal_copy_mode = None;
+        app.command_history_popup = None;
+        app.set_bottom_panel_tab(BottomPanelTab::Output);
+        app.focus_pane(Pane::Editor);
+        app.run_command(cmd);
+        assert!(app.bottom_panel_tab == BottomPanelTab::Terminal, "{cmd:?}");
+        assert!(app.focus == Pane::Terminal, "{cmd:?}");
+    }
+}
+
+/// #1562 negative: on a bottom-panel tab other than Terminal there is no
+/// shell, so a chord for a terminal command is not taken for it there.
+#[test]
+fn a_user_chord_for_a_terminal_command_is_not_taken_on_another_panel_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{ "key": "ctrl+alt+k", "command": "terminal_clear" }]"#,
+    );
+    app.set_bottom_panel_tab(BottomPanelTab::Output);
+    app.status.clear();
+    app.handle_key(key(
+        KeyCode::Char('k'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert_ne!(app.status, "Cleared terminal");
+}
+
 /// #1562: a `keybindings.json` chord for a terminal command works with the
 /// terminal focused, where the shell would otherwise get it; a chord for
 /// any other command still goes to the shell there.

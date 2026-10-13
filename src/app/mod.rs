@@ -16572,7 +16572,9 @@ impl App {
     /// `keybindings.json` chord or an imported VS Code one. Each acts on the
     /// active pane, showing the panel when it was hidden, as its chord and
     /// menu row do; those that take the keyboard (rename, copy mode, quick
-    /// select, history) also focus the terminal.
+    /// select, history) also focus the terminal and bring its tab to the
+    /// front, since another bottom-panel tab would hide the mode and take
+    /// its keys.
     fn run_terminal_command(&mut self, cmd: crate::widgets::command_palette::Command) {
         use crate::widgets::command_palette::Command as Cmd;
         self.show_terminal = true;
@@ -16604,15 +16606,15 @@ impl App {
             },
             Cmd::TerminalNewWithProfile => self.open_terminal_profile_picker(idx),
             Cmd::TerminalQuickSelect => {
-                self.focus_pane(Pane::Terminal);
+                self.set_bottom_panel_tab(BottomPanelTab::Terminal);
                 self.open_terminal_quick_select();
             }
             Cmd::TerminalCopyMode => {
-                self.focus_pane(Pane::Terminal);
+                self.set_bottom_panel_tab(BottomPanelTab::Terminal);
                 self.open_terminal_copy_mode();
             }
             Cmd::TerminalCommandHistory => {
-                self.focus_pane(Pane::Terminal);
+                self.set_bottom_panel_tab(BottomPanelTab::Terminal);
                 self.open_command_history();
             }
             Cmd::TerminalOpenScrollback => self.open_scrollback_in_editor(),
@@ -23219,8 +23221,11 @@ impl App {
         }
         // A user's chord for a terminal command is meant for the terminal
         // (#1562), so it is taken before the shell sees the key; every other
-        // chord still passes through to the shell.
+        // chord still passes through to the shell. Only the Terminal tab has
+        // a shell: on Output, Problems, Ports or Captures the key is the
+        // panel's own.
         if self.focus == Pane::Terminal
+            && self.bottom_panel_tab == BottomPanelTab::Terminal
             && !self.keymap.is_empty()
             && is_rebindable_chord(key)
             && let Some(cmd) = self.keymap.command_for(key).filter(|c| c.skips_the_shell())
