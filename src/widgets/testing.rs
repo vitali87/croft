@@ -250,6 +250,25 @@ impl TestingPanel {
         });
     }
 
+    /// Begin a run of these exact cases (#1535: Rerun Failed Tests): mark
+    /// each Running, as [`Self::start_single`] marks one, keeping the rest
+    /// of the tree.
+    pub fn start_many(&mut self, names: &[String]) {
+        self.activity = Activity::Running;
+        self.progress = None;
+        self.run_reported_failed = false;
+        self.failed_run = false;
+        self.discovery_failed = false;
+        self.run_tally = (0, 0, 0);
+        self.prerun = Vec::new();
+        for c in &mut self.cases {
+            if names.contains(&c.name) {
+                self.prerun.push((c.name.clone(), Some(c.status)));
+                c.status = TestStatus::Running;
+            }
+        }
+    }
+
     /// Begin a filtered run (a suite, or a run-at-cursor by leaf name): mark
     /// every known case whose name contains `pattern` as Running and enter the
     /// busy state, keeping the rest of the tree. cargo's name filter is a

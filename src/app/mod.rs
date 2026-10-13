@@ -2903,6 +2903,16 @@ type PendingTestDebug = (
     PathBuf,
 );
 
+/// The test run Testing: Rerun Last Run repeats (#1535), as it was asked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LastTestRun {
+    All,
+    One(String),
+    Filter(String),
+    Suite(String),
+    Many(Vec<String>),
+}
+
 /// A "Running …" status an operation put in the status bar (#856), kept
 /// until the operation ends so the bar can say how it went instead of
 /// claiming it still runs: a test run, a task, a runnable fenced block.
@@ -3003,6 +3013,8 @@ pub struct App {
     test_worker: crate::testing::worker::TestWorker,
     /// The run whose "Running test …" status awaits its outcome (#856).
     test_run_status: Option<RunningStatus>,
+    /// The last test run started, for Testing: Rerun Last Run (#1535).
+    last_test_run: Option<LastTestRun>,
     /// Tasks and fenced blocks whose "Running …" status awaits their pane's
     /// command-finished report (#856), by pane uid.
     pane_run_statuses: Vec<(u64, RunningStatus)>,
@@ -5841,6 +5853,7 @@ impl App {
             codeql: crate::widgets::codeql::CodeqlPanel::new(),
             test_worker: crate::testing::worker::TestWorker::spawn(root.clone()),
             test_run_status: None,
+            last_test_run: None,
             pane_run_statuses: Vec::new(),
             extensions,
             vscode_listed: Vec::new(),
@@ -24524,6 +24537,8 @@ impl App {
         // The build this armed for is being dropped (#373).
         self.disarm_failure_breakpoint();
         self.pending_test_debug = None;
+        // Its names belong to the old project (#1535).
+        self.last_test_run = None;
         if self.sidebar_view == SidebarView::Testing {
             self.discover_tests();
         }
@@ -24945,6 +24960,7 @@ impl App {
         if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
+        self.last_test_run = Some(LastTestRun::All);
         self.test_run_with_unsaved_saved(|app| {
             app.test_worker.run_all();
             app.set_sidebar_view(SidebarView::Testing);
@@ -24957,6 +24973,7 @@ impl App {
         if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
+        self.last_test_run = Some(LastTestRun::One(name.clone()));
         self.test_run_with_unsaved_saved(|app| {
             app.testing.start_single(&name);
             app.test_worker.run_one(name);
@@ -24985,6 +25002,7 @@ impl App {
         if self.refuse_test_run_while_busy() || !self.testing_runner_available() {
             return;
         }
+        self.last_test_run = Some(LastTestRun::Suite(suite.clone()));
         self.test_run_with_unsaved_saved(|app| {
             app.testing
                 .start_filter(&crate::testing::suite_pattern(&suite));
@@ -25024,14 +25042,103 @@ impl App {
         };
         if exact {
             self.testing.start_single(&run);
+            self.last_test_run = Some(LastTestRun::One(run.clone()));
             self.test_worker.run_one(run.clone());
         } else {
             self.testing.start_filter(&run);
+            self.last_test_run = Some(LastTestRun::Filter(run.clone()));
             self.test_worker.run_filter(run.clone());
         }
         self.set_sidebar_view(SidebarView::Testing);
         self.status = format!("Running test {run}");
         self.await_test_run_outcome(crate::testing::leaf_name(&run).to_string());
+    }
+
+    /// When a test run is already going, say so (#1535) rather than let a
+    /// palette command do nothing; true when it was.
+    fn testing_busy_says_so(&mut self) -> bool {
+        if self.testing.is_busy() {
+            self.status = String::from("Tests are already running");
+            return true;
+        }
+        false
+    }
+
+    /// Testing: Run Tests in Current File (#1535): the suite the active
+    /// file is, in the runner's own naming (see [`file_test_suite`]). A file
+    /// the runner cannot select by itself says so.
+    fn run_tests_in_current_file(&mut self) {
+        if self.testing_busy_says_so() || !self.testing_runner_available() {
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Run Tests in Current File: open a test file first");
+            return;
+        };
+        let root = self.active_test_root.clone();
+        let suite = crate::testing::worker::runner_for(&root)
+            .and_then(|runner| file_test_suite(runner, &root, &path));
+        let Some(suite) = suite else {
+            self.status = String::from(
+                "Run Tests in Current File: the runner cannot pick out this file's tests; use Run All Tests",
+            );
+            return;
+        };
+        self.run_suite(suite.clone());
+        self.status = format!("Running tests in {suite}");
+        self.await_test_run_outcome(suite);
+    }
+
+    /// Testing: Rerun Failed Tests (#1535): each test the tree shows failed,
+    /// by its exact name.
+    fn rerun_failed_tests(&mut self) {
+        if self.testing_busy_says_so() || !self.testing_runner_available() {
+            return;
+        }
+        let failed = self.testing.failed_names();
+        if failed.is_empty() {
+            self.status = String::from("Rerun Failed Tests: no test has failed");
+            return;
+        }
+        self.start_many_tests(failed);
+    }
+
+    /// Run `names` exactly, one after another, as one run.
+    fn start_many_tests(&mut self, names: Vec<String>) {
+        self.testing.start_many(&names);
+        self.last_test_run = Some(LastTestRun::Many(names.clone()));
+        let label = format!("{} tests", names.len());
+        self.test_worker.run_many(names);
+        self.set_sidebar_view(SidebarView::Testing);
+        self.status = format!("Running {label}");
+        self.await_test_run_outcome(label);
+    }
+
+    /// Testing: Rerun Last Run (#1535): the last run started, as it was
+    /// asked (everything, one test, a filter, a suite or a set).
+    fn rerun_last_test_run(&mut self) {
+        if self.testing_busy_says_so() {
+            return;
+        }
+        let Some(last) = self.last_test_run.clone() else {
+            self.status = String::from("Rerun Last Run: no test has run yet");
+            return;
+        };
+        if !self.testing_runner_available() {
+            return;
+        }
+        match last {
+            LastTestRun::All => self.run_all_tests(),
+            LastTestRun::One(name) => self.run_test(name),
+            LastTestRun::Suite(suite) => self.run_suite(suite),
+            LastTestRun::Filter(pattern) => {
+                self.testing.start_filter(&pattern);
+                self.last_test_run = Some(LastTestRun::Filter(pattern.clone()));
+                self.test_worker.run_filter(pattern);
+                self.set_sidebar_view(SidebarView::Testing);
+            }
+            LastTestRun::Many(names) => self.start_many_tests(names),
+        }
     }
 
     /// Keep the "Running …" status a test run just set until the run ends,
@@ -51814,6 +51921,14 @@ impl App {
             Cmd::CodeqlOpenResultsDirectory => self.open_codeql_results_directory(),
             Cmd::ShowCodeQL => self.open_codeql_view(),
             Cmd::RunTestAtCursor => self.run_test_at_cursor(),
+            Cmd::TestingRunAll => {
+                if !self.testing_busy_says_so() {
+                    self.run_all_tests();
+                }
+            }
+            Cmd::TestingRunFile => self.run_tests_in_current_file(),
+            Cmd::TestingRerunFailed => self.rerun_failed_tests(),
+            Cmd::TestingRerunLast => self.rerun_last_test_run(),
             Cmd::DebugTestAtCursor => self.debug_test_at_cursor(),
             Cmd::ToggleSideBar => self.toggle_side_bar(),
             Cmd::ToggleAutoHideSideBar => self.toggle_sidebar_auto_hide(),
@@ -69392,6 +69507,77 @@ fn is_terminal_cycle_back_key(key: KeyEvent) -> bool {
 /// continue to consume Backspace for their own purposes.
 fn is_delete_node_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Delete | KeyCode::Backspace)
+}
+
+/// The suite that is the file `path` for `runner` (#1535: Run Tests in
+/// Current File), in the runner's own naming: pytest takes the file's path
+/// as a node-ID prefix; cargo a source file's module path (`src/a/b.rs` and
+/// `src/a/b/mod.rs` are `a::b`); go the
+/// file's package directory; CodeQL the test file itself. `None` for a file
+/// the runner cannot select alone: a cargo crate root (its tests carry no
+/// module prefix to filter on), a binary under `src/bin` or an integration
+/// test (each its own test binary, which the name filter cannot pick), any
+/// jest or vitest file
+/// (their suites are describe titles, not files), and a file outside `root`.
+fn file_test_suite(
+    runner: crate::testing::worker::Runner,
+    root: &Path,
+    path: &Path,
+) -> Option<String> {
+    use crate::testing::worker::Runner;
+    let rel = path.strip_prefix(root).ok()?;
+    let rel_str = rel.to_str()?.replace('\\', "/");
+    match runner {
+        Runner::Pytest | Runner::Codeql => Some(rel_str),
+        Runner::Go => {
+            let dir = rel.parent().and_then(Path::to_str).unwrap_or("");
+            Some(if dir.is_empty() {
+                String::from(".")
+            } else {
+                format!("./{}", dir.replace('\\', "/"))
+            })
+        }
+        Runner::Cargo => {
+            // Relative to the package the file belongs to: in a workspace,
+            // `crates/foo/src/parse.rs` is module `parse`.
+            let in_package = cargo_package_relative(root, path)?;
+            let in_src = in_package.strip_prefix("src/")?.strip_suffix(".rs")?;
+            let module = in_src.strip_suffix("/mod").unwrap_or(in_src);
+            // A crate root's tests have no module prefix to filter on: a
+            // `tests::` filter is a substring, and would sweep every
+            // module's `tests` too.
+            match module {
+                "main" | "lib" => None,
+                _ if module.starts_with("bin/") => None,
+                _ => Some(module.replace('/', "::")),
+            }
+        }
+        Runner::Vitest | Runner::Jest => None,
+    }
+}
+
+/// `path` relative to the nearest package directory above it, up to
+/// `root`: the closest ancestor holding a `Cargo.toml` with the file under
+/// its `src/`, or `root` itself.
+fn cargo_package_relative(root: &Path, path: &Path) -> Option<String> {
+    let rel_to = |dir: &Path| {
+        path.strip_prefix(dir)
+            .ok()
+            .and_then(Path::to_str)
+            .map(|s| s.replace('\\', "/"))
+    };
+    for dir in path.ancestors().skip(1) {
+        if dir == root || !dir.starts_with(root) {
+            break;
+        }
+        if let Some(rel) = rel_to(dir)
+            && rel.starts_with("src/")
+            && dir.join("Cargo.toml").is_file()
+        {
+            return Some(rel);
+        }
+    }
+    rel_to(root)
 }
 
 /// Returns true if the given key event should trigger "Save".
