@@ -1,0 +1,1 @@
+fix: Drop Stash now asks before it deletes: picking a stash opens a "Drop stash?" question naming it, and only Y drops it. One Enter in the picker used to run `git stash drop` straight away, with no undo.

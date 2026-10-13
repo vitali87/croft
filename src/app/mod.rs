@@ -2664,6 +2664,17 @@ struct PendingUnsavedScm {
     files: Vec<PathBuf>,
 }
 
+/// A Drop Stash pick waiting on its confirm popup (#1128): a stash is
+/// usually work kept nowhere else, and `git stash drop` has no undo. `root`
+/// is the repository it was picked in, held in case Source Control moves
+/// to another root before the answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingStashDrop {
+    root: PathBuf,
+    index: usize,
+    label: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingDiscard {
     rel_path: String,
@@ -4994,6 +5005,8 @@ pub struct App {
     undo_pushed_commit_armed: Option<String>,
     /// True while the "Discard All Changes" confirmation modal is up.
     pub pending_discard_all: bool,
+    /// Drop Stash, picked but not yet confirmed (#1128).
+    pending_stash_drop: Option<PendingStashDrop>,
     /// The Replace All confirmation (#123): `(occurrences, files, dirty
     /// files to be skipped)` counted without writing; the modal shows them,
     /// Enter/Y commits, Esc cancels.
@@ -6385,6 +6398,7 @@ impl App {
             build_diag_files_by_pane: std::collections::HashMap::new(),
             undo_pushed_commit_armed: None,
             pending_discard_all: false,
+            pending_stash_drop: None,
             pending_replace_all: None,
             file_finder_index: None,
             file_finder_index_rx: Some(file_finder_index_rx),
@@ -20654,6 +20668,7 @@ impl App {
         self.render_discard_confirm(frame);
         self.render_revert_hunk_confirm(frame);
         self.render_discard_all_confirm(frame);
+        self.render_stash_drop_confirm(frame);
         self.render_unsaved_scm_confirm(frame);
         self.render_replace_all_confirm(frame);
         self.render_broadcast_confirm(frame);
@@ -21436,6 +21451,72 @@ impl App {
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ),
                 ratatui::text::Span::raw("es, discard all   "),
+                ratatui::text::Span::styled(
+                    "[N]",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                ratatui::text::Span::raw("o / Esc"),
+            ]),
+        ]);
+        frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+    }
+
+    /// Confirmation modal for Drop Stash (#1128), in the Discard All style.
+    /// Only Y drops: the pick that opened it was an Enter, and a second
+    /// stray one must not delete the stash.
+    fn render_stash_drop_confirm(&self, frame: &mut ratatui::Frame) {
+        let Some(pending) = &self.pending_stash_drop else {
+            return;
+        };
+        let area = frame.area();
+        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
+        let height: u16 = 8;
+        let rect = Rect {
+            x: (area.width.saturating_sub(width)) / 2 + area.x,
+            y: (area.height.saturating_sub(height)) / 2 + area.y,
+            width,
+            height,
+        };
+        let rect = rect.intersection(area);
+        let warn = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(warn))
+            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
+            .title(ratatui::text::Span::styled(
+                " DROP STASH? ",
+                Style::default()
+                    .fg(Color::White)
+                    .bg(warn)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(block, rect);
+        let inner = Rect {
+            x: rect.x + 2,
+            y: rect.y + 1,
+            width: rect.width.saturating_sub(4),
+            height: rect.height.saturating_sub(2),
+        };
+        let white = Style::default().fg(self.theme.ui(Color::White));
+        let body = ratatui::text::Text::from(vec![
+            ratatui::text::Line::from(ratatui::text::Span::styled(
+                pending.label.as_str(),
+                white.add_modifier(Modifier::BOLD),
+            )),
+            ratatui::text::Line::from(ratatui::text::Span::styled(
+                "This permanently deletes the stash.",
+                white,
+            )),
+            ratatui::text::Line::from(""),
+            ratatui::text::Line::from(vec![
+                ratatui::text::Span::styled(
+                    "[Y]",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                ratatui::text::Span::raw("es, drop it   "),
                 ratatui::text::Span::styled(
                     "[N]",
                     Style::default()
@@ -23017,6 +23098,17 @@ impl App {
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.cancel_pending_unsaved_scm();
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        if self.pending_stash_drop.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.confirm_pending_stash_drop(),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.pending_stash_drop = None;
+                    self.status = String::from("Kept the stash");
                 }
                 _ => {}
             }
@@ -34352,6 +34444,15 @@ impl App {
         self.pending_discard_all = true;
     }
 
+    /// Drop the stash the Drop Stash confirm was asked about (#1128).
+    fn confirm_pending_stash_drop(&mut self) {
+        let Some(pending) = self.pending_stash_drop.take() else {
+            return;
+        };
+        let r = crate::git::stash_drop(&pending.root, pending.index);
+        self.run_scm_op("stash drop", r, "Dropped stash", "Drop stash");
+    }
+
     pub fn cancel_pending_discard_all(&mut self) {
         self.pending_discard_all = false;
     }
@@ -37481,9 +37582,13 @@ impl App {
                 let r = crate::git::stash_pop_at(&self.scm_root(), index);
                 self.run_scm_op("stash pop", r, "Popped stash", "Pop stash");
             }
+            // Asked first: the drop cannot be undone (#1128).
             ListPurpose::StashDrop => {
-                let r = crate::git::stash_drop(&self.scm_root(), index);
-                self.run_scm_op("stash drop", r, "Dropped stash", "Drop stash");
+                self.pending_stash_drop = Some(PendingStashDrop {
+                    root: self.scm_root(),
+                    index,
+                    label: row.label,
+                });
             }
             ListPurpose::RemoveRemote => {
                 let r = crate::git::remove_remote(&self.scm_root(), &row.id);
