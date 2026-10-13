@@ -6,7 +6,7 @@
     { "action": "terminal", "caption": "Ctrl+J opens a real terminal inside croft. It runs your shell, in this folder." },
     { "action": { "run": "python3 -m py_compile app.py" }, "caption": "Commands run right here. This one checks app.py, and it has a mistake in it." },
     { "action": "jump_to_error", "caption": "croft reads the error in the terminal and takes you to the line. {mod}+click does the same on any file:line you see." },
-    { "action": { "palette": "color theme" }, "caption": "{mod}+Shift+P is the command palette, every command searchable. Enter opens the theme picker; pick with the arrows, Enter keeps it." },
+    { "action": { "palette": "color theme" }, "caption": "{mod}+Shift+P is the command palette, every command searchable. Enter opens the theme picker: arrows pick, Enter keeps one." },
     { "action": "done", "caption": "That is the tour. Press Enter to finish; the sample project is removed and you are back in croft." }
   ]
 }

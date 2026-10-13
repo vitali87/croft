@@ -39,6 +39,45 @@ pub struct EditorFind {
     /// Ctrl+A. The next typed character or paste replaces it and Backspace
     /// clears it, as in VS Code; a caret key just drops the selection.
     pub query_selected: bool,
+    /// Find in Selection (#1577): the `(start, end)` positions, row and
+    /// char column, the matches are limited to. `Alt+L` sets it from the
+    /// selection and clears it again.
+    pub in_selection: Option<FindRange>,
+}
+
+/// A buffer range as `(start, end)` `(row, char column)` positions.
+pub type FindRange = ((usize, usize), (usize, usize));
+
+/// `range` held inside `lines`: rows past the end come back to the last
+/// line, columns past a line's end to that end, and the ends in order.
+pub fn clamp_range(lines: &[String], range: FindRange) -> FindRange {
+    let last = lines.len().saturating_sub(1);
+    let fit = |(r, c): (usize, usize)| {
+        let r = r.min(last);
+        let len = lines.get(r).map_or(0, |l| l.chars().count());
+        (r, c.min(len))
+    };
+    let (a, b) = (fit(range.0), fit(range.1));
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+/// The char columns of row `row` a find limited to `range` covers
+/// (#1577): `None` with no range (the whole line), `Some((0, 0))` for a row
+/// outside it.
+pub fn find_window(range: Option<FindRange>, row: usize) -> Option<(usize, usize)> {
+    let ((r0, c0), (r1, c1)) = range?;
+    if row < r0 || row > r1 {
+        return Some((0, 0));
+    }
+    Some((
+        if row == r0 { c0 } else { 0 },
+        if row == r1 { c1 } else { usize::MAX },
+    ))
+}
+
+/// Whether the match at `(col, len)` lies wholly inside `window`.
+fn in_window(window: Option<(usize, usize)>, col: usize, len: usize) -> bool {
+    window.is_none_or(|(lo, hi)| col >= lo && col + len <= hi)
 }
 
 impl EditorFind {
@@ -95,13 +134,38 @@ pub fn line_matches(line: &str, opts: SearchOpts, needle: &str) -> Vec<(usize, u
     out
 }
 
+/// [`line_matches`] kept to those wholly inside `window` (see
+/// [`find_window`]). The line is matched whole, so a word or line boundary
+/// is judged on the real text, never on one the window cut (#1577).
+pub fn line_matches_in(
+    line: &str,
+    opts: SearchOpts,
+    needle: &str,
+    window: Option<(usize, usize)>,
+) -> Vec<(usize, usize)> {
+    let mut out = line_matches(line, opts, needle);
+    out.retain(|&(col, len)| in_window(window, col, len));
+    out
+}
+
 pub fn count_matches(lines: &[String], needle: &str, opts: SearchOpts) -> usize {
+    count_matches_in(lines, needle, opts, None)
+}
+
+/// [`count_matches`] limited to `range` of `lines` (Find in Selection).
+pub fn count_matches_in(
+    lines: &[String],
+    needle: &str,
+    opts: SearchOpts,
+    range: Option<FindRange>,
+) -> usize {
     if needle.is_empty() {
         return 0;
     }
     let mut total = 0usize;
-    for line in lines {
-        total = total.saturating_add(line_matches(line, opts, needle).len());
+    for (r, line) in lines.iter().enumerate() {
+        total =
+            total.saturating_add(line_matches_in(line, opts, needle, find_window(range, r)).len());
     }
     total
 }
@@ -114,13 +178,34 @@ pub fn find_next_match(
     from_col_chars: usize,
     skip_current: bool,
 ) -> Option<MatchPos> {
+    find_next_match_in(
+        lines,
+        needle,
+        opts,
+        None,
+        from_row,
+        from_col_chars,
+        skip_current,
+    )
+}
+
+/// [`find_next_match`] over the matches inside `range` of `lines` only.
+pub fn find_next_match_in(
+    lines: &[String],
+    needle: &str,
+    opts: SearchOpts,
+    range: Option<FindRange>,
+    from_row: usize,
+    from_col_chars: usize,
+    skip_current: bool,
+) -> Option<MatchPos> {
     if needle.is_empty() || lines.is_empty() {
         return None;
     }
     let n = lines.len();
     for delta in 0..=n {
         let row = (from_row + delta) % n;
-        let matches = line_matches(&lines[row], opts, needle);
+        let matches = line_matches_in(&lines[row], opts, needle, find_window(range, row));
         for (col, len) in matches {
             if delta == 0 && row == from_row {
                 let cmp = if skip_current {
@@ -153,13 +238,34 @@ pub fn find_prev_match(
     from_col_chars: usize,
     skip_current: bool,
 ) -> Option<MatchPos> {
+    find_prev_match_in(
+        lines,
+        needle,
+        opts,
+        None,
+        from_row,
+        from_col_chars,
+        skip_current,
+    )
+}
+
+/// [`find_prev_match`] over the matches inside `range` of `lines` only.
+pub fn find_prev_match_in(
+    lines: &[String],
+    needle: &str,
+    opts: SearchOpts,
+    range: Option<FindRange>,
+    from_row: usize,
+    from_col_chars: usize,
+    skip_current: bool,
+) -> Option<MatchPos> {
     if needle.is_empty() || lines.is_empty() {
         return None;
     }
     let n = lines.len();
     for delta in 0..=n {
         let row = (from_row + n - (delta % n)) % n;
-        let matches = line_matches(&lines[row], opts, needle);
+        let matches = line_matches_in(&lines[row], opts, needle, find_window(range, row));
         let mut best: Option<(usize, usize)> = None;
         for (col, len) in matches {
             if delta == 0 && row == from_row {
@@ -275,11 +381,24 @@ fn unescape_escapes(replacement: &str) -> String {
 /// capture references and VS Code's `\n`/`\t` escapes; a replacement
 /// newline splits the line. Returns `None` when the needle is empty or
 /// the pattern can't compile, so callers leave the buffer untouched.
+#[cfg(test)]
 pub fn replace_all_in_lines(
     lines: &[String],
     needle: &str,
     replacement: &str,
     opts: SearchOpts,
+) -> Option<(Vec<String>, usize)> {
+    replace_all_in_lines_in(lines, needle, replacement, opts, None)
+}
+
+/// [`replace_all_in_lines`] touching only the matches wholly inside `range`
+/// of `lines`, found on the whole lines (#1577).
+pub fn replace_all_in_lines_in(
+    lines: &[String],
+    needle: &str,
+    replacement: &str,
+    opts: SearchOpts,
+    range: Option<FindRange>,
 ) -> Option<(Vec<String>, usize)> {
     if needle.is_empty() {
         return None;
@@ -298,7 +417,8 @@ pub fn replace_all_in_lines(
     };
     let mut total = 0usize;
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
-    for line in lines {
+    for (r, line) in lines.iter().enumerate() {
+        let window = find_window(range, r);
         let segs = split_for_highlight(line, needle, opts);
         if !segs.iter().any(|(_, is_match)| *is_match) {
             out.push(line.clone());
@@ -307,8 +427,13 @@ pub fn replace_all_in_lines(
         let mut new = String::new();
         // Byte offset of the current segment in `line`, for captures_at.
         let mut pos = 0usize;
+        // Char column of the current segment, for the window test.
+        let mut col = 0usize;
         for (chunk, is_match) in &segs {
-            if !is_match || chunk.is_empty() {
+            let chunk_chars = chunk.chars().count();
+            let inside = in_window(window, col, chunk_chars);
+            col += chunk_chars;
+            if !is_match || chunk.is_empty() || !inside {
                 // Zero-width matches stay unreplaced in the find bar (the
                 // highlighter shows nothing there); the empty chunk still
                 // contributes no text.
@@ -350,12 +475,24 @@ pub fn match_index_at(
     target_row: usize,
     target_col_chars: usize,
 ) -> Option<usize> {
+    match_index_at_in(lines, needle, opts, None, target_row, target_col_chars)
+}
+
+/// [`match_index_at`] numbering only the matches inside `range` of `lines`.
+pub fn match_index_at_in(
+    lines: &[String],
+    needle: &str,
+    opts: SearchOpts,
+    range: Option<FindRange>,
+    target_row: usize,
+    target_col_chars: usize,
+) -> Option<usize> {
     if needle.is_empty() {
         return None;
     }
     let mut idx = 0usize;
     for (r, line) in lines.iter().enumerate() {
-        for (col, _len) in line_matches(line, opts, needle) {
+        for (col, _len) in line_matches_in(line, opts, needle, find_window(range, r)) {
             idx += 1;
             if r == target_row && col == target_col_chars {
                 return Some(idx);
@@ -475,6 +612,22 @@ pub fn render_editor_find(
         }
         Line::from(spans)
     };
+    // Find in Selection (#1577): `≡` at the query row's right edge, lit
+    // while the find is limited to the selection.
+    let paint_chip = |buf: &mut Buffer| {
+        if inner.width < 4 {
+            return;
+        }
+        let style = if state.in_selection.is_some() {
+            Style::default()
+                .fg(theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
+                .bg(theme.ui(Color::Rgb(0x26, 0x4f, 0x78)))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.ui(Color::Rgb(0x6b, 0x73, 0x85)))
+        };
+        buf.set_string(inner.x + inner.width - 2, inner.y, "≡", style);
+    };
     if state.replace_visible && inner.height >= 2 {
         let rows = vec![
             input_row(
@@ -495,6 +648,7 @@ pub fn render_editor_find(
         let prompt = input_row("> ", &state.query, true, query_selected);
         Widget::render(Paragraph::new(prompt), inner, buf);
     }
+    paint_chip(buf);
 }
 
 #[cfg(test)]
@@ -526,6 +680,79 @@ mod tests {
 
     fn lines(strs: &[&str]) -> Vec<String> {
         strs.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// #1577: a range limits the count to the matches inside it.
+    #[test]
+    fn a_range_limits_the_count_to_its_matches() {
+        let src = lines(&[
+            "def a(x):",
+            "    return x + 1",
+            "def b(x):",
+            "    return x * 2",
+        ]);
+        let x = SearchOpts::default();
+        assert_eq!(count_matches_in(&src, "x", x, Some(((2, 0), (3, 16)))), 2);
+        assert_eq!(count_matches_in(&src, "x", x, Some(((1, 11), (1, 12)))), 1);
+        assert_eq!(count_matches_in(&src, "x", x, Some(((0, 6), (1, 4)))), 1);
+        assert_eq!(count_matches_in(&src, "x", x, None), 4);
+    }
+
+    /// #1577: matches are found on the whole lines, so the range's edges are
+    /// no word or line boundary: selecting `foo` out of `foobar` finds no
+    /// whole word `foo` and no `^foo$`, as the highlighter shows none.
+    #[test]
+    fn a_range_edge_is_not_a_word_or_line_boundary() {
+        let src = lines(&["foobar", "foo"]);
+        let range = Some(((0, 0), (0, 3)));
+        let word = SearchOpts {
+            whole_word: true,
+            ..SearchOpts::default()
+        };
+        assert_eq!(count_matches_in(&src, "foo", word, range), 0);
+        let re = SearchOpts {
+            use_regex: true,
+            ..SearchOpts::default()
+        };
+        assert_eq!(count_matches_in(&src, "^foo$", re, range), 0);
+        assert_eq!(
+            replace_all_in_lines_in(&src, "foo", "X", word, range).map(|(_, n)| n),
+            Some(0)
+        );
+        assert_eq!(
+            find_next_match_in(&src, "foo", word, range, 0, 0, false),
+            None
+        );
+        // The same text selected whole is a word and a line.
+        assert_eq!(
+            count_matches_in(&src, "foo", word, Some(((1, 0), (1, 3)))),
+            1
+        );
+    }
+
+    /// #1577: Replace All in a range touches the matches inside it only and
+    /// keeps the text either side as it was.
+    #[test]
+    fn a_range_replace_keeps_the_text_around_it() {
+        let src = lines(&["x = x", "y = x + x", "z = x"]);
+        let (out, n) = replace_all_in_lines_in(
+            &src,
+            "x",
+            "long",
+            SearchOpts::default(),
+            Some(((0, 4), (1, 5))),
+        )
+        .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(out, lines(&["x = long", "y = long + x", "z = x"]));
+    }
+
+    /// Negative (#1577): a range past the buffer is held inside it and an
+    /// inverted one is put in order, rather than panicking.
+    #[test]
+    fn a_stale_range_is_clamped_not_trusted() {
+        let src = lines(&["ab", "cd"]);
+        assert_eq!(clamp_range(&src, ((9, 9), (0, 1))), ((0, 1), (1, 2)));
     }
 
     #[test]
