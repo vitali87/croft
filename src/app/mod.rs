@@ -50778,19 +50778,19 @@ impl App {
                     self.editor.selection_text().chars().count()
                 );
             }
-            Cmd::CloseEditor => self.request_close_tab(self.editor.active_index()),
+            Cmd::CloseEditor => self.request_close_tab(self.tab_command_target()),
             Cmd::ReopenClosedEditor => self.reopen_closed_tab(),
             // The Explorer's Cmd+Z (#843), which has no `Ctrl` form.
             Cmd::ZoxideJump => self.open_zoxide_jump(),
             // The tab menu's rows (#852), on the active tab and through the
             // same methods its clicks and the Cmd+K chords use.
-            Cmd::CloseOtherEditors => self.close_other_tabs(self.editor.active_index()),
-            Cmd::CloseEditorsToTheRight => self.close_tabs_to_right(self.editor.active_index()),
+            Cmd::CloseOtherEditors => self.close_other_tabs(self.tab_command_target()),
+            Cmd::CloseEditorsToTheRight => self.close_tabs_to_right(self.tab_command_target()),
             Cmd::CloseSavedEditors => self.close_saved_tabs(),
             Cmd::CloseAllEditors => self.close_all_tabs(),
             Cmd::PinEditor => self.set_active_tab_pinned(true),
             Cmd::UnpinEditor => self.set_active_tab_pinned(false),
-            Cmd::KeepEditor => self.keep_tab_open(self.editor.active_index()),
+            Cmd::KeepEditor => self.keep_tab_open(self.tab_command_target()),
             Cmd::SplitEditor => self.split_editor(),
             // The chords' own moves (#843): Cmd+Opt+Left / Right have no
             // `Ctrl` form off macOS.
@@ -54546,6 +54546,18 @@ impl App {
                 self.last_mouse_pos = None;
                 return;
             }
+        }
+        // A middle-click on a tab closes that tab (#1427), as in VS Code and
+        // browsers, asking about unsaved edits first as Ctrl+W does. The
+        // active tab stays active. A `middle_click` binding in `tab_strip`
+        // has already run above instead.
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Middle))
+            && let Some(idx) = self.editor.tab_at(m.column, m.row)
+        {
+            self.dismiss_click_overlays(m);
+            self.focus_pane(Pane::Editor);
+            self.request_close_tab(idx);
+            return;
         }
         let in_problems = self.bottom_panel_tab == BottomPanelTab::Problems
             && rect_contains(self.problems.last_area, m.column, m.row);
@@ -61138,6 +61150,17 @@ impl App {
             self.remote_launch = None;
             self.tear_down_connect_auth();
         }
+    }
+
+    /// The tab a tab command acts on (#1427): the tab under the click when
+    /// a mouse binding in the tab strip runs it, as VS Code's tab commands
+    /// act on the clicked tab, else the active tab. A `close_editor` bound to
+    /// a middle-click on a background tab used to close the file being
+    /// edited instead.
+    fn tab_command_target(&self) -> usize {
+        self.last_mouse_pos
+            .and_then(|(col, row)| self.editor.tab_at(col, row))
+            .unwrap_or_else(|| self.editor.active_index())
     }
 
     /// Close the focused group's tab at `idx` without asking: the shared end

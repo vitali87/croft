@@ -2716,6 +2716,138 @@ fn a_tab_strip_binding_fires_only_on_the_strip() {
     );
 }
 
+/// Tabs a.py, b.txt and c.txt, pinned in that order with c.txt active, the
+/// keymap `json`, painted once so the strip has its cells.
+fn three_tab_app(json: &str) -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for (name, text) in [("a.py", "a\n"), ("b.txt", "b\n"), ("c.txt", "c\n")] {
+        let f = tmp.path().join(name);
+        std::fs::write(&f, text).unwrap();
+        app.editor.open_pinned(&f).unwrap();
+    }
+    app.keymap = crate::keymap::Keymap::from_json(json);
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    (app, tmp)
+}
+
+fn tab_names(app: &App) -> Vec<String> {
+    (0..app.editor.tab_count())
+        .map(|i| {
+            app.editor
+                .tab_path(i)
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn active_tab_name(app: &App) -> String {
+    tab_names(app)[app.editor.active_index()].clone()
+}
+
+/// A cell on tab `idx` in the strip.
+fn tab_cell(app: &App, idx: usize) -> (u16, u16) {
+    let y = app.editor.tab_strip_y_for_test();
+    let x = (0..app.editor.last_inner.right())
+        .find(|&x| app.editor.tab_at(x, y) == Some(idx))
+        .expect("the tab is drawn");
+    (x, y)
+}
+
+fn press(app: &mut App, button: crossterm::event::MouseButton, (x, y): (u16, u16)) {
+    use crossterm::event::MouseEventKind;
+    app.handle_mouse(mouse(MouseEventKind::Down(button), x, y));
+    app.handle_mouse(mouse(MouseEventKind::Up(button), x, y));
+}
+
+/// #1427: a middle-click on a background tab closes that tab, as in VS
+/// Code and browsers, and the tab being worked in stays active.
+#[test]
+fn a_middle_click_on_a_background_tab_closes_that_tab() {
+    use crossterm::event::MouseButton;
+    let (mut app, _tmp) = three_tab_app("[]");
+    assert_eq!(active_tab_name(&app), "c.txt");
+    let a = tab_cell(&app, 0);
+    press(&mut app, MouseButton::Middle, a);
+    assert_eq!(tab_names(&app), ["b.txt", "c.txt"]);
+    assert_eq!(active_tab_name(&app), "c.txt");
+}
+
+/// #1427: a middle-click on a tab with unsaved edits asks first, as Ctrl+W
+/// does, and keeps the tab until answered.
+#[test]
+fn a_middle_click_on_an_unsaved_tab_asks_before_closing() {
+    use crossterm::event::MouseButton;
+    let (mut app, _tmp) = three_tab_app("[]");
+    app.editor.editors[0].lines[0] = String::from("edited");
+    app.editor.editors[0].dirty = true;
+    let a = tab_cell(&app, 0);
+    press(&mut app, MouseButton::Middle, a);
+    assert!(app.pending_unsaved.is_some(), "the unsaved prompt is up");
+    assert_eq!(tab_names(&app), ["a.py", "b.txt", "c.txt"]);
+}
+
+/// #1427: a tab command bound to a tab-strip gesture acts on the clicked
+/// tab. `close_editor` on a middle-click used to close the active tab.
+#[test]
+fn a_tab_strip_close_binding_closes_the_clicked_tab() {
+    use crossterm::event::MouseButton;
+    let (mut app, _tmp) = three_tab_app(
+        r#"[{"key": "middle_click", "command": "close_editor", "when": "tab_strip"}]"#,
+    );
+    let a = tab_cell(&app, 0);
+    press(&mut app, MouseButton::Middle, a);
+    assert_eq!(tab_names(&app), ["b.txt", "c.txt"]);
+    assert_eq!(active_tab_name(&app), "c.txt");
+
+    let (mut app, _tmp) = three_tab_app(
+        r#"[{"key": "ctrl+click", "command": "close_other_editors", "when": "tab_strip"}]"#,
+    );
+    let (x, y) = tab_cell(&app, 1);
+    let mut ev = mouse(
+        crossterm::event::MouseEventKind::Down(MouseButton::Left),
+        x,
+        y,
+    );
+    ev.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ev);
+    assert_eq!(
+        tab_names(&app),
+        ["b.txt"],
+        "the clicked tab is the one kept"
+    );
+}
+
+/// #1427 negative: outside the strip, the tab commands keep acting on the
+/// active tab, from a binding in the editor or from the keyboard, and a
+/// middle-click in the text closes nothing.
+#[test]
+fn off_the_strip_tab_commands_still_act_on_the_active_tab() {
+    use crossterm::event::MouseButton;
+    let (mut app, _tmp) =
+        three_tab_app(r#"[{"key": "ctrl+click", "command": "close_editor", "when": "editor"}]"#);
+    let body = (app.editor.last_inner.x + 6, app.editor.last_inner.y);
+    press(&mut app, MouseButton::Middle, body);
+    assert_eq!(tab_names(&app).len(), 3, "a middle-click in the text");
+    let mut ev = mouse(
+        crossterm::event::MouseEventKind::Down(MouseButton::Left),
+        body.0,
+        body.1,
+    );
+    ev.modifiers = KeyModifiers::CONTROL;
+    app.handle_mouse(ev);
+    assert_eq!(
+        tab_names(&app),
+        ["a.py", "b.txt"],
+        "the active c.txt closed"
+    );
+    app.run_command(crate::widgets::command_palette::Command::CloseEditor);
+    assert_eq!(tab_names(&app), ["a.py"], "from the keyboard too");
+}
+
 #[test]
 fn the_at_click_commands_refuse_a_keyboard_invocation() {
     // Each reads the click through `last_mouse_pos`, which a palette or
@@ -78812,6 +78944,7 @@ fn diag_on_line(line: u32, message: &str) -> crate::lsp::manager::Diagnostic {
         end_char: 1,
         severity: crate::lsp::manager::DiagnosticSeverity::Warning,
         message: String::from(message),
+        tags: Default::default(),
     }
 }
 
