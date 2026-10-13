@@ -162,6 +162,21 @@ fn as_enabled_globs(v: &Value) -> Option<Value> {
     ))
 }
 
+/// The croft settings a VS Code `settings.json` key maps to, for telling a
+/// user who wrote the VS Code name in croft's config which keys to use
+/// (#1607). `files.autoSave` sets two: its focus and window modes are
+/// `auto_save_on_focus_change`, not a delayed `auto_save`.
+pub fn croft_keys_for(vscode_key: &str) -> Option<&'static [&'static str]> {
+    match vscode_key {
+        "files.autoSave" => Some(&["auto_save", "auto_save_on_focus_change"]),
+        "workbench.colorTheme" => Some(&["theme"]),
+        _ => SETTINGS
+            .iter()
+            .find(|m| m.vscode == vscode_key)
+            .map(|m| std::slice::from_ref(&m.croft)),
+    }
+}
+
 const SETTINGS: &[SettingMap] = &[
     SettingMap {
         vscode: "editor.formatOnSave",
