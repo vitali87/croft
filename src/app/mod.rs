@@ -33128,7 +33128,7 @@ impl App {
     /// paused line makes; the answer arrives as `StepInTargets`. An adapter
     /// that cannot say steps in plainly, as F11 does.
     fn debug_step_into_target(&mut self) {
-        use crate::dap::session::SessionPhase;
+        use crate::dap::session::{SessionPhase, StepInTargetsAsk};
         let Some(session) = self.debug_sessions.focused_mut() else {
             self.status = String::from("No debug session to step");
             return;
@@ -33137,11 +33137,18 @@ impl App {
             self.status = String::from("Step Into Target needs a paused program");
             return;
         }
-        if !session.request_step_in_targets() {
-            self.status = String::from(
-                "This debugger cannot list step-in targets; stepping into the first call",
-            );
-            self.debug_step("stepIn");
+        match session.request_step_in_targets() {
+            StepInTargetsAsk::Sent => {}
+            StepInTargetsAsk::NoFrame => {
+                self.status =
+                    String::from("The paused frame is still loading; try Step Into Target again");
+            }
+            StepInTargetsAsk::Unsupported => {
+                self.status = String::from(
+                    "This debugger cannot list step-in targets; stepping into the first call",
+                );
+                self.debug_step("stepIn");
+            }
         }
     }
 

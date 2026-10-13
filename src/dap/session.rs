@@ -20,6 +20,17 @@ use serde_json::{Value, json};
 use super::transport::DapTransport;
 
 /// Where a session is in its lifecycle.
+/// What [`DapSession::request_step_in_targets`] did (#1543).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepInTargetsAsk {
+    /// The request is out; the answer arrives as `StepInTargets`.
+    Sent,
+    /// Not paused, or the adapter cannot list step-in targets.
+    Unsupported,
+    /// The adapter could answer, but the paused frame is not known yet.
+    NoFrame,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionPhase {
     /// `initialize` sent, awaiting the `initialized` event.
@@ -1817,21 +1828,27 @@ impl DapSession {
     }
 
     /// Ask for the calls on the selected frame's line (#1543), answered as
-    /// [`DapEvent::StepInTargets`]. `false` when there is nothing to ask
-    /// about: not paused, no frame, or an adapter without
-    /// `supportsStepInTargetsRequest`.
-    pub fn request_step_in_targets(&mut self) -> bool {
+    /// [`DapEvent::StepInTargets`]. [`StepInTargetsAsk::Unsupported`] when
+    /// the program is not paused or the adapter lacks
+    /// `supportsStepInTargetsRequest`; [`StepInTargetsAsk::NoFrame`] when it
+    /// could answer but the paused frame has not arrived yet (or the send
+    /// failed), so the caller must not fall back to a plain step in.
+    pub fn request_step_in_targets(&mut self) -> StepInTargetsAsk {
         if self.phase != SessionPhase::Stopped || !self.supports("supportsStepInTargetsRequest") {
-            return false;
+            return StepInTargetsAsk::Unsupported;
         }
         let Some(frame) = self
             .selected_frame
             .or_else(|| self.stack_frames.first().map(|f| f.id))
         else {
-            return false;
+            return StepInTargetsAsk::NoFrame;
         };
         self.step_in_targets_seq = self.active().send(step_in_targets_request(frame)).ok();
-        self.step_in_targets_seq.is_some()
+        if self.step_in_targets_seq.is_some() {
+            StepInTargetsAsk::Sent
+        } else {
+            StepInTargetsAsk::NoFrame
+        }
     }
 
     /// Step into the call `target_id` on the paused line (#1543).
@@ -3672,7 +3689,7 @@ def stopped():"#,
             return;
         }
         let (_tmp, log, mut session) = step_in_targets_session(true);
-        assert!(session.request_step_in_targets());
+        assert_eq!(session.request_step_in_targets(), StepInTargetsAsk::Sent);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let targets = loop {
             assert!(std::time::Instant::now() < deadline, "no StepInTargets");
@@ -3718,7 +3735,10 @@ def stopped():"#,
             return;
         }
         let (_tmp, log, mut session) = step_in_targets_session(false);
-        assert!(!session.request_step_in_targets());
+        assert_eq!(
+            session.request_step_in_targets(),
+            StepInTargetsAsk::Unsupported
+        );
         session.step("next");
         poll_until(&mut session, &log, |qs| {
             qs.iter().any(|q| q["command"] == "next")
@@ -3727,6 +3747,28 @@ def stopped():"#,
             !requests(&log)
                 .iter()
                 .any(|q| q["command"] == "stepInTargets"),
+            "{:?}",
+            requests(&log)
+        );
+        session.disconnect();
+    }
+
+    /// #1543: asked before the paused frame's stack trace has arrived, a
+    /// supporting adapter reports `NoFrame` rather than `Unsupported`, so the
+    /// caller does not resume the program with a plain step in.
+    #[test]
+    fn step_in_targets_before_the_frame_arrives_is_not_unsupported() {
+        if python3_missing() {
+            return;
+        }
+        let (_tmp, log, mut session) = step_in_targets_session(true);
+        session.stack_frames.clear();
+        session.selected_frame = None;
+        assert_eq!(session.request_step_in_targets(), StepInTargetsAsk::NoFrame);
+        assert!(
+            !requests(&log)
+                .iter()
+                .any(|q| q["command"] == "stepInTargets" || q["command"] == "stepIn"),
             "{:?}",
             requests(&log)
         );
