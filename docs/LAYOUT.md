@@ -235,7 +235,7 @@ Live Run executes your code on every pause, so it is armed **per file**: togglin
 
 ## Tasks
 
-Zero configuration: `Cmd`/`Ctrl`+`Shift`+`B` runs the project's build task, auto-detected from the manifests the repo already has (Makefile, justfile, package.json with the right lockfile runner, Cargo.toml, pyproject.toml, and `.vscode/tasks.json` when present). "Tasks: Run Task" in the palette lists everything discovered; each task runs in its own named terminal pane, and rerunning reuses that pane.
+Zero configuration: `Cmd`/`Ctrl`+`Shift`+`B` runs the project's build task, auto-detected from the manifests the repo already has (Makefile, justfile, package.json with the right lockfile runner (and, in an npm, pnpm or yarn workspaces monorepo, every package's scripts, run from that package), Cargo.toml, pyproject.toml, and `.vscode/tasks.json` when present). "Tasks: Run Task" in the palette lists everything discovered; each task runs in its own named terminal pane, and rerunning reuses that pane.
 
 ## Status bar
 
