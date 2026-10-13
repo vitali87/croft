@@ -31,20 +31,34 @@ const SERVED: &[(&str, &[&str])] = &[
     ("vscode.html-language-features", &["html"]),
     ("redhat.vscode-yaml", &["yaml"]),
     ("tamasfe.even-better-toml", &["toml"]),
+    ("rvben.rumdl", &["markdown"]),
     ("sumneko.lua", &["lua"]),
     ("mads-hartmann.bash-ide-vscode", &["shellscript"]),
 ];
 
-/// The formatter named for a file in language `lang`: its language's entry,
-/// else the one for every file.
+/// The formatter named for a file in language `lang`: its own language's
+/// entry, else a grouped entry (`javascript][typescript`) that lists it,
+/// else the one for every file. As in VS Code, a single-language entry
+/// outranks a grouped one. An empty entry is an explicit `null`: it names
+/// no formatter and still shadows the ones below it.
 pub fn named<'a>(
     global: Option<&'a str>,
     per_language: &'a BTreeMap<String, String>,
     lang: Option<&str>,
 ) -> Option<&'a str> {
-    lang.and_then(|l| per_language.get(l))
-        .map(String::as_str)
-        .or(global)
+    let entry = lang.and_then(|l| {
+        per_language.get(l).or_else(|| {
+            per_language
+                .iter()
+                .find(|(k, _)| k.contains("][") && k.split("][").any(|g| g == l))
+                .map(|(_, f)| f)
+        })
+    });
+    match entry {
+        Some(f) => Some(f.as_str()),
+        None => global,
+    }
+    .filter(|f| !f.is_empty())
 }
 
 /// Whether croft's own language server for `lang` is the formatter
@@ -147,5 +161,47 @@ mod tests {
             Some("esbenp.prettier-vscode")
         );
         assert_eq!(named(None, &per, None), None);
+    }
+
+    /// A single-language entry outranks a grouped one that lists the same
+    /// language, whichever layer each came from; a grouped entry still
+    /// covers its other languages.
+    #[test]
+    fn a_single_language_entry_outranks_a_grouped_one() {
+        let per = langs(&[
+            ("javascript][typescript", "esbenp.prettier-vscode"),
+            ("typescript", "vscode.typescript-language-features"),
+        ]);
+        assert_eq!(foreign(None, &per, Some("typescript")), None);
+        assert_eq!(
+            foreign(None, &per, Some("javascript")),
+            Some("esbenp.prettier-vscode")
+        );
+        assert_eq!(foreign(None, &per, Some("java")), None);
+    }
+
+    /// An explicit `null` for a language (kept as "") names no formatter
+    /// and shadows the one named for every file.
+    #[test]
+    fn a_null_language_entry_shadows_the_global_one() {
+        let per = langs(&[("python", "")]);
+        assert_eq!(
+            named(Some("esbenp.prettier-vscode"), &per, Some("python")),
+            None
+        );
+        assert_eq!(
+            foreign(Some("esbenp.prettier-vscode"), &per, Some("python")),
+            None
+        );
+        assert_eq!(
+            foreign(Some("esbenp.prettier-vscode"), &per, Some("go")),
+            Some("esbenp.prettier-vscode")
+        );
+    }
+
+    /// rumdl is croft's bundled Markdown formatter.
+    #[test]
+    fn rumdl_formats_markdown() {
+        assert!(croft_runs("rvben.rumdl", Some("markdown")));
     }
 }

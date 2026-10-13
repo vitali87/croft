@@ -799,9 +799,8 @@ mod tests {
         assert_eq!(
             m.prefs.language_formatters,
             [
-                ("javascript", "esbenp.prettier-vscode"),
+                ("javascript][typescript", "esbenp.prettier-vscode"),
                 ("python", "charliermarsh.ruff"),
-                ("typescript", "esbenp.prettier-vscode"),
             ]
             .iter()
             .map(|(l, f)| (l.to_string(), f.to_string()))
@@ -812,6 +811,33 @@ mod tests {
             LayerKind::VsCodeWorkspace
         );
         assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+    }
+
+    /// #1499: an imported user `[typescript]` formatter survives a workspace
+    /// `[javascript][typescript]` one, as in VS Code, and a workspace
+    /// `null` clears the user's formatter for every file.
+    #[test]
+    fn a_grouped_workspace_formatter_keeps_a_user_single_language_one() {
+        let (_tmp, user, root) = setup();
+        write(
+            &user.join("config.json"),
+            r#"{ "default_formatter": "esbenp.prettier-vscode", "language_formatters": { "typescript": "vscode.typescript-language-features" } }"#,
+        );
+        write(
+            &root.join(".vscode/settings.json"),
+            r#"{ "editor.defaultFormatter": null, "[javascript][typescript]": { "editor.defaultFormatter": "biomejs.biome" }, "[python]": { "editor.defaultFormatter": null } }"#,
+        );
+        let m = load_merged_from(&user, Some(&root), "linux");
+        assert_eq!(m.prefs.default_formatter, None);
+        let per = &m.prefs.language_formatters;
+        let named = |l| crate::default_formatter::named(None, per, Some(l));
+        assert_eq!(
+            named("typescript"),
+            Some("vscode.typescript-language-features")
+        );
+        assert_eq!(named("javascript"), Some("biomejs.biome"));
+        assert_eq!(named("python"), None);
+        assert_eq!(per.get("python").map(String::as_str), Some(""));
     }
 
     /// #1499, negative: a language block without a formatter, or with an

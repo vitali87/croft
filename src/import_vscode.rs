@@ -162,7 +162,12 @@ fn as_enabled_globs(v: &Value) -> Option<Value> {
     ))
 }
 
+/// A non-empty string, or an explicit `null`, which VS Code accepts for
+/// `editor.defaultFormatter` to clear one named in a lower layer.
 fn as_string(v: &Value) -> Option<Value> {
+    if v.is_null() {
+        return Some(Value::Null);
+    }
     v.as_str().filter(|s| !s.is_empty()).map(Value::from)
 }
 
@@ -645,20 +650,29 @@ pub fn map_settings(
                 }
                 // `"[typescript]": { "editor.defaultFormatter": … }`, also
                 // as `"[javascript][typescript]"` (#1499): the formatter
-                // each language names. Its other keys stay unmapped.
+                // each language names. A grouped block keeps its whole key
+                // (`javascript][typescript`) so a layer's grouped block does
+                // not overwrite another layer's single-language one, which
+                // VS Code ranks above it. An explicit `null` is kept as ""
+                // so it still shadows the formatter named for every file.
+                // Its other keys stay unmapped.
                 if let Some(langs) = key.strip_prefix('[').and_then(|k| k.strip_suffix(']'))
                     && let Some(block) = value.as_object()
                 {
                     if let Some(formatter) =
                         block.get("editor.defaultFormatter").and_then(as_string)
+                        && !langs.is_empty()
                     {
+                        let formatter = if formatter.is_null() {
+                            Value::from("")
+                        } else {
+                            formatter
+                        };
                         let map = settings
                             .entry(String::from("language_formatters"))
                             .or_insert_with(|| Value::Object(Map::new()));
                         if let Some(map) = map.as_object_mut() {
-                            for lang in langs.split("][").filter(|l| !l.is_empty()) {
-                                map.insert(lang.to_string(), formatter.clone());
-                            }
+                            map.insert(langs.to_string(), formatter);
                         }
                     }
                     let rest: Vec<&String> = block
