@@ -14655,9 +14655,6 @@ fn is_bracket_pair_split(lang: Option<LangKind>, prev: Option<char>, next: Optio
     )
 }
 
-/// First 4 KiB of a file (or all of it when shorter): the sample both the
-/// BOM sniff and [`is_binary`] need, read without loading the whole file
-/// so the over-limit routing in `open` stays O(1) in file size.
 /// The private folder that holds decompressed gzip copies (#1469): one per
 /// user, mode 0700 on unix, and refused unless it is a real directory this
 /// user owns that no one else can enter, so another local user can neither
@@ -14690,6 +14687,9 @@ fn gunzip_scratch_dir() -> std::io::Result<std::path::PathBuf> {
     }
 }
 
+/// First 4 KiB of a file (or all of it when shorter): the sample both the
+/// BOM sniff and [`is_binary`] need, read without loading the whole file
+/// so the over-limit routing in `open` stays O(1) in file size.
 fn read_file_head(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     let mut head = vec![0u8; 4096];
