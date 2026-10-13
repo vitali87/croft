@@ -2047,16 +2047,32 @@ fn split_launch_location(
     let Some(file) = open_file else {
         return (path, None, path_at);
     };
-    let root = cwd.join(&path);
     let split = crate::view_ipc::split_location(cwd, &file).or_else(|| {
-        root.is_dir()
-            .then(|| crate::view_ipc::split_location(&root, &file))
-            .flatten()
+        launch_root(&cwd.join(&path)).and_then(|root| crate::view_ipc::split_location(&root, &file))
     });
     match split {
         Some((file, at)) => (path, Some(file), Some(at)),
         None => (path, Some(file), None),
     }
+}
+
+/// The folder a relative `--open-file` is looked for under once `path` is
+/// resolved as [`resolve_workspace_from`] does: the directory itself, a
+/// `.code-workspace` file's primary folder, or a file's parent. `None` when
+/// there is none to search.
+fn launch_root(path: &Path) -> Option<PathBuf> {
+    if path.is_dir() {
+        return Some(path.to_path_buf());
+    }
+    if crate::workspace::is_workspace_file(path) {
+        return crate::workspace::parse_workspace_file(path)
+            .ok()?
+            .into_iter()
+            .next();
+    }
+    path.is_file()
+        .then(|| path.parent().map(Path::to_path_buf))
+        .flatten()
 }
 
 /// An `--open-file` path made absolute: a relative one names a file under
@@ -2616,6 +2632,24 @@ mod tests {
             split_launch_location(&root, Some(PathBuf::from("src/main.rs:1:4")), dir.path());
         assert_eq!(open_file, Some(root.join("src/main.rs")));
         assert_eq!(at, Some((0, 3)));
+    }
+
+    /// #1606: with a `.code-workspace` file as PATH, a relative
+    /// `--open-file` location is found under the workspace's primary folder.
+    #[test]
+    fn an_open_file_location_is_found_under_a_workspace_files_primary_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let primary = dir.join("alpha");
+        std::fs::create_dir_all(primary.join("src")).unwrap();
+        std::fs::write(primary.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let file = dir.join("p.code-workspace");
+        crate::workspace::write_workspace_file(&file, std::slice::from_ref(&primary)).unwrap();
+        let (path, open_file, at) =
+            split_launch_location(&file, Some(PathBuf::from("src/main.rs:10")), &dir);
+        assert_eq!(path, file);
+        assert_eq!(open_file, Some(primary.join("src/main.rs")));
+        assert_eq!(at, Some((9, 0)));
     }
 
     /// Negative (#1606): a path that exists, even one named like `a:1`, is
