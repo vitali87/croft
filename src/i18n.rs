@@ -9,7 +9,9 @@
 //! with one `{}` is a pattern: `"Saved {}": "Gespeichert: {}"` translates
 //! every status that starts with `Saved ` and carries the variable part
 //! across. The locale is the `locale` setting, else `LC_ALL`,
-//! `LC_MESSAGES` or `LANG` (`de_DE.UTF-8` reads as `de`). Built-in
+//! `LC_MESSAGES` or `LANG` (`de_DE.UTF-8` reads as `de`); the environment
+//! only switches to a language whose catalog is near complete, or that the
+//! user has a catalog file for (#1629). Built-in
 //! catalogs ship in `assets/i18n/`; a file at `<config>/locales/<lang>.json`
 //! adds to or overrides one, which is also how a new language starts.
 //! `croft locale-template <lang>` prints every translatable string, and
@@ -125,19 +127,57 @@ pub fn catalog_for(lang: &str, user_file: Option<&str>) -> Catalog {
     c
 }
 
+/// The share of [`template`]'s strings a built-in catalog must translate
+/// before croft switches to it just because the system locale names its
+/// language (#1629). Below it the UI would flip language from one palette
+/// row to the next, so it stays English until the user asks.
+pub const FOLLOW_ENVIRONMENT_COVERAGE: f64 = 0.95;
+
+/// How many of the strings `croft locale-template` lists the built-in
+/// catalog for `lang` translates, and how many it lists.
+pub fn built_in_coverage(lang: &str) -> (usize, usize) {
+    let catalog = catalog_for(lang, None);
+    let keys = template_keys(TRANSLATABLE, None);
+    let done = keys
+        .iter()
+        .filter(|k| catalog.lookup(k) != k.as_str())
+        .count();
+    (done, keys.len())
+}
+
+/// The catalog croft starts with, if any. An explicit `locale` setting
+/// always loads its catalog. A language taken from the environment loads
+/// only when the user has a catalog file for it (they opted in) or the
+/// built-in catalog is near complete (#1629): a starter catalog would mix
+/// two languages on every screen of someone who never asked for it.
+pub fn startup_catalog(
+    setting: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+    user_file_for: &dyn Fn(&str) -> Option<String>,
+) -> Option<Catalog> {
+    let lang = pick_language(setting, env)?;
+    let explicit = setting.is_some_and(|s| !s.trim().is_empty());
+    let user = user_file_for(&lang);
+    if !explicit && user.is_none() {
+        let (done, total) = built_in_coverage(&lang);
+        if total == 0 || (done as f64) < FOLLOW_ENVIRONMENT_COVERAGE * total as f64 {
+            return None;
+        }
+    }
+    Some(catalog_for(&lang, user.as_deref())).filter(|c| !c.is_empty())
+}
+
 /// Load the catalog once at startup. Later calls are no-ops.
 pub fn init(setting: Option<&str>) {
-    let Some(lang) = pick_language(setting, &|k| std::env::var(k).ok()) else {
-        return;
+    let user_file_for = |lang: &str| {
+        std::fs::read_to_string(
+            crate::prefs::config_dir()
+                .join("locales")
+                .join(format!("{lang}.json")),
+        )
+        .ok()
     };
-    let user = std::fs::read_to_string(
-        crate::prefs::config_dir()
-            .join("locales")
-            .join(format!("{lang}.json")),
-    )
-    .ok();
-    let catalog = catalog_for(&lang, user.as_deref());
-    if !catalog.is_empty() {
+    if let Some(catalog) = startup_catalog(setting, &|k| std::env::var(k).ok(), &user_file_for) {
         let _ = CATALOG.set(catalog);
     }
 }
@@ -246,20 +286,7 @@ pub fn template(lang: &str, user_file: Option<&str>, extra: &[&str]) -> String {
     let user: serde_json::Map<String, serde_json::Value> = user_file
         .and_then(|json| serde_json::from_str(json).ok())
         .unwrap_or_default();
-    let built_in_keys = BUILT_IN.iter().flat_map(|(_, json)| {
-        serde_json::from_str::<HashMap<String, String>>(json)
-            .map(|map| map.into_keys().collect::<Vec<_>>())
-            .unwrap_or_default()
-    });
-    let mut keys: Vec<String> = crate::widgets::command_palette::ALL_COMMANDS
-        .iter()
-        .map(|c| c.title().to_string())
-        .chain(extra.iter().map(|s| s.to_string()))
-        .chain(built_in_keys)
-        .chain(user.keys().cloned())
-        .collect();
-    keys.sort();
-    keys.dedup();
+    let keys = template_keys(extra, Some(&user));
     let map: serde_json::Map<String, serde_json::Value> = keys
         .into_iter()
         .map(|k| {
@@ -282,6 +309,29 @@ pub fn template(lang: &str, user_file: Option<&str>, extra: &[&str]) -> String {
         })
         .collect();
     serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap_or_default()
+}
+
+/// The strings a template lists, sorted and once each: every palette title,
+/// `extra`, every key of every built-in catalog and of the user's file.
+fn template_keys(
+    extra: &[&str],
+    user: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Vec<String> {
+    let built_in_keys = BUILT_IN.iter().flat_map(|(_, json)| {
+        serde_json::from_str::<HashMap<String, String>>(json)
+            .map(|map| map.into_keys().collect::<Vec<_>>())
+            .unwrap_or_default()
+    });
+    let mut keys: Vec<String> = crate::widgets::command_palette::ALL_COMMANDS
+        .iter()
+        .map(|c| c.title().to_string())
+        .chain(extra.iter().map(|s| s.to_string()))
+        .chain(built_in_keys)
+        .chain(user.into_iter().flat_map(|u| u.keys().cloned()))
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 /// `croft locale-template <lang> --write` (#1148): bring the translation at
@@ -422,6 +472,95 @@ mod tests {
         assert_eq!(pick_language(None, &env).as_deref(), Some("es"));
         assert_eq!(pick_language(Some("de"), &env).as_deref(), Some("de"));
         assert_eq!(pick_language(Some("en"), &env), None);
+    }
+
+    /// A German desktop with no `locale` setting.
+    fn german_env(k: &str) -> Option<String> {
+        (k == "LANG").then(|| String::from("de_DE.UTF-8"))
+    }
+
+    fn no_user_file(_: &str) -> Option<String> {
+        None
+    }
+
+    fn translated(c: &Option<Catalog>, s: &str) -> String {
+        c.as_ref()
+            .map_or(s.to_string(), |c| c.lookup(s).into_owned())
+    }
+
+    /// #1629: the system locale alone no longer switches on a starter
+    /// catalog, so a German desktop gets one language, English, not a palette
+    /// that flips between "Datei: Speichern" and "View: Pin Editor".
+    #[test]
+    fn the_environment_does_not_switch_on_a_partial_catalog() {
+        let c = startup_catalog(None, &german_env, &no_user_file);
+        assert!(c.is_none(), "an 18% catalog must not load from LANG alone");
+        assert_eq!(translated(&c, "File: Save"), "File: Save");
+        assert_eq!(translated(&c, "View: Pin Editor"), "View: Pin Editor");
+        let spanish = |k: &str| (k == "LC_ALL").then(|| String::from("es_ES.UTF-8"));
+        assert!(startup_catalog(Some(""), &spanish, &no_user_file).is_none());
+    }
+
+    /// Asking for the language by name still loads the starter catalog.
+    #[test]
+    fn the_locale_setting_still_loads_a_partial_catalog() {
+        let c = startup_catalog(Some("de"), &german_env, &no_user_file);
+        assert_eq!(translated(&c, "File: Save"), "Datei: Speichern");
+        let c = startup_catalog(Some("es"), &|_| None, &no_user_file);
+        assert!(c.is_some());
+    }
+
+    /// A catalog file of the user's own for the environment's language is
+    /// opting in, so it loads, over the built-in entries.
+    #[test]
+    fn a_user_catalog_for_the_environments_language_is_honoured() {
+        let user = |lang: &str| {
+            (lang == "de")
+                .then(|| String::from(r#"{"View: Pin Editor": "Ansicht: Editor anheften"}"#))
+        };
+        let c = startup_catalog(None, &german_env, &user);
+        assert_eq!(
+            translated(&c, "View: Pin Editor"),
+            "Ansicht: Editor anheften"
+        );
+        assert_eq!(translated(&c, "File: Save"), "Datei: Speichern");
+    }
+
+    /// The gate is coverage of what the template lists, and the starter
+    /// catalogs are well under it; a complete catalog would pass.
+    #[test]
+    fn coverage_is_measured_against_the_template() {
+        for lang in ["de", "es"] {
+            let (done, total) = built_in_coverage(lang);
+            assert!(done > 0 && total > done, "{lang}: {done}/{total}");
+            assert!(
+                (done as f64) < FOLLOW_ENVIRONMENT_COVERAGE * total as f64,
+                "{lang} is a starter catalog: {done}/{total}"
+            );
+        }
+        assert_eq!(built_in_coverage("fr").0, 0, "no French catalog ships");
+        let total = built_in_coverage("de").1;
+        let template: HashMap<String, String> =
+            serde_json::from_str(&template("de", None, TRANSLATABLE)).unwrap();
+        assert_eq!(
+            template.len(),
+            total,
+            "the same strings locale-template lists"
+        );
+    }
+
+    /// Negative: English, C and no locale at all load nothing either way.
+    #[test]
+    fn english_and_unset_locales_load_nothing() {
+        for value in ["en_US.UTF-8", "C", "POSIX"] {
+            let env = |k: &str| (k == "LANG").then(|| value.to_string());
+            assert!(
+                startup_catalog(None, &env, &no_user_file).is_none(),
+                "{value}"
+            );
+        }
+        assert!(startup_catalog(None, &|_| None, &no_user_file).is_none());
+        assert!(startup_catalog(Some("en"), &german_env, &no_user_file).is_none());
     }
 
     #[test]

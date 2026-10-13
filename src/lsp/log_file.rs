@@ -92,10 +92,6 @@ pub fn log(line: &str) {
     f.write_line(&format!("{ts:.3} {line}"));
 }
 
-pub fn path() -> PathBuf {
-    default_path()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

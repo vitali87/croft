@@ -2,7 +2,6 @@ use std::time::{Duration, Instant};
 
 pub const HOVER_DELAY: Duration = Duration::from_millis(300);
 
-#[allow(dead_code)]
 #[derive(Default)]
 pub struct HoverDwell {
     anchor: Option<Instant>,
@@ -10,7 +9,6 @@ pub struct HoverDwell {
     fired: bool,
 }
 
-#[allow(dead_code)]
 impl HoverDwell {
     pub fn on_move(&mut self, now: Instant, col: u16, row: u16) {
         if self.cell != Some((col, row)) {
