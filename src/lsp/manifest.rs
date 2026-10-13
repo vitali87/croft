@@ -353,6 +353,13 @@ pub struct LanguageDecl {
     pub id: String,
     #[serde(default)]
     pub extensions: Vec<String>,
+    /// File-name patterns that map to this language ahead of the extension
+    /// table (#1084): `tsconfig*.json` is JSON with comments although its
+    /// extension says JSON. `*` matches within one path component, and a
+    /// pattern with `/` also matches the directories above the file
+    /// (`.vscode/*.json`).
+    #[serde(default)]
+    pub filenames: Vec<String>,
     /// Project-manifest filenames that mark a directory as this language's
     /// project root (anchors the server at the right sub-project).
     #[serde(default)]

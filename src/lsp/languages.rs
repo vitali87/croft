@@ -12,6 +12,7 @@
 //! phase; until then resolution covers exactly the first-party languages.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::OnceLock;
 
 use crate::lsp::config::Language;
@@ -24,6 +25,8 @@ struct LangRecord {
 
 struct LangTable {
     by_ext: HashMap<String, Language>,
+    /// File-name patterns, split on `/`, checked before `by_ext`.
+    by_name: Vec<(Vec<String>, Language)>,
     records: HashMap<&'static str, LangRecord>,
 }
 
@@ -37,6 +40,7 @@ fn intern(s: &str) -> &'static str {
 impl LangTable {
     fn from_sources(sources: &[&str]) -> Self {
         let mut by_ext = HashMap::new();
+        let mut by_name = Vec::new();
         let mut records = HashMap::new();
         for src in sources {
             let Ok(m) = manifest::parse(src) else {
@@ -47,6 +51,10 @@ impl LangTable {
                 let lang = Language(id);
                 for ext in &decl.extensions {
                     by_ext.insert(ext.to_ascii_lowercase(), lang);
+                }
+                for pattern in &decl.filenames {
+                    let parts = pattern.split('/').map(str::to_string).collect();
+                    by_name.push((parts, lang));
                 }
                 let markers: Vec<&'static str> =
                     decl.root_markers.iter().map(|s| intern(s)).collect();
@@ -59,7 +67,11 @@ impl LangTable {
                 );
             }
         }
-        LangTable { by_ext, records }
+        LangTable {
+            by_ext,
+            by_name,
+            records,
+        }
     }
 }
 
@@ -84,6 +96,48 @@ pub fn init_with_user_sources(user: &[&str]) {
 /// The language a file extension maps to, or `None` if no extension claims it.
 pub fn from_extension(ext: &str) -> Option<Language> {
     table().by_ext.get(&ext.to_ascii_lowercase()).copied()
+}
+
+/// The language a file maps to: a file-name pattern first, then its
+/// extension.
+pub fn from_path(path: &Path) -> Option<Language> {
+    let names: Vec<&str> = path
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    table()
+        .by_name
+        .iter()
+        .find(|(parts, _)| {
+            parts.len() <= names.len()
+                && parts
+                    .iter()
+                    .rev()
+                    .zip(names.iter().rev())
+                    .all(|(pattern, name)| wildcard_match(pattern, name))
+        })
+        .map(|(_, lang)| *lang)
+        .or_else(|| {
+            path.extension()
+                .and_then(|e| e.to_str())
+                .and_then(from_extension)
+        })
+}
+
+/// Whether `name` matches `pattern`, where `*` stands for any run of
+/// characters and everything else matches itself.
+fn wildcard_match(pattern: &str, name: &str) -> bool {
+    match pattern.split_once('*') {
+        None => pattern == name,
+        Some((head, rest)) => {
+            let Some(tail) = name.strip_prefix(head) else {
+                return false;
+            };
+            (0..=tail.len())
+                .filter(|&i| tail.is_char_boundary(i))
+                .any(|i| wildcard_match(rest, &tail[i..]))
+        }
+    }
 }
 
 /// Resolve an LSP `languageId` to a known language, or `None`.
@@ -227,5 +281,66 @@ root_markers = ["build.zig", "build.zig.zon"]
         let rec = t.records.get("zig").expect("zig language recorded");
         assert_eq!(rec.root_markers, &["build.zig", "build.zig.zon"]);
         assert!(rec.family.is_none());
+    }
+
+    /// #1084: the files whose format is JSON with comments open as `jsonc`,
+    /// by name or by the directory they sit in, and share the JSON server.
+    #[test]
+    fn json_with_comments_files_map_to_jsonc() {
+        let jsonc = Language("jsonc");
+        for path in [
+            "/repo/tsconfig.json",
+            "/repo/packages/web/tsconfig.app.json",
+            "/repo/tsconfig-base.json",
+            "/repo/jsconfig.json",
+            "/repo/.vscode/tasks.json",
+            "/repo/.vscode/settings.json",
+            "/repo/.devcontainer/devcontainer.json",
+            "/repo/app.code-workspace",
+            "/repo/.eslintrc",
+            "/repo/.eslintrc.json",
+            "/repo/.babelrc",
+            "/repo/.croft/config.json",
+            "/repo/notes.jsonc",
+            "/repo/NOTES.JSONC",
+        ] {
+            assert_eq!(from_path(Path::new(path)), Some(jsonc), "{path}");
+        }
+        assert_eq!(server_family(jsonc), Language::JSON);
+    }
+
+    /// The patterns stay narrow: plain JSON, a near-miss name, a file a
+    /// level below `.vscode`, and other languages keep their own ids.
+    #[test]
+    fn other_json_files_stay_json() {
+        for path in [
+            "/repo/package.json",
+            "/repo/my-tsconfig.json",
+            "/repo/vscode/tasks.json",
+            "/repo/.vscode/sub/tasks.json",
+            "/repo/.vscode.json",
+            "tsconfig/package.json",
+        ] {
+            assert_eq!(from_path(Path::new(path)), Some(Language::JSON), "{path}");
+        }
+        assert_eq!(from_path(Path::new("/repo/main.rs")), Some(Language::RUST));
+        assert_eq!(
+            from_path(Path::new("/repo/.eslintrc.js")),
+            Some(Language::JAVASCRIPT)
+        );
+        assert_eq!(from_path(Path::new("/repo/README")), None);
+        assert_eq!(from_path(Path::new("/repo/.vscode")), None);
+    }
+
+    #[test]
+    fn wildcards_match_any_run_of_characters() {
+        assert!(wildcard_match("tsconfig.*.json", "tsconfig.app.json"));
+        assert!(wildcard_match("*.json", ".json"));
+        assert!(wildcard_match("*", ""));
+        assert!(wildcard_match("a*b*c", "a-b-b-c"));
+        assert!(wildcard_match("*é.json", "café.json"));
+        assert!(!wildcard_match("tsconfig.*.json", "tsconfig.json"));
+        assert!(!wildcard_match("a*b*c", "a-c-b"));
+        assert!(!wildcard_match(".babelrc", ".babelrc.js"));
     }
 }

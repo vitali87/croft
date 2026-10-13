@@ -8506,8 +8506,7 @@ impl App {
             let Some(path) = tab.path.as_ref() else {
                 continue;
             };
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if crate::lsp::Language::from_extension(ext).is_none() {
+            if crate::lsp::Language::from_path(path).is_none() {
                 continue;
             }
             if i != active && active_path.as_ref() == Some(path) {
@@ -12073,9 +12072,7 @@ impl App {
             .editor
             .path
             .as_deref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
+            .and_then(crate::lsp::Language::from_path)
         else {
             return false;
         };
@@ -12118,11 +12115,7 @@ impl App {
         let Some(path) = self.editor.path.clone() else {
             return;
         };
-        let Some(lang) = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
-        else {
+        let Some(lang) = crate::lsp::Language::from_path(&path) else {
             return;
         };
         let triggers = self
@@ -12323,9 +12316,7 @@ impl App {
             .editor
             .path
             .as_deref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
+            .and_then(crate::lsp::Language::from_path)
             .is_some();
         if lang_known
             && self.lsp.is_some()
@@ -13709,9 +13700,7 @@ impl App {
             .editor
             .path
             .as_deref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
+            .and_then(crate::lsp::Language::from_path)
         else {
             return false;
         };
@@ -13731,9 +13720,7 @@ impl App {
             .editor
             .path
             .as_deref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
+            .and_then(crate::lsp::Language::from_path)
         else {
             return false;
         };
@@ -13753,9 +13740,7 @@ impl App {
             .editor
             .path
             .as_deref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
+            .and_then(crate::lsp::Language::from_path)
         else {
             return false;
         };
@@ -13774,9 +13759,7 @@ impl App {
             .editor
             .path
             .as_deref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
+            .and_then(crate::lsp::Language::from_path)
         else {
             return false;
         };
@@ -13791,9 +13774,7 @@ impl App {
             .editor
             .path
             .as_deref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
+            .and_then(crate::lsp::Language::from_path)
         else {
             return false;
         };
@@ -17637,8 +17618,7 @@ impl App {
         let Some(lsp) = self.lsp.as_ref() else {
             return;
         };
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if crate::lsp::Language::from_extension(ext).is_none() {
+        if crate::lsp::Language::from_path(&path).is_none() {
             return;
         }
         let opened = !self.lsp_last_seen.contains_key(&path);
@@ -57469,9 +57449,7 @@ impl App {
             .editor
             .path
             .as_deref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
+            .and_then(crate::lsp::Language::from_path)
         else {
             return false;
         };
@@ -69530,8 +69508,7 @@ fn lsp_server_family(lang: crate::lsp::Language) -> crate::lsp::Language {
 /// True when `path`'s language is served by one of the just-installed servers,
 /// so its LSP sync state should be dropped to force a re-open + re-probe.
 fn just_installed_covers_path(installed: &[crate::lsp::Language], path: &Path) -> bool {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let Some(lang) = crate::lsp::Language::from_extension(ext) else {
+    let Some(lang) = crate::lsp::Language::from_path(path) else {
         return false;
     };
     installed

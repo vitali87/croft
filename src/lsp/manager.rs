@@ -7465,9 +7465,7 @@ fn build_client_capabilities() -> ClientCapabilities {
 }
 
 fn path_to_language(path: &Path) -> Option<Language> {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .and_then(Language::from_extension)
+    Language::from_path(path)
 }
 
 /// Project-manifest filenames whose presence marks a directory as the root of a
@@ -9160,6 +9158,30 @@ while True:
                 CodeActionOptions::default()
             ))),
             "an options object means supported"
+        );
+    }
+
+    /// #1084: didOpen names a JSON-with-comments file `jsonc`, so the JSON
+    /// server neither flags its comments nor errors on trailing commas; plain
+    /// JSON stays `json`.
+    #[test]
+    fn json_with_comments_files_open_as_jsonc() {
+        let jsonc = Language::from_lsp_id("jsonc").expect("jsonc is a language");
+        for path in [
+            "/repo/tsconfig.json",
+            "/repo/.vscode/launch.json",
+            "/repo/.babelrc",
+            "/repo/notes.jsonc",
+        ] {
+            let lang = path_to_language(Path::new(path));
+            assert_eq!(lang, Some(jsonc), "{path}");
+            assert_eq!(lang.unwrap().lsp_id(), "jsonc");
+        }
+        let keybindings = crate::prefs::config_dir().join("keybindings.json");
+        assert_eq!(path_to_language(&keybindings), Some(jsonc));
+        assert_eq!(
+            path_to_language(Path::new("/repo/package.json")),
+            Some(Language::JSON)
         );
     }
 
