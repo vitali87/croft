@@ -32326,7 +32326,7 @@ impl App {
                     )
                     .with_context(|| {
                         format!(
-                            "nothing answered on {host}:{port}; start the program under `dlv --headless --listen=:{port} --api-version=2 --accept-multiclient` first"
+                            "nothing answered on {host}:{port}; start it first, e.g. `dlv debug <package> --headless --listen=:{port} --api-version=2 --accept-multiclient`"
                         )
                     })
                 } else {

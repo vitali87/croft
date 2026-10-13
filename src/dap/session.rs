@@ -1222,7 +1222,10 @@ impl DapSession {
     /// Attach to a headless delve that already serves DAP at `host:port`
     /// (#1418, the Go extension's "Connect to server"): no dlv is started,
     /// `initialize` and the `mode: "remote"` attach go straight to the
-    /// socket, and stopping disconnects without ending the remote program.
+    /// socket, and stopping disconnects with `terminateDebuggee: false`.
+    /// Delve keeps the remote program running only when it was started
+    /// with `--accept-multiclient`; a single-client server shuts down with
+    /// its debuggee on disconnect.
     pub fn attach_delve_server(
         host: &str,
         port: u16,
@@ -4255,8 +4258,8 @@ def stopped():"#,
 
     /// #1418: a remote Go attach connects to the headless delve's own port
     /// and sends it `initialize` and the `mode: "remote"` attach; no dlv is
-    /// started, and the session is an attach (stopping leaves the program
-    /// running).
+    /// started, and the session is an attach (stopping sends
+    /// `terminateDebuggee: false`).
     #[test]
     fn attach_delve_server_talks_to_the_headless_delve_directly() {
         let (port, server) = headless_delve(2);
