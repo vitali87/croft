@@ -1624,6 +1624,9 @@ struct CompoundLaunch {
 enum MemberOutcome {
     /// Started, and now in the running set.
     Launched,
+    /// Its `cargo` build is running (#1392); it joins the set when the
+    /// build lands.
+    Building,
     /// Not started: it declares a `preLaunchTask` of its own, and croft's
     /// parking is one-at-a-time, so the task cannot be run as part of a set.
     /// Launching regardless would debug whatever the last build left behind.
@@ -2889,15 +2892,20 @@ pub struct ClosedTerminal {
 /// its result, the test's name, and the workspace root it builds for (so a
 /// re-root mid-build discards the binary instead of debugging it in the
 /// wrong workspace).
+type PendingTestDebug = (
+    std::sync::mpsc::Receiver<Result<PathBuf, String>>,
+    String,
+    PathBuf,
+);
+
+/// A CodeLLDB `cargo` launch building its program on a background thread
+/// (#1392): the receiver for the executable (or the build error), the
+/// config to launch with it, the slot it launches into, and the workspace
+/// root it builds for (so a re-root mid-build discards the binary).
 type PendingCargoLaunch = (
     std::sync::mpsc::Receiver<Result<PathBuf, String>>,
     Box<crate::dap::configs::ResolvedConfig>,
     LaunchSlot,
-);
-
-type PendingTestDebug = (
-    std::sync::mpsc::Receiver<Result<PathBuf, String>>,
-    String,
     PathBuf,
 );
 
@@ -4805,10 +4813,11 @@ pub struct App {
     /// name rides along for the launch. Drained per tick; a second request
     /// while one is pending is refused with a status line.
     pending_test_debug: Option<PendingTestDebug>,
-    /// A CodeLLDB `cargo` launch building its program on a background
-    /// thread (#1392): the receiver yields the executable (or the build
-    /// error), and the config launches into its slot when it lands.
-    pending_cargo_launch: Option<PendingCargoLaunch>,
+    /// CodeLLDB `cargo` launches building their programs on background
+    /// threads (#1392): each receiver yields the executable (or the build
+    /// error), and its config launches into its slot when it lands. One per
+    /// compound member that builds; Stop Debugging drops them all.
+    pending_cargo_launches: Vec<PendingCargoLaunch>,
     /// Variable `variablesReference`s the user has expanded in the Variables
     /// panel. Persisted across polls so re-fetched variables stay open.
     pub debug_expanded: std::collections::HashSet<i64>,
@@ -6341,7 +6350,7 @@ impl App {
             pending_debug_launch: None,
             pending_attach: None,
             pending_test_debug: None,
-            pending_cargo_launch: None,
+            pending_cargo_launches: Vec::new(),
             debug_expanded: std::collections::HashSet::new(),
             watch_exprs: Vec::new(),
             watch_vals: std::collections::HashMap::new(),
@@ -25103,30 +25112,46 @@ impl App {
             "config \"{}\": building with {line} \u{2014} debug starts when it succeeds",
             rc.name
         );
-        self.pending_cargo_launch = Some((rx, Box::new(rc), slot));
+        let root = self.tree.root.clone();
+        self.pending_cargo_launches
+            .push((rx, Box::new(rc), slot, root));
     }
 
-    /// Launch a `cargo` config whose build finished, or report why it did
-    /// not. True when anything landed.
+    /// Launch every `cargo` config whose build finished, or report why it
+    /// did not. True when anything landed.
     fn drain_pending_cargo_launch(&mut self) -> bool {
         use std::sync::mpsc::TryRecvError;
-        let Some((rx, _, _)) = self.pending_cargo_launch.as_ref() else {
-            return false;
-        };
-        let result = match rx.try_recv() {
-            Ok(r) => r,
-            Err(TryRecvError::Empty) => return false,
-            Err(TryRecvError::Disconnected) => Err(String::from("the build thread died")),
-        };
-        let (_, mut rc, slot) = self.pending_cargo_launch.take().expect("checked above");
-        match result {
-            Ok(program) => {
-                rc.program = Some(program.to_string_lossy().into_owned());
-                self.launch_resolved_in(*rc, slot);
+        let mut landed = false;
+        let mut i = 0;
+        while i < self.pending_cargo_launches.len() {
+            let result = match self.pending_cargo_launches[i].0.try_recv() {
+                Ok(r) => r,
+                Err(TryRecvError::Empty) => {
+                    i += 1;
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => Err(String::from("the build thread died")),
+            };
+            let (_, mut rc, slot, build_root) = self.pending_cargo_launches.remove(i);
+            landed = true;
+            // Re-rooting mid-build would otherwise launch the old
+            // workspace's binary in the new one.
+            if build_root != self.tree.root {
+                self.status = format!(
+                    "config \"{}\": cargo finished, but the workspace changed — launch it again from its workspace",
+                    rc.name
+                );
+                continue;
             }
-            Err(e) => self.debug_error(format!("config \"{}\": {e}", rc.name)),
+            match result {
+                Ok(program) => {
+                    rc.program = Some(program.to_string_lossy().into_owned());
+                    self.launch_resolved_in(*rc, slot);
+                }
+                Err(e) => self.debug_error(format!("config \"{}\": {e}", rc.name)),
+            }
         }
-        true
+        landed
     }
 
     /// Drain the background test-binary build: on success launch lldb-dap
@@ -31831,9 +31856,12 @@ impl App {
         // `Launched` unconditionally counted members that never started and
         // made "N of M started" name an N the user does not have.
         let before = self.debug_sessions.len();
+        let building = self.pending_cargo_launches.len();
         self.launch_resolved_into_set(rc);
         if self.debug_sessions.len() > before {
             MemberOutcome::Launched
+        } else if self.pending_cargo_launches.len() > building {
+            MemberOutcome::Building
         } else {
             MemberOutcome::Failed
         }
@@ -31916,13 +31944,30 @@ impl App {
         self.pending_debug_launch = None;
         let total = members.len();
         let mut started = 0usize;
+        let mut building: Vec<String> = Vec::new();
         let mut unrun: Vec<String> = Vec::new();
         for cfg in members {
             match self.launch_member_into_set(&cfg) {
                 MemberOutcome::Launched => started += 1,
+                MemberOutcome::Building => building.push(cfg.name.clone()),
                 MemberOutcome::TaskUnrun => unrun.push(cfg.name.clone()),
                 MemberOutcome::Failed => {}
             }
+        }
+        if started == 0 && !building.is_empty() {
+            // Every member that could start is still building with cargo
+            // (#1392): each joins the set when its build lands.
+            self.debug_compound = Some(compound.clone());
+            self.run_debug.feedback = Some(format!(
+                "compound {compound}: building {} \u{2014} sessions start when cargo finishes",
+                building.join(", ")
+            ));
+            self.run_debug.feedback_is_error = building.len() != total;
+            self.status = format!(
+                "compound \"{compound}\": building {} \u{2014} sessions start when cargo finishes",
+                building.join(", ")
+            );
+            return;
         }
         if started == 0 {
             // Nothing started. Each member has already said why, so this names
@@ -31957,7 +32002,12 @@ impl App {
         // several the user has to be told which are running and which one the
         // call stack and variables belong to, or the view describes a session
         // they cannot identify.
-        let running = self.debug_sessions.names().join(", ");
+        let mut running = self.debug_sessions.names().join(", ");
+        if !building.is_empty() {
+            // Not failed: they join the set when their cargo builds land.
+            running = format!("{running}; building {}", building.join(", "));
+        }
+        let started = started + building.len();
         self.run_debug.feedback = Some(if started == total {
             format!("Debugging compound {compound}: {running}")
         } else if unrun.is_empty() {
@@ -32075,7 +32125,7 @@ impl App {
             self.debug_stop();
         }
         self.pending_debug_launch = None;
-        self.pending_cargo_launch = None;
+        self.pending_cargo_launches.clear();
         // A new run: the previous run's cleanup is not this one's.
         self.debug_post_tasks.clear();
         let root = self.active_workspace_root();
@@ -33542,6 +33592,9 @@ impl App {
             session.disconnect();
         }
         self.debug_sessions.clear();
+        // A `cargo` build still running for a launch (#1392) must not start
+        // its debuggee after the user stopped debugging.
+        self.pending_cargo_launches.clear();
         self.debug_compound = None;
         self.reset_watch_runtime();
         // Sweep js-debug's detached watchdog (and any leftover tree) once it has
