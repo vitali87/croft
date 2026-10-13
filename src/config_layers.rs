@@ -106,6 +106,7 @@ pub const WORKSPACE_ALLOWED_KEYS: &[&str] = &[
     "auto_save",
     "auto_save_on_focus_change",
     "render_whitespace",
+    "word_based_suggestions",
     "disable_inline_blame",
     "disable_auto_close_pairs",
     "disable_inline_values",
@@ -383,6 +384,14 @@ fn load_layer_document_inner(
             scoped = block;
         }
     }
+    // A key no setting reads was dropped without a word, so a VS Code name
+    // or a typo just did nothing (#1607). Checked here, per file, so a key
+    // from an `extends` base names that base rather than the file extending
+    // it.
+    drop_unknown_keys(&mut doc, path, warnings);
+    if let Some(Value::Object(block)) = scoped.as_mut() {
+        drop_unknown_keys(block, path, warnings);
+    }
     for (k, v) in doc {
         deep_merge(acc.entry(k).or_insert(Value::Null), &v);
     }
@@ -465,6 +474,105 @@ fn load_vscode_subset(path: &Path, warnings: &mut Vec<String>) -> Option<Map<Str
         .filter(|(k, _)| WORKSPACE_ALLOWED_KEYS.contains(&k.as_str()))
         .collect();
     (!out.is_empty()).then_some(out)
+}
+
+/// Every top-level key a settings layer may hold: each setting's name and
+/// `extends` (#1607).
+fn known_setting_keys() -> &'static std::collections::BTreeSet<String> {
+    static KEYS: std::sync::OnceLock<std::collections::BTreeSet<String>> =
+        std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        let mut keys: std::collections::BTreeSet<String> =
+            match serde_json::to_value(Prefs::default()) {
+                Ok(Value::Object(map)) => map.into_iter().map(|(k, _)| k).collect(),
+                _ => Default::default(),
+            };
+        keys.insert(String::from("extends"));
+        keys
+    })
+}
+
+/// Remove from `doc` (a settings file at `path`) each key no setting reads,
+/// warning about each one.
+fn drop_unknown_keys(doc: &mut Map<String, Value>, path: &Path, warnings: &mut Vec<String>) {
+    doc.retain(|key, _| match unknown_key_warning(path, key) {
+        Some(warning) => {
+            warnings.push(warning);
+            false
+        }
+        None => true,
+    });
+}
+
+/// The warning for `key` in the layer at `path` when no setting reads it,
+/// naming the croft key a VS Code name maps to, or the closest setting a
+/// typo was meant to be. `None` for a known key, and for a `$`-key such as
+/// `$schema`, which editors read and croft ignores.
+fn unknown_key_warning(path: &Path, key: &str) -> Option<String> {
+    let known = known_setting_keys();
+    if known.contains(key) || key.starts_with('$') {
+        return None;
+    }
+    let hint = match crate::import_vscode::croft_keys_for(key) {
+        Some([croft]) => format!(" (a VS Code setting; croft's is \"{croft}\")"),
+        Some(croft) => format!(
+            " (a VS Code setting; croft's are {})",
+            croft
+                .iter()
+                .map(|k| format!("\"{k}\""))
+                .collect::<Vec<_>>()
+                .join(" and ")
+        ),
+        None => closest_setting(key, known)
+            .map(|k| format!(" (did you mean \"{k}\"?)"))
+            .unwrap_or_default(),
+    };
+    Some(format!(
+        "{}: unknown setting \"{key}\" was ignored{hint}",
+        path.display()
+    ))
+}
+
+/// The known setting `key` most likely misspells: the same letters with the
+/// underscores and case ignored, else the nearest by edit distance within a
+/// third of the key's length.
+fn closest_setting<'a>(
+    key: &str,
+    known: &'a std::collections::BTreeSet<String>,
+) -> Option<&'a str> {
+    let squash = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    let wanted = squash(key);
+    if let Some(k) = known.iter().find(|k| squash(k) == wanted) {
+        return Some(k);
+    }
+    let limit = (key.chars().count() / 3).max(1);
+    known
+        .iter()
+        .map(|k| (edit_distance(&squash(k), &wanted), k))
+        .filter(|(d, _)| *d <= limit)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, k)| k.as_str())
+}
+
+/// Levenshtein distance between two strings, by chars.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cur = row[j + 1];
+            row[j + 1] = (prev + usize::from(ca != *cb)).min(row[j] + 1).min(cur + 1);
+            prev = cur;
+        }
+    }
+    row[b.len()]
 }
 
 /// Deserialize the merged map into [`Prefs`]. A single mistyped key must not
@@ -1099,5 +1207,125 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, root2.join(".croft")).unwrap();
         let err = ensure_workspace_local_ignored(&root2).unwrap_err();
         assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    /// #1607: a misspelt key was dropped without a word.
+    #[test]
+    fn a_misspelt_key_warns_naming_the_setting_it_meant() {
+        let (_tmp, user, root) = setup();
+        write(&user.join("config.json"), r#"{"autosave":true}"#);
+        let m = load_merged_from(&user, Some(&root), "macos");
+        assert_eq!(m.warnings.len(), 1, "{:?}", m.warnings);
+        let w = &m.warnings[0];
+        assert!(w.contains("unknown setting \"autosave\""), "{w}");
+        assert!(w.contains("did you mean \"auto_save\"?"), "{w}");
+        assert!(w.contains("config.json"), "names the file: {w}");
+        assert!(!m.prefs.auto_save, "the typo still sets nothing");
+    }
+
+    /// #1607: a VS Code name warns with the croft key to use instead.
+    #[test]
+    fn a_vs_code_key_warns_naming_croft_s_setting() {
+        let (_tmp, user, root) = setup();
+        write(
+            &user.join("config.json"),
+            r#"{"editor.formatOnSave":true,"files.autoSave":"afterDelay"}"#,
+        );
+        let m = load_merged_from(&user, Some(&root), "macos");
+        let joined = m.warnings.join("\n");
+        assert!(
+            joined.contains(
+                "unknown setting \"editor.formatOnSave\" was ignored (a VS Code setting; croft's is \"format_on_save\")"
+            ),
+            "{joined}"
+        );
+        assert!(
+            joined.contains(
+                "unknown setting \"files.autoSave\" was ignored (a VS Code setting; croft's are \"auto_save\" and \"auto_save_on_focus_change\")"
+            ),
+            "{joined}"
+        );
+        assert_eq!(m.warnings.len(), 2, "{joined}");
+    }
+
+    /// #1607: an unknown key in a workspace layer warns too, and a known
+    /// key beside it still applies.
+    #[test]
+    fn an_unknown_key_in_a_workspace_layer_warns_and_the_rest_applies() {
+        let (_tmp, user, root) = setup();
+        write(
+            &root.join(".croft/config.json"),
+            r#"{"format_on_save":true,"fromat_on_save":false}"#,
+        );
+        let m = load_merged_from(&user, Some(&root), "macos");
+        assert!(m.prefs.format_on_save);
+        assert_eq!(m.warnings.len(), 1, "{:?}", m.warnings);
+        assert!(
+            m.warnings[0].contains("\"fromat_on_save\"")
+                && m.warnings[0].contains("did you mean \"format_on_save\"?"),
+            "{:?}",
+            m.warnings
+        );
+    }
+
+    /// #1607 negative: known keys, `extends`, `$schema` and the platform
+    /// blocks are all read, so none of them warns.
+    #[test]
+    fn known_keys_extends_schema_and_platform_blocks_do_not_warn() {
+        let (_tmp, user, root) = setup();
+        write(&user.join("base.json"), r#"{"theme":"nord"}"#);
+        write(
+            &user.join("config.json"),
+            r#"{"$schema":"x","extends":"base.json","format_on_save":true,"explorer_views":{"rust_dependencies":false},"linux":{"theme":"black"},"macos":{"theme":"dracula"}}"#,
+        );
+        let m = load_merged_from(&user, Some(&root), "macos");
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+        assert!(m.prefs.format_on_save);
+        assert!(!m.prefs.explorer_views.dependencies);
+        assert_eq!(m.prefs.theme, "dracula");
+    }
+
+    /// #1607 negative: `.vscode/settings.json` is full of keys croft does not
+    /// read; only the mapped subset is taken, and none of the rest warns.
+    #[test]
+    fn a_vs_code_workspace_file_s_other_keys_do_not_warn() {
+        let (_tmp, user, root) = setup();
+        write(
+            &root.join(".vscode/settings.json"),
+            r#"{"editor.formatOnSave":true,"python.analysis.typeCheckingMode":"strict"}"#,
+        );
+        let m = load_merged_from(&user, Some(&root), "macos");
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+        assert!(m.prefs.format_on_save);
+    }
+
+    /// #1607: an unknown key in an `extends` base names the base, not the
+    /// file extending it.
+    #[test]
+    fn an_unknown_key_in_an_extends_base_names_the_base() {
+        let (_tmp, user, root) = setup();
+        write(&user.join("base.json"), r#"{"fromat_on_save":true}"#);
+        write(
+            &user.join("config.json"),
+            r#"{"extends":"base.json","theme":"nord"}"#,
+        );
+        let m = load_merged_from(&user, Some(&root), "macos");
+        assert_eq!(m.warnings.len(), 1, "{:?}", m.warnings);
+        let w = &m.warnings[0];
+        assert!(w.contains("unknown setting \"fromat_on_save\""), "{w}");
+        assert!(w.contains("base.json"), "names the base: {w}");
+        assert!(!w.contains("config.json"), "not the extending file: {w}");
+        assert_eq!(m.prefs.theme, "nord");
+    }
+
+    /// #1607 negative: a word nowhere near any setting warns without a guess.
+    #[test]
+    fn an_unrelated_key_warns_without_a_guess() {
+        let (_tmp, user, root) = setup();
+        write(&user.join("config.json"), r#"{"zzqxv":1}"#);
+        let m = load_merged_from(&user, Some(&root), "macos");
+        assert_eq!(m.warnings.len(), 1, "{:?}", m.warnings);
+        assert!(m.warnings[0].contains("unknown setting \"zzqxv\""));
+        assert!(!m.warnings[0].contains("did you mean"), "{:?}", m.warnings);
     }
 }
