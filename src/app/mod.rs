@@ -72458,8 +72458,6 @@ fn install_terminal_restore_panic_hook() {
     });
 }
 
-/// Append a panic record (version, thread, location, message, backtrace) to
-/// `~/.cache/croft/panic.log`. Best-effort and silent on any I/O failure.
 /// ` (did you mean "npm run build"?)` for a task label that was not found
 /// but has a near match (#1412), else nothing.
 fn did_you_mean(near: Option<String>) -> String {
@@ -72467,6 +72465,8 @@ fn did_you_mean(near: Option<String>) -> String {
         .unwrap_or_default()
 }
 
+/// Append a panic record (version, thread, location, message, backtrace) to
+/// `~/.cache/croft/panic.log`. Best-effort and silent on any I/O failure.
 fn log_panic_to_file(info: &std::panic::PanicHookInfo<'_>) {
     use std::io::Write;
     let Some(home) = std::env::var_os("HOME") else {

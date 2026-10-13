@@ -14,8 +14,9 @@
 //! - `Cargo.toml` → the standard cargo verbs
 //! - `pyproject.toml` `[project.scripts]` → `uv run <name>` (plus
 //!   `uv run pytest` when the file mentions pytest)
-//! - `tsconfig*.json` → `tsc -p <file>`, labelled `tsc: build - <file>` as
-//!   VS Code labels it
+//! - `tsconfig*.json` → `tsc -p <file>` (`tsc -b <file>` when it has
+//!   project references), labelled `tsc: build - <file>` as VS Code
+//!   labels it
 //!
 //! The command line is written to a shell pane's PTY, so PATH, aliases,
 //! and env resolve exactly as if the user typed it.
@@ -265,16 +266,41 @@ fn tsconfig_tasks(root: &Path) -> Vec<Task> {
     };
     names
         .into_iter()
-        .map(|name| Task {
-            label: format!("tsc: build - {name}"),
-            command: format!("{tsc} -p {name}"),
-            source: name,
-            is_build: true,
-            is_default: false,
-            problem_matcher: Some(serde_json::Value::String(String::from("$tsc"))),
-            vscode: None,
+        .map(|name| {
+            // The filename is repository-controlled and the terminal runs
+            // this line, so anything beyond plain text goes in as one word.
+            let word = if needs_quote(&name) {
+                quote_word(&name)
+            } else {
+                name.clone()
+            };
+            // A config with project references builds them only in build
+            // mode, which is what VS Code's task switches to.
+            let mode = if has_references(&root.join(&name)) {
+                "-b"
+            } else {
+                "-p"
+            };
+            Task {
+                label: format!("tsc: build - {name}"),
+                command: format!("{tsc} {mode} {word}"),
+                source: name,
+                is_build: true,
+                is_default: false,
+                problem_matcher: Some(serde_json::Value::String(String::from("$tsc"))),
+                vscode: None,
+            }
         })
         .collect()
+}
+
+/// Whether the tsconfig at `path` lists any project `references`.
+fn has_references(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&strip_jsonc(&text)).ok())
+        .and_then(|v| v.get("references")?.as_array().map(|a| !a.is_empty()))
+        .unwrap_or(false)
 }
 
 /// The task `Cmd+Shift+B` runs: the explicit `isDefault` build task when
@@ -1506,6 +1532,42 @@ mod tests {
             default_build_task(&tasks).map(|t| t.command.as_str()),
             Some("pnpm run build"),
             "the build script stays the default build"
+        );
+    }
+
+    /// #1412: a tsconfig filename with shell syntax goes to the shell as
+    /// one quoted word, and a config with project references (comments and
+    /// all) builds in `-b` mode so its dependencies build too.
+    #[test]
+    fn tsc_tasks_quote_filenames_and_build_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        let evil = "tsconfig$(touch${IFS}PWNED).json";
+        std::fs::write(p.join(evil), "{}").unwrap();
+        std::fs::write(
+            p.join("tsconfig.json"),
+            "{\n  // solution\n  \"files\": [],\n  \"references\": [{ \"path\": \"./a\" }],\n}\n",
+        )
+        .unwrap();
+        std::fs::write(p.join("tsconfig.empty.json"), r#"{"references": []}"#).unwrap();
+        let tasks = discover_tasks(p);
+        let cmd = |label: &str| {
+            tasks
+                .iter()
+                .find(|t| t.label == label)
+                .map(|t| t.command.clone())
+        };
+        assert_eq!(
+            cmd(&format!("tsc: build - {evil}")).as_deref(),
+            Some("tsc -p 'tsconfig$(touch${IFS}PWNED).json'")
+        );
+        assert_eq!(
+            cmd("tsc: build - tsconfig.json").as_deref(),
+            Some("tsc -b tsconfig.json")
+        );
+        assert_eq!(
+            cmd("tsc: build - tsconfig.empty.json").as_deref(),
+            Some("tsc -p tsconfig.empty.json")
         );
     }
 
