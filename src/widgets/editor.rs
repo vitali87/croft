@@ -17397,20 +17397,31 @@ fn quote_opens_string(before: &str, rest: &str, lang: Option<LangKind>) -> bool 
 fn rust_lifetime_at(before: &str) -> bool {
     let before = before.trim_end();
     match before.chars().next_back() {
-        Some('<' | '&' | '+') => true,
+        Some('<') => before[..before.len() - 1]
+            .chars()
+            .next_back()
+            .is_some_and(opens_generics_after),
+        Some('&' | '+') => true,
         Some(',') => inside_angle_brackets(before),
         _ => matches!(trailing_word(before), "break" | "continue" | "where"),
     }
 }
 
-/// Whether `s` ends inside an unclosed `<`, counting `->` and `=>` as
-/// arrows rather than closers.
+/// Whether a `<` right after `prev` opens generics (`foo<`, `impl<`,
+/// `Vec::<`) rather than comparing (`a < b`): a generic `<` sits right
+/// against a name or `::`.
+fn opens_generics_after(prev: char) -> bool {
+    prev.is_alphanumeric() || prev == '_' || prev == ':'
+}
+
+/// Whether `s` ends inside an unclosed generic `<`, counting `->` and `=>`
+/// as arrows rather than closers and a spaced-out `<` as a comparison.
 fn inside_angle_brackets(s: &str) -> bool {
     let mut depth = 0i32;
     let mut prev = ' ';
     for c in s.chars() {
         match c {
-            '<' => depth += 1,
+            '<' if opens_generics_after(prev) => depth += 1,
             '>' if prev != '-' && prev != '=' => depth = (depth - 1).max(0),
             _ => {}
         }
@@ -34843,9 +34854,6 @@ mod tests {
         }
     }
 
-    /// The line scan starts every line outside a string, so a quote typed in
-    /// a docstring body, a template literal or a block comment that an
-    /// earlier line opened still paired; the highlight pass knows (#844).
     /// #1163: in Rust, a `'` that starts a lifetime or a loop label gets no
     /// closing quote, so `fn foo<'a>` types as written.
     #[test]
@@ -34881,6 +34889,8 @@ mod tests {
             (Some(LangKind::Rust), "let c = |"),
             (Some(LangKind::Rust), "match c { 'a' => |"),
             (Some(LangKind::Rust), "let t = (Vec::<u8>::new(), |"),
+            (Some(LangKind::Rust), "if a < b { f(x, |"),
+            (Some(LangKind::Rust), "if c < |"),
             (Some(LangKind::Python), "x = a < |"),
             (Some(LangKind::JavaScript), "f(a & |"),
         ] {
@@ -34890,6 +34900,9 @@ mod tests {
         }
     }
 
+    /// The line scan starts every line outside a string, so a quote typed in
+    /// a docstring body, a template literal or a block comment that an
+    /// earlier line opened still paired; the highlight pass knows (#844).
     #[test]
     fn a_quote_in_a_string_or_comment_from_an_earlier_line_pairs_only_once_it_closes() {
         let typed_at_caret = |lang: LangKind, text: &str| {
