@@ -10746,6 +10746,67 @@ fn xlsx_grid_editing_saves_cells_and_holds_formulas_for_consent() {
     assert_eq!(ws3.cell((2u32, 3u32)).unwrap().value(), "8");
 }
 
+/// #1618: F2 is the spreadsheet "edit this cell" key, caret at the end, as
+/// docs/KEYBINDINGS.md says. Rename Symbol used to swallow it, so the next
+/// characters replaced the value instead of appending to it.
+#[test]
+fn f2_in_the_sheet_grid_edits_the_cell_with_the_caret_at_the_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("people.csv");
+    std::fs::write(&p, "id,name\n1,Smith\n2,Lee\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    app.handle_editor_key(key(KeyCode::Down, KeyModifiers::NONE));
+    app.handle_editor_key(key(KeyCode::Right, KeyModifiers::NONE));
+    app.handle_editor_key(key(KeyCode::F(2), KeyModifiers::NONE));
+    let editing = app.editor.sheet.as_ref().unwrap().editing.as_ref();
+    assert_eq!(
+        editing.map(|e| (e.value.as_str(), e.cursor)),
+        Some(("Lee", 3)),
+        "F2 opens the cell editor on the value, caret at the end"
+    );
+    for c in "son".chars() {
+        app.handle_editor_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    app.handle_editor_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    let view = app.editor.sheet.as_ref().unwrap();
+    assert_eq!(
+        view.sheets[0].cell(1, 1),
+        "Leeson",
+        "F2 appends, like Enter"
+    );
+    app.save();
+    assert_eq!(
+        std::fs::read_to_string(&p).unwrap(),
+        "id,name\n1,Smith\n2,Leeson\n"
+    );
+}
+
+/// #1618 negative: in a text buffer F2 is still Rename Symbol, and
+/// Ctrl+F2 in the grid still does not open the cell editor.
+#[test]
+fn f2_outside_the_grid_is_still_rename_symbol() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.txt", "Lee\n");
+    app.status.clear();
+    app.handle_editor_key(key(KeyCode::F(2), KeyModifiers::NONE));
+    assert!(
+        app.status == "No language server for this file" || app.status == "Preparing rename…",
+        "F2 went to Rename Symbol: {:?}",
+        app.status
+    );
+    assert_eq!(app.editor.lines[0], "Lee");
+
+    let p = tmp.path().join("people.csv");
+    std::fs::write(&p, "id,name\n2,Lee\n").unwrap();
+    app.editor.open(&p).unwrap();
+    app.handle_editor_key(key(KeyCode::F(2), KeyModifiers::CONTROL));
+    assert!(
+        app.editor.sheet.as_ref().unwrap().editing.is_none(),
+        "Ctrl+F2 is not the grid's edit key"
+    );
+}
+
 /// #1375 end-to-end: one cell typed into a fully quoted CSV and saved
 /// changes that line only, still fully quoted.
 #[test]
@@ -11255,6 +11316,83 @@ fn tree_context_menu_on_subfolder_offers_new_file_new_folder_then_cut_copy_renam
             "Delete"
         ],
     );
+}
+
+/// #1174: Cut then Paste with the selection still in the cut file's folder
+/// leaves the file alone and keeps the cut, so pasting on the folder it was
+/// meant for still moves it there.
+#[test]
+fn cut_then_paste_in_the_same_folder_leaves_the_file_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("notes.txt"), "notes\n").unwrap();
+    std::fs::create_dir(tmp.path().join("sub")).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Explorer);
+    app.focus_pane(Pane::Tree);
+    let select = |app: &mut App, name: &str| {
+        app.tree.selected = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.path.file_name().is_some_and(|f| f == name))
+            .unwrap_or_else(|| panic!("{name} in the tree"));
+    };
+    select(&mut app, "notes.txt");
+    let notes = app.tree.nodes[app.tree.selected].path.clone();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::CONTROL))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(notes.exists(), "the file keeps its name");
+    assert!(!notes.with_file_name("notes copy.txt").exists());
+    assert_eq!(app.status, "Already in this folder: nothing to move");
+    assert!(app.tree_clipboard.is_some(), "the cut is kept");
+
+    select(&mut app, "sub");
+    let sub = app.tree.nodes[app.tree.selected].path.clone();
+    app.handle_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(sub.join("notes.txt").exists(), "{}", app.status);
+    assert!(!notes.exists());
+    assert!(app.tree_clipboard.is_none());
+}
+
+/// Negative (#1174): a cut pasted into another folder still moves the
+/// file there, and a copy pasted into its own folder still makes
+/// "<name> copy", as before.
+#[test]
+fn cut_to_another_folder_moves_and_copy_in_place_still_duplicates() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("notes.txt"), "notes\n").unwrap();
+    std::fs::write(tmp.path().join("todo.txt"), "todo\n").unwrap();
+    std::fs::create_dir(tmp.path().join("sub")).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Explorer);
+    app.focus_pane(Pane::Tree);
+    let select = |app: &mut App, name: &str| {
+        app.tree.selected = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.path.file_name().is_some_and(|f| f == name))
+            .unwrap_or_else(|| panic!("{name} in the tree"));
+    };
+    select(&mut app, "notes.txt");
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::CONTROL))
+        .unwrap();
+    select(&mut app, "sub");
+    app.handle_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(tmp.path().join("sub/notes.txt").exists(), "{}", app.status);
+    assert!(!tmp.path().join("notes.txt").exists());
+    assert!(app.tree_clipboard.is_none(), "a done move clears the cut");
+    select(&mut app, "todo.txt");
+    app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(tmp.path().join("todo copy.txt").exists(), "{}", app.status);
+    assert!(tmp.path().join("todo.txt").exists());
 }
 
 #[test]
@@ -17220,6 +17358,42 @@ fn opening_a_config_file_keeps_the_active_tabs_unsaved_edits() {
         .expect("a.txt still has its tab");
     assert!(kept.dirty);
     assert_eq!(kept.lines, vec![String::from("unsaved")]);
+}
+
+/// #1617: Open Settings (JSON) on a fresh install creates a `config.json`
+/// with no settings in it. Seeding every default made each one a user
+/// setting, over an `extends` base and over later default changes.
+#[test]
+fn open_settings_json_seeds_a_config_with_no_settings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let path = tmp.path().join("user").join("config.json");
+    app.open_config_file_in_editor(path.clone(), ConfigFileSeed::Settings);
+    assert_eq!(app.editor.path.as_deref(), Some(path.as_path()));
+    let written = std::fs::read_to_string(&path).unwrap();
+    let doc: serde_json::Value =
+        serde_json::from_str(&crate::tasks::strip_jsonc(&written)).unwrap();
+    assert_eq!(doc, serde_json::json!({}), "{written}");
+    assert!(written.contains("docs/SETTINGS.md"), "{written}");
+    assert_eq!(
+        crate::prefs::Prefs::load(&path).unwrap(),
+        crate::prefs::Prefs::default()
+    );
+}
+
+/// #1617 negative: an existing `config.json` opens as it is.
+#[test]
+fn open_settings_json_leaves_an_existing_config_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, "{ \"vim_mode\": true }\n").unwrap();
+    app.open_config_file_in_editor(path.clone(), ConfigFileSeed::Settings);
+    assert_eq!(app.editor.path.as_deref(), Some(path.as_path()));
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "{ \"vim_mode\": true }\n"
+    );
 }
 
 #[test]
@@ -33670,6 +33844,53 @@ fn open_line_above_relocated_from_cmd_shift_o_to_cmd_shift_enter() {
     )));
 }
 
+/// #1181: Ctrl+/ in a file with no comment syntax says so, as the palette
+/// command does, instead of doing nothing silently; in a file croft has no
+/// grammar for but knows the comment of, it comments.
+#[test]
+fn ctrl_slash_reports_a_file_with_no_comment_and_comments_one_by_extension() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("notes.unknownext");
+    std::fs::write(&plain, "hello\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&plain).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "hello");
+    assert_eq!(
+        app.status,
+        "Toggle Line Comment: no comment for this language"
+    );
+    let kt = tmp.path().join("App.kt");
+    std::fs::write(&kt, "class App\n").unwrap();
+    app.editor.open_pinned(&kt).unwrap();
+    app.status.clear();
+    app.handle_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "// class App");
+    assert!(app.status.is_empty(), "{}", app.status);
+}
+
+/// #1181 negative: Ctrl+/ on a blank line of a language that has a comment
+/// does nothing, without claiming the language has no comment.
+#[test]
+fn ctrl_slash_on_a_blank_line_does_not_report_no_comment() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (name, text) in [("main.rs", "   \n"), ("index.html", "\n")] {
+        let path = tmp.path().join(name);
+        std::fs::write(&path, text).unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open_pinned(&path).unwrap();
+        app.focus_pane(Pane::Editor);
+        app.status.clear();
+        app.handle_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(app.editor.lines[0], text.trim_end_matches('\n'), "{name}");
+        assert!(app.status.is_empty(), "{name}: {}", app.status);
+    }
+}
+
 #[test]
 fn toggle_line_comment_key_is_cmd_or_ctrl_slash() {
     assert!(is_toggle_line_comment_key(key(
@@ -35363,6 +35584,54 @@ fn the_emmet_chord_expands_the_abbreviation_in_the_editor() {
         vec!["<ul>", "    <li></li>", "    <li></li>", "</ul>"]
     );
     assert_eq!(app.status, "Emmet: expanded abbreviation");
+}
+
+/// #1640: the climb-up `^` used to stop the scan, so only the part after it
+/// expanded and `header>nav>a*2^` stayed on the line as text.
+#[test]
+fn the_emmet_chord_expands_an_abbreviation_that_climbs_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("climb.html");
+    std::fs::write(&f, "header>nav>a*2^h1\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 17;
+    app.handle_editor_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(
+        app.editor.lines,
+        vec![
+            "<header>",
+            "    <nav>",
+            "        <a href=\"\"></a>",
+            "        <a href=\"\"></a>",
+            "    </nav>",
+            "    <h1></h1>",
+            "</header>",
+        ]
+    );
+    assert_eq!(app.status, "Emmet: expanded abbreviation");
+}
+
+/// #1640 negative: a caret in prose is left alone, with the usual status.
+#[test]
+fn the_emmet_chord_leaves_a_power_in_prose_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("page.html");
+    std::fs::write(&f, "<p>2^10\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 7;
+    app.handle_editor_key(key(
+        KeyCode::Char('e'),
+        KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(app.editor.lines, vec!["<p>2^10"]);
+    assert_eq!(app.status, "Emmet: no abbreviation at the cursor");
 }
 
 /// Silence would leave the user unable to tell "wrong language" from

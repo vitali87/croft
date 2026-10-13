@@ -43167,8 +43167,9 @@ impl App {
         }
         // Rename Symbol (F2) and Change All Occurrences (Cmd/Ctrl+F2) are only
         // meaningful on a text buffer, so they sit above the read-only diff /
-        // sheet / image guards below.
-        if is_rename_symbol_key(key) {
+        // sheet / image guards below. The sheet grid is editable and F2 is its
+        // own "edit this cell" key (#1618), so there F2 falls through to it.
+        if is_rename_symbol_key(key) && self.editor.sheet.is_none() {
             self.start_rename_symbol();
             return;
         }
@@ -43219,8 +43220,14 @@ impl App {
         // reachable from the Command Palette, which guarantees parity on
         // terminals that don't deliver the Alt+letter chords.
         if is_toggle_line_comment_key(key) {
-            if self.editor_is_text() {
-                self.editor.toggle_line_comment();
+            // The palette's message too: a key that does nothing because the
+            // language has no comment must say so (#1181); a blank line in
+            // one that has does nothing quietly.
+            if self.editor_is_text()
+                && !self.editor.toggle_line_comment()
+                && !self.editor.has_line_comment_syntax()
+            {
+                self.status = String::from("Toggle Line Comment: no comment for this language");
             }
             return;
         }
@@ -50691,7 +50698,7 @@ impl App {
             Cmd::MoveLineUp => self.editor.move_lines_up(),
             Cmd::MoveLineDown => self.editor.move_lines_down(),
             Cmd::ToggleLineComment => {
-                if !self.editor.toggle_line_comment() {
+                if !self.editor.toggle_line_comment() && !self.editor.has_line_comment_syntax() {
                     self.status = String::from("Toggle Line Comment: no comment for this language");
                 }
             }
@@ -51943,10 +51950,7 @@ impl App {
                 let _ = std::fs::create_dir_all(parent);
             }
             let contents = match seed {
-                ConfigFileSeed::Settings => {
-                    let prefs = crate::prefs::Prefs::load_or_default();
-                    serde_json::to_string_pretty(&prefs).unwrap_or_else(|_| String::from("{}\n"))
-                }
+                ConfigFileSeed::Settings => SETTINGS_TEMPLATE.to_string(),
                 ConfigFileSeed::SettingsLayer => SETTINGS_LAYER_TEMPLATE.to_string(),
                 ConfigFileSeed::Keybindings => crate::keymap::TEMPLATE.to_string(),
                 ConfigFileSeed::Snippets => crate::snippets::TEMPLATE.to_string(),
@@ -66706,8 +66710,10 @@ impl App {
             self.status = String::from("Explorer clipboard is empty");
             return;
         };
-        self.move_or_copy_in_explorer(&dest_dir, &clip.paths, clip.mode);
-        if matches!(clip.mode, ExplorerClipMode::Cut) {
+        let moved = self.move_or_copy_in_explorer(&dest_dir, &clip.paths, clip.mode);
+        // A cut pasted back where it already is moved nothing, so it stays
+        // on the clipboard for the paste into the folder it was meant for.
+        if moved && matches!(clip.mode, ExplorerClipMode::Cut) {
             self.tree_clipboard = None;
         }
     }
@@ -66720,10 +66726,22 @@ impl App {
         dest_dir: &Path,
         paths: &[PathBuf],
         mode: ExplorerClipMode,
-    ) {
+    ) -> bool {
         if matches!(mode, ExplorerClipMode::Copy) {
             let _ = self.apply_paste_or_drop(dest_dir, paths, mode);
-            return;
+            return true;
+        }
+        // An item already in `dest_dir` stays as it is: moving it there is
+        // no move, and a fresh name for it renamed the file to "<name> copy"
+        // on disk, retargeting its tabs and the servers' imports (#1174).
+        let paths: Vec<PathBuf> = paths
+            .iter()
+            .filter(|p| !crate::widgets::file_tree::is_directly_in(dest_dir, p))
+            .cloned()
+            .collect();
+        if paths.is_empty() {
+            self.status = String::from("Already in this folder: nothing to move");
+            return false;
         }
         let renames = paths
             .iter()
@@ -66735,9 +66753,10 @@ impl App {
             .collect();
         let op = FileMove::Paste {
             dest_dir: dest_dir.to_path_buf(),
-            paths: paths.to_vec(),
+            paths,
         };
         self.start_file_move(op, renames);
+        true
     }
 
     /// Ask the servers about `renames`, then run `op` once they answer (or
@@ -69044,6 +69063,17 @@ const SETTINGS_LAYER_TEMPLATE: &str = r#"{
   // blocks). Workspace files may set appearance and editor/terminal
   // behavior keys only; trust-related settings are user-config only and
   // warn in OUTPUT · Settings.
+}
+"#;
+
+/// What Open Settings (JSON) creates when there is no `config.json` yet: an
+/// object with no keys, like VS Code's settings.json. Seeding every default
+/// made each one a user setting, over an `extends` base and over defaults a
+/// later release changes (#1617).
+const SETTINGS_TEMPLATE: &str = r#"{
+  // Your croft settings: add only the keys you want to change, and every
+  // other setting keeps its default. docs/SETTINGS.md lists the keys and
+  // explains "extends" and platform blocks.
 }
 "#;
 
