@@ -25,6 +25,10 @@ Usage:
                                          reads the tags already released, one
                                          per line on stdin, and prints the notes
                                          of every version since the newest one
+  release.py commit <version>            the commit on HEAD's first-parent chain
+                                         that set HEAD's version, <version>:
+                                         what publish-crate.yml publishes and
+                                         tags
 """
 
 from __future__ import annotations
@@ -234,6 +238,41 @@ def release_notes(root, version: str, released: list[str]) -> str:
     return "\n".join(sections)
 
 
+def setting_commit(version: str, cwd=None) -> str:
+    """The commit that set Cargo.toml's version to `version`, which HEAD carries.
+
+    That is the newest commit on HEAD's first-parent chain whose first parent
+    carries another version: a later merge still carries the version but its
+    code is not that version's yet. publish-crate.yml publishes and tags this
+    commit, and tag.yml tags a push only when its commit and first parent
+    differ in version, the same comparison, so the two never name different
+    commits. Versions are compared rather than diff lines matched: `git log -G`
+    also picks a later commit that only rewrites the version line, or a
+    dependency's `version =` line that happens to hold the same number.
+    """
+    if not VERSION.fullmatch(version):
+        raise ReleaseError(f"refusing malformed version {version!r}")
+    chain = git("rev-list", "--first-parent", "HEAD", cwd=cwd).split()
+
+    def version_at(commit: str) -> str:
+        return package_version(git("show", f"{commit}:Cargo.toml", cwd=cwd))
+
+    head = version_at(chain[0])
+    if head != version:
+        raise ReleaseError(f"HEAD carries version {head}, not {version}")
+    for commit, parent in zip(chain, chain[1:]):
+        if version_at(parent) != version:
+            return commit
+    # The walk reached a commit with no parent. In a shallow clone that is
+    # only where the history was cut off, not where the version was set.
+    if git("rev-parse", "--is-shallow-repository", cwd=cwd).strip() == "true":
+        raise ReleaseError(
+            f"the clone is shallow and every commit in it carries {version}; "
+            "fetch the full history to find the commit that set it"
+        )
+    return chain[-1]
+
+
 def check(base: str, head: str, cwd=None) -> list[str]:
     """The PR gate. Returns its errors, each in GitHub's `::error` form.
 
@@ -325,10 +364,11 @@ def main(argv: list[str]) -> int:
         return run_command(argv)
     except subprocess.CalledProcessError as err:
         # A ref the clone lacks (a shallow checkout, a mistyped base): one
-        # line CI shows as an error, not a traceback.
+        # line CI shows as an error, not a traceback. On stderr, so a step
+        # that captures stdout (`cut`'s version, `commit`'s hash) still shows it.
         command = " ".join(err.cmd)
         why = (err.stderr or "").strip().splitlines()
-        print(f"::error::{command} failed: {why[0] if why else f'exit {err.returncode}'}")
+        print(f"::error::{command} failed: {why[0] if why else f'exit {err.returncode}'}", file=sys.stderr)
         return 1
 
 
@@ -354,6 +394,14 @@ def run_command(argv: list[str]) -> int:
             print(f"::error::{err}", file=sys.stderr)
             return 1
         sys.stdout.write(body)
+        return 0
+    if len(argv) == 2 and argv[0] == "commit":
+        try:
+            commit = setting_commit(argv[1])
+        except ReleaseError as err:
+            print(f"::error::{err}", file=sys.stderr)
+            return 1
+        print(commit)
         return 0
     print(__doc__, file=sys.stderr)
     return 2

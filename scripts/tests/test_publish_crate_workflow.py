@@ -11,7 +11,13 @@ and the GitHub releases hold the same versions (#1579).
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -85,9 +91,10 @@ class WorkflowContract(unittest.TestCase):
         # crates.io that the tag, and the binaries built from it, do not
         # have, and the tag step would then refuse the mismatch after the
         # upload.
+        # scripts/tests/test_release.py runs the lookup step itself.
         _, publish = re.split(r"(?m)^  publish:$", self.text)
         self.assertIn("fetch-depth: 0", publish)
-        lookup = publish.index("git log --first-parent -1 --format=%H -G")
+        lookup = publish.index('python3 scripts/release.py commit "$VERSION"')
         checkout = publish.index('git checkout -q --detach "$commit"')
         upload = publish.index("run: cargo publish --locked")
         self.assertLess(lookup, checkout)
@@ -124,6 +131,151 @@ class WorkflowContract(unittest.TestCase):
         # ref instead and must accept a dispatch.
         self.assertIn("gh workflow run release.yml --ref", self.text)
         self.assertRegex(RELEASE.read_text(), r"(?m)^\s*workflow_dispatch:")
+
+
+# Stands in for the runner's `gh` in tag.yml's step: serves Cargo.toml and
+# first parents per commit and the tag refs from a JSON state file, and
+# records a created tag there. It answers only the calls the step makes, with
+# the --jq each one names, so a changed call fails here rather than passing.
+FAKE_GH = """\
+import json, os, sys
+
+state_path = os.environ["FAKE_GH_STATE"]
+with open(state_path) as f:
+    state = json.load(f)
+args = sys.argv[1:]
+assert args[0] == "api", args
+endpoint, fields, jq, i = None, {}, None, 1
+while i < len(args):
+    if args[i] == "-H":
+        i += 2
+    elif args[i] == "-f":
+        key, value = args[i + 1].split("=", 1)
+        fields[key] = value
+        i += 2
+    elif args[i] == "--jq":
+        jq = args[i + 1]
+        i += 2
+    else:
+        endpoint = args[i]
+        i += 1
+prefix = "repos/" + os.environ["GITHUB_REPOSITORY"] + "/"
+assert endpoint.startswith(prefix), endpoint
+path = endpoint[len(prefix):]
+if path.startswith("contents/Cargo.toml?ref="):
+    sys.stdout.write(state["tomls"][path.split("=", 1)[1]])
+elif path.startswith("git/commits/"):
+    assert jq == '.parents[0].sha // ""', jq
+    parents = state["parents"][path.rsplit("/", 1)[1]]
+    print(parents[0] if parents else "")
+elif path.startswith("git/ref/tags/"):
+    assert jq == ".object.sha", jq
+    tag = path.rsplit("/", 1)[1]
+    if tag not in state["tags"]:
+        sys.exit("gh: Not Found (HTTP 404)")
+    print(state["tags"][tag])
+elif path == "git/refs":
+    state["tags"][fields["ref"].removeprefix("refs/tags/")] = fields["sha"]
+    with open(state_path, "w") as f:
+        json.dump(state, f)
+else:
+    sys.exit("unexpected call: " + endpoint)
+"""
+
+TOML = '[package]\nname = "croft-software"\nversion = "{}"\n'
+
+
+def tag_step() -> str:
+    """tag.yml's one `run:` block, dedented."""
+    lines = TAG.read_text().splitlines()
+    at = next(i for i, line in enumerate(lines) if line.strip() == "run: |")
+    indent = len(lines[at]) - len(lines[at].lstrip())
+    body = []
+    for line in lines[at + 1 :]:
+        if line.strip() and len(line) - len(line.lstrip()) <= indent:
+            break
+        body.append(line)
+    cut = min(len(line) - len(line.lstrip()) for line in body if line.strip())
+    return "\n".join(line[cut:] for line in body)
+
+
+@unittest.skipUnless(shutil.which("bash"), "needs bash")
+class TagRun(unittest.TestCase):
+    """tag.yml's step, run against a fake `gh`. It tags only the commit that
+    set a version, the one publish-crate.yml publishes (`release.py commit`),
+    so a later merge whose run executes first cannot take the tag and make
+    publish-crate.yml refuse it after the upload."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        bin_dir = self.dir / "bin"
+        bin_dir.mkdir()
+        gh = bin_dir / "gh"
+        gh.write_text(f"#!{sys.executable}\n{FAKE_GH}")
+        gh.chmod(0o755)
+        self.path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+        self.state = self.dir / "state.json"
+        # main: B (0.2.11) <- R, the release commit (0.2.12) <- M, a merge.
+        self.write_state(
+            {
+                "tomls": {"B": TOML.format("0.2.11"), "R": TOML.format("0.2.12"), "M": TOML.format("0.2.12")},
+                "parents": {"B": [], "R": ["B"], "M": ["R", "pr"]},
+                "tags": {"v0.2.11": "B"},
+            }
+        )
+
+    def write_state(self, state):
+        self.state.write_text(json.dumps(state))
+
+    def tags(self):
+        return json.loads(self.state.read_text())["tags"]
+
+    def run_for(self, sha: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", "-c", tag_step()],
+            env={
+                **os.environ,
+                "PATH": self.path,
+                "FAKE_GH_STATE": str(self.state),
+                "GITHUB_REPOSITORY": "vitali87/croft",
+                "GITHUB_SHA": sha,
+                "GH_TOKEN": "unused",
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_the_release_commit_is_tagged(self):
+        out = self.run_for("R")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.tags(), {"v0.2.11": "B", "v0.2.12": "R"})
+
+    def test_a_later_merge_whose_run_executes_first_does_not_take_the_tag(self):
+        out = self.run_for("M")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("did not set version 0.2.12", out.stdout)
+        self.assertEqual(self.tags(), {"v0.2.11": "B"})
+        out = self.run_for("R")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.tags(), {"v0.2.11": "B", "v0.2.12": "R"})
+
+    def test_an_existing_tag_is_never_moved(self):
+        self.write_state({**json.loads(self.state.read_text()), "tags": {"v0.2.12": "elsewhere"}})
+        out = self.run_for("R")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("never moved", out.stdout)
+        self.assertEqual(self.tags(), {"v0.2.12": "elsewhere"})
+
+    def test_a_failed_parent_lookup_stops_rather_than_tags(self):
+        # Reading no version for the parent must not pass for "it differs".
+        state = json.loads(self.state.read_text())
+        del state["tomls"]["R"]
+        self.write_state(state)
+        out = self.run_for("M")
+        self.assertNotEqual(out.returncode, 0, out.stdout)
+        self.assertEqual(self.tags(), {"v0.2.11": "B"})
 
 
 if __name__ == "__main__":

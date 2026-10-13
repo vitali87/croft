@@ -132,30 +132,18 @@ jobs:
         # Not this run's commit. That can be a merge that landed after the
         # version was cut and before the next one (a forced run, or the run
         # that replaced the release commit's own), and its code is not this
-        # version yet. tag.yml tagged the release commit, so crates.io, the
-        # tag and the binaries release.yml builds from it are one source.
+        # version yet. `release.py commit` walks main's first-parent chain
+        # back to the commit whose first parent carries another version, and
+        # tag.yml tags a push only when its commit is that one, by the same
+        # comparison, so crates.io, the tag and the binaries release.yml
+        # builds from it are one source. It refuses a malformed version and
+        # a head that does not carry this one.
         id: source
         env:
           VERSION: ${{ needs.decide.outputs.version }}
         run: |
           set -euo pipefail
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::refusing malformed version '$VERSION'"
-            exit 1
-          fi
-          commit="$(git log --first-parent -1 --format=%H -G "^version *= *\"${VERSION//./\\.}\"" -- Cargo.toml)"
-          if [ -z "$commit" ]; then
-            echo "::error::could not find the commit that set version $VERSION"
-            exit 1
-          fi
-          # -G also matches the commit that REPLACED a version line. For the
-          # head's version no later commit has, but say so if one ever does
-          # rather than publish another version's code.
-          found="$(git show "$commit:Cargo.toml" | sed -n 's/^version *= *"\([0-9.]*\)".*/\1/p' | head -n1)"
-          if [ "$found" != "$VERSION" ]; then
-            echo "::error::$commit carries version $found, not $VERSION"
-            exit 1
-          fi
+          commit="$(python3 scripts/release.py commit "$VERSION")"
           git checkout -q --detach "$commit"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
           echo "Publishing $VERSION from $commit"

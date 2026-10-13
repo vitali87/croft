@@ -14,10 +14,17 @@ name: tag
 # too, every version got a GitHub release and only every fiftieth reached
 # crates.io.
 #
-# Any other push to main (the merge itself, or one that ships nothing) still
-# carries the previous version, and that version's tag already exists on the
-# commit that introduced it. Moving it would change what a published release
-# points at, so such a push is reported and left alone.
+# Only the commit that set a version is tagged: the one whose first parent
+# carries another version. Any other push to main (the merge itself, or one
+# that ships nothing) still carries a version an earlier commit set, and its
+# code is not that version's. publish-crate.yml publishes the commit that set
+# the version, found by the same comparison (`scripts/release.py commit`),
+# and refuses a tag on any other, so a later merge whose run executes before
+# the release commit's own (or after that one failed) is reported and left
+# untagged rather than taking the tag. A release commit whose run failed is
+# tagged by re-running that run, or by publish-crate.yml when it publishes
+# the version. An existing tag is never moved: that would change what a
+# published release points at.
 
 on:
   push:
@@ -55,16 +62,29 @@ jobs:
         run: |
           set -euo pipefail
           api() { gh api -H "X-GitHub-Api-Version: 2026-03-10" "$@"; }
-          version="$(api -H "Accept: application/vnd.github.raw+json" \
-            "repos/$GITHUB_REPOSITORY/contents/Cargo.toml?ref=$GITHUB_SHA" \
-            | sed -n 's/^version *= *"\([0-9.]*\)".*/\1/p' | head -n1)"
+          version_at() {
+            api -H "Accept: application/vnd.github.raw+json" \
+              "repos/$GITHUB_REPOSITORY/contents/Cargo.toml?ref=$1" \
+              | sed -n 's/^version *= *"\([0-9.]*\)".*/\1/p' | head -n1
+          }
+          version="$(version_at "$GITHUB_SHA")"
           if [ -z "$version" ]; then
             echo "::error file=Cargo.toml::could not read the package version"
             exit 1
           fi
           tag="v$version"
+          # The first parent is main as it was before this push. If it
+          # already carries the version, this commit did not set it.
+          parent="$(api "repos/$GITHUB_REPOSITORY/git/commits/$GITHUB_SHA" --jq '.parents[0].sha // ""')"
+          if [ -n "$parent" ]; then
+            before="$(version_at "$parent")"
+            if [ "$before" = "$version" ]; then
+              echo "::notice::$GITHUB_SHA did not set version $version (its first parent $parent carries it too), so it is not tagged $tag; the commit that set it is."
+              exit 0
+            fi
+          fi
           if existing="$(api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha 2>/dev/null)"; then
-            echo "::notice::$tag already exists ($existing); this merge did not bump the version, so there is no new release to tag."
+            echo "::notice::$tag already exists ($existing), and an existing tag is never moved."
             exit 0
           fi
           api "repos/$GITHUB_REPOSITORY/git/refs" \
