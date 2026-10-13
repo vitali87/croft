@@ -1,0 +1,1 @@
+fix: A setting croft does not know, in `config.json` or any other settings layer, is no longer dropped without a word. OUTPUT > Settings now warns about it and names the croft setting to use instead: `"editor.formatOnSave"` points at `format_on_save`, and the typo `"autosave"` asks "did you mean `auto_save`?".
