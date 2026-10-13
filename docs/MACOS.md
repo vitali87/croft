@@ -79,7 +79,7 @@ The launcher is an AppleScript applet rather than a shell script for this reason
 
 ## Inline previews
 
-iTerm2 renders inline image, PDF, and spreadsheet previews via OSC 1337; kitty and Ghostty use the Kitty graphics protocol; sixel-capable terminals (detected at startup via a DA1 probe) use DEC sixel. Other terminals fall back to a metadata header line.
+iTerm2 renders inline image, PDF, and spreadsheet previews via OSC 1337; kitty and Ghostty use the Kitty graphics protocol; sixel-capable terminals (detected at startup via a DA1 probe) use DEC sixel. Other terminals draw image and PDF previews with half-block characters, two pixels a cell, under a metadata header line.
 
 Multi-page PDF preview (with clickable links, via `pdftohtml`) needs poppler:
 

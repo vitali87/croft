@@ -44262,6 +44262,41 @@ fn collab_caret_label_fade_signals_one_redraw_per_transition() {
     assert!(!app.collab_labels_dirty(), "stays hidden: quiet");
 }
 
+/// #1591: with no inline-image protocol (tmux, plain SSH) an image tab
+/// draws its picture in half blocks; a terminal that shows inline images
+/// gets the empty canvas it paints over, as before.
+#[test]
+fn an_image_tab_draws_half_blocks_without_an_inline_image_protocol() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("shot.png");
+    let mut png = Vec::new();
+    image::RgbaImage::from_pixel(6, 6, image::Rgba([10, 200, 30, 255]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("encode test png");
+    std::fs::write(&path, &png).unwrap();
+    let half_blocks = |protocol| {
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.inline_protocol = protocol;
+        app.editor.open(&path).unwrap();
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        buf.content()
+            .iter()
+            .filter(|c| c.symbol() == "\u{2580}" && c.fg == Color::Rgb(10, 200, 30))
+            .count()
+    };
+    use crate::iterm2_inline::InlineImageProtocol;
+    assert_eq!(
+        half_blocks(InlineImageProtocol::None),
+        18,
+        "6×6 pixels, 6×3 cells"
+    );
+    assert_eq!(half_blocks(InlineImageProtocol::Kitty), 0);
+    assert_eq!(half_blocks(InlineImageProtocol::ITerm2), 0);
+}
+
 /// A right-click menu opened over an image tab was painted *under* the
 /// picture: on Kitty the editor preview was placed at the default z=0, which
 /// the spec puts above text. Placing it below text AND below non-default
