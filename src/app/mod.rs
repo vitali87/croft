@@ -24295,6 +24295,8 @@ impl App {
         // The build this armed for is being dropped (#373).
         self.disarm_failure_breakpoint();
         self.pending_test_debug = None;
+        // Its names belong to the old project (#1535).
+        self.last_test_run = None;
         if self.sidebar_view == SidebarView::Testing {
             self.discover_tests();
         }
@@ -69107,7 +69109,10 @@ fn file_test_suite(
             })
         }
         Runner::Cargo => {
-            let in_src = rel_str.strip_prefix("src/")?.strip_suffix(".rs")?;
+            // Relative to the package the file belongs to: in a workspace,
+            // `crates/foo/src/parse.rs` is module `parse`.
+            let in_package = cargo_package_relative(root, path)?;
+            let in_src = in_package.strip_prefix("src/")?.strip_suffix(".rs")?;
             let module = in_src.strip_suffix("/mod").unwrap_or(in_src);
             // A crate root's tests have no module prefix to filter on: a
             // `tests::` filter is a substring, and would sweep every
@@ -69120,6 +69125,30 @@ fn file_test_suite(
         }
         Runner::Vitest | Runner::Jest => None,
     }
+}
+
+/// `path` relative to the nearest package directory above it, up to
+/// `root`: the closest ancestor holding a `Cargo.toml` with the file under
+/// its `src/`, or `root` itself.
+fn cargo_package_relative(root: &Path, path: &Path) -> Option<String> {
+    let rel_to = |dir: &Path| {
+        path.strip_prefix(dir)
+            .ok()
+            .and_then(Path::to_str)
+            .map(|s| s.replace('\\', "/"))
+    };
+    for dir in path.ancestors().skip(1) {
+        if dir == root || !dir.starts_with(root) {
+            break;
+        }
+        if let Some(rel) = rel_to(dir)
+            && rel.starts_with("src/")
+            && dir.join("Cargo.toml").is_file()
+        {
+            return Some(rel);
+        }
+    }
+    rel_to(root)
 }
 
 /// Returns true if the given key event should trigger "Save".

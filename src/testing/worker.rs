@@ -1426,9 +1426,41 @@ fn run_many(root: &Path, tx: &EpochTx, names: &[String]) {
     };
     let mut ok = true;
     for name in names {
-        ok &= run_one_case(root, tx, runner, name);
+        ok &= run_one_case_seen(root, tx, runner, name);
     }
     tx.send(TestResponse::Finished { ok: Some(ok) });
+}
+
+/// [`run_one_case`], passed only when the runner also reported a result
+/// for `name`: a test renamed since discovery matches nothing, and a
+/// name-filtered runner exits cleanly having run zero tests.
+fn run_one_case_seen(root: &Path, tx: &EpochTx, runner: Runner, name: &str) -> bool {
+    let (case_tx, case_rx) = std::sync::mpsc::channel::<(u64, TestResponse)>();
+    std::thread::scope(|s| {
+        let forward = s.spawn(|| {
+            let mut seen = false;
+            for (epoch, resp) in case_rx {
+                if let TestResponse::Case(case) = &resp {
+                    seen |= case.name == name;
+                }
+                let _ = tx.tx.send((epoch, resp));
+            }
+            seen
+        });
+        let passed = {
+            let etx = EpochTx {
+                tx: &case_tx,
+                epoch: tx.epoch,
+                codeql: tx.codeql,
+                control: tx.control,
+                request: tx.request,
+            };
+            run_one_case(root, &etx, runner, name)
+        };
+        drop(case_tx);
+        let seen = forward.join().unwrap_or(false);
+        passed && seen
+    })
 }
 
 /// One test by its exact name under `runner`, its result streamed; true
@@ -2534,7 +2566,7 @@ mod tests {
         fake_venv(
             root,
             ".venv",
-            "echo \"$*\" >> \"$0.log\"\ncase \"$*\" in *test_b*) exit 1;; esac\nexit 0",
+            "echo \"$*\" >> \"$0.log\"\ncase \"$*\" in *test_b*) exit 1;; *test_gone*) exit 0;; esac\nfor a; do last=$a; done\necho \"$last PASSED\"\nexit 0",
         );
         assert_eq!(
             ran(&["t.py::test_a", "t.py::test_b", "t.py::test_c"]),
@@ -2547,6 +2579,11 @@ mod tests {
             ran(&["t.py::test_a", "t.py::test_c"]),
             (2, vec![Some(true)]),
             "every one passing is a passed run"
+        );
+        assert_eq!(
+            ran(&["t.py::test_a", "t.py::test_gone"]),
+            (2, vec![Some(false)]),
+            "a name the runner reported no result for, though it exited 0, fails the run"
         );
     }
 

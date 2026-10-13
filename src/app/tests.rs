@@ -43191,6 +43191,44 @@ fn file_test_suite_names_a_file_s_tests_per_runner() {
     );
 }
 
+/// #1535: in a Cargo workspace a member's module is named from its own
+/// package, not the workspace root.
+#[test]
+fn file_test_suite_names_a_workspace_member_s_module() {
+    use crate::testing::worker::Runner;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let member = root.join("crates/foo");
+    std::fs::create_dir_all(member.join("src/a")).unwrap();
+    std::fs::write(member.join("Cargo.toml"), "[package]\nname = \"foo\"\n").unwrap();
+    let at = |p: &str| super::file_test_suite(Runner::Cargo, root, &root.join(p));
+    assert_eq!(at("crates/foo/src/parser.rs").as_deref(), Some("parser"));
+    assert_eq!(at("crates/foo/src/a/b.rs").as_deref(), Some("a::b"));
+    assert_eq!(at("crates/foo/src/lib.rs"), None, "a member's crate root");
+    assert_eq!(
+        at("crates/bar/src/x.rs"),
+        None,
+        "no package holds it, so it is not under the root's src/"
+    );
+}
+
+/// #1535 negative: switching the workspace folder forgets the last run,
+/// whose names belong to the old project.
+#[test]
+fn rebinding_the_test_root_forgets_the_last_run() {
+    use crate::testing::model::TestStatus;
+    let (_tmp, mut app) = testing_app(&[("parse::a", TestStatus::NotRun)]);
+    app.run_suite(String::from("parse"));
+    assert_eq!(app.last_test_run, Some(LastTestRun::Suite("parse".into())));
+    let other = tempfile::tempdir().unwrap();
+
+    app.rebind_test_root(other.path().to_path_buf());
+
+    assert_eq!(app.last_test_run, None);
+    app.run_command(crate::widgets::command_palette::Command::TestingRerunLast);
+    assert_eq!(app.status, "Rerun Last Run: no test has run yet");
+}
+
 /// #1535: the four everyday Testing commands are in the palette.
 #[test]
 fn the_everyday_testing_commands_are_in_the_palette() {
