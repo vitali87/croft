@@ -3351,6 +3351,9 @@ pub struct App {
     /// The workspace root the Testing panel and worker are bound to —
     /// follows the focused file's folder like the SCM surfaces (#151).
     active_test_root: PathBuf,
+    /// The last `followed_test_root` answer and the workspace folder and
+    /// focused file it was for (#1520).
+    test_root_follow: Option<((PathBuf, Option<PathBuf>), PathBuf)>,
     /// Folder set from an explicitly opened `.code-workspace` (#163):
     /// consumed by `change_workspace_root` INSTEAD of the automatic
     /// per-primary restore, so the file defines the arrangement exactly.
@@ -5961,6 +5964,7 @@ impl App {
             scm_pin: None,
             scm_follow_root: root.clone(),
             active_test_root: root.clone(),
+            test_root_follow: None,
             pending_workspace_folders: None,
             git_head_oids: std::collections::BTreeMap::new(),
             git,
@@ -8004,8 +8008,9 @@ impl App {
         if active != self.active_scm_root {
             self.seed_active_scm(active);
         }
-        if follow != self.active_test_root {
-            self.rebind_test_root(follow);
+        let test_root = self.followed_test_root(follow);
+        if test_root != self.active_test_root {
+            self.rebind_test_root(test_root);
         }
         // Ship any refresh the debounce window coalesced once the gap clears,
         // so the trailing edge of an edit burst lands without another FS event.
@@ -8972,6 +8977,22 @@ impl App {
     /// The workspace root the focus-following surfaces resolve against:
     /// the root owning the focused editor's file, else the primary
     /// (#149 git, #151 testing/tasks/run).
+    /// The folder the Testing view follows for workspace folder `root`
+    /// (#1520): `root`, or in a monorepo whose root no runner claims, the
+    /// package of the focused file that one does. Resolved again only when
+    /// the folder or the focused file changes, since it reads manifests.
+    fn followed_test_root(&mut self, root: PathBuf) -> PathBuf {
+        let key = (root, self.editor.path.clone());
+        if let Some((k, v)) = &self.test_root_follow
+            && *k == key
+        {
+            return v.clone();
+        }
+        let found = crate::testing::registry::test_root_for(&key.0, key.1.as_deref());
+        self.test_root_follow = Some((key, found.clone()));
+        found
+    }
+
     fn active_workspace_root(&self) -> PathBuf {
         self.editor
             .path

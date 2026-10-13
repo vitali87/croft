@@ -81542,3 +81542,53 @@ fn go_and_lint_rows_reach_problems_only_for_real_files() {
         ]
     );
 }
+
+/// #1520: opened at a monorepo root whose packages each declare their own
+/// vitest, the Testing view runs in the focused file's package instead of
+/// reporting no runner, and follows the focus to another package.
+#[test]
+fn the_testing_view_follows_the_focused_package_in_a_monorepo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"vmono","private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    for (name, marker) in [("math", "vitest.config.ts"), ("web", "jest.config.js")] {
+        let pkg = root.join("packages").join(name);
+        std::fs::create_dir_all(pkg.join("src")).unwrap();
+        std::fs::write(pkg.join(marker), "export default {};\n").unwrap();
+        std::fs::write(pkg.join("src/a.test.ts"), "test('a', () => {});\n").unwrap();
+    }
+    let mut app = App::new(root.clone()).unwrap();
+    app.drain_git_responses();
+    assert_eq!(app.active_test_root, root.join("packages/math"));
+    assert!(app.testing_runner_available(), "{}", app.status);
+
+    app.editor
+        .open_pinned(&root.join("packages/web/src/a.test.ts"))
+        .unwrap();
+    app.drain_git_responses();
+    assert_eq!(app.active_test_root, root.join("packages/web"));
+    assert_eq!(app.test_worker.root(), root.join("packages/web"));
+}
+
+/// #1520, negative: a folder with no runner anywhere keeps its own root and
+/// still says no runner was detected.
+#[test]
+fn a_folder_with_no_runner_keeps_its_root_and_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("packages/docs")).unwrap();
+    std::fs::write(
+        root.join("packages/docs/package.json"),
+        r#"{"name":"docs"}"#,
+    )
+    .unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.drain_git_responses();
+    assert_eq!(app.active_test_root, root);
+    assert!(!app.testing_runner_available());
+    assert_eq!(app.status, crate::testing::NO_RUNNER_STATUS);
+}
