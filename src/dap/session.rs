@@ -1219,6 +1219,24 @@ impl DapSession {
         Ok(session)
     }
 
+    /// Attach to a headless delve that already serves DAP at `host:port`
+    /// (#1418, the Go extension's "Connect to server"): no dlv is started,
+    /// `initialize` and the `mode: "remote"` attach go straight to the
+    /// socket, and stopping disconnects without ending the remote program.
+    pub fn attach_delve_server(
+        host: &str,
+        port: u16,
+        attach_request: Value,
+        breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
+    ) -> Result<DapSession> {
+        let transport = DapTransport::connect_tcp(host, port)?;
+        transport.send(initialize_request())?;
+        transport.send(attach_request)?;
+        let mut session = Self::new_with_transport(transport, breakpoints, None);
+        session.attached = true;
+        Ok(session)
+    }
+
     /// Assemble a fresh session around its (parent) `transport`. `js_server` is
     /// set only for vscode-js-debug, marking the session multi-session and
     /// carrying the address its child connection reuses.
@@ -2050,7 +2068,7 @@ fn with_run_to(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     /// #264: an adapter that refuses `launch` (delve rejecting a Go too old
     /// for it, with its real payload) ends the session with the reason, on
     /// the console and in `launch_error`, instead of leaving it Initializing.
@@ -4197,5 +4215,59 @@ def stopped():"#,
             std::thread::sleep(std::time::Duration::from_millis(300));
             assert!(leftovers().is_empty(), "left behind: {:?}", leftovers());
         }
+    }
+
+    /// The first `n` DAP messages a client sends to a socket listening on a
+    /// free port (#1418): a stand-in for `dlv --headless --listen`.
+    pub(crate) fn headless_delve(n: usize) -> (u16, std::thread::JoinHandle<Vec<Value>>) {
+        use std::io::{BufRead, Read};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut out = Vec::new();
+            while out.len() < n {
+                let mut len = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        return out;
+                    }
+                    if let Some(v) = line.trim().strip_prefix("Content-Length:") {
+                        len = v.trim().parse().unwrap();
+                    }
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                }
+                let mut body = vec![0; len];
+                reader.read_exact(&mut body).unwrap();
+                out.push(serde_json::from_slice(&body).unwrap());
+            }
+            out
+        });
+        (port, handle)
+    }
+
+    /// #1418: a remote Go attach connects to the headless delve's own port
+    /// and sends it `initialize` and the `mode: "remote"` attach; no dlv is
+    /// started, and the session is an attach (stopping leaves the program
+    /// running).
+    #[test]
+    fn attach_delve_server_talks_to_the_headless_delve_directly() {
+        let (port, server) = headless_delve(2);
+        let attach = json!({"type": "request", "command": "attach",
+            "arguments": {"mode": "remote"}});
+        let session = DapSession::attach_delve_server("127.0.0.1", port, attach, BTreeMap::new())
+            .expect("connects");
+        let got = server.join().unwrap();
+        assert_eq!(got[0]["command"], "initialize");
+        assert_eq!(got[1]["command"], "attach");
+        assert_eq!(got[1]["arguments"]["mode"], "remote");
+        assert!(session.attached);
     }
 }

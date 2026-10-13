@@ -1,0 +1,1 @@
+fix: Go: a "Connect to server" configuration (`"request": "attach"`, `"mode": "remote"`, `"port"` and optional `"host"`) now connects to that headless delve (`dlv --headless --listen`, in Docker or on another host) instead of being refused for lacking a `processId`; stopping disconnects and leaves the remote program running.
