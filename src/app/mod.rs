@@ -32348,7 +32348,10 @@ impl App {
                     &node,
                     &server,
                     &cwd,
-                    configs::js_request(&rc),
+                    configs::with_workspace_folder(
+                        configs::js_request(&rc),
+                        &self.active_workspace_root(),
+                    ),
                     breakpoints,
                 )
             }

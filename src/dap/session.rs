@@ -347,6 +347,10 @@ pub fn js_launch_request(program: &Path, cwd: &Path, stop_on_entry: bool) -> Val
             "request": "launch",
             "program": program.to_string_lossy(),
             "cwd": cwd.to_string_lossy(),
+            // js-debug resolves its `${workspaceFolder}` defaults (rootPath,
+            // resolveSourceMapLocations) against this, as VS Code sends it
+            // (#1414); `cwd` is the file's workspace root here.
+            "__workspaceFolder": cwd.to_string_lossy(),
             "console": "internalConsole",
             "sourceMaps": true,
             "stopOnEntry": stop_on_entry
@@ -2725,6 +2729,8 @@ while True:
         assert_eq!(req["arguments"]["request"], "launch");
         assert_eq!(req["arguments"]["program"], "/proj/app.ts");
         assert_eq!(req["arguments"]["cwd"], "/proj");
+        // #1414: js-debug's source-map defaults need the workspace folder.
+        assert_eq!(req["arguments"]["__workspaceFolder"], "/proj");
         // TypeScript debugging rides on source maps (matches Zed's defaults).
         assert_eq!(req["arguments"]["sourceMaps"], true);
         assert_eq!(req["arguments"]["console"], "internalConsole");

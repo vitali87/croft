@@ -984,6 +984,19 @@ pub fn delve_request(rc: &ResolvedConfig) -> Value {
     }
 }
 
+/// `request` with `__workspaceFolder` set to `root` unless the config set it
+/// (#1414). VS Code sends it with every js-debug launch and attach; js-debug
+/// resolves its `${workspaceFolder}` defaults (`rootPath`,
+/// `resolveSourceMapLocations`) against it, and without it a breakpoint in a
+/// compiled TypeScript file is bound only after startup code has run past it.
+pub fn with_workspace_folder(mut request: Value, root: &Path) -> Value {
+    if let Some(args) = request.get_mut("arguments").and_then(Value::as_object_mut) {
+        args.entry("__workspaceFolder")
+            .or_insert_with(|| json!(root.to_string_lossy()));
+    }
+    request
+}
+
 /// Build the vscode-js-debug `launch`/`attach` request (`pwa-node`, the
 /// canonical Node type — croft already normalises onto it for zero-config).
 pub fn js_request(rc: &ResolvedConfig) -> Value {
@@ -1809,6 +1822,37 @@ mod tests {
         assert_eq!(req["command"], "attach");
         assert_eq!(req["arguments"]["port"], 9229);
         assert_eq!(req["arguments"]["address"], "127.0.0.1");
+    }
+
+    /// #1414: js-debug launches and attaches carry the workspace folder, and
+    /// one the config sets is kept.
+    #[test]
+    fn js_requests_carry_the_workspace_folder_unless_the_config_sets_one() {
+        let root = Path::new("/work/proj");
+        for text in [
+            r#"[{ "name": "L", "type": "node", "program": "${workspaceFolder}/dist/main.js", "outFiles": ["${workspaceFolder}/dist/**/*.js"] }]"#,
+            r#"[{ "name": "A", "type": "node", "request": "attach", "port": 9229 }]"#,
+        ] {
+            let rc = resolve(&config(text), &ctx()).unwrap();
+            let req = with_workspace_folder(js_request(&rc), root);
+            assert_eq!(
+                req["arguments"]["__workspaceFolder"], "/work/proj",
+                "{text}"
+            );
+        }
+        let rc = resolve(
+            &config(r#"[{ "name": "W", "type": "node", "program": "a.js", "__workspaceFolder": "/elsewhere" }]"#),
+            &ctx(),
+        )
+        .unwrap();
+        let req = with_workspace_folder(js_request(&rc), root);
+        assert_eq!(
+            req["arguments"]["__workspaceFolder"], "/elsewhere",
+            "the config's own value wins"
+        );
+        // Negative: a request without arguments is left as it is.
+        let bare = json!({ "type": "request", "command": "launch" });
+        assert_eq!(with_workspace_folder(bare.clone(), root), bare);
     }
 
     #[test]
