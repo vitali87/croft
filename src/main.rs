@@ -30,6 +30,7 @@ mod config_layers;
 mod config_sync;
 mod dap;
 mod deep_link;
+mod default_formatter;
 mod devcontainer;
 mod docx;
 mod editorconfig;

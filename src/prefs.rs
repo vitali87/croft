@@ -215,6 +215,17 @@ pub struct Prefs {
     /// an older config parses straight to disabled.
     #[serde(default)]
     pub format_on_save: bool,
+    /// The formatter a project names for every file, VS Code's
+    /// `editor.defaultFormatter` (#1499), as an extension id such as
+    /// `biomejs.biome`. Format on save skips a file whose named formatter
+    /// croft does not run, rather than formatting it with something else.
+    #[serde(default)]
+    pub default_formatter: Option<String>,
+    /// `editor.defaultFormatter` for one language, keyed by its VS Code
+    /// language id (`"[typescript]": { "editor.defaultFormatter": … }`,
+    /// #1499). Wins over `default_formatter` for that language.
+    #[serde(default)]
+    pub language_formatters: BTreeMap<String, String>,
     /// When true, typing one of the language server's on-type trigger
     /// characters (`}`, `;`, newline, per its capability) runs
     /// `textDocument/onTypeFormatting` on the just-typed spot (VS Code's

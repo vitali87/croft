@@ -3077,6 +3077,14 @@ pub struct App {
     /// server to format the buffer, then writes once the reply lands. Loaded
     /// from prefs at startup, toggled from the palette / `Cmd+K F`.
     format_on_save: bool,
+    /// The formatter the settings name for every file and per language
+    /// (VS Code's `editor.defaultFormatter`, #1499). Format on save skips a
+    /// file whose named formatter croft does not run.
+    default_formatter: Option<String>,
+    language_formatters: std::collections::BTreeMap<String, String>,
+    /// Named formatters whose skipped save has been explained once this
+    /// session (#1499); later saves say only "Saved".
+    foreign_formatters_noted: std::collections::BTreeSet<String>,
     /// VS Code `terminal.integrated.copyOnSelection`: a finished terminal
     /// mouse selection lands on the clipboard without an explicit Cmd+C.
     /// Loaded from prefs at startup, toggled in the Settings hub.
@@ -5831,6 +5839,9 @@ impl App {
             ]),
             snippets: load_snippets(&crate::snippets::snippets_path()),
             format_on_save: loaded_prefs.format_on_save,
+            default_formatter: loaded_prefs.default_formatter.clone(),
+            language_formatters: loaded_prefs.language_formatters.clone(),
+            foreign_formatters_noted: std::collections::BTreeSet::new(),
             copy_on_select: loaded_prefs.copy_on_select,
             files_exclude: Vec::new(),
             log_highlight: !loaded_prefs.disable_log_highlight,
@@ -57398,6 +57409,42 @@ impl App {
             && self.editor.image.is_none()
     }
 
+    /// The formatter the settings name for the active file when croft does
+    /// not run it (#1499), e.g. `biomejs.biome` for a TypeScript file.
+    fn foreign_formatter(&self) -> Option<String> {
+        let lang = self
+            .editor
+            .path
+            .as_deref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .and_then(crate::lsp::Language::from_extension)
+            .map(|l| l.lsp_id());
+        crate::default_formatter::foreign(
+            self.default_formatter.as_deref(),
+            &self.language_formatters,
+            lang,
+        )
+        .map(str::to_owned)
+    }
+
+    /// Save the active file as typed because the project formats it with
+    /// `formatter`, which croft does not run (#1499): formatting it with
+    /// the language server instead rewrites lines the project's formatter
+    /// laid out. The first such save per formatter says why.
+    fn save_for_foreign_formatter(&mut self, formatter: String) {
+        self.write_current_to_disk();
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        if self.path_is_saved(&path) && self.foreign_formatters_noted.insert(formatter.clone()) {
+            self.status = format!(
+                "Saved {} without formatting: this project formats with {formatter}, which croft does not run",
+                self.status_path(&path)
+            );
+        }
+    }
+
     /// Arm the deferred write for the active tab, ahead of the format request
     /// whose reply will complete it.
     ///
@@ -59336,9 +59383,19 @@ impl App {
             self.save_without_formatting("saved again before the formatter answered");
             return;
         }
-        // Format-on-save: defer the write until the format reply arrives, then
-        // `drain_lsp_format` calls `complete_pending_save`.
-        if self.format_on_save_eligible(self.editor_language_supports_formatting()) {
+        self.format_and_save(self.editor_language_supports_formatting());
+    }
+
+    /// The write at the end of a save: with format on save on and a server
+    /// that formats, defer it until the format reply arrives
+    /// (`drain_lsp_format` calls `complete_pending_save`), unless the
+    /// project names a formatter croft does not run (#1499).
+    fn format_and_save(&mut self, supports_formatting: bool) {
+        if self.format_on_save_eligible(supports_formatting) {
+            if let Some(formatter) = self.foreign_formatter() {
+                self.save_for_foreign_formatter(formatter);
+                return;
+            }
             self.arm_deferred_save();
             self.start_format_document();
             return;
@@ -59534,6 +59591,8 @@ impl App {
             self.apply_theme_visuals(theme);
         }
         self.format_on_save = p.format_on_save;
+        self.default_formatter = p.default_formatter.clone();
+        self.language_formatters = p.language_formatters.clone();
         self.format_on_type = p.format_on_type;
         self.auto_save = p.auto_save;
         self.auto_save_on_focus_change = p.auto_save_on_focus_change;

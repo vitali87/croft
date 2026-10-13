@@ -162,11 +162,20 @@ fn as_enabled_globs(v: &Value) -> Option<Value> {
     ))
 }
 
+fn as_string(v: &Value) -> Option<Value> {
+    v.as_str().filter(|s| !s.is_empty()).map(Value::from)
+}
+
 const SETTINGS: &[SettingMap] = &[
     SettingMap {
         vscode: "editor.formatOnSave",
         croft: "format_on_save",
         convert: as_bool,
+    },
+    SettingMap {
+        vscode: "editor.defaultFormatter",
+        croft: "default_formatter",
+        convert: as_string,
     },
     SettingMap {
         vscode: "editor.formatOnType",
@@ -632,6 +641,39 @@ pub fn map_settings(
                         String::from("auto_save_on_focus_change"),
                         Value::from(focus),
                     );
+                    continue;
+                }
+                // `"[typescript]": { "editor.defaultFormatter": … }`, also
+                // as `"[javascript][typescript]"` (#1499): the formatter
+                // each language names. Its other keys stay unmapped.
+                if let Some(langs) = key.strip_prefix('[').and_then(|k| k.strip_suffix(']'))
+                    && let Some(block) = value.as_object()
+                {
+                    if let Some(formatter) =
+                        block.get("editor.defaultFormatter").and_then(as_string)
+                    {
+                        let map = settings
+                            .entry(String::from("language_formatters"))
+                            .or_insert_with(|| Value::Object(Map::new()));
+                        if let Some(map) = map.as_object_mut() {
+                            for lang in langs.split("][").filter(|l| !l.is_empty()) {
+                                map.insert(lang.to_string(), formatter.clone());
+                            }
+                        }
+                    }
+                    let rest: Vec<&String> = block
+                        .keys()
+                        .filter(|k| *k != "editor.defaultFormatter")
+                        .collect();
+                    if !rest.is_empty() {
+                        unmapped.push(format!(
+                            "{key} ({})",
+                            rest.iter()
+                                .map(|k| k.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
                     continue;
                 }
                 unmapped.push(key.clone());
@@ -2279,5 +2321,32 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let report = scan_profile(dir.path()).expect("an empty profile is fine");
         assert!(report.is_empty());
+    }
+
+    /// #1499: the importer names what a language block holds besides its
+    /// formatter, and maps the formatter.
+    #[test]
+    fn a_language_block_maps_its_formatter_and_lists_the_rest() {
+        let doc = serde_json::json!({
+            "editor.defaultFormatter": "esbenp.prettier-vscode",
+            "[python]": { "editor.defaultFormatter": "charliermarsh.ruff", "editor.tabSize": 4 },
+            "[go]": { "editor.tabSize": 8 },
+        });
+        let (mapped, unmapped, _) = map_settings(doc.as_object().unwrap());
+        assert_eq!(
+            mapped.get("default_formatter"),
+            Some(&Value::from("esbenp.prettier-vscode"))
+        );
+        assert_eq!(
+            mapped.get("language_formatters"),
+            Some(&serde_json::json!({ "python": "charliermarsh.ruff" }))
+        );
+        assert_eq!(
+            unmapped,
+            vec![
+                String::from("[go] (editor.tabSize)"),
+                String::from("[python] (editor.tabSize)"),
+            ]
+        );
     }
 }
