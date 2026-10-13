@@ -82061,5 +82061,46 @@ fn a_failed_debug_build_says_why_and_keeps_its_output() {
             "a new F5 drops the running build"
         );
         assert_eq!(app.status, "Open a file to debug");
+
+        // Stop while the build runs: it never launches.
+        app.begin_debug_build(&main);
+        app.debug_stop_by_user();
+        assert!(app.debug_build.is_none(), "Stop drops the running build");
+        assert!(!app.poll_debug_build());
+    });
+}
+
+/// #1359: F5 on a C++ file in an added workspace folder builds that
+/// folder's CMake project, not the primary root's.
+#[test]
+fn f5_builds_the_project_of_the_files_own_workspace_folder() {
+    use crate::lsp::manager::is_on_path;
+    if !(is_on_path("cmake") && is_on_path("c++")) {
+        return;
+    }
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = tmp.path().join("primary");
+    std::fs::create_dir_all(&primary).unwrap();
+    let second = tmp.path().join("second");
+    let main = cmake_debug_project(&second);
+    let configured = std::process::Command::new("cmake")
+        .arg("-S")
+        .arg(&second)
+        .arg("-B")
+        .arg(second.join("build"))
+        .output()
+        .unwrap();
+    assert!(configured.status.success(), "{configured:?}");
+    with_relay_home(tmp.path(), || {
+        let mut app = App::new(primary.clone()).unwrap();
+        app.roots.add(second.clone());
+        app.begin_debug_build(&main);
+        let (_, built) = finished_debug_build(&mut app);
+        let built = built.unwrap_or_else(|f| panic!("{}\n{}", f.summary, f.output));
+        assert_eq!(
+            built.binary.canonicalize().unwrap(),
+            second.join("build/app").canonicalize().unwrap()
+        );
     });
 }

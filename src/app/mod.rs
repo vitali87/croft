@@ -31862,6 +31862,7 @@ impl App {
         // this set (#567). The task-gated path reaches here via `take()`, so
         // this only ever drops a STALE parking.
         self.pending_debug_launch = None;
+        self.debug_build = None;
         let total = members.len();
         let mut started = 0usize;
         let mut unrun: Vec<String> = Vec::new();
@@ -31986,6 +31987,7 @@ impl App {
             self.debug_stop();
         }
         self.pending_debug_launch = None;
+        self.debug_build = None;
         let root = self.active_workspace_root();
         let tasks = crate::tasks::discover_tasks(&root);
         let Some(task) = tasks.into_iter().find(|t| t.label == task_label) else {
@@ -32023,6 +32025,7 @@ impl App {
             self.debug_stop();
         }
         self.pending_debug_launch = None;
+        self.debug_build = None;
         // A new run: the previous run's cleanup is not this one's.
         self.debug_post_tasks.clear();
         let root = self.active_workspace_root();
@@ -32679,7 +32682,13 @@ impl App {
     /// replaces it.
     fn begin_debug_build(&mut self, path: &Path) {
         let (tx, rx) = std::sync::mpsc::channel();
-        let workspace = self.workspace_root().to_path_buf();
+        // The root that owns the file: an added folder's project, not the
+        // primary's.
+        let workspace = self
+            .roots
+            .owning_root(path)
+            .unwrap_or_else(|| self.roots.primary())
+            .to_path_buf();
         let source = path.to_path_buf();
         let cache = croft_cache_dir().join("debug-builds");
         std::thread::spawn(move || {
@@ -33530,6 +33539,9 @@ impl App {
         }
         self.debug_sessions.clear();
         self.debug_compound = None;
+        // A C/C++ build still running must not launch once it finishes
+        // (#1359): Stop means stop.
+        self.debug_build = None;
         self.reset_watch_runtime();
         // Sweep js-debug's detached watchdog (and any leftover tree) once it has
         // reparented to init after the server dies. See the Terminated arm in

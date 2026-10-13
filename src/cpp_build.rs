@@ -229,7 +229,9 @@ fn run(cmd: &mut Command, what: &str) -> Result<String, Failed> {
 
 /// Build the CMake project in `dir` and return the program that runs
 /// `source`. The File API query is written first, so a build folder
-/// configured without it is re-configured once to answer it.
+/// configured without it is re-configured once to answer it. Only the
+/// target that runs `source` is built when the reply already names it, so
+/// an unrelated broken target does not stop the debug.
 fn cmake_build(workspace: &Path, dir: &Path, source: &Path) -> Result<Built, Failed> {
     let query = dir.join(".cmake/api/v1/query/codemodel-v2");
     if reply_index(dir).is_none() {
@@ -245,15 +247,25 @@ fn cmake_build(workspace: &Path, dir: &Path, source: &Path) -> Result<Built, Fai
         .unwrap_or(dir)
         .display()
         .to_string();
-    run(
-        Command::new("cmake")
-            .arg("--build")
-            .arg(dir)
-            .current_dir(workspace),
-        &format!("cmake --build {shown}"),
-    )?;
+    let build = |target: Option<&str>| {
+        let mut cmd = Command::new("cmake");
+        cmd.arg("--build").arg(dir).current_dir(workspace);
+        if let Some(name) = target {
+            cmd.arg("--target").arg(name);
+        }
+        run(&mut cmd, &format!("cmake --build {shown}"))
+    };
+    let chosen = target_for(&executable_targets(dir), source)
+        .ok()
+        .map(|t| t.name.clone());
+    build(chosen.as_deref())?;
+    // The build may re-configure and change the reply: resolve again, and
+    // build the target it now names if that is another one.
     let targets = executable_targets(dir);
     let target = target_for(&targets, source).map_err(|e| Failed::new(e, ""))?;
+    if chosen.as_deref() != Some(target.name.as_str()) {
+        build(Some(&target.name))?;
+    }
     Ok(Built {
         binary: target.program.clone(),
         how: format!("cmake --build {shown} (target {})", target.name),
@@ -476,6 +488,40 @@ mod tests {
             2,
             "nothing written beside the sources: {in_src:?}"
         );
+    }
+
+    /// #1359: F5 builds only the target that runs the file, so another
+    /// executable that does not compile does not stop the debug.
+    #[test]
+    fn only_the_files_target_is_built() {
+        if !have(&["cmake", "c++"]) {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        cmake_project(root);
+        write(root, "tool/broken.cpp", "int main() { return nope; }\n");
+        let lists = root.join("CMakeLists.txt");
+        let mut text = std::fs::read_to_string(&lists).unwrap();
+        text.push_str("add_executable(broken tool/broken.cpp)\n");
+        std::fs::write(&lists, text).unwrap();
+        let st = Command::new("cmake")
+            .args(["-S", ".", "-B", "build"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(st.status.success(), "{st:?}");
+        let cache = tmp.path().join("cache");
+        let main = root.join("src/main.cpp");
+        // The first build writes the File API query and re-configures.
+        for _ in 0..2 {
+            let built = build_for_debug(root, &main, &cache)
+                .unwrap_or_else(|f| panic!("{}\n{}", f.summary, f.output));
+            assert_eq!(built.binary, root.join("build/app"));
+        }
+        // Negative: debugging the broken program still reports its error.
+        let err = build_for_debug(root, &root.join("tool/broken.cpp"), &cache).unwrap_err();
+        assert!(err.output.contains("nope"), "{}", err.output);
     }
 
     /// #1359: with only a `compile_commands.json`, a one-file program
