@@ -227,6 +227,14 @@ impl Pattern {
         }
     }
 
+    /// The number of capture groups, the whole match (group 0) included.
+    fn captures_len(&self) -> usize {
+        match self {
+            Self::Plain(re) => re.captures_len(),
+            Self::Fancy(re) => re.captures_len(),
+        }
+    }
+
     /// Every match in `line`, as byte spans.
     pub(crate) fn spans(&self, line: &str) -> Vec<(usize, usize)> {
         match self {
@@ -252,7 +260,9 @@ impl Pattern {
         end: usize,
         replacement: &str,
     ) -> Option<String> {
-        let template = brace_refs(replacement, |name| self.has_group(name));
+        let template = brace_refs(replacement, self.captures_len(), |name| {
+            self.has_group(name)
+        });
         let mut out = String::new();
         match self {
             Self::Plain(re) => {
@@ -576,9 +586,15 @@ pub fn search_workspace_streaming_filtered<F>(
     let Some(matcher) = build_matcher(q, opts) else {
         return;
     };
+    // Dotfiles are searched (#1648): `.env`, `.github/workflows` and lint
+    // configs are among the files most searched, and Quick Open already
+    // lists them. `hidden(true)` skipped every dot-entry, whole `.github`
+    // tree included. A repository's own store stays out, as VS Code's
+    // default `files.exclude` keeps it out.
     let walker = WalkBuilder::new(root)
         .git_ignore(true)
-        .hidden(true)
+        .hidden(false)
+        .filter_entry(|entry| entry.depth() == 0 || !is_vcs_store(entry.file_name()))
         .build_parallel();
     let root = root.to_path_buf();
     walker.run(|| {
@@ -627,6 +643,16 @@ pub fn search_workspace_streaming_filtered<F>(
             WalkState::Continue
         })
     });
+}
+
+/// A version-control store (`.git`, `.hg`, `.svn`, `.bzr`, `CVS`): never
+/// searched, as VS Code's default `files.exclude` keeps it out. `.git` can be
+/// a worktree's gitlink file as well as a directory.
+fn is_vcs_store(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some(".git" | ".hg" | ".svn" | ".bzr" | "CVS")
+    )
 }
 
 /// Aggregating wrapper around `search_workspace_streaming`. Returns every
@@ -1113,8 +1139,10 @@ fn trim_leading_context(lead: &str, avail: usize, need: usize) -> Option<String>
 /// 1 then `_old`. `$&` is the whole match and `$$` a literal dollar. A
 /// `$NAME` or `${NAME}` expands only when `is_group` knows that name;
 /// any other `$` is text (#1399), so a shell, PHP or Perl variable such as
-/// `$PREFIX` survives instead of expanding to nothing.
-fn brace_refs(replacement: &str, is_group: impl Fn(&str) -> bool) -> String {
+/// `$PREFIX` survives instead of expanding to nothing. A `$N` or `${N}`
+/// with no group N is text too (#1636); `groups` counts them, group 0
+/// included.
+fn brace_refs(replacement: &str, groups: usize, is_group: impl Fn(&str) -> bool) -> String {
     let is_name = |c: &char| c.is_ascii_alphanumeric() || *c == '_';
     let mut out = String::with_capacity(replacement.len());
     let mut rest = replacement;
@@ -1135,10 +1163,13 @@ fn brace_refs(replacement: &str, is_group: impl Fn(&str) -> bool) -> String {
         } else if after.starts_with('&') {
             (String::from("${0}"), 1)
         } else if digits > 0 {
-            (format!("${{{}}}", &after[..digits]), digits)
+            numbered_ref(&after[..digits], groups)
         } else if let Some(name) = braced {
-            let group =
-                name.chars().all(|c| c.is_ascii_digit()) && !name.is_empty() || is_group(name);
+            let group = if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+                name.parse::<usize>().is_ok_and(|g| g < groups)
+            } else {
+                is_group(name)
+            };
             if group {
                 (format!("${{{name}}}"), name.len() + 2)
             } else {
@@ -1154,6 +1185,20 @@ fn brace_refs(replacement: &str, is_group: impl Fn(&str) -> bool) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// `$` then `digits`, read the way VS Code reads it: the longest prefix of
+/// the digits that numbers a group of the pattern, the rest left as text, so
+/// `$10` with one group is group 1 then `0`. With no such prefix the `$` is
+/// text (#1636): a price like `$5` or a shell `$2` survives instead of
+/// expanding to nothing. Returns the expansion and the digits it used.
+fn numbered_ref(digits: &str, groups: usize) -> (String, usize) {
+    (1..=digits.len())
+        .rev()
+        .find(|&n| digits[..n].parse::<usize>().is_ok_and(|g| g < groups))
+        .map_or((String::from("$$"), 0), |n| {
+            (format!("${{{}}}", &digits[..n]), n)
+        })
 }
 
 /// Replace every match of `query` (honouring `opts`) in `content` with
@@ -3075,6 +3120,76 @@ mod tests {
             .collect();
         assert!(names.contains(&"a.txt".to_string()));
         assert!(names.contains(&"b.rs".to_string()));
+    }
+
+    /// #1648's repro: a git repo with `SECRET_TOKEN` in a source file, in
+    /// dotfiles and under a dot-directory, and in gitignored copies.
+    fn dotfile_repo() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        fs::create_dir_all(root.join("node_modules/x")).unwrap();
+        write(&root.join(".gitignore"), "node_modules/\n*.log\n");
+        write(&root.join("src/app.js"), "const SECRET_TOKEN = 1;\n");
+        write(&root.join(".env"), "SECRET_TOKEN=abc\n");
+        write(&root.join(".github/workflows/ci.yml"), "SECRET_TOKEN\n");
+        write(&root.join("node_modules/x/index.js"), "SECRET_TOKEN\n");
+        write(&root.join("debug.log"), "SECRET_TOKEN\n");
+        write(&root.join(".git/SECRET_TOKEN_NOTE"), "SECRET_TOKEN\n");
+        tmp
+    }
+
+    fn hit_paths(root: &Path, query: &str) -> Vec<String> {
+        let mut paths: Vec<String> = search_workspace(root, query, SearchOpts::default())
+            .into_iter()
+            .map(|h| {
+                h.path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// #1648: dotfiles and dot-directories that are not gitignored are
+    /// searched, as in VS Code and as Quick Open already lists them.
+    #[test]
+    fn search_finds_matches_in_dotfiles_and_dot_directories() {
+        let tmp = dotfile_repo();
+        assert_eq!(
+            hit_paths(tmp.path(), "SECRET_TOKEN"),
+            [".env", ".github/workflows/ci.yml", "src/app.js"]
+        );
+    }
+
+    /// #1648 negative: gitignored files and the VCS's own directory stay
+    /// out of the results.
+    #[test]
+    fn search_still_skips_gitignored_files_and_vcs_internals() {
+        let tmp = dotfile_repo();
+        for vcs in [".hg", ".svn"] {
+            fs::create_dir_all(tmp.path().join(vcs)).unwrap();
+            write(&tmp.path().join(vcs).join("store"), "SECRET_TOKEN\n");
+        }
+        let paths = hit_paths(tmp.path(), "SECRET_TOKEN");
+        for skipped in ["node_modules", "debug.log", ".git/", ".hg/", ".svn/"] {
+            assert!(
+                paths.iter().all(|p| !p.starts_with(skipped)),
+                "{skipped} must not be searched: {paths:?}"
+            );
+        }
+        assert!(hit_paths(tmp.path(), "core.bare").is_empty());
     }
 
     #[test]
@@ -5062,6 +5177,48 @@ mod tests {
         assert_eq!(replace("ab", "(a)(b)", "$2$1 $0 ${1} $$"), "ba ab a $");
         assert_eq!(replace("foo", "(foo)", "$1_old"), "foo_old");
         assert_eq!(replace("cat", r"(?P<HOME>\w+)", "${HOME}/$HOME"), "cat/cat");
+    }
+
+    /// #1636: a numbered reference the pattern has no group for is text,
+    /// as in VS Code, so a price or a positional parameter survives.
+    #[test]
+    fn a_numbered_reference_with_no_group_stays_literal() {
+        let opts = SearchOpts {
+            use_regex: true,
+            ..Default::default()
+        };
+        let replace =
+            |text: &str, find: &str, with: &str| replace_in_text(text, find, with, opts).unwrap().0;
+        assert_eq!(replace("apple", "(apple)", "$1 costs $5"), "apple costs $5");
+        assert_eq!(replace("x", "x", "echo $2 $9"), "echo $2 $9");
+        assert_eq!(replace("x", "x", "${3}"), "${3}");
+        // The issue's repro: `$10` with one group is `$1` then `0`.
+        assert_eq!(
+            replace("apple\nitem 7\n", "(apple)", "v$10 costs $5"),
+            "vapple0 costs $5\nitem 7\n"
+        );
+        // The preview row shows the same text Replace All writes.
+        assert_eq!(
+            expand_replacement("apple", "(apple)", "v$10 costs $5", opts),
+            "vapple0 costs $5"
+        );
+    }
+
+    /// #1636 negative: references to groups that exist keep their meaning,
+    /// `$10` included when the pattern has ten groups.
+    #[test]
+    fn numbered_references_to_existing_groups_still_expand() {
+        let opts = SearchOpts {
+            use_regex: true,
+            ..Default::default()
+        };
+        let replace =
+            |text: &str, find: &str, with: &str| replace_in_text(text, find, with, opts).unwrap().0;
+        let ten = "(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)";
+        assert_eq!(replace("abcdefghij", ten, "$10$1"), "ja");
+        assert_eq!(replace("abcdefghij", ten, "${10}"), "j");
+        assert_eq!(replace("ab", "(a)(b)", "$1 ${1} $2 $0"), "a a b ab");
+        assert_eq!(replace("ab", "(a)(b)", "$2_x"), "b_x");
     }
 
     #[test]
