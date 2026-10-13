@@ -357,6 +357,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_toggle_wrap_key",
             },
             ShortcutEntry {
+                keys: "Alt+O",
+                description: "C/C++: switch between a source file and its header",
+                handler: "is_switch_header_source_key",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+Shift+V",
                 description: "Markdown: toggle the rendered preview for this file",
                 handler: "is_markdown_preview_key",

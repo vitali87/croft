@@ -43986,6 +43986,18 @@ impl App {
             }
             return;
         }
+        // Alt+O: C/C++: Switch Header/Source (#1360), as VS Code's clangd
+        // extension binds it. Other files keep the chord.
+        if is_switch_header_source_key(key)
+            && self
+                .editor
+                .path
+                .as_deref()
+                .is_some_and(crate::header_source::is_c_family)
+        {
+            self.switch_header_source();
+            return;
+        }
         // VS Code "Go to Bracket" (Cmd+Shift+\): jump the cursor to the
         // matching bracket. Also reachable from the Command Palette.
         if is_goto_bracket_key(key) {
@@ -50008,6 +50020,67 @@ impl App {
         self.file_finder_index_dirty = false;
     }
 
+    /// C/C++: Switch Header/Source (#1360): open the header of the source
+    /// in the editor, or the source of the header, found beside it, across
+    /// an `include/` ↔ `src/` split, or anywhere in the workspace.
+    fn switch_header_source(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("No file in the active tab");
+            return;
+        };
+        if !crate::header_source::is_c_family(&path) {
+            self.status =
+                String::from("Switch Header/Source works on C, C++ and Objective-C files");
+            return;
+        }
+        self.poll_file_finder_index();
+        // The root that owns the file, so a file in a secondary root of a
+        // multi-root workspace finds its counterpart in that root.
+        let root = self
+            .roots
+            .owning_root(&path)
+            .unwrap_or_else(|| self.roots.primary())
+            .to_path_buf();
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let index_paths = |app: &Self| -> Vec<PathBuf> {
+            app.file_finder_index
+                .as_ref()
+                .map(|entries| entries.iter().map(|e| e.path.clone()).collect())
+                .unwrap_or_default()
+        };
+        let is_file = |p: &Path| p.is_file();
+        let mut found =
+            crate::header_source::counterpart(&path, &root, &index_paths(self), &is_file);
+        // The background index has not landed yet: walk the workspace
+        // synchronously this once, as Go to File does, so the
+        // anywhere-in-the-workspace fallback is not answered from nothing.
+        if found.is_none() && self.file_finder_index.is_none() {
+            let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
+            let entries = crate::widgets::file_finder::build_multi_file_index(&roots);
+            self.file_finder_index = Some(std::sync::Arc::new(entries));
+            self.file_finder_index_rx = None;
+            found = crate::header_source::counterpart(&path, &root, &index_paths(self), &is_file);
+        }
+        let Some(found) = found else {
+            self.status = format!("No header/source counterpart for {name}");
+            return;
+        };
+        // A tab-aware open: the counterpart gets its own tab (or its
+        // existing one), so unsaved edits in the current buffer survive.
+        match self.editor.open_pinned(&found) {
+            Ok(()) => {
+                self.sync_open_file_poll_mtime();
+                self.focus_pane(Pane::Editor);
+                let shown = found.strip_prefix(&root).unwrap_or(&found);
+                self.status = format!("{name} \u{2194} {}", shown.display());
+            }
+            Err(e) => self.status = format!("Could not open {}: {e}", found.display()),
+        }
+    }
+
     fn open_file_finder(&mut self) {
         if self.file_finder.is_some() {
             return;
@@ -51474,6 +51547,7 @@ impl App {
             Cmd::EmmetExpandAbbreviation => self.expand_emmet_abbreviation(),
             Cmd::ExpandSelection => self.expand_selection(),
             Cmd::ShrinkSelection => self.shrink_selection(),
+            Cmd::SwitchHeaderSource => self.switch_header_source(),
             Cmd::ToggleWordWrap => {
                 self.editor.toggle_wrap();
                 self.status = if self.editor.wrap_enabled() {
@@ -68827,6 +68901,19 @@ fn is_toggle_block_comment_key(key: KeyEvent) -> bool {
     }
     key.modifiers.contains(KeyModifiers::SHIFT)
         && key.modifiers.contains(KeyModifiers::ALT)
+        && !key.modifiers.contains(KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// `Alt+O`: C/C++: Switch Header/Source (#1360), the clangd extension's
+/// chord in VS Code. Rejects Shift and the other modifiers.
+fn is_switch_header_source_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    c.eq_ignore_ascii_case(&'o')
+        && key.modifiers.contains(KeyModifiers::ALT)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
         && !key.modifiers.contains(KeyModifiers::SUPER)
         && !key.modifiers.contains(KeyModifiers::CONTROL)
 }

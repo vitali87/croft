@@ -40,6 +40,7 @@ mod ghostty;
 mod git;
 mod gradient;
 mod gui_path;
+mod header_source;
 mod hex;
 mod highlight;
 mod history;
