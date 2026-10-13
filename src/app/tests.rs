@@ -81953,6 +81953,34 @@ fn the_testing_view_follows_the_focused_package_in_a_monorepo() {
     assert_eq!(app.test_worker.root(), root.join("packages/web"));
 }
 
+/// #1520 review: the followed package is cached per focused file, so a
+/// runner marker added while the same file stays open must still be picked
+/// up by the next Testing refresh or run gesture, not only by a focus change.
+#[test]
+fn a_runner_added_under_the_open_file_is_followed_on_refresh() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"vmono","private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    let pkg = root.join("packages/math");
+    std::fs::create_dir_all(pkg.join("src")).unwrap();
+    std::fs::write(pkg.join("src/a.test.ts"), "test('a', () => {});\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open_pinned(&pkg.join("src/a.test.ts")).unwrap();
+    app.drain_git_responses();
+    assert_eq!(app.active_test_root, root);
+    assert!(!app.testing_runner_available());
+
+    std::fs::write(pkg.join("vitest.config.ts"), "export default {};\n").unwrap();
+    app.drain_git_responses();
+    assert!(app.testing_runner_available(), "{}", app.status);
+    assert_eq!(app.active_test_root, pkg);
+    assert_eq!(app.test_worker.root(), pkg);
+}
+
 /// #1520, negative: a folder with no runner anywhere keeps its own root and
 /// still says no runner was detected.
 #[test]

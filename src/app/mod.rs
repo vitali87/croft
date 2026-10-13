@@ -8986,6 +8986,20 @@ impl App {
         found
     }
 
+    /// Resolve the followed Testing folder afresh and rebind to it if it
+    /// moved (#1520): a runner enabled or a package marker added since the
+    /// focus last changed can change the answer the cache still holds.
+    /// Whether it rebound.
+    fn refollow_test_root(&mut self) -> bool {
+        self.test_root_follow = None;
+        let root = self.followed_test_root(self.active_workspace_root());
+        if root == self.active_test_root {
+            return false;
+        }
+        self.rebind_test_root(root);
+        true
+    }
+
     /// The workspace root the focus-following surfaces resolve against:
     /// the root owning the focused editor's file, else the primary
     /// (#149 git, #151 testing/tasks/run).
@@ -16171,6 +16185,8 @@ impl App {
     /// view is shown or a toggle flips, so the list always reflects the manifests
     /// on disk and the current disable set.
     fn refresh_extensions(&mut self) {
+        // A runner toggled on or off changes which folder Testing follows.
+        self.test_root_follow = None;
         let mut vscode: Vec<String> = self
             .roots
             .iter()
@@ -24285,6 +24301,11 @@ impl App {
         if crate::testing::worker::runner_for(&self.active_test_root).is_some() {
             return true;
         }
+        if self.refollow_test_root()
+            && crate::testing::worker::runner_for(&self.active_test_root).is_some()
+        {
+            return true;
+        }
         self.status = String::from(crate::testing::NO_RUNNER_STATUS);
         false
     }
@@ -25174,6 +25195,13 @@ impl App {
     /// error with no manifest, and `cargo test -- --list` compiles the test
     /// binary so we never auto-fire it per-keystroke.
     fn discover_tests(&mut self) {
+        // The rebind re-discovers on its own while the view is showing.
+        if !self.testing.is_busy()
+            && self.refollow_test_root()
+            && self.sidebar_view == SidebarView::Testing
+        {
+            return;
+        }
         if self.testing.is_busy()
             || crate::testing::worker::runner_for(&self.active_test_root).is_none()
         {
