@@ -19129,6 +19129,12 @@ fn save_all_and_stash_stashes_the_text_in_the_tab() {
         .unwrap();
     assert!(app.pending_unsaved_scm.is_none());
     assert!(!app.editor.dirty, "the tab was saved");
+    // #1581: the stash asks for its name next, seeded with the message box.
+    app.submit_input_prompt();
+    assert_eq!(
+        git_out(tmp.path(), &["stash", "list", "--format=%gs"]),
+        "On main: bump seed\n"
+    );
     assert_eq!(
         git_out(tmp.path(), &["show", "stash@{0}:seed.txt"]),
         "edited changed\n"
@@ -19138,6 +19144,130 @@ fn save_all_and_stash_stashes_the_text_in_the_tab() {
         "seed\n",
         "the stash put the work aside"
     );
+}
+
+fn stash_names(root: &std::path::Path) -> String {
+    git_out(root, &["stash", "list", "--format=%gs"])
+}
+
+/// #1581: Stash asks what to call the stash, seeded with the commit box's
+/// first line, and the stash takes that name; nothing is stashed until the
+/// prompt is answered.
+#[test]
+fn stash_asks_for_a_name_seeded_from_the_commit_box() {
+    let (tmp, mut app) = scm_ready_to_commit();
+    app.source_control.message = "retry tweak\n\nlonger body".to_string();
+    app.stash_source_control();
+    let prompt = app.input_prompt.as_ref().expect("the name prompt opens");
+    assert_eq!(
+        prompt.purpose,
+        crate::widgets::input_prompt::InputPurpose::StashMessage {
+            kind: crate::git::StashKind::Tracked
+        }
+    );
+    assert_eq!(prompt.value, "retry tweak");
+    assert_eq!(stash_names(tmp.path()), "", "nothing stashed yet");
+    app.submit_input_prompt();
+    assert!(app.input_prompt.is_none());
+    assert_eq!(stash_names(tmp.path()), "On main: retry tweak\n");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
+        "seed\n",
+        "the work was put aside"
+    );
+
+    // Include Untracked asks too, and takes a typed name.
+    std::fs::write(tmp.path().join("new.txt"), b"fresh\n").unwrap();
+    app.source_control.message.clear();
+    app.stash_include_untracked_source_control();
+    let prompt = app.input_prompt.as_mut().expect("the -u prompt opens");
+    assert_eq!(prompt.value, "", "an empty commit box seeds nothing");
+    for c in "spike".chars() {
+        prompt.push_char(c);
+    }
+    app.submit_input_prompt();
+    assert_eq!(
+        stash_names(tmp.path()),
+        "On main: spike\nOn main: retry tweak\n"
+    );
+    assert!(!tmp.path().join("new.txt").exists(), "-u took the new file");
+}
+
+/// Negative (#1581): a blank name keeps git's `WIP on` name, and Esc
+/// stashes nothing at all.
+#[test]
+fn a_blank_stash_name_is_wip_and_esc_stashes_nothing() {
+    let (tmp, mut app) = scm_ready_to_commit();
+    app.source_control.message.clear();
+    app.stash_source_control();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.input_prompt.is_none(), "Esc closes the prompt");
+    assert_eq!(stash_names(tmp.path()), "", "Esc stashes nothing");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
+        "changed\n",
+        "the work is untouched"
+    );
+    app.stash_source_control();
+    app.submit_input_prompt();
+    let names = stash_names(tmp.path());
+    assert!(names.starts_with("WIP on main: "), "{names}");
+}
+
+/// #1581: View Stash lists each stash with its age and files, and opening
+/// one shows its patch in a tab without applying or dropping it.
+#[test]
+fn view_stash_lists_files_and_opens_the_patch() {
+    let (tmp, mut app) = scm_ready_to_commit();
+    std::fs::write(tmp.path().join("seed.txt"), b"retries = 5\n").unwrap();
+    crate::git::stash_push(tmp.path(), Some("retries")).unwrap();
+    std::fs::write(tmp.path().join("other.txt"), b"x\n").unwrap();
+    crate::git::stash_push_untracked(tmp.path(), Some("other")).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::GitViewStash);
+    let picker = app.list_picker.as_ref().expect("the picker opens");
+    assert_eq!(picker.title, "View Stash");
+    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+    assert!(
+        labels[0].starts_with("stash@{0}: On main: other \u{b7} ")
+            && labels[0].ends_with(" \u{b7} other.txt"),
+        "{labels:?}"
+    );
+    assert!(labels[1].ends_with(" \u{b7} seed.txt"), "{labels:?}");
+    app.list_picker.as_mut().unwrap().select_next();
+    app.confirm_list_picker();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(10),
+        "the stash patch",
+        || {
+            app.drain_git_view();
+            app.git_view_job.is_none()
+        },
+    );
+    assert_eq!(app.status, "Opened stash@{1}");
+    assert_eq!(app.editor.path.as_deref(), Some(Path::new("stash@{1}")));
+    let body = app.editor.lines.join("\n");
+    assert!(body.contains("+retries = 5"), "{body}");
+    assert_eq!(
+        stash_names(tmp.path()).lines().count(),
+        2,
+        "nothing dropped"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
+        "seed\n",
+        "nothing applied"
+    );
+}
+
+/// Negative (#1581): with no stashes, View Stash says so and opens nothing.
+#[test]
+fn view_stash_without_stashes_opens_nothing() {
+    let (_tmp, mut app) = scm_ready_to_commit();
+    app.run_command(crate::widgets::command_palette::Command::GitViewStash);
+    assert!(app.list_picker.is_none());
+    assert_eq!(app.status, "No stashes to choose");
+    assert!(app.git_view_job.is_none());
 }
 
 fn last_commit_message(root: &std::path::Path) -> String {

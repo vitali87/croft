@@ -78,6 +78,8 @@ pub enum Command {
     /// Git: Undo Last Commit (#1350): `reset --soft HEAD~1`, its message
     /// back in the Source Control box.
     GitUndoLastCommit,
+    /// Pick a stash and open its changes (#1581).
+    GitViewStash,
     AddCursorAbove,
     AddCursorBelow,
     AddSelectionToNextMatch,
@@ -547,6 +549,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::UnstageHunk,
     Command::RevertHunk,
     Command::GitUndoLastCommit,
+    Command::GitViewStash,
     Command::AddCursorAbove,
     Command::AddCursorBelow,
     Command::AddSelectionToNextMatch,
@@ -949,6 +952,7 @@ impl Command {
             Command::UnstageHunk => "Git: Unstage Hunk",
             Command::RevertHunk => "Git: Revert Hunk",
             Command::GitUndoLastCommit => "Git: Undo Last Commit",
+            Command::GitViewStash => "Git: View Stash\u{2026}",
             Command::AddCursorAbove => "Add Cursor Above",
             Command::AddCursorBelow => "Add Cursor Below",
             Command::AddSelectionToNextMatch => "Add Selection to Next Find Match",
@@ -1362,6 +1366,7 @@ impl Command {
             Command::UnstageHunk => "U in diff",
             Command::RevertHunk => "R in diff",
             Command::GitUndoLastCommit => "",
+            Command::GitViewStash => "",
             Command::AddCursorAbove => "Cmd+Opt+↑",
             Command::AddCursorBelow => "Cmd+Opt+↓",
             Command::AddSelectionToNextMatch => "Cmd+D",
@@ -1753,6 +1758,7 @@ impl Command {
             Command::UnstageHunk => "unstage_hunk",
             Command::RevertHunk => "revert_hunk",
             Command::GitUndoLastCommit => "git_undo_last_commit",
+            Command::GitViewStash => "git_view_stash",
             Command::AddCursorAbove => "add_cursor_above",
             Command::AddCursorBelow => "add_cursor_below",
             Command::AddSelectionToNextMatch => "add_selection_to_next_match",

@@ -62,6 +62,8 @@ pub enum ScmAction {
     PopStashLatest,
     PopStashPick,
     DropStash,
+    /// Pick a stash and open its changes (#1581).
+    ViewStash,
     // Tags submenu.
     CreateTag,
     DeleteTag,
@@ -186,6 +188,7 @@ const STASH_ITEMS: &[Leaf] = &[
     leaf(ScmAction::PopStashLatest, "Pop Latest Stash", ICON_ARCHIVE),
     leaf(ScmAction::PopStashPick, "Pop Stash", ICON_ARCHIVE),
     leaf(ScmAction::DropStash, "Drop Stash", ICON_TRASH),
+    leaf(ScmAction::ViewStash, "View Stash", ICON_ARCHIVE),
 ];
 
 const TAGS_ITEMS: &[Leaf] = &[
@@ -402,7 +405,7 @@ fn action_color(action: ScmAction) -> Color {
         | PopStashLatest
         | PopStashPick
         | CreateTag => ACCENT_AMBER,
-        UnstageAll | ShowGitOutput => ACCENT_GREY,
+        UnstageAll | ShowGitOutput | ViewStash => ACCENT_GREY,
         ContinueOperation | BisectGood => ACCENT_GREEN,
         SkipOperation => ACCENT_AMBER,
         AbortOperation | BisectBad => ACCENT_RED,

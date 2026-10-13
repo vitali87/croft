@@ -24598,6 +24598,29 @@ impl App {
         });
     }
 
+    /// View Stash (#1581): stash `index`'s changes against the commit it
+    /// was made on, untracked files included, in a read-only scratch tab
+    /// like a commit's patch.
+    fn open_stash_patch(&mut self, index: usize) {
+        let root = self.scm_root();
+        let label = format!("stash@{{{index}}}");
+        self.status = format!("Loading {label}\u{2026}");
+        self.spawn_git_view(move || {
+            let result = crate::git::show_stash(&root, index);
+            Box::new(move |app: &mut App| match result {
+                Ok(text) => match app.editor.open_text_buffer(Path::new(&label), &text) {
+                    Ok(()) => {
+                        app.focus_pane(Pane::Editor);
+                        app.sync_open_file_poll_mtime();
+                        app.status = format!("Opened {label}");
+                    }
+                    Err(e) => app.status = format!("Open stash failed: {e}"),
+                },
+                Err(e) => app.status = format!("Show stash failed: {e}"),
+            })
+        });
+    }
+
     /// Open a commit's full patch (header, message, diffstat, diff) in a
     /// read-only scratch tab — the graph's click-through, tig's enter key.
     fn open_commit_patch(&mut self, hash: &str, short_hash: &str) {
@@ -34714,7 +34737,62 @@ impl App {
         if self.hold_for_unsaved(ScmWrite::Stash) {
             return;
         }
-        let stashed = crate::git::stash_push(&self.scm_root());
+        self.ask_stash_message(crate::git::StashKind::Tracked);
+    }
+
+    /// Ask what to call the stash before making it (#1581), as VS Code's
+    /// Git: Stash does, seeded with the commit box's first line. Without a
+    /// name every stash on a commit read `WIP on <branch>: <commit>`, and
+    /// the Apply / Pop / Drop pickers chose between identical rows.
+    fn ask_stash_message(&mut self, kind: crate::git::StashKind) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let title = match kind {
+            crate::git::StashKind::Tracked => "Stash",
+            crate::git::StashKind::IncludeUntracked => "Stash (Include Untracked)",
+            crate::git::StashKind::Staged => "Stash Staged",
+        };
+        let seed = self
+            .source_control
+            .message
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::StashMessage { kind },
+                title,
+                "Message (optional)",
+            )
+            .allowing_blank()
+            .with_hint("Enter names the stash \u{b7} left blank, git names it WIP on <branch>")
+            .with_value(seed),
+        );
+    }
+
+    /// Make the stash the prompt asked about, named `message` when given.
+    fn perform_stash(&mut self, kind: crate::git::StashKind, message: Option<&str>) {
+        match kind {
+            crate::git::StashKind::Tracked => self.stash_tracked(message),
+            crate::git::StashKind::IncludeUntracked => {
+                let r = crate::git::stash_push_untracked(&self.scm_root(), message);
+                self.run_scm_op(
+                    "stash push -u",
+                    r,
+                    "Stashed (incl. untracked)",
+                    "Stash (incl. untracked)",
+                );
+            }
+            crate::git::StashKind::Staged => {
+                let r = crate::git::stash_push_staged(&self.scm_root(), message);
+                self.run_scm_op("stash push --staged", r, "Stashed staged", "Stash staged");
+            }
+        }
+    }
+
+    fn stash_tracked(&mut self, message: Option<&str>) {
+        let stashed = crate::git::stash_push(&self.scm_root(), message);
         self.log_git("stash push", &stashed);
         match stashed {
             Ok(summary) => {
@@ -35129,13 +35207,7 @@ impl App {
         if self.hold_for_unsaved(ScmWrite::StashIncludeUntracked) {
             return;
         }
-        let r = crate::git::stash_push_untracked(&self.scm_root());
-        self.run_scm_op(
-            "stash push -u",
-            r,
-            "Stashed (incl. untracked)",
-            "Stash (incl. untracked)",
-        );
+        self.ask_stash_message(crate::git::StashKind::IncludeUntracked);
     }
 
     /// `git stash push --staged` from the commit dropdown.
@@ -35143,8 +35215,7 @@ impl App {
         if self.hold_for_unsaved(ScmWrite::StashStaged) {
             return;
         }
-        let r = crate::git::stash_push_staged(&self.scm_root());
-        self.run_scm_op("stash push --staged", r, "Stashed staged", "Stash staged");
+        self.ask_stash_message(crate::git::StashKind::Staged);
     }
 
     /// The files of tabs with unsaved edits under the repository, each
@@ -35641,6 +35712,7 @@ impl App {
             ScmAction::PopStashLatest => self.stash_pop_source_control(),
             ScmAction::PopStashPick => self.open_stash_picker(ListPurpose::StashPop),
             ScmAction::DropStash => self.open_stash_picker(ListPurpose::StashDrop),
+            ScmAction::ViewStash => self.open_stash_picker(ListPurpose::StashView),
             ScmAction::CreateTag => self.open_input_prompt(InputPrompt::new(
                 InputPurpose::CreateTag,
                 "Create Tag",
@@ -35657,7 +35729,7 @@ impl App {
                 .into_iter()
                 .map(|s| ListRow {
                     id: s.index.to_string(),
-                    label: format!("stash@{{{}}}: {}", s.index, s.message),
+                    label: s.label(),
                 })
                 .collect(),
             Err(err) => {
@@ -35668,6 +35740,7 @@ impl App {
         let title = match purpose {
             crate::widgets::list_picker::ListPurpose::StashApply => "Apply Stash",
             crate::widgets::list_picker::ListPurpose::StashDrop => "Drop Stash",
+            crate::widgets::list_picker::ListPurpose::StashView => "View Stash",
             _ => "Pop Stash",
         };
         self.open_list_picker(
@@ -35753,6 +35826,11 @@ impl App {
             InputPurpose::AddWatch => {
                 self.close_input_prompt();
                 self.add_watch_expression(value);
+            }
+            InputPurpose::StashMessage { kind } => {
+                self.close_input_prompt();
+                let message = (!value.is_empty()).then_some(value.as_str());
+                self.perform_stash(kind, message);
             }
             InputPurpose::MacroReplayCount => {
                 self.close_input_prompt();
@@ -38235,6 +38313,7 @@ impl App {
                 let r = crate::git::stash_pop_at(&self.scm_root(), index);
                 self.run_scm_op("stash pop", r, "Popped stash", "Pop stash");
             }
+            ListPurpose::StashView => self.open_stash_patch(index),
             ListPurpose::StashDrop => {
                 let r = crate::git::stash_drop(&self.scm_root(), index);
                 self.run_scm_op("stash drop", r, "Dropped stash", "Drop stash");
@@ -51853,6 +51932,9 @@ impl App {
             Cmd::StageHunk => self.stage_hunk_at_caret(),
             Cmd::UnstageHunk => self.unstage_hunk_at_caret(),
             Cmd::RevertHunk => self.request_revert_hunk_at_caret(),
+            Cmd::GitViewStash => {
+                self.open_stash_picker(crate::widgets::list_picker::ListPurpose::StashView)
+            }
             Cmd::GitUndoLastCommit => {
                 self.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::UndoLastCommit)
             }
