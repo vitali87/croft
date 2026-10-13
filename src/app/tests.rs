@@ -33447,6 +33447,31 @@ fn status_transient_keeps_its_tail_when_longer_than_the_bar() {
     );
 }
 
+/// #1609: a message is measured in terminal cells, so a path of
+/// double-width names is elided to fit beside the right cluster instead of
+/// counting half its width and having its tail painted over.
+#[test]
+fn status_message_with_wide_chars_keeps_its_tail_beside_the_cluster() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(140, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    let deep = "\u{76ee}\u{5f55}/".repeat(15);
+    app.status = format!("Opened /{deep}main.rs");
+    app.status_logged = app.status.clone();
+    app.status_wide = false;
+    term.draw(|f| app.render(f)).unwrap();
+    let row = status_row(&term);
+    assert!(
+        row.contains("Ln 1, Col 1"),
+        "the right cluster paints: {row:?}"
+    );
+    assert!(
+        row.contains("main.rs"),
+        "the wide-char message keeps its tail: {row:?}"
+    );
+}
+
 /// The recorder's prompt from Preferences: Open Keyboard Shortcuts, which
 /// is longer than the room the right-hand cluster leaves at 140 columns.
 fn recorder_prompt() -> String {

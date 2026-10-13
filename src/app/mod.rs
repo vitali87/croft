@@ -20562,19 +20562,20 @@ impl App {
             };
             // A fresh message that does not fit beside the cluster takes the
             // cluster's room until the next key or click (#1609).
-            if self.status_wide && status_text.chars().count() as u16 > fits_beside(right_total) {
+            let text_cells = |t: &str| unicode_width::UnicodeWidthStr::width(t) as u16;
+            if self.status_wide && text_cells(&status_text) > fits_beside(right_total) {
                 right_total = 0;
             }
             let avail = fits_beside(right_total);
             if let Some(last) = spans.last_mut()
-                && last.content.chars().count() as u16 > avail
+                && text_cells(&last.content) > avail
             {
                 // Keep the message's dim style through the elision so a
                 // truncated transient doesn't suddenly brighten.
                 *last = Span::styled(elide_middle(&status_text, avail as usize), last.style);
             }
             if status_h > 0 && status_x < status_rect.width {
-                let shown = spans.last().map_or(0, |l| l.content.chars().count() as u16);
+                let shown = spans.last().map_or(0, |l| text_cells(&l.content));
                 self.status_message_rect = Rect {
                     x: status_rect.x + status_x,
                     y: status_rect.y,
@@ -67463,25 +67464,31 @@ fn mode_reassert_seq() -> Vec<u8> {
     seq
 }
 
-/// Shrink `s` to at most `max` chars by cutting the middle, keeping roughly
-/// a third of the head and two thirds of the tail — for path-shaped
-/// messages the tail carries the filename, the part worth keeping. Never
-/// appends a trailing ellipsis (the cut is interior by construction).
+/// Shrink `s` to at most `max` terminal cells by cutting the middle,
+/// keeping roughly a third of the head and two thirds of the tail — for
+/// path-shaped messages the tail carries the filename, the part worth
+/// keeping. Never appends a trailing ellipsis (the cut is interior by
+/// construction). Measured in cells, not chars, so a CJK name is not
+/// overdrawn by the status bar's right cluster.
 fn elide_middle(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if s.width() <= max {
         return s.to_string();
     }
     if max < 3 {
-        return chars.iter().take(max).collect();
+        let mut out = String::new();
+        let mut used = 0;
+        for c in s.chars() {
+            let w = c.width().unwrap_or(0);
+            if used + w > max {
+                break;
+            }
+            used += w;
+            out.push(c);
+        }
+        return out;
     }
-    let keep = max - 1; // one cell for the ellipsis
-    let head = keep / 3;
-    let tail = keep - head;
-    let mut out: String = chars[..head].iter().collect();
-    out.push('\u{2026}');
-    out.extend(&chars[chars.len() - tail..]);
-    out
+    crate::widgets::process_picker::elide_middle_cols(s, max)
 }
 
 /// The excerpt window for a Peek popup: up to `total` lines, at most

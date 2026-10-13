@@ -106,7 +106,7 @@ fn fit_label(label: &str, room: usize) -> String {
 /// `s` cut to at most `max` terminal columns by dropping its middle for one
 /// `…`, keeping a third of what fits from the start and the rest from the
 /// end, like [`crate::dap::discovery::elide_middle`] but by display width.
-fn elide_middle_cols(s: &str, max: usize) -> String {
+pub(crate) fn elide_middle_cols(s: &str, max: usize) -> String {
     if s.width() <= max {
         return s.to_string();
     }
