@@ -52,6 +52,9 @@ pub struct CompletionItem {
     /// `additionalTextEdits`: an auto-import or `#include` elsewhere in the
     /// file, applied along with the item.
     pub additional_edits: Vec<TextSpanEdit>,
+    /// The item's documentation, Markdown or plain text as the server sent
+    /// it, for the popup's details pane (#1527).
+    pub documentation: Option<String>,
 }
 
 #[derive(Debug)]
@@ -67,7 +70,6 @@ pub struct CompletionResult {
 #[derive(Debug)]
 pub struct HoverResult {
     pub request_id: u64,
-    pub path: PathBuf,
     pub text: Option<String>,
 }
 
@@ -92,7 +94,6 @@ pub struct SignatureHelpResult {
 #[derive(Debug)]
 pub struct DefinitionResult {
     pub request_id: u64,
-    pub path: PathBuf,
     pub target: Option<(PathBuf, u32, u32)>,
 }
 
@@ -202,7 +203,6 @@ pub struct DocumentSymbolsResult {
 #[derive(Debug)]
 pub struct DeclarationResult {
     pub request_id: u64,
-    pub path: PathBuf,
     pub target: Option<(PathBuf, u32, u32)>,
     /// True when no spawned server advertises a usable `declarationProvider`
     /// (e.g. vtsls, which sends `declarationProvider: false`). Lets the app
@@ -213,7 +213,6 @@ pub struct DeclarationResult {
 #[derive(Debug)]
 pub struct TypeDefinitionResult {
     pub request_id: u64,
-    pub path: PathBuf,
     pub target: Option<(PathBuf, u32, u32)>,
     /// True when no spawned server advertises a usable `typeDefinitionProvider`.
     /// Mirrors `DeclarationResult::unsupported` so the app can report it plainly
@@ -224,7 +223,6 @@ pub struct TypeDefinitionResult {
 #[derive(Debug)]
 pub struct ImplementationResult {
     pub request_id: u64,
-    pub path: PathBuf,
     /// Every implementation location the server returned. `textDocument/
     /// implementation` is the 1:many goto (one abstraction, several
     /// implementors), so all of them are carried through; the app jumps
@@ -256,7 +254,6 @@ pub struct WorkspaceSymbolsResult {
 #[derive(Debug)]
 pub struct ReferencesResult {
     pub request_id: u64,
-    pub path: PathBuf,
     /// Every reference location the server returned. `textDocument/references`
     /// is inherently 1:many (a symbol used in many places), so all of them are
     /// carried through; the app jumps directly when there is one and shows a
@@ -269,7 +266,6 @@ pub struct ReferencesResult {
 #[derive(Debug)]
 pub struct RenameResult {
     pub request_id: u64,
-    pub path: PathBuf,
     /// `None` when the server declined or returned no edits. Otherwise the
     /// per-file, char-indexed spans to apply across the workspace.
     pub edits: Option<Vec<(PathBuf, Vec<TextSpanEdit>)>>,
@@ -301,7 +297,6 @@ pub struct WillRenameFilesResult {
 #[derive(Debug)]
 pub struct PrepareRenameResult {
     pub request_id: u64,
-    pub path: PathBuf,
     pub unsupported: bool,
     pub error: Option<String>,
     /// `((start_line, start_char, end_line, end_char), placeholder)`.
@@ -348,7 +343,6 @@ pub struct CodeActionItem {
 #[derive(Debug)]
 pub struct CodeActionResult {
     pub request_id: u64,
-    pub path: PathBuf,
     /// The available actions. `None` means the request errored; `Some(vec![])`
     /// means the server ran but offered nothing here. The same shape is reused
     /// for a `codeAction/resolve` reply (a single, now-resolved item).
@@ -529,7 +523,6 @@ pub struct DocumentColorsUpdate {
 #[derive(Debug)]
 pub struct ColorPresentationsResult {
     pub request_id: u64,
-    pub path: PathBuf,
     pub presentations: Vec<(String, Vec<TextSpanEdit>)>,
 }
 
@@ -599,7 +592,6 @@ pub struct OccurrenceItem {
 #[derive(Debug)]
 pub struct DocumentHighlightsResult {
     pub request_id: u64,
-    pub path: PathBuf,
     pub items: Vec<OccurrenceItem>,
 }
 
@@ -611,7 +603,6 @@ pub struct DocumentHighlightsResult {
 #[derive(Debug)]
 pub struct LinkedEditingResult {
     pub request_id: u64,
-    pub path: PathBuf,
     /// `(start_line, start_char, end_line, end_char)` per span.
     pub ranges: Vec<(u32, u32, u32, u32)>,
 }
@@ -625,7 +616,6 @@ pub struct LinkedEditingResult {
 #[derive(Debug)]
 pub struct SelectionRangesResult {
     pub request_id: u64,
-    pub path: PathBuf,
     pub unsupported: bool,
     /// Per cursor: `(start_line, start_char, end_line, end_char)`.
     pub chains: Vec<Vec<(u32, u32, u32, u32)>>,
@@ -656,6 +646,35 @@ pub struct Diagnostic {
     pub severity: DiagnosticSeverity,
     pub message: String,
     pub tags: DiagnosticTags,
+    /// The rule the diagnostic reports (#1540): ruff's `F401`, ty's
+    /// `invalid-argument-type`, TypeScript's `2322`.
+    pub code: Option<DiagnosticCode>,
+}
+
+/// A diagnostic's rule code with the server's `source` and the rule's
+/// documentation link, what a user needs to silence the rule or look it up
+/// (#1540).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticCode {
+    pub value: String,
+    /// The diagnostic's own `source` (`Ruff`, `ty`, `ts`), if it named one.
+    pub source: Option<String>,
+    /// `codeDescription.href`, the rule's page.
+    pub href: Option<String>,
+}
+
+impl DiagnosticCode {
+    /// `source(code)` as VS Code writes it after the message, with `source`
+    /// standing in when the diagnostic named none; just the code without
+    /// either.
+    pub fn label(&self, fallback_source: &str) -> String {
+        let source = self.source.as_deref().unwrap_or(fallback_source);
+        if source.is_empty() {
+            self.value.clone()
+        } else {
+            format!("{source}({})", self.value)
+        }
+    }
 }
 
 /// The LSP `DiagnosticTag`s croft draws (#1522). Servers tag unused names
@@ -944,8 +963,6 @@ struct LangCapabilitySupport {
     formatting: HashMap<Language, bool>,
     code_action: HashMap<Language, bool>,
     call_hierarchy: HashMap<Language, bool>,
-    /// Whether a server for the language answers type hierarchy (#613).
-    type_hierarchy: HashMap<Language, bool>,
     /// Whether a server for the language wants `willRenameFiles` (#610).
     will_rename: HashMap<Language, bool>,
     /// Concatenated on-type trigger characters per language (#254);
@@ -1023,6 +1040,8 @@ pub struct LspManager {
     /// (#694); see [`LspManager::take_servers_restarted`].
     servers_restarted: Arc<AtomicBool>,
     next_request_id: u64,
+    /// Read by the app tests, to prove the servers follow a workspace change.
+    #[cfg_attr(not(test), allow(dead_code))]
     workspace_root: PathBuf,
     _runtime: LspRuntime,
 }
@@ -1199,6 +1218,7 @@ impl LspManager {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
     }
@@ -1270,15 +1290,21 @@ impl LspManager {
         character: u32,
         incomplete: bool,
     ) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        let _ = self.cmd_tx.send(Cmd::RequestCompletion {
-            request_id: id,
+        self.send_request(|request_id| Cmd::RequestCompletion {
+            request_id,
             path,
             line,
             character,
             incomplete,
-        });
+        })
+    }
+
+    /// Allocate the next request id, send the command `make` builds around
+    /// it, and return the id the reply will echo.
+    fn send_request(&mut self, make: impl FnOnce(u64) -> Cmd) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(make(id));
         id
     }
 
@@ -1287,15 +1313,12 @@ impl LspManager {
     }
 
     pub fn request_signature_help(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        let _ = self.cmd_tx.send(Cmd::RequestSignatureHelp {
-            request_id: id,
+        self.send_request(|request_id| Cmd::RequestSignatureHelp {
+            request_id,
             path,
             line,
             character,
-        });
-        id
+        })
     }
 
     pub fn drain_signature_help(&self) -> Option<SignatureHelpResult> {
@@ -1303,15 +1326,12 @@ impl LspManager {
     }
 
     pub fn request_hover(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        let _ = self.cmd_tx.send(Cmd::RequestHover {
-            request_id: id,
+        self.send_request(|request_id| Cmd::RequestHover {
+            request_id,
             path,
             line,
             character,
-        });
-        id
+        })
     }
 
     pub fn drain_hover(&self) -> Option<HoverResult> {
@@ -1434,16 +1454,13 @@ impl LspManager {
         start: (u32, u32),
         end: (u32, u32),
     ) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        let _ = self.cmd_tx.send(Cmd::RequestColorPresentations {
-            request_id: id,
+        self.send_request(|request_id| Cmd::RequestColorPresentations {
+            request_id,
             path,
             color,
             start,
             end,
-        });
-        id
+        })
     }
 
     pub fn drain_color_presentations(&self) -> Option<ColorPresentationsResult> {
@@ -1507,15 +1524,12 @@ impl LspManager {
     }
 
     pub fn request_definition(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        let _ = self.cmd_tx.send(Cmd::RequestDefinition {
-            request_id: id,
+        self.send_request(|request_id| Cmd::RequestDefinition {
+            request_id,
             path,
             line,
             character,
-        });
-        id
+        })
     }
 
     pub fn drain_definition(&self) -> Option<DefinitionResult> {
@@ -1556,15 +1570,12 @@ impl LspManager {
     }
 
     pub fn request_declaration(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        let _ = self.cmd_tx.send(Cmd::RequestDeclaration {
-            request_id: id,
+        self.send_request(|request_id| Cmd::RequestDeclaration {
+            request_id,
             path,
             line,
             character,
-        });
-        id
+        })
     }
 
     pub fn drain_declaration(&self) -> Option<DeclarationResult> {
@@ -1572,15 +1583,12 @@ impl LspManager {
     }
 
     pub fn request_type_definition(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        let _ = self.cmd_tx.send(Cmd::RequestTypeDefinition {
-            request_id: id,
+        self.send_request(|request_id| Cmd::RequestTypeDefinition {
+            request_id,
             path,
             line,
             character,
-        });
-        id
+        })
     }
 
     pub fn drain_type_definition(&self) -> Option<TypeDefinitionResult> {
@@ -1588,15 +1596,12 @@ impl LspManager {
     }
 
     pub fn request_implementation(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        let _ = self.cmd_tx.send(Cmd::RequestImplementation {
-            request_id: id,
+        self.send_request(|request_id| Cmd::RequestImplementation {
+            request_id,
             path,
             line,
             character,
-        });
-        id
+        })
     }
 
     pub fn drain_implementation(&self) -> Option<ImplementationResult> {
@@ -1604,28 +1609,19 @@ impl LspManager {
     }
 
     pub fn request_references(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        let _ = self.cmd_tx.send(Cmd::RequestReferences {
-            request_id: id,
+        self.send_request(|request_id| Cmd::RequestReferences {
+            request_id,
             path,
             line,
             character,
-        });
-        id
+        })
     }
 
     /// Fire a `workspace/symbol` query at every running server that
     /// supports it; the merged reply arrives via
     /// [`Self::drain_workspace_symbols`] tagged with the returned id.
     pub fn request_workspace_symbols(&mut self, query: String) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        let _ = self.cmd_tx.send(Cmd::RequestWorkspaceSymbols {
-            request_id: id,
-            query,
-        });
-        id
+        self.send_request(|request_id| Cmd::RequestWorkspaceSymbols { request_id, query })
     }
 
     pub fn drain_workspace_symbols(&self) -> Option<WorkspaceSymbolsResult> {
@@ -1641,15 +1637,12 @@ impl LspManager {
     /// the returned id. Silent when no server supports the method — the app
     /// simply never gets a reply to paint.
     pub fn request_document_highlights(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        let _ = self.cmd_tx.send(Cmd::RequestDocumentHighlights {
-            request_id: id,
+        self.send_request(|request_id| Cmd::RequestDocumentHighlights {
+            request_id,
             path,
             line,
             character,
-        });
-        id
+        })
     }
 
     pub fn drain_document_highlights(&self) -> Option<DocumentHighlightsResult> {
@@ -1660,29 +1653,23 @@ impl LspManager {
     /// fire-and-forget id contract as occurrences; no reply arrives for
     /// a language without the provider.
     pub fn request_linked_editing(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        let _ = self.cmd_tx.send(Cmd::RequestLinkedEditing {
-            request_id: id,
+        self.send_request(|request_id| Cmd::RequestLinkedEditing {
+            request_id,
             path,
             line,
             character,
-        });
-        id
+        })
     }
 
     /// Ask for the Expand Selection chains at every cursor (#254): one
     /// request carries all positions, primary first. Returns the request
     /// id the reply will echo.
     pub fn request_selection_ranges(&mut self, path: PathBuf, positions: Vec<(u32, u32)>) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        let _ = self.cmd_tx.send(Cmd::RequestSelectionRanges {
-            request_id: id,
+        self.send_request(|request_id| Cmd::RequestSelectionRanges {
+            request_id,
             path,
             positions,
-        });
-        id
+        })
     }
 
     pub fn drain_linked_editing(&self) -> Option<LinkedEditingResult> {
@@ -1709,31 +1696,17 @@ impl LspManager {
         character: u32,
         incoming: bool,
     ) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        let _ = self.cmd_tx.send(Cmd::RequestCallHierarchy {
-            request_id: id,
+        self.send_request(|request_id| Cmd::RequestCallHierarchy {
+            request_id,
             path,
             line,
             character,
             incoming,
-        });
-        id
+        })
     }
 
     pub fn drain_call_hierarchy(&self) -> Option<CallHierarchyResult> {
         self.calls_rx.try_recv().ok()
-    }
-
-    /// Whether the server for `lang` answers type hierarchy (#613). `None`
-    /// means no server has reported yet.
-    pub fn language_supports_type_hierarchy(&self, lang: Language) -> Option<bool> {
-        self.capability_support
-            .lock()
-            .ok()?
-            .type_hierarchy
-            .get(&lang)
-            .copied()
     }
 
     /// The supertypes or subtypes of the type at a position (#613); the
@@ -1745,16 +1718,13 @@ impl LspManager {
         character: u32,
         supertypes: bool,
     ) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        let _ = self.cmd_tx.send(Cmd::RequestTypeHierarchy {
-            request_id: id,
+        self.send_request(|request_id| Cmd::RequestTypeHierarchy {
+            request_id,
             path,
             line,
             character,
             supertypes,
-        });
-        id
+        })
     }
 
     /// Whether any running server wants `willRenameFiles` (#610). When none
@@ -1792,6 +1762,17 @@ impl LspManager {
         self.registered_servers.insert(lang, names.to_vec());
     }
 
+    /// Whether any running server has the open document `path` (#1566):
+    /// one that does answers its completions, and word completion waits for
+    /// that answer instead of opening on the document's words at once.
+    pub fn document_has_server(&self, path: &Path) -> bool {
+        self.capability_support.lock().is_ok_and(|s| {
+            s.document_servers
+                .get(path)
+                .is_some_and(|names| !names.is_empty())
+        })
+    }
+
     /// Test hook: record `names` as the servers reporting on `path`, as an
     /// open would, without starting any.
     #[cfg(test)]
@@ -1807,60 +1788,35 @@ impl LspManager {
     /// Whether the server for `lang` implements call hierarchy. `None` means
     /// no server has reported yet. Drives the right-click menu rows.
     pub fn language_supports_call_hierarchy(&self, lang: Language) -> Option<bool> {
-        self.capability_support
-            .lock()
-            .ok()?
-            .call_hierarchy
-            .get(&lang)
-            .copied()
+        self.language_supports(lang, |s| &s.call_hierarchy)
     }
 
     /// Whether the server for `lang` implements `textDocument/declaration`.
     /// `None` means no server has reported yet (not spawned). Read synchronously
     /// by the app to decide whether to show the "Go to Declaration" menu item.
     pub fn language_supports_declaration(&self, lang: Language) -> Option<bool> {
-        self.capability_support
-            .lock()
-            .ok()?
-            .declaration
-            .get(&lang)
-            .copied()
+        self.language_supports(lang, |s| &s.declaration)
     }
 
     /// Whether the server for `lang` implements `textDocument/typeDefinition`.
     /// `None` means no server has reported yet. Read synchronously by the app to
     /// decide whether to show the "Go to Type Definition" menu item.
     pub fn language_supports_type_definition(&self, lang: Language) -> Option<bool> {
-        self.capability_support
-            .lock()
-            .ok()?
-            .type_definition
-            .get(&lang)
-            .copied()
+        self.language_supports(lang, |s| &s.type_definition)
     }
 
     /// Whether the server for `lang` implements `textDocument/implementation`.
     /// `None` means no server has reported yet. Read synchronously by the app to
     /// decide whether to show the "Go to Implementations" menu item.
     pub fn language_supports_implementation(&self, lang: Language) -> Option<bool> {
-        self.capability_support
-            .lock()
-            .ok()?
-            .implementation
-            .get(&lang)
-            .copied()
+        self.language_supports(lang, |s| &s.implementation)
     }
 
     /// Whether the server for `lang` implements `textDocument/references`.
     /// `None` means no server has reported yet. Read synchronously by the app to
     /// decide whether to show the "Go to References" menu item.
     pub fn language_supports_references(&self, lang: Language) -> Option<bool> {
-        self.capability_support
-            .lock()
-            .ok()?
-            .references
-            .get(&lang)
-            .copied()
+        self.language_supports(lang, |s| &s.references)
     }
 
     pub fn request_rename(
@@ -1870,30 +1826,24 @@ impl LspManager {
         character: u32,
         new_name: String,
     ) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        let _ = self.cmd_tx.send(Cmd::RequestRename {
-            request_id: id,
+        self.send_request(|request_id| Cmd::RequestRename {
+            request_id,
             path,
             line,
             character,
             new_name,
-        });
-        id
+        })
     }
 
     /// Validate a rename position and fetch its placeholder (#254);
     /// the reply always arrives via [`Self::drain_prepare_rename`].
     pub fn request_prepare_rename(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        let _ = self.cmd_tx.send(Cmd::RequestPrepareRename {
-            request_id: id,
+        self.send_request(|request_id| Cmd::RequestPrepareRename {
+            request_id,
             path,
             line,
             character,
-        });
-        id
+        })
     }
 
     pub fn drain_prepare_rename(&self) -> Option<PrepareRenameResult> {
@@ -1908,13 +1858,10 @@ impl LspManager {
     /// (#610). Always answered, with no edits when no server cares, so the
     /// caller can wait on it.
     pub fn request_will_rename_files(&mut self, renames: Vec<FileRenameOp>) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        let _ = self.cmd_tx.send(Cmd::RequestWillRenameFiles {
-            request_id: id,
+        self.send_request(|request_id| Cmd::RequestWillRenameFiles {
+            request_id,
             renames,
-        });
-        id
+        })
     }
 
     pub fn drain_will_rename_files(&self) -> Option<WillRenameFilesResult> {
@@ -1927,15 +1874,12 @@ impl LspManager {
     }
 
     pub fn request_formatting(&mut self, path: PathBuf, tab_size: u32, insert_spaces: bool) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        let _ = self.cmd_tx.send(Cmd::RequestFormatting {
-            request_id: id,
+        self.send_request(|request_id| Cmd::RequestFormatting {
+            request_id,
             path,
             tab_size,
             insert_spaces,
-        });
-        id
+        })
     }
 
     /// Fire `textDocument/onTypeFormatting` for the just-typed trigger
@@ -1951,18 +1895,15 @@ impl LspManager {
         tab_size: u32,
         insert_spaces: bool,
     ) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        let _ = self.cmd_tx.send(Cmd::RequestOnTypeFormatting {
-            request_id: id,
+        self.send_request(|request_id| Cmd::RequestOnTypeFormatting {
+            request_id,
             path,
             line,
             character,
             ch,
             tab_size,
             insert_spaces,
-        });
-        id
+        })
     }
 
     pub fn drain_on_type_formatting(&self) -> Option<FormatResult> {
@@ -1993,17 +1934,14 @@ impl LspManager {
         tab_size: u32,
         insert_spaces: bool,
     ) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        let _ = self.cmd_tx.send(Cmd::RequestRangeFormatting {
-            request_id: id,
+        self.send_request(|request_id| Cmd::RequestRangeFormatting {
+            request_id,
             path,
             start,
             end,
             tab_size,
             insert_spaces,
-        });
-        id
+        })
     }
 
     pub fn drain_formatting(&self) -> Option<FormatResult> {
@@ -2014,12 +1952,7 @@ impl LspManager {
     /// `None` means no server has reported yet. Read synchronously by the app
     /// to decide whether to offer "Format Document".
     pub fn language_supports_formatting(&self, lang: Language) -> Option<bool> {
-        self.capability_support
-            .lock()
-            .ok()?
-            .formatting
-            .get(&lang)
-            .copied()
+        self.language_supports(lang, |s| &s.formatting)
     }
 
     /// Request the quick fixes / refactors available over a range (use the same
@@ -2036,18 +1969,15 @@ impl LspManager {
         end_char: u32,
         diagnostics: Vec<Diagnostic>,
     ) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        let _ = self.cmd_tx.send(Cmd::RequestCodeAction {
-            request_id: id,
+        self.send_request(|request_id| Cmd::RequestCodeAction {
+            request_id,
             path,
             start_line,
             start_char,
             end_line,
             end_char,
             diagnostics,
-        });
-        id
+        })
     }
 
     /// Resolve an action that arrived without its edit (it carried only `data`).
@@ -2058,15 +1988,12 @@ impl LspManager {
         server: String,
         action: serde_json::Value,
     ) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        let _ = self.cmd_tx.send(Cmd::ResolveCodeAction {
-            request_id: id,
+        self.send_request(|request_id| Cmd::ResolveCodeAction {
+            request_id,
             path,
             server,
             action,
-        });
-        id
+        })
     }
 
     /// Fire a `workspace/executeCommand` for a command-style code action. The
@@ -2091,10 +2018,17 @@ impl LspManager {
     /// Whether the server for `lang` implements `textDocument/codeAction`.
     /// `None` means no server has reported yet.
     pub fn language_supports_code_action(&self, lang: Language) -> Option<bool> {
-        self.capability_support
-            .lock()
-            .ok()?
-            .code_action
+        self.language_supports(lang, |s| &s.code_action)
+    }
+
+    /// What the servers for `lang` reported in the per-language capability
+    /// map `pick` names. `None` means no server has reported yet.
+    fn language_supports(
+        &self,
+        lang: Language,
+        pick: fn(&LangCapabilitySupport) -> &HashMap<Language, bool>,
+    ) -> Option<bool> {
+        pick(&*self.capability_support.lock().ok()?)
             .get(&lang)
             .copied()
     }
@@ -2211,11 +2145,20 @@ struct ManagedClient {
 /// auto-detect that project's environment.
 type ClientKey = (Language, PathBuf);
 
+/// Why [`WorkerState::pick_server`] found no server to ask.
+enum NoServer {
+    /// The file is not open, or no server set exists for its language and
+    /// root: the request is dropped without a reply.
+    Unknown,
+    /// Servers run for the file, but none carries the method.
+    Unsupported,
+}
+
 struct WorkerState {
     workspace_root: PathBuf,
     /// Secondary workspace roots (multi-root, #147). Servers stay one
     /// instance per (language, project root); these only widen the bound
-    /// `project_root_for` walks within, so a file under a secondary root
+    /// `project_root_for_roots` walks within, so a file under a secondary root
     /// spawns its servers AT that root instead of falling back to the
     /// primary — the per-root-instance model every server supports.
     extra_roots: Vec<PathBuf>,
@@ -3170,9 +3113,6 @@ impl WorkerState {
                 support.code_action.insert(lang, supports_code_action);
                 support.call_hierarchy.insert(lang, supports_call_hierarchy);
                 support
-                    .type_hierarchy
-                    .insert(lang, spawned.iter().any(|c| c.supports_type_hierarchy));
-                support
                     .will_rename
                     .insert(lang, spawned.iter().any(|c| c.will_rename.is_some()));
             }
@@ -3211,6 +3151,29 @@ impl WorkerState {
             self.clients.insert(key.clone(), spawned);
         }
         self.clients.get(&key).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// The first server running for the open document `path` that `supports`
+    /// a method, as its name and client. Re-probes first, so a server
+    /// installed since the file was opened (e.g. the managed vtsls finishing
+    /// its lazy background install) is picked up without reopening the file;
+    /// cheap once the list is non-empty.
+    async fn pick_server(
+        &mut self,
+        path: &Path,
+        supports: fn(&ManagedClient) -> bool,
+    ) -> Result<(String, Arc<TokioMutex<LspClient>>), NoServer> {
+        let doc = self.docs.get(path).ok_or(NoServer::Unknown)?;
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        self.clients
+            .get(&(lang, root))
+            .ok_or(NoServer::Unknown)?
+            .iter()
+            .find(|c| supports(c))
+            .map(|c| (c.name.clone(), c.client.clone()))
+            .ok_or(NoServer::Unsupported)
     }
 
     /// Spawn (or begin provisioning) the servers for every language whose
@@ -3612,35 +3575,21 @@ impl WorkerState {
         character: u32,
         tx: &std_mpsc::Sender<HoverResult>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        // Re-probe so a server installed since the file was opened (e.g. the
-        // managed vtsls finishing its lazy background install) is picked up
-        // without reopening the file. Cheap once the list is non-empty.
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_hover)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
-            let _ = tx.send(HoverResult {
-                request_id,
-                path,
-                text: None,
-            });
-            return;
+        let (server_name, client_arc) = match self.pick_server(&path, |c| c.supports_hover).await {
+            Ok(picked) => picked,
+            Err(NoServer::Unsupported) => {
+                let _ = tx.send(HoverResult {
+                    request_id,
+                    text: None,
+                });
+                return;
+            }
+            Err(NoServer::Unknown) => return,
         };
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
         };
         let tx = tx.clone();
-        let path_clone = path.clone();
         log_file::log(&format!(
             "hover request id={request_id} server={server_name} path={} line={line} char={character}",
             path.display()
@@ -3661,11 +3610,7 @@ impl WorkerState {
                 "hover response id={request_id} server={server_name} has_text={}",
                 text.is_some()
             ));
-            let _ = tx.send(HoverResult {
-                request_id,
-                path: path_clone,
-                text,
-            });
+            let _ = tx.send(HoverResult { request_id, text });
         });
     }
 
@@ -3771,20 +3716,9 @@ impl WorkerState {
         seq: u64,
         tx: &std_mpsc::Sender<InlayHintsUpdate>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_inlay_hints)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
+        let Ok((server_name, client_arc)) =
+            self.pick_server(&path, |c| c.supports_inlay_hints).await
+        else {
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
@@ -3820,20 +3754,9 @@ impl WorkerState {
         seq: u64,
         tx: &std_mpsc::Sender<DocumentLinksUpdate>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_document_link)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
+        let Ok((server_name, client_arc)) =
+            self.pick_server(&path, |c| c.supports_document_link).await
+        else {
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
@@ -3986,20 +3909,9 @@ impl WorkerState {
         seq: u64,
         tx: &std_mpsc::Sender<FoldingRangesUpdate>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_folding_range)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
+        let Ok((server_name, client_arc)) =
+            self.pick_server(&path, |c| c.supports_folding_range).await
+        else {
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
@@ -4033,20 +3945,9 @@ impl WorkerState {
         seq: u64,
         tx: &std_mpsc::Sender<DocumentColorsUpdate>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_document_color)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
+        let Ok((server_name, client_arc)) =
+            self.pick_server(&path, |c| c.supports_document_color).await
+        else {
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
@@ -4078,34 +3979,20 @@ impl WorkerState {
         end: (u32, u32),
         tx: &std_mpsc::Sender<ColorPresentationsResult>,
     ) {
-        let empty = |tx: &std_mpsc::Sender<ColorPresentationsResult>, path: PathBuf| {
+        let empty = |tx: &std_mpsc::Sender<ColorPresentationsResult>| {
             let _ = tx.send(ColorPresentationsResult {
                 request_id,
-                path,
                 presentations: Vec::new(),
             });
         };
-        let Some(doc) = self.docs.get(&path) else {
-            empty(tx, path);
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            empty(tx, path);
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_document_color)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
-            empty(tx, path);
+        let Ok((server_name, client_arc)) =
+            self.pick_server(&path, |c| c.supports_document_color).await
+        else {
+            empty(tx);
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
-            empty(tx, path);
+            empty(tx);
             return;
         };
         let lsp_color = lsp_types::Color {
@@ -4115,7 +4002,6 @@ impl WorkerState {
             alpha: color.3,
         };
         let tx = tx.clone();
-        let path_clone = path.clone();
         tokio::spawn(async move {
             let mut client = client_arc.lock().await.requests();
             let resp = client.color_presentations(uri, lsp_color, start, end).await;
@@ -4151,7 +4037,6 @@ impl WorkerState {
             };
             let _ = tx.send(ColorPresentationsResult {
                 request_id,
-                path: path_clone,
                 presentations,
             });
         });
@@ -4235,35 +4120,22 @@ impl WorkerState {
         character: u32,
         tx: &std_mpsc::Sender<DefinitionResult>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        // Re-probe so a server installed since the file was opened (e.g. the
-        // managed vtsls finishing its lazy background install) is picked up
-        // without reopening the file. Cheap once the list is non-empty.
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_definition)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
-            let _ = tx.send(DefinitionResult {
-                request_id,
-                path,
-                target: None,
-            });
-            return;
-        };
+        let (server_name, client_arc) =
+            match self.pick_server(&path, |c| c.supports_definition).await {
+                Ok(picked) => picked,
+                Err(NoServer::Unsupported) => {
+                    let _ = tx.send(DefinitionResult {
+                        request_id,
+                        target: None,
+                    });
+                    return;
+                }
+                Err(NoServer::Unknown) => return,
+            };
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
         };
         let tx = tx.clone();
-        let path_clone = path.clone();
         log_file::log(&format!(
             "definition request id={request_id} server={server_name} path={} line={line} char={character}",
             path.display()
@@ -4284,11 +4156,7 @@ impl WorkerState {
                 "definition response id={request_id} server={server_name} has_target={}",
                 target.is_some()
             ));
-            let _ = tx.send(DefinitionResult {
-                request_id,
-                path: path_clone,
-                target,
-            });
+            let _ = tx.send(DefinitionResult { request_id, target });
         });
     }
 
@@ -4298,28 +4166,22 @@ impl WorkerState {
         seq: u64,
         tx: &std_mpsc::Sender<DocumentSymbolsResult>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_document_symbol)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
-            // No symbol provider: send an empty outline so the panel shows
-            // "No symbols" rather than a stale tree from a previous file.
-            let _ = tx.send(DocumentSymbolsResult {
-                path,
-                seq,
-                symbols: Vec::new(),
-            });
-            return;
+        let (server_name, client_arc) = match self
+            .pick_server(&path, |c| c.supports_document_symbol)
+            .await
+        {
+            Ok(picked) => picked,
+            Err(NoServer::Unsupported) => {
+                // No symbol provider: send an empty outline so the panel shows
+                // "No symbols" rather than a stale tree from a previous file.
+                let _ = tx.send(DocumentSymbolsResult {
+                    path,
+                    seq,
+                    symbols: Vec::new(),
+                });
+                return;
+            }
+            Err(NoServer::Unknown) => return,
         };
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
@@ -4358,36 +4220,23 @@ impl WorkerState {
         character: u32,
         tx: &std_mpsc::Sender<DeclarationResult>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        // Re-probe so a server installed since the file was opened (e.g. the
-        // managed vtsls finishing its lazy background install) is picked up
-        // without reopening the file. Cheap once the list is non-empty.
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_declaration)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
-            let _ = tx.send(DeclarationResult {
-                request_id,
-                path,
-                target: None,
-                unsupported: true,
-            });
-            return;
-        };
+        let (server_name, client_arc) =
+            match self.pick_server(&path, |c| c.supports_declaration).await {
+                Ok(picked) => picked,
+                Err(NoServer::Unsupported) => {
+                    let _ = tx.send(DeclarationResult {
+                        request_id,
+                        target: None,
+                        unsupported: true,
+                    });
+                    return;
+                }
+                Err(NoServer::Unknown) => return,
+            };
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
         };
         let tx = tx.clone();
-        let path_clone = path.clone();
         log_file::log(&format!(
             "declaration request id={request_id} server={server_name} path={} line={line} char={character}",
             path.display()
@@ -4412,7 +4261,6 @@ impl WorkerState {
             ));
             let _ = tx.send(DeclarationResult {
                 request_id,
-                path: path_clone,
                 target,
                 unsupported: false,
             });
@@ -4427,36 +4275,25 @@ impl WorkerState {
         character: u32,
         tx: &std_mpsc::Sender<TypeDefinitionResult>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        // Re-probe so a server installed since the file was opened (e.g. the
-        // managed vtsls finishing its lazy background install) is picked up
-        // without reopening the file. Cheap once the list is non-empty.
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_type_definition)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
-            let _ = tx.send(TypeDefinitionResult {
-                request_id,
-                path,
-                target: None,
-                unsupported: true,
-            });
-            return;
+        let (server_name, client_arc) = match self
+            .pick_server(&path, |c| c.supports_type_definition)
+            .await
+        {
+            Ok(picked) => picked,
+            Err(NoServer::Unsupported) => {
+                let _ = tx.send(TypeDefinitionResult {
+                    request_id,
+                    target: None,
+                    unsupported: true,
+                });
+                return;
+            }
+            Err(NoServer::Unknown) => return,
         };
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
         };
         let tx = tx.clone();
-        let path_clone = path.clone();
         log_file::log(&format!(
             "type_definition request id={request_id} server={server_name} path={} line={line} char={character}",
             path.display()
@@ -4481,7 +4318,6 @@ impl WorkerState {
             ));
             let _ = tx.send(TypeDefinitionResult {
                 request_id,
-                path: path_clone,
                 target,
                 unsupported: false,
             });
@@ -4496,36 +4332,23 @@ impl WorkerState {
         character: u32,
         tx: &std_mpsc::Sender<ImplementationResult>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        // Re-probe so a server installed since the file was opened (e.g. the
-        // managed vtsls finishing its lazy background install) is picked up
-        // without reopening the file. Cheap once the list is non-empty.
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_implementation)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
-            let _ = tx.send(ImplementationResult {
-                request_id,
-                path,
-                targets: Vec::new(),
-                unsupported: true,
-            });
-            return;
-        };
+        let (server_name, client_arc) =
+            match self.pick_server(&path, |c| c.supports_implementation).await {
+                Ok(picked) => picked,
+                Err(NoServer::Unsupported) => {
+                    let _ = tx.send(ImplementationResult {
+                        request_id,
+                        targets: Vec::new(),
+                        unsupported: true,
+                    });
+                    return;
+                }
+                Err(NoServer::Unknown) => return,
+            };
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
         };
         let tx = tx.clone();
-        let path_clone = path.clone();
         log_file::log(&format!(
             "implementation request id={request_id} server={server_name} path={} line={line} char={character}",
             path.display()
@@ -4550,7 +4373,6 @@ impl WorkerState {
             ));
             let _ = tx.send(ImplementationResult {
                 request_id,
-                path: path_clone,
                 targets,
                 unsupported: false,
             });
@@ -4651,36 +4473,23 @@ impl WorkerState {
         character: u32,
         tx: &std_mpsc::Sender<ReferencesResult>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        // Re-probe so a server installed since the file was opened (e.g. the
-        // managed vtsls finishing its lazy background install) is picked up
-        // without reopening the file. Cheap once the list is non-empty.
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_references)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
-            let _ = tx.send(ReferencesResult {
-                request_id,
-                path,
-                targets: Vec::new(),
-                unsupported: true,
-            });
-            return;
-        };
+        let (server_name, client_arc) =
+            match self.pick_server(&path, |c| c.supports_references).await {
+                Ok(picked) => picked,
+                Err(NoServer::Unsupported) => {
+                    let _ = tx.send(ReferencesResult {
+                        request_id,
+                        targets: Vec::new(),
+                        unsupported: true,
+                    });
+                    return;
+                }
+                Err(NoServer::Unknown) => return,
+            };
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
         };
         let tx = tx.clone();
-        let path_clone = path.clone();
         log_file::log(&format!(
             "references request id={request_id} server={server_name} path={} line={line} char={character}",
             path.display()
@@ -4705,7 +4514,6 @@ impl WorkerState {
             ));
             let _ = tx.send(ReferencesResult {
                 request_id,
-                path: path_clone,
                 targets,
                 unsupported: false,
             });
@@ -4720,30 +4528,19 @@ impl WorkerState {
         character: u32,
         tx: &std_mpsc::Sender<DocumentHighlightsResult>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
         // No unsupported reply: occurrences are a silent background
         // decoration, so a language without the capability just never
         // paints (the app cleared the old set when the caret moved).
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_document_highlight)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
+        let Ok((server_name, client_arc)) = self
+            .pick_server(&path, |c| c.supports_document_highlight)
+            .await
+        else {
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
         };
         let tx = tx.clone();
-        let path_clone = path.clone();
         tokio::spawn(async move {
             let mut client = client_arc.lock().await.requests();
             let resp = client.document_highlight(uri, line, character).await;
@@ -4758,11 +4555,7 @@ impl WorkerState {
                     Vec::new()
                 }
             };
-            let _ = tx.send(DocumentHighlightsResult {
-                request_id,
-                path: path_clone,
-                items,
-            });
+            let _ = tx.send(DocumentHighlightsResult { request_id, items });
         });
     }
 
@@ -4777,27 +4570,15 @@ impl WorkerState {
         character: u32,
         tx: &std_mpsc::Sender<LinkedEditingResult>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_linked_editing)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
+        let Ok((server_name, client_arc)) =
+            self.pick_server(&path, |c| c.supports_linked_editing).await
+        else {
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
         };
         let tx = tx.clone();
-        let path_clone = path.clone();
         tokio::spawn(async move {
             let mut client = client_arc.lock().await.requests();
             let resp = client.linked_editing_range(uri, line, character).await;
@@ -4816,11 +4597,7 @@ impl WorkerState {
                     Vec::new()
                 }
             };
-            let _ = tx.send(LinkedEditingResult {
-                request_id,
-                path: path_clone,
-                ranges,
-            });
+            let _ = tx.send(LinkedEditingResult { request_id, ranges });
         });
     }
 
@@ -4835,35 +4612,22 @@ impl WorkerState {
         positions: Vec<(u32, u32)>,
         tx: &std_mpsc::Sender<SelectionRangesResult>,
     ) {
-        let unsupported = |tx: &std_mpsc::Sender<SelectionRangesResult>, path: PathBuf| {
+        let unsupported = |tx: &std_mpsc::Sender<SelectionRangesResult>| {
             let _ = tx.send(SelectionRangesResult {
                 request_id,
-                path,
                 unsupported: true,
                 chains: Vec::new(),
             });
         };
-        let Some(doc) = self.docs.get(&path) else {
-            unsupported(tx, path);
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            unsupported(tx, path);
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_selection_range)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
-            unsupported(tx, path);
+        let Ok((server_name, client_arc)) = self
+            .pick_server(&path, |c| c.supports_selection_range)
+            .await
+        else {
+            unsupported(tx);
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
-            unsupported(tx, path);
+            unsupported(tx);
             return;
         };
         let lsp_positions: Vec<lsp_types::Position> = positions
@@ -4871,7 +4635,6 @@ impl WorkerState {
             .map(|&(line, character)| lsp_types::Position { line, character })
             .collect();
         let tx = tx.clone();
-        let path_clone = path.clone();
         tokio::spawn(async move {
             let mut client = client_arc.lock().await.requests();
             let resp = client.selection_ranges(uri, lsp_positions).await;
@@ -4889,7 +4652,6 @@ impl WorkerState {
             };
             let _ = tx.send(SelectionRangesResult {
                 request_id,
-                path: path_clone,
                 unsupported,
                 chains,
             });
@@ -4915,28 +4677,20 @@ impl WorkerState {
         } else {
             HierarchyKind::OutgoingCalls
         };
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_call_hierarchy)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
-            let _ = tx.send(CallHierarchyResult {
-                request_id,
-                kind,
-                sites: Vec::new(),
-                unsupported: true,
-            });
-            return;
-        };
+        let (server_name, client_arc) =
+            match self.pick_server(&path, |c| c.supports_call_hierarchy).await {
+                Ok(picked) => picked,
+                Err(NoServer::Unsupported) => {
+                    let _ = tx.send(CallHierarchyResult {
+                        request_id,
+                        kind,
+                        sites: Vec::new(),
+                        unsupported: true,
+                    });
+                    return;
+                }
+                Err(NoServer::Unknown) => return,
+            };
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
         };
@@ -5096,7 +4850,6 @@ impl WorkerState {
         if servers.is_empty() {
             let _ = tx.send(CodeActionResult {
                 request_id,
-                path,
                 items: None,
                 unsupported: true,
             });
@@ -5117,7 +4870,6 @@ impl WorkerState {
         };
         let diags: Vec<lsp_types::Diagnostic> = diagnostics.iter().map(to_lsp_diagnostic).collect();
         let tx = tx.clone();
-        let path_clone = path.clone();
         log_file::log(&format!(
             "code_action request id={request_id} servers={} path={} line={start_line}",
             servers.len(),
@@ -5150,7 +4902,6 @@ impl WorkerState {
             ));
             let _ = tx.send(CodeActionResult {
                 request_id,
-                path: path_clone,
                 // `None` only when every server errored; an empty Vec means a
                 // server answered with nothing.
                 items: if any_ran { Some(combined) } else { None },
@@ -5172,7 +4923,6 @@ impl WorkerState {
         let Ok(action) = serde_json::from_value::<lsp_types::CodeAction>(action) else {
             let _ = tx.send(CodeActionResult {
                 request_id,
-                path,
                 items: None,
                 unsupported: false,
             });
@@ -5197,14 +4947,12 @@ impl WorkerState {
         let Some((server_name, client_arc)) = picked else {
             let _ = tx.send(CodeActionResult {
                 request_id,
-                path,
                 items: None,
                 unsupported: true,
             });
             return;
         };
         let tx = tx.clone();
-        let path_clone = path.clone();
         tokio::spawn(async move {
             let mut client = client_arc.lock().await.requests();
             let resolved = client.code_action_resolve(action).await;
@@ -5223,7 +4971,6 @@ impl WorkerState {
             };
             let _ = tx.send(CodeActionResult {
                 request_id,
-                path: path_clone,
                 items,
                 unsupported: false,
             });
@@ -5236,20 +4983,9 @@ impl WorkerState {
         command: String,
         arguments: Vec<serde_json::Value>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_code_action)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
+        let Ok((server_name, client_arc)) =
+            self.pick_server(&path, |c| c.supports_code_action).await
+        else {
             return;
         };
         tokio::spawn(async move {
@@ -5271,41 +5007,22 @@ impl WorkerState {
     ) {
         // Every early exit answers with no edits, so the caller's "Renaming
         // symbol" always resolves (#1193).
-        let unanswerable = |path: PathBuf| {
+        let unanswerable = || {
             let _ = tx.send(RenameResult {
                 request_id,
-                path,
                 edits: None,
             });
         };
-        let Some(doc) = self.docs.get(&path) else {
-            unanswerable(path);
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        // Re-probe so a server installed since the file was opened (e.g. the
-        // managed vtsls finishing its lazy background install) is picked up
-        // without reopening the file. Cheap once the list is non-empty.
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            unanswerable(path);
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_rename)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
-            unanswerable(path);
+        let Ok((server_name, client_arc)) = self.pick_server(&path, |c| c.supports_rename).await
+        else {
+            unanswerable();
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
-            unanswerable(path);
+            unanswerable();
             return;
         };
         let tx = tx.clone();
-        let path_clone = path.clone();
         log_file::log(&format!(
             "rename request id={request_id} server={server_name} path={} line={line} char={character} new_name={new_name}",
             path.display()
@@ -5326,11 +5043,7 @@ impl WorkerState {
                 "rename response id={request_id} server={server_name} files={}",
                 edits.as_ref().map(Vec::len).unwrap_or(0)
             ));
-            let _ = tx.send(RenameResult {
-                request_id,
-                path: path_clone,
-                edits,
-            });
+            let _ = tx.send(RenameResult { request_id, edits });
         });
     }
 
@@ -5418,24 +5131,23 @@ impl WorkerState {
         character: u32,
         tx: &std_mpsc::Sender<PrepareRenameResult>,
     ) {
-        let unsupported = |tx: &std_mpsc::Sender<PrepareRenameResult>, path: PathBuf| {
+        let unsupported = |tx: &std_mpsc::Sender<PrepareRenameResult>| {
             let _ = tx.send(PrepareRenameResult {
                 request_id,
-                path,
                 unsupported: true,
                 error: None,
                 target: None,
             });
         };
         let Some(doc) = self.docs.get(&path) else {
-            unsupported(tx, path);
+            unsupported(tx);
             return;
         };
         let lang = doc.language;
         let root = doc.project_root.clone();
         self.ensure_clients(lang, &root).await;
         let Some(clients) = self.clients.get(&(lang, root)) else {
-            unsupported(tx, path);
+            unsupported(tx);
             return;
         };
         let picked = clients.iter().find(|c| c.supports_prepare_rename).map(|c| {
@@ -5446,17 +5158,16 @@ impl WorkerState {
             )
         });
         let Some((server_name, client_arc, stalled)) = picked else {
-            unsupported(tx, path);
+            unsupported(tx);
             return;
         };
         let Ok(uri) = Url::from_file_path(&path) else {
-            unsupported(tx, path);
+            unsupported(tx);
             return;
         };
         spawn_prepare_rename(
             PrepareRenameAsk {
                 request_id,
-                path,
                 server_name,
                 client: client_arc,
                 uri,
@@ -5629,22 +5340,10 @@ impl WorkerState {
         insert_spaces: bool,
         tx: &std_mpsc::Sender<FormatResult>,
     ) {
-        let Some(doc) = self.docs.get(&path) else {
-            answer_unsupported(tx, request_id, path);
-            return;
-        };
-        let lang = doc.language;
-        let root = doc.project_root.clone();
-        self.ensure_clients(lang, &root).await;
-        let Some(clients) = self.clients.get(&(lang, root)) else {
-            answer_unsupported(tx, request_id, path);
-            return;
-        };
-        let picked = clients
-            .iter()
-            .find(|c| c.supports_range_formatting)
-            .map(|c| (c.name.clone(), c.client.clone()));
-        let Some((server_name, client_arc)) = picked else {
+        let Ok((server_name, client_arc)) = self
+            .pick_server(&path, |c| c.supports_range_formatting)
+            .await
+        else {
             answer_unsupported(tx, request_id, path);
             return;
         };
@@ -5850,9 +5549,28 @@ fn into_item(item: lsp_types::CompletionItem) -> CompletionItem {
         .flatten()
         .map(text_edit_to_span)
         .collect();
+    let documentation = item.documentation.map(|d| match d {
+        lsp_types::Documentation::String(s) => s,
+        lsp_types::Documentation::MarkupContent(m) => m.value,
+    });
+    // A server that puts the signature only in `labelDetails` (#1527)
+    // still gets it shown: its `detail` (the suffix after the label, often
+    // the parameter list) then its `description` (a qualifier), both kept.
+    let detail = item.detail.or_else(|| {
+        item.label_details.and_then(|l| {
+            let parts: Vec<String> = [l.detail, l.description]
+                .into_iter()
+                .flatten()
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect();
+            (!parts.is_empty()).then(|| parts.join(" "))
+        })
+    });
     CompletionItem {
         label: item.label,
-        detail: item.detail,
+        detail,
+        documentation,
         insert_text: item.insert_text,
         filter_text: item.filter_text,
         kind: item.kind,
@@ -6230,11 +5948,6 @@ impl DiagnosticResultIds {
         }
     }
 
-    /// Drop everything, for when the server restarts or the workspace moves.
-    pub fn clear(&mut self) {
-        self.by_uri.clear();
-    }
-
     /// How many files carry an id, so a caller can tell a cold cache from a
     /// warm one without reaching inside.
     pub fn len(&self) -> usize {
@@ -6242,6 +5955,7 @@ impl DiagnosticResultIds {
     }
 
     /// Whether the cache is cold.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_empty(&self) -> bool {
         self.by_uri.is_empty()
     }
@@ -6269,7 +5983,6 @@ const PREPARE_RENAME_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// caret is.
 struct PrepareRenameAsk {
     request_id: u64,
-    path: PathBuf,
     server_name: String,
     client: Arc<TokioMutex<LspClient>>,
     uri: Url,
@@ -6292,7 +6005,6 @@ fn spawn_prepare_rename(
     tokio::spawn(async move {
         let PrepareRenameAsk {
             request_id,
-            path,
             server_name,
             client,
             uri,
@@ -6300,15 +6012,14 @@ fn spawn_prepare_rename(
             character,
             stalled,
         } = ask;
-        let unsupported = |request_id, path| PrepareRenameResult {
+        let unsupported = |request_id| PrepareRenameResult {
             request_id,
-            path,
             unsupported: true,
             error: None,
             target: None,
         };
         if stalled.load(Ordering::Relaxed) {
-            let _ = tx.send(unsupported(request_id, path));
+            let _ = tx.send(unsupported(request_id));
             return;
         }
         // Only a request that actually went out can leak, so only then does
@@ -6333,7 +6044,7 @@ fn spawn_prepare_rename(
                     ""
                 }
             ));
-            let _ = tx.send(unsupported(request_id, path));
+            let _ = tx.send(unsupported(request_id));
             return;
         };
         let (error, target, fallback) = match resp {
@@ -6368,7 +6079,6 @@ fn spawn_prepare_rename(
         };
         let _ = tx.send(PrepareRenameResult {
             request_id,
-            path,
             unsupported: fallback,
             error,
             target,
@@ -7382,6 +7092,8 @@ fn build_client_capabilities() -> ClientCapabilities {
             // unused or deprecated code would otherwise leave the tag out.
             publish_diagnostics: Some(PublishDiagnosticsClientCapabilities {
                 related_information: Some(true),
+                // Servers may leave the rule's link out otherwise (#1540).
+                code_description_support: Some(true),
                 tag_support: Some(lsp_types::TagSupport {
                     value_set: vec![
                         lsp_types::DiagnosticTag::UNNECESSARY,
@@ -7512,16 +7224,7 @@ fn manifest_names(lang: Language) -> &'static [&'static str] {
     lang.root_markers()
 }
 
-/// The project root a file's language server should be anchored at: the nearest
-/// ancestor holding a language manifest (e.g. `pyproject.toml`, `Cargo.toml`,
-/// `go.mod`, `package.json`), bounded by croft's workspace root. Falls back to
-/// the workspace root when none is found, so a plain single-project workspace
-/// behaves exactly as before.
-fn project_root_for(path: &Path, lang: Language, workspace_root: &Path) -> PathBuf {
-    project_root_within(path, lang, workspace_root)
-}
-
-/// [`project_root_for`] with the multi-root bound (#147): the walk stays
+/// [`project_root_within`] with the multi-root bound (#147): the walk stays
 /// inside the workspace root OWNING the file (longest prefix over all
 /// roots), and the fallback is that owning root — so a file under a
 /// secondary root roots its servers there, never at the primary. A file
@@ -7540,6 +7243,11 @@ fn project_root_for_roots(
     project_root_within(path, lang, owner)
 }
 
+/// The project root a file's language server should be anchored at: the nearest
+/// ancestor holding a language manifest (e.g. `pyproject.toml`, `Cargo.toml`,
+/// `go.mod`, `package.json`), bounded by the workspace root `bound`. Falls back
+/// to `bound` when none is found, so a plain single-project workspace behaves
+/// exactly as before.
 fn project_root_within(path: &Path, lang: Language, bound: &Path) -> PathBuf {
     let manifests = manifest_names(lang);
     if !manifests.is_empty() {
@@ -7692,6 +7400,25 @@ mod tests {
     };
     use std::time::{Duration, Instant};
 
+    /// #1532: a `.scss` or `.less` file resolves to its own language, which
+    /// the CSS server is started for; `.sass` resolves to none.
+    #[test]
+    fn scss_and_less_files_resolve_to_css_server_languages() {
+        assert_eq!(
+            path_to_language(Path::new("src/app.scss")).map(|l| l.lsp_id()),
+            Some("scss")
+        );
+        assert_eq!(
+            path_to_language(Path::new("src/theme.less")).map(|l| l.lsp_id()),
+            Some("less")
+        );
+        assert_eq!(path_to_language(Path::new("old.sass")), None);
+        assert_eq!(
+            path_to_language(Path::new("plain.css")),
+            Some(Language::CSS)
+        );
+    }
+
     impl LspManager {
         /// Test seam for App-level completion tests: swap the completion
         /// reply channel for one the test holds, so a reply lands in
@@ -7705,6 +7432,69 @@ mod tests {
             self.completion_rx = rx;
             tx
         }
+    }
+
+    /// #1527: an item's documentation and its `labelDetails` signature
+    /// survive the conversion; they were dropped, so nothing could show them.
+    #[test]
+    fn a_completion_item_keeps_its_documentation_and_label_details() {
+        let item: lsp_types::CompletionItem = serde_json::from_value(serde_json::json!({
+            "label": "trim",
+            "detail": "fn(&self) -> &str",
+            "documentation": { "kind": "markdown", "value": "Returns a string slice." }
+        }))
+        .unwrap();
+        let ours = into_item(item);
+        assert_eq!(
+            ours.documentation.as_deref(),
+            Some("Returns a string slice.")
+        );
+        assert_eq!(ours.detail.as_deref(), Some("fn(&self) -> &str"));
+
+        let item: lsp_types::CompletionItem = serde_json::from_value(serde_json::json!({
+            "label": "dumps",
+            "labelDetails": { "detail": "(obj, ...)", "description": "def dumps(obj) -> str" },
+            "documentation": "Serialize obj to a JSON formatted str."
+        }))
+        .unwrap();
+        let ours = into_item(item);
+        assert_eq!(
+            ours.detail.as_deref(),
+            Some("(obj, ...) def dumps(obj) -> str")
+        );
+        assert_eq!(
+            ours.documentation.as_deref(),
+            Some("Serialize obj to a JSON formatted str.")
+        );
+    }
+
+    /// #1527: `labelDetails.detail` is the signature and `description` a
+    /// separate qualifier; having both must not drop the signature.
+    #[test]
+    fn label_details_keep_the_signature_beside_the_description() {
+        let item: lsp_types::CompletionItem = serde_json::from_value(serde_json::json!({
+            "label": "dumps",
+            "labelDetails": { "detail": "(obj, ...)", "description": "json" }
+        }))
+        .unwrap();
+        assert_eq!(into_item(item).detail.as_deref(), Some("(obj, ...) json"));
+
+        let item: lsp_types::CompletionItem = serde_json::from_value(serde_json::json!({
+            "label": "dumps",
+            "labelDetails": { "detail": "(obj, ...)", "description": "  " }
+        }))
+        .unwrap();
+        assert_eq!(into_item(item).detail.as_deref(), Some("(obj, ...)"));
+    }
+
+    /// #1527 negative: an item with neither keeps neither.
+    #[test]
+    fn a_bare_completion_item_has_no_documentation() {
+        let item: lsp_types::CompletionItem =
+            serde_json::from_value(serde_json::json!({ "label": "x" })).unwrap();
+        let ours = into_item(item);
+        assert_eq!(ours.documentation, None);
+        assert_eq!(ours.detail, None);
     }
 
     #[test]
@@ -8935,6 +8725,11 @@ while True:
             ]),
             "a server that checks tagSupport would otherwise leave the tags out"
         );
+        assert_eq!(
+            publish.code_description_support,
+            Some(true),
+            "#1540: a server may leave a rule's link out otherwise"
+        );
     }
 
     #[test]
@@ -8947,6 +8742,7 @@ while True:
             severity: DiagnosticSeverity::Hint,
             message: "`tmp` is declared but its value is never read.".into(),
             tags,
+            code: None,
         };
         let unused = to_lsp_diagnostic(&d(DiagnosticTags {
             unnecessary: true,
@@ -9206,7 +9002,7 @@ while True:
         std::fs::create_dir_all(svc.join("src/pkg")).unwrap();
         std::fs::write(svc.join("pyproject.toml"), b"[project]\n").unwrap();
         let file = svc.join("src/pkg/mod.py");
-        assert_eq!(project_root_for(&file, Language::PYTHON, root), svc);
+        assert_eq!(project_root_within(&file, Language::PYTHON, root), svc);
     }
 
     #[test]
@@ -9216,7 +9012,7 @@ while True:
         let file = root.join("a/b/loose.py");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         // No pyproject anywhere up the tree → workspace root.
-        assert_eq!(project_root_for(&file, Language::PYTHON, root), root);
+        assert_eq!(project_root_within(&file, Language::PYTHON, root), root);
     }
 
     #[test]
@@ -9228,11 +9024,11 @@ while True:
         // A Cargo.toml must not anchor a Python file; Python keeps walking to root.
         std::fs::write(sub.join("Cargo.toml"), b"[package]\n").unwrap();
         let file = sub.join("script.py");
-        assert_eq!(project_root_for(&file, Language::PYTHON, root), root);
+        assert_eq!(project_root_within(&file, Language::PYTHON, root), root);
         // ...but it does anchor a Rust file.
         let rs = sub.join("src/main.rs");
         std::fs::create_dir_all(rs.parent().unwrap()).unwrap();
-        assert_eq!(project_root_for(&rs, Language::RUST, root), sub);
+        assert_eq!(project_root_within(&rs, Language::RUST, root), sub);
     }
 
     #[test]
@@ -9301,9 +9097,6 @@ while True:
             Some(String::from("v2")),
             "the newest id is what goes back"
         );
-
-        ids.clear();
-        assert!(ids.is_empty(), "a restart drops everything");
     }
 
     /// A server that pulls per-document but NOT per-workspace advertises
@@ -9719,7 +9512,6 @@ while True:
         let result =
             drain_hover_blocking(&manager, Duration::from_secs(30)).expect("hover arrived");
         assert_eq!(result.request_id, id);
-        assert_eq!(result.path, file);
         let hover = result.text.expect("hover text for the greet call");
         assert!(
             hover.contains("greet"),
@@ -9856,7 +9648,7 @@ while True:
         let col = body.find("value").expect("value in body");
         let hit = spans[1]
             .iter()
-            .find(|s| s.start <= col && col < s.end)
+            .find(|s| s.range().contains(&col))
             .expect("a semantic span should cover the body `value`");
         assert_eq!(
             hit.style.fg,
@@ -10183,7 +9975,6 @@ while True:
             spawn_prepare_rename(
                 PrepareRenameAsk {
                     request_id: 7,
-                    path: file.clone(),
                     server_name: String::from("prepare-rename"),
                     client: Arc::new(TokioMutex::new(client)),
                     uri: Url::from_file_path(&file).unwrap(),
@@ -11784,7 +11575,6 @@ while True:
             .recv_timeout(Duration::from_secs(30))
             .expect("a document-highlight reply must reach the drain channel");
         assert_eq!(result.request_id, 7, "the reply must echo the request id");
-        assert_eq!(result.path, file);
         assert_eq!(
             result.items,
             vec![
