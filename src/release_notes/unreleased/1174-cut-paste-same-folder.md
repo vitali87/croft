@@ -1,0 +1,1 @@
+fix: In the Explorer, Cut then Paste back into the item's own folder no longer renames it on disk to "<name> copy": nothing moves, the status bar says so, and the cut stays on the clipboard for the paste you meant.
