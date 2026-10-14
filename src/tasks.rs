@@ -701,12 +701,12 @@ fn package_json_tasks(root: &Path) -> Vec<Task> {
                 problem_matcher: None,
                 vscode: Some(VscodeCommand {
                     command: runner.to_string(),
+                    command_quoting: None,
                     // A script name can hold shell syntax (`check;false`);
                     // it goes to the runner as one word.
-                    args: vec![if needs_quote(name) {
-                        quote_word(name)
-                    } else {
-                        name.clone()
+                    args: vec![TaskArg {
+                        value: name.clone(),
+                        quoting: needs_quote(name).then_some(Quoting::Strong),
                     }],
                     cwd: Some(format!("${{workspaceFolder}}/{rel}")),
                     env: Vec::new(),
