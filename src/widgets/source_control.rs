@@ -508,7 +508,8 @@ impl SourceControlPanel {
 
     /// Fill an empty box with git's prepared message (#1282), so finishing
     /// a merge commits `Merge branch 'other'` rather than "Empty commit
-    /// message". The whole message, body included (#1336): a revert's
+    /// message", or with the `commit.template` file when no merge is in
+    /// progress (#1620). The whole message, body included (#1336): a revert's
     /// "This reverts commit …" and a cherry-pick's "(cherry picked from
     /// commit …)" are what tie the commit to the one it came from. Text the
     /// user typed, or edited from the seed, is never replaced; a seed the
@@ -522,6 +523,16 @@ impl SourceControlPanel {
             .map(|m| m.trim().to_string());
         match prepared {
             Some(prepared) => {
+                // An untouched seed gives way to a different prepared
+                // message: switching repositories, or a changed template,
+                // must not leave the other one's text to be committed.
+                if let Some(seed) = self.seeded_message.as_deref()
+                    && seed != prepared
+                    && self.message == seed
+                {
+                    self.clear_message();
+                    self.seeded_message = None;
+                }
                 if self.message.is_empty()
                     && !prepared.is_empty()
                     && self.seeded_message.as_deref() != Some(prepared.as_str())
@@ -538,6 +549,15 @@ impl SourceControlPanel {
                 }
             }
         }
+    }
+
+    /// Empty the box after a commit made from it, and forget the seed it
+    /// held, so the next refresh fills it from `commit.template` again
+    /// (#1620): every commit starts from the team's template, not just the
+    /// first.
+    pub fn clear_after_commit(&mut self) {
+        self.clear_message();
+        self.seeded_message = None;
     }
 
     pub fn clear_message(&mut self) {
@@ -1299,11 +1319,7 @@ impl Widget for &mut SourceControlPanel {
             "\u{ea68} ",
             Style::default().fg(self.theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
         ));
-        let label = match (&self.status.branch, &self.status.detached_hash) {
-            (Some(b), _) => b.clone(),
-            (None, Some(h)) => h.clone(),
-            (None, None) => "(no head)".to_string(),
-        };
+        let label = self.status.head_label().to_string();
         // The glyph (2 cells) plus the name is the clickable target that
         // opens the branch picker, clamped to the panel width.
         let branch_w = (2 + label.chars().count() as u16).min(inner.width);
@@ -2093,11 +2109,13 @@ mod tests {
             behind: 0,
             head_oid: None,
             ignored: std::sync::Arc::default(),
+            decorations: std::sync::Arc::default(),
             dirty: false,
             repo_root: None,
             changed_count: 0,
             prepared_message: None,
             operation: None,
+            rebasing_branch: None,
         }
     }
 
@@ -3188,6 +3206,50 @@ mod tests {
         p.insert_str(" into main");
         p.set_status(merging(None), Vec::new());
         assert_eq!(p.message, "Merge branch 'other' into main");
+    }
+
+    /// #1620: after a commit from the box, the template fills it again for
+    /// the next commit.
+    #[test]
+    fn the_template_comes_back_after_each_commit() {
+        let mut p = SourceControlPanel::new();
+        p.set_status(merging(Some("PROJ-:\n\nWhy:")), Vec::new());
+        assert_eq!(p.message, "PROJ-:\n\nWhy:");
+        p.insert_str(" because");
+        p.clear_after_commit();
+        assert_eq!(p.message, "");
+        p.set_status(merging(Some("PROJ-:\n\nWhy:")), Vec::new());
+        assert_eq!(p.message, "PROJ-:\n\nWhy:", "seeded for the next commit");
+    }
+
+    /// #1620: an untouched seed is replaced when another repository (or a
+    /// changed template) prepares a different message, so A's template is
+    /// never committed in B; an edited seed is kept.
+    #[test]
+    fn an_untouched_seed_follows_the_repository() {
+        let mut p = SourceControlPanel::new();
+        p.set_status(merging(Some("A-:")), Vec::new());
+        p.set_status(merging(Some("B-:")), Vec::new());
+        assert_eq!(p.message, "B-:");
+        p.insert_str(" edited");
+        p.set_status(merging(Some("A-:")), Vec::new());
+        assert_eq!(p.message, "B-: edited");
+    }
+
+    /// Negative (#1620): text the user typed is kept when the template
+    /// changes, and a template they cleared is not put back until a commit.
+    #[test]
+    fn a_changed_template_never_replaces_typed_text() {
+        let mut p = SourceControlPanel::new();
+        p.insert_str("fix: my words");
+        p.set_status(merging(Some("PROJ-:")), Vec::new());
+        p.set_status(merging(Some("TEAM-:")), Vec::new());
+        assert_eq!(p.message, "fix: my words");
+        let mut p = SourceControlPanel::new();
+        p.set_status(merging(Some("PROJ-:")), Vec::new());
+        p.clear_message();
+        p.set_status(merging(Some("PROJ-:")), Vec::new());
+        assert_eq!(p.message, "");
     }
 
     #[test]

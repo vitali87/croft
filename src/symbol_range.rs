@@ -52,8 +52,7 @@ impl SymbolRange {
         self.end.saturating_sub(self.start)
     }
 
-    /// Clippy requires this beside `len`; nothing calls it yet.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Whether the range covers no bytes.
     pub fn is_empty(&self) -> bool {
         self.end <= self.start
     }

@@ -195,10 +195,6 @@ pub fn static_name(name: &str) -> &'static str {
     leaked
 }
 
-/// The registry name for the TypeScript server, shared so config and the
-/// manager's resolver agree on which server croft provisions itself.
-pub const VTSLS_SERVER_NAME: &str = "vtsls";
-
 // ---------------------------------------------------------------------------
 // Resolution: turn a `Provision` into a spawnable command, kicking off a lazy
 // background install when the server isn't there yet.
@@ -403,16 +399,11 @@ fn managed_uv_binary(bin: &str) -> Option<PathBuf> {
 /// runaway or redirected body is refused past this.
 const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 
-/// The download URL for the running platform, or `None` if unsupported. Tries
-/// the specific `"<os>-<arch>"` key first (e.g. `linux-x86_64`), then a bare
-/// `"<os>"` key (e.g. `macos` for a universal build). Pure and testable.
-fn target_url<'a>(targets: &'a [(&'a str, &'a str)], os: &str, arch: &str) -> Option<&'a str> {
-    target_entry(targets, os, arch).map(|(_, url)| url)
-}
-
-/// The key and value the platform resolves to in a per-target map, so a
-/// caller that needs two maps to agree (the URL and its digest) can look
-/// both up under the one key the URL came from.
+/// The key and value the platform resolves to in a per-target map, or `None`
+/// if unsupported. Tries the specific `"<os>-<arch>"` key first (e.g.
+/// `linux-x86_64`), then a bare `"<os>"` key (e.g. `macos` for a universal
+/// build). Returning the key lets a caller that needs two maps to agree (the
+/// URL and its digest) look both up under the one key the URL came from.
 fn target_entry<'a>(
     targets: &'a [(&'a str, &'a str)],
     os: &str,
@@ -657,7 +648,7 @@ fn extract_tar_xz_capped(bytes: &[u8], dir: &Path, target: &Path, cap: u64) -> s
 /// index cannot be read. Only a single-stream file is understood, which is
 /// what `xz` and cargo-dist produce; a concatenation of streams reads as
 /// unreadable and is refused by the caller, on the conservative side.
-fn xz_declared_size(bytes: &[u8]) -> Option<u64> {
+pub(crate) fn xz_declared_size(bytes: &[u8]) -> Option<u64> {
     // Stream footer, last 12 bytes: CRC32, backward size (index size / 4 - 1),
     // stream flags, "YZ". The index precedes it: 0x00, a record count, then
     // per record the unpadded and uncompressed sizes as 7-bit varints.
@@ -701,9 +692,9 @@ fn xz_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
 /// unpacked, not the decoder's own buffering; the declared-size check in
 /// [`extract_tar_xz_capped`] is what keeps an oversize stream from being
 /// decoded at all.
-struct Capped {
-    buf: Vec<u8>,
-    cap: u64,
+pub(crate) struct Capped {
+    pub(crate) buf: Vec<u8>,
+    pub(crate) cap: u64,
 }
 
 impl std::io::Write for Capped {
@@ -1581,23 +1572,25 @@ mod tests {
     }
 
     #[test]
-    fn target_url_prefers_os_arch_then_falls_back_to_bare_os() {
+    fn target_entry_prefers_os_arch_then_falls_back_to_bare_os() {
         // clangd's matrix: universal mac (a bare `macos` key serves any arch),
         // x86_64-only linux, and no linux-aarch64 build at all.
         let targets = [("macos", "MAC"), ("linux-x86_64", "LINUX64")];
-        assert_eq!(target_url(&targets, "macos", "aarch64"), Some("MAC"));
-        assert_eq!(target_url(&targets, "macos", "x86_64"), Some("MAC"));
-        assert_eq!(target_url(&targets, "linux", "x86_64"), Some("LINUX64"));
+        let url = |os, arch| target_entry(&targets, os, arch).map(|(_, url)| url);
+        assert_eq!(url("macos", "aarch64"), Some("MAC"));
+        assert_eq!(url("macos", "x86_64"), Some("MAC"));
+        assert_eq!(url("linux", "x86_64"), Some("LINUX64"));
         // Unsupported platform -> None, so the caller falls back to PATH.
-        assert_eq!(target_url(&targets, "linux", "aarch64"), None);
-        assert_eq!(target_url(&targets, "android", "aarch64"), None);
+        assert_eq!(url("linux", "aarch64"), None);
+        assert_eq!(url("android", "aarch64"), None);
     }
 
     #[test]
-    fn target_url_specific_os_arch_key_wins_over_bare_os() {
+    fn target_entry_specific_os_arch_key_wins_over_bare_os() {
         let targets = [("macos", "GENERIC"), ("macos-aarch64", "ARM")];
-        assert_eq!(target_url(&targets, "macos", "aarch64"), Some("ARM"));
-        assert_eq!(target_url(&targets, "macos", "x86_64"), Some("GENERIC"));
+        let url = |os, arch| target_entry(&targets, os, arch).map(|(_, url)| url);
+        assert_eq!(url("macos", "aarch64"), Some("ARM"));
+        assert_eq!(url("macos", "x86_64"), Some("GENERIC"));
     }
 
     /// End-to-end exercise of the real download + gunzip path against taplo's

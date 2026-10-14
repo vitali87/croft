@@ -883,6 +883,7 @@ fn unsaved_edits_survive_a_kill_and_come_back_on_the_next_launch() {
             .env("HOME", dir)
             .env("TERM", "xterm-256color")
             .env_remove("TERM_PROGRAM")
+            .env_remove("XDG_STATE_HOME")
             .stdin(slave.try_clone().unwrap())
             .stdout(slave.try_clone().unwrap())
             .stderr(slave.try_clone().unwrap());
@@ -947,7 +948,8 @@ fn unsaved_edits_survive_a_kill_and_come_back_on_the_next_launch() {
     let home = tempfile::tempdir().unwrap();
     let file = home.path().join("a.txt");
     std::fs::write(&file, "alpha\n").unwrap();
-    let backups = home.path().join(".cache/croft/hot-exit");
+    // In the state directory, not the cache that cleaners delete (#1578).
+    let backups = home.path().join(".local/state/croft/hot-exit");
     let (mut child, mut pty) = spawn(home.path(), &["a.txt"]);
     let started = read_until(&mut pty, limit, |out| out.contains("alpha"));
     assert!(
@@ -1714,5 +1716,30 @@ fn a_live_croft_still_gets_the_plan() {
     assert_eq!(
         std::fs::read_to_string(&plan).unwrap(),
         "pick 1234567 one\n"
+    );
+}
+
+/// #1439: off macOS, `setup-ghostty` refuses instead of writing a macOS
+/// path Ghostty never reads there and reporting success.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn setup_ghostty_refuses_off_macos_and_writes_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join(".config/ghostty/config.ghostty");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "font-size = 14\n").unwrap();
+    let out = Command::cargo_bin("croft")
+        .unwrap()
+        .args(["setup-ghostty", "-y"])
+        .env("HOME", home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("macOS-only"), "stderr was: {stderr}");
+    assert!(!home.path().join("Library").exists());
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        "font-size = 14\n"
     );
 }

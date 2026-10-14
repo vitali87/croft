@@ -1529,30 +1529,25 @@ impl PtyTerminal {
     /// next, read under the same lock: redaction joins wrapped rows, since a
     /// secret split across two rows matches neither on its own.
     pub fn grid_lines_wrapped(&self) -> (Vec<String>, Vec<bool>, i32) {
+        grid_rows_wrapped(&self.term.lock())
+    }
+
+    /// The grid as find's logical lines: soft-wrapped rows joined, so a
+    /// match the pane's width cut in two is found (#1275). See
+    /// [`join_wrapped_rows`].
+    pub fn find_lines(&self) -> Vec<FindLine> {
+        let (lines, wraps, top) = self.grid_lines_wrapped();
+        join_wrapped_rows(lines, &wraps, top)
+    }
+
+    /// [`Self::find_lines`] plus the scroll-clock reading, captured under
+    /// ONE term lock. Terminal find stamps its match anchor with the clock;
+    /// separate reads would let output land between them and mis-pair a
+    /// line with a reading it wasn't captured at.
+    pub fn find_lines_and_clock(&self) -> (Vec<FindLine>, i64) {
         let term = self.term.lock();
-        if term.columns() == 0 {
-            return (Vec::new(), Vec::new(), 0);
-        }
-        let top = term.grid().topmost_line().0;
-        let bottom = term.screen_lines() as i32 - 1;
-        let mut lines = Vec::new();
-        let mut wraps = Vec::new();
-        let mut l = top;
-        while l <= bottom {
-            let (s, _cols) = row_text_and_cols(&term, l);
-            // A wrapped row keeps its trailing blanks: a space in its last
-            // column separates words of the logical line (`Bearer ` then the
-            // token), and trimming it glued them so a redact rule missed.
-            let wraps_on = l < bottom && row_wraps(&term, l);
-            lines.push(if wraps_on {
-                s
-            } else {
-                s.trim_end().to_string()
-            });
-            wraps.push(wraps_on);
-            l += 1;
-        }
-        (lines, wraps, top)
+        let (lines, wraps, top) = grid_rows_wrapped(&term);
+        (join_wrapped_rows(lines, &wraps, top), self.clock_now(&term))
     }
 
     /// Every readable grid row as `(plain, coloured)`: the plain text
@@ -1605,27 +1600,6 @@ impl PtyTerminal {
         (rows, cursor)
     }
 
-    /// [`Self::grid_lines`] plus the scroll-clock reading, captured under
-    /// ONE term lock. Terminal find stamps its match anchor with the clock;
-    /// separate reads would let output land between them and mis-pair a
-    /// line with a reading it wasn't captured at.
-    pub fn grid_lines_and_clock(&self) -> (Vec<String>, i32, i64) {
-        let term = self.term.lock();
-        if term.columns() == 0 {
-            return (Vec::new(), 0, self.clock_now(&term));
-        }
-        let top = term.grid().topmost_line().0;
-        let bottom = term.screen_lines() as i32 - 1;
-        let mut lines = Vec::new();
-        let mut l = top;
-        while l <= bottom {
-            let (s, _cols) = row_text_and_cols(&term, l);
-            lines.push(s.trim_end().to_string());
-            l += 1;
-        }
-        (lines, top, self.clock_now(&term))
-    }
-
     /// The OSC 8 hyperlink URI stored under viewport cell `(row, col)`, if
     /// any. Hyperlinked cells carry the URI invisibly; the app's
     /// Cmd/Ctrl+click handler checks this before the plain-text URL regex.
@@ -1652,9 +1626,11 @@ impl PtyTerminal {
     }
 
     /// Mark which occurrence is the active match `(abs_line, col, len)` so the
-    /// render loop paints it in the brighter accent. `clock` is the
+    /// render loop paints it in the brighter accent. `abs_line` is the first
+    /// row of the match's logical line and `col` a char index into it (see
+    /// [`FindLine`]). `clock` is the
     /// scroll-clock reading the line was captured against (the
-    /// [`Self::grid_lines_and_clock`] snapshot); the render re-bases per
+    /// [`Self::find_lines_and_clock`] snapshot); the render re-bases per
     /// frame so the highlight follows its text through streaming output.
     pub fn set_current_match(&mut self, m: Option<(i32, usize, usize)>, clock: i64) {
         self.current_match = m.map(|(line, col, len)| (clock, line, col, len));
@@ -2053,7 +2029,22 @@ impl PtyTerminal {
             let mut cmd_start: Option<std::time::Instant> = None;
             let mut buf = [0u8; 65536];
             loop {
-                if !wait_pty_readable(pty_fd, &shutdown_r) {
+                // A dev-server URL that ended the last read is held back in
+                // case the next read extends it; when the output goes quiet
+                // instead, it is sent as it stands (#1449).
+                let ready = if port_sniffer.has_pending() {
+                    match poll_pty(pty_fd, &shutdown_r, PORT_URL_SETTLE_MS) {
+                        PtyWait::Ready => true,
+                        PtyWait::Closed => false,
+                        PtyWait::Idle => {
+                            port_sniffer.flush(&port_tx);
+                            continue;
+                        }
+                    }
+                } else {
+                    wait_pty_readable(pty_fd, &shutdown_r)
+                };
+                if !ready {
                     break;
                 }
                 match reader.read(&mut buf) {
@@ -4406,6 +4397,30 @@ impl PaneLink {
 /// the shell dies, so the read never returns and joining the reader would
 /// freeze the UI for as long as the job runs.
 fn wait_pty_readable(pty_fd: std::os::fd::RawFd, shutdown: &std::io::PipeReader) -> bool {
+    matches!(poll_pty(pty_fd, shutdown, -1), PtyWait::Ready)
+}
+
+/// How long the reader waits for more output before sending a held-back
+/// dev-server URL as it stands.
+const PORT_URL_SETTLE_MS: i32 = 150;
+
+/// What [`poll_pty`] saw.
+#[derive(Debug, PartialEq, Eq)]
+enum PtyWait {
+    /// The pty has output.
+    Ready,
+    /// Shutdown was signalled, or polling failed.
+    Closed,
+    /// `timeout_ms` passed with neither.
+    Idle,
+}
+
+/// [`wait_pty_readable`] with a timeout in milliseconds (`-1` waits forever).
+fn poll_pty(
+    pty_fd: std::os::fd::RawFd,
+    shutdown: &std::io::PipeReader,
+    timeout_ms: i32,
+) -> PtyWait {
     use std::os::fd::AsRawFd;
     let mut fds = [
         libc::pollfd {
@@ -4420,18 +4435,21 @@ fn wait_pty_readable(pty_fd: std::os::fd::RawFd, shutdown: &std::io::PipeReader)
         },
     ];
     loop {
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
         if n < 0 {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            return false;
+            return PtyWait::Closed;
+        }
+        if n == 0 {
+            return PtyWait::Idle;
         }
         if fds[1].revents != 0 {
-            return false;
+            return PtyWait::Closed;
         }
         if fds[0].revents != 0 {
-            return true;
+            return PtyWait::Ready;
         }
     }
 }
@@ -4466,6 +4484,13 @@ impl Drop for PtyTerminal {
 /// neighbours joined, at most 64 rows either way) and the char offset of
 /// that row's text within it, both in `row_text_and_cols` terms.
 pub fn logical_row_text(term: &Term<VoidListener>, line_idx: i32) -> (String, usize) {
+    let (joined, offset, _start) = logical_row_span(term, line_idx);
+    (joined, offset)
+}
+
+/// [`logical_row_text`] plus the absolute grid line the logical line starts
+/// on, which names a find match (see [`FindLine::start`]).
+pub fn logical_row_span(term: &Term<VoidListener>, line_idx: i32) -> (String, usize, i32) {
     const REACH: i32 = 64;
     let top = term.grid().topmost_line().0;
     let bottom = term.screen_lines() as i32 - 1;
@@ -4486,7 +4511,85 @@ pub fn logical_row_text(term: &Term<VoidListener>, line_idx: i32) -> (String, us
         }
         joined.push_str(&s);
     }
-    (joined, offset)
+    (joined, offset, start)
+}
+
+/// Every grid row from the top of the scrollback, with its soft-wrap flag
+/// and the absolute line of row 0: see [`PtyTerminal::grid_lines_wrapped`].
+fn grid_rows_wrapped(term: &Term<VoidListener>) -> (Vec<String>, Vec<bool>, i32) {
+    if term.columns() == 0 {
+        return (Vec::new(), Vec::new(), 0);
+    }
+    let top = term.grid().topmost_line().0;
+    let bottom = term.screen_lines() as i32 - 1;
+    let mut lines = Vec::new();
+    let mut wraps = Vec::new();
+    let mut l = top;
+    while l <= bottom {
+        let (s, _cols) = row_text_and_cols(term, l);
+        // A wrapped row keeps its trailing blanks: a space in its last
+        // column separates words of the logical line (`Bearer ` then the
+        // token), and trimming it glued them so a redact rule missed.
+        let wraps_on = l < bottom && row_wraps(term, l);
+        lines.push(if wraps_on {
+            s
+        } else {
+            s.trim_end().to_string()
+        });
+        wraps.push(wraps_on);
+        l += 1;
+    }
+    (lines, wraps, top)
+}
+
+/// One logical line of terminal output as find sees it: a run of rows the
+/// pane soft-wrapped, joined back into the text that was printed (#1275).
+/// A match position is a char index into `text`; `start` is the absolute
+/// grid line of its first row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindLine {
+    pub text: String,
+    pub start: i32,
+    /// Chars per row, in order, so a position maps back to its row.
+    pub row_lens: Vec<usize>,
+}
+
+impl FindLine {
+    /// The absolute grid line holding char `col` of this logical line.
+    pub fn line_of(&self, col: usize) -> i32 {
+        let mut seen = 0;
+        for (i, len) in self.row_lens.iter().enumerate() {
+            seen += len;
+            if col < seen {
+                return self.start + i as i32;
+            }
+        }
+        self.start + self.row_lens.len().saturating_sub(1) as i32
+    }
+}
+
+/// Join each run of rows whose wrap flag is set into one [`FindLine`]. A
+/// row without the flag ends its line, so rows that merely sit next to each
+/// other are never searched as one.
+pub fn join_wrapped_rows(lines: Vec<String>, wraps: &[bool], top: i32) -> Vec<FindLine> {
+    let mut out: Vec<FindLine> = Vec::new();
+    let mut continues = false;
+    for (i, row) in lines.into_iter().enumerate() {
+        let len = row.chars().count();
+        match out.last_mut() {
+            Some(line) if continues => {
+                line.text.push_str(&row);
+                line.row_lens.push(len);
+            }
+            _ => out.push(FindLine {
+                text: row,
+                start: top + i as i32,
+                row_lens: vec![len],
+            }),
+        }
+        continues = wraps.get(i).copied().unwrap_or(false);
+    }
+    out
 }
 
 /// Grid rows from `top` to the bottom of the screen as `(plain, coloured,
@@ -5338,14 +5441,24 @@ impl Widget for &mut PtyTerminal {
             // (the same text the find bar searched); the colmap translates
             // them back to grid columns. 0 = no match, 1 = match, 2 = active.
             let row_line_idx = (y as i32) - (display_offset as i32);
+            //
+            // Matches are found on the logical line, as the find bar counts
+            // them, and each paints the part that falls on this row: a match
+            // the soft wrap cut in two lights up on both rows (#1275).
             let row_paint: Option<Vec<u8>> = self.search_needle.as_deref().map(|needle| {
                 let (text, colmap) = row_text_and_cols(&term, row_line_idx);
+                let (logical, offset, start) = logical_row_span(&term, row_line_idx);
+                let row_len = text.chars().count();
                 let mut paint = vec![0u8; cols as usize];
                 for (mc, ml) in
-                    crate::widgets::editor_find::line_matches(&text, self.search_opts, needle)
+                    crate::widgets::editor_find::line_matches(&logical, self.search_opts, needle)
                 {
-                    let active = active_match == Some((row_line_idx, mc, ml));
-                    for k in mc..mc + ml {
+                    let (lo, hi) = (mc.max(offset), (mc + ml).min(offset + row_len));
+                    if lo >= hi {
+                        continue;
+                    }
+                    let active = active_match == Some((start, mc, ml));
+                    for k in lo - offset..hi - offset {
                         if let Some(&col) = colmap.get(k) {
                             paint[col] = if active { 2 } else { 1 };
                         }
@@ -5974,13 +6087,24 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
             waited += 20;
         }
-        let (lines, top) = term.grid_lines();
-        let expect_line = top
-            + lines
-                .iter()
-                .position(|l| l.starts_with("note-worthy-line"))
-                .unwrap() as i32;
-        let cur = term.annotations_current();
+        // The reader thread can still be scrolling (the newline after
+        // `fill-29`) between reading the grid and reading the anchors, so
+        // compare the two only once they come from the same screen.
+        let mut waited = 0u32;
+        let (expect_line, cur) = loop {
+            let (lines, top) = term.grid_lines();
+            let expect_line = top
+                + lines
+                    .iter()
+                    .position(|l| l.starts_with("note-worthy-line"))
+                    .unwrap() as i32;
+            let cur = term.annotations_current();
+            if (cur.len() == 1 && cur[0].0 == expect_line) || waited >= 2000 {
+                break (expect_line, cur);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        };
         assert_eq!(cur.len(), 1);
         assert_eq!(
             cur[0].0, expect_line,
@@ -6341,6 +6465,36 @@ mod tests {
         let set = crate::triggers::TriggerSet::default().with_builtin_redactions();
         let masked = crate::triggers::mask_rows(&lines, &wraps, &set).concat();
         assert!(!masked.contains("c2lnbmF0dXJl"), "{masked}");
+    }
+
+    /// Find's logical lines join only rows that soft-wrap, and a position
+    /// maps back to the row that shows it, which is where the jump scrolls
+    /// (#1275).
+    #[test]
+    fn find_lines_join_wrapped_rows_and_map_a_position_to_its_row() {
+        let rows = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let lines = join_wrapped_rows(
+            rows(&["abc", "def", "gh", "solo", "x"]),
+            &[true, true, false, false, false],
+            -3,
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .map(|l| (l.text.as_str(), l.start))
+                .collect::<Vec<_>>(),
+            vec![("abcdefgh", -3), ("solo", 0), ("x", 1)]
+        );
+        assert_eq!(lines[0].row_lens, vec![3, 3, 2]);
+        assert_eq!(lines[0].line_of(0), -3);
+        assert_eq!(lines[0].line_of(3), -2);
+        assert_eq!(lines[0].line_of(7), -1);
+        assert_eq!(
+            lines[0].line_of(99),
+            -1,
+            "past the end stays on the last row"
+        );
+        assert_eq!(lines[1].line_of(2), 0);
     }
 
     #[test]
@@ -10480,6 +10634,127 @@ mod tests {
             .expect("the 133;D must yield a FinishedCommand");
         let deco = term.command_decorations()[0];
         (f.cmd.clone(), term.command_input_text(&deco))
+    }
+
+    /// The `printf` formats fish runs in `func` of croft's fish hooks, in
+    /// order, rewritten for `/bin/sh`'s printf (which spells ESC `\033`).
+    fn fish_hook_printfs(script: &str, func: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut lines = script.lines();
+        let Some(head) = lines.find(|l| {
+            l.trim_start().starts_with(&format!("function {func} "))
+                || l.trim() == format!("function {func}")
+        }) else {
+            return out;
+        };
+        let indent = head.len() - head.trim_start().len();
+        for line in lines {
+            let t = line.trim_start();
+            if t == "end" && line.len() - t.len() == indent {
+                break;
+            }
+            if let Some(rest) = t.strip_prefix("printf '") {
+                let fmt = &rest[..rest.find('\'').unwrap()];
+                out.push(fmt.replace("\\e", "\\033"));
+            }
+        }
+        out
+    }
+
+    /// #1514: replay what croft's fish 3 hooks print around one command
+    /// (the prompt event, the user's prompt, the wrapped prompt's end mark,
+    /// the typed line, preexec, postexec) through a real pane, and the
+    /// command is recorded with its text. Without an end-of-prompt mark it
+    /// was recorded empty, so the history never got it.
+    #[test]
+    fn a_fish_3_pane_records_the_typed_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crate::shell_integration::ensure_fish_integration(tmp.path()).unwrap();
+        let script = std::fs::read_to_string(dir.join("fish/vendor_conf.d/croft.fish")).unwrap();
+        let fmts = |func: &str| {
+            fish_hook_printfs(&script, func)
+                .into_iter()
+                .filter(|f| !f.contains("]7;"))
+                .map(|f| f.replace("%s", "0"))
+                .collect::<String>()
+        };
+        // The prompt event's own `133;D` closes a cycle a command left
+        // open; with none open here, it does not fire.
+        let prompt_start = fmts("_croft_mark_prompt").replace("\\033]133;D\\a", "");
+        assert!(prompt_start.contains("133;A"), "{prompt_start:?}");
+        let stream = format!(
+            "{prompt_start}~> {}ls -d /tmp\\n{}/tmp\\n{}",
+            fmts("_croft_prompt_end"),
+            fmts("_croft_mark_output_start"),
+            fmts("_croft_mark_output_end"),
+        );
+        let term = PtyTerminal::new_running(
+            "/bin/sh",
+            &[String::from("-c"), format!("printf '{stream}'")],
+            tmp.path(),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut finished = Vec::new();
+        while std::time::Instant::now() < deadline {
+            finished.extend(term.drain_finished_commands());
+            if !finished.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        let f = finished.first().expect("the hooks' 133;D ends a command");
+        assert_eq!(f.cmd, "ls -d /tmp", "stream {stream:?}");
+    }
+
+    /// #1514 negative: fish 4 marks prompts itself, so croft's hooks, the
+    /// prompt wrap among them, stay behind the old-fish check and never
+    /// add a second set of marks.
+    #[test]
+    fn the_fish_prompt_wrap_is_only_for_old_fish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crate::shell_integration::ensure_fish_integration(tmp.path()).unwrap();
+        let script = std::fs::read_to_string(dir.join("fish/vendor_conf.d/croft.fish")).unwrap();
+        let gate = script.find("forward-char-passive").unwrap();
+        let wrap = script.find("function _croft_wrap_prompt").unwrap();
+        let end_mark = script.find("133;B").unwrap();
+        assert!(gate < wrap && gate < end_mark);
+        // The wrap leaves an already wrapped prompt alone, so a redrawn
+        // prompt does not stack wrappers or print the mark twice.
+        let body = &script[wrap..];
+        let body = &body[..body.find("\n        end\n").unwrap()];
+        assert!(body.contains("string match -q '*_croft_prompt_end*'; and return"));
+    }
+
+    /// #1514: `funcsave fish_prompt` (and `fish_config prompt save`, which
+    /// calls it) and `funced` must see the user's prompt, not croft's
+    /// wrapper, or the saved prompt would call croft-only helpers in every
+    /// later fish session. Both are wrapped to unwrap the prompt first, and
+    /// only on old fish, where the prompt wrap exists.
+    #[test]
+    fn saving_the_fish_prompt_saves_the_users_prompt_not_the_wrapper() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crate::shell_integration::ensure_fish_integration(tmp.path()).unwrap();
+        let script = std::fs::read_to_string(dir.join("fish/vendor_conf.d/croft.fish")).unwrap();
+        let gate = script.find("forward-char-passive").unwrap();
+        let unwrap = script.find("function _croft_unwrap_prompt").unwrap();
+        assert!(gate < unwrap);
+        let body = &script[unwrap..];
+        let body = &body[..body.find("\n        end\n").unwrap()];
+        assert!(body.contains("functions --copy _croft_user_prompt fish_prompt"));
+        for cmd in ["funcsave", "funced"] {
+            assert!(script.contains(&format!("functions --copy {cmd} _croft_{cmd}")));
+            let def = format!("function {cmd}\n");
+            let at = script
+                .find(&def)
+                .unwrap_or_else(|| panic!("{cmd} is wrapped"));
+            assert!(gate < at);
+            let wrapper = &script[at..];
+            let wrapper = &wrapper[..wrapper.find("\n            end\n").unwrap()];
+            let un = wrapper.find("_croft_unwrap_prompt").unwrap();
+            let orig = wrapper.find(&format!("_croft_{cmd} $argv")).unwrap();
+            assert!(un < orig, "{wrapper}");
+        }
     }
 
     #[test]
