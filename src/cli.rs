@@ -1887,6 +1887,13 @@ fn fetch_marketplace_theme(
 }
 
 fn setup_ghostty(yes: bool) -> Result<()> {
+    // The block forwards Ghostty's Cmd chords; on Linux croft's chords use
+    // Ctrl, so there is nothing of this block's to forward (#1439).
+    if !cfg!(target_os = "macos") {
+        anyhow::bail!(
+            "setup-ghostty is macOS-only: it forwards Ghostty's Cmd chords, and croft's chords on this system use Ctrl"
+        );
+    }
     let config_path = crate::ghostty::default_config_path();
     println!(
         "This will add a managed keybind block to your Ghostty config so Croft, not Ghostty, owns its chords:"

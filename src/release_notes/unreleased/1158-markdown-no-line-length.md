@@ -1,0 +1,1 @@
+fix: Markdown files no longer get "Line length exceeds 80 characters" warnings. rumdl's line-length rule (MD013) is now off unless the project's own `.rumdl.toml` or `.markdownlint.*` sets a line length.
