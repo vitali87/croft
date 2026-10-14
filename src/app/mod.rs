@@ -26193,13 +26193,7 @@ impl App {
                     .to_path_buf();
                 let project_py =
                     debuggee_python(&test_dir, &root, std::env::var_os("PATH").as_deref());
-                let note = match project_py.as_deref().map_or(Ok(None), debuggee_python_note) {
-                    Ok(note) => note,
-                    Err(refusal) => {
-                        self.debug_error(refusal);
-                        return;
-                    }
-                };
+                let project_found = project_py.is_some();
                 let adapter_py = match crate::dap::install::ensure_debug_venv() {
                     Ok(py) => py,
                     Err(e) => {
@@ -26208,8 +26202,45 @@ impl App {
                     }
                 };
                 let project_py = project_py.unwrap_or_else(|| adapter_py.clone());
-                let request =
+                let mut request =
                     crate::dap::session::pytest_debug_launch_request(&project_py, &root, &name);
+                // A launch.json config for debugging tests (#1398) brings
+                // its env, cwd, args and debugpy settings, as in VS Code.
+                let configs = crate::dap::configs::discover_configs(&root);
+                let test_config = crate::dap::configs::debug_test_config(&configs);
+                if let Some(cfg) = test_config {
+                    let ctx = crate::dap::configs::SubstCtx {
+                        workspace_folder: root.clone(),
+                        file: self.editor.path.clone(),
+                        folders: self.workspace_folders(),
+                    };
+                    match crate::dap::configs::resolve(cfg, &ctx) {
+                        Ok(rc) => {
+                            request = crate::dap::configs::with_debug_test_config(request, &rc);
+                        }
+                        Err(e) => {
+                            self.disarm_failure_breakpoint();
+                            self.debug_error(e);
+                            return;
+                        }
+                    }
+                }
+                // Checked once the config has had its say, so a `python`
+                // it names is the one validated (#1398).
+                let note = match debug_test_python(&request, &root, &adapter_py, project_found)
+                    .as_deref()
+                    .map_or(Ok(None), debuggee_python_note)
+                {
+                    Ok(note) => note,
+                    Err(refusal) => {
+                        self.disarm_failure_breakpoint();
+                        self.debug_error(refusal);
+                        return;
+                    }
+                };
+                let using = test_config
+                    .map(|c| format!(" with \"{}\"", c.name))
+                    .unwrap_or_default();
                 let adapter_args = vec![String::from("-m"), String::from("debugpy.adapter")];
                 match crate::dap::session::DapSession::launch_with(
                     &adapter_py.to_string_lossy(),
@@ -26220,10 +26251,12 @@ impl App {
                 ) {
                     Ok(session) => {
                         self.debug_sessions.replace_with(name.clone(), session);
-                        self.run_debug.feedback = Some(format!("Debugging test {name}"));
+                        self.run_debug.feedback = Some(format!("Debugging test {name}{using}"));
                         self.run_debug.feedback_is_error = false;
-                        let lead =
-                            with_python_note(format!("Debugging test {name}"), note.as_deref());
+                        let lead = with_python_note(
+                            format!("Debugging test {name}{using}"),
+                            note.as_deref(),
+                        );
                         self.status = self.with_failure_note(format!(
                             "{lead} — F5 continue · F10 step over · Shift+F5 stop"
                         ));
@@ -73407,6 +73440,19 @@ fn launch_request_python(request: &serde_json::Value, adapter_dir: &Path) -> Opt
         None => program_dir.map_or_else(|| adapter_dir.to_path_buf(), |d| adapter_dir.join(d)),
     };
     Some(launch_dir.join(python))
+}
+
+/// The interpreter Debug Test's pytest runs under once any debug-test
+/// config is applied (#1398): the request's own `python`, a config's
+/// included, but not the debug venv's stand-in for a project that has no
+/// interpreter of its own, which was never the project's to report on.
+fn debug_test_python(
+    request: &serde_json::Value,
+    root: &Path,
+    adapter_py: &Path,
+    project_found: bool,
+) -> Option<PathBuf> {
+    launch_request_python(request, root).filter(|py| project_found || py != adapter_py)
 }
 
 /// The interpreter a launch.json Python config's program runs under when

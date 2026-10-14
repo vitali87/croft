@@ -802,6 +802,57 @@ const MAPPED_KEYS: &[&str] = &[
     "console",
 ];
 
+/// Whether `cfg` is for debugging tests (#1398): a debugpy configuration
+/// whose `purpose` names `"debug-test"`, as VS Code's Python extension
+/// reads it (a list, or a single string).
+pub fn is_debug_test_config(cfg: &DebugConfig) -> bool {
+    let debug_test = match cfg.raw.get("purpose") {
+        Some(Value::String(s)) => s == "debug-test",
+        Some(Value::Array(list)) => list.iter().any(|v| v.as_str() == Some("debug-test")),
+        _ => false,
+    };
+    debug_test && adapter_for_type(&cfg.type_name) == Some(AdapterKind::Debugpy)
+}
+
+/// The workspace's configuration for debugging tests (#1398): the first
+/// that [`is_debug_test_config`], as VS Code takes it.
+pub fn debug_test_config(configs: &[DebugConfig]) -> Option<&DebugConfig> {
+    configs.iter().find(|c| is_debug_test_config(c))
+}
+
+/// Keys of a debug-test configuration that describe the configuration,
+/// not the launch, so they never reach debugpy.
+const DEBUG_TEST_META_KEYS: &[&str] = &["purpose", "presentation"];
+
+/// Overlay a resolved debug-test configuration (#1398) onto croft's pytest
+/// launch `request`: its `env`, `cwd`, `python`, `justMyCode` and every
+/// other debugpy key replace croft's, and its `args` follow pytest's own.
+/// pytest stays the module, croft's test selection stays first, and the
+/// console stays croft's own.
+pub fn with_debug_test_config(mut request: Value, rc: &ResolvedConfig) -> Value {
+    let Some(args) = request["arguments"].as_object_mut() else {
+        return request;
+    };
+    for (key, value) in &rc.extra {
+        if !DEBUG_TEST_META_KEYS.contains(&key.as_str()) {
+            args.insert(key.clone(), value.clone());
+        }
+    }
+    if !rc.env.is_empty() {
+        args.insert("env".into(), json!(rc.env));
+    }
+    if let Some(cwd) = &rc.cwd {
+        args.insert("cwd".into(), json!(cwd.to_string_lossy()));
+    }
+    if let Some(list) = args.get_mut("args").and_then(Value::as_array_mut) {
+        list.extend(rc.args.iter().map(|a| json!(a)));
+    }
+    if rc.stop_on_entry {
+        args.insert("stopOnEntry".into(), json!(true));
+    }
+    request
+}
+
 /// cppdbg's spellings of mapped fields (#1394): `environment` joins `env`
 /// and `stopAtEntry` is `stopOnEntry`.
 const CPPDBG_MAPPED_KEYS: &[&str] = &["environment", "stopAtEntry"];
@@ -2185,6 +2236,84 @@ mod tests {
         assert_eq!(req["command"], "attach");
         assert_eq!(req["arguments"]["port"], 9229);
         assert_eq!(req["arguments"]["address"], "127.0.0.1");
+    }
+
+    /// The issue's launch.json: a debugpy config for debugging tests.
+    const DEBUG_TESTS: &str = r#"[
+        { "name": "Run", "type": "debugpy", "request": "launch", "program": "${file}" },
+        { "name": "Debug Tests", "type": "debugpy", "request": "launch",
+          "purpose": ["debug-test"], "console": "integratedTerminal",
+          "env": { "APP_MODE": "test" }, "justMyCode": false,
+          "args": ["--maxfail=1"], "cwd": "${workspaceFolder}/tests",
+          "subProcess": true }
+    ]"#;
+
+    /// #1398: a debugpy config whose `purpose` names `debug-test` is the
+    /// one Debug Test uses; a plain one is not.
+    #[test]
+    fn the_debug_test_config_is_found_by_its_purpose() {
+        let cfgs = parse_launch_json(DEBUG_TESTS, ".vscode/launch.json");
+        assert_eq!(
+            debug_test_config(&cfgs).map(|c| c.name.as_str()),
+            Some("Debug Tests")
+        );
+        assert!(!is_debug_test_config(&cfgs[0]));
+        let single = config(r#"[{ "name": "T", "type": "python", "purpose": "debug-test" }]"#);
+        assert!(is_debug_test_config(&single), "a single string counts too");
+    }
+
+    /// #1398, negative: no `purpose`, another purpose, or a debug-test
+    /// purpose on a non-Python config is not a test-debugging config.
+    #[test]
+    fn other_purposes_and_other_debuggers_are_not_debug_test_configs() {
+        let cfgs = parse_launch_json(
+            r#"[
+                { "name": "A", "type": "debugpy", "purpose": ["debug-in-terminal"] },
+                { "name": "B", "type": "node", "purpose": ["debug-test"], "program": "x.js" },
+                { "name": "C", "type": "debugpy" }
+            ]"#,
+            ".vscode/launch.json",
+        );
+        assert!(debug_test_config(&cfgs).is_none());
+    }
+
+    /// #1398: the config's env, cwd, justMyCode and other keys land on the
+    /// pytest request; its args follow the test selection; pytest stays
+    /// the module and the console stays croft's.
+    #[test]
+    fn a_debug_test_config_overlays_the_pytest_request() {
+        let cfgs = parse_launch_json(DEBUG_TESTS, ".vscode/launch.json");
+        let rc = resolve(debug_test_config(&cfgs).unwrap(), &ctx()).unwrap();
+        let base = crate::dap::session::pytest_debug_launch_request(
+            Path::new("/venv/bin/python"),
+            Path::new("/work/proj"),
+            "test_mode",
+        );
+        let req = with_debug_test_config(base, &rc);
+        let a = &req["arguments"];
+        assert_eq!(a["env"]["APP_MODE"], "test");
+        assert_eq!(a["cwd"], "/work/proj/tests");
+        assert_eq!(a["justMyCode"], false);
+        assert_eq!(a["subProcess"], true);
+        assert_eq!(a["args"], json!(["-v", "-k", "test_mode", "--maxfail=1"]));
+        assert_eq!(a["module"], "pytest");
+        assert_eq!(a["console"], "internalConsole");
+        assert_eq!(a["python"], json!(["/venv/bin/python"]));
+        assert!(a.get("purpose").is_none(), "{a}");
+    }
+
+    /// #1398, negative: a config that sets nothing leaves croft's request
+    /// as it was.
+    #[test]
+    fn an_empty_debug_test_config_changes_nothing() {
+        let cfg = config(r#"[{ "name": "T", "type": "debugpy", "purpose": ["debug-test"] }]"#);
+        let rc = resolve(&cfg, &ctx()).unwrap();
+        let base = crate::dap::session::pytest_debug_launch_request(
+            Path::new("/venv/bin/python"),
+            Path::new("/work/proj"),
+            "test_mode",
+        );
+        assert_eq!(with_debug_test_config(base.clone(), &rc), base);
     }
 
     /// The issue's cppdbg configuration (#1394).

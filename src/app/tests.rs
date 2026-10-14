@@ -28042,6 +28042,50 @@ fn a_debuggee_debugpy_cannot_run_under_is_refused() {
     );
 }
 
+/// #1398 review: Debug Test's version check reads the interpreter a
+/// debug-test config names, not the project `.venv` it replaced, and
+/// checks nothing when the debug venv only stands in for a project that
+/// has no interpreter of its own.
+#[test]
+fn a_debug_test_configs_interpreter_is_the_one_checked() {
+    use crate::dap::configs::{SubstCtx, parse_launch_json, resolve, with_debug_test_config};
+    let root = Path::new("/work/proj");
+    let ctx = SubstCtx {
+        workspace_folder: root.to_path_buf(),
+        file: None,
+        folders: Vec::new(),
+    };
+    let base = |py: &str| {
+        crate::dap::session::pytest_debug_launch_request(Path::new(py), root, "test_mode")
+    };
+    let cfgs = parse_launch_json(
+        r#"[{ "name": "T", "type": "debugpy", "purpose": ["debug-test"],
+              "python": "/opt/py314/bin/python" }]"#,
+        ".vscode/launch.json",
+    );
+    let rc = resolve(&cfgs[0], &ctx).unwrap();
+    let adapter = Path::new("/debug-venv/bin/python");
+    let req = with_debug_test_config(base("/work/proj/.venv/bin/python"), &rc);
+    assert_eq!(
+        super::debug_test_python(&req, root, adapter, true),
+        Some(PathBuf::from("/opt/py314/bin/python"))
+    );
+    let req = with_debug_test_config(base("/debug-venv/bin/python"), &rc);
+    assert_eq!(
+        super::debug_test_python(&req, root, adapter, false),
+        Some(PathBuf::from("/opt/py314/bin/python")),
+        "a config's python is checked even when no project one was found"
+    );
+    assert_eq!(
+        super::debug_test_python(&base("/debug-venv/bin/python"), root, adapter, false),
+        None
+    );
+    assert_eq!(
+        super::debug_test_python(&base("/work/proj/.venv/bin/python"), root, adapter, true),
+        Some(PathBuf::from("/work/proj/.venv/bin/python"))
+    );
+}
+
 /// #864: a launch.json config's version check reads the interpreter the
 /// request actually runs: its `python` (a path or a command line) or the
 /// legacy `pythonPath`, and nothing for a request that names neither.
