@@ -45712,6 +45712,42 @@ fn a_workspace_with_no_test_runner_refuses_every_run_gesture() {
     assert_refused(&mut app, "named run");
 }
 
+/// #1841: switching to the Testing view never waits on finding a runner.
+/// The worker finds it, so a workspace with none opens the view silently;
+/// and reopening the view before the worker answers queues nothing more.
+#[test]
+fn opening_testing_leaves_finding_the_runner_to_the_worker() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("notes.txt"), "no project here\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let sent = app.test_worker.requests_sent();
+    app.open_testing_view();
+    assert_eq!(app.sidebar_view, SidebarView::Testing);
+    assert!(
+        app.test_worker.discover_queued(),
+        "the discovery goes to the worker without a runner check first"
+    );
+    app.open_testing_view();
+    app.set_sidebar_view(SidebarView::Explorer);
+    app.open_testing_view();
+    assert_eq!(
+        app.test_worker.requests_sent(),
+        sent + 1,
+        "reopening before the worker answers must not queue another discovery"
+    );
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the worker to find no runner",
+        || {
+            app.test_worker.drain(&mut app.testing);
+            !app.test_worker.discover_queued()
+        },
+    );
+    assert!(!app.testing.take_refusal(), "opening the view says nothing");
+    assert!(!app.testing.is_busy());
+    assert!(!app.status.contains("No test runner"), "{:?}", app.status);
+}
+
 /// cargo's positional filter is a substring match, so running suite `parse`
 /// with a bare pattern also sweeps `parse_utils::b` and every other
 /// prefix-sharing sibling. The suite gesture must anchor on `parse::`.

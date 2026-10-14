@@ -25268,7 +25268,7 @@ impl App {
             KeyCode::Esc => self.set_sidebar_view(SidebarView::Explorer),
             KeyCode::Enter => self.run_all_tests(),
             KeyCode::Char('s' | 'S') if self.testing.is_busy() => self.cancel_test_run(),
-            KeyCode::Char('r' | 'R') => self.discover_tests(),
+            KeyCode::Char('r' | 'R') => self.rediscover_tests(),
             KeyCode::Char('w' | 'W') => {
                 self.toggle_test_watch(crate::testing::watch::WatchScope::All)
             }
@@ -25648,9 +25648,16 @@ impl App {
         if self.testing.watch.scope().is_none() {
             return changed;
         }
+        // Only a due rerun needs the runner looked up: that lookup reads the
+        // runner manifests, and this runs on every pass of the main loop
+        // while a watch is on (#1841).
+        let now = std::time::Instant::now();
+        if self.testing.watch.due_at().is_none_or(|due| now < due) {
+            return changed;
+        }
         let busy = self.testing.is_busy()
             || crate::testing::worker::runner_for(&self.active_test_root).is_none();
-        let Some(scope) = self.testing.watch.take_due(std::time::Instant::now(), busy) else {
+        let Some(scope) = self.testing.watch.take_due(now, busy) else {
             return changed;
         };
         match scope {
@@ -26374,16 +26381,27 @@ impl App {
     }
 
     /// List tests without running them (populate the tree). No-op while busy or
-    /// outside a recognised test project (Cargo or pytest) — the tool would
-    /// error with no manifest, and `cargo test -- --list` compiles the test
-    /// binary so we never auto-fire it per-keystroke.
+    /// while one is already queued. Outside a recognised test project the
+    /// worker finds no runner and says nothing — the tool would error with no
+    /// manifest, and `cargo test -- --list` compiles the test binary so we
+    /// never auto-fire it per-keystroke. Finding the runner is the worker's
+    /// job, not this thread's (#1841): it reads every runner manifest and
+    /// can walk the whole tree for CodeQL test packs, which stalled the
+    /// switch to the Testing view.
     fn discover_tests(&mut self) {
-        if self.testing.is_busy()
-            || crate::testing::worker::runner_for(&self.active_test_root).is_none()
-        {
+        if self.testing.is_busy() || self.test_worker.discover_queued() {
             return;
         }
-        self.test_worker.discover();
+        self.test_worker.discover_quietly();
+    }
+
+    /// `r` in the Testing view: discover again, saying so when no runner
+    /// claims the workspace rather than doing nothing. Like the view's own
+    /// discover, the worker is the one that looks for the runner (#1841).
+    fn rediscover_tests(&mut self) {
+        if !self.testing.is_busy() {
+            self.test_worker.discover();
+        }
     }
 
     /// Reveal the CodeQL view (#578): the QL icon and the palette. Refused,
