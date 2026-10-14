@@ -14324,6 +14324,35 @@ impl App {
         }
     }
 
+    /// VS Code "Select All Occurrences of Find Match" (`Cmd+Shift+L`,
+    /// #1558): a selection on every match of the selection, or of the word
+    /// at the caret.
+    fn select_all_occurrences(&mut self) {
+        if self.editor.has_non_text_view() {
+            return;
+        }
+        let n = self.editor.select_all_occurrences();
+        self.status = if n == 0 {
+            String::from("Nothing to select: select text on one line, or put the caret on a word")
+        } else {
+            format!("Selected {n} occurrences (type to replace, Esc to cancel)")
+        };
+    }
+
+    /// VS Code "Add Cursors to Line Ends" (`Shift+Alt+I`, #1558): a caret at
+    /// the end of each selected line.
+    fn add_cursors_to_line_ends(&mut self) {
+        if self.editor.has_non_text_view() {
+            return;
+        }
+        let n = self.editor.add_cursors_to_line_ends();
+        self.status = if n == 0 {
+            String::from("Select the lines to put cursors at the ends of")
+        } else {
+            format!("{n} cursors at line ends")
+        };
+    }
+
     /// VS Code "Add Selection to Next Find Match" (`Cmd+D`): select the word
     /// under the cursor, then grow the multi-cursor one occurrence per press.
     fn start_select_next_occurrence(&mut self) {
@@ -23555,6 +23584,8 @@ impl App {
     /// built-in defaults call their app methods directly, so a command-level
     /// recorder would miss most of what a user does.
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        self.editor.sync_occurrence_word_sel();
+
         // A key press means the status message has been seen: the right-hand
         // cluster takes its room back (#1609).
         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -44500,6 +44531,14 @@ impl App {
             self.start_select_next_occurrence();
             return;
         }
+        if is_select_all_occurrences_key(key) {
+            self.select_all_occurrences();
+            return;
+        }
+        if is_add_cursors_to_line_ends_key(key) {
+            self.add_cursors_to_line_ends();
+            return;
+        }
         if is_delete_line_key(key) {
             self.delete_current_line();
             return;
@@ -52286,6 +52325,8 @@ impl App {
             Cmd::AddCursorAbove => self.editor.add_cursor_above(),
             Cmd::AddCursorBelow => self.editor.add_cursor_below(),
             Cmd::AddSelectionToNextMatch => self.start_select_next_occurrence(),
+            Cmd::SelectAllOccurrences => self.select_all_occurrences(),
+            Cmd::AddCursorsToLineEnds => self.add_cursors_to_line_ends(),
             Cmd::JumpToBracket => {
                 if !self.editor.jump_to_matching_bracket() {
                     self.status = String::from("Go to Bracket: no matching bracket");
@@ -56004,6 +56045,7 @@ impl App {
     }
 
     fn handle_mouse(&mut self, m: MouseEvent) {
+        self.editor.sync_occurrence_word_sel();
         self.recording_file_switches(|app| app.handle_mouse_inner(m));
     }
 
@@ -71727,6 +71769,23 @@ fn just_installed_covers_path(installed: &[crate::lsp::Language], path: &Path) -
     installed
         .iter()
         .any(|&i| lsp_server_family(i) == lsp_server_family(lang))
+}
+
+/// `Cmd+Shift+L` (`Ctrl+Shift+L` off macOS): Select All Occurrences of Find
+/// Match (#1558), VS Code's chord. On a remote session Drop to Local takes
+/// it first.
+fn is_select_all_occurrences_key(key: KeyEvent) -> bool {
+    is_cmd_shift_letter(key, 'l')
+}
+
+/// `Shift+Alt+I`: Add Cursors to Line Ends (#1558), VS Code's chord.
+fn is_add_cursors_to_line_ends_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('i' | 'I'))
+        && key.modifiers.contains(KeyModifiers::ALT)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
 }
 
 /// Editor-pane Change All Occurrences: `Cmd+F2` (macOS) or `Ctrl+F2` (Linux),

@@ -14124,6 +14124,8 @@ fn every_cmd_chord_is_ctrl_off_macos_unless_linux_md_lists_it() {
         is_editor_redo_key,
         is_rename_symbol_key,
         is_change_all_occurrences_key,
+        is_select_all_occurrences_key,
+        is_add_cursors_to_line_ends_key,
         is_select_next_occurrence_key,
         is_delete_line_key,
         is_go_to_definition_key,
@@ -35913,6 +35915,182 @@ fn cmd_d_selects_word_then_adds_the_next_match_as_a_caret() {
         app.editor.has_multi_cursor(),
         "second Cmd+D adds the next match as a caret"
     );
+}
+
+/// The issue's file (#1558), open in the editor.
+fn occurrences_app(tmp: &Path) -> App {
+    app_with_open_file(tmp, "s.py", "foo = 1\nbar = foo\nfoo += 2\nfood = 3")
+}
+
+fn select(app: &mut App, anchor: (usize, usize), head: (usize, usize)) {
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection { anchor, head });
+    (app.editor.cursor_row, app.editor.cursor_col) = head;
+}
+
+fn cmd_shift_l(app: &mut App) {
+    app.handle_key(key(
+        KeyCode::Char('l'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+}
+
+fn type_char(app: &mut App, c: char) {
+    app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+        .unwrap();
+}
+
+/// #1558: `Cmd+Shift+L` with the caret on `foo` selects every whole-word
+/// `foo`, and typing replaces them all (not the `foo` inside `food`). It
+/// used to do nothing.
+#[test]
+fn cmd_shift_l_selects_every_occurrence_of_the_word() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = occurrences_app(tmp.path());
+    app.editor.cursor_col = 1;
+    cmd_shift_l(&mut app);
+    assert_eq!(app.editor.carets.len() + 1, 3);
+    type_char(&mut app, 'X');
+    assert_eq!(app.editor.lines, ["X = 1", "bar = X", "X += 2", "food = 3"]);
+}
+
+/// #1558: a hand-made selection matches as plain text, so `oo` is found in
+/// every `foo` and in `food`, where whole-word matching finds none.
+#[test]
+fn cmd_shift_l_matches_a_hand_made_selection_as_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = occurrences_app(tmp.path());
+    select(&mut app, (0, 1), (0, 3));
+    cmd_shift_l(&mut app);
+    assert_eq!(app.editor.carets.len() + 1, 4);
+    let primary = app.editor.selection.unwrap();
+    assert_eq!(
+        primary.normalised(),
+        ((0, 1), (0, 3)),
+        "the user's stays primary"
+    );
+    type_char(&mut app, 'Q');
+    assert_eq!(
+        app.editor.lines,
+        ["fQ = 1", "bar = fQ", "fQ += 2", "fQd = 3"]
+    );
+}
+
+/// #1558: `Cmd+D` from a hand-made selection also matches plain text; from
+/// the caret it still takes whole words.
+#[test]
+fn cmd_d_from_a_hand_made_selection_matches_as_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = occurrences_app(tmp.path());
+    select(&mut app, (0, 1), (0, 3));
+    for _ in 0..2 {
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER))
+            .unwrap();
+    }
+    type_char(&mut app, 'Q');
+    assert_eq!(
+        app.editor.lines,
+        ["fQ = 1", "bar = fQ", "fQ += 2", "food = 3"]
+    );
+
+    let mut app = occurrences_app(tmp.path());
+    app.editor.cursor_col = 1;
+    for _ in 0..4 {
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER))
+            .unwrap();
+    }
+    assert_eq!(app.editor.carets.len() + 1, 3, "`food` is no whole `foo`");
+}
+
+/// #1558: the word `Cmd+D` selected is forgotten once that selection is
+/// dropped, so selecting the same `foo` again by hand matches plain text and
+/// reaches the `foo` inside `food`.
+#[test]
+fn cmd_d_after_esc_and_a_hand_made_reselection_matches_as_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = occurrences_app(tmp.path());
+    app.editor.cursor_col = 1;
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.editor.selection.unwrap().normalised(), ((0, 0), (0, 3)));
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.selection.is_none());
+    app.editor.cursor_col = 0;
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Right, KeyModifiers::SHIFT))
+            .unwrap();
+    }
+    assert_eq!(app.editor.selection.unwrap().normalised(), ((0, 0), (0, 3)));
+    for _ in 0..4 {
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER))
+            .unwrap();
+    }
+    assert_eq!(app.editor.carets.len() + 1, 4, "`food` holds a text `foo`");
+}
+
+/// #1558: `Shift+Alt+I` puts a caret at the end of each selected line, so
+/// typing appends to all three; a selection ending at column 0 of the next
+/// line leaves that line out.
+#[test]
+fn shift_alt_i_adds_a_cursor_at_each_line_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = occurrences_app(tmp.path());
+    select(&mut app, (0, 0), (2, 8));
+    app.handle_key(key(
+        KeyCode::Char('I'),
+        KeyModifiers::SHIFT | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert!(app.editor.selection.is_none_or(|s| s.anchor == s.head));
+    type_char(&mut app, 'Z');
+    assert_eq!(
+        app.editor.lines,
+        ["foo = 1Z", "bar = fooZ", "foo += 2Z", "food = 3"]
+    );
+
+    let mut app = occurrences_app(tmp.path());
+    select(&mut app, (0, 0), (2, 0));
+    assert!(run_from_palette(&mut app, "Add Cursors to Line Ends"));
+    type_char(&mut app, ';');
+    assert_eq!(
+        app.editor.lines,
+        ["foo = 1;", "bar = foo;", "foo += 2", "food = 3"]
+    );
+}
+
+/// Negatives (#1558): with nothing to match, neither command changes the
+/// buffer or leaves stray carets, and the palette and VS Code ids reach
+/// them.
+#[test]
+fn occurrence_commands_with_nothing_to_act_on_change_nothing() {
+    use crate::widgets::command_palette::Command;
+    assert_eq!(
+        Command::from_id("select_all_occurrences"),
+        Some(Command::SelectAllOccurrences)
+    );
+    assert_eq!(
+        Command::from_id("add_cursors_to_line_ends"),
+        Some(Command::AddCursorsToLineEnds)
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = occurrences_app(tmp.path());
+    // The caret on `=`, no word under it.
+    app.editor.cursor_col = 4;
+    cmd_shift_l(&mut app);
+    assert!(!app.editor.has_multi_cursor());
+    app.handle_key(key(
+        KeyCode::Char('I'),
+        KeyModifiers::SHIFT | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert!(!app.editor.has_multi_cursor());
+    // A selection across lines is not matched; it stays as it was.
+    select(&mut app, (0, 4), (1, 3));
+    cmd_shift_l(&mut app);
+    assert!(!app.editor.has_multi_cursor());
+    assert_eq!(app.editor.selection.unwrap().normalised(), ((0, 4), (1, 3)));
+    assert_eq!(app.editor.lines[0], "foo = 1");
 }
 
 #[test]

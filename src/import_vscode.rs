@@ -433,6 +433,11 @@ const COMMANDS: &[(&str, &str)] = &[
         "editor.action.addSelectionToNextFindMatch",
         "add_selection_to_next_match",
     ),
+    ("editor.action.selectHighlights", "select_all_occurrences"),
+    (
+        "editor.action.insertCursorAtEndOfEachLineSelected",
+        "add_cursors_to_line_ends",
+    ),
     ("editor.action.smartSelect.expand", "expand_selection"),
     ("editor.action.smartSelect.shrink", "shrink_selection"),
     ("editor.action.jumpToBracket", "jump_to_bracket"),
@@ -2630,6 +2635,32 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let report = scan_profile(dir.path()).expect("an empty profile is fine");
         assert!(report.is_empty());
+    }
+
+    /// #1558: VS Code's Select All Occurrences and Add Cursors to Line Ends
+    /// chords import onto croft's commands.
+    #[test]
+    fn select_highlights_and_line_end_cursors_import() {
+        let doc = json!([
+            { "key": "ctrl+alt+l", "command": "editor.action.selectHighlights" },
+            { "key": "ctrl+alt+e", "command": "editor.action.insertCursorAtEndOfEachLineSelected" }
+        ]);
+        let mut report = Report::default();
+        convert_keybindings(&doc, &mut report);
+        assert_eq!(
+            report.keybindings,
+            [
+                (
+                    String::from("ctrl+alt+e"),
+                    String::from("add_cursors_to_line_ends")
+                ),
+                (
+                    String::from("ctrl+alt+l"),
+                    String::from("select_all_occurrences")
+                ),
+            ]
+        );
+        assert!(report.dropped_keybindings.is_empty());
     }
 
     /// #1577: VS Code's Find in Selection toggle chord imports onto croft's.

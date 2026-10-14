@@ -582,6 +582,16 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_change_all_occurrences_key",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+L",
+                description: "Select all occurrences of the find match",
+                handler: "is_select_all_occurrences_key",
+            },
+            ShortcutEntry {
+                keys: "Shift+Opt+I / Shift+Alt+I",
+                description: "Add a cursor at the end of each selected line",
+                handler: "is_add_cursors_to_line_ends_key",
+            },
+            ShortcutEntry {
                 keys: "F12",
                 description: "Go to definition",
                 handler: "is_go_to_definition_key",

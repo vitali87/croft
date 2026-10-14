@@ -329,7 +329,9 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Cmd`+`Shift`+`G` | Go to the bottom of the file (with a leading count, that line) |
 | `Cmd`+`Shift`+`K` / `Ctrl`+`Shift`+`K` | Delete Line: remove every line touched by a cursor or its selection, so it composes with the extra cursors `Cmd`+`D` and `Opt`+click create; yanks to clipboard |
 | `Cmd`+`y` `y` | Yank the current line (`Cmd`+`N` `Cmd`+`y` `y` for N lines) |
-| `Cmd`+`D` / `Ctrl`+`D` | Add Selection to Next Find Match: select the word under the cursor, then grow the multi-cursor one occurrence per press |
+| `Cmd`+`D` / `Ctrl`+`D` | Add Selection to Next Find Match: select the word under the cursor, then grow the multi-cursor one occurrence per press (whole words when it selected the word itself; a selection you made matches as text, inside other words too) |
+| `Cmd`+`Shift`+`L` / `Ctrl`+`Shift`+`L` | Select All Occurrences of Find Match: a cursor on every occurrence of the selection (or the word under the cursor) at once; also in the Command Palette |
+| `Shift`+`Alt`+`I` | Add Cursors to Line Ends: one cursor at the end of every line the selection touches; also in the Command Palette |
 | `Option`+click | Add (or toggle off) a secondary caret at the click |
 | `Shift`+`Option`+drag | Column (box) selection: one caret per spanned row |
 | `Cmd`+`F2` / `Ctrl`+`F2` | Change All Occurrences of the word under the cursor at once |
