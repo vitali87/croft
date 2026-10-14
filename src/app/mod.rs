@@ -43741,11 +43741,7 @@ impl App {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let has_language = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
-            .is_some();
+        let has_language = crate::lsp::Language::from_path(&path).is_some();
         if !has_language {
             self.status = format!("No language server serves {name}");
             return;
