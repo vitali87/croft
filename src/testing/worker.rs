@@ -7,13 +7,15 @@
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 use super::model::{Activity, TestCase, TestStatus};
 use super::parse::{
     parse_jest_json, parse_list_line, parse_pytest_collect_line, parse_pytest_line,
-    parse_test_line, parse_vitest_list_line, parse_vitest_tap_line,
+    parse_test_line, parse_vitest_list_json, parse_vitest_list_line, parse_vitest_tap_line,
 };
 use super::regex_escape;
 use crate::output::{self, OutputLevel};
@@ -45,6 +47,9 @@ pub enum TestRequest {
     /// Run every test whose name contains the string (run-at-cursor by
     /// function name). cargo's name filter is a substring match.
     RunFilter(String),
+    /// Run each of these tests by its exact name, one after another, as one
+    /// run (#1535: Rerun Failed Tests). Ends once, failed if any failed.
+    RunMany(Vec<String>),
     /// Run a whole suite by its unanchored name (a header click). The cargo
     /// arm anchors it with [`super::suite_pattern`] so `parse` cannot sweep
     /// `parse_utils::b`; pytest gets it positionally as a node-ID prefix.
@@ -102,8 +107,72 @@ pub enum CoverageError {
     Unsupported { runner: &'static str },
 }
 
+/// What a cancel (#1534) needs to reach the runner the worker thread is
+/// blocked on: the process group of the child it is streaming, and how
+/// many requests the app has cancelled. Requests are counted on both sides
+/// in channel order, so a cancel covers the request in flight and any the
+/// worker has not picked up yet, and never a later one.
+#[derive(Clone, Default)]
+pub struct RunControl {
+    /// The streaming child's pid, which is its process group (it is
+    /// spawned as a group leader).
+    running: Arc<Mutex<Option<i32>>>,
+    /// Requests numbered up to this one are cancelled.
+    cancelled_upto: Arc<AtomicU64>,
+}
+
+impl RunControl {
+    /// Cancel every request numbered up to `upto`: kill the running child's
+    /// whole process group (the runner, pytest-xdist workers, a `cargo
+    /// test` binary), and keep any further child of those requests from
+    /// starting.
+    fn cancel(&self, upto: u64) {
+        self.cancelled_upto.fetch_max(upto, Ordering::SeqCst);
+        if let Some(pgid) = *self.running.lock().unwrap() {
+            // SAFETY: `pgid` is the group of a child this worker spawned as
+            // its own group leader, so only the test run is signalled.
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+        }
+    }
+
+    fn is_cancelled(&self, request: u64) -> bool {
+        request <= self.cancelled_upto.load(Ordering::SeqCst)
+    }
+
+    /// Spawn `cmd` as the leader of a new process group and record it, or
+    /// refuse with `None` when `request` was cancelled. Checked and
+    /// recorded under the lock, so a cancel either sees the pid or the
+    /// spawn sees the cancel.
+    fn spawn(&self, request: u64, cmd: &mut Command) -> Option<std::io::Result<Child>> {
+        use std::os::unix::process::CommandExt;
+        let mut running = self.running.lock().unwrap();
+        if self.is_cancelled(request) {
+            return None;
+        }
+        cmd.process_group(0);
+        let child = cmd.spawn();
+        if let Ok(c) = &child {
+            *running = i32::try_from(c.id()).ok();
+        }
+        Some(child)
+    }
+
+    fn finished(&self) {
+        *self.running.lock().unwrap() = None;
+    }
+}
+
 pub struct TestWorker {
     request_tx: Sender<TestRequest>,
+    /// Reaches the runner the worker thread is blocked on (#1534).
+    control: RunControl,
+    /// Requests sent so far: the worker numbers them in the same order.
+    sent: u64,
+    /// A cancel is waiting for its run's end, which the drain reports as
+    /// cancelled rather than as a verdict.
+    cancel_pending: bool,
     /// Responses arrive tagged with the epoch of the root they ran under; the
     /// drain drops tags older than [`Self::expected_epoch`] so a run still
     /// streaming when the Explorer re-roots can't pollute the new project's
@@ -125,9 +194,16 @@ impl TestWorker {
         let (response_tx, response_rx) = std::sync::mpsc::channel::<(u64, TestResponse)>();
         #[cfg(test)]
         let root = workspace_root.clone();
-        std::thread::spawn(move || worker_loop(workspace_root, request_rx, response_tx));
+        let control = RunControl::default();
+        let worker_control = control.clone();
+        std::thread::spawn(move || {
+            worker_loop(workspace_root, request_rx, response_tx, &worker_control)
+        });
         Self {
             request_tx,
+            control,
+            sent: 0,
+            cancel_pending: false,
             response_rx,
             expected_epoch: 0,
             #[cfg(test)]
@@ -144,6 +220,9 @@ impl TestWorker {
         (
             Self {
                 request_tx,
+                control: RunControl::default(),
+                sent: 0,
+                cancel_pending: false,
                 response_rx,
                 expected_epoch: 0,
                 root: PathBuf::new(),
@@ -152,37 +231,55 @@ impl TestWorker {
         )
     }
 
-    pub fn run_coverage(&self) {
-        let _ = self.request_tx.send(TestRequest::RunCoverage(None));
+    /// Queue `req`, numbered as the worker will number it.
+    fn send(&mut self, req: TestRequest) {
+        self.sent += 1;
+        let _ = self.request_tx.send(req);
+    }
+
+    pub fn run_coverage(&mut self) {
+        self.send(TestRequest::RunCoverage(None));
     }
 
     /// Run only the tests `scope` names with coverage on (#263).
-    pub fn run_coverage_scoped(&self, scope: CoverageScope) {
-        let _ = self.request_tx.send(TestRequest::RunCoverage(Some(scope)));
+    pub fn run_coverage_scoped(&mut self, scope: CoverageScope) {
+        self.send(TestRequest::RunCoverage(Some(scope)));
     }
 
-    pub fn run_all(&self) {
-        let _ = self.request_tx.send(TestRequest::RunAll);
+    pub fn run_all(&mut self) {
+        self.send(TestRequest::RunAll);
     }
 
-    pub fn run_one(&self, name: String) {
-        let _ = self.request_tx.send(TestRequest::RunOne(name));
+    pub fn run_one(&mut self, name: String) {
+        self.send(TestRequest::RunOne(name));
     }
 
-    pub fn run_filter(&self, pattern: String) {
-        let _ = self.request_tx.send(TestRequest::RunFilter(pattern));
+    pub fn run_many(&self, names: Vec<String>) {
+        let _ = self.request_tx.send(TestRequest::RunMany(names));
     }
 
-    pub fn run_suite(&self, suite: String) {
-        let _ = self.request_tx.send(TestRequest::RunSuite(suite));
+    pub fn run_filter(&mut self, pattern: String) {
+        self.send(TestRequest::RunFilter(pattern));
     }
 
-    pub fn discover(&self) {
-        let _ = self.request_tx.send(TestRequest::Discover);
+    pub fn run_suite(&mut self, suite: String) {
+        self.send(TestRequest::RunSuite(suite));
     }
 
-    pub fn set_codeql_program(&self, program: PathBuf) {
-        let _ = self.request_tx.send(TestRequest::SetCodeqlProgram(program));
+    pub fn discover(&mut self) {
+        self.send(TestRequest::Discover);
+    }
+
+    pub fn set_codeql_program(&mut self, program: PathBuf) {
+        self.send(TestRequest::SetCodeqlProgram(program));
+    }
+
+    /// Stop the run or discovery in flight (#1534): its runner's process
+    /// group is killed, and its end reaches the panel as cancelled. Also
+    /// called on quit, so no runner outlives croft.
+    pub fn cancel(&mut self) {
+        self.control.cancel(self.sent);
+        self.cancel_pending = true;
     }
 
     /// Rebind the worker to a new workspace root after an Explorer re-root.
@@ -194,7 +291,12 @@ impl TestWorker {
             self.root = root.clone();
         }
         self.expected_epoch += 1;
-        let _ = self.request_tx.send(TestRequest::SetRoot(root));
+        // Every request a pending cancel covers was sent before this
+        // re-root, so its end carries the old epoch and is dropped below:
+        // the cancel must not outlive it and swallow the new root's next
+        // verdict.
+        self.cancel_pending = false;
+        self.send(TestRequest::SetRoot(root));
     }
 
     #[cfg(test)]
@@ -216,8 +318,16 @@ impl TestWorker {
                 TestResponse::Started(activity) => panel.on_busy_started(activity),
                 TestResponse::Case(case) => panel.apply_case(case),
                 TestResponse::Progress(line) => panel.set_progress(line),
+                TestResponse::Finished { .. } | TestResponse::Refused
+                    if std::mem::take(&mut self.cancel_pending) =>
+                {
+                    panel.on_cancelled()
+                }
                 TestResponse::Finished { ok } => panel.on_finished(ok),
                 TestResponse::Refused => panel.on_refused(),
+                // A cancelled coverage run's killed child wrote no report:
+                // that error is not news, and would overwrite the cancel.
+                TestResponse::Coverage(_) if self.cancel_pending => continue,
                 TestResponse::Coverage(result) => panel.on_coverage(result),
             }
             changed = true;
@@ -235,6 +345,10 @@ struct EpochTx<'a> {
     /// [`TestRequest::SetCodeqlProgram`]); carried here because every
     /// handler already takes the sender.
     codeql: &'a Path,
+    /// Where the streaming child is recorded for a cancel (#1534), and the
+    /// number of the request being served.
+    control: &'a RunControl,
+    request: u64,
 }
 
 impl EpochTx<'_> {
@@ -248,21 +362,31 @@ impl EpochTx<'_> {
     }
 }
 
-fn worker_loop(mut root: PathBuf, rx: Receiver<TestRequest>, tx: Sender<(u64, TestResponse)>) {
+fn worker_loop(
+    mut root: PathBuf,
+    rx: Receiver<TestRequest>,
+    tx: Sender<(u64, TestResponse)>,
+    control: &RunControl,
+) {
     let mut epoch = 0u64;
     // Found on PATH, as the CodeQL side bar finds it, until the app says
     // otherwise.
     let mut codeql = PathBuf::from("codeql");
+    let mut request = 0u64;
     while let Ok(req) = rx.recv() {
+        request += 1;
         let etx = EpochTx {
             tx: &tx,
             epoch,
             codeql: &codeql,
+            control,
+            request,
         };
         match req {
             TestRequest::RunAll => run_all(&root, &etx),
             TestRequest::RunCoverage(scope) => run_coverage(&root, &etx, scope.as_ref()),
             TestRequest::RunOne(name) => run_one(&root, &etx, &name),
+            TestRequest::RunMany(names) => run_many(&root, &etx, &names),
             TestRequest::RunFilter(pattern) => run_filter(&root, &etx, &pattern, false),
             TestRequest::RunSuite(suite) => run_filter(&root, &etx, &suite, true),
             TestRequest::Discover => discover(&root, &etx),
@@ -411,6 +535,17 @@ fn pytest_script(path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     }
     None
 }
+
+/// pytest's verbosity for a run: `<id> PASSED` lines are printed from 1
+/// up. Set outright, not with `-v`, which counts on from the project's
+/// `addopts`: with the common `-q` there, `-v` lands on 0 and the run
+/// prints only dots, so no result is read (#1502).
+const PYTEST_RUN_VERBOSITY: &str = "--verbosity=1";
+
+/// pytest's verbosity for `--collect-only`: one node id per line is level
+/// -1 exactly. `-q` would stack on an `addopts` `-q` to -2, which prints a
+/// count per file instead (#1502).
+const PYTEST_COLLECT_VERBOSITY: &str = "--verbosity=-1";
 
 /// `pytest <args>` rooted at the workspace, launched as [`pytest_launch`]
 /// says, with piped stdio. Discovery, runs and coverage all come through
@@ -752,6 +887,73 @@ pub fn build_test_binary(
     }
 }
 
+/// The config file stems and extensions vitest reads its `projects` from.
+const VITEST_CONFIG_STEMS: [&str; 2] = ["vitest.config", "vite.config"];
+const VITEST_CONFIG_EXTS: [&str; 6] = ["ts", "mts", "cts", "js", "mjs", "cjs"];
+
+/// Whether `root` runs vitest projects (#1504), formerly workspaces: a
+/// `vitest.workspace.*` or `vitest.projects.*` file, or a config declaring
+/// `projects` (or the older `workspace`). There tap-flat names a test by its file relative to its
+/// PROJECT, without the project, so two packages' `x.test.ts` collapse into
+/// one suite and same-named tests overwrite each other. A false positive
+/// costs only the live tree updates: the run is read from its JSON report.
+fn vitest_has_projects(root: &Path) -> bool {
+    let ws_file = ["vitest.workspace", "vitest.projects"].iter().any(|stem| {
+        VITEST_CONFIG_EXTS
+            .iter()
+            .chain(&["json"])
+            .any(|ext| root.join(format!("{stem}.{ext}")).is_file())
+    });
+    ws_file
+        || VITEST_CONFIG_STEMS.iter().any(|stem| {
+            VITEST_CONFIG_EXTS.iter().any(|ext| {
+                std::fs::read_to_string(root.join(format!("{stem}.{ext}")))
+                    .is_ok_and(|config| declares_vitest_projects(&config))
+            })
+        })
+}
+
+/// Whether config source declares a `projects:` or `workspace:` key, quoted
+/// or not. Not a parser: a key-shaped word is enough.
+fn declares_vitest_projects(config: &str) -> bool {
+    ["projects", "workspace"].iter().any(|key| {
+        config.match_indices(key).any(|(i, _)| {
+            let word_start = config[..i]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '$'));
+            let after = &config[i + key.len()..];
+            let after = after.strip_prefix(['"', '\'']).unwrap_or(after);
+            word_start && after.trim_start().starts_with(':')
+        })
+    })
+}
+
+/// Run vitest with `args`, a `run` reporting through tap-flat. Outside a
+/// projects setup the tap-flat lines stream into the tree as they come. In
+/// one (#1504) they only reach OUTPUT: the json reporter's report, whose
+/// files are absolute, names the cases once the run ends, rooted at the
+/// workspace-relative file so each package keeps its own tests.
+fn run_vitest(tx: &EpochTx, root: &Path, args: &[String]) -> Option<bool> {
+    if !vitest_has_projects(root) {
+        return run_streaming(tx, js_cmd(root, "vitest", args), one(parse_vitest_tap_line));
+    }
+    static RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let report = std::env::temp_dir().join(format!("croft-vitest-{}-{n}.json", std::process::id()));
+    let _ = std::fs::remove_file(&report);
+    let mut args = args.to_vec();
+    args.push(String::from("--reporter=json"));
+    args.push(format!("--outputFile.json={}", report.display()));
+    let ok = run_streaming(tx, js_cmd(root, "vitest", &args), |_| Vec::new());
+    let text = std::fs::read_to_string(&report).unwrap_or_default();
+    let _ = std::fs::remove_file(&report);
+    for case in parse_jest_json(root, &text) {
+        tx.send(TestResponse::Case(case));
+    }
+    ok
+}
+
 /// vitest argv for one exact test: the file scopes the run and `-t` narrows
 /// to the title. vitest's `-t/--testNamePattern` is jest-compatible — a
 /// REGEX over the full name — so the title is escaped like jest's.
@@ -888,9 +1090,11 @@ fn run_streaming_exit(
     show: impl Fn(&str) -> Option<String>,
     parse: impl Fn(&str) -> Vec<TestCase>,
 ) -> Option<Option<i32>> {
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
+    let mut child = match tx.control.spawn(tx.request, &mut cmd) {
+        // Cancelled before it started: it ended without a verdict.
+        None => return Some(None),
+        Some(Ok(c)) => c,
+        Some(Err(e)) => {
             output::push(
                 output::CHANNEL_TESTS,
                 OutputLevel::Error,
@@ -923,7 +1127,9 @@ fn run_streaming_exit(
     if let Some(h) = stderr_handle {
         let _ = h.join();
     }
-    Some(child.wait().ok().and_then(|s| s.code()))
+    let code = child.wait().ok().and_then(|s| s.code());
+    tx.control.finished();
+    Some(code)
 }
 
 /// The cargo build-status verbs printed to stderr (whitespace-indented on a
@@ -963,13 +1169,14 @@ fn run_all(root: &Path, tx: &EpochTx) {
     tx.send(TestResponse::Started(Activity::Running));
     let ok = match runner {
         Runner::Pytest => {
-            let cmd = pytest_cmd(root, &["-v", "--color=no"]);
+            let cmd = pytest_cmd(root, &[PYTEST_RUN_VERBOSITY, "--color=no"]);
             run_streaming(tx, cmd, one(parse_pytest_line))
         }
-        Runner::Vitest => {
-            let cmd = js_cmd(root, "vitest", &["run", "--reporter=tap-flat"]);
-            run_streaming(tx, cmd, one(parse_vitest_tap_line))
-        }
+        Runner::Vitest => run_vitest(
+            tx,
+            root,
+            &[String::from("run"), String::from("--reporter=tap-flat")],
+        ),
         Runner::Jest => {
             let cmd = js_cmd(root, "jest", &["--json"]);
             run_streaming(tx, cmd, |line| parse_jest_json(root, line))
@@ -1084,7 +1291,12 @@ fn coverage_args(runner: Runner, dir: &Path) -> Vec<String> {
     let v = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
     match runner {
         Runner::Pytest => {
-            let mut a = v(&["-v", "--color=no", "--cov=.", "--cov-branch"]);
+            let mut a = v(&[
+                PYTEST_RUN_VERBOSITY,
+                "--color=no",
+                "--cov=.",
+                "--cov-branch",
+            ]);
             a.push(format!("--cov-report=lcov:{report}"));
             a
         }
@@ -1227,11 +1439,10 @@ fn run_coverage(root: &Path, tx: &EpochTx, scope: Option<&CoverageScope>) {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let ok = match runner {
         Runner::Pytest => run_streaming(tx, pytest_cmd(root, &args), one(parse_pytest_line)),
-        Runner::Vitest => run_streaming(
-            tx,
-            js_cmd(root, "vitest", &args),
-            one(parse_vitest_tap_line),
-        ),
+        Runner::Vitest => {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            run_vitest(tx, root, &args)
+        }
         Runner::Jest => run_streaming(tx, js_cmd(root, "jest", &args), |line| {
             parse_jest_json(root, line)
         }),
@@ -1267,15 +1478,67 @@ fn run_one(root: &Path, tx: &EpochTx, name: &str) {
         tx.send(TestResponse::Refused);
         return;
     };
-    let ok = match runner {
+    let ok = run_one_case(root, tx, runner, name);
+    tx.send(TestResponse::Finished { ok: Some(ok) });
+}
+
+/// Run each of `names` exactly, one after another, as a single run (#1535):
+/// every runner can run one test by name, which no shared multi-name filter
+/// spans. All are run whatever an earlier one did, and the run fails if any
+/// of them did.
+fn run_many(root: &Path, tx: &EpochTx, names: &[String]) {
+    let Some(runner) = runner_for(root) else {
+        tx.send(TestResponse::Refused);
+        return;
+    };
+    let mut ok = true;
+    for name in names {
+        ok &= run_one_case_seen(root, tx, runner, name);
+    }
+    tx.send(TestResponse::Finished { ok: Some(ok) });
+}
+
+/// [`run_one_case`], passed only when the runner also reported a result
+/// for `name`: a test renamed since discovery matches nothing, and a
+/// name-filtered runner exits cleanly having run zero tests.
+fn run_one_case_seen(root: &Path, tx: &EpochTx, runner: Runner, name: &str) -> bool {
+    let (case_tx, case_rx) = std::sync::mpsc::channel::<(u64, TestResponse)>();
+    std::thread::scope(|s| {
+        let forward = s.spawn(|| {
+            let mut seen = false;
+            for (epoch, resp) in case_rx {
+                if let TestResponse::Case(case) = &resp {
+                    seen |= case.name == name;
+                }
+                let _ = tx.tx.send((epoch, resp));
+            }
+            seen
+        });
+        let passed = {
+            let etx = EpochTx {
+                tx: &case_tx,
+                epoch: tx.epoch,
+                codeql: tx.codeql,
+                control: tx.control,
+                request: tx.request,
+            };
+            run_one_case(root, &etx, runner, name)
+        };
+        drop(case_tx);
+        let seen = forward.join().unwrap_or(false);
+        passed && seen
+    })
+}
+
+/// One test by its exact name under `runner`, its result streamed; true
+/// when the runner exited cleanly.
+fn run_one_case(root: &Path, tx: &EpochTx, runner: Runner, name: &str) -> bool {
+    match runner {
         Runner::Pytest => {
-            let cmd = pytest_cmd(root, &["-v", "--color=no", name]);
+            let cmd = pytest_cmd(root, &[PYTEST_RUN_VERBOSITY, "--color=no", name]);
             run_streaming(tx, cmd, one(parse_pytest_line))
         }
-        Runner::Vitest => {
-            let cmd = js_cmd(root, "vitest", &vitest_one_args(name));
-            run_streaming(tx, cmd, one(parse_vitest_tap_line))
-        }
+        Runner::Vitest => run_vitest(tx, root, &vitest_one_args(name)),
         Runner::Jest => {
             let cmd = js_cmd(root, "jest", &jest_one_args(name));
             run_streaming(tx, cmd, |line| parse_jest_json(root, line))
@@ -1287,8 +1550,7 @@ fn run_one(root: &Path, tx: &EpochTx, name: &str) {
         Runner::Go => run_go(tx, root, &super::gotest::one_args(name)),
         Runner::Codeql => run_codeql(tx, root, &super::codeqltest::select_args(name)),
     }
-    .unwrap_or(false);
-    tx.send(TestResponse::Finished { ok: Some(ok) });
+    .unwrap_or(false)
 }
 
 /// Run every test matching a name filter. `suite` marks a header click: the
@@ -1313,16 +1575,13 @@ fn run_filter(root: &Path, tx: &EpochTx, pattern: &str, suite: bool) {
             // A suite is always a node-ID prefix; the `.py` sniff keeps a
             // node-ID handed to a plain filter run positional too.
             let cmd = if suite || pattern.contains(".py") {
-                pytest_cmd(root, &["-v", "--color=no", pattern])
+                pytest_cmd(root, &[PYTEST_RUN_VERBOSITY, "--color=no", pattern])
             } else {
-                pytest_cmd(root, &["-v", "--color=no", "-k", pattern])
+                pytest_cmd(root, &[PYTEST_RUN_VERBOSITY, "--color=no", "-k", pattern])
             };
             run_streaming(tx, cmd, one(parse_pytest_line))
         }
-        Runner::Vitest => {
-            let cmd = js_cmd(root, "vitest", &vitest_filter_args(pattern, suite));
-            run_streaming(tx, cmd, one(parse_vitest_tap_line))
-        }
+        Runner::Vitest => run_vitest(tx, root, &vitest_filter_args(pattern, suite)),
         Runner::Jest => {
             let cmd = js_cmd(root, "jest", &jest_filter_args(pattern, suite));
             run_streaming(tx, cmd, |line| parse_jest_json(root, line))
@@ -1366,7 +1625,7 @@ fn discover(root: &Path, tx: &EpochTx) {
     };
     let ok = match runner {
         Runner::Pytest => {
-            let cmd = pytest_cmd(root, &["--collect-only", "-q", "--color=no"]);
+            let cmd = pytest_cmd(root, &["--collect-only", PYTEST_COLLECT_VERBOSITY, "--color=no"]);
             let show = |line: &str| Some(line.to_string());
             run_streaming_exit(tx, cmd, show, |line| {
                 parse_pytest_collect_line(line)
@@ -1383,6 +1642,23 @@ fn discover(root: &Path, tx: &EpochTx) {
         // vitest 2 and later exit 0 with no tests either way, and 1 still
         // on a file that fails to load. jest's `--listTests` exits 0 with
         // nothing to list.
+        // A projects setup (#1504) lists as JSON, whose absolute files keep
+        // each package's tests apart; the text listing names a test by its
+        // project and a file relative to that project.
+        Runner::Vitest if vitest_has_projects(root) => {
+            let listed = std::cell::RefCell::new(String::new());
+            let cmd = js_cmd(root, "vitest", &["list", "--json", "--passWithNoTests"]);
+            let ok = run_streaming(tx, cmd, |line| {
+                let mut listed = listed.borrow_mut();
+                listed.push_str(line);
+                listed.push('\n');
+                Vec::new()
+            });
+            for name in parse_vitest_list_json(root, &listed.borrow()) {
+                tx.send(TestResponse::Case(not_run(name)));
+            }
+            ok
+        }
         Runner::Vitest => {
             let cmd = js_cmd(root, "vitest", &["list", "--passWithNoTests"]);
             run_streaming(tx, cmd, |line| {
@@ -1454,6 +1730,8 @@ mod tests {
             tx: &tx,
             epoch: 0,
             codeql: Path::new("codeql"),
+            control: &RunControl::default(),
+            request: 1,
         };
         run_all(tmp.path(), &etx);
         run_one(tmp.path(), &etx, "a::b");
@@ -1478,6 +1756,124 @@ mod tests {
                 .any(|m| matches!(m, TestResponse::Finished { .. })),
             "a bare Finished after start_single/start_filter strands cases Running"
         );
+    }
+
+    /// Running and not a zombie: a killed runner's background child is
+    /// reparented and may wait to be reaped.
+    #[cfg(unix)]
+    fn running(pid: i32) -> bool {
+        // SAFETY: signal 0 only checks that the pid exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+            !stat
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+        })
+    }
+
+    #[cfg(unix)]
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// #1534: a run whose test hangs (here a `codeql` that never returns,
+    /// with a child of its own) is cancelled: the whole process group dies,
+    /// the panel goes idle with the run marked cancelled, and the next run
+    /// goes ahead and reports its own verdict.
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_a_hung_run_kills_its_processes_and_frees_the_worker() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("test/Find")).unwrap();
+        std::fs::write(
+            root.join("test/qlpack.yml"),
+            "name: acme/tests\nextractor: javascript\ntests: .\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("test/Find/Find.qlref"), "Find.ql\n").unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let hang = bin.path().join("hang");
+        std::fs::write(
+            &hang,
+            format!(
+                "#!/bin/sh\necho $$ > '{d}/runner.pid'\nsleep 1000 &\necho $! > '{d}/child.pid'\nwait\n",
+                d = bin.path().display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hang, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pid = |name: &str| -> Option<i32> {
+            std::fs::read_to_string(bin.path().join(name))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        };
+
+        let mut worker = TestWorker::spawn(root.to_path_buf());
+        let mut panel = TestingPanel::new();
+        worker.set_codeql_program(hang);
+        worker.run_all();
+        wait_until("the hung run starts", || {
+            worker.drain(&mut panel);
+            panel.is_busy() && pid("child.pid").is_some()
+        });
+        let (runner, child) = (pid("runner.pid").unwrap(), pid("child.pid").unwrap());
+        worker.cancel();
+        wait_until("the run ends", || {
+            worker.drain(&mut panel);
+            !panel.is_busy()
+        });
+        assert!(panel.take_cancelled(), "the end reads as cancelled");
+        wait_until("the runner dies", || !running(runner));
+        wait_until("the runner's child dies", || !running(child));
+
+        // The next run is not cancelled: it reports its own verdict.
+        let codeql = fake_codeql(
+            bin.path(),
+            root,
+            "[1/1 comp 1.1s eval 20ms] PASSED @ROOT@/test/Find/Find.qlref\n",
+        );
+        worker.set_codeql_program(codeql);
+        worker.run_all();
+        panel.take_finished();
+        let mut verdict = None;
+        wait_until("the second run ends", || {
+            worker.drain(&mut panel);
+            verdict = panel.take_finished();
+            verdict.is_some()
+        });
+        assert!(!panel.take_cancelled());
+        assert_eq!(verdict, Some(Some(true)));
+    }
+
+    /// #1534 negative: a cancel covers the requests sent before it, never a
+    /// later one, and refuses to start their further children.
+    #[cfg(unix)]
+    #[test]
+    fn a_cancel_covers_only_the_requests_sent_before_it() {
+        let control = RunControl::default();
+        control.cancel(2);
+        assert!(control.is_cancelled(1));
+        assert!(control.is_cancelled(2));
+        assert!(!control.is_cancelled(3));
+        let mut cmd = Command::new("true");
+        assert!(
+            control.spawn(2, &mut cmd).is_none(),
+            "a cancelled run starts nothing"
+        );
+        let mut child = control.spawn(3, &mut cmd).unwrap().unwrap();
+        child.wait().unwrap();
+        control.finished();
+        assert!(control.running.lock().unwrap().is_none());
     }
 
     /// A stand-in `codeql` in `dir` that logs its arguments and prints
@@ -1536,6 +1932,8 @@ mod tests {
             tx: &tx,
             epoch: 0,
             codeql: &codeql,
+            control: &RunControl::default(),
+            request: 1,
         };
         let drain = |rx: &Receiver<(u64, TestResponse)>| {
             let mut cases = Vec::new();
@@ -1629,6 +2027,8 @@ mod tests {
             tx: &tx,
             epoch: 0,
             codeql: Path::new("codeql"),
+            control: &RunControl::default(),
+            request: 1,
         };
         let cases = |rx: &Receiver<(u64, TestResponse)>| {
             let mut v: Vec<(String, TestStatus)> = rx
@@ -1762,6 +2162,43 @@ mod tests {
         .unwrap();
         assert!(w.drain(&mut panel));
         assert!(!panel.is_empty());
+    }
+
+    /// #1534: a cancel whose run's end is dropped as stale by a re-root
+    /// does not carry over to the new root's next run.
+    #[test]
+    fn a_cancel_dropped_by_a_re_root_does_not_cancel_the_next_run() {
+        let (mut w, tx) = TestWorker::for_test();
+        let mut panel = TestingPanel::new();
+        w.cancel();
+        w.set_root(PathBuf::from("/new"));
+        tx.send((0, TestResponse::Finished { ok: None })).unwrap();
+        tx.send((1, TestResponse::Started(Activity::Running)))
+            .unwrap();
+        tx.send((1, TestResponse::Finished { ok: Some(true) }))
+            .unwrap();
+        w.drain(&mut panel);
+        assert!(!panel.take_cancelled(), "the new run is not cancelled");
+        assert_eq!(panel.take_finished(), Some(Some(true)));
+    }
+
+    /// #1534: a cancelled coverage run's missing report does not replace
+    /// the cancel with a coverage error.
+    #[test]
+    fn a_cancelled_coverage_run_reports_no_coverage_error() {
+        let (mut w, tx) = TestWorker::for_test();
+        let mut panel = TestingPanel::new();
+        tx.send((0, TestResponse::Started(Activity::Running)))
+            .unwrap();
+        w.drain(&mut panel);
+        w.cancel();
+        tx.send((0, TestResponse::Coverage(Err(CoverageError::NoReport))))
+            .unwrap();
+        tx.send((0, TestResponse::Finished { ok: Some(false) }))
+            .unwrap();
+        w.drain(&mut panel);
+        assert!(panel.take_cancelled());
+        assert!(panel.take_coverage_error().is_none());
     }
 
     #[test]
@@ -2028,7 +2465,10 @@ mod tests {
             py.contains(&"--cov-report=lcov:/t/cov/lcov.info".to_string()),
             "{py:?}"
         );
-        assert!(py.contains(&"--cov-branch".to_string()) && py.contains(&"-v".to_string()));
+        assert!(
+            py.contains(&"--cov-branch".to_string())
+                && py.contains(&PYTEST_RUN_VERBOSITY.to_string())
+        );
         let vi = coverage_args(Runner::Vitest, dir);
         assert!(vi.contains(&"--reporter=tap-flat".to_string()));
         assert!(
@@ -2168,6 +2608,181 @@ mod tests {
         }
     }
 
+    /// #1535: Rerun Failed Tests runs each name exactly, all of them even
+    /// after one fails, and the run ends once: failed if any failed, passed
+    /// only when every one did.
+    #[cfg(unix)]
+    #[test]
+    fn run_many_runs_every_name_and_fails_if_any_did() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("pyproject.toml"), "[project]\nname = \"g\"\n").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let etx = EpochTx {
+            tx: &tx,
+            epoch: 0,
+            codeql: Path::new("codeql"),
+            control: &RunControl::default(),
+            request: 1,
+        };
+        let log = root.join(".venv/bin/python.log");
+        let ran = |names: &[&str]| {
+            let _ = std::fs::remove_file(&log);
+            let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            run_many(root, &etx, &names);
+            let finished: Vec<Option<bool>> = rx
+                .try_iter()
+                .filter_map(|(_, r)| match r {
+                    TestResponse::Finished { ok } => Some(ok),
+                    _ => None,
+                })
+                .collect();
+            let calls = std::fs::read_to_string(&log).unwrap_or_default();
+            (calls.lines().count(), finished)
+        };
+
+        fake_venv(
+            root,
+            ".venv",
+            "echo \"$*\" >> \"$0.log\"\ncase \"$*\" in *test_b*) exit 1;; *test_gone*) exit 0;; esac\nfor a; do last=$a; done\necho \"$last PASSED\"\nexit 0",
+        );
+        assert_eq!(
+            ran(&["t.py::test_a", "t.py::test_b", "t.py::test_c"]),
+            (3, vec![Some(false)]),
+            "test_c still runs after test_b fails, and the run ends once, failed"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(calls.contains("t.py::test_a") && calls.contains("t.py::test_c"));
+        assert_eq!(
+            ran(&["t.py::test_a", "t.py::test_c"]),
+            (2, vec![Some(true)]),
+            "every one passing is a passed run"
+        );
+        assert_eq!(
+            ran(&["t.py::test_a", "t.py::test_gone"]),
+            (2, vec![Some(false)]),
+            "a name the runner reported no result for, though it exited 0, fails the run"
+        );
+    }
+
+    /// A project whose pytest `addopts` is `addopts`, with a venv python
+    /// that answers the way pytest does for the verbosity it ends up at:
+    /// `addopts` comes first, `-v` / `-q` (and `-qq`) count up and down
+    /// from there, and `--verbosity=N` sets the level outright. Collection
+    /// prints node ids only at -1; a run prints `<id> PASSED` lines only
+    /// from 1 up, and dots below that.
+    #[cfg(unix)]
+    fn pytest_project_with_addopts(root: &Path, addopts: &str) {
+        std::fs::write(
+            root.join("pyproject.toml"),
+            format!("[tool.pytest.ini_options]\naddopts = \"{addopts}\"\n"),
+        )
+        .unwrap();
+        let body = format!(
+            r#"shift 2
+v=0
+collect=0
+for a in {addopts} "$@"; do
+  case "$a" in
+    -v) v=$((v+1)) ;;
+    -vv) v=$((v+2)) ;;
+    -q) v=$((v-1)) ;;
+    -qq) v=$((v-2)) ;;
+    --verbosity=*) v="${{a#--verbosity=}}" ;;
+    --collect-only) collect=1 ;;
+  esac
+done
+if [ "$collect" = 1 ]; then
+  if [ "$v" -le -2 ]; then echo "tests/test_x.py: 2"
+  elif [ "$v" -eq -1 ]; then echo "tests/test_x.py::test_a"; echo "tests/test_x.py::test_b"
+  else echo "<Module tests/test_x.py>"; echo "  <Function test_a>"; echo "  <Function test_b>"
+  fi
+  echo "2 tests collected in 0.01s"
+  exit 0
+fi
+if [ "$v" -ge 1 ]; then
+  echo "tests/test_x.py::test_a PASSED"
+  echo "tests/test_x.py::test_b FAILED"
+else
+  echo "tests/test_x.py .F"
+fi
+echo "1 failed, 1 passed in 0.01s"
+exit 1"#
+        );
+        fake_venv(root, ".venv", &body);
+    }
+
+    /// What `f` sends: the cases by name and status, and the run's verdict.
+    fn collect_responses(
+        root: &Path,
+        f: impl Fn(&Path, &EpochTx),
+    ) -> (Vec<(String, TestStatus)>, Option<Option<bool>>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let etx = EpochTx {
+            tx: &tx,
+            epoch: 0,
+            codeql: Path::new("codeql"),
+            control: &RunControl::default(),
+            request: 1,
+        };
+        f(root, &etx);
+        let mut cases = Vec::new();
+        let mut finished = None;
+        for (_, r) in rx.try_iter() {
+            match r {
+                TestResponse::Case(c) => cases.push((c.name, c.status)),
+                TestResponse::Finished { ok } => finished = Some(ok),
+                _ => {}
+            }
+        }
+        (cases, finished)
+    }
+
+    /// #1502: a project with `-q` in its pytest `addopts` (the pytest docs'
+    /// own `-ra -q` example) listed no tests: croft's `-q` stacked on it and
+    /// collection printed per-file counts instead of node ids. Discovery now
+    /// sets the verbosity outright.
+    #[cfg(unix)]
+    #[test]
+    fn discovery_lists_pytest_tests_under_a_quiet_addopts() {
+        for addopts in ["-ra -q", "-qq", "", "-v"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            pytest_project_with_addopts(root, addopts);
+            let (cases, finished) = collect_responses(root, discover);
+            assert_eq!(
+                cases,
+                vec![
+                    (String::from("tests/test_x.py::test_a"), TestStatus::NotRun),
+                    (String::from("tests/test_x.py::test_b"), TestStatus::NotRun),
+                ],
+                "addopts {addopts:?}"
+            );
+            assert_eq!(finished, Some(Some(true)), "addopts {addopts:?}");
+        }
+    }
+
+    /// #1502: with `-q` in `addopts`, croft's `-v` cancelled out, the run
+    /// printed dots, no result was parsed and the view said "Run failed".
+    /// Runs now ask for verbosity 1 outright, whatever `addopts` holds.
+    #[cfg(unix)]
+    #[test]
+    fn a_pytest_run_reports_results_under_a_quiet_addopts() {
+        for addopts in ["-ra -q", "-qq", "", "-v"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            pytest_project_with_addopts(root, addopts);
+            let expected = vec![
+                (String::from("tests/test_x.py::test_a"), TestStatus::Passed),
+                (String::from("tests/test_x.py::test_b"), TestStatus::Failed),
+            ];
+            let (cases, _) = collect_responses(root, run_all);
+            assert_eq!(cases, expected, "run all, addopts {addopts:?}");
+            let (cases, _) = collect_responses(root, |r, t| run_one(r, t, "tests/test_x.py"));
+            assert_eq!(cases, expected, "run one, addopts {addopts:?}");
+        }
+    }
+
     /// #845: `pytest --collect-only` exits 2 on a collection error, having
     /// listed nothing. Discovery used to drop that status and finish exactly
     /// as an empty project does, so the view offered a run that would fail
@@ -2185,6 +2800,8 @@ mod tests {
             tx: &tx,
             epoch: 0,
             codeql: Path::new("codeql"),
+            control: &RunControl::default(),
+            request: 1,
         };
         let discovered = || {
             discover(root, &etx);
@@ -2221,6 +2838,57 @@ mod tests {
         // pytest's exit 5 ("no tests were collected") is an empty project.
         fake_venv(root, ".venv", "echo 'no tests ran in 0.01s'\nexit 5");
         assert_eq!(discovered(), (Vec::new(), Some(Some(true))));
+    }
+
+    /// #1503: with `-n auto` in a project's addopts, pytest-xdist prints each
+    /// result outcome first. Run All read none of them and, the run exiting 1
+    /// for its failed test, the view showed "Run failed" over an empty list.
+    #[cfg(unix)]
+    #[test]
+    fn run_all_reads_results_under_pytest_xdist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("pyproject.toml"), "[project]\nname = \"x\"\n").unwrap();
+        fake_venv(
+            root,
+            ".venv",
+            "cat <<'EOF'\n\
+             ============================= test session starts ==============================\n\
+             created: 2/2 workers\n\
+             2 workers [2 items]\n\
+             \n\
+             scheduling tests via LoadScheduling\n\
+             \n\
+             [gw0] [ 50%] PASSED tests/test_x.py::test_a \n\
+             [gw1] [100%] FAILED tests/test_x.py::test_b \n\
+             =========================== short test summary info ============================\n\
+             FAILED tests/test_x.py::test_b - assert False\n\
+             ========================= 1 failed, 1 passed in 0.61s ==========================\n\
+             EOF\nexit 1",
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let etx = EpochTx {
+            tx: &tx,
+            epoch: 0,
+            codeql: Path::new("codeql"),
+            control: &RunControl::default(),
+            request: 1,
+        };
+        run_all(root, &etx);
+        let cases: Vec<(String, TestStatus)> = rx
+            .try_iter()
+            .filter_map(|(_, r)| match r {
+                TestResponse::Case(c) => Some((c.name, c.status)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cases,
+            vec![
+                (String::from("tests/test_x.py::test_a"), TestStatus::Passed),
+                (String::from("tests/test_x.py::test_b"), TestStatus::Failed),
+            ]
+        );
     }
 
     /// #845: a project venv with pytest in it runs pytest as a module of the
@@ -2279,6 +2947,8 @@ mod tests {
             tx: &tx,
             epoch: 0,
             codeql: Path::new("codeql"),
+            control: &RunControl::default(),
+            request: 1,
         };
         let finished = || {
             discover(root, &etx);
@@ -2446,6 +3116,8 @@ mod tests {
             tx: &tx,
             epoch: 0,
             codeql: Path::new("codeql"),
+            control: &RunControl::default(),
+            request: 1,
         };
         discover(root, &etx);
         let mut cases = Vec::new();
@@ -2500,6 +3172,165 @@ mod tests {
         fake_js_runner(tmp.path(), "jest", "exit 0");
         assert_eq!(runner_for(tmp.path()), Some(Runner::Jest));
         assert_eq!(discovery_of(tmp.path()), (Vec::new(), Some(Some(true))));
+    }
+
+    /// Run everything in `root` on this thread: the cases reported, in order.
+    fn run_all_of(root: &Path) -> Vec<(String, TestStatus)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let etx = EpochTx {
+            tx: &tx,
+            epoch: 0,
+            codeql: Path::new("codeql"),
+            control: &RunControl::default(),
+            request: 1,
+        };
+        run_all(root, &etx);
+        rx.try_iter()
+            .filter_map(|(_, r)| match r {
+                TestResponse::Case(c) => Some((c.name, c.status)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A stand-in vitest 3 for the #1504 monorepo: packages `a` and `b`
+    /// each hold an `x.test.ts` with the same two tests, and `b`'s second
+    /// fails. tap-flat names each test by its file relative to its project,
+    /// so all four print as `x.test.ts > ...`; `list --json` and the json
+    /// reporter carry absolute files.
+    #[cfg(unix)]
+    fn fake_vitest_monorepo(root: &Path) {
+        let r = root.display();
+        let list = format!(
+            r#"[{{"name":"parses input","file":"{r}/packages/a/x.test.ts","projectName":"a"}},{{"name":"rejects bad input","file":"{r}/packages/a/x.test.ts","projectName":"a"}},{{"name":"parses input","file":"{r}/packages/b/x.test.ts","projectName":"b"}},{{"name":"rejects bad input","file":"{r}/packages/b/x.test.ts","projectName":"b"}}]"#
+        );
+        let pass = |t: &str| {
+            format!(
+                r#"{{"ancestorTitles":[],"status":"passed","title":"{t}","failureMessages":[]}}"#
+            )
+        };
+        let report = format!(
+            r#"{{"testResults":[{{"name":"{r}/packages/a/x.test.ts","assertionResults":[{},{}]}},{{"name":"{r}/packages/b/x.test.ts","assertionResults":[{},{{"ancestorTitles":[],"status":"failed","title":"rejects bad input","failureMessages":["no"]}}]}}]}}"#,
+            pass("parses input"),
+            pass("rejects bad input"),
+            pass("parses input"),
+        );
+        std::fs::write(root.join("list.json"), list).unwrap();
+        std::fs::write(root.join("report.json"), report).unwrap();
+        fake_js_runner(
+            root,
+            "vitest",
+            "case \"$1\" in list)\n\
+               case \" $* \" in *\" --json \"*) cat list.json ;;\n\
+               *) echo '[a] x.test.ts > parses input'; echo '[b] x.test.ts > parses input' ;; esac\n\
+               exit 0 ;; esac\n\
+             echo 'ok 1 - x.test.ts > parses input # time=1ms'\n\
+             echo 'ok 2 - x.test.ts > rejects bad input # time=1ms'\n\
+             echo 'ok 3 - x.test.ts > parses input # time=1ms'\n\
+             echo 'not ok 4 - x.test.ts > rejects bad input # time=1ms'\n\
+             for a in \"$@\"; do case \"$a\" in --outputFile.json=*) cp report.json \"${a#*=}\" ;; esac; done\n\
+             exit 1",
+        );
+    }
+
+    /// #1504: with vitest `projects`, a run reports four tests in two
+    /// packages, not two in one merged `x.test.ts`, and on the same IDs the
+    /// discovery listed.
+    #[cfg(unix)]
+    #[test]
+    fn a_vitest_projects_run_keeps_each_packages_tests_apart() {
+        let tmp = tempfile::tempdir().unwrap();
+        fake_vitest_monorepo(tmp.path());
+        std::fs::write(
+            tmp.path().join("vitest.config.ts"),
+            "import { defineConfig } from 'vitest/config'\n\
+             export default defineConfig({ test: { projects: ['packages/*'] } })\n",
+        )
+        .unwrap();
+        let ran = run_all_of(tmp.path());
+        assert_eq!(
+            ran,
+            vec![
+                (
+                    "packages/a/x.test.ts::parses input".into(),
+                    TestStatus::Passed
+                ),
+                (
+                    "packages/a/x.test.ts::rejects bad input".into(),
+                    TestStatus::Passed
+                ),
+                (
+                    "packages/b/x.test.ts::parses input".into(),
+                    TestStatus::Passed
+                ),
+                (
+                    "packages/b/x.test.ts::rejects bad input".into(),
+                    TestStatus::Failed
+                ),
+            ]
+        );
+        let (listed, finished) = discovery_of(tmp.path());
+        assert_eq!(finished, Some(Some(true)));
+        assert_eq!(listed, ran.into_iter().map(|c| c.0).collect::<Vec<_>>());
+    }
+
+    /// #1504 negative: a single-project vitest root keeps streaming
+    /// tap-flat as before, and is never asked for a JSON report.
+    #[cfg(unix)]
+    #[test]
+    fn a_single_vitest_project_still_streams_tap_flat() {
+        let tmp = tempfile::tempdir().unwrap();
+        fake_vitest_monorepo(tmp.path());
+        std::fs::write(
+            tmp.path().join("vitest.config.ts"),
+            "export default { test: { include: ['projects/**/*.test.ts'] } }\n",
+        )
+        .unwrap();
+        let ran = run_all_of(tmp.path());
+        assert_eq!(ran.len(), 4, "{ran:?}");
+        assert!(
+            ran.iter().all(|c| c.0.starts_with("x.test.ts::")),
+            "{ran:?}"
+        );
+        let (listed, _) = discovery_of(tmp.path());
+        assert_eq!(
+            listed,
+            vec!["[a] x.test.ts::parses input", "[b] x.test.ts::parses input"]
+        );
+    }
+
+    #[test]
+    fn vitest_projects_are_found_in_the_config_or_a_workspace_file() {
+        for config in [
+            "defineConfig({ test: { projects: ['packages/*'] } })",
+            "export default { test: { \"projects\" : [] } }",
+            "export default { test: { 'projects': [] } }",
+            "defineWorkspace; export default { test: { workspace: ['a'] } }",
+        ] {
+            assert!(declares_vitest_projects(config), "{config}");
+        }
+        for config in [
+            "export default { test: { include: ['projects/**'] } }",
+            "const projects = ['a']",
+            "export default { test: { myprojects: 1, workspaceRoot: 'x' } }",
+            "",
+        ] {
+            assert!(!declares_vitest_projects(config), "{config}");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!vitest_has_projects(tmp.path()));
+        std::fs::write(
+            tmp.path().join("vitest.workspace.ts"),
+            "export default []\n",
+        )
+        .unwrap();
+        assert!(vitest_has_projects(tmp.path()));
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("vitest.projects.json"), "[]\n").unwrap();
+        assert!(vitest_has_projects(tmp.path()));
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("vite.config.mts"), "test: { projects: [] }").unwrap();
+        assert!(vitest_has_projects(tmp.path()));
     }
 
     /// #845 guard: `--passWithNoTests` only forgives an empty project. A

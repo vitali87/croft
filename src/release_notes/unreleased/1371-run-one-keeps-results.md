@@ -1,0 +1,1 @@
+fix: Running one vitest or jest test, or one suite, from the Testing view no longer turns the other tests in its file grey "skipped". They keep their last result, and the header tally only changes for the tests that ran.
