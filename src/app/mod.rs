@@ -45,6 +45,7 @@ use perf_hud::PerfHud;
 use sidebar_dwell::{AUTO_HIDE_DWELL, SidebarDwell};
 use welcome::WelcomeState;
 
+use crate::lsp::manager::{diagnostics_by_source, diagnostics_source, diagnostics_store_key};
 use crate::widgets::terminal::cwd_of_pid;
 
 use crate::widgets::{
@@ -73276,47 +73277,6 @@ fn store_diagnostics_update(
     } else {
         store.entry(u.path).or_default().insert(key, u.diagnostics);
     }
-}
-
-/// Marks the store entry holding what a server answered to a pull, beside
-/// the entry of what it pushed (#1102). rust-analyzer answers a pull with
-/// its own analysis and pushes the `cargo check` results; one entry per
-/// server let each empty the other, so an open file showed no compile
-/// errors. A server name never holds a NUL.
-const PULLED_DIAGNOSTICS: &str = "\u{0}pulled";
-
-/// The diagnostics store key for an update: its server's name, marked
-/// when the update answers a pull.
-fn diagnostics_store_key(u: &crate::lsp::manager::DiagnosticsUpdate) -> String {
-    if u.pulled {
-        format!("{}{PULLED_DIAGNOSTICS}", u.server)
-    } else {
-        u.server.clone()
-    }
-}
-
-/// The server (or other source) a diagnostics store key names.
-fn diagnostics_source(key: &str) -> &str {
-    key.strip_suffix(PULLED_DIAGNOSTICS).unwrap_or(key)
-}
-
-/// One path's stored diagnostics, each with the source that reported it.
-/// A server's pulled findings leave out any its push already carries, so a
-/// server that reports the same finding both ways shows it once.
-fn diagnostics_by_source(
-    by_server: &std::collections::HashMap<String, Vec<crate::lsp::manager::Diagnostic>>,
-) -> impl Iterator<Item = (&str, &crate::lsp::manager::Diagnostic)> {
-    by_server.iter().flat_map(move |(key, diags)| {
-        let source = diagnostics_source(key);
-        let pushed = key
-            .ends_with(PULLED_DIAGNOSTICS)
-            .then(|| by_server.get(source))
-            .flatten();
-        diags
-            .iter()
-            .filter(move |d| !pushed.is_some_and(|p| p.contains(d)))
-            .map(move |d| (source, d))
-    })
 }
 
 /// Run a resolved MCP command to completion on a worker thread: provision +
