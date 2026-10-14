@@ -3261,6 +3261,10 @@ pub struct Editor {
     /// its language default.
     wrap_override: Option<bool>,
     highlights: Vec<Vec<HiSpan>>,
+    /// tailspin's spans for each distinct line of a plain `.log` buffer
+    /// (#1537), keyed by the line's text so an edit re-highlights only the
+    /// lines it touched. Theme-free: colours resolve on every recompute.
+    log_spans: std::collections::HashMap<String, Vec<crate::ansi_text::AnsiSpan>>,
     /// The background syntax pass in flight, if any (#850). An edit never
     /// waits on tree-sitter for a large file: `recompute_highlights` carries
     /// the current spans through the edit and hands the text to a worker
@@ -3447,6 +3451,11 @@ pub struct Editor {
     /// same-path reloads, so the FS-sync sweep cannot flip the tab back
     /// to a preview, and clears when the tab opens a different file.
     pub force_text: bool,
+    /// Per-tab "Reopen as Preview" on a plain text file (#1537): `open`
+    /// shows it in the rendered log view, tailspin's colours and all, even
+    /// though it carries no escapes. Sticks across same-path reloads and
+    /// clears with a different file, like `force_text`, which wins.
+    pub force_log: bool,
     /// Notebook code cells (indices into `cells`) running or queued in the
     /// notebook's kernel: the preview shows them as `In [*]` (#355).
     pub notebook_running: Vec<usize>,
@@ -3617,6 +3626,7 @@ impl Editor {
             live_run: None,
             wrap_override: None,
             highlights: Vec::new(),
+            log_spans: std::collections::HashMap::new(),
             highlight_job: None,
             highlight_requests: 0,
             highlight_base: PackedLines::default(),
@@ -3664,6 +3674,7 @@ impl Editor {
             merge: None,
             merge_edit_row: 0,
             force_text: false,
+            force_log: false,
             notebook_running: Vec::new(),
             coverage: None,
             diff_prev_arrow: Rect::default(),
@@ -5210,6 +5221,7 @@ impl Editor {
         // change is a different document, which routes normally again.
         if self.path.as_deref() != Some(path) {
             self.force_text = false;
+            self.force_log = false;
         }
         // Why a `.sarif` file is showing as text, when it is: the text path
         // below reports it instead of a bare "Opened".
@@ -5227,7 +5239,7 @@ impl Editor {
             // the theme palette instead of showing raw escapes. Sniffed, so a
             // plain .txt with pytest output routes here too; a failure falls
             // through to the normal text path.
-            if Self::should_open_as_log(path) && self.open_log(path).is_ok() {
+            if (self.force_log || Self::should_open_as_log(path)) && self.open_log(path).is_ok() {
                 return Ok(());
             }
             // Media (#183): header-probed info card; junk with a media
@@ -6886,7 +6898,7 @@ impl Editor {
             None => {
                 self.highlight_job = None;
                 self.highlight_base = PackedLines::default();
-                self.highlights = vec![Vec::new(); self.lines.len()];
+                self.highlights = self.plain_log_highlights();
                 self.protected_ranges.clear();
                 // No grammar means no string/comment knowledge; brackets in
                 // plain text still colorize (VS Code does the same) — unless
@@ -6915,6 +6927,62 @@ impl Editor {
         self.recompute_semantic_overlay();
         self.recompute_diagnostic_spans();
         self.recompute_inlay_spans();
+    }
+
+    /// Whether this buffer is a plain `.log` file shown as text (#1537): no
+    /// grammar, no rendered view. It gets tailspin's colours, the same ones
+    /// the rendered log view paints, and reads "Log" in the status bar.
+    pub fn is_plain_log(&self) -> bool {
+        self.lang.is_none()
+            && !self.has_non_text_view()
+            && self
+                .path
+                .as_deref()
+                .and_then(|p| p.extension())
+                .is_some_and(|e| e.eq_ignore_ascii_case("log"))
+    }
+
+    /// Recolour a plain `.log` tab after "Log: Highlighting (tailspin)"
+    /// flips (#1537); every other buffer is unaffected by that setting.
+    pub fn refresh_log_highlight(&mut self) {
+        if self.is_plain_log() {
+            self.recompute_highlights();
+        }
+    }
+
+    /// Spans for a grammar-less buffer: none, except on a plain `.log`
+    /// (#1537), where tailspin colours levels, dates, numbers and ids while
+    /// "Log: Highlighting (tailspin)" is on. A log too big to rescan on every
+    /// edit stays uncoloured rather than making typing pay for it.
+    fn plain_log_highlights(&mut self) -> Vec<Vec<HiSpan>> {
+        let bytes: usize = self.lines.iter().map(String::len).sum();
+        if !self.is_plain_log()
+            || !crate::log_view::default_highlight()
+            || bytes > LOG_HIGHLIGHT_MAX_BYTES
+        {
+            self.log_spans.clear();
+            return vec![Vec::new(); self.lines.len()];
+        }
+        let mut seen = std::mem::take(&mut self.log_spans);
+        let mut kept = std::collections::HashMap::with_capacity(seen.len());
+        let theme = self.theme;
+        let out = self
+            .lines
+            .iter()
+            .map(|line| {
+                let spans: &Vec<crate::ansi_text::AnsiSpan> =
+                    kept.entry(line.clone()).or_insert_with(|| {
+                        seen.remove(line)
+                            .unwrap_or_else(|| crate::log_view::plain_line_spans(line))
+                    });
+                spans
+                    .iter()
+                    .map(|s| HiSpan::new(s.start, s.end, log_span_style(&s.style, theme)))
+                    .collect()
+            })
+            .collect();
+        self.log_spans = kept;
+        out
     }
 
     /// Hand the buffer's text to a worker thread for a syntax pass as `kind`.
@@ -8011,6 +8079,10 @@ impl Editor {
 
     /// Human label for the buffer's language mode, for the status bar.
     pub fn language_label(&self) -> &'static str {
+        if self.is_plain_log() {
+            return "Log";
+        }
+
         // SCSS, Less and Sass share the CSS grammar but are their own
         // languages to the reader and to the CSS server (#1532), so the
         // status bar names them the way VS Code does.
@@ -14595,6 +14667,34 @@ fn bracket_col(col: usize) -> u32 {
 /// Grammar-backed buffers are not gated here: their scan runs inside the
 /// syntax pass, on its worker thread (#850).
 const BRACKET_SCAN_MAX_BYTES: usize = 1_000_000;
+
+/// Above this many bytes a plain `.log` buffer is left uncoloured (#1537):
+/// tailspin runs over every line the first time, and the rendered log view,
+/// which windows the file, is the place for logs this big.
+const LOG_HIGHLIGHT_MAX_BYTES: usize = 4_000_000;
+
+/// A tailspin span's style for the text editor (#1537). Foreground and
+/// emphasis only: the highlighter never sets a background, and the editor's
+/// own background, selection and find marks must show through.
+fn log_span_style(s: &crate::ansi_text::AnsiStyle, theme: crate::theme::Theme) -> Style {
+    let mut style = Style::default();
+    if let Some(c) = s.fg {
+        style = style.fg(ansi_color_to_tui(c, theme));
+    }
+    if s.bold {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if s.dim {
+        style = style.add_modifier(Modifier::DIM);
+    }
+    if s.italic {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if s.underline {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    style
+}
 /// Nesting-depth colours cycle through this many entries (VS Code's default
 /// themes define three `editorBracketHighlight` foregrounds).
 const BRACKET_COLOR_CYCLE: usize = 3;
@@ -23079,6 +23179,135 @@ mod tests {
         std::fs::write(&rec, "\u{1b}[2J\u{1b}[10;1Hmoved\n").unwrap();
         e.open(&rec).unwrap();
         assert!(e.log.is_none(), "cursor movement alone does not render");
+    }
+
+    /// The fg of the highlight span covering byte `at` of line `row`.
+    fn fg_at(e: &Editor, row: usize, at: usize) -> Option<Color> {
+        e.highlights
+            .get(row)?
+            .iter()
+            .find(|s| s.range().contains(&at))
+            .and_then(|s| s.style.fg)
+    }
+
+    /// #1537: a plain `.log` with no escapes stays an editable text tab but
+    /// reads as Log and wears tailspin's colours: ERROR is not INFO.
+    #[test]
+    fn a_plain_log_gets_log_colours_in_the_text_editor() {
+        let _exclusive = crate::log_view::DEFAULT_HIGHLIGHT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let before = crate::log_view::default_highlight();
+        crate::log_view::set_default_highlight(true);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("app.log");
+        std::fs::write(
+            &p,
+            "2026-10-08T12:00:01Z ERROR worker-1 took 120ms\n2026-10-08T12:00:02Z INFO worker-2 ok\n",
+        )
+        .unwrap();
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+        crate::log_view::set_default_highlight(before);
+        assert!(e.log.is_none(), "still the editable text tab");
+        assert_eq!(e.language_label(), "Log");
+        let error = fg_at(&e, 0, e.lines[0].find("ERROR").unwrap());
+        let info = fg_at(&e, 1, e.lines[1].find("INFO").unwrap());
+        assert!(error.is_some(), "ERROR is coloured: {:?}", e.highlights[0]);
+        assert!(info.is_some(), "INFO is coloured: {:?}", e.highlights[1]);
+        assert_ne!(error, info, "and ERROR does not look like INFO");
+        assert!(
+            fg_at(&e, 0, 0).is_some(),
+            "the timestamp is coloured too: {:?}",
+            e.highlights[0]
+        );
+        let plain = fg_at(&e, 0, e.lines[0].find("worker").unwrap());
+        assert!(plain.is_none(), "a bare word keeps the editor's colour");
+    }
+
+    /// #1537: a line typed into a plain log is coloured like the rest, and
+    /// one whose text changed loses the spans of the text it replaced.
+    #[test]
+    fn an_edit_to_a_plain_log_recolours_the_edited_line() {
+        let _exclusive = crate::log_view::DEFAULT_HIGHLIGHT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let before = crate::log_view::default_highlight();
+        crate::log_view::set_default_highlight(true);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("app.log");
+        std::fs::write(&p, "ERROR one\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+        assert!(fg_at(&e, 0, 0).is_some(), "ERROR is coloured on open");
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        for c in "xx ".chars() {
+            e.insert_char(c);
+        }
+        let shifted = fg_at(&e, 0, 3);
+        e.cursor_col = 12;
+        e.insert_newline();
+        for c in "WARN two".chars() {
+            e.insert_char(c);
+        }
+        crate::log_view::set_default_highlight(before);
+        assert_eq!(e.lines, vec!["xx ERROR one", "WARN two"]);
+        assert!(shifted.is_some(), "ERROR keeps its colour where it moved");
+        assert!(fg_at(&e, 0, 0).is_none(), "the typed prefix is plain");
+        assert!(fg_at(&e, 1, 0).is_some(), "the typed WARN line is coloured");
+    }
+
+    /// #1537 negatives: the colours belong to `.log` files, and to the
+    /// "Log: Highlighting (tailspin)" setting. The same lines under a
+    /// `.txt` name, or with the setting off, stay plain.
+    #[test]
+    fn only_a_log_with_highlighting_on_gets_log_colours() {
+        let _exclusive = crate::log_view::DEFAULT_HIGHLIGHT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let before = crate::log_view::default_highlight();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let body = "2026-10-08T12:00:01Z ERROR worker-1 took 120ms\n";
+        let txt = tmp.path().join("notes.txt");
+        std::fs::write(&txt, body).unwrap();
+        let log = tmp.path().join("app.log");
+        std::fs::write(&log, body).unwrap();
+
+        crate::log_view::set_default_highlight(true);
+        let mut t = Editor::new();
+        t.open(&txt).unwrap();
+        assert_eq!(t.language_label(), "Plain Text");
+        assert!(t.highlights.iter().all(Vec::is_empty), "a .txt is plain");
+
+        crate::log_view::set_default_highlight(false);
+        let mut l = Editor::new();
+        l.open(&log).unwrap();
+        assert_eq!(l.language_label(), "Log");
+        assert!(
+            l.highlights.iter().all(Vec::is_empty),
+            "the setting off leaves the log plain"
+        );
+        crate::log_view::set_default_highlight(true);
+        l.refresh_log_highlight();
+        assert!(fg_at(&l, 0, 0).is_some(), "and on again colours it");
+        crate::log_view::set_default_highlight(before);
+    }
+
+    /// #1537: a line that would need its text changed to colour it gets no
+    /// spans rather than spans at the wrong offsets.
+    #[test]
+    fn plain_line_spans_cover_the_raw_text_only() {
+        let line = "2026-10-08 ERROR id=7";
+        let spans = crate::log_view::plain_line_spans(line);
+        assert!(!spans.is_empty());
+        assert!(spans.iter().all(|s| s.end <= line.len() && s.start < s.end));
+        assert!(crate::log_view::plain_line_spans("").is_empty());
+        assert!(crate::log_view::plain_line_spans("just words here").is_empty());
+        assert!(
+            crate::log_view::plain_line_spans("\u{1b}[31mERROR\u{1b}[0m").is_empty(),
+            "a line with its own escapes is not re-coloured"
+        );
     }
 
     /// #257 acceptance: a log far past the text size guard still opens,

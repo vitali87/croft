@@ -53205,8 +53205,10 @@ impl App {
                 }
                 Some(p) => {
                     // The explicit hex choice supersedes a lingering
-                    // Reopen-as-Text override.
+                    // Reopen-as-Text override, and a Reopen-as-Preview
+                    // log view's (#1537), which a reload would restore.
                     self.editor.force_text = false;
+                    self.editor.force_log = false;
                     if let Err(e) = self.editor.open_hex(&p) {
                         self.status = format!("Reopen as hex: {e}");
                     }
@@ -53338,7 +53340,28 @@ impl App {
                     // Undo a Reopen-as-Text: normal routing decides the
                     // view again (SVG raster, image, sheet, hex).
                     self.editor.force_text = false;
+                    self.editor.force_log = false;
                     match self.editor.open(&p) {
+                        // Plain text with no grammar (#1537): a `.txt` or
+                        // `.out` capture, or a `.log`, gets the rendered
+                        // log view's colours instead of a refusal. The
+                        // log view reads raw bytes as UTF-8, so a UTF-16 or
+                        // legacy-encoded buffer keeps its decoded text.
+                        Ok(())
+                            if !self.editor.has_non_text_view()
+                                && self.editor.markdown_preview.is_none()
+                                && self.editor.language().is_none()
+                                && self.editor.encoding == encoding_rs::UTF_8 =>
+                        {
+                            self.editor.force_log = true;
+                            if let Err(e) = self.editor.open(&p) {
+                                self.status = format!("Reopen as preview: {e}");
+                            } else if self.editor.log.is_none() {
+                                self.editor.force_log = false;
+                                self.status =
+                                    String::from("No preview for this file type; showing the text");
+                            }
+                        }
                         Ok(())
                             if !self.editor.has_non_text_view()
                                 && self.editor.markdown_preview.is_none() =>
@@ -61627,9 +61650,10 @@ impl App {
 
     /// Apply a log-highlight setting everywhere it lives (#466): the app's
     /// field, the log view's opening default for logs opened later, and
-    /// every log view already open in any split group. Shared by the
-    /// palette / Settings toggle and by a settings remerge (a workspace
-    /// layer setting `disable_log_highlight`), so the two cannot drift.
+    /// every log view and plain `.log` text tab already open in any split
+    /// group. Shared by the palette / Settings toggle and by a settings
+    /// remerge (a workspace layer setting `disable_log_highlight`), so the
+    /// two cannot drift.
     fn set_log_highlight(&mut self, on: bool) {
         self.log_highlight = on;
         seed_log_highlight_default(on);
@@ -61640,6 +61664,8 @@ impl App {
                 if let Some(log) = ed.log.as_mut() {
                     log.set_highlight(on);
                 }
+                // A plain `.log` open as text wears the same colours (#1537).
+                ed.refresh_log_highlight();
             }
         }
     }
