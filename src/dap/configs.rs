@@ -50,6 +50,10 @@ pub struct DebugConfig {
     /// sorts BOTH kinds in one list, so a config that asks for a group must
     /// be able to sort against a compound that asks for the same one.
     pub presentation: Option<Presentation>,
+    /// The workspace folder this configuration belongs to when it is not
+    /// the active one: a compound member named with `"folder"` (#1425)
+    /// resolves `${workspaceFolder}` against its own folder.
+    pub root: Option<PathBuf>,
     raw: Map<String, Value>,
 }
 
@@ -140,6 +144,7 @@ pub fn parse_launch_json(text: &str, source: &'static str) -> Vec<DebugConfig> {
                 request,
                 source,
                 presentation: parse_presentation(obj),
+                root: None,
                 raw: obj.clone(),
             })
         })
@@ -332,6 +337,10 @@ fn compare_orders(first: Option<f64>, second: Option<f64>) -> std::cmp::Ordering
 pub struct Compound {
     pub name: String,
     pub configurations: Vec<String>,
+    /// Each member's `"folder"` (#1425), aligned with `configurations`:
+    /// `Some("web")` names a configuration in the `web` workspace folder's
+    /// launch.json; `None`, a bare name, one beside the compound.
+    pub folders: Vec<Option<String>>,
     /// The compound's own `preLaunchTask`, if it asks for one (#318). Run
     /// before the member starts, and separate from the member's own task:
     /// VS Code runs both, so croft chains them rather than choosing.
@@ -421,8 +430,8 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
             let obj = c.as_object()?;
             let name = obj.get("name")?.as_str()?.to_string();
             // Members may be bare names or `{ "folder": …, "name": … }`
-            // objects in multi-root workspaces; croft resolves against one
-            // root, so take the name either way rather than dropping the row.
+            // objects in multi-root workspaces; the folder is kept beside the
+            // name (#1425) so the member resolves in that folder.
             //
             // Collect FALLIBLY: one unusable member drops the whole compound
             // rather than shrinking it to the members that happen to parse.
@@ -430,16 +439,25 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
             // member names no configuration; a malformed member is the same
             // situation one boundary earlier, and silently running two of the
             // three a user wrote is the outcome both guards exist to prevent.
-            let configurations: Vec<String> = obj
+            let members: Vec<(String, Option<String>)> = obj
                 .get("configurations")?
                 .as_array()?
                 .iter()
                 .map(|m| match m {
-                    Value::String(s) => Some(s.clone()),
-                    Value::Object(o) => o.get("name")?.as_str().map(str::to_string),
+                    Value::String(s) => Some((s.clone(), None)),
+                    Value::Object(o) => {
+                        let name = o.get("name")?.as_str()?.to_string();
+                        let folder = match o.get("folder") {
+                            None | Some(Value::Null) => None,
+                            Some(f) => Some(f.as_str()?.to_string()),
+                        };
+                        Some((name, folder))
+                    }
                     _ => None,
                 })
-                .collect::<Option<Vec<String>>>()?;
+                .collect::<Option<Vec<_>>>()?;
+            let (configurations, folders): (Vec<String>, Vec<Option<String>>) =
+                members.into_iter().unzip();
             if configurations.is_empty() {
                 return None;
             }
@@ -520,6 +538,7 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
             Some(Compound {
                 name,
                 configurations,
+                folders,
                 source,
                 pre_launch_task,
                 presentation,
@@ -534,33 +553,81 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
 /// beside it, in the compound's own order. Pass [`discover_configs_all`], not
 /// [`discover_configs`]: the latter drops a lower-precedence duplicate by name,
 /// which is exactly the entry a `.vscode` compound naming that name needs, so
-/// the source preference below would have nothing to prefer. Errors naming the first member that
-/// does not exist — launching the subset that happens to resolve would debug
+/// the source preference below would have nothing to prefer. A member with a
+/// `"folder"` (#1425) is looked up in that workspace folder's launch.json
+/// instead, `folders` being the workspace's `(name, root)` pairs, and comes
+/// back carrying that root. Errors naming the first member that does not
+/// exist — launching the subset that happens to resolve would debug
 /// something other than what the user asked for, and silently.
-pub fn resolve_compound<'a>(
+pub fn resolve_compound(
     compound: &Compound,
-    configs: &'a [DebugConfig],
-) -> Result<Vec<&'a DebugConfig>, String> {
+    configs: &[DebugConfig],
+    folders: &[(String, PathBuf)],
+) -> Result<Vec<DebugConfig>, String> {
     compound
         .configurations
         .iter()
-        .map(|want| {
+        .enumerate()
+        .map(|(i, want)| {
+            if let Some(folder) = compound.folders.get(i).cloned().flatten() {
+                let root = folder_root(folders, &folder).ok_or_else(|| {
+                    format!(
+                        "compound \"{}\" names folder \"{folder}\", which is not a folder of this workspace",
+                        compound.name
+                    )
+                })?;
+                let mut cfg = discover_configs_all(&root)
+                    .into_iter()
+                    .find(|c| &c.name == want)
+                    .ok_or_else(|| {
+                        format!(
+                            "compound \"{}\" names configuration \"{want}\" in folder \"{folder}\", which no launch.json there declares",
+                            compound.name
+                        )
+                    })?;
+                cfg.root = Some(root);
+                return Ok(cfg);
+            }
             // The compound's own file first: `discover_configs` merges both
             // files with `.croft` winning a duplicate name, so a bare name
             // match would bind a `.vscode` compound to a `.croft` config that
             // may run a different program under a different adapter. Falling
             // back to any file keeps a compound working when its members live
-            // in the sibling file, which VS Code also allows via `folder`.
+            // in the sibling file.
             configs
                 .iter()
                 .find(|c| &c.name == want && c.source == compound.source)
                 .or_else(|| configs.iter().find(|c| &c.name == want))
+                .cloned()
                 .ok_or_else(|| {
                     format!(
                         "compound \"{}\" names configuration \"{}\", which no launch.json declares",
                         compound.name, want
                     )
                 })
+        })
+        .collect()
+}
+
+/// The root of the workspace folder called `name` (#1425): VS Code names a
+/// folder by its directory name.
+fn folder_root(folders: &[(String, PathBuf)], name: &str) -> Option<PathBuf> {
+    folders
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, root)| root.clone())
+}
+
+/// The `(name, root)` pairs `${workspaceFolder:name}` and a compound
+/// member's `"folder"` look up (#1425): each root under its directory name.
+pub fn workspace_folders<'a>(roots: impl Iterator<Item = &'a Path>) -> Vec<(String, PathBuf)> {
+    roots
+        .map(|r| {
+            let name = r
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            (name, r.to_path_buf())
         })
         .collect()
 }
@@ -639,6 +706,9 @@ pub struct SubstCtx {
     pub workspace_folder: PathBuf,
     /// Active editor file; `None` makes `${file}`-family variables error.
     pub file: Option<PathBuf>,
+    /// The workspace's folders as `(name, root)`, for
+    /// `${workspaceFolder:name}` (#1425).
+    pub folders: Vec<(String, PathBuf)>,
 }
 
 /// Expand the supported `${...}` variables in `input`. An unknown or
@@ -703,6 +773,13 @@ fn expand_variable(var: &str, ctx: &SubstCtx) -> Result<String, String> {
                 return std::env::var(name)
                     .map_err(|_| format!("${{env:{name}}}: environment variable not set"));
             }
+            // `${workspaceFolder:web}` (#1425): the root of the workspace
+            // folder named `web`, as multi-root configurations write it.
+            if let Some(name) = var.strip_prefix("workspaceFolder:") {
+                return folder_root(&ctx.folders, name)
+                    .map(|r| r.to_string_lossy().into_owned())
+                    .ok_or_else(|| format!("${{{var}}}: no workspace folder is named \"{name}\""));
+            }
             Err(format!("${{{var}}}: unsupported substitution variable"))
         }
     }
@@ -755,6 +832,10 @@ pub struct ResolvedConfig {
     /// process at launch, so `process_id` is `None` until they have.
     pub pick_process: bool,
     pub extra: Map<String, Value>,
+    /// The cppdbg keys lldb-dap ignores (#1394), carried with the resolved
+    /// config so every launch path (a preLaunchTask resume, a compound
+    /// member) can say so in the debug console once the session starts.
+    pub ignored_keys: Vec<&'static str>,
 }
 
 /// The fields [`resolve`] consumes; everything else lands in `extra`.
@@ -778,6 +859,42 @@ const MAPPED_KEYS: &[&str] = &[
     // console would hang the session at launch.
     "console",
 ];
+
+/// cppdbg's spellings of mapped fields (#1394): `environment` joins `env`
+/// and `stopAtEntry` is `stopOnEntry`.
+const CPPDBG_MAPPED_KEYS: &[&str] = &["environment", "stopAtEntry"];
+
+/// cppdbg keys for gdb or the C/C++ extension that lldb-dap, which runs a
+/// cppdbg configuration in croft, has no use for (#1394).
+const CPPDBG_IGNORED_KEYS: &[&str] = &[
+    "MIMode",
+    "miDebuggerPath",
+    "miDebuggerArgs",
+    "miDebuggerServerAddress",
+    "setupCommands",
+    "externalConsole",
+    "targetArchitecture",
+    "symbolSearchPath",
+    "additionalSOLibSearchPath",
+    "sourceFileMap",
+    "visualizerFile",
+    "logging",
+];
+
+/// The keys of a cppdbg configuration that lldb-dap ignores (#1394), in
+/// the order croft lists them, so the debug console can say why a gdb
+/// path or a pretty-printer `setupCommands` has no effect. Empty for any
+/// other type.
+pub fn ignored_cppdbg_keys(cfg: &DebugConfig) -> Vec<&'static str> {
+    if cfg.type_name != "cppdbg" {
+        return Vec::new();
+    }
+    CPPDBG_IGNORED_KEYS
+        .iter()
+        .copied()
+        .filter(|k| cfg.raw.contains_key(*k))
+        .collect()
+}
 
 /// Resolve `cfg` against the editor state: substitute variables, load the
 /// `envFile`, and split the mapped fields. Errors are user-facing strings
@@ -813,6 +930,21 @@ pub fn resolve(cfg: &DebugConfig, ctx: &SubstCtx) -> Result<ResolvedConfig, Stri
             .map_err(|e| format!("config \"{}\": envFile {}: {e}", cfg.name, path.display()))?;
         env.extend(parse_env_file(&text));
     }
+    // cppdbg's own spelling (#1394): `environment` is a list of
+    // `{ name, value }`, under `env`, which wins per key.
+    let cppdbg = cfg.type_name == "cppdbg";
+    if cppdbg && let Some(list) = obj.get("environment").and_then(Value::as_array) {
+        for item in list {
+            if let Some(name) = item.get("name").and_then(Value::as_str) {
+                let value = match item.get("value") {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Null) | None => String::new(),
+                    Some(other) => other.to_string(),
+                };
+                env.insert(name.to_string(), value);
+            }
+        }
+    }
     if let Some(map) = obj.get("env").and_then(Value::as_object) {
         for (k, v) in map {
             // VS Code allows non-string scalars here; stringify them.
@@ -847,6 +979,7 @@ pub fn resolve(cfg: &DebugConfig, ctx: &SubstCtx) -> Result<ResolvedConfig, Stri
     let mut extra: Map<String, Value> = obj
         .iter()
         .filter(|(k, _)| !MAPPED_KEYS.contains(&k.as_str()))
+        .filter(|(k, _)| !(cppdbg && CPPDBG_MAPPED_KEYS.contains(&k.as_str())))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     // A browser config maps its URLs onto files under `webRoot`, which VS
@@ -866,17 +999,23 @@ pub fn resolve(cfg: &DebugConfig, ctx: &SubstCtx) -> Result<ResolvedConfig, Stri
         module: get_str("module"),
         args,
         env,
-        cwd: get_str("cwd").map(|c| absolute_in(&c, &ctx.workspace_folder)),
+        // A member from another workspace folder (#1425) runs there when it
+        // names no cwd, not in the active folder the launch would default to.
+        cwd: get_str("cwd")
+            .map(|c| absolute_in(&c, &ctx.workspace_folder))
+            .or_else(|| cfg.root.clone()),
         pre_launch_task: get_str("preLaunchTask"),
         post_debug_task: get_str("postDebugTask"),
         stop_on_entry: obj
             .get("stopOnEntry")
+            .or_else(|| obj.get("stopAtEntry").filter(|_| cppdbg))
             .and_then(Value::as_bool)
             .unwrap_or(false),
         port,
         process_id,
         pick_process,
         extra,
+        ignored_keys: ignored_cppdbg_keys(cfg),
     })
 }
 
@@ -1009,6 +1148,8 @@ pub fn debugpy_request(rc: &ResolvedConfig, project_python: &Path) -> Value {
 /// lldb-vscode. Attach targets `pid`.
 pub fn lldb_request(rc: &ResolvedConfig) -> Value {
     let mut args = base_arguments(rc);
+    // CodeLLDB's build step (#1392), done before the launch; not lldb-dap's.
+    args.remove("cargo");
     if !rc.env.is_empty() {
         let pairs: Vec<String> = rc.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
         args.insert("env".into(), json!(pairs));
@@ -1025,6 +1166,167 @@ pub fn lldb_request(rc: &ResolvedConfig) -> Value {
             request_value("attach", args)
         }
     }
+}
+
+/// A CodeLLDB `cargo` block (#1392): the program is whatever executable
+/// `cargo <args>` builds that matches `filter`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CargoSpec {
+    pub args: Vec<String>,
+    /// `filter.name`: the target's name.
+    pub name: Option<String>,
+    /// `filter.kind`: one of the target's kinds (`bin`, `lib`, `test`, …).
+    pub kind: Option<String>,
+    pub env: BTreeMap<String, String>,
+    pub cwd: Option<PathBuf>,
+}
+
+/// The `cargo` block of an lldb-family launch, if it has one; Err when it
+/// is there but unreadable.
+pub fn cargo_spec(rc: &ResolvedConfig) -> Option<Result<CargoSpec, String>> {
+    let cargo = rc.extra.get("cargo")?;
+    let strings = |v: Option<&Value>| -> Option<Vec<String>> {
+        v?.as_array()?
+            .iter()
+            .map(|a| a.as_str().map(str::to_string))
+            .collect()
+    };
+    let Some(args) = strings(cargo.get("args")).filter(|a| !a.is_empty()) else {
+        return Some(Err(String::from(
+            "\"cargo.args\" must list cargo's arguments (\"build\", …)",
+        )));
+    };
+    let filter = cargo.get("filter");
+    let text = |key: &str| {
+        filter
+            .and_then(|f| f.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let env = cargo
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|e| {
+            e.iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(Ok(CargoSpec {
+        args,
+        name: text("name"),
+        kind: text("kind"),
+        env,
+        cwd: cargo.get("cwd").and_then(Value::as_str).map(PathBuf::from),
+    }))
+}
+
+/// The cargo command line for `spec`, as CodeLLDB runs it: JSON messages,
+/// and `test` builds only (`--no-run`).
+pub fn cargo_build_args(spec: &CargoSpec) -> Vec<String> {
+    let mut args = spec.args.clone();
+    if args.first().map(String::as_str) == Some("test") && !args.iter().any(|a| a == "--no-run") {
+        args.insert(1, String::from("--no-run"));
+    }
+    if !args.iter().any(|a| a.starts_with("--message-format")) {
+        args.push(String::from("--message-format=json"));
+    }
+    args
+}
+
+/// The one executable in cargo's JSON output that matches the filter: a
+/// `compiler-artifact` with an `executable`, whose target name is `name`
+/// and whose kinds include `kind`, when those are set. None or several is
+/// an error naming the filter.
+pub fn cargo_artifact(output: &str, spec: &CargoSpec) -> Result<PathBuf, String> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    for line in output.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v.get("reason").and_then(Value::as_str) != Some("compiler-artifact") {
+            continue;
+        }
+        let Some(exe) = v.get("executable").and_then(Value::as_str) else {
+            continue;
+        };
+        let target = v.get("target");
+        let name_ok = spec.name.as_deref().is_none_or(|want| {
+            target.and_then(|t| t.get("name")).and_then(Value::as_str) == Some(want)
+        });
+        let kind_ok = spec.kind.as_deref().is_none_or(|want| {
+            target
+                .and_then(|t| t.get("kind"))
+                .and_then(Value::as_array)
+                .is_some_and(|k| k.iter().any(|k| k.as_str() == Some(want)))
+        });
+        let exe = PathBuf::from(exe);
+        if name_ok && kind_ok && !found.contains(&exe) {
+            found.push(exe);
+        }
+    }
+    let filter = match (&spec.name, &spec.kind) {
+        (Some(n), Some(k)) => format!("name \"{n}\", kind \"{k}\""),
+        (Some(n), None) => format!("name \"{n}\""),
+        (None, Some(k)) => format!("kind \"{k}\""),
+        (None, None) => String::from("no filter"),
+    };
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => Err(format!("cargo built no executable matching {filter}")),
+        n => Err(format!(
+            "cargo built {n} executables matching {filter} ({}): set \"cargo.filter\" to pick one",
+            found
+                .iter()
+                .filter_map(|p| p.file_name())
+                .map(|f| f.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// Run `cargo` for `spec` in `cwd` and pick its executable. A failed build
+/// is an error carrying cargo's first error line. Blocking: the App runs
+/// this on a background thread.
+pub fn build_cargo_program(spec: &CargoSpec, cwd: &Path) -> Result<PathBuf, String> {
+    let dir = spec.cwd.as_deref().map_or_else(
+        || cwd.to_path_buf(),
+        |c| absolute_in(&c.to_string_lossy(), cwd),
+    );
+    let out = std::process::Command::new("cargo")
+        .args(cargo_build_args(spec))
+        .envs(&spec.env)
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("cargo: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() {
+        // With JSON messages, the compile errors are on stdout; cargo's own
+        // complaints (bad flags, no Cargo.toml) on stderr.
+        let rendered = stdout.lines().find_map(|l| {
+            let v: Value = serde_json::from_str(l).ok()?;
+            let m = v.get("message")?;
+            (m.get("level")?.as_str()? == "error")
+                .then(|| m.get("message")?.as_str().map(str::to_string))?
+        });
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let why = rendered
+            .or_else(|| {
+                stderr
+                    .lines()
+                    .find(|l| l.starts_with("error"))
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| stderr.lines().last().unwrap_or("").to_string());
+        return Err(format!(
+            "cargo {} failed: {}",
+            spec.args.join(" "),
+            why.trim()
+        ));
+    }
+    cargo_artifact(&stdout, spec)
 }
 
 /// Where a Go "Connect to server" attach finds its headless delve (#1418):
@@ -1487,6 +1789,7 @@ mod tests {
         SubstCtx {
             workspace_folder: PathBuf::from("/work/proj"),
             file: Some(PathBuf::from("/work/proj/src/main.py")),
+            folders: Vec::new(),
         }
     }
 
@@ -1742,6 +2045,7 @@ mod tests {
         let no_file = SubstCtx {
             workspace_folder: PathBuf::from("/w"),
             file: None,
+            folders: Vec::new(),
         };
         assert!(substitute("${fileBasename}", &no_file).is_err());
     }
@@ -1812,6 +2116,7 @@ mod tests {
         let c = SubstCtx {
             workspace_folder: tmp.path().to_path_buf(),
             file: None,
+            folders: Vec::new(),
         };
         let rc = resolve(&cfg, &c).unwrap();
         assert_eq!(rc.env["FROM_FILE"], "1");
@@ -2083,6 +2388,80 @@ mod tests {
         assert_eq!(req["arguments"]["runtimeArgs"], json!(["--headless=new"]));
     }
 
+    /// The issue's cppdbg configuration (#1394).
+    const CPPDBG: &str = r#"[{
+        "name": "(gdb) Launch", "type": "cppdbg", "request": "launch",
+        "program": "${workspaceFolder}/app", "args": ["one"],
+        "stopAtEntry": true, "cwd": "${workspaceFolder}",
+        "environment": [{ "name": "GREETING", "value": "hi" }, { "name": "N", "value": 3 }],
+        "externalConsole": false, "MIMode": "gdb",
+        "setupCommands": [{ "text": "-enable-pretty-printing" }]
+    }]"#;
+
+    /// #1394: cppdbg's `environment` list and `stopAtEntry` reach lldb-dap
+    /// as its `env` and `stopOnEntry`.
+    #[test]
+    fn a_cppdbg_environment_and_stop_at_entry_reach_lldb_dap() {
+        let rc = resolve(&config(CPPDBG), &ctx()).unwrap();
+        let req = lldb_request(&rc);
+        let a = &req["arguments"];
+        assert_eq!(a["env"], json!(["GREETING=hi", "N=3"]));
+        assert_eq!(a["stopOnEntry"], true);
+        assert_eq!(a["args"], json!(["one"]));
+        assert!(a.get("environment").is_none(), "{a}");
+        assert!(a.get("stopAtEntry").is_none(), "{a}");
+    }
+
+    /// #1394: an explicit `env` wins over `environment` for the same key.
+    #[test]
+    fn a_cppdbg_env_wins_over_its_environment_list() {
+        let cfg = config(
+            r#"[{ "name": "C", "type": "cppdbg", "program": "/a",
+                  "environment": [{ "name": "A", "value": "1" }, { "name": "B", "value": "x" }],
+                  "env": { "A": "2" } }]"#,
+        );
+        let req = lldb_request(&resolve(&cfg, &ctx()).unwrap());
+        assert_eq!(req["arguments"]["env"], json!(["A=2", "B=x"]));
+    }
+
+    /// #1394: the gdb-only keys are named, so the debug console can say
+    /// lldb-dap ignores them; only for cppdbg.
+    #[test]
+    fn a_cppdbg_config_names_the_keys_lldb_dap_ignores() {
+        assert_eq!(
+            ignored_cppdbg_keys(&config(CPPDBG)),
+            ["MIMode", "setupCommands", "externalConsole"]
+        );
+        // Carried on the resolved config, which is all a preLaunchTask
+        // resume or a compound member launch has to go on.
+        assert_eq!(
+            resolve(&config(CPPDBG), &ctx()).unwrap().ignored_keys,
+            ["MIMode", "setupCommands", "externalConsole"]
+        );
+    }
+
+    /// #1394, negative: an lldb config keeps its own spellings: an
+    /// `environment` or `stopAtEntry` key there is not lldb-dap's and is
+    /// passed through, not mapped, and it names no ignored keys.
+    #[test]
+    fn only_cppdbg_configs_get_cppdbg_spellings() {
+        let cfg = config(
+            r#"[{ "name": "L", "type": "lldb", "program": "/a", "MIMode": "gdb",
+                  "environment": [{ "name": "A", "value": "1" }], "stopAtEntry": true }]"#,
+        );
+        let rc = resolve(&cfg, &ctx()).unwrap();
+        assert!(rc.env.is_empty());
+        assert!(!rc.stop_on_entry);
+        assert!(ignored_cppdbg_keys(&cfg).is_empty());
+        let rc = resolve(
+            &config(r#"[{ "name": "C", "type": "cppdbg", "program": "/a" }]"#),
+            &ctx(),
+        )
+        .unwrap();
+        assert!(rc.env.is_empty());
+        assert!(!rc.stop_on_entry);
+    }
+
     #[test]
     fn parse_env_file_handles_comments_export_and_quotes() {
         let env = parse_env_file(
@@ -2169,7 +2548,7 @@ mod tests {
             "and the picker's list drops it, which is why the two lists differ"
         );
 
-        let members = resolve_compound(&compounds[0], &configs).expect("resolves");
+        let members = resolve_compound(&compounds[0], &configs, &[]).expect("resolves");
         assert_eq!(
             members[0].source, ".vscode/launch.json",
             "the .vscode compound binds .vscode's Server, not .croft's same-named one"
@@ -2298,7 +2677,7 @@ mod tests {
         let compounds = parse_compounds(text, ".vscode/launch.json");
         assert_eq!(compounds.len(), 1, "precondition: the compound parsed");
 
-        let err = resolve_compound(&compounds[0], &cfgs)
+        let err = resolve_compound(&compounds[0], &cfgs, &[])
             .expect_err("a missing member is an error, not a shorter list");
         assert!(
             err.contains("Ghost"),
@@ -2846,6 +3225,123 @@ mod tests {
         assert!(by("Hid").presentation.is_some_and(|p| p.hidden));
     }
 
+    /// #1425: a multi-root workspace, `api` and `web`, each with its own
+    /// launch.json.
+    fn multi_root() -> (tempfile::TempDir, Vec<(String, PathBuf)>) {
+        let tmp = tempfile::tempdir().unwrap();
+        for (folder, text) in [
+            (
+                "api",
+                r#"{ "configurations": [
+                    { "name": "Run api", "type": "debugpy", "request": "launch", "program": "${workspaceFolder}/main.py" }
+                ],
+                "compounds": [
+                    { "name": "API + web", "configurations": ["Run api", { "folder": "web", "name": "Run web" }] },
+                    { "name": "Nowhere", "configurations": [{ "folder": "docs", "name": "Run web" }] },
+                    { "name": "Missing", "configurations": [{ "folder": "web", "name": "Run api" }] }
+                ] }"#,
+            ),
+            (
+                "web",
+                r#"{ "configurations": [
+                    { "name": "Run web", "type": "debugpy", "request": "launch", "program": "${workspaceFolder}/main.py" }
+                ] }"#,
+            ),
+        ] {
+            std::fs::create_dir_all(tmp.path().join(folder).join(".vscode")).unwrap();
+            std::fs::write(tmp.path().join(folder).join(".vscode/launch.json"), text).unwrap();
+        }
+        let roots = [tmp.path().join("api"), tmp.path().join("web")];
+        let folders = workspace_folders(roots.iter().map(PathBuf::as_path));
+        (tmp, folders)
+    }
+
+    /// #1425: a member written `{ "folder": "web", "name": "Run web" }`
+    /// resolves to web's own configuration, with `${workspaceFolder}` the
+    /// web root; a bare member still resolves beside the compound.
+    #[test]
+    fn a_folder_member_resolves_in_that_workspace_folder() {
+        let (tmp, folders) = multi_root();
+        let api = tmp.path().join("api");
+        let compounds = discover_compounds(&api);
+        assert_eq!(compounds[0].folders, vec![None, Some(String::from("web"))]);
+        let members =
+            resolve_compound(&compounds[0], &discover_configs_all(&api), &folders).unwrap();
+        assert_eq!(
+            members.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            vec!["Run api", "Run web"]
+        );
+        assert_eq!(members[0].root, None);
+        let web = tmp.path().join("web");
+        assert_eq!(members[1].root.as_deref(), Some(web.as_path()));
+        let ctx = SubstCtx {
+            workspace_folder: members[1].root.clone().unwrap(),
+            file: None,
+            folders: folders.clone(),
+        };
+        let rc = resolve(&members[1], &ctx).unwrap();
+        assert_eq!(
+            rc.program.as_deref(),
+            Some(web.join("main.py").to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            rc.cwd.as_deref(),
+            Some(web.as_path()),
+            "a foreign member with no cwd runs in its own folder"
+        );
+    }
+
+    /// #1425, negative: a folder the workspace does not have, or a name
+    /// that folder's launch.json does not declare, is refused by name
+    /// rather than resolved against the compound's own file.
+    #[test]
+    fn a_folder_member_with_no_such_folder_or_config_is_refused() {
+        let (tmp, folders) = multi_root();
+        let api = tmp.path().join("api");
+        let compounds = discover_compounds(&api);
+        let all = discover_configs_all(&api);
+        let err = resolve_compound(&compounds[1], &all, &folders).unwrap_err();
+        assert_eq!(
+            err,
+            "compound \"Nowhere\" names folder \"docs\", which is not a folder of this workspace"
+        );
+        let err = resolve_compound(&compounds[2], &all, &folders).unwrap_err();
+        assert_eq!(
+            err,
+            "compound \"Missing\" names configuration \"Run api\" in folder \"web\", which no launch.json there declares"
+        );
+        // A non-string folder is a malformed member: the compound is dropped.
+        let bad = parse_compounds(
+            r#"{ "compounds": [{ "name": "Bad", "configurations": [{ "folder": 3, "name": "x" }] }] }"#,
+            ".vscode/launch.json",
+        );
+        assert!(bad.is_empty());
+    }
+
+    /// #1425: `${workspaceFolder:web}` is the web root; an unknown folder
+    /// name is an error naming it.
+    #[test]
+    fn workspace_folder_by_name_expands_or_names_the_missing_folder() {
+        let (tmp, folders) = multi_root();
+        let ctx = SubstCtx {
+            workspace_folder: tmp.path().join("api"),
+            file: None,
+            folders,
+        };
+        assert_eq!(
+            substitute("${workspaceFolder:web}/main.py", &ctx).unwrap(),
+            tmp.path().join("web/main.py").to_string_lossy()
+        );
+        assert_eq!(
+            substitute("${workspaceFolder}", &ctx).unwrap(),
+            tmp.path().join("api").to_string_lossy()
+        );
+        assert_eq!(
+            substitute("${workspaceFolder:docs}/x", &ctx).unwrap_err(),
+            "${workspaceFolder:docs}: no workspace folder is named \"docs\""
+        );
+    }
+
     /// A compound resolves to its members in the order written, so the picker
     /// and the launch sequence agree with the file.
     #[test]
@@ -2859,7 +3355,7 @@ mod tests {
         }"#;
         let cfgs = parse_launch_json(text, ".vscode/launch.json");
         let compounds = parse_compounds(text, ".vscode/launch.json");
-        let members = resolve_compound(&compounds[0], &cfgs).unwrap();
+        let members = resolve_compound(&compounds[0], &cfgs, &[]).unwrap();
         assert_eq!(
             members.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
             vec!["Server", "Client"],
@@ -3072,5 +3568,130 @@ mod tests {
             .map(|c| c.name)
             .collect();
         assert_eq!(names, ["First", "Web"], "and the file is whole: {before}");
+    }
+
+    /// What `cargo build`/`cargo test --no-run --message-format=json` print
+    /// for a crate with a lib and a bin named `rc` (shapes from cargo 1.97).
+    const CARGO_JSON_1392: &str = concat!(
+        r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"rc","src_path":"/w/src/lib.rs"},"profile":{"test":false},"executable":null}"#,
+        "\n",
+        r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"rc","src_path":"/w/src/main.rs"},"profile":{"test":false},"executable":"/w/target/debug/rc"}"#,
+        "\n",
+        r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"rc","src_path":"/w/src/lib.rs"},"profile":{"test":true},"executable":"/w/target/debug/deps/rc-1a2b"}"#,
+        "\n",
+        r#"{"reason":"build-finished","success":true}"#,
+        "\n"
+    );
+
+    fn cargo_cfg(cargo: &str) -> ResolvedConfig {
+        let text = format!(
+            r#"[{{ "name": "Debug executable 'rc'", "type": "lldb", "request": "launch", "cargo": {cargo}, "args": [] }}]"#
+        );
+        resolve(&config(&text), &ctx()).unwrap()
+    }
+
+    /// #1392: a CodeLLDB `cargo` launch builds with cargo's JSON messages
+    /// and debugs the executable its filter picks; the block is croft's
+    /// build step, not something lldb-dap is sent.
+    #[test]
+    fn a_cargo_launch_debugs_the_executable_its_filter_picks() {
+        let rc = cargo_cfg(
+            r#"{ "args": ["build", "--bin=rc", "--package=rc"], "filter": { "name": "rc", "kind": "bin" },
+                 "env": { "RUSTFLAGS": "-g" }, "cwd": "sub" }"#,
+        );
+        assert!(rc.program.is_none());
+        let spec = cargo_spec(&rc).expect("a cargo block").unwrap();
+        assert_eq!(
+            cargo_build_args(&spec),
+            ["build", "--bin=rc", "--package=rc", "--message-format=json"]
+        );
+        assert_eq!(spec.env.get("RUSTFLAGS").map(String::as_str), Some("-g"));
+        assert_eq!(spec.cwd, Some(PathBuf::from("sub")));
+        assert_eq!(
+            cargo_artifact(CARGO_JSON_1392, &spec).unwrap(),
+            PathBuf::from("/w/target/debug/rc")
+        );
+        let lib_tests = cargo_spec(&cargo_cfg(
+            r#"{ "args": ["test", "--lib"], "filter": { "kind": "lib" } }"#,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            cargo_build_args(&lib_tests),
+            ["test", "--no-run", "--lib", "--message-format=json"]
+        );
+        assert_eq!(
+            cargo_artifact(CARGO_JSON_1392, &lib_tests).unwrap(),
+            PathBuf::from("/w/target/debug/deps/rc-1a2b")
+        );
+        let mut with_program = rc.clone();
+        with_program.program = Some(String::from("/w/target/debug/rc"));
+        let req = lldb_request(&with_program);
+        assert!(req["arguments"].get("cargo").is_none(), "{req}");
+        assert_eq!(req["arguments"]["program"], "/w/target/debug/rc");
+    }
+
+    /// #1392 negatives: no executable or several matching the filter is an
+    /// error naming it; a `cargo` block with no args is refused; a config
+    /// without one has no cargo step.
+    #[test]
+    fn a_cargo_launch_refuses_no_match_or_several() {
+        let spec = |cargo: &str| cargo_spec(&cargo_cfg(cargo)).unwrap();
+        let none = spec(r#"{ "args": ["build"], "filter": { "name": "nope" } }"#).unwrap();
+        let err = cargo_artifact(CARGO_JSON_1392, &none).unwrap_err();
+        assert!(
+            err.contains("no executable matching name \"nope\""),
+            "{err}"
+        );
+        let both = spec(r#"{ "args": ["build"] }"#).unwrap();
+        let err = cargo_artifact(CARGO_JSON_1392, &both).unwrap_err();
+        assert!(
+            err.contains("2 executables matching no filter") && err.contains("rc, rc-1a2b"),
+            "{err}"
+        );
+        assert!(spec(r#"{ "filter": { "name": "rc" } }"#).is_err());
+        assert!(spec(r#"{ "args": [] }"#).is_err());
+        let plain = config(r#"[{ "name": "P", "type": "lldb", "program": "/bin/true" }]"#);
+        assert!(cargo_spec(&resolve(&plain, &ctx()).unwrap()).is_none());
+    }
+
+    /// #1392 end to end: cargo really builds a crate and the bin is picked;
+    /// a crate that does not compile is an error carrying cargo's message.
+    #[test]
+    fn cargo_builds_the_program_or_says_why_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = tmp.path();
+        std::fs::create_dir_all(w.join("src")).unwrap();
+        std::fs::write(
+            w.join("Cargo.toml"),
+            "[package]\nname = \"rc\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(w.join("src/main.rs"), "fn main() { println!(\"hi\"); }\n").unwrap();
+        let spec = CargoSpec {
+            args: vec![
+                String::from("build"),
+                String::from("--bin=rc"),
+                String::from("--offline"),
+            ],
+            name: Some(String::from("rc")),
+            kind: Some(String::from("bin")),
+            // Its own target dir: the suite's is locked by the outer cargo.
+            env: BTreeMap::from([(
+                String::from("CARGO_TARGET_DIR"),
+                w.join("target").to_string_lossy().into_owned(),
+            )]),
+            cwd: None,
+        };
+        let exe = build_cargo_program(&spec, w).unwrap();
+        assert!(exe.is_file(), "{}", exe.display());
+        assert_eq!(exe.file_name().unwrap(), "rc");
+        std::fs::write(w.join("src/main.rs"), "fn main() { let x: u8 = \"no\"; }\n").unwrap();
+        let err = build_cargo_program(&spec, w).unwrap_err();
+        assert!(
+            err.starts_with("cargo build --bin=rc --offline failed: ")
+                && err.contains("mismatched types"),
+            "{err}"
+        );
     }
 }
