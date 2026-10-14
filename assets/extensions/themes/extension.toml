@@ -313,3 +313,65 @@ syn_type = "#267f99"
 syn_tag = "#800000"
 syn_fg = "#3b3b3b"
 ansi = ["#000000","#cd3131","#107c10","#949800","#0451a5","#bc05bc","#0598bc","#555555","#666666","#cd3131","#14ce14","#b5ba00","#0451a5","#bc05bc","#0598bc","#a5a5a5"]
+
+# --- High Contrast and High Contrast Light (#1548): VS Code's
+# Dark / Light High Contrast for low-vision users. Pure black or white
+# background, pure white or black text, VS Code's high contrast focus colour
+# as the accent (#f38518 dark, #0f4a85 light), a code palette that reads at
+# 7:1 or better, and `high_contrast`, which makes croft's hardcoded chrome
+# greys resolve to the pure foreground and background (see `Theme::ui`).
+[[themes]]
+id = "hc-black"
+label = "High Contrast"
+background = "#000000"
+accent = "#f38518"
+selection = "#04395e"
+search = "#000000"
+button = "#0f4a85"
+gradient = false
+high_contrast = true
+osk_key = "#1a1a1a"
+osk_special = "#262626"
+osk_armed = "#f38518"
+tab_strip = "#000000"
+tab_inactive = "#000000"
+tab_active = "#0f4a85"
+tab_hover = "#1a1a1a"
+tab_close_pill = "#f38518"
+syn_comment = "#7ca668"
+syn_keyword = "#569cd6"
+syn_string = "#ce9178"
+syn_constant = "#b5cea8"
+syn_function = "#dcdcaa"
+syn_type = "#4ec9b0"
+syn_tag = "#d7ba7d"
+syn_fg = "#ffffff"
+ansi = ["#000000","#ff5f5f","#00cd00","#cdcd00","#5c8aff","#ff5fff","#00cdcd","#e5e5e5","#a0a0a0","#ff7f7f","#00ff00","#ffff00","#8fafff","#ff8fff","#00ffff","#ffffff"]
+
+[[themes]]
+id = "hc-light"
+label = "High Contrast Light"
+background = "#ffffff"
+accent = "#0f4a85"
+selection = "#cfe3f7"
+search = "#ffffff"
+button = "#0f4a85"
+gradient = false
+high_contrast = true
+osk_key = "#e8e8e8"
+osk_special = "#d8d8d8"
+osk_armed = "#0f4a85"
+tab_strip = "#ffffff"
+tab_inactive = "#ffffff"
+tab_active = "#cfe3f7"
+tab_hover = "#f0f0f0"
+tab_close_pill = "#0f4a85"
+syn_comment = "#515151"
+syn_keyword = "#0f4a85"
+syn_string = "#a31515"
+syn_constant = "#005a32"
+syn_function = "#5e2cbc"
+syn_type = "#185e73"
+syn_tag = "#800000"
+syn_fg = "#000000"
+ansi = ["#000000","#a31515","#005a32","#5c5a00","#0f4a85","#7a0a7a","#055a6e","#3b3b3b","#3b3b3b","#a31515","#005a32","#5c5a00","#0f4a85","#7a0a7a","#055a6e","#000000"]

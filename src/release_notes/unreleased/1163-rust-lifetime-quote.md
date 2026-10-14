@@ -1,0 +1,1 @@
+fix: Typing a Rust lifetime or loop label (`fn foo<'a>`, `&'a str`, `T + 'static`, `break 'outer`) no longer auto-inserts a closing quote that ends up dangling after it; a char literal such as `push('x')` still gets its pair.
