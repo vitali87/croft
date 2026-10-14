@@ -696,14 +696,22 @@ fn pyproject_tasks_on(root: &Path, on_path: &dyn Fn(&str) -> bool) -> Vec<Task> 
         .find(|v| root.join(v).join("bin/python").is_file());
     // (prefix for a script, the pytest command)
     let uv_on_path = on_path("uv");
-    let (script_prefix, pytest) = if root.join("uv.lock").exists() && uv_on_path {
+    let uv_runs = root.join("uv.lock").exists() && uv_on_path;
+    let poetry_runs = !uv_runs
+        && (root.join("poetry.lock").exists() || tool("poetry").is_some())
+        && on_path("poetry");
+    let pdm_runs = !uv_runs
+        && !poetry_runs
+        && (root.join("pdm.lock").exists() || tool("pdm").is_some())
+        && on_path("pdm");
+    let (script_prefix, pytest) = if uv_runs {
         (String::from("uv run "), String::from("uv run pytest"))
-    } else if (root.join("poetry.lock").exists() || tool("poetry").is_some()) && on_path("poetry") {
+    } else if poetry_runs {
         (
             String::from("poetry run "),
             String::from("poetry run pytest"),
         )
-    } else if (root.join("pdm.lock").exists() || tool("pdm").is_some()) && on_path("pdm") {
+    } else if pdm_runs {
         (String::from("pdm run "), String::from("pdm run pytest"))
     } else if let Some(venv) = venv {
         (
@@ -715,10 +723,17 @@ fn pyproject_tasks_on(root: &Path, on_path: &dyn Fn(&str) -> bool) -> Vec<Task> 
     } else {
         (String::new(), String::from("python3 -m pytest"))
     };
+    // `[project.scripts]` and Poetry's scripts are entry points installed
+    // into the venv's `bin/`, so any runner reaches them. `[tool.pdm.scripts]`
+    // are PDM's own task definitions (`lint = "ruff check ."`), which only
+    // `pdm run` understands: under the venv or uv they named a binary that
+    // does not exist.
     let script_tables = [
         table.get("project").and_then(|p| p.get("scripts")),
         tool("poetry").and_then(|p| p.get("scripts")),
-        tool("pdm").and_then(|p| p.get("scripts")),
+        tool("pdm")
+            .and_then(|p| p.get("scripts"))
+            .filter(|_| pdm_runs),
     ];
     let mut names: Vec<&String> = Vec::new();
     for scripts in script_tables
@@ -1308,6 +1323,34 @@ mod tests {
         assert_eq!(
             py_commands(tmp.path(), true),
             ["pdm run lint", "pdm run pytest"]
+        );
+    }
+
+    /// #1296 negative: `[tool.pdm.scripts]` are PDM task definitions, not
+    /// installed binaries, so without PDM they are left out rather than
+    /// offered as `.venv/bin/lint` or `uv run lint`, which fail.
+    #[test]
+    fn pdm_scripts_need_pdm_to_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\n\n[project.scripts]\nserve = \"x:main\"\n\n[tool.pdm.scripts]\nlint = \"ruff check .\"\n\n[tool.pdm.dev-dependencies]\ntest = [\"pytest\"]\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("pdm.lock"), "").unwrap();
+        assert_eq!(
+            py_commands_with(tmp.path(), &["pdm"]),
+            ["pdm run serve", "pdm run lint", "pdm run pytest"]
+        );
+        assert_eq!(
+            py_commands_with(tmp.path(), &["uv"]),
+            ["uv run serve", "uv run pytest"]
+        );
+        std::fs::create_dir_all(tmp.path().join(".venv/bin")).unwrap();
+        std::fs::write(tmp.path().join(".venv/bin/python"), "").unwrap();
+        assert_eq!(
+            py_commands_with(tmp.path(), &[]),
+            [".venv/bin/serve", ".venv/bin/python -m pytest"]
         );
     }
 
