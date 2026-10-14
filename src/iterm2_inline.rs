@@ -424,6 +424,11 @@ pub fn inline_image_protocol_for(
     match term_program {
         Some("iTerm.app") | Some("WezTerm") => InlineImageProtocol::ITerm2,
         Some("ghostty") => InlineImageProtocol::Kitty,
+        // A croft terminal pane (#1453): it captures OSC 1337 and draws the
+        // picture through whatever the outer terminal speaks. Whether that
+        // terminal draws images at all is `CROFT_INLINE_IMAGES`, which
+        // `detect_inline_image_protocol` checks before trusting this.
+        Some(CROFT_TERM_PROGRAM) => InlineImageProtocol::ITerm2,
         // SSH forwards `TERM` (Ghostty advertises `xterm-ghostty`, Kitty
         // `xterm-kitty`) but not `TERM_PROGRAM` unless the remote sshd opts in
         // via `AcceptEnv`, so a remote croft must key Kitty detection off `TERM`
@@ -448,10 +453,37 @@ pub fn terminal_warrants_switch_warning(protocol: InlineImageProtocol, termux: b
     protocol == InlineImageProtocol::None && !termux
 }
 
+/// `TERM_PROGRAM` in a croft terminal pane (#1453), as `vscode` is in VS
+/// Code's: programs in the pane talk to croft's emulator, not the host's.
+pub const CROFT_TERM_PROGRAM: &str = "croft";
+
+/// Set to `1` in a croft pane whose croft can show the pane's images, `0`
+/// when the outer terminal draws none and a program must print text instead.
+pub const CROFT_INLINE_IMAGES_ENV: &str = "CROFT_INLINE_IMAGES";
+
+/// The protocol a program should write with, from its `TERM_PROGRAM`,
+/// `TERM` and `CROFT_INLINE_IMAGES`. In a croft pane an image only shows
+/// when the croft around it can draw one; otherwise `croft plot` would
+/// print blank rows where its braille chart belongs (#1453).
+pub fn inline_image_protocol_in(
+    term_program: Option<&str>,
+    term: Option<&str>,
+    croft_inline_images: Option<&str>,
+) -> InlineImageProtocol {
+    if term_program == Some(CROFT_TERM_PROGRAM) && croft_inline_images != Some("1") {
+        return InlineImageProtocol::None;
+    }
+    inline_image_protocol_for(term_program, term)
+}
+
 pub fn detect_inline_image_protocol() -> InlineImageProtocol {
     let term_program = std::env::var("TERM_PROGRAM").ok();
     let term = std::env::var("TERM").ok();
-    let protocol = inline_image_protocol_for(term_program.as_deref(), term.as_deref());
+    let protocol = inline_image_protocol_in(
+        term_program.as_deref(),
+        term.as_deref(),
+        std::env::var(CROFT_INLINE_IMAGES_ENV).ok().as_deref(),
+    );
     if protocol != InlineImageProtocol::None {
         return protocol;
     }
@@ -1944,6 +1976,33 @@ mod tests {
         );
         assert_eq!(
             inline_image_protocol_for(None, None),
+            InlineImageProtocol::None
+        );
+    }
+
+    #[test]
+    fn a_croft_pane_draws_osc_1337_only_when_its_croft_shows_images() {
+        // #1453: a pane is croft's emulator, which captures OSC 1337 and
+        // draws it through the outer terminal, whatever that terminal is.
+        assert_eq!(
+            inline_image_protocol_in(Some("croft"), Some("xterm-256color"), Some("1")),
+            InlineImageProtocol::ITerm2
+        );
+        // The outer terminal draws no images: text, never a dropped picture.
+        for gate in [Some("0"), None, Some("")] {
+            assert_eq!(
+                inline_image_protocol_in(Some("croft"), Some("xterm-256color"), gate),
+                InlineImageProtocol::None,
+                "{gate:?}"
+            );
+        }
+        // The gate is croft's own; it changes nothing for a real terminal.
+        assert_eq!(
+            inline_image_protocol_in(Some("ghostty"), Some("xterm-256color"), Some("0")),
+            InlineImageProtocol::Kitty
+        );
+        assert_eq!(
+            inline_image_protocol_in(Some("Apple_Terminal"), None, Some("1")),
             InlineImageProtocol::None
         );
     }
