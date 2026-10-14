@@ -4105,6 +4105,10 @@ pub struct App {
     /// or its maximize-rail row). The reorder is live: crossing another pane
     /// or rail row moves the terminal there immediately, and this follows it.
     terminal_drag_from: Option<usize>,
+    /// Index of the editor tab being drag-reordered (#1565), set by a press
+    /// on a tab and cleared on release. Live like `terminal_drag_from`:
+    /// crossing another tab moves the dragged one there, and this follows.
+    editor_tab_drag_from: Option<usize>,
     /// A left press that was FORWARDED to a pane because its child tracks
     /// the mouse (#474), live until the release. The release goes to the
     /// same pane, clamped to its grid if the pointer left it. What the drag
@@ -6407,6 +6411,7 @@ impl App {
             terminal_rail_revealed: None,
             terminal_label_rects: Vec::new(),
             terminal_drag_from: None,
+            editor_tab_drag_from: None,
             terminal_pointer_forwarded: None,
             terminal_pane_maximized: false,
             bottom_panel_tab: BottomPanelTab::Terminal,
@@ -19787,7 +19792,14 @@ impl App {
         // A nominal area: seam adjacency is scale-invariant, so the exact pane
         // size doesn't matter for finding the directional neighbour.
         let synth = ratatui::layout::Rect::new(0, 0, 10_000, 10_000);
-        match self.editor_layout.neighbor_leaf_in_dir(synth, 1, dir) {
+        let target = self.editor_layout.neighbor_leaf_in_dir(synth, 1, dir);
+        self.move_active_editor_to_group(target, dir);
+    }
+
+    /// Move the active tab into the group at depth-first index `target`, or,
+    /// with none, into a new group created in direction `dir`.
+    fn move_active_editor_to_group(&mut self, target: Option<usize>, dir: editor_layout::Dir) {
+        match target {
             Some(target) => {
                 let moved = self.editor.take_active_editor();
                 let source_emptied = self.editor.is_blank_initial();
@@ -19814,6 +19826,38 @@ impl App {
                 self.focus_pane(Pane::Editor);
             }
         }
+    }
+
+    /// VS Code "Move Editor into Next / Previous Group" (#1565): the active
+    /// tab moves to the group after (or before) this one in reading order;
+    /// past the last (or first) group, a new group opens to the right (or
+    /// left) to hold it, as VS Code does.
+    fn move_active_editor_to_adjacent_group(&mut self, next: bool) {
+        let here = self.editor_layout.active_dfs_index();
+        let (target, dir) = if next {
+            let target = here + 1;
+            (
+                (target < self.editor_layout.leaf_count()).then_some(target),
+                editor_layout::Dir::Right,
+            )
+        } else {
+            (here.checked_sub(1), editor_layout::Dir::Left)
+        };
+        self.move_active_editor_to_group(target, dir);
+    }
+
+    /// View: Move Editor Left / Right (#1565): the active tab one place
+    /// along its tab bar. At the end of the bar (or of the pinned block)
+    /// nothing moves and the status line says so.
+    fn move_active_tab(&mut self, right: bool) {
+        if !self.editor.move_active_tab(right) {
+            self.status = String::from(if right {
+                "Move: the editor is already the last tab"
+            } else {
+                "Move: the editor is already the first tab"
+            });
+        }
+        self.poke_cursor();
     }
 
     /// VS Code "Split in Group": open a second view of the active file beside
@@ -24222,6 +24266,17 @@ impl App {
             && let Some(cmd) = self.keymap.command_for(key)
         {
             self.run_command(cmd);
+            return Ok(());
+        }
+        // Ctrl+Shift+PageUp / PageDown: View: Move Editor Left / Right
+        // (#1565), VS Code's Linux and Windows chords. Ahead of the editor's
+        // Shift+PageUp / PageDown page selection, which would otherwise read
+        // them as a select with the Ctrl ignored.
+        if self.focus == Pane::Editor
+            && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
+            && key.modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        {
+            self.move_active_tab(key.code == KeyCode::PageDown);
             return Ok(());
         }
         // A user's chord for a terminal command is meant for the terminal
@@ -53040,6 +53095,10 @@ impl App {
             Cmd::PinEditor => self.set_active_tab_pinned(true),
             Cmd::UnpinEditor => self.set_active_tab_pinned(false),
             Cmd::KeepEditor => self.keep_tab_open(tab_target),
+            Cmd::MoveEditorLeftInGroup => self.move_active_tab(false),
+            Cmd::MoveEditorRightInGroup => self.move_active_tab(true),
+            Cmd::MoveEditorToNextGroup => self.move_active_editor_to_adjacent_group(true),
+            Cmd::MoveEditorToPreviousGroup => self.move_active_editor_to_adjacent_group(false),
             Cmd::SplitEditor => self.split_editor(),
             // The chords' own moves (#843): Cmd+Opt+Left / Right have no
             // `Ctrl` form off macOS.
@@ -58717,6 +58776,8 @@ impl App {
                             self.editor.select(idx);
                             self.sync_open_file_poll_mtime();
                         }
+                        // A drag from here reorders the tab (#1565).
+                        self.editor_tab_drag_from = Some(idx);
                         self.poke_cursor();
                     }
                 } else if in_editor {
@@ -59098,6 +59159,19 @@ impl App {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                // Tab drag (#1565): live reorder, as the terminal panes below
+                // do. Crossing another tab of the same bar moves the dragged
+                // tab there; it stays active and the drag follows it.
+                if let Some(from) = self.editor_tab_drag_from {
+                    if let Some(to) = self.editor.tab_at(m.column, m.row)
+                        && to != from
+                        && let Some(at) = self.editor.move_tab(from, to)
+                    {
+                        self.editor_tab_drag_from = Some(at);
+                        self.poke_cursor();
+                    }
+                    return;
+                }
                 if let Some(from) = self.terminal_drag_from {
                     // Live reorder: the moment the pointer crosses another
                     // pane (side-by-side) or rail row (maximize mode), the
@@ -59355,6 +59429,7 @@ impl App {
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                self.editor_tab_drag_from = None;
                 // The release of a press that was forwarded to a tracking
                 // child goes to the same pane (#474), clamped to its grid
                 // like the drag. `report_mouse` may decline if the child

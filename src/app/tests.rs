@@ -87349,6 +87349,196 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
 }
 
+// --- #1565: rearranging editor tabs -------------------------------------------
+
+/// An app with `a.py`, `b.py` and `c.py` open as kept tabs, `c.py` active.
+fn three_tab_app_1565() -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "a = 1\n");
+    app.editor.pin_active();
+    for name in ["b.py", "c.py"] {
+        let p = tmp.path().join(name);
+        std::fs::write(&p, "x = 1\n").unwrap();
+        app.editor.open_pinned(&p).unwrap();
+    }
+    app.focus_pane(Pane::Editor);
+    assert_eq!(tab_names_852(&app.editor), ["a.py", "b.py", "c.py"]);
+    (app, tmp)
+}
+
+fn active_name_1565(app: &App) -> String {
+    tab_names_852(&app.editor)[app.editor.active_index()].clone()
+}
+
+#[test]
+fn ctrl_shift_page_up_and_down_move_the_active_tab_along_the_bar() {
+    let (mut app, _tmp) = three_tab_app_1565();
+    let up = key(KeyCode::PageUp, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+    let down = key(
+        KeyCode::PageDown,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    );
+    app.handle_key(up).unwrap();
+    assert_eq!(tab_names_852(&app.editor), ["a.py", "c.py", "b.py"]);
+    assert_eq!(active_name_1565(&app), "c.py", "the moved tab stays active");
+    app.handle_key(up).unwrap();
+    assert_eq!(tab_names_852(&app.editor), ["c.py", "a.py", "b.py"]);
+    assert!(
+        app.editor.selection.is_none(),
+        "the chord moves the tab, not a Shift+PageUp page selection"
+    );
+    app.handle_key(down).unwrap();
+    assert_eq!(tab_names_852(&app.editor), ["a.py", "c.py", "b.py"]);
+    assert_eq!(active_name_1565(&app), "c.py");
+}
+
+#[test]
+fn move_editor_left_on_the_first_tab_moves_nothing() {
+    let (mut app, _tmp) = three_tab_app_1565();
+    app.editor.select(0);
+    app.run_command(crate::widgets::command_palette::Command::MoveEditorLeftInGroup);
+    assert_eq!(tab_names_852(&app.editor), ["a.py", "b.py", "c.py"]);
+    assert_eq!(app.status, "Move: the editor is already the first tab");
+    app.editor.select(2);
+    app.run_command(crate::widgets::command_palette::Command::MoveEditorRightInGroup);
+    assert_eq!(tab_names_852(&app.editor), ["a.py", "b.py", "c.py"]);
+    assert_eq!(app.status, "Move: the editor is already the last tab");
+}
+
+#[test]
+fn the_palette_offers_the_move_editor_commands() {
+    let (mut app, _tmp) = three_tab_app_1565();
+    let rows = palette_rows_852(&mut app, "move editor");
+    for title in [
+        "View: Move Editor Left",
+        "View: Move Editor Right",
+        "View: Move Editor into Next Group",
+        "View: Move Editor into Previous Group",
+    ] {
+        assert!(
+            rows.iter().any(|r| r == title),
+            "{title} missing from {rows:?}"
+        );
+    }
+    assert_eq!(
+        run_in_palette_852(&mut app, "View: Move Editor Left").as_deref(),
+        Some("View: Move Editor Left")
+    );
+    assert_eq!(tab_names_852(&app.editor), ["a.py", "c.py", "b.py"]);
+}
+
+#[test]
+fn move_tab_keeps_the_active_tab_and_pinned_tabs_first() {
+    let (mut app, _tmp) = three_tab_app_1565();
+    let tabs = &mut app.editor;
+    assert_eq!(tabs.move_tab(2, 0), Some(0));
+    assert_eq!(tab_names_852(tabs), ["c.py", "a.py", "b.py"]);
+    assert_eq!(
+        tabs.active_index(),
+        0,
+        "c.py, the active tab, moved with it"
+    );
+    tabs.select(1); // a.py
+    assert_eq!(tabs.move_tab(2, 0), Some(0));
+    assert_eq!(tab_names_852(tabs), ["b.py", "c.py", "a.py"]);
+    assert_eq!(
+        tabs.active_index(),
+        2,
+        "another tab moving keeps a.py active"
+    );
+    assert_eq!(tabs.move_tab(7, 0), None, "out of range moves nothing");
+    // Pin a.py: pinned tabs lead, and no move crosses that boundary.
+    assert!(tabs.toggle_pin(2));
+    assert_eq!(tab_names_852(tabs), ["a.py", "b.py", "c.py"]);
+    assert_eq!(
+        tabs.move_tab(2, 0),
+        Some(1),
+        "an unpinned tab stops after the pins"
+    );
+    assert_eq!(tab_names_852(tabs), ["a.py", "c.py", "b.py"]);
+    assert_eq!(
+        tabs.move_tab(0, 2),
+        Some(0),
+        "a pinned tab stays among the pins"
+    );
+    assert_eq!(tab_names_852(tabs), ["a.py", "c.py", "b.py"]);
+}
+
+/// The column of the tab at `idx` on the rendered tab strip.
+fn tab_col_1565(app: &App, idx: usize) -> (u16, u16) {
+    let y = app.editor.tab_strip_y_for_test();
+    let x = (0..200)
+        .find(|&x| app.editor.tab_at(x, y) == Some(idx))
+        .expect("tab on the strip");
+    (x + 1, y)
+}
+
+#[test]
+fn dragging_a_tab_onto_another_reorders_the_bar() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp) = three_tab_app_1565();
+    draw(&mut app, 120, 30);
+    let (cx, y) = tab_col_1565(&app, 2);
+    let (ax, _) = tab_col_1565(&app, 0);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), cx, y));
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), ax, y));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), ax, y));
+    assert_eq!(tab_names_852(&app.editor), ["c.py", "a.py", "b.py"]);
+    assert_eq!(active_name_1565(&app), "c.py");
+}
+
+#[test]
+fn a_click_or_a_drag_off_the_bar_leaves_the_tab_order_alone() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp) = three_tab_app_1565();
+    draw(&mut app, 120, 30);
+    let (bx, y) = tab_col_1565(&app, 1);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), bx, y));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), bx, y));
+    assert_eq!(tab_names_852(&app.editor), ["a.py", "b.py", "c.py"]);
+    assert_eq!(
+        active_name_1565(&app),
+        "b.py",
+        "a click still selects the tab"
+    );
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), bx, y));
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), bx, y + 6));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), bx, y + 6));
+    assert_eq!(tab_names_852(&app.editor), ["a.py", "b.py", "c.py"]);
+    // After the release, a drag in the editor body is not a tab drag.
+    let (cx, _) = tab_col_1565(&app, 2);
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), cx, y));
+    assert_eq!(tab_names_852(&app.editor), ["a.py", "b.py", "c.py"]);
+}
+
+#[test]
+fn move_editor_into_next_group_splits_then_previous_brings_it_back() {
+    let (mut app, tmp) = three_tab_app_1565();
+    let c = tmp.path().join("c.py");
+    app.run_command(crate::widgets::command_palette::Command::MoveEditorToNextGroup);
+    assert_eq!(
+        app.editor_layout.leaf_count(),
+        2,
+        "one group: a new one opens"
+    );
+    assert_eq!(app.editor_layout.active_dfs_index(), 1, "to the right");
+    assert_eq!(app.editor.path.as_deref(), Some(c.as_path()));
+    let left = &app.editor_layout.inactive_groups()[0];
+    assert_eq!(
+        tab_names_852(left),
+        ["a.py", "b.py"],
+        "the source lost c.py"
+    );
+    app.run_command(crate::widgets::command_palette::Command::MoveEditorToPreviousGroup);
+    assert_eq!(
+        app.editor_layout.leaf_count(),
+        1,
+        "the emptied group closes"
+    );
+    assert_eq!(tab_names_852(&app.editor), ["a.py", "b.py", "c.py"]);
+    assert_eq!(active_name_1565(&app), "c.py");
+}
+
 /// Serve one `croft edit` request for `path` at `at` through a socket pair.
 fn serve_view_request_1606(
     app: &mut App,

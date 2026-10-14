@@ -19740,6 +19740,55 @@ impl EditorTabs {
         now_pinned
     }
 
+    /// Move the tab at `from` to position `to` in this group (#1565), as VS
+    /// Code's tab drag and Move Editor Left / Right do. Pinned tabs stay ahead
+    /// of the rest, so `to` is clamped into the moved tab's own block. The
+    /// active tab stays active. Returns the tab's new index, or `None` when
+    /// `from` is out of range.
+    pub fn move_tab(&mut self, from: usize, to: usize) -> Option<usize> {
+        if from >= self.editors.len() {
+            return None;
+        }
+        let pinned = self.editors.iter().filter(|e| e.pinned).count();
+        let to = if self.editors[from].pinned {
+            to.min(pinned - 1)
+        } else {
+            to.clamp(pinned, self.editors.len() - 1)
+        };
+        if to == from {
+            return Some(from);
+        }
+        let active = self.active;
+        let ed = self.editors.remove(from);
+        self.editors.insert(to, ed);
+        self.active = if active == from {
+            to
+        } else if from < active && active <= to {
+            active - 1
+        } else if to <= active && active < from {
+            active + 1
+        } else {
+            active
+        };
+        Some(to)
+    }
+
+    /// View: Move Editor Left / Right (#1565): shift the active tab one place
+    /// within its group. False when it is already at that end (of its pinned
+    /// or unpinned block), so nothing moved.
+    pub fn move_active_tab(&mut self, right: bool) -> bool {
+        let from = self.active;
+        let to = if right {
+            from + 1
+        } else {
+            match from.checked_sub(1) {
+                Some(to) => to,
+                None => return false,
+            }
+        };
+        self.move_tab(from, to).is_some_and(|at| at != from)
+    }
+
     /// Remove and return the active editor (for a Move to another group). When
     /// it was the only tab the group falls back to a single blank tab (like
     /// closing the last tab), so the group stays renderable; the caller can
@@ -19760,7 +19809,8 @@ impl EditorTabs {
 
     /// Add `ed` (moved from another group) and make it active. A blank-initial
     /// group is replaced in place so a Move never leaves a stray blank tab
-    /// beside the moved editor.
+    /// beside the moved editor. A pinned editor lands at the end of the
+    /// pinned block, so pinned tabs stay ahead of the rest.
     pub fn push_editor(&mut self, mut ed: Editor) {
         if self.is_blank_initial() {
             ed.focused = true;
@@ -19768,8 +19818,13 @@ impl EditorTabs {
             self.active = 0;
             return;
         }
-        self.editors.push(ed);
-        self.active = self.editors.len() - 1;
+        let at = if ed.pinned {
+            self.editors.iter().take_while(|e| e.pinned).count()
+        } else {
+            self.editors.len()
+        };
+        self.editors.insert(at, ed);
+        self.active = at;
         for (i, e) in self.editors.iter_mut().enumerate() {
             e.focused = i == self.active;
         }
@@ -32824,6 +32879,27 @@ mod tests {
         assert_eq!(dst.tab_count(), 2, "a second push appends and activates it");
         assert_eq!(dst.active_index(), 1);
         assert_eq!(dst.tab_path(1).as_deref(), Some(std::path::Path::new("/b")));
+    }
+
+    #[test]
+    fn push_editor_puts_a_pinned_editor_at_the_end_of_the_pinned_block() {
+        let mut dst = EditorTabs::new();
+        dst.editors[0].path = Some(std::path::PathBuf::from("/p"));
+        dst.add_tab_with_path(std::path::PathBuf::from("/u"));
+        dst.toggle_pin(0);
+        let mut src = EditorTabs::new();
+        src.editors[0].path = Some(std::path::PathBuf::from("/moved"));
+        src.toggle_pin(0);
+        dst.push_editor(src.take_active_editor());
+        assert_eq!(dst.tab_count(), 3);
+        assert_eq!(
+            dst.tab_path(1).as_deref(),
+            Some(std::path::Path::new("/moved")),
+            "the pinned editor joins the pinned block, ahead of unpinned tabs"
+        );
+        assert!(dst.editors[1].pinned);
+        assert_eq!(dst.tab_path(2).as_deref(), Some(std::path::Path::new("/u")));
+        assert_eq!(dst.active_index(), 1, "the moved editor is active");
     }
 
     #[test]
