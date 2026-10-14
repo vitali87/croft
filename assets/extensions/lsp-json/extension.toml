@@ -37,6 +37,7 @@ filenames = [
   ".eslintrc.json",
   ".babelrc",
   ".babelrc.json",
+  "babel.config.json",
   ".swcrc",
   ".jshintrc",
   ".jscsrc",

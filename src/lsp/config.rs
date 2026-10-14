@@ -34,7 +34,9 @@ impl Language {
 impl Language {
     /// The language whose manifests map this file extension, or `None`.
     /// Data-driven: the mapping comes from every loaded extension's
-    /// `[[languages]]` blocks.
+    /// `[[languages]]` blocks. Production resolves files through
+    /// [`Language::from_path`], which also honours file-name patterns.
+    #[cfg(test)]
     pub fn from_extension(ext: &str) -> Option<Self> {
         crate::lsp::languages::from_extension(ext)
     }
@@ -45,8 +47,8 @@ impl Language {
     /// JSON with comments.
     pub fn from_path(path: &std::path::Path) -> Option<Self> {
         let lang = crate::lsp::languages::from_path(path)?;
-        if lang == Self::JSON && path.starts_with(crate::prefs::config_dir()) {
-            return Self::from_lsp_id("jsonc").or(Some(lang));
+        if lang.lsp_id() == "json" && path.starts_with(crate::prefs::config_dir()) {
+            return crate::lsp::languages::resolve("jsonc").or(Some(lang));
         }
         Some(lang)
     }

@@ -300,6 +300,7 @@ root_markers = ["build.zig", "build.zig.zon"]
             "/repo/.eslintrc",
             "/repo/.eslintrc.json",
             "/repo/.babelrc",
+            "/repo/packages/app/babel.config.json",
             "/repo/.croft/config.json",
             "/repo/notes.jsonc",
             "/repo/NOTES.JSONC",
