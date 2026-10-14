@@ -85645,6 +85645,33 @@ fn change_line_numbers_cycles_modes_across_every_editor() {
     );
 }
 
+/// #1576: the palette command and a settings reload both reach the split
+/// beside the active one at once, not at the next focus change.
+#[test]
+fn line_numbers_reach_every_split_group() {
+    use crate::widgets::editor::LineNumbers;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "a\nb\n");
+    app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+    let modes = |app: &App| -> Vec<LineNumbers> {
+        std::iter::once(&app.editor)
+            .chain(app.editor_layout.inactive_groups())
+            .flat_map(|group| group.editors.iter().map(|e| e.line_numbers))
+            .collect()
+    };
+    assert_eq!(modes(&app), [LineNumbers::On, LineNumbers::On]);
+
+    app.run_command(crate::widgets::command_palette::Command::CycleLineNumbers);
+    assert_eq!(modes(&app), [LineNumbers::Relative, LineNumbers::Relative]);
+
+    let prefs = crate::prefs::Prefs {
+        line_numbers: String::from("off"),
+        ..Default::default()
+    };
+    app.apply_merged_settings(&prefs);
+    assert_eq!(modes(&app), [LineNumbers::Off, LineNumbers::Off]);
+}
+
 /// #1576: a project's `.vscode/settings.json` `editor.lineNumbers` sets
 /// the gutter; a value croft has no mode for is ignored.
 #[test]

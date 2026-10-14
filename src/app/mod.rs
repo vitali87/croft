@@ -60460,11 +60460,25 @@ impl App {
     /// off (#1576), on every editor, and save the choice.
     fn cycle_line_numbers(&mut self) {
         self.line_numbers = self.line_numbers.next();
-        self.editor.line_numbers = self.line_numbers;
+        self.apply_line_numbers();
         if !cfg!(test) {
             let _ = crate::prefs::save_line_numbers(self.line_numbers.pref_id());
         }
         self.status = format!("Line Numbers: {}", self.line_numbers.pref_id());
+    }
+
+    /// Give every open editor, in every split group, the current line
+    /// number mode (#1576). A split beside the active one is on screen
+    /// too, and nothing else resyncs it until focus next moves.
+    fn apply_line_numbers(&mut self) {
+        let mode = self.line_numbers;
+        for group in
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
+        {
+            for ed in &mut group.editors {
+                ed.line_numbers = mode;
+            }
+        }
     }
 
     fn toggle_render_whitespace(&mut self) {
@@ -61133,7 +61147,7 @@ impl App {
             crate::widgets::editor::WhitespaceMode::from_pref(&p.render_whitespace);
         self.editor.whitespace_mode = self.whitespace_mode;
         self.line_numbers = crate::widgets::editor::LineNumbers::from_pref(&p.line_numbers);
-        self.editor.line_numbers = self.line_numbers;
+        self.apply_line_numbers();
         self.word_suggestions =
             crate::word_suggest::WordSuggestions::from_pref(&p.word_based_suggestions);
         if !p.disable_inlay_hints && !self.inlay_hints_enabled {
