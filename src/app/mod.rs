@@ -62731,6 +62731,8 @@ impl App {
             open_submenu: None,
             submenu_selected: 0,
             target_dir: self.tree.root.clone(),
+            crumb: None,
+            scroll: Default::default(),
         }
     }
 
