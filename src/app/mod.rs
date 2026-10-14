@@ -39148,11 +39148,11 @@ impl App {
         self.run_project_task_in(task, root)
     }
 
-    /// [`Self::run_project_task`] in the workspace folder `root`: the pane
+    /// [`Self::run_project_task`] in the workspace folder `folder`: the pane
     /// starts there and the task's variables expand against it, so a
     /// compound member's preLaunchTask from another folder (#1425) builds
     /// that folder's project.
-    fn run_project_task_in(&mut self, task: crate::tasks::Task, root: PathBuf) -> Option<u64> {
+    fn run_project_task_in(&mut self, task: crate::tasks::Task, folder: PathBuf) -> Option<u64> {
         let pane_name = format!("Task: {}", task.label);
         // The task's problemMatcher (#252), translated up front so both the
         // reuse and fresh-pane paths assign the same thing (or clear a
@@ -39165,7 +39165,7 @@ impl App {
         // Ctrl-E + Ctrl-U first: the idle shell's line editor may hold a
         // half-typed command that would otherwise concatenate and run
         // (same rule `format_cd_command` pins for the cd seed).
-        let line = match self.task_command_line_in(&task, root.clone()) {
+        let line = match self.task_command_line_in(&task, folder.clone()) {
             Ok(line) => line,
             Err(e) => {
                 self.status = format!("Task \u{201c}{}\u{201d} not run: {e}", task.label);
@@ -39180,7 +39180,7 @@ impl App {
         // old one. Shares `pane_is_idle_at` with the runnable-fence path
         // (#430) — this guard existed twice and only one copy was fixed,
         // which is precisely how the two defects survived a green suite.
-        let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+        let canonical = folder.canonicalize().unwrap_or_else(|_| folder.clone());
         if let Some(idx) = self
             .terminals
             .iter()
@@ -39200,7 +39200,7 @@ impl App {
             self.assign_task_matcher(uid, matcher);
             return Some(uid);
         }
-        match crate::widgets::terminal::PtyTerminal::new(&root) {
+        match crate::widgets::terminal::PtyTerminal::new(&folder) {
             Ok(mut term) => {
                 term.set_manual_name(Some(pane_name));
                 term.write_input(command.as_bytes());
