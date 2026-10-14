@@ -7227,6 +7227,91 @@ fn welcome_tagline_constant_is_present() {
     assert!(WELCOME_TAGLINE.contains("DEVELOPERS"));
 }
 
+/// #1843: the version never shares a cell with the logo or the tagline, at
+/// any window size and whatever height the release-note card takes. The
+/// logo's cells are the image's, edge to edge; the tagline's last column
+/// reaches the badge's first, and once painted over its corner.
+#[test]
+fn the_welcome_version_never_overlaps_the_logo_or_the_tagline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let mut seen_badge = false;
+    let mut seen_below = false;
+    for notes in [Vec::new(), long_test_note()] {
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.welcome.set_test_notes(notes);
+        for w in (30..=200).step_by(3) {
+            for h in (8..=56).step_by(2) {
+                let mut term =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+                term.draw(|f| app.render_welcome(f, f.area())).unwrap();
+                let buf = term.backend().buffer();
+                let rows: Vec<String> = (0..h)
+                    .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
+                    .collect();
+                let logo = *app.overlays.welcome.layout().expect("laid out");
+                // Beside the logo or in the row under it; the release-note
+                // card further down names the version too.
+                let hits: Vec<(u16, u16)> = rows
+                    .iter()
+                    .enumerate()
+                    .take((logo.cell_y + logo.cell_h + 1) as usize)
+                    .filter_map(|(y, r)| {
+                        r.find(&version)
+                            .map(|i| (r[..i].chars().count() as u16, y as u16))
+                    })
+                    .collect();
+                let Some(&(vx, vy)) = hits.first() else {
+                    continue;
+                };
+                assert_eq!(hits.len(), 1, "one version at {w}x{h}");
+                let boxed = vx >= 2 && buf[(vx - 2, vy)].symbol() == "\u{2502}";
+                let (x0, x1, y0, y1) = if boxed {
+                    seen_badge = true;
+                    let x1 = vx + version.chars().count() as u16 + 1;
+                    for (x, y, corner) in [
+                        (vx - 2, vy - 1, "\u{256d}"),
+                        (x1, vy - 1, "\u{256e}"),
+                        (vx - 2, vy + 1, "\u{2570}"),
+                        (x1, vy + 1, "\u{256f}"),
+                    ] {
+                        assert_eq!(buf[(x, y)].symbol(), corner, "badge corner at {w}x{h}");
+                    }
+                    (vx - 2, x1, vy - 1, vy + 1)
+                } else {
+                    seen_below = true;
+                    (vx, vx + version.chars().count() as u16 - 1, vy, vy)
+                };
+                let logo_x1 = logo.cell_x + logo.cell_w - 1;
+                let logo_y1 = logo.cell_y + logo.cell_h - 1;
+                assert!(
+                    x1 < logo.cell_x || x0 > logo_x1 || y1 < logo.cell_y || y0 > logo_y1,
+                    "the version overlaps the logo at {w}x{h}"
+                );
+                if let Some(t) = rows.iter().position(|r| r.contains(WELCOME_TAGLINE)) {
+                    let t = t as u16;
+                    assert!(
+                        t < y0 || t > y1,
+                        "the tagline crosses the version at {w}x{h}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(seen_badge, "the boxed badge must be exercised");
+    assert!(
+        seen_below,
+        "the version under a narrow logo must be exercised"
+    );
+}
+
+#[test]
+fn a_cell_pixel_size_needs_the_terminal_to_report_pixels() {
+    assert_eq!(cell_pixel_of(100, 40, 800, 640), Some((8, 16)));
+    assert_eq!(cell_pixel_of(100, 40, 0, 0), None);
+    assert_eq!(cell_pixel_of(0, 40, 800, 640), None);
+}
+
 #[test]
 fn modified_terminal_keys_keep_their_modifiers() {
     let k = |c, m| key_to_bytes(key(c, m), false);

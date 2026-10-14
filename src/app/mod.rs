@@ -207,6 +207,14 @@ const ACTIVITY_ICON_HEIGHT: u16 = 2;
 const ACTIVITY_ICON_GAP: u16 = 0;
 const FALLBACK_CELL_PIXEL: (u32, u32) = (10, 20);
 
+/// One cell's size in pixels, from a window size report of `cols` x `rows`
+/// cells over `width` x `height` pixels; `None` when the terminal reports
+/// no pixel size.
+fn cell_pixel_of(cols: u16, rows: u16, width: u16, height: u16) -> Option<(u32, u32)> {
+    (cols > 0 && rows > 0 && width > 0 && height > 0)
+        .then(|| ((width / cols).max(1) as u32, (height / rows).max(1) as u32))
+}
+
 /// Fixed width of the secondary side bar (hosts the active file's Outline),
 /// on the edge opposite the primary side bar. VS Code's auxiliary bar.
 const SECONDARY_SIDEBAR_WIDTH: u16 = 30;
@@ -6894,14 +6902,8 @@ impl App {
         if ws.columns == 0 || ws.rows == 0 {
             return;
         }
-        let (cell_w, cell_h) = if ws.width > 0 && ws.height > 0 {
-            (
-                (ws.width / ws.columns).max(1) as u32,
-                (ws.height / ws.rows).max(1) as u32,
-            )
-        } else {
-            FALLBACK_CELL_PIXEL
-        };
+        let (cell_w, cell_h) =
+            cell_pixel_of(ws.columns, ws.rows, ws.width, ws.height).unwrap_or(FALLBACK_CELL_PIXEL);
         self.cell_pixel = Some((cell_w, cell_h));
         // OSC-1337 hero will own the no-repo illustration cells; the
         // widget skips its ASCII fallback so resize doesn't flash old
@@ -7491,6 +7493,17 @@ impl App {
         // still claims every cell is painted; force the next frame to wipe and
         // re-emit everything on every protocol.
         self.resize_repaint_needed = true;
+        // A font zoom resizes the cells, not only the grid. Every inline
+        // image was baked for the old cell size, and a sixel image is sized
+        // in pixels, so it would outgrow its cells and paint over its
+        // neighbours: the welcome logo over the version badge (#1843).
+        if let Some(cell) = self.cell_pixel
+            && let Ok(ws) = crossterm::terminal::window_size()
+            && cell_pixel_of(ws.columns, ws.rows, ws.width, ws.height)
+                .is_some_and(|now| now != cell)
+        {
+            self.rebake_inline_images();
+        }
     }
 
     /// One-shot consumer for the "leaving Source Control after the no-repo
@@ -14063,6 +14076,13 @@ impl App {
             }
             let _ = out.flush();
         }
+        self.rebake_inline_images();
+        self.status = format!("Color Theme: {}", theme.label());
+    }
+
+    /// Bake every inline image again, for a new background or a new cell
+    /// size.
+    fn rebake_inline_images(&mut self) {
         // Re-bake the fixed icon/badge/run-debug PNGs against the new bg.
         self.init_graphics();
         // The welcome wordmark, no-repo hero, SSH empty state, and editor
@@ -14078,7 +14098,6 @@ impl App {
         // every cell — SGR and image alike — repaints on the new background.
         self.overlays.activity.mark_dirty();
         self.overlays.activity.request_clear();
-        self.status = format!("Color Theme: {}", theme.label());
     }
 
     /// [`Self::open_at`] for a position that came FROM a language server, whose
@@ -16296,11 +16315,31 @@ impl App {
         // Plain `vX.Y.Z` (#282). The hash told two builds of one version
         // apart; the drift banner already does that, with an actionable
         // message, at the moment it matters.
+        //
+        // It never shares a cell with the logo or the tagline at any size
+        // (#1843): it starts past the logo's cells, which the image fills
+        // edge to edge, and its three rows end on the logo's last row, so
+        // the tagline below (whose last column reaches the badge's first)
+        // can never paint over its corner. Where there is no room beside
+        // the logo, the version goes in the blank row under it instead.
         let version_label = format!(" v{} ", env!("CARGO_PKG_VERSION"));
         let version_w = version_label.chars().count() as u16;
         let badge_x = logo_x + logo_w_cells + 1;
-        let badge_y = logo_y + (logo_h_cells * 5) / 6;
-        if badge_x + version_w + 2 <= area.x + area.width && badge_y + 2 < area_max_y {
+        let badge_y = logo_y + ((logo_h_cells * 5) / 6).min(logo_h_cells.saturating_sub(3));
+        let gap_y = logo_y + logo_h_cells;
+        let badge_fits = badge_x + version_w + 2 <= area.x + area.width && badge_y + 2 < area_max_y;
+        // Clear of the Take the Tour button, two rows above the border.
+        if !badge_fits && gap_y + 2 < area_max_y && version_w <= area.width {
+            frame.buffer_mut().set_string(
+                area.x + (area.width - version_w) / 2,
+                gap_y,
+                &version_label,
+                Style::default()
+                    .fg(self.theme.ui(rgb_color(GRAD_TL)))
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
+        if badge_fits {
             let badge_style = Style::default()
                 .fg(self.theme.ui(rgb_color(GRAD_TL)))
                 .add_modifier(Modifier::BOLD);
