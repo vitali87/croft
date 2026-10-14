@@ -225,6 +225,7 @@ fn diag(
         severity,
         message: message.to_string(),
         tags: Default::default(),
+        code: None,
     }
 }
 
