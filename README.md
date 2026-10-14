@@ -33,7 +33,7 @@ See **[LAYOUT.md](docs/LAYOUT.md)** for the pane-by-pane reference: every editor
 | Requirement | Why |
 |-------------|-----|
 | macOS, Linux, or Android (Termux) | The PTY layer is POSIX. On Windows, run the Linux build inside WSL2; see [WINDOWS.md](docs/WINDOWS.md). |
-| Rust 1.85+ stable | To compile the binary (edition 2024). |
+| Rust 1.93+ stable and a C compiler | Only to build from source (edition 2024; the tree-sitter grammars compile C). See [Install Rust](#install-rust). |
 | A Nerd Font as your terminal font | File and activity-bar icons are Nerd Font glyphs; without one they render as `[?]` boxes. |
 | A 256 color or truecolor terminal | Terminal.app, iTerm2, Alacritty, kitty, WezTerm, and Ghostty all qualify. |
 | iTerm2, WezTerm, Ghostty, kitty, or a sixel terminal (optional) | Inline image / PDF / spreadsheet previews. Elsewhere croft shows a metadata header line. |
@@ -49,6 +49,10 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
 Then open a new terminal — or run `. "$HOME/.cargo/env"` in the current one — so `cargo` is on `PATH`.
+
+rustup does not install the C compiler and linker the build needs. On macOS run
+`xcode-select --install`; on Debian or Ubuntu, `sudo apt install build-essential`
+(or your distribution's equivalent).
 
 ## Install
 
@@ -80,32 +84,45 @@ Or straight from the latest release, with nothing but `curl` and `tar`:
 os=$([ "$(uname -s)" = Darwin ] && echo apple-darwin || echo unknown-linux-musl)
 arch=$(uname -m | sed 's/arm64/aarch64/')
 curl -fsSL "https://github.com/vitali87/croft/releases/latest/download/croft-$arch-$os.tar.gz" | tar xz
+sudo mkdir -p /usr/local/bin
 sudo mv "croft-$arch-$os/croft" /usr/local/bin/
 ```
 
-On Android in Termux there is no `sudo` and no `/usr/local/bin`: move it to
-`"$PREFIX/bin/"` instead.
+`/usr/local/bin` is on the default `PATH` but may not exist yet on a fresh Mac,
+hence the `mkdir`. On Android in Termux there is no `sudo` and no
+`/usr/local/bin`: move it to `"$PREFIX/bin/"` instead.
 
-Every release also carries a `SHA256SUMS` covering all four archives, so a
-download can be verified independently. It lists every archive, so check only
-the one you fetched rather than running it whole:
+To verify the archive before installing it, download it to a file instead of
+piping it into `tar`, together with the release's `SHA256SUMS` and that file's
+signature. `SHA256SUMS` lists all four archives, so check only the one you
+fetched rather than running it whole:
 
 ```bash
-grep "croft-aarch64-apple-darwin.tar.gz" SHA256SUMS | sha256sum -c -
-# macOS: grep "..." SHA256SUMS | shasum -a 256 -c -
+os=$([ "$(uname -s)" = Darwin ] && echo apple-darwin || echo unknown-linux-musl)
+arch=$(uname -m | sed 's/arm64/aarch64/')
+tag=$(curl -fsSLo /dev/null -w '%{url_effective}' https://github.com/vitali87/croft/releases/latest | sed 's|.*/||')
+for f in "croft-$arch-$os.tar.gz" SHA256SUMS SHA256SUMS.sigstore.json; do
+  curl -fsSLO "https://github.com/vitali87/croft/releases/download/$tag/$f"
+done
+grep "croft-$arch-$os.tar.gz" SHA256SUMS | sha256sum -c -
+# macOS: grep "croft-$arch-$os.tar.gz" SHA256SUMS | shasum -a 256 -c -
 ```
 
 `SHA256SUMS` is itself signed with [Sigstore](https://www.sigstore.dev/) by the
 release workflow, keyless, so the signature proves the file came from this
-repository's `release.yml` run for that tag. Check it before trusting the sums
-(replace `v0.1.963` with the tag you downloaded):
+repository's `release.yml` run for that tag. Check it with
+[cosign](https://docs.sigstore.dev/cosign/system_config/installation/) before
+trusting the sums, then install the archive you verified:
 
 ```bash
 cosign verify-blob \
   --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity "https://github.com/vitali87/croft/.github/workflows/release.yml@refs/tags/v0.1.963" \
+  --certificate-identity "https://github.com/vitali87/croft/.github/workflows/release.yml@refs/tags/$tag" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
+tar xzf "croft-$arch-$os.tar.gz"
+sudo mkdir -p /usr/local/bin
+sudo mv "croft-$arch-$os/croft" /usr/local/bin/
 ```
 
 To build from source instead:
