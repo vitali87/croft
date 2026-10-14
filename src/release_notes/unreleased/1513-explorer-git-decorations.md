@@ -1,0 +1,1 @@
+feature: The Explorer shows which files changed, as VS Code does: a modified, untracked, staged, renamed, deleted or conflicted file's name takes its git status colour with `M`, `U`, `A`, `R`, `D` or `!` at the right edge, and a folder with changes inside is coloured and marked with a dot.
