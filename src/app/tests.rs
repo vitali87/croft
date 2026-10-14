@@ -67572,6 +67572,7 @@ fn a_proposals_diagnostics_show_in_the_popup_not_the_buffer() {
             tags: Default::default(),
             code: None,
         }],
+        pulled: false,
     }]);
     assert!(
         !app.lsp_diagnostics.contains_key(&file),
@@ -78232,6 +78233,7 @@ fn an_all_clear_from_every_server_drops_the_path_from_the_store() {
         path: path.clone(),
         server: server.to_string(),
         diagnostics,
+        pulled: false,
     };
     store_diagnostics_update(
         &mut store,
@@ -78248,6 +78250,103 @@ fn an_all_clear_from_every_server_drops_the_path_from_the_store() {
     // An all-clear for a path never reported does not create one.
     store_diagnostics_update(&mut store, update("ra", Vec::new()));
     assert!(store.is_empty());
+}
+
+/// #1102: rust-analyzer answers a document pull with its own analysis and
+/// pushes `cargo check`'s findings. Neither empties the other, so an open
+/// file keeps its compile errors in PROBLEMS and under its text.
+#[test]
+fn a_pull_answer_keeps_what_the_same_server_pushed() {
+    use crate::lsp::manager::{DiagnosticSeverity, DiagnosticsUpdate};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let path = tmp.path().join("names.rs");
+    let update = |pulled, diagnostics| DiagnosticsUpdate {
+        path: path.clone(),
+        server: "rust-analyzer".into(),
+        diagnostics,
+        pulled,
+    };
+    let mut moved = diag(4, 9, DiagnosticSeverity::Error);
+    moved.message = "borrow of moved value: `names`".into();
+    app.apply_diagnostics_updates(vec![update(false, vec![moved.clone()])]);
+    // The file opens and rust-analyzer's pull finds nothing of its own.
+    app.apply_diagnostics_updates(vec![update(true, Vec::new())]);
+    app.rebuild_problems();
+    assert_eq!(app.problems.error_count(), 1, "{:?}", app.lsp_diagnostics);
+    assert_eq!(app.merged_diagnostics(&path), vec![moved.clone()]);
+    assert_eq!(app.problems.groups()[0].items[0].source, "rust-analyzer");
+    // A save: cargo check pushes again, then the pull finds a warning.
+    let mut unused = diag(0, 3, DiagnosticSeverity::Warning);
+    unused.message = "unused variable: `total`".into();
+    app.apply_diagnostics_updates(vec![
+        update(false, vec![moved.clone()]),
+        update(true, vec![unused.clone()]),
+    ]);
+    app.rebuild_problems();
+    assert_eq!(app.problems.total_count(), 2);
+    let merged = app.merged_diagnostics(&path);
+    assert!(
+        merged.contains(&moved) && merged.contains(&unused),
+        "{merged:?}"
+    );
+    // And the push no longer replaces the pulled warning.
+    app.apply_diagnostics_updates(vec![update(false, vec![moved.clone()])]);
+    assert_eq!(app.merged_diagnostics(&path).len(), 2);
+}
+
+/// #1102: each kind of report still clears its own findings, and a path
+/// leaves the store once neither has any.
+#[test]
+fn an_empty_pull_or_push_still_clears_its_own_findings() {
+    use crate::lsp::manager::{DiagnosticSeverity, DiagnosticsUpdate};
+    let mut store = std::collections::HashMap::new();
+    let path = PathBuf::from("/w/names.rs");
+    let update = |pulled, diagnostics| DiagnosticsUpdate {
+        path: path.clone(),
+        server: "rust-analyzer".into(),
+        diagnostics,
+        pulled,
+    };
+    let pushed = diag(0, 1, DiagnosticSeverity::Error);
+    let pulled = diag(2, 3, DiagnosticSeverity::Warning);
+    store_diagnostics_update(&mut store, update(false, vec![pushed.clone()]));
+    store_diagnostics_update(&mut store, update(true, vec![pulled.clone()]));
+    store_diagnostics_update(&mut store, update(true, Vec::new()));
+    let left: Vec<_> = diagnostics_by_source(&store[&path]).collect();
+    assert_eq!(left, vec![("rust-analyzer", &pushed)]);
+    store_diagnostics_update(&mut store, update(true, vec![pulled.clone()]));
+    store_diagnostics_update(&mut store, update(false, Vec::new()));
+    let left: Vec<_> = diagnostics_by_source(&store[&path]).collect();
+    assert_eq!(left, vec![("rust-analyzer", &pulled)]);
+    store_diagnostics_update(&mut store, update(true, Vec::new()));
+    assert!(store.is_empty(), "{store:?}");
+}
+
+/// #1102: a server that pushes a finding and also returns it to a pull
+/// lists it once, under the server's own name.
+#[test]
+fn a_finding_both_pushed_and_pulled_is_listed_once() {
+    use crate::lsp::manager::{DiagnosticSeverity, DiagnosticsUpdate};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let path = tmp.path().join("main.py");
+    let undefined = diag(0, 4, DiagnosticSeverity::Error);
+    app.apply_diagnostics_updates(
+        [false, true]
+            .into_iter()
+            .map(|pulled| DiagnosticsUpdate {
+                path: path.clone(),
+                server: "pyright".into(),
+                diagnostics: vec![undefined.clone()],
+                pulled,
+            })
+            .collect(),
+    );
+    app.rebuild_problems();
+    assert_eq!(app.problems.total_count(), 1);
+    assert_eq!(app.problems.groups()[0].items[0].source, "pyright");
+    assert_eq!(app.merged_diagnostics(&path), vec![undefined]);
 }
 
 /// #262: a config file croft did not write itself (one that arrived by
