@@ -62,6 +62,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "",
             },
             ShortcutEntry {
+                keys: "Esc Esc",
+                description: "Leave Zen Mode",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "Ctrl+J",
                 description: "Toggle the terminal pane",
                 handler: "is_terminal_toggle_key",
@@ -585,6 +590,16 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 keys: "Cmd/Ctrl+F2",
                 description: "Change all occurrences in this file",
                 handler: "is_change_all_occurrences_key",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+L",
+                description: "Select all occurrences of the find match",
+                handler: "is_select_all_occurrences_key",
+            },
+            ShortcutEntry {
+                keys: "Shift+Opt+I / Shift+Alt+I",
+                description: "Add a cursor at the end of each selected line",
+                handler: "is_add_cursors_to_line_ends_key",
             },
             ShortcutEntry {
                 keys: "F12",
