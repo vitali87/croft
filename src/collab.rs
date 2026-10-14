@@ -1165,8 +1165,6 @@ impl CollabSession {
     }
 
     /// Ask whoever is streaming on this relay to stop and revert.
-    // Callers land with the cancel affordances (follow-up slice).
-    #[allow(dead_code)]
     pub fn send_stream_cancel(&mut self) {
         self.channel.send(&CollabMsg::StreamCancel {});
     }

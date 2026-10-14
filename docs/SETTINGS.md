@@ -27,7 +27,10 @@ editable layers) or the palette commands "Preferences: Open Settings (JSON)"
 and "Preferences: Open Workspace Settings (JSON) / — Local (JSON)". Saving a
 layer file applies live: theme, editor toggles, save behavior, and host
 accents re-merge on the spot; the few startup-read settings (layout,
-terminal scrollback) still need a relaunch. The hub shows where a value came
+terminal scrollback) still need a relaunch. A layer, or a file one
+`extends`, changed outside croft (a `git pull`, an edit in the terminal, a
+dotfiles sync, another croft window) applies the same way within about two
+seconds. The hub shows where a value came
 from (`· workspace`, `· user-local`, …) whenever a layer other than your own
 user config decided it.
 
@@ -94,7 +97,7 @@ never change what croft trusts or executes. They are limited to an explicit
 allowlist — appearance and editor/terminal behavior:
 
 `theme`, `format_on_save`, `insert_final_newline`, `trim_trailing_whitespace`, `trim_final_newlines`, `format_on_type`, `auto_save`, `auto_save_on_focus_change`,
-`render_whitespace`, `disable_inline_blame`, `disable_auto_close_pairs`,
+`render_whitespace`, `word_based_suggestions`, `disable_inline_blame`, `disable_auto_close_pairs`,
 `disable_inline_values`, `disable_save_before_debug`, `disable_bracket_colors`, `disable_indent_guides`,
 `disable_inlay_hints`, `copy_on_select`, `disable_secret_redaction`, `disable_log_highlight`, `explorer_views`,
 `files_exclude`, `search_exclude`.
@@ -123,6 +126,7 @@ means the same thing whichever path reads it.
 | `files.autoSave: "onFocusChange"` / `"onWindowChange"` | `auto_save_on_focus_change: true` |
 | `files.autoSave: "off"` | both auto-save modes off |
 | `editor.renderWhitespace` | `render_whitespace` (`none` / `selection` / `all`; VS Code's `boundary` and `trailing` have no croft mode and map to `none`) |
+| `editor.wordBasedSuggestions` | `word_based_suggestions` (`off` / `currentDocument` / `matchingDocuments` / `allDocuments`; the older `true` / `false` map to `matchingDocuments` / `off`) |
 | `editor.bracketPairColorization.enabled` | `disable_bracket_colors` (negated) |
 | `editor.guides.indentation` | `disable_indent_guides` (negated) |
 | `editor.inlayHints.enabled` | `disable_inlay_hints` (negated) |
@@ -328,7 +332,7 @@ Profiles live in `~/.config/croft/profiles/<name>/`. History, macros and session
 
 * `"screen_reader": true` (or **Accessibility: Toggle Screen Reader Mode**, also in Settings) stops the caret blinking and keeps the real cursor on the focused text: the editor caret, the shell cursor in a terminal, or the status bar when a picker, menu or the Explorer has focus. The status bar then describes each change in one line: the line the caret moved to, the diagnostic under it, the highlighted completion, palette entry or file, focus changes and status messages. Terminal screen readers (VoiceOver, Orca, NVDA over WSL) read it from there.
 * `"screen_reader_command": "spd-say"` (or `"say"` on macOS) also speaks each line through that program, with the line as its last argument.
-* `"locale": "de"` picks the UI language; unset, croft follows `LC_ALL`, `LC_MESSAGES` or `LANG`. Menus, palette titles and status messages are translated where the catalog has an entry, and the palette matches queries in either language. German (`de`) and Spanish (`es`) ship as starter catalogs. For another language or to fix a translation, run `croft locale-template <lang> --write` and fill in the values it leaves empty in `~/.config/croft/locales/<lang>.json`; entries there override the built-in ones. Run it again after an upgrade to add new strings: it keeps every value you already wrote. Don't redirect the plain command onto that file, since the shell empties the file before croft can read it. A key with `{}` is a pattern: `"Saved {}": "Gespeichert: {}"`.
+* `"locale": "de"` picks the UI language; unset, croft follows `LC_ALL`, `LC_MESSAGES` or `LANG`, but only into a language whose built-in catalog translates at least 95% of the strings `croft locale-template` lists, or one you have a `locales/<lang>.json` for, so a partial catalog never mixes two languages on screen unasked. Menus, palette titles and status messages are translated where the catalog has an entry, and the palette matches queries in either language. German (`de`) and Spanish (`es`) ship as starter catalogs, so they are opt-in: set `"locale"` to use them. For another language or to fix a translation, run `croft locale-template <lang> --write` and fill in the values it leaves empty in `~/.config/croft/locales/<lang>.json`; entries there override the built-in ones. Run it again after an upgrade to add new strings: it keeps every value you already wrote. Don't redirect the plain command onto that file, since the shell empties the file before croft can read it. A key with `{}` is a pattern: `"Saved {}": "Gespeichert: {}"`.
 
 All three are user-config only.
 
