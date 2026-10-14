@@ -24,8 +24,8 @@ A handful of chords have no `Ctrl` form, or one a legacy terminal cannot send, b
 | `Cmd`+`Opt`+`←` / `→` focus the left / right editor group | `Ctrl`+`Alt`+arrows switch desktop workspaces | Command Palette "View: Focus Left Editor Group" / "View: Focus Right Editor Group" |
 | `Cmd`+`]` / `Cmd`+`[` next / previous terminal | `Ctrl`+`[` is `Esc` | Command Palette "Terminal: Focus Next Terminal" / "Terminal: Focus Previous Terminal" |
 | `Cmd`+`Shift`+`T` focus the terminal | `Ctrl`+`Shift`+`T` opens another terminal | `Ctrl`+`J` shows and focuses a hidden terminal (on a showing one it hides it: press it twice) |
-| `Cmd`+`C` / `Cmd`+`W` copy the selection / close the active terminal, in the terminal pane | `Ctrl`+`C` and `Ctrl`+`W` go to the shell (interrupt, delete a word) | `Ctrl`+`Shift`+`C` / `Ctrl`+`Shift`+`W` |
-| `Cmd`+`T` split terminal | `Ctrl`+`T` belongs to the shell and the editor | `Ctrl`+`Shift`+`T` |
+| `Cmd`+`C` / `Cmd`+`W` copy the selection / close the active terminal, in the terminal pane | `Ctrl`+`C` and `Ctrl`+`W` go to the shell (interrupt, delete a word) | the pane's right-click menu: Copy / Kill Terminal; or the Settings toggle Terminal: Copy on Selection, and the pane's `-` button. `Ctrl`+`Shift`+`C` / `Ctrl`+`Shift`+`W` where the host terminal passes them on (below) |
+| `Cmd`+`T` split terminal | `Ctrl`+`T` belongs to the shell and the editor | the pane's right-click menu: Split Terminal; the pane's `+` button; or Command Palette "Terminal: Create New Terminal". `Ctrl`+`Shift`+`T` where the host terminal passes it on (below) |
 | `Cmd`+`F12` go to implementations | `Ctrl`+`F12` is Go to Type Definition | Command Palette "Go to Implementations" |
 | `Cmd`+`Enter` run the Markdown code block under the caret | `Ctrl`+`Enter` runs it too where the terminal reports it (the kitty keyboard protocol, tmux `extended-keys`), but a legacy terminal sends it as a bare `Enter` | Command Palette "Markdown: Run Code Block at Cursor" |
 | `Cmd`+`A` select all, in the editor | `Ctrl`+`A` is line start there, as in the shell | Command Palette "Select All" |
@@ -33,6 +33,8 @@ A handful of chords have no `Ctrl` form, or one a legacy terminal cannot send, b
 | `Cmd+K` chords typed in the terminal pane | `Ctrl`+`K` goes to the shell | the ones that act on the active terminal (`R`, `K`, `M`, `D`) work as `Ctrl`+`K` chords from any other pane |
 
 `Cmd` is `Super`, and it reaches croft only over the kitty keyboard protocol: kitty, Ghostty, WezTerm, and Alacritty deliver it natively, so these chords work there. In GNOME Terminal, Konsole, xterm, or tmux, use the right-hand column, or give its palette command a chord of your own: pick the command in the Keyboard Shortcuts view (`Ctrl`+`K` `Ctrl`+`S`) and press the chord, which croft writes to `keybindings.json`.
+
+GNOME Terminal and Konsole keep `Ctrl`+`Shift`+`C`, `W` and `T` as their own Copy, Close Tab and New Tab, so there the chord never reaches croft: `Ctrl`+`Shift`+`W` closes (or offers to close) the tab croft runs in, not one terminal pane. Use the pane's right-click menu there (Copy, Split Terminal, Kill Terminal), or turn on "Terminal: Copy on Selection" in Settings so a drag-selection copies itself. kitty, Ghostty and WezTerm bind the same three chords by default, but `Super` reaches croft in them, so `Cmd`+`C` / `W` / `T` work as the left-hand column says.
 
 The same protocol is what tells `Ctrl`+`Shift`+a letter from `Ctrl`+that letter: without it both send one control byte, so `Ctrl`+`Shift`+`S` arrives as `Ctrl`+`S` and saves instead of jumping to Source Control (the activity bar icon, or the palette's "View: Show Source Control", gets there).
 

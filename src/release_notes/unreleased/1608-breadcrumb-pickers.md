@@ -1,0 +1,1 @@
+feature: Breadcrumbs browse: a folder crumb lists that folder (folders first; Enter opens a file or lists a subfolder), the file crumb lists its folder, and a symbol crumb lists the symbols beside it. View: Focus and Select Breadcrumbs (`Ctrl+Shift+.`, `Cmd+Shift+.` on macOS) opens the last crumb's list from the keyboard, and Left / Right move along the bar.
