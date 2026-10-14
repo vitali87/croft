@@ -34,6 +34,21 @@ pub struct LayoutPrefs {
     pub panel_alignment: PanelAlignment,
     #[serde(default)]
     pub quick_input_position: QuickInputPosition,
+    /// View: Toggle Centered Layout (#1585): the editor keeps
+    /// `centered_layout_width` columns in the middle of the window.
+    #[serde(default)]
+    pub centered_layout: bool,
+    /// Zen Mode centres the editor, as VS Code's `zenMode.centerLayout`
+    /// (#1585). On by default.
+    #[serde(default = "default_true")]
+    pub zen_center_layout: bool,
+    /// How wide the centred editor is, in columns (#1585).
+    #[serde(default = "default_centered_layout_width")]
+    pub centered_layout_width: u16,
+}
+
+fn default_centered_layout_width() -> u16 {
+    120
 }
 
 impl Default for LayoutPrefs {
@@ -45,6 +60,9 @@ impl Default for LayoutPrefs {
             secondary_side_bar: false,
             panel_alignment: PanelAlignment::default(),
             quick_input_position: QuickInputPosition::default(),
+            centered_layout: false,
+            zen_center_layout: true,
+            centered_layout_width: default_centered_layout_width(),
         }
     }
 }
@@ -1767,6 +1785,9 @@ mod tests {
                 secondary_side_bar: true,
                 panel_alignment: PanelAlignment::Justify,
                 quick_input_position: QuickInputPosition::Center,
+                centered_layout: true,
+                zen_center_layout: false,
+                centered_layout_width: 100,
             },
             ..Prefs::default()
         };
@@ -1784,6 +1805,9 @@ mod tests {
         assert!(!old.secondary_side_bar);
         assert_eq!(old.panel_alignment, PanelAlignment::Center);
         assert_eq!(old.quick_input_position, QuickInputPosition::Top);
+        // #1585: no centred layout outside Zen, a centred Zen, 120 columns.
+        assert!(!old.centered_layout && old.zen_center_layout);
+        assert_eq!(old.centered_layout_width, 120);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

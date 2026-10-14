@@ -33,8 +33,10 @@ import release  # noqa: E402
 
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 VERSION_BUMP = ROOT / ".github" / "workflows" / "version-bump.yml"
+PUBLISH_CRATE = ROOT / ".github" / "workflows" / "publish-crate.yml"
 GATE_STEP = "Shipped changes add release notes and leave the version alone"
 BUMP_STEP = "Fold the notes, bump the version and push"
+SOURCE_STEP = "Check out the commit that set this version"
 # What the steps run, copied into the throwaway repos they run in.
 SCRIPTS = ["release.py", "next_version.py", "ships_nothing.py", "check_doc_ownership.py"]
 
@@ -449,6 +451,218 @@ class Cut(unittest.TestCase):
             self.assertTrue(repo.exists("src/release_notes/unreleased/847-plot.md"))
 
 
+class Notes(unittest.TestCase):
+    """The GitHub release body: every version's notes since the last release.
+
+    A release goes out every 50 versions, so publishing only the released
+    version's own notes would leave 49 versions' changes out of it."""
+
+    def notes_dir(self, tmp: str, **versions: str) -> Path:
+        root = Path(tmp)
+        (root / "src" / "release_notes").mkdir(parents=True)
+        for version, text in versions.items():
+            (root / "src" / "release_notes" / f"{version.replace('_', '.')}.md").write_text(text)
+        return root
+
+    def test_every_version_since_the_last_release_newest_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(
+                tmp,
+                **{"0_2_28": "fix: Old.\n", "0_2_29": "fix: A.\n", "0_2_30": "feature: B.\nfix: C.\n"},
+            )
+            self.assertEqual(
+                release.release_notes(root, "0.2.30", ["v0.2.28", "v0.1.942"]),
+                "## 0.2.30\n\nfeature: B.\nfix: C.\n\n## 0.2.29\n\nfix: A.\n",
+            )
+
+    def test_the_next_version_after_a_release_is_its_own_notes(self):
+        """What every release body was when every version was released."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(tmp, **{"0_2_28": "fix: Old.\n", "0_2_29": "fix: A.\n"})
+            self.assertEqual(release.release_notes(root, "0.2.29", ["v0.2.28"]), "fix: A.\n")
+
+    def test_with_no_earlier_release_only_its_own_notes(self):
+        """Not the whole history: nothing says where the last release was."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(tmp, **{"0_2_28": "fix: Old.\n", "0_2_29": "fix: A.\n"})
+            self.assertEqual(release.release_notes(root, "0.2.29", []), "fix: A.\n")
+
+    def test_versions_compare_as_numbers_not_text(self):
+        """0.2.10 is above 0.2.9, and 0.1.999 below 0.2.0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(
+                tmp,
+                **{"0_1_999": "fix: Old.\n", "0_2_0": "fix: A.\n", "0_2_9": "fix: B.\n", "0_2_10": "fix: C.\n"},
+            )
+            self.assertEqual(
+                release.release_notes(root, "0.2.10", ["v0.1.999"]),
+                "## 0.2.10\n\nfix: C.\n\n## 0.2.9\n\nfix: B.\n\n## 0.2.0\n\nfix: A.\n",
+            )
+
+    def test_a_release_above_this_version_and_other_tags_are_ignored(self):
+        """Re-running an older tag's release must not shrink its range to
+        nothing because a newer release exists; a tag that is not a version
+        names no release."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(
+                tmp, **{"0_2_28": "fix: Old.\n", "0_2_29": "fix: A.\n", "0_2_30": "fix: B.\n"}
+            )
+            self.assertEqual(
+                release.release_notes(root, "0.2.30", ["v0.2.31", "nightly", "v0.2", "", "v0.2.28"]),
+                "## 0.2.30\n\nfix: B.\n\n## 0.2.29\n\nfix: A.\n",
+            )
+
+    def test_unreleased_fragments_are_not_notes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(tmp, **{"0_2_28": "fix: Old.\n", "0_2_29": "fix: A.\n"})
+            (root / "src" / "release_notes" / "unreleased").mkdir()
+            (root / "src" / "release_notes" / "unreleased" / "9-x.md").write_text("fix: Pending.\n")
+            (root / "src" / "release_notes" / "README.md").write_text("# Notes\n")
+            self.assertEqual(release.release_notes(root, "0.2.29", ["v0.2.28"]), "fix: A.\n")
+
+    def test_a_version_without_notes_is_refused(self):
+        """A tag that matches no version: say so rather than invent a body."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(tmp, **{"0_2_28": "fix: Old.\n"})
+            with self.assertRaises(release.ReleaseError):
+                release.release_notes(root, "0.2.29", ["v0.2.28"])
+
+    def test_the_cli_reads_released_tags_on_stdin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(tmp, **{"0_2_28": "fix: Old.\n", "0_2_29": "fix: A.\n", "0_2_30": "fix: B.\n"})
+            done = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "release.py"), "notes", "0.2.30"],
+                cwd=root,
+                input="v0.2.28\n",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(done.stdout, "## 0.2.30\n\nfix: B.\n\n## 0.2.29\n\nfix: A.\n")
+            missing = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "release.py"), "notes", "0.2.31"],
+                cwd=root,
+                input="v0.2.28\n",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(missing.returncode, 1)
+            self.assertEqual(missing.stdout, "")
+
+
+def with_version(version: str) -> str:
+    """CARGO_TOML with [package]'s version, and only that, set to `version`."""
+    return CARGO_TOML.replace('version = "0.2.11"\nedition', f'version = "{version}"\nedition', 1)
+
+
+def head(repo: Repo) -> str:
+    return run(repo.path, "git", "rev-parse", "HEAD").strip()
+
+
+@unittest.skipUnless(shutil.which("git"), "needs git")
+class SettingCommit(unittest.TestCase):
+    """The commit publish-crate.yml publishes and tags for a version: the
+    one on main's first-parent chain whose first parent carries another.
+    tag.yml tags only that commit, by the same comparison, so the two never
+    name different commits and the published crate's tag is never refused."""
+
+    def released(self, tmp: str) -> tuple[Repo, str]:
+        """A repo whose main set 0.2.12 in a release commit, and that commit."""
+        repo = Repo(Path(tmp))
+        repo.write("Cargo.toml", with_version("0.2.12"))
+        repo.commit()
+        return repo, head(repo)
+
+    def test_a_merge_after_the_release_commit_is_not_it(self):
+        """The merge that lands next still carries the version, but its code
+        is not that version's, and its tag run can execute first."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, release_commit = self.released(tmp)
+            repo.branch()
+            repo.write("src/lib.rs", SHIPPED.replace("/ 2", "/ 3"))
+            repo.commit()
+            run(repo.path, "git", "checkout", "-q", "main")
+            run(repo.path, "git", "merge", "-q", "--no-ff", "-m", "merge", "work")
+            self.assertEqual(release.setting_commit("0.2.12", cwd=repo.path), release_commit)
+
+    def test_a_later_commit_rewriting_a_matching_version_line_is_not_it(self):
+        """`git log -G` picked both: the version line rewritten with the same
+        value, and a dependency table's `version =` line that comes to hold
+        the same number."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, release_commit = self.released(tmp)
+            spaced = with_version("0.2.12").replace('version = "0.2.12"', 'version  =  "0.2.12"', 1)
+            repo.write("Cargo.toml", spaced)
+            repo.commit()
+            dep = '[dependencies.toml]\nversion = "0.2.1'
+            self.assertIn(dep + '1"', spaced, "fixture anchor is stale")
+            repo.write("Cargo.toml", spaced.replace(dep + '1"', dep + '2"'))
+            repo.commit()
+            self.assertEqual(release.setting_commit("0.2.12", cwd=repo.path), release_commit)
+
+    def test_a_branch_that_merged_main_in_is_not_walked(self):
+        """The PR's merge of main carries the version on a branch whose own
+        first parent did not; only main's first-parent chain counts."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.branch()
+            repo.write("src/lib.rs", SHIPPED.replace("/ 2", "/ 3"))
+            repo.commit()
+            run(repo.path, "git", "checkout", "-q", "main")
+            repo.write("Cargo.toml", with_version("0.2.12"))
+            repo.commit()
+            release_commit = head(repo)
+            run(repo.path, "git", "checkout", "-q", "work")
+            run(repo.path, "git", "merge", "-q", "--no-ff", "-m", "main into work", "main")
+            run(repo.path, "git", "checkout", "-q", "main")
+            run(repo.path, "git", "merge", "-q", "--no-ff", "-m", "merge", "work")
+            self.assertEqual(release.setting_commit("0.2.12", cwd=repo.path), release_commit)
+
+    def test_the_newest_setting_wins(self):
+        """A version set, replaced and set again was set by the last commit."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _ = self.released(tmp)
+            repo.write("Cargo.toml", CARGO_TOML)
+            repo.commit()
+            self.assertEqual(release.setting_commit("0.2.11", cwd=repo.path), head(repo))
+
+    def test_the_root_commit_set_its_own_version(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            self.assertEqual(release.setting_commit("0.2.11", cwd=repo.path), head(repo))
+
+    def test_a_version_head_does_not_carry_or_a_malformed_one_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _ = self.released(tmp)
+            with self.assertRaisesRegex(release.ReleaseError, "HEAD carries version 0.2.12, not 0.2.11"):
+                release.setting_commit("0.2.11", cwd=repo.path)
+            with self.assertRaisesRegex(release.ReleaseError, "malformed"):
+                release.setting_commit("0.2.12;x", cwd=repo.path)
+
+    def test_the_cli_prints_the_commit_or_refuses_on_stderr(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, release_commit = self.released(tmp)
+
+            def cli(version):
+                return subprocess.run(
+                    [sys.executable, str(ROOT / "scripts" / "release.py"), "commit", version],
+                    cwd=repo.path,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+            found = cli("0.2.12")
+            self.assertEqual(found.returncode, 0, found.stderr)
+            self.assertEqual(found.stdout, release_commit + "\n")
+            refused = cli("0.2.13")
+            self.assertEqual(refused.returncode, 1)
+            self.assertEqual(refused.stdout, "")
+            self.assertIn("::error::HEAD carries version 0.2.12, not 0.2.13", refused.stderr)
+
+
 def step_script(workflow: Path, name: str) -> str:
     """A step's `run:` block, exactly as the workflow file has it."""
     lines = workflow.read_text().splitlines()
@@ -643,6 +857,49 @@ class Workflows(unittest.TestCase):
             self.assertNotEqual(out.returncode, 0)
             self.assertIn("848-edit.md", out.stderr)
             self.assertEqual(run(origin, "git", "log", "--format=%s", "-1", "main").strip(), "c")
+
+    def publish_source(self, repo: Repo, version: str, out: Path) -> subprocess.CompletedProcess[str]:
+        """publish-crate.yml's step that checks out what it publishes."""
+        return subprocess.run(
+            ["bash", "-c", step_script(PUBLISH_CRATE, SOURCE_STEP)],
+            cwd=repo.path,
+            env={**os.environ, "VERSION": version, "GITHUB_OUTPUT": str(out)},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_the_publish_step_checks_out_the_commit_that_set_the_version(self):
+        """Not the run's own commit: a merge after the release commit still
+        carries the version, and tag.yml tagged the release commit."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            with_scripts(repo)
+            repo.commit()
+            repo.write("Cargo.toml", with_version("0.2.12"))
+            repo.commit()
+            release_commit = head(repo)
+            repo.write("src/lib.rs", SHIPPED.replace("/ 2", "/ 3"))
+            repo.commit()
+            output = Path(tmp) / "output.txt"
+            out = self.publish_source(repo, "0.2.12", output)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertIn(f"commit={release_commit}\n", output.read_text())
+            self.assertEqual(head(repo), release_commit)
+
+    def test_the_publish_step_stops_on_a_version_main_does_not_carry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            with_scripts(repo)
+            repo.commit()
+            before = head(repo)
+            output = Path(tmp) / "output.txt"
+            output.write_text("")
+            out = self.publish_source(repo, "0.2.12", output)
+            self.assertNotEqual(out.returncode, 0)
+            self.assertIn("::error::HEAD carries version 0.2.11, not 0.2.12", out.stderr)
+            self.assertEqual(output.read_text(), "")
+            self.assertEqual(head(repo), before)
 
 
 if __name__ == "__main__":
