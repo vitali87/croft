@@ -1,0 +1,1 @@
+fix: Multi-root debugging: a compound member written `{ "folder": "web", "name": "Run web" }` now starts the configuration from the web folder's launch.json, with `${workspaceFolder}` and its preLaunchTask resolved in that folder, instead of failing with "which no launch.json declares"; `${workspaceFolder:web}` now expands to the web folder's root.
