@@ -99,6 +99,11 @@ impl ServerRegistry {
             None => &[],
         }
     }
+
+    /// Every language with at least one server registered.
+    pub fn languages(&self) -> impl Iterator<Item = Language> + '_ {
+        self.by_language.keys().copied()
+    }
 }
 
 impl Default for ServerRegistry {
