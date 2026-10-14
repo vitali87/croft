@@ -43,7 +43,7 @@ pkg install rsync                   # required by `croft remote <host>`
 
 ## Inline previews
 
-Mainline Termux supports no image protocol (the OSC 1337 support PR is unmerged), so inline image / PDF / spreadsheet previews fall back to a metadata-header line. A Termux build that does support OSC 1337 can opt in with `CROFT_FORCE_INLINE_IMAGES=1`.
+Mainline Termux supports no image protocol (the OSC 1337 support PR is unmerged), so image and PDF previews are drawn with half-block characters under a metadata-header line. A Termux build that does support OSC 1337 can opt in with `CROFT_FORCE_INLINE_IMAGES=1`.
 
 ## Activity-bar icons (font auto-install)
 
