@@ -14,6 +14,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::highlight::{
     HiSpan, LangKind, LangRegistry, compute_line_starts, decode_semantic_tokens,
 };
+use crate::packed_lines::PackedLines;
 use crate::widgets::scrollbar;
 
 /// Hard cap on the size of a single text file the editor will load.
@@ -25,6 +26,9 @@ use crate::widgets::scrollbar;
 /// PDF / spreadsheet branches in `open`, so larger media keep their
 /// own per-format limits.
 const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
+/// The most a single gzipped file may decompress to and still open as text
+/// (#1469); past it the file stays a hex dump of its gzip bytes.
+const MAX_GUNZIP_BYTES: u64 = 256 * 1024 * 1024;
 /// The colour of a SARIF analysis step drawn after its line (#577).
 const STEP_MARK_COLOR: Color = Color::Rgb(0x4f, 0xc1, 0xff);
 const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
@@ -40,7 +44,7 @@ fn image_dimensions_of(bytes: &[u8]) -> Option<(u32, u32)> {
         .into_dimensions()
         .ok()
 }
-const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp", "ico"];
 
 /// Read-only image preview attached to a tab. Holds the raw file bytes so
 /// the OSC-1337 inline-image bake can re-fit on resize without rereading
@@ -183,6 +187,86 @@ fn render_image_placeholder(
             .bg(theme.ui(Color::Rgb(0x09, 0x4d, 0x77)))
             .add_modifier(Modifier::BOLD),
     );
+}
+
+/// An image drawn with half blocks (#1591): `rows` × `cols` cells, each a
+/// `▀` whose foreground is the upper pixel and background the lower one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CellImage {
+    /// `(image generation, area width, area height, background)`.
+    key: (u64, u16, u16, Color),
+    cols: u16,
+    rows: u16,
+    cells: Vec<(Color, Color)>,
+}
+
+/// Half-block cells as `(columns, rows, (upper, lower) colours)`.
+type HalfBlocks = (u16, u16, Vec<(Color, Color)>);
+
+/// Decode `bytes` and shrink the picture to fit `cols` × `rows` cells, two
+/// pixels a cell, keeping its shape (a cell is about twice as tall as it is
+/// wide, so a half cell is square) and never enlarging it. Transparency is
+/// blended over `bg`. `None` for bytes the decoder refuses or an empty
+/// area. Returns the cells' `(columns, rows, (upper, lower) colours)`.
+fn halfblock_cells(bytes: &[u8], cols: u16, rows: u16, bg: Color) -> Option<HalfBlocks> {
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (iw, ih) = img.dimensions();
+    if iw == 0 || ih == 0 {
+        return None;
+    }
+    let (max_w, max_h) = (u32::from(cols), u32::from(rows) * 2);
+    let scale = (f64::from(max_w) / f64::from(iw))
+        .min(f64::from(max_h) / f64::from(ih))
+        .min(1.0);
+    let w = ((f64::from(iw) * scale).round() as u32).clamp(1, max_w);
+    let h = ((f64::from(ih) * scale).round() as u32).clamp(1, max_h);
+    let small = if (w, h) == (iw, ih) {
+        img
+    } else {
+        image::imageops::resize(&img, w, h, image::imageops::FilterType::Triangle)
+    };
+    let (br, bg_g, bb) = match bg {
+        Color::Rgb(r, g, b) => (r, g, b),
+        _ => (0, 0, 0),
+    };
+    let blend = |p: &image::Rgba<u8>| {
+        let a = u16::from(p[3]);
+        let mix =
+            |c: u8, under: u8| ((u16::from(c) * a + u16::from(under) * (255 - a)) / 255) as u8;
+        Color::Rgb(mix(p[0], br), mix(p[1], bg_g), mix(p[2], bb))
+    };
+    let cell_rows = h.div_ceil(2);
+    let mut cells = Vec::with_capacity((w * cell_rows) as usize);
+    for r in 0..cell_rows {
+        for x in 0..w {
+            let upper = blend(small.get_pixel(x, 2 * r));
+            let lower = if 2 * r + 1 < h {
+                blend(small.get_pixel(x, 2 * r + 1))
+            } else {
+                Color::Rgb(br, bg_g, bb)
+            };
+            cells.push((upper, lower));
+        }
+    }
+    Some((w as u16, cell_rows as u16, cells))
+}
+
+/// Paint `picture` centred in `area`.
+fn paint_cell_image(picture: &CellImage, area: Rect, buf: &mut Buffer) {
+    let x0 = area.x + area.width.saturating_sub(picture.cols) / 2;
+    let y0 = area.y + area.height.saturating_sub(picture.rows) / 2;
+    for r in 0..picture.rows.min(area.height) {
+        for c in 0..picture.cols.min(area.width) {
+            let (upper, lower) =
+                picture.cells[usize::from(r) * usize::from(picture.cols) + usize::from(c)];
+            let cell = &mut buf[(x0 + c, y0 + r)];
+            cell.set_symbol("\u{2580}");
+            cell.set_style(Style::default().fg(upper).bg(lower));
+        }
+    }
 }
 
 /// Resolve one parsed ANSI colour against the active theme, so the rendered
@@ -381,6 +465,7 @@ fn render_log(
                 active_on_line,
                 &[],
                 Some(&cells),
+                None,
                 theme,
             );
         }
@@ -551,8 +636,15 @@ fn render_hex(
                 .fg(theme.ui(Color::Rgb(0xe0, 0x9a, 0x4e)))
                 .bg(bg)
                 .add_modifier(Modifier::BOLD);
+            // A high contrast theme's selection may be pale (High Contrast
+            // Light, #1548): its pure foreground keeps selected bytes legible.
+            let selected_fg = if theme.high_contrast() {
+                theme.ui(Color::White)
+            } else {
+                Color::White
+            };
             let base_style = if selected {
-                Style::default().fg(Color::White).bg(theme.selection())
+                Style::default().fg(selected_fg).bg(theme.selection())
             } else if edited {
                 edited_style
             } else if byte_dim {
@@ -1575,6 +1667,7 @@ fn render_diff(
                     active,
                     &[],
                     None,
+                    None,
                     theme,
                 );
             }
@@ -1593,6 +1686,7 @@ fn render_diff(
                     diff.scroll_x,
                     active,
                     &[],
+                    None,
                     None,
                     theme,
                 );
@@ -2259,7 +2353,8 @@ enum PairAction {
 
 #[derive(Clone, Debug)]
 struct Snapshot {
-    lines: Vec<String>,
+    /// Packed (#1707): a step held as a `Vec<String>` cost twice its text.
+    lines: PackedLines,
     cursor_row: usize,
     cursor_col: usize,
     selection: Option<EditorSelection>,
@@ -2274,8 +2369,13 @@ struct Snapshot {
     /// with it, so a cycle never credits lines to whoever wrote a different
     /// buffer.
     provenance: crate::provenance::Provenance,
-    /// The text this step holds, each line's `String` header included,
-    /// measured once when it is taken (see [`UNDO_BYTES_LIMIT`]).
+    /// The server's fold spans as they stood over this text, with the line
+    /// count they were checked against: a line move rewrites them, so an
+    /// undo must bring back the ones that described the restored text.
+    lsp_folds: Option<Vec<crate::lsp::manager::FoldingRangeItem>>,
+    lsp_folds_lines: usize,
+    /// The bytes this step's text holds, measured once when it is taken
+    /// (see [`UNDO_BYTES_LIMIT`]).
     bytes: usize,
 }
 
@@ -2714,7 +2814,7 @@ pub struct Editor {
     /// HEAD baseline for the git gutter: the committed version's lines. Set by
     /// the app (read off the workspace git root once per file / HEAD change).
     /// `None` when the file is untracked, outside a repo, or not yet fetched.
-    pub git_head_lines: Option<Vec<String>>,
+    pub git_head_lines: Option<PackedLines>,
     /// The path `git_head_lines` was fetched for. The app refetches when this
     /// stops matching `path` (the tab switched files) so the gutter can never
     /// show another file's diff.
@@ -2773,7 +2873,7 @@ pub struct Editor {
     /// by the app off-thread once per (file, HEAD); `None` until fetched or
     /// when blame is disabled. Drives the GitLens-style current-line inline
     /// annotation.
-    pub blame_lines: Option<Vec<crate::git::BlameLine>>,
+    pub blame_lines: Option<crate::git::Blame>,
     /// The path `blame_lines` was fetched for; the app refetches when this
     /// stops matching `path` so blame can never show another file's authors.
     pub blame_for: Option<PathBuf>,
@@ -3044,7 +3144,7 @@ pub struct Editor {
     /// syntax spans by every syntax pass and carried through edits between
     /// passes, never per frame. App-synced from prefs; on by default.
     pub show_bracket_colors: bool,
-    bracket_colors: Vec<Vec<(usize, u8)>>,
+    bracket_colors: BracketColors,
     /// Byte ranges of every string and comment in the buffer (lines joined
     /// by `\n`), from the same highlight pass as `bracket_colors`. Quote
     /// auto-pairing reads it to see a string or block comment an earlier
@@ -3065,6 +3165,13 @@ pub struct Editor {
     /// server resolves one. Rebuilt in `recompute_highlights`, on by default.
     show_color_swatches: bool,
     color_swatches: Vec<Vec<(usize, usize, Color, Color)>>,
+    /// Draw an image tab with half-block cells (#1591): set by the app on a
+    /// terminal with no inline-image protocol (tmux, plain SSH, GNOME
+    /// Terminal), where the header line was all the tab showed.
+    pub cell_images: bool,
+    /// The last half-block rendering, kept until the image, the area or
+    /// the background changes, so a redraw does not decode the file again.
+    cell_image: Option<CellImage>,
     /// Whether the overview ruler paints its whole-file ticks over the
     /// vertical scrollbar track. On by default, like VS Code's; the palette's
     /// `View: Toggle Overview Ruler` turns it off for a plain bar.
@@ -3103,8 +3210,9 @@ pub struct Editor {
     /// the buffer was edited after it started.
     highlight_requests: u64,
     /// The text `highlights` and `bracket_colors` describe, line for line:
-    /// what an edit is diffed against to carry them over.
-    highlight_base: Vec<String>,
+    /// what an edit is diffed against to carry them over. Packed (#1707):
+    /// a second `Vec<String>` of a large file cost twice its text.
+    highlight_base: PackedLines,
     /// How long the last pass took. An edit waits for its pass only when the
     /// last one fit the budget, so a small file still colors each keystroke
     /// in the same frame and a large one never makes it wait.
@@ -3202,6 +3310,9 @@ pub struct Editor {
     /// "current match" highlight. Cleared when the find bar closes or when
     /// the highlight term is cleared.
     pub active_search_match: Option<(usize, usize, usize)>,
+    /// Find in Selection (#1577): while the find bar is limited to a range,
+    /// only matches inside it are highlighted.
+    pub find_range: Option<crate::widgets::editor_find::FindRange>,
     /// Some when this tab is a read-only image preview rather than a text
     /// buffer. The text fields (`lines`, undo, highlights, …) are left in
     /// their default empty state and the renderer paints metadata only;
@@ -3429,6 +3540,8 @@ impl Editor {
             protected_current: false,
             show_color_swatches: true,
             color_swatches: Vec::new(),
+            cell_images: false,
+            cell_image: None,
             whitespace_mode: WhitespaceMode::default(),
             diff_ws_default: crate::widgets::diff::DiffWhitespace::default(),
             inline_values: std::collections::BTreeMap::new(),
@@ -3437,7 +3550,7 @@ impl Editor {
             highlights: Vec::new(),
             highlight_job: None,
             highlight_requests: 0,
-            highlight_base: Vec::new(),
+            highlight_base: PackedLines::default(),
             highlight_cost: std::time::Duration::ZERO,
             highlight_budget: (!cfg!(test)).then_some(HIGHLIGHT_INLINE_BUDGET),
             highlight_generation: 0,
@@ -3465,6 +3578,7 @@ impl Editor {
             search_highlight: None,
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
             active_search_match: None,
+            find_range: None,
             markdown_preview: None,
             md_outputs: crate::markdown::BlockOutputs::new(),
             image: None,
@@ -3998,7 +4112,7 @@ impl Editor {
     /// calls this once per file (and again after HEAD moves) with the
     /// committed version's lines; `None` means untracked / not a repo. Forces
     /// the per-line marks to recompute on the next render.
-    pub fn set_git_head_lines(&mut self, path: PathBuf, head: Option<Vec<String>>) {
+    pub fn set_git_head_lines(&mut self, path: PathBuf, head: Option<PackedLines>) {
         self.git_baseline_for = Some(path);
         self.git_head_lines = head;
         self.git_marks_seq = u64::MAX;
@@ -4006,7 +4120,7 @@ impl Editor {
 
     /// Install (or clear) per-line git blame for `path`. The app fetches this
     /// off-thread once per file and after HEAD moves.
-    pub fn set_blame(&mut self, path: PathBuf, blame: Option<Vec<crate::git::BlameLine>>) {
+    pub fn set_blame(&mut self, path: PathBuf, blame: Option<crate::git::Blame>) {
         self.blame_for = Some(path);
         self.blame_lines = blame;
     }
@@ -4070,25 +4184,21 @@ impl Editor {
         if blame.len() != self.lines.len() {
             return None;
         }
-        let line = blame.get(self.cursor_row)?;
+        let (commit, text) = blame.line(self.cursor_row)?;
         // Same count is not same lines: a cut and paste further down keeps
         // the count and shifts every row between, each then wearing the
         // blame of the line that used to sit there.
-        if line
-            .text
-            .as_ref()
-            .is_some_and(|t| Some(t) != self.lines.get(self.cursor_row))
-        {
+        if text.is_some_and(|t| Some(t) != self.lines.get(self.cursor_row).map(String::as_str)) {
             return None;
         }
-        if line.uncommitted {
+        if commit.uncommitted {
             return Some("Uncommitted changes".to_string());
         }
         Some(format!(
             "{}, {} • {}",
-            line.author,
-            crate::git::humanize_age(line.age_secs),
-            line.summary
+            commit.author,
+            crate::git::humanize_age(commit.age_secs),
+            commit.summary
         ))
     }
 
@@ -4163,7 +4273,8 @@ impl Editor {
         // `build_diff_rows` pairs consecutive delete+insert into `Replaced`, so
         // a bare `Removed` run is a real deletion: attach a `Deleted` marker to
         // the next surviving line (the gutter's deletion boundary, VS Code-style).
-        let rows = crate::widgets::diff::build_diff_rows(head, &self.lines);
+        let head: Vec<&str> = head.iter().collect();
+        let rows = crate::widgets::diff::build_diff_rows(&head, &self.lines);
         let mut pending_delete = false;
         for row in &rows {
             match *row {
@@ -4359,7 +4470,7 @@ impl Editor {
         // Built off the UI thread, and no tick polls a scrubber view: take
         // the whole pass here rather than leaving it to land later.
         e.recompute_highlights_within(None);
-        e.set_git_head_lines(path.to_path_buf(), Some(baseline));
+        e.set_git_head_lines(path.to_path_buf(), Some(PackedLines::from(baseline)));
         // Never edited, so the marks are computed once, here.
         e.refresh_git_marks();
         e.warm_render_caches();
@@ -5061,6 +5172,15 @@ impl Editor {
             // BINARY file opens fine (#172). Only text — which the
             // editor genuinely must hold in memory — keeps the guard.
             let head = read_file_head(path)?;
+            // A gzip is judged by what it decompresses to, not by its own
+            // size (#1469): a 60 MiB rotated log can hold far less than
+            // the decompressed-size cap.
+            if !self.force_text
+                && crate::magic::sniff(&head) == Some(crate::magic::Magic::Gzip)
+                && self.route_gzip(path)
+            {
+                return Ok(());
+            }
             let head_bom_text = encoding_rs::Encoding::for_bom(&head).is_some();
             if !head_bom_text && is_binary(&head) {
                 return self.open_hex(path);
@@ -5118,12 +5238,8 @@ impl Editor {
             // Same shape as the zip arm above: a SIZE refusal is policy,
             // so its reason rides to the hex fallback rather than vanishing.
             Some(crate::magic::Magic::Gzip) => {
-                match self.open_archive(path, crate::archive::ArchiveKind::TarGz) {
-                    Ok(()) => return Ok(()),
-                    Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
-                        self.route_note = Some((path.to_path_buf(), e.to_string()));
-                    }
-                    Err(_) => {}
+                if self.route_gzip(path) {
+                    return Ok(());
                 }
             }
             // A `.tar.xz` under another name (#1645); a plain xz file is not
@@ -5861,6 +5977,102 @@ impl Editor {
         self.provenance.clone()
     }
 
+    /// Route a gzip-magic file: a tar inside opens the archive browser, one
+    /// compressed text file opens as its text (#1469). `false` leaves the
+    /// caller to fall back to hex; a size refusal on either route rides
+    /// along as the route note so the viewer can say why.
+    fn route_gzip(&mut self, path: &Path) -> bool {
+        match self.open_archive(path, crate::archive::ArchiveKind::TarGz) {
+            Ok(()) => return true,
+            Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
+                self.route_note = Some((path.to_path_buf(), e.to_string()));
+                return false;
+            }
+            Err(_) => {}
+        }
+        // Not a tar: one compressed file, such as a rotated `app.log.1.gz`.
+        // Its text opens; binary, or too large once decompressed, stays hex.
+        match self.open_gunzipped(path) {
+            Ok(()) => true,
+            Err(e) => {
+                if e.to_string().contains("too large") {
+                    self.route_note = Some((path.to_path_buf(), e.to_string()));
+                }
+                false
+            }
+        }
+    }
+
+    /// A gzip of one file (#1469), such as logrotate's `app.log.1.gz` or a
+    /// `dump.sql.gz`: its text, decompressed to a scratch copy, in the
+    /// read-only log view, so it reads like the file it was and a save can
+    /// never write the text over the archive. It used to open as a hex dump
+    /// of the gzip bytes. Fails, so the caller falls back to hex, when the
+    /// file does not decompress, holds binary data, or decompresses to more
+    /// than [`MAX_GUNZIP_BYTES`], a bound against a decompression bomb.
+    fn open_gunzipped(&mut self, path: &Path) -> Result<()> {
+        use std::io::{Read, Write};
+        let file = std::fs::File::open(path)?;
+        let mut decoder = flate2::read::MultiGzDecoder::new(std::io::BufReader::new(file))
+            .take(MAX_GUNZIP_BYTES + 1);
+        let mut head = vec![0u8; 8192];
+        let mut filled = 0;
+        while filled < head.len() {
+            match decoder.read(&mut head[filled..])? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        head.truncate(filled);
+        // The log view reads UTF-8 only, so a UTF-16 BOM would render as
+        // NULs and replacement characters: such a payload stays hex.
+        match encoding_rs::Encoding::for_bom(&head) {
+            Some((enc, _)) if enc != encoding_rs::UTF_8 => {
+                anyhow::bail!("not UTF-8 text once decompressed");
+            }
+            Some(_) => {}
+            None if is_binary(&head) => anyhow::bail!("not text once decompressed"),
+            None => {}
+        }
+        let inner = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.strip_suffix(".gz").unwrap_or(n).to_string())
+            .unwrap_or_default();
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            path.hash(&mut h);
+            h.finish()
+        };
+        let scratch = gunzip_scratch_dir()?.join(format!("{key:016x}-{inner}"));
+        // Never follow a link planted at the name: unlink whatever is there
+        // (a link, not its target) and create the file exclusively.
+        match std::fs::remove_file(&scratch) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&scratch)?;
+        out.write_all(&head)?;
+        let written = head.len() as u64 + std::io::copy(&mut decoder, &mut out)?;
+        drop(out);
+        if written > MAX_GUNZIP_BYTES {
+            let _ = std::fs::remove_file(&scratch);
+            anyhow::bail!(
+                "Decompressed file too large to show (over {} MiB)",
+                MAX_GUNZIP_BYTES / (1024 * 1024)
+            );
+        }
+        self.open_log(&scratch)?;
+        self.path = Some(path.to_path_buf());
+        self.disk_stamp = Self::disk_stamp_of(path);
+        self.status = format!("Opened {} decompressed, read-only", path.display());
+        Ok(())
+    }
+
     /// Open `path` as a rendered ANSI log (#257): colours paint through the
     /// theme's palette and escapes never reach the text. Windowed, so the
     /// file is not read whole. Fails (and the caller falls through to the
@@ -6470,7 +6682,7 @@ impl Editor {
             }
             None => {
                 self.highlight_job = None;
-                self.highlight_base = Vec::new();
+                self.highlight_base = PackedLines::default();
                 self.highlights = vec![Vec::new(); self.lines.len()];
                 self.protected_ranges.clear();
                 // No grammar means no string/comment knowledge; brackets in
@@ -6588,7 +6800,7 @@ impl Editor {
         self.highlights = pass.spans;
         self.bracket_colors = pass.brackets;
         // String and comment ranges hold only for the text the pass read.
-        self.protected_current = pass.lines == self.lines;
+        self.protected_current = pass.lines == self.lines[..];
         self.protected_ranges = if self.protected_current {
             pass.protected
         } else {
@@ -6883,7 +7095,12 @@ impl Editor {
     pub fn line_spans_for_test(&self, line: usize) -> Vec<(usize, usize, Style)> {
         self.highlights
             .get(line)
-            .map(|spans| spans.iter().map(|s| (s.start, s.end, s.style)).collect())
+            .map(|spans| {
+                spans
+                    .iter()
+                    .map(|s| (s.range().start, s.range().end, s.style))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -7359,7 +7576,9 @@ impl Editor {
                 .is_none_or(|p| !p.is_alphanumeric() && p != '_' && p != c)
             || (self.lang == Some(LangKind::Python)
                 && is_python_string_prefix(trailing_word(before)));
-        if !next_ok || !prev_ok {
+        // A Rust lifetime or loop label has no closing quote (#1163).
+        let lifetime = c == '\'' && self.lang == Some(LangKind::Rust) && rust_lifetime_at(before);
+        if !next_ok || !prev_ok || lifetime {
             return PairAction::Plain;
         }
         // A quote typed inside a string or comment is text there, or that
@@ -7522,7 +7741,7 @@ impl Editor {
         if self
             .undo_stack
             .last()
-            .is_some_and(|s| s.lines == self.lines)
+            .is_some_and(|s| s.lines == self.lines[..])
         {
             self.undo_stack.pop();
         }
@@ -7573,6 +7792,23 @@ impl Editor {
 
     /// Human label for the buffer's language mode, for the status bar.
     pub fn language_label(&self) -> &'static str {
+        // SCSS, Less and Sass share the CSS grammar but are their own
+        // languages to the reader and to the CSS server (#1532), so the
+        // status bar names them the way VS Code does.
+        if self.lang == Some(LangKind::Css) {
+            let ext = self
+                .path
+                .as_deref()
+                .and_then(|p| p.extension())
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase);
+            match ext.as_deref() {
+                Some("scss") => return "SCSS",
+                Some("less") => return "Less",
+                Some("sass") => return "Sass",
+                _ => {}
+            }
+        }
         language_label(self.lang)
     }
 
@@ -7921,6 +8157,10 @@ impl Editor {
         }
         let row = self.cursor_row;
         let col = self.cursor_col;
+        if let Some(rule) = on_enter_rule(self.lang, &self.lines, row, self.byte_index(row, col)) {
+            self.apply_on_enter(rule);
+            return;
+        }
         let line = self.lines[row].clone();
 
         // Inside a doc comment the new line continues it (#1443).
@@ -7971,6 +8211,29 @@ impl Editor {
             }
             self.cursor_row -= 1;
             self.cursor_col = new_indent.chars().count();
+        }
+    }
+
+    /// Carry out a Markdown Enter rule (#1495). The text after
+    /// the caret moves to the new line behind the continuation, without the
+    /// blanks that separated it from the caret.
+    fn apply_on_enter(&mut self, rule: OnEnter) {
+        let row = self.cursor_row;
+        match rule {
+            OnEnter::EndList => {
+                self.lines[row].clear();
+                self.cursor_col = 0;
+                self.mark_buffer_changed();
+            }
+            OnEnter::Continue(text) => {
+                self.insert_newline_raw();
+                let rest = self.lines[row + 1]
+                    .trim_start_matches([' ', '\t'])
+                    .to_string();
+                self.lines[row + 1] = format!("{text}{rest}");
+                self.cursor_col = text.chars().count();
+                self.mark_buffer_changed();
+            }
         }
     }
 
@@ -9644,11 +9907,8 @@ impl Editor {
     }
 
     fn snapshot(&self) -> Snapshot {
-        let lines = self.lines.clone();
-        let bytes = lines
-            .iter()
-            .map(|l| l.capacity() + std::mem::size_of::<String>())
-            .sum();
+        let lines = PackedLines::from(&self.lines[..]);
+        let bytes = lines.heap_bytes();
         Snapshot {
             lines,
             bytes,
@@ -9659,6 +9919,8 @@ impl Editor {
             dirty: self.dirty,
             save_seq: self.save_seq,
             provenance: self.provenance.clone(),
+            lsp_folds: self.lsp_folds.clone(),
+            lsp_folds_lines: self.lsp_folds_lines,
         }
     }
 
@@ -9751,7 +10013,7 @@ impl Editor {
     /// Replace the buffer state with a snapshot (shared by undo/redo), clamping
     /// the caret into the restored buffer and refreshing highlights.
     fn restore_snapshot(&mut self, snap: Snapshot) {
-        self.lines = snap.lines;
+        self.lines = snap.lines.iter().map(String::from).collect();
         // The map that described this text comes back with it (#349): an
         // undo re-credits the lines it restores to the seats that wrote
         // them, a redo re-credits the edit to its seat. Truncated below to
@@ -9761,6 +10023,8 @@ impl Editor {
             self.lines.push(String::new());
         }
         self.provenance.truncate(self.lines.len());
+        self.lsp_folds = snap.lsp_folds;
+        self.lsp_folds_lines = snap.lsp_folds_lines;
         self.cursor_row = snap.cursor_row.min(self.lines.len().saturating_sub(1));
         self.cursor_col = snap.cursor_col.min(self.line_char_len(self.cursor_row));
         self.selection = snap.selection;
@@ -9971,7 +10235,7 @@ impl Editor {
         if self.has_non_text_view() || self.encoding != encoding {
             return;
         }
-        if before.lines == self.lines {
+        if before.lines == self.lines[..] {
             // Only the stamp moved (`touch`, a formatter with nothing to
             // do): no step that undoes to the same text.
             self.undo_stack = undo;
@@ -10190,6 +10454,21 @@ impl Editor {
             }
         }
         out
+    }
+
+    /// The buffer as `\n`-joined text with the final newline the file has,
+    /// for an external formatter that reads the whole file (#1255).
+    pub fn text_for_formatter(&self) -> String {
+        let mut text = self.lines.join("\n");
+        if self.final_newline && !text.is_empty() {
+            text.push('\n');
+        }
+        text
+    }
+
+    /// Whether the buffer's last line ends in a line break on disk.
+    pub fn has_final_newline(&self) -> bool {
+        self.final_newline
     }
 
     /// The text a save writes: the lines joined with the file's EOL, and
@@ -10760,7 +11039,7 @@ impl Editor {
     /// `EditKind::DuplicateLines`.
     pub fn duplicate_lines_down(&mut self) {
         self.push_undo(EditKind::DuplicateLines);
-        let blocks = self.selected_row_blocks();
+        let blocks = self.selected_row_blocks_over_folds();
         for &(start, end) in blocks.iter().rev() {
             let block: Vec<String> = self.lines[start..=end].to_vec();
             self.lines.splice(end + 1..end + 1, block);
@@ -10779,7 +11058,7 @@ impl Editor {
     /// it started at (the original is pushed down by `block_len`).
     pub fn duplicate_lines_up(&mut self) {
         self.push_undo(EditKind::DuplicateLines);
-        let blocks = self.selected_row_blocks();
+        let blocks = self.selected_row_blocks_over_folds();
         for &(start, end) in blocks.iter().rev() {
             let block: Vec<String> = self.lines[start..=end].to_vec();
             self.lines.splice(start..start, block);
@@ -10827,6 +11106,59 @@ impl Editor {
             })
             .collect();
         merge_row_blocks(rows, true)
+    }
+
+    /// [`Self::selected_row_blocks`], with a block that ends on a folded
+    /// header widened over the lines the fold hides, so Move Line and Copy
+    /// Line take a folded region whole instead of its header alone (#1611).
+    fn selected_row_blocks_over_folds(&self) -> Vec<(usize, usize)> {
+        let rows = self
+            .selected_row_blocks()
+            .into_iter()
+            .map(|(start, end)| (start, self.folded_end(end).unwrap_or(end)))
+            .collect();
+        merge_row_blocks(rows, true)
+    }
+
+    /// The last line `row`'s fold hides, when `row` is a folded header.
+    fn folded_end(&self, row: usize) -> Option<usize> {
+        self.hidden_ranges
+            .iter()
+            .find(|&&(header, _)| header == row)
+            .map(|&(_, end)| end)
+    }
+
+    /// The header of the fold hiding `row`, when a fold hides it.
+    fn folded_header_hiding(&self, row: usize) -> Option<usize> {
+        self.hidden_ranges
+            .iter()
+            .find(|&&(header, end)| header < row && row <= end)
+            .map(|&(header, _)| header)
+    }
+
+    /// Carry the folds through a line move that sent each row `r` to
+    /// `map(r)`: a moved fold stays folded over the same text. `before` is
+    /// the fold set ahead of the move. It replaces what the edit's own fold
+    /// sync made of the move, which follows a header by its text and so
+    /// loses one whose text repeats. The server's spans move too, since a
+    /// move keeps the line count they are checked against; one the move
+    /// split apart is dropped until the next reply.
+    fn move_folds(
+        &mut self,
+        before: std::collections::BTreeSet<usize>,
+        map: impl Fn(usize) -> usize,
+    ) {
+        self.folded = before.into_iter().map(&map).collect();
+        if let Some(spans) = self.lsp_folds.as_mut() {
+            for span in spans.iter_mut() {
+                span.start_line = map(span.start_line);
+                span.end_line = map(span.end_line);
+            }
+            spans.retain(|span| span.start_line < span.end_line);
+        }
+        // The marker and comment table is rebuilt from the moved text.
+        self.refresh_fold_tables();
+        self.rebuild_hidden_ranges();
     }
 
     /// Move the primary caret and selection and every extra caret through
@@ -10931,55 +11263,99 @@ impl Editor {
     /// block with the line below it, carrying the cursor and selection along.
     /// With several carets every caret's block moves. No-op when a block
     /// already touches the last line: all of them move or none does.
+    ///
+    /// A folded region moves as one line and stays folded (#1611): a block
+    /// on a folded header takes the hidden lines with it, and a block above
+    /// a folded header moves below its whole region, never into its body.
     pub fn move_lines_down(&mut self) {
-        let blocks = self.selected_row_blocks();
+        let blocks = self.selected_row_blocks_over_folds();
+        // What each block swaps with: the line below it, or all of a folded
+        // region that starts there.
+        let below: Vec<(usize, usize)> = blocks
+            .iter()
+            .map(|&(_, end)| (end + 1, self.folded_end(end + 1).unwrap_or(end + 1)))
+            .collect();
         // A symbol tab's block stops at the symbol's last line.
         let limit = self.symbol_clip().map_or(self.lines.len(), |(_, e)| e);
-        if blocks.last().is_none_or(|&(_, end)| end + 1 >= limit) {
+        if below.last().is_none_or(|&(_, last)| last >= limit)
+            || below
+                .iter()
+                .zip(blocks.iter().skip(1))
+                .any(|(b, next)| b.1 >= next.0)
+        {
             return;
         }
         self.push_undo(EditKind::MoveLines);
-        for &(start, end) in blocks.iter().rev() {
-            self.forget_folds_in(start, end + 1);
-            self.lines[start..=end + 1].rotate_right(1);
+        let folds = self.folded.clone();
+        for (&(start, end), &(_, last)) in blocks.iter().zip(&below).rev() {
+            self.lines[start..=last].rotate_right(last - end);
         }
-        self.remap_carets(|(r, c)| {
-            let row = match blocks.iter().find(|b| b.0 <= r && r <= b.1 + 1) {
-                // The line below a block swaps up over it.
-                Some(&(start, end)) if r == end + 1 => start,
-                Some(_) => r + 1,
-                None => r,
-            };
-            (row, c)
-        });
+        let map = |r: usize| {
+            for (&(start, end), &(first, last)) in blocks.iter().zip(&below) {
+                if (start..=end).contains(&r) {
+                    return r + (last - end);
+                }
+                // The lines below a block swap up over it.
+                if (first..=last).contains(&r) {
+                    return r - (end - start + 1);
+                }
+            }
+            r
+        };
+        self.remap_carets(|(r, c)| (map(r), c));
         self.mark_buffer_changed();
+        self.move_folds(folds, map);
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
     }
 
     /// VS Code "Move Line Up" (Alt+Up): mirror of `move_lines_down`. No-op
-    /// when a block already touches the first line.
+    /// when a block already touches the first line. A block below a folded
+    /// region moves above all of it (#1611).
     pub fn move_lines_up(&mut self) {
-        let blocks = self.selected_row_blocks();
+        let blocks = self.selected_row_blocks_over_folds();
         let first = self.symbol_clip().map_or(0, |(first, _)| first);
         if blocks.first().is_none_or(|&(start, _)| start <= first) {
             return;
         }
-        self.push_undo(EditKind::MoveLines);
-        for &(start, end) in &blocks {
-            self.forget_folds_in(start - 1, end);
-            self.lines[start - 1..=end].rotate_left(1);
+        // What each block swaps with: the line above it, or all of the
+        // folded region whose hidden lines end there.
+        let above: Vec<(usize, usize)> = blocks
+            .iter()
+            .map(|&(start, _)| {
+                let row = start - 1;
+                (self.folded_header_hiding(row).unwrap_or(row), row)
+            })
+            .collect();
+        if above.first().is_some_and(|&(top, _)| top < first)
+            || above
+                .iter()
+                .skip(1)
+                .zip(&blocks)
+                .any(|(a, prev)| a.0 <= prev.1)
+        {
+            return;
         }
-        self.remap_carets(|(r, c)| {
-            let row = match blocks.iter().find(|b| b.0 <= r + 1 && r <= b.1) {
-                // The line above a block swaps down under it.
-                Some(&(start, end)) if r + 1 == start => end,
-                Some(_) => r - 1,
-                None => r,
-            };
-            (row, c)
-        });
+        self.push_undo(EditKind::MoveLines);
+        let folds = self.folded.clone();
+        for (&(start, end), &(top, _)) in blocks.iter().zip(&above) {
+            self.lines[top..=end].rotate_left(start - top);
+        }
+        let map = |r: usize| {
+            for (&(start, end), &(top, bottom)) in blocks.iter().zip(&above) {
+                if (start..=end).contains(&r) {
+                    return r - (start - top);
+                }
+                // The lines above a block swap down under it.
+                if (top..=bottom).contains(&r) {
+                    return r + (end - start + 1);
+                }
+            }
+            r
+        };
+        self.remap_carets(|(r, c)| (map(r), c));
         self.mark_buffer_changed();
+        self.move_folds(folds, map);
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
     }
@@ -10993,8 +11369,13 @@ impl Editor {
     /// what it did. Returns false (a no-op) for languages with no line
     /// comment.
     pub fn toggle_line_comment(&mut self) -> bool {
-        let Some(token) = line_comment_token(self.lang) else {
-            return false;
+        let Some(token) = self.line_comment_marker() else {
+            // VS Code's fallback for a language with only block comments
+            // (HTML, CSS, Markdown, XML): wrap the lines in one (#1181).
+            return match block_comment_tokens(self.lang) {
+                Some((open, close)) => self.toggle_lines_in_block_comment(open, close),
+                None => false,
+            };
         };
         let blocks = self.selected_row_blocks();
         let non_blank: Vec<usize> = blocks
@@ -11012,7 +11393,7 @@ impl Editor {
             if jsx.contains(&r) {
                 is_jsx_comment(self.lines[r].trim())
             } else {
-                self.lines[r].trim_start().starts_with(token)
+                line_comment_prefix_len(self.lines[r].trim_start(), token).is_some()
             }
         });
         // Each changed row with the char column of its edit and the chars it
@@ -11034,8 +11415,9 @@ impl Editor {
                     continue;
                 }
                 let mut rest = line[off..].to_string();
-                rest.drain(..token.len());
-                let mut removed = token.chars().count();
+                let len = line_comment_prefix_len(&rest, token).unwrap_or(0);
+                let mut removed = rest[..len].chars().count();
+                rest.drain(..len);
                 if rest.starts_with(' ') {
                     rest.drain(..1);
                     removed += 1;
@@ -11086,6 +11468,104 @@ impl Editor {
         self.remap_carets(|(r, c)| match edits.iter().find(|e| e.0 == r) {
             Some(&(_, at, delta)) => (r, shift_col(c, at, delta)),
             None => (r, c),
+        });
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        self.ensure_cursor_col_visible();
+        true
+    }
+
+    /// This buffer's line-comment marker: its language's, or for a file
+    /// croft has no grammar for, the one its name or extension uses
+    /// (#1181).
+    fn line_comment_marker(&self) -> Option<&'static str> {
+        match self.lang {
+            // SCSS and Sass share the CSS grammar but, unlike CSS, have a
+            // `//` line comment, so the file's extension decides.
+            Some(LangKind::Css) | None => {
+                self.path.as_deref().and_then(line_comment_token_for_path)
+            }
+            Some(_) => line_comment_token(self.lang),
+        }
+    }
+
+    /// Whether Toggle Line Comment has any comment to use in this buffer: a
+    /// line comment, or a block comment to wrap the lines in.
+    pub fn has_line_comment_syntax(&self) -> bool {
+        self.line_comment_marker().is_some() || block_comment_tokens(self.lang).is_some()
+    }
+
+    /// Toggle Line Comment where the language has only block comments: each
+    /// block of lines is wrapped in one `open … close` pair, from its first
+    /// non-blank character to its last, or unwrapped when every block
+    /// already is one, as VS Code does (#1181).
+    fn toggle_lines_in_block_comment(&mut self, open: &str, close: &str) -> bool {
+        // Each block's first and last non-blank rows.
+        let spans: Vec<(usize, usize)> = self
+            .selected_row_blocks()
+            .into_iter()
+            .filter_map(|(start, end)| {
+                let blank = |r: &usize| self.lines[*r].trim().is_empty();
+                let first = (start..=end).find(|r| !blank(r))?;
+                let last = (start..=end).rev().find(|r| !blank(r))?;
+                Some((first, last))
+            })
+            .collect();
+        if spans.is_empty() {
+            return false;
+        }
+        let commented = spans.iter().all(|&(first, last)| {
+            let (head, tail) = (self.lines[first].trim_start(), self.lines[last].trim_end());
+            head.starts_with(open)
+                && tail.ends_with(close)
+                && (first != last || head.len() >= open.len() + close.len())
+        });
+        self.push_undo(EditKind::ToggleComment);
+        // Each edit as (row, char column, chars added or, negative, removed),
+        // in the order made: a row's closing edit comes before its opening
+        // one, so each column is still true when its edit is applied.
+        let mut edits: Vec<(usize, usize, isize)> = Vec::with_capacity(spans.len() * 2);
+        for &(first, last) in &spans {
+            let line = &self.lines[last];
+            let end = line.trim_end().len();
+            if commented {
+                let mut cut = end - close.len();
+                if line[..cut].ends_with(' ') {
+                    cut -= 1;
+                }
+                let at = line[..cut].chars().count();
+                let removed = line[cut..end].chars().count();
+                self.lines[last].replace_range(cut..end, "");
+                edits.push((last, at, -(removed as isize)));
+            } else {
+                let at = line[..end].chars().count();
+                let marker = format!(" {close}");
+                self.lines[last].insert_str(end, &marker);
+                edits.push((last, at, marker.chars().count() as isize));
+            }
+            let line = &self.lines[first];
+            let indent = line.len() - line.trim_start().len();
+            let at = line[..indent].chars().count();
+            if commented {
+                let mut cut = indent + open.len();
+                if line[cut..].starts_with(' ') {
+                    cut += 1;
+                }
+                let removed = line[indent..cut].chars().count();
+                self.lines[first].replace_range(indent..cut, "");
+                edits.push((first, at, -(removed as isize)));
+            } else {
+                let marker = format!("{open} ");
+                self.lines[first].insert_str(indent, &marker);
+                edits.push((first, at, marker.chars().count() as isize));
+            }
+        }
+        self.remap_carets(|(r, c)| {
+            let c = edits
+                .iter()
+                .filter(|e| e.0 == r)
+                .fold(c, |c, &(_, at, delta)| shift_col(c, at, delta));
+            (r, c)
         });
         self.mark_buffer_changed();
         self.recompute_highlights();
@@ -11573,20 +12053,47 @@ impl Editor {
         self.lines.get(row)?.chars().nth(col)
     }
 
+    /// Which string or comment each bracket lies in (#1634), from the last
+    /// highlight pass. `None` while the pass is stale or the buffer has no
+    /// grammar: every bracket then counts, as before.
+    fn bracket_zones(&self) -> Option<BracketZones<'_>> {
+        if !self.protected_current || self.protected_ranges.is_empty() {
+            return None;
+        }
+        let mut starts = Vec::with_capacity(self.lines.len());
+        let mut at = 0;
+        for line in &self.lines {
+            starts.push(at);
+            at += line.len() + 1;
+        }
+        Some(BracketZones {
+            lines: &self.lines,
+            starts,
+            ranges: &self.protected_ranges,
+        })
+    }
+
     /// Forward-scan from the opening bracket at `open` to its matching close,
     /// counting nesting of the SAME pair type. Returns the `(row, col)` of the
-    /// closing bracket, or None when unbalanced.
-    fn match_bracket_forward(&self, open: BPos) -> Option<BPos> {
+    /// closing bracket, or None when unbalanced. Brackets in strings and
+    /// comments are text (#1634): they are passed over, and one of them as
+    /// `open` matches nothing, even a balanced `"()"`.
+    fn match_bracket_forward(&self, open: BPos, zones: Option<&BracketZones>) -> Option<BPos> {
         let oc = self.char_at(open.0, open.1)?;
         let cc = matching_close(oc)?;
+        if zones.is_some_and(|z| z.zone(open).is_some()) {
+            return None;
+        }
         let mut depth = 0i32;
         let (mut row, mut col) = open;
         loop {
             match self.char_at(row, col) {
                 Some(ch) => {
-                    if ch == oc {
+                    let counts = (ch == oc || ch == cc)
+                        && zones.is_none_or(|z| z.zone((row, col)).is_none());
+                    if counts && ch == oc {
                         depth += 1;
-                    } else if ch == cc {
+                    } else if counts && ch == cc {
                         depth -= 1;
                         if depth == 0 {
                             return Some((row, col));
@@ -11605,10 +12112,15 @@ impl Editor {
         }
     }
 
-    /// Backward-scan from the closing bracket at `close` to its matching open.
-    fn match_bracket_backward(&self, close: BPos) -> Option<BPos> {
+    /// Backward-scan from the closing bracket at `close` to its matching open,
+    /// passing over brackets in strings and comments, as
+    /// [`Self::match_bracket_forward`] does.
+    fn match_bracket_backward(&self, close: BPos, zones: Option<&BracketZones>) -> Option<BPos> {
         let cc = self.char_at(close.0, close.1)?;
         let oc = matching_open(cc)?;
+        if zones.is_some_and(|z| z.zone(close).is_some()) {
+            return None;
+        }
         let mut depth = 0i32;
         let mut row = close.0;
         let mut col = close.1 as isize;
@@ -11622,9 +12134,11 @@ impl Editor {
                 continue;
             }
             let ch = self.char_at(row, col as usize)?;
-            if ch == cc {
+            let counts = (ch == oc || ch == cc)
+                && zones.is_none_or(|z| z.zone((row, col as usize)).is_none());
+            if counts && ch == cc {
                 depth += 1;
-            } else if ch == oc {
+            } else if counts && ch == oc {
                 depth -= 1;
                 if depth == 0 {
                     return Some((row, col as usize));
@@ -11636,8 +12150,10 @@ impl Editor {
 
     /// The innermost bracket pair enclosing the cursor, found by walking
     /// backwards for the first unmatched opening bracket and matching it
-    /// forwards. Mirrors VS Code's `findEnclosingBrackets`.
-    fn enclosing_brackets(&self) -> Option<(BPos, BPos)> {
+    /// forwards. Mirrors VS Code's `findEnclosingBrackets`. Brackets in
+    /// strings and comments are passed over, so from inside a string this
+    /// finds the pair in code around it.
+    fn enclosing_brackets(&self, zones: Option<&BracketZones>) -> Option<(BPos, BPos)> {
         let mut row = self.cursor_row;
         let mut col = self.cursor_col as isize - 1;
         let mut expected: Vec<char> = Vec::new();
@@ -11651,17 +12167,18 @@ impl Editor {
                 continue;
             }
             let ch = self.char_at(row, col as usize)?;
-            if is_close_bracket(ch) {
+            let pos = (row, col as usize);
+            let in_code = || zones.is_none_or(|z| z.zone(pos).is_none());
+            if is_close_bracket(ch) && in_code() {
                 expected.push(matching_open(ch)?);
-            } else if is_open_bracket(ch) {
+            } else if is_open_bracket(ch) && in_code() {
                 match expected.last() {
                     Some(&want) if want == ch => {
                         expected.pop();
                     }
                     _ => {
-                        let open = (row, col as usize);
-                        let close = self.match_bracket_forward(open)?;
-                        return Some((open, close));
+                        let close = self.match_bracket_forward(pos, zones)?;
+                        return Some((pos, close));
                     }
                 }
             }
@@ -11669,19 +12186,23 @@ impl Editor {
         }
     }
 
-    /// The first bracket pair at or after the cursor (`findNextBracket`).
-    fn next_bracket_pair(&self) -> Option<(BPos, BPos)> {
+    /// The first bracket pair at or after the cursor (`findNextBracket`),
+    /// passing over brackets in strings and comments.
+    fn next_bracket_pair(&self, zones: Option<&BracketZones>) -> Option<(BPos, BPos)> {
         let mut row = self.cursor_row;
         let mut col = self.cursor_col;
         loop {
+            let in_code = zones.is_none_or(|z| z.zone((row, col)).is_none());
             match self.char_at(row, col) {
-                Some(ch) if is_open_bracket(ch) => {
+                Some(ch) if is_open_bracket(ch) && in_code => {
                     let open = (row, col);
-                    return self.match_bracket_forward(open).map(|c| (open, c));
+                    return self.match_bracket_forward(open, zones).map(|c| (open, c));
                 }
-                Some(ch) if is_close_bracket(ch) => {
+                Some(ch) if is_close_bracket(ch) && in_code => {
                     let close = (row, col);
-                    return self.match_bracket_backward(close).map(|o| (o, close));
+                    return self
+                        .match_bracket_backward(close, zones)
+                        .map(|o| (o, close));
                 }
                 Some(_) => col += 1,
                 None => {
@@ -11703,40 +12224,51 @@ impl Editor {
     /// left, then a close to the right; failing all four it falls back to the
     /// enclosing pair, then the next bracket forward.
     fn find_bracket_pair(&self) -> Option<(BPos, BPos, bool)> {
-        if let Some(pair) = self.adjacent_bracket_pair() {
+        let zones = self.bracket_zones();
+        if let Some(pair) = self.adjacent_bracket_pair(zones.as_ref()) {
             return Some(pair);
         }
-        if let Some((open, close)) = self.enclosing_brackets() {
+        if let Some((open, close)) = self.enclosing_brackets(zones.as_ref()) {
             return Some((open, close, false));
         }
-        self.next_bracket_pair().map(|(o, c)| (o, c, false))
+        self.next_bracket_pair(zones.as_ref())
+            .map(|(o, c)| (o, c, false))
     }
 
     /// The bracket pair whose bracket sits immediately to the left or right of
     /// the caret, as `(open, close, anchored_on_close)`. `None` when the caret
     /// touches no bracket. Adjacency priority mirrors VS Code's `matchBracket`:
     /// a close to the left wins, then an open to the right, then an open to the
-    /// left, then a close to the right.
-    fn adjacent_bracket_pair(&self) -> Option<(BPos, BPos, bool)> {
+    /// left, then a close to the right. A bracket in a string or comment
+    /// pairs with nothing.
+    fn adjacent_bracket_pair(&self, zones: Option<&BracketZones>) -> Option<(BPos, BPos, bool)> {
         let row = self.cursor_row;
         let col = self.cursor_col;
         let left = col.checked_sub(1).and_then(|c| self.char_at(row, c));
         let right = self.char_at(row, col);
         if left.is_some_and(is_close_bracket) {
             let close = (row, col - 1);
-            return self.match_bracket_backward(close).map(|o| (o, close, true));
+            return self
+                .match_bracket_backward(close, zones)
+                .map(|o| (o, close, true));
         }
         if right.is_some_and(is_open_bracket) {
             let open = (row, col);
-            return self.match_bracket_forward(open).map(|c| (open, c, false));
+            return self
+                .match_bracket_forward(open, zones)
+                .map(|c| (open, c, false));
         }
         if left.is_some_and(is_open_bracket) {
             let open = (row, col - 1);
-            return self.match_bracket_forward(open).map(|c| (open, c, false));
+            return self
+                .match_bracket_forward(open, zones)
+                .map(|c| (open, c, false));
         }
         if right.is_some_and(is_close_bracket) {
             let close = (row, col);
-            return self.match_bracket_backward(close).map(|o| (o, close, true));
+            return self
+                .match_bracket_backward(close, zones)
+                .map(|o| (o, close, true));
         }
         None
     }
@@ -11746,7 +12278,9 @@ impl Editor {
     /// [`Self::find_bracket_pair`] it never falls back to the enclosing or next
     /// pair, so the highlight appears only when the caret is beside a bracket.
     pub fn bracket_match_pair(&self) -> Option<(BPos, BPos)> {
-        self.adjacent_bracket_pair().map(|(o, c, _)| (o, c))
+        let zones = self.bracket_zones();
+        self.adjacent_bracket_pair(zones.as_ref())
+            .map(|(o, c, _)| (o, c))
     }
 
     /// VS Code "Go to Bracket" (`editor.action.jumpToBracket`, Cmd+Shift+\):
@@ -11788,8 +12322,10 @@ impl Editor {
     /// VS Code increment extensions all copy: bump the number under the
     /// cursor. When the cursor is not inside a number, the next one to its
     /// right on the same line is used, so the caret rarely needs positioning
-    /// precisely. Returns false when the line holds no number at or after
-    /// the cursor, leaving the buffer and the undo stack untouched.
+    /// precisely. With several carets every caret bumps its own number, in
+    /// one undo step, and each caret ends on its number (#1637). Returns
+    /// false when no caret's line holds a number at or after it, leaving the
+    /// buffer and the undo stack untouched.
     ///
     /// Formatting is preserved rather than normalised, because the point is
     /// to edit a literal in place: zero padding keeps its width (`007` ->
@@ -11797,44 +12333,100 @@ impl Editor {
     /// (`0xFF` -> `0x100`, `0Xff` -> `0X100`). Width only grows when the
     /// value needs the room.
     pub fn bump_number(&mut self, delta: i64) -> bool {
-        let row = self.cursor_row;
-        let Some(line) = self.lines.get(row) else {
+        // Every caret's number, read off the buffer before anything changes.
+        // Carets that share a number bump it once, so two carets on `19`
+        // give `20`, not `21`.
+        let all = self.selections_with_primary();
+        let mut owned: Vec<Option<(usize, usize)>> = Vec::with_capacity(all.len());
+        let mut bumps: Vec<(usize, NumberToken, String)> = Vec::new();
+        for s in &all {
+            let (row, col) = s.head;
+            let found = self.lines.get(row).and_then(|line| {
+                let tok = number_token_at_or_after(line, self.byte_index(row, col))?;
+                Some((tok, tok.bumped(line, delta)?))
+            });
+            let Some((tok, replacement)) = found else {
+                owned.push(None);
+                continue;
+            };
+            owned.push(Some((row, tok.start)));
+            if !bumps
+                .iter()
+                .any(|(r, t, _)| *r == row && t.start == tok.start)
+            {
+                bumps.push((row, tok, replacement));
+            }
+        }
+        if bumps.is_empty() {
             return false;
-        };
-        let caret = self.byte_index(row, self.cursor_col);
-        let Some(tok) = number_token_at_or_after(line, caret) else {
-            return false;
-        };
-        let Some(replacement) = tok.bumped(line, delta) else {
-            return false;
-        };
+        }
         // A clamped bump (`0x00` down) finds a number but changes nothing;
         // recording it would dirty a clean buffer and leave an undo step
         // that undoes nothing.
-        if replacement == line[tok.start..tok.end] {
+        bumps.retain(|(row, tok, rep)| *rep != self.lines[*row][tok.start..tok.end]);
+        if bumps.is_empty() {
             return true;
         }
 
         // A real edit from here on: pin a preview tab, or the next preview
         // open reuses it and the bump is lost with it.
         self.pin_on_edit();
+        // One undo step for every caret's bump.
         self.push_undo(EditKind::BumpNumber);
-        self.carets.clear();
         // Never coalesce: a run of bumps must undo one at a time, the way
         // holding Ctrl-A in vim does.
         self.last_edit_kind = None;
-        let line = &mut self.lines[row];
-        line.replace_range(tok.start..tok.end, &replacement);
-        // vim leaves the caret on the number's last digit, which is what
-        // makes a repeated bump keep working on the same literal even as it
-        // grows a digit.
-        let end_byte = tok.start + replacement.len();
-        let last = line[..end_byte]
-            .char_indices()
-            .next_back()
-            .map_or(end_byte, |(i, _)| i);
-        self.cursor_col = line[..last].chars().count();
-        self.selection = None;
+
+        // Where every caret lands, worked out on the text before the edits.
+        // Literals are ASCII, so a bump's growth in bytes is its growth in
+        // chars, and a point moves by what the bumps left of it on its row
+        // added.
+        let char_of =
+            |this: &Self, row: usize, byte: usize| this.lines[row][..byte].chars().count();
+        let growth_before = |this: &Self, row: usize, col: usize| -> isize {
+            bumps
+                .iter()
+                .filter(|(r, t, _)| *r == row && char_of(this, row, t.end) <= col)
+                .map(|(_, t, rep)| rep.len() as isize - (t.end - t.start) as isize)
+                .sum()
+        };
+        let shift = |this: &Self, (row, col): (usize, usize)| {
+            (
+                row,
+                col.saturating_add_signed(growth_before(this, row, col)),
+            )
+        };
+        let moved: Vec<EditorSelection> = all
+            .iter()
+            .zip(&owned)
+            .map(|(s, own)| {
+                let bump = own.and_then(|(row, start)| {
+                    bumps.iter().find(|(r, t, _)| *r == row && t.start == start)
+                });
+                match bump {
+                    // vim leaves the caret on the number's last digit, which
+                    // is what makes a repeated bump keep working on the same
+                    // literal even as it grows a digit.
+                    Some((row, tok, rep)) => {
+                        let start = char_of(self, *row, tok.start);
+                        let (_, start) = shift(self, (*row, start));
+                        EditorSelection::new(*row, start + rep.len().saturating_sub(1))
+                    }
+                    None => EditorSelection {
+                        anchor: shift(self, s.anchor),
+                        head: shift(self, s.head),
+                    },
+                }
+            })
+            .collect();
+
+        // Right to left along each row, so an edit never moves a literal
+        // still waiting for its own.
+        bumps.sort_by(|(ra, ta, _), (rb, tb, _)| (rb, tb.start).cmp(&(ra, ta.start)));
+        for (row, tok, replacement) in &bumps {
+            self.lines[*row].replace_range(tok.start..tok.end, replacement);
+        }
+        self.set_selections(&moved);
         self.mark_buffer_changed();
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
@@ -11948,46 +12540,102 @@ impl Editor {
     /// the one after it and advance the cursor (emacs `transpose-chars`). At
     /// the end of a non-final line the last character moves across the line
     /// break to the start of the next line. At the end of the final line it is
-    /// a no-op.
+    /// a no-op. With several carets each one swaps around itself, in one undo
+    /// step (#1637).
     pub fn transpose_chars(&mut self) {
-        let row = self.cursor_row;
-        let col = self.cursor_col;
+        let all = self.selections_with_primary();
+        let edits = all.iter().any(|s| {
+            let (row, col) = s.head;
+            if col >= self.line_char_len(row) {
+                row + 1 < self.lines.len()
+            } else {
+                col > 0
+            }
+        });
+        // One undo step for every caret's swap.
+        if edits {
+            self.push_undo(EditKind::Transpose);
+        }
+        // Bottom up and right to left: a swap only touches its own row's
+        // chars at its caret, or moves a row's last char to the start of the
+        // next, so every caret still waiting is where it was, and every caret
+        // already done is pinned from its line's end.
+        let mut order: Vec<usize> = (0..all.len()).collect();
+        order.sort_by(|&a, &b| all[b].head.cmp(&all[a].head));
+        // Two carets whose swaps share a character (`ab` with carets after
+        // `a` and after `b`) would each act on text the other already moved:
+        // the second of them, in this order, stays where it is instead.
+        let mut taken: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        let mut pinned = vec![(0, 0); all.len()];
+        for i in order {
+            let head = all[i].head;
+            let cells = self.transpose_cells(head);
+            if cells.iter().any(|c| taken.contains(c)) {
+                pinned[i] = self.pin_from_end(head);
+                continue;
+            }
+            taken.extend(cells);
+            let at = self.transpose_at(head);
+            pinned[i] = self.pin_from_end(at);
+        }
+        let moved: Vec<EditorSelection> = pinned
+            .iter()
+            .map(|&p| {
+                let (row, col) = self.unpin_from_end(p);
+                EditorSelection::new(row, col)
+            })
+            .collect();
+        self.set_selections(&moved);
+        if edits {
+            self.mark_buffer_changed();
+            self.recompute_highlights();
+        }
+        self.ensure_cursor_col_visible();
+    }
+
+    /// The `(row, char col)` cells one caret's Transpose Characters
+    /// changes, in the buffer as it is: the two chars it swaps, or a line's
+    /// last char and the line break it moves across (col = the line's
+    /// length). Empty when it only steps the caret.
+    fn transpose_cells(&self, (row, col): (usize, usize)) -> Vec<(usize, usize)> {
+        let len = self.line_char_len(row);
+        if col >= len {
+            if row + 1 >= self.lines.len() || len == 0 {
+                return Vec::new();
+            }
+            return vec![(row, len - 1), (row, len)];
+        }
+        if col == 0 {
+            return Vec::new();
+        }
+        vec![(row, col - 1), (row, col)]
+    }
+
+    /// One caret's Transpose Characters, returning where that caret goes.
+    fn transpose_at(&mut self, (row, col): (usize, usize)) -> (usize, usize) {
         let len = self.line_char_len(row);
         if col >= len {
             if row + 1 >= self.lines.len() {
-                return;
+                return (row, col);
             }
-            self.push_undo(EditKind::Transpose);
-            if len > 0 {
-                let mut chars: Vec<char> = self.lines[row].chars().collect();
-                let moved = chars.pop().unwrap();
-                self.lines[row] = chars.into_iter().collect();
-                self.lines[row + 1].insert(0, moved);
-                self.cursor_col = 1;
-            } else {
-                self.cursor_col = 0;
+            if len == 0 {
+                return (row + 1, 0);
             }
-            self.cursor_row = row + 1;
-            self.mark_buffer_changed();
-            self.recompute_highlights();
-            self.ensure_cursor_col_visible();
-            return;
+            let mut chars: Vec<char> = self.lines[row].chars().collect();
+            let moved = chars.pop().unwrap();
+            self.lines[row] = chars.into_iter().collect();
+            self.lines[row + 1].insert(0, moved);
+            return (row + 1, 1);
         }
         if col == 0 {
             // VS Code's single-character range at column 1: no swap, just step
             // the cursor right.
-            self.cursor_col = 1;
-            self.ensure_cursor_col_visible();
-            return;
+            return (row, 1);
         }
-        self.push_undo(EditKind::Transpose);
         let mut chars: Vec<char> = self.lines[row].chars().collect();
         chars.swap(col - 1, col);
         self.lines[row] = chars.into_iter().collect();
-        self.cursor_col = col + 1;
-        self.mark_buffer_changed();
-        self.recompute_highlights();
-        self.ensure_cursor_col_visible();
+        (row, col + 1)
     }
 
     /// VS Code "Convert Indentation to Spaces" (`editor.action.indentationToSpaces`):
@@ -12464,14 +13112,60 @@ impl Editor {
         self.last_edit_kind = None;
     }
 
+    /// Start of the logical line (`Ctrl+A`, and Home's second step).
     pub fn home_line(&mut self) {
         self.cursor_col = 0;
         self.last_edit_kind = None;
     }
 
+    /// End of the logical line (`Ctrl+E`, and End's second step).
     pub fn end_line(&mut self) {
         self.cursor_col = self.line_char_len(self.cursor_row);
         self.last_edit_kind = None;
+    }
+
+    /// The Home key. With wrap on (#1569) it first goes to the start of the
+    /// wrapped row the caret is on, as VS Code does, and to the line's start
+    /// from there.
+    pub fn home_key(&mut self) {
+        self.cursor_col = match self.wrapped_row_of_cursor() {
+            // A row can start on a combining mark (the wrap breaks after the
+            // space it sits on), so step back to its cluster's start.
+            Some((start, _)) => match floor_grapheme_col(&self.lines[self.cursor_row], start) {
+                row_start if self.cursor_col > row_start => row_start,
+                _ => 0,
+            },
+            None => 0,
+        };
+        self.last_edit_kind = None;
+    }
+
+    /// The End key. With wrap on (#1569) it first goes to the end of the
+    /// wrapped row the caret is on, before the character the row breaks at
+    /// (the space, usually), since the column after it is drawn on the next
+    /// row; from there, to the line's end.
+    pub fn end_key(&mut self) {
+        let len = self.line_char_len(self.cursor_row);
+        self.cursor_col = match self.wrapped_row_of_cursor() {
+            Some((_, end)) if end < len => {
+                let last = floor_grapheme_col(&self.lines[self.cursor_row], end - 1);
+                if self.cursor_col < last { last } else { len }
+            }
+            _ => len,
+        };
+        self.last_edit_kind = None;
+    }
+
+    /// The `(start, end)` columns of the wrapped row holding the caret, or
+    /// `None` with wrap off.
+    fn wrapped_row_of_cursor(&self) -> Option<(usize, usize)> {
+        if !self.wrap_enabled() {
+            return None;
+        }
+        let width = self.visible_text_width().max(1);
+        let segs = self.line_segments(self.cursor_row, width);
+        let idx = self.segment_index_of_col(self.cursor_row, self.cursor_col, width);
+        segs.get(idx).copied()
     }
 
     /// Scroll an open spreadsheet preview by `rows` (negative scrolls up).
@@ -12789,11 +13483,11 @@ impl Editor {
                 if col >= w {
                     break;
                 }
-                while si < merged.len() && merged[si].end <= byte {
+                while si < merged.len() && merged[si].range().end <= byte {
                     si += 1;
                 }
                 if !ch.is_whitespace() {
-                    let (r, g, b) = if si < merged.len() && merged[si].start <= byte {
+                    let (r, g, b) = if si < merged.len() && merged[si].range().start <= byte {
                         span_rgb(merged[si].style, fg)
                     } else {
                         fg
@@ -13132,7 +13826,9 @@ impl Editor {
     }
 
     /// Severities and messages of every diagnostic whose range covers the
-    /// character position `(line, ch)`. Decoded on demand from the retained
+    /// character position, each message followed by its rule as
+    /// `source(code)` and the rule's link on a line of its own (#1540).
+    /// The position is `(line, ch)`. Decoded on demand from the retained
     /// `diagnostics` (UTF-16 positions) rather than the per-line span cache so
     /// the messages don't have to be duplicated into the render-time cache.
     /// Only runs on a hover dwell, never per frame. A zero-width diagnostic is
@@ -13169,7 +13865,7 @@ impl Editor {
             };
             let to = to.max(from + 1);
             if ch >= from && ch < to {
-                out.push((d.severity, d.message.clone()));
+                out.push((d.severity, message_with_code(d)));
             }
         }
         out
@@ -13211,6 +13907,27 @@ impl Editor {
             }
         }
         None
+    }
+}
+
+/// The string and comment byte ranges of a buffer, with each line's start
+/// offset, so a bracket scan can tell code from text (#1634).
+struct BracketZones<'a> {
+    lines: &'a [String],
+    starts: Vec<usize>,
+    ranges: &'a [(usize, usize)],
+}
+
+impl BracketZones<'_> {
+    /// The string or comment `(row, char col)` lies in, as an index into
+    /// the ranges; `None` in code.
+    fn zone(&self, (row, col): BPos) -> Option<usize> {
+        let byte = self.starts.get(row)? + char_byte(self.lines.get(row)?, col);
+        let i = self.ranges.partition_point(|&(_, end)| end <= byte);
+        self.ranges
+            .get(i)
+            .filter(|&&(start, _)| start <= byte)
+            .map(|_| i)
     }
 }
 
@@ -13414,8 +14131,68 @@ fn line_comment_token(lang: Option<LangKind>) -> Option<&'static str> {
         | Some(LangKind::Dockerfile) => Some("#"),
         Some(LangKind::Java) | Some(LangKind::CSharp) => Some("//"),
         Some(LangKind::Lua) | Some(LangKind::Sql) => Some("--"),
+        // JSONC, which croft's and VS Code's own settings files are: VS
+        // Code's JSON language comments with `//` too.
+        Some(LangKind::Json) => Some("//"),
         _ => None,
     }
+}
+
+/// The line comment of a file croft has no grammar for, by its file name or
+/// extension, as VS Code's language configurations give them (#1181).
+fn line_comment_token_for_path(path: &Path) -> Option<&'static str> {
+    let name = path.file_name()?.to_str()?;
+    if name.starts_with(".env")
+        || matches!(
+            name,
+            ".gitignore"
+                | ".dockerignore"
+                | ".npmignore"
+                | ".prettierignore"
+                | ".gitattributes"
+                | ".editorconfig"
+                | "CODEOWNERS"
+        )
+    {
+        return Some("#");
+    }
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "kt" | "kts" | "swift" | "scala" | "sc" | "dart" | "php" | "groovy" | "gradle"
+        | "jsonc" | "json5" | "proto" | "zig" | "v" | "sv" | "fs" | "fsx" | "scss" | "sass"
+        | "less" => Some("//"),
+        "pl" | "pm" | "r" | "ps1" | "psm1" | "mk" | "conf" | "cfg" | "properties" | "env"
+        | "tf" | "hcl" | "nix" | "jl" | "ex" | "exs" | "cmake" | "gitignore" | "zsh" | "fish"
+        | "awk" | "tcl" | "nim" | "cr" | "graphql" | "gql" => Some("#"),
+        "hs" | "elm" | "ada" | "adb" | "ads" | "vhd" | "vhdl" => Some("--"),
+        "ini" | "clj" | "cljs" | "edn" | "lisp" | "el" | "scm" | "rkt" | "asm" => Some(";"),
+        "tex" | "sty" | "erl" | "hrl" => Some("%"),
+        "vim" => Some("\""),
+        "bat" | "cmd" => Some("@REM"),
+        _ => None,
+    }
+}
+
+/// The byte length of the line comment `token` that `text` (a line with its
+/// indentation trimmed) starts with, or `None` when it is not commented. A
+/// word token (batch's `@REM`) must end at whitespace or the line's end, so
+/// `REMOTE.EXE` is not a comment, and batch's plain `REM` counts too.
+fn line_comment_prefix_len(text: &str, token: &str) -> Option<usize> {
+    let word = |t: &str| {
+        text.starts_with(t)
+            && text[t.len()..]
+                .chars()
+                .next()
+                .is_none_or(char::is_whitespace)
+    };
+    if !token.ends_with(|c: char| c.is_ascii_alphabetic()) {
+        return text.starts_with(token).then_some(token.len());
+    }
+    if word(token) {
+        return Some(token.len());
+    }
+    let plain = token.trim_start_matches('@');
+    (plain != token && word(plain)).then_some(plain.len())
 }
 
 /// The block-comment delimiters for a language (VS Code `blockComment`), or
@@ -13434,7 +14211,9 @@ fn block_comment_tokens(lang: Option<LangKind>) -> Option<(&'static str, &'stati
         | Some(LangKind::Css)
         | Some(LangKind::Ql)
         | Some(LangKind::Dbscheme) => Some(("/*", "*/")),
-        Some(LangKind::Html) | Some(LangKind::Markdown) => Some(("<!--", "-->")),
+        Some(LangKind::Html) | Some(LangKind::Markdown) | Some(LangKind::Xml) => {
+            Some(("<!--", "-->"))
+        }
         Some(LangKind::Lua) => Some(("--[[", "]]")),
         Some(LangKind::Java) | Some(LangKind::CSharp) | Some(LangKind::Sql) => Some(("/*", "*/")),
         // Python has no true block comment; VS Code's language config maps
@@ -13590,7 +14369,14 @@ fn identifier_tokens(line: &str) -> Vec<&str> {
 /// Colour-index marker for an unmatched closing bracket (painted red).
 const UNEXPECTED_BRACKET: u8 = u8::MAX;
 /// Per line, the `(char column, colour index)` of every colored bracket.
-type BracketColors = Vec<Vec<(usize, u8)>>;
+/// The column is a `u32` (#1707): 8 bytes a bracket rather than 16, and no
+/// line the editor holds is four billion characters long.
+type BracketColors = Vec<Vec<(u32, u8)>>;
+
+/// A bracket's char column as [`BracketColors`] holds it.
+fn bracket_col(col: usize) -> u32 {
+    u32::try_from(col).unwrap_or(u32::MAX)
+}
 /// Plain-text buffers above this size skip bracket colorization: a
 /// no-grammar file has no tree-sitter pass absorbing a per-edit full scan,
 /// so typing in a large log must not pay O(total chars) per keystroke.
@@ -13610,13 +14396,13 @@ const BRACKET_COLOR_CYCLE: usize = 3;
 /// nothing — or not the innermost open bracket — marks `UNEXPECTED_BRACKET`
 /// while leaving the stack alone, so `(]` reddens the `]` and a later `)`
 /// still pairs with the `(`.
-fn scan_bracket_colors(lines: &[String], protected: &[(usize, usize)]) -> Vec<Vec<(usize, u8)>> {
+fn scan_bracket_colors<S: AsRef<str>>(lines: &[S], protected: &[(usize, usize)]) -> BracketColors {
     let mut out = vec![Vec::new(); lines.len()];
     let mut stack: Vec<char> = Vec::new();
     let mut abs = 0usize;
     let mut pi = 0usize;
     for (li, line) in lines.iter().enumerate() {
-        for (ci, ch) in line.chars().enumerate() {
+        for (ci, ch) in line.as_ref().chars().enumerate() {
             let b = abs;
             abs += ch.len_utf8();
             while pi < protected.len() && protected[pi].1 <= b {
@@ -13627,7 +14413,7 @@ fn scan_bracket_colors(lines: &[String], protected: &[(usize, usize)]) -> Vec<Ve
             }
             match ch {
                 '(' | '[' | '{' => {
-                    out[li].push((ci, (stack.len() % BRACKET_COLOR_CYCLE) as u8));
+                    out[li].push((bracket_col(ci), (stack.len() % BRACKET_COLOR_CYCLE) as u8));
                     stack.push(ch);
                 }
                 ')' | ']' | '}' => {
@@ -13638,9 +14424,9 @@ fn scan_bracket_colors(lines: &[String], protected: &[(usize, usize)]) -> Vec<Ve
                     };
                     if stack.last() == Some(&want) {
                         stack.pop();
-                        out[li].push((ci, (stack.len() % BRACKET_COLOR_CYCLE) as u8));
+                        out[li].push((bracket_col(ci), (stack.len() % BRACKET_COLOR_CYCLE) as u8));
                     } else {
-                        out[li].push((ci, UNEXPECTED_BRACKET));
+                        out[li].push((bracket_col(ci), UNEXPECTED_BRACKET));
                     }
                 }
                 _ => {}
@@ -13672,7 +14458,7 @@ struct HighlightPass {
     kind: LangKind,
     /// The text highlighted, line for line: the base the result is carried
     /// from when edits landed while it ran.
-    lines: Vec<String>,
+    lines: PackedLines,
     spans: Vec<Vec<HiSpan>>,
     brackets: BracketColors,
     /// Byte ranges of the strings and comments the grammar found (#844).
@@ -13686,17 +14472,21 @@ struct HighlightPass {
 fn run_highlight_pass(kind: LangKind, text: String) -> HighlightPass {
     let started = std::time::Instant::now();
     let line_starts = compute_line_starts(text.as_bytes());
-    let (spans, protected) = crate::highlight::highlight_text_with_protected(
+    let (mut spans, protected) = crate::highlight::highlight_text_with_protected(
         &mut LangRegistry::new(),
         kind,
         text.as_bytes(),
         &line_starts,
     );
-    let lines: Vec<String> = text.split('\n').map(String::from).collect();
-    let brackets = scan_bracket_colors(&lines, &protected);
+    let mut brackets = scan_bracket_colors(&text.split('\n').collect::<Vec<_>>(), &protected);
+    // The result lives as long as the tab (#1707): each line's list grew by
+    // doubling, which left about a third of it spare. Trimmed here, on the
+    // worker, rather than on the UI thread that keeps it.
+    spans.iter_mut().for_each(Vec::shrink_to_fit);
+    brackets.iter_mut().for_each(Vec::shrink_to_fit);
     HighlightPass {
         kind,
-        lines,
+        lines: PackedLines::from_joined(text),
         spans,
         brackets,
         protected,
@@ -13718,7 +14508,7 @@ const CARRY_DIFF_BUDGET: std::time::Duration = std::time::Duration::from_millis(
 /// pass. Every offset stays inside its line and on a char boundary. False
 /// when `base` already matches `lines`.
 fn carry_highlights(
-    base: &mut Vec<String>,
+    base: &mut PackedLines,
     spans: &mut Vec<Vec<HiSpan>>,
     brackets: &mut BracketColors,
     lines: &[String],
@@ -13728,13 +14518,13 @@ fn carry_highlights(
         // Not computed for `base`, so there is nothing sound to carry.
         *spans = vec![Vec::new(); lines.len()];
         *brackets = vec![Vec::new(); lines.len()];
-        *base = lines.to_vec();
+        *base = PackedLines::from(lines);
         return true;
     }
     let prefix = base
         .iter()
         .zip(lines)
-        .take_while(|(old, new)| old == new)
+        .take_while(|(old, new)| *old == new.as_str())
         .count();
     if prefix == base.len() && prefix == lines.len() {
         return false;
@@ -13745,15 +14535,16 @@ fn carry_highlights(
         .rev()
         .zip(lines.iter().rev())
         .take(room)
-        .take_while(|(old, new)| old == new)
+        .take_while(|(old, new)| *old == new.as_str())
         .count();
     let (old_end, new_end) = (base.len() - suffix, lines.len() - suffix);
-    let (old, new) = (&base[prefix..old_end], &lines[prefix..new_end]);
+    let old: Vec<&str> = base.lines_in(prefix..old_end).collect();
+    let new: Vec<&str> = lines[prefix..new_end].iter().map(String::as_str).collect();
     let (old_spans, old_brackets) = (&spans[prefix..old_end], &brackets[prefix..old_end]);
     let ops = similar::capture_diff_slices_deadline(
         similar::Algorithm::Myers,
-        old,
-        new,
+        &old,
+        &new,
         Some(std::time::Instant::now() + CARRY_DIFF_BUDGET),
     );
     let mut mid_spans = Vec::with_capacity(new.len());
@@ -13801,7 +14592,7 @@ fn carry_highlights(
     debug_assert_eq!(mid_spans.len(), new.len());
     spans.splice(prefix..old_end, mid_spans);
     brackets.splice(prefix..old_end, mid_brackets);
-    base.splice(prefix..old_end, new.iter().cloned());
+    base.splice(prefix..old_end, &new);
     true
 }
 
@@ -13815,10 +14606,10 @@ fn carry_highlights(
 /// then re-split at `new`'s line ends. A bracket keeps its colour wherever
 /// the change left it.
 fn carry_changed_lines(
-    old: &[String],
-    new: &[String],
+    old: &[&str],
+    new: &[&str],
     spans: &[Vec<HiSpan>],
-    brackets: &[Vec<(usize, u8)>],
+    brackets: &[Vec<(u32, u8)>],
 ) -> (Vec<Vec<HiSpan>>, BracketColors) {
     let mut out_spans = vec![Vec::new(); new.len()];
     let mut out_brackets = vec![Vec::new(); new.len()];
@@ -13869,11 +14660,12 @@ fn carry_changed_lines(
     let mut old_start = 0usize;
     for (i, line) in old.iter().enumerate() {
         for span in &spans[i] {
-            let end = span.end.min(line.len());
-            if span.start >= end {
+            let end = span.range().end.min(line.len());
+            if span.range().start >= end {
                 continue;
             }
-            let Some((mut from, to)) = carry_span(old_start + span.start, old_start + end) else {
+            let Some((mut from, to)) = carry_span(old_start + span.range().start, old_start + end)
+            else {
                 continue;
             };
             let mut li = line_of(from);
@@ -13881,11 +14673,11 @@ fn carry_changed_lines(
                 let line_start = new_starts[li];
                 let piece_end = to.min(line_start + new[li].len());
                 if piece_end > from {
-                    out_spans[li].push(HiSpan {
-                        start: from - line_start,
-                        end: piece_end - line_start,
-                        style: span.style,
-                    });
+                    out_spans[li].push(HiSpan::new(
+                        from - line_start,
+                        piece_end - line_start,
+                        span.style,
+                    ));
                 }
                 li += 1;
                 if let Some(&next) = new_starts.get(li) {
@@ -13896,7 +14688,7 @@ fn carry_changed_lines(
         // Columns ascend, so one pass over the line's chars finds them all.
         let mut chars = line.char_indices().enumerate();
         for &(col, depth) in &brackets[i] {
-            let Some((_, (byte, _))) = chars.find(|(c, _)| *c == col) else {
+            let Some((_, (byte, _))) = chars.find(|(c, _)| *c == col as usize) else {
                 break;
             };
             let at = old_start + byte;
@@ -13911,7 +14703,7 @@ fn carry_changed_lines(
             }
             cursor.2 += new[li][cursor.1..in_line].chars().count();
             cursor.1 = in_line;
-            out_brackets[li].push((cursor.2, depth));
+            out_brackets[li].push((bracket_col(cursor.2), depth));
         }
         old_start += line.len() + 1;
     }
@@ -14617,6 +15409,122 @@ fn extra_indent_triggered(lang: Option<LangKind>, last_non_ws: Option<char>) -> 
     }
 }
 
+/// What Enter does on a line a per-language rule recognises, in place of
+/// copying the indent (#1495), as the Markdown editors people come from do.
+/// Doc comments (#1443) go through `comment_on_enter`.
+#[derive(Debug, PartialEq, Eq)]
+enum OnEnter {
+    /// Open a new line starting with this text: the indent plus the list
+    /// marker or quote that continues the line.
+    Continue(String),
+    /// Enter on a list item or quote that holds only its marker: clear the
+    /// marker, which ends the list.
+    EndList,
+}
+
+/// The Enter rule for the caret at byte `col` of `lines[row]`, if any.
+fn on_enter_rule(
+    lang: Option<LangKind>,
+    lines: &[String],
+    row: usize,
+    col: usize,
+) -> Option<OnEnter> {
+    let line = lines.get(row)?;
+    match lang? {
+        LangKind::Markdown if !in_markdown_fence(lines, row) => markdown_on_enter(line, col),
+        _ => None,
+    }
+}
+
+/// True when `row` sits inside a fenced code block opened above it. A fence
+/// opens with three or more `` ` `` or `~` and closes only on a line of the
+/// same character, at least as long, with nothing after it.
+fn in_markdown_fence(lines: &[String], row: usize) -> bool {
+    let mut open: Option<(char, usize)> = None;
+    for l in &lines[..row] {
+        let t = l.trim_start();
+        let Some(ch) = t.chars().next().filter(|c| matches!(c, '`' | '~')) else {
+            continue;
+        };
+        let width = t.len() - t.trim_start_matches(ch).len();
+        if width < 3 {
+            continue;
+        }
+        match open {
+            None => open = Some((ch, width)),
+            Some((c, w)) if c == ch && width >= w && t[width..].trim().is_empty() => open = None,
+            Some(_) => {}
+        }
+    }
+    open.is_some()
+}
+
+/// Enter on a Markdown list item, task item or blockquote (#1495): the next
+/// line repeats the indent, the `>` quotes and the marker, with an ordered
+/// number counted on and a task box left unticked. An item that is only its
+/// marker ends the list instead. A caret inside the marker, a thematic break
+/// (`* * *`) or emphasis (`**bold**`) is no list.
+fn markdown_on_enter(line: &str, col: usize) -> Option<OnEnter> {
+    let trimmed = line.trim();
+    if trimmed.len() >= 3
+        && let Some(first) = trimmed.chars().next()
+        && matches!(first, '-' | '*' | '_')
+        && trimmed.chars().all(|c| c == first || c == ' ' || c == '\t')
+    {
+        return None;
+    }
+    let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+    let mut i = indent;
+    let mut quote = String::new();
+    while line[i..].starts_with('>') {
+        quote.push('>');
+        i += 1;
+        if line[i..].starts_with(' ') {
+            quote.push(' ');
+            i += 1;
+        }
+    }
+    let spaced = |at: usize| line[at..].starts_with([' ', '\t']);
+    let rest = &line[i..];
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let mut marker = None;
+    if rest.starts_with(['-', '*', '+']) && spaced(i + 1) {
+        marker = Some(rest[..1].to_string());
+        i += 1;
+    } else if (1..=9).contains(&digits)
+        && rest[digits..].starts_with(['.', ')'])
+        && spaced(i + digits + 1)
+    {
+        let n: u64 = rest[..digits].parse().ok()?;
+        marker = Some(format!("{}{}", n + 1, &rest[digits..=digits]));
+        i += digits + 1;
+    }
+    let mut next = format!("{}{quote}", &line[..indent]);
+    if let Some(marker) = marker {
+        let gap = line[i..].len() - line[i..].trim_start_matches([' ', '\t']).len();
+        next.push_str(&marker);
+        next.push_str(&line[i..i + gap]);
+        i += gap;
+        let after = &line[i..];
+        if matches!(after.get(..3), Some("[ ]" | "[x]" | "[X]"))
+            && (after.len() == 3 || spaced(i + 3))
+        {
+            next.push_str("[ ] ");
+            i += 3;
+            i += line[i..].len() - line[i..].trim_start_matches([' ', '\t']).len();
+        }
+    } else if quote.is_empty() {
+        return None;
+    }
+    if col < i.min(line.trim_end().len()) {
+        return None;
+    }
+    if line[i.min(line.len())..].trim().is_empty() {
+        return Some(OnEnter::EndList);
+    }
+    Some(OnEnter::Continue(next))
+}
+
 /// The indent for the line Enter opens after `prefix` in YAML (#1309).
 /// A key with no value (`services:`), a block scalar (`run: |`) or an open
 /// flow collection (`args: [`) starts a nested block one `unit` deeper. In a
@@ -14640,7 +15548,15 @@ fn yaml_newline_indent(prefix: &str, unit: &str) -> String {
     let Some(colon) = yaml_key_colon(content) else {
         return leading;
     };
-    let value = content[colon + 1..].trim();
+    let mut value = content[colon + 1..].trim();
+    // An anchor or tag (`&defaults`, `!!map`) comes before the node it names,
+    // so `.defaults: &defaults` still opens the mapping below it, as shared
+    // blocks in GitLab CI, compose and Helm values are written.
+    while let Some(prop) = value.split_whitespace().next()
+        && prop.starts_with(['&', '!'])
+    {
+        value = value[prop.len()..].trim_start();
+    }
     let opens_block = value.is_empty()
         || value.ends_with('[')
         || value.ends_with('{')
@@ -14715,6 +15631,38 @@ fn is_bracket_pair_split(lang: Option<LangKind>, prev: Option<char>, next: Optio
         (prev, next),
         (Some('{'), Some('}')) | (Some('['), Some(']')) | (Some('('), Some(')'))
     )
+}
+
+/// The private folder that holds decompressed gzip copies (#1469): one per
+/// user, mode 0700 on unix, and refused unless it is a real directory this
+/// user owns that no one else can enter, so another local user can neither
+/// plant links in it nor read the text written there.
+fn gunzip_scratch_dir() -> std::io::Result<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let dir = std::env::temp_dir().join(format!("croft-gunzip-{uid}"));
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+            _ => {}
+        }
+        let meta = std::fs::symlink_metadata(&dir)?;
+        if !meta.is_dir() || meta.uid() != uid || meta.permissions().mode() & 0o077 != 0 {
+            return Err(std::io::Error::other(format!(
+                "{} is not a private directory",
+                dir.display()
+            )));
+        }
+        Ok(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        let dir = std::env::temp_dir().join("croft-gunzip");
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
 }
 
 /// First 4 KiB of a file (or all of it when shorter): the sample both the
@@ -15058,16 +16006,15 @@ pub(crate) fn normalize_newlines(text: &str) -> String {
 fn shift_spans_for_view(spans: &[HiSpan], byte_start: usize) -> Vec<HiSpan> {
     let mut out = Vec::with_capacity(spans.len());
     for sp in spans {
-        if sp.end <= byte_start {
+        let range = sp.range();
+        if range.end <= byte_start {
             continue;
         }
-        let new_start = sp.start.saturating_sub(byte_start);
-        let new_end = sp.end - byte_start;
-        out.push(HiSpan {
-            start: new_start,
-            end: new_end,
-            style: sp.style,
-        });
+        out.push(HiSpan::new(
+            range.start.saturating_sub(byte_start),
+            range.end - byte_start,
+            sp.style,
+        ));
     }
     out
 }
@@ -15166,14 +16113,15 @@ fn build_line_spans<'a>(line: &'a str, spans: &[HiSpan]) -> Vec<Span<'a>> {
     let mut out: Vec<Span> = Vec::with_capacity(spans.len() * 2);
     let mut cursor = 0usize;
     for sp in spans {
-        if sp.start > cursor && sp.start <= line.len() {
-            let slice = &line[cursor..sp.start];
+        let range = sp.range();
+        if range.start > cursor && range.start <= line.len() {
+            let slice = &line[cursor..range.start];
             if !slice.is_empty() {
                 out.push(Span::raw(slice));
             }
         }
-        let s = sp.start.min(line.len());
-        let e = sp.end.min(line.len());
+        let s = range.start.min(line.len());
+        let e = range.end.min(line.len());
         if e > s {
             out.push(Span::styled(&line[s..e], sp.style));
             cursor = e;
@@ -15250,6 +16198,31 @@ impl Widget for &mut Editor {
                 self.theme,
             );
             render_image_placeholder(image, self.path.as_deref(), inner, buf, ibg, self.theme);
+            if self.cell_images {
+                let area = Rect {
+                    y: inner.y + 1,
+                    height: inner.height.saturating_sub(1),
+                    ..inner
+                };
+                let key = (image.generation, area.width, area.height, ibg);
+                if self.cell_image.as_ref().map(|c| c.key) != Some(key) {
+                    // A body that does not decode (a truncated file whose
+                    // header still gave dimensions) is cached as an empty
+                    // picture too, so each frame does not decode it again.
+                    let (cols, rows, cells) =
+                        halfblock_cells(&image.bytes, area.width, area.height, ibg)
+                            .unwrap_or_default();
+                    self.cell_image = Some(CellImage {
+                        key,
+                        cols,
+                        rows,
+                        cells,
+                    });
+                }
+                if let Some(picture) = self.cell_image.as_ref() {
+                    paint_cell_image(picture, area, buf);
+                }
+            }
             return;
         }
         if let Some(view) = self.sheet.as_mut() {
@@ -15930,13 +16903,7 @@ impl Widget for &mut Editor {
                 // segment so build_line_spans never slices past `visible_raw`.
                 let shifted: Vec<HiSpan> = shift_spans_for_view(&merged, byte_start)
                     .into_iter()
-                    .filter_map(|mut sp| {
-                        if sp.start >= seg_bytes {
-                            return None;
-                        }
-                        sp.end = sp.end.min(seg_bytes);
-                        Some(sp)
-                    })
+                    .filter_map(|sp| sp.clipped(seg_bytes))
                     .collect();
                 let spans = build_line_spans(visible_raw, &shifted);
                 buf.set_line(text_x, y, &Line::from(spans), row_width);
@@ -15985,6 +16952,7 @@ impl Widget for &mut Editor {
                 && let Some(cols) = self.bracket_colors.get(line_idx)
             {
                 for &(c, ci) in cols {
+                    let c = c as usize;
                     if c < row_start {
                         continue;
                     }
@@ -16229,7 +17197,11 @@ impl Widget for &mut Editor {
                 }
             }
 
-            if let Some(term) = self.search_highlight.as_deref() {
+            if let Some(term) = self
+                .search_highlight
+                .as_deref()
+                .filter(|_| find_window(self.find_range, line_idx) != Some((0, 0)))
+            {
                 let active_on_line = self
                     .active_search_match
                     .filter(|(r, _, _)| *r == line_idx)
@@ -16246,6 +17218,7 @@ impl Widget for &mut Editor {
                     active_on_line,
                     &hint_cells,
                     None,
+                    find_window(self.find_range, line_idx),
                     self.theme,
                 );
             }
@@ -16851,13 +17824,7 @@ impl Editor {
         let raw_bytes = raw.len();
         let clamped: Vec<HiSpan> = merged
             .into_iter()
-            .filter_map(|mut sp| {
-                if sp.start >= raw_bytes {
-                    return None;
-                }
-                sp.end = sp.end.min(raw_bytes);
-                Some(sp)
-            })
+            .filter_map(|sp| sp.clipped(raw_bytes))
             .collect();
         let spans = build_line_spans(raw, &clamped);
         buf.set_line(text_x, y, &Line::from(spans), width);
@@ -17054,13 +18021,7 @@ fn inlay_text_segment<'a>(
     let seg_bytes = byte_to - byte_from;
     let shifted: Vec<HiSpan> = shift_spans_for_view(merged, byte_from)
         .into_iter()
-        .filter_map(|mut sp| {
-            if sp.start >= seg_bytes {
-                return None;
-            }
-            sp.end = sp.end.min(seg_bytes);
-            Some(sp)
-        })
+        .filter_map(|sp| sp.clipped(seg_bytes))
         .collect();
     build_line_spans(seg, &shifted)
 }
@@ -17121,6 +18082,7 @@ fn paint_search_highlight(
     active_match_on_line: Option<(usize, usize)>,
     hints: &[(usize, usize)],
     cells: Option<&crate::cell_map::CellMap>,
+    window: Option<(usize, usize)>,
     theme: crate::theme::Theme,
 ) {
     if needle.is_empty() {
@@ -17134,7 +18096,9 @@ fn paint_search_highlight(
     let mut abs_col: usize = 0;
     for (chunk, is_match) in segments {
         let chunk_cols = chunk.chars().count();
-        if is_match {
+        // Find in Selection (#1577): only matches wholly inside the window.
+        let in_window = window.is_none_or(|(lo, hi)| abs_col >= lo && abs_col + chunk_cols <= hi);
+        if is_match && in_window {
             let is_active =
                 active_match_on_line.is_some_and(|(c, l)| c == abs_col && l == chunk_cols);
             let style = if is_active {
@@ -17177,6 +18141,8 @@ fn paint_search_highlight(
         }
     }
 }
+
+use crate::widgets::editor_find::find_window;
 
 /// Paint VS Code-style "selection highlight": a muted blue box over every
 /// occurrence of `needle` on this line. Matches the literal selected text
@@ -17553,6 +18519,47 @@ fn quote_opens_string(before: &str, rest: &str, lang: Option<LangKind>) -> bool 
     true
 }
 
+/// Whether a `'` typed after `before` on a Rust line starts a lifetime or a
+/// loop label, which take no closing quote (#1163): after `<` or `&`
+/// (`impl<'a>`, `&'a str`), `+` (`T + 'static`), `break`, `continue` or
+/// `where`, or after a `,` inside an unclosed `<` (`<'a, 'b>`). Anywhere
+/// else it may open a char literal (`f('x')`, `['a', 'b']`), so it pairs.
+fn rust_lifetime_at(before: &str) -> bool {
+    let before = before.trim_end();
+    match before.chars().next_back() {
+        Some('<') => before[..before.len() - 1]
+            .chars()
+            .next_back()
+            .is_some_and(opens_generics_after),
+        Some('&' | '+') => true,
+        Some(',') => inside_angle_brackets(before),
+        _ => matches!(trailing_word(before), "break" | "continue" | "where"),
+    }
+}
+
+/// Whether a `<` right after `prev` opens generics (`foo<`, `impl<`,
+/// `Vec::<`) rather than comparing (`a < b`): a generic `<` sits right
+/// against a name or `::`.
+fn opens_generics_after(prev: char) -> bool {
+    prev.is_alphanumeric() || prev == '_' || prev == ':'
+}
+
+/// Whether `s` ends inside an unclosed generic `<`, counting `->` and `=>`
+/// as arrows rather than closers and a spaced-out `<` as a comparison.
+fn inside_angle_brackets(s: &str) -> bool {
+    let mut depth = 0i32;
+    let mut prev = ' ';
+    for c in s.chars() {
+        match c {
+            '<' if opens_generics_after(prev) => depth += 1,
+            '>' if prev != '-' && prev != '=' => depth = (depth - 1).max(0),
+            _ => {}
+        }
+        prev = c;
+    }
+    depth > 0
+}
+
 /// Whether a backslash escapes the next character inside a `q`-quoted string
 /// of `lang`. Shell, YAML and TOML single quotes and Go's backtick raw strings
 /// take every character literally.
@@ -17713,6 +18720,21 @@ fn paint_diagnostic_underline(
     }
 }
 
+/// A diagnostic's message for its hover (#1540): VS Code's `source(code)`
+/// after it, and the rule's documentation link below, when the server sent
+/// them.
+fn message_with_code(d: &crate::lsp::manager::Diagnostic) -> String {
+    let Some(code) = &d.code else {
+        return d.message.clone();
+    };
+    let mut text = format!("{}  {}", d.message, code.label(""));
+    if let Some(href) = &code.href {
+        text.push('\n');
+        text.push_str(href);
+    }
+    text
+}
+
 /// Draw a tagged diagnostic's look across `[start_char, end_char)` of a
 /// rendered row (#1522): Unnecessary code (unused, unreachable) faded, as VS
 /// Code draws it at reduced opacity, and Deprecated code struck through. The
@@ -17801,6 +18823,8 @@ pub struct EditorTabs {
     /// pill behind the close `\u{2715}` cell when the pointer rests on it.
     /// `None` when the pointer is off-screen or unknown.
     pub hover_pointer: Option<(u16, u16)>,
+    /// Handed to the active editor each frame: see [`Editor::cell_images`].
+    pub cell_images: bool,
 }
 
 impl EditorTabs {
@@ -17812,6 +18836,7 @@ impl EditorTabs {
             breadcrumbs: Vec::new(),
             breadcrumb_ranges: Vec::new(),
             breadcrumb_y: None,
+            cell_images: false,
             tab_screen_ranges: Vec::new(),
             tab_close_x: Vec::new(),
             tab_strip_y: 0,
@@ -18914,6 +19939,22 @@ impl DerefMut for EditorTabs {
 const TAB_INACTIVE_FG: Color = Color::Rgb(0x9d, 0xa5, 0xb4);
 const TAB_ACTIVE_FG: Color = Color::White;
 
+/// Ink for the tab close/pin glyph on its hover pill: white, except that a
+/// high contrast theme (#1548) takes whichever of black or white reads
+/// better on its pill (black on High Contrast's orange).
+fn close_pill_fg(theme: crate::theme::Theme, pill: Color) -> Color {
+    match pill {
+        Color::Rgb(r, g, b)
+            if theme.high_contrast()
+                && crate::theme::contrast_ratio((r, g, b), (0, 0, 0))
+                    > crate::theme::contrast_ratio((r, g, b), (0xff, 0xff, 0xff)) =>
+        {
+            Color::Black
+        }
+        _ => Color::White,
+    }
+}
+
 impl Widget for &mut EditorTabs {
     fn render(self, area: Rect, buf: &mut Buffer) {
         self.last_full_area = area;
@@ -19032,6 +20073,14 @@ impl Widget for &mut EditorTabs {
             } else {
                 TAB_INACTIVE_FG
             };
+            // A high contrast theme resolves the label greys to its pure
+            // foreground (#1548): white on High Contrast Light's pale active
+            // tab would be unreadable.
+            let fg = if theme.high_contrast() {
+                theme.ui(fg)
+            } else {
+                fg
+            };
             let mut modifiers = Modifier::empty();
             if is_active {
                 modifiers |= Modifier::BOLD;
@@ -19055,7 +20104,7 @@ impl Widget for &mut EditorTabs {
                     strip.y,
                     close_glyph,
                     Style::default()
-                        .fg(Color::White)
+                        .fg(close_pill_fg(theme, pill_bg))
                         .bg(pill_bg)
                         .add_modifier(Modifier::BOLD),
                 );
@@ -19126,6 +20175,7 @@ impl Widget for &mut EditorTabs {
 
         self.last_body = body;
         let active_editor = &mut self.editors[active];
+        active_editor.cell_images = self.cell_images;
         Widget::render(active_editor, body, buf);
     }
 }
@@ -19141,6 +20191,26 @@ impl EditorTabs {
             .iter()
             .find(|&&(x, w, _)| col >= x && col < x + w)
             .and_then(|&(_, _, target)| target)
+    }
+
+    /// The index in `breadcrumbs` of the crumb drawn under `(col, row)`,
+    /// path or symbol alike (#1608).
+    pub fn breadcrumb_index_at(&self, col: u16, row: u16) -> Option<usize> {
+        if self.breadcrumb_y != Some(row) {
+            return None;
+        }
+        self.breadcrumb_ranges
+            .iter()
+            .position(|&(x, w, _)| col >= x && col < x + w)
+    }
+
+    /// Where crumb `i`'s picker opens: the row under the bar, at the
+    /// crumb's first cell. `None` while the bar is hidden or the crumb did
+    /// not fit on it.
+    pub fn breadcrumb_anchor(&self, i: usize) -> Option<(u16, u16)> {
+        let y = self.breadcrumb_y?;
+        let &(x, _, _) = self.breadcrumb_ranges.get(i)?;
+        Some((x, y + 1))
     }
 }
 
@@ -19396,15 +20466,19 @@ mod tests {
         summary: &str,
         age: i64,
         uncommitted: bool,
-    ) -> crate::git::BlameLine {
-        crate::git::BlameLine {
+    ) -> std::sync::Arc<crate::git::BlameCommit> {
+        std::sync::Arc::new(crate::git::BlameCommit {
             short_hash: "abc12345".into(),
             summary: summary.into(),
             author: author.into(),
             age_secs: age,
             uncommitted,
-            text: None,
-        }
+        })
+    }
+
+    /// Blame for lines whose text as blamed is not known.
+    fn blame_of(commits: Vec<std::sync::Arc<crate::git::BlameCommit>>) -> crate::git::Blame {
+        crate::git::Blame::new(commits, None)
     }
 
     #[test]
@@ -19651,10 +20725,10 @@ mod tests {
         e.path = Some(PathBuf::from("f.rs"));
         e.set_blame(
             PathBuf::from("f.rs"),
-            Some(vec![
+            Some(blame_of(vec![
                 blame_line("Vitali", "fix: the thing", 90, false),
                 blame_line("Alice", "feat: two", 7200, false),
-            ]),
+            ])),
         );
         e.cursor_row = 0;
         assert_eq!(
@@ -19672,17 +20746,13 @@ mod tests {
     fn blame_is_not_shown_on_a_row_that_holds_another_lines_text() {
         let mut e = editor_with("one\ntwo\nthree\n");
         e.path = Some(PathBuf::from("f.rs"));
-        let with_text = |author: &str, text: &str| crate::git::BlameLine {
-            text: Some(text.into()),
-            ..blame_line(author, "s", 90, false)
-        };
+        let commits = ["A", "B", "C"].map(|author| blame_line(author, "s", 90, false));
         e.set_blame(
             PathBuf::from("f.rs"),
-            Some(vec![
-                with_text("A", "one"),
-                with_text("B", "two"),
-                with_text("C", "three"),
-            ]),
+            Some(crate::git::Blame::new(
+                commits.to_vec(),
+                Some(PackedLines::from(&["one", "two", "three"][..])),
+            )),
         );
         // A cut and paste that keeps the count: `one` moved to the end.
         e.lines = vec!["two".into(), "three".into(), "one".into()];
@@ -19696,7 +20766,12 @@ mod tests {
         e.path = Some(PathBuf::from("f.rs"));
         e.set_blame(
             PathBuf::from("f.rs"),
-            Some(vec![blame_line("Not Committed Yet", "x", 0, true)]),
+            Some(blame_of(vec![blame_line(
+                "Not Committed Yet",
+                "x",
+                0,
+                true,
+            )])),
         );
         e.cursor_row = 0;
         assert_eq!(
@@ -19713,7 +20788,7 @@ mod tests {
         assert!(e.current_line_blame_annotation().is_none());
         e.set_blame(
             PathBuf::from("f.rs"),
-            Some(vec![blame_line("V", "s", 5, false)]),
+            Some(blame_of(vec![blame_line("V", "s", 5, false)])),
         );
         e.blame_enabled = false;
         assert!(
@@ -19735,10 +20810,10 @@ mod tests {
         e.path = Some(PathBuf::from("a.rs"));
         e.set_blame(
             PathBuf::from("a.rs"),
-            Some(vec![
+            Some(blame_of(vec![
                 blame_line("Alice", "s", 5, false),
                 blame_line("Alice", "s", 5, false),
-            ]),
+            ])),
         );
         e.path = Some(PathBuf::from("b.rs"));
         assert!(
@@ -20904,8 +21979,8 @@ mod tests {
         e
     }
 
-    fn head(lines: &[&str]) -> Option<Vec<String>> {
-        Some(lines.iter().map(|s| s.to_string()).collect())
+    fn head(lines: &[&str]) -> Option<PackedLines> {
+        Some(PackedLines::from(lines))
     }
 
     #[test]
@@ -21018,10 +22093,10 @@ mod tests {
         e.path = Some(PathBuf::from("f.rs"));
         e.set_blame(
             PathBuf::from("f.rs"),
-            Some(vec![
+            Some(blame_of(vec![
                 blame_line("Vitali", "fix: the thing", 90, false),
                 blame_line("Alice", "feat: two", 7200, false),
-            ]),
+            ])),
         );
         e.provenance
             .record(0..1, Seat::Agent(String::from("pane 2")));
@@ -21210,6 +22285,43 @@ mod tests {
             view.layout.data_rows > 0,
             "layout written back for mouse hit-testing"
         );
+    }
+
+    /// #1548: on High Contrast Light the hex editor's selected bytes are
+    /// black on the pale selection, not white; other themes keep white.
+    #[test]
+    fn hex_selected_bytes_use_a_readable_ink_on_high_contrast_light() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("blob.bin");
+        std::fs::write(&p, (0u8..32).collect::<Vec<_>>()).unwrap();
+        for (id, want) in [
+            ("hc-light", Color::Rgb(0, 0, 0)),
+            ("hc-black", Color::Rgb(0xff, 0xff, 0xff)),
+            ("dark", Color::White),
+        ] {
+            let mut ed = Editor::new();
+            ed.theme = crate::theme::Theme::from_id(id);
+            ed.open(&p).unwrap();
+            {
+                let view = ed.hex.as_mut().unwrap();
+                view.sel_anchor = Some(0);
+                view.cursor = 3;
+            }
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width: 92,
+                height: 12,
+            };
+            let mut buf = ratatui::buffer::Buffer::empty(area);
+            ratatui::widgets::Widget::render(&mut ed, area, &mut buf);
+            let l = ed.hex.as_ref().unwrap().layout;
+            // Byte 1 is selected and is not the cursor.
+            let cell = &buf[(l.hex_x + 3, l.data_top)];
+            assert_eq!(cell.symbol(), "0", "{id}: byte 1's hex cell");
+            assert_eq!(cell.fg, want, "{id}: selected byte ink");
+            assert_eq!(cell.bg, ed.theme.selection(), "{id}: selection fill");
+        }
     }
 
     #[test]
@@ -21940,6 +23052,175 @@ mod tests {
         assert!(e.sheet.is_none() && e.hex.is_none());
     }
 
+    fn gzip_to(path: &Path, data: &[u8]) {
+        use std::io::Write as _;
+        let mut gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(path).unwrap(),
+            flate2::Compression::fast(),
+        );
+        gz.write_all(data).unwrap();
+        gz.finish().unwrap();
+    }
+
+    fn log_lines(e: &mut Editor, n: usize) -> Vec<String> {
+        let view = e.log.as_mut().expect("the log view");
+        view.ensure(0, n).unwrap();
+        (0..n)
+            .filter_map(|i| view.visible_text(i).map(str::to_string))
+            .collect()
+    }
+
+    /// #1469: a rotated log, gzipped alone, opens as its text, read-only,
+    /// under its own name; it opened as a hex dump of the gzip bytes.
+    #[test]
+    fn a_gzipped_log_opens_as_its_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gz = tmp.path().join("app.log.1.gz");
+        gzip_to(&gz, b"2026-10-04 INFO request id=1\n2026-10-04 WARN slow\n");
+        let mut e = Editor::new();
+        e.open(&gz).unwrap();
+        assert!(e.hex.is_none(), "not hex");
+        assert_eq!(e.path.as_deref(), Some(gz.as_path()), "the tab is the .gz");
+        assert_eq!(
+            log_lines(&mut e, 2),
+            ["2026-10-04 INFO request id=1", "2026-10-04 WARN slow"]
+        );
+        assert!(e.status.contains("read-only"), "{}", e.status);
+    }
+
+    /// #1469: any text compresses the same way: a `data.json.gz` opens as
+    /// its JSON.
+    #[test]
+    fn a_gzipped_json_file_opens_as_its_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gz = tmp.path().join("data.json.gz");
+        gzip_to(&gz, b"{\"a\": 1}\n");
+        let mut e = Editor::new();
+        e.open(&gz).unwrap();
+        assert_eq!(log_lines(&mut e, 1), ["{\"a\": 1}"]);
+    }
+
+    /// #1469 negative: the decompressed text is never saved over the
+    /// archive, and the .gz on disk is unchanged.
+    #[test]
+    fn a_gunzipped_tab_is_never_saved_over_the_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gz = tmp.path().join("dump.sql.gz");
+        gzip_to(&gz, b"select 1;\n");
+        let before = std::fs::read(&gz).unwrap();
+        let mut e = Editor::new();
+        e.open(&gz).unwrap();
+        assert!(
+            e.save_to_disk_force().is_err(),
+            "a read-only view saves nothing"
+        );
+        assert_eq!(std::fs::read(&gz).unwrap(), before);
+    }
+
+    /// #1469 negative: a gzip of binary data stays a hex dump, and a tar.gz
+    /// still opens the archive browser.
+    #[test]
+    fn binary_gzip_stays_hex_and_a_tar_gz_stays_an_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("blob.bin.gz");
+        gzip_to(&bin, &[0u8, 1, 2, 3, 0, 0, 0xff, 0xfe, 0, 7]);
+        let mut e = Editor::new();
+        e.open(&bin).unwrap();
+        assert!(e.hex.is_some() && e.log.is_none());
+
+        let tgz = tmp.path().join("bundle.gz");
+        let gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(&tgz).unwrap(),
+            flate2::Compression::fast(),
+        );
+        let mut t = tar::Builder::new(gz);
+        let data = b"tar payload";
+        let mut hdr = tar::Header::new_gnu();
+        hdr.set_size(data.len() as u64);
+        hdr.set_mode(0o644);
+        hdr.set_cksum();
+        t.append_data(&mut hdr, "inner/file.txt", &data[..])
+            .unwrap();
+        t.into_inner().unwrap().finish().unwrap();
+        let mut e = Editor::new();
+        e.open(&tgz).unwrap();
+        assert!(e.archive.is_some() && e.log.is_none());
+    }
+
+    /// #1469 review: a UTF-16 payload, which the UTF-8 log view would
+    /// render as NULs and replacement characters, stays hex.
+    #[test]
+    fn a_gzipped_utf16_file_stays_hex() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gz = tmp.path().join("notes.txt.gz");
+        let mut data = vec![0xff, 0xfe];
+        for u in "hello\n".encode_utf16() {
+            data.extend_from_slice(&u.to_le_bytes());
+        }
+        gzip_to(&gz, &data);
+        let mut e = Editor::new();
+        e.open(&gz).unwrap();
+        assert!(e.hex.is_some() && e.log.is_none());
+    }
+
+    /// #1469 review: a gzip larger than the in-memory text cap still opens
+    /// as its text when it decompresses under the gunzip cap; the size
+    /// guard used to send it to hex before the gzip route ran.
+    #[test]
+    fn a_gzip_past_the_text_cap_still_opens_as_its_text() {
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let gz = tmp.path().join("big.log.gz");
+        let mut enc = flate2::write::GzEncoder::new(
+            std::fs::File::create(&gz).unwrap(),
+            flate2::Compression::none(),
+        );
+        let line = b"2026-10-04 INFO a line of a big rotated log\n";
+        let mut written = 0u64;
+        while written <= MAX_FILE_BYTES {
+            enc.write_all(line).unwrap();
+            written += line.len() as u64;
+        }
+        enc.finish().unwrap();
+        assert!(std::fs::metadata(&gz).unwrap().len() > MAX_FILE_BYTES);
+        let mut e = Editor::new();
+        e.open(&gz).unwrap();
+        assert!(e.hex.is_none(), "not hex");
+        assert_eq!(
+            log_lines(&mut e, 1),
+            ["2026-10-04 INFO a line of a big rotated log"]
+        );
+    }
+
+    /// #1469 review: a link planted at the scratch name is replaced, never
+    /// followed, so opening a gzip cannot overwrite the link's target.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_planted_at_the_gunzip_scratch_name_is_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gz = tmp.path().join("planted.log.gz");
+        gzip_to(&gz, b"decompressed text\n");
+        let victim = tmp.path().join("victim.txt");
+        std::fs::write(&victim, b"keep me").unwrap();
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            gz.as_path().hash(&mut h);
+            h.finish()
+        };
+        let scratch = gunzip_scratch_dir()
+            .unwrap()
+            .join(format!("{key:016x}-planted.log"));
+        let _ = std::fs::remove_file(&scratch);
+        std::os::unix::fs::symlink(&victim, &scratch).unwrap();
+        let mut e = Editor::new();
+        e.open(&gz).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
+        assert!(!std::fs::symlink_metadata(&scratch).unwrap().is_symlink());
+        assert_eq!(log_lines(&mut e, 1), ["decompressed text"]);
+        let _ = std::fs::remove_file(&scratch);
+    }
+
     #[test]
     fn preview_openers_supersede_a_diff_view_and_its_arrow_rects() {
         // #187 review: only `open`'s TEXT tail cleared `diff`, and the
@@ -22094,6 +23375,7 @@ mod tests {
             severity,
             message: String::from("test diagnostic"),
             tags: Default::default(),
+            code: None,
         }
     }
 
@@ -22251,7 +23533,7 @@ mod tests {
         // A HEAD baseline that differs from the buffer on known lines.
         let mut head: Vec<String> = (1..=100).map(|i| format!("line {i}")).collect();
         head[10] = String::from("line 11 as committed");
-        e.git_head_lines = Some(head);
+        e.git_head_lines = Some(PackedLines::from(head));
         e.git_baseline_for = e.path.clone();
         let rows = e.overview_ruler_rows(100);
         assert_eq!(
@@ -22499,6 +23781,7 @@ mod tests {
                 severity: DiagnosticSeverity::Error,
                 message: String::from("Type 'number' is not assignable to type 'string'."),
                 tags: Default::default(),
+                code: None,
             }],
         );
         assert_eq!(
@@ -22512,6 +23795,58 @@ mod tests {
         assert!(
             e.diagnostics_at(0, 0).is_empty(),
             "a point outside every diagnostic range must surface nothing"
+        );
+    }
+
+    /// #1540: the hover message carries the rule as `source(code)` and its
+    /// link on the next line; a diagnostic without a code reads as before.
+    #[test]
+    fn diagnostics_at_adds_the_rule_code_and_its_link() {
+        let mut e = editor_with("import os, json");
+        e.path = Some(PathBuf::from("/tmp/app.py"));
+        let diag = |start: u32, end: u32, message: &str, code| crate::lsp::manager::Diagnostic {
+            start_line: 0,
+            start_char: start,
+            end_line: 0,
+            end_char: end,
+            severity: crate::lsp::manager::DiagnosticSeverity::Warning,
+            message: message.into(),
+            tags: Default::default(),
+            code,
+        };
+        e.apply_diagnostics(
+            PathBuf::from("/tmp/app.py"),
+            vec![
+                diag(
+                    7,
+                    9,
+                    "`os` imported but unused",
+                    Some(crate::lsp::manager::DiagnosticCode {
+                        value: String::from("F401"),
+                        source: Some(String::from("Ruff")),
+                        href: Some(String::from(
+                            "https://docs.astral.sh/ruff/rules/unused-import",
+                        )),
+                    }),
+                ),
+                diag(11, 15, "`json` is unused", None),
+            ],
+        );
+        assert_eq!(
+            e.diagnostics_at(0, 8),
+            vec![(
+                crate::lsp::manager::DiagnosticSeverity::Warning,
+                String::from(
+                    "`os` imported but unused  Ruff(F401)\nhttps://docs.astral.sh/ruff/rules/unused-import"
+                )
+            )]
+        );
+        assert_eq!(
+            e.diagnostics_at(0, 12),
+            vec![(
+                crate::lsp::manager::DiagnosticSeverity::Warning,
+                String::from("`json` is unused")
+            )]
         );
     }
 
@@ -22531,6 +23866,7 @@ mod tests {
                 severity: DiagnosticSeverity::Warning,
                 message: String::from("missing semicolon"),
                 tags: Default::default(),
+                code: None,
             }],
         );
         assert_eq!(
@@ -22560,6 +23896,7 @@ mod tests {
                 severity: DiagnosticSeverity::Error,
                 message: String::from("unexpected token"),
                 tags: Default::default(),
+                code: None,
             }],
         );
         assert_eq!(
@@ -25067,6 +26404,28 @@ mod tests {
         assert_eq!(small.undo_stack.len(), 40);
     }
 
+    /// An undo step holds the buffer's text packed (#1707): about the text's
+    /// own size, not the ~45 bytes a line more a `Vec<String>` copy took.
+    #[test]
+    fn an_undo_step_holds_about_its_texts_size() {
+        let text: String = (0..1000).map(|i| format!("line {i}\n")).collect();
+        let mut e = editor_with(&text);
+        e.push_undo(EditKind::Paste);
+        let held = e.undo_stack[0].bytes;
+        let text_bytes: usize = e.lines.iter().map(|l| l.len() + 1).sum();
+        assert!(
+            held <= text_bytes + 8 * e.lines.len(),
+            "{held} bytes held for {text_bytes} bytes of text"
+        );
+        e.lines[0] = String::from("changed");
+        assert!(e.undo());
+        assert_eq!(
+            e.lines,
+            text.lines().collect::<Vec<_>>(),
+            "and undoes to it"
+        );
+    }
+
     #[test]
     fn redo_reapplies_an_undone_edit() {
         let mut e = editor_with("");
@@ -25252,6 +26611,27 @@ mod tests {
     }
 
     #[test]
+    fn yaml_enter_after_an_anchored_or_tagged_key_indents_one_step() {
+        // #1309: the anchor names the mapping typed below it.
+        assert_eq!(yaml_enter(".defaults: &defaults"), "  ");
+        assert_eq!(yaml_enter("x-common: &common  # shared"), "  ");
+        assert_eq!(yaml_enter("  data: !!map"), "    ");
+        assert_eq!(yaml_enter("base: &a !!map"), "  ");
+        assert_eq!(yaml_enter("script: &steps |"), "  ");
+        assert_eq!(yaml_enter("- step: &s"), "    ");
+    }
+
+    #[test]
+    fn yaml_enter_after_an_anchored_or_tagged_value_keeps_the_indent() {
+        // Negative: the anchor or tag is on a value already written, and an
+        // alias is a value.
+        assert_eq!(yaml_enter("image: &img python:3.12"), "");
+        assert_eq!(yaml_enter("  port: !!int 80"), "  ");
+        assert_eq!(yaml_enter("<<: *defaults"), "");
+        assert_eq!(yaml_enter("name: a&b"), "");
+    }
+
+    #[test]
     fn yaml_enter_in_a_list_item_lines_up_with_the_item_content() {
         assert_eq!(yaml_enter("  - name: x"), "    ");
         assert_eq!(yaml_enter("- name:"), "    ");
@@ -25269,6 +26649,183 @@ mod tests {
         assert_eq!(yaml_enter("  note: 'ends with a colon:'"), "  ");
         assert_eq!(yaml_enter("# todo:"), "");
         assert_eq!(yaml_enter("cmd: echo hi # really:"), "");
+    }
+
+    /// Enter at byte-and-char column `col` of row `row` in `text`; returns
+    /// the lines and the caret.
+    fn enter_in(
+        lang: LangKind,
+        text: &str,
+        row: usize,
+        col: usize,
+    ) -> (Vec<String>, (usize, usize)) {
+        let mut e = editor_with(text);
+        e.lang = Some(lang);
+        e.cursor_row = row;
+        e.cursor_col = col;
+        e.insert_newline();
+        (e.lines.clone(), (e.cursor_row, e.cursor_col))
+    }
+
+    /// Enter at the end of a one-line Markdown buffer; returns the new line
+    /// and checks the caret ends it.
+    fn md_enter(line: &str) -> String {
+        let (lines, caret) = enter_in(LangKind::Markdown, line, 0, line.chars().count());
+        assert_eq!(lines.len(), 2, "one new line for {line:?}: {lines:?}");
+        assert_eq!(lines[0], line);
+        assert_eq!(caret, (1, lines[1].chars().count()), "{line:?}");
+        lines[1].clone()
+    }
+
+    // #1495: Enter after a Markdown list item, task item or quote starts the
+    // next one, as GitHub, Obsidian and VS Code's Markdown All in One do.
+    #[test]
+    fn markdown_enter_continues_bullets_numbers_tasks_and_quotes() {
+        assert_eq!(md_enter("- first"), "- ");
+        assert_eq!(md_enter("* a"), "* ");
+        assert_eq!(md_enter("  + nested"), "  + ");
+        assert_eq!(md_enter("1. one"), "2. ");
+        assert_eq!(md_enter("9) nine"), "10) ");
+        assert_eq!(md_enter("3.  wide gap"), "4.  ");
+        assert_eq!(md_enter("- [x] done"), "- [ ] ");
+        assert_eq!(md_enter("- [ ] todo"), "- [ ] ");
+        assert_eq!(md_enter("> quoted"), "> ");
+        assert_eq!(md_enter("> - in a quote"), "> - ");
+        assert_eq!(md_enter("- caf\u{e9}"), "- ");
+        // Mid-item, the rest of the item moves to the new one.
+        let (lines, caret) = enter_in(LangKind::Markdown, "- foo bar", 0, 5);
+        assert_eq!(lines, ["- foo", "- bar"]);
+        assert_eq!(caret, (1, 2));
+        // One undo takes the whole continuation back.
+        let mut e = editor_with("- first");
+        e.lang = Some(LangKind::Markdown);
+        e.cursor_col = 7;
+        e.insert_newline();
+        assert!(e.undo());
+        assert_eq!(e.lines, ["- first"]);
+    }
+
+    // #1495: Enter on an item that is only its marker ends the list: the
+    // marker goes and the line is left blank.
+    #[test]
+    fn markdown_enter_on_an_empty_item_ends_the_list() {
+        for line in ["- ", "3. ", "- [ ] ", "- [ ]", "> ", ">"] {
+            let (lines, caret) = enter_in(LangKind::Markdown, line, 0, line.len());
+            assert_eq!(lines, [""], "{line:?}");
+            assert_eq!(caret, (0, 0), "{line:?}");
+        }
+        let (lines, caret) = enter_in(LangKind::Markdown, "- a\n- ", 1, 2);
+        assert_eq!(lines, ["- a", ""]);
+        assert_eq!(caret, (1, 0));
+    }
+
+    // Negatives (#1495): lines that are not list items, a caret before the
+    // marker, a fenced code block and other languages keep the plain Enter.
+    #[test]
+    fn markdown_enter_leaves_other_lines_alone() {
+        for line in [
+            "plain",
+            "**bold**",
+            "---",
+            "* * *",
+            "1.5 apples",
+            "-dash",
+            "#1 fan",
+        ] {
+            assert_eq!(md_enter(line), "", "{line:?}");
+        }
+        let (lines, _) = enter_in(LangKind::Markdown, "- a", 0, 0);
+        assert_eq!(lines, ["", "- a"], "a caret before the marker");
+        let (lines, _) = enter_in(LangKind::Markdown, "```\n- a", 1, 3);
+        assert_eq!(lines, ["```", "- a", ""], "inside a code fence");
+        let (lines, _) = enter_in(LangKind::Markdown, "```\nx\n```\n- a", 3, 3);
+        assert_eq!(lines[4], "- ", "after a closed fence");
+        let (lines, _) = enter_in(LangKind::Markdown, "```\n~~~\n- a", 2, 3);
+        assert_eq!(
+            lines,
+            ["```", "~~~", "- a", ""],
+            "an unlike fence closes nothing"
+        );
+        let (lines, _) = enter_in(LangKind::Markdown, "````\n```\n- a", 2, 3);
+        assert_eq!(
+            lines,
+            ["````", "```", "- a", ""],
+            "a shorter fence closes nothing"
+        );
+        let (lines, _) = enter_in(LangKind::Markdown, "```rust\nx\n````\n- a", 3, 3);
+        assert_eq!(lines[4], "- ", "a longer fence of the same kind closes");
+        let (lines, _) = enter_in(LangKind::Rust, "- a", 0, 3);
+        assert_eq!(lines, ["- a", ""], "Markdown only");
+    }
+
+    // #1443: `/**` then Enter opens a JSDoc / Doxygen block and closes it;
+    // a ` * ` line inside a block comment continues; Rust `///` and `//!`
+    // lines continue.
+    #[test]
+    fn enter_continues_doc_comments() {
+        let (lines, caret) = enter_in(LangKind::JavaScript, "/**", 0, 3);
+        assert_eq!(lines, ["/**", " * ", " */"]);
+        assert_eq!(caret, (1, 3));
+        let (lines, caret) = enter_in(LangKind::Java, "  /**\n  void f();", 0, 5);
+        assert_eq!(lines, ["  /**", "   * ", "   */", "  void f();"]);
+        assert_eq!(caret, (1, 5));
+        let (lines, caret) = enter_in(LangKind::TypeScript, "/** */", 0, 3);
+        assert_eq!(lines, ["/**", " * ", " */"]);
+        assert_eq!(caret, (1, 3));
+        // Already closed below: no second closer.
+        let (lines, _) = enter_in(LangKind::C, "/**\n * Adds.\n */", 0, 3);
+        assert_eq!(lines, ["/**", " * ", " * Adds.", " */"]);
+        let (lines, caret) = enter_in(LangKind::Tsx, "/**\n * Adds two.\n */", 1, 12);
+        assert_eq!(lines, ["/**", " * Adds two.", " * ", " */"]);
+        assert_eq!(caret, (2, 3));
+        let (lines, _) = enter_in(LangKind::Java, "/**\ndescription\n\n */", 0, 3);
+        assert_eq!(
+            lines,
+            ["/**", " * ", "description", "", " */"],
+            "a plain body line"
+        );
+        let (lines, _) = enter_in(LangKind::C, "/**\nint f();\n/** g */", 0, 3);
+        assert_eq!(
+            lines,
+            ["/**", " * ", " */", "int f();", "/** g */"],
+            "a later comment"
+        );
+        let (lines, _) = enter_in(LangKind::Cpp, "/*\n * plain block", 1, 14);
+        assert_eq!(lines[2], " * ");
+        let (lines, caret) = enter_in(LangKind::Rust, "/// Adds two numbers.", 0, 21);
+        assert_eq!(lines, ["/// Adds two numbers.", "/// "]);
+        assert_eq!(caret, (1, 4));
+        let (lines, _) = enter_in(LangKind::Rust, "    //! crate docs", 0, 18);
+        assert_eq!(lines[1], "    //! ");
+    }
+
+    // Negatives (#1443): a `*` in code, plain `//` comments, a caret before
+    // `*/`, a closed one-line doc and other languages keep the plain Enter.
+    #[test]
+    fn enter_outside_a_doc_comment_adds_no_leader() {
+        let plain = |lang, text: &str, row, col| enter_in(lang, text, row, col).0;
+        assert_eq!(
+            plain(LangKind::JavaScript, "x = a *", 0, 7),
+            ["x = a *", ""]
+        );
+        assert_eq!(plain(LangKind::Rust, "// a", 0, 4), ["// a", ""]);
+        assert_eq!(
+            plain(LangKind::Rust, "//// banner", 0, 11),
+            ["//// banner", ""]
+        );
+        assert_eq!(
+            plain(LangKind::C, "/*\n * text */", 1, 8),
+            ["/*", " * text ", " */"],
+            "a caret before the closer"
+        );
+        assert_eq!(
+            plain(LangKind::Java, "/** done */", 0, 11),
+            ["/** done */", ""]
+        );
+        assert_eq!(plain(LangKind::Java, "/**/", 0, 4), ["/**/", ""]);
+        assert_eq!(plain(LangKind::Python, "/**", 0, 3), ["/**", ""]);
+        assert_eq!(plain(LangKind::Markdown, "/**", 0, 3), ["/**", ""]);
+        assert_eq!(plain(LangKind::Go, "/// x", 0, 5), ["/// x", ""]);
     }
 
     #[test]
@@ -25915,6 +27472,18 @@ mod tests {
         assert_eq!(e.lines, vec!["hello", "next"]);
     }
 
+    /// #1577: the columns of each row a find in a range highlights.
+    #[test]
+    fn find_window_covers_the_range_rows_only() {
+        let range = Some(((2, 4), (4, 3)));
+        assert_eq!(find_window(None, 9), None, "no range: the whole line");
+        assert_eq!(find_window(range, 1), Some((0, 0)), "above");
+        assert_eq!(find_window(range, 2), Some((4, usize::MAX)));
+        assert_eq!(find_window(range, 3), Some((0, usize::MAX)));
+        assert_eq!(find_window(range, 4), Some((0, 3)));
+        assert_eq!(find_window(range, 5), Some((0, 0)), "below");
+    }
+
     #[test]
     fn open_line_below_inserts_empty_line_after_current() {
         let mut e = editor_with("alpha\nbeta");
@@ -26014,6 +27583,116 @@ mod tests {
         assert_eq!(e.cursor_col, 0);
         e.end_line();
         assert_eq!(e.cursor_col, 11);
+    }
+
+    /// The issue's paragraph, `Notes: word0 … word59`, wrapped in a 60-column
+    /// pane, with its wrap rows as `(start, end)` columns.
+    fn wrapped_paragraph(wrap: bool) -> (Editor, Vec<(usize, usize)>) {
+        let words: Vec<String> = (0..60).map(|i| format!("word{i}")).collect();
+        let mut e = editor_with(&format!("Notes: {}", words.join(" ")));
+        e.wrap_override = Some(wrap);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 20,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        let segs = e.line_segments(0, e.visible_text_width().max(1));
+        assert!(segs.len() >= 4, "the paragraph wraps: {segs:?}");
+        (e, segs)
+    }
+
+    /// #1569: with wrap on, End went to the end of the whole line from any of
+    /// its rows. Like VS Code it now stops at the end of the caret's row (on
+    /// the space the row broke at), and a second End goes to the line's end.
+    #[test]
+    fn end_in_a_wrapped_line_stops_at_the_end_of_the_row_first() {
+        let (mut e, segs) = wrapped_paragraph(true);
+        let len = e.line_char_len(0);
+        e.cursor_col = segs[1].0;
+        e.end_key();
+        assert_eq!(e.cursor_col, segs[1].1 - 1, "the end of row 2: {segs:?}");
+        assert_eq!(e.lines[0].chars().nth(e.cursor_col), Some(' '));
+        let width = e.visible_text_width();
+        assert_eq!(
+            e.segment_index_of_col(0, e.cursor_col, width),
+            1,
+            "still on row 2"
+        );
+        e.end_key();
+        assert_eq!(
+            e.cursor_col, len,
+            "a second End goes to the end of the line"
+        );
+        e.end_key();
+        assert_eq!(e.cursor_col, len);
+    }
+
+    /// #1569: Home from inside a wrapped row stops at that row's start first.
+    #[test]
+    fn home_in_a_wrapped_line_stops_at_the_start_of_the_row_first() {
+        let (mut e, segs) = wrapped_paragraph(true);
+        e.cursor_col = segs[2].0 + 5;
+        e.home_key();
+        assert_eq!(e.cursor_col, segs[2].0, "the start of row 3: {segs:?}");
+        e.home_key();
+        assert_eq!(
+            e.cursor_col, 0,
+            "a second Home goes to the start of the line"
+        );
+    }
+
+    /// #1569: a wrapped row can begin on a combining mark (the row before
+    /// broke after the space it combines with); Home must not leave the caret
+    /// inside that cluster.
+    #[test]
+    fn home_in_a_wrapped_line_stays_on_a_grapheme_boundary() {
+        let (probe, _) = wrapped_paragraph(true);
+        let width = probe.visible_text_width();
+        let text = format!("{} \u{301}{}", "x".repeat(width - 1), "y".repeat(width + 5));
+        let mut e = editor_with(&text);
+        e.wrap_override = Some(true);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 20,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        let segs = e.line_segments(0, e.visible_text_width().max(1));
+        assert_eq!(segs[1].0, width, "row 2 starts on the mark: {segs:?}");
+        e.cursor_col = width + 3;
+        e.home_key();
+        assert_eq!(e.cursor_col, width - 1, "the space the mark sits on");
+    }
+
+    /// #1569: on the first and last rows the row's ends are the line's.
+    #[test]
+    fn home_and_end_on_the_outer_rows_of_a_wrapped_line_reach_the_line_ends() {
+        let (mut e, segs) = wrapped_paragraph(true);
+        let len = e.line_char_len(0);
+        e.cursor_col = segs.last().unwrap().0 + 1;
+        e.end_key();
+        assert_eq!(e.cursor_col, len);
+        e.cursor_col = 3;
+        e.home_key();
+        assert_eq!(e.cursor_col, 0);
+    }
+
+    /// #1569 negative: with wrap off, Home and End go to the line's ends.
+    #[test]
+    fn home_and_end_without_wrap_go_to_the_line_ends() {
+        let (mut e, segs) = wrapped_paragraph(false);
+        let len = e.line_char_len(0);
+        e.cursor_col = segs[1].0;
+        e.end_key();
+        assert_eq!(e.cursor_col, len);
+        e.cursor_col = segs[2].0 + 5;
+        e.home_key();
+        assert_eq!(e.cursor_col, 0);
     }
 
     #[test]
@@ -26210,6 +27889,32 @@ mod tests {
         assert!(!e.toggle_line_comment());
     }
 
+    /// #1532: the status bar names SCSS, Less and Sass the way VS Code does
+    /// (they share the CSS grammar), and plain CSS stays CSS.
+    #[test]
+    fn style_sheet_dialects_get_their_own_labels() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for (name, label) in [
+            ("app.scss", "SCSS"),
+            ("theme.less", "Less"),
+            ("old.sass", "Sass"),
+            ("plain.css", "CSS"),
+        ] {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, ".a { color: red; }\n").unwrap();
+            let mut e = Editor::new();
+            e.open(&path).unwrap();
+            assert_eq!(e.language_label(), label, "{name}");
+        }
+        // A hand-picked language wins over the extension.
+        let path = tmp.path().join("x.scss");
+        std::fs::write(&path, "x = 1\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        e.set_language(Some(crate::highlight::LangKind::Python));
+        assert_eq!(e.language_label(), "Python");
+    }
+
     #[test]
     fn set_language_updates_the_label() {
         let mut e = editor_with("x = 1");
@@ -26241,6 +27946,58 @@ mod tests {
             ],
             "lone CR and CRLF must each split a line, matching the LSP"
         );
+    }
+
+    /// A 32x16 favicon: a PNG wrapped in an ICO container (#1652).
+    fn favicon_bytes() -> Vec<u8> {
+        let img: image::RgbaImage =
+            image::ImageBuffer::from_pixel(32, 16, image::Rgba([74, 144, 226, 255]));
+        let mut buf: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Ico)
+            .unwrap();
+        assert!(buf.starts_with(b"\0\0\x01\0"), "setup: an ICO container");
+        buf
+    }
+
+    /// #1652: a `.ico` opens in the image viewer with its size, not as hex.
+    #[test]
+    fn a_favicon_opens_as_an_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("favicon.ico");
+        std::fs::write(&path, favicon_bytes()).unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        assert!(e.hex.is_none(), "not the hex viewer");
+        let img = e.image.as_ref().expect("image-mode tab");
+        assert_eq!((img.pixel_w, img.pixel_h), (32, 16));
+        assert_eq!(img.format_label, "ICO");
+    }
+
+    /// #1652: an icon with no extension routes to the image viewer by its
+    /// bytes, like an extensionless PNG.
+    #[test]
+    fn an_extensionless_icon_routes_to_the_image_viewer_by_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("icon");
+        std::fs::write(&path, favicon_bytes()).unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        let img = e.image.as_ref().expect("image-mode tab");
+        assert_eq!((img.pixel_w, img.pixel_h), (32, 16));
+    }
+
+    /// Negative (#1652): a truncated `.ico` that does not decode falls back
+    /// to the hex viewer, without a panic.
+    #[test]
+    fn a_broken_icon_falls_back_to_hex() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.ico");
+        std::fs::write(&path, &favicon_bytes()[..30]).unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        assert!(e.image.is_none());
+        assert!(e.hex.is_some(), "an undecodable icon opens as bytes");
     }
 
     #[test]
@@ -26359,9 +28116,154 @@ mod tests {
         assert_eq!(e.pdf_page(), Some(1), "the page must not move");
     }
 
+    /// A PNG of `w` × `h` pixels, `pixel(x, y)` each.
+    fn png_of(w: u32, h: u32, pixel: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
+        let img: image::RgbaImage =
+            image::ImageBuffer::from_fn(w, h, |x, y| image::Rgba(pixel(x, y)));
+        let mut buf: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        buf
+    }
+
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    const BLUE: [u8; 4] = [0, 0, 255, 255];
+
+    /// #1591: a cell is `▀` over two pixels, the upper one in front.
+    #[test]
+    fn a_half_block_cell_shows_the_upper_pixel_over_the_lower() {
+        let png = png_of(1, 2, |_, y| if y == 0 { RED } else { BLUE });
+        let bg = Color::Rgb(9, 9, 9);
+        assert_eq!(
+            halfblock_cells(&png, 1, 1, bg),
+            Some((1, 1, vec![(Color::Rgb(255, 0, 0), Color::Rgb(0, 0, 255))]))
+        );
+        // Transparent pixels take the background.
+        let clear = png_of(1, 2, |_, _| [200, 200, 200, 0]);
+        assert_eq!(
+            halfblock_cells(&clear, 1, 1, bg),
+            Some((1, 1, vec![(bg, bg)]))
+        );
+    }
+
+    /// #1591: a large picture shrinks to the area keeping its shape; an odd
+    /// last pixel row sits over the background.
+    #[test]
+    fn a_large_image_shrinks_to_fit_keeping_its_shape() {
+        let png = png_of(40, 20, |x, y| {
+            if y < 10 {
+                [x as u8 * 6, 0, 0, 255]
+            } else {
+                BLUE
+            }
+        });
+        let bg = Color::Rgb(1, 2, 3);
+        let (cols, rows, cells) = halfblock_cells(&png, 10, 10, bg).unwrap();
+        assert_eq!((cols, rows), (10, 3), "40×20 to 10×5 pixels, 3 cell rows");
+        assert_eq!(cells.len(), 30);
+        assert!(cells[20..].iter().all(|&(_, lower)| lower == bg));
+        let Color::Rgb(r, _, b) = cells[0].0 else {
+            panic!("{:?}", cells[0]);
+        };
+        assert!(
+            r < 60 && b < 40,
+            "the upper left stays dark red: {:?}",
+            cells[0]
+        );
+        let Color::Rgb(r, _, b) = cells[9].0 else {
+            panic!("{:?}", cells[9]);
+        };
+        assert!(
+            r > 150 && b < 40,
+            "the upper right is bright red: {:?}",
+            cells[9]
+        );
+        let Color::Rgb(r, _, b) = cells[20].0 else {
+            panic!("{:?}", cells[20]);
+        };
+        assert!(b > 200 && r < 40, "the bottom is blue: {:?}", cells[20]);
+    }
+
+    /// #1591 negatives: a small image is not enlarged, and bytes that do
+    /// not decode or an empty area draw nothing.
+    #[test]
+    fn half_blocks_never_enlarge_and_refuse_what_they_cannot_draw() {
+        let png = png_of(2, 2, |_, _| RED);
+        assert_eq!(
+            halfblock_cells(&png, 50, 50, Color::Black).map(|c| (c.0, c.1)),
+            Some((2, 1))
+        );
+        assert_eq!(halfblock_cells(b"not an image", 10, 10, Color::Black), None);
+        assert_eq!(halfblock_cells(&png, 0, 10, Color::Black), None);
+        assert_eq!(halfblock_cells(&png, 10, 0, Color::Black), None);
+    }
+
+    /// #1591: an image tab with `cell_images` draws the picture under its
+    /// header, centred; without it (an inline-image terminal paints the
+    /// picture itself) the canvas stays empty.
+    #[test]
+    fn an_image_tab_draws_half_blocks_only_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pic.png");
+        std::fs::write(&path, png_of(4, 4, |_, y| if y < 2 { RED } else { BLUE })).unwrap();
+        let area = Rect::new(0, 0, 30, 10);
+        let draw = |cell_images: bool| {
+            let mut e = Editor::new();
+            e.open(&path).unwrap();
+            e.cell_images = cell_images;
+            let mut buf = Buffer::empty(area);
+            Widget::render(&mut e, area, &mut buf);
+            buf
+        };
+        let buf = draw(true);
+        let blocks: Vec<(u16, u16)> = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].symbol() == "\u{2580}")
+            .collect();
+        assert_eq!(blocks.len(), 8, "4×4 pixels are 4×2 cells: {blocks:?}");
+        let &(x, y) = blocks.first().unwrap();
+        assert_eq!(buf[(x, y)].fg, Color::Rgb(255, 0, 0));
+        assert_eq!(buf[(x, y + 1)].bg, Color::Rgb(0, 0, 255));
+        let buf = draw(false);
+        assert!(
+            (0..area.height).all(|y| (0..area.width).all(|x| buf[(x, y)].symbol() != "\u{2580}")),
+            "no half blocks where the terminal shows the picture"
+        );
+    }
+
+    /// #1591: an image whose body does not decode is remembered as an
+    /// empty picture under its key, so the next frame does not decode the
+    /// bytes again, and nothing is drawn.
+    #[test]
+    fn an_undecodable_image_body_is_cached_not_retried_each_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pic.png");
+        let png = png_of(4, 4, |_, _| RED);
+        std::fs::write(&path, &png).unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        e.cell_images = true;
+        e.image.as_mut().unwrap().bytes = png[..png.len() / 2].to_vec();
+        let area = Rect::new(0, 0, 30, 10);
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut e, area, &mut buf);
+        let cached = e.cell_image.clone().expect("the failed decode is cached");
+        assert_eq!(cached.key.0, e.image.as_ref().unwrap().generation);
+        assert!(cached.cells.is_empty());
+        assert!(
+            (0..area.height).all(|y| (0..area.width).all(|x| buf[(x, y)].symbol() != "\u{2580}")),
+            "nothing is drawn for an undecodable body"
+        );
+        Widget::render(&mut e, area, &mut Buffer::empty(area));
+        assert_eq!(e.cell_image, Some(cached), "the cache entry stays put");
+    }
+
     #[test]
     fn extension_is_image_recognises_common_formats() {
-        for ext in ["png", "PNG", "jpg", "jpeg", "JPEG", "gif", "bmp", "webp"] {
+        for ext in [
+            "png", "PNG", "jpg", "jpeg", "JPEG", "gif", "bmp", "webp", "ico", "ICO",
+        ] {
             assert!(extension_is_image(ext), "should recognise: {ext}");
         }
         for ext in ["txt", "rs", "md", "py", ""] {
@@ -26619,6 +28521,91 @@ mod tests {
         let mut e = Editor::new();
         e.open(std::path::Path::new(&f)).unwrap();
         e.insert_str("# A new entry at the top\n");
+        assert!(
+            e.save_to_disk().is_err(),
+            "the write must fail past the limit"
+        );
+        assert!(e.dirty, "the edits are still only in the buffer");
+        assert!(
+            !e.disk_changed_externally(),
+            "croft's own failed write must not read as an external change"
+        );
+    }
+
+    /// Make the save path's copy aside fail as a full disk does, for the
+    /// rest of this thread.
+    #[cfg(target_os = "linux")]
+    fn fill_the_disk_for_copies() {
+        crate::prefs::test_hooks::ASIDE_OUT_OF_SPACE.set(true);
+    }
+
+    /// #1614: with no room for a second copy of the file, a save writes the
+    /// file in place instead of failing with "No space left on device".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_save_with_no_room_for_a_copy_writes_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("notes.md");
+        let original: String = (0..2000)
+            .map(|i| format!("line {i} of the notes\n"))
+            .collect();
+        std::fs::write(&f, &original).unwrap();
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.insert_str("X");
+        fill_the_disk_for_copies();
+        let saved = e.save_to_disk();
+        crate::prefs::test_hooks::ASIDE_OUT_OF_SPACE.set(false);
+        assert_eq!(saved.unwrap(), SaveOutcome::Saved);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), format!("X{original}"));
+        assert!(!e.dirty);
+        assert!(!e.disk_changed_externally());
+        let stray: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "notes.md")
+            .collect();
+        assert!(stray.is_empty(), "temp files left behind: {stray:?}");
+    }
+
+    /// #1614 negative: when the new contents don't fit in place either, the
+    /// save fails and the file is left whole (#1124).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_save_that_fits_neither_aside_nor_in_place_leaves_the_file_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("notes.md");
+        let original: String = (0..400).map(|i| format!("- entry {i:04}\n")).collect();
+        std::fs::write(&f, &original).unwrap();
+        run_with_file_size_limit(
+            "widgets::editor::tests::child_saves_in_place_under_a_file_size_limit",
+            &f,
+            4096,
+        );
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            original,
+            "the failed save cut the file short"
+        );
+        let stray: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "notes.md")
+            .collect();
+        assert!(stray.is_empty(), "temp files left behind: {stray:?}");
+    }
+
+    /// The child half of the test above; a no-op unless run by it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_saves_in_place_under_a_file_size_limit() {
+        let Some(f) = std::env::var_os("CROFT_TEST_FSIZE_FILE") else {
+            return;
+        };
+        let mut e = Editor::new();
+        e.open(std::path::Path::new(&f)).unwrap();
+        e.insert_str("# A new entry at the top\n");
+        fill_the_disk_for_copies();
         assert!(
             e.save_to_disk().is_err(),
             "the write must fail past the limit"
@@ -29903,6 +31890,97 @@ mod tests {
         );
     }
 
+    /// #1548: on High Contrast Light the tab labels are black, not the
+    /// dark themes' white and grey, so the active tab reads on its pale
+    /// fill; High Contrast keeps white on its dark blue.
+    #[test]
+    fn high_contrast_tab_labels_use_the_themes_foreground() {
+        use ratatui::buffer::Buffer;
+        for (id, want) in [
+            ("hc-light", Color::Rgb(0, 0, 0)),
+            ("hc-black", Color::Rgb(0xff, 0xff, 0xff)),
+        ] {
+            let theme = crate::theme::Theme::from_id(id);
+            let mut t = EditorTabs::new();
+            t.editors[0].path = Some(std::path::PathBuf::from("/foo.rs"));
+            t.add_tab_with_path(std::path::PathBuf::from("/bar.rs"));
+            for ed in t.editors.iter_mut() {
+                ed.theme = theme;
+            }
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 10,
+            };
+            let mut buf = Buffer::empty(area);
+            (&mut t).render(area, &mut buf);
+            let label_fg = |name: &str| buf[(cell_of(&buf, area.width, name), 0)].fg;
+            assert_eq!(label_fg("bar.rs"), want, "{id}: the active tab's label");
+            assert_eq!(label_fg("foo.rs"), want, "{id}: an inactive tab's label");
+        }
+        // Negative: the ordinary light theme keeps its own tab colours.
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(std::path::PathBuf::from("/foo.rs"));
+        t.editors[0].theme = crate::theme::Theme::from_id("light");
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        assert_eq!(
+            buf[(cell_of(&buf, area.width, "foo.rs"), 0)].fg,
+            TAB_ACTIVE_FG
+        );
+    }
+
+    /// The column where `text` starts on row 0, cell by cell (a tab's icon
+    /// may be several bytes wide in one cell).
+    fn cell_of(buf: &ratatui::buffer::Buffer, width: u16, text: &str) -> u16 {
+        let cells: Vec<String> = (0..width)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+        (0..cells.len())
+            .find(|&i| cells[i..].concat().starts_with(text))
+            .unwrap_or_else(|| panic!("{text} is on the tab row: {cells:?}")) as u16
+    }
+
+    /// #1548: the close glyph on High Contrast's orange hover pill is
+    /// black (white reads at about 2.6:1 there); High Contrast Light's dark
+    /// blue pill and the ordinary themes keep white.
+    #[test]
+    fn high_contrast_close_pill_glyph_contrasts_with_the_pill() {
+        use ratatui::buffer::Buffer;
+        for (id, want) in [
+            ("hc-black", Color::Black),
+            ("hc-light", Color::White),
+            ("dark", Color::White),
+        ] {
+            let theme = crate::theme::Theme::from_id(id);
+            let mut t = EditorTabs::new();
+            t.editors[0].path = Some(std::path::PathBuf::from("/foo.rs"));
+            t.editors[0].theme = theme;
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 10,
+            };
+            let mut buf = Buffer::empty(area);
+            (&mut t).render(area, &mut buf);
+            let cx = t.close_screen_x(t.active).expect("a close cross");
+            t.hover_pointer = Some((cx, area.y));
+            let mut buf = Buffer::empty(area);
+            (&mut t).render(area, &mut buf);
+            let cell = &buf[(cx, area.y)];
+            assert_eq!(cell.bg, theme.tab_close_pill_bg(), "{id}: the pill shows");
+            assert_eq!(cell.fg, want, "{id}: the glyph's ink");
+        }
+    }
+
     #[test]
     fn black_theme_close_pill_is_distinct_from_the_active_tab_bg() {
         use ratatui::buffer::Buffer;
@@ -30812,12 +32890,12 @@ mod tests {
         assert!(e.toggle_line_comment());
         let after: Vec<(usize, usize, Option<Color>)> = e.highlights[0]
             .iter()
-            .map(|s| (s.start, s.end, s.style.fg))
+            .map(|s| (s.range().start, s.range().end, s.style.fg))
             .collect();
         e.recompute_highlights();
         let fresh: Vec<(usize, usize, Option<Color>)> = e.highlights[0]
             .iter()
-            .map(|s| (s.start, s.end, s.style.fg))
+            .map(|s| (s.range().start, s.range().end, s.style.fg))
             .collect();
         assert_eq!(
             after, fresh,
@@ -31007,6 +33085,142 @@ mod tests {
         });
         assert!(e.toggle_block_comment());
         assert_eq!(e.lines[1], "  /* return */ (");
+    }
+
+    /// #1181: where the language has only block comments, Toggle Line
+    /// Comment wraps the lines in one, as VS Code does, and unwraps them.
+    #[test]
+    fn toggle_line_comment_wraps_lines_in_a_block_comment_where_there_is_no_line_comment() {
+        for (lang, text, commented) in [
+            (LangKind::Html, "  <ul>", "  <!-- <ul> -->"),
+            (LangKind::Css, "body {", "/* body { */"),
+            (LangKind::Markdown, "# Title", "<!-- # Title -->"),
+            (LangKind::Xml, "<a/>", "<!-- <a/> -->"),
+        ] {
+            let mut e = editor_with(text);
+            e.lang = Some(lang);
+            e.cursor_col = text.chars().count() - 1;
+            assert!(e.toggle_line_comment(), "{lang:?}");
+            assert_eq!(e.lines, vec![commented], "{lang:?}");
+            assert!(e.toggle_line_comment(), "{lang:?}");
+            assert_eq!(e.lines, vec![text], "{lang:?} unwraps");
+            assert_eq!(e.cursor_col, text.chars().count() - 1, "{lang:?} caret");
+        }
+        // A selection of lines gets one pair, from the first line's text to
+        // the last one's, and blank lines around it are left out.
+        let mut e = editor_with("<ul>\n  <li>one</li>\n</ul>\n\n");
+        e.lang = Some(LangKind::Html);
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (3, 0),
+        });
+        assert!(e.toggle_line_comment());
+        assert_eq!(
+            e.lines,
+            vec!["<!-- <ul>", "  <li>one</li>", "</ul> -->", ""]
+        );
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["<ul>", "  <li>one</li>", "</ul>", ""]);
+    }
+
+    /// #1181: JSON(C) comments with `//`, and a file croft has no grammar
+    /// for comments by its name or extension.
+    #[test]
+    fn toggle_line_comment_covers_json_and_files_without_a_grammar() {
+        let mut e = editor_with("  \"a\": 1,");
+        e.lang = Some(LangKind::Json);
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["  // \"a\": 1,"]);
+        for (name, text, commented) in [
+            ("App.kt", "class App {", "// class App {"),
+            ("main.swift", "let x = 1", "// let x = 1"),
+            (".gitignore", "target/", "# target/"),
+            (".env.local", "KEY=1", "# KEY=1"),
+            ("run.ps1", "Write-Host hi", "# Write-Host hi"),
+            ("Main.hs", "main = pure ()", "-- main = pure ()"),
+            ("setup.ini", "[core]", "; [core]"),
+            ("paper.tex", "\\section{A}", "% \\section{A}"),
+        ] {
+            let mut e = editor_with(text);
+            e.lang = None;
+            e.path = Some(PathBuf::from("/tmp/x").join(name));
+            assert!(e.toggle_line_comment(), "{name}");
+            assert_eq!(e.lines, vec![commented], "{name}");
+            assert!(e.toggle_line_comment(), "{name}");
+            assert_eq!(e.lines, vec![text], "{name} uncomments");
+        }
+    }
+
+    /// #1181: SCSS, Sass and Less comment with `//`, though SCSS and Sass
+    /// share the CSS grammar, which still wraps in `/* */`.
+    #[test]
+    fn toggle_line_comment_uses_slashes_in_scss_sass_and_less() {
+        for (name, lang) in [
+            ("a.scss", Some(LangKind::Css)),
+            ("a.sass", Some(LangKind::Css)),
+            ("a.less", None),
+        ] {
+            let mut e = editor_with("  color: red;");
+            e.lang = lang;
+            e.path = Some(PathBuf::from("/tmp/x").join(name));
+            assert!(e.toggle_line_comment(), "{name}");
+            assert_eq!(e.lines, vec!["  // color: red;"], "{name}");
+            assert!(e.toggle_line_comment(), "{name}");
+            assert_eq!(e.lines, vec!["  color: red;"], "{name} uncomments");
+        }
+        let mut e = editor_with("body {");
+        e.lang = Some(LangKind::Css);
+        e.path = Some(PathBuf::from("/tmp/x/a.css"));
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["/* body { */"]);
+    }
+
+    /// #1181: batch files comment with `@REM`, as VS Code does, and
+    /// uncomment `@REM` or `REM` only as a whole word, so `REMOTE.EXE` is
+    /// a command, not a comment.
+    #[test]
+    fn toggle_line_comment_in_batch_files_uses_at_rem_as_a_word() {
+        let bat = |text: &str| {
+            let mut e = editor_with(text);
+            e.lang = None;
+            e.path = Some(PathBuf::from("/tmp/x/run.bat"));
+            e
+        };
+        let mut e = bat("echo hi");
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["@REM echo hi"]);
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["echo hi"]);
+        let mut e = bat("REM note");
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["note"], "plain REM uncomments");
+        let mut e = bat("REM");
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec![""]);
+        for text in ["REMOTE.EXE --sync", "@REMOTE.EXE --sync"] {
+            let mut e = bat(text);
+            assert!(e.toggle_line_comment());
+            assert_eq!(e.lines, vec![format!("@REM {text}")], "{text}");
+        }
+    }
+
+    /// #1181 negative: a file of an unknown kind, or a language with no
+    /// comment of either kind, is still left alone, as are blank lines.
+    #[test]
+    fn toggle_line_comment_still_skips_what_has_no_comment() {
+        let mut e = editor_with("x = 1");
+        e.lang = None;
+        e.path = Some(PathBuf::from("/tmp/x/notes.unknownext"));
+        assert!(!e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["x = 1"]);
+        let mut e = editor_with("   ");
+        e.lang = Some(LangKind::Html);
+        assert!(!e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["   "]);
+        let mut e = editor_with("x: 1");
+        e.lang = Some(LangKind::Yaml);
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["# x: 1"], "a line comment still wins");
     }
 
     // ---- Toggle Block Comment (Shift+Alt+A) ----
@@ -31255,6 +33469,115 @@ mod tests {
         rows.push(e.cursor_row);
         rows.sort_unstable();
         rows
+    }
+
+    /// #1637: Increment and Decrement Number bump the number after every
+    /// caret, in one undo step, and keep every caret on its number.
+    #[test]
+    fn bump_number_changes_the_number_after_every_caret() {
+        let mut e = three_foo_selections();
+        assert!(e.bump_number(1));
+        assert_eq!(
+            e.lines,
+            vec!["let foo = 2;", "let bar = foo + 3;", "let baz = foo * 4;"]
+        );
+        assert_eq!(e.carets.len(), 2, "no caret is dropped");
+        let mut at: Vec<(usize, usize)> = e.carets.iter().map(|s| s.head).collect();
+        at.push((e.cursor_row, e.cursor_col));
+        at.sort_unstable();
+        assert_eq!(at, vec![(0, 10), (1, 16), (2, 16)], "each on its number");
+        assert!(e.undo());
+        assert_eq!(
+            e.lines,
+            vec!["let foo = 1;", "let bar = foo + 2;", "let baz = foo * 3;"]
+        );
+        let mut e = three_foo_selections();
+        assert!(e.bump_number(-1));
+        assert_eq!(
+            e.lines,
+            vec!["let foo = 0;", "let bar = foo + 1;", "let baz = foo * 2;"]
+        );
+    }
+
+    /// #1637: two carets on one number bump it once, two numbers on a line
+    /// with a caret before each both change, and a caret with no number
+    /// after it is kept where it was.
+    #[test]
+    fn bump_number_bumps_a_shared_number_once() {
+        let mut e = editor_with("x = 19; y = 5;");
+        carets_at(&mut e, &[(0, 4), (0, 5)]);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["x = 20; y = 5;"]);
+        let mut e = editor_with("x = 19; y = 5;");
+        carets_at(&mut e, &[(0, 0), (0, 8)]);
+        assert!(e.bump_number(10));
+        assert_eq!(e.lines, vec!["x = 29; y = 15;"]);
+        assert_eq!(e.carets.len(), 1);
+        let mut e = editor_with("n = 1\nno number");
+        carets_at(&mut e, &[(0, 0), (1, 3)]);
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["n = 2", "no number"]);
+        assert_eq!(e.carets[0].head, (1, 3), "the caret with no number stays");
+    }
+
+    /// #1637: Transpose Characters swaps around every caret, in one undo
+    /// step, and each caret steps past its swap.
+    #[test]
+    fn transpose_swaps_at_every_caret() {
+        let mut e = editor_with("let foo = 1;\nlet bar = foo + 2;\nlet baz = foo * 3;");
+        carets_at(&mut e, &[(2, 5), (0, 5), (1, 5)]);
+        e.transpose_chars();
+        assert_eq!(
+            e.lines,
+            vec!["let ofo = 1;", "let abr = foo + 2;", "let abz = foo * 3;"]
+        );
+        assert_eq!(caret_rows(&e), vec![0, 1, 2]);
+        assert_eq!(
+            (e.cursor_row, e.cursor_col),
+            (2, 6),
+            "the primary stays primary"
+        );
+        assert!(e.carets.iter().all(|s| s.head.1 == 6));
+        assert!(e.undo());
+        assert_eq!(e.lines[0], "let foo = 1;");
+        assert_eq!(e.lines[2], "let baz = foo * 3;");
+    }
+
+    /// #1637: two carets whose swaps share a character do not act on text
+    /// the other already moved: `ab` with carets after `a` and after `b`
+    /// moves `b` to the next line once, and leaves `a` where it was.
+    #[test]
+    fn overlapping_transpose_carets_do_not_compound() {
+        let mut e = editor_with("ab\nx");
+        carets_at(&mut e, &[(0, 1), (0, 2)]);
+        e.transpose_chars();
+        assert_eq!(e.lines, vec!["a", "bx"]);
+        // Two carets with disjoint swaps on one line both still swap.
+        let mut e = editor_with("abcd");
+        carets_at(&mut e, &[(0, 1), (0, 3)]);
+        e.transpose_chars();
+        assert_eq!(e.lines, vec!["badc"]);
+    }
+
+    /// #1637 negative: one caret bumps and transposes as before, and a line
+    /// with no number is still reported as nothing to bump.
+    #[test]
+    fn a_single_caret_bumps_and_transposes_as_before() {
+        let mut e = editor_with("x = 41");
+        assert!(e.bump_number(1));
+        assert_eq!(e.lines, vec!["x = 42"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 5));
+        assert!(e.carets.is_empty());
+        let mut e = editor_with("abc\ndef");
+        e.cursor_col = 1;
+        e.transpose_chars();
+        assert_eq!(e.lines, vec!["bac", "def"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 2));
+        e.cursor_col = 3;
+        e.transpose_chars();
+        assert_eq!(e.lines, vec!["ba", "cdef"], "end of line moves to the next");
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 1));
+        assert!(!editor_with("none").bump_number(1));
     }
 
     #[test]
@@ -31605,6 +33928,132 @@ mod tests {
         assert_eq!(folded_rows(&e), vec![2, 8]);
         assert_eq!(e.lines[2], "def alpha():");
         assert!(e.is_line_hidden(3) && !e.is_line_hidden(2));
+    }
+
+    /// The #1611 file, with `def b()` (row 4, body rows 5-6) folded.
+    fn folded_b() -> Editor {
+        let mut e =
+            editor_with("def a():\n    return 1\n\n\ndef b():\n    x = 1\n    return x\nlast = 3");
+        e.toggle_fold(4);
+        assert_eq!(folded_rows(&e), vec![4]);
+        assert!(e.is_line_hidden(5) && e.is_line_hidden(6));
+        e
+    }
+
+    /// #1611: Move Line Up below a folded function moves the line above the
+    /// whole function, not into its hidden body, and the fold stays closed.
+    #[test]
+    fn move_line_up_below_a_folded_function_moves_above_it() {
+        let mut e = folded_b();
+        (e.cursor_row, e.cursor_col) = (7, 0);
+        e.move_lines_up();
+        assert_eq!(
+            e.lines[3..],
+            ["", "last = 3", "def b():", "    x = 1", "    return x"]
+        );
+        assert_eq!(e.cursor_row, 4);
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![5], "the fold moved with its text");
+        assert!(e.is_line_hidden(6) && e.is_line_hidden(7));
+        assert!(e.undo());
+        assert_eq!(e.lines[7], "last = 3");
+    }
+
+    /// #1611: Move Line Down on a folded header moves the header and its
+    /// body together, and a line above a fold moves below all of it.
+    #[test]
+    fn move_line_down_moves_a_folded_function_whole() {
+        let mut e = folded_b();
+        (e.cursor_row, e.cursor_col) = (4, 0);
+        e.move_lines_down();
+        assert_eq!(
+            e.lines[3..],
+            ["", "last = 3", "def b():", "    x = 1", "    return x"]
+        );
+        assert_eq!(e.cursor_row, 5, "the caret stays on the header");
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![5]);
+        assert!(e.is_line_hidden(6) && e.is_line_hidden(7));
+
+        let mut e = folded_b();
+        (e.cursor_row, e.cursor_col) = (3, 0);
+        e.move_lines_down();
+        assert_eq!(
+            e.lines[3..],
+            ["def b():", "    x = 1", "    return x", "", "last = 3"]
+        );
+        assert_eq!(e.cursor_row, 6);
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![3]);
+        assert!(e.is_line_hidden(4) && e.is_line_hidden(5));
+    }
+
+    /// #1611: a fold from the language server stays closed over its text
+    /// through a Move Line and its undo: the undo brings back the spans that
+    /// described the restored text, not the ones the move rewrote.
+    #[test]
+    fn undoing_a_move_keeps_a_server_fold_closed() {
+        use crate::lsp::manager::{FoldRangeKind, FoldingRangeItem};
+        let mut e = editor_with("a\nb {\nc\nd\n}\ne");
+        e.set_lsp_folds(vec![FoldingRangeItem {
+            start_line: 1,
+            end_line: 3,
+            kind: FoldRangeKind::Other,
+        }]);
+        e.toggle_fold(1);
+        assert!(e.is_line_hidden(2) && e.is_line_hidden(3));
+        (e.cursor_row, e.cursor_col) = (1, 0);
+        e.move_lines_down();
+        paint(&mut e);
+        assert_eq!(folded_rows(&e), vec![2], "{:?}", e.lines);
+        assert!(e.undo());
+        paint(&mut e);
+        assert_eq!(e.lines[1], "b {");
+        assert_eq!(folded_rows(&e), vec![1]);
+        assert!(
+            e.is_line_hidden(2) && e.is_line_hidden(3),
+            "the server's fold is closed again over its rows"
+        );
+    }
+
+    /// #1611: Copy Line Down on a folded header copies the whole function.
+    #[test]
+    fn copy_line_down_on_a_folded_header_copies_its_body_too() {
+        let mut e = folded_b();
+        (e.cursor_row, e.cursor_col) = (4, 0);
+        e.duplicate_lines_down();
+        assert_eq!(
+            e.lines[4..],
+            [
+                "def b():",
+                "    x = 1",
+                "    return x",
+                "def b():",
+                "    x = 1",
+                "    return x",
+                "last = 3"
+            ]
+        );
+        assert_eq!(e.cursor_row, 7, "the caret is on the copy's header");
+    }
+
+    /// #1611 negative: with no fold, or with the fold open, Move Line swaps
+    /// one line as before.
+    #[test]
+    fn move_line_without_a_closed_fold_swaps_one_line() {
+        let mut e =
+            editor_with("def a():\n    return 1\n\n\ndef b():\n    x = 1\n    return x\nlast = 3");
+        (e.cursor_row, e.cursor_col) = (7, 0);
+        e.move_lines_up();
+        assert_eq!(e.lines[6..], ["last = 3", "    return x"]);
+        let mut e = folded_b();
+        e.toggle_fold(4);
+        assert!(e.folded.is_empty());
+        (e.cursor_row, e.cursor_col) = (4, 0);
+        e.move_lines_down();
+        assert_eq!(e.lines[4..6], ["    x = 1", "def b():"]);
+        e.duplicate_lines_down();
+        assert_eq!(e.lines[5..7], ["def b():", "def b():"]);
     }
 
     /// An untitled buffer has no path, and its folds follow edits too.
@@ -32197,6 +34646,76 @@ mod tests {
         assert_eq!((e.cursor_row, e.cursor_col), (2, 0)); // the '}'
     }
 
+    /// #1634's `br.rs`, highlighted as Rust so strings and comments are
+    /// known.
+    fn bracket_sample() -> Editor {
+        let mut e = editor_with(
+            "fn main() {\n    let re = Regex::new(\"\\\\(\").unwrap();\n    let n = count(\")\", s) + 1;\n    // closes the block: }\n    println!(\"{}\", n);\n}\n",
+        );
+        e.set_language(Some(LangKind::Rust));
+        e
+    }
+
+    /// #1634: a bracket inside a string or a comment is text, so the
+    /// highlight, Go to Bracket and Select to Bracket pair the code's own
+    /// brackets.
+    #[test]
+    fn brackets_in_strings_and_comments_are_skipped_when_matching() {
+        let mut e = bracket_sample();
+        // The `(` after `Regex::new` pairs with the `)` before `.unwrap`.
+        (e.cursor_row, e.cursor_col) = (1, 23);
+        assert_eq!(e.bracket_match_pair(), Some(((1, 23), (1, 29))));
+        assert!(e.jump_to_matching_bracket());
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 29));
+        // `count(")", s)`: the string's `)` is skipped.
+        (e.cursor_row, e.cursor_col) = (2, 17);
+        assert_eq!(e.bracket_match_pair(), Some(((2, 17), (2, 24))));
+        // The `{` of `fn main` pairs with line 6's `}`, not the comment's.
+        (e.cursor_row, e.cursor_col) = (0, 10);
+        assert_eq!(e.bracket_match_pair(), Some(((0, 10), (5, 0))));
+        assert!(e.select_to_matching_bracket());
+        assert_eq!(
+            e.selection,
+            Some(EditorSelection {
+                anchor: (0, 10),
+                head: (5, 1)
+            })
+        );
+        // And back from the `}`.
+        (e.cursor_row, e.cursor_col) = (5, 1);
+        assert_eq!(e.bracket_match_pair(), Some(((0, 10), (5, 0))));
+    }
+
+    /// #1634: from inside a string, Go to Bracket goes to the enclosing
+    /// pair in code, and a bracket inside a string pairs with nothing.
+    #[test]
+    fn a_caret_inside_a_string_uses_the_enclosing_code_brackets() {
+        let mut e = bracket_sample();
+        (e.cursor_row, e.cursor_col) = (2, 19);
+        assert!(e.jump_to_matching_bracket());
+        assert_eq!((e.cursor_row, e.cursor_col), (2, 24));
+        (e.cursor_row, e.cursor_col) = (2, 20);
+        assert_eq!(e.bracket_match_pair(), None, "the string's `)` is text");
+        // A balanced pair inside a string is text too: `"{}"` on line 5.
+        assert_eq!(&e.lines[4][13..17], "\"{}\"");
+        (e.cursor_row, e.cursor_col) = (4, 15);
+        assert_eq!(e.bracket_match_pair(), None, "the string's `{{}}` is text");
+    }
+
+    /// #1634 negative: brackets in code match as before, across lines and
+    /// nested, and a buffer with no grammar still counts every bracket.
+    #[test]
+    fn brackets_in_code_match_as_before() {
+        let mut e = bracket_sample();
+        (e.cursor_row, e.cursor_col) = (0, 7);
+        assert_eq!(e.bracket_match_pair(), Some(((0, 7), (0, 8))));
+        (e.cursor_row, e.cursor_col) = (4, 12);
+        assert_eq!(e.bracket_match_pair(), Some(((4, 12), (4, 20))));
+        let mut plain = editor_with("f(\")\")\n");
+        (plain.cursor_row, plain.cursor_col) = (0, 1);
+        assert_eq!(plain.bracket_match_pair(), Some(((0, 1), (0, 3))));
+    }
+
     #[test]
     fn jump_to_bracket_noop_without_a_bracket() {
         let mut e = editor_with("hello world");
@@ -32751,7 +35270,7 @@ mod tests {
                 .flat_map(|(row, bs)| {
                     bs.iter()
                         .filter(|b| b.1 == UNEXPECTED_BRACKET)
-                        .map(move |b| (row, b.0))
+                        .map(move |b| (row, b.0 as usize))
                 })
                 .collect();
             assert!(
@@ -32822,7 +35341,11 @@ mod tests {
     fn span_tuples(spans: &[Vec<HiSpan>]) -> Vec<Vec<(usize, usize, Style)>> {
         spans
             .iter()
-            .map(|line| line.iter().map(|s| (s.start, s.end, s.style)).collect())
+            .map(|line| {
+                line.iter()
+                    .map(|s| (s.range().start, s.range().end, s.style))
+                    .collect()
+            })
             .collect()
     }
 
@@ -32834,7 +35357,7 @@ mod tests {
             Style::default().fg(Color::Blue),
         );
         let span = |start, end, style| HiSpan { start, end, style };
-        let mut base = vec![String::from("let name = 1;"), String::from("f(x)")];
+        let mut base = PackedLines::from(vec![String::from("let name = 1;"), String::from("f(x)")]);
         let mut spans = vec![
             vec![span(0, 3, kw), span(4, 8, id), span(11, 12, num)],
             Vec::new(),
@@ -32853,7 +35376,11 @@ mod tests {
             "the identifier covers the typed X; the number moves right"
         );
         assert_eq!(brackets[1], vec![(1, 0), (3, 0)], "an untouched line");
-        assert_eq!(base, lines, "the base follows the text");
+        assert_eq!(
+            base,
+            PackedLines::from(&lines[..]),
+            "the base follows the text"
+        );
         assert!(
             !carry_highlights(&mut base, &mut spans, &mut brackets, &lines),
             "nothing left to carry"
@@ -32874,7 +35401,7 @@ mod tests {
             // Before the second, after a gap no span covers: nobody's.
             ("ab Xcd", vec![(0, 2, a), (4, 6, b)]),
         ] {
-            let mut base = vec![String::from("ab cd")];
+            let mut base = PackedLines::from(vec![String::from("ab cd")]);
             let mut spans = vec![vec![span(0, 2, a), span(3, 5, b)]];
             let mut brackets = vec![Vec::new()];
             carry_highlights(&mut base, &mut spans, &mut brackets, &[String::from(typed)]);
@@ -32891,7 +35418,10 @@ mod tests {
             Style::default().fg(Color::Blue),
         );
         let span = |start, end, style| HiSpan { start, end, style };
-        let mut base = vec![String::from("// a comment"), String::from("fn x() {}")];
+        let mut base = PackedLines::from(vec![
+            String::from("// a comment"),
+            String::from("fn x() {}"),
+        ]);
         let mut spans = vec![vec![span(0, 12, comment)], vec![span(0, 2, kw)]];
         let mut brackets = vec![Vec::new(), vec![(4, 0), (5, 0), (7, 0), (8, 0)]];
         let lines = vec![String::from("let y = 2;"), String::from("fn x() {}")];
@@ -32907,10 +35437,10 @@ mod tests {
         // and so does each edited line's untouched text.
         let style = Style::default().fg(Color::Blue);
         let span = |start, end| HiSpan { start, end, style };
-        let mut base: Vec<String> = (0..6).map(|i| format!("word{i} tail")).collect();
+        let mut lines: Vec<String> = (0..6).map(|i| format!("word{i} tail")).collect();
+        let mut base = PackedLines::from(&lines[..]);
         let mut spans: Vec<Vec<HiSpan>> = (0..6).map(|_| vec![span(6, 10)]).collect();
         let mut brackets = vec![Vec::new(); 6];
-        let mut lines = base.clone();
         lines[0].insert(0, 'X');
         lines[5].insert(0, 'X');
         carry_highlights(&mut base, &mut spans, &mut brackets, &lines);
@@ -32930,11 +35460,11 @@ mod tests {
             Style::default().fg(Color::Green),
         );
         let span = |start, end, style| HiSpan { start, end, style };
-        let mut base = vec![
+        let mut base = PackedLines::from(vec![
             String::from("a"),
             String::from("\"hello\""),
             String::from("z"),
-        ];
+        ]);
         let mut spans = vec![Vec::new(), vec![span(0, 7, s)], vec![span(0, 1, z)]];
         let mut brackets = vec![Vec::new(); 3];
         let lines = vec![
@@ -32959,8 +35489,8 @@ mod tests {
 
     #[test]
     fn carry_moves_brackets_with_their_text_and_drops_deleted_ones() {
-        let carried = |before: &str, brackets: Vec<(usize, u8)>, after: &str| {
-            let mut base = vec![String::from(before)];
+        let carried = |before: &str, brackets: Vec<(u32, u8)>, after: &str| {
+            let mut base = PackedLines::from(vec![String::from(before)]);
             let mut spans = vec![Vec::new()];
             let mut brackets = vec![brackets];
             carry_highlights(&mut base, &mut spans, &mut brackets, &[String::from(after)]);
@@ -32993,11 +35523,11 @@ mod tests {
     }
 
     /// Each bracket of `line` at its char column, the way a pass colors them.
-    fn bracket_columns(line: &str) -> Vec<(usize, u8)> {
+    fn bracket_columns(line: &str) -> Vec<(u32, u8)> {
         line.chars()
             .enumerate()
             .filter(|(_, c)| "(){}[]".contains(*c))
-            .map(|(col, _)| (col, (col % 3) as u8))
+            .map(|(col, _)| (col as u32, (col % 3) as u8))
             .collect()
     }
 
@@ -33013,13 +35543,9 @@ mod tests {
         // A token every few bytes, each with its color, as a pass leaves them.
         let style = Style::default().fg(Color::Blue);
         let tokens: Vec<HiSpan> = (0..before.len() / 4)
-            .map(|k| HiSpan {
-                start: 4 * k,
-                end: 4 * k + 3,
-                style,
-            })
+            .map(|k| HiSpan::new(4 * k, 4 * k + 3, style))
             .collect();
-        let mut base = vec![before];
+        let mut base = PackedLines::from(vec![before]);
         let mut spans = vec![tokens.clone()];
         let mut carried = vec![brackets.clone()];
         let started = std::time::Instant::now();
@@ -33029,7 +35555,7 @@ mod tests {
             took < std::time::Duration::from_millis(500),
             "one keystroke's carry took {took:?}"
         );
-        let shifted: Vec<(usize, u8)> = brackets.iter().map(|&(c, d)| (c + 1, d)).collect();
+        let shifted: Vec<(u32, u8)> = brackets.iter().map(|&(c, d)| (c + 1, d)).collect();
         assert_eq!(carried[0], shifted, "every bracket moved one column right");
         assert_eq!(spans[0].len(), tokens.len());
         assert_eq!(
@@ -33044,13 +35570,13 @@ mod tests {
         // The single pass must land every bracket where counting its
         // column from scratch does: across new line breaks, deletions
         // that take brackets with them, and multi-byte text on either side.
-        fn counted(old: &str, brackets: &[(usize, u8)], new: &str) -> Vec<Vec<(usize, u8)>> {
+        fn counted(old: &str, brackets: &[(u32, u8)], new: &str) -> Vec<Vec<(u32, u8)>> {
             let (head, tail) = common_affixes(old, new);
             let (old_end, new_end) = (old.len() - tail, new.len() - tail);
             let new_lines: Vec<&str> = new.split('\n').collect();
             let mut out = vec![Vec::new(); new_lines.len()];
             for &(col, depth) in brackets {
-                let at = old.char_indices().nth(col).unwrap().0;
+                let at = old.char_indices().nth(col as usize).unwrap().0;
                 if at >= head && at < old_end {
                     continue;
                 }
@@ -33061,7 +35587,7 @@ mod tests {
                 };
                 let li = new[..moved].matches('\n').count();
                 let start = new[..moved].rfind('\n').map_or(0, |n| n + 1);
-                out[li].push((new[start..moved].chars().count(), depth));
+                out[li].push((new[start..moved].chars().count() as u32, depth));
             }
             out
         }
@@ -33079,7 +35605,7 @@ mod tests {
             "é(a, [b]) → {c}✓",
             "",
         ] {
-            let mut base = vec![String::from(old)];
+            let mut base = PackedLines::from(vec![String::from(old)]);
             let mut spans = vec![Vec::new()];
             let mut carried = vec![brackets.clone()];
             let lines: Vec<String> = new.split('\n').map(String::from).collect();
@@ -33092,7 +35618,7 @@ mod tests {
     fn carry_starts_clean_when_the_spans_do_not_describe_the_base() {
         // A non-text view resets `highlights` to one empty line without
         // touching the base; carrying from that must not misplace anything.
-        let mut base = vec![String::from("a"), String::from("b")];
+        let mut base = PackedLines::from(vec![String::from("a"), String::from("b")]);
         let mut spans = vec![Vec::new()];
         let mut brackets = Vec::new();
         let lines = vec![String::from("x()")];
@@ -33104,7 +35630,51 @@ mod tests {
         ));
         assert_eq!((spans.len(), brackets.len()), (1, 1));
         assert!(spans[0].is_empty() && brackets[0].is_empty());
-        assert_eq!(base, lines);
+        assert_eq!(base, PackedLines::from(&lines[..]));
+    }
+
+    /// What a syntax pass leaves is kept for as long as the tab (#1707): each
+    /// line's spans and brackets are held at their size, not at whatever the
+    /// list had doubled to while it grew.
+    #[test]
+    fn a_landed_pass_holds_no_spare_capacity() {
+        let src: String = (0..200)
+            .map(|i| format!("fn f{i}(a: u8, b: [u8; 4]) -> u8 {{ a + b[0] * {i} }}\n"))
+            .collect();
+        let mut e = editor_with(&src);
+        e.lang = Some(LangKind::Rust);
+        e.recompute_highlights();
+        assert!(
+            e.highlights.iter().any(|line| line.len() > 4),
+            "lines carry several spans"
+        );
+        for (i, line) in e.highlights.iter().enumerate() {
+            assert_eq!(line.capacity(), line.len(), "line {i}'s spans");
+        }
+        for (i, line) in e.bracket_colors.iter().enumerate() {
+            assert_eq!(line.capacity(), line.len(), "line {i}'s brackets");
+        }
+    }
+
+    /// The semantic overlay is decoded into lists sized to each line's tokens
+    /// (#1707), not grown to the next power of two.
+    #[test]
+    fn a_decoded_semantic_overlay_holds_no_spare_capacity() {
+        let mut e = editor_with("def f(x, y, z):\n    return x + y + z + x + y\n");
+        let p = std::path::PathBuf::from("/tmp/sem_fit.py");
+        e.path = Some(p.clone());
+        let legend = std::sync::Arc::new(vec!["parameter".to_string()]);
+        let data = vec![
+            0, 6, 1, 0, 0, 0, 3, 1, 0, 0, 0, 3, 1, 0, 0, // x, y, z
+            1, 11, 1, 0, 0, 0, 4, 1, 0, 0, 0, 4, 1, 0, 0, // x + y + z
+            0, 4, 1, 0, 0, 0, 4, 1, 0, 0, // + x + y
+        ];
+        e.apply_semantic_tokens(p, data, legend, true);
+        let overlay = e.semantic_overlay_for_test();
+        assert_eq!((overlay[0].len(), overlay[1].len()), (3, 5));
+        for (i, line) in overlay.iter().enumerate() {
+            assert_eq!(line.capacity(), line.len(), "line {i}");
+        }
     }
 
     #[test]
@@ -33128,8 +35698,8 @@ mod tests {
         let covering = |at: usize| {
             e.highlights[1]
                 .iter()
-                .find(|s| s.start <= at && at < s.end)
-                .map(|s| (s.start, s.end))
+                .find(|s| s.range().contains(&at))
+                .map(|s| s.range())
         };
         assert_eq!(
             covering(8),
@@ -33173,11 +35743,12 @@ mod tests {
         assert_eq!(e.bracket_colors.len(), e.lines.len(), "{after}");
         for (i, line) in e.lines.iter().enumerate() {
             for s in &e.highlights[i] {
+                let r = s.range();
                 assert!(
-                    s.start < s.end
-                        && s.end <= line.len()
-                        && line.is_char_boundary(s.start)
-                        && line.is_char_boundary(s.end),
+                    r.start < r.end
+                        && r.end <= line.len()
+                        && line.is_char_boundary(r.start)
+                        && line.is_char_boundary(r.end),
                     "{after}: span {}..{} on line {i} {line:?}",
                     s.start,
                     s.end
@@ -33186,7 +35757,10 @@ mod tests {
             let chars: Vec<char> = line.chars().collect();
             for &(col, _) in &e.bracket_colors[i] {
                 assert!(
-                    matches!(chars.get(col), Some('(' | ')' | '[' | ']' | '{' | '}')),
+                    matches!(
+                        chars.get(col as usize),
+                        Some('(' | ')' | '[' | ']' | '{' | '}')
+                    ),
                     "{after}: bracket color at {col} on line {i} {line:?}"
                 );
             }
@@ -35126,6 +37700,52 @@ mod tests {
                 format!("{head}\"\"{tail}"),
                 "{lang:?}: {text:?}"
             );
+        }
+    }
+
+    /// #1163: in Rust, a `'` that starts a lifetime or a loop label gets no
+    /// closing quote, so `fn foo<'a>` types as written.
+    #[test]
+    fn a_rust_lifetime_or_label_quote_does_not_pair() {
+        for text in [
+            "fn foo<|",
+            "impl<|",
+            "fn f(s: &|",
+            "fn f<'a, |",
+            "struct S<T: Clone + |",
+            "        break |",
+            "    continue |",
+            "fn f<'a, 'b>() where |",
+        ] {
+            let (mut e, head, tail) = with_caret(Some(LangKind::Rust), text);
+            e.insert_char('\'');
+            assert_eq!(e.lines[0], format!("{head}'{tail}"), "{text:?}");
+        }
+        let (mut e, _, _) = with_caret(Some(LangKind::Rust), "fn foo|");
+        for c in "<'a>".chars() {
+            e.insert_char(c);
+        }
+        assert_eq!(e.lines[0], "fn foo<'a>");
+    }
+
+    /// #1163, negative: a Rust char literal still pairs, and so does a
+    /// `'` after `<` in a language without lifetimes.
+    #[test]
+    fn a_rust_char_literal_and_other_languages_still_pair_quotes() {
+        for (lang, text) in [
+            (Some(LangKind::Rust), "s.push(|"),
+            (Some(LangKind::Rust), "let v = vec!['a', |"),
+            (Some(LangKind::Rust), "let c = |"),
+            (Some(LangKind::Rust), "match c { 'a' => |"),
+            (Some(LangKind::Rust), "let t = (Vec::<u8>::new(), |"),
+            (Some(LangKind::Rust), "if a < b { f(x, |"),
+            (Some(LangKind::Rust), "if c < |"),
+            (Some(LangKind::Python), "x = a < |"),
+            (Some(LangKind::JavaScript), "f(a & |"),
+        ] {
+            let (mut e, head, tail) = with_caret(lang, text);
+            e.insert_char('\'');
+            assert_eq!(e.lines[0], format!("{head}''{tail}"), "{lang:?}: {text:?}");
         }
     }
 
