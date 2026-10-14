@@ -26145,6 +26145,7 @@ impl App {
                     let ctx = crate::dap::configs::SubstCtx {
                         workspace_folder: root.clone(),
                         file: self.editor.path.clone(),
+                        folders: self.workspace_folders(),
                     };
                     match crate::dap::configs::resolve(cfg, &ctx) {
                         Ok(rc) => {

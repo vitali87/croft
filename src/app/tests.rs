@@ -27888,6 +27888,7 @@ fn a_debug_test_configs_interpreter_is_the_one_checked() {
     let ctx = SubstCtx {
         workspace_folder: root.to_path_buf(),
         file: None,
+        folders: Vec::new(),
     };
     let base = |py: &str| {
         crate::dap::session::pytest_debug_launch_request(Path::new(py), root, "test_mode")
