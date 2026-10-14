@@ -235,6 +235,7 @@ impl ClientState {
                         path,
                         server: this.name.clone(),
                         diagnostics,
+                        pulled: false,
                     });
                 }
                 ControlFlow::Continue(())
