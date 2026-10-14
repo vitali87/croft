@@ -4,9 +4,6 @@
 //! first-run card whose one button adds one. Sections fold like VS Code's
 //! view panes; an empty one starts folded to a one-line summary.
 
-// The activity bar and side bar that use this land in the next change.
-#![allow(dead_code)]
-
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
