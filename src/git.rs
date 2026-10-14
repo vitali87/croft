@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -26,6 +26,11 @@ pub struct GitStatus {
     /// resolved by walking ancestors, never enumerated. Arc: the status is
     /// cloned per consumer each refresh and the set can be large.
     pub ignored: Arc<HashSet<PathBuf>>,
+    /// The Explorer's git decorations (#1513): each changed file under the
+    /// workspace root with its status, and each folder above one with the
+    /// strongest status beneath it, keyed by absolute path in the root's
+    /// own spelling. Arc for the same reason as `ignored`.
+    pub decorations: Arc<HashMap<PathBuf, GitDecoration>>,
     /// The repository toplevel containing the workspace root, or `None`
     /// outside a repo. Porcelain and numstat paths are TOPLEVEL-relative,
     /// so every consumer that joins a repo-relative path or names one on a
@@ -41,11 +46,30 @@ pub struct GitStatus {
     /// The message git prepared for the commit in progress (#1282): a
     /// conflicted merge, cherry-pick or revert writes `MERGE_MSG`, a
     /// `merge --squash` writes `SQUASH_MSG`. Comment lines are dropped, as
-    /// `commit.cleanup=strip` would. `None` when neither file is there.
+    /// `commit.cleanup=strip` would. Without either, the `commit.template`
+    /// file (#1620). `None` when there is none of them.
     pub prepared_message: Option<String>,
     /// The merge, rebase, cherry-pick, revert or bisect the repository is
     /// in the middle of (#1356), from [`repo_operation`].
     pub operation: Option<RepoOp>,
+    /// The branch a rebase is rewriting (#1647). HEAD is detached on the
+    /// commit being replayed onto throughout, so `branch` is `None`; git
+    /// keeps the branch's name in the rebase's `head-name` file. `None`
+    /// outside a rebase, and for a rebase of a detached HEAD.
+    pub rebasing_branch: Option<String>,
+}
+
+impl GitStatus {
+    /// What HEAD is called in the status bar and the Source Control header:
+    /// the branch, the branch a rebase is rewriting (#1647), else the short
+    /// hash of a detached HEAD.
+    pub fn head_label(&self) -> &str {
+        match (&self.branch, &self.rebasing_branch, &self.detached_hash) {
+            (Some(b), _, _) | (None, Some(b), _) => b,
+            (None, None, Some(h)) => h,
+            (None, None, None) => "(no head)",
+        }
+    }
 }
 
 /// An operation git stopped half-way through (#1356): what the status bar
@@ -200,10 +224,19 @@ pub fn query(root: &Path) -> GitStatus {
     } else {
         None
     };
-    let porcelain =
-        run_git(root, &["status", "--porcelain", "--untracked-files=all"]).unwrap_or_default();
-    let dirty = parse_porcelain_dirty(&porcelain);
-    let changed_count = porcelain.lines().filter(|l| !l.trim().is_empty()).count();
+    // Raw `-z` bytes: `run_git` trims stdout, which would shift the first
+    // record's status column (` M a.py` -> `M a.py`), and a lossy string
+    // would not key a non-UTF-8 filename to its real path.
+    let porcelain = git_raw(
+        root,
+        &["status", "--porcelain", "-z", "--untracked-files=all"],
+        None,
+    )
+    .unwrap_or_default();
+    let prefix = run_git(root, &["rev-parse", "--show-prefix"]).unwrap_or_default();
+    let decorations = parse_decorations(root, &prefix, &porcelain);
+    let changed_count = porcelain_z_count(&porcelain);
+    let dirty = changed_count > 0;
     let (ahead, behind) = match run_git(
         root,
         &["rev-list", "--left-right", "--count", "HEAD...@{u}"],
@@ -215,28 +248,63 @@ pub fn query(root: &Path) -> GitStatus {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let prepared = prepared_message(root, &repo_root);
+
+    let operation = repo_operation(root);
     GitStatus {
         in_repo: true,
-        branch,
         detached_hash,
         dirty,
         ahead,
         behind,
         head_oid,
         ignored: Arc::new(query_ignored(root)),
+        decorations: Arc::new(decorations),
         repo_root: Some(repo_root),
         changed_count,
-        prepared_message: prepared_message(root),
-        operation: repo_operation(root),
+        prepared_message: prepared,
+        rebasing_branch: match (&branch, operation) {
+            (None, Some(RepoOp::Rebase { .. })) => rebasing_branch(root),
+            _ => None,
+        },
+        branch,
+        operation,
     }
+}
+
+/// The branch the rebase in progress is rewriting (#1647), from the
+/// `head-name` git writes in `rebase-merge/` or `rebase-apply/`
+/// (`refs/heads/feature`). A rebase of a detached HEAD writes `detached
+/// HEAD` there, which names no branch.
+fn rebasing_branch(root: &Path) -> Option<String> {
+    let out = run_git(
+        root,
+        &[
+            "rev-parse",
+            "--git-path",
+            "rebase-merge/head-name",
+            "--git-path",
+            "rebase-apply/head-name",
+        ],
+    )
+    .ok()?;
+    out.lines()
+        .find_map(|l| std::fs::read_to_string(root.join(l.trim())).ok())
+        .and_then(|name| {
+            name.trim()
+                .strip_prefix("refs/heads/")
+                .filter(|b| !b.is_empty())
+                .map(String::from)
+        })
 }
 
 /// git's prepared message for the commit in progress (#1282): `MERGE_MSG`
 /// (a conflicted merge, cherry-pick or revert), else `SQUASH_MSG`, found
-/// through `--git-path` so a worktree or submodule reads its own. Comment
-/// lines are dropped as `commit.cleanup=strip` drops them; nothing left
-/// is no message.
-fn prepared_message(root: &Path) -> Option<String> {
+/// through `--git-path` so a worktree or submodule reads its own; else the
+/// `commit.template` file (#1620). Comment lines are dropped as
+/// `commit.cleanup=strip` drops them, by git's own [`comment_marker`];
+/// nothing left is no message.
+fn prepared_message(root: &Path, top: &Path) -> Option<String> {
     let paths = run_git(
         root,
         &[
@@ -248,16 +316,64 @@ fn prepared_message(root: &Path) -> Option<String> {
         ],
     )
     .ok()?;
-    paths.lines().find_map(|p| {
-        let text = std::fs::read_to_string(root.join(p.trim())).ok()?;
-        let kept: Vec<&str> = text
-            .lines()
-            .filter(|l| !l.starts_with('#'))
-            .map(str::trim_end)
-            .collect();
-        let message = kept.join("\n").trim().to_string();
-        (!message.is_empty()).then_some(message)
-    })
+    // Asked only once there is text to strip: most refreshes have none.
+    let marker = std::cell::OnceCell::new();
+    let strip = |text: String| {
+        without_comments(
+            &text,
+            marker.get_or_init(|| comment_marker(root)).as_deref(),
+        )
+    };
+    paths
+        .lines()
+        .find_map(|p| strip(std::fs::read_to_string(root.join(p.trim())).ok()?))
+        .or_else(|| strip(commit_template(root, top)?))
+}
+
+/// `text` without the lines starting with `marker` and without outer
+/// blank lines, or `None` when nothing is left. No marker drops no line.
+fn without_comments(text: &str, marker: Option<&str>) -> Option<String> {
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|l| !marker.is_some_and(|m| l.starts_with(m)))
+        .map(str::trim_end)
+        .collect();
+    let message = kept.join("\n").trim().to_string();
+    (!message.is_empty()).then_some(message)
+}
+
+/// The marker that starts a comment line for `git commit` (#1620):
+/// whichever of `core.commentChar` and `core.commentString` the config
+/// sets last, as git reads them, else `#`. A team that writes `#123` in
+/// its messages sets another, and its template's help lines start with
+/// that one. `None` for `auto`: git then picks a marker no line of the
+/// message starts with, so none of it is a comment.
+fn comment_marker(root: &Path) -> Option<String> {
+    let set = run_git(
+        root,
+        &["config", "--get-regexp", r"^core\.comment(char|string)$"],
+    )
+    .unwrap_or_default();
+    match set.lines().last().and_then(|l| l.split_once(' ')) {
+        Some((_, v)) if v.eq_ignore_ascii_case("auto") => None,
+        Some((_, v)) => Some(v.to_string()),
+        None => Some(String::from("#")),
+    }
+}
+
+/// The text of the file git's `commit.template` names (#1620), for the
+/// message box when no merge or squash message is prepared: croft commits
+/// with `-m`, and with `-m` git skips the template, so a team's required
+/// ticket prefix and headings were lost. `--path` expands `~`; a relative
+/// path is taken from `top`, the repository's top level, where `git
+/// commit` reads it.
+fn commit_template(root: &Path, top: &Path) -> Option<String> {
+    let named = run_git(root, &["config", "--path", "commit.template"]).ok()?;
+    let named = Path::new(named.trim());
+    if named.as_os_str().is_empty() {
+        return None;
+    }
+    std::fs::read_to_string(top.join(named)).ok()
 }
 
 /// The git-ignored paths under `root`, absolute.
@@ -573,11 +689,6 @@ pub fn parse_branch(out: String) -> Option<String> {
     }
 }
 
-/// `git status --porcelain` prints one line per changed entry.
-pub fn parse_porcelain_dirty(out: &str) -> bool {
-    out.lines().any(|l| !l.trim().is_empty())
-}
-
 /// Working-tree change reported by `git status --porcelain`. The Source
 /// Control panel groups entries by `kind.section()` and renders a one-letter
 /// badge per row.
@@ -737,6 +848,36 @@ pub fn unquote_porcelain_path(raw: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// The change kinds one porcelain v1 `XY` status code reports: a conflict
+/// or an untracked file is one kind; otherwise the index (`X`) and worktree
+/// (`Y`) columns each contribute one when set.
+fn status_kinds(x: char, y: char) -> [Option<ChangeKind>; 2] {
+    // Conflicts: AA, DD, AU, UA, DU, UD, UU.
+    let conflict = matches!(
+        (x, y),
+        ('A', 'A') | ('D', 'D') | ('A', 'U') | ('U', 'A') | ('D', 'U') | ('U', 'D') | ('U', 'U')
+    );
+    if conflict {
+        return [Some(ChangeKind::Conflicted), None];
+    }
+    if x == '?' && y == '?' {
+        return [Some(ChangeKind::Untracked), None];
+    }
+    let staged = (x != ' ' && x != '?').then_some(match x {
+        'A' => ChangeKind::StagedAdded,
+        'M' => ChangeKind::StagedModified,
+        'D' => ChangeKind::StagedDeleted,
+        'R' | 'C' => ChangeKind::StagedRenamed,
+        _ => ChangeKind::StagedModified,
+    });
+    let unstaged = (y != ' ' && y != '?').then_some(match y {
+        'M' => ChangeKind::Modified,
+        'D' => ChangeKind::Deleted,
+        _ => ChangeKind::Modified,
+    });
+    [staged, unstaged]
+}
+
 /// Parse `git status --porcelain` (v1) into the change entries the Source
 /// Control panel renders. Each line is `XY <path>` where `X` is the index
 /// status and `Y` is the worktree status; renames carry both old and new
@@ -757,61 +898,132 @@ pub fn parse_porcelain_changes(out: &str) -> Vec<ChangeEntry> {
         } else {
             unquote_porcelain_path(path_part)
         };
-        // Conflicts: AA, DD, AU, UA, DU, UD, UU.
-        let conflict = matches!(
-            (x, y),
-            ('A', 'A')
-                | ('D', 'D')
-                | ('A', 'U')
-                | ('U', 'A')
-                | ('D', 'U')
-                | ('U', 'D')
-                | ('U', 'U')
-        );
-        if conflict {
-            entries.push(ChangeEntry {
-                path,
-                kind: ChangeKind::Conflicted,
-                ..Default::default()
-            });
-            continue;
-        }
-        if x == '?' && y == '?' {
-            entries.push(ChangeEntry {
-                path,
-                kind: ChangeKind::Untracked,
-                ..Default::default()
-            });
-            continue;
-        }
-        if x != ' ' && x != '?' {
-            let kind = match x {
-                'A' => ChangeKind::StagedAdded,
-                'M' => ChangeKind::StagedModified,
-                'D' => ChangeKind::StagedDeleted,
-                'R' | 'C' => ChangeKind::StagedRenamed,
-                _ => ChangeKind::StagedModified,
-            };
+        for kind in status_kinds(x, y).into_iter().flatten() {
             entries.push(ChangeEntry {
                 path: path.clone(),
                 kind,
                 ..Default::default()
             });
         }
-        if y != ' ' && y != '?' {
-            let kind = match y {
-                'M' => ChangeKind::Modified,
-                'D' => ChangeKind::Deleted,
-                _ => ChangeKind::Modified,
-            };
-            entries.push(ChangeEntry {
-                path,
-                kind,
-                ..Default::default()
-            });
-        }
     }
     entries
+}
+
+/// How the Explorer marks a changed path (#1513), after VS Code's git
+/// decorations. Ordered weakest to strongest: a folder wears the strongest
+/// status among the files beneath it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GitDecoration {
+    Untracked,
+    Added,
+    Renamed,
+    Deleted,
+    Modified,
+    Conflicted,
+}
+
+impl GitDecoration {
+    /// The letter VS Code puts after a changed file's name.
+    pub fn letter(self) -> char {
+        match self {
+            Self::Untracked => 'U',
+            Self::Added => 'A',
+            Self::Renamed => 'R',
+            Self::Deleted => 'D',
+            Self::Modified => 'M',
+            Self::Conflicted => '!',
+        }
+    }
+
+    fn from_kind(kind: ChangeKind) -> Self {
+        match kind {
+            ChangeKind::StagedAdded => Self::Added,
+            ChangeKind::StagedModified | ChangeKind::Modified => Self::Modified,
+            ChangeKind::StagedDeleted | ChangeKind::Deleted => Self::Deleted,
+            ChangeKind::StagedRenamed => Self::Renamed,
+            ChangeKind::Untracked => Self::Untracked,
+            ChangeKind::Conflicted => Self::Conflicted,
+        }
+    }
+}
+
+/// The Explorer's decorations from `git status --porcelain -z` output
+/// (#1513). Porcelain paths are toplevel-relative, so `prefix` (`rev-parse
+/// --show-prefix`: where `root` sits in the repository) is stripped and the
+/// rest joined onto `root`; a change outside `root` is not in its tree. A
+/// partially staged file keeps its strongest status, and each folder between
+/// a file and `root` takes the strongest status beneath it.
+///
+/// `-z` records are `XY <path>` with raw, unquoted path bytes, and a rename
+/// or copy is followed by one more record holding its source. Paths stay
+/// bytes until joined, so a filename that is not UTF-8 or that contains
+/// ` -> ` still keys the exact path the file tree holds.
+pub fn parse_decorations(
+    root: &Path,
+    prefix: &str,
+    porcelain: &[u8],
+) -> HashMap<PathBuf, GitDecoration> {
+    let prefix = prefix.trim().as_bytes();
+    let mut out: HashMap<PathBuf, GitDecoration> = HashMap::new();
+    let mut records = porcelain.split(|b| *b == 0);
+    while let Some(record) = records.next() {
+        if record.len() < 4 {
+            continue;
+        }
+        let (x, y) = (record[0] as char, record[1] as char);
+        if matches!(x, 'R' | 'C') {
+            // The source path; a rename decorates its destination.
+            records.next();
+        }
+        let Some(rel) = record[3..].strip_prefix(prefix) else {
+            continue;
+        };
+        if rel.is_empty() {
+            continue;
+        }
+        let Some(dec) = status_kinds(x, y)
+            .into_iter()
+            .flatten()
+            .map(GitDecoration::from_kind)
+            .max()
+        else {
+            continue;
+        };
+        let mut path = join_raw(root, rel);
+        loop {
+            match out.get(&path) {
+                // Every ancestor already wears at least this status.
+                Some(&have) if have >= dec => break,
+                _ => {
+                    out.insert(path.clone(), dec);
+                }
+            }
+            match path.parent() {
+                Some(parent) if parent != root && parent.starts_with(root) => {
+                    path = parent.to_path_buf();
+                }
+                _ => break,
+            }
+        }
+    }
+    out
+}
+
+/// How many changed entries `git status --porcelain -z` output lists: one
+/// per record, not counting the source record a rename or copy carries.
+fn porcelain_z_count(porcelain: &[u8]) -> usize {
+    let mut count = 0;
+    let mut records = porcelain.split(|b| *b == 0);
+    while let Some(record) = records.next() {
+        if record.is_empty() {
+            continue;
+        }
+        count += 1;
+        if matches!(record.first(), Some(b'R' | b'C')) {
+            records.next();
+        }
+    }
+    count
 }
 
 /// Run `git status --porcelain` against `root` and return parsed entries.
@@ -2367,11 +2579,12 @@ pub fn parse_commit_graph(out: &str, now: i64) -> Vec<GraphCommit> {
         .collect()
 }
 
-/// The commit that last touched one line, for GitLens-style inline blame.
-/// Lines not yet committed (staged or unstaged working-tree edits) blame
-/// against the all-zero hash, which [`parse_blame`] marks `uncommitted`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BlameLine {
+/// The commit that last touched one or more lines, for GitLens-style inline
+/// blame. Lines not yet committed (staged or unstaged working-tree edits)
+/// blame against the all-zero hash, which [`parse_blame`] marks
+/// `uncommitted`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct BlameCommit {
     pub short_hash: String,
     pub summary: String,
     pub author: String,
@@ -2380,30 +2593,69 @@ pub struct BlameLine {
     /// True for a not-yet-committed line (the zero hash `git blame` reports
     /// for working-tree changes).
     pub uncommitted: bool,
-    /// The line's text as blamed, when known: the annotation is shown only
+}
+
+/// A file's blame, line by line (#1707). Each line's commit is shared with
+/// every other line it last touched, and the lines' text is packed: a file
+/// names far fewer commits than it has lines, and a copy of the hash,
+/// author, summary and text on every line cost ~330 bytes a line, 23 MB for
+/// a 73,000-line file, in every tab blame had visited.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Blame {
+    commits: Vec<Arc<BlameCommit>>,
+    /// The lines' text as blamed, when known: the annotation is shown only
     /// while the buffer's line still reads the same (see
     /// `Editor::committed_blame_annotation`).
-    pub text: Option<String>,
+    text: Option<crate::packed_lines::PackedLines>,
+}
+
+impl Blame {
+    /// Blame for lines whose commits are `commits`, in order, and whose
+    /// text as blamed is `text` when known.
+    pub fn new(
+        commits: Vec<Arc<BlameCommit>>,
+        text: Option<crate::packed_lines::PackedLines>,
+    ) -> Self {
+        Self { commits, text }
+    }
+
+    /// How many lines were blamed.
+    pub fn len(&self) -> usize {
+        self.commits.len()
+    }
+
+    /// Whether no line was blamed (git failed, or the file is untracked).
+    pub fn is_empty(&self) -> bool {
+        self.commits.is_empty()
+    }
+
+    /// Line `i`'s commit, and its text as blamed when known.
+    pub fn line(&self, i: usize) -> Option<(&BlameCommit, Option<&str>)> {
+        let commit = self.commits.get(i)?;
+        Some((commit, self.text.as_ref().and_then(|t| t.get(i))))
+    }
 }
 
 /// Per-line blame for `rel_path`, indexed 0-based by result position (result
-/// `[0]` is line 1). Uses `git blame --line-porcelain` so each line carries
-/// its author, author-time, and summary. Returns empty on any failure so the
-/// caller renders no annotation rather than an error.
-pub fn blame(root: &Path, rel_path: &str) -> Vec<BlameLine> {
+/// `[0]` is line 1). Uses `git blame --porcelain`, which describes each
+/// commit once, where `--line-porcelain` repeated its author, time and
+/// summary on every line it touched: several times the output to read for
+/// the same answer. Returns empty on any failure so the caller renders no
+/// annotation rather than an error.
+pub fn blame(root: &Path, rel_path: &str) -> Blame {
     let (dir, name) = file_cwd(root, rel_path);
     let Some(path_str) = dir.to_str() else {
-        return Vec::new();
+        return Blame::default();
     };
     let output = Command::new("git")
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .args(["-C", path_str, "blame", "--line-porcelain", "--", &name])
+        .args(["-C", path_str, "blame", "--porcelain", "--", &name])
         .output();
     let Ok(output) = output else {
-        return Vec::new();
+        return Blame::default();
     };
     if !output.status.success() {
-        return Vec::new();
+        return Blame::default();
     }
     parse_blame(
         &String::from_utf8_lossy(&output.stdout),
@@ -2411,12 +2663,18 @@ pub fn blame(root: &Path, rel_path: &str) -> Vec<BlameLine> {
     )
 }
 
-/// Parse `git blame --line-porcelain` output into one [`BlameLine`] per source
+/// Parse `git blame --porcelain` output into the [`Blame`] of each source
 /// line, in order. Porcelain groups each line as a header (`<hash> <orig>
-/// <final> [group]`) followed by `author`, `author-time`, `summary`, etc.,
-/// then a tab-prefixed content line. `now` (unix seconds) dates each line.
-pub fn parse_blame(out: &str, now: i64) -> Vec<BlameLine> {
+/// <final> [group]`), then the commit's `author`, `author-time`, `summary`,
+/// etc. the first time that commit appears, then a tab-prefixed content
+/// line. A later line of the same commit shares the first one's
+/// [`BlameCommit`]; `--line-porcelain`'s repeated metadata parses the same.
+/// `now` (unix seconds) dates each commit.
+pub fn parse_blame(out: &str, now: i64) -> Blame {
     let mut lines = Vec::new();
+    let mut text = crate::packed_lines::PackedLines::default();
+    let mut commits: std::collections::HashMap<String, Arc<BlameCommit>> =
+        std::collections::HashMap::new();
     let mut hash: Option<String> = None;
     let mut author = String::new();
     let mut summary = String::new();
@@ -2431,25 +2689,31 @@ pub fn parse_blame(out: &str, now: i64) -> Vec<BlameLine> {
         } else if let Some(content) = raw.strip_prefix('\t') {
             // The content line closes a group: emit the accumulated blame.
             if let Some(full) = hash.take() {
-                let uncommitted = full.chars().all(|c| c == '0');
-                lines.push(BlameLine {
-                    short_hash: full.chars().take(8).collect(),
-                    summary: std::mem::take(&mut summary),
-                    author: std::mem::take(&mut author),
-                    age_secs: now - author_time,
-                    uncommitted,
-                    text: Some(content.to_string()),
+                let commit = commits.entry(full).or_insert_with_key(|full| {
+                    Arc::new(BlameCommit {
+                        short_hash: full.chars().take(8).collect(),
+                        summary: std::mem::take(&mut summary),
+                        author: std::mem::take(&mut author),
+                        age_secs: now - author_time,
+                        uncommitted: full.chars().all(|c| c == '0'),
+                    })
                 });
+                lines.push(Arc::clone(commit));
+                text.push(content);
             }
         } else if let Some(h) = raw.split(' ').next() {
             // A header line begins with a 40-char hash; other porcelain
-            // metadata (previous/filename/committer/…) is ignored.
+            // metadata (previous/filename/committer/…) is ignored. A group's
+            // metadata is only what follows its own header.
             if h.len() == 40 && h.chars().all(|c| c.is_ascii_hexdigit()) {
                 hash = Some(h.to_string());
+                author.clear();
+                summary.clear();
+                author_time = now;
             }
         }
     }
-    lines
+    Blame::new(lines, Some(text))
 }
 
 /// Repo's default branch name. Tries `origin/HEAD` first (set by
@@ -2755,8 +3019,33 @@ pub fn create_branch(root: &Path, name: &str) -> Result<String, String> {
 
 /// Stash the working tree (`git stash push`). Tracked changes are saved
 /// and the working tree reverts to HEAD, exactly like VS Code's Stash.
-pub fn stash_push(root: &Path) -> Result<String, String> {
-    run_mutation(root, &["stash", "push"])
+/// A `message` names the stash (`-m`, #1581); without one git calls it
+/// `WIP on <branch>: <commit>`.
+pub fn stash_push(root: &Path, message: Option<&str>) -> Result<String, String> {
+    stash_push_args(root, &[], message)
+}
+
+/// Which of Source Control's three stash commands is asking for a
+/// message (#1581).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StashKind {
+    /// `git stash push`.
+    Tracked,
+    /// `git stash push -u`.
+    IncludeUntracked,
+    /// `git stash push --staged`.
+    Staged,
+}
+
+/// `git stash push <extra> [-m <message>]`, a blank message counting as
+/// none.
+fn stash_push_args(root: &Path, extra: &[&str], message: Option<&str>) -> Result<String, String> {
+    let mut args = vec!["stash", "push"];
+    args.extend_from_slice(extra);
+    if let Some(message) = message.map(str::trim).filter(|m| !m.is_empty()) {
+        args.extend(["-m", message]);
+    }
+    run_mutation(root, &args)
 }
 
 /// Restore and drop the most recent stash (`git stash pop`). A pop
@@ -3025,19 +3314,44 @@ pub fn unpublished_branch(root: &Path) -> Option<String> {
 /// set, else `origin`, else the only remote. With several remotes and
 /// none of those, picking one would be a guess, so it is an error.
 fn publish_remote(root: &Path) -> Result<String, String> {
+    match default_push_remote(root)? {
+        Some(remote) => Ok(remote),
+        None if run_git(root, &["remote"]).is_ok_and(|r| r.is_empty()) => {
+            Err(String::from("no remote to publish this branch to"))
+        }
+        None => Err(String::from(
+            "branch has no upstream and several remotes, none of them origin: set remote.pushDefault to pick one",
+        )),
+    }
+}
+
+/// `remote.pushDefault`, else the only remote, else `origin` among
+/// several; `None` when there is no remote or several and none of those.
+fn default_push_remote(root: &Path) -> Result<Option<String>, String> {
     if let Ok(remote) = run_git(root, &["config", "--get", "remote.pushDefault"])
         && !remote.is_empty()
     {
-        return Ok(remote);
+        return Ok(Some(remote));
     }
     let listed = run_git(root, &["remote"]).map_err(|e| e.to_string())?;
     let remotes: Vec<&str> = listed.lines().filter(|l| !l.is_empty()).collect();
-    match remotes.as_slice() {
-        [] => Err(String::from("no remote to publish this branch to")),
-        [only] => Ok((*only).to_string()),
-        several if several.contains(&"origin") => Ok(String::from("origin")),
-        _ => Err(String::from(
-            "branch has no upstream and several remotes, none of them origin: set remote.pushDefault to pick one",
+    Ok(match remotes.as_slice() {
+        [only] => Some((*only).to_string()),
+        several if several.contains(&"origin") => Some(String::from("origin")),
+        _ => None,
+    })
+}
+
+/// The remote tags are pushed to and deleted from (#1582): the one a new
+/// branch is published to, by the same rules.
+pub fn tag_remote(root: &Path) -> Result<String, String> {
+    match default_push_remote(root)? {
+        Some(remote) => Ok(remote),
+        None if run_git(root, &["remote"]).is_ok_and(|r| r.is_empty()) => {
+            Err(String::from("no remote to push tags to"))
+        }
+        None => Err(String::from(
+            "several remotes, none of them origin: set remote.pushDefault to pick one",
         )),
     }
 }
@@ -3127,13 +3441,13 @@ pub fn remove_remote(root: &Path, name: &str) -> Result<String, String> {
 // --- Stash (full set) ----------------------------------------------------
 
 /// Stash including untracked files (`git stash push -u`).
-pub fn stash_push_untracked(root: &Path) -> Result<String, String> {
-    run_mutation(root, &["stash", "push", "-u"])
+pub fn stash_push_untracked(root: &Path, message: Option<&str>) -> Result<String, String> {
+    stash_push_args(root, &["-u"], message)
 }
 
 /// Stash only the staged changes (`git stash push --staged`).
-pub fn stash_push_staged(root: &Path) -> Result<String, String> {
-    run_mutation(root, &["stash", "push", "--staged"])
+pub fn stash_push_staged(root: &Path, message: Option<&str>) -> Result<String, String> {
+    stash_push_args(root, &["--staged"], message)
 }
 
 /// One entry in the stash list, for the apply/pop/drop pickers.
@@ -3143,16 +3457,61 @@ pub struct StashInfo {
     pub index: usize,
     /// The human description git stores (`WIP on main: …`).
     pub message: String,
+    /// How long ago it was made (`5 minutes ago`, #1581).
+    pub age: String,
+    /// The files it holds, untracked ones included (#1581), so two stashes
+    /// on the same commit can be told apart.
+    pub files: Vec<String>,
 }
 
-/// List stashes newest-first (`git stash list`).
+impl StashInfo {
+    /// The picker row (#1581): `stash@{N}: <message> · <age> · <files>`,
+    /// naming at most three files.
+    pub fn label(&self) -> String {
+        let mut label = format!("stash@{{{}}}: {}", self.index, self.message);
+        if !self.age.is_empty() {
+            label.push_str(&format!(" \u{b7} {}", self.age));
+        }
+        if !self.files.is_empty() {
+            let shown: Vec<&str> = self.files.iter().take(3).map(String::as_str).collect();
+            label.push_str(&format!(" \u{b7} {}", shown.join(", ")));
+            if self.files.len() > 3 {
+                label.push_str(&format!(" +{}", self.files.len() - 3));
+            }
+        }
+        label
+    }
+}
+
+/// List stashes newest-first (`git stash list`), each with its age and
+/// files. Two git processes however many stashes there are, since the
+/// pickers call this on the UI thread: one `git stash list --name-only`
+/// for the tracked files (diffed against the commit the stash was made
+/// on) and one `git show` over every stash's untracked-files commit.
 pub fn list_stashes(root: &Path) -> Result<Vec<StashInfo>, String> {
-    let raw =
-        run_git(root, &["stash", "list", "--format=%gd\x1f%gs"]).map_err(|e| e.to_string())?;
+    let raw = run_git(
+        root,
+        &[
+            "stash",
+            "list",
+            "-m",
+            "--name-only",
+            "--format=%x1e%gd%x1f%cr%x1f%P%x1f%gs",
+        ],
+    )
+    .map_err(|e| e.to_string())?;
     let mut out = Vec::new();
-    for line in raw.lines() {
-        let mut parts = line.split('\x1f');
-        let Some(reflog) = parts.next() else { continue };
+    // The third parent, when there is one, holds the untracked files.
+    let mut untracked_commits: Vec<(usize, String)> = Vec::new();
+    for record in raw.split('\x1e') {
+        let mut lines = record.lines();
+        let Some(header) = lines.next().filter(|h| !h.is_empty()) else {
+            continue;
+        };
+        let mut parts = header.split('\x1f');
+        let reflog = parts.next().unwrap_or("");
+        let age = parts.next().unwrap_or("").to_string();
+        let parents = parts.next().unwrap_or("");
         let message = parts.next().unwrap_or("").to_string();
         // reflog looks like "stash@{2}" — pull the integer out.
         let index = reflog
@@ -3160,9 +3519,69 @@ pub fn list_stashes(root: &Path) -> Result<Vec<StashInfo>, String> {
             .trim_end_matches('}')
             .parse::<usize>()
             .unwrap_or(out.len());
-        out.push(StashInfo { index, message });
+        if let Some(untracked) = parents.split_whitespace().nth(2) {
+            untracked_commits.push((out.len(), untracked.to_string()));
+        }
+        let files = lines
+            .map(str::trim_end)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        out.push(StashInfo {
+            index,
+            message,
+            age,
+            files,
+        });
+    }
+    if !untracked_commits.is_empty() {
+        let mut args = vec!["show", "--root", "--name-only", "--format=%x1e%H"];
+        args.extend(untracked_commits.iter().map(|(_, hash)| hash.as_str()));
+        if let Ok(raw) = run_git(root, &args) {
+            let mut by_hash: std::collections::HashMap<&str, Vec<String>> =
+                std::collections::HashMap::new();
+            for record in raw.split('\x1e') {
+                let mut lines = record.lines();
+                let Some(hash) = lines.next().filter(|h| !h.is_empty()) else {
+                    continue;
+                };
+                let names = lines
+                    .map(str::trim_end)
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                by_hash.insert(hash.trim(), names);
+            }
+            for (pos, hash) in &untracked_commits {
+                if let Some(names) = by_hash.remove(hash.as_str()) {
+                    let files = &mut out[*pos].files;
+                    files.extend(names);
+                    files.sort();
+                    files.dedup();
+                }
+            }
+        }
     }
     Ok(out)
+}
+
+/// A stash's changes as a patch against the commit it was made on,
+/// untracked files included (`git stash show --stat --patch
+/// --include-untracked stash@{N}`), for View Stash (#1581).
+pub fn show_stash(root: &Path, index: usize) -> Result<String, String> {
+    diff_text(
+        root,
+        &[
+            "stash",
+            "show",
+            "--no-color",
+            "--no-ext-diff",
+            "--stat",
+            "--patch",
+            "--include-untracked",
+            &format!("stash@{{{index}}}"),
+        ],
+    )
 }
 
 /// Apply a stash without dropping it (`git stash apply stash@{N}`).
@@ -3192,9 +3611,45 @@ pub fn list_tags(root: &Path) -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// Create a lightweight tag at HEAD (`git tag <name>`).
-pub fn create_tag(root: &Path, name: &str) -> Result<String, String> {
-    run_mutation(root, &["tag", name])
+/// Create a tag at HEAD: annotated (`git tag -a <name> -m <message>`)
+/// when there is a message, as VS Code's Create Tag makes one (#1582),
+/// else lightweight (`git tag <name>`).
+pub fn create_tag(root: &Path, name: &str, message: Option<&str>) -> Result<String, String> {
+    match message.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(message) => run_mutation(root, &["tag", "-a", name, "-m", message]),
+        None => run_mutation(root, &["tag", name]),
+    }
+}
+
+/// Push every local tag to `remote` (`git push <remote> --tags`, #1582).
+/// A plain push sends none, so a tag made here stayed local.
+pub fn push_tags(root: &Path, remote: &str) -> Result<String, String> {
+    run_mutation(root, &["push", remote, "--tags"])
+}
+
+/// The tags on `remote` (`git ls-remote --tags --refs`), by name (#1582).
+pub fn list_remote_tags(root: &Path, remote: &str) -> Result<Vec<String>, String> {
+    let raw = run_mutation(root, &["ls-remote", "--tags", "--refs", remote])?;
+    Ok(parse_remote_tags(&raw))
+}
+
+/// The tag names in `git ls-remote --tags --refs` output; a peeled
+/// `^{}` line, which `--refs` already drops, is the same tag again.
+fn parse_remote_tags(raw: &str) -> Vec<String> {
+    raw.lines()
+        .filter_map(|line| line.split_once('\t')?.1.strip_prefix("refs/tags/"))
+        .filter(|tag| !tag.ends_with("^{}"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Delete tag `name` from `remote` (`git push <remote> --delete
+/// refs/tags/<name>`, #1582); the local tag stays.
+pub fn delete_remote_tag(root: &Path, remote: &str, name: &str) -> Result<String, String> {
+    run_mutation(
+        root,
+        &["push", remote, "--delete", &format!("refs/tags/{name}")],
+    )
 }
 
 /// Delete a tag (`git tag -d <name>`).
@@ -3620,17 +4075,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_porcelain_dirty_empty_means_clean() {
-        assert!(!parse_porcelain_dirty(""));
-        assert!(!parse_porcelain_dirty("\n"));
-        assert!(!parse_porcelain_dirty("   "));
+    fn porcelain_z_count_empty_means_clean() {
+        assert_eq!(porcelain_z_count(b""), 0);
+        assert_eq!(porcelain_z_count(b"\0"), 0);
     }
 
     #[test]
-    fn parse_porcelain_dirty_any_line_means_dirty() {
-        assert!(parse_porcelain_dirty(" M src/app.rs\n"));
-        assert!(parse_porcelain_dirty("?? new.txt\n"));
-        assert!(parse_porcelain_dirty("MM Cargo.toml\n M src/lib.rs\n"));
+    fn porcelain_z_count_counts_a_rename_once() {
+        assert_eq!(porcelain_z_count(b" M src/app.rs\0"), 1);
+        assert_eq!(porcelain_z_count(b"MM Cargo.toml\0 M src/lib.rs\0"), 2);
+        assert_eq!(
+            porcelain_z_count(b"R  new.rs\0old.rs\0?? x.txt\0"),
+            2,
+            "a rename's source record is not a second change"
+        );
     }
 
     #[test]
@@ -4894,6 +5352,77 @@ mod tests {
         assert!(err.contains("no commit"), "{err}");
     }
 
+    /// #1582: a message makes an annotated tag; without one (or a blank
+    /// one) the tag is lightweight, as before.
+    #[test]
+    fn create_tag_with_a_message_is_annotated() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        create_tag(p, "v1", Some("Release 1")).unwrap();
+        assert_eq!(git_in(p, &["cat-file", "-t", "v1"]), "tag");
+        assert_eq!(
+            git_in(p, &["tag", "-l", "--format=%(contents:subject)", "v1"]),
+            "Release 1"
+        );
+        create_tag(p, "v0", None).unwrap();
+        create_tag(p, "v0b", Some("   ")).unwrap();
+        assert_eq!(git_in(p, &["cat-file", "-t", "v0"]), "commit");
+        assert_eq!(git_in(p, &["cat-file", "-t", "v0b"]), "commit");
+    }
+
+    /// #1582: Push Tags sends local tags to the remote, the remote's tags
+    /// list by name, and Delete Remote Tag removes one there only.
+    #[test]
+    fn tags_push_list_and_delete_on_the_remote() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        let remote = TempDir::new().unwrap();
+        git_in(remote.path(), &["init", "-q", "--bare"]);
+        git_in(
+            p,
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        );
+        git_in(p, &["tag", "v1"]);
+        git_in(p, &["tag", "-a", "v2", "-m", "two"]);
+        assert_eq!(tag_remote(p).as_deref(), Ok("origin"));
+        assert_eq!(list_remote_tags(p, "origin"), Ok(Vec::new()));
+        push_tags(p, "origin").unwrap();
+        assert_eq!(
+            list_remote_tags(p, "origin"),
+            Ok(vec![String::from("v1"), String::from("v2")])
+        );
+        delete_remote_tag(p, "origin", "v1").unwrap();
+        assert_eq!(list_remote_tags(p, "origin"), Ok(vec![String::from("v2")]));
+        assert_eq!(git_in(p, &["tag"]), "v1\nv2", "local tags stay");
+    }
+
+    /// #1582, negative: no remote, or several with none of them origin and
+    /// no `remote.pushDefault`, is no remote to guess; `pushDefault` wins.
+    /// ls-remote's peeled and non-tag lines are not tags.
+    #[test]
+    fn the_tag_remote_is_never_a_guess() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        assert_eq!(
+            tag_remote(p),
+            Err(String::from("no remote to push tags to"))
+        );
+        git_in(p, &["remote", "add", "a", "/nowhere/a"]);
+        git_in(p, &["remote", "add", "b", "/nowhere/b"]);
+        assert!(tag_remote(p).unwrap_err().contains("remote.pushDefault"));
+        git_in(p, &["config", "remote.pushDefault", "b"]);
+        assert_eq!(tag_remote(p).as_deref(), Ok("b"));
+        assert_eq!(
+            parse_remote_tags(
+                "abc\trefs/tags/v1\ndef\trefs/heads/main\nfff\trefs/tags/v2^{}\nnoise"
+            ),
+            ["v1"]
+        );
+    }
+
     /// #1350: whether HEAD is already on its upstream, so the app can warn
     /// that undoing it means a force push later. No upstream is not pushed.
     #[test]
@@ -4979,6 +5508,133 @@ mod tests {
         );
     }
 
+    /// #1513: each porcelain status maps to its Explorer letter, a partially
+    /// staged file keeps its strongest status, and each folder above a
+    /// change takes the strongest status beneath it, whatever order the
+    /// lines come in. The root itself is never decorated.
+    #[test]
+    fn decorations_carry_each_status_and_roll_up_to_folders() {
+        use GitDecoration as D;
+        let root = Path::new("/w");
+        let porcelain = b" M a.py\0?? c.py\0A  d.py\0R  new.py\0old.py\0UU x.py\0 D gone.py\0AM part.py\0?? pkg/new.py\0 M pkg/old.py\0?? pkg/deep/n.py\0 M lib/x/y.py\0?? lib/z.py\0";
+        let got = parse_decorations(root, "", porcelain);
+        let at = |p: &str| got.get(&root.join(p)).copied();
+        assert_eq!(at("a.py"), Some(D::Modified));
+        assert_eq!(at("c.py"), Some(D::Untracked));
+        assert_eq!(at("d.py"), Some(D::Added));
+        assert_eq!(at("new.py"), Some(D::Renamed));
+        assert_eq!(at("old.py"), None, "a rename decorates its destination");
+        assert_eq!(at("x.py"), Some(D::Conflicted));
+        assert_eq!(at("gone.py"), Some(D::Deleted));
+        assert_eq!(
+            at("part.py"),
+            Some(D::Modified),
+            "AM: the strongest of the two"
+        );
+        assert_eq!(
+            at("pkg"),
+            Some(D::Modified),
+            "untracked first, modified wins"
+        );
+        assert_eq!(at("pkg/deep"), Some(D::Untracked));
+        assert_eq!(
+            at("lib"),
+            Some(D::Modified),
+            "modified first, untracked does not demote"
+        );
+        assert_eq!(at("lib/x"), Some(D::Modified));
+        assert_eq!(got.get(root), None, "the root row is never decorated");
+        let letters: String = [
+            D::Untracked,
+            D::Added,
+            D::Renamed,
+            D::Deleted,
+            D::Modified,
+            D::Conflicted,
+        ]
+        .map(GitDecoration::letter)
+        .iter()
+        .collect();
+        assert_eq!(letters, "UARDM!");
+    }
+
+    /// #1513 negatives: a workspace root inside the repository keeps only
+    /// its own changes (porcelain paths are toplevel-relative), and a clean
+    /// tree has no decorations.
+    #[test]
+    fn decorations_stay_inside_the_workspace_root() {
+        let root = Path::new("/repo/app");
+        let got = parse_decorations(
+            root,
+            "app/\n",
+            b" M app/src/x.py\0 M other/y.py\0?? apple.py\0",
+        );
+        assert_eq!(
+            got.keys().cloned().collect::<HashSet<_>>(),
+            HashSet::from([root.join("src/x.py"), root.join("src")])
+        );
+        assert!(parse_decorations(Path::new("/w"), "", b"").is_empty());
+    }
+
+    /// #1513: a decoration keys the exact path bytes, so a filename that is
+    /// not UTF-8 and a rename whose source contains ` -> ` still mark the
+    /// file the tree holds.
+    #[cfg(unix)]
+    #[test]
+    fn decorations_keep_exact_path_bytes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let root = Path::new("/w");
+        let got = parse_decorations(
+            root,
+            "",
+            b" M bad\xff.py\0R  new.py\0a -> b.py\0?? sp ace.py\0",
+        );
+        assert_eq!(
+            got.get(&root.join(OsStr::from_bytes(b"bad\xff.py"))),
+            Some(&GitDecoration::Modified)
+        );
+        assert_eq!(got.get(&root.join("new.py")), Some(&GitDecoration::Renamed));
+        assert_eq!(
+            got.get(&root.join("sp ace.py")),
+            Some(&GitDecoration::Untracked)
+        );
+        assert_eq!(got.len(), 3, "the rename source is not decorated: {got:?}");
+    }
+
+    /// #1513, end to end over the issue's repro: modified, staged and
+    /// untracked files are decorated from a real `git status`, and the
+    /// unchanged file is not.
+    #[test]
+    fn query_decorates_changed_files_and_their_folders() {
+        use GitDecoration as D;
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        std::fs::create_dir_all(p.join("sub")).unwrap();
+        for f in ["a.py", "b.py", "sub/e.py"] {
+            std::fs::write(p.join(f), "x = 1\n").unwrap();
+        }
+        init_repo_with_commit(p);
+        std::fs::write(p.join("a.py"), "x = 1\ny = 2\n").unwrap();
+        std::fs::write(p.join("sub/e.py"), "x = 1\ny = 2\n").unwrap();
+        std::fs::write(p.join("c.py"), "new = 1\n").unwrap();
+        std::fs::write(p.join("d.py"), "staged = 1\n").unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(p)
+            .args(["add", "d.py"])
+            .status()
+            .unwrap();
+        let st = query(p);
+        let at = |f: &str| st.decorations.get(&p.join(f)).copied();
+        assert_eq!(at("a.py"), Some(D::Modified));
+        assert_eq!(at("sub/e.py"), Some(D::Modified));
+        assert_eq!(at("sub"), Some(D::Modified));
+        assert_eq!(at("c.py"), Some(D::Untracked));
+        assert_eq!(at("d.py"), Some(D::Added));
+        assert_eq!(at("b.py"), None, "an unchanged file is not decorated");
+    }
+
     /// A new folder lists each of its files (#1279), not one `dir/` row
     /// that opens nothing and has no line count.
     #[test]
@@ -5046,6 +5702,82 @@ mod tests {
         assert_eq!(
             query(p).prepared_message.as_deref(),
             Some("Merge branch 'other'")
+        );
+    }
+
+    /// #1620: `commit.template` fills the message, comments dropped, read
+    /// from the repository's top level even when croft is in a subfolder;
+    /// a merge's own message wins over it.
+    #[test]
+    fn the_commit_template_is_the_message_when_nothing_is_prepared() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(
+            p.join(".gitmessage"),
+            "PROJ-: \n\nWhy:\n\n# Subject: PROJ-<ticket>: <summary>, at most 50 characters\n",
+        )
+        .unwrap();
+        run_git(p, &["config", "commit.template", ".gitmessage"]).unwrap();
+        assert_eq!(query(p).prepared_message.as_deref(), Some("PROJ-:\n\nWhy:"));
+        std::fs::create_dir(p.join("sub")).unwrap();
+        assert_eq!(
+            query(&p.join("sub")).prepared_message.as_deref(),
+            Some("PROJ-:\n\nWhy:"),
+            "relative to the top level, not the folder croft is in"
+        );
+        std::fs::write(p.join(".git/MERGE_MSG"), "Merge branch 'other'\n").unwrap();
+        assert_eq!(
+            query(p).prepared_message.as_deref(),
+            Some("Merge branch 'other'")
+        );
+    }
+
+    /// #1620: with `core.commentChar` set, lines starting with it are the
+    /// comments, and `#` lines are message text.
+    #[test]
+    fn the_configured_comment_char_marks_template_comments() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join(".gitmessage"), "#42: \n; helper text\n").unwrap();
+        run_git(p, &["config", "commit.template", ".gitmessage"]).unwrap();
+        run_git(p, &["config", "core.commentChar", ";"]).unwrap();
+        assert_eq!(query(p).prepared_message.as_deref(), Some("#42:"));
+    }
+
+    /// Negative (#1620): a template that names no readable file, or holds
+    /// only comments, is no message; an absolute path is read as named.
+    #[test]
+    fn a_missing_or_comment_only_template_is_no_message() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        run_git(p, &["config", "commit.template", "nope.txt"]).unwrap();
+        assert_eq!(query(p).prepared_message, None);
+        let only = tmp.path().join("only-comments.txt");
+        std::fs::write(&only, "# write something\n\n").unwrap();
+        run_git(p, &["config", "commit.template", only.to_str().unwrap()]).unwrap();
+        assert_eq!(query(p).prepared_message, None);
+        let abs = tmp.path().join("abs.txt");
+        std::fs::write(&abs, "Ticket: \n").unwrap();
+        run_git(p, &["config", "commit.template", abs.to_str().unwrap()]).unwrap();
+        assert_eq!(query(p).prepared_message.as_deref(), Some("Ticket:"));
+    }
+
+    /// #1620: under `core.commentChar=auto` git picks a marker no line of
+    /// the template starts with, so every line of it is the message.
+    #[test]
+    fn under_an_auto_comment_char_every_template_line_is_kept() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join(".gitmessage"), "#42: \n; helper text\n").unwrap();
+        run_git(p, &["config", "commit.template", ".gitmessage"]).unwrap();
+        run_git(p, &["config", "core.commentChar", "auto"]).unwrap();
+        assert_eq!(
+            query(p).prepared_message.as_deref(),
+            Some("#42:\n; helper text")
         );
     }
 
@@ -5855,12 +6587,55 @@ filename seed.txt
 ";
         let b = parse_blame(out, now);
         assert_eq!(b.len(), 2, "one entry per source line");
-        assert_eq!(b[0].short_hash, "abcdef01");
-        assert_eq!(b[0].author, "Vitali");
-        assert_eq!(b[0].summary, "fix: the thing");
-        assert_eq!(b[0].age_secs, 4, "now (10000) minus author-time (9996)");
-        assert!(!b[0].uncommitted);
-        assert!(b[1].uncommitted, "the zero hash marks an uncommitted line");
+        let (first, text) = b.line(0).unwrap();
+        assert_eq!(first.short_hash, "abcdef01");
+        assert_eq!(first.author, "Vitali");
+        assert_eq!(first.summary, "fix: the thing");
+        assert_eq!(first.age_secs, 4, "now (10000) minus author-time (9996)");
+        assert!(!first.uncommitted);
+        assert_eq!(text, Some("one"));
+        assert!(
+            b.line(1).unwrap().0.uncommitted,
+            "the zero hash marks an uncommitted line"
+        );
+    }
+
+    /// `--porcelain` describes a commit only the first time it appears
+    /// (#1707): every later line of it must still read its author, age and
+    /// summary, from the one record they share.
+    #[test]
+    fn parse_blame_gives_a_commits_later_lines_its_first_description() {
+        let now = 10_000i64;
+        let out = "\
+abcdef0123456789abcdef0123456789abcdef01 1 1 1
+author Vitali
+author-time 9996
+summary fix: the thing
+filename seed.txt
+\tone
+1111111111111111111111111111111111111111 2 2 1
+author Alice
+author-time 9000
+summary add two
+filename seed.txt
+\ttwo
+abcdef0123456789abcdef0123456789abcdef01 3 3 1
+filename seed.txt
+\tthree
+";
+        let b = parse_blame(out, now);
+        assert_eq!(b.len(), 3, "one entry per source line");
+        let (third, text) = b.line(2).unwrap();
+        assert_eq!(text, Some("three"));
+        assert_eq!(third.author, "Vitali");
+        assert_eq!(third.summary, "fix: the thing");
+        assert_eq!(third.age_secs, 4);
+        assert_eq!(third.short_hash, "abcdef01");
+        assert!(
+            std::ptr::eq(b.line(0).unwrap().0, third),
+            "two lines of one commit share its record"
+        );
+        assert_eq!(b.line(1).unwrap().0.author, "Alice");
     }
 
     #[test]
@@ -5871,12 +6646,18 @@ filename seed.txt
         // seed.txt is "one\ntwo\n" — two committed lines.
         let b = blame(p, "seed.txt");
         assert_eq!(b.len(), 2, "blame reports every source line");
+        let (first, _) = b.line(0).unwrap();
         assert_eq!(
-            b[0].author, "a",
+            first.author, "a",
             "committed by init_repo_with_commit's user"
         );
-        assert!(!b[0].uncommitted);
-        assert!(!b[0].short_hash.is_empty());
+        assert!(!first.uncommitted);
+        assert!(!first.short_hash.is_empty());
+        assert_eq!(
+            b.line(1).unwrap().0.author,
+            "a",
+            "a commit's second line reads its author too"
+        );
     }
 
     /// A workspace opened one folder ABOVE its repo (#1227): `tl/` holding
@@ -5900,7 +6681,7 @@ filename seed.txt
         init_repo_with_commit(&sub);
         let b = blame(tmp.path(), "sub/seed.txt");
         assert_eq!(b.len(), 2, "blame of sub/seed.txt from the parent");
-        assert!(!b[0].uncommitted);
+        assert!(!b.line(0).unwrap().0.uncommitted);
     }
 
     #[test]
@@ -6048,7 +6829,7 @@ filename seed.txt
         let p = tmp.path();
         init_repo_with_commit(p);
         std::fs::write(p.join("seed.txt"), "one\ntwo\nstashed\n").unwrap();
-        stash_push(p).expect("stash push must succeed");
+        stash_push(p, None).expect("stash push must succeed");
         // The dirty edit is gone from the working tree after stashing.
         assert_eq!(
             std::fs::read_to_string(p.join("seed.txt")).unwrap(),
@@ -6182,7 +6963,7 @@ filename seed.txt
         let tmp = TempDir::new().unwrap();
         let p = tmp.path();
         init_repo_with_commit(p);
-        create_tag(p, "v1.0.0").expect("create_tag");
+        create_tag(p, "v1.0.0", None).expect("create_tag");
         assert!(list_tags(p).unwrap().contains(&"v1.0.0".to_string()));
         delete_tag(p, "v1.0.0").expect("delete_tag");
         assert!(!list_tags(p).unwrap().contains(&"v1.0.0".to_string()));
@@ -6194,9 +6975,9 @@ filename seed.txt
         let p = tmp.path();
         init_repo_with_commit(p);
         std::fs::write(p.join("seed.txt"), "one\ntwo\nfirst\n").unwrap();
-        stash_push(p).expect("first stash");
+        stash_push(p, None).expect("first stash");
         std::fs::write(p.join("seed.txt"), "one\ntwo\nsecond\n").unwrap();
-        stash_push(p).expect("second stash");
+        stash_push(p, None).expect("second stash");
         let stashes = list_stashes(p).unwrap();
         assert_eq!(stashes.len(), 2);
         assert_eq!(stashes[0].index, 0, "newest stash is stash@{{0}}");
@@ -6211,6 +6992,114 @@ filename seed.txt
         // Drop the newest; one remains.
         stash_drop(p, 0).expect("stash_drop");
         assert_eq!(list_stashes(p).unwrap().len(), 1);
+    }
+
+    // #1581: a stash takes the name it is given, for every kind of stash,
+    // and its row says how old it is and which files it holds.
+    #[test]
+    fn a_stash_message_names_the_stash_and_the_row_lists_its_files() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join("seed.txt"), "one\ntwo\ntracked\n").unwrap();
+        stash_push(p, Some("retry tweak")).expect("named stash");
+        std::fs::write(p.join("new.txt"), "untracked\n").unwrap();
+        stash_push_untracked(p, Some("with the new file")).expect("named -u stash");
+        std::fs::write(p.join("seed.txt"), "one\ntwo\nstaged\n").unwrap();
+        run_git(p, &["add", "seed.txt"]).unwrap();
+        stash_push_staged(p, Some("only staged")).expect("named --staged stash");
+        let stashes = list_stashes(p).unwrap();
+        let messages: Vec<&str> = stashes.iter().map(|s| s.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            [
+                "On main: only staged",
+                "On main: with the new file",
+                "On main: retry tweak"
+            ]
+        );
+        assert_eq!(stashes[1].files, ["new.txt"], "untracked files are listed");
+        assert_eq!(stashes[2].files, ["seed.txt"]);
+        assert!(!stashes[2].age.is_empty(), "{:?}", stashes[2]);
+        let label = stashes[2].label();
+        assert!(
+            label.starts_with("stash@{2}: On main: retry tweak \u{b7} ")
+                && label.ends_with(" \u{b7} seed.txt"),
+            "{label}"
+        );
+    }
+
+    // #1581: the file lists come from one listing for every stash, so a
+    // stash's tracked and untracked files are merged into one row and
+    // each stash keeps its own files.
+    #[test]
+    fn stash_rows_merge_tracked_and_untracked_files_per_stash() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join("seed.txt"), "one\ntwo\nmixed\n").unwrap();
+        std::fs::write(p.join("a_new.txt"), "untracked\n").unwrap();
+        stash_push_untracked(p, Some("mixed")).unwrap();
+        std::fs::write(p.join("seed.txt"), "one\ntwo\nplain\n").unwrap();
+        stash_push(p, Some("plain")).unwrap();
+        std::fs::write(p.join("z_new.txt"), "only untracked\n").unwrap();
+        stash_push_untracked(p, Some("untracked only")).unwrap();
+        let stashes = list_stashes(p).unwrap();
+        assert_eq!(stashes.len(), 3);
+        assert_eq!(stashes[0].files, ["z_new.txt"]);
+        assert_eq!(stashes[1].files, ["seed.txt"]);
+        assert_eq!(stashes[2].files, ["a_new.txt", "seed.txt"]);
+        assert_eq!(
+            stashes.iter().map(|s| s.index).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+    }
+
+    // Negative (#1581): a blank or missing message leaves git's own
+    // `WIP on` name, and a row never lists more than three files.
+    #[test]
+    fn a_blank_stash_message_keeps_the_wip_name_and_long_file_lists_are_cut() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join("seed.txt"), "one\ntwo\nblank\n").unwrap();
+        stash_push(p, Some("   ")).expect("blank-named stash");
+        let stashes = list_stashes(p).unwrap();
+        assert!(
+            stashes[0].message.starts_with("WIP on main: "),
+            "{:?}",
+            stashes[0]
+        );
+        let info = StashInfo {
+            index: 4,
+            message: "On main: big".into(),
+            age: String::new(),
+            files: ["a", "b", "c", "d", "e"].map(String::from).to_vec(),
+        };
+        assert_eq!(info.label(), "stash@{4}: On main: big \u{b7} a, b, c +2");
+    }
+
+    // #1581: View Stash shows the stash's diff, untracked files included,
+    // without applying it.
+    #[test]
+    fn show_stash_is_the_patch_without_applying_it() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::write(p.join("seed.txt"), "one\ntwo\nretries = 5\n").unwrap();
+        std::fs::write(p.join("extra.txt"), "brand new\n").unwrap();
+        stash_push_untracked(p, Some("retries")).unwrap();
+        let patch = show_stash(p, 0).expect("show_stash");
+        assert!(patch.contains("+retries = 5"), "{patch}");
+        assert!(patch.contains("+brand new"), "untracked: {patch}");
+        assert!(patch.contains("2 files changed"), "the stat: {patch}");
+        assert_eq!(
+            std::fs::read_to_string(p.join("seed.txt")).unwrap(),
+            "one\ntwo\n",
+            "viewing does not apply"
+        );
+        assert_eq!(list_stashes(p).unwrap().len(), 1, "viewing does not drop");
+        assert!(show_stash(p, 3).is_err(), "no such stash");
     }
 
     #[test]

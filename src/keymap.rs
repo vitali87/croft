@@ -222,6 +222,68 @@ impl Chord {
     }
 }
 
+/// The chord a built-in command's keybinding hint names (#1482), as this
+/// platform spells it (`Cmd+/` is `Ctrl+/` off macOS). None for no hint, a
+/// two-step chord (`Cmd+K A`) or a hint that only holds in one view
+/// (`R in diff`).
+pub fn hint_chord(hint: &str) -> Option<Chord> {
+    let hint = crate::widgets::command_palette::platform_hint(hint);
+    if hint.is_empty() || hint.contains(' ') {
+        return None;
+    }
+    let spelled = hint
+        .replace('\u{2191}', "up")
+        .replace('\u{2193}', "down")
+        .replace('\u{2190}', "left")
+        .replace('\u{2192}', "right");
+    Chord::parse(&spelled)
+}
+
+/// A config chord (`ctrl+alt+j`) as the palette spells shortcuts
+/// (`Ctrl+Alt+J`, #1482).
+pub fn display_chord(config: &str) -> String {
+    let mut tokens: Vec<&str> = config.split('+').collect();
+    // `ctrl++`: the key itself is `+`.
+    if config.ends_with("++") {
+        tokens.truncate(tokens.len() - 2);
+        tokens.push("+");
+    }
+    tokens
+        .into_iter()
+        .map(|t| match t {
+            "ctrl" => String::from("Ctrl"),
+            "alt" => String::from(if cfg!(target_os = "macos") {
+                "Opt"
+            } else {
+                "Alt"
+            }),
+            "shift" => String::from("Shift"),
+            "cmd" => String::from("Cmd"),
+            "up" => String::from("\u{2191}"),
+            "down" => String::from("\u{2193}"),
+            "left" => String::from("\u{2190}"),
+            "right" => String::from("\u{2192}"),
+            other => {
+                let mut chars = other.chars();
+                chars
+                    .next()
+                    .map(|c| c.to_uppercase().chain(chars).collect())
+                    .unwrap_or_default()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+/// The built-in commands whose own shortcut is `chord` (#1482).
+pub fn builtin_commands_on(chord: Chord) -> Vec<Command> {
+    crate::widgets::command_palette::ALL_COMMANDS
+        .iter()
+        .copied()
+        .filter(|cmd| hint_chord(cmd.keybinding_hint()) == Some(chord))
+        .collect()
+}
+
 /// What prose calls the portable `mod` modifier [`Chord::parse`] resolves:
 /// `Cmd` on macOS, `Ctrl` elsewhere. Text that tells a user which chord to
 /// press (the `croft demo` captions, #863) names the key they actually
@@ -737,6 +799,15 @@ impl Keymap {
     /// caller only asks for chords that carry a modifier or are function keys.
     pub fn command_for(&self, key: KeyEvent) -> Option<Command> {
         self.bindings.get(&Chord::from_event(key)).copied()
+    }
+
+    /// Whether a user binding gives `cmd`'s built-in chord to another
+    /// command (#1482): that chord no longer reaches `cmd`, so its hint
+    /// must not be shown next to it.
+    pub fn shadows_builtin(&self, cmd: Command) -> bool {
+        hint_chord(cmd.keybinding_hint())
+            .and_then(|chord| self.bindings.get(&chord))
+            .is_some_and(|bound| *bound != cmd)
     }
 
     /// The user's chord for `cmd`, when `keybindings.json` binds one (#612).
@@ -1447,5 +1518,53 @@ mod tests {
         let (map, warnings) = Keymap::resolve(json);
         assert_eq!(map.chords().len(), 2);
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// #1482: built-in hints read back as the chords croft binds them to.
+    #[test]
+    fn built_in_hints_name_their_chords() {
+        let m = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        let a = if cfg!(target_os = "macos") {
+            "opt"
+        } else {
+            "alt"
+        };
+        assert_eq!(hint_chord("Cmd+/"), Chord::parse(&format!("{m}+/")));
+        assert_eq!(hint_chord("Alt+\u{2191}"), Chord::parse("alt+up"));
+        assert_eq!(
+            hint_chord("Cmd+Opt+Shift+U"),
+            Chord::parse(&format!("{m}+{a}+shift+u"))
+        );
+        assert_eq!(hint_chord("F12"), Chord::parse("f12"));
+        let slash = Chord::parse(&format!("{m}+/")).unwrap();
+        assert_eq!(builtin_commands_on(slash), vec![Command::ToggleLineComment]);
+    }
+
+    /// #1482 negative: two-step chords, view-only hints and no hint name no
+    /// chord, so they never count as taken.
+    #[test]
+    fn leader_and_view_hints_name_no_chord() {
+        assert_eq!(hint_chord("Cmd+K A"), None);
+        assert_eq!(hint_chord("R in diff"), None);
+        assert_eq!(hint_chord(""), None);
+        assert!(builtin_commands_on(Chord::parse("ctrl+alt+j").unwrap()).is_empty());
+    }
+
+    #[test]
+    fn display_chord_spells_a_chord_as_the_palette_does() {
+        let alt = if cfg!(target_os = "macos") {
+            "Opt"
+        } else {
+            "Alt"
+        };
+        assert_eq!(display_chord("ctrl+alt+j"), format!("Ctrl+{alt}+J"));
+        assert_eq!(display_chord("cmd+shift+p"), "Cmd+Shift+P");
+        assert_eq!(display_chord("ctrl++"), "Ctrl++");
+        assert_eq!(display_chord("f8"), "F8");
+        assert_eq!(display_chord("alt+up"), format!("{alt}+\u{2191}"));
     }
 }
