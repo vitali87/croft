@@ -301,6 +301,17 @@ pub(crate) fn convert_diagnostic(d: &lsp_types::Diagnostic) -> Diagnostic {
             unnecessary: tagged(lsp_types::DiagnosticTag::UNNECESSARY),
             deprecated: tagged(lsp_types::DiagnosticTag::DEPRECATED),
         },
+        code: d
+            .code
+            .as_ref()
+            .map(|code| crate::lsp::manager::DiagnosticCode {
+                value: match code {
+                    lsp_types::NumberOrString::Number(n) => n.to_string(),
+                    lsp_types::NumberOrString::String(s) => s.clone(),
+                },
+                source: d.source.clone().filter(|s| !s.is_empty()),
+                href: d.code_description.as_ref().map(|c| c.href.to_string()),
+            }),
     }
 }
 
@@ -385,7 +396,6 @@ pub struct LspClient {
     capabilities: ServerCapabilities,
     /// See [`LspClient::supports_type_hierarchy`].
     type_hierarchy: bool,
-    name: String,
     // Holds the process so kill_on_drop only fires when this client is
     // dropped, not when spawn() returns. Without this the server is
     // SIGKILLed mid-handshake and the mainloop reader sees EOF.
@@ -506,7 +516,7 @@ impl LspClient {
         let stdout = crate::lsp::trace::TraceRead::new(stdout, name.clone());
         let stdin = crate::lsp::trace::TraceWrite::new(stdin, name.clone());
 
-        let mainloop_name = name.clone();
+        let mainloop_name = name;
         let exited = Arc::new(AtomicBool::new(false));
         let exited_for_loop = exited.clone();
         let mainloop_task = tokio::spawn(async move {
@@ -557,15 +567,10 @@ impl LspClient {
             server,
             capabilities: init.capabilities,
             type_hierarchy,
-            name,
             child,
             mainloop_task,
             exited,
         })
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
     }
 
     pub fn capabilities(&self) -> &ServerCapabilities {
@@ -576,10 +581,6 @@ impl LspClient {
     /// [`ServerCapabilities`] cannot carry in `lsp-types` 0.95.
     pub fn supports_type_hierarchy(&self) -> bool {
         self.type_hierarchy
-    }
-
-    pub fn server_mut(&mut self) -> &mut ServerSocket {
-        &mut self.server
     }
 
     /// A detached handle to the server, for a request whose answer must be
@@ -695,6 +696,25 @@ impl LspClient {
     }
 }
 
+/// The document and position a positional request is about.
+fn position_params(uri: Url, line: u32, character: u32) -> TextDocumentPositionParams {
+    TextDocumentPositionParams {
+        text_document: TextDocumentIdentifier { uri },
+        position: Position { line, character },
+    }
+}
+
+/// The params of every go-to request. lsp-types aliases the declaration,
+/// type-definition and implementation params and responses to the definition
+/// ones, so the same params serve all four; only the wire method differs.
+fn goto_params(uri: Url, line: u32, character: u32) -> GotoDefinitionParams {
+    GotoDefinitionParams {
+        text_document_position_params: position_params(uri, line, character),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    }
+}
+
 /// The request half of an [`LspClient`]: a clone of its server socket,
 /// cheap to take while the client's lock is held and awaited after it is
 /// released. A server may take long to answer, or never answer, and holding
@@ -717,10 +737,7 @@ impl LspRequests {
     ) -> Result<Option<CompletionResponse>> {
         self.server
             .completion(CompletionParams {
-                text_document_position: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
+                text_document_position: position_params(uri, line, character),
                 work_done_progress_params: WorkDoneProgressParams::default(),
                 partial_result_params: PartialResultParams::default(),
                 context: Some(CompletionContext {
@@ -745,10 +762,7 @@ impl LspRequests {
         self.server
             .signature_help(lsp_types::SignatureHelpParams {
                 context: None,
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
+                text_document_position_params: position_params(uri, line, character),
                 work_done_progress_params: WorkDoneProgressParams::default(),
             })
             .await
@@ -758,10 +772,7 @@ impl LspRequests {
     pub async fn hover(&mut self, uri: Url, line: u32, character: u32) -> Result<Option<Hover>> {
         self.server
             .hover(HoverParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
+                text_document_position_params: position_params(uri, line, character),
                 work_done_progress_params: WorkDoneProgressParams::default(),
             })
             .await
@@ -775,14 +786,7 @@ impl LspRequests {
         character: u32,
     ) -> Result<Option<GotoDefinitionResponse>> {
         self.server
-            .definition(GotoDefinitionParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: PartialResultParams::default(),
-            })
+            .definition(goto_params(uri, line, character))
             .await
             .context("definition")
     }
@@ -808,18 +812,8 @@ impl LspRequests {
         line: u32,
         character: u32,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        // `GotoDeclarationParams`/`GotoDeclarationResponse` are type aliases for
-        // the definition variants in lsp-types, so the same params and the same
-        // `def_location` parser are reused; only the wire method differs.
         self.server
-            .declaration(GotoDefinitionParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: PartialResultParams::default(),
-            })
+            .declaration(goto_params(uri, line, character))
             .await
             .context("declaration")
     }
@@ -830,19 +824,8 @@ impl LspRequests {
         line: u32,
         character: u32,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        // `GotoTypeDefinitionParams`/`GotoTypeDefinitionResponse` are type aliases
-        // for the definition variants in lsp-types, so the same params and the
-        // same `def_location` parser are reused; only the wire method differs
-        // (`textDocument/typeDefinition`).
         self.server
-            .type_definition(GotoDefinitionParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: PartialResultParams::default(),
-            })
+            .type_definition(goto_params(uri, line, character))
             .await
             .context("type_definition")
     }
@@ -853,21 +836,10 @@ impl LspRequests {
         line: u32,
         character: u32,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        // `GotoImplementationParams`/`GotoImplementationResponse` are type aliases
-        // for the definition variants in lsp-types, so the same params and the
-        // same `def_location` parser are reused; only the wire method differs
-        // (`textDocument/implementation`). Note this commonly returns an Array of
-        // locations (one abstraction, many implementors); `def_location` jumps to
-        // the first.
+        // This commonly returns an Array of locations (one abstraction, many
+        // implementors), which the manager keeps whole (`def_locations`).
         self.server
-            .implementation(GotoDefinitionParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: PartialResultParams::default(),
-            })
+            .implementation(goto_params(uri, line, character))
             .await
             .context("implementation")
     }
@@ -962,10 +934,7 @@ impl LspRequests {
         // peek list includes the declaration site alongside every use.
         self.server
             .references(ReferenceParams {
-                text_document_position: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
+                text_document_position: position_params(uri, line, character),
                 work_done_progress_params: WorkDoneProgressParams::default(),
                 partial_result_params: PartialResultParams::default(),
                 context: ReferenceContext {
@@ -986,10 +955,7 @@ impl LspRequests {
     ) -> Result<Option<Vec<lsp_types::CallHierarchyItem>>> {
         self.server
             .prepare_call_hierarchy(lsp_types::CallHierarchyPrepareParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
+                text_document_position_params: position_params(uri, line, character),
                 work_done_progress_params: WorkDoneProgressParams::default(),
             })
             .await
@@ -1006,10 +972,7 @@ impl LspRequests {
     ) -> Result<Option<Vec<lsp_types::TypeHierarchyItem>>> {
         self.server
             .prepare_type_hierarchy(lsp_types::TypeHierarchyPrepareParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
+                text_document_position_params: position_params(uri, line, character),
                 work_done_progress_params: WorkDoneProgressParams::default(),
             })
             .await
@@ -1084,10 +1047,7 @@ impl LspRequests {
     ) -> Result<Option<Vec<lsp_types::DocumentHighlight>>> {
         self.server
             .document_highlight(lsp_types::DocumentHighlightParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
+                text_document_position_params: position_params(uri, line, character),
                 work_done_progress_params: WorkDoneProgressParams::default(),
                 partial_result_params: PartialResultParams::default(),
             })
@@ -1106,10 +1066,7 @@ impl LspRequests {
     ) -> Result<Option<lsp_types::LinkedEditingRanges>> {
         self.server
             .linked_editing_range(lsp_types::LinkedEditingRangeParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
+                text_document_position_params: position_params(uri, line, character),
                 work_done_progress_params: WorkDoneProgressParams::default(),
             })
             .await
@@ -1252,10 +1209,7 @@ impl LspRequests {
     ) -> Result<Option<WorkspaceEdit>> {
         self.server
             .rename(RenameParams {
-                text_document_position: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
+                text_document_position: position_params(uri, line, character),
                 new_name,
                 work_done_progress_params: WorkDoneProgressParams::default(),
             })
@@ -1286,10 +1240,7 @@ impl LspRequests {
         character: u32,
     ) -> Result<Option<lsp_types::PrepareRenameResponse>> {
         self.server
-            .prepare_rename(TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri },
-                position: Position { line, character },
-            })
+            .prepare_rename(position_params(uri, line, character))
             .await
             .context("prepare_rename")
     }
@@ -1444,10 +1395,7 @@ impl LspRequests {
     ) -> Result<Option<Vec<TextEdit>>> {
         self.server
             .on_type_formatting(lsp_types::DocumentOnTypeFormattingParams {
-                text_document_position: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri },
-                    position: Position { line, character },
-                },
+                text_document_position: position_params(uri, line, character),
                 ch,
                 options: FormattingOptions {
                     tab_size,
@@ -1840,6 +1788,62 @@ mod tests {
         assert!(!convert_diagnostic(&wire(Some(vec![unknown]))).tags.any());
     }
 
+    /// #1540: the rule code survives the conversion, a string (ruff, ty)
+    /// or a number (TypeScript), with the diagnostic's source and its link.
+    #[test]
+    fn convert_diagnostic_keeps_the_rule_code_source_and_link() {
+        let wire: lsp_types::Diagnostic = serde_json::from_value(json!({
+            "range": { "start": { "line": 0, "character": 7 }, "end": { "line": 0, "character": 9 } },
+            "severity": 2,
+            "code": "F401",
+            "codeDescription": { "href": "https://docs.astral.sh/ruff/rules/unused-import" },
+            "source": "Ruff",
+            "message": "`os` imported but unused"
+        }))
+        .unwrap();
+        let code = convert_diagnostic(&wire).code.expect("the code is kept");
+        assert_eq!(code.value, "F401");
+        assert_eq!(code.source.as_deref(), Some("Ruff"));
+        assert_eq!(
+            code.href.as_deref(),
+            Some("https://docs.astral.sh/ruff/rules/unused-import")
+        );
+        assert_eq!(code.label("ruff"), "Ruff(F401)");
+
+        let ts: lsp_types::Diagnostic = serde_json::from_value(json!({
+            "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 1 } },
+            "code": 2322,
+            "message": "Type 'string' is not assignable to type 'number'."
+        }))
+        .unwrap();
+        let code = convert_diagnostic(&ts).code.unwrap();
+        assert_eq!(
+            (code.value.as_str(), code.source, code.href),
+            ("2322", None, None)
+        );
+        assert_eq!(
+            convert_diagnostic(&ts).code.unwrap().label("typescript"),
+            "typescript(2322)"
+        );
+    }
+
+    /// #1540 negative: no code, no label; an empty source is no source.
+    #[test]
+    fn convert_diagnostic_without_a_code_has_none() {
+        let wire = lsp_types::Diagnostic {
+            message: "unclassified".into(),
+            source: Some(String::from("rustc")),
+            ..Default::default()
+        };
+        assert_eq!(convert_diagnostic(&wire).code, None);
+        let blank: lsp_types::Diagnostic = serde_json::from_value(json!({
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } },
+            "code": "E1", "source": "", "message": "m"
+        }))
+        .unwrap();
+        assert_eq!(convert_diagnostic(&blank).code.unwrap().label(""), "E1");
+    }
+
     #[test]
     fn router_continues_past_unhandled_vendor_notification_like_pyright_begin_progress() {
         let (diag_tx, _diag_rx) = std_mpsc::channel();
@@ -1984,13 +1988,12 @@ mod tests {
             return;
         }
         let rt = LspRuntime::new().expect("runtime");
-        let expected_name = config.name;
         let display_name = config.name;
 
         let result: Result<()> = rt.handle().block_on(async move {
             let (diag_tx, _diag_rx) = std_mpsc::channel();
             let (prog_tx, _prog_rx) = std_mpsc::channel();
-            let client = LspClient::spawn(
+            let mut client = LspClient::spawn(
                 &config,
                 &root,
                 ClientCapabilities::default(),
@@ -2002,8 +2005,6 @@ mod tests {
                 prog_tx,
             )
             .await?;
-            assert_eq!(client.name(), expected_name);
-            let mut client = client;
             client.shutdown().await
         });
 
