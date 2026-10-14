@@ -176,6 +176,7 @@ mod tests {
                 case_sensitive: true,
                 whole_word: false,
                 use_regex: true,
+                ..SearchOpts::default()
             },
             include: String::from("src"),
             exclude: String::new(),
@@ -218,6 +219,7 @@ mod tests {
                 case_sensitive: false,
                 whole_word: true,
                 use_regex: false,
+                ..SearchOpts::default()
             },
             include: String::from("*.rs"),
             exclude: String::from("target"),
