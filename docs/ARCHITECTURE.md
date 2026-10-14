@@ -1119,6 +1119,8 @@ A release-availability check plus a staged upgrade. Once a day, tracked by the c
 
 **Update stages, it does not replace.** A croft that is itself a release (from crates.io or a release archive) on Linux or macOS copies in the release's own archive binary, checked against its signed `SHA256SUMS`; otherwise, or when that fails, Update runs `cargo install croft-software --version X --root ~/.cache/croft/staged`. Either way it runs in the background, so the binary on PATH is untouched and a fresh launch stays on the current version. The popup then offers Relaunch, which copies the staged binary over the installed one and re-execs — the same path the updater chord (`Ctrl+Shift+F9`) takes.
 
+**Failures say why (#1844).** A release download that cannot reach the server at all is a missing network: the staging stops there rather than falling back to a `cargo install` that needs the network too, and the popup comes back as "was not installed: no internet connection" (or that cargo is missing, or that the build failed) with Retry and Later. The updater chord and "Help: Update croft" stage a version the popup offers; with none on offer they ask GitHub now, whatever the daily throttle and an earlier Later, and say what they found: up to date, a newer version, or why they could not ask.
+
 **Never automatic.** Later remembers the version so it is not offered again, and `CROFT_NO_UPDATE_CHECK` disables the check entirely.
 
 ### voice.rs

@@ -253,17 +253,64 @@ fn crate_version_published(version: &str) -> Option<bool> {
 /// asked; `Some(None)` when it answered
 /// but the latest release is not one this install can stage.
 fn fetch_latest() -> Option<Option<String>> {
+    fetch_latest_checked().ok()
+}
+
+/// [`fetch_latest`] saying why it could not ask (#1844): the newest release
+/// this install can stage, `None` when there is none, or the reason.
+pub fn fetch_latest_checked() -> Result<Option<String>, String> {
     let resp = http_agent()
         .get(RELEASES_LATEST_URL)
         .set("Accept", "application/vnd.github+json")
         .set("User-Agent", concat!("croft/", env!("CARGO_PKG_VERSION")))
         .call()
-        .ok()?;
-    let body = resp.into_string().ok()?;
-    latest_from_release_json(&body)?;
+        .map_err(|e| match e {
+            ureq::Error::Transport(_) => String::from(OFFLINE_REASON),
+            ureq::Error::Status(code, _) => format!("GitHub answered {code}"),
+        })?;
+    let unreadable = || String::from("GitHub's answer could not be read");
+    let body = resp.into_string().map_err(|_| unreadable())?;
+    latest_from_release_json(&body).ok_or_else(unreadable)?;
     let triple =
         prebuilt_triple().filter(|_| crate::remote_prebuilt::eligible(env!("CARGO_MANIFEST_DIR")));
     installable_release(&body, triple, &crate_version_published)
+        .ok_or_else(|| String::from("crates.io could not be reached"))
+}
+
+/// A check the user asked for (#1844): unlike the daily one it always asks
+/// the network, offers a version they said Later to, and says what it
+/// found, failures included.
+pub struct ManualCheck {
+    rx: Receiver<Result<Option<String>, String>>,
+}
+
+impl ManualCheck {
+    /// Ask with `fetch` off-thread, recording its answer for the daily
+    /// check. The verdict is the newer release to offer, `None` when croft
+    /// is up to date, or why the network could not be asked.
+    pub fn start_with(
+        cache_dir: PathBuf,
+        current_version: String,
+        fetch: fn() -> Result<Option<String>, String>,
+    ) -> Self {
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let verdict = fetch().map(|latest| {
+                let mut cache = CheckCache::load(&cache_dir);
+                cache.latest = latest.clone();
+                cache.checked_at = now_secs();
+                let _ = cache.save(&cache_dir);
+                latest.filter(|v| is_newer(v, &current_version))
+            });
+            let _ = tx.send(verdict);
+        });
+        Self { rx }
+    }
+
+    /// The verdict once it lands; `None` while still checking.
+    pub fn take(&self) -> Option<Result<Option<String>, String>> {
+        self.rx.try_recv().ok()
+    }
 }
 
 /// One background answer: `Some(version)` when a newer release is available
@@ -422,6 +469,14 @@ pub fn stage_update(
                     )),
                 }
             }
+            // No network: building from crates.io needs it too, and would
+            // only fail the same way after cargo's own retries (#1844).
+            Err(e) if crate::remote_prebuilt::is_unreachable(&e) => {
+                log.push_str(&format!(
+                    "{OFFLINE_LOG}: the v{version} release binary ({e:#}); not building either\n"
+                ));
+                return (UpdateEvent::Failed, log);
+            }
             Err(e) if crate::remote_prebuilt::is_not_published(&e) => log.push_str(&format!(
                 "v{version} has no release binary for {triple}; building instead\n"
             )),
@@ -448,6 +503,35 @@ pub fn stage_update(
     }
 }
 
+/// What a staging log opens a line with when the release server could not
+/// be reached (#1844).
+const OFFLINE_LOG: &str = "Could not reach the network to fetch";
+
+/// Why an update could not be staged or checked when the network is the
+/// reason, in the words the popup and status line use (#1844).
+pub const OFFLINE_REASON: &str = "no internet connection";
+
+/// What cargo prints when it cannot reach crates.io.
+const CARGO_OFFLINE_MARKERS: [&str; 5] = [
+    "Couldn't resolve host",
+    "Could not resolve host",
+    "spurious network error",
+    "failed to download from",
+    "network failure",
+];
+
+/// Why a staging that failed did, from its log, said briefly enough for
+/// the update popup (#1844): the network, a missing cargo, or the build.
+pub fn failure_reason(log: &str) -> &'static str {
+    if log.contains(OFFLINE_LOG) || CARGO_OFFLINE_MARKERS.iter().any(|m| log.contains(m)) {
+        OFFLINE_REASON
+    } else if log.contains("failed to run cargo") {
+        "cargo was not found, and this install has no release binary to fetch"
+    } else {
+        "the build failed"
+    }
+}
+
 /// A background staged build, reported through the same [`UpdateEvent`]
 /// lifecycle the remote watcher and the drift reinstall use so the app's
 /// spinner and "ready" pill need no third state machine.
@@ -455,15 +539,22 @@ pub struct StagedInstall {
     rx: Receiver<UpdateEvent>,
     binary: PathBuf,
     pub version: String,
+    /// Why it failed, set before `Failed` is sent (#1844).
+    failure: std::sync::Arc<std::sync::Mutex<Option<&'static str>>>,
 }
 
 impl StagedInstall {
     /// Build output lands in `log_path` so a failure is diagnosable.
+    // Tests never download or build croft: the app stages a preloaded
+    // install instead.
+    #[cfg_attr(test, allow(dead_code))]
     pub fn start(cache_dir: PathBuf, version: String, log_path: PathBuf) -> Self {
         let (tx, rx) = channel();
         let binary = staged_binary_path(&cache_dir);
         let stage_root = cache_dir.join(STAGE_DIR);
         let ver = version.clone();
+        let failure = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let failure_tx = failure.clone();
         std::thread::spawn(move || {
             let _ = tx.send(UpdateEvent::InProgress);
             if let Some(dir) = log_path.parent() {
@@ -494,6 +585,11 @@ impl StagedInstall {
                 .map(|t| (t, &prepare as &PrepareRelease<'_>));
             let staged = staged_binary_path(&cache_dir);
             let (event, log) = stage_update(&ver, &staged, prebuilt, &build);
+            if event == UpdateEvent::Failed
+                && let Ok(mut reason) = failure_tx.lock()
+            {
+                *reason = Some(failure_reason(&log));
+            }
             let _ = std::fs::write(&log_path, log);
             let _ = tx.send(event);
         });
@@ -501,7 +597,13 @@ impl StagedInstall {
             rx,
             binary,
             version,
+            failure,
         }
+    }
+
+    /// Why the staging failed, once `Failed` has been sent.
+    pub fn failure_reason(&self) -> Option<&'static str> {
+        self.failure.lock().ok().and_then(|r| *r)
     }
 
     /// The staged binary's path (present once `Ready` was sent).
@@ -527,7 +629,15 @@ impl StagedInstall {
             rx,
             binary,
             version: version.to_string(),
+            failure: Default::default(),
         }
+    }
+
+    /// A preloaded install that failed for `reason`.
+    #[cfg(test)]
+    pub fn failing_with(self, reason: &'static str) -> Self {
+        *self.failure.lock().unwrap() = Some(reason);
+        self
     }
 }
 
@@ -880,6 +990,87 @@ mod tests {
         let (event, log) = stage_update("0.2.3", &staged, None, &failing);
         assert_eq!(event, UpdateEvent::Failed);
         assert!(log.contains("broken"), "{log}");
+    }
+
+    /// #1844: with no network the release download fails before anything
+    /// is fetched. Building from crates.io needs the network as well, so
+    /// the staging stops there and says the network is why.
+    #[test]
+    fn an_unreachable_release_server_stops_the_staging_without_building() {
+        use crate::remote_prebuilt::{Signature, Unreachable};
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("staged/bin/croft");
+        let built = std::cell::Cell::new(0);
+        let build = || {
+            built.set(built.get() + 1);
+            std::process::Command::new("true").output()
+        };
+        let offline = |_: &str, _: &str| -> anyhow::Result<(PathBuf, Signature)> {
+            Err(Unreachable {
+                url: String::from(
+                    "https://github.com/vitali87/croft/releases/download/v9/SHA256SUMS",
+                ),
+                detail: String::from("Dns Failed: resolve dns name 'github.com:443'"),
+            }
+            .into())
+        };
+        let (event, log) = stage_update("9.0.0", &staged, Some(("t", &offline)), &build);
+        assert_eq!(event, UpdateEvent::Failed);
+        assert_eq!(built.get(), 0, "no build that needs the network too");
+        assert_eq!(failure_reason(&log), OFFLINE_REASON, "{log}");
+    }
+
+    /// #1844: the popup says why a staging failed in a few words.
+    #[test]
+    fn a_failure_reason_names_the_network_cargo_or_the_build() {
+        let cargo_offline = "    Updating crates.io index\nwarning: spurious network error \
+                             (3 tries remaining): [6] Couldn't resolve host name";
+        assert_eq!(failure_reason(cargo_offline), OFFLINE_REASON);
+        assert!(
+            failure_reason("failed to run cargo: No such file or directory")
+                .starts_with("cargo was not found")
+        );
+        assert_eq!(
+            failure_reason("error[E0425]: cannot find value"),
+            "the build failed"
+        );
+    }
+
+    /// #1844: a check the user asks for always asks, says when it could
+    /// not, offers a version they said Later to, and records what it found.
+    #[test]
+    fn a_manual_check_says_what_it_found() {
+        fn offline() -> Result<Option<String>, String> {
+            Err(String::from(OFFLINE_REASON))
+        }
+        fn newer() -> Result<Option<String>, String> {
+            Ok(Some(String::from("9.0.0")))
+        }
+        fn same() -> Result<Option<String>, String> {
+            Ok(Some(String::from("1.0.0")))
+        }
+        let wait = |check: ManualCheck| loop {
+            if let Some(v) = check.take() {
+                return v;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        // Checked a minute ago, and 9.0.0 declined: the daily check would
+        // stay silent on both counts.
+        CheckCache {
+            checked_at: now_secs(),
+            latest: None,
+            dismissed: Some(String::from("9.0.0")),
+        }
+        .save(&dir)
+        .unwrap();
+        let start = |fetch| ManualCheck::start_with(dir.clone(), String::from("1.0.0"), fetch);
+        assert_eq!(wait(start(offline)), Err(String::from(OFFLINE_REASON)));
+        assert_eq!(wait(start(same)), Ok(None));
+        assert_eq!(wait(start(newer)), Ok(Some(String::from("9.0.0"))));
+        assert_eq!(CheckCache::load(&dir).latest.as_deref(), Some("9.0.0"));
     }
 
     /// #1579: GitHub's v0.2.28 release with its macOS and Linux archives.

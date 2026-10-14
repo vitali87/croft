@@ -28467,11 +28467,21 @@ fn the_update_chord_relaunches_only_when_an_update_is_ready() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let chord = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
 
-    // Not ready: the chord must not arm the re-exec, and says why.
+    // Not ready: the chord must not arm the re-exec. With nothing on offer
+    // it checks now, and says what it found (#1844).
     let _ = app.handle_key(key(KeyCode::F(9), chord));
     assert!(!app.pending_reexec);
     assert!(!app.quit);
-    assert_eq!(app.status, "No croft update is waiting");
+    assert_eq!(app.status, "Checking for croft updates\u{2026}");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the update check to answer",
+        || app.poll_update_watch(),
+    );
+    assert_eq!(
+        app.status,
+        "Could not check for croft updates: tests never ask the network"
+    );
 
     // Ready: the chord arms the re-exec and quits the loop so `run` can
     // exec. Cmd+Shift+F9 is the same chord.
@@ -28482,6 +28492,131 @@ fn the_update_chord_relaunches_only_when_an_update_is_ready() {
     ));
     assert!(app.pending_reexec);
     assert!(app.quit);
+}
+
+/// #1844: Help: Update croft with a version on offer stages it, the way
+/// the popup's Update does: it used to say no update was waiting.
+#[test]
+fn the_update_command_stages_the_offered_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.install_source = crate::update_check::InstallSource::SelfManaged;
+    app.update_toast = Some(super::UpdateToast {
+        version: String::from("9.9.9"),
+        ready: false,
+        failed: None,
+        buttons: Vec::new(),
+    });
+    app.run_command(crate::widgets::command_palette::Command::UpdateCroft);
+    assert_eq!(
+        app.staged_install.as_ref().map(|s| s.version.as_str()),
+        Some("9.9.9")
+    );
+    assert!(app.manual_update_check.is_none(), "{}", app.status);
+}
+
+/// #1844: an update that fails says why in the popup, the network above
+/// all, and offers Retry; it used to come back as a fresh offer, with only
+/// a "could not be built" on the status line.
+#[test]
+fn a_failed_update_says_why_in_the_popup_and_offers_retry() {
+    use crate::update_watch::UpdateEvent;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.install_source = crate::update_check::InstallSource::SelfManaged;
+    app.update_toast = Some(super::UpdateToast {
+        version: String::from("9.9.9"),
+        ready: false,
+        failed: None,
+        buttons: Vec::new(),
+    });
+    // A failure that lands with its start, as an offline one does.
+    app.staged_install = Some(
+        crate::update_check::StagedInstall::preloaded(
+            &[UpdateEvent::InProgress, UpdateEvent::Failed],
+            PathBuf::new(),
+            "9.9.9",
+        )
+        .failing_with(crate::update_check::OFFLINE_REASON),
+    );
+    assert!(app.poll_update_watch());
+    assert!(app.staged_install.is_none());
+    assert!(
+        app.status.contains("not installed: no internet connection"),
+        "{}",
+        app.status
+    );
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let text: String = (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("croft v9.9.9 was not installed: no internet connection"),
+        "{text}"
+    );
+    let retry = app
+        .update_toast
+        .as_ref()
+        .unwrap()
+        .buttons
+        .iter()
+        .find(|(_, a)| *a == super::UpdateToastAction::Update)
+        .map(|(r, _)| *r)
+        .expect("a Retry button");
+    assert_eq!(buf[(retry.x + 1, retry.y)].symbol(), "R", "labelled Retry");
+    left_click(&mut app, retry.x, retry.y);
+    assert!(app.staged_install.is_some(), "Retry stages again");
+    assert_eq!(app.update_toast.as_ref().unwrap().failed, None);
+}
+
+/// #1844: with nothing on offer, Help: Update croft asks the network now
+/// and says what it found: up to date, a newer version (the popup comes
+/// up), or that it could not ask.
+#[test]
+fn the_update_command_checks_now_and_reports_the_answer() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let ask = |app: &mut App, fetch: fn() -> Result<Option<String>, String>| {
+            app.update_fetch = fetch;
+            app.update_croft();
+            assert_eq!(app.status, "Checking for croft updates\u{2026}");
+            crate::test_budget::await_spawned(
+                std::time::Duration::from_millis(500),
+                "the update check to answer",
+                || app.poll_update_watch(),
+            );
+            app.status.clone()
+        };
+        assert_eq!(
+            ask(&mut app, || Err(String::from(
+                crate::update_check::OFFLINE_REASON
+            ))),
+            "Could not check for croft updates: no internet connection"
+        );
+        assert_eq!(
+            ask(&mut app, || Ok(None)),
+            format!("croft v{} is up to date", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(app.update_toast.is_none());
+        assert_eq!(
+            ask(&mut app, || Ok(Some(String::from("999.0.0")))),
+            "croft v999.0.0 is available"
+        );
+        assert_eq!(
+            app.update_toast.as_ref().map(|t| t.version.as_str()),
+            Some("999.0.0")
+        );
+    });
 }
 
 // #865: with croft older than its checkout, the status bar offered a
@@ -33094,6 +33229,7 @@ fn update_events_are_charged_to_their_own_producer_body() {
     app.update_toast = Some(super::UpdateToast {
         version: String::from("9.9.9"),
         ready: true,
+        failed: None,
         buttons: Vec::new(),
     });
     term.draw(|f| app.render(f)).unwrap();
@@ -33121,6 +33257,7 @@ fn the_update_toast_stacks_above_the_port_toast() {
     app.update_toast = Some(super::UpdateToast {
         version: String::from("9.9.9"),
         ready: false,
+        failed: None,
         buttons: Vec::new(),
     });
     app.show_port_toast(3000, Some("node".into()));

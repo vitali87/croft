@@ -272,6 +272,29 @@ pub fn is_not_published(err: &anyhow::Error) -> bool {
         .any(|e| e.downcast_ref::<NotPublished>().is_some())
 }
 
+/// The server could not be reached at all (#1844): no network, a name that
+/// does not resolve, a refused or timed-out connection. Nothing was fetched
+/// or refused, and anything else that needs the network will fail too.
+#[derive(Debug)]
+pub struct Unreachable {
+    pub url: String,
+    pub detail: String,
+}
+
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "could not reach {}: {}", self.url, self.detail)
+    }
+}
+
+impl std::error::Error for Unreachable {}
+
+/// Whether `err` (anywhere in its chain) is an [`Unreachable`].
+pub fn is_unreachable(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|e| e.downcast_ref::<Unreachable>().is_some())
+}
+
 /// Fetch `url` over HTTPS, capped at [`MAX_ARCHIVE_BYTES`].
 pub fn http_get(url: &str) -> Result<Vec<u8>> {
     let resp = match ureq::get(url)
@@ -280,6 +303,13 @@ pub fn http_get(url: &str) -> Result<Vec<u8>> {
     {
         Ok(r) => r,
         Err(ureq::Error::Status(404, _)) => return Err(NotPublished(url.to_string()).into()),
+        Err(ureq::Error::Transport(t)) => {
+            return Err(Unreachable {
+                url: url.to_string(),
+                detail: t.to_string(),
+            }
+            .into());
+        }
         Err(e) => return Err(anyhow::Error::new(e).context(format!("GET {url}"))),
     };
     let mut bytes = Vec::new();

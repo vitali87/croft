@@ -1017,6 +1017,9 @@ enum PairLockDenial {
 struct UpdateToast {
     version: String,
     ready: bool,
+    /// Why the last Update did not stage the version (#1844): said in the
+    /// popup, which then offers Retry.
+    failed: Option<&'static str>,
     /// Action button hit rects, recomputed each render.
     buttons: Vec<(Rect, UpdateToastAction)>,
 }
@@ -1024,6 +1027,7 @@ struct UpdateToast {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum UpdateToastAction {
     /// Stage the new version in the background; nothing on PATH changes.
+    /// Labelled Retry once an Update has failed.
     Update,
     /// Dismiss, and never offer this version again.
     Later,
@@ -4778,6 +4782,10 @@ pub struct App {
     /// the version this binary carries? Local-only, throttled to a daily
     /// network request by its cache file. Dropped once its verdict lands.
     update_check: Option<crate::update_check::UpdateCheck>,
+    /// A check the user asked for with Help: Update croft when nothing was
+    /// on offer (#1844), and how it asks the network (stubbed in tests).
+    manual_update_check: Option<crate::update_check::ManualCheck>,
+    update_fetch: fn() -> Result<Option<String>, String>,
     /// The "vX available" popup, present from the offer landing until the
     /// user picks Update, Later, or (once staged) Relaunch.
     update_toast: Option<UpdateToast>,
@@ -6500,6 +6508,12 @@ impl App {
             local_drift: None,
             self_install: None,
             update_check: None,
+            manual_update_check: None,
+            update_fetch: if cfg!(test) {
+                || Err(String::from("tests never ask the network"))
+            } else {
+                crate::update_check::fetch_latest_checked
+            },
             update_toast: None,
             install_source: crate::update_check::current_install_source(),
             staged_install: None,
@@ -22926,6 +22940,7 @@ impl App {
         };
         let version = toast.version.clone();
         let ready = toast.ready;
+        let failed = toast.failed;
         let staging = self.staged_status == UpdateStatus::InProgress && !ready;
         let accent = self.theme.accent();
         let btn_bg = self.theme.button();
@@ -22939,13 +22954,20 @@ impl App {
             // command and be dismissed.
             vec![(" Later ".to_string(), UpdateToastAction::Later)]
         } else {
+            let update = if failed.is_some() {
+                " Retry "
+            } else {
+                " Update "
+            };
             vec![
-                (" Update ".to_string(), UpdateToastAction::Update),
+                (update.to_string(), UpdateToastAction::Update),
                 (" Later ".to_string(), UpdateToastAction::Later),
             ]
         };
         let title_line = if ready {
             format!("\u{27f3} croft v{version} is ready - relaunch to update")
+        } else if let (Some(reason), false) = (failed, staging) {
+            format!("\u{2717} croft v{version} was not installed: {reason}")
         } else if staging {
             format!(
                 "{} building croft v{version} in the background",
@@ -43576,6 +43598,7 @@ impl App {
         self.update_toast = Some(UpdateToast {
             version,
             ready: false,
+            failed: None,
             buttons: Vec::new(),
         });
         true
@@ -43595,11 +43618,27 @@ impl App {
             return;
         }
         self.staged_status = UpdateStatus::Idle;
-        self.staged_install = Some(crate::update_check::StagedInstall::start(
-            croft_cache_dir(),
-            version,
-            staged_install_log_path(),
-        ));
+        if let Some(t) = self.update_toast.as_mut() {
+            t.failed = None;
+        }
+        // Tests never download or build croft: they get a staging that has
+        // only started.
+        #[cfg(test)]
+        {
+            self.staged_install = Some(crate::update_check::StagedInstall::preloaded(
+                &[],
+                PathBuf::new(),
+                &version,
+            ));
+        }
+        #[cfg(not(test))]
+        {
+            self.staged_install = Some(crate::update_check::StagedInstall::start(
+                croft_cache_dir(),
+                version,
+                staged_install_log_path(),
+            ));
+        }
     }
 
     /// Decline the offered version for good (until a newer one appears).
@@ -43700,15 +43739,56 @@ impl App {
             || self.any_update_in_progress()
         {
             self.status = String::from("croft is already updating in the background");
+        } else if let Some(version) = self
+            .update_toast
+            .as_ref()
+            .filter(|t| !t.ready)
+            .map(|t| t.version.clone())
+        {
+            // The popup's Update, from the keyboard (#1844).
+            self.start_staged_update(version);
+        } else if self.manual_update_check.is_some() {
+            self.status = String::from("Already checking for croft updates");
         } else {
-            self.status = String::from("No croft update is waiting");
+            // Nothing on offer: ask now, and say what the answer was, a
+            // missing network included (#1844).
+            self.status = String::from("Checking for croft updates\u{2026}");
+            self.manual_update_check = Some(crate::update_check::ManualCheck::start_with(
+                croft_cache_dir(),
+                String::from(env!("CARGO_PKG_VERSION")),
+                self.update_fetch,
+            ));
         }
+    }
+
+    /// The answer to a check Help: Update croft asked for (#1844).
+    fn poll_manual_update_check(&mut self) -> bool {
+        let Some(verdict) = self.manual_update_check.as_ref().and_then(|c| c.take()) else {
+            return false;
+        };
+        self.manual_update_check = None;
+        self.status = match verdict {
+            Ok(Some(version)) => {
+                let status = format!("croft v{version} is available");
+                self.update_toast = Some(UpdateToast {
+                    version,
+                    ready: false,
+                    failed: None,
+                    buttons: Vec::new(),
+                });
+                status
+            }
+            Ok(None) => format!("croft v{} is up to date", env!("CARGO_PKG_VERSION")),
+            Err(reason) => format!("Could not check for croft updates: {reason}"),
+        };
+        true
     }
 
     pub fn poll_update_watch(&mut self) -> bool {
         let mut changed = self.poll_drift_probe();
         changed |= self.poll_source_build_marker();
         changed |= self.poll_update_check();
+        changed |= self.poll_manual_update_check();
         // Three producers share one event vocabulary; each event keeps its
         // origin so a drift rebuild's failure is never charged to the
         // staged release build (or the reverse).
@@ -43761,29 +43841,23 @@ impl App {
                     }
                     self.status = match source {
                         UpdateSource::Staged => {
-                            let version = self
-                                .staged_install
-                                .take()
-                                .map(|s| s.version)
-                                .unwrap_or_default();
-                            // The offer stays declinable: the popup comes
-                            // back so a retry or Later is one click away -
-                            // unless the user already said Later to this
-                            // version in an earlier session.
-                            let dismissed =
-                                crate::update_check::CheckCache::load(&croft_cache_dir())
-                                    .dismissed
-                                    .as_deref()
-                                    == Some(version.as_str());
-                            if !dismissed {
-                                self.update_toast = Some(UpdateToast {
-                                    version: version.clone(),
-                                    ready: false,
-                                    buttons: Vec::new(),
-                                });
-                            }
+                            let staging = self.staged_install.take();
+                            let reason = staging
+                                .as_ref()
+                                .and_then(|s| s.failure_reason())
+                                .unwrap_or("the build failed");
+                            let version = staging.map(|s| s.version).unwrap_or_default();
+                            // The user just asked for this version, so the
+                            // popup comes back saying why it failed, with
+                            // Retry and Later one click away (#1844).
+                            self.update_toast = Some(UpdateToast {
+                                version: version.clone(),
+                                ready: false,
+                                failed: Some(reason),
+                                buttons: Vec::new(),
+                            });
                             format!(
-                                "croft {version} could not be built - see {} (still on v{})",
+                                "croft v{version} was not installed: {reason} - see {} (still on v{})",
                                 staged_install_log_path().display(),
                                 env!("CARGO_PKG_VERSION")
                             )
@@ -43821,6 +43895,7 @@ impl App {
                         self.update_toast = Some(UpdateToast {
                             version: install.version.clone(),
                             ready: true,
+                            failed: None,
                             buttons: Vec::new(),
                         });
                     }
@@ -49331,6 +49406,8 @@ impl App {
             UpdateToastAction::Update => {
                 if self.staged_install.is_none() && self.self_install.is_none() {
                     self.start_staged_update(version);
+                } else {
+                    self.status = String::from("croft is already updating in the background");
                 }
             }
             UpdateToastAction::Later => {
