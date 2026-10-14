@@ -564,6 +564,9 @@ fn package_json_tasks(root: &Path) -> Vec<Task> {
                     cwd: Some(format!("${{workspaceFolder}}/{rel}")),
                     env: Vec::new(),
                     unrunnable: None,
+                    // package.json scripts have no `${input:id}` prompts.
+                    inputs: Vec::new(),
+                    answers: Default::default(),
                 }),
             });
         }
