@@ -119,6 +119,9 @@ pub enum ListPurpose {
     /// A `pickString` input a launch or task asks for (#1424); `id` the
     /// chosen value.
     LaunchInput,
+    /// Notebook: Select Kernel (#1377): the installed kernelspecs, `id`
+    /// the kernel's name.
+    NotebookKernel,
 }
 
 /// The Review Pull Request row that asks for a number or URL instead.
