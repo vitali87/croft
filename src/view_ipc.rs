@@ -402,6 +402,7 @@ pub fn extension_for(magic: crate::magic::Magic) -> &'static str {
         Magic::Gif => "gif",
         Magic::WebP => "webp",
         Magic::Bmp => "bmp",
+        Magic::Ico => "ico",
         Magic::Pdf => "pdf",
         // A zip is most often an xlsx/docx here; the sheet and docx openers
         // both fail soft to the archive view, so this is the useful guess.

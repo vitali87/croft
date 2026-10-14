@@ -18,6 +18,8 @@ use crate::theme::Theme;
 const FG: Color = Color::Rgb(0xC0, 0xC5, 0xCE);
 const DIM: Color = Color::Rgb(0x60, 0x68, 0x78);
 const CODE: Color = Color::Rgb(0xD0, 0x87, 0x70);
+/// How far a `$$` display block sits in from its paragraph (#1564).
+const MATH_INDENT: &str = "    ";
 const RULE_COLS: usize = 60;
 
 /// The editor-held preview state: the built lines, the vertical scroll, and
@@ -719,8 +721,8 @@ fn code_line_spans(line: &str, spans: &[HiSpan], code_fg: Color) -> Vec<Span<'st
     let mut out = Vec::new();
     let mut cursor = 0usize;
     for sp in spans {
-        let start = sp.start.min(line.len());
-        let end = sp.end.min(line.len());
+        let start = sp.range().start.min(line.len());
+        let end = sp.range().end.min(line.len());
         if start > cursor {
             out.push(Span::styled(
                 line[cursor..start].to_string(),
@@ -1126,8 +1128,12 @@ pub fn render_markdown_mapped(
     outputs: BlockOutputs,
 ) -> (Vec<Line<'static>>, Vec<MdImage>, Vec<MdRunnable>, SourceMap) {
     let mut source_map: Vec<(usize, usize)> = Vec::new();
-    let options =
-        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    // `$…$` and `$$…$$` math (#1564), as VS Code's preview and GitHub read
+    // it; without the option a display block ran into one paragraph line.
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_MATH;
     let mut r = Renderer {
         theme,
         registry,
@@ -1373,6 +1379,40 @@ pub fn render_markdown_mapped(
                     ));
                 }
             }
+            Event::InlineMath(tex) => {
+                let text = crate::tex_text::to_unicode(&tex).replace('\n', " ");
+                if r.suppress_inline {
+                } else if let Some(rows) = r.table.as_mut() {
+                    if let Some(cell) = rows.last_mut().and_then(|row| row.last_mut()) {
+                        cell.push_str(&text);
+                    }
+                } else {
+                    let style = r.inline_style().add_modifier(Modifier::ITALIC);
+                    r.push_text(&text, style);
+                }
+            }
+            // A display block keeps its own lines, indented like a quote of
+            // the paragraph it sits in, one per `\\` row.
+            Event::DisplayMath(tex) => {
+                let text = crate::tex_text::to_unicode(&tex);
+                if r.suppress_inline {
+                } else if let Some(rows) = r.table.as_mut() {
+                    if let Some(cell) = rows.last_mut().and_then(|row| row.last_mut()) {
+                        cell.push_str(&text.replace('\n', " "));
+                    }
+                } else {
+                    r.flush_line();
+                    let style = Style::default()
+                        .fg(theme.ui(FG))
+                        .add_modifier(Modifier::ITALIC);
+                    for row in text.lines() {
+                        r.begin_content();
+                        r.cur.push(Span::raw(MATH_INDENT));
+                        r.cur.push(Span::styled(row.to_string(), style));
+                        r.flush_line();
+                    }
+                }
+            }
             Event::SoftBreak => {
                 if !r.suppress_inline {
                     let style = r.inline_style();
@@ -1581,6 +1621,82 @@ mod tests {
 
     fn line_text(l: &Line) -> String {
         l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn preview_rows(md: &str) -> Vec<String> {
+        let mut reg = LangRegistry::new();
+        let (lines, _, _, _) =
+            render_markdown_mapped(md, Theme::default(), &mut reg, None, BlockOutputs::new());
+        lines.iter().map(line_text).collect()
+    }
+
+    /// The issue's file (#1564): inline math reads as symbols, and the
+    /// `$$` block keeps its own line without the markers.
+    #[test]
+    fn math_renders_as_symbols_and_display_math_keeps_its_line() {
+        let rows = preview_rows(
+            "# Math\n\nEuler: $e^{i\\pi} + 1 = 0$ inline.\n\n$$\n\\sum_{k=1}^{n} k = \\frac{n(n+1)}{2}\n$$\n\nDone.\n",
+        );
+        assert!(
+            rows.iter().any(|r| r == "Euler: e^(iπ) + 1 = 0 inline."),
+            "{rows:#?}"
+        );
+        let display = rows
+            .iter()
+            .find(|r| r.contains('∑'))
+            .expect("the display block is rendered");
+        assert_eq!(display, "    ∑ₖ₌₁ⁿ k = n(n+1)/2");
+        assert!(rows.iter().all(|r| !r.contains("$$") && !r.contains('\\')));
+        assert!(rows.iter().any(|r| r == "Done."));
+    }
+
+    #[test]
+    fn display_math_rows_stay_on_their_own_lines() {
+        let rows = preview_rows("$$\n\\begin{aligned}\na &= b \\\\\n  &= c\n\\end{aligned}\n$$\n");
+        let math: Vec<&str> = rows
+            .iter()
+            .map(String::as_str)
+            .filter(|r| !r.is_empty())
+            .collect();
+        assert_eq!(math, ["    a = b", "    = c"]);
+    }
+
+    #[test]
+    fn inline_math_is_italic_and_in_tables() {
+        let mut reg = LangRegistry::new();
+        let (lines, ..) = render_markdown_mapped(
+            "Area $\\pi r^2$.\n",
+            Theme::default(),
+            &mut reg,
+            None,
+            BlockOutputs::new(),
+        );
+        let span = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content == "π r²")
+            .expect("the math span");
+        assert!(span.style.add_modifier.contains(Modifier::ITALIC));
+        let rows = preview_rows("| f | value |\n|---|---|\n| area | $\\pi r^2$ |\n");
+        assert!(rows.iter().any(|r| r.contains("π r²")), "{rows:#?}");
+    }
+
+    /// Prices and shell variables are not math: an unclosed `$`, or one
+    /// closed after a space, stays as typed, and code keeps its TeX.
+    #[test]
+    fn dollars_that_are_not_math_stay_as_text() {
+        let rows = preview_rows(
+            "It costs $5 and $10 today.\n\nRun `echo $HOME $PATH`.\n\n```\n$x^2$\n```\n",
+        );
+        assert!(
+            rows.iter().any(|r| r == "It costs $5 and $10 today."),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("echo $HOME $PATH")),
+            "{rows:#?}"
+        );
+        assert!(rows.iter().any(|r| r.contains("$x^2$")), "{rows:#?}");
     }
 
     #[test]
@@ -2279,6 +2395,94 @@ mod tests {
             keyword.style.fg,
             Some(Color::Rgb(0xB4, 0x8E, 0xAD)),
             "the fenced block must carry the editor's keyword colour"
+        );
+    }
+
+    /// The colour the preview gives `word` on the code line containing
+    /// `line` in a fence tagged `info`; `None` when it is not its own span
+    /// or carries no colour of its own.
+    fn fence_keyword_colour(info: &str, line: &str, word: &str) -> Option<Color> {
+        let lines = render(&format!("```{info}\n{line}\n```"));
+        let code_line = lines.iter().find(|l| text_of(l).contains(line))?;
+        code_line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref().trim() == word)?
+            .style
+            .fg
+    }
+
+    /// #1642: rustdoc and mdBook attributes after a comma, and Pandoc's
+    /// braces, are not part of the language.
+    #[test]
+    fn fence_attributes_do_not_hide_the_language() {
+        for info in [
+            "rust,ignore",
+            "rust,no_run",
+            "rust,should_panic",
+            "Rust,editable",
+        ] {
+            assert_eq!(lang_for_fence(info), Some(LangKind::Rust), "{info}");
+        }
+        for info in [
+            "{python}",
+            "{.python}",
+            "{.python .numberLines}",
+            "{python echo=false}",
+            "{#example .python .numberLines}",
+            "{ #example .python }",
+            "{.python #example}",
+            "python,linenos",
+        ] {
+            assert_eq!(lang_for_fence(info), Some(LangKind::Python), "{info}");
+        }
+        assert_eq!(lang_for_fence("{r, echo=FALSE}"), lang_for_fence("r"));
+    }
+
+    /// The issue's chapter: each block is coloured like the same block
+    /// tagged with the bare language.
+    #[test]
+    fn the_preview_colours_fences_that_carry_attributes() {
+        let rust = fence_keyword_colour("rust", "fn main() {}", "fn");
+        assert!(rust.is_some(), "a plain rust fence is coloured");
+        for info in ["rust,ignore", "rust,no_run"] {
+            assert_eq!(
+                fence_keyword_colour(info, "fn main() {}", "fn"),
+                rust,
+                "{info}"
+            );
+        }
+        let python = fence_keyword_colour("python", "def f(): return 1", "def");
+        assert!(python.is_some(), "a plain python fence is coloured");
+        for info in ["{python}", "{.python .numberLines}"] {
+            assert_eq!(
+                fence_keyword_colour(info, "def f(): return 1", "def"),
+                python,
+                "{info}"
+            );
+        }
+    }
+
+    /// Negative: fences with no language, or one croft does not know, stay
+    /// plain, attributes or not.
+    #[test]
+    fn fences_without_a_known_language_stay_plain() {
+        for info in [
+            "",
+            "text",
+            "text,ignore",
+            "{}",
+            "{.}",
+            "{#example}",
+            "{#example linenos=true}",
+            ",rust",
+            "nosuchlang,rust",
+        ] {
+            assert_eq!(lang_for_fence(info), None, "{info:?}");
+        }
+        assert_eq!(
+            fence_keyword_colour("text,ignore", "fn main() {}", "fn"),
+            None
         );
     }
 
