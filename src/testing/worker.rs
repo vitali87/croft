@@ -1635,13 +1635,17 @@ fn run_one(root: &Path, tx: &EpochTx, name: &str) {
 /// spans. All are run whatever an earlier one did, and the run fails if any
 /// of them did.
 fn run_many(root: &Path, tx: &EpochTx, names: &[String]) {
-    let Some(runner) = runner_for(root) else {
+    let runners = runners_for(root);
+    if runners.is_empty() {
         tx.send(TestResponse::Refused);
         return;
-    };
+    }
     let mut ok = true;
     for name in names {
-        ok &= run_one_case_seen(root, tx, runner, name);
+        // Each test goes back to the runner that listed it (#1408).
+        ok &= tx
+            .choose(&runners, name, None)
+            .is_some_and(|runner| run_one_case_seen(root, tx, runner, name));
     }
     tx.send(TestResponse::Finished { ok: Some(ok) });
 }
@@ -1669,6 +1673,8 @@ fn run_one_case_seen(root: &Path, tx: &EpochTx, runner: Runner, name: &str) -> b
                 codeql: tx.codeql,
                 control: tx.control,
                 request: tx.request,
+                owners: tx.owners,
+                tag: tx.tag,
             };
             run_one_case(root, &etx, runner, name)
         };
@@ -2794,6 +2800,8 @@ mod tests {
             codeql: Path::new("codeql"),
             control: &RunControl::default(),
             request: 1,
+            owners: None,
+            tag: None,
         };
         let log = root.join(".venv/bin/python.log");
         let ran = |names: &[&str]| {
@@ -2896,9 +2904,6 @@ exit 1"#
             request: 1,
             owners: None,
             tag: None,
-
-            control: &RunControl::default(),
-            request: 1,
         };
         f(root, &etx);
         let mut cases = Vec::new();
@@ -3272,9 +3277,6 @@ exit 1"#
             request: 1,
             owners: None,
             tag: None,
-
-            control: &RunControl::default(),
-            request: 1,
         };
         run_all(root, &etx);
         let cases: Vec<(String, TestStatus)> = rx
@@ -3589,6 +3591,8 @@ exit 1"#
             codeql: Path::new("codeql"),
             control: &RunControl::default(),
             request: 1,
+            owners: None,
+            tag: None,
         };
         run_all(root, &etx);
         rx.try_iter()
