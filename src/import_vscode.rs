@@ -2298,7 +2298,11 @@ mod tests {
             ]),
             &mut report,
         );
-        let mut got: Vec<&str> = report.keybindings.iter().map(|(_, c)| c.as_str()).collect();
+        let mut got: Vec<&str> = report
+            .keybindings
+            .iter()
+            .map(|(_, c, _)| c.as_str())
+            .collect();
         got.sort();
         assert_eq!(
             got,
@@ -2816,7 +2820,8 @@ mod tests {
             report.keybindings,
             [(
                 String::from("ctrl+alt+i"),
-                String::from("toggle_find_in_selection")
+                String::from("toggle_find_in_selection"),
+                None
             )]
         );
     }
