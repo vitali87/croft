@@ -2736,7 +2736,9 @@ mod tests {
 
     /// Negative (#1606): a path that exists, even one named like `a:1`, is
     /// left alone and carries no location; an explicit `--open-file` wins
-    /// over the PATH argument's location.
+    /// over the PATH argument's location. A missing file keeps its suffix as
+    /// part of its name, so it opens as a new file of that name (#1157), and
+    /// a missing folder is still refused.
     #[test]
     fn an_existing_path_or_an_explicit_open_file_keeps_its_meaning() {
         let dir = tempfile::tempdir().unwrap();
@@ -2754,7 +2756,13 @@ mod tests {
         let (_, open_file, at) =
             split_launch_location(Path::new("big.txt:9"), Some(PathBuf::from("a:1")), &root);
         assert_eq!((open_file, at), (Some(PathBuf::from("a:1")), None));
-        assert!(resolve_workspace_from(Path::new("nope.txt:9"), None, &root).is_err());
+        assert_eq!(
+            split_launch_location(Path::new("nope.txt:9"), None, &root),
+            (PathBuf::from("nope.txt:9"), None, None)
+        );
+        let (_, open, _) = resolve_workspace_from(Path::new("nope.txt:9"), None, &root).unwrap();
+        assert_eq!(open, Some(root.join("nope.txt:9")));
+        assert!(resolve_workspace_from(Path::new("nope/x.txt:9"), None, &root).is_err());
     }
 
     #[test]
