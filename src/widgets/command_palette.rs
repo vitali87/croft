@@ -83,6 +83,8 @@ pub enum Command {
     AddCursorAbove,
     AddCursorBelow,
     AddSelectionToNextMatch,
+    SelectAllOccurrences,
+    AddCursorsToLineEnds,
     // --- Editor: bracket / character / indentation ops ---
     JumpToBracket,
     SelectToBracket,
@@ -206,6 +208,7 @@ pub enum Command {
     NotebookRunAll,
     NotebookInterrupt,
     NotebookRestart,
+    NotebookSelectKernel,
     TestingRunWithCoverage,
     CoverageClear,
     TestingInstallCoverageTool,
@@ -311,6 +314,9 @@ pub enum Command {
     ToggleAutoHideSideBar,
     ToggleSecondarySideBar,
     ToggleZenMode,
+    /// Centre the editor in its column (#1585), VS Code's View: Toggle
+    /// Centered Layout.
+    ToggleCenteredLayout,
     ToggleTerminal,
     /// The Customize Layout popup's rows as commands (#852), VS Code's
     /// names: the bars' visibility, the side bar's side, and pickers for
@@ -348,6 +354,19 @@ pub enum Command {
     /// have no `Ctrl` form (`Ctrl+[` is `Esc`).
     FocusNextTerminal,
     FocusPreviousTerminal,
+    /// The terminal's own actions as commands (#1562): before, each was a
+    /// fixed chord or a right-click row only, so the palette could not find
+    /// it, `keybindings.json` could not bind it, and `croft import-vscode`
+    /// dropped a VS Code user's chord for it. Each acts on the active pane.
+    TerminalClear,
+    TerminalRename,
+    TerminalKill,
+    TerminalSplit,
+    TerminalNewWithProfile,
+    TerminalQuickSelect,
+    TerminalCopyMode,
+    TerminalCommandHistory,
+    TerminalOpenScrollback,
     // --- Run / debug ---
     StartDebugging,
     SelectDebugConfig,
@@ -559,6 +578,8 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::AddCursorAbove,
     Command::AddCursorBelow,
     Command::AddSelectionToNextMatch,
+    Command::SelectAllOccurrences,
+    Command::AddCursorsToLineEnds,
     Command::JumpToBracket,
     Command::SelectToBracket,
     Command::TransposeCharacters,
@@ -653,6 +674,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::NotebookRunAll,
     Command::NotebookInterrupt,
     Command::NotebookRestart,
+    Command::NotebookSelectKernel,
     Command::TestingRunWithCoverage,
     Command::CoverageClear,
     Command::TestingInstallCoverageTool,
@@ -756,6 +778,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ToggleAutoHideSideBar,
     Command::ToggleSecondarySideBar,
     Command::ToggleZenMode,
+    Command::ToggleCenteredLayout,
     Command::ToggleTerminal,
     Command::ToggleActivityBar,
     Command::ToggleStatusBar,
@@ -778,6 +801,15 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::RunSelectedText,
     Command::FocusNextTerminal,
     Command::FocusPreviousTerminal,
+    Command::TerminalClear,
+    Command::TerminalRename,
+    Command::TerminalKill,
+    Command::TerminalSplit,
+    Command::TerminalNewWithProfile,
+    Command::TerminalQuickSelect,
+    Command::TerminalCopyMode,
+    Command::TerminalCommandHistory,
+    Command::TerminalOpenScrollback,
     Command::StartDebugging,
     Command::SelectDebugConfig,
     Command::AddDebugConfig,
@@ -901,6 +933,7 @@ pub const LAYOUT_COMMANDS: &[Command] = &[
     Command::SetPanelAlignment,
     Command::SetQuickInputPosition,
     Command::ToggleZenMode,
+    Command::ToggleCenteredLayout,
 ];
 
 impl Command {
@@ -966,6 +999,8 @@ impl Command {
             Command::AddCursorAbove => "Add Cursor Above",
             Command::AddCursorBelow => "Add Cursor Below",
             Command::AddSelectionToNextMatch => "Add Selection to Next Find Match",
+            Command::SelectAllOccurrences => "Select All Occurrences of Find Match",
+            Command::AddCursorsToLineEnds => "Add Cursors to Line Ends",
             Command::JumpToBracket => "Go to Bracket",
             Command::SelectToBracket => "Select to Bracket",
             Command::TransposeCharacters => "Transpose Characters around the Cursor",
@@ -1059,6 +1094,7 @@ impl Command {
             Command::NotebookRunAll => "Notebook: Run All Cells",
             Command::NotebookInterrupt => "Notebook: Interrupt Kernel",
             Command::NotebookRestart => "Notebook: Restart Kernel",
+            Command::NotebookSelectKernel => "Notebook: Select Kernel",
             Command::TestingRunWithCoverage => "Testing: Run All Tests with Coverage",
             Command::CoverageClear => "Coverage: Clear",
             Command::TestingInstallCoverageTool => "Testing: Install Coverage Tool",
@@ -1165,6 +1201,7 @@ impl Command {
             Command::ToggleAutoHideSideBar => "View: Toggle Auto-Hide Side Bar",
             Command::ToggleSecondarySideBar => "View: Toggle Secondary Side Bar",
             Command::ToggleZenMode => "View: Toggle Zen Mode",
+            Command::ToggleCenteredLayout => "View: Toggle Centered Layout",
             Command::ToggleTerminal => "View: Toggle Terminal",
             Command::ToggleActivityBar => "View: Toggle Activity Bar Visibility",
             Command::ToggleStatusBar => "View: Toggle Status Bar Visibility",
@@ -1189,6 +1226,15 @@ impl Command {
             Command::RunSelectedText => "Terminal: Run Selected Text in Active Terminal",
             Command::FocusNextTerminal => "Terminal: Focus Next Terminal",
             Command::FocusPreviousTerminal => "Terminal: Focus Previous Terminal",
+            Command::TerminalClear => "Terminal: Clear",
+            Command::TerminalRename => "Terminal: Rename",
+            Command::TerminalKill => "Terminal: Kill the Active Terminal Instance",
+            Command::TerminalSplit => "Terminal: Split Terminal",
+            Command::TerminalNewWithProfile => "Terminal: Create New Terminal (With Profile)",
+            Command::TerminalQuickSelect => "Terminal: Quick Select",
+            Command::TerminalCopyMode => "Terminal: Enter Copy Mode",
+            Command::TerminalCommandHistory => "Terminal: Show Command History",
+            Command::TerminalOpenScrollback => "Terminal: Open Scrollback in Editor",
             Command::StartDebugging => "Debug: Start Debugging",
             Command::SelectDebugConfig => "Debug: Select and Start Debugging",
             Command::AddDebugConfig => "Debug: Add Configuration…",
@@ -1384,6 +1430,8 @@ impl Command {
             Command::AddCursorAbove => "Cmd+Opt+↑",
             Command::AddCursorBelow => "Cmd+Opt+↓",
             Command::AddSelectionToNextMatch => "Cmd+D",
+            Command::SelectAllOccurrences => "Cmd+Shift+L",
+            Command::AddCursorsToLineEnds => "Shift+Alt+I",
             Command::JumpToBracket => "Cmd+Shift+\\",
             Command::SelectToBracket => "Cmd+Opt+\\",
             Command::TransposeCharacters => "Ctrl+T",
@@ -1475,6 +1523,7 @@ impl Command {
             Command::NotebookRunAll => "",
             Command::NotebookInterrupt => "",
             Command::NotebookRestart => "",
+            Command::NotebookSelectKernel => "",
             Command::TestingRunWithCoverage => "",
             Command::CoverageClear => "",
             Command::TestingInstallCoverageTool => "",
@@ -1579,6 +1628,7 @@ impl Command {
             Command::ToggleAutoHideSideBar => "",
             Command::ToggleSecondarySideBar => "Cmd+Opt+B",
             Command::ToggleZenMode => "Cmd+K Z",
+            Command::ToggleCenteredLayout => "",
             Command::ToggleTerminal => "Ctrl+J",
             Command::ToggleActivityBar => "",
             Command::ToggleStatusBar => "",
@@ -1601,6 +1651,15 @@ impl Command {
             Command::RunSelectedText => "",
             Command::FocusNextTerminal => "Cmd+]",
             Command::FocusPreviousTerminal => "Cmd+[",
+            Command::TerminalClear => "Cmd+K K",
+            Command::TerminalRename => "Cmd+K R",
+            Command::TerminalKill => "",
+            Command::TerminalSplit => "",
+            Command::TerminalNewWithProfile => "",
+            Command::TerminalQuickSelect => "Ctrl+Shift+Space",
+            Command::TerminalCopyMode => "Ctrl+Shift+Y",
+            Command::TerminalCommandHistory => "Ctrl+Shift+H",
+            Command::TerminalOpenScrollback => "Cmd+K D",
             Command::KeyboardShortcuts => "F1",
             Command::UpdateCroft => "Cmd+Shift+F9",
             Command::StartDebugging => "F5",
@@ -1780,6 +1839,8 @@ impl Command {
             Command::AddCursorAbove => "add_cursor_above",
             Command::AddCursorBelow => "add_cursor_below",
             Command::AddSelectionToNextMatch => "add_selection_to_next_match",
+            Command::SelectAllOccurrences => "select_all_occurrences",
+            Command::AddCursorsToLineEnds => "add_cursors_to_line_ends",
             Command::JumpToBracket => "jump_to_bracket",
             Command::SelectToBracket => "select_to_bracket",
             Command::TransposeCharacters => "transpose_characters",
@@ -1873,6 +1934,7 @@ impl Command {
             Command::NotebookRunAll => "notebook_run_all",
             Command::NotebookInterrupt => "notebook_interrupt",
             Command::NotebookRestart => "notebook_restart",
+            Command::NotebookSelectKernel => "notebook_select_kernel",
             Command::TestingRunWithCoverage => "testing_run_with_coverage",
             Command::CoverageClear => "coverage_clear",
             Command::TestingInstallCoverageTool => "testing_install_coverage_tool",
@@ -1977,6 +2039,7 @@ impl Command {
             Command::ToggleAutoHideSideBar => "toggle_auto_hide_side_bar",
             Command::ToggleSecondarySideBar => "toggle_secondary_side_bar",
             Command::ToggleZenMode => "toggle_zen_mode",
+            Command::ToggleCenteredLayout => "toggle_centered_layout",
             Command::ToggleTerminal => "toggle_terminal",
             Command::ToggleActivityBar => "toggle_activity_bar",
             Command::ToggleStatusBar => "toggle_status_bar",
@@ -1999,6 +2062,15 @@ impl Command {
             Command::RunSelectedText => "run_selected_text",
             Command::FocusNextTerminal => "focus_next_terminal",
             Command::FocusPreviousTerminal => "focus_previous_terminal",
+            Command::TerminalClear => "terminal_clear",
+            Command::TerminalRename => "terminal_rename",
+            Command::TerminalKill => "terminal_kill",
+            Command::TerminalSplit => "terminal_split",
+            Command::TerminalNewWithProfile => "terminal_new_with_profile",
+            Command::TerminalQuickSelect => "terminal_quick_select",
+            Command::TerminalCopyMode => "terminal_copy_mode",
+            Command::TerminalCommandHistory => "terminal_command_history",
+            Command::TerminalOpenScrollback => "terminal_open_scrollback",
             Command::StartDebugging => "start_debugging",
             Command::SelectDebugConfig => "select_debug_config",
             Command::AddDebugConfig => "add_debug_config",
@@ -2125,6 +2197,15 @@ impl Command {
     /// than fatal.
     pub fn from_id(id: &str) -> Option<Command> {
         ALL_COMMANDS.iter().copied().find(|c| c.id() == id)
+    }
+
+    /// Whether a `keybindings.json` chord for this command runs it while the
+    /// terminal has focus, instead of going to the shell (#1562). VS Code
+    /// sends its terminal commands' chords past the shell the same way
+    /// (`terminal.integrated.commandsToSkipShell`): a user who binds
+    /// Terminal: Clear means it for the terminal.
+    pub fn skips_the_shell(self) -> bool {
+        self.title().starts_with("Terminal: ")
     }
 }
 
