@@ -263,6 +263,14 @@ pub struct Prefs {
     /// "all", or "none". Parsed by `WhitespaceMode::from_pref`.
     #[serde(default)]
     pub render_whitespace: String,
+    /// Word-based completion (#1566), VS Code's
+    /// `editor.wordBasedSuggestions`: which open documents' words Ctrl+Space
+    /// offers when no language server has suggestions. "off",
+    /// "currentDocument", "matchingDocuments" (the default, also what the
+    /// empty string means: the open documents in the same language) or
+    /// "allDocuments". Parsed by `WordSuggestions::from_pref`.
+    #[serde(default)]
+    pub word_based_suggestions: String,
     /// Opt-out for bracket-pair colorization (#131), on by default like VS
     /// Code's `editor.bracketPairColorization.enabled` (default since 1.67).
     /// Stored as the disable flag so the derived `Default` and an older
@@ -463,6 +471,21 @@ fn merge_changed(
         if before == Some(value) {
             continue;
         }
+        // A nested object the file does not have yet (the first `layout`
+        // change in a new config.json) gets only its changed keys too, so its
+        // untouched siblings keep following the defaults and any `extends`
+        // base.
+        if let (Some(b @ Value::Object(_)), Value::Object(_)) = (before, value)
+            && !doc.contains_key(key)
+            && !SERDE_ALIASES
+                .iter()
+                .any(|(canonical, legacy)| key == canonical && doc.contains_key(*legacy))
+        {
+            let mut inner = serde_json::Map::new();
+            merge_changed(&mut inner, b, value);
+            doc.insert(key.clone(), Value::Object(inner));
+            continue;
+        }
         match (doc.get_mut(key), before, value) {
             (Some(Value::Object(inner)), Some(b @ Value::Object(_)), Value::Object(_)) => {
                 merge_changed(inner, b, value);
@@ -542,6 +565,7 @@ impl Prefs {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let json = serde_json::to_string_pretty(&self.document()?).context("serializing prefs")?;
+        let before = crate::config_sync::stamp(path);
         // Written aside and renamed in: a reader on another thread (the MCP
         // worker's fingerprint check) must never see a truncated file, and a
         // crash mid-write must not leave one.
@@ -555,18 +579,26 @@ impl Prefs {
         std::fs::rename(&tmp, path).with_context(|| {
             let _ = std::fs::remove_file(&tmp);
             format!("replacing {}", path.display())
-        })
+        })?;
+        // croft's own write, already applied: the settings watch must not
+        // re-merge it as if it came from outside (#1435).
+        crate::config_sync::note_own_write(path, before);
+        Ok(())
     }
 
     /// What [`Prefs::save`] writes: the loaded file with only the settings
     /// that changed since it was read replaced, so keys this struct does not
     /// model survive. A value is compared against the file's own typed view,
     /// so an untouched setting is left exactly as the user wrote it.
+    ///
+    /// With no file read, the file is an empty object, whose typed view is
+    /// every default: the first save writes only the settings that differ
+    /// from them (#1617). Writing them all pinned every default as a user
+    /// setting, over an `extends` base and over any default a later release
+    /// changes.
     fn document(&self) -> Result<serde_json::Value> {
         let current = serde_json::to_value(self).context("serializing prefs")?;
-        let Some(mut doc) = self.source.0.clone() else {
-            return Ok(current);
-        };
+        let mut doc = self.source.0.clone().unwrap_or_default();
         let loaded: Self = serde_json::from_value(serde_json::Value::Object(doc.clone()))
             .context("re-reading prefs")?;
         let loaded = serde_json::to_value(&loaded).context("serializing prefs")?;
@@ -679,6 +711,12 @@ impl From<ReplaceError> for std::io::Error {
 /// be given; and it is impossible where the directory refuses the temp file.
 /// Those are written in place, with the space for the new contents reserved
 /// before the first byte changes.
+///
+/// So is a file with room for its new contents but not for a second copy of
+/// them (#1614): on a nearly full disk, a one-character edit to a file bigger
+/// than the free space could never be saved. That fallback is Linux only,
+/// where the reservation is made, and only when the space is reserved, so
+/// a write that doesn't fit still fails with the file whole.
 pub(crate) fn replace_file_contents(path: &Path, bytes: &[u8]) -> Result<(), ReplaceError> {
     let untouched = |error| ReplaceError {
         error,
@@ -706,11 +744,31 @@ pub(crate) fn replace_file_contents(path: &Path, bytes: &[u8]) -> Result<(), Rep
                     untouched(e)
                 });
             }
+            #[cfg(target_os = "linux")]
+            Err(Aside::Failed(e)) if is_out_of_space(&e) => {
+                return write_in_place(&target, bytes, true).map_err(|r| {
+                    // Nothing changed: the save failed for the reason the
+                    // copy aside did, and that is what the user can act on.
+                    if r.touched { r } else { untouched(e) }
+                });
+            }
             Err(Aside::Failed(e)) => return Err(untouched(e)),
             Err(Aside::InPlace) => {}
         }
     }
-    write_in_place(&target, bytes)
+    write_in_place(&target, bytes, false)
+}
+
+/// `statfs` magic numbers of the filesystems that copy every overwritten
+/// block, where reserving space does not make an overwrite safe: Btrfs, ZFS
+/// and bcachefs.
+#[cfg(target_os = "linux")]
+const COPY_ON_WRITE_FS_MAGIC: [u32; 3] = [0x9123_683E, 0x2FC1_2FC1, 0xCA45_1A4E];
+
+/// The disk or the user's quota is full.
+#[cfg(target_os = "linux")]
+fn is_out_of_space(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT))
 }
 
 /// Why [`write_aside`] gave up: the write failed (a full disk), or the
@@ -761,6 +819,10 @@ fn write_aside(target: &Path, meta: &std::fs::Metadata, bytes: &[u8]) -> Result<
         let _ = std::fs::remove_file(tmp);
         Aside::Failed(e)
     };
+    #[cfg(test)]
+    if test_hooks::ASIDE_OUT_OF_SPACE.get() {
+        return Err(fail(&tmp, std::io::Error::from_raw_os_error(libc::ENOSPC)));
+    }
     if let Err(e) = file.write_all(bytes).and_then(|()| file.flush()) {
         return Err(fail(&tmp, e));
     }
@@ -852,9 +914,15 @@ fn copy_xattrs(_fd: libc::c_int, _target: &Path) -> bool {
 
 /// Overwrite `target` with `bytes` without truncating it first. On Linux
 /// the space a longer file needs is reserved before the first byte changes,
-/// so running out of it fails with the file untouched.
-fn write_in_place(target: &Path, bytes: &[u8]) -> Result<(), ReplaceError> {
+/// so running out of it fails with the file untouched. With `must_reserve`,
+/// the whole output is reserved even when it is not longer (a sparse or
+/// copy-on-write file can need new blocks to overwrite), and a filesystem
+/// that can't reserve space fails the write too, untouched, instead of
+/// writing on unguarded.
+fn write_in_place(target: &Path, bytes: &[u8], must_reserve: bool) -> Result<(), ReplaceError> {
     use std::io::{Seek as _, Write as _};
+    #[cfg(not(target_os = "linux"))]
+    let _ = must_reserve;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .open(target)
@@ -869,11 +937,53 @@ fn write_in_place(target: &Path, bytes: &[u8]) -> Result<(), ReplaceError> {
     let before = file.metadata().ok();
     #[cfg(target_os = "linux")]
     let old_len = before.as_ref().map_or(0, |m| m.len());
+    // Reserving space does not hold on a filesystem that writes every
+    // overwritten block somewhere new (Btrfs, ZFS, bcachefs): an overwrite
+    // can still run out halfway through the old contents, so the mandatory
+    // fallback refuses there, untouched. XFS shares reflinked extents the
+    // same way but can unshare them up front, which leaves nothing to copy
+    // on write.
     #[cfg(target_os = "linux")]
-    if new_len > old_len {
+    if must_reserve {
+        use std::os::unix::io::AsRawFd as _;
+        let fd = file.as_raw_fd();
+        let refuse = |err: i32| ReplaceError {
+            error: std::io::Error::from_raw_os_error(err),
+            touched: false,
+        };
+        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatfs(fd, &mut st) } != 0 {
+            return Err(refuse(libc::EOPNOTSUPP));
+        }
+        if COPY_ON_WRITE_FS_MAGIC.contains(&(st.f_type as u32)) {
+            return Err(refuse(libc::EOPNOTSUPP));
+        }
+        if old_len > 0 {
+            let err = unsafe {
+                libc::fallocate(fd, libc::FALLOC_FL_UNSHARE_RANGE, 0, old_len as libc::off_t)
+            };
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if err != 0 && errno != libc::EOPNOTSUPP && errno != libc::EINVAL {
+                return Err(refuse(errno));
+            }
+        }
+    }
+    // A mandatory reservation covers the whole output even when it is no
+    // longer than the file: overwriting a sparse file's holes, or any block
+    // on a copy-on-write filesystem, can still need new blocks and fail
+    // halfway through the old contents.
+    #[cfg(target_os = "linux")]
+    if new_len > old_len || (must_reserve && new_len > 0) {
         use std::os::unix::io::AsRawFd as _;
         let err = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, new_len as libc::off_t) };
-        if err != 0 && err != libc::EOPNOTSUPP && err != libc::EINVAL {
+        let unsupported = err == libc::EOPNOTSUPP || err == libc::EINVAL;
+        if unsupported && must_reserve {
+            return Err(ReplaceError {
+                error: std::io::Error::from_raw_os_error(err),
+                touched: false,
+            });
+        }
+        if err != 0 && !unsupported {
             // A reservation that failed partway may have grown the file: cut
             // it back. The contents are as they were, but the attempt can
             // still have moved the file's timestamp (ext4 marks it modified
@@ -898,6 +1008,16 @@ fn write_in_place(target: &Path, bytes: &[u8]) -> Result<(), ReplaceError> {
             error,
             touched: true,
         })
+}
+
+/// Faults a test can inject into the save path.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    thread_local! {
+        /// Fail the copy aside the way a full disk does (#1614).
+        pub(crate) static ASIDE_OUT_OF_SPACE: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
 }
 
 /// The settings file under `config_dir`. The real config dir means the
@@ -1316,6 +1436,103 @@ mod tests {
         );
     }
     use super::*;
+
+    /// The keys of the `config.json` in `dir`.
+    fn saved_keys(dir: &Path) -> Vec<String> {
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let mut keys: Vec<String> = doc.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    /// #1617: the first save on a fresh install writes the one setting that
+    /// changed, not every default.
+    #[test]
+    fn the_first_save_writes_only_the_setting_that_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        save_tour_done_in(dir.path()).unwrap();
+        assert_eq!(saved_keys(dir.path()), vec!["tour_done"]);
+        let other = tempfile::tempdir().unwrap();
+        let mut prefs = Prefs::load_for_update(&other.path().join("config.json")).unwrap();
+        prefs.vim_mode = true;
+        prefs.suppress_terminal_warning = true;
+        prefs.save(&other.path().join("config.json")).unwrap();
+        assert_eq!(
+            saved_keys(other.path()),
+            vec!["suppress_terminal_warning", "vim_mode"]
+        );
+        let loaded = Prefs::load(&other.path().join("config.json")).unwrap();
+        assert!(loaded.vim_mode && loaded.suppress_terminal_warning);
+        assert_eq!(
+            loaded,
+            Prefs {
+                vim_mode: true,
+                suppress_terminal_warning: true,
+                ..Prefs::default()
+            },
+            "every other setting reads back as its default"
+        );
+    }
+
+    /// #1617: the first save of a nested setting writes only that field of
+    /// it, so its siblings keep following the defaults.
+    #[test]
+    fn the_first_save_of_a_nested_setting_writes_only_its_changed_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut prefs = Prefs::load_for_update(&path).unwrap();
+        prefs.layout.status_bar = !prefs.layout.status_bar;
+        prefs.save(&path).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let layout: Vec<&String> = doc["layout"].as_object().unwrap().keys().collect();
+        assert_eq!(layout, vec!["status_bar"], "{doc}");
+        assert_eq!(Prefs::load(&path).unwrap(), prefs);
+    }
+
+    /// #1617: an `extends` base added after the first save is not overridden
+    /// by defaults that save pinned.
+    #[test]
+    fn an_extends_base_still_applies_after_the_first_save() {
+        let dir = tempfile::tempdir().unwrap();
+        save_tour_done_in(dir.path()).unwrap();
+        let base = dir.path().join("base.json");
+        std::fs::write(&base, r#"{ "vim_mode": true }"#).unwrap();
+        let path = dir.path().join("config.json");
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        doc["extends"] = serde_json::Value::String(base.display().to_string());
+        std::fs::write(&path, doc.to_string()).unwrap();
+        let merged = crate::config_layers::load_merged_from(dir.path(), None, "linux");
+        assert!(merged.prefs.vim_mode, "{:?}", merged.warnings);
+        assert!(merged.prefs.tour_done);
+        assert_eq!(
+            crate::config_layers::layer_of(&merged.provenance, "format_on_save"),
+            crate::config_layers::LayerKind::Default,
+            "a setting nobody set is not a user setting"
+        );
+    }
+
+    /// #1617 negative: in a file that already exists, a key the user wrote
+    /// stays even when it holds the default, and the one that changed is
+    /// written.
+    #[test]
+    fn an_existing_file_keeps_its_keys_when_another_setting_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"vim_mode": false, "theme": "dark"}"#).unwrap();
+        save_tour_done_in(dir.path()).unwrap();
+        assert_eq!(
+            saved_keys(dir.path()),
+            vec!["theme", "tour_done", "vim_mode"]
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["vim_mode"], false);
+        assert_eq!(doc["theme"], "dark");
+    }
 
     #[test]
     fn saving_keeps_unknown_keys_nested_in_a_changed_object_and_drops_removed_entries() {

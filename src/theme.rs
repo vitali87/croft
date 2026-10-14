@@ -108,6 +108,8 @@ pub struct Theme {
     tab_active: (u8, u8, u8),
     tab_hover: (u8, u8, u8),
     tab_pill: (u8, u8, u8),
+    /// A high contrast theme (#1548): see [`Theme::high_contrast`].
+    high_contrast: bool,
 }
 
 impl Theme {
@@ -136,6 +138,7 @@ impl Theme {
         tab_active: (0x26, 0x4f, 0x4a),
         tab_hover: (0x2f, 0x35, 0x50),
         tab_pill: (0x3c, 0x8a, 0x7e),
+        high_contrast: false,
     };
 
     /// Croft Dark (Blue) — the historical look. Const mirror of the manifest,
@@ -160,6 +163,7 @@ impl Theme {
         tab_active: (0x1e, 0x3a, 0x6e),
         tab_hover: (0x34, 0x50, 0x7f),
         tab_pill: (0x4e, 0x9a, 0xff),
+        high_contrast: false,
     };
 
     /// Every available theme in pick-list order, loaded once from the bundled +
@@ -237,6 +241,7 @@ impl Theme {
             tab_active: hex_or(&d.tab_active, selection),
             tab_hover: hex_or(&d.tab_hover, blend(accent, 0.25, tab_strip)),
             tab_pill: hex_or(&d.tab_close_pill, accent),
+            high_contrast: d.high_contrast,
             gradient: d.gradient,
             osk_key: parse_hex(&d.osk_key),
             osk_special: parse_hex(&d.osk_special),
@@ -312,8 +317,17 @@ impl Theme {
         luma(self.bg) > 128.0
     }
 
+    /// Whether this is a high contrast theme (VS Code's Dark / Light High
+    /// Contrast, #1548). [`Theme::ui`] then resolves croft's hardcoded
+    /// chrome greys to the theme's pure foreground or background and lifts
+    /// every other chrome color to 7:1 against the background, so no dim
+    /// label or faint border survives into a theme picked to be readable.
+    pub fn high_contrast(self) -> bool {
+        self.high_contrast
+    }
+
     /// Adapt a hardcoded dark-chrome color to the active theme. On every
-    /// dark theme this is the identity, so wrapping a legacy constant in
+    /// dark theme but a high contrast one this is the identity, so wrapping a legacy constant in
     /// `theme.ui(..)` is byte-for-byte invisible there. On a light
     /// background the recurring chrome vocabulary (the historical dark
     /// constants that predate theme-driven popups) resolves to its VS Code
@@ -324,95 +338,165 @@ impl Theme {
     /// Color::Rgb(0x16, 0x18, 0x1f))`), which documents the dark rendering
     /// and concentrates all light-theme knowledge here.
     pub fn ui(self, dark: Color) -> Color {
+        if self.high_contrast {
+            return self.high_contrast_ui(dark);
+        }
         if !self.is_light() {
             return dark;
         }
-        let Color::Rgb(r, g, b) = dark else {
-            // The named ANSI colors that read on dark but wash out on white
-            // land on their VS Code light-terminal counterparts; everything
-            // else (Reset, the legible named colors, indexed) passes through.
-            return match dark {
-                Color::White => Color::Rgb(0x1f, 0x1f, 0x1f),
-                Color::Yellow | Color::LightYellow => Color::Rgb(0xbf, 0x88, 0x03),
-                Color::Green | Color::LightGreen => Color::Rgb(0x10, 0x7c, 0x10),
-                Color::Cyan | Color::LightCyan => Color::Rgb(0x05, 0x98, 0xbc),
-                Color::Gray => Color::Rgb(0x61, 0x61, 0x61),
-                other => other,
-            };
-        };
-        let mapped = match (r, g, b) {
-            // -- fills -----------------------------------------------------
-            // Popup / widget body -> quickInput.background.
-            (0x16, 0x18, 0x1f) => (0xf8, 0xf8, 0xf8),
-            (0x1e, 0x1e, 0x1e) => (0xf8, 0xf8, 0xf8),
-            // Panel and input fills, darkest first.
-            (0x14, 0x14, 0x14) => (0xec, 0xec, 0xec),
-            (0x1e, 0x21, 0x2a) => (0xf3, 0xf3, 0xf3),
-            (0x1f, 0x24, 0x36) => (0xf3, 0xf3, 0xf3),
-            (0x20, 0x24, 0x2b) => (0xe8, 0xe8, 0xe8),
-            (0x23, 0x27, 0x2f) => (0xec, 0xec, 0xec),
-            (0x2a, 0x2f, 0x3e) => (0xec, 0xec, 0xec),
-            (0x2b, 0x31, 0x42) => (0xe0, 0xe0, 0xe0),
-            (0x2c, 0x31, 0x40) => (0xe4, 0xe4, 0xe4),
-            (0x2f, 0x35, 0x50) => (0xe4, 0xe4, 0xe4),
-            (0x34, 0x50, 0x7f) => (0xd0, 0xd0, 0xd0),
-            (0x3a, 0x40, 0x52) => (0xd8, 0xd8, 0xd8),
-            // Selected list row -> list.activeSelectionBackground.
-            (0x1e, 0x3a, 0x6e) => (0xe8, 0xe8, 0xe8),
-            // Editor text selection blues -> editor.selectionBackground.
-            (0x26, 0x4f, 0x78) => (0xad, 0xd6, 0xff),
-            (0x09, 0x4d, 0x77) => (0xad, 0xd6, 0xff),
-            (0x07, 0x33, 0x55) => (0xd0, 0xe6, 0xff),
-            (0x37, 0x61, 0x8e) => (0xc8, 0xdf, 0xf5),
-            // Separators and borders -> widget.border.
-            (0x3b, 0x42, 0x52) => (0xe5, 0xe5, 0xe5),
-            (0x60, 0x68, 0x78) => (0xc8, 0xc8, 0xc8),
-            // -- foregrounds ----------------------------------------------
-            (0xff, 0xff, 0xff) => (0x1f, 0x1f, 0x1f),
-            (0xec, 0xef, 0xf4) => (0x3b, 0x3b, 0x3b),
-            (0xe8, 0xee, 0xf8) => (0x3b, 0x3b, 0x3b),
-            (0xe5, 0xe9, 0xf0) => (0x3b, 0x3b, 0x3b),
-            (0xcc, 0xcc, 0xcc) => (0x3b, 0x3b, 0x3b),
-            (0xd8, 0xde, 0xe9) => (0x42, 0x42, 0x42),
-            (0xc5, 0xcd, 0xd9) => (0x50, 0x50, 0x50),
-            (0xb4, 0xbe, 0xc8) => (0x50, 0x50, 0x50),
-            (0xb0, 0xb8, 0xc8) => (0x50, 0x50, 0x50),
-            (0x9d, 0xa5, 0xb4) => (0x61, 0x61, 0x61),
-            (0x9a, 0xa4, 0xb2) => (0x61, 0x61, 0x61),
-            (0x8e, 0x95, 0xa4) => (0x71, 0x71, 0x71),
-            (0x8b, 0x93, 0xa1) => (0x71, 0x71, 0x71),
-            (0x7a, 0x82, 0x90) => (0x71, 0x71, 0x71),
-            (0xa0, 0xb4, 0xd8) => (0x71, 0x71, 0x71),
-            (0x80, 0x88, 0x98) => (0x8e, 0x8e, 0x8e),
-            (0x6c, 0x76, 0x86) => (0x8e, 0x8e, 0x8e),
-            (0x6c, 0x7d, 0x9c) => (0x8e, 0x8e, 0x8e),
-            // Accents: the two recurring blues -> focusBorder.
-            (0x4e, 0x9a, 0xff) => (0x00, 0x5f, 0xb8),
-            (0x88, 0xc0, 0xd0) => (0x00, 0x5f, 0xb8),
-            // -- status hues (dark-tuned pastels -> saturated-on-white) ----
-            (0xff, 0xd7, 0x4a) => (0xbf, 0x88, 0x03),
-            (0xe5, 0xc0, 0x7b) => (0xbf, 0x88, 0x03),
-            (0xeb, 0xcb, 0x8b) => (0xbf, 0x88, 0x03),
-            (0xcc, 0xa7, 0x00) => (0xbf, 0x88, 0x03),
-            (0xff, 0xa5, 0x00) => (0xc0, 0x6c, 0x00),
-            (0xff, 0x9d, 0x2f) => (0xc0, 0x6c, 0x00),
-            (0xe0, 0x9a, 0x4e) => (0xc0, 0x6c, 0x00),
-            (0xa3, 0xbe, 0x8c) => (0x10, 0x7c, 0x10),
-            (0xb6, 0xee, 0xc4) => (0x10, 0x7c, 0x10),
-            (0x8c, 0xc2, 0x65) => (0x10, 0x7c, 0x10),
-            (0xe7, 0x70, 0x70) => (0xc4, 0x2b, 0x1f),
-            (0xf1, 0x4c, 0x4c) => (0xcd, 0x31, 0x31),
-            // Fills that carry BLACK text (the editor block cursor, the
-            // active search-match band): they must stay light so the black
-            // glyph keeps its contrast, not be darkened as if they were
-            // foregrounds (review round 1).
-            (0xae, 0xc6, 0xff) => (0xad, 0xd6, 0xff),
-            (0xff, 0x8c, 0x2a) => (0xff, 0x8c, 0x2a),
-            other => light_fallback(other),
-        };
-        rgb(mapped)
+        light_ui(dark)
     }
 
+    /// [`Theme::ui`] for a high contrast theme (#1548). A fill (dark on a
+    /// dark theme, light on a light one) that is a grey becomes the
+    /// background, so panels and popups sit on pure black or white; a tinted
+    /// fill (a selection, a diff band) keeps its hue. A grey foreground
+    /// becomes the pure foreground, and a colored one (an accent, a status
+    /// hue) is pushed toward it until it reads at 7:1, WCAG's AAA level.
+    fn high_contrast_ui(self, dark: Color) -> Color {
+        let light = self.is_light();
+        let (fg, bg) = if light {
+            ((0x00, 0x00, 0x00), (0xff, 0xff, 0xff))
+        } else {
+            ((0xff, 0xff, 0xff), (0x00, 0x00, 0x00))
+        };
+        // Light themes take the light adaptation of the dark vocabulary
+        // first, so the fill / foreground split below sees light-theme roles.
+        // A strongly saturated color outside that vocabulary is a status
+        // foreground (the breakpoint red, an error hue): the light fallback
+        // would pale it into a grey fill and so into the background, so it
+        // goes straight to the contrast lift instead.
+        let adapted = match dark {
+            Color::Rgb(r, g, b)
+                if light
+                    && light_vocab((r, g, b)).is_none()
+                    && r.max(g).max(b) - r.min(g).min(b) >= 0x80 =>
+            {
+                return rgb(raise_contrast((r, g, b), bg, fg, 7.0));
+            }
+            _ if light => light_ui(dark),
+            _ => dark,
+        };
+        let c = match adapted {
+            Color::Rgb(r, g, b) => (r, g, b),
+            Color::White | Color::Gray | Color::DarkGray => fg,
+            Color::Black => bg,
+            named => match named_rgb(named) {
+                Some(c) => c,
+                None => return adapted,
+            },
+        };
+        let (hi, lo) = (c.0.max(c.1).max(c.2), c.0.min(c.1).min(c.2));
+        let grey = hi - lo < 0x30;
+        let fill = if light {
+            luma(c) > 155.0
+        } else {
+            luma(c) < 100.0
+        };
+        rgb(match (fill, grey) {
+            (true, true) => bg,
+            (true, false) => c,
+            (false, true) => fg,
+            (false, false) => raise_contrast(c, bg, fg, 7.0),
+        })
+    }
+}
+
+/// The light-theme half of [`Theme::ui`]: the dark chrome vocabulary
+/// mapped onto VS Code Light Modern.
+fn light_ui(dark: Color) -> Color {
+    let Color::Rgb(r, g, b) = dark else {
+        // The named ANSI colors that read on dark but wash out on white
+        // land on their VS Code light-terminal counterparts; everything
+        // else (Reset, the legible named colors, indexed) passes through.
+        return match dark {
+            Color::White => Color::Rgb(0x1f, 0x1f, 0x1f),
+            Color::Yellow | Color::LightYellow => Color::Rgb(0xbf, 0x88, 0x03),
+            Color::Green | Color::LightGreen => Color::Rgb(0x10, 0x7c, 0x10),
+            Color::Cyan | Color::LightCyan => Color::Rgb(0x05, 0x98, 0xbc),
+            Color::Gray => Color::Rgb(0x61, 0x61, 0x61),
+            other => other,
+        };
+    };
+    rgb(light_vocab((r, g, b)).unwrap_or_else(|| light_fallback((r, g, b))))
+}
+
+/// The recurring dark chrome colors with a hand-picked VS Code Light
+/// Modern counterpart; `None` for any other color.
+fn light_vocab((r, g, b): (u8, u8, u8)) -> Option<(u8, u8, u8)> {
+    Some(match (r, g, b) {
+        // -- fills -----------------------------------------------------
+        // Popup / widget body -> quickInput.background.
+        (0x16, 0x18, 0x1f) => (0xf8, 0xf8, 0xf8),
+        (0x1e, 0x1e, 0x1e) => (0xf8, 0xf8, 0xf8),
+        // Panel and input fills, darkest first.
+        (0x14, 0x14, 0x14) => (0xec, 0xec, 0xec),
+        (0x1e, 0x21, 0x2a) => (0xf3, 0xf3, 0xf3),
+        (0x1f, 0x24, 0x36) => (0xf3, 0xf3, 0xf3),
+        (0x20, 0x24, 0x2b) => (0xe8, 0xe8, 0xe8),
+        (0x23, 0x27, 0x2f) => (0xec, 0xec, 0xec),
+        (0x2a, 0x2f, 0x3e) => (0xec, 0xec, 0xec),
+        (0x2b, 0x31, 0x42) => (0xe0, 0xe0, 0xe0),
+        (0x2c, 0x31, 0x40) => (0xe4, 0xe4, 0xe4),
+        (0x2f, 0x35, 0x50) => (0xe4, 0xe4, 0xe4),
+        (0x34, 0x50, 0x7f) => (0xd0, 0xd0, 0xd0),
+        (0x3a, 0x40, 0x52) => (0xd8, 0xd8, 0xd8),
+        // Selected list row -> list.activeSelectionBackground.
+        (0x1e, 0x3a, 0x6e) => (0xe8, 0xe8, 0xe8),
+        // Editor text selection blues -> editor.selectionBackground.
+        (0x26, 0x4f, 0x78) => (0xad, 0xd6, 0xff),
+        (0x09, 0x4d, 0x77) => (0xad, 0xd6, 0xff),
+        (0x07, 0x33, 0x55) => (0xd0, 0xe6, 0xff),
+        (0x37, 0x61, 0x8e) => (0xc8, 0xdf, 0xf5),
+        // Separators and borders -> widget.border.
+        (0x3b, 0x42, 0x52) => (0xe5, 0xe5, 0xe5),
+        (0x60, 0x68, 0x78) => (0xc8, 0xc8, 0xc8),
+        // -- foregrounds ----------------------------------------------
+        (0xff, 0xff, 0xff) => (0x1f, 0x1f, 0x1f),
+        (0xec, 0xef, 0xf4) => (0x3b, 0x3b, 0x3b),
+        (0xe8, 0xee, 0xf8) => (0x3b, 0x3b, 0x3b),
+        (0xe5, 0xe9, 0xf0) => (0x3b, 0x3b, 0x3b),
+        (0xcc, 0xcc, 0xcc) => (0x3b, 0x3b, 0x3b),
+        (0xd8, 0xde, 0xe9) => (0x42, 0x42, 0x42),
+        (0xc5, 0xcd, 0xd9) => (0x50, 0x50, 0x50),
+        (0xb4, 0xbe, 0xc8) => (0x50, 0x50, 0x50),
+        (0xb0, 0xb8, 0xc8) => (0x50, 0x50, 0x50),
+        (0x9d, 0xa5, 0xb4) => (0x61, 0x61, 0x61),
+        (0x9a, 0xa4, 0xb2) => (0x61, 0x61, 0x61),
+        (0x8e, 0x95, 0xa4) => (0x71, 0x71, 0x71),
+        (0x8b, 0x93, 0xa1) => (0x71, 0x71, 0x71),
+        (0x7a, 0x82, 0x90) => (0x71, 0x71, 0x71),
+        (0xa0, 0xb4, 0xd8) => (0x71, 0x71, 0x71),
+        (0x80, 0x88, 0x98) => (0x8e, 0x8e, 0x8e),
+        (0x6c, 0x76, 0x86) => (0x8e, 0x8e, 0x8e),
+        (0x6c, 0x7d, 0x9c) => (0x8e, 0x8e, 0x8e),
+        // Accents: the two recurring blues -> focusBorder.
+        (0x4e, 0x9a, 0xff) => (0x00, 0x5f, 0xb8),
+        (0x88, 0xc0, 0xd0) => (0x00, 0x5f, 0xb8),
+        // -- status hues (dark-tuned pastels -> saturated-on-white) ----
+        (0xff, 0xd7, 0x4a) => (0xbf, 0x88, 0x03),
+        (0xe5, 0xc0, 0x7b) => (0xbf, 0x88, 0x03),
+        (0xeb, 0xcb, 0x8b) => (0xbf, 0x88, 0x03),
+        (0xcc, 0xa7, 0x00) => (0xbf, 0x88, 0x03),
+        (0xff, 0xa5, 0x00) => (0xc0, 0x6c, 0x00),
+        (0xff, 0x9d, 0x2f) => (0xc0, 0x6c, 0x00),
+        (0xe0, 0x9a, 0x4e) => (0xc0, 0x6c, 0x00),
+        (0xa3, 0xbe, 0x8c) => (0x10, 0x7c, 0x10),
+        (0xb6, 0xee, 0xc4) => (0x10, 0x7c, 0x10),
+        (0x8c, 0xc2, 0x65) => (0x10, 0x7c, 0x10),
+        (0xe7, 0x70, 0x70) => (0xc4, 0x2b, 0x1f),
+        (0xf1, 0x4c, 0x4c) => (0xcd, 0x31, 0x31),
+        // Fills that carry BLACK text (the editor block cursor, the
+        // active search-match band): they must stay light so the black
+        // glyph keeps its contrast, not be darkened as if they were
+        // foregrounds (review round 1).
+        (0xae, 0xc6, 0xff) => (0xad, 0xd6, 0xff),
+        (0xff, 0x8c, 0x2a) => (0xff, 0x8c, 0x2a),
+        _ => return None,
+    })
+}
+
+impl Theme {
     /// The 16 ANSI terminal colors (black..bright white) the theme's panes
     /// render Named/Indexed 0-15 cell colors with.
     pub fn ansi(self) -> [(u8, u8, u8); 16] {
@@ -639,6 +723,30 @@ impl Theme {
         (0xf8, 0x51, 0x49)
     }
 
+    /// Explorer name and badge colour for a changed path (#1513): VS Code's
+    /// `gitDecoration.*ResourceForeground` defaults, the dark-theme set on
+    /// dark backgrounds and the light-theme set on light ones.
+    pub fn git_decoration_fg(self, dec: crate::git::GitDecoration) -> Color {
+        use crate::git::GitDecoration as D;
+        let (r, g, b) = if self.is_light() {
+            match dec {
+                D::Modified => (0x89, 0x55, 0x03),
+                D::Untracked | D::Renamed => (0x00, 0x71, 0x00),
+                D::Added => (0x58, 0x7c, 0x0c),
+                D::Deleted | D::Conflicted => (0xad, 0x07, 0x07),
+            }
+        } else {
+            match dec {
+                D::Modified => (0xe2, 0xc0, 0x8d),
+                D::Untracked | D::Renamed => (0x73, 0xc9, 0x91),
+                D::Added => (0x81, 0xb8, 0x8b),
+                D::Deleted => (0xc7, 0x4e, 0x39),
+                D::Conflicted => (0xe4, 0x67, 0x6b),
+            }
+        };
+        Color::Rgb(r, g, b)
+    }
+
     /// Explorer name foreground for a git-ignored file or directory (VS Code
     /// `gitDecoration.ignoredResourceForeground`, #8C8C8C on dark themes).
     /// White at 55% over the theme background lands exactly on that grey for
@@ -758,6 +866,64 @@ impl Default for Theme {
 
 fn rgb(c: (u8, u8, u8)) -> Color {
     Color::Rgb(c.0, c.1, c.2)
+}
+
+/// The RGB of a named ANSI color, as VS Code's dark terminal paints it,
+/// for adapters that need a value to adjust.
+fn named_rgb(c: Color) -> Option<(u8, u8, u8)> {
+    let i = match c {
+        Color::Red => 1,
+        Color::Green => 2,
+        Color::Yellow => 3,
+        Color::Blue => 4,
+        Color::Magenta => 5,
+        Color::Cyan => 6,
+        Color::LightRed => 9,
+        Color::LightGreen => 10,
+        Color::LightYellow => 11,
+        Color::LightBlue => 12,
+        Color::LightMagenta => 13,
+        Color::LightCyan => 14,
+        _ => return None,
+    };
+    Some(VSCODE_ANSI[i])
+}
+
+/// WCAG 2 relative luminance of an sRGB color (0.0 black ..= 1.0 white).
+fn relative_luminance((r, g, b): (u8, u8, u8)) -> f64 {
+    let lin = |v: u8| {
+        let s = f64::from(v) / 255.0;
+        if s <= 0.039_28 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+}
+
+/// WCAG 2 contrast ratio between two colors (1.0 ..= 21.0).
+pub fn contrast_ratio(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Blend `c` toward `toward` in small steps until it reads at `ratio`
+/// against `bg`, keeping as much of its hue as that allows.
+fn raise_contrast(
+    c: (u8, u8, u8),
+    bg: (u8, u8, u8),
+    toward: (u8, u8, u8),
+    ratio: f64,
+) -> (u8, u8, u8) {
+    let mut out = c;
+    let mut step: f32 = 0.0;
+    while contrast_ratio(out, bg) < ratio && step < 1.0 {
+        step += 0.05;
+        out = blend(toward, step.min(1.0), c);
+    }
+    out
 }
 
 /// Perceived luminance (0..=255) of an sRGB tuple.
@@ -1015,7 +1181,7 @@ mod tests {
         for t in Theme::all() {
             assert_eq!(
                 t.is_light(),
-                t.id() == "light",
+                t.id() == "light" || t.id() == "hc-light",
                 "`{}` misclassified by is_light",
                 t.id()
             );
@@ -1026,8 +1192,9 @@ mod tests {
     fn the_ui_adapter_is_the_identity_on_every_dark_theme() {
         // The whole sweep's safety net: wrapping a hardcoded chrome color in
         // `theme.ui(..)` must be byte-for-byte invisible on dark themes.
+        // High contrast themes adapt on purpose (#1548).
         for t in Theme::all() {
-            if t.is_light() {
+            if t.is_light() || t.high_contrast() {
                 continue;
             }
             for c in [
@@ -1183,10 +1350,204 @@ mod tests {
 
     #[test]
     fn dark_activity_icon_ink_keeps_the_historical_chrome() {
-        for t in Theme::all().iter().filter(|t| !t.is_light()) {
+        for t in Theme::all()
+            .iter()
+            .filter(|t| !t.is_light() && !t.high_contrast())
+        {
             assert_eq!(t.activity_icon_active_rgb(), (0xff, 0xff, 0xff));
             assert_eq!(t.activity_icon_inactive_rgb(), (0x9d, 0xa5, 0xb4));
             assert_eq!(t.activity_icon_pill_rgb(), (0x4e, 0x9a, 0xff));
         }
+    }
+
+    fn high_contrast_pair() -> [Theme; 2] {
+        [Theme::from_id("hc-black"), Theme::from_id("hc-light")]
+    }
+
+    /// #1548: croft ships VS Code's two high contrast themes: pure black or
+    /// white behind pure white or black text.
+    #[test]
+    fn croft_ships_dark_and_light_high_contrast_themes() {
+        let [dark, light] = high_contrast_pair();
+        assert_eq!(dark.label(), "High Contrast");
+        assert_eq!(light.label(), "High Contrast Light");
+        assert!(dark.high_contrast() && light.high_contrast());
+        assert!(!dark.is_light() && light.is_light());
+        assert_eq!(dark.editor_bg_rgb(), (0x00, 0x00, 0x00));
+        assert_eq!(light.editor_bg_rgb(), (0xff, 0xff, 0xff));
+        assert_eq!(dark.syntax().fg, (0xff, 0xff, 0xff));
+        assert_eq!(light.syntax().fg, (0x00, 0x00, 0x00));
+        // VS Code's high contrast focus colors carry the active chrome.
+        assert_eq!(dark.accent_rgb(), (0xf3, 0x85, 0x18));
+        assert_eq!(light.accent_rgb(), (0x0f, 0x4a, 0x85));
+        assert!(!dark.gradient() && !light.gradient(), "no gradient chrome");
+    }
+
+    /// #1548: every code color reads at 7:1 (WCAG AAA) on its background,
+    /// and every terminal color but the background's own at 4.5:1.
+    #[test]
+    fn high_contrast_code_and_terminal_colors_are_readable() {
+        for t in high_contrast_pair() {
+            let bg = t.editor_bg_rgb();
+            let s = t.syntax();
+            for (role, c) in [
+                ("comment", s.comment),
+                ("keyword", s.keyword),
+                ("string", s.string),
+                ("constant", s.constant),
+                ("function", s.function),
+                ("type", s.type_),
+                ("tag", s.tag),
+                ("fg", s.fg),
+            ] {
+                let r = contrast_ratio(c, bg);
+                assert!(r >= 7.0, "{} {role} {c:?} reads at {r:.2}:1", t.id());
+            }
+            for (i, c) in t.ansi().iter().enumerate() {
+                if *c == bg {
+                    continue;
+                }
+                let r = contrast_ratio(*c, bg);
+                assert!(r >= 4.5, "{} ansi {i} {c:?} reads at {r:.2}:1", t.id());
+            }
+            let tab = rgb(t.syntax().fg);
+            assert_ne!(
+                t.tab_active_bg(),
+                tab,
+                "{}: the active tab label shows",
+                t.id()
+            );
+            let Color::Rgb(r, g, b) = t.tab_active_bg() else {
+                panic!("tab fill is rgb");
+            };
+            assert!(
+                contrast_ratio((r, g, b), t.syntax().fg) >= 7.0,
+                "{}: the active tab's label reads on its fill",
+                t.id()
+            );
+        }
+    }
+
+    /// #1548: croft's chrome greys (dim labels, hints, panel and popup
+    /// fills) resolve to the pure foreground and background, and colored
+    /// chrome keeps its hue but is lifted to 7:1.
+    #[test]
+    fn high_contrast_chrome_has_no_dim_text_or_grey_panels() {
+        let [dark, light] = high_contrast_pair();
+        for grey in [
+            (0x6c, 0x76, 0x86),
+            (0x80, 0x88, 0x98),
+            (0x9d, 0xa5, 0xb4),
+            (0xcc, 0xcc, 0xcc),
+            (0xec, 0xef, 0xf4),
+        ] {
+            assert_eq!(dark.ui(rgb(grey)), Color::Rgb(0xff, 0xff, 0xff), "{grey:?}");
+            assert_eq!(
+                light.ui(rgb(grey)),
+                Color::Rgb(0x00, 0x00, 0x00),
+                "{grey:?}"
+            );
+        }
+        for named in [Color::Gray, Color::DarkGray, Color::White] {
+            assert_eq!(dark.ui(named), Color::Rgb(0xff, 0xff, 0xff), "{named:?}");
+            assert_eq!(light.ui(named), Color::Rgb(0x00, 0x00, 0x00), "{named:?}");
+        }
+        for fill in [
+            (0x16, 0x18, 0x1f),
+            (0x14, 0x14, 0x14),
+            (0x1e, 0x21, 0x2a),
+            (0x2a, 0x2f, 0x3e),
+        ] {
+            assert_eq!(dark.ui(rgb(fill)), Color::Rgb(0x00, 0x00, 0x00), "{fill:?}");
+            assert_eq!(
+                light.ui(rgb(fill)),
+                Color::Rgb(0xff, 0xff, 0xff),
+                "{fill:?}"
+            );
+        }
+        for t in [dark, light] {
+            let bg = t.editor_bg_rgb();
+            for hue in [
+                (0x4e, 0x9a, 0xff),
+                (0xe5, 0xc0, 0x7b),
+                (0xf1, 0x4c, 0x4c),
+                (0xa3, 0xbe, 0x8c),
+                (0x6c, 0x7d, 0x9c),
+            ] {
+                let Color::Rgb(r, g, b) = t.ui(rgb(hue)) else {
+                    panic!("rgb in, rgb out");
+                };
+                let ratio = contrast_ratio((r, g, b), bg);
+                assert!(
+                    ratio >= 7.0,
+                    "{} {hue:?} -> {:?} at {ratio:.2}:1",
+                    t.id(),
+                    (r, g, b)
+                );
+            }
+            // A tinted fill (a selection, a diff band) keeps its color: the
+            // dark vocabulary's own on black, its light adaptation on white.
+            let band = rgb((0x26, 0x4f, 0x78));
+            let kept = if t.is_light() { light_ui(band) } else { band };
+            assert_eq!(t.ui(band), kept, "{}", t.id());
+            assert_eq!(t.ui(Color::Reset), Color::Reset);
+        }
+    }
+
+    /// #1548: on High Contrast Light a saturated status foreground outside
+    /// the light vocabulary (the breakpoint dot's red) stays a readable
+    /// red, not paled by the light fallback into a grey fill and so into
+    /// the white background.
+    #[test]
+    fn high_contrast_light_keeps_unmapped_status_hues_visible() {
+        let light = Theme::from_id("hc-light");
+        for hue in [(0xe5, 0x14, 0x00), (0x00, 0x7a, 0xcc), (0x10, 0xc0, 0x30)] {
+            let Color::Rgb(r, g, b) = light.ui(rgb(hue)) else {
+                panic!("rgb in, rgb out");
+            };
+            assert!(
+                contrast_ratio((r, g, b), (0xff, 0xff, 0xff)) >= 7.0,
+                "{hue:?} -> {:?}",
+                (r, g, b)
+            );
+            assert!(
+                r.max(g).max(b) - r.min(g).min(b) >= 0x30,
+                "{hue:?} keeps its hue"
+            );
+        }
+        // Negative: Croft Light's own fallback is unchanged.
+        let croft = Theme::from_id("light");
+        assert_eq!(
+            croft.ui(rgb((0xe5, 0x14, 0x00))),
+            rgb(light_fallback((0xe5, 0x14, 0x00)))
+        );
+    }
+
+    /// #1548 negative: high contrast is opt-in per theme. Every other theme
+    /// keeps its own chrome, including Croft Light's softer greys.
+    #[test]
+    fn only_the_high_contrast_themes_adapt_chrome_to_high_contrast() {
+        for t in Theme::all() {
+            assert_eq!(
+                t.high_contrast(),
+                matches!(t.id(), "hc-black" | "hc-light"),
+                "{}",
+                t.id()
+            );
+        }
+        let light = Theme::from_id("light");
+        assert_eq!(
+            light.ui(Color::Rgb(0x8b, 0x93, 0xa1)),
+            Color::Rgb(0x71, 0x71, 0x71),
+            "Croft Light keeps its dim hint grey"
+        );
+        assert_eq!(
+            Theme::BLACK.ui(Color::Rgb(0x6c, 0x76, 0x86)),
+            Color::Rgb(0x6c, 0x76, 0x86)
+        );
+        assert!(
+            contrast_ratio((0x6c, 0x76, 0x86), (0, 0, 0)) < 7.0,
+            "the grey HC lifts is dim"
+        );
     }
 }
