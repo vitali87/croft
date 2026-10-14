@@ -14353,25 +14353,21 @@ fn run_highlight_pass(
                 })
                 .collect();
             let mut pieces = spans.into_iter();
-            spans =
-                lines
-                    .iter()
-                    .map(|line| {
-                        let mut out = Vec::new();
-                        let mut offset = 0;
-                        for piece in line.split('\n') {
-                            out.extend(pieces.next().unwrap_or_default().into_iter().map(|s| {
-                                HiSpan {
-                                    start: s.start + offset,
-                                    end: s.end + offset,
-                                    style: s.style,
-                                }
-                            }));
-                            offset += piece.len() + 1;
-                        }
-                        out
-                    })
-                    .collect();
+            spans = lines
+                .iter()
+                .map(|line| {
+                    let mut out = Vec::new();
+                    let mut offset = 0;
+                    for piece in line.split('\n') {
+                        out.extend(pieces.next().unwrap_or_default().into_iter().map(|s| {
+                            let r = s.range();
+                            HiSpan::new(r.start + offset, r.end + offset, s.style)
+                        }));
+                        offset += piece.len() + 1;
+                    }
+                    out
+                })
+                .collect();
             PackedLines::from(&lines[..])
         }
     };
