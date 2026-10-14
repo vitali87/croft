@@ -931,6 +931,8 @@ pub fn lang_for_language_id(id: &str) -> Option<LangKind> {
         "sql" => LangKind::Sql,
         "makefile" => LangKind::Make,
         "dockerfile" => LangKind::Dockerfile,
+        "vue" => LangKind::Vue,
+        "svelte" => LangKind::Svelte,
         _ => return None,
     })
 }
