@@ -1,0 +1,1 @@
+fix: `croft notes.md` for a file that does not exist yet opens an empty `notes.md` tab, rooted at its folder, and the first save creates the file, as `code notes.md` and `vim notes.md` do. It exited with "resolving workspace path: No such file or directory" before. A missing folder is still an error.

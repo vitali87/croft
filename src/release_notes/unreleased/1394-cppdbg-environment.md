@@ -1,0 +1,1 @@
+fix: A `cppdbg` launch configuration now passes its `environment` list and `stopAtEntry` to lldb-dap as `env` and `stopOnEntry`, so the program gets its variables and stops at entry, and the debug console names the gdb-only keys (such as `MIMode` and `setupCommands`) that lldb-dap ignores.
