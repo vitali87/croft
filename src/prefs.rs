@@ -163,6 +163,32 @@ pub fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {
     Some(((n >> 16) as u8, (n >> 8) as u8, n as u8))
 }
 
+/// The settings one language may override (#1440). Each is unset unless a
+/// `languages.<id>` block names it, and an unset one falls back to the
+/// global setting of the same name. Any other key in a block is ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct LanguagePrefs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_on_save: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_on_type: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_whitespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable_inlay_hints: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable_auto_close_pairs: Option<bool>,
+}
+
+/// The [`LanguagePrefs`] keys: the settings a language block may set.
+pub const LANGUAGE_KEYS: &[&str] = &[
+    "format_on_save",
+    "format_on_type",
+    "render_whitespace",
+    "disable_inlay_hints",
+    "disable_auto_close_pairs",
+];
+
 /// The on-disk preferences document. New fields must default so an older
 /// config still parses; `#[serde(default)]` covers that.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -326,6 +352,12 @@ pub struct Prefs {
     /// `files_exclude` (VS Code's `search.exclude`, #1345).
     #[serde(default)]
     pub search_exclude: Vec<String>,
+    /// Per-language overrides (#1440), keyed by VS Code's language id
+    /// (`python`, `c`, `markdown`, `shellscript`, …), VS Code's
+    /// `"[python]": { … }` blocks. A value set here wins over the global
+    /// one for a file in that language; see [`LanguagePrefs`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub languages: BTreeMap<String, LanguagePrefs>,
     /// Opt-out for tailspin highlighting in the rendered log view (#466):
     /// dates, numbers, UUIDs, IPs, URLs, paths, quotes and severity keywords
     /// are coloured on lines that carry no colour of their own. Stored as
@@ -1863,6 +1895,25 @@ mod tests {
         assert!(!old.centered_layout && old.zen_center_layout);
         assert_eq!(old.centered_layout_width, 120);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1440: a language block reads its known keys and ignores the rest,
+    /// and a config with no blocks writes no `languages` key.
+    #[test]
+    fn language_blocks_read_their_known_keys_only() {
+        let p: Prefs = serde_json::from_str(
+            r#"{"languages":{"c":{"format_on_save":true,"theme":"light","font_size":3}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            p.languages.get("c"),
+            Some(&LanguagePrefs {
+                format_on_save: Some(true),
+                ..LanguagePrefs::default()
+            })
+        );
+        let out = serde_json::to_string(&Prefs::default()).unwrap();
+        assert!(!out.contains("languages"), "{out}");
     }
 
     #[test]
