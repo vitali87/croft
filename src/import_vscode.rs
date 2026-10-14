@@ -2343,7 +2343,7 @@ mod tests {
         );
         let mut got = report.keybindings.clone();
         got.sort();
-        let mut want: Vec<(String, String)> = [
+        let mut want: Vec<(String, String, Option<String>)> = [
             ("ctrl+alt+k", "terminal_clear"),
             ("ctrl+alt+r", "terminal_rename"),
             ("ctrl+alt+x", "terminal_kill"),
@@ -2351,12 +2351,12 @@ mod tests {
             ("ctrl+alt+p", "terminal_new_with_profile"),
         ]
         .iter()
-        .map(|(k, c)| (k.to_string(), c.to_string()))
+        .map(|(k, c)| (k.to_string(), c.to_string(), None))
         .collect();
         want.sort();
         assert_eq!(got, want);
         assert_eq!(report.dropped_keybindings.len(), 1, "sizeToContentWidth");
-        for (_, id) in &want {
+        for (_, id, _) in &want {
             assert!(
                 crate::widgets::command_palette::Command::from_id(id).is_some(),
                 "{id} is a croft command"
