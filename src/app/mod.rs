@@ -39752,7 +39752,7 @@ impl App {
                 "Run Task",
                 rows,
             ),
-            "No tasks found (Makefile, justfile, package.json, Cargo.toml, pyproject.toml, .vscode/tasks.json)",
+            "No tasks found (Makefile, justfile, package.json, Cargo.toml, pyproject.toml, go.mod, CMakeLists.txt, .vscode/tasks.json)",
         );
     }
 

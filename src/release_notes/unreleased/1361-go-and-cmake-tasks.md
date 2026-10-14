@@ -1,0 +1,1 @@
+feature: Cmd+Shift+B and Tasks: Run Task now find tasks in Go modules (`go build ./...`, `go test ./...`, `go vet ./...`, `go run .`) and CMake projects (configure, build and `ctest`, using `CMakePresets.json` when it has presets), with compiler errors sent to PROBLEMS.
