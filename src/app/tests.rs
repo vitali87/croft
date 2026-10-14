@@ -28055,6 +28055,7 @@ fn a_debug_test_configs_interpreter_is_the_one_checked() {
     let ctx = SubstCtx {
         workspace_folder: root.to_path_buf(),
         file: None,
+        inputs: Default::default(),
         folders: Vec::new(),
     };
     let base = |py: &str| {
