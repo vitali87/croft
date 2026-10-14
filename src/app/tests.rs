@@ -35323,19 +35323,43 @@ fn zen_app() -> (tempfile::TempDir, App) {
     (tmp, app)
 }
 
+/// The editor as last drawn, `(x, width)` (#1585): its text and the
+/// minimap strip carved from its right edge. Centered Layout centres the
+/// two together, as VS Code centres an editor with its minimap.
+fn editor_column(app: &App) -> (u16, u16) {
+    let text = app.editor.last_full_area;
+    let strip = if app.minimap_visible && app.minimap_room {
+        MINIMAP_WIDTH_CELLS
+    } else {
+        0
+    };
+    (text.x, text.width + strip)
+}
+
 /// #1585: Zen Mode centres the editor: in 200 columns it is 120 wide and
-/// starts at column 40, like VS Code's `zenMode.centerLayout`.
+/// starts at column 40, like VS Code's `zenMode.centerLayout`. The
+/// minimap is part of those 120 columns; without it the text takes them.
 #[test]
 fn zen_mode_centres_the_editor_in_a_wide_window() {
     let (_tmp, mut app) = zen_app();
     app.toggle_zen_mode();
     draw_wide(&mut app, 200);
+    assert!(app.minimap_visible && app.minimap_room, "the minimap shows");
+    assert_eq!(
+        editor_column(&app),
+        (40, 120),
+        "{:?}",
+        app.editor.last_full_area
+    );
+    app.toggle_minimap();
+    draw_wide(&mut app, 200);
     let area = app.editor.last_full_area;
     assert_eq!((area.x, area.width), (40, 120), "{area:?}");
+    app.toggle_minimap();
     app.toggle_zen_mode();
     draw_wide(&mut app, 200);
     assert!(
-        app.editor.last_full_area.width > 120,
+        editor_column(&app).1 > 120,
         "out of Zen the editor fills its column again: {:?}",
         app.editor.last_full_area
     );
@@ -35353,8 +35377,7 @@ fn toggle_centered_layout_centres_outside_zen_and_uncentres_zen() {
     assert!(app.centered_layout);
     assert_eq!(app.status, "Centered Layout on");
     draw_wide(&mut app, 200);
-    assert_eq!(app.editor.last_full_area.width, 120);
-    assert_eq!(app.editor.last_full_area.x, 40);
+    assert_eq!(editor_column(&app), (40, 120));
     app.run_command(crate::widgets::command_palette::Command::ToggleCenteredLayout);
     assert!(!app.centered_layout);
 
@@ -35363,7 +35386,7 @@ fn toggle_centered_layout_centres_outside_zen_and_uncentres_zen() {
     app.run_command(crate::widgets::command_palette::Command::ToggleCenteredLayout);
     assert!(!app.centered_layout_active() && !app.centered_layout);
     draw_wide(&mut app, 200);
-    assert_eq!(app.editor.last_full_area.width, 200);
+    assert_eq!(editor_column(&app), (0, 200));
     let rows = app.customize_layout_items();
     assert!(
         rows.iter().any(|r| matches!(r, MenuEntry::Item { label, action: MenuAction::ToggleCenteredLayout, .. } if label.contains("Centered Layout"))),
@@ -35378,13 +35401,12 @@ fn a_narrow_window_or_zen_without_centring_keeps_the_full_width() {
     let (_tmp, mut app) = zen_app();
     app.toggle_zen_mode();
     draw_wide(&mut app, 110);
-    assert_eq!(app.editor.last_full_area.x, 0);
-    assert_eq!(app.editor.last_full_area.width, 110);
+    assert_eq!(editor_column(&app), (0, 110));
     app.toggle_zen_mode();
     app.zen_center_layout = false;
     app.toggle_zen_mode();
     draw_wide(&mut app, 200);
-    assert_eq!(app.editor.last_full_area.width, 200);
+    assert_eq!(editor_column(&app), (0, 200));
     assert_eq!(
         centered_editor_rect(Rect::new(5, 1, 50, 9), 0),
         Rect::new(5, 1, 50, 9),
