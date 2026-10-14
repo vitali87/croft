@@ -109,12 +109,24 @@ pub struct TestingPanel {
     /// Latched by [`Self::on_refused`] and consumed by the app's drain, which
     /// surfaces the no-runner status message.
     refused: bool,
+    /// Latched by [`Self::on_cancelled`] for the app's "Test run cancelled".
+    cancelled: bool,
+    /// The summary line's Stop control while a run is in flight (#1534).
+    pub last_stop: Rect,
     /// Pre-run statuses of the cases the last `start_single`/`start_filter`
     /// marked Running (`None` = the start inserted the case). A worker
     /// refusal restores the tree from this snapshot exactly — old
     /// Passed/Failed/Skipped results come back instead of demoting to
     /// NotRun. Cleared when the run actually starts answering.
     prerun: Vec<(String, Option<TestStatus>)>,
+    /// A single-test or filtered run is in flight (#1371): the rest of the
+    /// tree keeps its results, whatever the runner says about it.
+    scoped: bool,
+    /// The name filter of a scoped filtered run (`None` for a single-test
+    /// run): a skip for a row the panel has not seen yet counts only when
+    /// the filter selects it, since jest/vitest report every test the filter
+    /// left out as skipped too.
+    scope_filter: Option<String>,
     scroll: usize,
 
     pub focus_gradient: bool,
@@ -140,6 +152,8 @@ impl TestingPanel {
             discovery_failed: false,
             last_output_hint: Rect::default(),
             run_tally: (0, 0, 0),
+            scoped: false,
+            scope_filter: None,
             coverage: None,
             coverage_error: None,
             coverage_fresh: false,
@@ -149,6 +163,8 @@ impl TestingPanel {
             last_cover_all: Rect::default(),
             progress: None,
             refused: false,
+            cancelled: false,
+            last_stop: Rect::default(),
             prerun: Vec::new(),
             scroll: 0,
             focus_gradient: false,
@@ -169,6 +185,8 @@ impl TestingPanel {
     pub fn on_busy_started(&mut self, activity: Activity) {
         self.cases.clear();
         self.prerun.clear();
+        self.scoped = false;
+        self.scope_filter = None;
         self.activity = activity;
         self.last_run_ok = None;
         self.run_reported_failed = false;
@@ -197,6 +215,8 @@ impl TestingPanel {
         // no-runner status or restore cases into the new project's tree.
         self.refused = false;
         self.prerun.clear();
+        self.scoped = false;
+        self.scope_filter = None;
         self.scroll = 0;
         self.finished = None;
         // The watched names described the old project.
@@ -222,10 +242,31 @@ impl TestingPanel {
         // worker refusal can put the tree back exactly.
         let old = self.cases.iter().find(|c| c.name == name).map(|c| c.status);
         self.prerun = vec![(name.to_string(), old)];
+        self.scoped = true;
+        self.scope_filter = None;
         self.apply_case(TestCase {
             name: name.to_string(),
             status: TestStatus::Running,
         });
+    }
+
+    /// Begin a run of these exact cases (#1535: Rerun Failed Tests): mark
+    /// each Running, as [`Self::start_single`] marks one, keeping the rest
+    /// of the tree.
+    pub fn start_many(&mut self, names: &[String]) {
+        self.activity = Activity::Running;
+        self.progress = None;
+        self.run_reported_failed = false;
+        self.failed_run = false;
+        self.discovery_failed = false;
+        self.run_tally = (0, 0, 0);
+        self.prerun = Vec::new();
+        for c in &mut self.cases {
+            if names.contains(&c.name) {
+                self.prerun.push((c.name.clone(), Some(c.status)));
+                c.status = TestStatus::Running;
+            }
+        }
     }
 
     /// Begin a filtered run (a suite, or a run-at-cursor by leaf name): mark
@@ -241,6 +282,8 @@ impl TestingPanel {
         self.run_tally = (0, 0, 0);
         // Snapshot each selected case's pre-run status for a refusal rollback.
         self.prerun = Vec::new();
+        self.scoped = true;
+        self.scope_filter = Some(pattern.to_string());
         for c in &mut self.cases {
             if c.name.contains(pattern) {
                 self.prerun.push((c.name.clone(), Some(c.status)));
@@ -252,6 +295,25 @@ impl TestingPanel {
     /// Apply one streamed result: update the matching case in place, or insert
     /// it (kept sorted by name so the tree is stable).
     pub fn apply_case(&mut self, case: TestCase) {
+        // vitest and jest run one test, or a suite, as the whole file under
+        // a `-t` filter and report every test it left out as skipped (`#
+        // SKIP`, `pending`). That is the filter, not a result (#1371): in a
+        // scoped run a skip lands only on a row the run marked Running, so
+        // the rest of the file keeps its last pass or failure, and the tally.
+        // A skip for a name the panel has not seen (discovery listed only the
+        // files) counts only when the run's filter selects it.
+        if self.scoped && case.status == TestStatus::Skipped {
+            let keep = match self.cases.iter().find(|c| c.name == case.name) {
+                Some(c) => c.status == TestStatus::Running,
+                None => self
+                    .scope_filter
+                    .as_deref()
+                    .is_some_and(|f| case.name.contains(f)),
+            };
+            if !keep {
+                return;
+            }
+        }
         if case.status == TestStatus::Failed {
             self.run_reported_failed = true;
         }
@@ -301,6 +363,8 @@ impl TestingPanel {
     /// Running dot forever.
     pub fn on_finished(&mut self, ok: Option<bool>) {
         let discovery = self.activity == Activity::Discovering;
+        self.scoped = false;
+        self.scope_filter = None;
         self.activity = Activity::Idle;
         self.progress = None;
         if discovery {
@@ -441,6 +505,8 @@ impl TestingPanel {
     /// (A bare finish would have stranded the marks Running forever.)
     pub fn on_refused(&mut self) {
         self.activity = Activity::Idle;
+        self.scoped = false;
+        self.scope_filter = None;
         self.progress = None;
         for (name, old) in std::mem::take(&mut self.prerun) {
             match old {
@@ -458,6 +524,27 @@ impl TestingPanel {
     /// Consume the refusal latch (one status message per refusal).
     pub fn take_refusal(&mut self) -> bool {
         std::mem::take(&mut self.refused)
+    }
+
+    /// A cancelled run or discovery ended (#1534). The cases a single or
+    /// filtered start marked Running go back to what they were, like a
+    /// refusal; any other case that never reported is not run. The run
+    /// ends without a verdict.
+    pub fn on_cancelled(&mut self) {
+        self.on_refused();
+        self.refused = false;
+        for c in &mut self.cases {
+            if c.status == TestStatus::Running {
+                c.status = TestStatus::NotRun;
+            }
+        }
+        self.cancelled = true;
+        self.finished = Some(None);
+    }
+
+    /// Consume the cancel latch (one status message per cancel).
+    pub fn take_cancelled(&mut self) -> bool {
+        std::mem::take(&mut self.cancelled)
     }
 
     pub fn is_running(&self) -> bool {
@@ -670,6 +757,7 @@ impl Widget for &mut TestingPanel {
         }
         self.last_area = area;
         self.last_output_hint = Rect::default();
+        self.last_stop = Rect::default();
         if inner.height == 0 || inner.width == 0 {
             return;
         }
@@ -741,6 +829,25 @@ impl Widget for &mut TestingPanel {
                 avail(inner.x + 1),
                 Style::default().fg(self.theme.accent()),
             );
+            // The Stop control (#1534): a click, `s`, or Testing: Cancel
+            // Test Run ends a run that hangs.
+            let stop = "\u{25a0} Stop (s)";
+            let stop_x = inner.x + 1 + label.chars().count() as u16 + 2;
+            let room = avail(stop_x);
+            if room >= stop.chars().count() {
+                buf.set_string(
+                    stop_x,
+                    summary_y,
+                    stop,
+                    Style::default().fg(self.theme.git_deleted()),
+                );
+                self.last_stop = Rect {
+                    x: stop_x,
+                    y: summary_y,
+                    width: stop.chars().count() as u16,
+                    height: 1,
+                };
+            }
         } else if self.cases.is_empty() {
             // A run or discovery that wiped the tree and then failed (compile
             // error on a full run, a collection error) must not hide behind
@@ -964,6 +1071,141 @@ mod tests {
         });
         assert_eq!(p.failed_count(), 2);
         assert_eq!(p.cases.len(), 4);
+    }
+
+    /// A tree after Run All: `add::one` and `add::two` passed, `sub::x` failed.
+    fn ran_file() -> TestingPanel {
+        let mut p = TestingPanel::new();
+        p.on_busy_started(Activity::Running);
+        for (name, status) in [
+            ("m.test.js::add::one", TestStatus::Passed),
+            ("m.test.js::add::two", TestStatus::Passed),
+            ("m.test.js::sub::x", TestStatus::Failed),
+        ] {
+            p.apply_case(TestCase {
+                name: name.into(),
+                status,
+            });
+        }
+        p.on_finished(Some(false));
+        p
+    }
+
+    fn statuses(p: &TestingPanel) -> Vec<(&str, TestStatus)> {
+        p.cases
+            .iter()
+            .map(|c| (c.name.as_str(), c.status))
+            .collect()
+    }
+
+    /// #1371: vitest runs one test as its whole file under `-t` and reports
+    /// the rest `# SKIP` (jest: `pending`). Those rows keep their results.
+    #[test]
+    fn running_one_js_test_keeps_the_rest_of_its_files_results() {
+        let mut p = ran_file();
+        p.start_single("m.test.js::add::one");
+        for (name, status) in [
+            ("m.test.js::add::one", TestStatus::Passed),
+            ("m.test.js::add::two", TestStatus::Skipped),
+            ("m.test.js::sub::x", TestStatus::Skipped),
+        ] {
+            p.apply_case(TestCase {
+                name: name.into(),
+                status,
+            });
+        }
+        p.on_finished(Some(true));
+        assert_eq!(
+            statuses(&p),
+            vec![
+                ("m.test.js::add::one", TestStatus::Passed),
+                ("m.test.js::add::two", TestStatus::Passed),
+                ("m.test.js::sub::x", TestStatus::Failed),
+            ]
+        );
+        assert_eq!(p.counts(), (2, 1, 0), "the header tally is unchanged");
+    }
+
+    /// #1371, a suite: tests outside it keep their results, while a test
+    /// inside it that really is skipped (`test.skip`) still shows skipped.
+    #[test]
+    fn a_suite_run_skips_only_inside_the_suite() {
+        let mut p = ran_file();
+        p.start_filter("m.test.js::add");
+        for (name, status) in [
+            ("m.test.js::add::one", TestStatus::Passed),
+            ("m.test.js::add::two", TestStatus::Skipped),
+            ("m.test.js::sub::x", TestStatus::Skipped),
+        ] {
+            p.apply_case(TestCase {
+                name: name.into(),
+                status,
+            });
+        }
+        p.on_finished(Some(true));
+        assert_eq!(
+            statuses(&p),
+            vec![
+                ("m.test.js::add::one", TestStatus::Passed),
+                ("m.test.js::add::two", TestStatus::Skipped),
+                ("m.test.js::sub::x", TestStatus::Failed),
+            ]
+        );
+    }
+
+    /// #1371 negative: Run All still takes every skip the runner reports,
+    /// and once a scoped run ends the next full run is not filtered.
+    #[test]
+    fn a_full_run_after_a_scoped_one_still_records_skips() {
+        let mut p = ran_file();
+        p.start_single("m.test.js::add::one");
+        p.on_finished(Some(true));
+        p.on_busy_started(Activity::Running);
+        p.apply_case(TestCase {
+            name: "m.test.js::add::two".into(),
+            status: TestStatus::Skipped,
+        });
+        assert_eq!(
+            statuses(&p),
+            vec![("m.test.js::add::two", TestStatus::Skipped)]
+        );
+    }
+
+    /// #1371, a run at the cursor right after a discovery that listed only
+    /// the file: jest reports every test outside the filter as `pending`,
+    /// none of them known yet. Only a skip the filter selects is a result.
+    #[test]
+    fn a_filtered_run_drops_unknown_skips_outside_the_filter() {
+        let mut p = TestingPanel::new();
+        p.start_filter("one");
+        for (name, status) in [
+            ("m.test.js::add::one", TestStatus::Passed),
+            ("m.test.js::add::two", TestStatus::Skipped),
+            ("m.test.js::sub::x", TestStatus::Skipped),
+            ("m.test.js::sub::one_more", TestStatus::Skipped),
+        ] {
+            p.apply_case(TestCase {
+                name: name.into(),
+                status,
+            });
+        }
+        p.on_finished(Some(true));
+        assert_eq!(
+            statuses(&p),
+            vec![
+                ("m.test.js::add::one", TestStatus::Passed),
+                ("m.test.js::sub::one_more", TestStatus::Skipped),
+            ]
+        );
+        assert_eq!(p.counts(), (1, 0, 1));
+        // A single-test run takes no skip for a name it never marked.
+        let mut p = ran_file();
+        p.start_single("m.test.js::add::one");
+        p.apply_case(TestCase {
+            name: "m.test.js::new::later".into(),
+            status: TestStatus::Skipped,
+        });
+        assert!(!p.cases.iter().any(|c| c.name == "m.test.js::new::later"));
     }
 
     /// libtest prints only `test <path> ... <outcome>` on stdout; the harness
@@ -1226,6 +1468,64 @@ mod tests {
             summary.contains("run failed"),
             "a nonzero exit with no Failed case must say so, got {summary:?}"
         );
+    }
+
+    /// #1534: a cancelled run puts back what a single run marked, marks a
+    /// case that started but never reported as not run, ends with no
+    /// verdict, and latches the cancel once.
+    #[test]
+    fn a_cancelled_run_marks_unreported_cases_not_run() {
+        let mut p = TestingPanel::new();
+        p.on_busy_started(Activity::Running);
+        p.apply_case(TestCase {
+            name: "m::a".into(),
+            status: TestStatus::Passed,
+        });
+        p.on_finished(Some(true));
+        p.take_finished();
+        p.start_single("m::a");
+        p.apply_case(TestCase {
+            name: "m::hangs".into(),
+            status: TestStatus::Running,
+        });
+        p.on_cancelled();
+        assert!(!p.is_busy());
+        assert_eq!(
+            p.cases_for_test(),
+            vec![
+                (String::from("m::a"), TestStatus::Passed),
+                (String::from("m::hangs"), TestStatus::NotRun),
+            ]
+        );
+        assert_eq!(p.take_finished(), Some(None), "no verdict");
+        assert!(p.take_cancelled());
+        assert!(!p.take_cancelled(), "one status message per cancel");
+        assert!(!p.take_refusal(), "a cancel is not a refusal");
+    }
+
+    /// #1534: the Stop control shows while a run is in flight, and not when
+    /// the view is idle.
+    #[test]
+    fn the_stop_control_shows_only_while_busy() {
+        let mut p = TestingPanel::new();
+        let area = Rect::new(0, 0, 40, 10);
+        let summary = |p: &mut TestingPanel| {
+            let mut buf = Buffer::empty(area);
+            p.render(area, &mut buf);
+            (0..40).map(|x| buf[(x, 2)].symbol()).collect::<String>()
+        };
+        let idle = summary(&mut p);
+        assert!(!idle.contains("Stop"), "{idle:?}");
+        assert_eq!(p.last_stop, Rect::default());
+        p.on_busy_started(Activity::Running);
+        let busy = summary(&mut p);
+        assert!(busy.contains("Running tests"), "{busy:?}");
+        assert!(busy.contains("\u{25a0} Stop (s)"), "{busy:?}");
+        assert_eq!(p.last_stop.y, 2);
+        assert!(p.last_stop.width > 0);
+        p.on_cancelled();
+        summary(&mut p);
+        assert_eq!(p.last_stop, Rect::default(), "gone once the run ends");
     }
 
     /// A run that dies unreported must stay visible even when an OLD failure

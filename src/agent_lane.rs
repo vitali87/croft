@@ -495,10 +495,6 @@ impl AgentLedger {
     /// this, so a file two agents both touched counts twice, once in each
     /// lane. For "how many files must the user look at", which is what a
     /// single global badge means, use [`Self::unreviewed_files`].
-    ///
-    /// Exposed for the deferred sidebar section that will render those
-    /// badges; nothing in production reads it yet.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn total_unreviewed(&self) -> usize {
         self.lanes
             .values()

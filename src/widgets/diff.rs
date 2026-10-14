@@ -176,6 +176,12 @@ pub struct DiffData {
     /// against. Gates stage/unstage/revert: a Timeline snapshot diff is
     /// built by the same opener and must not reach the git index.
     pub left_is_git_head: bool,
+    /// True when the right side is an open tab's unsaved text rather than
+    /// the file on disk (#1572). Hunk actions patch the saved file, so they
+    /// refuse this view until a save (whose disk write rebuilds it) lines the
+    /// two up again.
+    pub right_is_unsaved: bool,
+
     /// The encoding both sides were decoded with: UTF-8 unless the file's tab
     /// was reopened with another (#1242). Hunk patches are built from the
     /// decoded text, so stage/unstage/revert are refused for any other.
@@ -406,6 +412,8 @@ impl DiffData {
             find: DiffFindState::default(),
             nav_anchor: None,
             left_is_git_head: false,
+            right_is_unsaved: false,
+
             text_encoding: encoding_rs::UTF_8,
             left_crlf,
             right_crlf,
@@ -446,6 +454,8 @@ impl DiffData {
             find: DiffFindState::default(),
             nav_anchor: None,
             left_is_git_head: false,
+            right_is_unsaved: false,
+
             text_encoding: encoding_rs::UTF_8,
             left_crlf: Vec::new(),
             right_crlf: Vec::new(),
@@ -505,6 +515,8 @@ impl DiffData {
                 find: DiffFindState::default(),
                 nav_anchor: None,
                 left_is_git_head: false,
+                right_is_unsaved: false,
+
                 text_encoding: encoding_rs::UTF_8,
                 left_crlf: Vec::new(),
                 right_crlf: Vec::new(),
@@ -609,6 +621,8 @@ impl DiffData {
             find: DiffFindState::default(),
             nav_anchor: None,
             left_is_git_head: false,
+            right_is_unsaved: false,
+
             text_encoding: encoding_rs::UTF_8,
             left_crlf: Vec::new(),
             right_crlf: Vec::new(),
@@ -1769,20 +1783,20 @@ pub const DIFF_DEADLINE: std::time::Duration = std::time::Duration::from_millis(
 /// visual row. Adjacent Delete + Insert runs are paired (so a one-line
 /// "edit" becomes a single Replaced row, not a Removed row above an Added
 /// row), which is what makes the side-by-side alignment readable.
-pub fn build_diff_rows(left: &[String], right: &[String]) -> Vec<DiffRow> {
+pub fn build_diff_rows<L: AsRef<str>, R: AsRef<str>>(left: &[L], right: &[R]) -> Vec<DiffRow> {
     build_diff_rows_within(left, right, DIFF_DEADLINE).0
 }
 
 /// [`build_diff_rows`] with its search bounded by `budget`; the flag is
 /// true when the budget ran out and the rows are the coarser diff.
-pub fn build_diff_rows_within(
-    left: &[String],
-    right: &[String],
+pub fn build_diff_rows_within<L: AsRef<str>, R: AsRef<str>>(
+    left: &[L],
+    right: &[R],
     budget: std::time::Duration,
 ) -> (Vec<DiffRow>, bool) {
     use similar::{ChangeTag, TextDiff};
-    let l: Vec<&str> = left.iter().map(|s| s.as_str()).collect();
-    let r: Vec<&str> = right.iter().map(|s| s.as_str()).collect();
+    let l: Vec<&str> = left.iter().map(AsRef::as_ref).collect();
+    let r: Vec<&str> = right.iter().map(AsRef::as_ref).collect();
     let started = std::time::Instant::now();
     let diff = TextDiff::configure().timeout(budget).diff_slices(&l, &r);
     let coarse = started.elapsed() >= budget;

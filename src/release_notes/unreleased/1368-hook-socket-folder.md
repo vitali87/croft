@@ -1,0 +1,1 @@
+fix: On a fresh install, `croft .` now answers its agent-edit hook instead of the hook reporting "no croft is open": croft creates its sessions folder before binding the hook socket, and if the socket still cannot be bound, the status bar says why.
