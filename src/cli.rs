@@ -610,7 +610,7 @@ impl Cli {
                 match crate::remote::launch_croft(&host, path.as_deref(), solo)? {
                     crate::remote::RemoteOutcome::ReturnToLocal => {
                         let cwd = std::env::current_dir().context("resolving workspace path")?;
-                        crate::app::run(cwd, None, None, false, Vec::new())
+                        crate::app::run(cwd, None, None, None, false, Vec::new())
                     }
                     crate::remote::RemoteOutcome::Exited => Ok(()),
                 }
@@ -726,7 +726,7 @@ impl Cli {
                 };
                 crate::pr_review::set_startup_pr(selector);
                 let cwd = std::env::current_dir()?;
-                crate::app::run(cwd, None, None, false, Vec::new())
+                crate::app::run(cwd, None, None, None, false, Vec::new())
             }
             Some(CliCommand::Demo { tour }) => {
                 if let Some(path) = tour {
@@ -740,7 +740,7 @@ impl Cli {
                 }
                 crate::tour::request_startup_demo();
                 let cwd = std::env::current_dir()?;
-                crate::app::run(cwd, None, None, false, Vec::new())
+                crate::app::run(cwd, None, None, None, false, Vec::new())
             }
             Some(CliCommand::View { path, as_ext }) => {
                 // Printed and exited here rather than returned: an `Err` out
@@ -1053,8 +1053,17 @@ impl Cli {
                 let path = self
                     .path
                     .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
-                let (path, open_file, folders) = resolve_workspace(&path, self.open_file)?;
-                crate::app::run(path, self.restore_session, open_file, self.zen, folders)
+                let cwd = std::env::current_dir().context("reading the current directory")?;
+                let (path, open_file, open_at) = split_launch_location(&path, self.open_file, &cwd);
+                let (path, open_file, folders) = resolve_workspace(&path, open_file)?;
+                crate::app::run(
+                    path,
+                    self.restore_session,
+                    open_file,
+                    open_at,
+                    self.zen,
+                    folders,
+                )
             }
         }
     }
@@ -2028,6 +2037,51 @@ fn resolve_workspace(
     resolve_workspace_from(path, open_file, &cwd)
 }
 
+/// `croft file:line[:col]` and `--open-file file:line[:col]` (#1606): the
+/// `PATH` and `--open-file` arguments with a location suffix taken off, and
+/// the 0-based (line, column) for the caret in the file that opens. An
+/// explicit `--open-file` wins, its location with it. A relative one is
+/// looked for under `cwd`, then under the workspace, as it is opened.
+fn split_launch_location(
+    path: &Path,
+    open_file: Option<PathBuf>,
+    cwd: &Path,
+) -> (PathBuf, Option<PathBuf>, Option<(usize, usize)>) {
+    let (path, path_at) = match crate::view_ipc::split_location(cwd, path) {
+        Some((file, at)) => (file, Some(at)),
+        None => (path.to_path_buf(), None),
+    };
+    let Some(file) = open_file else {
+        return (path, None, path_at);
+    };
+    let split = crate::view_ipc::split_location(cwd, &file).or_else(|| {
+        launch_root(&cwd.join(&path)).and_then(|root| crate::view_ipc::split_location(&root, &file))
+    });
+    match split {
+        Some((file, at)) => (path, Some(file), Some(at)),
+        None => (path, Some(file), None),
+    }
+}
+
+/// The folder a relative `--open-file` is looked for under once `path` is
+/// resolved as [`resolve_workspace_from`] does: the directory itself, a
+/// `.code-workspace` file's primary folder, or a file's parent. `None` when
+/// there is none to search.
+fn launch_root(path: &Path) -> Option<PathBuf> {
+    if path.is_dir() {
+        return Some(path.to_path_buf());
+    }
+    if crate::workspace::is_workspace_file(path) {
+        return crate::workspace::parse_workspace_file(path)
+            .ok()?
+            .into_iter()
+            .next();
+    }
+    path.is_file()
+        .then(|| path.parent().map(Path::to_path_buf))
+        .flatten()
+}
+
 /// An `--open-file` path made absolute: a relative one names a file under
 /// `cwd` (as the shell typed it), else under the workspace `root`, so the
 /// tab is keyed by the absolute path its language server tracks (#1193).
@@ -2044,16 +2098,51 @@ fn resolve_open_file(open_file: PathBuf, root: &Path, cwd: &Path) -> PathBuf {
         .unwrap_or_else(|| candidates[candidates.len() - 1].clone())
 }
 
+/// The canonical folder and file name of `path` when `err` (its
+/// canonicalize failure) says only its last component is missing: a file
+/// not written yet. `None` for a path written as a folder (`new/`), one with
+/// no name (`..`), or one whose folder is missing too.
+fn new_file_in_existing_dir(
+    path: &Path,
+    err: &std::io::Error,
+) -> Option<(PathBuf, std::ffi::OsString)> {
+    if err.kind() != std::io::ErrorKind::NotFound
+        || path.as_os_str().as_encoded_bytes().ends_with(b"/")
+    {
+        return None;
+    }
+    let name = match path.components().next_back()? {
+        std::path::Component::Normal(name) => name.to_os_string(),
+        _ => return None,
+    };
+    let parent = path.parent()?.canonicalize().ok()?;
+    parent.is_dir().then_some((parent, name))
+}
+
 /// [`resolve_workspace`] with the directory croft was launched from.
 fn resolve_workspace_from(
     path: &Path,
     open_file: Option<PathBuf>,
     cwd: &Path,
 ) -> Result<(PathBuf, Option<PathBuf>, Vec<PathBuf>)> {
-    let path = cwd
-        .join(path)
-        .canonicalize()
-        .with_context(|| format!("resolving workspace path {}", path.display()))?;
+    let joined = cwd.join(path);
+    let path = match joined.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            // A file not written yet, in a folder that exists: root at the
+            // folder and open the file as a new buffer, as `code new.md` and
+            // `vim new.md` do (#1157). A missing folder is still an error.
+            if let Some((parent, name)) = new_file_in_existing_dir(&joined, &e) {
+                let open_file = open_file.map(|f| resolve_open_file(f, &parent, cwd));
+                return Ok((
+                    parent.clone(),
+                    open_file.or(Some(parent.join(name))),
+                    Vec::new(),
+                ));
+            }
+            return Err(e).with_context(|| format!("resolving workspace path {}", path.display()));
+        }
+    };
     if path.is_dir() {
         let open_file = open_file.map(|f| resolve_open_file(f, &path, cwd));
         return Ok((path, open_file, Vec::new()));
@@ -2506,12 +2595,52 @@ mod tests {
     #[test]
     fn a_missing_workspace_path_is_named_in_the_error() {
         let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("missing-dir");
+        // Its folder is missing too: a new file there has nowhere to go.
+        let missing = dir.path().join("missing-dir/notes.md");
         let err = resolve_workspace(&missing, None).unwrap_err();
         assert!(
             format!("{err:#}").contains(&missing.display().to_string()),
             "{err:#}"
         );
+    }
+
+    /// #1157: `croft notes.md` for a file not written yet roots at its
+    /// folder and opens it, as `code notes.md` and `vim notes.md` do, from
+    /// the cwd or by absolute path.
+    #[test]
+    fn a_file_not_written_yet_roots_at_its_folder_and_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let canon = dir.path().canonicalize().unwrap();
+        let (root, open, folders) =
+            resolve_workspace_from(Path::new("notes.md"), None, dir.path()).unwrap();
+        assert_eq!(root, canon);
+        assert_eq!(open, Some(canon.join("notes.md")));
+        assert!(folders.is_empty());
+        let (root, open, _) = resolve_workspace(&dir.path().join("todo.txt"), None).unwrap();
+        assert_eq!(root, canon);
+        assert_eq!(open, Some(canon.join("todo.txt")));
+        assert!(
+            !canon.join("notes.md").exists(),
+            "nothing is created on disk"
+        );
+        assert!(
+            !canon.join("todo.txt").exists(),
+            "nothing is created on disk"
+        );
+    }
+
+    /// #1157, negative: a missing folder, a path written as a folder, and a
+    /// path that ends in `..` are still refused.
+    #[test]
+    fn a_new_file_needs_an_existing_folder_and_a_name() {
+        let dir = tempfile::tempdir().unwrap();
+        for typed in ["no-such-dir/notes.md", "new-dir/", "no-such-dir/.."] {
+            let err = resolve_workspace_from(Path::new(typed), None, dir.path()).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("resolving workspace path"),
+                "{typed}: {err:#}"
+            );
+        }
     }
 
     #[test]
@@ -2550,6 +2679,82 @@ mod tests {
         let bad = dir.path().join("bad.code-workspace");
         std::fs::write(&bad, "{ nope").unwrap();
         assert!(resolve_workspace(&bad, None).is_err());
+    }
+
+    /// #1606: `croft big.txt:150` roots the workspace at big.txt's folder and
+    /// opens it at line 150; `--open-file big.txt:150:3` adds the column.
+    #[test]
+    fn a_file_line_launch_argument_opens_the_file_at_that_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("big.txt"), "a\nb\n").unwrap();
+        let (path, open_file, at) = split_launch_location(Path::new("big.txt:150"), None, &root);
+        assert_eq!(at, Some((149, 0)));
+        let (ws, open_file, _) = resolve_workspace_from(&path, open_file, &root).unwrap();
+        assert_eq!(ws, root);
+        assert_eq!(open_file, Some(root.join("big.txt")));
+
+        let (path, open_file, at) =
+            split_launch_location(Path::new("."), Some(PathBuf::from("big.txt:150:3")), &root);
+        assert_eq!(at, Some((149, 2)));
+        let (ws, open_file, _) = resolve_workspace_from(&path, open_file, &root).unwrap();
+        assert_eq!(ws, root);
+        assert_eq!(open_file, Some(root.join("big.txt")));
+    }
+
+    /// #1606: a relative `--open-file` location under the workspace, launched
+    /// from elsewhere, is found there.
+    #[test]
+    fn an_open_file_location_is_found_under_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let (_, open_file, at) =
+            split_launch_location(&root, Some(PathBuf::from("src/main.rs:1:4")), dir.path());
+        assert_eq!(open_file, Some(root.join("src/main.rs")));
+        assert_eq!(at, Some((0, 3)));
+    }
+
+    /// #1606: with a `.code-workspace` file as PATH, a relative
+    /// `--open-file` location is found under the workspace's primary folder.
+    #[test]
+    fn an_open_file_location_is_found_under_a_workspace_files_primary_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let primary = dir.join("alpha");
+        std::fs::create_dir_all(primary.join("src")).unwrap();
+        std::fs::write(primary.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let file = dir.join("p.code-workspace");
+        crate::workspace::write_workspace_file(&file, std::slice::from_ref(&primary)).unwrap();
+        let (path, open_file, at) =
+            split_launch_location(&file, Some(PathBuf::from("src/main.rs:10")), &dir);
+        assert_eq!(path, file);
+        assert_eq!(open_file, Some(primary.join("src/main.rs")));
+        assert_eq!(at, Some((9, 0)));
+    }
+
+    /// Negative (#1606): a path that exists, even one named like `a:1`, is
+    /// left alone and carries no location; an explicit `--open-file` wins
+    /// over the PATH argument's location.
+    #[test]
+    fn an_existing_path_or_an_explicit_open_file_keeps_its_meaning() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("a:1"), "x\n").unwrap();
+        std::fs::write(root.join("big.txt"), "a\n").unwrap();
+        assert_eq!(
+            split_launch_location(Path::new("a:1"), None, &root),
+            (PathBuf::from("a:1"), None, None)
+        );
+        assert_eq!(
+            split_launch_location(Path::new("."), None, &root),
+            (PathBuf::from("."), None, None)
+        );
+        let (_, open_file, at) =
+            split_launch_location(Path::new("big.txt:9"), Some(PathBuf::from("a:1")), &root);
+        assert_eq!((open_file, at), (Some(PathBuf::from("a:1")), None));
+        assert!(resolve_workspace_from(Path::new("nope.txt:9"), None, &root).is_err());
     }
 
     #[test]
