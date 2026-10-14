@@ -51,7 +51,8 @@ root. Re-rooting re-merges against the new primary.
   both; untouched keys keep their earlier values.
 - **Arrays and scalars replace.** A later `host_accents` list replaces the
   whole earlier list; lists never concatenate, so a layer can narrow as well
-  as extend.
+  as extend. The two exclusion lists are the exception (see
+  [Project exclusions](#project-exclusions)).
 - **Comments are fine.** All layer files tolerate `//` and `/* */` comments
   and trailing commas (JSONC), like `.vscode/tasks.json`.
 - **A mistyped value only loses itself.** `"terminal_scrollback": "lots"`
@@ -133,7 +134,7 @@ means the same thing whichever path reads it.
 | `editor.autoClosingBrackets: "never"` | `disable_auto_close_pairs` |
 | `debug.saveBeforeStart: "none"` | `disable_save_before_debug` (every other value saves before a launch, a task or a Testing run) |
 | `terminal.integrated.copyOnSelection` | `copy_on_select` |
-| `files.exclude` | `files_exclude` (the globs set to `true`; `false` entries and `when` clauses are left out). VS Code reads a bare glob such as `build` from the workspace root, so it arrives anchored, as `/build`, and `scripts/build/` stays visible |
+| `files.exclude` | `files_exclude` (the globs set to `true`; a glob set to `false` becomes `!glob`, which takes it back from an earlier layer; `when` clauses are left out). VS Code reads a bare glob such as `build` from the workspace root, so it arrives anchored, as `/build`, and `scripts/build/` stays visible |
 | `search.exclude` | `search_exclude` (same) |
 
 Keys croft honours only as user config (a terminal scrollback, say) are
@@ -176,6 +177,14 @@ its `*` stays within one folder.
 |---------|----------|------------|------------------------|
 | `files_exclude` | hidden | skipped | skipped |
 | `search_exclude` | listed | skipped | skipped |
+
+Every layer adds to these two lists instead of replacing them, as VS Code
+merges `files.exclude` across user and workspace: a user `**/tests`, a
+`.vscode` `"**/dist": true` and a `.croft` `**/generated` all apply. To take
+an earlier layer's glob back, list it with a leading `!` (`"!**/tests"`), or
+set it to `false` in `.vscode/settings.json`; a later layer can add it again.
+A glob that really starts with `!` is escaped with a backslash: `\!draft`,
+which is `"\\!draft"` in JSON.
 
 Search adds what you type in "files to exclude" to these. With the box
 open, a `[x] project excludes: ...` row under it names the active globs;
