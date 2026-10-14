@@ -171,17 +171,99 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn fetch_latest() -> Option<String> {
-    let resp = ureq::AgentBuilder::new()
-        .timeout(REQUEST_TIMEOUT)
-        .build()
+/// crates.io's record of one version of the crate `cargo install` builds.
+const CRATES_IO_VERSION_URL: &str = "https://crates.io/api/v1/crates/croft-software";
+
+/// Whether the latest release carries the archive, checksums and signature
+/// [`stage_update`] fetches for `triple` (`croft-<triple>.tar.gz`,
+/// `SHA256SUMS` and `SHA256SUMS.sigstore.json`, without which the archive
+/// is refused), read from GitHub's release JSON `assets`.
+pub fn release_has_archive(json: &str, triple: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return false;
+    };
+    let names: Vec<&str> = v
+        .get("assets")
+        .and_then(|a| a.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|a| a.get("name")?.as_str())
+        .collect();
+    let archive = format!("croft-{triple}.tar.gz");
+    names.contains(&archive.as_str())
+        && names.contains(&"SHA256SUMS")
+        && names.contains(&"SHA256SUMS.sigstore.json")
+}
+
+/// Whether crates.io's JSON for one version says it is published and not
+/// yanked, so `cargo install --version` can build it.
+pub fn crate_version_listed(json: &str, version: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return false;
+    };
+    let Some(entry) = v.get("version") else {
+        return false;
+    };
+    entry.get("num").and_then(|n| n.as_str()) == Some(version)
+        && entry.get("yanked").and_then(|y| y.as_bool()) != Some(true)
+}
+
+/// The latest release's version when this install can actually stage it
+/// (#1579): the release has an archive for `triple`, this machine's
+/// release target, or crates.io has the version for `cargo install` to
+/// build. A release that is tagged but neither is never offered, since
+/// choosing Update could only fail.
+///
+/// `on_crates_io` answers `None` when crates.io could not be asked; that
+/// failure is passed on as `None` (rather than "not installable") so the
+/// caller keeps what it had cached, as it does when GitHub fails.
+pub fn installable_release(
+    json: &str,
+    triple: Option<&str>,
+    on_crates_io: &dyn Fn(&str) -> Option<bool>,
+) -> Option<Option<String>> {
+    let Some(version) = latest_from_release_json(json) else {
+        return Some(None);
+    };
+    if triple.is_some_and(|t| release_has_archive(json, t)) {
+        return Some(Some(version));
+    }
+    Some(on_crates_io(&version)?.then_some(version))
+}
+
+fn http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new().timeout(REQUEST_TIMEOUT).build()
+}
+
+/// `None` when crates.io could not be asked (a timeout, a 5xx, an
+/// unreadable body); `Some(false)` when it says the version is absent.
+fn crate_version_published(version: &str) -> Option<bool> {
+    let resp = http_agent()
+        .get(&format!("{CRATES_IO_VERSION_URL}/{version}"))
+        .set("User-Agent", concat!("croft/", env!("CARGO_PKG_VERSION")))
+        .call();
+    match resp {
+        Ok(resp) => Some(crate_version_listed(&resp.into_string().ok()?, version)),
+        Err(ureq::Error::Status(404, _)) => Some(false),
+        Err(_) => None,
+    }
+}
+
+/// `None` when GitHub (or, when it is consulted, crates.io) could not be
+/// asked; `Some(None)` when it answered
+/// but the latest release is not one this install can stage.
+fn fetch_latest() -> Option<Option<String>> {
+    let resp = http_agent()
         .get(RELEASES_LATEST_URL)
         .set("Accept", "application/vnd.github+json")
         .set("User-Agent", concat!("croft/", env!("CARGO_PKG_VERSION")))
         .call()
         .ok()?;
     let body = resp.into_string().ok()?;
-    latest_from_release_json(&body)
+    latest_from_release_json(&body)?;
+    let triple =
+        prebuilt_triple().filter(|_| crate::remote_prebuilt::eligible(env!("CARGO_MANIFEST_DIR")));
+    installable_release(&body, triple, &crate_version_published)
 }
 
 /// One background answer: `Some(version)` when a newer release is available
@@ -199,18 +281,22 @@ impl UpdateCheck {
     }
 
     /// [`Self::start`] with the network call injected, so the throttle can
-    /// be exercised without a network.
+    /// be exercised without a network. `fetch` answers `None` when the
+    /// request failed and `Some(None)` when no installable release exists.
     pub fn start_with(
         cache_dir: PathBuf,
         current_version: String,
-        fetch: impl FnOnce() -> Option<String> + Send + 'static,
+        fetch: impl FnOnce() -> Option<Option<String>> + Send + 'static,
     ) -> Self {
         let (tx, rx) = channel();
         std::thread::spawn(move || {
             let mut cache = CheckCache::load(&cache_dir);
             if should_query(&cache, now_secs()) {
+                // An answer replaces what was cached, an empty one too: a
+                // version remembered before this check knew to ask whether
+                // it can be installed is not offered again (#1579).
                 if let Some(latest) = fetch() {
-                    cache.latest = Some(latest);
+                    cache.latest = latest;
                 }
                 // Stamped on failure too: a blocked or rate-limited endpoint
                 // must not be asked again on every launch, and every launch
@@ -275,12 +361,22 @@ pub fn stage_command(cargo: PathBuf, version: &str, stage_root: &Path) -> std::p
 }
 
 /// The release binary target this machine runs, when releases carry one:
-/// the static musl builds for Linux on x86_64 and aarch64 (#261).
+/// the static musl builds for Linux on x86_64 and aarch64 (#261), and the
+/// Apple silicon and Intel builds for macOS (#1579).
 pub fn prebuilt_triple() -> Option<&'static str> {
-    if cfg!(target_os = "linux") {
-        crate::remote::arch_to_musl_triple(std::env::consts::ARCH)
-    } else {
-        None
+    prebuilt_triple_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// [`prebuilt_triple`] for an explicit OS and architecture.
+pub fn prebuilt_triple_for(os: &str, arch: &str) -> Option<&'static str> {
+    match os {
+        "linux" => crate::remote::arch_to_musl_triple(arch),
+        "macos" => match arch {
+            "aarch64" => Some("aarch64-apple-darwin"),
+            "x86_64" => Some("x86_64-apple-darwin"),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -623,7 +719,7 @@ mod tests {
         );
         // A later successful fetch after the interval offers normally.
         let check = UpdateCheck::start_with(dir.path().to_path_buf(), "0.1.0".into(), || {
-            Some("0.2.0".into())
+            Some(Some("0.2.0".into()))
         });
         assert_eq!(
             check.wait(),
@@ -784,5 +880,173 @@ mod tests {
         let (event, log) = stage_update("0.2.3", &staged, None, &failing);
         assert_eq!(event, UpdateEvent::Failed);
         assert!(log.contains("broken"), "{log}");
+    }
+
+    /// #1579: GitHub's v0.2.28 release with its macOS and Linux archives.
+    const RELEASE_0_2_28: &str = r#"{"tag_name":"v0.2.28","assets":[
+        {"name":"croft-aarch64-apple-darwin.tar.gz"},
+        {"name":"croft-x86_64-apple-darwin.tar.gz"},
+        {"name":"croft-x86_64-unknown-linux-musl.tar.gz"},
+        {"name":"croft-aarch64-unknown-linux-musl.tar.gz"},
+        {"name":"SHA256SUMS"},
+        {"name":"SHA256SUMS.sigstore.json"}]}"#;
+
+    /// #1579: the issue's case. v0.2.28 is tagged but crates.io stops at
+    /// 0.2.3, so a machine with no release target could only run a
+    /// `cargo install --version 0.2.28` that fails: nothing is offered.
+    #[test]
+    fn a_release_with_no_crate_and_no_archive_for_this_machine_is_not_offered() {
+        let not_on_crates_io = |_: &str| Some(false);
+        assert_eq!(
+            installable_release(RELEASE_0_2_28, None, &not_on_crates_io),
+            Some(None)
+        );
+        assert_eq!(
+            installable_release(
+                RELEASE_0_2_28,
+                Some("riscv64gc-unknown-linux-gnu"),
+                &not_on_crates_io
+            ),
+            Some(None),
+            "an archive for some other machine does not count"
+        );
+    }
+
+    /// #1579: either route makes the release installable: its archive for
+    /// this machine, or the version on crates.io.
+    #[test]
+    fn a_release_is_offered_when_its_archive_or_its_crate_exists() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let on_crates_io = |v: &str| {
+            asked.borrow_mut().push(v.to_string());
+            Some(v == "0.2.28")
+        };
+        assert_eq!(
+            installable_release(RELEASE_0_2_28, None, &on_crates_io),
+            Some(Some("0.2.28".to_string()))
+        );
+        assert_eq!(
+            *asked.borrow(),
+            ["0.2.28"],
+            "crates.io is asked for the tag"
+        );
+        for triple in [
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+            "x86_64-unknown-linux-musl",
+        ] {
+            assert_eq!(
+                installable_release(RELEASE_0_2_28, Some(triple), &|_| Some(false)),
+                Some(Some("0.2.28".to_string())),
+                "{triple}"
+            );
+        }
+        // An archive without the checksums `stage_update` verifies is not one.
+        let unsummed =
+            r#"{"tag_name":"v0.2.29","assets":[{"name":"croft-x86_64-apple-darwin.tar.gz"}]}"#;
+        assert_eq!(
+            installable_release(unsummed, Some("x86_64-apple-darwin"), &|_| Some(false)),
+            Some(None)
+        );
+        // Nor without the signature bundle `remote_prebuilt` refuses to go
+        // without: only the crate route is left, and here it is missing.
+        let unsigned = r#"{"tag_name":"v0.2.29","assets":[
+            {"name":"croft-x86_64-apple-darwin.tar.gz"},{"name":"SHA256SUMS"}]}"#;
+        assert_eq!(
+            installable_release(unsigned, Some("x86_64-apple-darwin"), &|_| Some(false)),
+            Some(None)
+        );
+        assert_eq!(
+            installable_release("not json", None, &|_| Some(true)),
+            Some(None)
+        );
+    }
+
+    /// A crates.io request that fails is a failed check, not a "no": the
+    /// caller keeps its cached offer instead of clearing it for a day.
+    #[test]
+    fn a_crates_io_failure_is_not_an_uninstallable_answer() {
+        assert_eq!(installable_release(RELEASE_0_2_28, None, &|_| None), None);
+        // An archive for this machine needs no crates.io answer at all.
+        assert_eq!(
+            installable_release(RELEASE_0_2_28, Some("x86_64-apple-darwin"), &|_| None),
+            Some(Some("0.2.28".to_string()))
+        );
+    }
+
+    #[test]
+    fn crates_io_says_which_versions_cargo_can_install() {
+        let listed = r#"{"version":{"num":"0.2.28","yanked":false}}"#;
+        assert!(crate_version_listed(listed, "0.2.28"));
+        assert!(!crate_version_listed(listed, "0.2.29"), "another version");
+        assert!(!crate_version_listed(
+            r#"{"version":{"num":"0.2.28","yanked":true}}"#,
+            "0.2.28"
+        ));
+        assert!(!crate_version_listed(
+            r#"{"errors":[{"detail":"crate `croft-software` does not have a version `0.2.28`"}]}"#,
+            "0.2.28"
+        ));
+        assert!(!crate_version_listed("<html>", "0.2.28"));
+    }
+
+    /// #1579: macOS stages the release's own archive, as Linux does, so it
+    /// no longer depends on crates.io keeping up with every tag.
+    #[test]
+    fn macos_and_linux_have_release_targets() {
+        assert_eq!(
+            prebuilt_triple_for("macos", "aarch64"),
+            Some("aarch64-apple-darwin")
+        );
+        assert_eq!(
+            prebuilt_triple_for("macos", "x86_64"),
+            Some("x86_64-apple-darwin")
+        );
+        assert_eq!(
+            prebuilt_triple_for("linux", "x86_64"),
+            Some("x86_64-unknown-linux-musl")
+        );
+        assert_eq!(
+            prebuilt_triple_for("linux", "aarch64"),
+            Some("aarch64-unknown-linux-musl")
+        );
+        assert_eq!(prebuilt_triple_for("macos", "powerpc"), None);
+        assert_eq!(prebuilt_triple_for("windows", "x86_64"), None);
+        assert_eq!(prebuilt_triple_for("freebsd", "x86_64"), None);
+    }
+
+    /// #1579: a version cached before croft asked whether it can be
+    /// installed is dropped once the check says it cannot, rather than
+    /// being offered from the cache every day.
+    #[test]
+    fn an_uninstallable_answer_clears_a_cached_offer() {
+        let dir = tempfile::tempdir().unwrap();
+        CheckCache {
+            checked_at: 1,
+            latest: Some("0.2.28".into()),
+            dismissed: None,
+        }
+        .save(dir.path())
+        .unwrap();
+        let check =
+            UpdateCheck::start_with(dir.path().to_path_buf(), "0.2.3".into(), || Some(None));
+        assert_eq!(check.wait(), None);
+        assert_eq!(CheckCache::load(dir.path()).latest, None);
+    }
+
+    /// #1579 negative: a request that fails keeps what the cache knew, as
+    /// before; only an answer replaces it.
+    #[test]
+    fn a_failed_request_keeps_the_cached_offer() {
+        let dir = tempfile::tempdir().unwrap();
+        CheckCache {
+            checked_at: 1,
+            latest: Some("0.2.28".into()),
+            dismissed: None,
+        }
+        .save(dir.path())
+        .unwrap();
+        let check = UpdateCheck::start_with(dir.path().to_path_buf(), "0.2.3".into(), || None);
+        assert_eq!(check.wait().as_deref(), Some("0.2.28"));
     }
 }
