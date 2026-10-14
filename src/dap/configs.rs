@@ -50,6 +50,10 @@ pub struct DebugConfig {
     /// sorts BOTH kinds in one list, so a config that asks for a group must
     /// be able to sort against a compound that asks for the same one.
     pub presentation: Option<Presentation>,
+    /// The workspace folder this configuration belongs to when it is not
+    /// the active one: a compound member named with `"folder"` (#1425)
+    /// resolves `${workspaceFolder}` against its own folder.
+    pub root: Option<PathBuf>,
     raw: Map<String, Value>,
 }
 
@@ -140,6 +144,7 @@ pub fn parse_launch_json(text: &str, source: &'static str) -> Vec<DebugConfig> {
                 request,
                 source,
                 presentation: parse_presentation(obj),
+                root: None,
                 raw: obj.clone(),
             })
         })
@@ -332,6 +337,10 @@ fn compare_orders(first: Option<f64>, second: Option<f64>) -> std::cmp::Ordering
 pub struct Compound {
     pub name: String,
     pub configurations: Vec<String>,
+    /// Each member's `"folder"` (#1425), aligned with `configurations`:
+    /// `Some("web")` names a configuration in the `web` workspace folder's
+    /// launch.json; `None`, a bare name, one beside the compound.
+    pub folders: Vec<Option<String>>,
     /// The compound's own `preLaunchTask`, if it asks for one (#318). Run
     /// before the member starts, and separate from the member's own task:
     /// VS Code runs both, so croft chains them rather than choosing.
@@ -421,8 +430,8 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
             let obj = c.as_object()?;
             let name = obj.get("name")?.as_str()?.to_string();
             // Members may be bare names or `{ "folder": …, "name": … }`
-            // objects in multi-root workspaces; croft resolves against one
-            // root, so take the name either way rather than dropping the row.
+            // objects in multi-root workspaces; the folder is kept beside the
+            // name (#1425) so the member resolves in that folder.
             //
             // Collect FALLIBLY: one unusable member drops the whole compound
             // rather than shrinking it to the members that happen to parse.
@@ -430,16 +439,25 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
             // member names no configuration; a malformed member is the same
             // situation one boundary earlier, and silently running two of the
             // three a user wrote is the outcome both guards exist to prevent.
-            let configurations: Vec<String> = obj
+            let members: Vec<(String, Option<String>)> = obj
                 .get("configurations")?
                 .as_array()?
                 .iter()
                 .map(|m| match m {
-                    Value::String(s) => Some(s.clone()),
-                    Value::Object(o) => o.get("name")?.as_str().map(str::to_string),
+                    Value::String(s) => Some((s.clone(), None)),
+                    Value::Object(o) => {
+                        let name = o.get("name")?.as_str()?.to_string();
+                        let folder = match o.get("folder") {
+                            None | Some(Value::Null) => None,
+                            Some(f) => Some(f.as_str()?.to_string()),
+                        };
+                        Some((name, folder))
+                    }
                     _ => None,
                 })
-                .collect::<Option<Vec<String>>>()?;
+                .collect::<Option<Vec<_>>>()?;
+            let (configurations, folders): (Vec<String>, Vec<Option<String>>) =
+                members.into_iter().unzip();
             if configurations.is_empty() {
                 return None;
             }
@@ -520,6 +538,7 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
             Some(Compound {
                 name,
                 configurations,
+                folders,
                 source,
                 pre_launch_task,
                 presentation,
@@ -534,33 +553,81 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
 /// beside it, in the compound's own order. Pass [`discover_configs_all`], not
 /// [`discover_configs`]: the latter drops a lower-precedence duplicate by name,
 /// which is exactly the entry a `.vscode` compound naming that name needs, so
-/// the source preference below would have nothing to prefer. Errors naming the first member that
-/// does not exist — launching the subset that happens to resolve would debug
+/// the source preference below would have nothing to prefer. A member with a
+/// `"folder"` (#1425) is looked up in that workspace folder's launch.json
+/// instead, `folders` being the workspace's `(name, root)` pairs, and comes
+/// back carrying that root. Errors naming the first member that does not
+/// exist — launching the subset that happens to resolve would debug
 /// something other than what the user asked for, and silently.
-pub fn resolve_compound<'a>(
+pub fn resolve_compound(
     compound: &Compound,
-    configs: &'a [DebugConfig],
-) -> Result<Vec<&'a DebugConfig>, String> {
+    configs: &[DebugConfig],
+    folders: &[(String, PathBuf)],
+) -> Result<Vec<DebugConfig>, String> {
     compound
         .configurations
         .iter()
-        .map(|want| {
+        .enumerate()
+        .map(|(i, want)| {
+            if let Some(folder) = compound.folders.get(i).cloned().flatten() {
+                let root = folder_root(folders, &folder).ok_or_else(|| {
+                    format!(
+                        "compound \"{}\" names folder \"{folder}\", which is not a folder of this workspace",
+                        compound.name
+                    )
+                })?;
+                let mut cfg = discover_configs_all(&root)
+                    .into_iter()
+                    .find(|c| &c.name == want)
+                    .ok_or_else(|| {
+                        format!(
+                            "compound \"{}\" names configuration \"{want}\" in folder \"{folder}\", which no launch.json there declares",
+                            compound.name
+                        )
+                    })?;
+                cfg.root = Some(root);
+                return Ok(cfg);
+            }
             // The compound's own file first: `discover_configs` merges both
             // files with `.croft` winning a duplicate name, so a bare name
             // match would bind a `.vscode` compound to a `.croft` config that
             // may run a different program under a different adapter. Falling
             // back to any file keeps a compound working when its members live
-            // in the sibling file, which VS Code also allows via `folder`.
+            // in the sibling file.
             configs
                 .iter()
                 .find(|c| &c.name == want && c.source == compound.source)
                 .or_else(|| configs.iter().find(|c| &c.name == want))
+                .cloned()
                 .ok_or_else(|| {
                     format!(
                         "compound \"{}\" names configuration \"{}\", which no launch.json declares",
                         compound.name, want
                     )
                 })
+        })
+        .collect()
+}
+
+/// The root of the workspace folder called `name` (#1425): VS Code names a
+/// folder by its directory name.
+fn folder_root(folders: &[(String, PathBuf)], name: &str) -> Option<PathBuf> {
+    folders
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, root)| root.clone())
+}
+
+/// The `(name, root)` pairs `${workspaceFolder:name}` and a compound
+/// member's `"folder"` look up (#1425): each root under its directory name.
+pub fn workspace_folders<'a>(roots: impl Iterator<Item = &'a Path>) -> Vec<(String, PathBuf)> {
+    roots
+        .map(|r| {
+            let name = r
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            (name, r.to_path_buf())
         })
         .collect()
 }
@@ -583,6 +650,9 @@ pub struct SubstCtx {
     pub workspace_folder: PathBuf,
     /// Active editor file; `None` makes `${file}`-family variables error.
     pub file: Option<PathBuf>,
+    /// The workspace's folders as `(name, root)`, for
+    /// `${workspaceFolder:name}` (#1425).
+    pub folders: Vec<(String, PathBuf)>,
 }
 
 /// Expand the supported `${...}` variables in `input`. An unknown or
@@ -646,6 +716,13 @@ fn expand_variable(var: &str, ctx: &SubstCtx) -> Result<String, String> {
             if let Some(name) = var.strip_prefix("env:") {
                 return std::env::var(name)
                     .map_err(|_| format!("${{env:{name}}}: environment variable not set"));
+            }
+            // `${workspaceFolder:web}` (#1425): the root of the workspace
+            // folder named `web`, as multi-root configurations write it.
+            if let Some(name) = var.strip_prefix("workspaceFolder:") {
+                return folder_root(&ctx.folders, name)
+                    .map(|r| r.to_string_lossy().into_owned())
+                    .ok_or_else(|| format!("${{{var}}}: no workspace folder is named \"{name}\""));
             }
             Err(format!("${{{var}}}: unsupported substitution variable"))
         }
@@ -799,7 +876,11 @@ pub fn resolve(cfg: &DebugConfig, ctx: &SubstCtx) -> Result<ResolvedConfig, Stri
         module: get_str("module"),
         args,
         env,
-        cwd: get_str("cwd").map(|c| absolute_in(&c, &ctx.workspace_folder)),
+        // A member from another workspace folder (#1425) runs there when it
+        // names no cwd, not in the active folder the launch would default to.
+        cwd: get_str("cwd")
+            .map(|c| absolute_in(&c, &ctx.workspace_folder))
+            .or_else(|| cfg.root.clone()),
         pre_launch_task: get_str("preLaunchTask"),
         post_debug_task: get_str("postDebugTask"),
         stop_on_entry: obj
@@ -1576,6 +1657,7 @@ mod tests {
         SubstCtx {
             workspace_folder: PathBuf::from("/work/proj"),
             file: Some(PathBuf::from("/work/proj/src/main.py")),
+            folders: Vec::new(),
         }
     }
 
@@ -1831,6 +1913,7 @@ mod tests {
         let no_file = SubstCtx {
             workspace_folder: PathBuf::from("/w"),
             file: None,
+            folders: Vec::new(),
         };
         assert!(substitute("${fileBasename}", &no_file).is_err());
     }
@@ -1901,6 +1984,7 @@ mod tests {
         let c = SubstCtx {
             workspace_folder: tmp.path().to_path_buf(),
             file: None,
+            folders: Vec::new(),
         };
         let rc = resolve(&cfg, &c).unwrap();
         assert_eq!(rc.env["FROM_FILE"], "1");
@@ -2131,7 +2215,7 @@ mod tests {
             "and the picker's list drops it, which is why the two lists differ"
         );
 
-        let members = resolve_compound(&compounds[0], &configs).expect("resolves");
+        let members = resolve_compound(&compounds[0], &configs, &[]).expect("resolves");
         assert_eq!(
             members[0].source, ".vscode/launch.json",
             "the .vscode compound binds .vscode's Server, not .croft's same-named one"
@@ -2260,7 +2344,7 @@ mod tests {
         let compounds = parse_compounds(text, ".vscode/launch.json");
         assert_eq!(compounds.len(), 1, "precondition: the compound parsed");
 
-        let err = resolve_compound(&compounds[0], &cfgs)
+        let err = resolve_compound(&compounds[0], &cfgs, &[])
             .expect_err("a missing member is an error, not a shorter list");
         assert!(
             err.contains("Ghost"),
@@ -2808,6 +2892,123 @@ mod tests {
         assert!(by("Hid").presentation.is_some_and(|p| p.hidden));
     }
 
+    /// #1425: a multi-root workspace, `api` and `web`, each with its own
+    /// launch.json.
+    fn multi_root() -> (tempfile::TempDir, Vec<(String, PathBuf)>) {
+        let tmp = tempfile::tempdir().unwrap();
+        for (folder, text) in [
+            (
+                "api",
+                r#"{ "configurations": [
+                    { "name": "Run api", "type": "debugpy", "request": "launch", "program": "${workspaceFolder}/main.py" }
+                ],
+                "compounds": [
+                    { "name": "API + web", "configurations": ["Run api", { "folder": "web", "name": "Run web" }] },
+                    { "name": "Nowhere", "configurations": [{ "folder": "docs", "name": "Run web" }] },
+                    { "name": "Missing", "configurations": [{ "folder": "web", "name": "Run api" }] }
+                ] }"#,
+            ),
+            (
+                "web",
+                r#"{ "configurations": [
+                    { "name": "Run web", "type": "debugpy", "request": "launch", "program": "${workspaceFolder}/main.py" }
+                ] }"#,
+            ),
+        ] {
+            std::fs::create_dir_all(tmp.path().join(folder).join(".vscode")).unwrap();
+            std::fs::write(tmp.path().join(folder).join(".vscode/launch.json"), text).unwrap();
+        }
+        let roots = [tmp.path().join("api"), tmp.path().join("web")];
+        let folders = workspace_folders(roots.iter().map(PathBuf::as_path));
+        (tmp, folders)
+    }
+
+    /// #1425: a member written `{ "folder": "web", "name": "Run web" }`
+    /// resolves to web's own configuration, with `${workspaceFolder}` the
+    /// web root; a bare member still resolves beside the compound.
+    #[test]
+    fn a_folder_member_resolves_in_that_workspace_folder() {
+        let (tmp, folders) = multi_root();
+        let api = tmp.path().join("api");
+        let compounds = discover_compounds(&api);
+        assert_eq!(compounds[0].folders, vec![None, Some(String::from("web"))]);
+        let members =
+            resolve_compound(&compounds[0], &discover_configs_all(&api), &folders).unwrap();
+        assert_eq!(
+            members.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            vec!["Run api", "Run web"]
+        );
+        assert_eq!(members[0].root, None);
+        let web = tmp.path().join("web");
+        assert_eq!(members[1].root.as_deref(), Some(web.as_path()));
+        let ctx = SubstCtx {
+            workspace_folder: members[1].root.clone().unwrap(),
+            file: None,
+            folders: folders.clone(),
+        };
+        let rc = resolve(&members[1], &ctx).unwrap();
+        assert_eq!(
+            rc.program.as_deref(),
+            Some(web.join("main.py").to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            rc.cwd.as_deref(),
+            Some(web.as_path()),
+            "a foreign member with no cwd runs in its own folder"
+        );
+    }
+
+    /// #1425, negative: a folder the workspace does not have, or a name
+    /// that folder's launch.json does not declare, is refused by name
+    /// rather than resolved against the compound's own file.
+    #[test]
+    fn a_folder_member_with_no_such_folder_or_config_is_refused() {
+        let (tmp, folders) = multi_root();
+        let api = tmp.path().join("api");
+        let compounds = discover_compounds(&api);
+        let all = discover_configs_all(&api);
+        let err = resolve_compound(&compounds[1], &all, &folders).unwrap_err();
+        assert_eq!(
+            err,
+            "compound \"Nowhere\" names folder \"docs\", which is not a folder of this workspace"
+        );
+        let err = resolve_compound(&compounds[2], &all, &folders).unwrap_err();
+        assert_eq!(
+            err,
+            "compound \"Missing\" names configuration \"Run api\" in folder \"web\", which no launch.json there declares"
+        );
+        // A non-string folder is a malformed member: the compound is dropped.
+        let bad = parse_compounds(
+            r#"{ "compounds": [{ "name": "Bad", "configurations": [{ "folder": 3, "name": "x" }] }] }"#,
+            ".vscode/launch.json",
+        );
+        assert!(bad.is_empty());
+    }
+
+    /// #1425: `${workspaceFolder:web}` is the web root; an unknown folder
+    /// name is an error naming it.
+    #[test]
+    fn workspace_folder_by_name_expands_or_names_the_missing_folder() {
+        let (tmp, folders) = multi_root();
+        let ctx = SubstCtx {
+            workspace_folder: tmp.path().join("api"),
+            file: None,
+            folders,
+        };
+        assert_eq!(
+            substitute("${workspaceFolder:web}/main.py", &ctx).unwrap(),
+            tmp.path().join("web/main.py").to_string_lossy()
+        );
+        assert_eq!(
+            substitute("${workspaceFolder}", &ctx).unwrap(),
+            tmp.path().join("api").to_string_lossy()
+        );
+        assert_eq!(
+            substitute("${workspaceFolder:docs}/x", &ctx).unwrap_err(),
+            "${workspaceFolder:docs}: no workspace folder is named \"docs\""
+        );
+    }
+
     /// A compound resolves to its members in the order written, so the picker
     /// and the launch sequence agree with the file.
     #[test]
@@ -2821,7 +3022,7 @@ mod tests {
         }"#;
         let cfgs = parse_launch_json(text, ".vscode/launch.json");
         let compounds = parse_compounds(text, ".vscode/launch.json");
-        let members = resolve_compound(&compounds[0], &cfgs).unwrap();
+        let members = resolve_compound(&compounds[0], &cfgs, &[]).unwrap();
         assert_eq!(
             members.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
             vec!["Server", "Client"],

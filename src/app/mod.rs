@@ -9153,6 +9153,12 @@ impl App {
             .to_path_buf()
     }
 
+    /// Every workspace folder as `(name, root)`, for a compound member's
+    /// `"folder"` and `${workspaceFolder:name}` (#1425).
+    fn workspace_folders(&self) -> Vec<(String, PathBuf)> {
+        crate::dap::configs::workspace_folders(self.roots.iter())
+    }
+
     /// Feed the Source Control empty state the repos one folder below the
     /// active root when that root is in none (#1227), so it offers to open
     /// them rather than `git init` around them. A depth-1 `read_dir`,
@@ -32339,6 +32345,7 @@ impl App {
         // name, which is the very entry a `.vscode` compound
         // naming that name has to bind.
         let all = crate::dap::configs::discover_configs_all(&self.active_workspace_root());
+        let folders = self.workspace_folders();
         // #310 defers compounds that need SEVERAL sessions at
         // once. A compound naming ONE configuration needs one,
         // which croft has run since #250 — so the arity has to
@@ -32346,7 +32353,7 @@ impl App {
         // multi-session limit for a one-member compound cites
         // a limitation that does not apply and tells the user
         // something false about their own launch.json.
-        match crate::dap::configs::resolve_compound(compound, &all) {
+        match crate::dap::configs::resolve_compound(compound, &all, &folders) {
             Err(e) => self.debug_error(e),
             // A one-member compound carrying keys croft does
             // not honour is REFUSED rather than launched.
@@ -32441,10 +32448,6 @@ impl App {
                 // for and the order a client-then-server
                 // compound depends on.
                 let label = compound.name.clone();
-                // `resolve_compound` borrows from the config
-                // list; the launch outlives that borrow, so
-                // the members are owned from here on.
-                let members: Vec<_> = members.into_iter().cloned().collect();
                 match compound.pre_launch_task.clone() {
                     Some(task) => self.launch_after_compound_task_all(
                         &task,
@@ -32627,10 +32630,15 @@ impl App {
     /// interleave unpredictably. Its task is skipped with a status saying so,
     /// which is honest, and #310 is where the general form belongs.
     fn launch_member_into_set(&mut self, cfg: &crate::dap::configs::DebugConfig) -> MemberOutcome {
-        let root = self.active_workspace_root();
+        // A member from another workspace folder resolves there (#1425).
+        let root = cfg
+            .root
+            .clone()
+            .unwrap_or_else(|| self.active_workspace_root());
         let ctx = crate::dap::configs::SubstCtx {
             workspace_folder: root,
             file: self.editor.path.clone(),
+            folders: self.workspace_folders(),
         };
         let rc = match crate::dap::configs::resolve(cfg, &ctx) {
             Ok(rc) => rc,
@@ -32926,10 +32934,16 @@ impl App {
         self.pending_cargo_launches.clear();
         // A new run: the previous run's cleanup is not this one's.
         self.debug_post_tasks.clear();
-        let root = self.active_workspace_root();
+        // A compound member from another workspace folder resolves, and
+        // finds its preLaunchTask, there (#1425).
+        let root = cfg
+            .root
+            .clone()
+            .unwrap_or_else(|| self.active_workspace_root());
         let ctx = configs::SubstCtx {
             workspace_folder: root.clone(),
             file: self.editor.path.clone(),
+            folders: self.workspace_folders(),
         };
         let rc = match configs::resolve(cfg, &ctx) {
             Ok(rc) => rc,
@@ -32948,9 +32962,9 @@ impl App {
                 return;
             };
             let command = self
-                .task_command_line(&task)
+                .task_command_line_in(&task, root.clone())
                 .unwrap_or_else(|_| task.command.clone());
-            let Some(pane) = self.run_project_task(task) else {
+            let Some(pane) = self.run_project_task_in(task, root) else {
                 // run_project_task already reported why the pane failed.
                 return;
             };
@@ -39250,9 +39264,21 @@ impl App {
     /// expanded against the active workspace and file. The preLaunchTask
     /// gate matches the pane's finished command against this same line.
     fn task_command_line(&self, task: &crate::tasks::Task) -> Result<String, String> {
+        self.task_command_line_in(task, self.active_workspace_root())
+    }
+
+    /// [`Self::task_command_line`] against the workspace folder `root`: a
+    /// compound member's preLaunchTask from another folder (#1425) expands
+    /// `${workspaceFolder}` to that folder, not the active one.
+    fn task_command_line_in(
+        &self,
+        task: &crate::tasks::Task,
+        root: PathBuf,
+    ) -> Result<String, String> {
         task.command_line(&crate::dap::configs::SubstCtx {
-            workspace_folder: self.active_workspace_root(),
+            workspace_folder: root,
             file: self.editor.path.clone(),
+            folders: self.workspace_folders(),
         })
     }
 
@@ -39263,6 +39289,15 @@ impl App {
     /// correlate the task's FinishedCommand (the preLaunchTask gate, #250);
     /// `None` when no pane could be started (already reported in `status`).
     pub fn run_project_task(&mut self, task: crate::tasks::Task) -> Option<u64> {
+        let root = self.active_workspace_root();
+        self.run_project_task_in(task, root)
+    }
+
+    /// [`Self::run_project_task`] in the workspace folder `folder`: the pane
+    /// starts there and the task's variables expand against it, so a
+    /// compound member's preLaunchTask from another folder (#1425) builds
+    /// that folder's project.
+    fn run_project_task_in(&mut self, task: crate::tasks::Task, folder: PathBuf) -> Option<u64> {
         let pane_name = format!("Task: {}", task.label);
         // The task's problemMatcher (#252), translated up front so both the
         // reuse and fresh-pane paths assign the same thing (or clear a
@@ -39275,7 +39310,7 @@ impl App {
         // Ctrl-E + Ctrl-U first: the idle shell's line editor may hold a
         // half-typed command that would otherwise concatenate and run
         // (same rule `format_cd_command` pins for the cd seed).
-        let line = match self.task_command_line(&task) {
+        let line = match self.task_command_line_in(&task, folder.clone()) {
             Ok(line) => line,
             Err(e) => {
                 self.status = format!("Task \u{201c}{}\u{201d} not run: {e}", task.label);
@@ -39290,12 +39325,11 @@ impl App {
         // old one. Shares `pane_is_idle_at` with the runnable-fence path
         // (#430) — this guard existed twice and only one copy was fixed,
         // which is precisely how the two defects survived a green suite.
-        let active = self.active_workspace_root();
-        let root = active.canonicalize().unwrap_or(active);
+        let canonical = folder.canonicalize().unwrap_or_else(|_| folder.clone());
         if let Some(idx) = self
             .terminals
             .iter()
-            .position(|t| pane_is_idle_at(t, &pane_name, &root))
+            .position(|t| pane_is_idle_at(t, &pane_name, &canonical))
         {
             // Reused panes may be folded (#313): the release notes name the
             // build pane as the thing you would fold, and a task written into
@@ -39311,7 +39345,7 @@ impl App {
             self.assign_task_matcher(uid, matcher);
             return Some(uid);
         }
-        match crate::widgets::terminal::PtyTerminal::new(&self.active_workspace_root()) {
+        match crate::widgets::terminal::PtyTerminal::new(&folder) {
             Ok(mut term) => {
                 term.set_manual_name(Some(pane_name));
                 term.write_input(command.as_bytes());

@@ -933,6 +933,7 @@ mod tests {
         let ctx = crate::dap::configs::SubstCtx {
             workspace_folder: ws.clone(),
             file: Some(ws.join("a;touch${IFS}pwned.rs")),
+            folders: Vec::new(),
         };
         let build = task("build").command_line(&ctx).unwrap();
         assert!(
@@ -973,6 +974,7 @@ mod tests {
         let no_file = crate::dap::configs::SubstCtx {
             workspace_folder: PathBuf::from("/w"),
             file: None,
+            folders: Vec::new(),
         };
         assert!(
             task("build").command_line(&no_file).is_err(),
@@ -1492,6 +1494,7 @@ mod tests {
         crate::dap::configs::SubstCtx {
             workspace_folder: root.to_path_buf(),
             file: None,
+            folders: Vec::new(),
         }
     }
 
