@@ -3599,6 +3599,33 @@ pub fn stash_drop(root: &Path, index: usize) -> Result<String, String> {
     run_mutation(root, &["stash", "drop", &format!("stash@{{{index}}}")])
 }
 
+/// The commit a stash entry records (`git rev-parse stash@{N}`). Unlike its
+/// index, it keeps naming the same stash while others are pushed or dropped.
+pub fn stash_oid(root: &Path, index: usize) -> Result<String, String> {
+    run_git(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("stash@{{{index}}}"),
+        ],
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Drop the stash whose commit is `oid`, at whatever index it holds now: a
+/// stash pushed or dropped since it was picked shifts every index, and the
+/// old one would name a different stash. Refuses when it is gone.
+pub fn stash_drop_oid(root: &Path, oid: &str) -> Result<String, String> {
+    let list = run_git(root, &["stash", "list", "--format=%H"]).map_err(|e| e.to_string())?;
+    let index = list
+        .lines()
+        .position(|hash| hash.trim() == oid)
+        .ok_or_else(|| String::from("that stash is no longer in the stash list"))?;
+    stash_drop(root, index)
+}
+
 // --- Tags ----------------------------------------------------------------
 
 /// List tags newest-first (`git tag --sort=-creatordate`).

@@ -85694,6 +85694,89 @@ fn drop_stash_answered_no_keeps_the_stash() {
     }
 }
 
+/// Runs `git` in `root` for the #1128 tests, failing the test on error.
+fn git_1128(root: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+/// #1128: only a plain (or shifted) Y answers. Ctrl+Shift+Y is terminal copy
+/// mode, and pressing it with the question up must not drop the stash.
+#[test]
+fn drop_stash_ignores_a_modified_y() {
+    let (tmp, mut app) = drop_stash_picker_1128();
+    app.confirm_list_picker();
+    app.handle_key(key(
+        KeyCode::Char('Y'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert_eq!(
+        stash_messages_1128(tmp.path()).len(),
+        2,
+        "Ctrl+Shift+Y kept it"
+    );
+    assert!(
+        draw_screen(&mut app).contains("DROP STASH?"),
+        "still asking"
+    );
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::SHIFT))
+        .unwrap();
+    let left = stash_messages_1128(tmp.path());
+    assert_eq!(left.len(), 1, "Shift+Y answers: {left:?}");
+    assert!(left[0].contains("quick experiment"), "{left:?}");
+}
+
+/// #1128: a stash pushed while the question is up shifts every
+/// `stash@{N}`; Y still drops the stash the question named, not the one
+/// that slid into its old index.
+#[test]
+fn drop_stash_drops_the_named_stash_after_the_list_moves() {
+    let (tmp, mut app) = drop_stash_picker_1128();
+    app.confirm_list_picker();
+    std::fs::write(tmp.path().join("billing.py"), "v3\n").unwrap();
+    git_1128(
+        tmp.path(),
+        &["stash", "push", "-q", "-m", "pushed meanwhile"],
+    );
+    app.handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE))
+        .unwrap();
+    let left = stash_messages_1128(tmp.path());
+    assert_eq!(left.len(), 2, "{left:?}");
+    assert!(
+        left.iter().all(|m| !m.contains("WIP payment retries")),
+        "the named stash went: {left:?}"
+    );
+    assert!(
+        left.iter().any(|m| m.contains("quick experiment")),
+        "the one now at its old index stayed: {left:?}"
+    );
+    assert!(app.status.starts_with("Dropped stash"), "{}", app.status);
+}
+
+/// #1128 negative: when the named stash is dropped elsewhere while the
+/// question is up, Y drops nothing and says why.
+#[test]
+fn drop_stash_refuses_when_the_named_stash_is_gone() {
+    let (tmp, mut app) = drop_stash_picker_1128();
+    app.confirm_list_picker();
+    git_1128(tmp.path(), &["stash", "drop", "-q", "stash@{1}"]);
+    app.handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE))
+        .unwrap();
+    let left = stash_messages_1128(tmp.path());
+    assert_eq!(left.len(), 1, "nothing else dropped: {left:?}");
+    assert!(left[0].contains("quick experiment"), "{left:?}");
+    assert!(
+        app.status.contains("no longer in the stash list"),
+        "{}",
+        app.status
+    );
+}
+
 /// #1598: GNOME Terminal and Konsole keep Ctrl+Shift+T / W for their own New
 /// Tab and Close Tab, so the pane menu carries Split Terminal and Kill
 /// Terminal, as VS Code's does. Kill closes the pane that was right-clicked,

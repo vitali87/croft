@@ -2717,11 +2717,13 @@ struct PendingUnsavedScm {
 /// A Drop Stash pick waiting on its confirm popup (#1128): a stash is
 /// usually work kept nowhere else, and `git stash drop` has no undo. `root`
 /// is the repository it was picked in, held in case Source Control moves
-/// to another root before the answer.
+/// to another root before the answer. `oid` is the stash's commit, not its
+/// index: a stash pushed or dropped while the question is up shifts every
+/// `stash@{N}`, and the drop must still hit the stash that was named.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingStashDrop {
     root: PathBuf,
-    index: usize,
+    oid: String,
     label: String,
 }
 
@@ -23746,10 +23748,17 @@ impl App {
             }
             return Ok(());
         }
+        // Letters count only unmodified (Shift aside), so a chord such as
+        // Ctrl+Shift+Y (terminal copy mode) cannot answer for the user.
         if self.pending_stash_drop.is_some() {
+            let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
             match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => self.confirm_pending_stash_drop(),
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                KeyCode::Char('y' | 'Y') if plain => self.confirm_pending_stash_drop(),
+                KeyCode::Char('n' | 'N') if plain => {
+                    self.pending_stash_drop = None;
+                    self.status = String::from("Kept the stash");
+                }
+                KeyCode::Esc => {
                     self.pending_stash_drop = None;
                     self.status = String::from("Kept the stash");
                 }
@@ -35314,7 +35323,7 @@ impl App {
         let Some(pending) = self.pending_stash_drop.take() else {
             return;
         };
-        let r = crate::git::stash_drop(&pending.root, pending.index);
+        let r = crate::git::stash_drop_oid(&pending.root, &pending.oid);
         self.run_scm_op("stash drop", r, "Dropped stash", "Drop stash");
     }
 
@@ -38557,15 +38566,22 @@ impl App {
                 let r = crate::git::stash_pop_at(&self.scm_root(), index);
                 self.run_scm_op("stash pop", r, "Popped stash", "Pop stash");
             }
-            // Asked first: the drop cannot be undone (#1128).
-
             ListPurpose::StashView => self.open_stash_patch(index),
+            // Asked first: the drop cannot be undone (#1128).
             ListPurpose::StashDrop => {
-                self.pending_stash_drop = Some(PendingStashDrop {
-                    root: self.scm_root(),
-                    index,
-                    label: row.label,
-                });
+                let root = self.scm_root();
+                match crate::git::stash_oid(&root, index) {
+                    Ok(oid) => {
+                        self.pending_stash_drop = Some(PendingStashDrop {
+                            root,
+                            oid,
+                            label: row.label,
+                        });
+                    }
+                    Err(err) => {
+                        self.status = crate::git::failure_line("Drop stash", &err);
+                    }
+                }
             }
             ListPurpose::RemoveRemote => {
                 let r = crate::git::remove_remote(&self.scm_root(), &row.id);
