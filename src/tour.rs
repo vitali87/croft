@@ -11,8 +11,6 @@
 //! (#863). A literal `Cmd+P` told a Linux user to press a key that does
 //! nothing there.
 
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::path::{Path, PathBuf};
 
 /// The built-in tour.

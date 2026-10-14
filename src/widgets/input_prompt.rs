@@ -180,6 +180,20 @@ pub enum InputPurpose {
     CreateTagAt {
         target: String,
     },
+    /// The optional message for tag `name` (#1582): one makes an annotated
+    /// tag, none (Enter on a blank field) a lightweight one.
+    CreateTagMessage {
+        name: String,
+    },
+    /// Confirm deleting tag `name` from `remote` (#1582). Submitting (Enter)
+    /// deletes it there; Esc keeps it. The value is a sentinel. `root` is
+    /// the repository whose remote was listed: the deletion is dropped if
+    /// Source Control has moved to another one by then.
+    DeleteRemoteTag {
+        root: std::path::PathBuf,
+        remote: String,
+        name: String,
+    },
     /// Add a debugger watch expression (#112): submitting appends it to the
     /// App's watch list and re-evaluates at the current stop.
     AddWatch,
@@ -205,6 +219,12 @@ pub enum InputPurpose {
     /// that is not a positive number is refused rather than silently
     /// replaying once.
     MacroReplayCount,
+    /// The optional name for a stash (#1581), as VS Code's Git: Stash asks:
+    /// one becomes `git stash push -m`, a blank field keeps git's own
+    /// `WIP on <branch>: <commit>`.
+    StashMessage {
+        kind: crate::git::StashKind,
+    },
     /// Confirm uninstalling an installed extension. Submitting (Enter) performs
     /// the removal; Esc keeps it. The submitted value is a sentinel, ignored.
     ExtensionUninstall {

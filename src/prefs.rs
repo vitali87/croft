@@ -263,6 +263,14 @@ pub struct Prefs {
     /// "all", or "none". Parsed by `WhitespaceMode::from_pref`.
     #[serde(default)]
     pub render_whitespace: String,
+    /// Word-based completion (#1566), VS Code's
+    /// `editor.wordBasedSuggestions`: which open documents' words Ctrl+Space
+    /// offers when no language server has suggestions. "off",
+    /// "currentDocument", "matchingDocuments" (the default, also what the
+    /// empty string means: the open documents in the same language) or
+    /// "allDocuments". Parsed by `WordSuggestions::from_pref`.
+    #[serde(default)]
+    pub word_based_suggestions: String,
     /// Opt-out for bracket-pair colorization (#131), on by default like VS
     /// Code's `editor.bracketPairColorization.enabled` (default since 1.67).
     /// Stored as the disable flag so the derived `Default` and an older
@@ -552,6 +560,7 @@ impl Prefs {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let json = serde_json::to_string_pretty(&self.document()?).context("serializing prefs")?;
+        let before = crate::config_sync::stamp(path);
         // Written aside and renamed in: a reader on another thread (the MCP
         // worker's fingerprint check) must never see a truncated file, and a
         // crash mid-write must not leave one.
@@ -565,7 +574,11 @@ impl Prefs {
         std::fs::rename(&tmp, path).with_context(|| {
             let _ = std::fs::remove_file(&tmp);
             format!("replacing {}", path.display())
-        })
+        })?;
+        // croft's own write, already applied: the settings watch must not
+        // re-merge it as if it came from outside (#1435).
+        crate::config_sync::note_own_write(path, before);
+        Ok(())
     }
 
     /// What [`Prefs::save`] writes: the loaded file with only the settings
