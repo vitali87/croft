@@ -50,9 +50,12 @@ fn diff(
     }
 }
 
-/// One member of a JSONC object, as byte offsets into the text.
+/// One member of a JSONC object, or element of an array, as byte offsets
+/// into the text.
 struct Member {
-    key: String,
+    /// `None` for an array element.
+    key: Option<String>,
+    /// Where the member starts: its key, or an element's value.
     key_start: usize,
     value_start: usize,
     value_end: usize,
@@ -60,7 +63,7 @@ struct Member {
     comma: Option<usize>,
 }
 
-/// An object's braces and members.
+/// An object's braces and members, or an array's brackets and elements.
 struct Object {
     open: usize,
     close: usize,
@@ -118,21 +121,7 @@ impl Scanner<'_> {
     fn value(&mut self) -> Option<()> {
         match *self.s.get(self.i)? {
             b'"' => self.string().map(|_| ()),
-            b'{' => self.object().map(|_| ()),
-            b'[' => {
-                self.i += 1;
-                loop {
-                    self.skip_blank()?;
-                    match *self.s.get(self.i)? {
-                        b']' => {
-                            self.i += 1;
-                            return Some(());
-                        }
-                        b',' => self.i += 1,
-                        _ => self.value()?,
-                    }
-                }
-            }
+            b'{' | b'[' => self.container().map(|_| ()),
             _ => {
                 let start = self.i;
                 while self
@@ -149,15 +138,25 @@ impl Scanner<'_> {
 
     /// The object starting at the cursor.
     fn object(&mut self) -> Option<Object> {
-        let open = self.i;
         if self.s.get(self.i) != Some(&b'{') {
             return None;
         }
+        self.container()
+    }
+
+    /// The object or array starting at the cursor.
+    fn container(&mut self) -> Option<Object> {
+        let open = self.i;
+        let (keyed, end) = match *self.s.get(self.i)? {
+            b'{' => (true, b'}'),
+            b'[' => (false, b']'),
+            _ => return None,
+        };
         self.i += 1;
         let mut members = Vec::new();
         loop {
             self.skip_blank()?;
-            if self.s.get(self.i) == Some(&b'}') {
+            if self.s.get(self.i) == Some(&end) {
                 let close = self.i;
                 self.i += 1;
                 return Some(Object {
@@ -167,13 +166,18 @@ impl Scanner<'_> {
                 });
             }
             let key_start = self.i;
-            let key = self.string()?;
-            self.skip_blank()?;
-            if self.s.get(self.i) != Some(&b':') {
-                return None;
-            }
-            self.i += 1;
-            self.skip_blank()?;
+            let key = if keyed {
+                let key = self.string()?;
+                self.skip_blank()?;
+                if self.s.get(self.i) != Some(&b':') {
+                    return None;
+                }
+                self.i += 1;
+                self.skip_blank()?;
+                Some(key)
+            } else {
+                None
+            };
             let value_start = self.i;
             self.value()?;
             let value_end = self.i;
@@ -189,7 +193,7 @@ impl Scanner<'_> {
                 value_end,
                 comma,
             });
-            if comma.is_none() && self.s.get(self.i) != Some(&b'}') {
+            if comma.is_none() && self.s.get(self.i) != Some(&end) {
                 return None;
             }
         }
@@ -205,11 +209,27 @@ fn object_at(text: &str, path: &[String]) -> Option<Object> {
     sc.skip_blank()?;
     let mut obj = sc.object()?;
     for key in path {
-        let m = obj.members.iter().rev().find(|m| &m.key == key)?;
+        let m = obj
+            .members
+            .iter()
+            .rev()
+            .find(|m| m.key.as_deref() == Some(key.as_str()))?;
         sc.i = m.value_start;
         obj = sc.object()?;
     }
     Some(obj)
+}
+
+/// The array whose `[` is at `at`.
+fn array_at(text: &str, at: usize) -> Option<Object> {
+    if text.as_bytes().get(at) != Some(&b'[') {
+        return None;
+    }
+    Scanner {
+        s: text.as_bytes(),
+        i: at,
+    }
+    .container()
 }
 
 /// The whitespace before `at` on its line, when nothing else is.
@@ -220,6 +240,13 @@ fn line_indent(text: &str, at: usize) -> Option<&str> {
         .chars()
         .all(|c| c == ' ' || c == '\t')
         .then_some(indent)
+}
+
+/// The whitespace that starts the line `at` is on.
+fn leading_indent(text: &str, at: usize) -> &str {
+    let start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+    let line = &text[start..at];
+    &line[..line.len() - line.trim_start_matches([' ', '\t']).len()]
 }
 
 /// `value` as JSON, its later lines indented to sit under `indent`.
@@ -233,10 +260,20 @@ fn apply(text: &str, path: &[String], value: Option<&Value>) -> Option<String> {
     let (key, parent) = path.split_last()?;
     let obj = object_at(text, parent)?;
     // serde_json keeps the last of a repeated key, so that is the one to edit.
-    let found = obj.members.iter().rposition(|m| &m.key == key);
+    let found = obj
+        .members
+        .iter()
+        .rposition(|m| m.key.as_deref() == Some(key.as_str()));
     match (found, value) {
         (Some(i), Some(value)) => {
             let m = &obj.members[i];
+            // An array is edited element by element, so the comments
+            // between its elements (why an extension is disabled) stay.
+            if let Value::Array(new) = value
+                && let Some(out) = edit_array(text, m.value_start, new)
+            {
+                return Some(out);
+            }
             let indent = line_indent(text, m.key_start).unwrap_or("");
             Some(format!(
                 "{}{}{}",
@@ -246,29 +283,133 @@ fn apply(text: &str, path: &[String], value: Option<&Value>) -> Option<String> {
             ))
         }
         (Some(i), None) => Some(remove(text, &obj, i)),
-        (None, Some(value)) => insert(text, &obj, key, value),
+        (None, Some(value)) => insert(text, &obj, obj.members.len(), Some(key), value),
         (None, None) => Some(text.to_string()),
     }
 }
 
-/// `text` with a new member `key: value` after the last one of `obj`.
-fn insert(text: &str, obj: &Object, key: &str, value: &Value) -> Option<String> {
-    let name = serde_json::to_string(key).ok()?;
-    let Some(last) = obj.members.last() else {
-        // An empty object: open it onto lines of its own.
-        let outer = line_indent(text, obj.open).unwrap_or("");
-        let indent = format!("{outer}  ");
+/// `text` with the array whose `[` is at `at` turned into `new` one element
+/// at a time: the elements it shares with `new` stay where they are, with
+/// the comments around them, the others are removed, and each new element
+/// is inserted after the one it follows. `None` when the array can't be read.
+fn edit_array(text: &str, at: usize, new: &[Value]) -> Option<String> {
+    let old = array_at(text, at)?
+        .members
+        .iter()
+        .map(|m| {
+            serde_json::from_str(&crate::tasks::strip_jsonc(
+                &text[m.value_start..m.value_end],
+            ))
+            .ok()
+        })
+        .collect::<Option<Vec<Value>>>()?;
+    let kept = common(&old, new);
+    let mut out = text.to_string();
+    // Last first, so the indices still name the elements they did.
+    for i in (0..old.len()).rev() {
+        if !kept.iter().any(|&(o, _)| o == i) {
+            out = remove(&out, &array_at(&out, at)?, i);
+        }
+    }
+    // The array now holds the kept elements in order, so each new element
+    // goes in at its own index in `new`.
+    for (j, value) in new.iter().enumerate() {
+        if !kept.iter().any(|&(_, n)| n == j) {
+            out = insert(&out, &array_at(&out, at)?, j, None, value)?;
+        }
+    }
+    Some(out)
+}
+
+/// The longest run of elements `old` and `new` share, in order, as pairs of
+/// their indices: what an array edit keeps.
+fn common(old: &[Value], new: &[Value]) -> Vec<(usize, usize)> {
+    let mut len = vec![vec![0usize; new.len() + 1]; old.len() + 1];
+    for i in (0..old.len()).rev() {
+        for j in (0..new.len()).rev() {
+            len[i][j] = if old[i] == new[j] {
+                len[i + 1][j + 1] + 1
+            } else {
+                len[i + 1][j].max(len[i][j + 1])
+            };
+        }
+    }
+    let (mut i, mut j, mut pairs) = (0, 0, Vec::new());
+    while i < old.len() && j < new.len() {
+        if old[i] == new[j] {
+            pairs.push((i, j));
+            i += 1;
+            j += 1;
+        } else if len[i + 1][j] >= len[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    pairs
+}
+
+/// `text` with a new member `key: value`, or element `value` for no key,
+/// placed in `obj` at `index`: after the member before it, or first.
+fn insert(
+    text: &str,
+    obj: &Object,
+    index: usize,
+    key: Option<&str>,
+    value: &Value,
+) -> Option<String> {
+    let name = key.map(serde_json::to_string).transpose().ok()?;
+    // Pretty under an indent on a line of its own, else compact.
+    let member = |indent: Option<&str>| -> Option<String> {
+        let value = match indent {
+            Some(indent) => render(value, indent)?,
+            None => serde_json::to_string(value).ok()?,
+        };
+        Some(match &name {
+            Some(name) => format!("{name}: {value}"),
+            None => value,
+        })
+    };
+    let Some(prev) = index.checked_sub(1) else {
+        let Some(first) = obj.members.first() else {
+            // Empty: opened onto lines of its own, below any comment inside
+            // it, which documents the settings to come.
+            let outer = leading_indent(text, obj.open);
+            let indent = format!("{outer}  ");
+            let inside = text[obj.open + 1..obj.close].trim_end();
+            return Some(format!(
+                "{}{inside}\n{indent}{}\n{outer}{}",
+                &text[..=obj.open],
+                member(Some(&indent))?,
+                &text[obj.close..]
+            ));
+        };
+        // Members one per line: the new one gets the line after the
+        // bracket's, so a comment above the first member keeps it.
+        if let Some(indent) = line_indent(text, first.key_start)
+            && let Some(eol) = text[obj.open..first.key_start].find('\n')
+        {
+            let eol = obj.open + eol;
+            return Some(format!(
+                "{}\n{indent}{},{}",
+                &text[..eol],
+                member(Some(indent))?,
+                &text[eol..]
+            ));
+        }
         return Some(format!(
-            "{}{{\n{indent}{name}: {}\n{outer}}}{}",
-            &text[..obj.open],
-            render(value, &indent)?,
-            &text[obj.close + 1..]
+            "{}{}, {}",
+            &text[..first.key_start],
+            member(None)?,
+            &text[first.key_start..]
         ));
     };
-    // Members one per line: the new one gets its own line after the last,
-    // past a comment that ends that line, so the comment keeps its member.
-    if let Some(indent) = line_indent(text, last.key_start) {
-        let after = last.comma.map_or(last.value_end, |c| c + 1);
+    let before = obj.members.get(prev)?;
+    // Members one per line: the new one gets its own line after the one it
+    // follows, past a comment that ends that line, so the comment keeps its
+    // member.
+    if let Some(indent) = line_indent(text, before.key_start) {
+        let after = before.comma.map_or(before.value_end, |c| c + 1);
         let eol = text[after..].find('\n').map(|n| after + n);
         let rest = &text[after..eol.unwrap_or(text.len())];
         let rest = rest.trim();
@@ -277,25 +418,25 @@ fn insert(text: &str, obj: &Object, key: &str, value: &Value) -> Option<String> 
             && after <= obj.close
             && eol < obj.close
         {
-            let member = format!("{name}: {}", render(value, indent)?);
-            return Some(match last.comma {
+            let member = member(Some(indent))?;
+            return Some(match before.comma {
                 // A trailing comma stays the file's style.
                 Some(_) => format!("{}\n{indent}{member},{}", &text[..eol], &text[eol..]),
                 None => format!(
                     "{},{}\n{indent}{member}{}",
-                    &text[..last.value_end],
-                    &text[last.value_end..eol],
+                    &text[..before.value_end],
+                    &text[before.value_end..eol],
                     &text[eol..]
                 ),
             });
         }
     }
-    // A one-line object: the member joins the line.
+    // All on one line: the member joins it.
     Some(format!(
-        "{}, {name}: {}{}",
-        &text[..last.value_end],
-        serde_json::to_string(value).ok()?,
-        &text[last.value_end..]
+        "{}, {}{}",
+        &text[..before.value_end],
+        member(None)?,
+        &text[before.value_end..]
     ))
 }
 
@@ -304,22 +445,26 @@ fn remove(text: &str, obj: &Object, i: usize) -> String {
     let m = &obj.members[i];
     let mut start = m.key_start;
     let mut end = m.comma.map_or(m.value_end, |c| c + 1);
-    if m.comma.is_none()
-        && i > 0
-        && let Some(prev) = obj.members[i - 1].comma
-    {
-        // The last member goes: the comma before it would now trail.
-        start = prev;
-    }
     if line_indent(text, m.key_start).is_some() {
         let line_start = text[..m.key_start].rfind('\n').map_or(0, |n| n + 1);
         let rest_end = text[end..].find('\n').map_or(text.len(), |n| end + n);
-        if text[end..rest_end].trim().is_empty() && start == m.key_start {
+        if text[end..rest_end].trim().is_empty() {
             start = line_start;
             end = (rest_end + 1).min(text.len());
         }
     }
-    format!("{}{}", &text[..start], &text[end..])
+    // The last member goes: the comma before it would now trail. Only that
+    // comma goes with it, so a comment after the comma keeps its member.
+    let prev = i.checked_sub(1).and_then(|p| obj.members[p].comma);
+    match (m.comma, prev) {
+        (None, Some(prev)) => format!(
+            "{}{}{}",
+            &text[..prev],
+            &text[prev + 1..start],
+            &text[end..]
+        ),
+        _ => format!("{}{}", &text[..start], &text[end..]),
+    }
 }
 
 #[cfg(test)]
@@ -421,5 +566,72 @@ mod tests {
         let text = "{ \"//a\": \"/* b */\" }";
         let out = update(text, &json!({ "//a": "c" })).unwrap();
         assert_eq!(out, "{ \"//a\": \"c\" }");
+    }
+
+    /// #1129: disabling an extension adds to `disabled_extensions` in the
+    /// set's sorted order; the comments between its elements stay with the
+    /// elements they explain, and a removed element takes only its own line.
+    #[test]
+    fn a_changed_array_keeps_the_comments_between_its_elements() {
+        let text = "{\n  \"disabled_extensions\": [\n    // rust-analyzer is too slow on this box\n    \"rust\",\n    \"zig\" // broken build\n  ]\n}\n";
+        let new = json!({ "disabled_extensions": ["go", "python", "rust", "zig"] });
+        let out = update(text, &new).unwrap();
+        assert_eq!(
+            out,
+            "{\n  \"disabled_extensions\": [\n    \"go\",\n    \"python\",\n    // rust-analyzer is too slow on this box\n    \"rust\",\n    \"zig\" // broken build\n  ]\n}\n"
+        );
+        let fewer = json!({ "disabled_extensions": ["python", "rust", "zig"] });
+        let out = update(&out, &fewer).unwrap();
+        assert_eq!(
+            out,
+            "{\n  \"disabled_extensions\": [\n    \"python\",\n    // rust-analyzer is too slow on this box\n    \"rust\",\n    \"zig\" // broken build\n  ]\n}\n"
+        );
+        let one_line = "{ \"disabled_extensions\": [ /* rationale */ \"rust\" ] }";
+        let out = update(
+            one_line,
+            &json!({ "disabled_extensions": ["go", "rust", "zig"] }),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "{ \"disabled_extensions\": [ /* rationale */ \"go\", \"rust\", \"zig\" ] }"
+        );
+        let out = update(one_line, &json!({ "disabled_extensions": [] })).unwrap();
+        assert_eq!(out, "{ \"disabled_extensions\": [ /* rationale */  ] }");
+    }
+
+    /// #1129: an object or array holding only comments keeps them when its
+    /// first member arrives, below them, indented under its own line.
+    #[test]
+    fn the_first_member_goes_below_the_comments_of_an_empty_object() {
+        let text = "{ /* shared defaults are documented here */ }";
+        let out = update(text, &json!({ "theme": "nord" })).unwrap();
+        assert_eq!(
+            out,
+            "{ /* shared defaults are documented here */\n  \"theme\": \"nord\"\n}"
+        );
+        let text = "{\n  // settings go here\n}\n";
+        let out = update(text, &json!({ "theme": "nord" })).unwrap();
+        assert_eq!(out, "{\n  // settings go here\n  \"theme\": \"nord\"\n}\n");
+        let text = "{\n  \"disabled_extensions\": [\n    // none yet\n  ],\n  \"linux\": {}\n}\n";
+        let new = json!({ "disabled_extensions": ["rust"], "linux": { "theme": "nord" } });
+        let out = update(text, &new).unwrap();
+        assert_eq!(
+            out,
+            "{\n  \"disabled_extensions\": [\n    // none yet\n    \"rust\"\n  ],\n  \"linux\": {\n    \"theme\": \"nord\"\n  }\n}\n"
+        );
+    }
+
+    /// #1129: removing the last member, with no comma after it, takes the
+    /// comma before it and nothing else: the comment after that comma
+    /// belongs to the member before.
+    #[test]
+    fn removing_the_last_member_keeps_the_comment_of_the_one_before() {
+        let text = "{ \"a\": 1, // explanation for a\n \"b\": 2 }";
+        let out = update(text, &json!({ "a": 1 })).unwrap();
+        assert_eq!(out, "{ \"a\": 1 // explanation for a\n  }");
+        let text = "{\n  \"a\": 1, // explanation for a\n  \"b\": 2\n}\n";
+        let out = update(text, &json!({ "a": 1 })).unwrap();
+        assert_eq!(out, "{\n  \"a\": 1 // explanation for a\n}\n");
     }
 }
