@@ -57574,7 +57574,8 @@ impl App {
                 }
                 // Merge editor (#253): a click on a source pane's
                 // per-conflict checkbox toggles that side's inclusion
-                // (both checked = Accept Combination). Any other click in
+                // (both checked = Accept Combination), and one on an accept
+                // button above a conflict sets it. Any other click in
                 // the source-pane area is swallowed — the panes are
                 // read-only; the Result below keeps normal click behavior.
                 if in_editor && self.editor.merge.is_some() {
@@ -57598,6 +57599,18 @@ impl App {
                     if let Some((idx, side)) = check_hit {
                         self.focus_pane(Pane::Editor);
                         self.merge_toggle_side(idx, side);
+                        return;
+                    }
+                    // An accept button above a conflict (#1169).
+                    let action_hit = self.editor.merge.as_ref().and_then(|mv| {
+                        mv.action_spans
+                            .iter()
+                            .find(|(y, xs, _, _)| *y == m.row && xs.contains(&m.column))
+                            .map(|(_, _, idx, state)| (*idx, *state))
+                    });
+                    if let Some((idx, state)) = action_hit {
+                        self.focus_pane(Pane::Editor);
+                        self.merge_set_conflict(idx, state);
                         return;
                     }
                     if in_panes {

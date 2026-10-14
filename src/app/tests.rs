@@ -47554,6 +47554,71 @@ fn merge_editor_renders_source_panes_and_result_at_100_columns() {
     assert_eq!(app.editor.lines[1], "mine");
 }
 
+/// #1169: the merge editor's side panes carry labelled accept buttons
+/// above each conflict, not only the `[ ]` checkboxes, and a click on one
+/// resolves the conflict that way and ticks the button.
+#[test]
+fn merge_editor_accept_buttons_resolve_the_conflict_above_which_they_sit() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("plain.txt"),
+        "top\n<<<<<<< HEAD\nmine\n=======\nyours\n>>>>>>> other\nbottom\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_pinned(&tmp.path().join("plain.txt"))
+        .unwrap();
+    app.focus_pane(Pane::Editor);
+    app.run_command(crate::widgets::command_palette::Command::MergeOpenEditor);
+    let backend = ratatui::backend::TestBackend::new(160, 60);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    let screen = |term: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    term.draw(|f| app.render(f)).unwrap();
+    let text = screen(&term);
+    for label in [" Accept Current ", " Accept Incoming ", " Accept Both "] {
+        assert!(text.contains(label), "{label:?} must be painted:\n{text}");
+    }
+    assert!(
+        text.contains("[ ]"),
+        "the checkboxes stay beside the buttons"
+    );
+    let mv = app.editor.merge.as_ref().unwrap();
+    let (y, xs, idx, _) = mv
+        .action_spans
+        .iter()
+        .find(|(_, _, _, s)| *s == crate::merge_editor::ConflictState::Incoming)
+        .cloned()
+        .expect("the incoming pane records its Accept Incoming button");
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: xs.start,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    });
+    let mv = app.editor.merge.as_ref().unwrap();
+    assert_eq!(
+        mv.conflicts[idx].state,
+        crate::merge_editor::ConflictState::Incoming
+    );
+    assert_eq!(app.editor.lines[1], "yours", "the Result took incoming");
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        screen(&term).contains("\u{2713} Accept Incoming"),
+        "the button for the state the conflict is in is ticked"
+    );
+}
+
 #[test]
 fn clicking_an_accept_action_on_the_header_row_resolves_that_block() {
     use crossterm::event::{MouseButton, MouseEventKind};
@@ -47578,8 +47643,8 @@ fn clicking_an_accept_action_on_the_header_row_resolves_that_block() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        text.contains("[Accept Current]") && text.contains("[Accept Incoming]"),
-        "the header row must carry the accept actions"
+        text.contains(" Accept Current ") && text.contains(" Accept Incoming "),
+        "the header row must carry the accept buttons"
     );
     let span = app
         .editor

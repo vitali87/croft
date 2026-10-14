@@ -967,7 +967,7 @@ Merge-conflict machinery. It scans VS Code-regex markers (`<<<<<<<`, `|||||||` d
 
 **Caching that cannot go stale.** The editor caches blocks per `edit_seq`. Every whole-buffer swap bumps the seq, including image, sheet and PDF previews, so the cache can never go stale. The editor tints the regions, and Cmd+. opens the resolve picker. Palette merge commands refuse non-text tabs.
 
-**The guided flow.** Source Control classifies unmerged porcelain codes into a MERGE CONFLICTS section whose entries open the working file parked on the first conflict. F7 and Shift+F7 wrap between blocks. Each header row paints clickable `[Accept …]` actions, with hit spans cleared per render — the frame-truth invariant — and the inline blame annotation is suppressed inside blocks so it cannot overpaint them.
+**The guided flow.** Source Control classifies unmerged porcelain codes into a MERGE CONFLICTS section whose entries open the working file parked on the first conflict. F7 and Shift+F7 wrap between blocks. Each header row paints clickable Accept Current / Incoming / Both buttons (#1169), shortened to Current / Incoming / Both on a narrow row rather than dropped, with hit spans cleared per render — the frame-truth invariant — and the inline blame annotation is suppressed inside blocks so it cannot overpaint them.
 
 **Bulk accept and completion.** "Accept All Current/Incoming" splices every block back-to-front, one undo step each. "Merge: Complete Merge" refuses while blocks remain, then saves and `git add`s the file so it rejoins the staged flow.
 
@@ -975,7 +975,7 @@ Merge-conflict machinery. It scans VS Code-regex markers (`<<<<<<<`, `|||||||` d
 
 A three-way merge editor following VS Code's 2022 merge-editor model. `MergeView` diffs base→ours and base→theirs with `build_diff_rows`, clusters transitively overlapping hunks in doubled coordinates so that same-point insertions conflict while adjacent hunks stay independent, auto-resolves one-sided clusters straight into the initial Result, and keeps base text in the conflict regions.
 
-**The Result is the ordinary buffer.** The view only tracks each region's span. Accepts splice through one undo step, and manual edits reconcile per-frame off `merge_edit_row`/`edit_seq` and mark the region manually resolved. Because the Result is the host editor's own buffer, LSP, undo and save need nothing special, and the renderer just carves Current | (Base) | Incoming panes off the top of the editor rect — stacked when narrow, with checkbox gutters clickable per conflict.
+**The Result is the ordinary buffer.** The view only tracks each region's span. Accepts splice through one undo step, and manual edits reconcile per-frame off `merge_edit_row`/`edit_seq` and mark the region manually resolved. Because the Result is the host editor's own buffer, LSP, undo and save need nothing special, and the renderer just carves Current | (Base) | Incoming panes off the top of the editor rect — stacked when narrow, with checkbox gutters clickable per conflict and, in a pane with room for it, a row of Accept buttons above each conflict (#1169) that sets it outright.
 
 **Where the sides come from.** Inputs are `git show :1:/:2:/:3:` via `git::read_file_at_stage`, where missing stages are empty sides (AA/DU/UD), or synthesized from the marker scan for a plain conflicted file. SCM's MERGE CONFLICTS entries open this editor, and "Reopen as Text" reaches the unchanged in-buffer marker flow.
 
