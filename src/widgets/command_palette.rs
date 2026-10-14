@@ -40,6 +40,7 @@ pub enum Command {
     ExpandSelection,
     ShrinkSelection,
     ReplaceInFile,
+    ToggleFindInSelection,
     MergeAcceptCurrent,
     MergeAcceptIncoming,
     MergeAcceptBoth,
@@ -65,6 +66,7 @@ pub enum Command {
     /// Go to Implementations (#843): Cmd+F12, which has no `Ctrl` form
     /// (`Ctrl+F12` is Go to Type Definition).
     GoToImplementations,
+    SwitchHeaderSource,
     RenameSymbol,
     MouseAddCursorAtClick,
     MouseGoToDefinitionAtClick,
@@ -76,6 +78,8 @@ pub enum Command {
     /// Git: Undo Last Commit (#1350): `reset --soft HEAD~1`, its message
     /// back in the Source Control box.
     GitUndoLastCommit,
+    /// Pick a stash and open its changes (#1581).
+    GitViewStash,
     AddCursorAbove,
     AddCursorBelow,
     AddSelectionToNextMatch,
@@ -189,6 +193,8 @@ pub enum Command {
     MacroReplayTimes,
     // --- View / navigation ---
     ShowExplorer,
+    /// View: Focus and Select Breadcrumbs (#1608): the last crumb's picker.
+    FocusBreadcrumbs,
     ShowSearch,
     /// Search: Replace in Files (#860): the Search side bar with its Replace
     /// row expanded and focused.
@@ -305,6 +311,12 @@ pub enum Command {
     CodeqlOpenResultsDirectory,
     RunTestAtCursor,
     DebugTestAtCursor,
+    /// Testing: Run All Tests / Run Tests in Current File / Rerun Failed
+    /// Tests / Rerun Last Run (#1535), VS Code's everyday test commands.
+    TestingRunAll,
+    TestingRunFile,
+    TestingRerunFailed,
+    TestingRerunLast,
     ToggleSideBar,
     ToggleAutoHideSideBar,
     ToggleSecondarySideBar,
@@ -375,6 +387,11 @@ pub enum Command {
     GitContinueOperation,
     GitSkipOperation,
     GitAbortOperation,
+    /// Source Control's Tags menu on the palette (#1582), so each can be
+    /// bound to a key.
+    GitCreateTag,
+    GitPushTags,
+    GitDeleteRemoteTag,
     ToggleTerminalSuggestions,
     ToggleScreenReader,
     OpenKeyboardShortcuts,
@@ -514,6 +531,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ExpandSelection,
     Command::ShrinkSelection,
     Command::ReplaceInFile,
+    Command::ToggleFindInSelection,
     Command::MergeAcceptCurrent,
     Command::MergeAcceptIncoming,
     Command::MergeAcceptBoth,
@@ -537,6 +555,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::GoToDeclaration,
     Command::GoToTypeDefinition,
     Command::GoToImplementations,
+    Command::SwitchHeaderSource,
     Command::RenameSymbol,
     Command::MouseAddCursorAtClick,
     Command::MouseGoToDefinitionAtClick,
@@ -546,6 +565,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::UnstageHunk,
     Command::RevertHunk,
     Command::GitUndoLastCommit,
+    Command::GitViewStash,
     Command::AddCursorAbove,
     Command::AddCursorBelow,
     Command::AddSelectionToNextMatch,
@@ -633,6 +653,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::MacroReplayLast,
     Command::MacroReplayTimes,
     Command::ShowExplorer,
+    Command::FocusBreadcrumbs,
     Command::ShowSearch,
     Command::ReplaceInFiles,
     Command::SearchToggleMatchCase,
@@ -744,6 +765,10 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::CodeqlFocusSideBar,
     Command::CodeqlOpenResultsDirectory,
     Command::RunTestAtCursor,
+    Command::TestingRunAll,
+    Command::TestingRunFile,
+    Command::TestingRerunFailed,
+    Command::TestingRerunLast,
     Command::DebugTestAtCursor,
     Command::ToggleSideBar,
     Command::ToggleAutoHideSideBar,
@@ -799,6 +824,9 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::GitContinueOperation,
     Command::GitSkipOperation,
     Command::GitAbortOperation,
+    Command::GitCreateTag,
+    Command::GitPushTags,
+    Command::GitDeleteRemoteTag,
     Command::ToggleTerminalSuggestions,
     Command::ToggleScreenReader,
     Command::OpenKeyboardShortcuts,
@@ -918,6 +946,7 @@ impl Command {
             Command::ExpandSelection => "Expand Selection",
             Command::ShrinkSelection => "Shrink Selection",
             Command::ReplaceInFile => "Replace in File",
+            Command::ToggleFindInSelection => "Find: Toggle Find in Selection",
             Command::MergeAcceptCurrent => "Merge Conflict: Accept Current",
             Command::MergeAcceptIncoming => "Merge Conflict: Accept Incoming",
             Command::MergeAcceptBoth => "Merge Conflict: Accept Both",
@@ -941,6 +970,7 @@ impl Command {
             Command::GoToDeclaration => "Go to Declaration",
             Command::GoToTypeDefinition => "Go to Type Definition",
             Command::GoToImplementations => "Go to Implementations",
+            Command::SwitchHeaderSource => "C/C++: Switch Header/Source",
             Command::RenameSymbol => "Rename Symbol",
             Command::MouseAddCursorAtClick => "Mouse: Add Cursor at Click",
             Command::MouseGoToDefinitionAtClick => "Mouse: Go to Definition at Click",
@@ -950,6 +980,7 @@ impl Command {
             Command::UnstageHunk => "Git: Unstage Hunk",
             Command::RevertHunk => "Git: Revert Hunk",
             Command::GitUndoLastCommit => "Git: Undo Last Commit",
+            Command::GitViewStash => "Git: View Stash\u{2026}",
             Command::AddCursorAbove => "Add Cursor Above",
             Command::AddCursorBelow => "Add Cursor Below",
             Command::AddSelectionToNextMatch => "Add Selection to Next Find Match",
@@ -1037,6 +1068,7 @@ impl Command {
             Command::MacroReplayLast => "Macro: Replay Last",
             Command::MacroReplayTimes => "Macro: Replay N Times…",
             Command::ShowExplorer => "View: Show Explorer",
+            Command::FocusBreadcrumbs => "View: Focus and Select Breadcrumbs",
             Command::ShowSearch => "View: Show Search",
             Command::ReplaceInFiles => "Search: Replace in Files",
             Command::SearchToggleMatchCase => "Search: Toggle Match Case",
@@ -1150,6 +1182,10 @@ impl Command {
             Command::CodeqlFocusSideBar => "CodeQL: Focus Side Bar",
             Command::CodeqlOpenResultsDirectory => "CodeQL: Open Query Results Directory",
             Command::RunTestAtCursor => "Testing: Run Test at Cursor",
+            Command::TestingRunAll => "Testing: Run All Tests",
+            Command::TestingRunFile => "Testing: Run Tests in Current File",
+            Command::TestingRerunFailed => "Testing: Rerun Failed Tests",
+            Command::TestingRerunLast => "Testing: Rerun Last Run",
             Command::DebugTestAtCursor => "Testing: Debug Test at Cursor",
             Command::ToggleSideBar => "View: Toggle Primary Side Bar",
             Command::ToggleAutoHideSideBar => "View: Toggle Auto-Hide Side Bar",
@@ -1207,6 +1243,9 @@ impl Command {
             Command::GitContinueOperation => "Git: Continue Rebase, Cherry-Pick or Revert",
             Command::GitSkipOperation => "Git: Skip Commit (Rebase, Cherry-Pick or Revert)",
             Command::GitAbortOperation => "Git: Abort Merge, Rebase, Cherry-Pick, Revert or Bisect",
+            Command::GitCreateTag => "Git: Create Tag",
+            Command::GitPushTags => "Git: Push Tags",
+            Command::GitDeleteRemoteTag => "Git: Delete Remote Tag",
             Command::ToggleTerminalSuggestions => "Terminal: Toggle Command Suggestions",
             Command::ToggleScreenReader => "Accessibility: Toggle Screen Reader Mode",
             Command::OpenKeyboardShortcuts => "Preferences: Open Keyboard Shortcuts",
@@ -1319,6 +1358,7 @@ impl Command {
             Command::ExpandSelection => "Shift+Alt+\u{2192}",
             Command::ShrinkSelection => "Shift+Alt+\u{2190}",
             Command::ReplaceInFile => "Cmd+Opt+F",
+            Command::ToggleFindInSelection => "Alt+L",
             Command::ToggleAutoSave => "",
             Command::ToggleAutoSaveOnFocusChange => "",
             Command::ToggleInlineBlame => "",
@@ -1356,6 +1396,7 @@ impl Command {
             Command::GoToDeclaration => "Ctrl+Shift+F12",
             Command::GoToTypeDefinition => "Ctrl+F12",
             Command::GoToImplementations => "Cmd+F12",
+            Command::SwitchHeaderSource => "Alt+O",
             Command::RenameSymbol => "F2",
             Command::MouseAddCursorAtClick => "",
             Command::MouseGoToDefinitionAtClick => "",
@@ -1365,6 +1406,7 @@ impl Command {
             Command::UnstageHunk => "U in diff",
             Command::RevertHunk => "R in diff",
             Command::GitUndoLastCommit => "",
+            Command::GitViewStash => "",
             Command::AddCursorAbove => "Cmd+Opt+↑",
             Command::AddCursorBelow => "Cmd+Opt+↓",
             Command::AddSelectionToNextMatch => "Cmd+D",
@@ -1448,6 +1490,7 @@ impl Command {
             Command::MacroReplayLast => "",
             Command::MacroReplayTimes => "",
             Command::ShowExplorer => "Cmd+Shift+E",
+            Command::FocusBreadcrumbs => "Cmd+Shift+.",
             Command::ShowSearch => "Cmd+Shift+F",
             Command::ReplaceInFiles => "Cmd+Shift+H",
             // VS Code's search-input keys, live while a Search input has
@@ -1563,6 +1606,10 @@ impl Command {
             Command::CodeqlFocusSideBar => "",
             Command::CodeqlOpenResultsDirectory => "",
             Command::RunTestAtCursor => "Cmd+K Enter",
+            Command::TestingRunAll => "",
+            Command::TestingRunFile => "",
+            Command::TestingRerunFailed => "",
+            Command::TestingRerunLast => "",
             Command::DebugTestAtCursor => "Cmd+K Shift+Enter",
             Command::ToggleSideBar => "Cmd+B",
             Command::ToggleAutoHideSideBar => "",
@@ -1621,6 +1668,9 @@ impl Command {
             Command::GitContinueOperation => "",
             Command::GitSkipOperation => "",
             Command::GitAbortOperation => "",
+            Command::GitCreateTag => "",
+            Command::GitPushTags => "",
+            Command::GitDeleteRemoteTag => "",
             Command::ToggleTerminalSuggestions => "",
             Command::ToggleScreenReader => "",
             Command::OpenKeyboardShortcuts => "Cmd+K Cmd+S",
@@ -1728,6 +1778,7 @@ impl Command {
             Command::ExpandSelection => "expand_selection",
             Command::ShrinkSelection => "shrink_selection",
             Command::ReplaceInFile => "replace_in_file",
+            Command::ToggleFindInSelection => "toggle_find_in_selection",
             Command::MergeAcceptCurrent => "merge_accept_current",
             Command::MergeAcceptIncoming => "merge_accept_incoming",
             Command::MergeAcceptBoth => "merge_accept_both",
@@ -1751,6 +1802,7 @@ impl Command {
             Command::GoToDeclaration => "go_to_declaration",
             Command::GoToTypeDefinition => "go_to_type_definition",
             Command::GoToImplementations => "go_to_implementations",
+            Command::SwitchHeaderSource => "switch_header_source",
             Command::RenameSymbol => "rename_symbol",
             Command::MouseAddCursorAtClick => "mouse_add_cursor_at_click",
             Command::MouseGoToDefinitionAtClick => "mouse_go_to_definition_at_click",
@@ -1760,6 +1812,7 @@ impl Command {
             Command::UnstageHunk => "unstage_hunk",
             Command::RevertHunk => "revert_hunk",
             Command::GitUndoLastCommit => "git_undo_last_commit",
+            Command::GitViewStash => "git_view_stash",
             Command::AddCursorAbove => "add_cursor_above",
             Command::AddCursorBelow => "add_cursor_below",
             Command::AddSelectionToNextMatch => "add_selection_to_next_match",
@@ -1847,6 +1900,7 @@ impl Command {
             Command::MacroReplayLast => "macro_replay_last",
             Command::MacroReplayTimes => "macro_replay_times",
             Command::ShowExplorer => "show_explorer",
+            Command::FocusBreadcrumbs => "breadcrumbs_focus_and_select",
             Command::ShowSearch => "show_search",
             Command::ReplaceInFiles => "replace_in_files",
             Command::SearchToggleMatchCase => "search_toggle_match_case",
@@ -1958,6 +2012,10 @@ impl Command {
             Command::CodeqlFocusSideBar => "codeql_focus_side_bar",
             Command::CodeqlOpenResultsDirectory => "codeql_open_results_directory",
             Command::RunTestAtCursor => "run_test_at_cursor",
+            Command::TestingRunAll => "testing_run_all",
+            Command::TestingRunFile => "testing_run_file",
+            Command::TestingRerunFailed => "testing_rerun_failed",
+            Command::TestingRerunLast => "testing_rerun_last",
             Command::DebugTestAtCursor => "debug_test_at_cursor",
             Command::ToggleSideBar => "toggle_side_bar",
             Command::ToggleAutoHideSideBar => "toggle_auto_hide_side_bar",
@@ -2013,6 +2071,9 @@ impl Command {
             Command::GitContinueOperation => "git_continue_operation",
             Command::GitSkipOperation => "git_skip_operation",
             Command::GitAbortOperation => "git_abort_operation",
+            Command::GitCreateTag => "git_create_tag",
+            Command::GitPushTags => "git_push_tags",
+            Command::GitDeleteRemoteTag => "git_delete_remote_tag",
             Command::ToggleTerminalSuggestions => "toggle_terminal_suggestions",
             Command::ToggleScreenReader => "toggle_screen_reader",
             Command::OpenKeyboardShortcuts => "open_keyboard_shortcuts",
@@ -2212,6 +2273,9 @@ pub struct CommandPalette {
     /// tab). They stay commands: keybindings.json and the Keyboard
     /// Shortcuts editor still reach them.
     pub hidden: Vec<Command>,
+    /// Shortcuts that differ from a command's built-in hint (#1482): the
+    /// user's own chord, or empty where a user binding took the chord.
+    pub hint_overrides: Vec<(Command, String)>,
     pub selected: usize,
     pub scroll: usize,
     pub last_rect: Rect,
@@ -2226,6 +2290,7 @@ impl CommandPalette {
             results: Vec::new(),
             extensions: Vec::new(),
             hidden: Vec::new(),
+            hint_overrides: Vec::new(),
             selected: 0,
             scroll: 0,
             last_rect: Rect::default(),
@@ -2233,6 +2298,17 @@ impl CommandPalette {
         };
         me.refresh_results();
         me
+    }
+
+    /// The shortcut shown beside `item`: an override from the user's
+    /// keybindings (#1482), else the built-in hint as this platform spells it.
+    pub fn hint_for(&self, item: &PaletteItem) -> std::borrow::Cow<'static, str> {
+        if let PaletteItem::Builtin(cmd) = item
+            && let Some((_, hint)) = self.hint_overrides.iter().find(|(c, _)| c == cmd)
+        {
+            return std::borrow::Cow::Owned(hint.clone());
+        }
+        platform_hint(item.keybinding_hint())
     }
 
     /// Inject the extension-contributed commands to interleave into the list,
@@ -2554,7 +2630,7 @@ pub fn render_command_palette(
         };
         let prefix = if is_selected { "> " } else { "  " };
         let title = crate::i18n::tr(cmd.title());
-        let hint = platform_hint(cmd.keybinding_hint());
+        let hint = palette.hint_for(cmd);
         // Right-align the keybinding hint: pad between the title and the hint
         // so the chord sits at the row's right edge, like VS Code.
         let used = 2 + title.chars().count() + hint.chars().count();
