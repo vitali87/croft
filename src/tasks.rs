@@ -529,6 +529,7 @@ fn package_json_tasks(root: &Path) -> Vec<Task> {
                 is_build: false,
                 is_default: false,
                 problem_matcher: None,
+                is_background: false,
                 vscode: Some(VscodeCommand {
                     command: runner.to_string(),
                     // A script name can hold shell syntax (`check;false`);
