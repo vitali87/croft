@@ -1034,6 +1034,7 @@ mod tests {
             severity,
             message: message.into(),
             tags: Default::default(),
+            code: None,
         };
         let now = Instant::now();
         let mut check = ProposalCheck {
