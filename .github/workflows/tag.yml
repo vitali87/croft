@@ -4,14 +4,27 @@ name: tag
 #
 # version-bump.yml folds every merge's pending release notes into a
 # `chore: release <version>` commit on main, so the version at that commit
-# names the binary it ships. This job turns it into `v<version>` on that commit
-# and starts release.yml for it, so a released version is published rather
-# than a number waiting for someone to remember to cut it.
+# names the binary it ships. This job turns it into `v<version>` on that
+# commit, and that is all it does.
 #
-# Any other push to main (the merge itself, or one that ships nothing) still
-# carries the previous version, and that version's tag already exists on the
-# commit that introduced it. Moving it would change what a published release
-# points at, so such a push is reported and left alone.
+# It does not start release.yml. publish-crate.yml decides which versions are
+# released (every PUBLISH_EVERY bumps, as code-graph-rag does) and sends each
+# one to crates.io and to release.yml together, so crates.io and the GitHub
+# releases hold the same versions (#1579). When this job started release.yml
+# too, every version got a GitHub release and only every fiftieth reached
+# crates.io.
+#
+# Only the commit that set a version is tagged: the one whose first parent
+# carries another version. Any other push to main (the merge itself, or one
+# that ships nothing) still carries a version an earlier commit set, and its
+# code is not that version's. publish-crate.yml publishes the commit that set
+# the version, found by the same comparison (`scripts/release.py commit`),
+# and refuses a tag on any other, so a later merge whose run executes before
+# the release commit's own (or after that one failed) is reported and left
+# untagged rather than taking the tag. A release commit whose run failed is
+# tagged by re-running that run, or by publish-crate.yml when it publishes
+# the version. An existing tag is never moved: that would change what a
+# published release points at.
 
 on:
   push:
@@ -19,9 +32,12 @@ on:
 
 # Two merges in quick succession must not race to read "no tag yet" for the
 # same version. Queued, not cancelled: a cancelled run is a merge left untagged.
+# By default a group keeps one pending run and a newer one replaces it (tag
+# runs were cancelled that way), so every queued run waits its turn instead.
 concurrency:
   group: tag-main
   cancel-in-progress: false
+  queue: max
 
 permissions:
   contents: read
@@ -31,39 +47,46 @@ jobs:
     name: tag the merged version
     runs-on: ubuntu-latest
     permissions:
-      # Read Cargo.toml at the merge commit and create the tag ref.
+      # Read Cargo.toml at the merge commit and create the tag ref. A tag
+      # created with github.token fires no `push: tags` workflow, so this
+      # starts no release.
       contents: write
-      # Dispatch release.yml. A tag created with github.token does not fire
-      # `push: tags` workflows (GitHub suppresses token-triggered runs to
-      # avoid recursion), but workflow_dispatch is exempt from that rule.
-      actions: write
     # No checkout and no action: with this token, the job runs only the
     # runner's own `gh`, every REST call pinned to an API version, so nothing
     # it executes can change without a diff here. scripts/check_tag_workflow.py
     # holds it to that.
     steps:
-      - name: Create v<version> on this commit and start the release
+      - name: Create v<version> on this commit
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           api() { gh api -H "X-GitHub-Api-Version: 2026-03-10" "$@"; }
-          version="$(api -H "Accept: application/vnd.github.raw+json" \
-            "repos/$GITHUB_REPOSITORY/contents/Cargo.toml?ref=$GITHUB_SHA" \
-            | sed -n 's/^version *= *"\([0-9.]*\)".*/\1/p' | head -n1)"
+          version_at() {
+            api -H "Accept: application/vnd.github.raw+json" \
+              "repos/$GITHUB_REPOSITORY/contents/Cargo.toml?ref=$1" \
+              | sed -n 's/^version *= *"\([0-9.]*\)".*/\1/p' | head -n1
+          }
+          version="$(version_at "$GITHUB_SHA")"
           if [ -z "$version" ]; then
             echo "::error file=Cargo.toml::could not read the package version"
             exit 1
           fi
           tag="v$version"
+          # The first parent is main as it was before this push. If it
+          # already carries the version, this commit did not set it.
+          parent="$(api "repos/$GITHUB_REPOSITORY/git/commits/$GITHUB_SHA" --jq '.parents[0].sha // ""')"
+          if [ -n "$parent" ]; then
+            before="$(version_at "$parent")"
+            if [ "$before" = "$version" ]; then
+              echo "::notice::$GITHUB_SHA did not set version $version (its first parent $parent carries it too), so it is not tagged $tag; the commit that set it is."
+              exit 0
+            fi
+          fi
           if existing="$(api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha 2>/dev/null)"; then
-            echo "::notice::$tag already exists ($existing); this merge did not bump the version, so there is no new release to tag."
+            echo "::notice::$tag already exists ($existing), and an existing tag is never moved."
             exit 0
           fi
           api "repos/$GITHUB_REPOSITORY/git/refs" \
             -f ref="refs/tags/$tag" -f sha="$GITHUB_SHA" >/dev/null
           echo "Tagged $GITHUB_SHA as $tag"
-          # API version 2026-03-10 answers a dispatch with the run it created.
-          run="$(api "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/dispatches" \
-            -f ref="$tag" --jq .html_url)"
-          echo "Started release.yml for $tag: $run"
