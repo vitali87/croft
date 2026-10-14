@@ -2903,11 +2903,13 @@ mod tests {
             [
                 (
                     String::from("ctrl+alt+e"),
-                    String::from("add_cursors_to_line_ends")
+                    String::from("add_cursors_to_line_ends"),
+                    None
                 ),
                 (
                     String::from("ctrl+alt+l"),
-                    String::from("select_all_occurrences")
+                    String::from("select_all_occurrences"),
+                    None
                 ),
             ]
         );
