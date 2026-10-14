@@ -325,6 +325,28 @@ struct ChromeLayout {
     sidebar_splitter_x: Option<u16>,
 }
 
+/// The editor rect for Centered Layout (#1585): `width` columns in the
+/// middle of `area`, or all of `area` when it is no wider than that.
+fn centered_editor_rect(area: Rect, width: u16) -> Rect {
+    if width == 0 || area.width <= width {
+        return area;
+    }
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        width,
+        ..area
+    }
+}
+
+/// The words the Zen hint shows, with the platform's command key (#1585).
+fn zen_hint_text() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Zen Mode: Cmd+K Z or Esc Esc to exit"
+    } else {
+        "Zen Mode: Ctrl+K Z or Esc Esc to exit"
+    }
+}
+
 /// Pure horizontal layout of the workspace chrome within `main`. Column order
 /// follows the primary side bar's position (the activity bar always flanks the
 /// primary side bar on its outer edge, like VS Code):
@@ -1427,6 +1449,8 @@ enum MenuAction {
     SetQuickInputPosition(QuickInputPosition),
     /// Customize Layout: toggle Zen Mode (hide all chrome / restore).
     ToggleZenMode,
+    /// Customize Layout: centre the editor (#1585).
+    ToggleCenteredLayout,
     /// Run the active editor's code lens at this index (#608).
     RunCodeLens(usize),
     /// Terminal pane right-click: rename the pane at `idx`.
@@ -1590,12 +1614,35 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
     }
 }
 
+/// The command a menu row runs, when it is one (#1562), so the row can show
+/// the chord a user bound to that command.
+fn menu_action_command(action: &MenuAction) -> Option<crate::widgets::command_palette::Command> {
+    use crate::widgets::command_palette::Command as Cmd;
+    Some(match action {
+        MenuAction::ClearTerminal(_) => Cmd::TerminalClear,
+        MenuAction::RenameTerminal(_) => Cmd::TerminalRename,
+        MenuAction::TerminalQuickSelect => Cmd::TerminalQuickSelect,
+        MenuAction::TerminalCopyMode => Cmd::TerminalCopyMode,
+        MenuAction::TerminalCommandHistory => Cmd::TerminalCommandHistory,
+        MenuAction::OpenScrollbackInEditor => Cmd::TerminalOpenScrollback,
+        _ => return None,
+    })
+}
+
+/// The hint on a menu row's right: the user's own chord for the command the
+/// row runs, else the built-in one.
+fn menu_hint(action: &MenuAction, keymap: &crate::keymap::Keymap) -> Option<String> {
+    menu_action_command(action)
+        .and_then(|cmd| keymap.chord_for(cmd))
+        .or_else(|| shortcut_for(action).map(str::to_string))
+}
+
 /// Display width (in cells) a menu entry needs: its label plus the right-aligned
 /// shortcut hint (items) or the `▸` submenu indicator. Dividers need none.
-fn menu_entry_width(entry: &MenuEntry) -> usize {
+fn menu_entry_width(entry: &MenuEntry, keymap: &crate::keymap::Keymap) -> usize {
     match entry {
         MenuEntry::Item { label, action } => {
-            let shortcut = shortcut_for(action)
+            let shortcut = menu_hint(action, keymap)
                 .map(|s| s.chars().count() + 2)
                 .unwrap_or(0);
             label.chars().count() + shortcut
@@ -1649,6 +1696,9 @@ struct CompoundLaunch {
 enum MemberOutcome {
     /// Started, and now in the running set.
     Launched,
+    /// Its `cargo` build is running (#1392); it joins the set when the
+    /// build lands.
+    Building,
     /// Not started: it declares a `preLaunchTask` of its own, and croft's
     /// parking is one-at-a-time, so the task cannot be run as part of a set.
     /// Launching regardless would debug whatever the last build left behind.
@@ -2945,6 +2995,17 @@ type PendingTestDebug = (
     PathBuf,
 );
 
+/// A CodeLLDB `cargo` launch building its program on a background thread
+/// (#1392): the receiver for the executable (or the build error), the
+/// config to launch with it, the slot it launches into, and the workspace
+/// root it builds for (so a re-root mid-build discards the binary).
+type PendingCargoLaunch = (
+    std::sync::mpsc::Receiver<Result<PathBuf, String>>,
+    Box<crate::dap::configs::ResolvedConfig>,
+    LaunchSlot,
+    PathBuf,
+);
+
 /// The test run Testing: Rerun Last Run repeats (#1535), as it was asked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum LastTestRun {
@@ -3359,6 +3420,23 @@ pub struct App {
     /// Layout: Zen Mode hides the activity bar, both side bars, the panel,
     /// and the status bar; toggling off restores `pre_zen`.
     zen_mode: bool,
+    /// View: Toggle Centered Layout (#1585), persisted: the editor keeps
+    /// `centered_layout_width` columns in the middle of its column.
+    centered_layout: bool,
+    /// Zen Mode starts centred (`zen_center_layout`, persisted, on by
+    /// default), as VS Code's `zenMode.centerLayout`.
+    zen_center_layout: bool,
+    /// Whether this Zen session is centred: `zen_center_layout` on entry,
+    /// until Toggle Centered Layout turns it off.
+    zen_centered: bool,
+    /// The centred editor's width in columns (#1585).
+    centered_layout_width: u16,
+    /// When the last Esc in Zen Mode that did nothing else landed: a
+    /// second such Esc inside [`ZEN_ESC_WINDOW`] leaves Zen (#1585).
+    zen_esc_at: Option<std::time::Instant>,
+    /// Until when the "how to leave Zen" hint shows (#1585). Zen hides the
+    /// status bar, so the hint draws on its own.
+    zen_hint_until: Option<std::time::Instant>,
     /// Auto-hide the sidebar when focus moves to the editor or a terminal
     /// (#260, `sidebar_auto_hide`). Off by default. The sidebar comes back
     /// on any deliberate sidebar action — Cmd+B, an activity-bar icon, or a
@@ -3817,6 +3895,17 @@ pub struct App {
     /// One Jupyter kernel per notebook that has run a cell (#355), by path.
     /// Dropping one (the map entry going) shuts its kernel down.
     notebook_kernels: std::collections::HashMap<PathBuf, crate::notebook_kernel::NotebookRun>,
+    /// Notebook: Select Kernel asking for the installed kernels (#1377):
+    /// the notebook it is for and the bridge listing them.
+    kernel_listing: Option<(PathBuf, crate::notebook_kernel::KernelSession)>,
+    /// The kernel picker's notebook, the kernelspecs its rows name, and
+    /// the kernel the notebook asked for that is not installed, if that is
+    /// why it opened.
+    kernel_choice: Option<(
+        PathBuf,
+        Vec<crate::notebook_kernel::KernelSpec>,
+        Option<String>,
+    )>,
     /// When the shown coverage report was taken, the file its editor lens
     /// was built for, and the install command a missing coverage tool
     /// needs (#263).
@@ -4909,6 +4998,11 @@ pub struct App {
     /// name rides along for the launch. Drained per tick; a second request
     /// while one is pending is refused with a status line.
     pending_test_debug: Option<PendingTestDebug>,
+    /// CodeLLDB `cargo` launches building their programs on background
+    /// threads (#1392): each receiver yields the executable (or the build
+    /// error), and its config launches into its slot when it lands. One per
+    /// compound member that builds; Stop Debugging drops them all.
+    pending_cargo_launches: Vec<PendingCargoLaunch>,
     /// Variable `variablesReference`s the user has expanded in the Variables
     /// panel. Persisted across polls so re-fetched variables stay open.
     pub debug_expanded: std::collections::HashSet<i64>,
@@ -5082,6 +5176,11 @@ pub struct App {
     #[allow(clippy::type_complexity)]
     pair_spawn_override:
         Option<Box<dyn Fn(&crate::pair::PairConfig) -> anyhow::Result<crate::pair_host::PairHost>>>,
+    /// Test seam: the kernel bridge Select Kernel starts, by kernel name
+    /// (the real one runs Python).
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    kernel_start_override: Option<Box<dyn Fn(&str) -> crate::notebook_kernel::KernelSession>>,
     /// Rolling log of git commands croft has run and their summaries, shown
     /// read-only by the "Show Git Output" action (VS Code's Git channel).
     pub git_output_log: Vec<String>,
@@ -5454,6 +5553,11 @@ const EDITOR_HEIGHT_MIN: u16 = 3;
 /// the workspace would be unusably squeezed, so the band collapses instead.
 const OSK_MIN_FRAME_HEIGHT: u16 = 16;
 const RIGHT_PANE_MIN: u16 = 20;
+/// Two Escapes in Zen Mode this close together leave it (#1585), the
+/// double-press window croft's clicks use too.
+const ZEN_ESC_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long the "how to leave Zen" hint shows after entering it (#1585).
+const ZEN_HINT_FOR: std::time::Duration = std::time::Duration::from_secs(4);
 /// Minimum width of the zoxide jump popup. The Explorer column it anchors
 /// over is typically ~32 cells, too narrow to read frecency paths like
 /// `~/Documents/platform/app/...`, so the box widens rightward to at least
@@ -6067,6 +6171,12 @@ impl App {
             panel_alignment: layout_prefs.panel_alignment,
             quick_input_position: layout_prefs.quick_input_position,
             zen_mode: false,
+            centered_layout: layout_prefs.centered_layout,
+            zen_center_layout: layout_prefs.zen_center_layout,
+            zen_centered: false,
+            centered_layout_width: layout_prefs.centered_layout_width,
+            zen_esc_at: None,
+            zen_hint_until: None,
             sidebar_auto_hide: loaded_prefs.sidebar_auto_hide,
             sidebar_auto_hide_suspended: false,
             sidebar_pinned_open: false,
@@ -6224,6 +6334,8 @@ impl App {
             approval_edit: None,
             approval_merge_into: None,
             notebook_kernels: std::collections::HashMap::new(),
+            kernel_listing: None,
+            kernel_choice: None,
             coverage_at: None,
             coverage_lens_path: None,
             coverage_install: None,
@@ -6473,6 +6585,7 @@ impl App {
             pending_debug_launch: None,
             pending_attach: None,
             pending_test_debug: None,
+            pending_cargo_launches: Vec::new(),
             debug_expanded: std::collections::HashSet::new(),
             watch_exprs: Vec::new(),
             watch_vals: std::collections::HashMap::new(),
@@ -6521,6 +6634,8 @@ impl App {
             proactive_scanned: std::collections::HashMap::new(),
             #[cfg(test)]
             pair_spawn_override: None,
+            #[cfg(test)]
+            kernel_start_override: None,
             collab_labels_visible: false,
             git_output_log: Vec::new(),
             build_diagnostics: std::collections::HashMap::new(),
@@ -9133,6 +9248,12 @@ impl App {
             .and_then(|p| self.roots.owning_root(p))
             .unwrap_or_else(|| self.roots.primary())
             .to_path_buf()
+    }
+
+    /// Every workspace folder as `(name, root)`, for a compound member's
+    /// `"folder"` and `${workspaceFolder:name}` (#1425).
+    fn workspace_folders(&self) -> Vec<(String, PathBuf)> {
+        crate::dap::configs::workspace_folders(self.roots.iter())
     }
 
     /// Feed the Source Control empty state the repos one folder below the
@@ -13210,6 +13331,10 @@ impl App {
                 format!("{}Zen Mode", check(self.zen_mode)),
                 MenuAction::ToggleZenMode,
             ),
+            MenuEntry::item(
+                format!("{}Centered Layout", check(self.centered_layout_active())),
+                MenuAction::ToggleCenteredLayout,
+            ),
         ]
     }
 
@@ -13263,6 +13388,9 @@ impl App {
             secondary_side_bar: self.secondary_side_bar_visible,
             panel_alignment: self.panel_alignment,
             quick_input_position: self.quick_input_position,
+            centered_layout: self.centered_layout,
+            zen_center_layout: self.zen_center_layout,
+            centered_layout_width: self.centered_layout_width,
         });
     }
 
@@ -13442,6 +13570,8 @@ impl App {
             self.secondary_side_bar_visible = prev.secondary_side_bar;
             self.show_terminal = prev.panel;
             self.zen_mode = false;
+            self.zen_esc_at = None;
+            self.zen_hint_until = None;
             self.status = String::from("Zen Mode off");
         } else {
             self.pre_zen = Some(PreZenLayout {
@@ -13471,9 +13601,93 @@ impl App {
             self.secondary_side_bar_visible = false;
             self.show_terminal = false;
             self.zen_mode = true;
+            self.zen_centered = self.zen_center_layout;
+            self.zen_esc_at = None;
+            self.zen_hint_until = Some(std::time::Instant::now() + ZEN_HINT_FOR);
             self.status = String::from("Zen Mode on");
         }
         self.after_chrome_visibility_change();
+    }
+
+    /// Whether the editor is centred this frame (#1585): Toggle Centered
+    /// Layout, or a Zen session that started centred.
+    fn centered_layout_active(&self) -> bool {
+        self.centered_layout || (self.zen_mode && self.zen_centered)
+    }
+
+    /// View: Toggle Centered Layout (#1585). Off turns off both the setting
+    /// and a centred Zen session, so the toggle always flips what is on
+    /// screen; the setting persists, Zen's own centring does not.
+    fn toggle_centered_layout(&mut self) {
+        if self.centered_layout_active() {
+            self.centered_layout = false;
+            self.zen_centered = false;
+        } else {
+            self.centered_layout = true;
+        }
+        self.status = String::from(if self.centered_layout_active() {
+            "Centered Layout on"
+        } else {
+            "Centered Layout off"
+        });
+        self.persist_layout();
+    }
+
+    /// One Esc reached Zen Mode's editor and closed or cleared nothing
+    /// (#1585): the second inside [`ZEN_ESC_WINDOW`] leaves Zen, as VS
+    /// Code's Esc Esc does.
+    fn note_idle_zen_esc(&mut self, now: std::time::Instant) {
+        match self.zen_esc_at.take() {
+            Some(at) if now.saturating_duration_since(at) <= ZEN_ESC_WINDOW => {
+                self.toggle_zen_mode();
+            }
+            _ => self.zen_esc_at = Some(now),
+        }
+    }
+
+    /// What an Esc in the editor can close or clear (#1585), compared
+    /// across one Esc to tell an Esc that did something from one that did
+    /// nothing. Only an Esc that did nothing counts toward Esc Esc.
+    fn esc_fingerprint(&self) -> impl PartialEq + use<> {
+        (
+            (
+                self.focus,
+                self.zen_mode,
+                self.modal_overlay_open(),
+                self.context_menu.is_some(),
+                self.prompt.is_some(),
+                self.peek_popup.is_some(),
+                self.hover_popup.is_some(),
+                self.completion_popup.is_some(),
+                self.signature_help_popup.is_some(),
+            ),
+            (
+                self.editor.selection,
+                self.editor.has_multi_cursor(),
+                self.editor.snippet_active(),
+                self.editor
+                    .markdown_preview
+                    .as_ref()
+                    .map(|md| md.has_selection()),
+                self.status.clone(),
+            ),
+            (
+                self.editor.comment_focus.is_some(),
+                self.vim.enabled,
+                self.vim.mode(),
+                self.vim.has_pending(),
+            ),
+        )
+    }
+
+    /// Drop the Zen hint once its time is up; true when it just went, so
+    /// the frame without it is drawn (#1585).
+    fn expire_zen_hint(&mut self, now: std::time::Instant) -> bool {
+        if self.zen_hint_until.is_some_and(|until| now >= until) {
+            self.zen_hint_until = None;
+            return true;
+        }
+        false
     }
 
     /// Replace the gear menu with the Color Theme picker: one row per theme,
@@ -13903,6 +14117,13 @@ impl App {
         self.hover_diagnostic = None;
         self.editor.open_preview(path)?;
         self.sync_open_file_poll_mtime();
+        self.place_caret_at(row, col);
+        Ok(())
+    }
+
+    /// Put the active editor's caret at the 0-based `row` and `col`, clamped
+    /// to the text, scroll it to mid-screen and focus the editor.
+    pub fn place_caret_at(&mut self, row: usize, col: usize) {
         let row = row.min(self.editor.lines.len().saturating_sub(1));
         let max_col = self
             .editor
@@ -13918,7 +14139,6 @@ impl App {
         self.editor.ensure_cursor_col_visible();
         self.focus_pane(Pane::Editor);
         self.poke_cursor();
-        Ok(())
     }
 
     /// The active editor's position as a NavLoc, for threading through
@@ -14255,6 +14475,35 @@ impl App {
         } else {
             self.status = format!("Selected {n} occurrences (type to replace, Esc to cancel)");
         }
+    }
+
+    /// VS Code "Select All Occurrences of Find Match" (`Cmd+Shift+L`,
+    /// #1558): a selection on every match of the selection, or of the word
+    /// at the caret.
+    fn select_all_occurrences(&mut self) {
+        if self.editor.has_non_text_view() {
+            return;
+        }
+        let n = self.editor.select_all_occurrences();
+        self.status = if n == 0 {
+            String::from("Nothing to select: select text on one line, or put the caret on a word")
+        } else {
+            format!("Selected {n} occurrences (type to replace, Esc to cancel)")
+        };
+    }
+
+    /// VS Code "Add Cursors to Line Ends" (`Shift+Alt+I`, #1558): a caret at
+    /// the end of each selected line.
+    fn add_cursors_to_line_ends(&mut self) {
+        if self.editor.has_non_text_view() {
+            return;
+        }
+        let n = self.editor.add_cursors_to_line_ends();
+        self.status = if n == 0 {
+            String::from("Select the lines to put cursors at the ends of")
+        } else {
+            format!("{n} cursors at line ends")
+        };
     }
 
     /// VS Code "Add Selection to Next Find Match" (`Cmd+D`): select the word
@@ -17087,6 +17336,60 @@ impl App {
         });
     }
 
+    /// A terminal action run as a command (#1562): from the palette, a
+    /// `keybindings.json` chord or an imported VS Code one. Each acts on the
+    /// active pane, showing the panel when it was hidden, as its chord and
+    /// menu row do; those that take the keyboard (rename, copy mode, quick
+    /// select, history) also focus the terminal and bring its tab to the
+    /// front, since another bottom-panel tab would hide the mode and take
+    /// its keys.
+    fn run_terminal_command(&mut self, cmd: crate::widgets::command_palette::Command) {
+        use crate::widgets::command_palette::Command as Cmd;
+        self.show_terminal = true;
+        let idx = self.active_terminal;
+        match cmd {
+            Cmd::TerminalClear => self.clear_terminal_at(idx),
+            Cmd::TerminalRename => self.begin_rename_terminal(idx),
+            Cmd::TerminalKill => {
+                if self.close_terminal_at(idx) {
+                    self.terminal_status(format!(
+                        "Closed terminal: {} remaining",
+                        self.terminals.len()
+                    ));
+                } else {
+                    self.status =
+                        String::from("Cannot close the last terminal; press Ctrl+J to hide");
+                }
+            }
+            Cmd::TerminalSplit => match self.split_terminal() {
+                Ok(()) => {
+                    self.terminal_status(format!(
+                        "Split terminal: {} active",
+                        self.terminals.len()
+                    ));
+                }
+                Err(e) => {
+                    self.status = format!("Split terminal failed: {e}");
+                }
+            },
+            Cmd::TerminalNewWithProfile => self.open_terminal_profile_picker(idx),
+            Cmd::TerminalQuickSelect => {
+                self.set_bottom_panel_tab(BottomPanelTab::Terminal);
+                self.open_terminal_quick_select();
+            }
+            Cmd::TerminalCopyMode => {
+                self.set_bottom_panel_tab(BottomPanelTab::Terminal);
+                self.open_terminal_copy_mode();
+            }
+            Cmd::TerminalCommandHistory => {
+                self.set_bottom_panel_tab(BottomPanelTab::Terminal);
+                self.open_command_history();
+            }
+            Cmd::TerminalOpenScrollback => self.open_scrollback_in_editor(),
+            _ => {}
+        }
+    }
+
     /// Clear the terminal at `idx`'s screen and scrollback (Cmd+K K / menu).
     fn clear_terminal_at(&mut self, idx: usize) {
         if let Some(t) = self.terminals.get_mut(idx) {
@@ -17311,7 +17614,14 @@ impl App {
         // rather than tested.
         let reply = match crate::view_ipc::read_request(&stream, deadline) {
             Ok(req) if req.probe => self.probe_view_path(&req.to_path()),
-            Ok(req) => self.apply_view_request(&req.to_path()),
+            Ok(req) => {
+                let reply = self.apply_view_request(&req.to_path());
+                // `croft edit file:line[:col]` (#1606).
+                if let (crate::view_ipc::ViewReply::Ok, Some((row, col))) = (&reply, req.at) {
+                    self.place_caret_at(row, col);
+                }
+                reply
+            }
             Err(e) => crate::view_ipc::ViewReply::Err {
                 message: format!("unreadable request: {e}"),
             },
@@ -19835,6 +20145,13 @@ impl App {
             self.terminal_splitter_y = None;
             (right_area, None, None)
         };
+        // Centered Layout (#1585): the editor keeps its width in the middle
+        // of the column and the margins stay plain background.
+        let editor_area = if self.centered_layout_active() {
+            centered_editor_rect(editor_area, self.centered_layout_width)
+        } else {
+            editor_area
+        };
 
         if let Some(activity_area) = activity_area {
             self.render_activity_bar(frame, activity_area);
@@ -21274,6 +21591,7 @@ impl App {
         }
         self.render_port_toast(frame);
         self.render_update_toast(frame);
+        self.render_zen_hint(frame);
         self.render_context_menu(frame);
         self.render_commit_dropdown(frame);
         self.render_prompt(frame);
@@ -21513,7 +21831,7 @@ impl App {
             };
             let (label, right_hint) = match entry {
                 MenuEntry::Item { label, action } => {
-                    (label.as_str(), shortcut_for(action).map(str::to_string))
+                    (label.as_str(), menu_hint(action, &self.keymap))
                 }
                 // A submenu parent shows the ▸ where a shortcut would sit.
                 MenuEntry::Submenu { label, .. } => {
@@ -22417,6 +22735,47 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+    }
+
+    /// Zen Mode hides the status bar, so for a few seconds after entering
+    /// it a box at the bottom says how to leave (#1585).
+    fn render_zen_hint(&self, frame: &mut ratatui::Frame) {
+        if !self.zen_mode
+            || !self
+                .zen_hint_until
+                .is_some_and(|until| std::time::Instant::now() < until)
+        {
+            return;
+        }
+        let text = zen_hint_text();
+        let area = frame.area();
+        let width = text.chars().count() as u16 + 4;
+        let height: u16 = 3;
+        if area.width < width || area.height < height + 1 {
+            return;
+        }
+        let rect = Rect {
+            x: area.x + (area.width - width) / 2,
+            y: area.y + area.height - height - 1,
+            width,
+            height,
+        };
+        let accent = self.theme.accent();
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::default().fg(accent))
+            .style(Style::default().bg(self.theme.editor_bg()));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(ratatui::text::Span::styled(
+                text,
+                Style::default().fg(accent),
+            ))
+            .alignment(ratatui::layout::Alignment::Center)
+            .block(block),
+            rect,
+        );
     }
 
     /// Paint the transient port-detection toast in the bottom-right corner and
@@ -23427,6 +23786,8 @@ impl App {
     /// built-in defaults call their app methods directly, so a command-level
     /// recorder would miss most of what a user does.
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        self.editor.sync_occurrence_word_sel();
+
         // A key press means the status message has been seen: the right-hand
         // cluster takes its room back (#1609).
         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -23442,7 +23803,23 @@ impl App {
         }
         let capture =
             self.macro_recording.is_some() && !self.macro_replaying && self.focus == Pane::Editor;
+        // Esc Esc leaves Zen Mode (#1585), counting only Escapes in the
+        // editor that closed or cleared nothing: one that dismisses a popup
+        // or a selection is that, not half of the pair.
+        let zen_esc = self.zen_mode
+            && self.focus == Pane::Editor
+            && key.code == KeyCode::Esc
+            && key.modifiers.is_empty()
+            && key.kind == KeyEventKind::Press;
+        let before = zen_esc.then(|| self.esc_fingerprint());
         let result = self.recording_file_switches(|app| app.handle_key_inner(key));
+        match before {
+            Some(before) if before == self.esc_fingerprint() => {
+                self.note_idle_zen_esc(std::time::Instant::now());
+            }
+            _ if key.kind != KeyEventKind::Release => self.zen_esc_at = None,
+            _ => {}
+        }
         // Focus is re-checked after dispatch too: a key that hands focus to
         // the terminal would otherwise be recorded while everything after it
         // is dropped, producing a macro that replays a focus change and then
@@ -23789,6 +24166,20 @@ impl App {
             && !self.keymap.is_empty()
             && is_rebindable_chord(key)
             && let Some(cmd) = self.keymap.command_for(key)
+        {
+            self.run_command(cmd);
+            return Ok(());
+        }
+        // A user's chord for a terminal command is meant for the terminal
+        // (#1562), so it is taken before the shell sees the key; every other
+        // chord still passes through to the shell. Only the Terminal tab has
+        // a shell: on Output, Problems, Ports or Captures the key is the
+        // panel's own.
+        if self.focus == Pane::Terminal
+            && self.bottom_panel_tab == BottomPanelTab::Terminal
+            && !self.keymap.is_empty()
+            && is_rebindable_chord(key)
+            && let Some(cmd) = self.keymap.command_for(key).filter(|c| c.skips_the_shell())
         {
             self.run_command(cmd);
             return Ok(());
@@ -25844,6 +26235,71 @@ impl App {
             });
         }
         self.pending_test_debug = Some((rx, name, root));
+    }
+
+    /// Run a launch's `cargo` build on a background thread (#1392); the
+    /// drain launches the config once cargo names the executable.
+    fn start_cargo_program_build(
+        &mut self,
+        rc: crate::dap::configs::ResolvedConfig,
+        slot: LaunchSlot,
+        spec: crate::dap::configs::CargoSpec,
+    ) {
+        let cwd = rc
+            .cwd
+            .clone()
+            .unwrap_or_else(|| self.active_workspace_root());
+        let line = format!("cargo {}", spec.args.join(" "));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::dap::configs::build_cargo_program(&spec, &cwd));
+        });
+        self.run_debug.feedback = Some(format!("Building with {line}\u{2026}"));
+        self.run_debug.feedback_is_error = false;
+        self.status = format!(
+            "config \"{}\": building with {line} \u{2014} debug starts when it succeeds",
+            rc.name
+        );
+        let root = self.tree.root.clone();
+        self.pending_cargo_launches
+            .push((rx, Box::new(rc), slot, root));
+    }
+
+    /// Launch every `cargo` config whose build finished, or report why it
+    /// did not. True when anything landed.
+    fn drain_pending_cargo_launch(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+        let mut landed = false;
+        let mut i = 0;
+        while i < self.pending_cargo_launches.len() {
+            let result = match self.pending_cargo_launches[i].0.try_recv() {
+                Ok(r) => r,
+                Err(TryRecvError::Empty) => {
+                    i += 1;
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => Err(String::from("the build thread died")),
+            };
+            let (_, mut rc, slot, build_root) = self.pending_cargo_launches.remove(i);
+            landed = true;
+            // Re-rooting mid-build would otherwise launch the old
+            // workspace's binary in the new one.
+            if build_root != self.tree.root {
+                self.status = format!(
+                    "config \"{}\": cargo finished, but the workspace changed — launch it again from its workspace",
+                    rc.name
+                );
+                continue;
+            }
+            match result {
+                Ok(program) => {
+                    rc.program = Some(program.to_string_lossy().into_owned());
+                    self.launch_resolved_in(*rc, slot);
+                }
+                Err(e) => self.debug_error(format!("config \"{}\": {e}", rc.name)),
+            }
+        }
+        landed
     }
 
     /// Drain the background test-binary build: on success launch lldb-dap
@@ -32249,6 +32705,7 @@ impl App {
         // name, which is the very entry a `.vscode` compound
         // naming that name has to bind.
         let all = crate::dap::configs::discover_configs_all(&self.active_workspace_root());
+        let folders = self.workspace_folders();
         // #310 defers compounds that need SEVERAL sessions at
         // once. A compound naming ONE configuration needs one,
         // which croft has run since #250 — so the arity has to
@@ -32256,7 +32713,7 @@ impl App {
         // multi-session limit for a one-member compound cites
         // a limitation that does not apply and tells the user
         // something false about their own launch.json.
-        match crate::dap::configs::resolve_compound(compound, &all) {
+        match crate::dap::configs::resolve_compound(compound, &all, &folders) {
             Err(e) => self.debug_error(e),
             // A one-member compound carrying keys croft does
             // not honour is REFUSED rather than launched.
@@ -32351,10 +32808,6 @@ impl App {
                 // for and the order a client-then-server
                 // compound depends on.
                 let label = compound.name.clone();
-                // `resolve_compound` borrows from the config
-                // list; the launch outlives that borrow, so
-                // the members are owned from here on.
-                let members: Vec<_> = members.into_iter().cloned().collect();
                 match compound.pre_launch_task.clone() {
                     Some(task) => self.launch_after_compound_task_all(
                         &task,
@@ -32537,10 +32990,15 @@ impl App {
     /// interleave unpredictably. Its task is skipped with a status saying so,
     /// which is honest, and #310 is where the general form belongs.
     fn launch_member_into_set(&mut self, cfg: &crate::dap::configs::DebugConfig) -> MemberOutcome {
-        let root = self.active_workspace_root();
+        // A member from another workspace folder resolves there (#1425).
+        let root = cfg
+            .root
+            .clone()
+            .unwrap_or_else(|| self.active_workspace_root());
         let ctx = crate::dap::configs::SubstCtx {
             workspace_folder: root,
             file: self.editor.path.clone(),
+            folders: self.workspace_folders(),
         };
         let rc = match crate::dap::configs::resolve(cfg, &ctx) {
             Ok(rc) => rc,
@@ -32564,9 +33022,12 @@ impl App {
         // `Launched` unconditionally counted members that never started and
         // made "N of M started" name an N the user does not have.
         let before = self.debug_sessions.len();
+        let building = self.pending_cargo_launches.len();
         self.launch_resolved_into_set(rc);
         if self.debug_sessions.len() > before {
             MemberOutcome::Launched
+        } else if self.pending_cargo_launches.len() > building {
+            MemberOutcome::Building
         } else {
             MemberOutcome::Failed
         }
@@ -32649,13 +33110,30 @@ impl App {
         self.pending_debug_launch = None;
         let total = members.len();
         let mut started = 0usize;
+        let mut building: Vec<String> = Vec::new();
         let mut unrun: Vec<String> = Vec::new();
         for cfg in members {
             match self.launch_member_into_set(&cfg) {
                 MemberOutcome::Launched => started += 1,
+                MemberOutcome::Building => building.push(cfg.name.clone()),
                 MemberOutcome::TaskUnrun => unrun.push(cfg.name.clone()),
                 MemberOutcome::Failed => {}
             }
+        }
+        if started == 0 && !building.is_empty() {
+            // Every member that could start is still building with cargo
+            // (#1392): each joins the set when its build lands.
+            self.debug_compound = Some(compound.clone());
+            self.run_debug.feedback = Some(format!(
+                "compound {compound}: building {} \u{2014} sessions start when cargo finishes",
+                building.join(", ")
+            ));
+            self.run_debug.feedback_is_error = building.len() != total;
+            self.status = format!(
+                "compound \"{compound}\": building {} \u{2014} sessions start when cargo finishes",
+                building.join(", ")
+            );
+            return;
         }
         if started == 0 {
             // Nothing started. Each member has already said why, so this names
@@ -32690,7 +33168,12 @@ impl App {
         // several the user has to be told which are running and which one the
         // call stack and variables belong to, or the view describes a session
         // they cannot identify.
-        let running = self.debug_sessions.names().join(", ");
+        let mut running = self.debug_sessions.names().join(", ");
+        if !building.is_empty() {
+            // Not failed: they join the set when their cargo builds land.
+            running = format!("{running}; building {}", building.join(", "));
+        }
+        let started = started + building.len();
         self.run_debug.feedback = Some(if started == total {
             format!("Debugging compound {compound}: {running}")
         } else if unrun.is_empty() {
@@ -32808,12 +33291,19 @@ impl App {
             self.debug_stop();
         }
         self.pending_debug_launch = None;
+        self.pending_cargo_launches.clear();
         // A new run: the previous run's cleanup is not this one's.
         self.debug_post_tasks.clear();
-        let root = self.active_workspace_root();
+        // A compound member from another workspace folder resolves, and
+        // finds its preLaunchTask, there (#1425).
+        let root = cfg
+            .root
+            .clone()
+            .unwrap_or_else(|| self.active_workspace_root());
         let ctx = configs::SubstCtx {
             workspace_folder: root.clone(),
             file: self.editor.path.clone(),
+            folders: self.workspace_folders(),
         };
         let rc = match configs::resolve(cfg, &ctx) {
             Ok(rc) => rc,
@@ -32832,9 +33322,9 @@ impl App {
                 return;
             };
             let command = self
-                .task_command_line(&task)
+                .task_command_line_in(&task, root.clone())
                 .unwrap_or_else(|_| task.command.clone());
-            let Some(pane) = self.run_project_task(task) else {
+            let Some(pane) = self.run_project_task_in(task, root) else {
                 // run_project_task already reported why the pane failed.
                 return;
             };
@@ -32992,6 +33482,19 @@ impl App {
         // does not depend on it; a missing lldb-dap is reported on resume.
         if rc.pick_process && rc.process_id.is_none() {
             self.open_attach_process_picker(rc, slot);
+            return;
+        }
+        // A CodeLLDB `cargo` launch names no program: cargo builds it first
+        // (#1392), off the UI thread, and the launch resumes here with it.
+        if rc.kind == AdapterKind::LldbDap
+            && rc.request == RequestKind::Launch
+            && rc.program.is_none()
+            && let Some(spec) = configs::cargo_spec(&rc)
+        {
+            match spec {
+                Ok(spec) => self.start_cargo_program_build(rc, slot, spec),
+                Err(e) => self.debug_error(format!("config \"{}\": {e}", rc.name)),
+            }
             return;
         }
         let breakpoints = self.collect_editor_breakpoints();
@@ -33190,6 +33693,16 @@ impl App {
                 self.reveal_debug_view();
                 if python_note.is_some() {
                     self.debug_console_push(lead);
+                }
+                // A cppdbg configuration runs under lldb-dap (#1394): say
+                // which of its gdb settings have no effect there. Here, not
+                // at the call site, so a preLaunchTask resume and a compound
+                // member say it too.
+                if !rc.ignored_keys.is_empty() {
+                    self.debug_console_push(format!(
+                        "config \"{name}\" runs under lldb-dap, which ignores its {}",
+                        rc.ignored_keys.join(", ")
+                    ));
                 }
             }
             Err(e) => self.debug_error(format!("Failed to start debugger: {e}")),
@@ -33935,25 +34448,27 @@ impl App {
         }
     }
 
-    /// Toggle "break on raised exceptions" for the active session. `uncaught` is
-    /// always kept on so unhandled exceptions still pause. No-op without a
-    /// session.
+    /// Toggle "break on raised exceptions" for the active session, with the
+    /// filter id this adapter uses for it (#1426). `uncaught` stays on so
+    /// unhandled exceptions still pause. No-op without a session.
     pub fn debug_toggle_raised_exceptions(&mut self) {
         let Some(session) = self.debug_sessions.focused_mut() else {
             self.status = String::from("Start debugging first to set exception breakpoints");
             return;
         };
-        let raised = !session.has_exception_filter("raised");
-        let mut filters = vec![String::from("uncaught")];
-        if raised {
-            filters.push(String::from("raised"));
-        }
-        session.set_exception_filters(filters);
-        self.status = if raised {
-            String::from("Breaking on raised exceptions (and uncaught)")
-        } else {
-            String::from("Breaking on uncaught exceptions only")
+        let Some(on) = session.toggle_raised_exceptions() else {
+            self.status = String::from(
+                "This debugger has no filter for raised exceptions; exception breakpoints are unchanged",
+            );
+            return;
         };
+        let uncaught = session.has_exception_filter("uncaught");
+        self.status = String::from(match (on, uncaught) {
+            (true, true) => "Breaking on raised exceptions (and uncaught)",
+            (true, false) => "Breaking on raised exceptions",
+            (false, true) => "Breaking on uncaught exceptions only",
+            (false, false) => "No longer breaking on raised exceptions",
+        });
     }
 
     /// F6: interrupt a running program so it stops at the current line.
@@ -34286,6 +34801,9 @@ impl App {
             session.disconnect();
         }
         self.debug_sessions.clear();
+        // A `cargo` build still running for a launch (#1392) must not start
+        // its debuggee after the user stopped debugging.
+        self.pending_cargo_launches.clear();
         self.debug_compound = None;
         self.reset_watch_runtime();
         // Sweep js-debug's detached watchdog (and any leftover tree) once it has
@@ -34516,23 +35034,36 @@ impl App {
     }
 
     /// Open `path` as a pinned editor tab and focus the editor. Used at launch
-    /// for `croft <root> --open-file <path>` (the new window spawned by Move /
-    /// Copy into New Window opens the handed-off file this way). Best-effort: a
-    /// missing / unreadable file just leaves the editor on the welcome screen.
+    /// for `croft <file>` and `croft <root> --open-file <path>` (the new
+    /// window spawned by Move / Copy into New Window opens the handed-off file
+    /// this way). Best-effort: an unreadable file, or a missing one whose
+    /// folder is missing too, leaves the editor on the welcome screen.
     /// A relative `path` is taken under the workspace root, so the tab gets
     /// the absolute path its language server is keyed by; a file that can't
-    /// be opened says why instead of opening nothing (#1193).
-    pub fn open_file_at_launch(&mut self, path: &Path) {
+    /// be opened says why instead of opening nothing (#1193). Returns whether
+    /// it opened.
+    pub fn open_file_at_launch(&mut self, path: &Path) -> bool {
         let path = self.workspace_root().join(path);
-        match self.editor.open_pinned(&path) {
+        // `croft new.md` for a file not written yet opens an empty buffer
+        // that the first save creates (#1157).
+        let new = std::fs::symlink_metadata(&path).is_err();
+        match self.editor.open_new_pinned(&path) {
             Ok(_) => {
+                if new {
+                    self.status =
+                        format!("New file {}: saving creates it", self.status_path(&path));
+                }
                 // Launch is not a user focus gesture: collapsing here would
                 // hide the sidebar before the user has interacted at all
                 // (#260).
                 self.without_auto_hide(|app| app.focus_pane(Pane::Editor));
                 self.sync_open_file_poll_mtime();
+                true
             }
-            Err(e) => self.status = format!("Couldn't open {}: {e}", path.display()),
+            Err(e) => {
+                self.status = format!("Couldn't open {}: {e}", path.display());
+                false
+            }
         }
     }
 
@@ -35641,6 +36172,15 @@ impl App {
         }
         self.list_picker = Some(picker);
         self.overlays.list_picker_clear.request();
+    }
+
+    /// The list picker closed with no row chosen (Esc, a click outside).
+    fn dismiss_list_picker(&mut self) {
+        let purpose = self.list_picker.as_ref().map(|p| p.purpose);
+        self.close_list_picker();
+        if purpose == Some(crate::widgets::list_picker::ListPurpose::NotebookKernel) {
+            self.kernel_choice_dismissed();
+        }
     }
 
     fn close_list_picker(&mut self) {
@@ -38793,6 +39333,7 @@ impl App {
                     self.set_panel_alignment(*al);
                 }
             }
+            ListPurpose::NotebookKernel => self.choose_notebook_kernel(&row.id),
             ListPurpose::QuickInputPosition => {
                 if let Some((pos, ..)) = QuickInputPosition::OPTIONS
                     .iter()
@@ -39113,9 +39654,21 @@ impl App {
     /// expanded against the active workspace and file. The preLaunchTask
     /// gate matches the pane's finished command against this same line.
     fn task_command_line(&self, task: &crate::tasks::Task) -> Result<String, String> {
+        self.task_command_line_in(task, self.active_workspace_root())
+    }
+
+    /// [`Self::task_command_line`] against the workspace folder `root`: a
+    /// compound member's preLaunchTask from another folder (#1425) expands
+    /// `${workspaceFolder}` to that folder, not the active one.
+    fn task_command_line_in(
+        &self,
+        task: &crate::tasks::Task,
+        root: PathBuf,
+    ) -> Result<String, String> {
         task.command_line(&crate::dap::configs::SubstCtx {
-            workspace_folder: self.active_workspace_root(),
+            workspace_folder: root,
             file: self.editor.path.clone(),
+            folders: self.workspace_folders(),
         })
     }
 
@@ -39126,6 +39679,15 @@ impl App {
     /// correlate the task's FinishedCommand (the preLaunchTask gate, #250);
     /// `None` when no pane could be started (already reported in `status`).
     pub fn run_project_task(&mut self, task: crate::tasks::Task) -> Option<u64> {
+        let root = self.active_workspace_root();
+        self.run_project_task_in(task, root)
+    }
+
+    /// [`Self::run_project_task`] in the workspace folder `folder`: the pane
+    /// starts there and the task's variables expand against it, so a
+    /// compound member's preLaunchTask from another folder (#1425) builds
+    /// that folder's project.
+    fn run_project_task_in(&mut self, task: crate::tasks::Task, folder: PathBuf) -> Option<u64> {
         let pane_name = format!("Task: {}", task.label);
         // The task's problemMatcher (#252), translated up front so both the
         // reuse and fresh-pane paths assign the same thing (or clear a
@@ -39138,7 +39700,7 @@ impl App {
         // Ctrl-E + Ctrl-U first: the idle shell's line editor may hold a
         // half-typed command that would otherwise concatenate and run
         // (same rule `format_cd_command` pins for the cd seed).
-        let line = match self.task_command_line(&task) {
+        let line = match self.task_command_line_in(&task, folder.clone()) {
             Ok(line) => line,
             Err(e) => {
                 self.status = format!("Task \u{201c}{}\u{201d} not run: {e}", task.label);
@@ -39153,12 +39715,11 @@ impl App {
         // old one. Shares `pane_is_idle_at` with the runnable-fence path
         // (#430) — this guard existed twice and only one copy was fixed,
         // which is precisely how the two defects survived a green suite.
-        let active = self.active_workspace_root();
-        let root = active.canonicalize().unwrap_or(active);
+        let canonical = folder.canonicalize().unwrap_or_else(|_| folder.clone());
         if let Some(idx) = self
             .terminals
             .iter()
-            .position(|t| pane_is_idle_at(t, &pane_name, &root))
+            .position(|t| pane_is_idle_at(t, &pane_name, &canonical))
         {
             // Reused panes may be folded (#313): the release notes name the
             // build pane as the thing you would fold, and a task written into
@@ -39174,7 +39735,7 @@ impl App {
             self.assign_task_matcher(uid, matcher);
             return Some(uid);
         }
-        match crate::widgets::terminal::PtyTerminal::new(&self.active_workspace_root()) {
+        match crate::widgets::terminal::PtyTerminal::new(&folder) {
             Ok(mut term) => {
                 term.set_manual_name(Some(pane_name));
                 term.write_input(command.as_bytes());
@@ -44188,6 +44749,14 @@ impl App {
             self.start_select_next_occurrence();
             return;
         }
+        if is_select_all_occurrences_key(key) {
+            self.select_all_occurrences();
+            return;
+        }
+        if is_add_cursors_to_line_ends_key(key) {
+            self.add_cursors_to_line_ends();
+            return;
+        }
         if is_delete_line_key(key) {
             self.delete_current_line();
             return;
@@ -46720,7 +47289,8 @@ impl App {
     /// the active tab keeps its events until it is.
     fn poll_notebook_kernels(&mut self) -> bool {
         let active = self.editor.path.clone();
-        let mut changed = false;
+        let mut changed = self.poll_kernel_listing();
+        let mut choice = None;
         for (path, run) in self.notebook_kernels.iter_mut() {
             if !run.collect() || active.as_ref() != Some(path) {
                 continue;
@@ -46735,9 +47305,156 @@ impl App {
             if let Some(note) = notes.last() {
                 self.status = note.clone();
             }
+            if let Some(c) = run.choice.take() {
+                choice = Some((path.clone(), c));
+            }
             changed = true;
         }
+        if let Some((path, c)) = choice {
+            self.open_kernel_picker(path, c.specs, Some(c.requested));
+        }
         changed
+    }
+
+    /// Notebook: Select Kernel (#1377): ask the bridge which kernels are
+    /// installed; the picker opens when it answers.
+    fn select_notebook_kernel(&mut self) {
+        let Some(path) = self.editor.path.clone().filter(|_| {
+            self.editor
+                .markdown_preview
+                .as_ref()
+                .is_some_and(|m| m.notebook)
+        }) else {
+            self.status = String::from("Select Kernel works on a notebook's rendered view");
+            return;
+        };
+        let listing = self.start_kernel_session(&path, crate::notebook_kernel::LIST_KERNELS);
+        self.kernel_listing = Some((path, listing));
+        self.status = String::from("Looking for installed kernels…");
+    }
+
+    /// A kernel bridge for the notebook at `path`, run in its folder.
+    fn start_kernel_session(
+        &self,
+        path: &Path,
+        kernel: &str,
+    ) -> crate::notebook_kernel::KernelSession {
+        #[cfg(test)]
+        if let Some(start) = &self.kernel_start_override {
+            return start(kernel);
+        }
+        let root = self.workspace_root();
+        let dir = path.parent().unwrap_or(root);
+        crate::notebook_kernel::KernelSession::start(root, dir, kernel)
+    }
+
+    /// The installed kernels arriving for Select Kernel.
+    fn poll_kernel_listing(&mut self) -> bool {
+        use crate::notebook_kernel::Event;
+        let Some((path, listing)) = self.kernel_listing.as_ref() else {
+            return false;
+        };
+        let path = path.clone();
+        for event in listing.try_events() {
+            match event {
+                Event::Specs { specs } => {
+                    self.kernel_listing = None;
+                    if self.editor.path.as_ref() == Some(&path) {
+                        self.status.clear();
+                        self.open_kernel_picker(path, specs, None);
+                    }
+                    return true;
+                }
+                Event::Error { message } => {
+                    self.kernel_listing = None;
+                    self.status = format!("Kernel: {message}");
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// The kernel picker for the notebook at `path`, opened on its own
+    /// kernel when installed, else on one for its language. `missing` is
+    /// the kernel it names that this machine does not have.
+    fn open_kernel_picker(
+        &mut self,
+        path: PathBuf,
+        specs: Vec<crate::notebook_kernel::KernelSpec>,
+        missing: Option<String>,
+    ) {
+        use crate::notebook_kernel::{kernel_name, notebook_language, preferred_kernel};
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        if self.editor.path.as_ref() != Some(&path) {
+            return;
+        }
+        let text = self.editor.lines.join("\n");
+        let rows = specs
+            .iter()
+            .map(|s| ListRow {
+                id: s.name.clone(),
+                label: format!("{}  ({})", s.display, s.name),
+            })
+            .collect();
+        let title = match &missing {
+            Some(k) => format!("Kernel '{k}' is not installed: Select Kernel"),
+            None => String::from("Select Kernel"),
+        };
+        let mut picker = ListPicker::new(ListPurpose::NotebookKernel, title, rows);
+        picker.selected = preferred_kernel(
+            &specs,
+            &kernel_name(&text),
+            notebook_language(&text).as_deref(),
+        );
+        self.kernel_choice = Some((path, specs, missing));
+        self.open_list_picker(picker, "No Jupyter kernels are installed");
+    }
+
+    /// The kernel picked for a notebook: written to its
+    /// `metadata.kernelspec` (Save keeps it, as in Jupyter), and a kernel
+    /// already started, or waiting on a missing one, is replaced by it.
+    fn choose_notebook_kernel(&mut self, name: &str) {
+        let Some((path, specs, _)) = self.kernel_choice.take() else {
+            return;
+        };
+        let Some(spec) = specs.into_iter().find(|s| s.name == name) else {
+            return;
+        };
+        if self.editor.path.as_ref() != Some(&path) {
+            return;
+        }
+        let text = self.editor.lines.join("\n");
+        if let Some(next) = crate::notebook_kernel::set_kernelspec(&text, &spec) {
+            self.editor
+                .replace_all_lines(next.split('\n').map(str::to_string).collect());
+        }
+        if !self.notebook_kernels.contains_key(&path) {
+            self.status = format!("Kernel: {} (starts on the next run)", spec.display);
+            return;
+        }
+        let session = self.start_kernel_session(&path, &spec.name);
+        if let Some(run) = self.notebook_kernels.get_mut(&path) {
+            run.restart_with(session);
+            self.editor.notebook_running = run.running_indices();
+            self.status = format!("Starting kernel {}…", spec.display);
+        }
+    }
+
+    /// The kernel picker closed without a choice. Cells waiting on a
+    /// kernel that is not installed cannot run, so they stop waiting.
+    fn kernel_choice_dismissed(&mut self) {
+        let Some((path, _, Some(missing))) = self.kernel_choice.take() else {
+            return;
+        };
+        if self.notebook_kernels.remove(&path).is_some() && self.editor.path.as_ref() == Some(&path)
+        {
+            self.editor.notebook_running.clear();
+        }
+        self.status = format!(
+            "Kernel '{missing}' is not installed: run Notebook: Select Kernel to pick another"
+        );
     }
 
     /// Interrupt or restart the active notebook's kernel.
@@ -51826,6 +52543,8 @@ impl App {
             Cmd::AddCursorAbove => self.editor.add_cursor_above(),
             Cmd::AddCursorBelow => self.editor.add_cursor_below(),
             Cmd::AddSelectionToNextMatch => self.start_select_next_occurrence(),
+            Cmd::SelectAllOccurrences => self.select_all_occurrences(),
+            Cmd::AddCursorsToLineEnds => self.add_cursors_to_line_ends(),
             Cmd::JumpToBracket => {
                 if !self.editor.jump_to_matching_bracket() {
                     self.status = String::from("Go to Bracket: no matching bracket");
@@ -52331,6 +53050,7 @@ impl App {
             Cmd::NotebookRestart => {
                 self.notebook_kernel_request(crate::notebook_kernel::Request::Restart)
             }
+            Cmd::NotebookSelectKernel => self.select_notebook_kernel(),
             Cmd::TestingRunWithCoverage => self.run_all_tests_with_coverage(),
             Cmd::CoverageClear => self.clear_coverage(),
             Cmd::TestingInstallCoverageTool => self.install_coverage_tool(),
@@ -52653,6 +53373,7 @@ impl App {
             Cmd::ToggleAutoHideSideBar => self.toggle_sidebar_auto_hide(),
             Cmd::ToggleSecondarySideBar => self.toggle_secondary_side_bar(),
             Cmd::ToggleZenMode => self.toggle_zen_mode(),
+            Cmd::ToggleCenteredLayout => self.toggle_centered_layout(),
             Cmd::ToggleTerminal => self.toggle_terminal(),
             // Each tab names the command that shows it, so the palette reads
             // the tab from there rather than keeping a second mapping.
@@ -52824,6 +53545,15 @@ impl App {
                     self.cycle_terminal_back();
                 }
             }
+            Cmd::TerminalClear
+            | Cmd::TerminalRename
+            | Cmd::TerminalKill
+            | Cmd::TerminalSplit
+            | Cmd::TerminalNewWithProfile
+            | Cmd::TerminalQuickSelect
+            | Cmd::TerminalCopyMode
+            | Cmd::TerminalCommandHistory
+            | Cmd::TerminalOpenScrollback => self.run_terminal_command(cmd),
             Cmd::NewTerminal => match self.split_terminal() {
                 Ok(()) => {
                     self.terminal_status(format!(
@@ -53603,7 +54333,7 @@ impl App {
             return;
         };
         match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) => self.close_list_picker(),
+            (KeyCode::Esc, _) => self.dismiss_list_picker(),
             (KeyCode::Enter, _) => self.confirm_list_picker(),
             (KeyCode::Up, _) => picker.select_prev(),
             (KeyCode::Down, _) => picker.select_next(),
@@ -53646,7 +54376,7 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
                 if !inside =>
             {
-                self.close_list_picker();
+                self.dismiss_list_picker();
             }
             // Click a row to select and run it, the way VS Code menus behave.
             MouseEventKind::Down(MouseButton::Left) => {
@@ -55534,6 +56264,7 @@ impl App {
     }
 
     fn handle_mouse(&mut self, m: MouseEvent) {
+        self.editor.sync_occurrence_word_sel();
         self.recording_file_switches(|app| app.handle_mouse_inner(m));
     }
 
@@ -61494,7 +62225,12 @@ impl App {
         // Selected") don't inflate the menu width past what's needed.
         // Width must also fit the shortcut hint on the right side, with
         // at least 2 cells of gap between label and shortcut.
-        let widest = menu.items.iter().map(menu_entry_width).max().unwrap_or(0);
+        let widest = menu
+            .items
+            .iter()
+            .map(|e| menu_entry_width(e, &self.keymap))
+            .max()
+            .unwrap_or(0);
         let area = self.last_frame_area;
         // Never past the frame: a long menu on a short terminal (or any menu
         // under 18 columns) built a rect outside the buffer, which panics.
@@ -61533,7 +62269,11 @@ impl App {
             return None;
         };
         let main = self.menu_rect()?;
-        let widest = items.iter().map(menu_entry_width).max().unwrap_or(0);
+        let widest = items
+            .iter()
+            .map(|e| menu_entry_width(e, &self.keymap))
+            .max()
+            .unwrap_or(0);
         let area = self.last_frame_area;
         let fit = |v: u16, max: u16| if max > 0 { v.min(max) } else { v };
         let width = fit((widest + 4).max(18) as u16, area.width);
@@ -62544,6 +63284,10 @@ impl App {
                 self.open_customize_layout_menu_on(&MenuAction::SetQuickInputPosition(pos));
             }
             MenuAction::ToggleZenMode => self.toggle_zen_mode(),
+            MenuAction::ToggleCenteredLayout => {
+                self.toggle_centered_layout();
+                self.open_customize_layout_menu_on(&MenuAction::ToggleCenteredLayout);
+            }
             MenuAction::RunCodeLens(idx) => self.run_code_lens(idx),
             MenuAction::RenameTerminal(idx) => self.begin_rename_terminal(idx),
             MenuAction::ClearTerminal(idx) => self.clear_terminal_at(idx),
@@ -71250,6 +71994,23 @@ fn just_installed_covers_path(installed: &[crate::lsp::Language], path: &Path) -
         .any(|&i| lsp_server_family(i) == lsp_server_family(lang))
 }
 
+/// `Cmd+Shift+L` (`Ctrl+Shift+L` off macOS): Select All Occurrences of Find
+/// Match (#1558), VS Code's chord. On a remote session Drop to Local takes
+/// it first.
+fn is_select_all_occurrences_key(key: KeyEvent) -> bool {
+    is_cmd_shift_letter(key, 'l')
+}
+
+/// `Shift+Alt+I`: Add Cursors to Line Ends (#1558), VS Code's chord.
+fn is_add_cursors_to_line_ends_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('i' | 'I'))
+        && key.modifiers.contains(KeyModifiers::ALT)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+}
+
 /// Editor-pane Change All Occurrences: `Cmd+F2` (macOS) or `Ctrl+F2` (Linux),
 /// matching VS Code on each platform so local and remote behave identically.
 /// iTerm2 may deliver Cmd folded onto the Meta/ALT bit (the same reason
@@ -73820,6 +74581,7 @@ pub fn run(
     root: PathBuf,
     restore_session: Option<PathBuf>,
     open_file: Option<PathBuf>,
+    open_at: Option<(usize, usize)>,
     zen: bool,
     workspace_folders: Vec<PathBuf>,
 ) -> Result<()> {
@@ -73898,7 +74660,12 @@ pub fn run(
     // `croft <root> --open-file <path>`: open the handed-off file (used by the
     // new window that Move / Copy into New Window spawns).
     if let Some(file) = open_file.as_ref() {
-        app.open_file_at_launch(file);
+        // `croft file:line[:col]` (#1606).
+        if app.open_file_at_launch(file)
+            && let Some((row, col)) = open_at
+        {
+            app.without_auto_hide(|app| app.place_caret_at(row, col));
+        }
     }
     // A `croft://` link (#359) names what to land on.
     match std::env::var("CROFT_FOCUS").as_deref() {
@@ -74125,7 +74892,7 @@ pub fn run(
         restore_host_terminal_state();
         match launch_result? {
             crate::remote::RemoteOutcome::ReturnToLocal => {
-                return run(root, None, None, false, Vec::new());
+                return run(root, None, None, None, false, Vec::new());
             }
             crate::remote::RemoteOutcome::Exited => return Ok(()),
         }
@@ -74683,8 +75450,9 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let progress_changed = app.drain_lsp_progress();
         let dap_changed = app.poll_dap();
-        let tests_changed =
-            app.test_worker.drain(&mut app.testing) | app.drain_pending_test_debug();
+        let tests_changed = app.test_worker.drain(&mut app.testing)
+            | app.drain_pending_test_debug()
+            | app.drain_pending_cargo_launch();
         // A queued run the worker refused (runner disabled after the entry
         // check) rolled its cases back in the drain; say why nothing ran.
         if app.testing.take_refusal() {
@@ -74713,6 +75481,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let pair_changed =
             app.maybe_seat_navigator() | app.poll_pair() | app.tick_proactive_navigator();
         let voice_changed = app.drain_voice();
+        let zen_hint_changed = app.expire_zen_hint(std::time::Instant::now());
         // Surface managed language-server install progress in the status bar so
         // the background work (which can take a few seconds) is visible.
         let install_status_changed = match crate::lsp::install::take_status() {
@@ -74733,6 +75502,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         }
 
         let non_pty_dirty = needs_redraw
+            || zen_hint_changed
             || fs_changed
             || mcp_changed
             || pair_changed
