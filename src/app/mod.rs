@@ -34088,25 +34088,27 @@ impl App {
         }
     }
 
-    /// Toggle "break on raised exceptions" for the active session. `uncaught` is
-    /// always kept on so unhandled exceptions still pause. No-op without a
-    /// session.
+    /// Toggle "break on raised exceptions" for the active session, with the
+    /// filter id this adapter uses for it (#1426). `uncaught` stays on so
+    /// unhandled exceptions still pause. No-op without a session.
     pub fn debug_toggle_raised_exceptions(&mut self) {
         let Some(session) = self.debug_sessions.focused_mut() else {
             self.status = String::from("Start debugging first to set exception breakpoints");
             return;
         };
-        let raised = !session.has_exception_filter("raised");
-        let mut filters = vec![String::from("uncaught")];
-        if raised {
-            filters.push(String::from("raised"));
-        }
-        session.set_exception_filters(filters);
-        self.status = if raised {
-            String::from("Breaking on raised exceptions (and uncaught)")
-        } else {
-            String::from("Breaking on uncaught exceptions only")
+        let Some(on) = session.toggle_raised_exceptions() else {
+            self.status = String::from(
+                "This debugger has no filter for raised exceptions; exception breakpoints are unchanged",
+            );
+            return;
         };
+        let uncaught = session.has_exception_filter("uncaught");
+        self.status = String::from(match (on, uncaught) {
+            (true, true) => "Breaking on raised exceptions (and uncaught)",
+            (true, false) => "Breaking on raised exceptions",
+            (false, true) => "Breaking on uncaught exceptions only",
+            (false, false) => "No longer breaking on raised exceptions",
+        });
     }
 
     /// F6: interrupt a running program so it stops at the current line.

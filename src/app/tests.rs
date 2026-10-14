@@ -63127,6 +63127,82 @@ fn poll_until(app: &mut App, done: impl Fn(&App) -> bool) {
     }
 }
 
+/// #1426: Alt+F9 sends js-debug's `all` filter and says it is on; with an
+/// adapter that offers no raised-exceptions filter it says so instead of
+/// claiming exceptions will break.
+#[test]
+fn the_raised_exceptions_toggle_follows_the_adapters_filters() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push(
+        "Node",
+        stub_emitting(&[
+            r#"{"seq":1,"type":"response","request_seq":1,"success":true,"command":"initialize","body":{"exceptionBreakpointFilters":[{"filter":"all","label":"Caught Exceptions"},{"filter":"uncaught","label":"Uncaught Exceptions"}]}}"#,
+        ]),
+    );
+    poll_until(&mut app, |a| {
+        a.debug_sessions
+            .focused()
+            .is_some_and(|s| !s.capabilities.is_null())
+    });
+    app.debug_toggle_raised_exceptions();
+    assert_eq!(app.status, "Breaking on raised exceptions (and uncaught)");
+    assert_eq!(
+        app.debug_sessions.focused().unwrap().exception_filters,
+        vec![String::from("uncaught"), String::from("all")]
+    );
+    app.debug_toggle_raised_exceptions();
+    assert_eq!(app.status, "Breaking on uncaught exceptions only");
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push(
+        "Go",
+        stub_emitting(&[
+            r#"{"seq":1,"type":"response","request_seq":1,"success":true,"command":"initialize","body":{"supportsConditionalBreakpoints":true}}"#,
+        ]),
+    );
+    poll_until(&mut app, |a| {
+        a.debug_sessions
+            .focused()
+            .is_some_and(|s| !s.capabilities.is_null())
+    });
+    app.debug_toggle_raised_exceptions();
+    assert_eq!(
+        app.status,
+        "This debugger has no filter for raised exceptions; exception breakpoints are unchanged"
+    );
+    assert_eq!(
+        app.debug_sessions.focused().unwrap().exception_filters,
+        vec![String::from("uncaught")]
+    );
+}
+
+/// #1426: Alt+F9 pressed before the adapter answers `initialize` is kept
+/// and translated into that adapter's own ids once it does, instead of
+/// sending debugpy's `raised`, which lldb-dap would then drop.
+#[test]
+fn the_raised_exceptions_toggle_before_initialize_uses_the_adapters_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push(
+        "LLDB",
+        stub_emitting(&[
+            r#"{"seq":1,"type":"response","request_seq":1,"success":true,"command":"initialize","body":{"exceptionBreakpointFilters":[{"filter":"cpp_catch","label":"C++ Catch"},{"filter":"cpp_throw","label":"C++ Throw"},{"filter":"objc_catch","label":"Objective-C Catch"},{"filter":"objc_throw","label":"Objective-C Throw"}]}}"#,
+        ]),
+    );
+    app.debug_toggle_raised_exceptions();
+    assert!(app.status.starts_with("Breaking on raised exceptions"));
+    poll_until(&mut app, |a| {
+        a.debug_sessions
+            .focused()
+            .is_some_and(|s| !s.capabilities.is_null())
+    });
+    assert_eq!(
+        app.debug_sessions.focused().unwrap().exception_filters,
+        vec![String::from("cpp_throw"), String::from("objc_throw")]
+    );
+}
+
 /// #1421: an expensive scope (js-debug's Global) shows collapsed with a
 /// chevron and no variables; a click opens it and fetches it. A cheap
 /// scope stays open with no chevron.
