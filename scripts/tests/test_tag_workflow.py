@@ -1,7 +1,7 @@
 """The tag workflow check must FAIL on each weakening it claims to catch.
 
-tag.yml runs on every merge to main with a token that can write tags and start
-workflows, so what it executes is pinned: every action by full commit SHA, and
+tag.yml runs on every merge to main with a token that can write the tags
+release.yml builds from, so what it executes is pinned: every action by full commit SHA, and
 every REST call to a named API version. Each case below breaks one of those
 and asserts the checker rejects it; the controls prove the shipped workflow
 and an unmutated fixture pass, so no rejection is vacuous.

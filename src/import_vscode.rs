@@ -151,9 +151,9 @@ fn as_scrollback(v: &Value) -> Option<Value> {
 }
 
 /// VS Code's `files.exclude` / `search.exclude` object (#1345): the globs
-/// set to `true`. A `false` entry switches a glob off, and a `when` clause
-/// hides a file only next to a sibling croft does not look for, so both are
-/// left out: a dropped entry shows a file, a misread one would hide it.
+/// set to `true`. A `when` clause hides a file only next to a sibling croft
+/// does not look for, so it is left out: a dropped entry shows a file, a
+/// misread one would hide it.
 ///
 /// VS Code matches these globs against the workspace-relative path, so a
 /// bare `build` is the root's `build` only, where croft's own bare glob
@@ -161,16 +161,27 @@ fn as_scrollback(v: &Value) -> Option<Value> {
 /// crosses anchored, as `/build`. A glob that already starts with `/`
 /// matches no workspace-relative path in VS Code, so it is left out rather
 /// than read as croft's root anchor, which would hide a file VS Code shows.
+///
+/// A glob set to `false` takes back the same glob from a lower layer, as in
+/// VS Code, so it crosses as `!glob` (#1494). A glob that itself starts
+/// with `!` is a literal one in VS Code, so it crosses escaped, as `\!glob`.
 fn as_enabled_globs(v: &Value) -> Option<Value> {
     let obj = v.as_object()?;
     Some(Value::from(
         obj.iter()
-            .filter(|(glob, on)| on.as_bool() == Some(true) && !glob.starts_with('/'))
-            .map(|(glob, _)| {
-                if glob.contains('/') || glob.starts_with("**") {
+            .filter(|(glob, on)| on.as_bool().is_some() && !glob.starts_with('/'))
+            .map(|(glob, on)| {
+                let glob = if glob.starts_with('!') && glob.contains('/') {
+                    format!("\\{glob}")
+                } else if glob.contains('/') || glob.starts_with("**") {
                     glob.clone()
                 } else {
                     format!("/{glob}")
+                };
+                if on.as_bool() == Some(true) {
+                    glob
+                } else {
+                    format!("!{glob}")
                 }
             })
             .collect::<Vec<String>>(),
@@ -342,6 +353,14 @@ const COMMANDS: &[(&str, &str)] = &[
         "focus_right_editor_group",
     ),
     ("workbench.action.terminal.focus", "focus_terminal"),
+    ("workbench.action.terminal.clear", "terminal_clear"),
+    ("workbench.action.terminal.rename", "terminal_rename"),
+    ("workbench.action.terminal.kill", "terminal_kill"),
+    ("workbench.action.terminal.split", "terminal_split"),
+    (
+        "workbench.action.terminal.newWithProfile",
+        "terminal_new_with_profile",
+    ),
     (
         "workbench.action.terminal.runSelectedText",
         "run_selected_text",
@@ -419,6 +438,11 @@ const COMMANDS: &[(&str, &str)] = &[
     (
         "editor.action.addSelectionToNextFindMatch",
         "add_selection_to_next_match",
+    ),
+    ("editor.action.selectHighlights", "select_all_occurrences"),
+    (
+        "editor.action.insertCursorAtEndOfEachLineSelected",
+        "add_cursors_to_line_ends",
     ),
     ("editor.action.smartSelect.expand", "expand_selection"),
     ("editor.action.smartSelect.shrink", "shrink_selection"),
@@ -1330,10 +1354,11 @@ mod tests {
     }
 
     /// #1345: `files.exclude` / `search.exclude` carry the globs set to
-    /// `true`; a `false` entry or a `when` clause (sibling-file rule croft
-    /// has no equivalent for) is left out rather than hiding files.
+    /// `true`; a `when` clause (sibling-file rule croft has no equivalent
+    /// for) is left out rather than hiding files. A `false` entry crosses as
+    /// a `!glob` removal (#1494), which hides nothing itself.
     #[test]
-    fn exclude_settings_keep_only_the_globs_set_to_true() {
+    fn exclude_settings_keep_the_true_globs_and_false_ones_as_removals() {
         let mut report = Report::default();
         convert_settings(
             &json!({
@@ -1346,16 +1371,31 @@ mod tests {
             }),
             &mut report,
         );
-        assert_eq!(report.settings["files_exclude"], json!(["**/generated"]));
+        assert_eq!(
+            report.settings["files_exclude"],
+            json!(["**/generated", "!**/keep"])
+        );
         assert_eq!(
             report.settings["search_exclude"],
             json!(["**/tests/fixtures"])
         );
-        let parsed: crate::prefs::Prefs = serde_json::from_value(serde_json::Value::Object(
-            report.settings.clone().into_iter().collect(),
-        ))
-        .unwrap();
-        assert_eq!(parsed.files_exclude, vec![String::from("**/generated")]);
+    }
+
+    /// #1494: a VS Code glob that starts with `!` is literal there, so it
+    /// crosses escaped and stays an exclusion instead of a removal.
+    #[test]
+    fn a_literal_bang_glob_crosses_escaped() {
+        let mut report = Report::default();
+        convert_settings(
+            &json!({
+                "files.exclude": { "!keep/out": true, "!drafts/old": false, "!bare": true }
+            }),
+            &mut report,
+        );
+        assert_eq!(
+            report.settings["files_exclude"],
+            json!(["/!bare", "!\\!drafts/old", "\\!keep/out"])
+        );
     }
 
     /// #1479: VS Code matches an exclude glob against the workspace-relative
@@ -2211,6 +2251,46 @@ mod tests {
         );
     }
 
+    /// #1562: VS Code's terminal clear / rename / kill / split / new with
+    /// profile chords import, where all were reported as having no croft
+    /// command; a terminal command croft lacks is still reported.
+    #[test]
+    fn terminal_action_keybindings_import() {
+        let mut report = Report::default();
+        convert_keybindings(
+            &json!([
+                { "key": "ctrl+alt+k", "command": "workbench.action.terminal.clear" },
+                { "key": "ctrl+alt+r", "command": "workbench.action.terminal.rename" },
+                { "key": "ctrl+alt+x", "command": "workbench.action.terminal.kill" },
+                { "key": "ctrl+alt+s", "command": "workbench.action.terminal.split" },
+                { "key": "ctrl+alt+p", "command": "workbench.action.terminal.newWithProfile" },
+                { "key": "ctrl+alt+z", "command": "workbench.action.terminal.sizeToContentWidth" }
+            ]),
+            &mut report,
+        );
+        let mut got = report.keybindings.clone();
+        got.sort();
+        let mut want: Vec<(String, String)> = [
+            ("ctrl+alt+k", "terminal_clear"),
+            ("ctrl+alt+r", "terminal_rename"),
+            ("ctrl+alt+x", "terminal_kill"),
+            ("ctrl+alt+s", "terminal_split"),
+            ("ctrl+alt+p", "terminal_new_with_profile"),
+        ]
+        .iter()
+        .map(|(k, c)| (k.to_string(), c.to_string()))
+        .collect();
+        want.sort();
+        assert_eq!(got, want);
+        assert_eq!(report.dropped_keybindings.len(), 1, "sizeToContentWidth");
+        for (_, id) in &want {
+            assert!(
+                crate::widgets::command_palette::Command::from_id(id).is_some(),
+                "{id} is a croft command"
+            );
+        }
+    }
+
     /// #1535: VS Code's Run All Tests / Run Tests in Current File / Rerun
     /// Failed Tests / Rerun Last Run chords import.
     #[test]
@@ -2561,6 +2641,32 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let report = scan_profile(dir.path()).expect("an empty profile is fine");
         assert!(report.is_empty());
+    }
+
+    /// #1558: VS Code's Select All Occurrences and Add Cursors to Line Ends
+    /// chords import onto croft's commands.
+    #[test]
+    fn select_highlights_and_line_end_cursors_import() {
+        let doc = json!([
+            { "key": "ctrl+alt+l", "command": "editor.action.selectHighlights" },
+            { "key": "ctrl+alt+e", "command": "editor.action.insertCursorAtEndOfEachLineSelected" }
+        ]);
+        let mut report = Report::default();
+        convert_keybindings(&doc, &mut report);
+        assert_eq!(
+            report.keybindings,
+            [
+                (
+                    String::from("ctrl+alt+e"),
+                    String::from("add_cursors_to_line_ends")
+                ),
+                (
+                    String::from("ctrl+alt+l"),
+                    String::from("select_all_occurrences")
+                ),
+            ]
+        );
+        assert!(report.dropped_keybindings.is_empty());
     }
 
     /// #1577: VS Code's Find in Selection toggle chord imports onto croft's.
