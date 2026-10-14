@@ -85615,6 +85615,87 @@ fn go_and_lint_rows_reach_problems_only_for_real_files() {
     );
 }
 
+/// #1392: a CodeLLDB `cargo` launch with no `program` builds with cargo
+/// first instead of being refused; an lldb launch with neither is still
+/// refused.
+#[test]
+fn a_cargo_launch_builds_first_and_a_bare_one_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "type": "lldb", "request": "launch", "name": "Debug executable 'rc'",
+              "cargo": { "args": ["build", "--bin=rc", "--package=rc"],
+                         "filter": { "name": "rc", "kind": "bin" } },
+              "cwd": "${workspaceFolder}" },
+            { "type": "lldb", "request": "launch", "name": "Bare" }
+        ]}"#,
+    )
+    .unwrap();
+    let launch = |name: &str| {
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let cfg = crate::dap::configs::discover_configs(tmp.path())
+            .into_iter()
+            .find(|c| c.name == name)
+            .unwrap();
+        app.launch_debug_config(&cfg);
+        app
+    };
+    let app = launch("Debug executable 'rc'");
+    assert!(
+        !app.pending_cargo_launches.is_empty() && !app.run_debug.feedback_is_error,
+        "{}",
+        app.status
+    );
+    assert!(
+        app.status
+            .contains("building with cargo build --bin=rc --package=rc"),
+        "{}",
+        app.status
+    );
+    let app = launch("Bare");
+    assert!(app.pending_cargo_launches.is_empty());
+    assert!(app.run_debug.feedback_is_error);
+    assert!(
+        app.status.contains("an lldb launch needs a \"program\""),
+        "{}",
+        app.status
+    );
+}
+
+/// #1392: Stop Debugging while cargo is still building drops the pending
+/// launch, so the debuggee does not start after the user stopped; and a
+/// compound with two cargo members queues both builds instead of keeping
+/// only the last and calling the set a failure.
+#[test]
+fn cargo_launches_queue_per_compound_member_and_stop_drops_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "type": "lldb", "request": "launch", "name": "A",
+              "cargo": { "args": ["build", "--bin=a"] } },
+            { "type": "lldb", "request": "launch", "name": "B",
+              "cargo": { "args": ["build", "--bin=b"] } }
+        ],
+        "compounds": [ { "name": "Both", "configurations": ["A", "B"] } ] }"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let compound = crate::dap::configs::discover_compounds(tmp.path())
+        .into_iter()
+        .find(|c| c.name == "Both")
+        .unwrap();
+    app.launch_compound(&compound);
+    assert_eq!(app.pending_cargo_launches.len(), 2, "{}", app.status);
+    assert!(!app.run_debug.feedback_is_error, "{}", app.status);
+    assert!(app.status.contains("building A, B"), "{}", app.status);
+    app.debug_stop_by_user();
+    assert!(app.pending_cargo_launches.is_empty());
+}
+
 /// #1598: GNOME Terminal and Konsole keep Ctrl+Shift+T / W for their own New
 /// Tab and Close Tab, so the pane menu carries Split Terminal and Kill
 /// Terminal, as VS Code's does. Kill closes the pane that was right-clicked,
