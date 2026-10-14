@@ -1590,12 +1590,35 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
     }
 }
 
+/// The command a menu row runs, when it is one (#1562), so the row can show
+/// the chord a user bound to that command.
+fn menu_action_command(action: &MenuAction) -> Option<crate::widgets::command_palette::Command> {
+    use crate::widgets::command_palette::Command as Cmd;
+    Some(match action {
+        MenuAction::ClearTerminal(_) => Cmd::TerminalClear,
+        MenuAction::RenameTerminal(_) => Cmd::TerminalRename,
+        MenuAction::TerminalQuickSelect => Cmd::TerminalQuickSelect,
+        MenuAction::TerminalCopyMode => Cmd::TerminalCopyMode,
+        MenuAction::TerminalCommandHistory => Cmd::TerminalCommandHistory,
+        MenuAction::OpenScrollbackInEditor => Cmd::TerminalOpenScrollback,
+        _ => return None,
+    })
+}
+
+/// The hint on a menu row's right: the user's own chord for the command the
+/// row runs, else the built-in one.
+fn menu_hint(action: &MenuAction, keymap: &crate::keymap::Keymap) -> Option<String> {
+    menu_action_command(action)
+        .and_then(|cmd| keymap.chord_for(cmd))
+        .or_else(|| shortcut_for(action).map(str::to_string))
+}
+
 /// Display width (in cells) a menu entry needs: its label plus the right-aligned
 /// shortcut hint (items) or the `▸` submenu indicator. Dividers need none.
-fn menu_entry_width(entry: &MenuEntry) -> usize {
+fn menu_entry_width(entry: &MenuEntry, keymap: &crate::keymap::Keymap) -> usize {
     match entry {
         MenuEntry::Item { label, action } => {
-            let shortcut = shortcut_for(action)
+            let shortcut = menu_hint(action, keymap)
                 .map(|s| s.chars().count() + 2)
                 .unwrap_or(0);
             label.chars().count() + shortcut
@@ -17111,6 +17134,60 @@ impl App {
         });
     }
 
+    /// A terminal action run as a command (#1562): from the palette, a
+    /// `keybindings.json` chord or an imported VS Code one. Each acts on the
+    /// active pane, showing the panel when it was hidden, as its chord and
+    /// menu row do; those that take the keyboard (rename, copy mode, quick
+    /// select, history) also focus the terminal and bring its tab to the
+    /// front, since another bottom-panel tab would hide the mode and take
+    /// its keys.
+    fn run_terminal_command(&mut self, cmd: crate::widgets::command_palette::Command) {
+        use crate::widgets::command_palette::Command as Cmd;
+        self.show_terminal = true;
+        let idx = self.active_terminal;
+        match cmd {
+            Cmd::TerminalClear => self.clear_terminal_at(idx),
+            Cmd::TerminalRename => self.begin_rename_terminal(idx),
+            Cmd::TerminalKill => {
+                if self.close_terminal_at(idx) {
+                    self.terminal_status(format!(
+                        "Closed terminal: {} remaining",
+                        self.terminals.len()
+                    ));
+                } else {
+                    self.status =
+                        String::from("Cannot close the last terminal; press Ctrl+J to hide");
+                }
+            }
+            Cmd::TerminalSplit => match self.split_terminal() {
+                Ok(()) => {
+                    self.terminal_status(format!(
+                        "Split terminal: {} active",
+                        self.terminals.len()
+                    ));
+                }
+                Err(e) => {
+                    self.status = format!("Split terminal failed: {e}");
+                }
+            },
+            Cmd::TerminalNewWithProfile => self.open_terminal_profile_picker(idx),
+            Cmd::TerminalQuickSelect => {
+                self.set_bottom_panel_tab(BottomPanelTab::Terminal);
+                self.open_terminal_quick_select();
+            }
+            Cmd::TerminalCopyMode => {
+                self.set_bottom_panel_tab(BottomPanelTab::Terminal);
+                self.open_terminal_copy_mode();
+            }
+            Cmd::TerminalCommandHistory => {
+                self.set_bottom_panel_tab(BottomPanelTab::Terminal);
+                self.open_command_history();
+            }
+            Cmd::TerminalOpenScrollback => self.open_scrollback_in_editor(),
+            _ => {}
+        }
+    }
+
     /// Clear the terminal at `idx`'s screen and scrollback (Cmd+K K / menu).
     fn clear_terminal_at(&mut self, idx: usize) {
         if let Some(t) = self.terminals.get_mut(idx) {
@@ -21544,7 +21621,7 @@ impl App {
             };
             let (label, right_hint) = match entry {
                 MenuEntry::Item { label, action } => {
-                    (label.as_str(), shortcut_for(action).map(str::to_string))
+                    (label.as_str(), menu_hint(action, &self.keymap))
                 }
                 // A submenu parent shows the ▸ where a shortcut would sit.
                 MenuEntry::Submenu { label, .. } => {
@@ -23820,6 +23897,20 @@ impl App {
             && !self.keymap.is_empty()
             && is_rebindable_chord(key)
             && let Some(cmd) = self.keymap.command_for(key)
+        {
+            self.run_command(cmd);
+            return Ok(());
+        }
+        // A user's chord for a terminal command is meant for the terminal
+        // (#1562), so it is taken before the shell sees the key; every other
+        // chord still passes through to the shell. Only the Terminal tab has
+        // a shell: on Output, Problems, Ports or Captures the key is the
+        // panel's own.
+        if self.focus == Pane::Terminal
+            && self.bottom_panel_tab == BottomPanelTab::Terminal
+            && !self.keymap.is_empty()
+            && is_rebindable_chord(key)
+            && let Some(cmd) = self.keymap.command_for(key).filter(|c| c.skips_the_shell())
         {
             self.run_command(cmd);
             return Ok(());
@@ -53015,6 +53106,15 @@ impl App {
                     self.cycle_terminal_back();
                 }
             }
+            Cmd::TerminalClear
+            | Cmd::TerminalRename
+            | Cmd::TerminalKill
+            | Cmd::TerminalSplit
+            | Cmd::TerminalNewWithProfile
+            | Cmd::TerminalQuickSelect
+            | Cmd::TerminalCopyMode
+            | Cmd::TerminalCommandHistory
+            | Cmd::TerminalOpenScrollback => self.run_terminal_command(cmd),
             Cmd::NewTerminal => match self.split_terminal() {
                 Ok(()) => {
                     self.terminal_status(format!(
@@ -61685,7 +61785,12 @@ impl App {
         // Selected") don't inflate the menu width past what's needed.
         // Width must also fit the shortcut hint on the right side, with
         // at least 2 cells of gap between label and shortcut.
-        let widest = menu.items.iter().map(menu_entry_width).max().unwrap_or(0);
+        let widest = menu
+            .items
+            .iter()
+            .map(|e| menu_entry_width(e, &self.keymap))
+            .max()
+            .unwrap_or(0);
         let area = self.last_frame_area;
         // Never past the frame: a long menu on a short terminal (or any menu
         // under 18 columns) built a rect outside the buffer, which panics.
@@ -61724,7 +61829,11 @@ impl App {
             return None;
         };
         let main = self.menu_rect()?;
-        let widest = items.iter().map(menu_entry_width).max().unwrap_or(0);
+        let widest = items
+            .iter()
+            .map(|e| menu_entry_width(e, &self.keymap))
+            .max()
+            .unwrap_or(0);
         let area = self.last_frame_area;
         let fit = |v: u16, max: u16| if max > 0 { v.min(max) } else { v };
         let width = fit((widest + 4).max(18) as u16, area.width);

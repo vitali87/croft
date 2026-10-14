@@ -347,6 +347,19 @@ pub enum Command {
     /// have no `Ctrl` form (`Ctrl+[` is `Esc`).
     FocusNextTerminal,
     FocusPreviousTerminal,
+    /// The terminal's own actions as commands (#1562): before, each was a
+    /// fixed chord or a right-click row only, so the palette could not find
+    /// it, `keybindings.json` could not bind it, and `croft import-vscode`
+    /// dropped a VS Code user's chord for it. Each acts on the active pane.
+    TerminalClear,
+    TerminalRename,
+    TerminalKill,
+    TerminalSplit,
+    TerminalNewWithProfile,
+    TerminalQuickSelect,
+    TerminalCopyMode,
+    TerminalCommandHistory,
+    TerminalOpenScrollback,
     // --- Run / debug ---
     StartDebugging,
     SelectDebugConfig,
@@ -776,6 +789,15 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::RunSelectedText,
     Command::FocusNextTerminal,
     Command::FocusPreviousTerminal,
+    Command::TerminalClear,
+    Command::TerminalRename,
+    Command::TerminalKill,
+    Command::TerminalSplit,
+    Command::TerminalNewWithProfile,
+    Command::TerminalQuickSelect,
+    Command::TerminalCopyMode,
+    Command::TerminalCommandHistory,
+    Command::TerminalOpenScrollback,
     Command::StartDebugging,
     Command::SelectDebugConfig,
     Command::AddDebugConfig,
@@ -1186,6 +1208,15 @@ impl Command {
             Command::RunSelectedText => "Terminal: Run Selected Text in Active Terminal",
             Command::FocusNextTerminal => "Terminal: Focus Next Terminal",
             Command::FocusPreviousTerminal => "Terminal: Focus Previous Terminal",
+            Command::TerminalClear => "Terminal: Clear",
+            Command::TerminalRename => "Terminal: Rename",
+            Command::TerminalKill => "Terminal: Kill the Active Terminal Instance",
+            Command::TerminalSplit => "Terminal: Split Terminal",
+            Command::TerminalNewWithProfile => "Terminal: Create New Terminal (With Profile)",
+            Command::TerminalQuickSelect => "Terminal: Quick Select",
+            Command::TerminalCopyMode => "Terminal: Enter Copy Mode",
+            Command::TerminalCommandHistory => "Terminal: Show Command History",
+            Command::TerminalOpenScrollback => "Terminal: Open Scrollback in Editor",
             Command::StartDebugging => "Debug: Start Debugging",
             Command::SelectDebugConfig => "Debug: Select and Start Debugging",
             Command::AddDebugConfig => "Debug: Add Configuration…",
@@ -1597,6 +1628,15 @@ impl Command {
             Command::RunSelectedText => "",
             Command::FocusNextTerminal => "Cmd+]",
             Command::FocusPreviousTerminal => "Cmd+[",
+            Command::TerminalClear => "Cmd+K K",
+            Command::TerminalRename => "Cmd+K R",
+            Command::TerminalKill => "",
+            Command::TerminalSplit => "",
+            Command::TerminalNewWithProfile => "",
+            Command::TerminalQuickSelect => "Ctrl+Shift+Space",
+            Command::TerminalCopyMode => "Ctrl+Shift+Y",
+            Command::TerminalCommandHistory => "Ctrl+Shift+H",
+            Command::TerminalOpenScrollback => "Cmd+K D",
             Command::KeyboardShortcuts => "F1",
             Command::UpdateCroft => "Cmd+Shift+F9",
             Command::StartDebugging => "F5",
@@ -1994,6 +2034,15 @@ impl Command {
             Command::RunSelectedText => "run_selected_text",
             Command::FocusNextTerminal => "focus_next_terminal",
             Command::FocusPreviousTerminal => "focus_previous_terminal",
+            Command::TerminalClear => "terminal_clear",
+            Command::TerminalRename => "terminal_rename",
+            Command::TerminalKill => "terminal_kill",
+            Command::TerminalSplit => "terminal_split",
+            Command::TerminalNewWithProfile => "terminal_new_with_profile",
+            Command::TerminalQuickSelect => "terminal_quick_select",
+            Command::TerminalCopyMode => "terminal_copy_mode",
+            Command::TerminalCommandHistory => "terminal_command_history",
+            Command::TerminalOpenScrollback => "terminal_open_scrollback",
             Command::StartDebugging => "start_debugging",
             Command::SelectDebugConfig => "select_debug_config",
             Command::AddDebugConfig => "add_debug_config",
@@ -2120,6 +2169,15 @@ impl Command {
     /// than fatal.
     pub fn from_id(id: &str) -> Option<Command> {
         ALL_COMMANDS.iter().copied().find(|c| c.id() == id)
+    }
+
+    /// Whether a `keybindings.json` chord for this command runs it while the
+    /// terminal has focus, instead of going to the shell (#1562). VS Code
+    /// sends its terminal commands' chords past the shell the same way
+    /// (`terminal.integrated.commandsToSkipShell`): a user who binds
+    /// Terminal: Clear means it for the terminal.
+    pub fn skips_the_shell(self) -> bool {
+        self.title().starts_with("Terminal: ")
     }
 }
 
