@@ -1,0 +1,1 @@
+fix: A left click in the editor's breakpoint lane, the column left of the fold arrow where `●` breakpoints are drawn, now sets a breakpoint on that line, and a second click removes it, as in VS Code. The caret stays where it was. Before, the click only moved the caret to the start of the line, and the right-click menu was the only way to add a breakpoint with the mouse.
