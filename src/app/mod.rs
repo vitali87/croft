@@ -33664,10 +33664,12 @@ impl App {
                             }
                         }
                     }
+                    // By pid, by program name or through attachCommands
+                    // (gdb-remote), sent as written (#1419).
                     RequestKind::Attach => {
-                        if rc.process_id.is_none() {
+                        if !configs::lldb_attach_has_target(&rc) {
                             self.debug_error(format!(
-                                "config \"{name}\": an lldb attach needs a numeric \"processId\""
+                                "config \"{name}\": an lldb attach needs a numeric \"processId\", a \"program\" or \"attachCommands\""
                             ));
                             return;
                         }
