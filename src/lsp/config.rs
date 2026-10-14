@@ -4,10 +4,13 @@
 /// change. The per-language data the enum used to hardcode — file extensions,
 /// project-root markers, the server family — lives in the language table built
 /// from extension manifests (see [`crate::lsp::languages`]); the constants
-/// below name the first-party languages for call sites and tests.
+/// below name the first-party languages for tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Language(pub(crate) &'static str);
 
+// Production resolves every language through the manifest-built table, so
+// the first-party names exist for tests only.
+#[cfg(test)]
 impl Language {
     pub const PYTHON: Language = Language("python");
     pub const TYPESCRIPT: Language = Language("typescript");
@@ -26,7 +29,9 @@ impl Language {
     pub const C: Language = Language("c");
     pub const CPP: Language = Language("cpp");
     pub const LUA: Language = Language("lua");
+}
 
+impl Language {
     /// The language whose manifests map this file extension, or `None`.
     /// Data-driven: the mapping comes from every loaded extension's
     /// `[[languages]]` blocks.
@@ -41,6 +46,7 @@ impl Language {
 
     /// Resolve an LSP `languageId` string to a known language, or `None` if no
     /// loaded extension contributes it.
+    #[cfg(test)]
     pub fn from_lsp_id(id: &str) -> Option<Self> {
         crate::lsp::languages::resolve(id)
     }
@@ -85,6 +91,7 @@ pub struct ServerConfig {
 /// on purpose: the linux-gnu build can't run on bionic, so Termux installs via
 /// `pkg` instead (the `termux_pkg` field on the provision). Bump the tag in
 /// both this const and `assets/extensions/lsp-rust/extension.toml` together.
+#[cfg(test)]
 const RUST_ANALYZER_TARGETS: &[(&str, &str)] = &[
     (
         "linux-aarch64",
@@ -104,6 +111,10 @@ const RUST_ANALYZER_TARGETS: &[(&str, &str)] = &[
     ),
 ];
 
+// The executable spec the bundled manifests reproduce (the
+// `bundled_manifests_reproduce_the_hardcoded_configs_exactly` test). Production
+// builds its servers from those manifests, so these compile for tests only.
+#[cfg(test)]
 impl ServerConfig {
     pub fn ty() -> Self {
         Self {
@@ -168,8 +179,8 @@ impl ServerConfig {
 
     pub fn vtsls() -> Self {
         Self {
-            name: crate::lsp::install::VTSLS_SERVER_NAME,
-            command: crate::lsp::install::VTSLS_SERVER_NAME.into(),
+            name: "vtsls",
+            command: "vtsls".into(),
             args: vec!["--stdio".into()],
             language: Language::TYPESCRIPT,
             initialization_options: None,
@@ -178,19 +189,8 @@ impl ServerConfig {
             provision: Some(crate::lsp::install::Provision::Npm {
                 package: "@vtsls/language-server",
                 version: Some("0.3.0"),
-                bin: crate::lsp::install::VTSLS_SERVER_NAME,
+                bin: "vtsls",
             }),
-        }
-    }
-
-    pub fn typescript_language_server() -> Self {
-        Self {
-            name: "typescript-language-server",
-            command: "typescript-language-server".into(),
-            args: vec!["--stdio".into()],
-            language: Language::TYPESCRIPT,
-            initialization_options: None,
-            provision: None,
         }
     }
 

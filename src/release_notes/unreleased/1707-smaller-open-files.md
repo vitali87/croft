@@ -1,0 +1,2 @@
+fix: A file open at launch, such as a restored tab, no longer keeps croft at the memory peak of parsing it: that memory is handed back a few seconds after launch, as it already was for a file opened later.
+fix: An open file takes much less memory, with nothing it shows or keeps any different: its syntax colors, inline blame, git gutter baseline and undo steps are held more compactly. With a 1.4 MB source file restored at launch croft now sits at 65 MB rather than 177 MB, and a 3.2 MB file adds 41 MB rather than 73 MB (measured on Linux).

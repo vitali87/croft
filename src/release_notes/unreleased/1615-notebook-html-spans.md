@@ -1,0 +1,1 @@
+fix: Notebook outputs with grouped pandas tables (MultiIndex rows or columns) now show every value under its own column, and HTML `<pre>` output keeps its lines and spacing instead of being joined onto one line.
