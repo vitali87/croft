@@ -1,0 +1,1 @@
+fix: `croft theme-import` reads a theme whose `tokenColors` names a TextMate `.tmTheme` (or JSON) file beside it, so its code colours are imported as VS Code shows them. Such a theme imported with croft's default code colours and no word about the file before; a file that cannot be read now fails the import and names it.

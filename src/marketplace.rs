@@ -462,8 +462,8 @@ fn check_host(url: &str) -> Result<()> {
 /// would accept — or accepting one it would refuse — is the wrong shape.
 const MAX_CHAIN: usize = 8;
 
-/// Extract the chosen theme AND every file its `include` chain names,
-/// keeping each at its own archive-relative path. Returns the path of the
+/// Extract the chosen theme AND every file its `include` chain names
+/// (plus any `tokenColors` file each theme names), keeping each at its own archive-relative path. Returns the path of the
 /// theme itself.
 ///
 /// The naive version wrote the one member out under a flat name at the
@@ -490,40 +490,60 @@ pub fn extract_theme_chain(vsix: &Path, theme_path: &str, scratch: &Path) -> Res
         if seen.len() >= MAX_CHAIN {
             bail!("include chain longer than {MAX_CHAIN} files (a cycle?)");
         }
-        let text = read_member(vsix, &format!("extension/{rel}"), scratch)
-            .with_context(|| format!("reading the theme member {rel}"))?;
-        let dest = contained_scratch_path(scratch, &rel)?;
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("making {}", parent.display()))?;
-        }
-        std::fs::write(&dest, &text).with_context(|| format!("writing {}", dest.display()))?;
+        let (text, dest) = extract_member_at(vsix, &rel, scratch)?;
         if entry.is_none() {
             entry = Some(dest);
         }
         seen.push(rel.clone());
-        if let Some(inc) = include_of(&text) {
-            // Resolved against the INCLUDING file's directory, exactly as the
-            // converter will resolve it.
-            let base = Path::new(&rel).parent().unwrap_or(Path::new(""));
-            let joined = base.join(inc.trim_start_matches("./"));
-            let next = joined.to_string_lossy().replace('\\', "/");
-            pending.push(next);
+        let (include, token_colors) = referenced_files(&text);
+        // A string `tokenColors` names a file the converter reads beside the
+        // theme (#1177), so it has to arrive too. It is a leaf: its own
+        // contents name no further files.
+        if let Some(file) = token_colors {
+            extract_member_at(vsix, &sibling_of(&rel, &file), scratch)?;
+        }
+        if let Some(inc) = include {
+            pending.push(sibling_of(&rel, &inc));
         }
     }
     entry.ok_or_else(|| anyhow::anyhow!("no theme file extracted"))
 }
 
-/// The `include` field of a theme document, if it names one.
+/// Extract the archive member at `rel` (relative to `extension/`) to the
+/// same relative path under `scratch`, returning its text and where it went.
+fn extract_member_at(vsix: &Path, rel: &str, scratch: &Path) -> Result<(String, PathBuf)> {
+    let text = read_member(vsix, &format!("extension/{rel}"), scratch)
+        .with_context(|| format!("reading the theme member {rel}"))?;
+    let dest = contained_scratch_path(scratch, rel)?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("making {}", parent.display()))?;
+    }
+    std::fs::write(&dest, &text).with_context(|| format!("writing {}", dest.display()))?;
+    Ok((text, dest))
+}
+
+/// `name`, as the theme at `rel` names it, resolved against that theme's
+/// directory, exactly as the converter will resolve it.
+fn sibling_of(rel: &str, name: &str) -> String {
+    let base = Path::new(rel).parent().unwrap_or(Path::new(""));
+    let joined = base.join(name.trim_start_matches("./"));
+    joined.to_string_lossy().replace('\\', "/")
+}
+
+/// The `include` field of a theme document and its `tokenColors` field when
+/// that is a file path rather than an inline array.
 ///
 /// Comments and trailing commas are stripped first, through the same
 /// `strip_jsonc` the converter uses: a theme carrying them is ordinary, and a
-/// stricter parse here would skip includes on files the converter then goes
-/// on to read successfully.
-fn include_of(text: &str) -> Option<String> {
+/// stricter parse here would skip files the converter then goes on to read
+/// successfully.
+fn referenced_files(text: &str) -> (Option<String>, Option<String>) {
     let stripped = crate::tasks::strip_jsonc(text);
-    let v: serde_json::Value = serde_json::from_str(&stripped).ok()?;
-    v.get("include")?.as_str().map(str::to_string)
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&stripped) else {
+        return (None, None);
+    };
+    let field = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+    (field("include"), field("tokenColors"))
 }
 
 /// Join `rel` under `scratch`, refusing anything that would land outside it.
@@ -905,6 +925,48 @@ mod tests {
             "the base theme's name did not survive the chain: {}",
             converted.manifest
         );
+    }
+
+    /// A theme whose `tokenColors` names a file (#1177) arrives with that
+    /// file beside it, for every theme in the chain, so the converter can
+    /// read it.
+    #[test]
+    fn a_token_colors_file_is_extracted_with_its_theme() {
+        let dir = tempfile::tempdir().unwrap();
+        let vsix = dir.path().join("x.vsix");
+        make_vsix(
+            &vsix,
+            &[
+                (
+                    "extension/themes/top.json",
+                    r##"{"include": "./base.json", "tokenColors": "./top-tokens.json"}"##,
+                ),
+                (
+                    "extension/themes/base.json",
+                    r##"{"name": "Base", "tokenColors": "sub/base-tokens.json"}"##,
+                ),
+                (
+                    "extension/themes/top-tokens.json",
+                    r##"[{"scope": "comment", "settings": {"foreground": "#00ff00"}}]"##,
+                ),
+                (
+                    "extension/themes/sub/base-tokens.json",
+                    r##"[{"scope": "string", "settings": {"foreground": "#ff0000"}}]"##,
+                ),
+            ],
+        );
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+
+        let entry = extract_theme_chain(&vsix, "themes/top.json", &scratch).unwrap();
+
+        for name in ["top-tokens.json", "sub/base-tokens.json"] {
+            assert!(
+                scratch.join("themes").join(name).is_file(),
+                "{name} missing from the extraction"
+            );
+        }
+        crate::vscode_theme::convert_file(&entry, None).unwrap();
     }
 
     /// A chain that points outside the archive, or loops, is refused.
