@@ -85623,6 +85623,8 @@ fn rows_without_an_expression_offer_less_or_nothing() {
             indent: 1,
             kind: DebugRowKind::Scope {
                 name: String::from("Locals"),
+                index: 0,
+                open: None,
             },
         },
         DebugRow {
