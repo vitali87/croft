@@ -18,7 +18,10 @@
 //! Mechanics: every layer may `extends` other JSON files (relative to itself
 //! or `~`-expanded; cycles warn and stop), and may carry `"macos"` /
 //! `"linux"` / `"android"` blocks that merge over its flat keys on the
-//! matching platform. Objects deep-merge; arrays and scalars replace.
+//! matching platform. Objects deep-merge; arrays and scalars replace, except
+//! the exclusion lists (`files_exclude`, `search_exclude`), which combine
+//! across layers as VS Code's do, and drop a glob a later layer names with
+//! a leading `!` (#1494).
 //!
 //! Workspace layers (4–6) are repo-controlled input, so they pass an explicit
 //! allowlist: keys that change trust posture or execute things
@@ -242,11 +245,12 @@ pub fn load_merged_from(
                 ));
                 continue;
             }
-            deep_merge(merged.entry(key.clone()).or_insert(Value::Null), &value);
+            merge_setting(&mut merged, &key, &value);
             provenance.insert(key, kind);
         }
     }
 
+    drop_negations(&mut merged);
     let prefs = deserialize_tolerantly(merged, &mut provenance, &mut warnings);
     MergedConfig {
         prefs,
@@ -371,7 +375,7 @@ fn load_layer_document_inner(
                 load_layer_document(&base_path, platform, visited, chain, warnings)
             {
                 for (k, v) in base_doc {
-                    deep_merge(acc.entry(k).or_insert(Value::Null), &v);
+                    merge_setting(&mut acc, &k, &v);
                 }
             }
         }
@@ -395,11 +399,11 @@ fn load_layer_document_inner(
         drop_unknown_keys(block, path, warnings);
     }
     for (k, v) in doc {
-        deep_merge(acc.entry(k).or_insert(Value::Null), &v);
+        merge_setting(&mut acc, &k, &v);
     }
     if let Some(Value::Object(block)) = scoped {
         for (k, v) in block {
-            deep_merge(acc.entry(k).or_insert(Value::Null), &v);
+            merge_setting(&mut acc, &k, &v);
         }
     }
     Some(acc)
@@ -420,6 +424,73 @@ fn resolve_extends_path(target: &str, extending_file: &Path) -> PathBuf {
         p
     } else {
         extending_file.parent().unwrap_or(Path::new(".")).join(p)
+    }
+}
+
+/// Settings whose lists combine across layers instead of replacing (#1494):
+/// in VS Code, `files.exclude` and `search.exclude` from user and workspace
+/// settings merge, so a repo's exclusions add to yours.
+const UNION_KEYS: &[&str] = &["files_exclude", "search_exclude"];
+
+/// Merge one setting of a layer into the accumulated map: the exclusion
+/// lists combine, everything else deep-merges.
+fn merge_setting(acc: &mut Map<String, Value>, key: &str, value: &Value) {
+    let slot = acc.entry(key.to_string()).or_insert(Value::Null);
+    if UNION_KEYS.contains(&key) {
+        union_globs(slot, value);
+    } else {
+        deep_merge(slot, value);
+    }
+}
+
+/// Add `over`'s globs to `base`'s, keeping order and dropping repeats. A
+/// `!glob` entry removes `glob` from what the earlier layers set (VS Code's
+/// `"glob": false`); it is kept until every layer is in, so a layer can
+/// also take back a glob an `extends` base added, and is stripped by
+/// [`drop_negations`]. A later plain `glob` cancels an earlier `!glob`.
+/// A glob that really starts with `!` is written `\!glob`, which merges as
+/// a plain glob. Anything but a list of strings replaces, so the usual type warning still
+/// names it.
+fn union_globs(base: &mut Value, over: &Value) {
+    let Some(entries) = over.as_array().filter(|a| a.iter().all(Value::is_string)) else {
+        *base = over.clone();
+        return;
+    };
+    let mut out: Vec<String> = match base {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        _ => Vec::new(),
+    };
+    for entry in entries.iter().filter_map(Value::as_str) {
+        let (drop, keep) = match entry.strip_prefix('!') {
+            Some(glob) => (glob.to_string(), entry.to_string()),
+            None => (format!("!{entry}"), entry.to_string()),
+        };
+        out.retain(|g| *g != drop);
+        if !out.contains(&keep) {
+            out.push(keep);
+        }
+    }
+    *base = Value::from(out);
+}
+
+/// Strip the `!glob` removals once every layer is merged: they only take
+/// globs away, and are not globs to match themselves. An escaped `\!glob`
+/// then becomes the literal `!glob` the matcher reads.
+fn drop_negations(merged: &mut Map<String, Value>) {
+    for key in UNION_KEYS {
+        if let Some(Value::Array(items)) = merged.get_mut(*key) {
+            items.retain(|v| !v.as_str().is_some_and(|g| g.starts_with('!')));
+            for item in items.iter_mut() {
+                if let Some(literal) = item.as_str().and_then(|g| g.strip_prefix('\\'))
+                    && literal.starts_with('!')
+                {
+                    *item = Value::from(literal);
+                }
+            }
+        }
     }
 }
 
@@ -1210,6 +1281,109 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, root2.join(".croft")).unwrap();
         let err = ensure_workspace_local_ignored(&root2).unwrap_err();
         assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    /// #1494: the issue's three layers. User `**/tests`, `.vscode`
+    /// `**/dist` and `.croft` `**/generated` + `*.log` all apply together,
+    /// in layer order.
+    #[test]
+    fn exclusion_lists_combine_across_layers() {
+        let user = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            user.path().join("config.json"),
+            r#"{ "files_exclude": ["**/tests"], "search_exclude": ["**/fixtures"] }"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join(".vscode")).unwrap();
+        std::fs::write(
+            root.path().join(".vscode/settings.json"),
+            r#"{ "files.exclude": { "**/dist": true } }"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join(".croft")).unwrap();
+        std::fs::write(
+            root.path().join(".croft/config.json"),
+            r#"{ "files_exclude": ["**/generated", "*.log", "**/dist"] }"#,
+        )
+        .unwrap();
+        let merged = load_merged_from(user.path(), Some(root.path()), "linux");
+        assert_eq!(
+            merged.prefs.files_exclude,
+            ["**/tests", "**/dist", "**/generated", "*.log"]
+        );
+        assert_eq!(merged.prefs.search_exclude, ["**/fixtures"]);
+    }
+
+    /// #1494: a layer takes a glob back with `!glob`, or with VS Code's
+    /// `"glob": false`; no `!` entry reaches the list croft matches with,
+    /// and a later layer can add the glob again.
+    #[test]
+    fn a_negated_glob_removes_an_earlier_layer_s_exclusion() {
+        let user = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            user.path().join("config.json"),
+            r#"{ "files_exclude": ["**/tests", "**/build", "**/out"] }"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join(".vscode")).unwrap();
+        std::fs::write(
+            root.path().join(".vscode/settings.json"),
+            r#"{ "files.exclude": { "**/tests": false, "**/out": false } }"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join(".croft")).unwrap();
+        std::fs::write(
+            root.path().join(".croft/config.json"),
+            r#"{ "files_exclude": ["!**/build", "!**/never-set", "**/out"] }"#,
+        )
+        .unwrap();
+        let merged = load_merged_from(user.path(), Some(root.path()), "linux");
+        assert_eq!(merged.prefs.files_exclude, ["**/out"]);
+    }
+
+    /// #1494: a glob that really starts with `!` is escaped as `\!glob`; it
+    /// merges as a plain glob, `!\!glob` takes it back, and it reaches the
+    /// matcher as the literal `!glob`.
+    #[test]
+    fn an_escaped_bang_is_a_literal_glob_not_a_removal() {
+        let user = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            user.path().join("config.json"),
+            r#"{ "files_exclude": ["\\!important", "\\!draft"] }"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join(".croft")).unwrap();
+        std::fs::write(
+            root.path().join(".croft/config.json"),
+            r#"{ "files_exclude": ["!\\!draft"] }"#,
+        )
+        .unwrap();
+        let merged = load_merged_from(user.path(), Some(root.path()), "linux");
+        assert_eq!(merged.prefs.files_exclude, ["!important"]);
+    }
+
+    /// #1494 negative: every other list still replaces, and a malformed
+    /// exclusion value still replaces (and warns) rather than merging.
+    #[test]
+    fn other_lists_still_replace_and_a_bad_exclusion_value_warns() {
+        let mut acc = Map::new();
+        merge_setting(
+            &mut acc,
+            "remote_offer_excluded_hosts",
+            &serde_json::json!(["a"]),
+        );
+        merge_setting(
+            &mut acc,
+            "remote_offer_excluded_hosts",
+            &serde_json::json!(["b"]),
+        );
+        assert_eq!(acc["remote_offer_excluded_hosts"], serde_json::json!(["b"]));
+        merge_setting(&mut acc, "files_exclude", &serde_json::json!(["a"]));
+        merge_setting(&mut acc, "files_exclude", &serde_json::json!("b"));
+        assert_eq!(acc["files_exclude"], serde_json::json!("b"));
     }
 
     /// #1607: a misspelt key was dropped without a word.
