@@ -59933,9 +59933,7 @@ impl App {
             .editor
             .path
             .as_deref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::lsp::Language::from_extension)
+            .and_then(crate::lsp::Language::from_path)
             .map(|l| l.lsp_id());
         crate::default_formatter::foreign(
             self.default_formatter.as_deref(),
