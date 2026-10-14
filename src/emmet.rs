@@ -1008,10 +1008,13 @@ pub fn wrap(
     let mut p = Parser {
         src: &chars,
         pos: 0,
+        climb: 0,
+        stray_caret: false,
     };
     // Not `parse`: a lone word is refused there only because, typed in
-    // prose, it is more likely a word than a tag. Here it was asked for.
-    let mut nodes = p.sequence()?;
+    // prose, it is more likely a word than a tag. Here it was asked for,
+    // so a stray `^` is read as `+`, as Emmet does, not taken for math.
+    let mut nodes = p.sequence(true)?;
     if p.pos != p.src.len() || (nodes.len() == 1 && nodes[0].is_bare()) {
         return None;
     }
