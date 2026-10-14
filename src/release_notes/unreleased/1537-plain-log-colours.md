@@ -1,0 +1,1 @@
+feature: Plain `.log` files without colour codes are now highlighted in the editor like the rendered log view (levels, dates, numbers, ids), and show "Log" in the status bar. "File: Reopen as Preview" now opens any plain text file, such as a `.txt` or `.out` capture, in the rendered log view.

@@ -1,0 +1,1 @@
+fix: Changing a setting from inside croft (Toggle Auto Save, picking a theme, the Settings hub, an MCP consent) now edits `config.json` in place: its comments, key order and trailing commas stay. It used to be rewritten as plain sorted JSON with every comment deleted.
