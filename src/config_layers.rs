@@ -561,6 +561,9 @@ fn known_setting_keys() -> &'static std::collections::BTreeSet<String> {
                 _ => Default::default(),
             };
         keys.insert(String::from("extends"));
+        // Skipped from the serialized default while it is empty, but a
+        // setting all the same (#1440).
+        keys.insert(String::from("languages"));
         keys
     })
 }
