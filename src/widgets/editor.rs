@@ -6917,20 +6917,25 @@ impl Editor {
     /// Hand the buffer's text to a worker thread for a syntax pass as `kind`.
     fn start_highlight_pass(&mut self, kind: LangKind) {
         let text = self.lines.join("\n");
+        let line_lens = embedded_line_lens(&self.lines);
         let (tx, rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name(String::from("croft-highlight"))
             .spawn(move || {
                 // Nobody listening (the tab closed, or a newer pass replaced
                 // this one) is fine: the result is simply dropped.
-                let _ = tx.send(run_highlight_pass(kind, text));
+                let _ = tx.send(run_highlight_pass(kind, text, line_lens));
             });
         let request = self.highlight_requests;
         match spawned {
             Ok(_) => self.highlight_job = Some(HighlightJob { kind, request, rx }),
             // No thread to be had: highlight here, as before #850.
             Err(_) => {
-                let pass = run_highlight_pass(kind, self.lines.join("\n"));
+                let pass = run_highlight_pass(
+                    kind,
+                    self.lines.join("\n"),
+                    embedded_line_lens(&self.lines),
+                );
                 self.land_highlight_pass(pass, request);
             }
         }
@@ -14660,10 +14665,27 @@ struct HighlightPass {
     cost: std::time::Duration,
 }
 
+/// The byte length of each of `lines`, when one of them holds a `\n` of its
+/// own (one typed as a character), so a pass over their joined text can tell
+/// the editor's lines from the grammar's. `None` in the usual case, where
+/// splitting the joined text on `\n` gives the lines back, so starting a pass
+/// costs no per-line allocation.
+fn embedded_line_lens(lines: &[String]) -> Option<Vec<usize>> {
+    lines
+        .iter()
+        .any(|l| l.contains('\n'))
+        .then(|| lines.iter().map(String::len).collect())
+}
+
 /// Highlight `text` as `kind` and scan its brackets outside the strings and
 /// comments the grammar found: everything `recompute_highlights` used to do
-/// inline, now run on a worker thread (#850).
-fn run_highlight_pass(kind: LangKind, text: String) -> HighlightPass {
+/// inline, now run on a worker thread (#850). `line_lens` is
+/// [`embedded_line_lens`] of the lines `text` joins.
+fn run_highlight_pass(
+    kind: LangKind,
+    text: String,
+    line_lens: Option<Vec<usize>>,
+) -> HighlightPass {
     let started = std::time::Instant::now();
     let line_starts = compute_line_starts(text.as_bytes());
     let (mut spans, protected) = crate::highlight::highlight_text_with_protected(
@@ -14672,7 +14694,44 @@ fn run_highlight_pass(kind: LangKind, text: String) -> HighlightPass {
         text.as_bytes(),
         &line_starts,
     );
-    let mut brackets = scan_bracket_colors(&text.split('\n').collect::<Vec<_>>(), &protected);
+    // A line can hold a `\n` of its own (one typed as a character), which
+    // the grammar reads as a line break. Fold those pieces' spans back onto
+    // their line, so the pass describes the editor's lines exactly: a pass
+    // over text that has not changed since then lands as is, instead of being
+    // carried through a line diff whose time budget makes the result vary run
+    // to run.
+    let lines = match line_lens {
+        None => PackedLines::from_joined(text),
+        Some(lens) => {
+            let mut at = 0;
+            let lines: Vec<&str> = lens
+                .iter()
+                .map(|&len| {
+                    let line = &text[at..at + len];
+                    at += len + 1;
+                    line
+                })
+                .collect();
+            let mut pieces = spans.into_iter();
+            spans = lines
+                .iter()
+                .map(|line| {
+                    let mut out = Vec::new();
+                    let mut offset = 0;
+                    for piece in line.split('\n') {
+                        out.extend(pieces.next().unwrap_or_default().into_iter().map(|s| {
+                            let r = s.range();
+                            HiSpan::new(r.start + offset, r.end + offset, s.style)
+                        }));
+                        offset += piece.len() + 1;
+                    }
+                    out
+                })
+                .collect();
+            PackedLines::from(&lines[..])
+        }
+    };
+    let mut brackets = scan_bracket_colors(&lines.iter().collect::<Vec<_>>(), &protected);
     // The result lives as long as the tab (#1707): each line's list grew by
     // doubling, which left about a third of it spare. Trimmed here, on the
     // worker, rather than on the UI thread that keeps it.
@@ -14680,7 +14739,7 @@ fn run_highlight_pass(kind: LangKind, text: String) -> HighlightPass {
     brackets.iter_mut().for_each(Vec::shrink_to_fit);
     HighlightPass {
         kind,
-        lines: PackedLines::from_joined(text),
+        lines,
         spans,
         brackets,
         protected,
@@ -35521,7 +35580,7 @@ mod tests {
         let cpp = "// greet the user (politely\n#include <string>\nint main() {\n    std::string s = \"smile :)\";\n    char c = '(';\n    return s.size() + c;\n}\n";
         let c = "int main() {\n    char c = '(';\n    int v[] = {1};\n    return c;\n}\n";
         for (kind, src) in [(LangKind::Cpp, cpp), (LangKind::C, c)] {
-            let pass = run_highlight_pass(kind, src.to_string());
+            let pass = run_highlight_pass(kind, src.to_string(), None);
             let red: Vec<(usize, usize)> = pass
                 .brackets
                 .iter()
@@ -35546,6 +35605,7 @@ mod tests {
         let pass = run_highlight_pass(
             LangKind::Cpp,
             String::from("int f() {\n    return 0;\n}}\n"),
+            None,
         );
         assert_eq!(pass.brackets[2], vec![(0, 0), (1, UNEXPECTED_BRACKET)]);
     }
