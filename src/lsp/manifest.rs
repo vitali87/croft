@@ -90,6 +90,7 @@ pub struct ExtensionManifest {
     /// appear in the user-facing Extensions panel.
     #[serde(default)]
     pub hidden: bool,
+    #[allow(dead_code)] // a required manifest key; croft never reads it back
     pub api_version: u32,
     #[serde(default)]
     pub languages: Vec<LanguageDecl>,
@@ -196,8 +197,10 @@ pub struct CommandDecl {
 pub struct DebugAdapterDecl {
     /// Stable id (matches the contributing extension's id for the toggle, e.g.
     /// the `debugpy` adapter id; the panel toggle keys on the manifest `id`).
+    #[allow(dead_code)] // a required manifest key; croft never reads it back
     pub id: String,
     /// Human-facing adapter name (shown in docs / future debugger UI).
+    #[allow(dead_code)] // a required manifest key; croft never reads it back
     pub label: String,
     /// Which built-in launch mechanism croft drives for this adapter.
     pub kind: AdapterKindDecl,
@@ -233,8 +236,10 @@ pub enum AdapterKindDecl {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TestRunnerDecl {
     /// Stable id (matches the contributing extension's id for the toggle).
+    #[allow(dead_code)] // a required manifest key; croft never reads it back
     pub id: String,
     /// Human-facing runner name (shown in docs / future Testing UI).
+    #[allow(dead_code)] // a required manifest key; croft never reads it back
     pub label: String,
     /// Which built-in run mechanism croft drives for this runner.
     pub kind: RunnerKindDecl,
@@ -340,6 +345,12 @@ pub struct ThemeDecl {
     pub syn_tag: String,
     #[serde(default)]
     pub syn_fg: String,
+    /// A high contrast theme (VS Code's `hc-black` / `hc-light`, #1548):
+    /// croft's own chrome greys resolve to the theme's pure foreground and
+    /// background, and every other chrome color is lifted until it reads
+    /// at 7:1 against the background.
+    #[serde(default)]
+    pub high_contrast: bool,
 }
 
 /// One `[[languages]]` entry: a language identity contributed by an extension.
