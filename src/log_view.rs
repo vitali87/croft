@@ -25,7 +25,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use crate::ansi_text::{AnsiLine, AnsiStyle, parse_into, parse_line};
+use crate::ansi_text::{AnsiLine, AnsiSpan, AnsiStyle, parse_into, parse_line};
 use crate::widgets::editor_find::{MatchPos, line_matches};
 use crate::widgets::search::{SearchOpts, line_may_match};
 
@@ -145,6 +145,26 @@ fn highlighted(raw: &str) -> std::borrow::Cow<'_, str> {
         return std::borrow::Cow::Borrowed(raw);
     }
     HIGHLIGHTER.with(|h| h.apply(raw))
+}
+
+/// tailspin's colours for one plain line (#1537), as spans over `raw`
+/// itself: the editor's Log mode paints them onto buffer text it does not
+/// own the bytes of, so a line the highlighter would leave as is (one with
+/// its own escapes, an over-wide one, or nothing to match) gets none.
+pub fn plain_line_spans(raw: &str) -> Vec<AnsiSpan> {
+    let lit = highlighted(raw);
+    if matches!(lit, std::borrow::Cow::Borrowed(_)) {
+        return Vec::new();
+    }
+    let parsed = parse_line(&lit, &mut AnsiStyle::default());
+    if parsed.text != raw {
+        return Vec::new();
+    }
+    parsed
+        .spans
+        .into_iter()
+        .filter(|s| s.style != AnsiStyle::default())
+        .collect()
 }
 
 /// One window refill: many screens' worth, still instant to read.
