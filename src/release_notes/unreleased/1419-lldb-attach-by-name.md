@@ -1,0 +1,1 @@
+fix: C/C++/Rust: an lldb attach configuration with a `program` (attach by process name, optionally with `waitFor`) or with `attachCommands` (such as `gdb-remote host:port` for gdbserver, QEMU or an embedded probe) now starts instead of being refused for lacking a numeric `processId`.
