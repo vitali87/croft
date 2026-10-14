@@ -1,0 +1,1 @@
+feature: Vue (`.vue`) and Svelte (`.svelte`) components now open as Vue and Svelte instead of Plain Text: the template is highlighted as HTML, a `<script lang="ts">` block as TypeScript (other scripts as JavaScript) and `<style>` as CSS, with HTML's block comment, tag closing and Emmet.
