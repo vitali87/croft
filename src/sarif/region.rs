@@ -223,16 +223,6 @@ fn offset_pos(lines: &Lines, units: usize, kind: ColumnKind) -> (Pos, bool) {
     (at_end, left > 0)
 }
 
-/// §3.30.3: `(offset, length)` of a binary region.
-pub fn byte_range(region: &Region) -> Option<(u64, u64)> {
-    let offset = u64::try_from(region.byte_offset?).ok()?;
-    let length = region
-        .byte_length
-        .and_then(|l| u64::try_from(l).ok())
-        .unwrap_or(0);
-    Some((offset, length))
-}
-
 /// A range as byte offsets into the text `lines` was built from.
 pub fn byte_span(lines: &Lines, range: &TextRange) -> (usize, usize) {
     let a = lines.byte_of(range.start);
@@ -616,12 +606,6 @@ mod tests {
             )
             .is_none()
         );
-        assert_eq!(byte_range(&region(r#"{"byteOffset":4}"#)), Some((4, 0)));
-        assert_eq!(
-            byte_range(&region(r#"{"byteOffset":4,"byteLength":8}"#)),
-            Some((4, 8))
-        );
-        assert_eq!(byte_range(&region(r#"{"startLine":1}"#)), None);
     }
 
     // ── re-anchoring ────────────────────────────────────────────────────
