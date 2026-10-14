@@ -14,8 +14,13 @@
 #        {"ev": "update", "id": "<cell>", "index": 0, "output": {...}}
 #        {"ev": "done", "id": "<cell>", "execution_count": 3, "status": "ok"|"error"}
 #        {"ev": "error", "message": "..."}
+#        {"ev": "missing", "kernel": "<asked for>", "specs": [...]}
+#        {"ev": "specs", "specs": [{"name", "display", "language"}, ...]}
 #
-# argv: kernel name (default "python3"), working directory.
+# argv: kernel name (default "python3"), working directory. The name
+# "--list" only reports the installed kernels. A notebook naming a kernel
+# this machine does not have gets "missing" with the installed ones, so
+# croft can ask which to use instead of failing (#1377).
 
 import json
 import queue
@@ -39,6 +44,38 @@ except Exception as e:  # noqa: BLE001 - report any import failure
 
 name = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else "python3"
 cwd = sys.argv[2] if len(sys.argv) > 2 else None
+
+
+def installed_specs():
+    try:
+        from jupyter_client.kernelspec import KernelSpecManager
+
+        found = KernelSpecManager().get_all_specs()
+    except Exception:  # noqa: BLE001 - no list means no picker, not a crash
+        return []
+    out = []
+    for spec_name, info in sorted(found.items()):
+        spec = info.get("spec", {}) if isinstance(info, dict) else {}
+        out.append(
+            {
+                "name": spec_name,
+                "display": spec.get("display_name") or spec_name,
+                "language": spec.get("language") or "",
+            }
+        )
+    return out
+
+
+if name == "--list":
+    emit({"ev": "specs", "specs": installed_specs()})
+    sys.exit(0)
+
+specs = installed_specs()
+# jupyter_client lowercases the requested name before lookup, so a
+# notebook asking for "Python3" still launches the installed "python3".
+if specs and name.lower() not in {s["name"].lower() for s in specs}:
+    emit({"ev": "missing", "kernel": name, "specs": specs})
+    sys.exit(1)
 
 try:
     km = KernelManager(kernel_name=name)
