@@ -3403,6 +3403,10 @@ pub struct Editor {
     /// whether an external process changed the file underneath us. `None`
     /// for a tab with no file (the blank initial buffer).
     disk_stamp: Option<(SystemTime, u64)>,
+    /// Set for a new file opened before it exists (#1157): its `None`
+    /// stamp means "expected absent", so the file appearing on disk is an
+    /// external change rather than a phantom one.
+    disk_expect_absent: bool,
     /// Set when an external on-disk change is detected while this buffer has
     /// unsaved edits. Reloading would discard the user's edits and saving
     /// would clobber the external change, so neither happens automatically:
@@ -3600,6 +3604,7 @@ impl Editor {
             diff_prev_arrow: Rect::default(),
             diff_next_arrow: Rect::default(),
             disk_stamp: None,
+            disk_expect_absent: false,
             disk_conflict: false,
             encoding_loss: false,
             lossy_save_armed: false,
@@ -5267,9 +5272,40 @@ impl Editor {
             }
             _ => {}
         }
+        self.load_text(path, &bytes, sarif_refusal)
+    }
+
+    /// A file that does not exist yet, in a folder that does: an empty text
+    /// buffer bound to `path`, written on the first save, as `code new.md`
+    /// and `vim new.md` start one (#1157). An existing file opens as usual.
+    pub fn open_new_file(&mut self, path: &Path) -> Result<()> {
+        if std::fs::symlink_metadata(path).is_ok() {
+            return self.open(path);
+        }
+        let dir = path.parent().unwrap_or(Path::new(""));
+        if !dir.is_dir() {
+            anyhow::bail!("no such directory {}", dir.display());
+        }
+        if self.path.as_deref() != Some(path) {
+            self.force_text = false;
+        }
+        self.load_text(path, &[], None)?;
+        self.disk_expect_absent = self.disk_stamp.is_none();
+        self.status = format!("New file {}: saving creates it", path.display());
+        Ok(())
+    }
+
+    /// Load `bytes`, the contents of `path`, as the buffer's text: the end
+    /// of [`Self::open`] once no viewer claimed the file.
+    fn load_text(
+        &mut self,
+        path: &Path,
+        bytes: &[u8],
+        sarif_refusal: Option<String>,
+    ) -> Result<()> {
         // Decode with the file's BOM-declared encoding if it has one, else
         // UTF-8. A later "Reopen with Encoding" overrides this.
-        let sniffed = encoding_rs::Encoding::for_bom(&bytes);
+        let sniffed = encoding_rs::Encoding::for_bom(bytes);
         let enc = sniffed.map(|(e, _)| e).unwrap_or(encoding_rs::UTF_8);
         // The BOM sniff comes FIRST: UTF-16 text is half NUL bytes, so the
         // binary heuristic would reject every UTF-16 file — including the ones
@@ -5277,7 +5313,7 @@ impl Editor {
         // menu. A byte-order mark is a positive declaration of text, so it
         // settles the question the heuristic is only guessing at.
         let bom_declares_text = enc == encoding_rs::UTF_16LE || enc == encoding_rs::UTF_16BE;
-        if !bom_declares_text && is_binary(&bytes) {
+        if !bom_declares_text && is_binary(bytes) {
             // Never a dead-end: binary files open in the hex viewer
             // instead of failing with "Binary file" (#172).
             return self.open_hex(path);
@@ -5296,7 +5332,7 @@ impl Editor {
         self.encoding = enc;
         // `decode` strips the BOM, so remember it or the next save drops it.
         self.bom = sniffed.is_some();
-        let (decoded, _, decode_lossy) = enc.decode(&bytes);
+        let (decoded, _, decode_lossy) = enc.decode(bytes);
         let text = decoded.into_owned();
         self.decode_lossy = decode_lossy;
         self.final_newline = text.ends_with(['\n', '\r']);
@@ -5335,6 +5371,7 @@ impl Editor {
         self.scroll_sub = 0;
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_expect_absent = false;
         self.disk_conflict = false;
         // A whole-buffer swap: whatever the previous contents could not be
         // encoded as is no longer this tab's problem.
@@ -5459,6 +5496,7 @@ impl Editor {
         let format_label = image_format_label_from_ext(ext);
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_expect_absent = false;
         self.disk_conflict = false;
         // A whole-buffer swap: whatever the previous contents could not be
         // encoded as is no longer this tab's problem.
@@ -5725,6 +5763,7 @@ impl Editor {
             crate::svg::rasterize(&src).map_err(|e| anyhow::anyhow!("SVG render failed: {e}"))?;
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_expect_absent = false;
         self.disk_conflict = false;
         // A whole-buffer swap: whatever the previous contents could not be
         // encoded as is no longer this tab's problem.
@@ -5785,6 +5824,7 @@ impl Editor {
     fn install_sheet_view(&mut self, path: &Path, view: crate::sheet::SheetView) {
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_expect_absent = false;
         self.disk_conflict = false;
         // A whole-buffer swap: whatever the previous contents could not be
         // encoded as is no longer this tab's problem.
@@ -5849,6 +5889,7 @@ impl Editor {
             .ok_or_else(|| anyhow::anyhow!("Could not decode rasterised PDF"))?;
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_expect_absent = false;
         self.disk_conflict = false;
         // A whole-buffer swap: whatever the previous contents could not be
         // encoded as is no longer this tab's problem.
@@ -6278,6 +6319,7 @@ impl Editor {
             crate::hex::HexView::open(path).map_err(|e| anyhow::anyhow!("Hex open failed: {e}"))?;
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_expect_absent = false;
         self.disk_conflict = false;
         // A whole-buffer swap: whatever the previous contents could not be
         // encoded as is no longer this tab's problem.
@@ -10120,7 +10162,9 @@ impl Editor {
         };
         match self.disk_stamp {
             Some(known) => Self::disk_stamp_of(path) != Some(known),
-            None => false,
+            // A new file not written yet: another process creating it is
+            // a change, or the first save would clobber what it wrote.
+            None => self.disk_expect_absent && Self::disk_stamp_of(path).is_some(),
         }
     }
 
@@ -19677,6 +19721,20 @@ impl EditorTabs {
     /// to it. Otherwise create a fresh pinned tab next to the active one.
     /// Used by double-click in the explorer and Ctrl+Enter on a tree row.
     pub fn open_pinned(&mut self, path: &Path) -> Result<()> {
+        self.open_pinned_with(path, Editor::open)
+    }
+
+    /// [`Self::open_pinned`] for a file that may not exist yet: a missing
+    /// one opens as an empty buffer that its first save creates (#1157).
+    pub fn open_new_pinned(&mut self, path: &Path) -> Result<()> {
+        self.open_pinned_with(path, Editor::open_new_file)
+    }
+
+    fn open_pinned_with(
+        &mut self,
+        path: &Path,
+        open: fn(&mut Editor, &Path) -> Result<()>,
+    ) -> Result<()> {
         // A diff tab can carry the working file's `path` yet is not an
         // editable view of it, so skip diffs here: Enter on a diff (or a
         // double-click) opens the real file beside the diff rather than just
@@ -19690,7 +19748,7 @@ impl EditorTabs {
         }
         if self.is_blank_initial() {
             let active = self.active;
-            self.editors[active].open(path)?;
+            open(&mut self.editors[active], path)?;
             self.editors[active].preview = false;
             self.editors[active].search_highlight = self.search_highlight_term.clone();
             self.editors[active].search_highlight_opts = self.search_highlight_opts;
@@ -19698,7 +19756,7 @@ impl EditorTabs {
         }
         let mut e = Editor::new();
         e.focused = self.editors[self.active].focused;
-        e.open(path)?;
+        open(&mut e, path)?;
         e.preview = false;
         e.search_highlight = self.search_highlight_term.clone();
         e.search_highlight_opts = self.search_highlight_opts;
@@ -32767,6 +32825,75 @@ mod tests {
         e.lang = None;
         assert!(!e.toggle_line_comment());
         assert_eq!(e.lines, vec!["x = 1"]);
+    }
+
+    /// #1157: a file not written yet opens as an empty, clean buffer bound
+    /// to its path, with its language, and the first save creates it.
+    #[test]
+    fn a_new_file_opens_empty_and_its_first_save_creates_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("notes.py");
+        let mut e = Editor::new();
+        e.open_new_file(&path).unwrap();
+        assert_eq!(e.path.as_deref(), Some(path.as_path()));
+        assert_eq!(e.lines, vec![String::new()]);
+        assert!(!e.dirty);
+        assert_eq!(e.language_label(), "Python");
+        assert!(e.status.contains("saving creates it"), "{}", e.status);
+        assert!(!path.exists(), "opening creates nothing");
+        assert!(!e.disk_changed_externally());
+        e.insert_str("x = 1");
+        assert!(matches!(e.save_to_disk().unwrap(), SaveOutcome::Saved));
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim_end(), "x = 1");
+        assert!(!e.disk_changed_externally());
+    }
+
+    /// #1157: a new file that another process creates before the first
+    /// save is an external change: the save refuses to clobber it and a
+    /// clean buffer reloads it.
+    #[test]
+    fn a_new_file_created_elsewhere_before_saving_is_detected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("notes.txt");
+        let mut e = Editor::new();
+        e.open_new_file(&path).unwrap();
+        std::fs::write(&path, "theirs\n").unwrap();
+        assert!(e.disk_changed_externally());
+        e.insert_str("mine");
+        assert!(matches!(
+            e.save_to_disk().unwrap(),
+            SaveOutcome::DiskConflict
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs\n");
+        let mut e = Editor::new();
+        std::fs::remove_file(&path).unwrap();
+        e.open_new_file(&path).unwrap();
+        std::fs::write(&path, "theirs\n").unwrap();
+        assert!(matches!(
+            e.reload_or_flag_conflict(),
+            ExternalChange::Reloaded
+        ));
+        assert_eq!(e.lines[0], "theirs");
+        assert!(!e.disk_changed_externally());
+    }
+
+    /// #1157, negative: an existing file opens with its text, and a new file
+    /// in a missing folder is refused rather than bound to a path no save
+    /// could write.
+    #[test]
+    fn a_new_file_keeps_existing_text_and_needs_its_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old.txt");
+        std::fs::write(&path, "kept\n").unwrap();
+        let mut e = Editor::new();
+        e.open_new_file(&path).unwrap();
+        assert_eq!(e.lines[0], "kept");
+        let mut e = Editor::new();
+        let err = e
+            .open_new_file(&tmp.path().join("gone/new.txt"))
+            .unwrap_err();
+        assert!(err.to_string().contains("no such directory"), "{err}");
+        assert!(e.path.is_none());
     }
 
     /// #1181: where the language has only block comments, Toggle Line
