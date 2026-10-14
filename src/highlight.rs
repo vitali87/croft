@@ -808,7 +808,7 @@ pub fn lang_for_extension(ext: &str) -> Option<LangKind> {
         "js" | "mjs" | "cjs" | "jsx" => LangKind::JavaScript,
         "ts" => LangKind::TypeScript,
         "tsx" => LangKind::Tsx,
-        "json" | "jsonc" => LangKind::Json,
+        "json" | "jsonc" | "code-workspace" => LangKind::Json,
         "xml" | "xsd" | "xsl" | "xslt" | "svg" | "plist" => LangKind::Xml,
         "toml" => LangKind::Toml,
         "yaml" | "yml" => LangKind::Yaml,
@@ -843,6 +843,8 @@ pub fn lang_for_path(path: &std::path::Path) -> Option<LangKind> {
         }
         "Makefile" | "makefile" | "GNUmakefile" => Some(LangKind::Make),
         "Gemfile" | "Rakefile" | "Guardfile" | "Vagrantfile" => Some(LangKind::Ruby),
+        // Tool configs written in JSON with comments (#1084).
+        ".eslintrc" | ".babelrc" | ".swcrc" | ".jshintrc" | ".jscsrc" => Some(LangKind::Json),
         // `Dockerfile.dev`, `Containerfile.prod`: the suffix names a stage,
         // not a language.
         _ if name.starts_with("Dockerfile.") || name.starts_with("Containerfile.") => {
@@ -3151,6 +3153,9 @@ def f() -> Config:\n\
             ("app.rb", LangKind::Ruby),
             ("Gemfile", LangKind::Ruby),
             ("Program.cs", LangKind::CSharp),
+            (".babelrc", LangKind::Json),
+            (".eslintrc", LangKind::Json),
+            ("app.code-workspace", LangKind::Json),
             // The supported ones still resolve by extension.
             ("main.rs", LangKind::Rust),
         ];

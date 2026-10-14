@@ -264,7 +264,7 @@ Which server runs per language:
 | Python | Astral's `ty` as the primary, `basedpyright` as a fallback for the few capabilities `ty` does not yet advertise, and `ruff` for lint |
 | TypeScript / JavaScript | `vtsls` |
 | YAML | `yaml-language-server` |
-| JSON / HTML / CSS, SCSS, Less | the VS Code servers (`vscode-json-language-server`, `vscode-html-language-server`, `vscode-css-language-server`, which also serves `.scss` and `.less`; `.sass` is highlighted only) |
+| JSON / HTML / CSS, SCSS, Less | the VS Code servers (`vscode-json-language-server`, `vscode-html-language-server`, `vscode-css-language-server`, which also serves `.scss` and `.less`; `.sass` is highlighted only). Files written as JSON with comments open as `jsonc`, as in VS Code, so comments are not errors and trailing commas are only warnings: `*.jsonc`, `tsconfig*.json`, `jsconfig*.json`, `.vscode/*.json`, `.devcontainer/*.json`, `*.code-workspace`, `.eslintrc`, `.babelrc`, `babel.config.json`, `.croft/*.json`, and croft's own files under `~/.config/croft/` |
 | Bash | `bash-language-server` |
 | TOML | `taplo` |
 | C / C++ | `clangd` |
