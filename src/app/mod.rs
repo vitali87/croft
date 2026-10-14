@@ -24061,18 +24061,8 @@ impl App {
             }
             return Ok(());
         }
-        if self.pending_broadcast_enable {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    self.confirm_pending_broadcast();
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.cancel_pending_broadcast();
-                }
-                _ => {}
-            }
-            return Ok(());
-        }
+        // The run-block confirm is drawn over the broadcast one and is the
+        // one announced (#1584), so it answers first.
         if self.pending_run_block.is_some() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
@@ -24080,6 +24070,18 @@ impl App {
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.cancel_pending_run_block();
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        if self.pending_broadcast_enable {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.confirm_pending_broadcast();
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.cancel_pending_broadcast();
                 }
                 _ => {}
             }

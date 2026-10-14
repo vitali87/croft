@@ -86688,6 +86688,31 @@ fn without_a_dialog_the_editor_is_announced_and_mode_off_stays_quiet() {
     assert_eq!(app.a11y_snapshot().focus, "Editor a.txt");
 }
 
+/// #1584 (review): with Cmd+K I's broadcast confirm open behind a
+/// run-block confirm, the key answers the run-block one, which is drawn on
+/// top and announced; the broadcast question is then announced and answered.
+#[test]
+fn a_run_block_confirm_over_the_broadcast_one_takes_the_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = markdown_fence_app(tmp.path());
+    assert!(run_from_palette(
+        &mut app,
+        "Markdown: Run Code Block at Cursor"
+    ));
+    assert!(app.pending_run_block.is_some(), "setup: the block confirms");
+    app.pending_broadcast_enable = true;
+    assert_eq!(app.a11y_snapshot().focus, "Run this block?");
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.pending_run_block.is_none(), "N answered the block");
+    assert!(app.pending_broadcast_enable, "the broadcast question stays");
+    assert_eq!(app.a11y_snapshot().focus, "Broadcast input to all panes?");
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.pending_broadcast_enable);
+    assert!(!app.broadcast_input);
+}
+
 /// Serve one `croft edit` request for `path` at `at` through a socket pair.
 fn serve_view_request_1606(
     app: &mut App,
