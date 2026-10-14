@@ -9,8 +9,6 @@
 //! of them a run targets. VS Code keeps the controller in a setting; here it
 //! sits beside them as `controllerRepository`.
 
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::path::Path;
 
 /// A named list of repositories (`owner/repo`).
