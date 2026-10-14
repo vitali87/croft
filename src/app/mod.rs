@@ -60864,16 +60864,23 @@ impl App {
     /// Put each workspace folder's `.vscode` directory and project snippets
     /// files under the config watch (#1484).
     fn watch_project_snippets(&mut self) {
-        let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
-        for root in roots {
-            self.config_watch.watch(root.join(".vscode"));
-            // Watched before it exists, so creating or pulling it applies.
-            self.config_watch
-                .watch(root.join(".croft").join("snippets.json"));
-            for file in crate::snippets::project_files(&root) {
-                self.config_watch.watch(file);
-            }
+        for path in self.project_snippet_watch_paths() {
+            self.config_watch.watch(path);
         }
+    }
+
+    /// What [`Self::watch_project_snippets`] watches: each workspace
+    /// folder's `.vscode` directory, its `.croft/snippets.json` and its
+    /// project snippets files.
+    fn project_snippet_watch_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for root in self.roots.iter() {
+            paths.push(root.join(".vscode"));
+            // Watched before it exists, so creating or pulling it applies.
+            paths.push(root.join(".croft").join("snippets.json"));
+            paths.extend(crate::snippets::project_files(root));
+        }
+        paths
     }
 
     /// After a save, if the file was one of croft's JSON configs, re-read it so
@@ -61046,8 +61053,14 @@ impl App {
         self.settings_chain = merged.chain;
         // The chain follows the primary root and the `extends` targets, so
         // the watch follows the chain (#1435).
-        self.config_watch
-            .set_paths(config_watch_paths(&self.settings_chain));
+        // The project snippets stay watched too (#1484).
+        let mut paths = config_watch_paths(&self.settings_chain);
+        for path in self.project_snippet_watch_paths() {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+        self.config_watch.set_paths(paths);
         self.settings_provenance = merged.provenance;
         self.apply_merged_settings(&merged.prefs);
         self.status = if merged.warnings.is_empty() {
