@@ -1,0 +1,1 @@
+fix: Terminal notifications sent the urxvt way (OSC 777 notify, as Ghostty, foot and WezTerm send them) or the kitty way (OSC 99) now reach the status bar and the notification sinks like OSC 9 ones, shown as "title: body".

@@ -1,0 +1,1 @@
+fix: The Checkout / Create Branch picker no longer lists `origin` as a branch in a clone, and picking a branch that two remotes carry (`upstream/feat`) checks it out tracking the remote you picked instead of failing.
