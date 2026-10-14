@@ -4458,6 +4458,31 @@ fn side_by_side_diff_link_records_one_go_back_entry() {
     );
 }
 
+/// #1157: `croft notes.md` for a file not written yet opens a tab for it
+/// that says the save creates it; the save does.
+#[test]
+fn a_file_not_written_yet_opens_at_launch_and_its_save_creates_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("notes.md");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_file_at_launch(&path);
+    assert_eq!(app.editor.path.as_deref(), Some(path.as_path()));
+    assert!(app.status.contains("saving creates it"), "{}", app.status);
+    assert!(!path.exists());
+    app.editor.insert_str("# Notes");
+    app.write_current_to_disk();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap().trim_end(),
+        "# Notes"
+    );
+
+    // Negative: a missing folder opens nothing and says why.
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_file_at_launch(&tmp.path().join("gone/new.md"));
+    assert!(app.editor.path.is_none());
+    assert!(app.status.contains("Couldn't open"), "{}", app.status);
+}
+
 /// #31: navigate-back rested entirely on the Ctrl+Shift+click mouse chord.
 /// The VS Code keyboard chord (Ctrl+-) and the palette command are the
 /// fallbacks that work when the host terminal never delivers that chord.
@@ -14099,6 +14124,8 @@ fn every_cmd_chord_is_ctrl_off_macos_unless_linux_md_lists_it() {
         is_editor_redo_key,
         is_rename_symbol_key,
         is_change_all_occurrences_key,
+        is_select_all_occurrences_key,
+        is_add_cursors_to_line_ends_key,
         is_select_next_occurrence_key,
         is_delete_line_key,
         is_go_to_definition_key,
@@ -14524,6 +14551,208 @@ fn the_palette_focuses_the_next_and_previous_terminal() {
         "Terminal: Focus Previous Terminal"
     ));
     assert_eq!(app.active_terminal, 2, "it wraps like Cmd+[");
+}
+
+/// #1562: the terminal's own actions are palette commands. Before, each was
+/// a chord or a right-click row only, and the palette found none of them.
+#[test]
+fn the_palette_lists_every_terminal_action() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for title in [
+        "Terminal: Clear",
+        "Terminal: Rename",
+        "Terminal: Kill the Active Terminal Instance",
+        "Terminal: Split Terminal",
+        "Terminal: Create New Terminal (With Profile)",
+        "Terminal: Quick Select",
+        "Terminal: Enter Copy Mode",
+        "Terminal: Show Command History",
+        "Terminal: Open Scrollback in Editor",
+    ] {
+        app.handle_key(key(
+            KeyCode::Char('p'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+        for c in title.chars() {
+            app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+                .unwrap();
+        }
+        let palette = app.command_palette.as_ref().expect("the palette opened");
+        assert!(
+            palette.results.iter().any(|i| i.title() == title),
+            "{title} is in the palette"
+        );
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+#[test]
+fn terminal_clear_from_the_palette_empties_the_active_pane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    app.active_terminal = 1;
+    await_terminal_probe(&mut app, "cleared-1562");
+    app.focus_pane(Pane::Editor);
+    assert!(run_from_palette(&mut app, "Terminal: Clear"));
+    assert!(
+        !app.terminals[1].visible_text().contains("cleared-1562"),
+        "{}",
+        app.terminals[1].visible_text()
+    );
+    assert_eq!(app.status, "Cleared terminal");
+}
+
+#[test]
+fn terminal_rename_split_and_kill_act_on_the_active_pane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Editor);
+    assert!(run_from_palette(&mut app, "Terminal: Split Terminal"));
+    assert_eq!(app.terminals.len(), 2);
+    assert!(app.show_terminal);
+    app.active_terminal = 1;
+    assert!(run_from_palette(&mut app, "Terminal: Rename"));
+    assert!(matches!(
+        app.prompt.as_ref().map(|p| &p.kind),
+        Some(PromptKind::RenameTerminal(1))
+    ));
+    app.prompt = None;
+    assert!(run_from_palette(
+        &mut app,
+        "Terminal: Kill the Active Terminal Instance"
+    ));
+    assert_eq!(app.terminals.len(), 1);
+}
+
+/// #1562 negative: Kill on the last pane keeps it, as Cmd+W does.
+#[test]
+fn terminal_kill_keeps_the_last_pane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::TerminalKill);
+    assert_eq!(app.terminals.len(), 1);
+    assert!(app.status.starts_with("Cannot close the last terminal"));
+}
+
+#[test]
+fn terminal_modes_from_the_palette_focus_the_terminal() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    draw(&mut app, 100, 30);
+    app.focus_pane(Pane::Editor);
+    app.run_command(Command::TerminalCopyMode);
+    assert!(app.terminal_copy_mode.is_some());
+    assert!(app.focus == Pane::Terminal);
+    app.terminal_copy_mode = None;
+    app.focus_pane(Pane::Editor);
+    app.run_command(Command::TerminalCommandHistory);
+    assert!(app.command_history_popup.is_some());
+    assert!(app.focus == Pane::Terminal);
+}
+
+/// #1562: a terminal mode opened from the palette while another
+/// bottom-panel tab is in front brings the Terminal tab forward, or the
+/// mode would be hidden and its keys would go to that tab.
+#[test]
+fn terminal_modes_from_the_palette_bring_the_terminal_tab_forward() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    draw(&mut app, 100, 30);
+    for cmd in [
+        Command::TerminalCopyMode,
+        Command::TerminalQuickSelect,
+        Command::TerminalCommandHistory,
+    ] {
+        app.terminal_copy_mode = None;
+        app.command_history_popup = None;
+        app.set_bottom_panel_tab(BottomPanelTab::Output);
+        app.focus_pane(Pane::Editor);
+        app.run_command(cmd);
+        assert!(app.bottom_panel_tab == BottomPanelTab::Terminal, "{cmd:?}");
+        assert!(app.focus == Pane::Terminal, "{cmd:?}");
+    }
+}
+
+/// #1562 negative: on a bottom-panel tab other than Terminal there is no
+/// shell, so a chord for a terminal command is not taken for it there.
+#[test]
+fn a_user_chord_for_a_terminal_command_is_not_taken_on_another_panel_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{ "key": "ctrl+alt+k", "command": "terminal_clear" }]"#,
+    );
+    app.set_bottom_panel_tab(BottomPanelTab::Output);
+    app.status.clear();
+    app.handle_key(key(
+        KeyCode::Char('k'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert_ne!(app.status, "Cleared terminal");
+}
+
+/// #1562: a `keybindings.json` chord for a terminal command works with the
+/// terminal focused, where the shell would otherwise get it; a chord for
+/// any other command still goes to the shell there.
+#[test]
+fn a_user_chord_for_a_terminal_command_works_in_the_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[
+          { "key": "ctrl+alt+k", "command": "terminal_clear" },
+          { "key": "ctrl+alt+b", "command": "toggle_side_bar" }
+        ]"#,
+    );
+    await_terminal_probe(&mut app, "bound-1562");
+    app.focus_pane(Pane::Terminal);
+    let side_bar = app.show_tree;
+    app.handle_key(key(
+        KeyCode::Char('b'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert_eq!(
+        app.show_tree, side_bar,
+        "not a terminal command: the shell's"
+    );
+    app.handle_key(key(
+        KeyCode::Char('k'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert_eq!(app.status, "Cleared terminal");
+    assert!(!app.terminal().visible_text().contains("bound-1562"));
+}
+
+/// #1562: a terminal menu row shows the chord the user bound to its
+/// command, and its built-in one otherwise.
+#[test]
+fn terminal_menu_rows_show_the_user_s_chord() {
+    let none = crate::keymap::Keymap::from_json("[]");
+    assert_eq!(
+        menu_hint(&MenuAction::ClearTerminal(0), &none).as_deref(),
+        Some("⌘K K")
+    );
+    let bound = crate::keymap::Keymap::from_json(
+        r#"[{ "key": "ctrl+alt+k", "command": "terminal_clear" }]"#,
+    );
+    assert_eq!(
+        menu_hint(&MenuAction::ClearTerminal(0), &bound).as_deref(),
+        Some("ctrl+alt+k")
+    );
+    assert_eq!(
+        menu_hint(&MenuAction::RenameTerminal(0), &bound).as_deref(),
+        Some("⌘K R"),
+        "only the rebound row changes"
+    );
 }
 
 /// Guard (#843): with no split, "View: Focus Left/Right Editor Group" change
@@ -27452,6 +27681,7 @@ fn a_launch_json_python_config_runs_under_the_project_venv_unless_it_names_one()
     let ctx = SubstCtx {
         workspace_folder: root.to_path_buf(),
         file: None,
+        folders: Vec::new(),
     };
     let python_of = |json: &str| {
         let cfg = parse_launch_json(json, ".vscode/launch.json").remove(0);
@@ -27504,6 +27734,7 @@ fn a_module_launch_that_also_names_a_program_runs_under_its_cwds_venv() {
     let ctx = SubstCtx {
         workspace_folder: root.to_path_buf(),
         file: None,
+        folders: Vec::new(),
     };
     let request_of = |json: &str| {
         let cfg = parse_launch_json(json, ".vscode/launch.json").remove(0);
@@ -35306,6 +35537,235 @@ fn zen_mode_hides_all_chrome_then_restores_the_snapshot() {
     assert!(app.status_bar_visible);
 }
 
+/// A 200-column frame with `app` drawn into it, and its text (#1585).
+fn draw_wide(app: &mut App, w: u16) -> String {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    screen_text(&term)
+}
+
+fn zen_app() -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("t.py");
+    std::fs::write(&p, "x = 1\ny = 2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    app.focus = Pane::Editor;
+    (tmp, app)
+}
+
+/// The editor as last drawn, `(x, width)` (#1585): its text and the
+/// minimap strip carved from its right edge. Centered Layout centres the
+/// two together, as VS Code centres an editor with its minimap.
+fn editor_column(app: &App) -> (u16, u16) {
+    let text = app.editor.last_full_area;
+    let strip = if app.minimap_visible && app.minimap_room {
+        MINIMAP_WIDTH_CELLS
+    } else {
+        0
+    };
+    (text.x, text.width + strip)
+}
+
+/// #1585: Zen Mode centres the editor: in 200 columns it is 120 wide and
+/// starts at column 40, like VS Code's `zenMode.centerLayout`. The
+/// minimap is part of those 120 columns; without it the text takes them.
+#[test]
+fn zen_mode_centres_the_editor_in_a_wide_window() {
+    let (_tmp, mut app) = zen_app();
+    app.toggle_zen_mode();
+    draw_wide(&mut app, 200);
+    assert!(app.minimap_visible && app.minimap_room, "the minimap shows");
+    assert_eq!(
+        editor_column(&app),
+        (40, 120),
+        "{:?}",
+        app.editor.last_full_area
+    );
+    app.toggle_minimap();
+    draw_wide(&mut app, 200);
+    let area = app.editor.last_full_area;
+    assert_eq!((area.x, area.width), (40, 120), "{area:?}");
+    app.toggle_minimap();
+    app.toggle_zen_mode();
+    draw_wide(&mut app, 200);
+    assert!(
+        editor_column(&app).1 > 120,
+        "out of Zen the editor fills its column again: {:?}",
+        app.editor.last_full_area
+    );
+}
+
+/// #1585: View: Toggle Centered Layout centres the editor outside Zen and
+/// persists in the layout; inside a centred Zen it turns the centring off.
+#[test]
+fn toggle_centered_layout_centres_outside_zen_and_uncentres_zen() {
+    let (_tmp, mut app) = zen_app();
+    app.show_tree = false;
+    app.activity_bar_visible = false;
+    app.show_terminal = false;
+    app.run_command(crate::widgets::command_palette::Command::ToggleCenteredLayout);
+    assert!(app.centered_layout);
+    assert_eq!(app.status, "Centered Layout on");
+    draw_wide(&mut app, 200);
+    assert_eq!(editor_column(&app), (40, 120));
+    app.run_command(crate::widgets::command_palette::Command::ToggleCenteredLayout);
+    assert!(!app.centered_layout);
+
+    app.toggle_zen_mode();
+    assert!(app.centered_layout_active(), "Zen starts centred");
+    app.run_command(crate::widgets::command_palette::Command::ToggleCenteredLayout);
+    assert!(!app.centered_layout_active() && !app.centered_layout);
+    draw_wide(&mut app, 200);
+    assert_eq!(editor_column(&app), (0, 200));
+    let rows = app.customize_layout_items();
+    assert!(
+        rows.iter().any(|r| matches!(r, MenuEntry::Item { label, action: MenuAction::ToggleCenteredLayout, .. } if label.contains("Centered Layout"))),
+        "the Customize Layout popup has the row"
+    );
+}
+
+/// #1585, negative: a window no wider than the centred width, or Zen with
+/// `zen_center_layout` off, leaves the editor its whole column.
+#[test]
+fn a_narrow_window_or_zen_without_centring_keeps_the_full_width() {
+    let (_tmp, mut app) = zen_app();
+    app.toggle_zen_mode();
+    draw_wide(&mut app, 110);
+    assert_eq!(editor_column(&app), (0, 110));
+    app.toggle_zen_mode();
+    app.zen_center_layout = false;
+    app.toggle_zen_mode();
+    draw_wide(&mut app, 200);
+    assert_eq!(editor_column(&app), (0, 200));
+    assert_eq!(
+        centered_editor_rect(Rect::new(5, 1, 50, 9), 0),
+        Rect::new(5, 1, 50, 9),
+        "a zero width centres nothing"
+    );
+    assert_eq!(
+        centered_editor_rect(Rect::new(5, 1, 51, 9), 20),
+        Rect::new(20, 1, 20, 9)
+    );
+}
+
+/// #1585: Esc Esc leaves Zen Mode and restores the chrome from before it.
+#[test]
+fn esc_esc_leaves_zen_mode_and_restores_the_chrome() {
+    let (_tmp, mut app) = zen_app();
+    app.show_tree = true;
+    app.status_bar_visible = true;
+    app.toggle_zen_mode();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.zen_mode, "one Esc is not enough");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.zen_mode, "Esc Esc leaves Zen");
+    assert!(app.show_tree && app.status_bar_visible);
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.zen_mode, "Esc Esc never enters Zen");
+}
+
+/// #1585, negative: an Esc that clears a selection, a key between the two,
+/// two Escapes too far apart, or Escapes typed into a terminal do not
+/// leave Zen.
+#[test]
+fn an_esc_that_did_something_is_not_half_of_esc_esc() {
+    let (_tmp, mut app) = zen_app();
+    app.toggle_zen_mode();
+    app.handle_key(key(KeyCode::Right, KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(app.editor.selection.is_some(), "precondition: a selection");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.selection.is_none(), "the first Esc cleared it");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.zen_mode,
+        "the Esc that cleared the selection did not count"
+    );
+
+    app.zen_esc_at = None;
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.zen_mode, "a key between the Escapes breaks the pair");
+
+    app.zen_esc_at = None;
+    let t = std::time::Instant::now();
+    app.note_idle_zen_esc(t);
+    app.note_idle_zen_esc(t + ZEN_ESC_WINDOW + std::time::Duration::from_millis(1));
+    assert!(app.zen_mode, "too far apart");
+
+    app.zen_esc_at = None;
+    app.focus = Pane::Terminal;
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.zen_mode, "Escapes for a terminal program stay its own");
+}
+
+/// #1585: an Esc that leaves a comment box's reply field or vim's Insert
+/// mode did something, so it is not half of Esc Esc.
+#[test]
+fn an_esc_leaving_a_comment_box_or_insert_mode_is_not_half_of_esc_esc() {
+    let (_tmp, mut app) = zen_app();
+    app.toggle_zen_mode();
+    app.editor.comment_focus = Some(crate::widgets::editor::CommentFocus {
+        id: 1,
+        reply: String::new(),
+        cursor: 0,
+    });
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.editor.comment_focus.is_none(),
+        "the first Esc left the box"
+    );
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.zen_mode, "the Esc that left the box did not count");
+
+    app.zen_esc_at = None;
+    app.vim.enabled = true;
+    app.vim.enter_insert_mode();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.vim.mode(), crate::vim::VimMode::Normal);
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.zen_mode, "the Esc that left Insert mode did not count");
+}
+
+/// #1585: Zen hides the status bar, so entering it shows how to leave for
+/// a few seconds; leaving takes the hint with it.
+#[test]
+fn entering_zen_says_how_to_leave_it_for_a_while() {
+    let (_tmp, mut app) = zen_app();
+    assert!(!draw_wide(&mut app, 120).contains("Esc Esc to exit"));
+    app.toggle_zen_mode();
+    assert!(draw_wide(&mut app, 120).contains(zen_hint_text()));
+    assert!(!app.expire_zen_hint(std::time::Instant::now()), "not yet");
+    assert!(app.expire_zen_hint(std::time::Instant::now() + ZEN_HINT_FOR));
+    assert!(!draw_wide(&mut app, 120).contains("Esc Esc to exit"));
+    app.toggle_zen_mode();
+    app.toggle_zen_mode();
+    app.toggle_zen_mode();
+    assert!(
+        app.zen_hint_until.is_none(),
+        "leaving Zen drops a hint still showing"
+    );
+}
+
 #[test]
 fn secondary_side_bar_toggle_flips_visibility() {
     let tmp = tempfile::tempdir().unwrap();
@@ -35684,6 +36144,182 @@ fn cmd_d_selects_word_then_adds_the_next_match_as_a_caret() {
         app.editor.has_multi_cursor(),
         "second Cmd+D adds the next match as a caret"
     );
+}
+
+/// The issue's file (#1558), open in the editor.
+fn occurrences_app(tmp: &Path) -> App {
+    app_with_open_file(tmp, "s.py", "foo = 1\nbar = foo\nfoo += 2\nfood = 3")
+}
+
+fn select(app: &mut App, anchor: (usize, usize), head: (usize, usize)) {
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection { anchor, head });
+    (app.editor.cursor_row, app.editor.cursor_col) = head;
+}
+
+fn cmd_shift_l(app: &mut App) {
+    app.handle_key(key(
+        KeyCode::Char('l'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+}
+
+fn type_char(app: &mut App, c: char) {
+    app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+        .unwrap();
+}
+
+/// #1558: `Cmd+Shift+L` with the caret on `foo` selects every whole-word
+/// `foo`, and typing replaces them all (not the `foo` inside `food`). It
+/// used to do nothing.
+#[test]
+fn cmd_shift_l_selects_every_occurrence_of_the_word() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = occurrences_app(tmp.path());
+    app.editor.cursor_col = 1;
+    cmd_shift_l(&mut app);
+    assert_eq!(app.editor.carets.len() + 1, 3);
+    type_char(&mut app, 'X');
+    assert_eq!(app.editor.lines, ["X = 1", "bar = X", "X += 2", "food = 3"]);
+}
+
+/// #1558: a hand-made selection matches as plain text, so `oo` is found in
+/// every `foo` and in `food`, where whole-word matching finds none.
+#[test]
+fn cmd_shift_l_matches_a_hand_made_selection_as_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = occurrences_app(tmp.path());
+    select(&mut app, (0, 1), (0, 3));
+    cmd_shift_l(&mut app);
+    assert_eq!(app.editor.carets.len() + 1, 4);
+    let primary = app.editor.selection.unwrap();
+    assert_eq!(
+        primary.normalised(),
+        ((0, 1), (0, 3)),
+        "the user's stays primary"
+    );
+    type_char(&mut app, 'Q');
+    assert_eq!(
+        app.editor.lines,
+        ["fQ = 1", "bar = fQ", "fQ += 2", "fQd = 3"]
+    );
+}
+
+/// #1558: `Cmd+D` from a hand-made selection also matches plain text; from
+/// the caret it still takes whole words.
+#[test]
+fn cmd_d_from_a_hand_made_selection_matches_as_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = occurrences_app(tmp.path());
+    select(&mut app, (0, 1), (0, 3));
+    for _ in 0..2 {
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER))
+            .unwrap();
+    }
+    type_char(&mut app, 'Q');
+    assert_eq!(
+        app.editor.lines,
+        ["fQ = 1", "bar = fQ", "fQ += 2", "food = 3"]
+    );
+
+    let mut app = occurrences_app(tmp.path());
+    app.editor.cursor_col = 1;
+    for _ in 0..4 {
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER))
+            .unwrap();
+    }
+    assert_eq!(app.editor.carets.len() + 1, 3, "`food` is no whole `foo`");
+}
+
+/// #1558: the word `Cmd+D` selected is forgotten once that selection is
+/// dropped, so selecting the same `foo` again by hand matches plain text and
+/// reaches the `foo` inside `food`.
+#[test]
+fn cmd_d_after_esc_and_a_hand_made_reselection_matches_as_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = occurrences_app(tmp.path());
+    app.editor.cursor_col = 1;
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.editor.selection.unwrap().normalised(), ((0, 0), (0, 3)));
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.selection.is_none());
+    app.editor.cursor_col = 0;
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Right, KeyModifiers::SHIFT))
+            .unwrap();
+    }
+    assert_eq!(app.editor.selection.unwrap().normalised(), ((0, 0), (0, 3)));
+    for _ in 0..4 {
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::SUPER))
+            .unwrap();
+    }
+    assert_eq!(app.editor.carets.len() + 1, 4, "`food` holds a text `foo`");
+}
+
+/// #1558: `Shift+Alt+I` puts a caret at the end of each selected line, so
+/// typing appends to all three; a selection ending at column 0 of the next
+/// line leaves that line out.
+#[test]
+fn shift_alt_i_adds_a_cursor_at_each_line_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = occurrences_app(tmp.path());
+    select(&mut app, (0, 0), (2, 8));
+    app.handle_key(key(
+        KeyCode::Char('I'),
+        KeyModifiers::SHIFT | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert!(app.editor.selection.is_none_or(|s| s.anchor == s.head));
+    type_char(&mut app, 'Z');
+    assert_eq!(
+        app.editor.lines,
+        ["foo = 1Z", "bar = fooZ", "foo += 2Z", "food = 3"]
+    );
+
+    let mut app = occurrences_app(tmp.path());
+    select(&mut app, (0, 0), (2, 0));
+    assert!(run_from_palette(&mut app, "Add Cursors to Line Ends"));
+    type_char(&mut app, ';');
+    assert_eq!(
+        app.editor.lines,
+        ["foo = 1;", "bar = foo;", "foo += 2", "food = 3"]
+    );
+}
+
+/// Negatives (#1558): with nothing to match, neither command changes the
+/// buffer or leaves stray carets, and the palette and VS Code ids reach
+/// them.
+#[test]
+fn occurrence_commands_with_nothing_to_act_on_change_nothing() {
+    use crate::widgets::command_palette::Command;
+    assert_eq!(
+        Command::from_id("select_all_occurrences"),
+        Some(Command::SelectAllOccurrences)
+    );
+    assert_eq!(
+        Command::from_id("add_cursors_to_line_ends"),
+        Some(Command::AddCursorsToLineEnds)
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = occurrences_app(tmp.path());
+    // The caret on `=`, no word under it.
+    app.editor.cursor_col = 4;
+    cmd_shift_l(&mut app);
+    assert!(!app.editor.has_multi_cursor());
+    app.handle_key(key(
+        KeyCode::Char('I'),
+        KeyModifiers::SHIFT | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert!(!app.editor.has_multi_cursor());
+    // A selection across lines is not matched; it stays as it was.
+    select(&mut app, (0, 4), (1, 3));
+    cmd_shift_l(&mut app);
+    assert!(!app.editor.has_multi_cursor());
+    assert_eq!(app.editor.selection.unwrap().normalised(), ((0, 4), (1, 3)));
+    assert_eq!(app.editor.lines[0], "foo = 1");
 }
 
 #[test]
@@ -62890,6 +63526,64 @@ fn add_debug_configuration_attaches_by_port() {
     );
 }
 
+/// #1425: in a multi-root workspace a compound member from another folder
+/// resolves in that folder: its preLaunchTask is found in web's tasks.json
+/// and its program is web's. Before, the compound failed with "which no
+/// launch.json declares".
+#[test]
+fn a_compound_member_from_another_folder_launches_from_that_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let api = tmp.path().join("api");
+    let web = tmp.path().join("web");
+    for d in [&api, &web] {
+        std::fs::create_dir_all(d.join(".vscode")).unwrap();
+    }
+    std::fs::write(
+        api.join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "name": "Run api", "type": "python", "request": "launch", "program": "${workspaceFolder}/main.py" }
+        ],
+        "compounds": [
+            { "name": "Web only", "configurations": [{ "folder": "web", "name": "Run web" }] }
+        ]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        web.join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "name": "Run web", "type": "python", "request": "launch", "program": "${workspaceFolder}/main.py", "preLaunchTask": "serve" }
+        ]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        web.join(".vscode/tasks.json"),
+        r#"{ "version": "2.0.0", "tasks": [
+            { "label": "serve", "type": "shell", "command": "sleep 30" }
+        ]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(api.clone()).unwrap();
+    app.roots.add(web.clone());
+    pick_debug_row(&mut app, "Web only");
+    assert!(
+        !app.status.contains("no launch.json declares"),
+        "status: {}",
+        app.status
+    );
+    let pending = app
+        .pending_debug_launch
+        .as_ref()
+        .expect("web's preLaunchTask parks the launch");
+    let PendingLaunchStep::Resolved(rc) = &pending.step else {
+        panic!("the member itself is parked behind its task");
+    };
+    assert_eq!(rc.name, "Run web");
+    assert_eq!(
+        rc.program.as_deref(),
+        Some(web.join("main.py").to_string_lossy().as_ref())
+    );
+}
+
 /// Open the debug picker and confirm the row whose label starts with `label`.
 fn pick_debug_row(app: &mut App, label: &str) {
     app.open_debug_config_picker();
@@ -63046,6 +63740,82 @@ fn poll_until(app: &mut App, done: impl Fn(&App) -> bool) {
         app.poll_dap();
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+/// #1426: Alt+F9 sends js-debug's `all` filter and says it is on; with an
+/// adapter that offers no raised-exceptions filter it says so instead of
+/// claiming exceptions will break.
+#[test]
+fn the_raised_exceptions_toggle_follows_the_adapters_filters() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push(
+        "Node",
+        stub_emitting(&[
+            r#"{"seq":1,"type":"response","request_seq":1,"success":true,"command":"initialize","body":{"exceptionBreakpointFilters":[{"filter":"all","label":"Caught Exceptions"},{"filter":"uncaught","label":"Uncaught Exceptions"}]}}"#,
+        ]),
+    );
+    poll_until(&mut app, |a| {
+        a.debug_sessions
+            .focused()
+            .is_some_and(|s| !s.capabilities.is_null())
+    });
+    app.debug_toggle_raised_exceptions();
+    assert_eq!(app.status, "Breaking on raised exceptions (and uncaught)");
+    assert_eq!(
+        app.debug_sessions.focused().unwrap().exception_filters,
+        vec![String::from("uncaught"), String::from("all")]
+    );
+    app.debug_toggle_raised_exceptions();
+    assert_eq!(app.status, "Breaking on uncaught exceptions only");
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push(
+        "Go",
+        stub_emitting(&[
+            r#"{"seq":1,"type":"response","request_seq":1,"success":true,"command":"initialize","body":{"supportsConditionalBreakpoints":true}}"#,
+        ]),
+    );
+    poll_until(&mut app, |a| {
+        a.debug_sessions
+            .focused()
+            .is_some_and(|s| !s.capabilities.is_null())
+    });
+    app.debug_toggle_raised_exceptions();
+    assert_eq!(
+        app.status,
+        "This debugger has no filter for raised exceptions; exception breakpoints are unchanged"
+    );
+    assert_eq!(
+        app.debug_sessions.focused().unwrap().exception_filters,
+        vec![String::from("uncaught")]
+    );
+}
+
+/// #1426: Alt+F9 pressed before the adapter answers `initialize` is kept
+/// and translated into that adapter's own ids once it does, instead of
+/// sending debugpy's `raised`, which lldb-dap would then drop.
+#[test]
+fn the_raised_exceptions_toggle_before_initialize_uses_the_adapters_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push(
+        "LLDB",
+        stub_emitting(&[
+            r#"{"seq":1,"type":"response","request_seq":1,"success":true,"command":"initialize","body":{"exceptionBreakpointFilters":[{"filter":"cpp_catch","label":"C++ Catch"},{"filter":"cpp_throw","label":"C++ Throw"},{"filter":"objc_catch","label":"Objective-C Catch"},{"filter":"objc_throw","label":"Objective-C Throw"}]}}"#,
+        ]),
+    );
+    app.debug_toggle_raised_exceptions();
+    assert!(app.status.starts_with("Breaking on raised exceptions"));
+    poll_until(&mut app, |a| {
+        a.debug_sessions
+            .focused()
+            .is_some_and(|s| !s.capabilities.is_null())
+    });
+    assert_eq!(
+        app.debug_sessions.focused().unwrap().exception_filters,
+        vec![String::from("cpp_throw"), String::from("objc_throw")]
+    );
 }
 
 /// #1421: an expensive scope (js-debug's Global) shows collapsed with a
@@ -63769,6 +64539,7 @@ fn resolved_attach(json: &str) -> crate::dap::configs::ResolvedConfig {
     let ctx = crate::dap::configs::SubstCtx {
         workspace_folder: tmp.path().to_path_buf(),
         file: None,
+        folders: Vec::new(),
     };
     crate::dap::configs::resolve(&cfg, &ctx).expect("resolves")
 }
@@ -67126,6 +67897,212 @@ fn clicking_a_cells_run_glyph_runs_it_and_writes_the_output_into_the_notebook() 
     assert_eq!(doc["cells"][0]["outputs"][0]["text"][0], "2\n");
     assert!(app.editor.notebook_running.is_empty());
     assert!(app.editor.dirty, "outputs are an edit; Save writes them");
+}
+
+/// The kernel bridges a test App starts through Select Kernel (#1377), by
+/// kernel name, with the test speaking for each.
+type StartedKernels = std::rc::Rc<
+    std::cell::RefCell<
+        Vec<(
+            String,
+            std::sync::mpsc::Sender<crate::notebook_kernel::Event>,
+            std::sync::mpsc::Receiver<crate::notebook_kernel::Request>,
+        )>,
+    >,
+>;
+
+/// A notebook naming `kernel` open in its rendered view, with the test as
+/// its kernel and as every kernel started after it.
+fn notebook_with_kernel(
+    kernel: &str,
+) -> (
+    tempfile::TempDir,
+    App,
+    PathBuf,
+    std::sync::mpsc::Sender<crate::notebook_kernel::Event>,
+    StartedKernels,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("shared.ipynb");
+    std::fs::write(
+        &path,
+        NOTEBOOK_355.replace("\"name\": \"python3\"", &format!("\"name\": \"{kernel}\"")),
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let (run, kernel_tx, _requests) = crate::notebook_kernel::NotebookRun::for_test();
+    app.notebook_kernels.insert(path.clone(), run);
+    let started: StartedKernels = Default::default();
+    let record = started.clone();
+    app.kernel_start_override = Some(Box::new(move |name| {
+        let (session, events, requests) = crate::notebook_kernel::KernelSession::for_test();
+        record
+            .borrow_mut()
+            .push((name.to_string(), events, requests));
+        session
+    }));
+    (tmp, app, path, kernel_tx, started)
+}
+
+fn installed_kernels() -> Vec<crate::notebook_kernel::KernelSpec> {
+    vec![
+        crate::notebook_kernel::KernelSpec {
+            name: "ir".into(),
+            display: "R".into(),
+            language: "R".into(),
+        },
+        crate::notebook_kernel::KernelSpec {
+            name: "python3".into(),
+            display: "Python 3 (ipykernel)".into(),
+            language: "python".into(),
+        },
+    ]
+}
+
+fn notebook_kernelspec(app: &App) -> serde_json::Value {
+    let doc: serde_json::Value = serde_json::from_str(&app.editor.lines.join("\n")).unwrap();
+    doc["metadata"]["kernelspec"].clone()
+}
+
+/// #1377: Run All on a notebook naming a kernel this machine does not have
+/// asks which installed kernel to use, opened on the one for the
+/// notebook's language; choosing it runs the cells and names it in the
+/// notebook, as Jupyter does.
+#[test]
+fn run_all_with_a_missing_kernel_asks_which_kernel_and_runs_on_it() {
+    use crate::notebook_kernel::{Event, Request};
+    use crate::widgets::list_picker::ListPurpose;
+    let (_tmp, mut app, _path, kernel, started) = notebook_with_kernel("conda-env-ds-py");
+    app.run_command(crate::widgets::command_palette::Command::NotebookRunAll);
+    assert_eq!(app.editor.notebook_running, vec![0]);
+    kernel
+        .send(Event::Missing {
+            kernel: "conda-env-ds-py".into(),
+            specs: installed_kernels(),
+        })
+        .unwrap();
+    app.poll_notebook_kernels();
+    let picker = app.list_picker.as_ref().expect("the kernel picker opens");
+    assert_eq!(picker.purpose, ListPurpose::NotebookKernel);
+    assert!(picker.title.contains("conda-env-ds-py"), "{}", picker.title);
+    assert_eq!(
+        picker.selected_row().map(|r| r.id.as_str()),
+        Some("python3"),
+        "the Python notebook's picker opens on the Python kernel"
+    );
+    assert_eq!(app.editor.notebook_running, vec![0], "the cell waits");
+
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.list_picker.is_none());
+    let started = started.borrow();
+    let [(name, _, requests)] = started.as_slice() else {
+        panic!("one kernel started: {:?}", started.len());
+    };
+    assert_eq!(name, "python3");
+    match requests.try_iter().collect::<Vec<_>>().as_slice() {
+        [Request::Execute { code, .. }] => assert_eq!(code, "print(1+1)"),
+        other => panic!("the waiting cell goes to the chosen kernel: {other:?}"),
+    }
+    let ks = notebook_kernelspec(&app);
+    assert_eq!(ks["name"], "python3");
+    assert_eq!(ks["display_name"], "Python 3 (ipykernel)");
+    assert!(app.editor.dirty, "Save writes the new kernel into the file");
+    assert_eq!(app.status, "Starting kernel Python 3 (ipykernel)…");
+}
+
+/// #1377, negative: closing the picker without a choice leaves nothing
+/// waiting at `In [*]` and the notebook's kernel as it was.
+#[test]
+fn declining_the_kernel_picker_stops_the_waiting_cells() {
+    use crate::notebook_kernel::Event;
+    let (_tmp, mut app, path, kernel, started) = notebook_with_kernel("conda-env-ds-py");
+    app.run_command(crate::widgets::command_palette::Command::NotebookRunAll);
+    kernel
+        .send(Event::Missing {
+            kernel: "conda-env-ds-py".into(),
+            specs: installed_kernels(),
+        })
+        .unwrap();
+    app.poll_notebook_kernels();
+    assert!(app.list_picker.is_some());
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.list_picker.is_none());
+    assert!(app.editor.notebook_running.is_empty());
+    assert!(!app.notebook_kernels.contains_key(&path));
+    assert!(started.borrow().is_empty(), "no kernel was started");
+    assert_eq!(notebook_kernelspec(&app)["name"], "conda-env-ds-py");
+    assert!(
+        app.status.contains("Notebook: Select Kernel"),
+        "{}",
+        app.status
+    );
+}
+
+/// #1377, negative: a kernel that is installed starts with no question.
+#[test]
+fn a_kernel_that_is_installed_opens_no_picker() {
+    use crate::notebook_kernel::Event;
+    let (_tmp, mut app, _path, kernel, started) = notebook_with_kernel("python3");
+    app.run_command(crate::widgets::command_palette::Command::NotebookRunAll);
+    kernel
+        .send(Event::Ready {
+            kernel: "python3".into(),
+            display: "Python 3 (ipykernel)".into(),
+        })
+        .unwrap();
+    app.poll_notebook_kernels();
+    assert!(app.list_picker.is_none());
+    assert!(started.borrow().is_empty());
+    assert_eq!(app.editor.notebook_running, vec![0]);
+}
+
+/// #1377: Notebook: Select Kernel lists the installed kernels, opened on
+/// the notebook's own, and the choice is written into the notebook for its
+/// next run.
+#[test]
+fn select_kernel_lists_the_installed_kernels_and_switches_the_notebook() {
+    use crate::notebook_kernel::Event;
+    let (_tmp, mut app, path, _kernel, started) = notebook_with_kernel("python3");
+    app.notebook_kernels.remove(&path);
+    app.run_command(crate::widgets::command_palette::Command::NotebookSelectKernel);
+    {
+        let started = started.borrow();
+        let [(name, events, _)] = started.as_slice() else {
+            panic!("one listing: {:?}", started.len());
+        };
+        assert_eq!(name, crate::notebook_kernel::LIST_KERNELS);
+        events
+            .send(Event::Specs {
+                specs: installed_kernels(),
+            })
+            .unwrap();
+    }
+    assert!(app.list_picker.is_none(), "the picker waits for the list");
+    app.poll_notebook_kernels();
+    let picker = app.list_picker.as_ref().expect("the kernel picker opens");
+    assert_eq!(picker.title, "Select Kernel");
+    assert_eq!(
+        picker.selected_row().map(|r| r.id.as_str()),
+        Some("python3")
+    );
+    app.handle_key(key(KeyCode::Up, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let ks = notebook_kernelspec(&app);
+    assert_eq!(ks["name"], "ir");
+    assert_eq!(ks["language"], "R");
+    assert_eq!(app.status, "Kernel: R (starts on the next run)");
+    assert_eq!(started.borrow().len(), 1, "no kernel starts until a run");
+    assert_eq!(
+        crate::notebook_kernel::kernel_name(&app.editor.lines.join("\n")),
+        "ir"
+    );
 }
 
 /// Acceptance for #355 against a real kernel: `print(1+1)` shows `2`, and
@@ -82013,6 +82990,7 @@ fn every_customize_layout_row_has_a_palette_command_that_does_the_same() {
             MenuAction::SetPanelAlignment(_) => Some(Command::SetPanelAlignment),
             MenuAction::SetQuickInputPosition(_) => Some(Command::SetQuickInputPosition),
             MenuAction::ToggleZenMode => Some(Command::ToggleZenMode),
+            MenuAction::ToggleCenteredLayout => Some(Command::ToggleCenteredLayout),
             _ => None,
         }
     }
@@ -82056,6 +83034,7 @@ fn every_customize_layout_row_has_a_palette_command_that_does_the_same() {
             app.panel_alignment,
             app.quick_input_position,
             app.zen_mode,
+            app.centered_layout,
         )
     };
     let tmp = tempfile::tempdir().unwrap();
@@ -84980,6 +85959,138 @@ fn save_all_does_not_report_a_file_waiting_on_its_formatter_as_saved() {
     );
 }
 
+/// `a.py` reading `value = 1`, open in the editor, then `00` typed at the
+/// end of the line and saved: the issue's (#1568) setup.
+fn app_with_a_saved_edit() -> (tempfile::TempDir, std::path::PathBuf, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.py");
+    std::fs::write(&a, "value = 1\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_editor_key(key(KeyCode::End, KeyModifiers::NONE));
+    type_str(&mut app, "00");
+    app.handle_key(ctrl('s')).unwrap();
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "value = 100\n");
+    assert!(!app.editor.dirty);
+    (tmp, a, app)
+}
+
+/// #1568: closing a tab threw its undo history away, so after Reopen Closed
+/// Editor Ctrl+Z said "Nothing to undo". The history now comes back with
+/// the file, and undoing past the save leaves the buffer modified.
+#[test]
+fn reopen_closed_editor_brings_back_the_undo_history() {
+    let (_tmp, _a, mut app) = app_with_a_saved_edit();
+    app.run_command(crate::widgets::command_palette::Command::CloseEditor);
+    assert!(app.editor.path.is_none(), "the tab closed");
+    app.run_command(crate::widgets::command_palette::Command::ReopenClosedEditor);
+    assert_eq!(app.editor.lines[0], "value = 100");
+    app.handle_key(ctrl('z')).unwrap();
+    assert_eq!(app.status, "Undo");
+    assert_eq!(app.editor.lines[0], "value = 1");
+    assert!(app.editor.dirty, "the undone text is not what is on disk");
+    app.handle_key(key(
+        KeyCode::Char('z'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert_eq!(app.editor.lines[0], "value = 100", "and redo still works");
+}
+
+/// #1568: opening the file again from the Explorer (a new tab, not Reopen
+/// Closed Editor) finds the history too.
+#[test]
+fn opening_a_closed_file_again_brings_back_the_undo_history() {
+    let (_tmp, a, mut app) = app_with_a_saved_edit();
+    app.run_command(crate::widgets::command_palette::Command::CloseEditor);
+    app.editor.open_preview(&a).unwrap();
+    assert!(app.editor.undo());
+    assert_eq!(app.editor.lines[0], "value = 1");
+}
+
+/// #1568 negative: a file changed on disk after its tab closed opens with
+/// no history, which describes text the file no longer has.
+#[test]
+fn a_file_changed_after_its_tab_closed_reopens_with_no_history() {
+    let (_tmp, a, mut app) = app_with_a_saved_edit();
+    app.run_command(crate::widgets::command_palette::Command::CloseEditor);
+    std::fs::write(&a, "value = 2\n").unwrap();
+    app.run_command(crate::widgets::command_palette::Command::ReopenClosedEditor);
+    assert_eq!(app.editor.lines[0], "value = 2");
+    app.handle_key(ctrl('z')).unwrap();
+    assert_eq!(app.status, "Nothing to undo");
+    assert_eq!(app.editor.lines[0], "value = 2");
+}
+
+/// #1568 negative: edits discarded at close ("Don't Save") are not on disk,
+/// so their history does not apply to the file that reopens.
+#[test]
+fn discarded_edits_leave_no_history_behind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.py");
+    std::fs::write(&a, "value = 1\n").unwrap();
+    let mut tabs = crate::widgets::editor::EditorTabs::new();
+    tabs.open_pinned(&a).unwrap();
+    tabs.end_line();
+    tabs.insert_str("00");
+    assert!(tabs.dirty);
+    tabs.close_tab(tabs.active_index());
+    tabs.open_pinned(&a).unwrap();
+    assert_eq!(tabs.lines[0], "value = 1");
+    assert!(!tabs.undo(), "nothing to undo in the file as it is on disk");
+}
+
+/// #1568: a tab moving on to another file (a reused preview slot, or any
+/// open into the same tab) keeps the history of the file it leaves, which
+/// comes back when that file opens there again.
+#[test]
+fn a_tab_keeps_the_history_of_the_file_it_moves_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.py");
+    let b = tmp.path().join("b.py");
+    std::fs::write(&a, "value = 1\n").unwrap();
+    std::fs::write(&b, "other\n").unwrap();
+    let mut e = crate::widgets::editor::Editor::new();
+    e.open(&a).unwrap();
+    e.end_line();
+    e.insert_str("00");
+    e.save_to_disk().unwrap();
+    e.open(&b).unwrap();
+    assert!(!e.undo(), "b.py has no history of its own");
+    e.open(&a).unwrap();
+    assert!(e.undo());
+    assert_eq!(e.lines[0], "value = 1");
+}
+
+/// #1568: the kept histories are capped; past the cap the oldest closed
+/// file's goes first and the newest stay.
+#[test]
+fn closed_tab_histories_are_capped_oldest_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let files: Vec<_> = (0..31)
+        .map(|i| {
+            let f = tmp.path().join(format!("f{i}.txt"));
+            std::fs::write(&f, "x\n").unwrap();
+            f
+        })
+        .collect();
+    for f in &files {
+        let mut e = crate::widgets::editor::Editor::new();
+        e.open(f).unwrap();
+        e.insert_str("y");
+        e.save_to_disk().unwrap();
+    }
+    let undoes = |f: &std::path::Path| {
+        let mut e = crate::widgets::editor::Editor::new();
+        e.open(f).unwrap();
+        e.undo()
+    };
+    assert!(!undoes(&files[0]), "the oldest of 31 is dropped");
+    assert!(undoes(&files[1]));
+    assert!(undoes(&files[30]));
+}
+
 /// #1569: Shift+End in a wrapped paragraph selects to the end of the row the
 /// caret is on, not the rest of the paragraph; a second Shift+End extends it
 /// to the line's end.
@@ -85585,6 +86696,56 @@ fn a_sudo_save_is_staged_where_only_this_user_can_read_it() {
     std::fs::remove_file(&staged).unwrap();
 }
 
+/// Serve one `croft edit` request for `path` at `at` through a socket pair.
+fn serve_view_request_1606(
+    app: &mut App,
+    path: &std::path::Path,
+    at: Option<(usize, usize)>,
+) -> crate::view_ipc::ViewReply {
+    let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut line = serde_json::to_vec(&crate::view_ipc::ViewRequest::at(path, at)).unwrap();
+    line.push(b'\n');
+    std::io::Write::write_all(&mut client, &line).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    app.answer_view_client(server, deadline).0
+}
+
+/// #1606: `croft edit big.txt:150:3` from a pane opens big.txt with the
+/// caret on line 150, column 3, scrolled into view.
+#[test]
+fn a_view_request_with_a_location_puts_the_caret_there() {
+    let tmp = tempfile::tempdir().unwrap();
+    let big = tmp.path().join("big.txt");
+    let text: String = (1..=300).map(|n| format!("line {n}\n")).collect();
+    std::fs::write(&big, text).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let reply = serve_view_request_1606(&mut app, &big, Some((149, 2)));
+    assert_eq!(reply, crate::view_ipc::ViewReply::Ok);
+    assert_eq!(app.editor.path.as_deref(), Some(big.as_path()));
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (149, 2));
+    assert!(app.editor.scroll > 0 && app.editor.scroll <= 149);
+    assert!(app.focus == Pane::Editor);
+}
+
+/// Negative (#1606): a location past the end clamps to the text, and a
+/// request without one leaves the caret at the top.
+#[test]
+fn a_view_request_location_clamps_and_none_leaves_the_caret_at_the_top() {
+    let tmp = tempfile::tempdir().unwrap();
+    let small = tmp.path().join("small.txt");
+    std::fs::write(&small, "one\ntwo\n").unwrap();
+    let other = tmp.path().join("other.txt");
+    std::fs::write(&other, "alpha\nbeta\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    serve_view_request_1606(&mut app, &small, Some((99, 99)));
+    let last = app.editor.lines.len() - 1;
+    assert_eq!(app.editor.cursor_row, last);
+    assert!(app.editor.cursor_col <= app.editor.lines[last].chars().count());
+    serve_view_request_1606(&mut app, &other, None);
+    assert_eq!(app.editor.path.as_deref(), Some(other.as_path()));
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
+}
+
 /// Issue #1622: auto save "onWindowChange". The terminal window croft runs
 /// in losing focus (alt-tab, another tmux window) writes every dirty buffer,
 /// the one being typed into included: the editor still has croft's own
@@ -85889,6 +87050,87 @@ fn go_and_lint_rows_reach_problems_only_for_real_files() {
             (String::from("main.go"), 3, String::from("go")),
         ]
     );
+}
+
+/// #1392: a CodeLLDB `cargo` launch with no `program` builds with cargo
+/// first instead of being refused; an lldb launch with neither is still
+/// refused.
+#[test]
+fn a_cargo_launch_builds_first_and_a_bare_one_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "type": "lldb", "request": "launch", "name": "Debug executable 'rc'",
+              "cargo": { "args": ["build", "--bin=rc", "--package=rc"],
+                         "filter": { "name": "rc", "kind": "bin" } },
+              "cwd": "${workspaceFolder}" },
+            { "type": "lldb", "request": "launch", "name": "Bare" }
+        ]}"#,
+    )
+    .unwrap();
+    let launch = |name: &str| {
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let cfg = crate::dap::configs::discover_configs(tmp.path())
+            .into_iter()
+            .find(|c| c.name == name)
+            .unwrap();
+        app.launch_debug_config(&cfg);
+        app
+    };
+    let app = launch("Debug executable 'rc'");
+    assert!(
+        !app.pending_cargo_launches.is_empty() && !app.run_debug.feedback_is_error,
+        "{}",
+        app.status
+    );
+    assert!(
+        app.status
+            .contains("building with cargo build --bin=rc --package=rc"),
+        "{}",
+        app.status
+    );
+    let app = launch("Bare");
+    assert!(app.pending_cargo_launches.is_empty());
+    assert!(app.run_debug.feedback_is_error);
+    assert!(
+        app.status.contains("an lldb launch needs a \"program\""),
+        "{}",
+        app.status
+    );
+}
+
+/// #1392: Stop Debugging while cargo is still building drops the pending
+/// launch, so the debuggee does not start after the user stopped; and a
+/// compound with two cargo members queues both builds instead of keeping
+/// only the last and calling the set a failure.
+#[test]
+fn cargo_launches_queue_per_compound_member_and_stop_drops_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "type": "lldb", "request": "launch", "name": "A",
+              "cargo": { "args": ["build", "--bin=a"] } },
+            { "type": "lldb", "request": "launch", "name": "B",
+              "cargo": { "args": ["build", "--bin=b"] } }
+        ],
+        "compounds": [ { "name": "Both", "configurations": ["A", "B"] } ] }"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let compound = crate::dap::configs::discover_compounds(tmp.path())
+        .into_iter()
+        .find(|c| c.name == "Both")
+        .unwrap();
+    app.launch_compound(&compound);
+    assert_eq!(app.pending_cargo_launches.len(), 2, "{}", app.status);
+    assert!(!app.run_debug.feedback_is_error, "{}", app.status);
+    assert!(app.status.contains("building A, B"), "{}", app.status);
+    app.debug_stop_by_user();
+    assert!(app.pending_cargo_launches.is_empty());
 }
 
 /// #1598: GNOME Terminal and Konsole keep Ctrl+Shift+T / W for their own New
