@@ -85620,36 +85620,9 @@ fn go_and_lint_rows_reach_problems_only_for_real_files() {
 /// and `attach` reach it, and the session is up.
 #[test]
 fn a_python_remote_attach_talks_to_the_listening_port() {
-    use std::io::{BufRead, Read};
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-            .unwrap();
-        let mut reader = std::io::BufReader::new(stream);
-        let mut first = String::new();
-        let mut len = 0;
-        loop {
-            let mut line = String::new();
-            if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                return first;
-            }
-            if let Some(v) = line.trim().strip_prefix("Content-Length:") {
-                len = v.trim().parse().unwrap();
-            }
-            if line.trim().is_empty() {
-                break;
-            }
-        }
-        let mut body = vec![0; len];
-        if reader.read_exact(&mut body).is_ok() {
-            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            first = v["command"].as_str().unwrap_or("").to_string();
-        }
-        first
-    });
+    // The stand-in accepts within a deadline, so a session routed anywhere
+    // but this port fails here instead of hanging the join below.
+    let (port, server) = crate::dap::session::tests::listening_adapter(1);
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
     std::fs::write(
@@ -85673,9 +85646,10 @@ fn a_python_remote_attach_talks_to_the_listening_port() {
         "{}",
         app.status
     );
+    let got = server.join().unwrap();
     assert_eq!(
-        server.join().unwrap(),
-        "initialize",
+        got.first().map(|m| m["command"].clone()),
+        Some(serde_json::json!("initialize")),
         "croft's own initialize reached the port"
     );
     app.debug_stop();
