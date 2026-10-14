@@ -4584,6 +4584,44 @@ fn side_by_side_diff_link_records_one_go_back_entry() {
     );
 }
 
+/// #1161: on an `.xml` file both comment commands from the palette comment
+/// the caret's line instead of saying the language has none.
+#[test]
+fn the_comment_commands_comment_an_xml_file() {
+    use crate::widgets::command_palette::Command as Cmd;
+    let tmp = tempfile::tempdir().unwrap();
+    for name in ["doc.xml", "schema.xsd", "Info.plist"] {
+        let f = tmp.path().join(name);
+        std::fs::write(&f, "<root>\n  <item id=\"1\">hello</item>\n</root>\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open_pinned(&f).unwrap();
+        app.editor.cursor_row = 1;
+        for cmd in [Cmd::ToggleBlockComment, Cmd::ToggleLineComment] {
+            app.run_command(cmd);
+            assert_eq!(
+                app.editor.lines[1], "  <!-- <item id=\"1\">hello</item> -->",
+                "{name} {cmd:?}"
+            );
+            assert!(!app.status.contains("no "), "{name}: {}", app.status);
+            app.editor.cursor_row = 1;
+            app.run_command(cmd);
+            assert_eq!(
+                app.editor.lines[1], "  <item id=\"1\">hello</item>",
+                "{name}"
+            );
+            app.editor.cursor_row = 1;
+        }
+    }
+    // Negative: a file with no comment at all says so.
+    let f = tmp.path().join("data.unknownext");
+    std::fs::write(&f, "{}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.run_command(Cmd::ToggleLineComment);
+    assert_eq!(app.editor.lines[0], "{}");
+    assert!(app.status.contains("no comment"), "{}", app.status);
+}
+
 /// #1157: `croft notes.md` for a file not written yet opens a tab for it
 /// that says the save creates it; the save does.
 #[test]

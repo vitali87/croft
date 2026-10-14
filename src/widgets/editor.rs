@@ -33336,6 +33336,92 @@ mod tests {
         assert_eq!(e.lines, vec!["x = 1"]);
     }
 
+    /// #1161: XML comments are `<!-- -->`, so Toggle Block Comment wraps
+    /// the caret's line in them and a second toggle takes them off.
+    #[test]
+    fn toggle_block_comment_wraps_an_xml_line() {
+        let mut e = editor_with("<root>\n  <item id=\"1\">hello</item>\n</root>");
+        e.lang = Some(LangKind::Xml);
+        e.cursor_row = 1;
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines[1], "  <!-- <item id=\"1\">hello</item> -->");
+        assert_eq!(e.lines[0], "<root>");
+        assert_eq!(e.lines[2], "</root>");
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines[1], "  <item id=\"1\">hello</item>");
+    }
+
+    /// #1161: Toggle Line Comment in a language with only block comments
+    /// (XML, HTML) wraps the lines a selection touches, whole, as VS Code
+    /// does, and toggles back.
+    #[test]
+    fn toggle_line_comment_wraps_whole_lines_where_only_block_comments_exist() {
+        let mut e = editor_with("<root>\n  <item id=\"1\">hello</item>\n</root>");
+        e.lang = Some(LangKind::Xml);
+        e.cursor_row = 1;
+        e.cursor_col = 5;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[1], "  <!-- <item id=\"1\">hello</item> -->");
+        e.cursor_row = 1;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[1], "  <item id=\"1\">hello</item>");
+
+        let mut e = editor_with("<ul>\n  <li>a</li>\n  <li>b</li>\n</ul>");
+        e.lang = Some(LangKind::Html);
+        e.selection = Some(EditorSelection {
+            anchor: (1, 5),
+            head: (2, 3),
+        });
+        assert!(e.toggle_line_comment());
+        assert_eq!(
+            e.lines,
+            vec!["<ul>", "  <!-- <li>a</li>", "  <li>b</li> -->", "</ul>"]
+        );
+        // The lines stay selected, so a second toggle uncomments them all.
+        assert!(e.selection.is_some_and(|s| s.has_area()));
+        assert!(e.toggle_line_comment());
+        assert_eq!(
+            e.lines,
+            vec!["<ul>", "  <li>a</li>", "  <li>b</li>", "</ul>"]
+        );
+        assert!(e.toggle_line_comment());
+        assert_eq!(
+            e.lines,
+            vec!["<ul>", "  <!-- <li>a</li>", "  <li>b</li> -->", "</ul>"]
+        );
+    }
+
+    /// #1161, negative: a selection ending at the start of a line takes that
+    /// line in, as a line comment does, a language with a line comment
+    /// (JSON's `//` since #1181) keeps it, and plain text, with neither,
+    /// still does nothing.
+    #[test]
+    fn toggle_line_comment_falls_back_only_without_a_line_comment() {
+        let mut e = editor_with("<a/>\n<b/>\n<c/>");
+        e.lang = Some(LangKind::Xml);
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (1, 0),
+        });
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["<!-- <a/>", "<b/> -->", "<c/>"]);
+
+        let mut e = editor_with("let x = 1;");
+        e.lang = Some(LangKind::Rust);
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["// let x = 1;"]);
+
+        for lang in [Some(LangKind::Json), Some(LangKind::Yaml), None] {
+            let mut e = editor_with("{}");
+            e.lang = lang;
+            let changed = e.toggle_line_comment();
+            assert_eq!(changed, lang.is_some(), "{lang:?}");
+            if lang.is_none() {
+                assert_eq!(e.lines, vec!["{}"]);
+            }
+        }
+    }
+
     /// #1157: a file not written yet opens as an empty, clean buffer bound
     /// to its path, with its language, and the first save creates it.
     #[test]
