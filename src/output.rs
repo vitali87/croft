@@ -47,6 +47,9 @@ pub const CHANNEL_DAP: &str = "Debug Adapter";
 pub const CHANNEL_GIT: &str = "Git";
 pub const CHANNEL_PROVISION: &str = "Server Provisioning";
 pub const CHANNEL_TESTS: &str = "Test Runner";
+/// Every status-bar message, in full (#1609): the bar may have to cut one
+/// to fit, and a click on it opens this channel.
+pub const CHANNEL_MESSAGES: &str = "Messages";
 /// Fleet run results, one line per host plus the summary (#363).
 pub const CHANNEL_FLEET: &str = "Fleet";
 /// Remote provisioning: which hosts got croft installed, and why an install
