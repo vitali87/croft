@@ -88352,6 +88352,84 @@ fn go_and_lint_rows_reach_problems_only_for_real_files() {
     );
 }
 
+/// #1499: zod's `.vscode/settings.json` turns format on save on and names
+/// Biome. croft runs no Biome, so a save writes the file as typed instead
+/// of letting tsserver reformat it, and the first such save says why.
+#[test]
+fn a_project_formatter_croft_does_not_run_saves_the_file_as_typed() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/settings.json"),
+        r#"{ "editor.formatOnSave": true, "editor.defaultFormatter": "biomejs.biome" }"#,
+    )
+    .unwrap();
+    let mut app = app_with_open_file(tmp.path(), "api.ts", "type A =\n  string;\n");
+    app.apply_merged_settings(&crate::config_layers::load_merged(Some(tmp.path())).prefs);
+    assert!(app.format_on_save, "the project's formatOnSave is honoured");
+    assert_eq!(app.default_formatter.as_deref(), Some("biomejs.biome"));
+    let file = app.editor.path.clone().unwrap();
+    app.editor.insert_char('x');
+    app.format_and_save(true);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "xtype A =\n  string;\n"
+    );
+    assert!(!app.editor.dirty);
+    assert!(
+        app.save_after_format.is_none(),
+        "no format request is waited on"
+    );
+    assert!(app.format_request_id.is_none());
+    assert_eq!(
+        app.status,
+        "Saved api.ts without formatting: this project formats with biomejs.biome, which croft does not run"
+    );
+
+    app.editor.insert_char('y');
+    app.format_and_save(true);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "xytype A =\n  string;\n"
+    );
+    assert!(
+        !app.status.contains("biomejs.biome"),
+        "said once: {}",
+        app.status
+    );
+}
+
+/// #1499, negative: with no formatter named, or croft's own server named
+/// for the language, format on save still formats; a language entry for
+/// another language leaves this one alone.
+#[test]
+fn format_on_save_still_formats_when_croft_runs_the_named_formatter() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (global, per_language) in [
+        (None, vec![]),
+        (Some("vscode.typescript-language-features"), vec![]),
+        (None, vec![("python", "charliermarsh.ruff")]),
+        (
+            Some("biomejs.biome"),
+            vec![("typescript", "vscode.typescript-language-features")],
+        ),
+    ] {
+        let mut app = app_with_open_file(tmp.path(), "api.ts", "type A = string;\n");
+        app.format_on_save = true;
+        app.default_formatter = global.map(String::from);
+        app.language_formatters = per_language
+            .iter()
+            .map(|(l, f)| (l.to_string(), f.to_string()))
+            .collect();
+        app.editor.insert_char('x');
+        app.format_and_save(true);
+        assert_eq!(
+            app.save_after_format, app.editor.path,
+            "{global:?} {per_language:?}: the save waits on the formatter"
+        );
+    }
+}
+
 /// #1117 fixture: `a.rs` open and drawn, `name` selected when `select`,
 /// then a right-click on the word `value`.
 fn editor_menu_1117(select: bool) -> (tempfile::TempDir, App) {
