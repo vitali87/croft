@@ -2925,19 +2925,23 @@ impl WorkerState {
     async fn restart_key(&mut self, key: ClientKey) {
         let clients = self.clients.remove(&key).unwrap_or_default();
         let names: Vec<String> = clients.iter().map(|c| c.name.clone()).collect();
-        // Withdraw what the old servers published for their documents: a
-        // server that does not come back would never clear it, and one that
-        // does republishes once the app re-opens the tabs.
+        // Withdraw what the old servers published or answered to a pull
+        // (#1102) for their documents: a server that does not come back
+        // would never clear it, and one that does reports again once the
+        // app re-opens the tabs.
         for (path, doc) in &self.docs {
             if (doc.language, doc.project_root.clone()) != key {
                 continue;
             }
             for name in &names {
-                let _ = self.diagnostics_tx.send(DiagnosticsUpdate {
-                    path: path.clone(),
-                    server: name.clone(),
-                    diagnostics: Vec::new(),
-                });
+                for pulled in [false, true] {
+                    let _ = self.diagnostics_tx.send(DiagnosticsUpdate {
+                        path: path.clone(),
+                        server: name.clone(),
+                        diagnostics: Vec::new(),
+                        pulled,
+                    });
+                }
             }
         }
         for managed in clients {
