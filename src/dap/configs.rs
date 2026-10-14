@@ -774,6 +774,10 @@ pub struct ResolvedConfig {
     /// process at launch, so `process_id` is `None` until they have.
     pub pick_process: bool,
     pub extra: Map<String, Value>,
+    /// The cppdbg keys lldb-dap ignores (#1394), carried with the resolved
+    /// config so every launch path (a preLaunchTask resume, a compound
+    /// member) can say so in the debug console once the session starts.
+    pub ignored_keys: Vec<&'static str>,
 }
 
 /// The fields [`resolve`] consumes; everything else lands in `extra`.
@@ -797,6 +801,42 @@ const MAPPED_KEYS: &[&str] = &[
     // console would hang the session at launch.
     "console",
 ];
+
+/// cppdbg's spellings of mapped fields (#1394): `environment` joins `env`
+/// and `stopAtEntry` is `stopOnEntry`.
+const CPPDBG_MAPPED_KEYS: &[&str] = &["environment", "stopAtEntry"];
+
+/// cppdbg keys for gdb or the C/C++ extension that lldb-dap, which runs a
+/// cppdbg configuration in croft, has no use for (#1394).
+const CPPDBG_IGNORED_KEYS: &[&str] = &[
+    "MIMode",
+    "miDebuggerPath",
+    "miDebuggerArgs",
+    "miDebuggerServerAddress",
+    "setupCommands",
+    "externalConsole",
+    "targetArchitecture",
+    "symbolSearchPath",
+    "additionalSOLibSearchPath",
+    "sourceFileMap",
+    "visualizerFile",
+    "logging",
+];
+
+/// The keys of a cppdbg configuration that lldb-dap ignores (#1394), in
+/// the order croft lists them, so the debug console can say why a gdb
+/// path or a pretty-printer `setupCommands` has no effect. Empty for any
+/// other type.
+pub fn ignored_cppdbg_keys(cfg: &DebugConfig) -> Vec<&'static str> {
+    if cfg.type_name != "cppdbg" {
+        return Vec::new();
+    }
+    CPPDBG_IGNORED_KEYS
+        .iter()
+        .copied()
+        .filter(|k| cfg.raw.contains_key(*k))
+        .collect()
+}
 
 /// Resolve `cfg` against the editor state: substitute variables, load the
 /// `envFile`, and split the mapped fields. Errors are user-facing strings
@@ -832,6 +872,21 @@ pub fn resolve(cfg: &DebugConfig, ctx: &SubstCtx) -> Result<ResolvedConfig, Stri
             .map_err(|e| format!("config \"{}\": envFile {}: {e}", cfg.name, path.display()))?;
         env.extend(parse_env_file(&text));
     }
+    // cppdbg's own spelling (#1394): `environment` is a list of
+    // `{ name, value }`, under `env`, which wins per key.
+    let cppdbg = cfg.type_name == "cppdbg";
+    if cppdbg && let Some(list) = obj.get("environment").and_then(Value::as_array) {
+        for item in list {
+            if let Some(name) = item.get("name").and_then(Value::as_str) {
+                let value = match item.get("value") {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Null) | None => String::new(),
+                    Some(other) => other.to_string(),
+                };
+                env.insert(name.to_string(), value);
+            }
+        }
+    }
     if let Some(map) = obj.get("env").and_then(Value::as_object) {
         for (k, v) in map {
             // VS Code allows non-string scalars here; stringify them.
@@ -866,6 +921,7 @@ pub fn resolve(cfg: &DebugConfig, ctx: &SubstCtx) -> Result<ResolvedConfig, Stri
     let extra: Map<String, Value> = obj
         .iter()
         .filter(|(k, _)| !MAPPED_KEYS.contains(&k.as_str()))
+        .filter(|(k, _)| !(cppdbg && CPPDBG_MAPPED_KEYS.contains(&k.as_str())))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     Ok(ResolvedConfig {
@@ -885,12 +941,14 @@ pub fn resolve(cfg: &DebugConfig, ctx: &SubstCtx) -> Result<ResolvedConfig, Stri
         post_debug_task: get_str("postDebugTask"),
         stop_on_entry: obj
             .get("stopOnEntry")
+            .or_else(|| obj.get("stopAtEntry").filter(|_| cppdbg))
             .and_then(Value::as_bool)
             .unwrap_or(false),
         port,
         process_id,
         pick_process,
         extra,
+        ignored_keys: ignored_cppdbg_keys(cfg),
     })
 }
 
@@ -2127,6 +2185,80 @@ mod tests {
         assert_eq!(req["command"], "attach");
         assert_eq!(req["arguments"]["port"], 9229);
         assert_eq!(req["arguments"]["address"], "127.0.0.1");
+    }
+
+    /// The issue's cppdbg configuration (#1394).
+    const CPPDBG: &str = r#"[{
+        "name": "(gdb) Launch", "type": "cppdbg", "request": "launch",
+        "program": "${workspaceFolder}/app", "args": ["one"],
+        "stopAtEntry": true, "cwd": "${workspaceFolder}",
+        "environment": [{ "name": "GREETING", "value": "hi" }, { "name": "N", "value": 3 }],
+        "externalConsole": false, "MIMode": "gdb",
+        "setupCommands": [{ "text": "-enable-pretty-printing" }]
+    }]"#;
+
+    /// #1394: cppdbg's `environment` list and `stopAtEntry` reach lldb-dap
+    /// as its `env` and `stopOnEntry`.
+    #[test]
+    fn a_cppdbg_environment_and_stop_at_entry_reach_lldb_dap() {
+        let rc = resolve(&config(CPPDBG), &ctx()).unwrap();
+        let req = lldb_request(&rc);
+        let a = &req["arguments"];
+        assert_eq!(a["env"], json!(["GREETING=hi", "N=3"]));
+        assert_eq!(a["stopOnEntry"], true);
+        assert_eq!(a["args"], json!(["one"]));
+        assert!(a.get("environment").is_none(), "{a}");
+        assert!(a.get("stopAtEntry").is_none(), "{a}");
+    }
+
+    /// #1394: an explicit `env` wins over `environment` for the same key.
+    #[test]
+    fn a_cppdbg_env_wins_over_its_environment_list() {
+        let cfg = config(
+            r#"[{ "name": "C", "type": "cppdbg", "program": "/a",
+                  "environment": [{ "name": "A", "value": "1" }, { "name": "B", "value": "x" }],
+                  "env": { "A": "2" } }]"#,
+        );
+        let req = lldb_request(&resolve(&cfg, &ctx()).unwrap());
+        assert_eq!(req["arguments"]["env"], json!(["A=2", "B=x"]));
+    }
+
+    /// #1394: the gdb-only keys are named, so the debug console can say
+    /// lldb-dap ignores them; only for cppdbg.
+    #[test]
+    fn a_cppdbg_config_names_the_keys_lldb_dap_ignores() {
+        assert_eq!(
+            ignored_cppdbg_keys(&config(CPPDBG)),
+            ["MIMode", "setupCommands", "externalConsole"]
+        );
+        // Carried on the resolved config, which is all a preLaunchTask
+        // resume or a compound member launch has to go on.
+        assert_eq!(
+            resolve(&config(CPPDBG), &ctx()).unwrap().ignored_keys,
+            ["MIMode", "setupCommands", "externalConsole"]
+        );
+    }
+
+    /// #1394, negative: an lldb config keeps its own spellings: an
+    /// `environment` or `stopAtEntry` key there is not lldb-dap's and is
+    /// passed through, not mapped, and it names no ignored keys.
+    #[test]
+    fn only_cppdbg_configs_get_cppdbg_spellings() {
+        let cfg = config(
+            r#"[{ "name": "L", "type": "lldb", "program": "/a", "MIMode": "gdb",
+                  "environment": [{ "name": "A", "value": "1" }], "stopAtEntry": true }]"#,
+        );
+        let rc = resolve(&cfg, &ctx()).unwrap();
+        assert!(rc.env.is_empty());
+        assert!(!rc.stop_on_entry);
+        assert!(ignored_cppdbg_keys(&cfg).is_empty());
+        let rc = resolve(
+            &config(r#"[{ "name": "C", "type": "cppdbg", "program": "/a" }]"#),
+            &ctx(),
+        )
+        .unwrap();
+        assert!(rc.env.is_empty());
+        assert!(!rc.stop_on_entry);
     }
 
     #[test]

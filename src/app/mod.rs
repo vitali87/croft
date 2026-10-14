@@ -33334,6 +33334,16 @@ impl App {
                 if python_note.is_some() {
                     self.debug_console_push(lead);
                 }
+                // A cppdbg configuration runs under lldb-dap (#1394): say
+                // which of its gdb settings have no effect there. Here, not
+                // at the call site, so a preLaunchTask resume and a compound
+                // member say it too.
+                if !rc.ignored_keys.is_empty() {
+                    self.debug_console_push(format!(
+                        "config \"{name}\" runs under lldb-dap, which ignores its {}",
+                        rc.ignored_keys.join(", ")
+                    ));
+                }
             }
             Err(e) => self.debug_error(format!("Failed to start debugger: {e}")),
         }
