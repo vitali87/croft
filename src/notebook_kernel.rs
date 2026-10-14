@@ -17,6 +17,10 @@ use serde_json::Value;
 
 const BRIDGE: &str = include_str!("../assets/jupyter/bridge.py");
 
+/// The kernel name that asks the bridge for the installed kernels only:
+/// one [`Event::Specs`] (or an [`Event::Error`]) and nothing else.
+pub const LIST_KERNELS: &str = "--list";
+
 /// What croft asks the kernel to do.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
@@ -65,6 +69,33 @@ pub enum Event {
     Error {
         message: String,
     },
+    /// The notebook's kernel is not installed here (#1377): the ones that
+    /// are, so the user can pick one.
+    Missing {
+        kernel: String,
+        specs: Vec<KernelSpec>,
+    },
+    /// The installed kernels, for Notebook: Select Kernel.
+    Specs {
+        specs: Vec<KernelSpec>,
+    },
+}
+
+/// An installed kernelspec, as `jupyter kernelspec list` knows it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct KernelSpec {
+    pub name: String,
+    pub display: String,
+    #[serde(default)]
+    pub language: String,
+}
+
+/// A notebook whose kernel is not installed, waiting for the user to pick
+/// another: the name it asked for and what this machine has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelChoice {
+    pub requested: String,
+    pub specs: Vec<KernelSpec>,
 }
 
 /// A notebook's kernel. Starting one never blocks: finding a Python with
@@ -87,6 +118,18 @@ impl KernelSession {
             requests: req_tx,
             events: ev_rx,
         }
+    }
+
+    /// A session whose kernel is the test.
+    #[cfg(test)]
+    pub fn for_test() -> (Self, Sender<Event>, Receiver<Request>) {
+        let (req_tx, req_rx) = channel();
+        let (ev_tx, ev_rx) = channel();
+        let session = Self {
+            requests: req_tx,
+            events: ev_rx,
+        };
+        (session, ev_tx, req_rx)
     }
 
     pub fn send(&self, request: Request) {
@@ -216,6 +259,9 @@ pub struct NotebookRun {
     backlog: Vec<Event>,
     /// The kernel's display name, once it is up.
     pub kernel: Option<String>,
+    /// Set when the notebook's kernel is not installed: the cells sent so
+    /// far wait for the user to pick another (#1377).
+    pub choice: Option<KernelChoice>,
     sent: u64,
 }
 
@@ -227,6 +273,7 @@ impl NotebookRun {
             finished: Vec::new(),
             backlog: Vec::new(),
             kernel: None,
+            choice: None,
             sent: 0,
         }
     }
@@ -235,12 +282,7 @@ impl NotebookRun {
     /// speaks for the kernel.
     #[cfg(test)]
     pub fn for_test() -> (Self, Sender<Event>, Receiver<Request>) {
-        let (req_tx, req_rx) = channel();
-        let (ev_tx, ev_rx) = channel();
-        let session = KernelSession {
-            requests: req_tx,
-            events: ev_rx,
-        };
+        let (session, ev_tx, req_rx) = KernelSession::for_test();
         (Self::new(session), ev_tx, req_rx)
     }
 
@@ -261,6 +303,22 @@ impl NotebookRun {
 
     pub fn send(&self, request: Request) {
         self.session.send(request);
+    }
+
+    /// Run on `session`'s kernel from now on: the old one is shut down and
+    /// the cells still waiting are sent again, so a Run All that stopped
+    /// on a missing kernel carries on with the chosen one.
+    pub fn restart_with(&mut self, session: KernelSession) {
+        self.session = session;
+        self.kernel = None;
+        self.choice = None;
+        self.backlog.clear();
+        for (id, cell) in &self.pending {
+            self.session.send(Request::Execute {
+                id: id.clone(),
+                code: cell.source.clone(),
+            });
+        }
     }
 
     /// Drop `cell`'s earlier finished runs, and tell the bridge, so its
@@ -317,6 +375,19 @@ impl NotebookRun {
                     notes.push(format!("Kernel: {message}"));
                     continue;
                 }
+                Event::Missing { kernel, specs } => {
+                    // The cells stay queued: they run once a kernel is
+                    // picked, and are dropped if the user declines.
+                    notes.push(format!(
+                        "Kernel '{kernel}' is not installed here: select one to run this notebook"
+                    ));
+                    self.choice = Some(KernelChoice {
+                        requested: kernel,
+                        specs,
+                    });
+                    continue;
+                }
+                Event::Specs { .. } => continue,
                 Event::Output { id, output } => (id, CellEdit::Output(output)),
                 Event::Clear { id } => (id, CellEdit::Clear),
                 Event::Update { id, index, output } => {
@@ -370,6 +441,59 @@ pub fn kernel_name(doc_text: &str) -> String {
                 .map(str::to_string)
         })
         .unwrap_or_else(|| "python3".into())
+}
+
+/// The notebook's language (`metadata.kernelspec.language`, else
+/// `metadata.language_info.name`), lowercased.
+pub fn notebook_language(doc_text: &str) -> Option<String> {
+    let doc = serde_json::from_str::<Value>(doc_text).ok()?;
+    [
+        "/metadata/kernelspec/language",
+        "/metadata/language_info/name",
+    ]
+    .iter()
+    .find_map(|p| doc.pointer(p).and_then(Value::as_str))
+    .filter(|l| !l.is_empty())
+    .map(str::to_lowercase)
+}
+
+/// The kernel a picker opens on: `current` when it is installed, else the
+/// first one for the notebook's `language`, else the first.
+pub fn preferred_kernel(specs: &[KernelSpec], current: &str, language: Option<&str>) -> usize {
+    specs
+        .iter()
+        .position(|s| s.name == current)
+        .or_else(|| {
+            let language = language?;
+            specs
+                .iter()
+                .position(|s| s.language.eq_ignore_ascii_case(language))
+        })
+        .unwrap_or(0)
+}
+
+/// `doc_text` with `metadata.kernelspec` naming `spec`, as Jupyter writes
+/// it when a kernel is changed; other metadata is kept.
+pub fn set_kernelspec(doc_text: &str, spec: &KernelSpec) -> Option<String> {
+    let mut doc: Value = serde_json::from_str(doc_text).ok()?;
+    let root = doc.as_object_mut()?;
+    let metadata = root
+        .entry("metadata")
+        .or_insert_with(|| Value::Object(Default::default()))
+        .as_object_mut()?;
+    let ks = metadata
+        .entry("kernelspec")
+        .or_insert_with(|| Value::Object(Default::default()));
+    if !ks.is_object() {
+        *ks = Value::Object(Default::default());
+    }
+    let ks = ks.as_object_mut()?;
+    ks.insert("name".into(), Value::from(spec.name.clone()));
+    ks.insert("display_name".into(), Value::from(spec.display.clone()));
+    if !spec.language.is_empty() {
+        ks.insert("language".into(), Value::from(spec.language.clone()));
+    }
+    Some(render(&doc))
 }
 
 /// A code cell as sent to the kernel: where it is and what it says.
@@ -673,6 +797,103 @@ mod tests {
         ));
     }
 
+    fn spec(name: &str, display: &str, language: &str) -> KernelSpec {
+        KernelSpec {
+            name: name.into(),
+            display: display.into(),
+            language: language.into(),
+        }
+    }
+
+    fn installed() -> Vec<KernelSpec> {
+        vec![
+            spec("ir", "R", "R"),
+            spec("python3", "Python 3 (ipykernel)", "python"),
+        ]
+    }
+
+    #[test]
+    fn a_missing_kernel_keeps_the_cells_until_another_is_chosen() {
+        let (mut run, _kernel, _old) = NotebookRun::for_test();
+        run.execute(code_cell(NB, 1).unwrap());
+        run.backlog = vec![Event::Missing {
+            kernel: "conda-env-ds-py".into(),
+            specs: installed(),
+        }];
+        let (text, notes) = run.fold(NB);
+        assert!(text.is_none());
+        assert_eq!(
+            notes,
+            vec![
+                "Kernel 'conda-env-ds-py' is not installed here: select one to run this notebook"
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            run.choice,
+            Some(KernelChoice {
+                requested: "conda-env-ds-py".into(),
+                specs: installed(),
+            })
+        );
+        assert_eq!(
+            run.running_indices(),
+            vec![1],
+            "the cell waits for a kernel"
+        );
+        // The chosen kernel gets the cell that was waiting.
+        let (session, _events, requests) = KernelSession::for_test();
+        run.restart_with(session);
+        assert!(run.choice.is_none());
+        match requests.try_iter().collect::<Vec<_>>().as_slice() {
+            [Request::Execute { code, .. }] => assert_eq!(code, "print(1+1)\n40+2"),
+            other => panic!("expected the waiting cell, got {other:?}"),
+        }
+        assert_eq!(run.running_indices(), vec![1]);
+    }
+
+    #[test]
+    fn the_picker_opens_on_the_notebooks_kernel_or_its_language() {
+        let specs = installed();
+        assert_eq!(preferred_kernel(&specs, "ir", Some("python")), 0);
+        assert_eq!(
+            preferred_kernel(&specs, "conda-env-ds-py", Some("python")),
+            1
+        );
+        assert_eq!(preferred_kernel(&specs, "conda-env-ds-py", Some("r")), 0);
+        // Negative: nothing matches, so the first row.
+        assert_eq!(preferred_kernel(&specs, "julia-1.10", Some("julia")), 0);
+        assert_eq!(preferred_kernel(&specs, "gone", None), 0);
+        let nb = r#"{"metadata":{"kernelspec":{"name":"conda-env-ds-py","language":"Python"}},"cells":[]}"#;
+        assert_eq!(notebook_language(nb).as_deref(), Some("python"));
+        let info = r#"{"metadata":{"language_info":{"name":"python"}},"cells":[]}"#;
+        assert_eq!(notebook_language(info).as_deref(), Some("python"));
+        assert_eq!(notebook_language(r#"{"cells":[]}"#), None);
+    }
+
+    #[test]
+    fn choosing_a_kernel_writes_it_into_the_notebook_metadata() {
+        let nb = NB.replace("\"name\": \"python3\"", "\"name\": \"conda-env-ds-py\"");
+        let out = set_kernelspec(&nb, &spec("python3", "Python 3 (ipykernel)", "python")).unwrap();
+        let doc: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(doc["metadata"]["kernelspec"]["name"], "python3");
+        assert_eq!(
+            doc["metadata"]["kernelspec"]["display_name"],
+            "Python 3 (ipykernel)"
+        );
+        assert_eq!(doc["metadata"]["kernelspec"]["language"], "python");
+        assert_eq!(kernel_name(&out), "python3");
+        // Negative: the cells and the rest of the file are untouched.
+        assert_eq!(
+            doc["cells"],
+            serde_json::from_str::<Value>(NB).unwrap()["cells"]
+        );
+        assert_eq!(doc["nbformat_minor"], 5);
+        // A notebook with no metadata gets one.
+        let bare = set_kernelspec(r#"{"cells":[]}"#, &spec("ir", "R", "R")).unwrap();
+        assert_eq!(kernel_name(&bare), "ir");
+    }
+
     fn run_without_kernel() -> NotebookRun {
         NotebookRun::for_test().0
     }
@@ -848,16 +1069,37 @@ class KernelManager:
     /// Runs the real bridge against the fake kernel with `requests` as its
     /// stdin; returns what it emitted and the threads that used the client.
     fn bridge_against_fake(requests: &[&str], restart_fails: bool) -> (Vec<Event>, Vec<String>) {
+        bridge_run("python3", requests, restart_fails, false)
+    }
+
+    /// The installed kernels the fake `jupyter_client` reports (#1377).
+    const FAKE_KERNELSPEC: &str = r#"class KernelSpecManager:
+    def get_all_specs(self):
+        return {
+            "python3": {"resource_dir": "", "spec": {"display_name": "Python 3 (ipykernel)", "language": "python"}},
+            "ir": {"resource_dir": "", "spec": {"display_name": "R", "language": "R"}},
+        }
+"#;
+
+    fn bridge_run(
+        kernel: &str,
+        requests: &[&str],
+        restart_fails: bool,
+        with_specs: bool,
+    ) -> (Vec<Event>, Vec<String>) {
         let tmp = tempfile::tempdir().unwrap();
         let pkg = tmp.path().join("jupyter_client");
         std::fs::create_dir_all(&pkg).unwrap();
         std::fs::write(pkg.join("__init__.py"), "").unwrap();
         std::fs::write(pkg.join("manager.py"), FAKE_JUPYTER).unwrap();
+        if with_specs {
+            std::fs::write(pkg.join("kernelspec.py"), FAKE_KERNELSPEC).unwrap();
+        }
         let touched = tmp.path().join("touched.json");
         let mut cmd = std::process::Command::new("python3");
         cmd.arg("-c")
             .arg(BRIDGE)
-            .arg("python3")
+            .arg(kernel)
             .arg(tmp.path())
             .env("PYTHONPATH", tmp.path())
             .env("FAKE_TOUCHED", &touched)
@@ -871,12 +1113,14 @@ class KernelManager:
         {
             use std::io::Write;
             let mut stdin = child.stdin.take().unwrap();
+            // A bridge that already exited (a missing kernel, a listing)
+            // reads none of it.
             for r in requests {
-                writeln!(stdin, "{r}").unwrap();
+                let _ = writeln!(stdin, "{r}");
             }
             // Let the bridge work through them before it is told to stop.
             std::thread::sleep(std::time::Duration::from_millis(800));
-            writeln!(stdin, r#"{{"op":"shutdown"}}"#).unwrap();
+            let _ = writeln!(stdin, r#"{{"op":"shutdown"}}"#);
         }
         let out = child.wait_with_output().unwrap();
         let events = String::from_utf8_lossy(&out.stdout)
@@ -1255,6 +1499,83 @@ class KernelManager:
         assert!(
             took < std::time::Duration::from_secs(3),
             "queued requests were slowed by iopub polls: {took:?}"
+        );
+    }
+
+    fn fake_specs() -> Vec<KernelSpec> {
+        vec![
+            KernelSpec {
+                name: "ir".into(),
+                display: "R".into(),
+                language: "R".into(),
+            },
+            KernelSpec {
+                name: "python3".into(),
+                display: "Python 3 (ipykernel)".into(),
+                language: "python".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_kernel_this_machine_lacks_is_reported_with_the_installed_ones() {
+        if !crate::lsp::manager::is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let (events, _) = bridge_run(
+            "conda-env-ds-py",
+            &[r#"{"op":"execute","id":"a","code":"x = 1"}"#],
+            false,
+            true,
+        );
+        assert_eq!(
+            events,
+            vec![Event::Missing {
+                kernel: "conda-env-ds-py".into(),
+                specs: fake_specs(),
+            }],
+            "no kernel is started and nothing runs"
+        );
+    }
+
+    /// Negative: a notebook naming an installed kernel starts it with no
+    /// question, as before.
+    #[test]
+    fn an_installed_kernel_starts_without_asking() {
+        if !crate::lsp::manager::is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let (events, _) = bridge_run(
+            "python3",
+            &[r#"{"op":"execute","id":"a","code":"x = 1"}"#],
+            false,
+            true,
+        );
+        assert!(
+            matches!(events.first(), Some(Event::Ready { .. })),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Missing { .. })),
+            "{events:?}"
+        );
+        assert_eq!(done_status(&events, "a").as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn the_bridge_lists_the_installed_kernels() {
+        if !crate::lsp::manager::is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let (events, _) = bridge_run("--list", &[], false, true);
+        assert_eq!(
+            events,
+            vec![Event::Specs {
+                specs: fake_specs()
+            }]
         );
     }
 }
