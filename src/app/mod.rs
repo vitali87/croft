@@ -23976,10 +23976,12 @@ impl App {
         }
         // File: New Untitled Text File (#1580). Only from the editor or the
         // side bar: a terminal's `Ctrl`+`N` is the shell's next-history, and
-        // vim's is its own.
+        // in a vim-mode editor it is vim's own.
         if is_new_untitled_file_key(key)
             && matches!(self.focus, Pane::Editor | Pane::Tree)
-            && !(self.vim.enabled && key.modifiers.contains(KeyModifiers::CONTROL))
+            && !(self.vim.enabled
+                && self.focus == Pane::Editor
+                && key.modifiers.contains(KeyModifiers::CONTROL))
         {
             self.new_untitled_file();
             return Ok(());
@@ -68530,7 +68532,14 @@ impl App {
     /// File: New Untitled Text File (#1580): a scratch tab with no path,
     /// focused; saving it asks where to write it.
     fn new_untitled_file(&mut self) {
-        let n = self.editor.new_untitled();
+        // The lowest number no tab holds in any split group: each group
+        // numbering its own would give two tabs the same name.
+        let taken: Vec<usize> = std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|group| group.editors.iter().filter_map(|e| e.untitled))
+            .collect();
+        let n = (1..).find(|n| !taken.contains(n)).unwrap_or(1);
+        self.editor.new_untitled(n);
         self.focus_pane(Pane::Editor);
         self.status = format!("Untitled-{n}: saving asks where to write it");
     }

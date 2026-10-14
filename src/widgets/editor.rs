@@ -19729,18 +19729,15 @@ impl EditorTabs {
     }
 
     /// File: New Untitled Text File (#1580): a pinned, empty tab with no
-    /// path next to the active one, numbered with the lowest `Untitled-n`
-    /// no open tab holds. The blank startup tab becomes it rather than
-    /// staying behind. Returns `n`.
-    pub fn new_untitled(&mut self) -> usize {
-        let n = (1..)
-            .find(|n| !self.editors.iter().any(|e| e.untitled == Some(*n)))
-            .unwrap_or(1);
+    /// path next to the active one, shown as `Untitled-n`. The caller picks
+    /// `n` across every split group, which this group cannot see. The blank
+    /// startup tab becomes it rather than staying behind.
+    pub fn new_untitled(&mut self, n: usize) {
         if self.is_blank_initial() {
             let active = self.active;
             self.editors[active].untitled = Some(n);
             self.editors[active].preview = false;
-            return n;
+            return;
         }
         let mut e = Editor::new();
         e.focused = self.editors[self.active].focused;
@@ -19751,7 +19748,6 @@ impl EditorTabs {
         self.editors.insert(pos, e);
         self.editors[self.active].focused = false;
         self.active = pos;
-        n
     }
 
     /// Test-only helper that mirrors `open_preview` without going through

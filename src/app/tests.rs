@@ -81209,6 +81209,43 @@ fn ctrl_n_leaves_terminals_vim_and_shifted_chords_alone() {
     );
 }
 
+/// #1580: untitled numbers are unique across split groups. With
+/// `Untitled-1` in one group, a new one in the other is `Untitled-2`.
+#[test]
+fn untitled_numbers_stay_unique_across_split_groups() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "b.txt", "keep\n");
+    app.run_command(Command::NewUntitledFile);
+    assert_eq!(app.editor.tab_display_label(1), "Untitled-1");
+    app.editor.select(0);
+    app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+    assert!(app.editor_layout.is_split());
+
+    app.run_command(Command::NewUntitledFile);
+
+    let label = app.editor.tab_display_label(app.editor.active_index());
+    assert_eq!(label, "Untitled-2");
+}
+
+/// #1580: vim mode keeps `Ctrl`+`N` only in the editor, where vim reads
+/// it; with the side bar focused the chord still opens an untitled tab.
+#[test]
+fn vim_mode_leaves_ctrl_n_to_the_side_bar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "b.txt", "keep\n");
+    app.vim.enabled = true;
+    app.focus_pane(Pane::Tree);
+    let ctrl_or_cmd = new_untitled_chords()[0];
+
+    app.handle_key(key(KeyCode::Char('n'), ctrl_or_cmd))
+        .unwrap();
+
+    assert_eq!(app.editor.tab_count(), 2, "{ctrl_or_cmd:?}");
+    let label = app.editor.tab_display_label(app.editor.active_index());
+    assert_eq!(label, "Untitled-1");
+}
+
 #[test]
 fn save_as_writes_the_buffer_to_a_new_path_and_moves_the_tab_there() {
     let tmp = tempfile::tempdir().unwrap();
