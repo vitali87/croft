@@ -58832,7 +58832,10 @@ impl App {
 
     /// The formatter the settings name for the active file when croft does
     /// not run it (#1499), e.g. `biomejs.biome` for a TypeScript file.
-    fn foreign_formatter(&self) -> Option<String> {
+    /// `prettier` says croft formats the file with the project's own
+    /// Prettier (#1255), so the Prettier extension named for it is not
+    /// foreign.
+    fn foreign_formatter(&self, prettier: bool) -> Option<String> {
         let lang = self
             .editor
             .path
@@ -58846,6 +58849,7 @@ impl App {
             &self.language_formatters,
             lang,
         )
+        .filter(|f| !(prettier && f.eq_ignore_ascii_case("esbenp.prettier-vscode")))
         .map(str::to_owned)
     }
 
@@ -60874,7 +60878,7 @@ impl App {
             .and_then(crate::prettier::for_file)
             .is_some();
         if self.format_on_save_eligible(prettier || supports_formatting) {
-            if let Some(formatter) = self.foreign_formatter() {
+            if let Some(formatter) = self.foreign_formatter(prettier) {
                 self.save_for_foreign_formatter(formatter);
                 return;
             }
