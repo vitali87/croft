@@ -92,6 +92,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_go_to_symbol_key",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+.",
+                description: "Focus Breadcrumbs: pick a folder, file or symbol from the path above the editor",
+                handler: "is_focus_breadcrumbs_key",
+            },
+            ShortcutEntry {
                 keys: "Opt+Cmd/Ctrl+M",
                 description: "Toggle the editor minimap",
                 handler: "is_minimap_toggle_key",
@@ -355,6 +360,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 keys: "Alt+Z",
                 description: "Toggle word wrap for this file",
                 handler: "is_toggle_wrap_key",
+            },
+            ShortcutEntry {
+                keys: "Alt+O",
+                description: "C/C++: switch between a source file and its header",
+                handler: "is_switch_header_source_key",
             },
             ShortcutEntry {
                 keys: "Cmd/Ctrl+Shift+V",
