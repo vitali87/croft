@@ -93,7 +93,20 @@ pub fn handoff_path() -> PathBuf {
     base.join(format!("session-{}.json", std::process::id()))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Where `dirs_cache_croft` points for the current test thread only.
+    pub(crate) static CACHE_DIR_FOR_THIS_TEST_THREAD: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 pub(crate) fn dirs_cache_croft() -> PathBuf {
+    // A test that redirects croft's cache must not reach the real one. The
+    // redirect is per thread so tests running alongside keep their own.
+    #[cfg(test)]
+    if let Some(dir) = CACHE_DIR_FOR_THIS_TEST_THREAD.with(|d| d.borrow().clone()) {
+        return dir;
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
