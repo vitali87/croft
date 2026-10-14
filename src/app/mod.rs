@@ -47161,6 +47161,22 @@ impl App {
         self.status = format!("Copied {} chars to clipboard", text.chars().count());
     }
 
+    /// Whether the active editor view shows a selection for Copy to take,
+    /// read as [`Self::copy_editor_selection`] reads it: a rendered preview's
+    /// or log's own selection, a diff's, else the buffer's in a text view.
+    fn editor_view_has_selection(&self) -> bool {
+        if let Some(md) = self.editor.markdown_preview.as_ref() {
+            return !md.selection_text().is_empty();
+        }
+        if let Some(log) = self.editor.log.as_ref() {
+            return log.has_selection();
+        }
+        if let Some(diff) = self.editor.diff.as_ref() {
+            return diff.selection_text().is_some_and(|t| !t.is_empty());
+        }
+        self.editor_is_text() && self.editor.selection.is_some_and(|s| s.has_area())
+    }
+
     fn cut_editor_selection(&mut self) {
         let Some(sel) = self.editor.selection else {
             return;
@@ -56775,15 +56791,25 @@ impl App {
                     // Then the clipboard and the palette, as VS Code's editor
                     // menu ends (#1117): the way to copy where the keys are
                     // awkward (Linux terminals, the `croft web` canvas).
-                    menu.items.push(MenuEntry::Separator);
-                    if self.editor.selection.is_some_and(|s| s.has_area()) {
-                        menu.items
-                            .push(MenuEntry::item("Cut", MenuAction::EditorCut));
-                        menu.items
-                            .push(MenuEntry::item("Copy", MenuAction::EditorCopy));
+                    // Cut and Paste edit the buffer, so only an editable text
+                    // view offers them: a rendered preview hides its source
+                    // and swallows those keys too. Copy takes the selection
+                    // the view shows.
+                    let editable = self.editor_is_text();
+                    let mut clipboard = Vec::new();
+                    if editable && self.editor.selection.is_some_and(|s| s.has_area()) {
+                        clipboard.push(MenuEntry::item("Cut", MenuAction::EditorCut));
                     }
-                    menu.items
-                        .push(MenuEntry::item("Paste", MenuAction::EditorPaste));
+                    if self.editor_view_has_selection() {
+                        clipboard.push(MenuEntry::item("Copy", MenuAction::EditorCopy));
+                    }
+                    if editable {
+                        clipboard.push(MenuEntry::item("Paste", MenuAction::EditorPaste));
+                    }
+                    if !clipboard.is_empty() {
+                        menu.items.push(MenuEntry::Separator);
+                        menu.items.extend(clipboard);
+                    }
                     menu.items.push(MenuEntry::Separator);
                     menu.items.push(MenuEntry::item(
                         "Command Palette",

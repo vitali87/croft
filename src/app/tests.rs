@@ -85694,6 +85694,67 @@ fn the_editor_menu_offers_cut_copy_paste_and_the_palette() {
     assert!(app.command_palette.is_some());
 }
 
+/// #1117: in a rendered Markdown preview the menu works on what the reader
+/// sees. A drag over the rendered text offers Copy of that text; Cut and
+/// Paste, which would edit the hidden source, are never offered, and a
+/// selection left in the source brings none of them back.
+#[test]
+fn the_editor_menu_in_a_markdown_preview_copies_only_the_rendered_selection() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let md = tmp.path().join("doc.md");
+    std::fs::write(&md, "# Heading\n\nSome rendered body text here.\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&md).unwrap();
+    app.focus_pane(Pane::Editor);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 0;
+    app.editor.start_selection_at_cursor();
+    app.editor.cursor_col = 4;
+    app.editor.extend_selection_to_cursor();
+    app.toggle_markdown_preview();
+    assert!(app.editor.markdown_preview.is_some());
+    term.draw(|frame| app.render(frame)).unwrap();
+    let (area, row, text) = {
+        let md = app.editor.markdown_preview.as_ref().unwrap();
+        let (i, t) = md
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(i, cells)| (i as u16, cells.concat()))
+            .find(|(_, r)| r.contains("rendered body"))
+            .expect("the body text is rendered");
+        (md.last_area, i, t)
+    };
+    let (x, y) = (area.x + text.find("rendered").unwrap() as u16, area.y + row);
+    let clipboard_items = |app: &App| -> Vec<String> {
+        menu_labels(&app.context_menu.as_ref().expect("a context menu").items)
+            .into_iter()
+            .filter(|l| ["Cut", "Copy", "Paste"].contains(l))
+            .map(str::to_string)
+            .collect()
+    };
+
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), x, y));
+    assert!(
+        clipboard_items(&app).is_empty(),
+        "{:?}",
+        clipboard_items(&app)
+    );
+    app.context_menu = None;
+
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), x + 7, y));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), x + 7, y));
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), x, y));
+    assert_eq!(clipboard_items(&app), ["Copy"]);
+    run_menu_item_1117(&mut app, "Copy");
+    assert_eq!(app.status, "Copied 8 chars to clipboard");
+    assert_eq!(app.editor.lines[2], "Some rendered body text here.");
+}
+
 /// #1117 negative: with nothing selected there is nothing to cut or copy,
 /// so only Paste is offered; the symbol actions stay where they were.
 #[test]
