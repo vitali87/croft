@@ -1,0 +1,1 @@
+fix: Closing a tab no longer throws away its undo history: reopen the file (Reopen Closed Editor, the Explorer, Quick Open) and Ctrl+Z takes back the edits made before it closed, as long as the file is unchanged on disk since.
