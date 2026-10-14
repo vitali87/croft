@@ -815,7 +815,7 @@ pub fn lang_for_extension(ext: &str) -> Option<LangKind> {
         "md" | "markdown" => LangKind::Markdown,
         "go" => LangKind::Go,
         "html" | "htm" => LangKind::Html,
-        "css" | "scss" | "sass" => LangKind::Css,
+        "css" | "scss" | "sass" | "less" => LangKind::Css,
         "sh" | "bash" | "zsh" => LangKind::Bash,
         "c" | "h" => LangKind::C,
         "cpp" | "cc" | "cxx" | "c++" | "C" | "hpp" | "hxx" | "h++" => LangKind::Cpp,
@@ -857,8 +857,26 @@ pub fn lang_for_path(path: &std::path::Path) -> Option<LangKind> {
 /// the common fence names and falls back to the file-extension table. Shared
 /// by the rendered preview and the editor's Markdown injections, so a fence
 /// colours the same in both.
+///
+/// Attributes after the language are not part of it (#1642): rustdoc and
+/// mdBook write `rust,ignore` and `rust,no_run`, Pandoc and Quarto
+/// `{python}`, `{.python .numberLines}` and `{#id .python}`.
 pub fn lang_for_fence(info: &str) -> Option<LangKind> {
-    let tag = info.split_whitespace().next().unwrap_or("");
+    let info = info.trim_start();
+    let tag = if let Some(attrs) = info.strip_prefix('{') {
+        // A Pandoc attribute list: the language is its first class (or a
+        // bare Quarto word), wherever it sits; `#id` and `key=value`
+        // entries are skipped.
+        let attrs = attrs.split('}').next().unwrap_or("");
+        attrs
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .find(|entry| !entry.is_empty() && !entry.starts_with('#') && !entry.contains('='))
+            .unwrap_or("")
+            .trim_start_matches('.')
+    } else {
+        let word = info.split_whitespace().next().unwrap_or("");
+        word.split(',').next().unwrap_or("")
+    };
     Some(match tag.to_ascii_lowercase().as_str() {
         "rust" => LangKind::Rust,
         "python" => LangKind::Python,
@@ -1241,11 +1259,43 @@ fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
 }
 
 /// One styled byte-range inside a line.
+///
+/// The offsets are `u32` (#1707): an open file keeps a span per token, the
+/// largest thing it holds, and `usize` offsets made each 32 bytes rather
+/// than 24. Nothing is lost: tree-sitter's own offsets are `u32`, and the
+/// editor refuses files past `MAX_FILE_BYTES`.
 #[derive(Clone, Copy, Debug)]
 pub struct HiSpan {
-    pub start: usize,
-    pub end: usize,
+    pub start: u32,
+    pub end: u32,
     pub style: Style,
+}
+
+impl HiSpan {
+    /// A span over the line's bytes `start..end`.
+    pub fn new(start: usize, end: usize, style: Style) -> Self {
+        let narrow = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        Self {
+            start: narrow(start),
+            end: narrow(end),
+            style,
+        }
+    }
+
+    /// The line's bytes this span covers.
+    pub fn range(&self) -> std::ops::Range<usize> {
+        self.start as usize..self.end as usize
+    }
+
+    /// This span cut off at byte `len`, or `None` when it starts there or
+    /// later.
+    pub fn clipped(mut self, len: usize) -> Option<Self> {
+        if self.range().start >= len {
+            return None;
+        }
+        self.end = self.end.min(u32::try_from(len).unwrap_or(u32::MAX));
+        Some(self)
+    }
 }
 
 // One built `HighlightConfiguration` per language, shared process-wide by every
@@ -1498,11 +1548,16 @@ fn project_range(
             chunk_end
         };
         if span_end_abs > start {
-            per_line[line_idx].push(HiSpan {
-                start: start - line_start,
-                end: span_end_abs - line_start,
-                style,
-            });
+            let span = HiSpan::new(start - line_start, span_end_abs - line_start, style);
+            let line = &mut per_line[line_idx];
+            match line.last_mut() {
+                // Runs the grammar split but that paint alike are one span
+                // (#1707): two in five of a pass's spans continued the one
+                // before in the same style, and each is kept as long as the
+                // tab is open.
+                Some(last) if last.end == span.start && last.style == style => last.end = span.end,
+                _ => line.push(span),
+            }
         }
         start = chunk_end;
         line_idx += 1;
@@ -1554,11 +1609,29 @@ pub fn decode_semantic_tokens(
     text: &[u8],
     line_starts: &[usize],
 ) -> Vec<Vec<HiSpan>> {
-    let mut per_line: Vec<Vec<HiSpan>> = vec![Vec::new(); line_starts.len()];
     let src = match std::str::from_utf8(text) {
         Ok(s) => s,
-        Err(_) => return per_line,
+        Err(_) => return vec![Vec::new(); line_starts.len()],
     };
+    // The style each legend entry paints, looked up once rather than per
+    // token.
+    let styles: Vec<Option<Style>> = token_type_names
+        .iter()
+        .map(|name| semantic_style_for(name))
+        .collect();
+    let style_of = |ttype: u32| styles.get(ttype as usize).copied().flatten();
+    // Each line's list sized to its tokens up front (#1707): grown by
+    // doubling, about a third of the overlay was spare capacity, kept for
+    // as long as the tab.
+    let mut counts = vec![0usize; line_starts.len()];
+    let mut line: usize = 0;
+    for group in data.chunks_exact(5) {
+        line += group[0] as usize;
+        if line < counts.len() && style_of(group[3]).is_some() {
+            counts[line] += 1;
+        }
+    }
+    let mut per_line: Vec<Vec<HiSpan>> = counts.into_iter().map(Vec::with_capacity).collect();
     let mut line: usize = 0;
     let mut col_u16: u32 = 0;
     for group in data.chunks_exact(5) {
@@ -1572,13 +1645,8 @@ pub fn decode_semantic_tokens(
         if line >= line_starts.len() {
             continue;
         }
-        let name = match token_type_names.get(ttype as usize) {
-            Some(n) => n.as_str(),
-            None => continue,
-        };
-        let style = match semantic_style_for(name) {
-            Some(s) => s,
-            None => continue,
+        let Some(style) = style_of(ttype) else {
+            continue;
         };
         let line_start = line_starts[line];
         let content_end = match line_starts.get(line + 1) {
@@ -1589,11 +1657,7 @@ pub fn decode_semantic_tokens(
         if let Some((b0, b1)) = utf16_span_to_bytes(line_str, col_u16, length)
             && b1 > b0
         {
-            per_line[line].push(HiSpan {
-                start: b0,
-                end: b1,
-                style,
-            });
+            per_line[line].push(HiSpan::new(b0, b1, style));
         }
     }
     per_line
@@ -1694,7 +1758,7 @@ mod tests {
         let col = line.find(needle)?;
         h[row]
             .iter()
-            .find(|s| s.start <= col && col < s.end)
+            .find(|s| s.range().contains(&col))
             .and_then(|s| s.style.fg)
     }
 
@@ -1825,6 +1889,7 @@ def f() -> Config:\n\
         assert_eq!(lang_for_extension("htm"), Some(LangKind::Html));
         assert_eq!(lang_for_extension("css"), Some(LangKind::Css));
         assert_eq!(lang_for_extension("scss"), Some(LangKind::Css));
+        assert_eq!(lang_for_extension("less"), Some(LangKind::Css));
         assert_eq!(lang_for_extension("sh"), Some(LangKind::Bash));
         assert_eq!(lang_for_extension("c"), Some(LangKind::C));
         assert_eq!(lang_for_extension("h"), Some(LangKind::C));
@@ -1908,7 +1973,7 @@ def f() -> Config:\n\
         );
         let tag_span = line0
             .iter()
-            .find(|sp| &src.as_bytes()[sp.start..sp.end] == b"TODO")
+            .find(|sp| &src.as_bytes()[sp.range()] == b"TODO")
             .expect("a span covering exactly \"TODO\"");
         assert!(
             tag_span.style.add_modifier.contains(Modifier::BOLD),
@@ -1931,7 +1996,7 @@ def f() -> Config:\n\
         let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &line_starts);
         let hit = h[0]
             .iter()
-            .find(|sp| src.as_bytes()[sp.start..sp.end].eq_ignore_ascii_case(b"todo"));
+            .find(|sp| src.as_bytes()[sp.range()].eq_ignore_ascii_case(b"todo"));
         if let Some(sp) = hit {
             assert!(
                 !sp.style.add_modifier.contains(Modifier::BOLD)
@@ -1951,7 +2016,7 @@ def f() -> Config:\n\
         let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &line_starts);
         let comment_spans: Vec<_> = h[0]
             .iter()
-            .filter(|sp| src.as_bytes()[sp.start..sp.end].starts_with(b"//"))
+            .filter(|sp| src.as_bytes()[sp.range()].starts_with(b"//"))
             .collect();
         assert_eq!(
             comment_spans.len(),
@@ -1969,7 +2034,7 @@ def f() -> Config:\n\
         );
         assert_eq!(h[0][0].start, 0);
         assert_eq!(
-            h[0][0].end,
+            h[0][0].end as usize,
             "// just a normal comment".len(),
             "the span must cover the complete comment"
         );
@@ -2100,13 +2165,13 @@ def f() -> Config:\n\
         let line0_len = "fn main() {".len();
         for sp in &highlights[0] {
             assert!(
-                sp.start <= line0_len,
+                sp.range().start <= line0_len,
                 "span start {} > line len {}",
                 sp.start,
                 line0_len
             );
             assert!(
-                sp.end <= line0_len,
+                sp.range().end <= line0_len,
                 "span end {} > line len {}",
                 sp.end,
                 line0_len
@@ -2137,7 +2202,7 @@ def f() -> Config:\n\
         let col = body.rfind('x').unwrap();
         let span = spans[1]
             .iter()
-            .find(|s| s.start <= col && col < s.end)
+            .find(|s| s.range().contains(&col))
             .expect("a semantic span should cover the body parameter `x`");
         assert_eq!(
             span.style.fg, param_fg,
@@ -2161,8 +2226,37 @@ def f() -> Config:\n\
         assert_eq!(spans[0].len(), 1, "only the mapped token survives");
         let byte_col = src.find("ab").unwrap();
         let s = &spans[0][0];
-        assert_eq!(s.start, byte_col, "UTF-16 col converted to the right byte");
-        assert_eq!(s.end, byte_col + 2);
+        assert_eq!(
+            s.range(),
+            byte_col..byte_col + 2,
+            "UTF-16 col converted to the right byte"
+        );
+    }
+
+    /// A span is kept for every token of every open file (#1707), so its
+    /// size is most of what a large file costs.
+    #[test]
+    fn a_span_is_24_bytes() {
+        assert_eq!(std::mem::size_of::<HiSpan>(), 24);
+    }
+
+    /// Runs the grammar splits but that paint alike come back as one span
+    /// (#1707): the line paints the same with fewer spans to keep.
+    #[test]
+    fn neighbouring_runs_of_one_style_are_one_span() {
+        let src = "fn main() {\n    let total = items.len() + other.len(); // count\n}\n";
+        let ls = compute_line_starts(src.as_bytes());
+        let mut reg = LangRegistry::new();
+        let h = highlight_text(&mut reg, LangKind::Rust, src.as_bytes(), &ls);
+        assert!(h[1].len() > 4, "{:?}", h[1]);
+        for line in &h {
+            for pair in line.windows(2) {
+                assert!(
+                    pair[0].end != pair[1].start || pair[0].style != pair[1].style,
+                    "{pair:?} paint alike and touch"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2184,7 +2278,7 @@ def f() -> Config:\n\
             let col = line0.find(name).expect("param in source");
             let span = h[0]
                 .iter()
-                .find(|s| s.start <= col && col < s.end)
+                .find(|s| s.range().contains(&col))
                 .unwrap_or_else(|| panic!("no span covers parameter `{name}`"));
             assert_eq!(
                 span.style.fg, param_fg,
@@ -2220,7 +2314,7 @@ def f() -> Config:\n\
         for col in [first, second] {
             let span = h[1]
                 .iter()
-                .find(|s| s.start <= col && col < s.end)
+                .find(|s| s.range().contains(&col))
                 .unwrap_or_else(|| panic!("no span covers body reference at col {col}"));
             assert_eq!(
                 span.style.fg, param_fg,
@@ -2242,7 +2336,7 @@ def f() -> Config:\n\
         for col in [first, second] {
             let span = h[1]
                 .iter()
-                .find(|s| s.start <= col && col < s.end)
+                .find(|s| s.range().contains(&col))
                 .unwrap_or_else(|| panic!("{lang:?}: no span covers body reference at col {col}"));
             assert_eq!(
                 span.style.fg, param_fg,
@@ -2493,7 +2587,9 @@ def f() -> Config:\n\
     fn span_at<'a>(spans: &'a [HiSpan], line: &str, needle: &str) -> Option<&'a HiSpan> {
         let off = line.find(needle)?;
         let end = off + needle.len();
-        spans.iter().find(|sp| sp.start <= off && sp.end >= end)
+        spans
+            .iter()
+            .find(|sp| sp.range().start <= off && sp.range().end >= end)
     }
 
     const TAG_COLOR: Color = Color::Rgb(0xbf, 0x61, 0x6a);
@@ -2531,7 +2627,7 @@ def f() -> Config:\n\
         let second_off = line0[first + 3..].find("div").unwrap() + first + 3;
         let span = h[0]
             .iter()
-            .find(|sp| sp.start <= second_off && sp.end >= second_off + 3)
+            .find(|sp| sp.range().start <= second_off && sp.range().end >= second_off + 3)
             .expect("the closing-tag 'div' in </div> must produce a highlight span");
         assert_eq!(span.style.fg, Some(TAG_COLOR));
     }
