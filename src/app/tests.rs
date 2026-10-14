@@ -54860,6 +54860,51 @@ fn a_rename_edits_the_files_tab_and_not_its_diff() {
     );
 }
 
+/// A split whose group shows only the file's diff while another group holds
+/// the file itself, unsaved: the rename edits that group's tab rather than
+/// rewriting the disk under it, and the stale check watches the same tab.
+#[test]
+fn a_rename_reaches_the_files_tab_in_another_split_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let main = tmp.path().join("main.ts");
+    std::fs::write(&main, "greet(1);\ngreet(2);\n// todo\n").unwrap();
+    app.editor.open_pinned(&main).unwrap();
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 0;
+    app.editor.insert_str("x");
+    assert!(app.editor.dirty);
+    app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+    app.editor
+        .open_head_diff_with_text(PathBuf::from("main.ts (HEAD)"), "greet(1);\n", &main, true)
+        .unwrap();
+    assert_eq!(
+        app.editor.find_buffer_tab(&main),
+        None,
+        "the diff took the split's preview slot: only the diff here"
+    );
+    let edits = greet_to_welcome(&main);
+    let baseline = app.edit_seqs_in_every_group();
+    assert_eq!(app.stale_edit_target(&baseline, &edits), None);
+
+    let (files, occurrences) = app.apply_rename_edits(&edits).unwrap();
+
+    assert_eq!((files, occurrences), (1, 2));
+    assert_eq!(
+        std::fs::read_to_string(&main).unwrap(),
+        "greet(1);\ngreet(2);\n// todo\n",
+        "the open tab takes the rename; the disk waits for its save"
+    );
+    let other = app.editor_layout.inactive_groups()[0];
+    let tab = &other.editors[other.find_buffer_tab(&main).unwrap()];
+    assert_eq!(tab.lines[..3], ["welcome(1);", "welcome(2);", "x// todo"]);
+    assert!(tab.dirty);
+    assert!(
+        app.stale_edit_target(&baseline, &edits).is_some(),
+        "a later edit to that tab is seen from the other group"
+    );
+}
+
 /// Opening a file whose diff is open (Quick Open, an Explorer click, a
 /// problem row) opens the file beside the diff instead of landing on it.
 /// The left side of an Explorer compare is the case that used to strand.
@@ -82946,6 +82991,25 @@ fn format_document_in_a_prettier_project_runs_its_prettier() {
     assert_eq!(args, format!("--stdin-filepath\n{}\n", file.display()));
     assert!(app.editor.undo(), "the format is one undo step");
     assert_eq!(app.editor.lines[0], "import { a } from \"./a\";");
+}
+
+/// #1113: Prettier's result lands in the file's tab even when a diff of
+/// the file was opened before it, rather than being compared against the
+/// diff and dropped.
+#[cfg(unix)]
+#[test]
+fn prettier_formats_a_file_whose_diff_is_open_too() {
+    let tmp = prettier_project(true, PRETTIER_STUB);
+    let file = tmp.path().join("app.ts");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_head_diff_with_text(PathBuf::from("app.ts (HEAD)"), "", &file, true)
+        .unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.start_format_document();
+    wait_for_prettier(&mut app);
+    assert_eq!(app.status, "Formatted document with Prettier");
+    assert_eq!(app.editor.lines[0], "import { a } from './a'");
 }
 
 #[cfg(unix)]

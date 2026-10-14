@@ -14506,14 +14506,54 @@ impl App {
         files
             .iter()
             .filter(|(_, edits)| !edits.is_empty())
-            .find(|(path, _)| self.editor.edited_since(baseline, path))
+            .find(|(path, _)| {
+                self.buffer_group(path)
+                    .is_some_and(|group| group.edited_since(baseline, path))
+            })
             .map(|(path, _)| self.status_path(path))
     }
 
+    /// Every open tab's file and `edit_seq`, in every split group: the
+    /// baseline a workspace edit is checked against when it lands (#1151).
+    fn edit_seqs_in_every_group(&self) -> Vec<(PathBuf, u64)> {
+        std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|group| group.edit_seqs())
+            .collect()
+    }
+
+    /// The editor group whose tab holds `path`'s text, the active group
+    /// first: the one [`Self::apply_edits_to_open_buffer`] edits. A split
+    /// may show only a diff of the file while another holds the file
+    /// itself (#1113).
+    fn buffer_group(&self, path: &Path) -> Option<&EditorTabs> {
+        std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .find(|group| group.find_buffer_tab(path).is_some())
+    }
+
+    /// Apply workspace `edits` to the tab holding `path`'s text in any
+    /// split group, the active group first. `None` when no group holds it,
+    /// so the caller edits the file on disk.
+    fn apply_edits_to_open_buffer(
+        &mut self,
+        path: &Path,
+        edits: &[crate::widgets::editor::TextSpanEdit],
+    ) -> Option<usize> {
+        if let Some(n) = self.editor.apply_rename_to_open_tab(path, edits) {
+            return Some(n);
+        }
+        self.editor_layout
+            .inactive_groups_mut()
+            .into_iter()
+            .find_map(|group| group.apply_rename_to_open_tab(path, edits))
+    }
+
     /// Apply an LSP rename `WorkspaceEdit` (already normalised to per-file
-    /// char-indexed spans). Open tabs are edited in-memory as one undo step
-    /// and left dirty; closed files are rewritten on disk (the fs watcher
-    /// refreshes the tree). Returns (files touched, occurrences replaced).
+    /// char-indexed spans). Open tabs, in any split group, are edited
+    /// in-memory as one undo step and left dirty; closed files are rewritten
+    /// on disk (the fs watcher refreshes the tree). Returns (files touched,
+    /// occurrences replaced).
     fn apply_rename_edits(
         &mut self,
         files: &[(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)],
@@ -14524,7 +14564,7 @@ impl App {
             if edits.is_empty() {
                 continue;
             }
-            if let Some(n) = self.editor.apply_rename_to_open_tab(path, edits) {
+            if let Some(n) = self.apply_edits_to_open_buffer(path, edits) {
                 occ_count += n;
             } else if self.is_collab_guest() && collab_file_key(&self.tree.root, path).is_some() {
                 // Closed-file rename edits are raw disk writes; a collab
@@ -14647,10 +14687,7 @@ impl App {
                 return true;
             }
         };
-        let tab = self
-            .editor
-            .find_tab_with_path(&job.path)
-            .or_else(|| self.editor.find_any_tab_with_path(&job.path));
+        let tab = self.editor.find_buffer_tab(&job.path);
         let buffer = tab.map(|i| &self.editor.editors[i]).map(|e| {
             (
                 e.text_for_formatter(),
@@ -15321,7 +15358,7 @@ impl App {
         let id = lsp.request_code_action(path, sr, sc, er, ec, diagnostics);
         self.code_action_request_id = Some(id);
         self.code_action_pending_resolve = false;
-        self.code_action_baseline = self.editor.edit_seqs();
+        self.code_action_baseline = self.edit_seqs_in_every_group();
         self.status = String::from("Finding quick fixes");
     }
 
@@ -15480,7 +15517,7 @@ impl App {
         let id = lsp.request_code_action_resolve(path, item.server, action);
         self.code_action_request_id = Some(id);
         self.code_action_pending_resolve = true;
-        self.code_action_baseline = self.editor.edit_seqs();
+        self.code_action_baseline = self.edit_seqs_in_every_group();
         self.status = String::from("Resolving quick fix");
     }
 
@@ -68261,7 +68298,7 @@ impl App {
             op,
             renames,
             deadline: std::time::Instant::now() + FILE_MOVE_DEADLINE,
-            baseline: self.editor.edit_seqs(),
+            baseline: self.edit_seqs_in_every_group(),
         });
     }
 
@@ -68728,7 +68765,7 @@ impl App {
                 };
                 let id = lsp.request_rename(path, line, character, new_name);
                 self.rename_request_id = Some(id);
-                self.rename_baseline = self.editor.edit_seqs();
+                self.rename_baseline = self.edit_seqs_in_every_group();
                 self.prompt = None;
                 self.status = String::from("Renaming symbol");
             }
