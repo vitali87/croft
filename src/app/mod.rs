@@ -8700,13 +8700,13 @@ impl App {
         while let Ok(event) = self.search_results_rx.try_recv() {
             match event {
                 SearchEvent::Hits(q, opts, batch) => {
-                    if q == self.search.query && opts == self.search.opts {
+                    if q == self.search.query && opts.same_matching(&self.search.opts) {
                         arrived.extend(batch);
                         applied = true;
                     }
                 }
                 SearchEvent::Done(q, opts) => {
-                    if q == self.search.query && opts == self.search.opts {
+                    if q == self.search.query && opts.same_matching(&self.search.opts) {
                         self.search.complete = true;
                         applied = true;
                     }
@@ -24842,9 +24842,13 @@ impl App {
             SearchToggle::CaseSensitive => "Match Case",
             SearchToggle::WholeWord => "Match Whole Word",
             SearchToggle::UseRegex => "Use Regular Expression",
+            SearchToggle::PreserveCase => "Preserve Case",
         };
         self.status = format!("Search: {name} {}", if on { "on" } else { "off" });
-        self.submit_search_query();
+        // Preserve Case shapes replacements only: the hits stay as they are.
+        if toggle != SearchToggle::PreserveCase {
+            self.submit_search_query();
+        }
     }
 
     /// Search: Replace in Files (#860, `Cmd+Shift+H`): the Search side bar
@@ -53162,6 +53166,10 @@ impl App {
                 self.set_sidebar_view(SidebarView::Search);
                 self.toggle_search_opt(crate::widgets::search::SearchToggle::UseRegex);
             }
+            Cmd::SearchTogglePreserveCase => {
+                self.set_sidebar_view(SidebarView::Search);
+                self.toggle_search_opt(crate::widgets::search::SearchToggle::PreserveCase);
+            }
             Cmd::SearchToggleDetails => {
                 self.set_sidebar_view(SidebarView::Search);
                 self.search.toggle_details();
@@ -70794,8 +70802,9 @@ fn editor_find_scope_pos(
     Some((r, col).clamp(start, end))
 }
 
-/// `Alt+C` / `Alt+W` / `Alt+R` while a Search side bar input has focus: the
-/// `Aa` / `ab` / `.*` toggle each flips, VS Code's search-input keys (#860).
+/// `Alt+C` / `Alt+W` / `Alt+R` / `Alt+P` while a Search side bar input has
+/// focus: the `Aa` / `ab` / `.*` / `AB` toggle each flips, VS Code's
+/// search-input keys (#860, #1612).
 /// Only a bare Alt: a macOS terminal that sends Option+C as `ç` is typing,
 /// and taking that glyph would eat it on the keyboards that have it.
 fn search_toggle_for_key(key: KeyEvent) -> Option<crate::widgets::search::SearchToggle> {
@@ -70807,6 +70816,7 @@ fn search_toggle_for_key(key: KeyEvent) -> Option<crate::widgets::search::Search
         KeyCode::Char('c' | 'C') => Some(SearchToggle::CaseSensitive),
         KeyCode::Char('w' | 'W') => Some(SearchToggle::WholeWord),
         KeyCode::Char('r' | 'R') => Some(SearchToggle::UseRegex),
+        KeyCode::Char('p' | 'P') => Some(SearchToggle::PreserveCase),
         _ => None,
     }
 }

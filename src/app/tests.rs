@@ -83455,6 +83455,69 @@ fn search_toggles_and_details_answer_the_keyboard() {
     assert_eq!(app.search.query, "c");
 }
 
+/// #1612: `Alt+P` in the Search side bar flips Preserve Case, names it on
+/// the status line and types nothing; the palette carries it too.
+#[test]
+fn alt_p_toggles_preserve_case_in_the_search_side_bar() {
+    use crate::widgets::command_palette::{ALL_COMMANDS, Command};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.open_replace();
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::ALT))
+        .unwrap();
+    assert!(app.search.opts.preserve_case);
+    assert_eq!(app.status, "Search: Preserve Case on");
+    assert!(
+        app.search.replace.is_empty(),
+        "the key toggles, it does not type"
+    );
+    // Negative: the other toggles are untouched.
+    assert!(!app.search.opts.case_sensitive && !app.search.opts.use_regex);
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::ALT))
+        .unwrap();
+    assert!(!app.search.opts.preserve_case);
+    assert_eq!(app.status, "Search: Preserve Case off");
+    assert!(ALL_COMMANDS.contains(&Command::SearchTogglePreserveCase));
+    app.show_tree = false;
+    app.run_command(Command::SearchTogglePreserveCase);
+    assert!(app.show_tree);
+    assert!(app.search.opts.preserve_case);
+}
+
+/// #1612: flipping Preserve Case while a search runs keeps its results:
+/// the worker's events carry the old toggle, and the search still
+/// completes so Replace All is not left blocked.
+#[test]
+fn toggling_preserve_case_mid_search_keeps_the_search_live() {
+    use crate::widgets::search::SearchEvent;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.query = String::from("user");
+    let before = app.search.opts;
+    app.toggle_search_opt(crate::widgets::search::SearchToggle::PreserveCase);
+    assert!(app.search.opts.preserve_case);
+    // Drain whatever the real worker sent, then hand in events stamped
+    // with the options from before the toggle.
+    app.drain_search_results();
+    app.search.complete = false;
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.search_results_rx = rx;
+    tx.send(SearchEvent::Done(String::from("user"), before))
+        .unwrap();
+    assert!(app.drain_search_results());
+    assert!(app.search.complete, "the search must finish");
+    // Negative: a result under a different Match Case is still dropped.
+    app.search.complete = false;
+    let mut other = before;
+    other.case_sensitive = !other.case_sensitive;
+    tx.send(SearchEvent::Done(String::from("user"), other))
+        .unwrap();
+    assert!(!app.drain_search_results());
+    assert!(!app.search.complete);
+}
+
 /// #860: `Ctrl/Cmd+Shift+H` is Replace in Files: the Search side bar opens
 /// with its Replace row expanded and focused, from the editor, and a second
 /// press never collapses it. In the live terminal `Ctrl+Shift+H` stays
