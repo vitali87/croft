@@ -66,7 +66,8 @@ The `⛶` icon at the top-right of the editor (and the welcome screen), or the s
 * **Primary Side Bar Position** — Left/Right; the activity bar moves with it.
 * **Panel Alignment** — Left/Center/Right/Justify, where Justify spans the panel across the full content width under the side bar.
 * **Quick Input Position** — Top/Center, for the Command Palette / Go to File.
-* **Zen Mode** (`Cmd`/`Ctrl`+`K` `Z`) — hides all chrome and restores it on the next toggle.
+* **Zen Mode** (`Cmd`/`Ctrl`+`K` `Z`) — hides all chrome and restores it on the next toggle, or on `Esc` `Esc` in the editor. It centres the editor too, as VS Code's `zenMode.centerLayout` does; set `"zen_center_layout": false` under `layout` to keep the full width. For a few seconds after entering it, a box at the bottom says how to leave, since the status bar is hidden.
+* **Centered Layout** (also **View: Toggle Centered Layout**) — keeps the editor `centered_layout_width` columns wide (120 by default) in the middle of its column, with plain margins either side. A window no wider than that is unchanged.
 
 Every choice except the frequently-toggled side-bar / panel visibility persists in `~/.config/croft/config.json`.
 
