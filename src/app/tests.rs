@@ -67486,6 +67486,212 @@ fn clicking_a_cells_run_glyph_runs_it_and_writes_the_output_into_the_notebook() 
     assert!(app.editor.dirty, "outputs are an edit; Save writes them");
 }
 
+/// The kernel bridges a test App starts through Select Kernel (#1377), by
+/// kernel name, with the test speaking for each.
+type StartedKernels = std::rc::Rc<
+    std::cell::RefCell<
+        Vec<(
+            String,
+            std::sync::mpsc::Sender<crate::notebook_kernel::Event>,
+            std::sync::mpsc::Receiver<crate::notebook_kernel::Request>,
+        )>,
+    >,
+>;
+
+/// A notebook naming `kernel` open in its rendered view, with the test as
+/// its kernel and as every kernel started after it.
+fn notebook_with_kernel(
+    kernel: &str,
+) -> (
+    tempfile::TempDir,
+    App,
+    PathBuf,
+    std::sync::mpsc::Sender<crate::notebook_kernel::Event>,
+    StartedKernels,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("shared.ipynb");
+    std::fs::write(
+        &path,
+        NOTEBOOK_355.replace("\"name\": \"python3\"", &format!("\"name\": \"{kernel}\"")),
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let (run, kernel_tx, _requests) = crate::notebook_kernel::NotebookRun::for_test();
+    app.notebook_kernels.insert(path.clone(), run);
+    let started: StartedKernels = Default::default();
+    let record = started.clone();
+    app.kernel_start_override = Some(Box::new(move |name| {
+        let (session, events, requests) = crate::notebook_kernel::KernelSession::for_test();
+        record
+            .borrow_mut()
+            .push((name.to_string(), events, requests));
+        session
+    }));
+    (tmp, app, path, kernel_tx, started)
+}
+
+fn installed_kernels() -> Vec<crate::notebook_kernel::KernelSpec> {
+    vec![
+        crate::notebook_kernel::KernelSpec {
+            name: "ir".into(),
+            display: "R".into(),
+            language: "R".into(),
+        },
+        crate::notebook_kernel::KernelSpec {
+            name: "python3".into(),
+            display: "Python 3 (ipykernel)".into(),
+            language: "python".into(),
+        },
+    ]
+}
+
+fn notebook_kernelspec(app: &App) -> serde_json::Value {
+    let doc: serde_json::Value = serde_json::from_str(&app.editor.lines.join("\n")).unwrap();
+    doc["metadata"]["kernelspec"].clone()
+}
+
+/// #1377: Run All on a notebook naming a kernel this machine does not have
+/// asks which installed kernel to use, opened on the one for the
+/// notebook's language; choosing it runs the cells and names it in the
+/// notebook, as Jupyter does.
+#[test]
+fn run_all_with_a_missing_kernel_asks_which_kernel_and_runs_on_it() {
+    use crate::notebook_kernel::{Event, Request};
+    use crate::widgets::list_picker::ListPurpose;
+    let (_tmp, mut app, _path, kernel, started) = notebook_with_kernel("conda-env-ds-py");
+    app.run_command(crate::widgets::command_palette::Command::NotebookRunAll);
+    assert_eq!(app.editor.notebook_running, vec![0]);
+    kernel
+        .send(Event::Missing {
+            kernel: "conda-env-ds-py".into(),
+            specs: installed_kernels(),
+        })
+        .unwrap();
+    app.poll_notebook_kernels();
+    let picker = app.list_picker.as_ref().expect("the kernel picker opens");
+    assert_eq!(picker.purpose, ListPurpose::NotebookKernel);
+    assert!(picker.title.contains("conda-env-ds-py"), "{}", picker.title);
+    assert_eq!(
+        picker.selected_row().map(|r| r.id.as_str()),
+        Some("python3"),
+        "the Python notebook's picker opens on the Python kernel"
+    );
+    assert_eq!(app.editor.notebook_running, vec![0], "the cell waits");
+
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.list_picker.is_none());
+    let started = started.borrow();
+    let [(name, _, requests)] = started.as_slice() else {
+        panic!("one kernel started: {:?}", started.len());
+    };
+    assert_eq!(name, "python3");
+    match requests.try_iter().collect::<Vec<_>>().as_slice() {
+        [Request::Execute { code, .. }] => assert_eq!(code, "print(1+1)"),
+        other => panic!("the waiting cell goes to the chosen kernel: {other:?}"),
+    }
+    let ks = notebook_kernelspec(&app);
+    assert_eq!(ks["name"], "python3");
+    assert_eq!(ks["display_name"], "Python 3 (ipykernel)");
+    assert!(app.editor.dirty, "Save writes the new kernel into the file");
+    assert_eq!(app.status, "Starting kernel Python 3 (ipykernel)…");
+}
+
+/// #1377, negative: closing the picker without a choice leaves nothing
+/// waiting at `In [*]` and the notebook's kernel as it was.
+#[test]
+fn declining_the_kernel_picker_stops_the_waiting_cells() {
+    use crate::notebook_kernel::Event;
+    let (_tmp, mut app, path, kernel, started) = notebook_with_kernel("conda-env-ds-py");
+    app.run_command(crate::widgets::command_palette::Command::NotebookRunAll);
+    kernel
+        .send(Event::Missing {
+            kernel: "conda-env-ds-py".into(),
+            specs: installed_kernels(),
+        })
+        .unwrap();
+    app.poll_notebook_kernels();
+    assert!(app.list_picker.is_some());
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.list_picker.is_none());
+    assert!(app.editor.notebook_running.is_empty());
+    assert!(!app.notebook_kernels.contains_key(&path));
+    assert!(started.borrow().is_empty(), "no kernel was started");
+    assert_eq!(notebook_kernelspec(&app)["name"], "conda-env-ds-py");
+    assert!(
+        app.status.contains("Notebook: Select Kernel"),
+        "{}",
+        app.status
+    );
+}
+
+/// #1377, negative: a kernel that is installed starts with no question.
+#[test]
+fn a_kernel_that_is_installed_opens_no_picker() {
+    use crate::notebook_kernel::Event;
+    let (_tmp, mut app, _path, kernel, started) = notebook_with_kernel("python3");
+    app.run_command(crate::widgets::command_palette::Command::NotebookRunAll);
+    kernel
+        .send(Event::Ready {
+            kernel: "python3".into(),
+            display: "Python 3 (ipykernel)".into(),
+        })
+        .unwrap();
+    app.poll_notebook_kernels();
+    assert!(app.list_picker.is_none());
+    assert!(started.borrow().is_empty());
+    assert_eq!(app.editor.notebook_running, vec![0]);
+}
+
+/// #1377: Notebook: Select Kernel lists the installed kernels, opened on
+/// the notebook's own, and the choice is written into the notebook for its
+/// next run.
+#[test]
+fn select_kernel_lists_the_installed_kernels_and_switches_the_notebook() {
+    use crate::notebook_kernel::Event;
+    let (_tmp, mut app, path, _kernel, started) = notebook_with_kernel("python3");
+    app.notebook_kernels.remove(&path);
+    app.run_command(crate::widgets::command_palette::Command::NotebookSelectKernel);
+    {
+        let started = started.borrow();
+        let [(name, events, _)] = started.as_slice() else {
+            panic!("one listing: {:?}", started.len());
+        };
+        assert_eq!(name, crate::notebook_kernel::LIST_KERNELS);
+        events
+            .send(Event::Specs {
+                specs: installed_kernels(),
+            })
+            .unwrap();
+    }
+    assert!(app.list_picker.is_none(), "the picker waits for the list");
+    app.poll_notebook_kernels();
+    let picker = app.list_picker.as_ref().expect("the kernel picker opens");
+    assert_eq!(picker.title, "Select Kernel");
+    assert_eq!(
+        picker.selected_row().map(|r| r.id.as_str()),
+        Some("python3")
+    );
+    app.handle_key(key(KeyCode::Up, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let ks = notebook_kernelspec(&app);
+    assert_eq!(ks["name"], "ir");
+    assert_eq!(ks["language"], "R");
+    assert_eq!(app.status, "Kernel: R (starts on the next run)");
+    assert_eq!(started.borrow().len(), 1, "no kernel starts until a run");
+    assert_eq!(
+        crate::notebook_kernel::kernel_name(&app.editor.lines.join("\n")),
+        "ir"
+    );
+}
+
 /// Acceptance for #355 against a real kernel: `print(1+1)` shows `2`, and
 /// after Save the file holds the output in the standard format. Set
 /// `CROFT_TEST_JUPYTER_PYTHON` to a venv python with ipykernel.
