@@ -313,6 +313,9 @@ pub enum Command {
     ToggleAutoHideSideBar,
     ToggleSecondarySideBar,
     ToggleZenMode,
+    /// Centre the editor in its column (#1585), VS Code's View: Toggle
+    /// Centered Layout.
+    ToggleCenteredLayout,
     ToggleTerminal,
     /// The Customize Layout popup's rows as commands (#852), VS Code's
     /// names: the bars' visibility, the side bar's side, and pickers for
@@ -773,6 +776,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ToggleAutoHideSideBar,
     Command::ToggleSecondarySideBar,
     Command::ToggleZenMode,
+    Command::ToggleCenteredLayout,
     Command::ToggleTerminal,
     Command::ToggleActivityBar,
     Command::ToggleStatusBar,
@@ -927,6 +931,7 @@ pub const LAYOUT_COMMANDS: &[Command] = &[
     Command::SetPanelAlignment,
     Command::SetQuickInputPosition,
     Command::ToggleZenMode,
+    Command::ToggleCenteredLayout,
 ];
 
 impl Command {
@@ -1193,6 +1198,7 @@ impl Command {
             Command::ToggleAutoHideSideBar => "View: Toggle Auto-Hide Side Bar",
             Command::ToggleSecondarySideBar => "View: Toggle Secondary Side Bar",
             Command::ToggleZenMode => "View: Toggle Zen Mode",
+            Command::ToggleCenteredLayout => "View: Toggle Centered Layout",
             Command::ToggleTerminal => "View: Toggle Terminal",
             Command::ToggleActivityBar => "View: Toggle Activity Bar Visibility",
             Command::ToggleStatusBar => "View: Toggle Status Bar Visibility",
@@ -1618,6 +1624,7 @@ impl Command {
             Command::ToggleAutoHideSideBar => "",
             Command::ToggleSecondarySideBar => "Cmd+Opt+B",
             Command::ToggleZenMode => "Cmd+K Z",
+            Command::ToggleCenteredLayout => "",
             Command::ToggleTerminal => "Ctrl+J",
             Command::ToggleActivityBar => "",
             Command::ToggleStatusBar => "",
@@ -2027,6 +2034,7 @@ impl Command {
             Command::ToggleAutoHideSideBar => "toggle_auto_hide_side_bar",
             Command::ToggleSecondarySideBar => "toggle_secondary_side_bar",
             Command::ToggleZenMode => "toggle_zen_mode",
+            Command::ToggleCenteredLayout => "toggle_centered_layout",
             Command::ToggleTerminal => "toggle_terminal",
             Command::ToggleActivityBar => "toggle_activity_bar",
             Command::ToggleStatusBar => "toggle_status_bar",

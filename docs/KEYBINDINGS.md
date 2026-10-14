@@ -80,7 +80,8 @@ Per platform:
 | `Cmd+K` `E` | Reveal the active file in the Explorer tree (expand parents, select, focus) |
 | `Cmd+K` `O` | Copy into New Window: open the active file in a new window of your terminal, focused on just the file (Explorer + terminal hidden; the current window is untouched; Ghostty / iTerm2 / Terminal; macOS only) |
 | `Cmd+K` `Shift+O` | Move into New Window: same, and close the file's tab here (macOS only; save a tab with unsaved changes first) |
-| `Cmd+K` `Z` | Toggle Zen Mode: hide the activity bar, both side bars, the panel, and the status bar; press again to restore exactly what was shown before |
+| `Cmd+K` `Z` | Toggle Zen Mode: hide the activity bar, both side bars, the panel, and the status bar, and centre the editor; press again to restore exactly what was shown before |
+| `Esc` `Esc` | Leave Zen Mode (two Escapes in the editor within half a second; an Esc that closes a popup or clears a selection does not count) |
 | `Cmd+K` `V` | Toggle Live Run for the active Python file: it re-runs on every pause in typing, and each line shows the values it produced, what it printed or returned, and the exception it died with. Line numbers go green for statements that ran and red for ones that never did. Also in the palette as "Python: Toggle Live Run" |
 | `Cmd+K` `B` | Show the Testing view (beaker icon); it discovers tests on first open (`cargo test` for Rust, `pytest` for Python). In the view: Enter runs all tests, `s` (or the ■ Stop control, or Testing: Cancel Test Run) stops a run or discovery in flight, `r` re-discovers, `o` opens OUTPUT on the Test Runner channel (as does clicking the "see OUTPUT › Test Runner" pointer a failed discovery or run shows), click a test's play/status glyph to run just it, click its name to jump to its source, click a suite header's play glyph to run the whole suite, click a row's eye to watch that test or suite (it reruns on every save under the project; the header's eye or `w` watches everything), ↑/↓ scroll or drag the scrollbar |
 | `Cmd+K` `Enter` | Run the test the editor caret sits in (also in the palette as "Testing: Run Test at Cursor") |
@@ -126,7 +127,8 @@ Click the **⛶** icon at the top-right of the editor (or the welcome screen), o
 | Primary Side Bar Position | Left / Right (moves the activity bar with it); **View: Toggle Primary Side Bar Position** swaps it |
 | Panel Alignment | Left / Center / Right / Justify (Justify spans the full width under the side bar); **View: Set Panel Alignment…** picks one from the keyboard |
 | Quick Input Position | Top / Center (where Command Palette / Go to File appears); **View: Set Quick Input Position…** picks one from the keyboard |
-| Zen Mode | `Cmd`/`Ctrl`+`K` `Z` |
+| Zen Mode | `Cmd`/`Ctrl`+`K` `Z`; `Esc` `Esc` leaves it. Zen centres the editor unless `layout.zen_center_layout` is `false` |
+| Centered Layout | Keeps the editor `layout.centered_layout_width` columns wide (120 by default) in the middle of its column; also **View: Toggle Centered Layout** |
 
 Every choice except the side-bar / panel visibility persists across launches in `~/.config/croft/config.json`.
 

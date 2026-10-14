@@ -35537,6 +35537,235 @@ fn zen_mode_hides_all_chrome_then_restores_the_snapshot() {
     assert!(app.status_bar_visible);
 }
 
+/// A 200-column frame with `app` drawn into it, and its text (#1585).
+fn draw_wide(app: &mut App, w: u16) -> String {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    screen_text(&term)
+}
+
+fn zen_app() -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("t.py");
+    std::fs::write(&p, "x = 1\ny = 2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    app.focus = Pane::Editor;
+    (tmp, app)
+}
+
+/// The editor as last drawn, `(x, width)` (#1585): its text and the
+/// minimap strip carved from its right edge. Centered Layout centres the
+/// two together, as VS Code centres an editor with its minimap.
+fn editor_column(app: &App) -> (u16, u16) {
+    let text = app.editor.last_full_area;
+    let strip = if app.minimap_visible && app.minimap_room {
+        MINIMAP_WIDTH_CELLS
+    } else {
+        0
+    };
+    (text.x, text.width + strip)
+}
+
+/// #1585: Zen Mode centres the editor: in 200 columns it is 120 wide and
+/// starts at column 40, like VS Code's `zenMode.centerLayout`. The
+/// minimap is part of those 120 columns; without it the text takes them.
+#[test]
+fn zen_mode_centres_the_editor_in_a_wide_window() {
+    let (_tmp, mut app) = zen_app();
+    app.toggle_zen_mode();
+    draw_wide(&mut app, 200);
+    assert!(app.minimap_visible && app.minimap_room, "the minimap shows");
+    assert_eq!(
+        editor_column(&app),
+        (40, 120),
+        "{:?}",
+        app.editor.last_full_area
+    );
+    app.toggle_minimap();
+    draw_wide(&mut app, 200);
+    let area = app.editor.last_full_area;
+    assert_eq!((area.x, area.width), (40, 120), "{area:?}");
+    app.toggle_minimap();
+    app.toggle_zen_mode();
+    draw_wide(&mut app, 200);
+    assert!(
+        editor_column(&app).1 > 120,
+        "out of Zen the editor fills its column again: {:?}",
+        app.editor.last_full_area
+    );
+}
+
+/// #1585: View: Toggle Centered Layout centres the editor outside Zen and
+/// persists in the layout; inside a centred Zen it turns the centring off.
+#[test]
+fn toggle_centered_layout_centres_outside_zen_and_uncentres_zen() {
+    let (_tmp, mut app) = zen_app();
+    app.show_tree = false;
+    app.activity_bar_visible = false;
+    app.show_terminal = false;
+    app.run_command(crate::widgets::command_palette::Command::ToggleCenteredLayout);
+    assert!(app.centered_layout);
+    assert_eq!(app.status, "Centered Layout on");
+    draw_wide(&mut app, 200);
+    assert_eq!(editor_column(&app), (40, 120));
+    app.run_command(crate::widgets::command_palette::Command::ToggleCenteredLayout);
+    assert!(!app.centered_layout);
+
+    app.toggle_zen_mode();
+    assert!(app.centered_layout_active(), "Zen starts centred");
+    app.run_command(crate::widgets::command_palette::Command::ToggleCenteredLayout);
+    assert!(!app.centered_layout_active() && !app.centered_layout);
+    draw_wide(&mut app, 200);
+    assert_eq!(editor_column(&app), (0, 200));
+    let rows = app.customize_layout_items();
+    assert!(
+        rows.iter().any(|r| matches!(r, MenuEntry::Item { label, action: MenuAction::ToggleCenteredLayout, .. } if label.contains("Centered Layout"))),
+        "the Customize Layout popup has the row"
+    );
+}
+
+/// #1585, negative: a window no wider than the centred width, or Zen with
+/// `zen_center_layout` off, leaves the editor its whole column.
+#[test]
+fn a_narrow_window_or_zen_without_centring_keeps_the_full_width() {
+    let (_tmp, mut app) = zen_app();
+    app.toggle_zen_mode();
+    draw_wide(&mut app, 110);
+    assert_eq!(editor_column(&app), (0, 110));
+    app.toggle_zen_mode();
+    app.zen_center_layout = false;
+    app.toggle_zen_mode();
+    draw_wide(&mut app, 200);
+    assert_eq!(editor_column(&app), (0, 200));
+    assert_eq!(
+        centered_editor_rect(Rect::new(5, 1, 50, 9), 0),
+        Rect::new(5, 1, 50, 9),
+        "a zero width centres nothing"
+    );
+    assert_eq!(
+        centered_editor_rect(Rect::new(5, 1, 51, 9), 20),
+        Rect::new(20, 1, 20, 9)
+    );
+}
+
+/// #1585: Esc Esc leaves Zen Mode and restores the chrome from before it.
+#[test]
+fn esc_esc_leaves_zen_mode_and_restores_the_chrome() {
+    let (_tmp, mut app) = zen_app();
+    app.show_tree = true;
+    app.status_bar_visible = true;
+    app.toggle_zen_mode();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.zen_mode, "one Esc is not enough");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.zen_mode, "Esc Esc leaves Zen");
+    assert!(app.show_tree && app.status_bar_visible);
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.zen_mode, "Esc Esc never enters Zen");
+}
+
+/// #1585, negative: an Esc that clears a selection, a key between the two,
+/// two Escapes too far apart, or Escapes typed into a terminal do not
+/// leave Zen.
+#[test]
+fn an_esc_that_did_something_is_not_half_of_esc_esc() {
+    let (_tmp, mut app) = zen_app();
+    app.toggle_zen_mode();
+    app.handle_key(key(KeyCode::Right, KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(app.editor.selection.is_some(), "precondition: a selection");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.selection.is_none(), "the first Esc cleared it");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.zen_mode,
+        "the Esc that cleared the selection did not count"
+    );
+
+    app.zen_esc_at = None;
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.zen_mode, "a key between the Escapes breaks the pair");
+
+    app.zen_esc_at = None;
+    let t = std::time::Instant::now();
+    app.note_idle_zen_esc(t);
+    app.note_idle_zen_esc(t + ZEN_ESC_WINDOW + std::time::Duration::from_millis(1));
+    assert!(app.zen_mode, "too far apart");
+
+    app.zen_esc_at = None;
+    app.focus = Pane::Terminal;
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.zen_mode, "Escapes for a terminal program stay its own");
+}
+
+/// #1585: an Esc that leaves a comment box's reply field or vim's Insert
+/// mode did something, so it is not half of Esc Esc.
+#[test]
+fn an_esc_leaving_a_comment_box_or_insert_mode_is_not_half_of_esc_esc() {
+    let (_tmp, mut app) = zen_app();
+    app.toggle_zen_mode();
+    app.editor.comment_focus = Some(crate::widgets::editor::CommentFocus {
+        id: 1,
+        reply: String::new(),
+        cursor: 0,
+    });
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.editor.comment_focus.is_none(),
+        "the first Esc left the box"
+    );
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.zen_mode, "the Esc that left the box did not count");
+
+    app.zen_esc_at = None;
+    app.vim.enabled = true;
+    app.vim.enter_insert_mode();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.vim.mode(), crate::vim::VimMode::Normal);
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.zen_mode, "the Esc that left Insert mode did not count");
+}
+
+/// #1585: Zen hides the status bar, so entering it shows how to leave for
+/// a few seconds; leaving takes the hint with it.
+#[test]
+fn entering_zen_says_how_to_leave_it_for_a_while() {
+    let (_tmp, mut app) = zen_app();
+    assert!(!draw_wide(&mut app, 120).contains("Esc Esc to exit"));
+    app.toggle_zen_mode();
+    assert!(draw_wide(&mut app, 120).contains(zen_hint_text()));
+    assert!(!app.expire_zen_hint(std::time::Instant::now()), "not yet");
+    assert!(app.expire_zen_hint(std::time::Instant::now() + ZEN_HINT_FOR));
+    assert!(!draw_wide(&mut app, 120).contains("Esc Esc to exit"));
+    app.toggle_zen_mode();
+    app.toggle_zen_mode();
+    app.toggle_zen_mode();
+    assert!(
+        app.zen_hint_until.is_none(),
+        "leaving Zen drops a hint still showing"
+    );
+}
+
 #[test]
 fn secondary_side_bar_toggle_flips_visibility() {
     let tmp = tempfile::tempdir().unwrap();
@@ -82755,6 +82984,7 @@ fn every_customize_layout_row_has_a_palette_command_that_does_the_same() {
             MenuAction::SetPanelAlignment(_) => Some(Command::SetPanelAlignment),
             MenuAction::SetQuickInputPosition(_) => Some(Command::SetQuickInputPosition),
             MenuAction::ToggleZenMode => Some(Command::ToggleZenMode),
+            MenuAction::ToggleCenteredLayout => Some(Command::ToggleCenteredLayout),
             _ => None,
         }
     }
@@ -82798,6 +83028,7 @@ fn every_customize_layout_row_has_a_palette_command_that_does_the_same() {
             app.panel_alignment,
             app.quick_input_position,
             app.zen_mode,
+            app.centered_layout,
         )
     };
     let tmp = tempfile::tempdir().unwrap();
