@@ -21,6 +21,14 @@ Usage:
   release.py cut [patch|minor|major]     fold the fragments and bump; prints the
                                          new version, or nothing when no
                                          fragment is pending
+  release.py notes <version>             the GitHub release body for <version>:
+                                         reads the tags already released, one
+                                         per line on stdin, and prints the notes
+                                         of every version since the newest one
+  release.py commit <version>            the commit on HEAD's first-parent chain
+                                         that set HEAD's version, <version>:
+                                         what publish-crate.yml publishes and
+                                         tags
 """
 
 from __future__ import annotations
@@ -32,7 +40,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from next_version import bump  # noqa: E402
+from next_version import VERSION, bump, parse  # noqa: E402
 from ships_nothing import ships_nothing  # noqa: E402
 
 NOTES_DIR = "src/release_notes"
@@ -186,6 +194,85 @@ def cut(root, kind: str = "patch") -> str | None:
     return new
 
 
+def release_notes(root, version: str, released: list[str]) -> str:
+    """The GitHub release body for `version`.
+
+    A GitHub release goes out every PUBLISH_EVERY versions
+    (.github/workflows/publish-crate.yml), so one release has to carry the
+    notes of every version since the previous one, not only its own. Those are
+    the versions above the newest entry in `released` (tags such as `v0.2.28`;
+    anything that is not one is ignored) up to `version`, newest first, each
+    under its own heading. A version in that range with no notes file shipped
+    nothing and is left out. With nothing released before it, or nothing in
+    between, the body is `version`'s own notes, as it was when every version
+    was released.
+    """
+    root = Path(root)
+    own = root / NOTES_DIR / f"{version}.md"
+    if not VERSION.fullmatch(version) or not own.is_file():
+        raise ReleaseError(f"no {NOTES_DIR}/{version}.md: the tag does not match any version")
+    top = parse(version)
+    before = [
+        parse(tag[1:])
+        for tag in (line.strip() for line in released)
+        if tag.startswith("v") and VERSION.fullmatch(tag[1:]) and parse(tag[1:]) < top
+    ]
+    floor = max(before, default=top)
+    versions = sorted(
+        (
+            path.stem
+            for path in (root / NOTES_DIR).glob("*.md")
+            if VERSION.fullmatch(path.stem) and floor < parse(path.stem) <= top
+        ),
+        key=parse,
+        reverse=True,
+    )
+    if len(versions) <= 1:
+        return own.read_text(encoding="utf-8")
+    sections = []
+    for v in versions:
+        text = (root / NOTES_DIR / f"{v}.md").read_text(encoding="utf-8")
+        if not text.endswith("\n"):
+            text += "\n"
+        sections.append(f"## {v}\n\n{text}")
+    return "\n".join(sections)
+
+
+def setting_commit(version: str, cwd=None) -> str:
+    """The commit that set Cargo.toml's version to `version`, which HEAD carries.
+
+    That is the newest commit on HEAD's first-parent chain whose first parent
+    carries another version: a later merge still carries the version but its
+    code is not that version's yet. publish-crate.yml publishes and tags this
+    commit, and tag.yml tags a push only when its commit and first parent
+    differ in version, the same comparison, so the two never name different
+    commits. Versions are compared rather than diff lines matched: `git log -G`
+    also picks a later commit that only rewrites the version line, or a
+    dependency's `version =` line that happens to hold the same number.
+    """
+    if not VERSION.fullmatch(version):
+        raise ReleaseError(f"refusing malformed version {version!r}")
+    chain = git("rev-list", "--first-parent", "HEAD", cwd=cwd).split()
+
+    def version_at(commit: str) -> str:
+        return package_version(git("show", f"{commit}:Cargo.toml", cwd=cwd))
+
+    head = version_at(chain[0])
+    if head != version:
+        raise ReleaseError(f"HEAD carries version {head}, not {version}")
+    for commit, parent in zip(chain, chain[1:]):
+        if version_at(parent) != version:
+            return commit
+    # The walk reached a commit with no parent. In a shallow clone that is
+    # only where the history was cut off, not where the version was set.
+    if git("rev-parse", "--is-shallow-repository", cwd=cwd).strip() == "true":
+        raise ReleaseError(
+            f"the clone is shallow and every commit in it carries {version}; "
+            "fetch the full history to find the commit that set it"
+        )
+    return chain[-1]
+
+
 def check(base: str, head: str, cwd=None) -> list[str]:
     """The PR gate. Returns its errors, each in GitHub's `::error` form.
 
@@ -277,10 +364,11 @@ def main(argv: list[str]) -> int:
         return run_command(argv)
     except subprocess.CalledProcessError as err:
         # A ref the clone lacks (a shallow checkout, a mistyped base): one
-        # line CI shows as an error, not a traceback.
+        # line CI shows as an error, not a traceback. On stderr, so a step
+        # that captures stdout (`cut`'s version, `commit`'s hash) still shows it.
         command = " ".join(err.cmd)
         why = (err.stderr or "").strip().splitlines()
-        print(f"::error::{command} failed: {why[0] if why else f'exit {err.returncode}'}")
+        print(f"::error::{command} failed: {why[0] if why else f'exit {err.returncode}'}", file=sys.stderr)
         return 1
 
 
@@ -298,6 +386,22 @@ def run_command(argv: list[str]) -> int:
             return 1
         if new:
             print(new)
+        return 0
+    if len(argv) == 2 and argv[0] == "notes":
+        try:
+            body = release_notes(Path.cwd(), argv[1], sys.stdin.read().splitlines())
+        except ReleaseError as err:
+            print(f"::error::{err}", file=sys.stderr)
+            return 1
+        sys.stdout.write(body)
+        return 0
+    if len(argv) == 2 and argv[0] == "commit":
+        try:
+            commit = setting_commit(argv[1])
+        except ReleaseError as err:
+            print(f"::error::{err}", file=sys.stderr)
+            return 1
+        print(commit)
         return 0
     print(__doc__, file=sys.stderr)
     return 2
