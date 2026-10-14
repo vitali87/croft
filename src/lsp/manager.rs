@@ -722,6 +722,8 @@ pub enum ServerEvent {
     /// "Failed to load workspaces" or gopls's "open your browser to …".
     /// Other notes and every `window/logMessage` stay in OUTPUT.
     Message {
+        /// Read by the tests, to prove the level is forwarded.
+        #[cfg_attr(not(test), allow(dead_code))]
         level: lsp_types::MessageType,
         text: String,
     },
@@ -729,7 +731,6 @@ pub enum ServerEvent {
     /// from. The pick, or `None` when the user dismisses it, goes back on
     /// `reply`; dropping `reply` answers `None` too.
     Question {
-        level: lsp_types::MessageType,
         text: String,
         actions: Vec<lsp_types::MessageActionItem>,
         reply: oneshot::Sender<Option<lsp_types::MessageActionItem>>,

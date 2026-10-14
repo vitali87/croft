@@ -211,7 +211,6 @@ impl ClientState {
                 let _ = this.progress_tx.send(ServerUpdate {
                     server: this.name.clone(),
                     event: ServerEvent::Question {
-                        level: params.typ,
                         text: params.message,
                         actions: params.actions.unwrap_or_default(),
                         reply,

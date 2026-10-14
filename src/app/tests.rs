@@ -85335,7 +85335,6 @@ fn go_mod_question(app: &mut App) -> ServerAnswer {
     app.apply_server_update(server_update(
         "gopls",
         crate::lsp::manager::ServerEvent::Question {
-            level: lsp_types::MessageType::WARNING,
             text: String::from("go.mod needs updating"),
             actions,
             reply,
@@ -85471,7 +85470,6 @@ fn a_question_without_actions_is_only_a_message() {
     app.apply_server_update(server_update(
         "gopls",
         crate::lsp::manager::ServerEvent::Question {
-            level: lsp_types::MessageType::INFO,
             text: String::from("Gopls is busy"),
             actions: Vec::new(),
             reply,
