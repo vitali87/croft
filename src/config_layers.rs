@@ -112,6 +112,7 @@ pub const WORKSPACE_ALLOWED_KEYS: &[&str] = &[
     "word_based_suggestions",
     "disable_inline_blame",
     "disable_auto_close_pairs",
+    "disable_paste_reindent",
     "disable_inline_values",
     "disable_save_before_debug",
     "disable_bracket_colors",
@@ -122,6 +123,9 @@ pub const WORKSPACE_ALLOWED_KEYS: &[&str] = &[
     "explorer_views",
     "files_exclude",
     "search_exclude",
+    // Per-language overrides (#1440), which hold only the editor settings
+    // in `crate::prefs::LANGUAGE_KEYS`; any other key in a block is dropped.
+    "languages",
 ];
 
 /// The synced layer's file name (#262). Config sync pushes the projection
@@ -558,6 +562,9 @@ fn known_setting_keys() -> &'static std::collections::BTreeSet<String> {
                 _ => Default::default(),
             };
         keys.insert(String::from("extends"));
+        // Skipped from the serialized default while it is empty, but a
+        // setting all the same (#1440).
+        keys.insert(String::from("languages"));
         keys
     })
 }
@@ -787,6 +794,39 @@ mod tests {
             layer_of(&m.provenance, "copy_on_select"),
             LayerKind::Default
         );
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+    }
+
+    /// #1440: a workspace may set per-language editor settings. Its blocks
+    /// merge with the user's a setting at a time, the repo's own
+    /// `.vscode/settings.json` language blocks apply, and a block's keys
+    /// outside the per-language set are dropped.
+    #[test]
+    fn language_blocks_merge_across_layers_and_keep_only_editor_keys() {
+        let (_tmp, user, root) = setup();
+        write(
+            &user.join("config.json"),
+            r#"{"languages":{"python":{"format_on_save":true,"render_whitespace":"all"}}}"#,
+        );
+        write(
+            &root.join(".vscode/settings.json"),
+            r#"{"[c]":{"editor.formatOnSave":true,"editor.fontSize":30}}"#,
+        );
+        write(
+            &root.join(".croft/config.json"),
+            r#"{"languages":{"python":{"format_on_save":false,"mcp_consented":["evil"]}}}"#,
+        );
+        let m = load_merged_from(&user, Some(&root), "macos");
+        let py = &m.prefs.languages["python"];
+        assert_eq!(py.format_on_save, Some(false), "the workspace wins");
+        assert_eq!(
+            py.render_whitespace.as_deref(),
+            Some("all"),
+            "the user's other python setting survives"
+        );
+        assert_eq!(m.prefs.languages["c"].format_on_save, Some(true));
+        assert!(m.prefs.mcp_consented.is_empty());
+        assert_eq!(layer_of(&m.provenance, "languages"), LayerKind::Workspace);
         assert!(m.warnings.is_empty(), "{:?}", m.warnings);
     }
 
