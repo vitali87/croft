@@ -1,13 +1,17 @@
-# Publish to crates.io every PUBLISH_EVERY version bumps.
+# Release every PUBLISH_EVERY version bumps: crates.io and GitHub together.
 #
 # croft bumps its version on every shipped merge, which is far more often
-# than crates.io needs a release. This mirrors code-graph-rag's cadence: on
+# than anyone needs a release. This mirrors code-graph-rag's cadence: on
 # each push to main, count the versions main has carried since the newest
 # one crates.io already holds (scripts/publish_cadence.py, anchored on the
 # crates.io index rather than on a counter kept in the repo), and when the
-# count reaches PUBLISH_EVERY, publish the head, tag it, and hand the tag to
-# release.yml for the prebuilt archives, the GitHub release and the Homebrew
-# formula.
+# count reaches PUBLISH_EVERY, publish that version from the commit that set
+# it, tag that commit, and hand the tag to release.yml for the prebuilt
+# archives, the GitHub release and the Homebrew formula.
+#
+# This is the only workflow that starts a release. tag.yml tags every
+# version but releases none, so crates.io and the GitHub releases hold the
+# same versions (#1579).
 #
 # Authentication is crates.io Trusted Publishing: the job exchanges its OIDC
 # token for a short-lived crates.io token scoped to this crate, so there is
@@ -76,20 +80,24 @@ jobs:
         id: cadence
         env:
           FORCE: ${{ inputs.force }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           head="$(sed -n 's/^version *= *"\([0-9.]*\)".*/\1/p' Cargo.toml | head -n1)"
           flags=()
           [ "$FORCE" = "true" ] && flags+=(--force)
-          # A head already on crates.io but not yet tagged is an upload whose
-          # handoff never ran; the script makes that due on its own. Exit 2
-          # from ls-remote is "no such tag"; anything else is a failure.
-          rc=0
-          git ls-remote --exit-code --tags origin "refs/tags/v$head" >/dev/null || rc=$?
-          case "$rc" in
-            0) flags+=(--tagged) ;;
-            2) ;;
-            *) echo "::error::git ls-remote failed with exit $rc"; exit 1 ;;
+          # A head already on crates.io with no GitHub release is an upload
+          # whose handoff never ran; the script makes that due on its own.
+          # The release is the evidence, not the tag: tag.yml tags every
+          # version. 404 is "no such release"; anything else is a failure.
+          code="$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/v$head")"
+          case "$code" in
+            200) flags+=(--released) ;;
+            404) ;;
+            *) echo "::error::asking for the v$head release answered HTTP $code"; exit 1 ;;
           esac
           # The script prints nothing on a refusal, so a partial answer never
           # reaches GITHUB_OUTPUT; `set -e` then fails the job on its exit 2.
@@ -116,9 +124,29 @@ jobs:
           # The token is not needed after the fetch; leaving it
           # in .git/config lets any later step push with it.
           persist-credentials: false
-          # Full history: a handoff after an earlier upload tags the commit
-          # that introduced the version, found by walking back to it.
+          # Full history: the commit that set the version is found by
+          # walking back to it.
           fetch-depth: 0
+
+      - name: Check out the commit that set this version
+        # Not this run's commit. That can be a merge that landed after the
+        # version was cut and before the next one (a forced run, or the run
+        # that replaced the release commit's own), and its code is not this
+        # version yet. `release.py commit` walks main's first-parent chain
+        # back to the commit whose first parent carries another version, and
+        # tag.yml tags a push only when its commit is that one, by the same
+        # comparison, so crates.io, the tag and the binaries release.yml
+        # builds from it are one source. It refuses a malformed version and
+        # a head that does not carry this one.
+        id: source
+        env:
+          VERSION: ${{ needs.decide.outputs.version }}
+        run: |
+          set -euo pipefail
+          commit="$(python3 scripts/release.py commit "$VERSION")"
+          git checkout -q --detach "$commit"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "Publishing $VERSION from $commit"
 
       - name: Install the pinned toolchain
         run: rustup show
@@ -162,30 +190,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.decide.outputs.version }}
-          UPLOADED_EARLIER: ${{ steps.index.outputs.uploaded }}
+          COMMIT: ${{ steps.source.outputs.commit }}
         run: |
           set -euo pipefail
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::refusing malformed version '$VERSION'"
-            exit 1
-          fi
           tag="v${VERSION}"
-          # A handoff after an earlier upload whose tagging failed tags the
-          # commit that introduced this version, not main's head: the head
-          # may have moved on without a bump, and the release must build what
-          # crates.io already holds. Without an earlier upload this job just
-          # published the head.
-          commit="$GITHUB_SHA"
-          if [ "$UPLOADED_EARLIER" = "true" ]; then
-            commit="$(git log --first-parent -1 --format=%H -G "^version *= *\"${VERSION//./\\.}\"" -- Cargo.toml)"
-            if [ -z "$commit" ]; then
-              echo "::error::could not find the commit that set version $VERSION"
-              exit 1
-            fi
-          fi
+          commit="$COMMIT"
           # An existing tag is reused only if it names the commit this job
-          # published: release.yml builds whatever the tag points at. An
-          # annotated tag's `^{}` line is the commit it peels to.
+          # published: release.yml builds whatever the tag points at. tag.yml
+          # has normally tagged it already. An annotated tag's `^{}` line is
+          # the commit it peels to.
           target="$(git ls-remote --tags origin "refs/tags/$tag" "refs/tags/$tag^{}" \
             | awk -v t="refs/tags/$tag" '$2 == t "^{}" { p = $1 } $2 == t { d = $1 } END { print (p != "" ? p : d) }')"
           if [ -n "$target" ]; then

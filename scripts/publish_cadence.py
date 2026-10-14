@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
-"""Decide whether main's head is due for crates.io.
+"""Decide whether main's head is due for crates.io and a GitHub release.
 
 croft bumps its version on every shipped merge (the release-hygiene gate in
 ci.yml), so "publish every N bumps" means: count the versions main has
 carried since the newest one crates.io already holds, and publish when that
 count reaches N. The same cadence code-graph-rag's version-bump workflow
-applies to PyPI, with one difference in where the count comes from. That
-repo counts tags since its latest GitHub release; croft tags only what it
-publishes, so the anchor here is the crates.io index itself and the history
-is Cargo.toml's version line along main's first-parent chain. Neither is a
-counter stored in the repo, so a repeated run reaches the same answer.
+applies to PyPI and its GitHub releases, with one difference in where the
+count comes from. That repo counts tags since its latest GitHub release; here
+the anchor is the crates.io index itself and the history is Cargo.toml's
+version line along main's first-parent chain. Neither is a counter stored in
+the repo, so a repeated run reaches the same answer. A due version goes to
+crates.io and, through release.yml, to a GitHub release: the one decision
+drives both, so the two hold the same versions.
 
 Usage (CI):
-  publish_cadence.py --every N --head <Cargo.toml version> --from-git --fetch [--tagged] [--force]
+  publish_cadence.py --every N --head <Cargo.toml version> --from-git --fetch [--released] [--force]
 
 Usage (tests, offline):
-  publish_cadence.py --every N --head V --history FILE --published FILE [--tagged] [--force]
+  publish_cadence.py --every N --head V --history FILE --published FILE [--released] [--force]
 
   --history   one version per line, newest first (what --from-git produces)
   --published the crate's sparse-index file, one JSON object per line (what
               --fetch downloads)
-  --tagged    the tag v<head> already exists
+  --released  the GitHub release v<head> already exists. Not the tag:
+              tag.yml tags every version, released or not
 
 Prints `key=value` lines ready for $GITHUB_OUTPUT:
 
@@ -28,9 +31,9 @@ Prints `key=value` lines ready for $GITHUB_OUTPUT:
   latest_published=   the newest crates.io version found in main's history
   bumps=              versions main carried after it, head included
   already_published=  whether head itself is on crates.io
-  tagged=             whether v<head> already exists
+  released=           whether the GitHub release v<head> already exists
   publish=            bumps >= N, --force, or a head that is on crates.io
-                      but not tagged: an upload whose tag and release.yml
+                      with no GitHub release: an upload whose release.yml
                       handoff never ran, which a re-run must still finish
 
 Exit status 2 means the inputs were refused: a malformed version, a history
@@ -167,14 +170,14 @@ def decide(
     head: str,
     every: int,
     force: bool,
-    tagged: bool = False,
+    released: bool = False,
 ) -> dict[str, str]:
     """The `key=value` outputs for main's head.
 
     Uploading and handing off are separate: once head is on crates.io its
     bump count is 0, so the cadence alone would never run the publish job
-    again, and an upload whose tagging failed would stay without its tag and
-    release. A published, untagged head is therefore due on its own.
+    again, and an upload whose handoff failed would stay without its GitHub
+    release. A published head with no release is therefore due on its own.
     """
     if history[0] != head:
         raise CadenceError(
@@ -183,13 +186,13 @@ def decide(
         )
     bumps, latest = bumps_since(history, published)
     already_published = head in published
-    pending_handoff = already_published and not tagged
+    pending_handoff = already_published and not released
     return {
         "version": head,
         "latest_published": latest,
         "bumps": str(bumps),
         "already_published": str(already_published).lower(),
-        "tagged": str(tagged).lower(),
+        "released": str(released).lower(),
         "publish": str(force or due(bumps, every) or pending_handoff).lower(),
     }
 
@@ -199,7 +202,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--every", type=int, required=True)
     parser.add_argument("--head", required=True, help="Cargo.toml's version")
     parser.add_argument("--force", action="store_true")
-    parser.add_argument("--tagged", action="store_true", help="v<head> exists")
+    parser.add_argument(
+        "--released", action="store_true", help="the GitHub release v<head> exists"
+    )
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--history", type=Path)
     source.add_argument("--from-git", action="store_true")
@@ -220,7 +225,7 @@ def main(argv: list[str]) -> int:
             args.head,
             args.every,
             args.force,
-            args.tagged,
+            args.released,
         )
     except (CadenceError, OSError, subprocess.CalledProcessError) as err:
         print(f"publish_cadence: {err}", file=sys.stderr)
