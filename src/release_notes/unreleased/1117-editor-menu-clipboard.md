@@ -1,0 +1,1 @@
+feature: The editor's right-click menu now ends with Cut and Copy (with a selection), Paste and Command Palette, as VS Code's does, so text can be copied where the keys are awkward, such as a Linux terminal or the `croft web` page. In a rendered Markdown preview it offers only Copy, of the rendered text you selected.
