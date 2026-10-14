@@ -55426,6 +55426,169 @@ fn one_tab_speaks_for_a_file_to_the_language_server() {
     assert_eq!(seen, vec![active, active, active], "no tick resends");
 }
 
+fn greet_to_welcome(
+    file: &std::path::Path,
+) -> Vec<(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)> {
+    let edit = |row| crate::widgets::editor::TextSpanEdit {
+        start: (row, 0),
+        end: (row, 5),
+        new_text: String::from("welcome"),
+        utf16: false,
+    };
+    vec![(file.to_path_buf(), vec![edit(0), edit(1)])]
+}
+
+/// #1113: a Source Control diff of a file carries the file's path but is not
+/// its buffer. A rename touching that file used to be "applied" to the diff,
+/// which changed nothing, and then skipped the disk because a tab "held" it.
+#[test]
+fn a_rename_reaches_a_file_whose_source_control_diff_is_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let main = tmp.path().join("main.ts");
+    std::fs::write(&main, "greet(1);\ngreet(2);\n// todo\n").unwrap();
+    app.editor
+        .open_head_diff_with_text(
+            PathBuf::from("main.ts (HEAD)"),
+            "greet(1);\ngreet(2);\n",
+            &main,
+            true,
+        )
+        .unwrap();
+    assert!(app.editor.diff.is_some());
+
+    let (files, occurrences) = app.apply_rename_edits(&greet_to_welcome(&main)).unwrap();
+
+    assert_eq!((files, occurrences), (1, 2));
+    assert_eq!(
+        std::fs::read_to_string(&main).unwrap(),
+        "welcome(1);\nwelcome(2);\n// todo\n"
+    );
+}
+
+/// With the file open as well as its diff, the rename edits the file's tab
+/// (unsaved, one undo step), whichever of the two was opened first, and
+/// leaves the disk to the save.
+#[test]
+fn a_rename_edits_the_files_tab_and_not_its_diff() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let main = tmp.path().join("main.ts");
+    std::fs::write(&main, "greet(1);\ngreet(2);\n").unwrap();
+    app.editor
+        .open_head_diff_with_text(PathBuf::from("main.ts (HEAD)"), "greet(1);\n", &main, true)
+        .unwrap();
+    app.editor.open_pinned(&main).unwrap();
+    let file_tab = app.editor.active_index();
+    assert_eq!(app.editor.editors.len(), 2);
+
+    let (_, occurrences) = app.apply_rename_edits(&greet_to_welcome(&main)).unwrap();
+
+    assert_eq!(occurrences, 2);
+    let tab = &app.editor.editors[file_tab];
+    assert!(tab.diff.is_none());
+    assert_eq!(tab.lines[..2], ["welcome(1);", "welcome(2);"]);
+    assert!(tab.dirty);
+    assert_eq!(
+        std::fs::read_to_string(&main).unwrap(),
+        "greet(1);\ngreet(2);\n",
+        "an open tab's rename waits for the save"
+    );
+}
+
+/// A split whose group shows only the file's diff while another group holds
+/// the file itself, unsaved: the rename edits that group's tab rather than
+/// rewriting the disk under it, and the stale check watches the same tab.
+#[test]
+fn a_rename_reaches_the_files_tab_in_another_split_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let main = tmp.path().join("main.ts");
+    std::fs::write(&main, "greet(1);\ngreet(2);\n// todo\n").unwrap();
+    app.editor.open_pinned(&main).unwrap();
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 0;
+    app.editor.insert_str("x");
+    assert!(app.editor.dirty);
+    app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+    app.editor
+        .open_head_diff_with_text(PathBuf::from("main.ts (HEAD)"), "greet(1);\n", &main, true)
+        .unwrap();
+    assert_eq!(
+        app.editor.find_buffer_tab(&main),
+        None,
+        "the diff took the split's preview slot: only the diff here"
+    );
+    let edits = greet_to_welcome(&main);
+    let baseline = app.edit_seqs_in_every_group();
+    assert_eq!(app.stale_edit_target(&baseline, &edits), None);
+
+    let (files, occurrences) = app.apply_rename_edits(&edits).unwrap();
+
+    assert_eq!((files, occurrences), (1, 2));
+    assert_eq!(
+        std::fs::read_to_string(&main).unwrap(),
+        "greet(1);\ngreet(2);\n// todo\n",
+        "the open tab takes the rename; the disk waits for its save"
+    );
+    let other = app.editor_layout.inactive_groups()[0];
+    let tab = &other.editors[other.find_buffer_tab(&main).unwrap()];
+    assert_eq!(tab.lines[..3], ["welcome(1);", "welcome(2);", "x// todo"]);
+    assert!(tab.dirty);
+    assert!(
+        app.stale_edit_target(&baseline, &edits).is_some(),
+        "a later edit to that tab is seen from the other group"
+    );
+}
+
+/// Opening a file whose diff is open (Quick Open, an Explorer click, a
+/// problem row) opens the file beside the diff instead of landing on it.
+/// The left side of an Explorer compare is the case that used to strand.
+#[test]
+fn opening_a_file_whose_diff_is_open_opens_the_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let a = tmp.path().join("a.yaml");
+    let b = tmp.path().join("b.yaml");
+    std::fs::write(&a, "k: 1\n").unwrap();
+    std::fs::write(&b, "k: 2\n").unwrap();
+    app.editor.open_diff(&a, &b).unwrap();
+    let diff_tab = app.editor.active_index();
+
+    app.editor.open_preview(&a).unwrap();
+
+    assert!(app.editor.diff.is_none(), "landed on the diff");
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    assert_eq!(app.editor.lines[0], "k: 1");
+    assert_eq!(app.editor.editors.len(), 2, "the diff stays open beside it");
+    assert!(app.editor.editors[diff_tab].diff.is_some());
+    // Opening it again reuses the file's tab, not a third one.
+    app.editor.open_preview(&a).unwrap();
+    assert_eq!(app.editor.editors.len(), 2);
+}
+
+/// Negative: a diff tab is still found as a diff. Reopening the same
+/// Source Control diff reuses its tab rather than stacking another.
+#[test]
+fn reopening_a_source_control_diff_still_reuses_its_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let main = tmp.path().join("main.ts");
+    std::fs::write(&main, "b\n").unwrap();
+    for _ in 0..2 {
+        app.editor
+            .open_head_diff_with_text(PathBuf::from("main.ts (HEAD)"), "a\n", &main, true)
+            .unwrap();
+    }
+    let diffs = app
+        .editor
+        .editors
+        .iter()
+        .filter(|e| e.diff.is_some())
+        .count();
+    assert_eq!(diffs, 1);
+}
+
 /// An LSP edit applied to the file's tab while its symbol tab is active
 /// survives the next keystroke in the symbol tab: both tabs changed, and
 /// the keystroke's tab used to be copied over the rename.
@@ -83807,6 +83970,25 @@ fn format_document_in_a_prettier_project_runs_its_prettier() {
     assert_eq!(args, format!("--stdin-filepath\n{}\n", file.display()));
     assert!(app.editor.undo(), "the format is one undo step");
     assert_eq!(app.editor.lines[0], "import { a } from \"./a\";");
+}
+
+/// #1113: Prettier's result lands in the file's tab even when a diff of
+/// the file was opened before it, rather than being compared against the
+/// diff and dropped.
+#[cfg(unix)]
+#[test]
+fn prettier_formats_a_file_whose_diff_is_open_too() {
+    let tmp = prettier_project(true, PRETTIER_STUB);
+    let file = tmp.path().join("app.ts");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_head_diff_with_text(PathBuf::from("app.ts (HEAD)"), "", &file, true)
+        .unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.start_format_document();
+    wait_for_prettier(&mut app);
+    assert_eq!(app.status, "Formatted document with Prettier");
+    assert_eq!(app.editor.lines[0], "import { a } from './a'");
 }
 
 #[cfg(unix)]
