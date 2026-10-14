@@ -128,6 +128,7 @@ pub enum Command {
     /// File: New File… / New Folder… (#852): the Explorer's create prompt
     /// from any pane, beside the active file or in the Explorer selection.
     NewFile,
+    NewUntitledFile,
     NewFolder,
     Undo,
     Redo,
@@ -165,6 +166,15 @@ pub enum Command {
     PinEditor,
     UnpinEditor,
     KeepEditor,
+    /// View: Move Editor Left / Right (#1565): the active tab one place
+    /// along its group's tab bar.
+    MoveEditorLeftInGroup,
+    MoveEditorRightInGroup,
+    /// View: Move Editor into Next / Previous Group (#1565): the active tab
+    /// to the next or previous group, creating one beside it when there is
+    /// none that way.
+    MoveEditorToNextGroup,
+    MoveEditorToPreviousGroup,
     SplitEditor,
     /// View: Focus Left / Right Editor Group (#843): Cmd+Opt+Left / Right,
     /// which have no `Ctrl` form off macOS.
@@ -202,6 +212,7 @@ pub enum Command {
     SearchToggleMatchCase,
     SearchToggleWholeWord,
     SearchToggleRegex,
+    SearchTogglePreserveCase,
     SearchToggleDetails,
     ShowSourceControl,
     AddWorkspaceFolder,
@@ -621,6 +632,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::RevertFile,
     Command::SaveAll,
     Command::NewFile,
+    Command::NewUntitledFile,
     Command::NewFolder,
     Command::Undo,
     Command::Redo,
@@ -649,6 +661,10 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::PinEditor,
     Command::UnpinEditor,
     Command::KeepEditor,
+    Command::MoveEditorLeftInGroup,
+    Command::MoveEditorRightInGroup,
+    Command::MoveEditorToNextGroup,
+    Command::MoveEditorToPreviousGroup,
     Command::SplitEditor,
     Command::FocusLeftEditorGroup,
     Command::FocusRightEditorGroup,
@@ -674,6 +690,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::SearchToggleMatchCase,
     Command::SearchToggleWholeWord,
     Command::SearchToggleRegex,
+    Command::SearchTogglePreserveCase,
     Command::SearchToggleDetails,
     Command::ShowSourceControl,
     Command::AddWorkspaceFolder,
@@ -1048,6 +1065,7 @@ impl Command {
             Command::RevertFile => "File: Revert File",
             Command::SaveAll => "File: Save All",
             Command::NewFile => "File: New File…",
+            Command::NewUntitledFile => "File: New Untitled Text File",
             Command::NewFolder => "File: New Folder…",
             Command::Undo => "Undo",
             Command::Redo => "Redo",
@@ -1076,6 +1094,10 @@ impl Command {
             Command::PinEditor => "View: Pin Editor",
             Command::UnpinEditor => "View: Unpin Editor",
             Command::KeepEditor => "View: Keep Editor",
+            Command::MoveEditorLeftInGroup => "View: Move Editor Left",
+            Command::MoveEditorRightInGroup => "View: Move Editor Right",
+            Command::MoveEditorToNextGroup => "View: Move Editor into Next Group",
+            Command::MoveEditorToPreviousGroup => "View: Move Editor into Previous Group",
             Command::SplitEditor => "View: Split Editor",
             Command::FocusLeftEditorGroup => "View: Focus Left Editor Group",
             Command::FocusRightEditorGroup => "View: Focus Right Editor Group",
@@ -1101,6 +1123,7 @@ impl Command {
             Command::SearchToggleMatchCase => "Search: Toggle Match Case",
             Command::SearchToggleWholeWord => "Search: Toggle Match Whole Word",
             Command::SearchToggleRegex => "Search: Toggle Use Regular Expression",
+            Command::SearchTogglePreserveCase => "Search: Toggle Preserve Case",
             Command::SearchToggleDetails => "Search: Toggle Search Details",
             Command::ShowSourceControl => "View: Show Source Control",
             Command::AddWorkspaceFolder => "Workspaces: Add Folder to Workspace",
@@ -1489,6 +1512,7 @@ impl Command {
             // Palette-only: the Explorer's `Cmd+F` / `Cmd+Shift+N` are Find
             // and unbound outside it, so neither is the command's chord.
             Command::NewFile => "",
+            Command::NewUntitledFile => "Cmd+N",
             Command::NewFolder => "",
             Command::Undo => "Cmd+Z",
             Command::Redo => "Shift+Cmd+Z",
@@ -1507,6 +1531,15 @@ impl Command {
             Command::PinEditor => "Cmd+K P",
             Command::UnpinEditor => "Cmd+K P",
             Command::KeepEditor => "Cmd+K Shift+P",
+            // VS Code's Linux and Windows chords; its macOS Cmd+K
+            // Cmd+Shift+Left / Right are rebindable by id.
+            Command::MoveEditorLeftInGroup => "Ctrl+Shift+PageUp",
+            Command::MoveEditorRightInGroup => "Ctrl+Shift+PageDown",
+            // VS Code's Ctrl+Alt+Left / Right already move croft's caret a
+            // word (they carry Alt), so these two are palette commands,
+            // bindable by id.
+            Command::MoveEditorToNextGroup => "",
+            Command::MoveEditorToPreviousGroup => "",
             Command::SplitEditor => "Cmd+\\",
             Command::FocusLeftEditorGroup => "Cmd+Opt+←",
             Command::FocusRightEditorGroup => "Cmd+Opt+→",
@@ -1534,6 +1567,7 @@ impl Command {
             Command::SearchToggleMatchCase => "Alt+C",
             Command::SearchToggleWholeWord => "Alt+W",
             Command::SearchToggleRegex => "Alt+R",
+            Command::SearchTogglePreserveCase => "Alt+P",
             // VS Code binds none that is free here (its Ctrl+Shift+J is
             // croft's maximize-terminal); D for details.
             Command::SearchToggleDetails => "Alt+D",
@@ -1900,6 +1934,7 @@ impl Command {
             Command::RevertFile => "revert_file",
             Command::SaveAll => "save_all",
             Command::NewFile => "new_file",
+            Command::NewUntitledFile => "new_untitled_file",
             Command::NewFolder => "new_folder",
             Command::Undo => "undo",
             Command::Redo => "redo",
@@ -1928,6 +1963,10 @@ impl Command {
             Command::PinEditor => "pin_editor",
             Command::UnpinEditor => "unpin_editor",
             Command::KeepEditor => "keep_editor",
+            Command::MoveEditorLeftInGroup => "move_editor_left_in_group",
+            Command::MoveEditorRightInGroup => "move_editor_right_in_group",
+            Command::MoveEditorToNextGroup => "move_editor_to_next_group",
+            Command::MoveEditorToPreviousGroup => "move_editor_to_previous_group",
             Command::SplitEditor => "split_editor",
             Command::FocusLeftEditorGroup => "focus_left_editor_group",
             Command::FocusRightEditorGroup => "focus_right_editor_group",
@@ -1953,6 +1992,7 @@ impl Command {
             Command::SearchToggleMatchCase => "search_toggle_match_case",
             Command::SearchToggleWholeWord => "search_toggle_whole_word",
             Command::SearchToggleRegex => "search_toggle_regex",
+            Command::SearchTogglePreserveCase => "search_toggle_preserve_case",
             Command::SearchToggleDetails => "search_toggle_details",
             Command::ShowSourceControl => "show_source_control",
             Command::AddWorkspaceFolder => "add_workspace_folder",
