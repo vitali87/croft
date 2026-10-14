@@ -3761,6 +3761,19 @@ impl Editor {
         (line < self.lines.len()).then_some(line)
     }
 
+    /// The 0-based line whose breakpoint lane `(col, row)` is on (#1544): the
+    /// sign cell left of the fold chevron, where breakpoints draw, on any
+    /// visual row of a source line. A left click there toggles a breakpoint,
+    /// as a click in VS Code's glyph margin does. The line number and the
+    /// chevron keep their own clicks, and views without source lines (a
+    /// diff, sheet, image, hex or log view, a Markdown preview) have no lane.
+    pub fn breakpoint_lane_line_at(&self, col: u16, row: u16) -> Option<usize> {
+        if col != self.last_inner.x || self.has_non_text_view() || self.markdown_preview.is_some() {
+            return None;
+        }
+        self.gutter_line_at(col, row)
+    }
+
     /// If `(col, row)` lands on a fold chevron in the gutter, toggle that fold
     /// and return `true`. The chevron sits at `inner.x + 1` on a foldable
     /// header's first visual row (see the render's fold-chevron block).
@@ -37657,6 +37670,39 @@ mod tests {
         assert!(e.is_line_hidden(1), "the body is now folded");
         assert!(e.fold_chevron_at(cx, cy), "a second click unfolds");
         assert!(!e.is_line_hidden(1));
+    }
+
+    #[test]
+    fn the_breakpoint_lane_is_the_sign_cell_of_each_source_line() {
+        // #1544: the lane is the sign cell left of the chevron, on every
+        // visual row of a line.
+        let mut e = editor_with("fn a() {\n    x\n}\nfn b() {}");
+        render_at(&mut e, 40, 10);
+        let x = e.last_inner.x;
+        let y = e.last_inner.y;
+        assert_eq!(e.breakpoint_lane_line_at(x, y), Some(0));
+        assert_eq!(e.breakpoint_lane_line_at(x, y + 3), Some(3));
+    }
+
+    #[test]
+    fn the_chevron_line_number_body_and_rows_past_the_end_are_not_the_lane() {
+        // #1544 negative: only the sign cell is the lane.
+        let mut e = editor_with("fn a() {\n    x\n}\nfn b() {}");
+        render_at(&mut e, 40, 10);
+        let x = e.last_inner.x;
+        let y = e.last_inner.y;
+        let text_x = x + e.last_gutter_width + 1;
+        assert_eq!(e.breakpoint_lane_line_at(x + 1, y), None, "the chevron");
+        assert_eq!(e.breakpoint_lane_line_at(x + 2, y), None, "the number");
+        assert_eq!(e.breakpoint_lane_line_at(text_x, y), None, "the body");
+        assert_eq!(e.breakpoint_lane_line_at(x, y + 6), None, "past the end");
+        e.lang = Some(LangKind::Markdown);
+        assert!(e.toggle_markdown_preview());
+        assert_eq!(
+            e.breakpoint_lane_line_at(x, y),
+            None,
+            "a preview has no source lines"
+        );
     }
 
     #[test]

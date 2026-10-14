@@ -4006,6 +4006,132 @@ fn right_click_on_the_gutter_opens_the_breakpoint_menu_and_toggles_the_clicked_l
     );
 }
 
+/// An app with `text` open in prog.py, painted once, so the gutter has its
+/// geometry.
+fn app_with_painted_file(text: &str) -> (App, tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("prog.py");
+    std::fs::write(&f, text).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    (app, tmp, f)
+}
+
+fn click_and_release(app: &mut App, col: u16, row: u16) {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), col, row));
+}
+
+/// #1544: a left click in the breakpoint lane sets a breakpoint on the
+/// clicked line, a second click removes it, and the caret stays put.
+#[test]
+fn a_left_click_in_the_breakpoint_lane_toggles_a_breakpoint_on_that_line() {
+    let (mut app, _tmp, f) = app_with_painted_file("l1\nl2\nl3\nl4\nl5\n");
+    let lane = app.editor.last_inner.x;
+    let row = app.editor.last_inner.y + 2;
+    click_and_release(&mut app, lane, row);
+    assert_eq!(app.editor.breakpoint_lines(&f), vec![3u32]);
+    assert_eq!(app.status, "Breakpoint set at line 3");
+    assert_eq!(app.editor.cursor_row, 0, "the caret stays on line 1");
+    // Past the double-click window, so the second click is its own.
+    app.editor_click.clear();
+    click_and_release(&mut app, lane, row);
+    assert!(app.editor.breakpoint_lines(&f).is_empty());
+    assert_eq!(app.status, "Breakpoint removed from line 3");
+    assert_eq!(app.editor.cursor_row, 0);
+}
+
+/// #1544: drags after a breakpoint-lane press belong to the lane, so the
+/// caret stays put and no selection is drawn from it to the clicked line,
+/// even when the terminal sends a drag at the press cell. The next gesture
+/// in the text selects as usual.
+#[test]
+fn drags_after_a_breakpoint_lane_press_neither_move_the_caret_nor_select() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, f) = app_with_painted_file("l1\nl2\nl3\nl4\nl5\n");
+    let lane = app.editor.last_inner.x;
+    let y = app.editor.last_inner.y;
+    let text_x = lane + app.editor.last_gutter_width + 1;
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), lane, y + 2));
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), lane, y + 2));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        text_x,
+        y + 3,
+    ));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), text_x, y + 3));
+    assert_eq!(app.editor.breakpoint_lines(&f), vec![3u32]);
+    assert_eq!(app.editor.cursor_row, 0, "the caret stays on line 1");
+    assert!(
+        app.editor.selection.is_none_or(|s| !s.has_area()),
+        "no selection from the caret to the clicked line"
+    );
+    app.editor_click.clear();
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        text_x,
+        y + 1,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        text_x + 1,
+        y + 1,
+    ));
+    app.handle_mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        text_x + 1,
+        y + 1,
+    ));
+    assert!(
+        app.editor.selection.is_some_and(|s| s.has_area()),
+        "a text drag after the lane gesture still selects"
+    );
+}
+
+/// #1544 negative: the line number and the text body keep their clicks:
+/// they move the caret and set no breakpoint.
+#[test]
+fn a_click_on_the_line_number_or_the_text_moves_the_caret_only() {
+    let (mut app, _tmp, f) = app_with_painted_file("l1\nl2\nl3\nl4\nl5\n");
+    let number = app.editor.last_inner.x + 2;
+    let text_x = app.editor.last_inner.x + app.editor.last_gutter_width + 1;
+    let (row2, row3) = (app.editor.last_inner.y + 2, app.editor.last_inner.y + 3);
+    click_and_release(&mut app, number, row2);
+    assert_eq!(app.editor.cursor_row, 2, "the number click moves the caret");
+    app.editor_click.clear();
+    click_and_release(&mut app, text_x + 1, row3);
+    assert_eq!(app.editor.cursor_row, 3, "the text click moves the caret");
+    assert!(app.editor.breakpoint_lines(&f).is_empty());
+}
+
+/// #1544 negative: the fold chevron still folds, and a lane click past the
+/// last line or with Shift held sets nothing.
+#[test]
+fn the_chevron_still_folds_and_off_line_or_shift_lane_clicks_set_nothing() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, f) = app_with_painted_file("def f():\n    a = 1\n    b = 2\n");
+    let x = app.editor.last_inner.x;
+    let y = app.editor.last_inner.y;
+    click_and_release(&mut app, x + 1, y);
+    assert!(app.editor.is_line_hidden(1), "the chevron folds the body");
+    assert!(app.editor.breakpoint_lines(&f).is_empty());
+    app.editor_click.clear();
+    click_and_release(&mut app, x, y + 20);
+    assert!(app.editor.breakpoint_lines(&f).is_empty(), "no line there");
+    app.editor_click.clear();
+    let mut shift = mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+    shift.modifiers = KeyModifiers::SHIFT;
+    app.handle_mouse(shift);
+    assert!(
+        app.editor.breakpoint_lines(&f).is_empty(),
+        "Shift+click keeps extending the selection"
+    );
+}
+
 /// "Add Conditional Breakpoint" must open a visible popup (the centered
 /// `Prompt` overlay), NOT capture keystrokes on the bottom status line. The
 /// status line is reserved for read-only info.
