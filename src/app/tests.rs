@@ -85309,6 +85309,56 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
 }
 
+/// Serve one `croft edit` request for `path` at `at` through a socket pair.
+fn serve_view_request_1606(
+    app: &mut App,
+    path: &std::path::Path,
+    at: Option<(usize, usize)>,
+) -> crate::view_ipc::ViewReply {
+    let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut line = serde_json::to_vec(&crate::view_ipc::ViewRequest::at(path, at)).unwrap();
+    line.push(b'\n');
+    std::io::Write::write_all(&mut client, &line).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    app.answer_view_client(server, deadline).0
+}
+
+/// #1606: `croft edit big.txt:150:3` from a pane opens big.txt with the
+/// caret on line 150, column 3, scrolled into view.
+#[test]
+fn a_view_request_with_a_location_puts_the_caret_there() {
+    let tmp = tempfile::tempdir().unwrap();
+    let big = tmp.path().join("big.txt");
+    let text: String = (1..=300).map(|n| format!("line {n}\n")).collect();
+    std::fs::write(&big, text).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let reply = serve_view_request_1606(&mut app, &big, Some((149, 2)));
+    assert_eq!(reply, crate::view_ipc::ViewReply::Ok);
+    assert_eq!(app.editor.path.as_deref(), Some(big.as_path()));
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (149, 2));
+    assert!(app.editor.scroll > 0 && app.editor.scroll <= 149);
+    assert!(app.focus == Pane::Editor);
+}
+
+/// Negative (#1606): a location past the end clamps to the text, and a
+/// request without one leaves the caret at the top.
+#[test]
+fn a_view_request_location_clamps_and_none_leaves_the_caret_at_the_top() {
+    let tmp = tempfile::tempdir().unwrap();
+    let small = tmp.path().join("small.txt");
+    std::fs::write(&small, "one\ntwo\n").unwrap();
+    let other = tmp.path().join("other.txt");
+    std::fs::write(&other, "alpha\nbeta\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    serve_view_request_1606(&mut app, &small, Some((99, 99)));
+    let last = app.editor.lines.len() - 1;
+    assert_eq!(app.editor.cursor_row, last);
+    assert!(app.editor.cursor_col <= app.editor.lines[last].chars().count());
+    serve_view_request_1606(&mut app, &other, None);
+    assert_eq!(app.editor.path.as_deref(), Some(other.as_path()));
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
+}
+
 /// Issue #1622: auto save "onWindowChange". The terminal window croft runs
 /// in losing focus (alt-tab, another tmux window) writes every dirty buffer,
 /// the one being typed into included: the editor still has croft's own

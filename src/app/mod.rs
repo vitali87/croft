@@ -13915,6 +13915,13 @@ impl App {
         self.hover_diagnostic = None;
         self.editor.open_preview(path)?;
         self.sync_open_file_poll_mtime();
+        self.place_caret_at(row, col);
+        Ok(())
+    }
+
+    /// Put the active editor's caret at the 0-based `row` and `col`, clamped
+    /// to the text, scroll it to mid-screen and focus the editor.
+    pub fn place_caret_at(&mut self, row: usize, col: usize) {
         let row = row.min(self.editor.lines.len().saturating_sub(1));
         let max_col = self
             .editor
@@ -13930,7 +13937,6 @@ impl App {
         self.editor.ensure_cursor_col_visible();
         self.focus_pane(Pane::Editor);
         self.poke_cursor();
-        Ok(())
     }
 
     /// The active editor's position as a NavLoc, for threading through
@@ -17323,7 +17329,14 @@ impl App {
         // rather than tested.
         let reply = match crate::view_ipc::read_request(&stream, deadline) {
             Ok(req) if req.probe => self.probe_view_path(&req.to_path()),
-            Ok(req) => self.apply_view_request(&req.to_path()),
+            Ok(req) => {
+                let reply = self.apply_view_request(&req.to_path());
+                // `croft edit file:line[:col]` (#1606).
+                if let (crate::view_ipc::ViewReply::Ok, Some((row, col))) = (&reply, req.at) {
+                    self.place_caret_at(row, col);
+                }
+                reply
+            }
             Err(e) => crate::view_ipc::ViewReply::Err {
                 message: format!("unreadable request: {e}"),
             },
@@ -34640,8 +34653,9 @@ impl App {
     /// missing / unreadable file just leaves the editor on the welcome screen.
     /// A relative `path` is taken under the workspace root, so the tab gets
     /// the absolute path its language server is keyed by; a file that can't
-    /// be opened says why instead of opening nothing (#1193).
-    pub fn open_file_at_launch(&mut self, path: &Path) {
+    /// be opened says why instead of opening nothing (#1193). Returns whether
+    /// it opened.
+    pub fn open_file_at_launch(&mut self, path: &Path) -> bool {
         let path = self.workspace_root().join(path);
         match self.editor.open_pinned(&path) {
             Ok(_) => {
@@ -34650,8 +34664,12 @@ impl App {
                 // (#260).
                 self.without_auto_hide(|app| app.focus_pane(Pane::Editor));
                 self.sync_open_file_poll_mtime();
+                true
             }
-            Err(e) => self.status = format!("Couldn't open {}: {e}", path.display()),
+            Err(e) => {
+                self.status = format!("Couldn't open {}: {e}", path.display());
+                false
+            }
         }
     }
 
@@ -73939,6 +73957,7 @@ pub fn run(
     root: PathBuf,
     restore_session: Option<PathBuf>,
     open_file: Option<PathBuf>,
+    open_at: Option<(usize, usize)>,
     zen: bool,
     workspace_folders: Vec<PathBuf>,
 ) -> Result<()> {
@@ -74017,7 +74036,12 @@ pub fn run(
     // `croft <root> --open-file <path>`: open the handed-off file (used by the
     // new window that Move / Copy into New Window spawns).
     if let Some(file) = open_file.as_ref() {
-        app.open_file_at_launch(file);
+        // `croft file:line[:col]` (#1606).
+        if app.open_file_at_launch(file)
+            && let Some((row, col)) = open_at
+        {
+            app.without_auto_hide(|app| app.place_caret_at(row, col));
+        }
     }
     // A `croft://` link (#359) names what to land on.
     match std::env::var("CROFT_FOCUS").as_deref() {
@@ -74244,7 +74268,7 @@ pub fn run(
         restore_host_terminal_state();
         match launch_result? {
             crate::remote::RemoteOutcome::ReturnToLocal => {
-                return run(root, None, None, false, Vec::new());
+                return run(root, None, None, None, false, Vec::new());
             }
             crate::remote::RemoteOutcome::Exited => return Ok(()),
         }
