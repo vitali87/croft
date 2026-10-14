@@ -6771,11 +6771,7 @@ impl Editor {
                     });
                 spans
                     .iter()
-                    .map(|s| HiSpan {
-                        start: s.start,
-                        end: s.end,
-                        style: log_span_style(&s.style, theme),
-                    })
+                    .map(|s| HiSpan::new(s.start, s.end, log_span_style(&s.style, theme)))
                     .collect()
             })
             .collect();
@@ -22529,7 +22525,7 @@ mod tests {
         e.highlights
             .get(row)?
             .iter()
-            .find(|s| s.start <= at && at < s.end)
+            .find(|s| s.range().contains(&at))
             .and_then(|s| s.style.fg)
     }
 
