@@ -174,7 +174,7 @@ A file without one opens in, first to last:
 2. the `.editorconfig` `charset` for the file (`latin1`, `utf-8`,
    `utf-8-bom`, `utf-16le`, `utf-16be`);
 3. `files_encoding`, VS Code's `files.encoding` ids such as `windows1252`,
-   `iso88591`, `shiftjis`, `gbk` or `utf8bom`;
+   `iso88591`, `shiftjis`, `gbk`, `utf16le` or `utf8bom`;
 4. UTF-8.
 
 ```json

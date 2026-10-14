@@ -85667,6 +85667,30 @@ fn the_status_bar_encoding_pick_survives_closing_the_tab() {
     assert_eq!(app.editor.lines[0], "Grüße aus Köln");
 }
 
+/// #1432: Make Root into a nested folder that declares no encoding drops
+/// the parent's `files_encoding`. Left registered, the parent's default
+/// still matched the nested files by prefix and opened UTF-8 text as
+/// windows-1252 mojibake, which the next save would write back.
+#[test]
+fn make_root_into_a_nested_folder_drops_the_parent_files_encoding() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/settings.json"),
+        r#"{ "files.encoding": "windows1252" }"#,
+    )
+    .unwrap();
+    let inner = tmp.path().join("inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    let f = inner.join("notes.txt");
+    std::fs::write(&f, "Grüße aus Köln\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.change_workspace_root(inner.clone());
+    app.editor.open_pinned(&f).unwrap();
+    assert_eq!(app.editor.encoding, encoding_rs::UTF_8);
+    assert_eq!(app.editor.lines[0], "Grüße aus Köln");
+}
+
 /// #1598: GNOME Terminal and Konsole keep Ctrl+Shift+T / W for their own New
 /// Tab and Close Tab, so the pane menu carries Split Terminal and Kill
 /// Terminal, as VS Code's does. Kill closes the pane that was right-clicked,

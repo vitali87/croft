@@ -61961,6 +61961,13 @@ impl App {
         // with it to the new root at the next tick, rather than staying
         // where the old workspace's next launch would restore it (#862).
         self.remove_own_hot_exit();
+        // The `files_encoding` defaults of the folders being left go with
+        // them (#1432). The settings merge below sets only the new roots,
+        // and a default left on a parent folder would still prefix-match
+        // every file of a nested new root and decode it in the old encoding.
+        for root in self.roots.iter() {
+            crate::file_encoding::set_workspace_default(root, None);
+        }
         self.roots.replace_primary(new_root.clone());
         // A panel the user never touched — the startup default, one unnamed
         // shell with no input ever typed and no launched program — is swapped

@@ -20,8 +20,9 @@ pub struct Charset {
 }
 
 /// Parse an `.editorconfig` `charset` or a VS Code `files.encoding` value:
-/// `latin1`, `utf-8`, `utf-8-bom`, `utf-16le`, `windows1252`, `shiftjis`,
-/// `iso88591` and any WHATWG label `encoding_rs` knows. `None` for a value
+/// `latin1`, `utf-8`, `utf-8-bom`, `utf-16le` (VS Code's `utf16le`),
+/// `windows1252`, `shiftjis`, `iso88591` and any WHATWG label `encoding_rs`
+/// knows. `None` for a value
 /// that names no encoding, so a typo never decodes a file as something
 /// random.
 pub fn parse(value: &str) -> Option<Charset> {
@@ -69,6 +70,8 @@ pub fn parse(value: &str) -> Option<Charset> {
             "koi8u" => String::from("koi8-u"),
             "big5hkscs" => String::from("big5"),
             "macroman" => String::from("macintosh"),
+            "utf16le" => String::from("utf-16le"),
+            "utf16be" => String::from("utf-16be"),
             _ => squashed.clone(),
         }
     };
@@ -183,6 +186,8 @@ mod tests {
         assert_eq!(enc("utf-8"), Some("UTF-8"));
         assert_eq!(enc("utf-16le"), Some("UTF-16LE"));
         assert_eq!(enc("utf-16be"), Some("UTF-16BE"));
+        assert_eq!(enc("utf16le"), Some("UTF-16LE"));
+        assert_eq!(enc("utf16be"), Some("UTF-16BE"));
         assert_eq!(enc("windows1252"), Some("windows-1252"));
         assert_eq!(enc("windows1251"), Some("windows-1251"));
         assert_eq!(enc("iso88591"), Some("windows-1252"));
