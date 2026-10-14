@@ -24415,6 +24415,18 @@ impl App {
             self.save();
             return Ok(());
         }
+        // File: New Untitled Text File (#1580). Only from the editor or the
+        // side bar: a terminal's `Ctrl`+`N` is the shell's next-history, and
+        // in a vim-mode editor it is vim's own.
+        if is_new_untitled_file_key(key)
+            && matches!(self.focus, Pane::Editor | Pane::Tree)
+            && !(self.vim.enabled
+                && self.focus == Pane::Editor
+                && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            self.new_untitled_file();
+            return Ok(());
+        }
         if is_terminal_toggle_key(key) {
             self.toggle_terminal();
             return Ok(());
@@ -52935,6 +52947,7 @@ impl App {
             Cmd::SaveAs => self.open_save_as_prompt(),
             Cmd::RevertFile => self.revert_file(),
             Cmd::SaveAll => self.save_all(),
+            Cmd::NewUntitledFile => self.new_untitled_file(),
             Cmd::NewFile => {
                 let target = self.palette_create_target_dir();
                 self.open_create_prompt(CreateKind::File, target);
@@ -61602,6 +61615,12 @@ impl App {
             };
             return;
         }
+        // An untitled buffer (#1580) has nowhere to go yet: Save is Save As,
+        // as in VS Code.
+        if self.editor.path.is_none() && self.editor.diff.is_none() {
+            self.open_save_as_prompt();
+            return;
+        }
         // Guests in a collab session never write shared files: the owner is
         // the single writer, so the FS watcher and history snapshots see one
         // author. The guest's edits already flowed to the owner as ops.
@@ -63822,7 +63841,10 @@ impl App {
                     seen.push(p);
                     labels.push(self.status_path(p));
                 }
-                None => labels.push(String::from("untitled")),
+                None => labels.push(
+                    ed.untitled
+                        .map_or_else(|| String::from("untitled"), |n| format!("Untitled-{n}")),
+                ),
             }
         }
         labels
@@ -69380,6 +69402,21 @@ impl App {
         }
     }
 
+    /// File: New Untitled Text File (#1580): a scratch tab with no path,
+    /// focused; saving it asks where to write it.
+    fn new_untitled_file(&mut self) {
+        // The lowest number no tab holds in any split group: each group
+        // numbering its own would give two tabs the same name.
+        let taken: Vec<usize> = std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|group| group.editors.iter().filter_map(|e| e.untitled))
+            .collect();
+        let n = (1..).find(|n| !taken.contains(n)).unwrap_or(1);
+        self.editor.new_untitled(n);
+        self.focus_pane(Pane::Editor);
+        self.status = format!("Untitled-{n}: saving asks where to write it");
+    }
+
     /// File: Save As… (#1203): ask where to write the active tab's buffer.
     fn open_save_as_prompt(&mut self) {
         if self.editor.has_non_text_view() {
@@ -70339,6 +70376,16 @@ fn is_tree_new_file_key(key: KeyEvent) -> bool {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// File: New Untitled Text File (#1580): `Cmd+N`, and `Ctrl+N` off macOS,
+/// as in VS Code. Shift belongs to New Folder.
+fn is_new_untitled_file_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('n' | 'N'))
+        && has_cmd_or_linux_ctrl(key.modifiers)
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
 }
 
 /// Explorer-pane shortcut: `Cmd+Shift+N` / `Ctrl+Shift+N` - "New Folder".

@@ -296,6 +296,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("workbench.action.files.revert", "revert_file"),
     ("workbench.action.files.saveAll", "save_all"),
     ("explorer.newFile", "new_file"),
+    (
+        "workbench.action.files.newUntitledFile",
+        "new_untitled_file",
+    ),
     ("explorer.newFolder", "new_folder"),
     ("git.viewStash", "git_view_stash"),
     ("editor.action.selectAll", "select_all"),
@@ -2635,6 +2639,24 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let report = scan_profile(dir.path()).expect("an empty profile is fine");
         assert!(report.is_empty());
+    }
+
+    /// #1580: VS Code's New Untitled Text File chord imports onto croft's.
+    #[test]
+    fn new_untitled_file_imports() {
+        let doc = json!([
+            { "key": "ctrl+alt+n", "command": "workbench.action.files.newUntitledFile" }
+        ]);
+        let mut report = Report::default();
+        convert_keybindings(&doc, &mut report);
+        assert_eq!(
+            report.keybindings,
+            [(
+                String::from("ctrl+alt+n"),
+                String::from("new_untitled_file")
+            )]
+        );
+        assert!(report.dropped_keybindings.is_empty());
     }
 
     /// #1558: VS Code's Select All Occurrences and Add Cursors to Line Ends
