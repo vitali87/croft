@@ -1,0 +1,1 @@
+feature: Zen Mode now centres the editor in a wide window (120 columns by default, `zen_center_layout` turns it off), Esc Esc leaves it, and a hint says how to leave when it starts. View: Toggle Centered Layout centres the editor outside Zen too.
