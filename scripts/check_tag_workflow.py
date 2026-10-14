@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Whether tag.yml runs only pinned code against a pinned API.
 
-tag.yml runs on every merge to main with a token that can create tags and
-dispatch release.yml, which publishes signed binaries. Two things it executes
-can change after review without a diff in this repo:
+tag.yml runs on every merge to main with a token that can create tags, and a
+`v<version>` tag is what release.yml builds signed binaries from. Two things
+it executes can change after review without a diff in this repo:
 
   * an action referenced by tag or branch, which its owner can move to new
     code. Only a full 40-hex commit SHA names fixed code.
