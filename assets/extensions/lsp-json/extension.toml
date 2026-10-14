@@ -16,10 +16,42 @@ api_version = 1
 id = "json"
 extensions = ["json"]
 
+# JSON with comments: the server ignores comments and only warns about
+# trailing commas. These are the files VS Code opens as JSONC.
+[[languages]]
+id = "jsonc"
+extensions = ["jsonc"]
+filenames = [
+  "tsconfig.json",
+  "tsconfig.*.json",
+  "tsconfig-*.json",
+  "jsconfig.json",
+  "jsconfig.*.json",
+  "jsconfig-*.json",
+  ".vscode/*.json",
+  ".devcontainer/*.json",
+  "devcontainer.json",
+  ".devcontainer.json",
+  "*.code-workspace",
+  ".eslintrc",
+  ".eslintrc.json",
+  ".babelrc",
+  ".babelrc.json",
+  "babel.config.json",
+  ".swcrc",
+  ".jshintrc",
+  ".jscsrc",
+  "tslint.json",
+  "api-extractor.json",
+  "language-configuration.json",
+  ".croft/*.json",
+]
+family = "json"
+
 [[language_servers]]
 name = "vscode-json-language-server"
 command = "vscode-json-language-server"
 args = ["--stdio"]
-language = "json"
+languages = ["json", "jsonc"]
 priority = 0
 provision = { kind = "npm", package = "@t1ckbase/vscode-langservers-extracted", version = "2.0.1", bin = "vscode-json-language-server" }
