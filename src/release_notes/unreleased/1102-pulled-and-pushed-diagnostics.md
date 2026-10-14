@@ -1,0 +1,1 @@
+fix: Rust: opening a file no longer hides its `cargo check` errors and warnings. rust-analyzer's answer to croft's diagnostics pull and the `cargo check` results it pushes are now kept side by side, so PROBLEMS, the underline and the status-bar count keep both while the file is open.

@@ -296,6 +296,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("workbench.action.files.revert", "revert_file"),
     ("workbench.action.files.saveAll", "save_all"),
     ("explorer.newFile", "new_file"),
+    (
+        "workbench.action.files.newUntitledFile",
+        "new_untitled_file",
+    ),
     ("explorer.newFolder", "new_folder"),
     ("git.viewStash", "git_view_stash"),
     ("editor.action.selectAll", "select_all"),
@@ -322,6 +326,22 @@ const COMMANDS: &[(&str, &str)] = &[
     ("workbench.action.pinEditor", "pin_editor"),
     ("workbench.action.unpinEditor", "unpin_editor"),
     ("workbench.action.keepEditor", "keep_editor"),
+    (
+        "workbench.action.moveEditorLeftInGroup",
+        "move_editor_left_in_group",
+    ),
+    (
+        "workbench.action.moveEditorRightInGroup",
+        "move_editor_right_in_group",
+    ),
+    (
+        "workbench.action.moveEditorToNextGroup",
+        "move_editor_to_next_group",
+    ),
+    (
+        "workbench.action.moveEditorToPreviousGroup",
+        "move_editor_to_previous_group",
+    ),
     ("workbench.action.splitEditor", "split_editor"),
     (
         "workbench.action.toggleSidebarVisibility",
@@ -666,6 +686,17 @@ pub fn map_settings(
     let mut unmapped: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for (key, value) in obj {
+        if let Some(ids) = language_block_ids(key) {
+            map_language_block(
+                key,
+                &ids,
+                value,
+                &mut settings,
+                &mut unmapped,
+                &mut warnings,
+            );
+            continue;
+        }
         match SETTINGS.iter().find(|m| m.vscode == key) {
             Some(map) => match (map.convert)(value) {
                 Some(converted) => {
@@ -712,7 +743,113 @@ pub fn map_settings(
         }
     }
     unmapped.sort();
+    unmapped.dedup();
     (settings, unmapped, warnings)
+}
+
+/// The language ids of a VS Code language block key (#1440): `[python]` is
+/// `python`, `[javascript][typescript]` both. `None` for any other key.
+fn language_block_ids(key: &str) -> Option<Vec<String>> {
+    let inner = key.strip_prefix('[')?.strip_suffix(']')?;
+    let ids: Vec<String> = inner.split("][").map(str::trim).map(String::from).collect();
+    ids.iter()
+        .all(|id| !id.is_empty() && !id.contains(['[', ']']))
+        .then_some(ids)
+}
+
+/// Map one `"[id]": { … }` block (#1440) into `languages.<id>`, for each of
+/// its ids. croft keys languages by VS Code's own ids, so they carry over
+/// as they are. A key inside that croft maps but only globally, or does not
+/// map at all, is reported with its block, as `[python] editor.rulers`.
+fn map_language_block(
+    key: &str,
+    ids: &[String],
+    value: &Value,
+    settings: &mut BTreeMap<String, Value>,
+    unmapped: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let Some(inner) = value.as_object() else {
+        unmapped.push(format!("{key} (not an object: {value})"));
+        return;
+    };
+    let (mapped, inner_unmapped, inner_warnings) = map_settings(inner);
+    unmapped.extend(inner_unmapped.into_iter().map(|k| format!("{key} {k}")));
+    warnings.extend(inner_warnings.into_iter().map(|w| format!("{key} {w}")));
+    let mut block = Map::new();
+    for (croft_key, v) in mapped {
+        if crate::prefs::LANGUAGE_KEYS.contains(&croft_key.as_str()) {
+            block.insert(croft_key, v);
+        } else {
+            let vscode = SETTINGS.iter().find(|m| m.croft == croft_key).map_or(
+                if croft_key.starts_with("auto_save") {
+                    "files.autoSave"
+                } else {
+                    croft_key.as_str()
+                },
+                |m| m.vscode,
+            );
+            unmapped.push(format!(
+                "{key} {vscode} (croft has {croft_key} only for every language)"
+            ));
+        }
+    }
+    if block.is_empty() {
+        return;
+    }
+    let languages = settings
+        .entry(String::from("languages"))
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Value::Object(languages) = languages {
+        for id in ids {
+            let entry = languages
+                .entry(id.clone())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Value::Object(entry) = entry {
+                entry.extend(block.clone());
+            }
+        }
+    }
+}
+
+/// Add imported `languages` blocks to the ones a config.json already has
+/// (#1440), a setting at a time: a language's setting the config already
+/// holds is kept and reported, like a top-level one. True when any was
+/// added.
+fn merge_languages(
+    current: &mut Map<String, Value>,
+    imported: &Map<String, Value>,
+    conflicts: &mut Vec<String>,
+) -> bool {
+    let mut changed = false;
+    for (id, block) in imported {
+        let Some(block) = block.as_object() else {
+            continue;
+        };
+        let entry = current
+            .entry(id.clone())
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Value::Object(entry) = entry else {
+            conflicts.push(format!(
+                "config.json languages.{id}: kept {entry}, VS Code had {}",
+                Value::Object(block.clone())
+            ));
+            continue;
+        };
+        for (key, value) in block {
+            match entry.get(key) {
+                Some(kept) if kept != value => conflicts.push(format!(
+                    "config.json languages.{id}.{key}: kept {kept}, VS Code had {value}"
+                )),
+                Some(_) => {}
+                None => {
+                    entry.insert(key.clone(), value.clone());
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
 }
 
 /// Convert a VS Code `settings.json` document.
@@ -1118,6 +1255,13 @@ pub fn apply_into_dirs(
             };
             let mut changed = false;
             for (key, value) in &report.settings {
+                if key == "languages"
+                    && let (Some(Value::Object(current)), Value::Object(imported)) =
+                        (existing.get_mut(key), value)
+                {
+                    changed |= merge_languages(current, imported, &mut report.conflicts);
+                    continue;
+                }
                 if let Some(current) = existing.get(key) {
                     if current != value {
                         // The converted theme is installed either way (it is
@@ -1304,6 +1448,120 @@ mod tests {
             report
                 .unmapped_settings
                 .contains(&String::from("workbench.iconTheme"))
+        );
+    }
+
+    /// #1440: a `"[python]": { … }` block maps its keys into
+    /// `languages.python`, a `[javascript][typescript]` block into both,
+    /// and the keys croft cannot scope to a language are listed with their
+    /// block rather than the bare `[python]` the whole block used to be.
+    #[test]
+    fn language_blocks_map_into_languages() {
+        let mut report = Report::default();
+        convert_settings(
+            &json!({
+                "[python]": {
+                    "editor.formatOnSave": true,
+                    "editor.defaultFormatter": "charliermarshall.ruff",
+                    "editor.rulers": [88]
+                },
+                "[javascript][typescript]": { "editor.renderWhitespace": "all" },
+                "[markdown]": { "editor.inlayHints.enabled": "off", "terminal.integrated.scrollback": 5 },
+                "[c]": { "files.autoSave": "afterDelay" }
+            }),
+            &mut report,
+        );
+        assert_eq!(
+            report.settings["languages"],
+            json!({
+                "python": { "format_on_save": true },
+                "javascript": { "render_whitespace": "all" },
+                "typescript": { "render_whitespace": "all" },
+                "markdown": { "disable_inlay_hints": true }
+            })
+        );
+        assert!(!report.settings.contains_key("format_on_save"));
+        assert!(!report.settings.contains_key("terminal_scrollback"));
+        let unmapped = &report.unmapped_settings;
+        for want in [
+            "[python] editor.rulers",
+            "[python] editor.defaultFormatter",
+            "[markdown] terminal.integrated.scrollback (croft has terminal_scrollback only for every language)",
+            "[c] files.autoSave (croft has auto_save only for every language)",
+        ] {
+            assert!(
+                unmapped.contains(&String::from(want)),
+                "{want} not in {unmapped:?}"
+            );
+        }
+        assert!(
+            !unmapped.iter().any(|u| u == "[python]"),
+            "a block is never listed whole: {unmapped:?}"
+        );
+    }
+
+    /// #1440 negative: keys that only look like a block, and a block that
+    /// is not an object, stay unmapped and set nothing.
+    #[test]
+    fn malformed_language_blocks_set_nothing() {
+        let mut report = Report::default();
+        convert_settings(
+            &json!({ "[]": { "editor.formatOnSave": true }, "[go]": true, "[a]b]": {} }),
+            &mut report,
+        );
+        assert!(
+            !report.settings.contains_key("languages"),
+            "{:?}",
+            report.settings
+        );
+        assert!(report.unmapped_settings.contains(&String::from("[]")));
+        assert!(report.unmapped_settings.contains(&String::from("[a]b]")));
+        assert!(
+            report
+                .unmapped_settings
+                .iter()
+                .any(|u| u.starts_with("[go] (not an object")),
+            "{:?}",
+            report.unmapped_settings
+        );
+    }
+
+    /// #1440: importing language blocks into a config.json that has some
+    /// adds the missing settings and keeps the ones already there.
+    #[test]
+    fn imported_language_blocks_merge_into_existing_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{ "languages": { "python": { "format_on_save": false } } }"#,
+        )
+        .unwrap();
+        let mut report = Report::default();
+        convert_settings(
+            &json!({
+                "[python]": { "editor.formatOnSave": true, "editor.formatOnType": true },
+                "[go]": { "editor.formatOnSave": true }
+            }),
+            &mut report,
+        );
+        apply_into(dir.path(), &mut report).expect("apply runs");
+
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            written["languages"],
+            json!({
+                "python": { "format_on_save": false, "format_on_type": true },
+                "go": { "format_on_save": true }
+            })
+        );
+        assert!(
+            report.conflicts.contains(&String::from(
+                "config.json languages.python.format_on_save: kept false, VS Code had true"
+            )),
+            "{:?}",
+            report.conflicts
         );
     }
 
@@ -1679,6 +1937,62 @@ mod tests {
             .iter()
             .map(|(key, _, croft)| (key.to_string(), croft.to_string()))
             .collect();
+        assert_eq!(report.keybindings, expected);
+        let rows: Vec<Value> = report
+            .keybindings
+            .iter()
+            .map(|(key, command)| json!({ "key": key, "command": command }))
+            .collect();
+        let json = serde_json::to_string(&Value::Array(rows)).unwrap();
+        let (_keymap, warnings) = crate::keymap::Keymap::resolve(&json);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// #1565: VS Code's move-editor commands import, with VS Code's own
+    /// default chords, and resolve to real croft commands.
+    #[test]
+    fn the_move_editor_commands_import_under_their_vscode_ids() {
+        let pairs = [
+            (
+                "ctrl+shift+pageup",
+                "workbench.action.moveEditorLeftInGroup",
+                "move_editor_left_in_group",
+            ),
+            (
+                "ctrl+shift+pagedown",
+                "workbench.action.moveEditorRightInGroup",
+                "move_editor_right_in_group",
+            ),
+            (
+                "ctrl+alt+right",
+                "workbench.action.moveEditorToNextGroup",
+                "move_editor_to_next_group",
+            ),
+            (
+                "ctrl+alt+left",
+                "workbench.action.moveEditorToPreviousGroup",
+                "move_editor_to_previous_group",
+            ),
+        ];
+        let doc = Value::Array(
+            pairs
+                .iter()
+                .map(|(key, vscode, _)| json!({ "key": key, "command": vscode }))
+                .collect(),
+        );
+        let mut report = Report::default();
+        convert_keybindings(&doc, &mut report);
+        assert!(
+            report.dropped_keybindings.is_empty(),
+            "{:?}",
+            report.dropped_keybindings
+        );
+        // The report lists bindings in key order.
+        let mut expected: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(key, _, croft)| (key.to_string(), croft.to_string()))
+            .collect();
+        expected.sort();
         assert_eq!(report.keybindings, expected);
         let rows: Vec<Value> = report
             .keybindings
@@ -2667,6 +2981,24 @@ mod tests {
             report.dropped_keybindings,
             ["ctrl+alt+enter: no croft command matches editor.action.insertLineAround"]
         );
+    }
+
+    /// #1580: VS Code's New Untitled Text File chord imports onto croft's.
+    #[test]
+    fn new_untitled_file_imports() {
+        let doc = json!([
+            { "key": "ctrl+alt+n", "command": "workbench.action.files.newUntitledFile" }
+        ]);
+        let mut report = Report::default();
+        convert_keybindings(&doc, &mut report);
+        assert_eq!(
+            report.keybindings,
+            [(
+                String::from("ctrl+alt+n"),
+                String::from("new_untitled_file")
+            )]
+        );
+        assert!(report.dropped_keybindings.is_empty());
     }
 
     /// #1558: VS Code's Select All Occurrences and Add Cursors to Line Ends
