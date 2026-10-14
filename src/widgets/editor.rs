@@ -2394,6 +2394,50 @@ const UNDO_BYTES_LIMIT: usize = if cfg!(test) {
 /// Undo steps kept whatever their size (see [`UNDO_BYTES_LIMIT`]).
 const UNDO_MIN_STEPS: usize = 16;
 
+/// The undo and redo history of a file whose tab closed (#1568), kept for
+/// the session so reopening the file brings it back, as VS Code's
+/// `files.restoreUndoStack` does. It only applies to the text it was
+/// recorded against: `text_hash` is the buffer at close, and a file that
+/// reopens with other content (edited elsewhere, or closed with its unsaved
+/// edits discarded) starts with no history.
+struct ClosedHistory {
+    path: PathBuf,
+    text_hash: u64,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    /// The editor's save point, so an undo across it re-dirties the buffer
+    /// exactly as it would have in the tab that closed.
+    save_seq: u64,
+    bytes: usize,
+}
+
+/// Closed files whose history is kept, newest last; the oldest go first.
+const CLOSED_HISTORY_FILES: usize = 30;
+
+/// Bytes of history kept across every closed file, on top of the per-buffer
+/// [`UNDO_BYTES_LIMIT`]: the oldest closed file's history goes first.
+const CLOSED_HISTORY_BYTES: usize = UNDO_BYTES_LIMIT;
+
+thread_local! {
+    static CLOSED_HISTORY: std::cell::RefCell<Vec<ClosedHistory>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One hash of a buffer's lines, to tell whether a reopened file still has
+/// the text a closed tab's history was recorded against.
+fn lines_hash(lines: &[String]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    lines.hash(&mut h);
+    h.finish()
+}
+
+/// The key a file's closed history is filed under: its canonical path, so a
+/// symlink or a relative spelling finds the same history.
+fn closed_history_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Max selected-text length that still drives occurrence highlighting, matching
 /// VS Code's default `editor.selectionHighlightMaxLength`.
 const SELECTION_HIGHLIGHT_MAX_LEN: usize = 200;
@@ -2703,6 +2747,14 @@ struct SnippetSession {
 #[cfg(test)]
 thread_local! {
     static FOLD_RANGE_REBUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A tab closing drops its editor: its history is kept for the file
+/// (#1568), whichever of the many close paths dropped it.
+impl Drop for Editor {
+    fn drop(&mut self) {
+        self.stash_history();
+    }
 }
 
 pub struct Editor {
@@ -3069,6 +3121,14 @@ pub struct Editor {
     /// double-click / Ctrl+Enter / typing into the buffer pin the tab
     /// (preview = false) so subsequent previews don't overwrite it.
     pub preview: bool,
+    /// The selection Add Selection to Next Find Match last made from the
+    /// word at the caret (#1558). While the primary selection is that one,
+    /// further matches are whole words, as in VS Code; a selection made by
+    /// hand matches as plain text, so `oo` is found inside every `foo`.
+    /// Paired with the `edit_seq` it was made at; dropped as soon as the
+    /// selection is seen to differ (see `sync_occurrence_word_sel`), so a
+    /// later hand-made selection at the same place is not mistaken for it.
+    occurrence_word_sel: Option<(EditorSelection, u64)>,
     /// True when the user has pinned this tab (VS Code "Pin"). Pinned tabs are
     /// kept leftmost in the strip, survive Close Others / Close to the Right,
     /// and show a thumb-tack glyph in place of the close `\u{2715}`. A pinned
@@ -3406,6 +3466,10 @@ pub struct Editor {
     /// whether an external process changed the file underneath us. `None`
     /// for a tab with no file (the blank initial buffer).
     disk_stamp: Option<(SystemTime, u64)>,
+    /// Set for a new file opened before it exists (#1157): its `None`
+    /// stamp means "expected absent", so the file appearing on disk is an
+    /// external change rather than a phantom one.
+    disk_expect_absent: bool,
     /// Set when an external on-disk change is detected while this buffer has
     /// unsaved edits. Reloading would discard the user's edits and saving
     /// would clobber the external change, so neither happens automatically:
@@ -3522,6 +3586,7 @@ impl Editor {
             fallback_kind_folds: Vec::new(),
             fallback_folds_seq: None,
             preview: false,
+            occurrence_word_sel: None,
             pinned: false,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -3604,6 +3669,7 @@ impl Editor {
             diff_prev_arrow: Rect::default(),
             diff_next_arrow: Rect::default(),
             disk_stamp: None,
+            disk_expect_absent: false,
             disk_conflict: false,
             encoding_loss: false,
             lossy_save_armed: false,
@@ -5028,7 +5094,90 @@ impl Editor {
         chars[start..end].iter().collect()
     }
 
+    /// Open `path` in this tab. Moving the tab to another file keeps the
+    /// history of the one it leaves for when that file opens again, and the
+    /// file it arrives at gets its own back if it has one (#1568).
     pub fn open(&mut self, path: &Path) -> Result<()> {
+        let changed_file = self.path.as_deref() != Some(path);
+        if changed_file {
+            self.stash_history();
+        }
+        let opened = self.open_file(path);
+        if changed_file {
+            // On a failed open the tab may still hold the file it left, and
+            // takes its history back the same way.
+            self.restore_history();
+        }
+        opened
+    }
+
+    /// File this tab's undo/redo history away when the file leaves the tab
+    /// (#1568). A tab with no history, no file, or a non-text view (whose
+    /// `lines` are a placeholder) has nothing to keep, and a symbol tab's
+    /// history covers a clip of the file, not the file.
+    fn stash_history(&mut self) {
+        let Some(path) = self.path.as_deref() else {
+            return;
+        };
+        if (self.undo_stack.is_empty() && self.redo_stack.is_empty())
+            || self.has_non_text_view()
+            || self.symbol_view.is_some()
+        {
+            return;
+        }
+        let undo = std::mem::take(&mut self.undo_stack);
+        let redo = std::mem::take(&mut self.redo_stack);
+        let entry = ClosedHistory {
+            path: closed_history_key(path),
+            text_hash: lines_hash(&self.lines),
+            bytes: undo.iter().chain(&redo).map(|s| s.bytes).sum(),
+            undo,
+            redo,
+            save_seq: self.save_seq,
+        };
+        // `try_with`: a tab dropped while the thread's storage is being torn
+        // down has nowhere to keep it, and must not panic.
+        let _ = CLOSED_HISTORY.try_with(|kept| {
+            let mut kept = kept.borrow_mut();
+            kept.retain(|h| h.path != entry.path);
+            kept.push(entry);
+            let mut total: usize = kept.iter().map(|h| h.bytes).sum();
+            while kept.len() > CLOSED_HISTORY_FILES
+                || (total > CLOSED_HISTORY_BYTES && kept.len() > 1)
+            {
+                total -= kept.remove(0).bytes;
+            }
+        });
+    }
+
+    /// Take back the history kept for this tab's file when it closed, if the
+    /// buffer is the text that history was recorded against (#1568).
+    /// Whichever way it goes, the kept copy is used up: a second tab of the
+    /// file must not replay the same history over its own edits.
+    fn restore_history(&mut self) {
+        let Some(path) = self.path.as_deref() else {
+            return;
+        };
+        if self.has_non_text_view() || self.symbol_view.is_some() {
+            return;
+        }
+        let key = closed_history_key(path);
+        let Ok(Some(entry)) = CLOSED_HISTORY.try_with(|kept| {
+            let mut kept = kept.borrow_mut();
+            let i = kept.iter().position(|h| h.path == key)?;
+            Some(kept.remove(i))
+        }) else {
+            return;
+        };
+        if entry.text_hash != lines_hash(&self.lines) {
+            return;
+        }
+        self.undo_stack = entry.undo;
+        self.redo_stack = entry.redo;
+        self.save_seq = entry.save_seq;
+    }
+
+    fn open_file(&mut self, path: &Path) -> Result<()> {
         // A FIFO, socket or device blocks the first read until some other
         // process writes to it, freezing the UI thread indefinitely; none of
         // them is a document. (Directories and missing paths go on to the
@@ -5271,9 +5420,40 @@ impl Editor {
             }
             _ => {}
         }
+        self.load_text(path, &bytes, sarif_refusal)
+    }
+
+    /// A file that does not exist yet, in a folder that does: an empty text
+    /// buffer bound to `path`, written on the first save, as `code new.md`
+    /// and `vim new.md` start one (#1157). An existing file opens as usual.
+    pub fn open_new_file(&mut self, path: &Path) -> Result<()> {
+        if std::fs::symlink_metadata(path).is_ok() {
+            return self.open(path);
+        }
+        let dir = path.parent().unwrap_or(Path::new(""));
+        if !dir.is_dir() {
+            anyhow::bail!("no such directory {}", dir.display());
+        }
+        if self.path.as_deref() != Some(path) {
+            self.force_text = false;
+        }
+        self.load_text(path, &[], None)?;
+        self.disk_expect_absent = self.disk_stamp.is_none();
+        self.status = format!("New file {}: saving creates it", path.display());
+        Ok(())
+    }
+
+    /// Load `bytes`, the contents of `path`, as the buffer's text: the end
+    /// of [`Self::open`] once no viewer claimed the file.
+    fn load_text(
+        &mut self,
+        path: &Path,
+        bytes: &[u8],
+        sarif_refusal: Option<String>,
+    ) -> Result<()> {
         // Decode with the file's BOM-declared encoding if it has one, else
         // UTF-8. A later "Reopen with Encoding" overrides this.
-        let sniffed = encoding_rs::Encoding::for_bom(&bytes);
+        let sniffed = encoding_rs::Encoding::for_bom(bytes);
         let enc = sniffed.map(|(e, _)| e).unwrap_or(encoding_rs::UTF_8);
         // The BOM sniff comes FIRST: UTF-16 text is half NUL bytes, so the
         // binary heuristic would reject every UTF-16 file — including the ones
@@ -5281,7 +5461,7 @@ impl Editor {
         // menu. A byte-order mark is a positive declaration of text, so it
         // settles the question the heuristic is only guessing at.
         let bom_declares_text = enc == encoding_rs::UTF_16LE || enc == encoding_rs::UTF_16BE;
-        if !bom_declares_text && is_binary(&bytes) {
+        if !bom_declares_text && is_binary(bytes) {
             // Never a dead-end: binary files open in the hex viewer
             // instead of failing with "Binary file" (#172).
             return self.open_hex(path);
@@ -5300,7 +5480,7 @@ impl Editor {
         self.encoding = enc;
         // `decode` strips the BOM, so remember it or the next save drops it.
         self.bom = sniffed.is_some();
-        let (decoded, _, decode_lossy) = enc.decode(&bytes);
+        let (decoded, _, decode_lossy) = enc.decode(bytes);
         let text = decoded.into_owned();
         self.decode_lossy = decode_lossy;
         self.final_newline = text.ends_with(['\n', '\r']);
@@ -5339,6 +5519,7 @@ impl Editor {
         self.scroll_sub = 0;
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_expect_absent = false;
         self.disk_conflict = false;
         // A whole-buffer swap: whatever the previous contents could not be
         // encoded as is no longer this tab's problem.
@@ -5464,6 +5645,7 @@ impl Editor {
         let format_label = image_format_label_from_ext(ext);
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_expect_absent = false;
         self.disk_conflict = false;
         // A whole-buffer swap: whatever the previous contents could not be
         // encoded as is no longer this tab's problem.
@@ -5734,6 +5916,7 @@ impl Editor {
             crate::svg::rasterize(&src).map_err(|e| anyhow::anyhow!("SVG render failed: {e}"))?;
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_expect_absent = false;
         self.disk_conflict = false;
         // A whole-buffer swap: whatever the previous contents could not be
         // encoded as is no longer this tab's problem.
@@ -5795,6 +5978,7 @@ impl Editor {
     fn install_sheet_view(&mut self, path: &Path, view: crate::sheet::SheetView) {
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_expect_absent = false;
         self.disk_conflict = false;
         // A whole-buffer swap: whatever the previous contents could not be
         // encoded as is no longer this tab's problem.
@@ -5860,6 +6044,7 @@ impl Editor {
             .ok_or_else(|| anyhow::anyhow!("Could not decode rasterised PDF"))?;
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_expect_absent = false;
         self.disk_conflict = false;
         // A whole-buffer swap: whatever the previous contents could not be
         // encoded as is no longer this tab's problem.
@@ -6292,6 +6477,7 @@ impl Editor {
             crate::hex::HexView::open(path).map_err(|e| anyhow::anyhow!("Hex open failed: {e}"))?;
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_expect_absent = false;
         self.disk_conflict = false;
         // A whole-buffer swap: whatever the previous contents could not be
         // encoded as is no longer this tab's problem.
@@ -8046,10 +8232,32 @@ impl Editor {
             .unwrap_or_default();
         let indent_len = indent.chars().count();
         let parsed = crate::snippets::parse_body(body);
+        // A body's leading `\t` is one indent level, VS Code's convention
+        // (#1554): it becomes this buffer's indent unit, so a space-indented
+        // file gets no tab after its spaces. Tabs past the indentation are
+        // text and stay.
+        let unit = self.indent_unit();
+        let grow = unit.chars().count().saturating_sub(1);
+        let body_lines: Vec<&str> = parsed.text.split('\n').collect();
+        let leading_tabs = |line: &str, upto: usize| {
+            line.chars()
+                .take(upto)
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .filter(|c| *c == '\t')
+                .count()
+        };
+        let text = body_lines
+            .iter()
+            .map(|line| {
+                let lead = line.len() - line.trim_start_matches([' ', '\t']).len();
+                format!("{}{}", line[..lead].replace('\t', &unit), &line[lead..])
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         let inserted = if indent.is_empty() {
-            parsed.text.clone()
+            text
         } else {
-            parsed.text.replace('\n', &format!("\n{indent}"))
+            text.replace('\n', &format!("\n{indent}"))
         };
         // A snippet body is text the user chose, not text they wrote (#349).
         self.insert_str_as(&inserted, crate::provenance::Seat::Generated);
@@ -8059,6 +8267,7 @@ impl Editor {
             .iter()
             .map(|s| {
                 let (ld, col) = crate::snippets::offset_to_line_col(&parsed.text, s.offset);
+                let col = col + grow * leading_tabs(body_lines[ld], col);
                 let row = start.0 + ld;
                 let c = if ld == 0 {
                     start.1 + col
@@ -8480,6 +8689,101 @@ impl Editor {
         self.carets.len() + 1
     }
 
+    /// The start of every occurrence of `word` in the buffer (a symbol tab's
+    /// symbol only), in document order: whole words when `whole_word`, else
+    /// every case-sensitive plain-text match, left to right without overlap.
+    fn occurrence_starts(&self, word: &[char], whole_word: bool) -> Vec<(usize, usize)> {
+        let (lo, hi) = self.symbol_clip().unwrap_or((0, self.lines.len()));
+        let mut occ = Vec::new();
+        for (row, line) in self.lines.iter().enumerate().take(hi).skip(lo) {
+            let chars: Vec<char> = line.chars().collect();
+            let cols = if whole_word {
+                find_word_occurrences(&chars, word)
+            } else {
+                find_text_occurrences(&chars, word)
+            };
+            occ.extend(cols.into_iter().map(|col| (row, col)));
+        }
+        occ
+    }
+
+    /// VS Code "Select All Occurrences of Find Match" (`Cmd+Shift+L`,
+    /// #1558): a selection on every match of the selected text, as plain
+    /// text for a hand-made selection and as whole words for one Add
+    /// Selection to Next Find Match took from the caret; with no selection,
+    /// every whole-word match of the word at the caret (Change All
+    /// Occurrences). The selection the caret is in stays primary. Returns
+    /// the number of selections, 0 when there is nothing to match.
+    pub fn select_all_occurrences(&mut self) -> usize {
+        let Some(sel) = self.selection.filter(|s| s.anchor != s.head) else {
+            return self.select_all_occurrences_of_word_at_cursor();
+        };
+        let (start, end) = sel.normalised();
+        if start.0 != end.0 {
+            // A match across lines is not looked for: the selection stays.
+            return 0;
+        }
+        let word: Vec<char> = self.lines[start.0]
+            .chars()
+            .skip(start.1)
+            .take(end.1 - start.1)
+            .collect();
+        self.sync_occurrence_word_sel();
+        let whole_word = self.occurrence_word_sel.is_some();
+        let occ = self.occurrence_starts(&word, whole_word);
+        if occ.is_empty() {
+            return 0;
+        }
+        let primary_idx = occ.iter().position(|&o| o == start).unwrap_or(0);
+        let as_sel = |(row, col): (usize, usize)| EditorSelection {
+            anchor: (row, col),
+            head: (row, col + word.len()),
+        };
+        let primary = as_sel(occ[primary_idx]);
+        self.selection = Some(primary);
+        (self.cursor_row, self.cursor_col) = primary.head;
+        self.carets = occ
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != primary_idx)
+            .map(|(_, &o)| as_sel(o))
+            .collect();
+        self.ensure_cursor_col_visible();
+        self.carets.len() + 1
+    }
+
+    /// VS Code "Add Cursors to Line Ends" (`Shift+Alt+I`, #1558): a caret at
+    /// the end of every line the selection covers, the selection dropped.
+    /// A last line the selection only reaches at column 0 is left out, as
+    /// VS Code does. The last line's caret is the primary. Returns the
+    /// number of carets, 0 with no selection.
+    pub fn add_cursors_to_line_ends(&mut self) -> usize {
+        let Some(sel) = self.selection.filter(|s| s.anchor != s.head) else {
+            return 0;
+        };
+        let (start, end) = sel.normalised();
+        let last = if end.1 == 0 && end.0 > start.0 {
+            end.0 - 1
+        } else {
+            end.0
+        };
+        let ends: Vec<(usize, usize)> = (start.0..=last)
+            .map(|row| (row, self.line_char_len(row)))
+            .collect();
+        let Some((&primary, rest)) = ends.split_last() else {
+            return 0;
+        };
+        self.selection = None;
+        (self.cursor_row, self.cursor_col) = primary;
+        self.carets = rest
+            .iter()
+            .map(|&(row, col)| EditorSelection::new(row, col))
+            .collect();
+        self.occurrence_word_sel = None;
+        self.ensure_cursor_col_visible();
+        self.carets.len() + 1
+    }
+
     /// VS Code "Add Selection to Next Find Match" (`Cmd+D`): the first press
     /// selects the word under the cursor; each further press finds the next
     /// occurrence of the selected text (document order, wrapping) that is not
@@ -8492,10 +8796,12 @@ impl Editor {
             let Some((s, e)) = self.word_at(self.cursor_row, self.cursor_col) else {
                 return 0;
             };
-            self.selection = Some(EditorSelection {
+            let word = EditorSelection {
                 anchor: (self.cursor_row, s),
                 head: (self.cursor_row, e),
-            });
+            };
+            self.selection = Some(word);
+            self.occurrence_word_sel = Some((word, self.edit_seq));
             self.cursor_col = e;
             self.ensure_cursor_col_visible();
             return 1;
@@ -8515,15 +8821,9 @@ impl Editor {
         }
         // Every occurrence in document order, and the set already selected
         // (the primary plus each existing caret), keyed by its start.
-        let mut occ: Vec<(usize, usize)> = Vec::new();
-        // A symbol tab matches only inside its symbol.
-        let (lo, hi) = self.symbol_clip().unwrap_or((0, self.lines.len()));
-        for (row, line) in self.lines.iter().enumerate().take(hi).skip(lo) {
-            let chars: Vec<char> = line.chars().collect();
-            for col in find_word_occurrences(&chars, &word) {
-                occ.push((row, col));
-            }
-        }
+        self.sync_occurrence_word_sel();
+        let whole_word = self.occurrence_word_sel.is_some();
+        let occ = self.occurrence_starts(&word, whole_word);
         let mut taken: Vec<(usize, usize)> = self.carets.iter().map(|c| c.normalised().0).collect();
         taken.push(start);
         // Scan forward from the primary, wrapping, for the first match not yet
@@ -8539,10 +8839,14 @@ impl Editor {
         // Demote the current primary to a caret, promote the new match.
         self.carets.push(sel);
         let head = (row, col + word.len());
-        self.selection = Some(EditorSelection {
+        let found = EditorSelection {
             anchor: (row, col),
             head,
-        });
+        };
+        self.selection = Some(found);
+        if whole_word {
+            self.occurrence_word_sel = Some((found, self.edit_seq));
+        }
         self.cursor_row = head.0;
         self.cursor_col = head.1;
         self.ensure_cursor_col_visible();
@@ -8799,6 +9103,21 @@ impl Editor {
 
     pub fn clear_selection(&mut self) {
         self.selection = None;
+        self.occurrence_word_sel = None;
+    }
+
+    /// Forget the Add Selection to Next Find Match word marker (#1558) once
+    /// the selection or the buffer has moved on from it. Called before each
+    /// input event and by the occurrence commands, so a selection that left
+    /// the marked one and came back (Esc, then the same word selected by
+    /// hand) matches as plain text again.
+    pub fn sync_occurrence_word_sel(&mut self) {
+        if self
+            .occurrence_word_sel
+            .is_some_and(|(sel, seq)| self.selection != Some(sel) || seq != self.edit_seq)
+        {
+            self.occurrence_word_sel = None;
+        }
     }
 
     // ---- Linked editing (#254) ------------------------------------------
@@ -10149,7 +10468,9 @@ impl Editor {
         };
         match self.disk_stamp {
             Some(known) => Self::disk_stamp_of(path) != Some(known),
-            None => false,
+            // A new file not written yet: another process creating it is
+            // a change, or the first save would clobber what it wrote.
+            None => self.disk_expect_absent && Self::disk_stamp_of(path).is_some(),
         }
     }
 
@@ -13967,6 +14288,26 @@ fn find_word_occurrences(chars: &[char], word: &[char]) -> Vec<usize> {
             }
         }
         i += 1;
+    }
+    out
+}
+
+/// Start char-indices of every case-sensitive occurrence of `text` within
+/// `chars`, as plain text and without overlap (#1558): what VS Code matches
+/// for a selection made by hand, so `oo` is found inside `foo`.
+fn find_text_occurrences(chars: &[char], text: &[char]) -> Vec<usize> {
+    let mut out = Vec::new();
+    if text.is_empty() || text.len() > chars.len() {
+        return out;
+    }
+    let mut i = 0;
+    while i + text.len() <= chars.len() {
+        if chars[i..i + text.len()] == *text {
+            out.push(i);
+            i += text.len();
+        } else {
+            i += 1;
+        }
     }
     out
 }
@@ -19706,6 +20047,20 @@ impl EditorTabs {
     /// to it. Otherwise create a fresh pinned tab next to the active one.
     /// Used by double-click in the explorer and Ctrl+Enter on a tree row.
     pub fn open_pinned(&mut self, path: &Path) -> Result<()> {
+        self.open_pinned_with(path, Editor::open)
+    }
+
+    /// [`Self::open_pinned`] for a file that may not exist yet: a missing
+    /// one opens as an empty buffer that its first save creates (#1157).
+    pub fn open_new_pinned(&mut self, path: &Path) -> Result<()> {
+        self.open_pinned_with(path, Editor::open_new_file)
+    }
+
+    fn open_pinned_with(
+        &mut self,
+        path: &Path,
+        open: fn(&mut Editor, &Path) -> Result<()>,
+    ) -> Result<()> {
         // A diff tab can carry the working file's `path` yet is not an
         // editable view of it, so skip diffs here: Enter on a diff (or a
         // double-click) opens the real file beside the diff rather than just
@@ -19719,7 +20074,7 @@ impl EditorTabs {
         }
         if self.is_blank_initial() {
             let active = self.active;
-            self.editors[active].open(path)?;
+            open(&mut self.editors[active], path)?;
             self.editors[active].preview = false;
             self.editors[active].search_highlight = self.search_highlight_term.clone();
             self.editors[active].search_highlight_opts = self.search_highlight_opts;
@@ -19727,7 +20082,7 @@ impl EditorTabs {
         }
         let mut e = Editor::new();
         e.focused = self.editors[self.active].focused;
-        e.open(path)?;
+        open(&mut e, path)?;
         e.preview = false;
         e.search_highlight = self.search_highlight_term.clone();
         e.search_highlight_opts = self.search_highlight_opts;
@@ -20580,6 +20935,75 @@ mod tests {
             e.lines[1], "        ",
             "continuation line keeps the 4-space block indent plus its own"
         );
+    }
+
+    /// #1554: a snippet body's `\t` is one indent level (VS Code's
+    /// convention) and was inserted as a literal tab, leaving a tab after
+    /// spaces in a space-indented file (ruff W191 / E101). It becomes the
+    /// buffer's indent unit, and the tab stop on that line moves with it.
+    #[test]
+    fn a_snippet_tab_becomes_the_buffers_indent_unit() {
+        let mut e = editor_with("def run():\n    ");
+        e.lang = Some(LangKind::Python);
+        e.cursor_row = 1;
+        e.cursor_col = 4;
+        e.expand_snippet("if __name__ == \"__main__\":\n\t${1:main()}", 0);
+        assert_eq!(e.lines[1], "    if __name__ == \"__main__\":");
+        assert_eq!(
+            e.lines[2], "        main()",
+            "four spaces of block indent, four for the tab"
+        );
+        assert_eq!((e.cursor_row, e.cursor_col), (2, 14));
+        assert_eq!(
+            e.selection_text(),
+            "main()",
+            "the stop still selects its placeholder"
+        );
+    }
+
+    /// #1554: nested levels (`\t\t`) each become a unit, and a stop past
+    /// the indentation on such a line lands on its text.
+    #[test]
+    fn nested_snippet_tabs_each_become_an_indent_unit() {
+        let mut e = editor_with("");
+        e.lang = Some(LangKind::Python);
+        e.expand_snippet(
+            "try:\n\tfor x in xs:\n\t\t${1:pass}\nexcept ${2:E}:\n\t${0}",
+            0,
+        );
+        assert_eq!(
+            e.lines,
+            vec![
+                "try:",
+                "    for x in xs:",
+                "        pass",
+                "except E:",
+                "    "
+            ]
+        );
+        assert_eq!(e.selection_text(), "pass");
+    }
+
+    /// Negative: a tab-indented buffer keeps the body's tabs, and a tab
+    /// inside a line (not leading) is left alone in any buffer.
+    #[test]
+    fn snippet_tabs_stay_tabs_in_a_tab_indented_buffer_and_mid_line() {
+        let mut e = editor_with("func f() {\n\t\n}");
+        e.set_indent_style(IndentStyle {
+            width: 4,
+            use_spaces: false,
+        });
+        e.cursor_row = 1;
+        e.cursor_col = 1;
+        e.expand_snippet("if x {\n\t${1:y}\n}", 0);
+        assert_eq!(e.lines[1], "\tif x {");
+        assert_eq!(e.lines[2], "\t\ty");
+        assert_eq!(e.selection_text(), "y");
+
+        let mut e = editor_with("");
+        e.lang = Some(LangKind::Python);
+        e.expand_snippet("a\tb\n\tc\td", 0);
+        assert_eq!(e.lines, vec!["a\tb", "    c\td"]);
     }
 
     #[test]
@@ -25056,6 +25480,19 @@ mod tests {
             !e.semantic_overlay_for_test()[1].is_empty(),
             "full reply must colour the previously-bare off-screen line"
         );
+    }
+
+    /// #1558: plain-text matching finds `oo` inside words, left to right
+    /// without overlapping, and nothing for an empty or longer needle.
+    #[test]
+    fn find_text_occurrences_matches_inside_words() {
+        let chars: Vec<char> = "foo food oooo".chars().collect();
+        let oo: Vec<char> = "oo".chars().collect();
+        assert_eq!(find_text_occurrences(&chars, &oo), vec![1, 5, 9, 11]);
+        assert_eq!(find_word_occurrences(&chars, &oo), Vec::<usize>::new());
+        assert!(find_text_occurrences(&chars, &[]).is_empty());
+        let long: Vec<char> = "foo food oooo!".chars().collect();
+        assert!(find_text_occurrences(&chars, &long).is_empty());
     }
 
     #[test]
@@ -32796,6 +33233,75 @@ mod tests {
         e.lang = None;
         assert!(!e.toggle_line_comment());
         assert_eq!(e.lines, vec!["x = 1"]);
+    }
+
+    /// #1157: a file not written yet opens as an empty, clean buffer bound
+    /// to its path, with its language, and the first save creates it.
+    #[test]
+    fn a_new_file_opens_empty_and_its_first_save_creates_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("notes.py");
+        let mut e = Editor::new();
+        e.open_new_file(&path).unwrap();
+        assert_eq!(e.path.as_deref(), Some(path.as_path()));
+        assert_eq!(e.lines, vec![String::new()]);
+        assert!(!e.dirty);
+        assert_eq!(e.language_label(), "Python");
+        assert!(e.status.contains("saving creates it"), "{}", e.status);
+        assert!(!path.exists(), "opening creates nothing");
+        assert!(!e.disk_changed_externally());
+        e.insert_str("x = 1");
+        assert!(matches!(e.save_to_disk().unwrap(), SaveOutcome::Saved));
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim_end(), "x = 1");
+        assert!(!e.disk_changed_externally());
+    }
+
+    /// #1157: a new file that another process creates before the first
+    /// save is an external change: the save refuses to clobber it and a
+    /// clean buffer reloads it.
+    #[test]
+    fn a_new_file_created_elsewhere_before_saving_is_detected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("notes.txt");
+        let mut e = Editor::new();
+        e.open_new_file(&path).unwrap();
+        std::fs::write(&path, "theirs\n").unwrap();
+        assert!(e.disk_changed_externally());
+        e.insert_str("mine");
+        assert!(matches!(
+            e.save_to_disk().unwrap(),
+            SaveOutcome::DiskConflict
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs\n");
+        let mut e = Editor::new();
+        std::fs::remove_file(&path).unwrap();
+        e.open_new_file(&path).unwrap();
+        std::fs::write(&path, "theirs\n").unwrap();
+        assert!(matches!(
+            e.reload_or_flag_conflict(),
+            ExternalChange::Reloaded
+        ));
+        assert_eq!(e.lines[0], "theirs");
+        assert!(!e.disk_changed_externally());
+    }
+
+    /// #1157, negative: an existing file opens with its text, and a new file
+    /// in a missing folder is refused rather than bound to a path no save
+    /// could write.
+    #[test]
+    fn a_new_file_keeps_existing_text_and_needs_its_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old.txt");
+        std::fs::write(&path, "kept\n").unwrap();
+        let mut e = Editor::new();
+        e.open_new_file(&path).unwrap();
+        assert_eq!(e.lines[0], "kept");
+        let mut e = Editor::new();
+        let err = e
+            .open_new_file(&tmp.path().join("gone/new.txt"))
+            .unwrap_err();
+        assert!(err.to_string().contains("no such directory"), "{err}");
+        assert!(e.path.is_none());
     }
 
     /// #1181: where the language has only block comments, Toggle Line

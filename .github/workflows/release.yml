@@ -24,9 +24,9 @@ on:
       - "v*"
   # Dispatched on a branch, this builds the matrix without publishing, to
   # prove a tag would work before cutting one. Dispatched on a tag ref, what
-  # tag.yml and publish-crate.yml do because a tag pushed with github.token
-  # never fires the `push: tags` trigger above, github.ref is that tag and
-  # the release publishes as if the tag push had triggered it.
+  # publish-crate.yml does every PUBLISH_EVERY versions because a tag pushed
+  # with github.token never fires the `push: tags` trigger above, github.ref
+  # is that tag and the release publishes as if the tag push had triggered it.
   workflow_dispatch:
 
 # Read at the top level; only the publish job needs write, and only to
@@ -171,8 +171,8 @@ jobs:
       id-token: write
     # Only a tag ref publishes. A workflow_dispatch on a branch builds and
     # stops, which is how you prove the matrix works without cutting a
-    # release; a dispatch on a tag ref (as tag.yml and publish-crate.yml
-    # send) carries that tag here and publishes.
+    # release; a dispatch on a tag ref (as publish-crate.yml sends) carries
+    # that tag here and publishes.
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v7
@@ -253,23 +253,29 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           tag="${GITHUB_REF#refs/tags/}"
           version="${tag#v}"
-          notes="src/release_notes/$version.md"
-          if [ -f "$notes" ]; then
-            gh release create "$tag" --title "$tag" --notes-file "$notes" \
-              dist/croft-*.tar.gz dist/SHA256SUMS dist/SHA256SUMS.sigstore.json
-          else
-            # Every version has a notes file: version-bump.yml writes it in
-            # the commit that sets the version, and before that ci.yml's
-            # release-notes gate required one. A missing one means the tag
-            # does not match any version. Say so rather than inventing a body.
-            echo "no src/release_notes/$version.md for tag $tag" >&2
-            exit 1
-          fi
+          # A release goes out every PUBLISH_EVERY versions (publish-crate.yml),
+          # so its body is the notes of every version since the newest release
+          # already out, not this version's alone. release.py refuses a tag
+          # with no src/release_notes/<version>.md: version-bump.yml writes one
+          # in the commit that sets every version, and before that ci.yml's
+          # release-notes gate required one, so a missing one means the tag
+          # does not match any version. It says so rather than inventing a body.
+          gh release list --exclude-drafts --limit 1000 --json tagName --jq '.[].tagName' \
+            > "$RUNNER_TEMP/released.txt"
+          python3 scripts/release.py notes "$version" < "$RUNNER_TEMP/released.txt" \
+            > "$RUNNER_TEMP/notes.md"
+          gh release create "$tag" --title "$tag" --notes-file "$RUNNER_TEMP/notes.md" \
+            dist/croft-*.tar.gz dist/SHA256SUMS dist/SHA256SUMS.sigstore.json
 
   crates:
     name: publish to crates.io
+    # A release started by publish-crate.yml finds its version on crates.io
+    # already and skips; this publishes only for a `v*` tag pushed by hand,
+    # so that release still reaches crates.io too (#1579).
+    #
     # `cargo binstall croft-software` asks crates.io for the newest version
     # and then downloads that version's release archive. With no publish
     # here crates.io stayed on 0.2.3, whose tag has no release, so binstall
