@@ -577,7 +577,17 @@ impl Prefs {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let json = serde_json::to_string_pretty(&self.document()?).context("serializing prefs")?;
+        let doc = self.document()?;
+        // The file is edited in place, so its comments and layout survive a
+        // setting changed from inside croft (#1129). Plain JSON only when
+        // there is no file yet or it cannot be edited that way.
+        let json = match std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| crate::jsonc_edit::update(&text, &doc))
+        {
+            Some(json) => json,
+            None => serde_json::to_string_pretty(&doc).context("serializing prefs")?,
+        };
         let before = crate::config_sync::stamp(path);
         // Written aside and renamed in: a reader on another thread (the MCP
         // worker's fingerprint check) must never see a truncated file, and a
@@ -1581,8 +1591,11 @@ mod tests {
         assert!(Prefs::load(&path).unwrap().osk_split);
         save_mcp_consent_in(dir.path(), "ext").unwrap();
         set_disable_secret_redaction(&path, true).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        // The comment survives the saves (#1129).
+        assert!(text.contains("// shared base"), "{text}");
         let doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            serde_json::from_str(&crate::tasks::strip_jsonc(&text)).unwrap();
         assert_eq!(doc["extends"], "base.json");
         assert_eq!(doc["macos"]["theme"], "light");
         assert_eq!(doc["future_setting"], 7);
@@ -1592,6 +1605,52 @@ mod tests {
         let prefs = Prefs::load(&path).unwrap();
         assert!(prefs.mcp_consented.contains("ext"));
         assert!(prefs.disable_secret_redaction);
+    }
+
+    /// #1129: a setting changed from inside croft (File: Toggle Auto Save
+    /// here) keeps the file's comments, key order and trailing commas; it
+    /// used to come back as plain sorted JSON with every comment gone.
+    #[test]
+    fn a_setting_saved_from_croft_keeps_the_files_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let text = r#"{
+  // Team defaults live in dotfiles; keep this file small.
+  "theme": "dark",
+  /* Format on save is OFF on purpose: prettier fights ruff here.
+     See INFRA-2231 before turning it back on. */
+  "format_on_save": false,
+  "linux": {
+    "theme": "nord", // matches the tmux theme on the build boxes
+  },
+}
+"#;
+        std::fs::write(&path, text).unwrap();
+        let mut prefs = Prefs::load_for_update(&path).unwrap();
+        prefs.auto_save = true;
+        prefs.save(&path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            saved,
+            text.replace("  },\n}", "  },\n  \"auto_save\": true,\n}"),
+            "{saved}"
+        );
+        assert!(Prefs::load(&path).unwrap().auto_save);
+    }
+
+    /// #1129 negative: with no file yet, or one that does not parse as a
+    /// settings object, the save still writes plain JSON.
+    #[test]
+    fn a_missing_or_unreadable_file_is_still_written_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut prefs = Prefs::load_for_update(&path).unwrap();
+        prefs.auto_save = true;
+        prefs.save(&path).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["auto_save"], true);
+        assert!(crate::jsonc_edit::update("[]", &doc).is_none());
     }
 
     #[test]
