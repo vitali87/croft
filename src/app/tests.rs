@@ -4486,8 +4486,8 @@ fn the_comment_commands_comment_an_xml_file() {
             app.editor.cursor_row = 1;
         }
     }
-    // Negative: a JSON file has no comment at all and says so.
-    let f = tmp.path().join("data.json");
+    // Negative: a file with no comment at all says so.
+    let f = tmp.path().join("data.unknownext");
     std::fs::write(&f, "{}\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open_pinned(&f).unwrap();

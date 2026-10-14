@@ -1,1 +1,1 @@
-fix: Toggle Block Comment (Shift+Alt+A) comments XML files (`.xml`, `.xsd`, `.xsl`, `.xslt`, `.plist`, `.svg`) with `<!-- -->`, and Toggle Line Comment (Ctrl+/) in a language with only block comments (XML, HTML, Markdown, CSS) wraps the selected lines in them, as VS Code does. Both did nothing before.
+fix: Toggle Block Comment (Shift+Alt+A) comments XML files (`.xml`, `.xsd`, `.xsl`, `.xslt`, `.plist`, `.svg`) with `<!-- -->` instead of doing nothing.

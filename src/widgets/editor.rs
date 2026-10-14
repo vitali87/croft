@@ -11548,70 +11548,46 @@ impl Editor {
     /// each on its own. Returns false for languages with no block comment
     /// (e.g. YAML).
     pub fn toggle_block_comment(&mut self) -> bool {
-        self.toggle_block_comment_over(false)
-    }
-
-    /// Toggle Block Comment on each selection, or with `whole_lines` on
-    /// every line a selection touches (Toggle Line Comment in a language
-    /// with no line comment). A selection ending at the start of a line
-    /// leaves that line out, as a line comment does.
-    fn toggle_block_comment_over(&mut self, whole_lines: bool) -> bool {
         let Some((open, close)) = block_comment_tokens(self.lang) else {
             return false;
         };
         let last = self.lines.len().saturating_sub(1);
-        // (start, end, primary, keeps a selection): a line-comment toggle
-        // over a selection keeps the lines selected, so toggling again
-        // undoes it.
-        let mut ranges: Vec<(BPos, BPos, bool, bool)> = self
+        let mut ranges: Vec<(BPos, BPos, bool)> = self
             .selections_with_primary()
             .iter()
             .enumerate()
             .map(|(i, s)| {
-                let (start, end) = if whole_lines {
-                    let (a, b) = s.normalised();
-                    let end_row = if s.has_area() && b.1 == 0 && b.0 > a.0 {
-                        b.0 - 1
-                    } else {
-                        b.0
-                    }
-                    .min(last);
-                    ((a.0.min(last), 0), (end_row, self.line_char_len(end_row)))
-                } else if s.has_area() {
+                let (start, end) = if s.has_area() {
                     s.normalised()
                 } else {
                     let row = s.head.0.min(last);
                     ((row, 0), (row, self.line_char_len(row)))
                 };
-                (start, end, i == 0, whole_lines && s.has_area())
+                (start, end, i == 0)
             })
             .collect();
         // Two carets on one line comment it once.
         ranges.sort_unstable();
-        let mut merged: Vec<(BPos, BPos, bool, bool)> = Vec::new();
-        for (start, end, primary, select) in ranges {
+        let mut merged: Vec<(BPos, BPos, bool)> = Vec::new();
+        for (start, end, primary) in ranges {
             match merged.last_mut() {
                 Some(m) if start < m.1 || start == m.0 => {
                     m.1 = m.1.max(end);
                     m.2 |= primary;
-                    m.3 |= select;
                 }
-                _ => merged.push((start, end, primary, select)),
+                _ => merged.push((start, end, primary)),
             }
         }
         if merged
             .iter()
-            .all(|&(start, end, _, _)| self.char_range_text(start, end).trim().is_empty())
+            .all(|&(start, end, _)| self.char_range_text(start, end).trim().is_empty())
         {
             return false;
         }
         self.push_undo(EditKind::ToggleComment);
         // From the bottom up, so an edit never moves a range still to come.
         let mut placed: Vec<(bool, (usize, usize))> = Vec::with_capacity(merged.len());
-        // Whole lines keep the line count, so a range's start row (its
-        // selection's anchor) stays put through the edits below it.
-        let mut anchors: Vec<Option<(usize, usize)>> = Vec::with_capacity(merged.len());
-        for &(start, end, primary, select) in merged.iter().rev() {
+        for &(start, end, primary) in merged.iter().rev() {
             let text = self.char_range_text(start, end);
             let trimmed = text.trim();
             let caret = if trimmed.is_empty() {
@@ -11640,9 +11616,8 @@ impl Editor {
                 text_end(start, &before)
             };
             placed.push((primary, self.pin_from_end(caret)));
-            anchors.push(select.then_some((start.0, 0)));
         }
-        self.place_pinned_selections(&placed, &anchors);
+        self.place_pinned_carets(&placed);
         self.mark_buffer_changed();
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
@@ -11652,25 +11627,11 @@ impl Editor {
     /// Put a bare caret at each pinned position, the one marked primary as
     /// the primary caret.
     fn place_pinned_carets(&mut self, placed: &[(bool, (usize, usize))]) {
-        self.place_pinned_selections(placed, &[]);
-    }
-
-    /// `place_pinned_carets`, with each caret that has an anchor in
-    /// `anchors` (matched by index) selecting from it.
-    fn place_pinned_selections(
-        &mut self,
-        placed: &[(bool, (usize, usize))],
-        anchors: &[Option<(usize, usize)>],
-    ) {
         let mut all: Vec<EditorSelection> = placed
             .iter()
-            .enumerate()
-            .map(|(i, &(_, pin))| {
-                let head = self.unpin_from_end(pin);
-                match anchors.get(i).copied().flatten() {
-                    Some(anchor) => EditorSelection { anchor, head },
-                    None => EditorSelection::new(head.0, head.1),
-                }
+            .map(|&(_, pin)| {
+                let (r, c) = self.unpin_from_end(pin);
+                EditorSelection::new(r, c)
             })
             .collect();
         if let Some(i) = placed.iter().position(|&(primary, _)| primary) {
@@ -32863,9 +32824,10 @@ mod tests {
         );
     }
 
-    /// #1161, negative: a selection ending at the start of a line leaves
-    /// that line out, a language with a line comment keeps it, and one with
-    /// neither (JSON, Plain Text) still does nothing.
+    /// #1161, negative: a selection ending at the start of a line takes that
+    /// line in, as a line comment does, a language with a line comment
+    /// (JSON's `//` since #1181) keeps it, and plain text, with neither,
+    /// still does nothing.
     #[test]
     fn toggle_line_comment_falls_back_only_without_a_line_comment() {
         let mut e = editor_with("<a/>\n<b/>\n<c/>");
@@ -32875,7 +32837,7 @@ mod tests {
             head: (1, 0),
         });
         assert!(e.toggle_line_comment());
-        assert_eq!(e.lines, vec!["<!-- <a/> -->", "<b/>", "<c/>"]);
+        assert_eq!(e.lines, vec!["<!-- <a/>", "<b/> -->", "<c/>"]);
 
         let mut e = editor_with("let x = 1;");
         e.lang = Some(LangKind::Rust);
@@ -32886,9 +32848,9 @@ mod tests {
             let mut e = editor_with("{}");
             e.lang = lang;
             let changed = e.toggle_line_comment();
-            assert_eq!(changed, lang == Some(LangKind::Yaml), "{lang:?}");
-            if lang != Some(LangKind::Yaml) {
-                assert_eq!(e.lines, vec!["{}"], "{lang:?}");
+            assert_eq!(changed, lang.is_some(), "{lang:?}");
+            if lang.is_none() {
+                assert_eq!(e.lines, vec!["{}"]);
             }
         }
     }
