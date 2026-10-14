@@ -701,6 +701,53 @@ pub struct DiagnosticsUpdate {
     pub path: PathBuf,
     pub server: String,
     pub diagnostics: Vec<Diagnostic>,
+    /// The batch answers a pull (`textDocument/diagnostic` or
+    /// `workspace/diagnostic`) rather than a `publishDiagnostics` push. A
+    /// server can do both with different findings, rust-analyzer pulling
+    /// its own analysis and pushing `cargo check`, so the two are kept
+    /// apart and neither replaces the other (#1102).
+    pub pulled: bool,
+}
+
+/// Marks the store entry holding what a server answered to a pull, beside
+/// the entry of what it pushed (#1102). rust-analyzer answers a pull with
+/// its own analysis and pushes the `cargo check` results; one entry per
+/// server let each empty the other, so an open file showed no compile
+/// errors. A server name never holds a NUL.
+const PULLED_DIAGNOSTICS: &str = "\u{0}pulled";
+
+/// The diagnostics store key for an update: its server's name, marked
+/// when the update answers a pull.
+pub fn diagnostics_store_key(u: &DiagnosticsUpdate) -> String {
+    if u.pulled {
+        format!("{}{PULLED_DIAGNOSTICS}", u.server)
+    } else {
+        u.server.clone()
+    }
+}
+
+/// The server (or other source) a diagnostics store key names.
+pub fn diagnostics_source(key: &str) -> &str {
+    key.strip_suffix(PULLED_DIAGNOSTICS).unwrap_or(key)
+}
+
+/// One path's stored diagnostics, each with the source that reported it.
+/// A server's pulled findings leave out any its push already carries, so a
+/// server that reports the same finding both ways shows it once.
+pub fn diagnostics_by_source(
+    by_server: &std::collections::HashMap<String, Vec<Diagnostic>>,
+) -> impl Iterator<Item = (&str, &Diagnostic)> {
+    by_server.iter().flat_map(move |(key, diags)| {
+        let source = diagnostics_source(key);
+        let pushed = key
+            .ends_with(PULLED_DIAGNOSTICS)
+            .then(|| by_server.get(source))
+            .flatten();
+        diags
+            .iter()
+            .filter(move |d| !pushed.is_some_and(|p| p.contains(d)))
+            .map(move |d| (source, d))
+    })
 }
 
 /// A server's work-done progress update, forwarded from a `$/progress`
@@ -3355,6 +3402,7 @@ impl WorkerState {
                     path: path.clone(),
                     server: managed.name.clone(),
                     diagnostics: Vec::new(),
+                    pulled: true,
                 });
             }
         }
@@ -6263,6 +6311,7 @@ fn apply_workspace_report(
                     path,
                     server: server.to_string(),
                     diagnostics,
+                    pulled: true,
                 });
                 forwarded += 1;
             }
@@ -6342,6 +6391,7 @@ impl DocumentPull {
                 path,
                 server: self.name.clone(),
                 diagnostics: Vec::new(),
+                pulled: true,
             });
         }
     }
@@ -6465,6 +6515,7 @@ fn spawn_document_pulls_within(
                     .iter()
                     .map(crate::lsp::client::convert_diagnostic)
                     .collect(),
+                pulled: true,
             });
         });
     }
@@ -7177,13 +7228,13 @@ fn build_client_capabilities() -> ClientCapabilities {
 }
 
 /// The language server language for `path`: its `files_associations` id
-/// (#1574), else its extension. The app's sync uses it to decide which
-/// tabs go to the servers at all.
+/// (#1574), else what its name and extension map to (#1084). The app's
+/// sync uses it to decide which tabs go to the servers at all.
 pub(crate) fn path_to_language(path: &Path) -> Option<Language> {
     // `files_associations` first (#1574), so the server serves the
     // language the editor highlights: a known id with no server gets none.
-    // An id croft does not know falls through to the extension, as it
-    // does for highlighting.
+    // An id croft does not know falls through to the name and extension,
+    // as it does for highlighting.
     if let Some(id) = crate::highlight::associated_language_id(path) {
         let lang = crate::lsp::languages::resolve(&id);
         if lang.is_some()
@@ -7193,9 +7244,7 @@ pub(crate) fn path_to_language(path: &Path) -> Option<Language> {
             return lang;
         }
     }
-    path.extension()
-        .and_then(|e| e.to_str())
-        .and_then(Language::from_extension)
+    Language::from_path(path)
 }
 
 /// Project-manifest filenames whose presence marks a directory as the root of a
@@ -9006,6 +9055,30 @@ while True:
                 CodeActionOptions::default()
             ))),
             "an options object means supported"
+        );
+    }
+
+    /// #1084: didOpen names a JSON-with-comments file `jsonc`, so the JSON
+    /// server neither flags its comments nor errors on trailing commas; plain
+    /// JSON stays `json`.
+    #[test]
+    fn json_with_comments_files_open_as_jsonc() {
+        let jsonc = Language::from_lsp_id("jsonc").expect("jsonc is a language");
+        for path in [
+            "/repo/tsconfig.json",
+            "/repo/.vscode/launch.json",
+            "/repo/.babelrc",
+            "/repo/notes.jsonc",
+        ] {
+            let lang = path_to_language(Path::new(path));
+            assert_eq!(lang, Some(jsonc), "{path}");
+            assert_eq!(lang.unwrap().lsp_id(), "jsonc");
+        }
+        let keybindings = crate::prefs::config_dir().join("keybindings.json");
+        assert_eq!(path_to_language(&keybindings), Some(jsonc));
+        assert_eq!(
+            path_to_language(Path::new("/repo/package.json")),
+            Some(Language::JSON)
         );
     }
 
