@@ -58894,7 +58894,9 @@ impl App {
         if !self.auto_save_on_focus_change {
             return false;
         }
-        self.sweep_dirty_buffers(false, false)
+        // An auto save: the caret lines keep their trailing whitespace,
+        // since the user may be mid-word when they alt-tab away (#1455).
+        self.sweep_dirty_buffers(false, false, true)
     }
 
     /// Sample the current focus (pane, active tab, active path) and report
