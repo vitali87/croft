@@ -563,7 +563,6 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::GitCopyPermalink,
     Command::GitCopyHeadLink,
     Command::GitOpenOnRemote,
-
     Command::GitViewStash,
     Command::AddCursorAbove,
     Command::AddCursorBelow,

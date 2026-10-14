@@ -284,7 +284,6 @@ const COMMANDS: &[(&str, &str)] = &[
     ("issue.copyGithubHeadLink", "git_copy_head_link"),
     ("issue.openGithubPermalink", "git_open_on_remote"),
     ("github.openOnGitHub", "git_open_on_remote"),
-
     ("git.createTag", "git_create_tag"),
     ("git.pushTags", "git_push_tags"),
     ("git.deleteRemoteTag", "git_delete_remote_tag"),
