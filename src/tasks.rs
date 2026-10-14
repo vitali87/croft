@@ -668,9 +668,11 @@ fn cargo_tasks(root: &Path) -> Vec<Task> {
 }
 
 fn pyproject_tasks(root: &Path) -> Vec<Task> {
-    let uv_on_path = std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|p| p.join("uv").is_file()));
-    pyproject_tasks_on(root, uv_on_path)
+    let on_path = |tool: &str| {
+        std::env::var_os("PATH")
+            .is_some_and(|paths| std::env::split_paths(&paths).any(|p| p.join(tool).is_file()))
+    };
+    pyproject_tasks_on(root, &on_path)
 }
 
 /// Tasks for a `pyproject.toml`: its scripts and, when it mentions pytest,
@@ -679,8 +681,11 @@ fn pyproject_tasks(root: &Path) -> Vec<Task> {
 /// lockfile: `uv.lock` means uv, Poetry's lock or table means Poetry, PDM's
 /// means PDM, then a project venv, then uv only when it is installed. A
 /// Poetry project under `uv run` fails with "No `project` table found", and
-/// a machine without uv fails every task.
-fn pyproject_tasks_on(root: &Path, uv_on_path: bool) -> Vec<Task> {
+/// a machine without uv fails every task. Each tool is used only when
+/// `on_path` finds it: a Poetry repo set up with a plain `python -m venv`
+/// offered nothing but `poetry run` tasks that failed with exit 127, while
+/// its `.venv` would have run them.
+fn pyproject_tasks_on(root: &Path, on_path: &dyn Fn(&str) -> bool) -> Vec<Task> {
     let Some(text) = read_first(root, &["pyproject.toml"]) else {
         return Vec::new();
     };
@@ -690,14 +695,23 @@ fn pyproject_tasks_on(root: &Path, uv_on_path: bool) -> Vec<Task> {
         .into_iter()
         .find(|v| root.join(v).join("bin/python").is_file());
     // (prefix for a script, the pytest command)
-    let (script_prefix, pytest) = if root.join("uv.lock").exists() {
+    let uv_on_path = on_path("uv");
+    let uv_runs = root.join("uv.lock").exists() && uv_on_path;
+    let poetry_runs = !uv_runs
+        && (root.join("poetry.lock").exists() || tool("poetry").is_some())
+        && on_path("poetry");
+    let pdm_runs = !uv_runs
+        && !poetry_runs
+        && (root.join("pdm.lock").exists() || tool("pdm").is_some())
+        && on_path("pdm");
+    let (script_prefix, pytest) = if uv_runs {
         (String::from("uv run "), String::from("uv run pytest"))
-    } else if root.join("poetry.lock").exists() || tool("poetry").is_some() {
+    } else if poetry_runs {
         (
             String::from("poetry run "),
             String::from("poetry run pytest"),
         )
-    } else if root.join("pdm.lock").exists() || tool("pdm").is_some() {
+    } else if pdm_runs {
         (String::from("pdm run "), String::from("pdm run pytest"))
     } else if let Some(venv) = venv {
         (
@@ -709,10 +723,17 @@ fn pyproject_tasks_on(root: &Path, uv_on_path: bool) -> Vec<Task> {
     } else {
         (String::new(), String::from("python3 -m pytest"))
     };
+    // `[project.scripts]` and Poetry's scripts are entry points installed
+    // into the venv's `bin/`, so any runner reaches them. `[tool.pdm.scripts]`
+    // are PDM's own task definitions (`lint = "ruff check ."`), which only
+    // `pdm run` understands: under the venv or uv they named a binary that
+    // does not exist.
     let script_tables = [
         table.get("project").and_then(|p| p.get("scripts")),
         tool("poetry").and_then(|p| p.get("scripts")),
-        tool("pdm").and_then(|p| p.get("scripts")),
+        tool("pdm")
+            .and_then(|p| p.get("scripts"))
+            .filter(|_| pdm_runs),
     ];
     let mut names: Vec<&String> = Vec::new();
     for scripts in script_tables
@@ -912,6 +933,7 @@ mod tests {
         let ctx = crate::dap::configs::SubstCtx {
             workspace_folder: ws.clone(),
             file: Some(ws.join("a;touch${IFS}pwned.rs")),
+            folders: Vec::new(),
         };
         let build = task("build").command_line(&ctx).unwrap();
         assert!(
@@ -952,6 +974,7 @@ mod tests {
         let no_file = crate::dap::configs::SubstCtx {
             workspace_folder: PathBuf::from("/w"),
             file: None,
+            folders: Vec::new(),
         };
         assert!(
             task("build").command_line(&no_file).is_err(),
@@ -1215,16 +1238,31 @@ mod tests {
         .unwrap();
         let cmds = py_commands(tmp.path(), true);
         assert_eq!(cmds, ["uv run serve", "uv run pytest"]);
-        // A uv.lock means uv whether or not this PATH has it.
+        // A uv.lock means uv, while uv is installed (#1296).
         std::fs::write(tmp.path().join("uv.lock"), "").unwrap();
         assert_eq!(
-            py_commands(tmp.path(), false),
+            py_commands_with(tmp.path(), &["uv"]),
             ["uv run serve", "uv run pytest"]
+        );
+        assert_eq!(
+            py_commands(tmp.path(), false),
+            ["serve", "python3 -m pytest"]
         );
     }
 
-    fn py_commands(root: &Path, uv_on_path: bool) -> Vec<String> {
-        pyproject_tasks_on(root, uv_on_path)
+    /// The commands with every runner on PATH, or none.
+    fn py_commands(root: &Path, on_path: bool) -> Vec<String> {
+        let tools: &[&str] = if on_path {
+            &["uv", "poetry", "pdm"]
+        } else {
+            &[]
+        };
+        py_commands_with(root, tools)
+    }
+
+    /// The commands with only `tools` on PATH.
+    fn py_commands_with(root: &Path, tools: &[&str]) -> Vec<String> {
+        pyproject_tasks_on(root, &|tool: &str| tools.contains(&tool))
             .into_iter()
             .map(|t| {
                 assert_eq!(t.label, t.command);
@@ -1287,6 +1325,90 @@ mod tests {
         assert_eq!(
             py_commands(tmp.path(), true),
             ["pdm run lint", "pdm run pytest"]
+        );
+    }
+
+    /// #1296 negative: `[tool.pdm.scripts]` are PDM task definitions, not
+    /// installed binaries, so without PDM they are left out rather than
+    /// offered as `.venv/bin/lint` or `uv run lint`, which fail.
+    #[test]
+    fn pdm_scripts_need_pdm_to_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\n\n[project.scripts]\nserve = \"x:main\"\n\n[tool.pdm.scripts]\nlint = \"ruff check .\"\n\n[tool.pdm.dev-dependencies]\ntest = [\"pytest\"]\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("pdm.lock"), "").unwrap();
+        assert_eq!(
+            py_commands_with(tmp.path(), &["pdm"]),
+            ["pdm run serve", "pdm run lint", "pdm run pytest"]
+        );
+        assert_eq!(
+            py_commands_with(tmp.path(), &["uv"]),
+            ["uv run serve", "uv run pytest"]
+        );
+        std::fs::create_dir_all(tmp.path().join(".venv/bin")).unwrap();
+        std::fs::write(tmp.path().join(".venv/bin/python"), "").unwrap();
+        assert_eq!(
+            py_commands_with(tmp.path(), &[]),
+            [".venv/bin/serve", ".venv/bin/python -m pytest"]
+        );
+    }
+
+    /// #1296: a Poetry, PDM or uv project whose tool is not installed runs
+    /// through the venv it was set up with, rather than offering only tasks
+    /// that fail with exit 127.
+    #[test]
+    fn a_project_whose_tool_is_not_installed_runs_through_its_venv() {
+        let venv = |root: &Path| {
+            std::fs::create_dir_all(root.join(".venv/bin")).unwrap();
+            std::fs::write(root.join(".venv/bin/python"), "").unwrap();
+        };
+        let poetry = tempfile::tempdir().unwrap();
+        std::fs::write(poetry.path().join("pyproject.toml"), POETRY_PYPROJECT).unwrap();
+        venv(poetry.path());
+        assert_eq!(
+            py_commands_with(poetry.path(), &["uv"]),
+            [".venv/bin/calc", ".venv/bin/python -m pytest"]
+        );
+        let pdm = tempfile::tempdir().unwrap();
+        std::fs::write(
+            pdm.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\n\n[tool.pdm.dev-dependencies]\ntest = [\"pytest\"]\n",
+        )
+        .unwrap();
+        std::fs::write(pdm.path().join("pdm.lock"), "").unwrap();
+        venv(pdm.path());
+        assert_eq!(
+            py_commands_with(pdm.path(), &["poetry"]),
+            [".venv/bin/python -m pytest"]
+        );
+        let uv = tempfile::tempdir().unwrap();
+        std::fs::write(
+            uv.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\ndependencies = [\"pytest\"]\n",
+        )
+        .unwrap();
+        std::fs::write(uv.path().join("uv.lock"), "").unwrap();
+        venv(uv.path());
+        assert_eq!(
+            py_commands(uv.path(), false),
+            [".venv/bin/python -m pytest"]
+        );
+    }
+
+    /// #1296 negative: with the project's own tool installed, it still runs
+    /// the tasks, venv or not.
+    #[test]
+    fn a_project_whose_tool_is_installed_still_uses_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("pyproject.toml"), POETRY_PYPROJECT).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".venv/bin")).unwrap();
+        std::fs::write(tmp.path().join(".venv/bin/python"), "").unwrap();
+        assert_eq!(
+            py_commands_with(tmp.path(), &["poetry"]),
+            ["poetry run calc", "poetry run pytest"]
         );
     }
 
@@ -1372,6 +1494,7 @@ mod tests {
         crate::dap::configs::SubstCtx {
             workspace_folder: root.to_path_buf(),
             file: None,
+            folders: Vec::new(),
         }
     }
 

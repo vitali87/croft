@@ -119,6 +119,9 @@ pub enum ListPurpose {
     /// A language server's `window/showMessageRequest` (#1599): the rows
     /// are its actions, `id` an index into them; Esc answers no action.
     ServerQuestion,
+    /// Notebook: Select Kernel (#1377): the installed kernelspecs, `id`
+    /// the kernel's name.
+    NotebookKernel,
 }
 
 /// The Review Pull Request row that asks for a number or URL instead.
