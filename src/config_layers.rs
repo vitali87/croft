@@ -112,6 +112,7 @@ pub const WORKSPACE_ALLOWED_KEYS: &[&str] = &[
     "word_based_suggestions",
     "disable_inline_blame",
     "disable_auto_close_pairs",
+    "disable_paste_reindent",
     "disable_inline_values",
     "disable_save_before_debug",
     "disable_bracket_colors",
