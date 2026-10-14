@@ -76,6 +76,20 @@ will ask about, such as an error or an empty state. Aim for 30 seconds or less
 and under 1 MB. If nothing visible changed, replace the template's Demo section
 with one line saying why.
 
+To show a before and after, stack the two images, each under its own label.
+Never put them side by side in a table: each image shrinks to half the width
+and the terminal text becomes too small to read.
+
+```markdown
+**Before**
+
+![before](https://raw.githubusercontent.com/vitali87/croft/<sha>/<pr>/before.gif)
+
+**After**
+
+![after](https://raw.githubusercontent.com/vitali87/croft/<sha>/<pr>/after.gif)
+```
+
 To record, use vhs, asciinema with agg, or any screen recorder, then drag the
 file into the PR description.
 
