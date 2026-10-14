@@ -1,0 +1,1 @@
+fix: `croft setup-ghostty` now edits the Ghostty config Ghostty actually reads (`config.ghostty` or `config`, honouring `XDG_CONFIG_HOME`), and refuses off macOS instead of writing a macOS path there and reporting success.

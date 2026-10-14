@@ -1,0 +1,1 @@
+feature: In a terminal with no inline-image support (tmux, plain SSH, GNOME Terminal, Alacritty), an image tab now draws the picture with half-block characters, two pixels a cell in true colour, instead of showing only its header line over an empty tab.
