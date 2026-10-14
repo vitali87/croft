@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use super::model::{Activity, TestCase, TestStatus};
 use super::parse::{
     parse_jest_json, parse_list_line, parse_pytest_collect_line, parse_pytest_line,
-    parse_test_line, parse_vitest_list_line, parse_vitest_tap_line,
+    parse_test_line, parse_vitest_list_json, parse_vitest_list_line, parse_vitest_tap_line,
 };
 use super::regex_escape;
 use crate::output::{self, OutputLevel};
@@ -47,6 +47,9 @@ pub enum TestRequest {
     /// Run every test whose name contains the string (run-at-cursor by
     /// function name). cargo's name filter is a substring match.
     RunFilter(String),
+    /// Run each of these tests by its exact name, one after another, as one
+    /// run (#1535: Rerun Failed Tests). Ends once, failed if any failed.
+    RunMany(Vec<String>),
     /// Run a whole suite by its unanchored name (a header click). The cargo
     /// arm anchors it with [`super::suite_pattern`] so `parse` cannot sweep
     /// `parse_utils::b`; pytest gets it positionally as a node-ID prefix.
@@ -251,6 +254,10 @@ impl TestWorker {
         self.send(TestRequest::RunOne(name));
     }
 
+    pub fn run_many(&self, names: Vec<String>) {
+        let _ = self.request_tx.send(TestRequest::RunMany(names));
+    }
+
     pub fn run_filter(&mut self, pattern: String) {
         self.send(TestRequest::RunFilter(pattern));
     }
@@ -379,6 +386,7 @@ fn worker_loop(
             TestRequest::RunAll => run_all(&root, &etx),
             TestRequest::RunCoverage(scope) => run_coverage(&root, &etx, scope.as_ref()),
             TestRequest::RunOne(name) => run_one(&root, &etx, &name),
+            TestRequest::RunMany(names) => run_many(&root, &etx, &names),
             TestRequest::RunFilter(pattern) => run_filter(&root, &etx, &pattern, false),
             TestRequest::RunSuite(suite) => run_filter(&root, &etx, &suite, true),
             TestRequest::Discover => discover(&root, &etx),
@@ -879,6 +887,73 @@ pub fn build_test_binary(
     }
 }
 
+/// The config file stems and extensions vitest reads its `projects` from.
+const VITEST_CONFIG_STEMS: [&str; 2] = ["vitest.config", "vite.config"];
+const VITEST_CONFIG_EXTS: [&str; 6] = ["ts", "mts", "cts", "js", "mjs", "cjs"];
+
+/// Whether `root` runs vitest projects (#1504), formerly workspaces: a
+/// `vitest.workspace.*` or `vitest.projects.*` file, or a config declaring
+/// `projects` (or the older `workspace`). There tap-flat names a test by its file relative to its
+/// PROJECT, without the project, so two packages' `x.test.ts` collapse into
+/// one suite and same-named tests overwrite each other. A false positive
+/// costs only the live tree updates: the run is read from its JSON report.
+fn vitest_has_projects(root: &Path) -> bool {
+    let ws_file = ["vitest.workspace", "vitest.projects"].iter().any(|stem| {
+        VITEST_CONFIG_EXTS
+            .iter()
+            .chain(&["json"])
+            .any(|ext| root.join(format!("{stem}.{ext}")).is_file())
+    });
+    ws_file
+        || VITEST_CONFIG_STEMS.iter().any(|stem| {
+            VITEST_CONFIG_EXTS.iter().any(|ext| {
+                std::fs::read_to_string(root.join(format!("{stem}.{ext}")))
+                    .is_ok_and(|config| declares_vitest_projects(&config))
+            })
+        })
+}
+
+/// Whether config source declares a `projects:` or `workspace:` key, quoted
+/// or not. Not a parser: a key-shaped word is enough.
+fn declares_vitest_projects(config: &str) -> bool {
+    ["projects", "workspace"].iter().any(|key| {
+        config.match_indices(key).any(|(i, _)| {
+            let word_start = config[..i]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '$'));
+            let after = &config[i + key.len()..];
+            let after = after.strip_prefix(['"', '\'']).unwrap_or(after);
+            word_start && after.trim_start().starts_with(':')
+        })
+    })
+}
+
+/// Run vitest with `args`, a `run` reporting through tap-flat. Outside a
+/// projects setup the tap-flat lines stream into the tree as they come. In
+/// one (#1504) they only reach OUTPUT: the json reporter's report, whose
+/// files are absolute, names the cases once the run ends, rooted at the
+/// workspace-relative file so each package keeps its own tests.
+fn run_vitest(tx: &EpochTx, root: &Path, args: &[String]) -> Option<bool> {
+    if !vitest_has_projects(root) {
+        return run_streaming(tx, js_cmd(root, "vitest", args), one(parse_vitest_tap_line));
+    }
+    static RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let report = std::env::temp_dir().join(format!("croft-vitest-{}-{n}.json", std::process::id()));
+    let _ = std::fs::remove_file(&report);
+    let mut args = args.to_vec();
+    args.push(String::from("--reporter=json"));
+    args.push(format!("--outputFile.json={}", report.display()));
+    let ok = run_streaming(tx, js_cmd(root, "vitest", &args), |_| Vec::new());
+    let text = std::fs::read_to_string(&report).unwrap_or_default();
+    let _ = std::fs::remove_file(&report);
+    for case in parse_jest_json(root, &text) {
+        tx.send(TestResponse::Case(case));
+    }
+    ok
+}
+
 /// vitest argv for one exact test: the file scopes the run and `-t` narrows
 /// to the title. vitest's `-t/--testNamePattern` is jest-compatible — a
 /// REGEX over the full name — so the title is escaped like jest's.
@@ -1097,10 +1172,11 @@ fn run_all(root: &Path, tx: &EpochTx) {
             let cmd = pytest_cmd(root, &[PYTEST_RUN_VERBOSITY, "--color=no"]);
             run_streaming(tx, cmd, one(parse_pytest_line))
         }
-        Runner::Vitest => {
-            let cmd = js_cmd(root, "vitest", &["run", "--reporter=tap-flat"]);
-            run_streaming(tx, cmd, one(parse_vitest_tap_line))
-        }
+        Runner::Vitest => run_vitest(
+            tx,
+            root,
+            &[String::from("run"), String::from("--reporter=tap-flat")],
+        ),
         Runner::Jest => {
             let cmd = js_cmd(root, "jest", &["--json"]);
             run_streaming(tx, cmd, |line| parse_jest_json(root, line))
@@ -1363,11 +1439,10 @@ fn run_coverage(root: &Path, tx: &EpochTx, scope: Option<&CoverageScope>) {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let ok = match runner {
         Runner::Pytest => run_streaming(tx, pytest_cmd(root, &args), one(parse_pytest_line)),
-        Runner::Vitest => run_streaming(
-            tx,
-            js_cmd(root, "vitest", &args),
-            one(parse_vitest_tap_line),
-        ),
+        Runner::Vitest => {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            run_vitest(tx, root, &args)
+        }
         Runner::Jest => run_streaming(tx, js_cmd(root, "jest", &args), |line| {
             parse_jest_json(root, line)
         }),
@@ -1403,15 +1478,67 @@ fn run_one(root: &Path, tx: &EpochTx, name: &str) {
         tx.send(TestResponse::Refused);
         return;
     };
-    let ok = match runner {
+    let ok = run_one_case(root, tx, runner, name);
+    tx.send(TestResponse::Finished { ok: Some(ok) });
+}
+
+/// Run each of `names` exactly, one after another, as a single run (#1535):
+/// every runner can run one test by name, which no shared multi-name filter
+/// spans. All are run whatever an earlier one did, and the run fails if any
+/// of them did.
+fn run_many(root: &Path, tx: &EpochTx, names: &[String]) {
+    let Some(runner) = runner_for(root) else {
+        tx.send(TestResponse::Refused);
+        return;
+    };
+    let mut ok = true;
+    for name in names {
+        ok &= run_one_case_seen(root, tx, runner, name);
+    }
+    tx.send(TestResponse::Finished { ok: Some(ok) });
+}
+
+/// [`run_one_case`], passed only when the runner also reported a result
+/// for `name`: a test renamed since discovery matches nothing, and a
+/// name-filtered runner exits cleanly having run zero tests.
+fn run_one_case_seen(root: &Path, tx: &EpochTx, runner: Runner, name: &str) -> bool {
+    let (case_tx, case_rx) = std::sync::mpsc::channel::<(u64, TestResponse)>();
+    std::thread::scope(|s| {
+        let forward = s.spawn(|| {
+            let mut seen = false;
+            for (epoch, resp) in case_rx {
+                if let TestResponse::Case(case) = &resp {
+                    seen |= case.name == name;
+                }
+                let _ = tx.tx.send((epoch, resp));
+            }
+            seen
+        });
+        let passed = {
+            let etx = EpochTx {
+                tx: &case_tx,
+                epoch: tx.epoch,
+                codeql: tx.codeql,
+                control: tx.control,
+                request: tx.request,
+            };
+            run_one_case(root, &etx, runner, name)
+        };
+        drop(case_tx);
+        let seen = forward.join().unwrap_or(false);
+        passed && seen
+    })
+}
+
+/// One test by its exact name under `runner`, its result streamed; true
+/// when the runner exited cleanly.
+fn run_one_case(root: &Path, tx: &EpochTx, runner: Runner, name: &str) -> bool {
+    match runner {
         Runner::Pytest => {
             let cmd = pytest_cmd(root, &[PYTEST_RUN_VERBOSITY, "--color=no", name]);
             run_streaming(tx, cmd, one(parse_pytest_line))
         }
-        Runner::Vitest => {
-            let cmd = js_cmd(root, "vitest", &vitest_one_args(name));
-            run_streaming(tx, cmd, one(parse_vitest_tap_line))
-        }
+        Runner::Vitest => run_vitest(tx, root, &vitest_one_args(name)),
         Runner::Jest => {
             let cmd = js_cmd(root, "jest", &jest_one_args(name));
             run_streaming(tx, cmd, |line| parse_jest_json(root, line))
@@ -1423,8 +1550,7 @@ fn run_one(root: &Path, tx: &EpochTx, name: &str) {
         Runner::Go => run_go(tx, root, &super::gotest::one_args(name)),
         Runner::Codeql => run_codeql(tx, root, &super::codeqltest::select_args(name)),
     }
-    .unwrap_or(false);
-    tx.send(TestResponse::Finished { ok: Some(ok) });
+    .unwrap_or(false)
 }
 
 /// Run every test matching a name filter. `suite` marks a header click: the
@@ -1455,10 +1581,7 @@ fn run_filter(root: &Path, tx: &EpochTx, pattern: &str, suite: bool) {
             };
             run_streaming(tx, cmd, one(parse_pytest_line))
         }
-        Runner::Vitest => {
-            let cmd = js_cmd(root, "vitest", &vitest_filter_args(pattern, suite));
-            run_streaming(tx, cmd, one(parse_vitest_tap_line))
-        }
+        Runner::Vitest => run_vitest(tx, root, &vitest_filter_args(pattern, suite)),
         Runner::Jest => {
             let cmd = js_cmd(root, "jest", &jest_filter_args(pattern, suite));
             run_streaming(tx, cmd, |line| parse_jest_json(root, line))
@@ -1519,6 +1642,23 @@ fn discover(root: &Path, tx: &EpochTx) {
         // vitest 2 and later exit 0 with no tests either way, and 1 still
         // on a file that fails to load. jest's `--listTests` exits 0 with
         // nothing to list.
+        // A projects setup (#1504) lists as JSON, whose absolute files keep
+        // each package's tests apart; the text listing names a test by its
+        // project and a file relative to that project.
+        Runner::Vitest if vitest_has_projects(root) => {
+            let listed = std::cell::RefCell::new(String::new());
+            let cmd = js_cmd(root, "vitest", &["list", "--json", "--passWithNoTests"]);
+            let ok = run_streaming(tx, cmd, |line| {
+                let mut listed = listed.borrow_mut();
+                listed.push_str(line);
+                listed.push('\n');
+                Vec::new()
+            });
+            for name in parse_vitest_list_json(root, &listed.borrow()) {
+                tx.send(TestResponse::Case(not_run(name)));
+            }
+            ok
+        }
         Runner::Vitest => {
             let cmd = js_cmd(root, "vitest", &["list", "--passWithNoTests"]);
             run_streaming(tx, cmd, |line| {
@@ -2468,6 +2608,63 @@ mod tests {
         }
     }
 
+    /// #1535: Rerun Failed Tests runs each name exactly, all of them even
+    /// after one fails, and the run ends once: failed if any failed, passed
+    /// only when every one did.
+    #[cfg(unix)]
+    #[test]
+    fn run_many_runs_every_name_and_fails_if_any_did() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("pyproject.toml"), "[project]\nname = \"g\"\n").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let etx = EpochTx {
+            tx: &tx,
+            epoch: 0,
+            codeql: Path::new("codeql"),
+            control: &RunControl::default(),
+            request: 1,
+        };
+        let log = root.join(".venv/bin/python.log");
+        let ran = |names: &[&str]| {
+            let _ = std::fs::remove_file(&log);
+            let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            run_many(root, &etx, &names);
+            let finished: Vec<Option<bool>> = rx
+                .try_iter()
+                .filter_map(|(_, r)| match r {
+                    TestResponse::Finished { ok } => Some(ok),
+                    _ => None,
+                })
+                .collect();
+            let calls = std::fs::read_to_string(&log).unwrap_or_default();
+            (calls.lines().count(), finished)
+        };
+
+        fake_venv(
+            root,
+            ".venv",
+            "echo \"$*\" >> \"$0.log\"\ncase \"$*\" in *test_b*) exit 1;; *test_gone*) exit 0;; esac\nfor a; do last=$a; done\necho \"$last PASSED\"\nexit 0",
+        );
+        assert_eq!(
+            ran(&["t.py::test_a", "t.py::test_b", "t.py::test_c"]),
+            (3, vec![Some(false)]),
+            "test_c still runs after test_b fails, and the run ends once, failed"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(calls.contains("t.py::test_a") && calls.contains("t.py::test_c"));
+        assert_eq!(
+            ran(&["t.py::test_a", "t.py::test_c"]),
+            (2, vec![Some(true)]),
+            "every one passing is a passed run"
+        );
+        assert_eq!(
+            ran(&["t.py::test_a", "t.py::test_gone"]),
+            (2, vec![Some(false)]),
+            "a name the runner reported no result for, though it exited 0, fails the run"
+        );
+    }
+
     /// A project whose pytest `addopts` is `addopts`, with a venv python
     /// that answers the way pytest does for the verbosity it ends up at:
     /// `addopts` comes first, `-v` / `-q` (and `-qq`) count up and down
@@ -2975,6 +3172,165 @@ exit 1"#
         fake_js_runner(tmp.path(), "jest", "exit 0");
         assert_eq!(runner_for(tmp.path()), Some(Runner::Jest));
         assert_eq!(discovery_of(tmp.path()), (Vec::new(), Some(Some(true))));
+    }
+
+    /// Run everything in `root` on this thread: the cases reported, in order.
+    fn run_all_of(root: &Path) -> Vec<(String, TestStatus)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let etx = EpochTx {
+            tx: &tx,
+            epoch: 0,
+            codeql: Path::new("codeql"),
+            control: &RunControl::default(),
+            request: 1,
+        };
+        run_all(root, &etx);
+        rx.try_iter()
+            .filter_map(|(_, r)| match r {
+                TestResponse::Case(c) => Some((c.name, c.status)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A stand-in vitest 3 for the #1504 monorepo: packages `a` and `b`
+    /// each hold an `x.test.ts` with the same two tests, and `b`'s second
+    /// fails. tap-flat names each test by its file relative to its project,
+    /// so all four print as `x.test.ts > ...`; `list --json` and the json
+    /// reporter carry absolute files.
+    #[cfg(unix)]
+    fn fake_vitest_monorepo(root: &Path) {
+        let r = root.display();
+        let list = format!(
+            r#"[{{"name":"parses input","file":"{r}/packages/a/x.test.ts","projectName":"a"}},{{"name":"rejects bad input","file":"{r}/packages/a/x.test.ts","projectName":"a"}},{{"name":"parses input","file":"{r}/packages/b/x.test.ts","projectName":"b"}},{{"name":"rejects bad input","file":"{r}/packages/b/x.test.ts","projectName":"b"}}]"#
+        );
+        let pass = |t: &str| {
+            format!(
+                r#"{{"ancestorTitles":[],"status":"passed","title":"{t}","failureMessages":[]}}"#
+            )
+        };
+        let report = format!(
+            r#"{{"testResults":[{{"name":"{r}/packages/a/x.test.ts","assertionResults":[{},{}]}},{{"name":"{r}/packages/b/x.test.ts","assertionResults":[{},{{"ancestorTitles":[],"status":"failed","title":"rejects bad input","failureMessages":["no"]}}]}}]}}"#,
+            pass("parses input"),
+            pass("rejects bad input"),
+            pass("parses input"),
+        );
+        std::fs::write(root.join("list.json"), list).unwrap();
+        std::fs::write(root.join("report.json"), report).unwrap();
+        fake_js_runner(
+            root,
+            "vitest",
+            "case \"$1\" in list)\n\
+               case \" $* \" in *\" --json \"*) cat list.json ;;\n\
+               *) echo '[a] x.test.ts > parses input'; echo '[b] x.test.ts > parses input' ;; esac\n\
+               exit 0 ;; esac\n\
+             echo 'ok 1 - x.test.ts > parses input # time=1ms'\n\
+             echo 'ok 2 - x.test.ts > rejects bad input # time=1ms'\n\
+             echo 'ok 3 - x.test.ts > parses input # time=1ms'\n\
+             echo 'not ok 4 - x.test.ts > rejects bad input # time=1ms'\n\
+             for a in \"$@\"; do case \"$a\" in --outputFile.json=*) cp report.json \"${a#*=}\" ;; esac; done\n\
+             exit 1",
+        );
+    }
+
+    /// #1504: with vitest `projects`, a run reports four tests in two
+    /// packages, not two in one merged `x.test.ts`, and on the same IDs the
+    /// discovery listed.
+    #[cfg(unix)]
+    #[test]
+    fn a_vitest_projects_run_keeps_each_packages_tests_apart() {
+        let tmp = tempfile::tempdir().unwrap();
+        fake_vitest_monorepo(tmp.path());
+        std::fs::write(
+            tmp.path().join("vitest.config.ts"),
+            "import { defineConfig } from 'vitest/config'\n\
+             export default defineConfig({ test: { projects: ['packages/*'] } })\n",
+        )
+        .unwrap();
+        let ran = run_all_of(tmp.path());
+        assert_eq!(
+            ran,
+            vec![
+                (
+                    "packages/a/x.test.ts::parses input".into(),
+                    TestStatus::Passed
+                ),
+                (
+                    "packages/a/x.test.ts::rejects bad input".into(),
+                    TestStatus::Passed
+                ),
+                (
+                    "packages/b/x.test.ts::parses input".into(),
+                    TestStatus::Passed
+                ),
+                (
+                    "packages/b/x.test.ts::rejects bad input".into(),
+                    TestStatus::Failed
+                ),
+            ]
+        );
+        let (listed, finished) = discovery_of(tmp.path());
+        assert_eq!(finished, Some(Some(true)));
+        assert_eq!(listed, ran.into_iter().map(|c| c.0).collect::<Vec<_>>());
+    }
+
+    /// #1504 negative: a single-project vitest root keeps streaming
+    /// tap-flat as before, and is never asked for a JSON report.
+    #[cfg(unix)]
+    #[test]
+    fn a_single_vitest_project_still_streams_tap_flat() {
+        let tmp = tempfile::tempdir().unwrap();
+        fake_vitest_monorepo(tmp.path());
+        std::fs::write(
+            tmp.path().join("vitest.config.ts"),
+            "export default { test: { include: ['projects/**/*.test.ts'] } }\n",
+        )
+        .unwrap();
+        let ran = run_all_of(tmp.path());
+        assert_eq!(ran.len(), 4, "{ran:?}");
+        assert!(
+            ran.iter().all(|c| c.0.starts_with("x.test.ts::")),
+            "{ran:?}"
+        );
+        let (listed, _) = discovery_of(tmp.path());
+        assert_eq!(
+            listed,
+            vec!["[a] x.test.ts::parses input", "[b] x.test.ts::parses input"]
+        );
+    }
+
+    #[test]
+    fn vitest_projects_are_found_in_the_config_or_a_workspace_file() {
+        for config in [
+            "defineConfig({ test: { projects: ['packages/*'] } })",
+            "export default { test: { \"projects\" : [] } }",
+            "export default { test: { 'projects': [] } }",
+            "defineWorkspace; export default { test: { workspace: ['a'] } }",
+        ] {
+            assert!(declares_vitest_projects(config), "{config}");
+        }
+        for config in [
+            "export default { test: { include: ['projects/**'] } }",
+            "const projects = ['a']",
+            "export default { test: { myprojects: 1, workspaceRoot: 'x' } }",
+            "",
+        ] {
+            assert!(!declares_vitest_projects(config), "{config}");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!vitest_has_projects(tmp.path()));
+        std::fs::write(
+            tmp.path().join("vitest.workspace.ts"),
+            "export default []\n",
+        )
+        .unwrap();
+        assert!(vitest_has_projects(tmp.path()));
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("vitest.projects.json"), "[]\n").unwrap();
+        assert!(vitest_has_projects(tmp.path()));
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("vite.config.mts"), "test: { projects: [] }").unwrap();
+        assert!(vitest_has_projects(tmp.path()));
     }
 
     /// #845 guard: `--passWithNoTests` only forgives an empty project. A
