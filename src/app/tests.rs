@@ -28619,6 +28619,19 @@ fn the_update_command_checks_now_and_reports_the_answer() {
     });
 }
 
+/// #1844: Help: Update croft checks for a release only where the startup
+/// check would: never on a remote-launched croft, which the croft that
+/// launched it updates, nor with `CROFT_NO_UPDATE_CHECK` set.
+#[test]
+fn a_manual_update_check_keeps_to_the_startup_checks_rules() {
+    assert_eq!(super::manual_update_check_refusal(false, false), None);
+    for (remote, disabled) in [(true, false), (false, true), (true, true)] {
+        let why = super::manual_update_check_refusal(remote, disabled)
+            .expect("no check when the startup check is off");
+        assert!(why.starts_with("No croft update is waiting"), "{why}");
+    }
+}
+
 // #865: with croft older than its checkout, the status bar offered a
 // rebuild on F9, and F9 then started `cargo install` instead of toggling a
 // breakpoint - and was swallowed while the build ran, and re-exec'd croft

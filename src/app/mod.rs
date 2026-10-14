@@ -207,6 +207,20 @@ const ACTIVITY_ICON_HEIGHT: u16 = 2;
 const ACTIVITY_ICON_GAP: u16 = 0;
 const FALLBACK_CELL_PIXEL: (u32, u32) = (10, 20);
 
+/// Why Help: Update croft must not check for a release itself (#1844),
+/// for the same reasons the startup check stays off: a remote-launched
+/// croft is updated by the croft that launched it, and
+/// `CROFT_NO_UPDATE_CHECK` turns checking off altogether.
+fn manual_update_check_refusal(remote: bool, disabled: bool) -> Option<&'static str> {
+    if remote {
+        Some("No croft update is waiting: this croft is updated by the croft that launched it")
+    } else if disabled {
+        Some("No croft update is waiting, and update checks are off (CROFT_NO_UPDATE_CHECK)")
+    } else {
+        None
+    }
+}
+
 /// One cell's size in pixels, from a window size report of `cols` x `rows`
 /// cells over `width` x `height` pixels; `None` when the terminal reports
 /// no pixel size.
@@ -43749,6 +43763,11 @@ impl App {
             self.start_staged_update(version);
         } else if self.manual_update_check.is_some() {
             self.status = String::from("Already checking for croft updates");
+        } else if let Some(why) = manual_update_check_refusal(
+            std::env::var_os("CROFT_REMOTE_AUTOUPDATE").is_some(),
+            std::env::var_os("CROFT_NO_UPDATE_CHECK").is_some(),
+        ) {
+            self.status = String::from(why);
         } else {
             // Nothing on offer: ask now, and say what the answer was, a
             // missing network included (#1844).

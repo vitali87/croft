@@ -18879,24 +18879,25 @@ fn conflict_row_tint(
 /// too narrow for every full label gets, and its fill.
 struct AcceptChip {
     label: String,
-    short: &'static str,
+    short: String,
     fill: Color,
 }
 
 impl AcceptChip {
-    fn new(label: &str, short: &'static str, fill: Color) -> Self {
+    fn new(label: &str, short: &str, fill: Color) -> Self {
         Self {
             label: label.to_string(),
-            short,
+            short: short.to_string(),
             fill,
         }
     }
 
     /// The button for `state`, ticked when the conflict is already resolved
-    /// that way.
+    /// that way, in both its full and short forms.
     fn ticked(mut self, ticked: bool) -> Self {
         if ticked {
             self.label = format!("\u{2713} {}", self.label);
+            self.short = format!("\u{2713} {}", self.short);
         }
         self
     }
@@ -18917,7 +18918,7 @@ fn lay_out_accept_chips(chips: &[AcceptChip], x0: u16, limit: u16) -> Vec<(u16, 
         let mut out = Vec::new();
         let mut x = x0;
         for c in chips {
-            let text = format!(" {} ", if short { c.short } else { c.label.as_str() });
+            let text = format!(" {} ", if short { &c.short } else { &c.label });
             let w = text.chars().count() as u16;
             if x.saturating_add(w) > limit {
                 break;
@@ -35109,6 +35110,10 @@ mod tests {
         assert!(texts(12).is_empty());
         let ticked = AcceptChip::new("Accept Both", "Both", ACCEPT_BOTH_FILL).ticked(true);
         assert_eq!(ticked.label, "\u{2713} Accept Both");
+        assert_eq!(
+            ticked.short, "\u{2713} Both",
+            "a narrow pane still shows which side was taken"
+        );
     }
 
     #[test]
