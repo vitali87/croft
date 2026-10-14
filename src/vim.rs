@@ -274,6 +274,18 @@ impl VimState {
         self.visual_anchor = Some((row, col));
     }
 
+    /// A count, operator, or other prefix awaits its next key (an Esc in
+    /// Normal mode cancels it).
+    pub fn has_pending(&self) -> bool {
+        self.count.is_some()
+            || self.pending_op.is_some()
+            || self.pending_find.is_some()
+            || self.pending_record
+            || self.pending_replay
+            || self.pending_textobj.is_some()
+            || self.pending_g
+    }
+
     /// Short uppercase label for the status bar, or `None` while typing a
     /// `:`/`/`/`?` line (the caller shows [`Self::command_line`] instead).
     pub fn mode_label(&self) -> Option<&'static str> {
