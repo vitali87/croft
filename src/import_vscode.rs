@@ -188,6 +188,15 @@ fn as_enabled_globs(v: &Value) -> Option<Value> {
     ))
 }
 
+/// A non-empty string, or an explicit `null`, which VS Code accepts for
+/// `editor.defaultFormatter` to clear one named in a lower layer.
+fn as_string(v: &Value) -> Option<Value> {
+    if v.is_null() {
+        return Some(Value::Null);
+    }
+    v.as_str().filter(|s| !s.is_empty()).map(Value::from)
+}
+
 /// The croft settings a VS Code `settings.json` key maps to, for telling a
 /// user who wrote the VS Code name in croft's config which keys to use
 /// (#1607). `files.autoSave` sets two: its focus and window modes are
@@ -208,6 +217,11 @@ const SETTINGS: &[SettingMap] = &[
         vscode: "editor.formatOnSave",
         croft: "format_on_save",
         convert: as_bool,
+    },
+    SettingMap {
+        vscode: "editor.defaultFormatter",
+        croft: "default_formatter",
+        convert: as_string,
     },
     SettingMap {
         vscode: "editor.formatOnType",
@@ -687,10 +701,35 @@ pub fn map_settings(
     let mut warnings: Vec<String> = Vec::new();
     for (key, value) in obj {
         if let Some(ids) = language_block_ids(key) {
+            // `"[typescript]": { "editor.defaultFormatter": … }`, also as
+            // `"[javascript][typescript]"` (#1499): the formatter each
+            // language names. A grouped block keeps its whole key
+            // (`javascript][typescript`) so a layer's grouped block does
+            // not overwrite another layer's single-language one, which
+            // VS Code ranks above it. An explicit `null` is kept as "" so
+            // it still shadows the formatter named for every file. The
+            // block's other keys map per language (#1440).
+            let mut block = value.clone();
+            if let Some(formatter) = block.get("editor.defaultFormatter").and_then(as_string) {
+                if let Some(b) = block.as_object_mut() {
+                    b.remove("editor.defaultFormatter");
+                }
+                let formatter = if formatter.is_null() {
+                    Value::from("")
+                } else {
+                    formatter
+                };
+                let map = settings
+                    .entry(String::from("language_formatters"))
+                    .or_insert_with(|| Value::Object(Map::new()));
+                if let Some(map) = map.as_object_mut() {
+                    map.insert(ids.join("]["), formatter);
+                }
+            }
             map_language_block(
                 key,
                 &ids,
-                value,
+                &block,
                 &mut settings,
                 &mut unmapped,
                 &mut warnings,
@@ -1480,12 +1519,21 @@ mod tests {
                 "markdown": { "disable_inlay_hints": true }
             })
         );
+        assert_eq!(
+            report.settings["language_formatters"],
+            json!({ "python": "charliermarshall.ruff" })
+        );
         assert!(!report.settings.contains_key("format_on_save"));
         assert!(!report.settings.contains_key("terminal_scrollback"));
         let unmapped = &report.unmapped_settings;
+        assert!(
+            !unmapped
+                .iter()
+                .any(|u| u.contains("editor.defaultFormatter")),
+            "{unmapped:?}"
+        );
         for want in [
             "[python] editor.rulers",
-            "[python] editor.defaultFormatter",
             "[markdown] terminal.integrated.scrollback (croft has terminal_scrollback only for every language)",
             "[c] files.autoSave (croft has auto_save only for every language)",
         ] {
@@ -2951,6 +2999,33 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let report = scan_profile(dir.path()).expect("an empty profile is fine");
         assert!(report.is_empty());
+    }
+
+    /// #1499: the importer maps a language block's formatter and reports
+    /// the block's keys croft cannot scope to a language (#1440).
+    #[test]
+    fn a_language_block_maps_its_formatter_and_lists_the_rest() {
+        let doc = serde_json::json!({
+            "editor.defaultFormatter": "esbenp.prettier-vscode",
+            "[python]": { "editor.defaultFormatter": "charliermarsh.ruff", "editor.tabSize": 4 },
+            "[go]": { "editor.tabSize": 8 },
+        });
+        let (mapped, unmapped, _) = map_settings(doc.as_object().unwrap());
+        assert_eq!(
+            mapped.get("default_formatter"),
+            Some(&Value::from("esbenp.prettier-vscode"))
+        );
+        assert_eq!(
+            mapped.get("language_formatters"),
+            Some(&serde_json::json!({ "python": "charliermarsh.ruff" }))
+        );
+        assert_eq!(
+            unmapped,
+            vec![
+                String::from("[go] editor.tabSize"),
+                String::from("[python] editor.tabSize"),
+            ]
+        );
     }
 
     /// #1571: VS Code's Insert Line Below / Above chords import onto croft's
