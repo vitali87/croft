@@ -1,1 +1,0 @@
-fix: Source Control and git submodules: clicking a changed submodule opens what moved in it (its commits and its own changes) instead of "git show HEAD failed: bad object", and Discard on a submodule says it cannot reset it instead of reporting "Discarded" while changing nothing.

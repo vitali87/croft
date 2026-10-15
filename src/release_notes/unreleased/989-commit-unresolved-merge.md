@@ -1,1 +1,0 @@
-fix: Committing during a merge with unresolved conflicts is refused ("Resolve 1 merge conflict (README.md) and stage it before committing") instead of recording the conflict markers in the merge commit.
