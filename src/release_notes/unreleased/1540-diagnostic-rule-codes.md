@@ -1,1 +1,0 @@
-feature: Diagnostics now show their rule code, as VS Code does: a PROBLEMS row reads `` `os` imported but unused Ruff(F401) ``, the hover adds the code and the rule's documentation link, and Fix with Navigator names the rule. Use it to silence a rule (`# noqa: F401`, `# ty: ignore[...]`) or look it up (#1540).
