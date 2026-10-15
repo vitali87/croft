@@ -87715,6 +87715,22 @@ fn a_local_branch_hides_its_remotes_and_switches_plainly() {
     assert_eq!(git_checked(&clone, &["branch", "--show-current"]), "main");
 }
 
+/// #1473: "Markdown: Run Code Block at Cursor" on a README's `console`
+/// fence parks only its commands behind the confirm box: no `$ ` prompt is
+/// typed, and no line of the sample output runs as a command.
+#[test]
+fn running_a_console_fence_types_only_its_commands() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let readme = "```console\n$ echo installed-ok\ninstalled-ok\n$ ls -1 /tmp/rd\nREADME.md\n```\n";
+    let mut app = app_with_open_file(tmp.path(), "README.md", readme);
+    app.editor.cursor_row = 5;
+    app.run_command(Command::RunCodeBlockAtCursor);
+    let pending = app.pending_run_block.as_ref().expect("the fence runs");
+    assert_eq!(pending.code, "echo installed-ok\nls -1 /tmp/rd\n");
+    assert_eq!(pending.command, "echo installed-ok\nls -1 /tmp/rd\r");
+}
+
 /// `a.py` reading `value = 1`, open in the editor, then `00` typed at the
 /// end of the line and saved: the issue's (#1568) setup.
 fn app_with_a_saved_edit() -> (tempfile::TempDir, std::path::PathBuf, App) {
