@@ -1,1 +1,0 @@
-fix: Debugging: a scope the debugger marks expensive, such as js-debug's Global scope in a Node or browser program, is no longer fetched at every stop; it shows collapsed in VARIABLES and is fetched when you open it, and it stays open at later stops until you close it, so stepping no longer waits for the whole global object.

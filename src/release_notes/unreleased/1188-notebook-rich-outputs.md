@@ -1,1 +1,0 @@
-fix: Notebook outputs that carry Markdown, SVG or HTML (`display(Markdown(...))`, `SVG(...)`, `HTML(...)`, a DataFrame) show their content instead of the `<IPython.core.display.Markdown object>` placeholder (#1188)

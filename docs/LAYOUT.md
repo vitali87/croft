@@ -236,7 +236,7 @@ Live Run executes your code on every pause, so it is armed **per file**: togglin
 
 ## Tasks
 
-Zero configuration: `Cmd`/`Ctrl`+`Shift`+`B` runs the project's build task, auto-detected from the manifests the repo already has (Makefile, justfile, package.json with the right lockfile runner (and, in an npm, pnpm or yarn workspaces monorepo, every package's scripts, run from that package), Cargo.toml, pyproject.toml, and `.vscode/tasks.json` when present). "Tasks: Run Task" in the palette lists everything discovered; each task runs in its own named terminal pane, and rerunning reuses that pane.
+Zero configuration: `Cmd`/`Ctrl`+`Shift`+`B` runs the project's build task, auto-detected from the manifests the repo already has (Makefile, justfile, package.json with the right lockfile runner (and, in an npm, pnpm or yarn workspaces monorepo, every package's scripts, run from that package), Cargo.toml, pyproject.toml, go.mod, CMakeLists.txt with its presets, and `.vscode/tasks.json` when present). "Tasks: Run Task" in the palette lists everything discovered; each task runs in its own named terminal pane, and rerunning reuses that pane.
 
 ## Status bar
 
@@ -264,7 +264,7 @@ Which server runs per language:
 | Python | Astral's `ty` as the primary, `basedpyright` as a fallback for the few capabilities `ty` does not yet advertise, and `ruff` for lint |
 | TypeScript / JavaScript | `vtsls` |
 | YAML | `yaml-language-server` |
-| JSON / HTML / CSS, SCSS, Less | the VS Code servers (`vscode-json-language-server`, `vscode-html-language-server`, `vscode-css-language-server`, which also serves `.scss` and `.less`; `.sass` is highlighted only) |
+| JSON / HTML / CSS, SCSS, Less | the VS Code servers (`vscode-json-language-server`, `vscode-html-language-server`, `vscode-css-language-server`, which also serves `.scss` and `.less`; `.sass` is highlighted only). Files written as JSON with comments open as `jsonc`, as in VS Code, so comments are not errors and trailing commas are only warnings: `*.jsonc`, `tsconfig*.json`, `jsconfig*.json`, `.vscode/*.json`, `.devcontainer/*.json`, `*.code-workspace`, `.eslintrc`, `.babelrc`, `babel.config.json`, `.croft/*.json`, and croft's own files under `~/.config/croft/` |
 | Bash | `bash-language-server` |
 | TOML | `taplo` |
 | C / C++ | `clangd` |

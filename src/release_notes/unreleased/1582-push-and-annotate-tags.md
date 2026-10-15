@@ -1,1 +1,0 @@
-feature: Source Control's Tags menu can now publish a tag: Create Tag asks for an optional message and makes an annotated tag with one, Push Tags sends your tags to the remote, and Delete Remote Tag removes a tag from the remote after asking. All three are on the Command Palette too.

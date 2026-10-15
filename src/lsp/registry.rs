@@ -277,6 +277,26 @@ mod tests {
         }
     }
 
+    /// #1084: JSON with comments is served by the JSON server, `.jsonc`
+    /// files included, which no language claimed before.
+    #[test]
+    fn the_json_server_serves_json_with_comments() {
+        let r = ServerRegistry::with_defaults();
+        let jsonc = Language::from_lsp_id("jsonc").expect("jsonc is a language");
+        let servers = r.for_language(jsonc);
+        assert_eq!(servers.len(), 1, "exactly one server for jsonc");
+        assert_eq!(servers[0].name, "vscode-json-language-server");
+        assert_eq!(
+            r.for_extension("jsonc")[0].name,
+            "vscode-json-language-server"
+        );
+        assert_eq!(
+            r.for_extension("json")[0].name,
+            "vscode-json-language-server"
+        );
+        assert_eq!(r.for_language(Language::JSON).len(), 1);
+    }
+
     #[test]
     fn bundled_manifests_register_bash_language_server() {
         // Bash (the `shellscript` language id, .sh/.bash) gets bash-language-server,
