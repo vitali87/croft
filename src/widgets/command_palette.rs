@@ -2581,7 +2581,10 @@ pub fn render_command_palette(
 
     Widget::render(Clear, rect, buf);
     let title = Span::styled(
-        " Command Palette — Esc to close, ↑/↓ to navigate, Enter to run ",
+        format!(
+            " {} ",
+            crate::i18n::tr("Command Palette — Esc to close, ↑/↓ to navigate, Enter to run")
+        ),
         Style::default()
             .fg(theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
             .add_modifier(Modifier::BOLD),
