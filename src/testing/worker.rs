@@ -57,7 +57,14 @@ pub enum TestRequest {
     /// Run with the runner's coverage tool on (#263): everything, or only
     /// the tests `scope` names.
     RunCoverage(Option<CoverageScope>),
-    Discover,
+    /// List the tests without running them. `quiet` is the Testing view's
+    /// own discover (#1841): the worker, not the UI thread, finds the
+    /// runner, which can mean walking the tree for CodeQL test packs. It
+    /// answers [`TestResponse::QuietDiscovery`] first, and a root no runner
+    /// claims ends there, without a refusal the status bar reports.
+    Discover {
+        quiet: bool,
+    },
     /// Rebind the worker's working directory (Explorer re-root). Without it the
     /// worker keeps shelling cargo in the launch dir captured at spawn, so after
     /// a Make Root into a child repo `cargo test -- --list` errors with "could
@@ -89,6 +96,11 @@ pub enum TestResponse {
     /// Running marks the `start_*` call painted instead of stranding them,
     /// and the app can say why nothing ran.
     Refused,
+    /// The worker reached a quiet discovery (#1841). Sent before anything
+    /// else it does, so the drain can tell the request the Testing view
+    /// queued from any other's answers; when no runner claims the root,
+    /// nothing follows it.
+    QuietDiscovery,
     /// A coverage run's report, or why there is none. Sent before its
     /// `Finished`.
     Coverage(Result<super::coverage::Coverage, CoverageError>),
@@ -178,6 +190,10 @@ pub struct TestWorker {
     /// streaming when the Explorer re-roots can't pollute the new project's
     /// tree (same idea as the commit graph's root-tagged drain).
     response_rx: Receiver<(u64, TestResponse)>,
+    /// A quiet discovery is queued and has not started yet (#1841). Until
+    /// the worker reaches it the panel is not busy, so without this every
+    /// reopen of the Testing view would queue another.
+    discover_queued: bool,
     /// Bumped on every [`Self::set_root`], in lockstep with the loop's own
     /// counter: the request channel is FIFO, so both sides count the same
     /// `SetRoot`s in the same order.
@@ -205,6 +221,7 @@ impl TestWorker {
             sent: 0,
             cancel_pending: false,
             response_rx,
+            discover_queued: false,
             expected_epoch: 0,
             #[cfg(test)]
             root,
@@ -224,6 +241,7 @@ impl TestWorker {
                 sent: 0,
                 cancel_pending: false,
                 response_rx,
+                discover_queued: false,
                 expected_epoch: 0,
                 root: PathBuf::new(),
             },
@@ -267,7 +285,26 @@ impl TestWorker {
     }
 
     pub fn discover(&mut self) {
-        self.send(TestRequest::Discover);
+        self.send(TestRequest::Discover { quiet: false });
+    }
+
+    /// Discover from the Testing view (#1841): queued without looking for a
+    /// runner first, so opening the view never waits on that search. The
+    /// worker finds the runner and stays silent when there is none.
+    pub fn discover_quietly(&mut self) {
+        self.discover_queued = true;
+        self.send(TestRequest::Discover { quiet: true });
+    }
+
+    /// A quiet discovery is queued and has not started yet.
+    pub fn discover_queued(&self) -> bool {
+        self.discover_queued
+    }
+
+    /// How many requests have been queued, for tests that count them.
+    #[cfg(test)]
+    pub fn requests_sent(&self) -> u64 {
+        self.sent
     }
 
     pub fn set_codeql_program(&mut self, program: PathBuf) {
@@ -291,6 +328,9 @@ impl TestWorker {
             self.root = root.clone();
         }
         self.expected_epoch += 1;
+        // A discovery queued for the old root reports under the old epoch,
+        // which the drain drops: nothing would ever clear it.
+        self.discover_queued = false;
         // Every request a pending cancel covers was sent before this
         // re-root, so its end carries the old epoch and is dropped below:
         // the cancel must not outlive it and swallow the new root's next
@@ -315,6 +355,10 @@ impl TestWorker {
                 continue;
             }
             match resp {
+                TestResponse::QuietDiscovery => {
+                    self.discover_queued = false;
+                    continue;
+                }
                 TestResponse::Started(activity) => panel.on_busy_started(activity),
                 TestResponse::Case(case) => panel.apply_case(case),
                 TestResponse::Progress(line) => panel.set_progress(line),
@@ -389,7 +433,7 @@ fn worker_loop(
             TestRequest::RunMany(names) => run_many(&root, &etx, &names),
             TestRequest::RunFilter(pattern) => run_filter(&root, &etx, &pattern, false),
             TestRequest::RunSuite(suite) => run_filter(&root, &etx, &suite, true),
-            TestRequest::Discover => discover(&root, &etx),
+            TestRequest::Discover { quiet } => discover(&root, &etx, quiet),
             TestRequest::SetRoot(p) => {
                 root = p;
                 epoch += 1;
@@ -399,6 +443,28 @@ fn worker_loop(
     }
 }
 
+/// `args` for a cargo test or coverage run at `root`, with `--workspace`
+/// after the subcommand when the root manifest has a `[workspace]` table
+/// (#1508). At the root of a workspace that is also a package, plain `cargo
+/// test` builds and runs only that package, so the members' tests were
+/// never listed or run; for a virtual manifest the flag changes nothing.
+fn workspace_args<'a>(root: &Path, args: &[&'a str]) -> Vec<&'a str> {
+    let mut out = args.to_vec();
+    let subcommand = matches!(args.first(), Some(&"test" | &"llvm-cov"));
+    if subcommand && !args.contains(&"--version") && declares_workspace(root) {
+        out.insert(1, "--workspace");
+    }
+    out
+}
+
+/// Whether `root/Cargo.toml` has a `[workspace]` table.
+fn declares_workspace(root: &Path) -> bool {
+    std::fs::read_to_string(root.join("Cargo.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .is_some_and(|manifest| manifest.contains_key("workspace"))
+}
+
 /// `cargo <args>` rooted at the workspace, with piped stdio. cargo is resolved
 /// by absolute path (GUI-launched croft inherits a stripped PATH) and its own
 /// dir is prepended to the child PATH so the rustup shim finds its sibling
@@ -406,7 +472,7 @@ fn worker_loop(
 fn cargo_cmd(root: &Path, args: &[&str]) -> Command {
     let cargo = crate::widgets::dependencies::cargo_binary();
     let mut cmd = Command::new(&cargo);
-    cmd.args(args)
+    cmd.args(workspace_args(root, args))
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1642,10 +1708,15 @@ fn run_filter(root: &Path, tx: &EpochTx, pattern: &str, suite: bool) {
 /// exit status goes back with `Finished`, so a listing that errors (pytest's
 /// exit 2 on a collection error, a build failure) reads as a failed
 /// discovery rather than a project with no tests (#845).
-fn discover(root: &Path, tx: &EpochTx) {
+fn discover(root: &Path, tx: &EpochTx, quiet: bool) {
+    if quiet {
+        tx.send(TestResponse::QuietDiscovery);
+    }
     // See run_all: refuse before `Started` so the panel keeps its tree.
     let Some(runner) = runner_for(root) else {
-        tx.send(TestResponse::Refused);
+        if !quiet {
+            tx.send(TestResponse::Refused);
+        }
         return;
     };
     tx.send(TestResponse::Started(Activity::Discovering));
@@ -1767,7 +1838,7 @@ mod tests {
         run_one(tmp.path(), &etx, "a::b");
         run_filter(tmp.path(), &etx, "a", false);
         run_filter(tmp.path(), &etx, "a", true);
-        discover(tmp.path(), &etx);
+        discover(tmp.path(), &etx, false);
         let msgs: Vec<TestResponse> = rx.try_iter().map(|(_, r)| r).collect();
         assert!(
             !msgs.iter().any(|m| matches!(m, TestResponse::Started(_))),
@@ -1979,7 +2050,7 @@ mod tests {
         };
         let log = || std::fs::read_to_string(bin.path().join("calls.log")).unwrap_or_default();
 
-        discover(root, &etx);
+        discover(root, &etx, false);
         let (cases, finished) = drain(&rx);
         assert_eq!(
             cases,
@@ -2074,7 +2145,7 @@ mod tests {
         use TestStatus::*;
         let s = String::from;
 
-        discover(root, &etx);
+        discover(root, &etx, false);
         assert_eq!(
             cases(&rx),
             [
@@ -2192,6 +2263,174 @@ mod tests {
         .unwrap();
         assert!(w.drain(&mut panel));
         assert!(!panel.is_empty());
+    }
+
+    /// #1841: the Testing view's own discover leaves finding the runner to
+    /// the worker, so a root no runner claims must end it without the
+    /// refusal a run gesture reports, and without a Started that would
+    /// wipe the panel.
+    #[test]
+    fn a_quiet_discovery_with_no_runner_ends_silently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let etx = EpochTx {
+            tx: &tx,
+            epoch: 0,
+            codeql: Path::new("codeql"),
+            control: &RunControl::default(),
+            request: 1,
+        };
+        discover(tmp.path(), &etx, true);
+        let msgs: Vec<TestResponse> = rx.try_iter().map(|(_, r)| r).collect();
+        assert!(
+            matches!(msgs.as_slice(), [TestResponse::QuietDiscovery]),
+            "a quiet discovery with no runner says it was reached and nothing else"
+        );
+
+        let (mut w, tx) = TestWorker::for_test();
+        let mut panel = TestingPanel::new();
+        w.discover_quietly();
+        assert!(w.discover_queued());
+        tx.send((0, TestResponse::QuietDiscovery)).unwrap();
+        assert!(
+            !w.drain(&mut panel),
+            "the marker changes nothing on screen, so nothing needs redrawing"
+        );
+        assert!(!w.discover_queued(), "the marker ends the queued discovery");
+        assert!(!panel.take_refusal(), "a quiet discovery never says why");
+        assert!(!panel.is_busy());
+    }
+
+    /// #1841: only the quiet discovery's own marker clears the queued flag:
+    /// a regular discovery queued ahead of it answering first must not, or
+    /// a reopen of the Testing view would queue another. A re-root clears
+    /// it too, since its drain drops the old root's answers.
+    #[test]
+    fn only_the_quiet_discovery_itself_clears_the_queued_flag() {
+        let (mut w, tx) = TestWorker::for_test();
+        let mut panel = TestingPanel::new();
+        w.discover();
+        w.discover_quietly();
+        tx.send((0, TestResponse::Started(Activity::Discovering)))
+            .unwrap();
+        tx.send((0, TestResponse::Finished { ok: Some(true) }))
+            .unwrap();
+        tx.send((0, TestResponse::Refused)).unwrap();
+        assert!(w.drain(&mut panel));
+        assert!(
+            w.discover_queued(),
+            "the earlier discovery's answers are not the quiet one starting"
+        );
+        tx.send((0, TestResponse::QuietDiscovery)).unwrap();
+        tx.send((0, TestResponse::Started(Activity::Discovering)))
+            .unwrap();
+        assert!(w.drain(&mut panel));
+        assert!(!w.discover_queued());
+        assert!(panel.is_busy(), "the panel now shows the discovery");
+
+        let (mut w, _tx) = TestWorker::for_test();
+        w.discover_quietly();
+        w.set_root(PathBuf::from("/new"));
+        assert!(
+            !w.discover_queued(),
+            "the old root's discovery can never report under the new epoch"
+        );
+    }
+
+    /// A root that is a package with `members` beside it (#1508).
+    fn package_and_workspace() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\nmembers = [\"util\"]\n",
+        )
+        .unwrap();
+        tmp
+    }
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// #1508: at the root of a workspace that is also a package, every test
+    /// and coverage run covers the members too: listing, Run All, one test,
+    /// a filter, the debug build and llvm-cov.
+    #[test]
+    fn cargo_runs_at_a_workspace_root_cover_every_member() {
+        let tmp = package_and_workspace();
+        let root = tmp.path();
+        for (args, want) in [
+            (
+                &["test", "--color=never", "--", "--list"][..],
+                &["test", "--workspace", "--color=never", "--", "--list"][..],
+            ),
+            (
+                &["test", "--no-fail-fast", "--color=never"][..],
+                &["test", "--workspace", "--no-fail-fast", "--color=never"][..],
+            ),
+            (
+                &[
+                    "test",
+                    "tests::util_works",
+                    "--color=never",
+                    "--",
+                    "--exact",
+                ][..],
+                &[
+                    "test",
+                    "--workspace",
+                    "tests::util_works",
+                    "--color=never",
+                    "--",
+                    "--exact",
+                ][..],
+            ),
+            (
+                &["test", "--no-run", "--message-format=json"][..],
+                &["test", "--workspace", "--no-run", "--message-format=json"][..],
+            ),
+            (
+                &["llvm-cov", "--no-fail-fast", "--lcov"][..],
+                &["llvm-cov", "--workspace", "--no-fail-fast", "--lcov"][..],
+            ),
+        ] {
+            assert_eq!(args_of(&cargo_cmd(root, args)), want);
+        }
+        // A virtual manifest takes the flag too; it changes nothing there.
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"a\", \"b\"]\n",
+        )
+        .unwrap();
+        assert_eq!(workspace_args(root, &["test"]), ["test", "--workspace"]);
+    }
+
+    /// #1508, negative: a single package, a probe for llvm-cov and a
+    /// manifest croft cannot read run as they always did.
+    #[test]
+    fn cargo_runs_without_a_workspace_table_are_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"solo\"\nversion = \"0.1.0\"\n# [workspace] in a comment\n",
+        )
+        .unwrap();
+        assert_eq!(
+            workspace_args(root, &["test", "--no-fail-fast"]),
+            ["test", "--no-fail-fast"]
+        );
+        let ws = package_and_workspace();
+        assert_eq!(
+            workspace_args(ws.path(), &["llvm-cov", "--version"]),
+            ["llvm-cov", "--version"]
+        );
+        std::fs::write(root.join("Cargo.toml"), "[workspace\nbroken").unwrap();
+        assert_eq!(workspace_args(root, &["test"]), ["test"]);
+        let none = tempfile::tempdir().unwrap();
+        assert_eq!(workspace_args(none.path(), &["test"]), ["test"]);
     }
 
     /// #1534: a cancel whose run's end is dropped as stale by a re-root
@@ -2886,7 +3125,7 @@ exit 1"#
             let tmp = tempfile::tempdir().unwrap();
             let root = tmp.path();
             pytest_project_with_addopts(root, addopts);
-            let (cases, finished) = collect_responses(root, discover);
+            let (cases, finished) = collect_responses(root, |r, t| discover(r, t, false));
             assert_eq!(
                 cases,
                 vec![
@@ -2941,7 +3180,7 @@ exit 1"#
             request: 1,
         };
         let discovered = || {
-            discover(root, &etx);
+            discover(root, &etx, false);
             let mut cases = Vec::new();
             let mut finished = None;
             for (_, r) in rx.try_iter() {
@@ -3088,7 +3327,7 @@ exit 1"#
             request: 1,
         };
         let finished = || {
-            discover(root, &etx);
+            discover(root, &etx, false);
             rx.try_iter().find_map(|(_, r)| match r {
                 TestResponse::Finished { ok } => Some(ok),
                 _ => None,
@@ -3256,7 +3495,7 @@ exit 1"#
             control: &RunControl::default(),
             request: 1,
         };
-        discover(root, &etx);
+        discover(root, &etx, false);
         let mut cases = Vec::new();
         let mut finished = None;
         for (_, r) in rx.try_iter() {
