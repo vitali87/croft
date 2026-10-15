@@ -98,10 +98,11 @@ never change what croft trusts or executes. They are limited to an explicit
 allowlist — appearance and editor/terminal behavior:
 
 `theme`, `format_on_save`, `format_on_type`, `auto_save`, `auto_save_on_focus_change`,
-`render_whitespace`, `word_based_suggestions`, `disable_inline_blame`, `disable_auto_close_pairs`,
+`render_whitespace`, `word_based_suggestions`, `disable_inline_blame`, `disable_auto_close_pairs`, `disable_paste_reindent`,
 `disable_inline_values`, `disable_save_before_debug`, `disable_bracket_colors`, `disable_indent_guides`, `line_numbers`,
 `disable_inlay_hints`, `copy_on_select`, `disable_secret_redaction`, `disable_log_highlight`, `explorer_views`,
-`files_exclude`, `search_exclude`.
+`files_exclude`, `search_exclude`, `languages` (only its per-language
+editor keys; see below).
 
 Everything else — `disabled_extensions`, `mcp_consented`, `disable_remote_offer`, `remote_offer_excluded_hosts`, `config_sync_excluded_hosts`, `config_sync_excluded_files`, `fleet_groups`, `code_scanning`, `lane_agent`,
 `mcp_tool_fingerprints`, `host_accents`, `notifications`, `screen_reader`, `screen_reader_command`, `codeql_cli_path`, `locale`, and any future key not explicitly
@@ -141,6 +142,36 @@ set them.
 
 The mapped values sit **below** `.croft/config.json` in the chain, so a
 croft-native workspace file always wins over the VS Code one.
+
+## Per-language settings
+
+`languages` overrides a few editor settings for one language, keyed by VS
+Code's language id (`python`, `c`, `cpp`, `rust`, `markdown`,
+`shellscript`, `typescriptreact`, `makefile`, …). A value set there wins
+over the global one for a file in that language; anything a block leaves
+out falls back to the global setting.
+
+```json
+{
+  "format_on_save": true,
+  "languages": {
+    "markdown": { "format_on_save": false },
+    "python": { "render_whitespace": "all", "disable_inlay_hints": true }
+  }
+}
+```
+
+A block may set `format_on_save`, `format_on_type`, `render_whitespace`,
+`disable_inlay_hints` and `disable_auto_close_pairs`; any other key in it
+is ignored. Blocks merge across layers a setting at a time, so a
+workspace's `languages.python.format_on_save` leaves your own
+`languages.python.render_whitespace` in place.
+
+VS Code's `"[python]": { … }` blocks map here, from a repo's
+`.vscode/settings.json` and in `croft import-vscode`, with the table above
+applied to the keys inside. `"[javascript][typescript]"` sets both. A key
+inside a block that croft has only globally, or not at all, is listed by
+`import-vscode` with its block, as `[python] editor.rulers`.
 
 ## Project exclusions
 

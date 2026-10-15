@@ -1,1 +1,0 @@
-change: Nothing you can see is different in this release. The language-server client shares one copy of the steps its requests and replies had each repeated, such as allocating a request id, picking the server to ask and fanning a reply out to every editor showing the file.
