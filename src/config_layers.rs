@@ -128,6 +128,7 @@ pub const WORKSPACE_ALLOWED_KEYS: &[&str] = &[
     // Per-language overrides (#1440), which hold only the editor settings
     // in `crate::prefs::LANGUAGE_KEYS`; any other key in a block is dropped.
     "languages",
+    "files_encoding",
 ];
 
 /// The synced layer's file name (#262). Config sync pushes the projection

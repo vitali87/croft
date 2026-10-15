@@ -35,6 +35,7 @@ mod devcontainer;
 mod docx;
 mod editorconfig;
 mod emmet;
+mod file_encoding;
 mod file_ref;
 mod fleet;
 mod ghostty;

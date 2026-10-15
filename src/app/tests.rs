@@ -88960,6 +88960,82 @@ fn the_editor_menu_without_a_selection_offers_only_paste() {
     );
 }
 
+/// #1432: the issue's repo without the `.editorconfig`: `.vscode/settings.json`
+/// says `"files.encoding": "windows1252"`, and the file opens as written.
+#[test]
+fn vs_code_files_encoding_decodes_a_legacy_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/settings.json"),
+        r#"{ "files.encoding": "windows1252" }"#,
+    )
+    .unwrap();
+    let f = tmp.path().join("notes.txt");
+    std::fs::write(&f, b"Gr\xfc\xdfe aus K\xf6ln\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    assert_eq!(app.editor.lines[0], "Grüße aus Köln");
+    assert_eq!(app.editor.encoding, encoding_rs::WINDOWS_1252);
+}
+
+/// #1432 negative: with no encoding declared anywhere the same bytes open
+/// as UTF-8, as before, with the lossy decode flagged.
+#[test]
+fn without_a_declared_encoding_a_legacy_file_opens_as_utf_8() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("notes.txt");
+    std::fs::write(&f, b"Gr\xfc\xdfe aus K\xf6ln\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    assert_eq!(app.editor.encoding, encoding_rs::UTF_8);
+    assert!(app.editor.decode_lossy);
+}
+
+/// #1432: the issue's steps 2 and 3. A status-bar encoding pick survives
+/// closing the tab and opening the file again.
+#[test]
+fn the_status_bar_encoding_pick_survives_closing_the_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("notes.txt");
+    std::fs::write(&f, b"Gr\xfc\xdfe aus K\xf6ln\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.dispatch_menu_action(
+        MenuAction::SetEncoding(encoding_rs::WINDOWS_1252),
+        tmp.path().to_path_buf(),
+    );
+    assert_eq!(app.editor.lines[0], "Grüße aus Köln");
+    app.editor.close_active();
+    app.editor.open_pinned(&f).unwrap();
+    assert_eq!(app.editor.encoding, encoding_rs::WINDOWS_1252);
+    assert_eq!(app.editor.lines[0], "Grüße aus Köln");
+}
+
+/// #1432: Make Root into a nested folder that declares no encoding drops
+/// the parent's `files_encoding`. Left registered, the parent's default
+/// still matched the nested files by prefix and opened UTF-8 text as
+/// windows-1252 mojibake, which the next save would write back.
+#[test]
+fn make_root_into_a_nested_folder_drops_the_parent_files_encoding() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/settings.json"),
+        r#"{ "files.encoding": "windows1252" }"#,
+    )
+    .unwrap();
+    let inner = tmp.path().join("inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    let f = inner.join("notes.txt");
+    std::fs::write(&f, "Grüße aus Köln\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.change_workspace_root(inner.clone());
+    app.editor.open_pinned(&f).unwrap();
+    assert_eq!(app.editor.encoding, encoding_rs::UTF_8);
+    assert_eq!(app.editor.lines[0], "Grüße aus Köln");
+}
+
 /// #1392: a CodeLLDB `cargo` launch with no `program` builds with cargo
 /// first instead of being refused; an lldb launch with neither is still
 /// refused.
