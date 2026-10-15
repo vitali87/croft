@@ -1,0 +1,1 @@
+fix: When a `croft remote` connection drops, croft hands the terminal back before reporting the reconnect, so the progress lines no longer scroll over the editor and moving the mouse no longer types `^[[<35;…M`; the session comes back fully redrawn once the host answers.

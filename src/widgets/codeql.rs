@@ -1663,25 +1663,30 @@ impl CodeqlPanel {
             let border = Style::default().fg(p.card);
             buf.set_string(row.x + 1, row.y, "│", border);
             buf.set_string(row.x + w - 2, row.y, "│", border);
-            let area = Rect::new(row.x + 3, row.y, w - 6, 1);
-            // The label row is the shared rounded button's middle; the caps
-            // are its fill with the rounded corners in the fill colour.
-            crate::widgets::source_control::render_rounded_button(
-                buf, area, label, p.button, p.bright,
-            );
-            if part != ButtonRow::Label {
-                let (l, r) = if part == ButtonRow::Top {
-                    ("╭", "╮")
-                } else {
-                    ("╰", "╯")
-                };
-                buf.set_string(area.x, row.y, " ", Style::default().bg(p.button));
-                let corner = Style::default().fg(p.button).bg(Color::Reset);
-                buf.set_string(area.x, row.y, l, corner);
-                buf.set_string(area.x + area.width - 1, row.y, r, corner);
-                for x in area.x + 1..area.x + area.width - 1 {
-                    buf.set_string(x, row.y, " ", Style::default().bg(p.button));
-                }
+            // One filled rectangle, a column inside each side of the card and
+            // painted only with a background, which every terminal tiles
+            // without a seam (#1459). The rounded caps this replaces reset
+            // their corner cells to the terminal's default background,
+            // rarely the panel's: each corner was a grey notch around a thin
+            // arc, and the label row stuck out between them.
+            let (left, right) = (row.x + 3, row.x + w - 4);
+            let fill = Style::default().bg(p.button);
+            for x in left..=right {
+                buf.set_string(x, row.y, " ", fill);
+            }
+            if part == ButtonRow::Label {
+                let inner_w = right - left - 1;
+                let n = (label.chars().count() as u16).min(inner_w);
+                buf.set_stringn(
+                    left + 1 + (inner_w - n) / 2,
+                    row.y,
+                    label,
+                    inner_w as usize,
+                    Style::default()
+                        .fg(p.bright)
+                        .bg(p.button)
+                        .add_modifier(Modifier::BOLD),
+                );
             }
             return;
         }
@@ -2812,7 +2817,10 @@ mod tests {
             buf[(x, y)].bg,
             crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG)
         );
-        assert_eq!(row(&buf, y - 1).chars().nth(4), Some('╭'), "a rounded cap");
+        assert!(
+            buf[(x, y)].modifier.contains(Modifier::BOLD),
+            "a bold label"
+        );
         assert!(
             find(&buf, "from a folder, archive,").is_some(),
             "the caption"
@@ -2826,6 +2834,48 @@ mod tests {
             find(&buf, "DATABASES").is_none(),
             "the card stands in for it"
         );
+    }
+
+    #[test]
+    fn the_add_database_button_fills_inside_its_card_and_leaves_the_panel_background() {
+        // #1459: the caps reset their corner cells to the terminal's
+        // default background, a grey notch on any theme whose panel is not
+        // that colour, with the label row sticking out between them.
+        let panel = Color::Rgb(0x0a, 0x0b, 0x0c);
+        let fill = crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG);
+        for w in [32, 20, 12] {
+            let mut p = CodeqlPanel::new();
+            p.focused = true;
+            p.focus_gradient = true;
+            p.theme = crate::theme::Theme::BLACK;
+            let area = Rect::new(0, 0, w, 44);
+            let mut cell = ratatui::buffer::Cell::default();
+            cell.set_bg(panel);
+            let mut buf = Buffer::filled(area, cell);
+            (&mut p).render(area, &mut buf);
+            let idx = p
+                .lines()
+                .iter()
+                .position(|l| *l == Line::Button(Action::AddDatabase, ButtonRow::Label))
+                .expect("the button");
+            let inner = p.last_inner;
+            let y = inner.y + (idx - p.scroll) as u16;
+            let (card_l, card_r) = (inner.x + 1, inner.x + inner.width - 2);
+            let (left, right) = (inner.x + 3, inner.x + inner.width - 4);
+            for row_y in [y - 1, y, y + 1] {
+                let at = |x: u16| &buf[(x, row_y)];
+                assert_eq!(at(card_l).symbol(), "│", "w={w}: the card's left side");
+                assert_eq!(at(card_r).symbol(), "│", "w={w}: the card's right side");
+                for x in card_l + 1..card_r {
+                    let inside = (left..=right).contains(&x);
+                    let want = if inside { fill } else { panel };
+                    assert_eq!(at(x).bg, want, "w={w}: the background at ({x}, {row_y})");
+                    if inside && (row_y != y || x == left || x == right) {
+                        assert_eq!(at(x).symbol(), " ", "w={w}: a plain fill at ({x}, {row_y})");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
