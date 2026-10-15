@@ -105,6 +105,8 @@ pub fn layer_of(provenance: &BTreeMap<String, LayerKind>, key: &str) -> LayerKin
 pub const WORKSPACE_ALLOWED_KEYS: &[&str] = &[
     "theme",
     "format_on_save",
+    "default_formatter",
+    "language_formatters",
     "format_on_type",
     "auto_save",
     "auto_save_on_focus_change",
@@ -112,6 +114,7 @@ pub const WORKSPACE_ALLOWED_KEYS: &[&str] = &[
     "word_based_suggestions",
     "disable_inline_blame",
     "disable_auto_close_pairs",
+    "disable_paste_reindent",
     "disable_inline_values",
     "disable_save_before_debug",
     "disable_bracket_colors",
@@ -122,6 +125,9 @@ pub const WORKSPACE_ALLOWED_KEYS: &[&str] = &[
     "explorer_views",
     "files_exclude",
     "search_exclude",
+    // Per-language overrides (#1440), which hold only the editor settings
+    // in `crate::prefs::LANGUAGE_KEYS`; any other key in a block is dropped.
+    "languages",
     "files_encoding",
 ];
 
@@ -559,6 +565,9 @@ fn known_setting_keys() -> &'static std::collections::BTreeSet<String> {
                 _ => Default::default(),
             };
         keys.insert(String::from("extends"));
+        // Skipped from the serialized default while it is empty, but a
+        // setting all the same (#1440).
+        keys.insert(String::from("languages"));
         keys
     })
 }
@@ -791,6 +800,39 @@ mod tests {
         assert!(m.warnings.is_empty(), "{:?}", m.warnings);
     }
 
+    /// #1440: a workspace may set per-language editor settings. Its blocks
+    /// merge with the user's a setting at a time, the repo's own
+    /// `.vscode/settings.json` language blocks apply, and a block's keys
+    /// outside the per-language set are dropped.
+    #[test]
+    fn language_blocks_merge_across_layers_and_keep_only_editor_keys() {
+        let (_tmp, user, root) = setup();
+        write(
+            &user.join("config.json"),
+            r#"{"languages":{"python":{"format_on_save":true,"render_whitespace":"all"}}}"#,
+        );
+        write(
+            &root.join(".vscode/settings.json"),
+            r#"{"[c]":{"editor.formatOnSave":true,"editor.fontSize":30}}"#,
+        );
+        write(
+            &root.join(".croft/config.json"),
+            r#"{"languages":{"python":{"format_on_save":false,"mcp_consented":["evil"]}}}"#,
+        );
+        let m = load_merged_from(&user, Some(&root), "macos");
+        let py = &m.prefs.languages["python"];
+        assert_eq!(py.format_on_save, Some(false), "the workspace wins");
+        assert_eq!(
+            py.render_whitespace.as_deref(),
+            Some("all"),
+            "the user's other python setting survives"
+        );
+        assert_eq!(m.prefs.languages["c"].format_on_save, Some(true));
+        assert!(m.prefs.mcp_consented.is_empty());
+        assert_eq!(layer_of(&m.provenance, "languages"), LayerKind::Workspace);
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+    }
+
     #[test]
     fn workspace_layers_cannot_touch_trust_or_execution_settings() {
         let (_tmp, user, root) = setup();
@@ -954,6 +996,82 @@ mod tests {
             layer_of(&m.provenance, "auto_save_on_focus_change"),
             LayerKind::VsCodeWorkspace
         );
+    }
+
+    /// #1499: a repo's `.vscode` names the formatter beside its
+    /// `formatOnSave`, for every file and per language; both reach croft
+    /// from the workspace layer.
+    #[test]
+    fn vscode_default_formatters_reach_the_workspace_layer() {
+        let (_tmp, user, root) = setup();
+        write(
+            &root.join(".vscode/settings.json"),
+            r#"{
+  "editor.formatOnSave": true,
+  "editor.defaultFormatter": "biomejs.biome",
+  "[python]": { "editor.defaultFormatter": "charliermarsh.ruff", "editor.tabSize": 4 },
+  "[javascript][typescript]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+}"#,
+        );
+        let m = load_merged_from(&user, Some(&root), "linux");
+        assert!(m.prefs.format_on_save);
+        assert_eq!(m.prefs.default_formatter.as_deref(), Some("biomejs.biome"));
+        assert_eq!(
+            m.prefs.language_formatters,
+            [
+                ("javascript][typescript", "esbenp.prettier-vscode"),
+                ("python", "charliermarsh.ruff"),
+            ]
+            .iter()
+            .map(|(l, f)| (l.to_string(), f.to_string()))
+            .collect::<BTreeMap<_, _>>()
+        );
+        assert_eq!(
+            layer_of(&m.provenance, "default_formatter"),
+            LayerKind::VsCodeWorkspace
+        );
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+    }
+
+    /// #1499: an imported user `[typescript]` formatter survives a workspace
+    /// `[javascript][typescript]` one, as in VS Code, and a workspace
+    /// `null` clears the user's formatter for every file.
+    #[test]
+    fn a_grouped_workspace_formatter_keeps_a_user_single_language_one() {
+        let (_tmp, user, root) = setup();
+        write(
+            &user.join("config.json"),
+            r#"{ "default_formatter": "esbenp.prettier-vscode", "language_formatters": { "typescript": "vscode.typescript-language-features" } }"#,
+        );
+        write(
+            &root.join(".vscode/settings.json"),
+            r#"{ "editor.defaultFormatter": null, "[javascript][typescript]": { "editor.defaultFormatter": "biomejs.biome" }, "[python]": { "editor.defaultFormatter": null } }"#,
+        );
+        let m = load_merged_from(&user, Some(&root), "linux");
+        assert_eq!(m.prefs.default_formatter, None);
+        let per = &m.prefs.language_formatters;
+        let named = |l| crate::default_formatter::named(None, per, Some(l));
+        assert_eq!(
+            named("typescript"),
+            Some("vscode.typescript-language-features")
+        );
+        assert_eq!(named("javascript"), Some("biomejs.biome"));
+        assert_eq!(named("python"), None);
+        assert_eq!(per.get("python").map(String::as_str), Some(""));
+    }
+
+    /// #1499, negative: a language block without a formatter, or with an
+    /// empty one, names nothing.
+    #[test]
+    fn a_language_block_without_a_formatter_names_none() {
+        let (_tmp, user, root) = setup();
+        write(
+            &root.join(".vscode/settings.json"),
+            r#"{ "editor.defaultFormatter": "", "[go]": { "editor.tabSize": 8 }, "[rust]": {} }"#,
+        );
+        let m = load_merged_from(&user, Some(&root), "linux");
+        assert_eq!(m.prefs.default_formatter, None);
+        assert!(m.prefs.language_formatters.is_empty());
     }
 
     #[test]

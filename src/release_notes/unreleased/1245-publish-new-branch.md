@@ -1,1 +1,0 @@
-fix: Push, Commit & Push and Sync now publish a branch that has no upstream (`git push -u`) instead of failing with "has no upstream branch"; Sync skips the pull it has nothing to pull from, and Publish Branch uses the repo's only remote or `remote.pushDefault` rather than assuming `origin`.

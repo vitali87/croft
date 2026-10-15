@@ -23,9 +23,11 @@ use ratatui::{
 /// What pressing Enter on the highlighted row resolves to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BranchAction {
-    /// Switch to an existing branch — the string is the `checkout_name`
-    /// (short name for remotes, so git creates the tracking branch).
+    /// Switch to an existing local branch, by its `checkout_name`.
     Checkout(String),
+    /// Check out a remote-tracking branch (`upstream/feat`) as local branch
+    /// `name` tracking that remote (#1445).
+    Track { remote_ref: String, name: String },
     /// Create a new branch off HEAD with this name and switch to it.
     Create(String),
 }
@@ -120,10 +122,13 @@ impl BranchPicker {
     /// an empty query).
     pub fn selected_action(&self) -> Option<BranchAction> {
         match self.rows().get(self.selected)? {
-            Row::Existing(i) => self
-                .branches
-                .get(*i)
-                .map(|b| BranchAction::Checkout(b.checkout_name.clone())),
+            Row::Existing(i) => self.branches.get(*i).map(|b| match &b.track {
+                Some(remote_ref) => BranchAction::Track {
+                    remote_ref: remote_ref.clone(),
+                    name: b.checkout_name.clone(),
+                },
+                None => BranchAction::Checkout(b.checkout_name.clone()),
+            }),
             Row::Create(name) => Some(BranchAction::Create(name.clone())),
         }
     }
@@ -406,6 +411,7 @@ mod tests {
             checkout_name: checkout_name.to_string(),
             is_current: current,
             is_remote: remote,
+            track: remote.then(|| display.to_string()),
         }
     }
 
@@ -444,16 +450,21 @@ mod tests {
         );
     }
 
+    /// #1445: a remote branch checks out tracking the remote picked, by its
+    /// full remote ref, not by a short name another remote may share.
     #[test]
-    fn remote_branch_checks_out_by_its_short_name() {
+    fn remote_branch_checks_out_tracking_the_remote_picked() {
         let mut p = sample();
         for c in "release".chars() {
             p.push_char(c);
         }
         assert_eq!(
             p.selected_action(),
-            Some(BranchAction::Checkout("release".to_string())),
-            "origin/release is offered as `git switch release` so git makes the tracking branch"
+            Some(BranchAction::Track {
+                remote_ref: "origin/release".to_string(),
+                name: "release".to_string(),
+            }),
+            "origin/release is `git switch -c release --track origin/release`"
         );
     }
 

@@ -163,6 +163,32 @@ pub fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {
     Some(((n >> 16) as u8, (n >> 8) as u8, n as u8))
 }
 
+/// The settings one language may override (#1440). Each is unset unless a
+/// `languages.<id>` block names it, and an unset one falls back to the
+/// global setting of the same name. Any other key in a block is ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct LanguagePrefs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_on_save: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_on_type: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_whitespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable_inlay_hints: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable_auto_close_pairs: Option<bool>,
+}
+
+/// The [`LanguagePrefs`] keys: the settings a language block may set.
+pub const LANGUAGE_KEYS: &[&str] = &[
+    "format_on_save",
+    "format_on_type",
+    "render_whitespace",
+    "disable_inlay_hints",
+    "disable_auto_close_pairs",
+];
+
 /// The on-disk preferences document. New fields must default so an older
 /// config still parses; `#[serde(default)]` covers that.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -233,6 +259,17 @@ pub struct Prefs {
     /// an older config parses straight to disabled.
     #[serde(default)]
     pub format_on_save: bool,
+    /// The formatter a project names for every file, VS Code's
+    /// `editor.defaultFormatter` (#1499), as an extension id such as
+    /// `biomejs.biome`. Format on save skips a file whose named formatter
+    /// croft does not run, rather than formatting it with something else.
+    #[serde(default)]
+    pub default_formatter: Option<String>,
+    /// `editor.defaultFormatter` for one language, keyed by its VS Code
+    /// language id (`"[typescript]": { "editor.defaultFormatter": … }`,
+    /// #1499). Wins over `default_formatter` for that language.
+    #[serde(default)]
+    pub language_formatters: BTreeMap<String, String>,
     /// When true, typing one of the language server's on-type trigger
     /// characters (`}`, `;`, newline, per its capability) runs
     /// `textDocument/onTypeFormatting` on the just-typed spot (VS Code's
@@ -260,6 +297,10 @@ pub struct Prefs {
     /// (a default-false field keeps old configs valid, like inline blame).
     #[serde(default)]
     pub disable_auto_close_pairs: bool,
+    /// A multi-line paste is re-indented under the caret line (#1218); this
+    /// stores the opt-out for people who want the clipboard verbatim.
+    #[serde(default)]
+    pub disable_paste_reindent: bool,
     /// Opt-out for debugger inline values (#135), on by default like VS
     /// Code's `debug.inlineValues: "auto"`. Stored as the disable flag so
     /// the derived `Default` and an older config both mean "values shown".
@@ -326,6 +367,12 @@ pub struct Prefs {
     /// `files_exclude` (VS Code's `search.exclude`, #1345).
     #[serde(default)]
     pub search_exclude: Vec<String>,
+    /// Per-language overrides (#1440), keyed by VS Code's language id
+    /// (`python`, `c`, `markdown`, `shellscript`, …), VS Code's
+    /// `"[python]": { … }` blocks. A value set here wins over the global
+    /// one for a file in that language; see [`LanguagePrefs`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub languages: BTreeMap<String, LanguagePrefs>,
     /// The encoding files without a byte-order mark open in (VS Code's
     /// `files.encoding`, #1432): `windows1252`, `latin1`, `shiftjis`,
     /// `utf8bom` and the like. Empty means UTF-8. A BOM, an `.editorconfig`
@@ -583,7 +630,17 @@ impl Prefs {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let json = serde_json::to_string_pretty(&self.document()?).context("serializing prefs")?;
+        let doc = self.document()?;
+        // The file is edited in place, so its comments and layout survive a
+        // setting changed from inside croft (#1129). Plain JSON only when
+        // there is no file yet or it cannot be edited that way.
+        let json = match std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| crate::jsonc_edit::update(&text, &doc))
+        {
+            Some(json) => json,
+            None => serde_json::to_string_pretty(&doc).context("serializing prefs")?,
+        };
         let before = crate::config_sync::stamp(path);
         // Written aside and renamed in: a reader on another thread (the MCP
         // worker's fingerprint check) must never see a truncated file, and a
@@ -1587,8 +1644,11 @@ mod tests {
         assert!(Prefs::load(&path).unwrap().osk_split);
         save_mcp_consent_in(dir.path(), "ext").unwrap();
         set_disable_secret_redaction(&path, true).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        // The comment survives the saves (#1129).
+        assert!(text.contains("// shared base"), "{text}");
         let doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            serde_json::from_str(&crate::tasks::strip_jsonc(&text)).unwrap();
         assert_eq!(doc["extends"], "base.json");
         assert_eq!(doc["macos"]["theme"], "light");
         assert_eq!(doc["future_setting"], 7);
@@ -1598,6 +1658,52 @@ mod tests {
         let prefs = Prefs::load(&path).unwrap();
         assert!(prefs.mcp_consented.contains("ext"));
         assert!(prefs.disable_secret_redaction);
+    }
+
+    /// #1129: a setting changed from inside croft (File: Toggle Auto Save
+    /// here) keeps the file's comments, key order and trailing commas; it
+    /// used to come back as plain sorted JSON with every comment gone.
+    #[test]
+    fn a_setting_saved_from_croft_keeps_the_files_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let text = r#"{
+  // Team defaults live in dotfiles; keep this file small.
+  "theme": "dark",
+  /* Format on save is OFF on purpose: prettier fights ruff here.
+     See INFRA-2231 before turning it back on. */
+  "format_on_save": false,
+  "linux": {
+    "theme": "nord", // matches the tmux theme on the build boxes
+  },
+}
+"#;
+        std::fs::write(&path, text).unwrap();
+        let mut prefs = Prefs::load_for_update(&path).unwrap();
+        prefs.auto_save = true;
+        prefs.save(&path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            saved,
+            text.replace("  },\n}", "  },\n  \"auto_save\": true,\n}"),
+            "{saved}"
+        );
+        assert!(Prefs::load(&path).unwrap().auto_save);
+    }
+
+    /// #1129 negative: with no file yet, or one that does not parse as a
+    /// settings object, the save still writes plain JSON.
+    #[test]
+    fn a_missing_or_unreadable_file_is_still_written_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut prefs = Prefs::load_for_update(&path).unwrap();
+        prefs.auto_save = true;
+        prefs.save(&path).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["auto_save"], true);
+        assert!(crate::jsonc_edit::update("[]", &doc).is_none());
     }
 
     #[test]
@@ -1810,6 +1916,25 @@ mod tests {
         assert!(!old.centered_layout && old.zen_center_layout);
         assert_eq!(old.centered_layout_width, 120);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1440: a language block reads its known keys and ignores the rest,
+    /// and a config with no blocks writes no `languages` key.
+    #[test]
+    fn language_blocks_read_their_known_keys_only() {
+        let p: Prefs = serde_json::from_str(
+            r#"{"languages":{"c":{"format_on_save":true,"theme":"light","font_size":3}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            p.languages.get("c"),
+            Some(&LanguagePrefs {
+                format_on_save: Some(true),
+                ..LanguagePrefs::default()
+            })
+        );
+        let out = serde_json::to_string(&Prefs::default()).unwrap();
+        assert!(!out.contains("languages"), "{out}");
     }
 
     #[test]
