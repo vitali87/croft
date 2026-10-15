@@ -85,6 +85,35 @@ const HTML_INJECTIONS_QUERY: &str = r#"
  (#set! injection.language "json"))
 "#;
 
+/// What a Vue or Svelte component embeds (#1632): `<script>` is
+/// TypeScript when its `lang` says `ts` (TSX for `tsx`), else
+/// JavaScript; `<style>` is CSS, whatever preprocessor its `lang` names
+/// (SCSS and Less read close enough as CSS). Parsed with the HTML grammar,
+/// which sees each block as an element with raw text inside.
+const SFC_INJECTIONS_QUERY: &str = r#"
+((style_element
+  (raw_text) @injection.content)
+ (#set! injection.language "css"))
+
+((script_element
+  (start_tag) @_start
+  (raw_text) @injection.content)
+ (#match? @_start "(?i)\\slang\\s*=\\s*[\"']?ts[\"'\\s>]")
+ (#set! injection.language "typescript"))
+
+((script_element
+  (start_tag) @_start
+  (raw_text) @injection.content)
+ (#match? @_start "(?i)\\slang\\s*=\\s*[\"']?tsx[\"'\\s>]")
+ (#set! injection.language "tsx"))
+
+((script_element
+  (start_tag) @_start
+  (raw_text) @injection.content)
+ (#not-match? @_start "(?i)\\slang\\s*=\\s*[\"']?tsx?[\"'\\s>]")
+ (#set! injection.language "javascript"))
+"#;
+
 /// JSX-specific captures appended onto the shared TypeScript/TSX
 /// highlights query. The bundled query has none of these, so JSX
 /// tags and attribute names land in default foreground without it.
@@ -765,6 +794,10 @@ pub enum LangKind {
     Sql,
     Make,
     Dockerfile,
+    /// Single-file components (#1632): HTML outside, with `<script>` and
+    /// `<style>` blocks in the language their `lang` attribute names.
+    Vue,
+    Svelte,
 }
 
 /// The bare tree-sitter grammar handle for `kind` — the parser the
@@ -798,6 +831,7 @@ pub fn language_for(kind: LangKind) -> tree_sitter::Language {
         LangKind::Sql => tree_sitter_sequel::LANGUAGE.into(),
         LangKind::Make => tree_sitter_make::LANGUAGE.into(),
         LangKind::Dockerfile => tree_sitter_containerfile::LANGUAGE.into(),
+        LangKind::Vue | LangKind::Svelte => tree_sitter_html::LANGUAGE.into(),
     }
 }
 
@@ -808,7 +842,7 @@ pub fn lang_for_extension(ext: &str) -> Option<LangKind> {
         "js" | "mjs" | "cjs" | "jsx" => LangKind::JavaScript,
         "ts" => LangKind::TypeScript,
         "tsx" => LangKind::Tsx,
-        "json" | "jsonc" => LangKind::Json,
+        "json" | "jsonc" | "code-workspace" => LangKind::Json,
         "xml" | "xsd" | "xsl" | "xslt" | "svg" | "plist" => LangKind::Xml,
         "toml" => LangKind::Toml,
         "yaml" | "yml" => LangKind::Yaml,
@@ -829,6 +863,8 @@ pub fn lang_for_extension(ext: &str) -> Option<LangKind> {
         "sql" => LangKind::Sql,
         "mk" | "mak" => LangKind::Make,
         "dockerfile" | "containerfile" => LangKind::Dockerfile,
+        "vue" => LangKind::Vue,
+        "svelte" => LangKind::Svelte,
         _ => return None,
     })
 }
@@ -843,6 +879,8 @@ pub fn lang_for_path(path: &std::path::Path) -> Option<LangKind> {
         }
         "Makefile" | "makefile" | "GNUmakefile" => Some(LangKind::Make),
         "Gemfile" | "Rakefile" | "Guardfile" | "Vagrantfile" => Some(LangKind::Ruby),
+        // Tool configs written in JSON with comments (#1084).
+        ".eslintrc" | ".babelrc" | ".swcrc" | ".jshintrc" | ".jscsrc" => Some(LangKind::Json),
         // `Dockerfile.dev`, `Containerfile.prod`: the suffix names a stage,
         // not a language.
         _ if name.starts_with("Dockerfile.") || name.starts_with("Containerfile.") => {
@@ -1134,6 +1172,14 @@ fn build_config(kind: LangKind) -> Option<HighlightConfiguration> {
             "",
         )
         .ok()?,
+        LangKind::Vue | LangKind::Svelte => HighlightConfiguration::new(
+            tree_sitter_html::LANGUAGE.into(),
+            "html",
+            tree_sitter_html::HIGHLIGHTS_QUERY,
+            SFC_INJECTIONS_QUERY,
+            "",
+        )
+        .ok()?,
         LangKind::Css => HighlightConfiguration::new(
             tree_sitter_css::LANGUAGE.into(),
             "css",
@@ -1380,6 +1426,17 @@ fn html_injection(name: &str) -> Option<&'static HighlightConfiguration> {
     })
 }
 
+/// The languages a Vue or Svelte component embeds (#1632).
+fn sfc_injection(name: &str) -> Option<&'static HighlightConfiguration> {
+    shared_config(match name {
+        "javascript" => LangKind::JavaScript,
+        "typescript" => LangKind::TypeScript,
+        "tsx" => LangKind::Tsx,
+        "css" => LangKind::Css,
+        _ => return None,
+    })
+}
+
 /// Pre-build the tree-sitter highlight configurations so the first file open
 /// does not pay the query-compilation cost on the paint path. Safe to call from
 /// any thread (the cache is process-wide); call once at startup off the UI
@@ -1470,6 +1527,7 @@ fn highlight_text_with_palette(
     let events = match hl.highlight(cfg, text, None, |name| match kind {
         LangKind::Markdown => markdown_injection(name),
         LangKind::Html => html_injection(name),
+        LangKind::Vue | LangKind::Svelte => sfc_injection(name),
         _ => None,
     }) {
         Ok(e) => e,
@@ -3066,6 +3124,84 @@ def f() -> Config:\n\
         );
     }
 
+    const VUE: &str = "<template>\n  <p class=\"msg\">{{ msg }}</p>\n</template>\n<script setup lang=\"ts\">\nconst count: number = 1;\n</script>\n<style scoped>\np { color: red; }\n</style>\n";
+
+    /// #1632: `.vue` and `.svelte` are their own languages, read with the
+    /// HTML grammar.
+    #[test]
+    fn vue_and_svelte_files_have_a_language() {
+        assert_eq!(lang_for_extension("vue"), Some(LangKind::Vue));
+        assert_eq!(lang_for_extension("svelte"), Some(LangKind::Svelte));
+        assert_eq!(
+            lang_for_path(std::path::Path::new("src/App.vue")),
+            Some(LangKind::Vue)
+        );
+        assert!(shared_config(LangKind::Vue).is_some());
+        assert!(shared_config(LangKind::Svelte).is_some());
+    }
+
+    /// #1632: a Vue component's template is HTML, its `lang="ts"` script
+    /// TypeScript and its style CSS, each coloured as in its own file.
+    #[test]
+    fn a_vue_component_highlights_template_script_and_style() {
+        let ts = "const count: number = 1;\n";
+        let number = embedded_style(LangKind::TypeScript, ts, 0, "number");
+        assert!(number.is_some());
+        assert_eq!(embedded_style(LangKind::Vue, VUE, 4, "number"), number);
+        assert_eq!(
+            embedded_style(LangKind::Vue, VUE, 4, "const"),
+            embedded_style(LangKind::TypeScript, ts, 0, "const")
+        );
+        assert_eq!(
+            embedded_style(LangKind::Vue, VUE, 1, "p"),
+            embedded_style(LangKind::Html, "<p>\n", 0, "p")
+        );
+        assert_eq!(
+            embedded_style(LangKind::Vue, VUE, 7, "color"),
+            embedded_style(LangKind::Css, "p { color: red; }\n", 0, "color")
+        );
+        assert!(embedded_style(LangKind::Vue, VUE, 7, "color").is_some());
+    }
+
+    /// #1632: a script with no `lang` (or `lang="js"`) is JavaScript, as in
+    /// Svelte's default, and `lang="tsx"` is TSX.
+    #[test]
+    fn a_component_script_without_lang_ts_is_javascript() {
+        let svelte = "<script>\n  let name = \"world\";\n</script>\n<h1>Hello {name}!</h1>\n";
+        let js = "let name = \"world\";\n";
+        assert_eq!(
+            embedded_style(LangKind::Svelte, svelte, 1, "let"),
+            embedded_style(LangKind::JavaScript, js, 0, "let")
+        );
+        assert!(embedded_style(LangKind::Svelte, svelte, 1, "let").is_some());
+        let tsx = "<script lang=\"tsx\">\nconst n: number = 1;\n</script>\n";
+        assert_eq!(
+            embedded_style(LangKind::Vue, tsx, 1, "number"),
+            embedded_style(LangKind::Tsx, "const n: number = 1;\n", 0, "number")
+        );
+        let js_lang = "<script lang=\"js\">\nconst n = 1;\n</script>\n";
+        assert_eq!(
+            embedded_style(LangKind::Vue, js_lang, 1, "const"),
+            embedded_style(LangKind::JavaScript, "const n = 1;\n", 0, "const")
+        );
+    }
+
+    /// #1632, negative: plain HTML keeps its own rules, so a `lang`
+    /// attribute there (a page language like `lang="ts"` for Tsonga) does
+    /// not make a script TypeScript.
+    #[test]
+    fn html_does_not_read_a_script_lang_attribute() {
+        let page = "<script lang=\"ts\">\nconst n: number = 1;\n</script>\n";
+        assert_eq!(
+            embedded_style(LangKind::Html, page, 1, "const"),
+            embedded_style(LangKind::JavaScript, "const n = 1;\n", 0, "const")
+        );
+        assert_ne!(
+            embedded_style(LangKind::Html, page, 1, "number"),
+            embedded_style(LangKind::TypeScript, "const n: number = 1;\n", 0, "number")
+        );
+    }
+
     /// #1649: a `<style>` body is highlighted as CSS.
     #[test]
     fn a_style_body_in_html_is_highlighted_as_css() {
@@ -3151,6 +3287,9 @@ def f() -> Config:\n\
             ("app.rb", LangKind::Ruby),
             ("Gemfile", LangKind::Ruby),
             ("Program.cs", LangKind::CSharp),
+            (".babelrc", LangKind::Json),
+            (".eslintrc", LangKind::Json),
+            ("app.code-workspace", LangKind::Json),
             // The supported ones still resolve by extension.
             ("main.rs", LangKind::Rust),
         ];
