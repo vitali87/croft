@@ -142,7 +142,7 @@ Or to build from a source checkout:
 ```bash
 git clone https://github.com/vitali87/croft.git
 cd croft
-cargo build --release && cargo install --path . --locked
+cargo install --path . --locked
 ```
 
 **macOS:** the build directory churns the Spotlight index and can spike your CPU and fans. Before building, point Cargo at a `.noindex` directory Spotlight ignores; see [MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
