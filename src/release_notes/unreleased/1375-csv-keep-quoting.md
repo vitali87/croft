@@ -1,1 +1,0 @@
-fix: Saving a CSV from the sheet grid keeps every row you did not change byte for byte and quotes edited rows the way the file is quoted, so a one-cell edit to an R `write.csv` or Python `QUOTE_ALL` file no longer rewrites every line.
