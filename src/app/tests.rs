@@ -88806,6 +88806,27 @@ fn format_on_save_still_formats_when_croft_runs_the_named_formatter() {
     }
 }
 
+/// #1410: a browser croft launches has a screen to open on only locally
+/// with a display; over SSH, or on Linux with no X or Wayland display, it
+/// runs headless.
+#[test]
+fn a_browser_runs_headless_only_where_there_is_no_display() {
+    let none = |_: &str| false;
+    let x11 = |k: &str| k == "DISPLAY";
+    let wayland = |k: &str| k == "WAYLAND_DISPLAY";
+    assert!(crate::app::no_display(true, true, x11), "over SSH");
+    assert!(
+        crate::app::no_display(false, true, none),
+        "Linux, no display"
+    );
+    assert!(!crate::app::no_display(false, true, x11));
+    assert!(!crate::app::no_display(false, true, wayland));
+    assert!(
+        !crate::app::no_display(false, false, none),
+        "macOS has a display with no DISPLAY set"
+    );
+}
+
 /// #1117 fixture: `a.rs` open and drawn, `name` selected when `select`,
 /// then a right-click on the word `value`.
 fn editor_menu_1117(select: bool) -> (tempfile::TempDir, App) {
