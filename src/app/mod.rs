@@ -9966,6 +9966,11 @@ impl App {
                     return Some(label);
                 }
             }
+            SidebarView::RunDebug if self.run_debug.debug_active => {
+                if let Some(control) = self.run_debug.debug_control_painted_at(col, row) {
+                    return Some(control.tooltip());
+                }
+            }
             SidebarView::Explorer => {
                 let t = &self.tree;
                 if rect_contains(t.header_new_file_btn, col, row) {
@@ -32427,6 +32432,10 @@ impl App {
     fn refresh_debug_panel(&mut self) {
         let (active, status, rows) = self.build_debug_view();
         self.run_debug.debug_active = active;
+        self.run_debug.debug_paused = self
+            .debug_sessions
+            .focused()
+            .is_some_and(|s| s.phase == crate::dap::session::SessionPhase::Stopped);
         if active {
             self.run_debug.debug_status = status;
             self.run_debug.debug_rows = rows;
@@ -34718,6 +34727,22 @@ impl App {
         for session in self.debug_sessions.iter_mut() {
             session.update_breakpoints(&path, &specs);
         }
+    }
+
+    /// A click on the Run and Debug panel's debug toolbar (#1545): the same
+    /// action as the button's key.
+    fn run_debug_control(&mut self, control: crate::widgets::run_debug::DebugControl) {
+        use crate::widgets::run_debug::DebugControl;
+        match control {
+            DebugControl::Continue => self.debug_start_or_continue(),
+            DebugControl::Pause => self.debug_pause(),
+            DebugControl::StepOver => self.debug_step("next"),
+            DebugControl::StepInto => self.debug_step("stepIn"),
+            DebugControl::StepOut => self.debug_step("stepOut"),
+            DebugControl::Restart => self.debug_restart(),
+            DebugControl::Stop => self.debug_stop_by_user(),
+        }
+        self.refresh_debug_panel();
     }
 
     /// F10/F11/Shift+F11: step the paused thread (`next` / `stepIn` / `stepOut`).
@@ -58710,7 +58735,9 @@ impl App {
                         return;
                     }
                     if self.run_debug.debug_active {
-                        if let Some(widx) = self.run_debug.watch_remove_at(m.column, m.row) {
+                        if let Some(control) = self.run_debug.debug_control_at(m.column, m.row) {
+                            self.run_debug_control(control);
+                        } else if let Some(widx) = self.run_debug.watch_remove_at(m.column, m.row) {
                             self.remove_watch_expression(widx);
                             self.refresh_debug_panel();
                         } else if let Some(idx) = self.run_debug.debug_row_at(m.row) {
