@@ -343,18 +343,12 @@ jobs:
           ruby -c croft.rb
           cat croft.rb
 
-      - name: Open and merge a pull request against the tap
+      - name: Open a pull request against the tap
         # The tap is its own repository, so github.token cannot push to it:
         # HOMEBREW_TAP_TOKEN is a fine-grained token with contents and pull
         # requests write on vitali87/homebrew-croft only. Until it is set the
         # release still ships; this says what is missing instead of failing
         # a release whose archives are already public.
-        #
-        # The pull request is merged as soon as it is open, so `brew upgrade`
-        # sees the release without anyone visiting the tap. It still goes
-        # through a pull request rather than a push to the default branch so
-        # every bump leaves a record there; the formula itself was already
-        # checked above (generator refuses an incomplete SHA256SUMS, `ruby -c`).
         env:
           TAP: vitali87/homebrew-croft
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -385,4 +379,3 @@ jobs:
           gh pr create --repo "$TAP" --head "$branch" \
             --title "croft $version" \
             --body "Formula for croft $version, rendered by vitali87/croft's release workflow from the release's signed SHA256SUMS."
-          gh pr merge "$branch" --repo "$TAP" --squash --delete-branch
