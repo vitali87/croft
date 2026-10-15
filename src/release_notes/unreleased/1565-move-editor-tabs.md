@@ -1,1 +1,0 @@
-feature: Editor tabs can be rearranged: drag a tab along the tab bar, or press `Ctrl+Shift+PageUp` / `Ctrl+Shift+PageDown` (View: Move Editor Left / Right) to move the active tab one place, and View: Move Editor into Next / Previous Group moves it to the neighbouring split, opening one when there is none. The VS Code commands for these import.
