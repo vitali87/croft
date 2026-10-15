@@ -1,1 +1,0 @@
-feature: Java, Ruby and C# files have a code outline: Go to Symbol in Editor, the OUTLINE panel, breadcrumbs and sticky scroll list their classes, interfaces, enums, constructors, methods, properties and fields without a language server.

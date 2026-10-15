@@ -1,1 +1,0 @@
-feature: Stash, Stash (Include Untracked) and Stash Staged ask for the stash's name, seeded with the commit box's first line; the stash pickers show each stash's age and files; and "Git: View Stash…" opens a stash's changes in a read-only tab without applying it
