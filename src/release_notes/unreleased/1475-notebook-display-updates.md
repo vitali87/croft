@@ -1,1 +1,0 @@
-fix: Notebook displays made with `display(..., display_id=True)` now update in place when `.update()` or `update_display(...)` is called, from their own cell or a later one, as in Jupyter, so progress and status displays no longer stay stuck on their first value, and the notebook saves the latest value.

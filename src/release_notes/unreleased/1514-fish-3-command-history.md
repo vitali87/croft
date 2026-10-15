@@ -1,1 +1,0 @@
-fix: In fish 3 terminals, commands now reach the command history (Ctrl+Shift+H), Re-run and the inline suggestion: croft marks the end of the fish prompt, so it can tell the typed command from the prompt.
