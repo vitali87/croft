@@ -524,7 +524,7 @@ Every launch (`F5`, restart, a picked configuration or compound, Debug Test, and
 | `Shift+Alt+F9` | Add or edit a logpoint on the cursor's line (amber diamond; prints instead of pausing) |
 | `Alt+F9` | Toggle break on raised (not just uncaught) exceptions |
 | `F10` | Step over |
-| `F11` / `Shift+F11` | Step into / out |
+| `F11` / `Shift+F11` | Step into / out (the palette's "Debug: Step Into" / "Debug: Step Out", ids `step_into` / `step_out` in `keybindings.json`) |
 
 A bare `F5` / `F9` / `F10` / `F11` pressed while the **terminal pane** is focused and no debug session is live is forwarded to the app running in the shell (process-compose's `F10` Quit, htop's `F9` kill) instead of being claimed by the debugger. Modified chords keep their debug meaning everywhere.
 
@@ -538,7 +538,7 @@ When the session ends the console output stays on screen rather than being wiped
 
 Gutter marks: the paused line is a yellow `▶`, a breakpoint a red `●`, a conditional breakpoint a red `◆`, and a breakpoint the adapter could not bind a hollow `○`.
 
-Also in the Command Palette: Start / Stop / Pause / Restart Debugging, Toggle Breakpoint, Add Conditional Breakpoint, Step Over, Toggle Break on Raised Exceptions (uncaught always breaks), and Attach to Python Process.
+Also in the Command Palette: Start / Stop / Pause / Restart Debugging, Toggle Breakpoint, Add Conditional Breakpoint, Continue, Step Over, Step Into, Step Out, Step Into Target (pick which call on the paused line to enter, such as `scale()` in `transform(load(p), scale(2))`; an adapter that cannot list the calls steps into the first), Toggle Break on Raised Exceptions (uncaught always breaks), and Attach to Python Process.
 
 ## Extensions sidebar
 

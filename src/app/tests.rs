@@ -88806,6 +88806,133 @@ fn format_on_save_still_formats_when_croft_runs_the_named_formatter() {
     }
 }
 
+/// #1543: Continue, Step Into, Step Out and Step Into Target are commands:
+/// the palette lists them, `keybindings.json` names them by id, and VS
+/// Code's own chords for them carry over in `croft import-vscode`.
+#[test]
+fn the_step_commands_are_in_the_palette_and_bindable() {
+    use crate::widgets::command_palette::{ALL_COMMANDS, Command};
+    for (title, id) in [
+        ("Debug: Continue", "continue"),
+        ("Debug: Step Into", "step_into"),
+        ("Debug: Step Out", "step_out"),
+        ("Debug: Step Into Target", "step_into_target"),
+    ] {
+        let cmd = Command::from_id(id).unwrap_or_else(|| panic!("no command {id}"));
+        assert_eq!(cmd.title(), title);
+        assert!(ALL_COMMANDS.contains(&cmd));
+    }
+    assert_eq!(
+        Command::from_id("step_into").unwrap().keybinding_hint(),
+        "F11"
+    );
+    assert_eq!(
+        Command::from_id("step_out").unwrap().keybinding_hint(),
+        "Shift+F11"
+    );
+}
+
+/// #1543: with a session paused on thread 1, the palette's Step Into and
+/// Step Out send `stepIn` / `stepOut`, and Step Into Target's picker sends
+/// `stepIn` with the chosen call's `targetId`.
+#[test]
+fn step_into_target_steps_into_the_picked_call() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let log = tmp.path().join("requests.log");
+    let mut session = crate::dap::session::DapSession::launch_with(
+        "sh",
+        &[String::from("-c"), format!("cat > '{}'", log.display())],
+        std::path::Path::new("."),
+        serde_json::json!({"seq": 2, "type": "request", "command": "launch", "arguments": {}}),
+        std::collections::BTreeMap::new(),
+    )
+    .expect("sh spawns");
+    session.phase = crate::dap::session::SessionPhase::Stopped;
+    session.stopped_thread = Some(1);
+    app.debug_sessions.push("app.py", session);
+    let sent = |needle: &str| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if std::fs::read_to_string(&log).is_ok_and(|s| s.contains(needle)) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    };
+    assert!(run_from_palette(&mut app, "Debug: Step Out"));
+    assert!(sent("\"command\":\"stepOut\""));
+
+    app.offer_step_in_targets(vec![
+        (1, String::from("load('data.csv')")),
+        (2, String::from("scale(2)")),
+        (3, String::from("transform(...)")),
+    ]);
+    let picker = app
+        .list_picker
+        .as_ref()
+        .expect("several calls open a picker");
+    assert_eq!(picker.title, "Step Into Target");
+    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["load('data.csv')", "scale(2)", "transform(...)"]);
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        sent("\"targetId\":2"),
+        "{:?}",
+        std::fs::read_to_string(&log)
+    );
+}
+
+/// #1543 negative: a line with one call steps straight into it and a line
+/// with none steps in plainly; neither opens a picker.
+#[test]
+fn one_or_no_step_in_target_needs_no_picker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let log = tmp.path().join("requests.log");
+    let mut session = crate::dap::session::DapSession::launch_with(
+        "sh",
+        &[String::from("-c"), format!("cat > '{}'", log.display())],
+        std::path::Path::new("."),
+        serde_json::json!({"seq": 2, "type": "request", "command": "launch", "arguments": {}}),
+        std::collections::BTreeMap::new(),
+    )
+    .expect("sh spawns");
+    session.phase = crate::dap::session::SessionPhase::Stopped;
+    session.stopped_thread = Some(1);
+    app.debug_sessions.push("app.py", session);
+    app.offer_step_in_targets(vec![(9, String::from("only()"))]);
+    assert!(app.list_picker.is_none());
+    app.offer_step_in_targets(Vec::new());
+    assert!(app.list_picker.is_none());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut text = String::new();
+    while std::time::Instant::now() < deadline {
+        text = std::fs::read_to_string(&log).unwrap_or_default();
+        if text.matches("\"command\":\"stepIn\"").count() >= 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(text.contains("\"targetId\":9"), "{text}");
+    assert_eq!(text.matches("\"command\":\"stepIn\"").count(), 2, "{text}");
+}
+
+/// #1543 negative: Debug: Continue resumes only a paused session; with no
+/// session it says so instead of starting one (F5 still starts).
+#[test]
+fn continue_with_no_session_starts_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(run_from_palette(&mut app, "Debug: Continue"));
+    assert!(app.debug_sessions.is_empty());
+    assert_eq!(app.status, "No debug session to continue");
+}
+
 /// #1117 fixture: `a.rs` open and drawn, `name` selected when `select`,
 /// then a right-click on the word `value`.
 fn editor_menu_1117(select: bool) -> (tempfile::TempDir, App) {
