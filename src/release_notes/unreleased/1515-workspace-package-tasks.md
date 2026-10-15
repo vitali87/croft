@@ -1,1 +1,0 @@
-feature: In an npm, pnpm or yarn workspaces monorepo, Tasks: Run Task now lists every package's scripts as `npm: build - packages/web` (the label VS Code gives them, so a launch.json `preLaunchTask` finds them) and runs each from its package folder.

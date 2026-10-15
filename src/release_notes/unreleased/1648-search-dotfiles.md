@@ -1,1 +1,0 @@
-fix: Project Search now searches dotfiles and dot-directories such as `.env`, `.eslintrc.json` and `.github/workflows` unless they are gitignored, as Quick Open already lists them; the `.git` store stays out.
