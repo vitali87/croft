@@ -48308,7 +48308,40 @@ impl App {
         self.status = format!("Pasted {} chars", s.chars().count());
     }
 
+    /// A terminal paste. While a macro records, a paste into the editor is a
+    /// step of it, on the same terms `handle_key` records a key: not while
+    /// replaying, and only when the editor had focus before and after and
+    /// the text went into it (#1464). Before, the replay silently left the pasted text out.
     fn handle_paste(&mut self, s: &str) {
+        let capture =
+            self.macro_recording.is_some() && !self.macro_replaying && self.focus == Pane::Editor;
+        let into_editor = self.handle_paste_inner(s);
+        if self.macro_recording.is_none() || self.macro_replaying {
+            return;
+        }
+        // A paste the palette, a prompt or the find bar took never reached
+        // the document, so replaying it there would insert stray text.
+        if capture && into_editor && self.focus == Pane::Editor {
+            if let Some(rec) = self.macro_recording.as_mut() {
+                rec.recorded.push_paste(s);
+            }
+        } else if !s.is_empty() {
+            // Logged as skipped keys are, by size only: a paste into a
+            // terminal can be a password.
+            crate::output::push(
+                "Macros",
+                crate::output::OutputLevel::Info,
+                &format!(
+                    "skipped a paste of {} chars: recording captures the editor pane only",
+                    s.chars().count()
+                ),
+            );
+        }
+    }
+
+    /// Route a paste to whatever owns it; true only when it went into the
+    /// editor's text, the one place a recording macro can replay it.
+    fn handle_paste_inner(&mut self, s: &str) -> bool {
         // Modal overlays own paste entirely while open — paste lands in
         // the modal's input field, never in the editor / tree / terminal
         // behind it. Without this, hitting Cmd+V right after Cmd+P pastes
@@ -48321,7 +48354,7 @@ impl App {
                     prompt.push_char(c);
                 }
             }
-            return;
+            return false;
         }
         if let Some(palette) = self.command_palette.as_mut() {
             for c in s.chars() {
@@ -48329,7 +48362,7 @@ impl App {
                     palette.push_char(c);
                 }
             }
-            return;
+            return false;
         }
         if let Some(picker) = self.go_to_symbol.as_mut() {
             for c in s.chars() {
@@ -48337,7 +48370,7 @@ impl App {
                     picker.push_char(c);
                 }
             }
-            return;
+            return false;
         }
         if let Some(picker) = self.workspace_symbols.as_mut() {
             for c in s.chars() {
@@ -48346,7 +48379,7 @@ impl App {
                 }
             }
             self.workspace_symbols_requery();
-            return;
+            return false;
         }
         if let Some(finder) = self.file_finder.as_mut() {
             for c in s.chars() {
@@ -48355,7 +48388,7 @@ impl App {
                 }
             }
             self.follow_quick_open_prefix();
-            return;
+            return false;
         }
         // The in-file find bar is a pane-scoped widget, not a modal: it only
         // owns the paste while the editor itself is focused. Without the focus
@@ -48374,7 +48407,7 @@ impl App {
                 }
             }
             self.editor_find_set_query(new_q);
-            return;
+            return false;
         }
         // Finder drag-and-drop into croft arrives via the host terminal as
         // a bracketed paste containing absolute filesystem path(s). The
@@ -48406,18 +48439,18 @@ impl App {
             .iter()
             .any(|p| p.is_absolute() && is_iterm2_inline_image_drop(p))
         {
-            return;
+            return false;
         }
         let dropped = parse_dropped_paths(s);
         if !dropped.is_empty() {
             match self.sidebar_view {
                 SidebarView::Remote if self.focus == Pane::Tree => {
                     self.import_paths_into_remote(&dropped);
-                    return;
+                    return false;
                 }
                 SidebarView::Explorer if self.focus == Pane::Tree => {
                     self.import_paths_into_explorer(&dropped);
-                    return;
+                    return false;
                 }
                 _ => {}
             }
@@ -48447,14 +48480,14 @@ impl App {
             let foreign = parse_foreign_dropped_paths(s);
             if !foreign.is_empty() {
                 self.request_remote_pulls(&foreign);
-                return;
+                return false;
             }
         }
         if self.sidebar_view == SidebarView::Search && self.focus == Pane::Tree {
             self.search.insert_str_into_query(s);
             self.submit_search_query();
             self.status = format!("Pasted {} chars", s.chars().count());
-            return;
+            return false;
         }
         // Source Control commit message box: bracketed paste must
         // populate it the same way Cmd+V via the key path does
@@ -48469,12 +48502,13 @@ impl App {
         {
             self.source_control.insert_str(s);
             self.status = format!("Pasted {} chars", s.chars().count());
-            return;
+            return false;
         }
         match self.focus {
             Pane::Editor => {
                 self.editor.paste_str(s, self.paste_reindent);
                 self.status = format!("Pasted {} chars", s.chars().count());
+                return true;
             }
             Pane::Terminal => {
                 if self.terminal_find.is_some() {
@@ -48495,6 +48529,7 @@ impl App {
             }
             Pane::Tree => {}
         }
+        false
     }
 
     /// Move every dropped path into the directory the explorer is
@@ -52803,10 +52838,10 @@ impl App {
             return;
         }
         let count = count.max(1);
-        // Budget the keys actually fed, not the recorded step count:
-        // `key_events` drops steps this build cannot replay, so `len()` is an
-        // upper bound rather than the real total.
-        let keys = mac.key_events();
+        // Budget the steps actually fed, not the recorded step count:
+        // `replay_steps` drops steps this build cannot replay, so `len()` is
+        // an upper bound rather than the real total.
+        let keys = mac.replay_steps();
         if keys.is_empty() {
             // Every step was one this build cannot replay (a macro from a
             // newer croft). Say so rather than reporting a successful run
@@ -52814,7 +52849,16 @@ impl App {
             self.status = String::from("Macro has no steps this version can replay");
             return;
         }
-        let total = keys.len().saturating_mul(count);
+        // A paste is one step but inserts all of its text, so its characters
+        // count against the budget like typed ones.
+        let per_run: usize = keys
+            .iter()
+            .map(|step| match step {
+                crate::macros::Replay::Key(_) => 1,
+                crate::macros::Replay::Paste(text) => text.chars().count().max(1),
+            })
+            .sum();
+        let total = per_run.saturating_mul(count);
         if total > MAX_REPLAY_KEYS {
             self.status =
                 format!("Macro would run {total} keys (limit {MAX_REPLAY_KEYS}) — refused");
@@ -52832,10 +52876,16 @@ impl App {
             // one-step-per-iteration guarantee needs an undo-group API the
             // editor does not have (its undo is whole-buffer snapshots).
             self.editor.break_undo_coalescing();
-            for k in &keys {
-                if let Err(e) = self.handle_key(*k) {
-                    aborted = Some((iteration + 1, e.to_string()));
-                    break 'outer;
+            for step in &keys {
+                match step {
+                    crate::macros::Replay::Key(k) => {
+                        if let Err(e) = self.handle_key(*k) {
+                            aborted = Some((iteration + 1, e.to_string()));
+                            break 'outer;
+                        }
+                    }
+                    // Pasted, not typed, as it was recorded (#1464).
+                    crate::macros::Replay::Paste(text) => self.handle_paste(text),
                 }
             }
             done = iteration + 1;
