@@ -14152,12 +14152,7 @@ impl App {
         if !cfg!(test) {
             use std::io::Write;
             let mut out = stdout();
-            // Portable dynamic colors first (all hosts), then the iTerm2
-            // sRGB override where supported.
-            let _ = out.write_all(host_colors_seq(theme).as_bytes());
-            if crate::iterm2_inline::detect_iterm2_inline_support() {
-                let _ = out.write_all(set_session_bg_srgb_seq(theme.editor_bg_rgb()).as_bytes());
-            }
+            let _ = out.write_all(theme_host_colors_seq(theme).as_bytes());
             let _ = out.flush();
         }
         self.rebake_inline_images();
@@ -70383,7 +70378,7 @@ fn set_session_bg_srgb_seq(rgb: (u8, u8, u8)) -> String {
 
 /// Revert the iTerm2 session bg to the user's profile default. Emitted on
 /// exit so the user's shell doesn't inherit croft's forced bg colour.
-fn reset_session_bg_seq() -> String {
+pub(crate) fn reset_session_bg_seq() -> String {
     String::from("\x1b]1337;SetColors=bg=default\x07")
 }
 
@@ -70401,9 +70396,31 @@ fn host_colors_seq(theme: crate::theme::Theme) -> String {
     format!("\x1b]11;rgb:{br:02x}/{bg:02x}/{bb:02x}\x07\x1b]10;rgb:{fr:02x}/{fg:02x}/{fb:02x}\x07")
 }
 
+/// The host terminal's default colours set to `theme`'s: the portable
+/// dynamic colours on every host, then iTerm2's sRGB session background
+/// where it has one. Startup, a theme switch and a reattach all send this.
+fn theme_host_colors_seq(theme: crate::theme::Theme) -> String {
+    let mut seq = host_colors_seq(theme);
+    if crate::iterm2_inline::detect_iterm2_inline_support() {
+        seq.push_str(&set_session_bg_srgb_seq(theme.editor_bg_rgb()));
+    }
+    seq
+}
+
+/// What a persistent session's croft sends on every WINCH, which is how a
+/// reattach reaches it: every startup mode ([`mode_reassert_seq`]), then the
+/// theme's default colours. A terminal attaching for the first time never
+/// had those colours, and a `croft remote` client resets them while its
+/// connection is down (#1460), so they come back with the modes.
+pub(crate) fn reattach_reassert_seq(theme: crate::theme::Theme) -> Vec<u8> {
+    let mut seq = mode_reassert_seq();
+    seq.extend_from_slice(theme_host_colors_seq(theme).as_bytes());
+    seq
+}
+
 /// Reset the host terminal's default foreground and background to its own
 /// configuration (OSC 110/111), undoing [`host_colors_seq`] on exit.
-fn reset_host_colors_seq() -> &'static str {
+pub(crate) fn reset_host_colors_seq() -> &'static str {
     "\x1b]110\x07\x1b]111\x07"
 }
 
@@ -75470,11 +75487,7 @@ pub fn run(
         // surrounding pane bg pixel-for-pixel
         // (https://gitlab.com/gnachman/iterm2/-/issues/12529).
         let theme = crate::prefs::Prefs::load_or_default().theme();
-        out.write_all(host_colors_seq(theme).as_bytes()).ok();
-        if crate::iterm2_inline::detect_iterm2_inline_support() {
-            out.write_all(set_session_bg_srgb_seq(theme.editor_bg_rgb()).as_bytes())
-                .ok();
-        }
+        out.write_all(theme_host_colors_seq(theme).as_bytes()).ok();
         out.flush().ok();
     }
     // Env-var-only iTerm2 detection: no stdin queries, so this can't
@@ -76589,7 +76602,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                         if std::env::var_os("CROFT_SESSION_PERSISTENT").is_some() {
                             use std::io::Write;
                             let out = terminal.backend_mut();
-                            let _ = out.write_all(&mode_reassert_seq());
+                            let _ = out.write_all(&reattach_reassert_seq(app.theme));
                             let _ = out.flush();
                         }
                     }

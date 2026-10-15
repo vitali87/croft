@@ -508,26 +508,35 @@ fn session_supervisor_check_command() -> &'static str {
 /// that is then where the cursor already is. On the alt screen it saves into
 /// the alt screen's own slot, which the main screen never reads.
 ///
-/// The terminal's default colours are left alone. croft sets them at startup
-/// but does not set them again when a resumed session re-asserts its modes,
-/// so resetting them here would leave the resumed screen in the wrong
-/// background.
-const LOST_SESSION_RELEASE_SEQ: &str = concat!(
-    "\x1b[<u\x1b[=0;1u",
-    "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l",
-    "\x1b[?2004l\x1b[?1004l",
-    "\x1b[0m\x1b[0 q\x1b[?25h",
-    "\x1b7\x1b[?1049l",
-);
+/// The terminal's default colours are reset as well, the same as croft's own
+/// exit does. Nothing runs after a session that is given up (Ctrl+C during
+/// the reconnect, the attempts running out, a host with no session to
+/// resume), so this is the last chance to put the shell's colours back. A
+/// resumed croft sets its theme's colours again with its modes
+/// (`reattach_reassert_seq` in app/mod.rs).
+fn lost_session_release_seq() -> String {
+    let mut seq = String::from(concat!(
+        "\x1b[<u\x1b[=0;1u",
+        "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l",
+        "\x1b[?2004l\x1b[?1004l",
+        "\x1b[0m\x1b[0 q\x1b[?25h",
+    ));
+    seq.push_str(crate::app::reset_host_colors_seq());
+    if crate::iterm2_inline::detect_iterm2_inline_support() {
+        seq.push_str(&crate::app::reset_session_bg_seq());
+    }
+    seq.push_str("\x1b7\x1b[?1049l");
+    seq
+}
 
 /// Give the terminal back after the remote croft lost it (#1460), before
-/// anything else is printed: see [`LOST_SESSION_RELEASE_SEQ`]. Mouse reports
+/// anything else is printed: see [`lost_session_release_seq`]. Mouse reports
 /// already on their way are then dropped from the tty's input, so they reach
 /// neither the shell nor the resumed croft as typed text.
 fn release_lost_session_terminal() {
     use std::io::Write;
     let mut out = std::io::stdout();
-    let _ = out.write_all(LOST_SESSION_RELEASE_SEQ.as_bytes());
+    let _ = out.write_all(lost_session_release_seq().as_bytes());
     let _ = out.flush();
     #[cfg(unix)]
     {
@@ -5170,7 +5179,7 @@ Host !blocked *.internal
         // so the reconnect lines scrolled its screen and mouse moves typed
         // `^[[<35;…M`. Whatever croft's takeover turns on, the release
         // turns off, so a mode added there later cannot be missed here.
-        let release = LOST_SESSION_RELEASE_SEQ;
+        let release = lost_session_release_seq();
         let takeover = String::from_utf8(crate::app::takeover_mode_seq()).unwrap();
         let mut modes = 0;
         for set in takeover.split("\x1b[?").skip(1) {
@@ -5202,8 +5211,8 @@ Host !blocked *.internal
     }
 
     #[test]
-    fn a_lost_session_leaves_the_alt_screen_last_and_keeps_the_colours() {
-        let release = LOST_SESSION_RELEASE_SEQ;
+    fn a_lost_session_leaves_the_alt_screen_last_and_its_colours_come_back_on_resume() {
+        let release = lost_session_release_seq();
         // The kitty flags are cleared on the alt screen that holds them,
         // before the screen changes.
         let kitty = release.find("\x1b[=0;1u").expect("the kitty flags cleared");
@@ -5212,9 +5221,26 @@ Host !blocked *.internal
         // when the main screen already shows.
         assert!(release.ends_with("\x1b7\x1b[?1049l"), "{release:?}");
         assert!(kitty < release.len() - "\x1b7\x1b[?1049l".len());
-        // The resumed croft does not set the default colours again, so the
-        // release must not reset them (OSC 110/111) or any other OSC.
-        assert!(!release.contains("\x1b]"), "{release:?}");
+        // A session given up runs nothing after this, so the shell gets its
+        // own colours back here...
+        assert!(
+            release.contains(crate::app::reset_host_colors_seq()),
+            "{release:?}"
+        );
+        // ...and a resumed croft sets its theme's again with its modes.
+        let theme = crate::theme::Theme::BLACK;
+        let reattach = String::from_utf8(crate::app::reattach_reassert_seq(theme)).unwrap();
+        let takeover = String::from_utf8(crate::app::takeover_mode_seq()).unwrap();
+        assert!(reattach.starts_with(&takeover), "{reattach:?}");
+        let (r, g, b) = theme.editor_bg_rgb();
+        assert!(
+            reattach.contains(&format!("\x1b]11;rgb:{r:02x}/{g:02x}/{b:02x}\x07")),
+            "the theme's background: {reattach:?}"
+        );
+        assert!(
+            reattach.contains("\x1b]10;rgb:"),
+            "and foreground: {reattach:?}"
+        );
     }
 
     #[test]
