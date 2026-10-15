@@ -233,7 +233,7 @@ impl Snippet {
 }
 
 /// The loaded set of user snippets.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SnippetSet {
     snippets: Vec<Snippet>,
     /// What could not be loaded: the file itself, or one entry by name. The
@@ -379,6 +379,15 @@ impl SnippetSet {
         self.snippets.is_empty()
     }
 
+    /// Add `other`'s snippets after these, so on a shared prefix the ones
+    /// already here win Tab expansion (#1484: the user's own over a
+    /// project's). Its warnings are kept; whether this set is broken is not
+    /// changed, since that describes the user's own file.
+    pub fn append(&mut self, other: SnippetSet) {
+        self.snippets.extend(other.snippets);
+        self.warnings.extend(other.warnings);
+    }
+
     /// What could not be loaded, one line each, for OUTPUT · Snippets.
     pub fn warnings(&self) -> &[String] {
         &self.warnings
@@ -410,6 +419,39 @@ impl SnippetSet {
 
 pub fn snippets_path() -> PathBuf {
     crate::profiles::file("snippets.json")
+}
+
+/// A workspace folder's own snippets (#1484), the files a team commits:
+/// every `.vscode/*.code-snippets` (VS Code's project snippets), in name
+/// order, then croft's `.croft/snippets.json`. Only files that exist.
+pub fn project_files(root: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(root.join(".vscode"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|p| is_project_file(p) && p.is_file())
+        .collect();
+    files.sort();
+    let croft = root.join(".croft").join("snippets.json");
+    if croft.is_file() {
+        files.push(croft);
+    }
+    files
+}
+
+/// Whether `path` is a project snippets file by its name and folder: a
+/// `*.code-snippets` in a `.vscode` folder, or `.croft/snippets.json`.
+pub fn is_project_file(path: &Path) -> bool {
+    let parent = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str());
+    match parent {
+        Some(".vscode") => path.extension().is_some_and(|e| e == "code-snippets"),
+        Some(".croft") => path.file_name().is_some_and(|n| n == "snippets.json"),
+        _ => false,
+    }
 }
 
 /// Seeded on first "Configure User Snippets" so the user starts from a working
@@ -735,5 +777,49 @@ mod tests {
                 .is_empty()
         );
         assert!(SnippetSet::from_json("{}").warnings().is_empty());
+    }
+
+    /// #1484: on a prefix both define, the snippet already in the set (the
+    /// user's) wins Tab; the appended one still shows in completion.
+    #[test]
+    fn appended_snippets_lose_a_shared_prefix_but_still_complete() {
+        let mut set = SnippetSet::from_json(r#"{ "Mine": { "prefix": "tlog", "body": "mine" } }"#);
+        set.append(SnippetSet::from_json(
+            r#"{ "Team": { "prefix": "tlog", "body": "team" }, "Other": { "prefix": "tdb", "body": "db" } }"#,
+        ));
+        assert_eq!(set.exact("tlog", "python").unwrap().body, "mine");
+        assert_eq!(set.exact("tdb", "python").unwrap().body, "db");
+        assert_eq!(set.matching("tlog", "python").len(), 2);
+    }
+
+    #[test]
+    fn project_files_are_the_vscode_code_snippets_then_croft_s_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".vscode")).unwrap();
+        std::fs::create_dir_all(root.join(".croft")).unwrap();
+        for f in [
+            ".vscode/z.code-snippets",
+            ".vscode/a.code-snippets",
+            ".vscode/settings.json",
+            ".croft/snippets.json",
+            "loose.code-snippets",
+        ] {
+            std::fs::write(root.join(f), "{}").unwrap();
+        }
+        std::fs::create_dir_all(root.join(".vscode/dir.code-snippets")).unwrap();
+        let names: Vec<_> = project_files(root)
+            .iter()
+            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ".vscode/a.code-snippets",
+                ".vscode/z.code-snippets",
+                ".croft/snippets.json"
+            ]
+        );
+        assert!(project_files(&root.join("nothing-here")).is_empty());
     }
 }
