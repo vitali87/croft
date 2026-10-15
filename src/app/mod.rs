@@ -70250,7 +70250,7 @@ fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
 /// inline `execute!` at a call site. The kitty keyboard flags are the one
 /// deliberate exception: startup pushes them (the push pairs with the
 /// teardown pop), while [`mode_reassert_seq`] appends the SET form.
-fn takeover_mode_seq() -> Vec<u8> {
+pub(crate) fn takeover_mode_seq() -> Vec<u8> {
     let mut seq = Vec::new();
     let _ = execute!(
         seq,
