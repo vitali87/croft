@@ -1,1 +1,0 @@
-fix: Opening a CodeQL query result no longer asks "Locate web.py" when the database was created from a sub-folder or another checkout: croft opens the file from the folder the database records, or read-only from the database's own source archive when that folder is not on this machine.
