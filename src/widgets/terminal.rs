@@ -1351,6 +1351,19 @@ pub fn pick_pane_label<'a>(manual: Option<&'a str>, auto: &'a str) -> &'a str {
 pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, view_sock: Option<&std::path::Path>) {
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    // The pane is croft's emulator, not the host's (#1453). A program that
+    // read Ghostty's `TERM_PROGRAM` here wrote Kitty graphics the pane drops,
+    // so `croft plot` printed blank rows. VS Code does the same with
+    // `TERM_PROGRAM=vscode`.
+    cmd.env("TERM_PROGRAM", crate::iterm2_inline::CROFT_TERM_PROGRAM);
+    cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+    for host_only in HOST_TERMINAL_VARS {
+        cmd.env_remove(host_only);
+    }
+    cmd.env(
+        crate::iterm2_inline::CROFT_INLINE_IMAGES_ENV,
+        if pane_images_shown() { "1" } else { "0" },
+    );
     // A pane's shell must count characters the way the terminal draws them.
     // macOS forwards `LC_CTYPE=UTF-8` over ssh, which Linux does not know, so
     // a remote shell fell back to ASCII and counted a 3-byte prompt glyph
@@ -1384,6 +1397,33 @@ pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, view_sock: Option<&std::p
         // plainly").
         None => cmd.env_remove(crate::view_ipc::SOCK_ENV),
     }
+}
+
+/// Variables that name the HOST terminal (#1453). In a pane they would send
+/// a program down a graphics or feature path croft's emulator does not relay.
+const HOST_TERMINAL_VARS: &[&str] = &[
+    "KITTY_WINDOW_ID",
+    "KITTY_PID",
+    "GHOSTTY_RESOURCES_DIR",
+    "GHOSTTY_BIN_DIR",
+    "ITERM_SESSION_ID",
+    "LC_TERMINAL",
+    "LC_TERMINAL_VERSION",
+    "WEZTERM_PANE",
+    "WEZTERM_EXECUTABLE",
+    "VTE_VERSION",
+];
+
+/// Set once the DA1 probe finds a sixel host, which no variable advertises.
+pub static SIXEL_HOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this croft draws a pane's captured images (#1453): the outer
+/// terminal speaks some image protocol. A pane opened before the sixel probe
+/// answers says no, which costs a picture, never a blank chart.
+fn pane_images_shown() -> bool {
+    crate::iterm2_inline::detect_inline_image_protocol()
+        != crate::iterm2_inline::InlineImageProtocol::None
+        || SIXEL_HOST.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The locale variable to set so a Linux shell reads its text as UTF-8, or
@@ -7898,6 +7938,26 @@ mod tests {
         assert!(
             term.drain_notifications().is_empty(),
             "a second drain returns nothing"
+        );
+    }
+
+    #[test]
+    fn osc777_and_osc99_notifications_drain_like_osc9() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "printf '\\033]777;notify;Build;finished OK\\007\\033]99;;kitty-style note\\033\\\\\\033]9;iTerm2-style note\\007ok\\n'";
+        let term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
+                .unwrap();
+        // The echoed command wraps past the pane's width, so a wrapped half
+        // of it can hold "ok" without "printf": wait for the output line.
+        wait_for_grid(&term, |ls| ls.iter().any(|l| l.trim() == "ok"));
+        assert_eq!(
+            term.drain_notifications(),
+            vec![
+                String::from("Build: finished OK"),
+                String::from("kitty-style note"),
+                String::from("iTerm2-style note"),
+            ]
         );
     }
 
