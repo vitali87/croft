@@ -991,13 +991,18 @@ fn render_sheet(
     );
 }
 
+/// The fewest body rows a merge editor source pane needs before it gives
+/// one to the accept buttons above a conflict (#1169).
+const MERGE_BUTTON_ROW_MIN_BODY: usize = 4;
+
 /// Render the merge editor's source panes (#253) into the TOP of `inner`
 /// and return the remaining rect for the ordinary text path — the
 /// editable Result pane. One header row carries the resolved counter,
 /// then Current | (Base) | Incoming as columns (stacked vertically when
 /// the terminal is narrow), then a separator row labelling the Result.
 /// Per-conflict checkboxes are painted in a small gutter on the region's
-/// first row and their hit rects recorded on the view for mouse routing.
+/// first row, accept buttons on a row above it, and their hit rects
+/// recorded on the view for mouse routing.
 fn render_merge_panes(
     mv: &mut crate::merge_editor::MergeView,
     inner: Rect,
@@ -1006,6 +1011,7 @@ fn render_merge_panes(
 ) -> Rect {
     use crate::merge_editor::{CheckSide, ConflictState};
     mv.check_spans.clear();
+    mv.action_spans.clear();
     mv.last_panes_area = Rect::default();
     // Too small for source panes: the Result gets everything, and the
     // commands (F7, accepts) still work off the tracked regions.
@@ -1213,9 +1219,59 @@ fn render_merge_panes(
         );
         let body_h = (rect.height - 1) as usize;
         let text_w = (rect.width - gutter) as usize;
+        // A side pane puts a row of accept buttons above each conflict
+        // (#1169), VS Code's merge editor CodeLens, so the lines below it
+        // move down a row. An empty side (a deletion) still gets its row. A
+        // pane too short to spare the row keeps only its checkboxes, rather
+        // than pushing the conflict itself out of sight.
+        let mut idx = pane.scroll;
+        let mut buttons_drawn: Vec<usize> = Vec::new();
+        let button_rows = body_h >= MERGE_BUTTON_ROW_MIN_BODY;
         for vis in 0..body_h {
-            let idx = pane.scroll + vis;
             let y = rect.y + 1 + vis as u16;
+            let buttons = pane.side.filter(|_| button_rows).and_then(|side| {
+                pane.regions
+                    .iter()
+                    .find(|(start, _, ci, _)| *start == idx && !buttons_drawn.contains(ci))
+                    .map(|&(_, _, ci, _)| (side, ci))
+            });
+            if let Some((side, ci)) = buttons {
+                buttons_drawn.push(ci);
+                let tint = if ci == mv.active {
+                    pane.active_tint
+                } else {
+                    pane.tint
+                };
+                for x in rect.x..rect.x + rect.width {
+                    buf[(x, y)].set_style(text_style.bg(tint));
+                    buf[(x, y)].set_symbol(" ");
+                }
+                let state = mv.conflicts[ci].state;
+                let both = matches!(state, ConflictState::Both | ConflictState::BothReverse);
+                let (own, own_state) = match side {
+                    CheckSide::Current => (
+                        AcceptChip::new("Accept Current", "Current", ACCEPT_CURRENT_FILL)
+                            .ticked(state == ConflictState::Current),
+                        ConflictState::Current,
+                    ),
+                    CheckSide::Incoming => (
+                        AcceptChip::new("Accept Incoming", "Incoming", ACCEPT_INCOMING_FILL)
+                            .ticked(state == ConflictState::Incoming),
+                        ConflictState::Incoming,
+                    ),
+                };
+                let chips = [
+                    own,
+                    AcceptChip::new("Accept Both", "Both", ACCEPT_BOTH_FILL).ticked(both),
+                ];
+                let states = [own_state, ConflictState::Both];
+                for (i, xs) in
+                    paint_accept_chips(buf, &chips, rect.x + 1, rect.x + rect.width, y, theme)
+                {
+                    mv.action_spans.push((y, xs, ci, states[i]));
+                }
+                continue;
+            }
             if idx >= pane.lines.len() {
                 break;
             }
@@ -1243,6 +1299,7 @@ fn render_merge_panes(
                 mv.check_spans.push((y, rect.x..rect.x + 3, ci, side));
             }
             buf.set_stringn(rect.x + gutter, y, &pane.lines[idx], text_w, style);
+            idx += 1;
         }
     }
 
@@ -7552,9 +7609,14 @@ impl Editor {
             decode_semantic_tokens(&self.semantic_data, legend, bytes, &line_starts);
     }
 
-    /// Number of logical lines in the buffer (the inlay-hint request range).
-    pub fn line_count(&self) -> usize {
-        self.lines.len()
+    /// Where the buffer ends, as an LSP position: the end of an inlay-hint
+    /// request range, which a strict server rejects past it (#1490).
+    pub fn document_end(&self) -> lsp_types::Position {
+        let last = self.lines.last().map_or("", String::as_str);
+        lsp_types::Position::new(
+            self.lines.len().saturating_sub(1) as u32,
+            last.encode_utf16().count() as u32,
+        )
     }
 
     /// Markdown: Toggle Preview (Cmd/Ctrl+Shift+V). Returns false when the
@@ -17603,10 +17665,11 @@ impl Widget for &mut Editor {
             if let Some(tint) = conflict_row_tint(&self.conflicts, line_idx, self.theme) {
                 paint_full_row_bg(buf, text_x, y, row_width, tint);
             }
-            // Clickable accept actions on the conflict header row — VS Code's
+            // Clickable accept buttons on the conflict header row — VS Code's
             // merge-conflict CodeLens, drawn after the marker text where the
-            // `<<<<<<<` line is otherwise dead space. Hit spans are recorded
-            // per frame (cleared at render start) so the rects always
+            // `<<<<<<<` line is otherwise dead space (#1169). A narrow row
+            // gets the short labels rather than losing buttons. Hit spans are
+            // recorded per frame (cleared at render start) so the rects always
             // describe the painted frame (#103's invariant).
             if let Some(block_idx) = self.conflicts.iter().position(|b| b.ours_start == line_idx) {
                 let block = self.conflicts[block_idx];
@@ -17616,28 +17679,22 @@ impl Widget for &mut Editor {
                     .map(|l| l.chars().count() as u16)
                     .unwrap_or(0)
                     .saturating_sub(row_start as u16);
-                let mut x = text_x + marker_len.min(row_width) + 2;
-                let actions: [(&str, crate::merge::Resolution); 3] = [
-                    ("[Accept Current]", crate::merge::Resolution::Current),
-                    ("[Accept Incoming]", crate::merge::Resolution::Incoming),
-                    ("[Accept Both]", crate::merge::Resolution::Both),
-                ];
-                for (label, res) in actions {
-                    let w = label.len() as u16;
-                    if x + w > text_x + row_width {
-                        break;
+                // A header that wraps gets them after its last segment only.
+                if marker_len <= row_width {
+                    use crate::merge::Resolution;
+                    let chips = [
+                        AcceptChip::new("Accept Current", "Current", ACCEPT_CURRENT_FILL),
+                        AcceptChip::new("Accept Incoming", "Incoming", ACCEPT_INCOMING_FILL),
+                        AcceptChip::new("Accept Both", "Both", ACCEPT_BOTH_FILL),
+                    ];
+                    let res = [Resolution::Current, Resolution::Incoming, Resolution::Both];
+                    let x0 = text_x + marker_len + 2;
+                    for (i, xs) in
+                        paint_accept_chips(buf, &chips, x0, text_x + row_width, y, self.theme)
+                    {
+                        self.merge_action_spans
+                            .push((y, xs, block.ours_start, res[i]));
                     }
-                    buf.set_string(
-                        x,
-                        y,
-                        label,
-                        Style::default()
-                            .fg(self.theme.ui(Color::Rgb(0x8a, 0xb4, 0xf8)))
-                            .add_modifier(Modifier::UNDERLINED),
-                    );
-                    self.merge_action_spans
-                        .push((y, x..x + w, block.ours_start, res));
-                    x += w + 2;
                 }
             }
 
@@ -19201,6 +19258,92 @@ fn conflict_row_tint(
     } else {
         theme.ui(Color::Rgb(0x16, 0x2b, 0x44))
     })
+}
+
+/// A merge-conflict accept button (#1169): its label, the shorter one a row
+/// too narrow for every full label gets, and its fill.
+struct AcceptChip {
+    label: String,
+    short: String,
+    fill: Color,
+}
+
+impl AcceptChip {
+    fn new(label: &str, short: &str, fill: Color) -> Self {
+        Self {
+            label: label.to_string(),
+            short: short.to_string(),
+            fill,
+        }
+    }
+
+    /// The button for `state`, ticked when the conflict is already resolved
+    /// that way, in both its full and short forms.
+    fn ticked(mut self, ticked: bool) -> Self {
+        if ticked {
+            self.label = format!("\u{2713} {}", self.label);
+            self.short = format!("\u{2713} {}", self.short);
+        }
+        self
+    }
+}
+
+/// The accept buttons' fills, in the hues of the conflict tints they sit
+/// on: green for current, blue for incoming, grey for both.
+const ACCEPT_CURRENT_FILL: Color = Color::Rgb(0x2f, 0x6b, 0x3e);
+const ACCEPT_INCOMING_FILL: Color = Color::Rgb(0x1f, 0x5a, 0x96);
+const ACCEPT_BOTH_FILL: Color = Color::Rgb(0x4b, 0x52, 0x63);
+
+/// Lay `chips` out from column `x0`, ending at or before `limit`, a cell
+/// apart: every full label when they all fit, else every short one, else as
+/// many short ones as fit. Each placed chip comes back, in order, with its
+/// column and the padded text to paint.
+fn lay_out_accept_chips(chips: &[AcceptChip], x0: u16, limit: u16) -> Vec<(u16, String)> {
+    let place = |short: bool| {
+        let mut out = Vec::new();
+        let mut x = x0;
+        for c in chips {
+            let text = format!(" {} ", if short { &c.short } else { &c.label });
+            let w = text.chars().count() as u16;
+            if x.saturating_add(w) > limit {
+                break;
+            }
+            out.push((x, text));
+            x += w + 1;
+        }
+        out
+    };
+    let full = place(false);
+    if full.len() == chips.len() {
+        return full;
+    }
+    place(true)
+}
+
+/// Paint the accept buttons laid out for row `y`, returning each painted
+/// button's index in `chips` and its column range for the click map.
+fn paint_accept_chips(
+    buf: &mut Buffer,
+    chips: &[AcceptChip],
+    x0: u16,
+    limit: u16,
+    y: u16,
+    theme: crate::theme::Theme,
+) -> Vec<(usize, std::ops::Range<u16>)> {
+    let mut spans = Vec::new();
+    for (i, (x, text)) in lay_out_accept_chips(chips, x0, limit)
+        .into_iter()
+        .enumerate()
+    {
+        let w = text.chars().count() as u16;
+        let style = Style::default()
+            .fg(theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
+            .bg(theme.ui(chips[i].fill))
+            .add_modifier(Modifier::BOLD);
+        buf.set_stringn(x, y, &text, w as usize, style);
+        spans.push((i, x..x + w));
+    }
+    spans
 }
 
 /// Tint every cell of one text row, keeping the glyphs and their colours.
@@ -35841,6 +35984,40 @@ mod tests {
             !e.sticky_click_rows.iter().any(|&(y, _)| y == caret.1),
             "the sticky band painted over the caret's own row {}",
             caret.1
+        );
+    }
+
+    /// #1169: accept buttons switch to their short labels instead of being
+    /// dropped when a row cannot fit every full label, and never run past
+    /// the row's end.
+    #[test]
+    fn accept_buttons_shorten_before_they_drop() {
+        let chips = [
+            AcceptChip::new("Accept Current", "Current", ACCEPT_CURRENT_FILL),
+            AcceptChip::new("Accept Incoming", "Incoming", ACCEPT_INCOMING_FILL),
+            AcceptChip::new("Accept Both", "Both", ACCEPT_BOTH_FILL),
+        ];
+        let texts = |limit: u16| -> Vec<String> {
+            lay_out_accept_chips(&chips, 10, limit)
+                .into_iter()
+                .map(|(x, t)| {
+                    assert!(x + t.chars().count() as u16 <= limit, "{t:?} overruns");
+                    t
+                })
+                .collect()
+        };
+        assert_eq!(
+            texts(100),
+            [" Accept Current ", " Accept Incoming ", " Accept Both "]
+        );
+        assert_eq!(texts(40), [" Current ", " Incoming ", " Both "]);
+        assert_eq!(texts(30), [" Current ", " Incoming "]);
+        assert!(texts(12).is_empty());
+        let ticked = AcceptChip::new("Accept Both", "Both", ACCEPT_BOTH_FILL).ticked(true);
+        assert_eq!(ticked.label, "\u{2713} Accept Both");
+        assert_eq!(
+            ticked.short, "\u{2713} Both",
+            "a narrow pane still shows which side was taken"
         );
     }
 
