@@ -4328,6 +4328,12 @@ pub struct App {
     screen_reader_command: Option<String>,
     announcer: crate::a11y::Announcer,
     announce_pos: Option<(u16, u16)>,
+    /// The latest event screen reader mode reads out whatever has focus
+    /// (#1547), numbered so a repeat is still read.
+    a11y_event: Option<(u64, String)>,
+    /// Why the focused debug session last stopped, until the stop's
+    /// location is known and the pause can be announced (#1547).
+    debug_pause_reason: Option<String>,
     /// Terminal command suggestions (#614): on or off, and the one painted
     /// this frame as (pane index, the text Right arrow would type).
     term_suggest_enabled: bool,
@@ -6511,6 +6517,8 @@ impl App {
             screen_reader_command: loaded_prefs.screen_reader_command.clone(),
             announcer: crate::a11y::Announcer::default(),
             announce_pos: None,
+            a11y_event: None,
+            debug_pause_reason: None,
             term_suggest_enabled: true,
             term_suggestion: None,
             recording_shortcut: None,
@@ -25870,6 +25878,7 @@ impl App {
         // "Running …" status (#856).
         let finished = self.testing.take_finished();
         let mut changed = self.announce_test_run_end(finished);
+        self.speak_test_run_end(finished, changed);
         if let Some(ok) = finished
             && self.testing.watch.finished(ok) == WatchNotice::NewlyRed
         {
@@ -26229,6 +26238,28 @@ impl App {
         run.settle(&mut self.status, |label, took| {
             testing.run_outcome(label, ok, took.as_secs_f64())
         })
+    }
+
+    /// Screen reader mode reads out how a finished test run went (#1547),
+    /// Run All included, which sets no "Running …" status to settle. When
+    /// [`Self::announce_test_run_end`] already put the counts in the status
+    /// (`settled`), which is read too, only the first failure is added.
+    fn speak_test_run_end(&mut self, finished: Option<Option<bool>>, settled: bool) {
+        let Some(Some(ok)) = finished else {
+            return;
+        };
+        if self.testing.is_busy() {
+            return;
+        }
+        let said = if settled {
+            match self.testing.run_first_failure() {
+                Some(name) => format!("First failure: {name}"),
+                None => return,
+            }
+        } else {
+            self.testing.spoken_outcome(ok)
+        };
+        self.announce_event(said);
     }
 
     /// Keep the "Running …" status a task or fenced block just set until
@@ -32271,6 +32302,7 @@ impl App {
                     self.run_debug.feedback = Some(format!("Paused ({reason})"));
                     self.run_debug.feedback_is_error = false;
                     self.watch_baseline_pending = true;
+                    self.debug_pause_reason = Some(reason);
                 }
                 // What the exception stop threw (#864): the panel's pill and
                 // the status line, which has the width the pill lacks.
@@ -32310,6 +32342,25 @@ impl App {
                     .debug_sessions
                     .focused()
                     .and_then(|s| s.current_location.clone());
+                // Said once this stop's stack trace has placed it, so the
+                // announcement names the file and line (#1547). The frames
+                // are cleared at each stop and the location is not, so an
+                // empty stack means the location is still the last stop's,
+                // and so does a top frame without a source: that stop is
+                // read without a file and line rather than with stale ones.
+                let top = self
+                    .debug_sessions
+                    .focused()
+                    .and_then(|s| s.stack_frames.first())
+                    .map(|f| (f.name.clone(), f.path.is_some()));
+                if let Some((frame, has_source)) = top
+                    && let Some(reason) = self.debug_pause_reason.take()
+                {
+                    let at = if has_source { loc.as_ref() } else { None };
+                    let said = self.debug_pause_announcement(&reason, at, &frame);
+                    self.announce_event(said);
+                    changed = true;
+                }
                 if let Some(loc) = loc
                     && self.editor.stop_line.as_ref() != Some(&loc)
                 {
@@ -32323,6 +32374,7 @@ impl App {
                 }
             }
             Some(SessionPhase::Terminated) => {
+                self.debug_pause_reason = None;
                 self.editor.stop_line = None;
                 self.editor.unverified_breakpoints.clear();
                 // A session that ends on its own must take croft's own
@@ -32919,6 +32971,7 @@ impl App {
                 session.continue_execution();
                 self.editor.stop_line = None;
                 self.clear_inline_values();
+                self.announce_event(String::from("Continued"));
             }
             return;
         }
@@ -60901,6 +60954,7 @@ impl App {
                         .and_then(|c| c.selected_item())
                         .map(|c| c.label.clone()),
                     status,
+                    event: None,
                 }
             }
             Pane::Terminal => {
@@ -61088,15 +61142,72 @@ impl App {
         if !self.screen_reader {
             return;
         }
-        let snap = self.a11y_snapshot();
+        let mut snap = self.a11y_snapshot();
+        snap.event = self.a11y_event.clone();
         let speak = self.screen_reader_command.clone();
         self.announcer.update(snap, speak.as_deref());
+    }
+
+    /// Have screen reader mode read `text` out whatever has focus (#1547):
+    /// something that happened, like a debugger pause, rather than
+    /// something the user moved to. Kept only while the mode is on, so
+    /// turning it on never reads out an old event.
+    fn announce_event(&mut self, text: String) {
+        if !self.screen_reader {
+            return;
+        }
+        let n = self.a11y_event.as_ref().map_or(0, |(n, _)| n + 1);
+        self.a11y_event = Some((n, crate::i18n::tr(&text).into_owned()));
+    }
+
+    /// What a debugger pause reads as (#1547): why it stopped, where, and
+    /// the line's text, as in `Paused on breakpoint, app.py line 3: total
+    /// += n`. The line comes from the buffer when the file is the one being
+    /// edited, else from disk. A stop with no source location (`at` is
+    /// `None`) names its frame instead, as in `Paused on step, in memcpy`.
+    fn debug_pause_announcement(
+        &self,
+        reason: &str,
+        at: Option<&(PathBuf, usize)>,
+        frame: &str,
+    ) -> String {
+        let what = match reason {
+            "" | "pause" => String::from("Paused"),
+            r => format!("Paused on {r}"),
+        };
+        let Some((path, line)) = at else {
+            return match frame.trim() {
+                "" => what,
+                f => format!("{what}, in {f}"),
+            };
+        };
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let index = line.saturating_sub(1);
+        let text = if self.editor.path.as_deref() == Some(path.as_path()) {
+            self.editor.lines.get(index).cloned()
+        } else {
+            use std::io::BufRead;
+            std::fs::File::open(path).ok().and_then(|f| {
+                std::io::BufReader::new(f)
+                    .lines()
+                    .nth(index)
+                    .and_then(Result::ok)
+            })
+        };
+        match text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            Some(t) => format!("{what}, {name} line {line}: {t}"),
+            None => format!("{what}, {name} line {line}"),
+        }
     }
 
     /// Accessibility: Toggle Screen Reader Mode (#621), persisted.
     fn toggle_screen_reader(&mut self) {
         self.screen_reader = !self.screen_reader;
         self.announcer.reset();
+        self.a11y_event = None;
         self.status = String::from(if self.screen_reader {
             "Screen reader mode: on"
         } else {

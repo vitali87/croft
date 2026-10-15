@@ -88806,6 +88806,281 @@ fn format_on_save_still_formats_when_croft_runs_the_named_formatter() {
     }
 }
 
+/// #1547: a stand-in adapter for a program paused in `app.py`: the first
+/// stop is a breakpoint on line 3, and every `next` or `continue` stops on
+/// line 3 again, as a loop body does.
+fn loop_stop_adapter(dir: &Path) -> crate::dap::session::DapSession {
+    stop_adapter(dir, false)
+}
+
+/// [`loop_stop_adapter`], where with `sourceless_step` a `next` stops in a
+/// frame with no source, as native code does.
+fn stop_adapter(dir: &Path, sourceless_step: bool) -> crate::dap::session::DapSession {
+    let app_py = dir.join("app.py");
+    std::fs::write(
+        &app_py,
+        "total = 0\nfor n in range(3):\n    total += n\nprint(total)\n",
+    )
+    .unwrap();
+    let script = format!(
+        r#"
+import json, sys
+seq = [1000]
+stepped = [False]
+sourceless = {sourceless}
+def read():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    return json.loads(sys.stdin.buffer.read(length))
+def send(msg):
+    seq[0] += 1
+    msg["seq"] = seq[0]
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+def reply(req, body=None):
+    send({{"type": "response", "request_seq": req["seq"], "success": True,
+          "command": req["command"], "body": body or {{}}}})
+def stop(reason):
+    send({{"type": "event", "event": "stopped", "body": {{"reason": reason, "threadId": 1}}}})
+while True:
+    req = read()
+    if req is None:
+        break
+    c = req["command"]
+    if c == "initialize":
+        reply(req)
+        send({{"type": "event", "event": "initialized"}})
+    elif c == "configurationDone":
+        reply(req)
+        stop("breakpoint")
+    elif c == "threads":
+        reply(req, {{"threads": [{{"id": 1, "name": "main"}}]}})
+    elif c == "stackTrace":
+        if sourceless and stepped[0]:
+            reply(req, {{"stackFrames": [{{"id": 2, "name": "memcpy", "line": 0, "column": 0}}],
+                        "totalFrames": 1}})
+        else:
+            reply(req, {{"stackFrames": [{{"id": 1, "name": "<module>", "line": 3, "column": 1,
+                        "source": {{"path": {path}}}}}], "totalFrames": 1}})
+    elif c == "next":
+        stepped[0] = True
+        reply(req)
+        stop("step")
+    elif c == "continue":
+        reply(req)
+        stop("breakpoint")
+    elif c == "disconnect":
+        reply(req)
+        break
+    else:
+        reply(req)
+"#,
+        path = serde_json::to_string(&app_py.display().to_string()).unwrap(),
+        sourceless = if sourceless_step { "True" } else { "False" },
+    );
+    let path = dir.join("loop_dap.py");
+    std::fs::write(&path, script).unwrap();
+    crate::dap::session::DapSession::launch_with(
+        "python3",
+        &[path.display().to_string()],
+        dir,
+        serde_json::json!({"type": "request", "command": "launch", "arguments": {}}),
+        std::collections::BTreeMap::new(),
+    )
+    .expect("python3 spawns")
+}
+
+fn has_python3() -> bool {
+    std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+/// Poll the adapter until screen reader mode has a new event past `seen`,
+/// and return it.
+fn await_a11y_event(app: &mut App, seen: Option<u64>) -> String {
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the pause's announcement",
+        || {
+            app.poll_dap();
+            app.a11y_event.as_ref().map(|(n, _)| *n) > seen
+        },
+    );
+    app.update_announcer();
+    app.announcer.line.clone()
+}
+
+/// #1547: hitting a breakpoint was silent in screen reader mode: a stop
+/// set only the panel's pill. It now reads why, where and the line.
+#[test]
+fn a_breakpoint_pause_is_read_out_with_its_file_line_and_text() {
+    if !has_python3() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.screen_reader = true;
+    app.debug_sessions.push("P", loop_stop_adapter(tmp.path()));
+    let said = await_a11y_event(&mut app, None);
+    app.debug_stop();
+    assert!(
+        said.contains("Paused on breakpoint, app.py line 3: total += n"),
+        "said: {said}"
+    );
+}
+
+/// #1547: a step that lands on the line it left, and a continue back to
+/// the same breakpoint, are each read again, and Continue says so.
+#[test]
+fn every_stop_is_read_even_on_the_same_line() {
+    if !has_python3() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.screen_reader = true;
+    app.debug_sessions.push("P", loop_stop_adapter(tmp.path()));
+    await_a11y_event(&mut app, None);
+    let first = app.a11y_event.as_ref().map(|(n, _)| *n);
+
+    app.debug_step("next");
+    let said = await_a11y_event(&mut app, first);
+    assert!(
+        said.contains("Paused on step, app.py line 3"),
+        "said: {said}"
+    );
+    let stepped = app.a11y_event.as_ref().map(|(n, _)| *n);
+
+    app.debug_start_or_continue();
+    assert_eq!(
+        app.a11y_event.as_ref().map(|(_, e)| e.as_str()),
+        Some("Continued")
+    );
+    app.update_announcer();
+    assert!(
+        app.announcer.line.contains("Continued"),
+        "{}",
+        app.announcer.line
+    );
+    let continued = app.a11y_event.as_ref().map(|(n, _)| *n);
+    assert!(continued > stepped);
+
+    let said = await_a11y_event(&mut app, continued);
+    app.debug_stop();
+    assert!(
+        said.contains("Paused on breakpoint, app.py line 3: total += n"),
+        "said: {said}"
+    );
+}
+
+/// #1547: a stop whose top frame has no source keeps the last stop's
+/// location in the session; the pause is read with the frame's name, not
+/// that stale file and line.
+#[test]
+fn a_sourceless_stop_is_not_read_with_the_last_stops_location() {
+    if !has_python3() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.screen_reader = true;
+    app.debug_sessions.push("P", stop_adapter(tmp.path(), true));
+    await_a11y_event(&mut app, None);
+    let first = app.a11y_event.as_ref().map(|(n, _)| *n);
+
+    app.debug_step("next");
+    let said = await_a11y_event(&mut app, first);
+    app.debug_stop();
+    assert!(said.contains("Paused on step, in memcpy"), "said: {said}");
+    assert!(!said.contains("app.py"), "said: {said}");
+}
+
+/// #1547 negative: with screen reader mode off a pause records nothing,
+/// so turning the mode on later never reads out a stale stop.
+#[test]
+fn a_pause_with_screen_reader_mode_off_is_not_kept() {
+    if !has_python3() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.screen_reader = false;
+    app.debug_sessions.push("P", loop_stop_adapter(tmp.path()));
+    crate::test_budget::await_spawned(std::time::Duration::from_millis(500), "the stop", || {
+        app.poll_dap();
+        app.editor.stop_line.is_some()
+    });
+    app.debug_stop();
+    assert_eq!(app.a11y_event, None);
+}
+
+/// #1547 (comment): a Run All that finished was silent; it sets no
+/// "Running …" status for the outcome to replace. Its counts and first
+/// failure are now read out.
+#[test]
+fn a_finished_run_all_is_read_out_with_its_first_failure() {
+    use crate::testing::model::{Activity, TestCase, TestStatus};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.screen_reader = true;
+    app.testing.on_busy_started(Activity::Running);
+    for (name, status) in [
+        ("m::a", TestStatus::Passed),
+        ("m::b", TestStatus::Failed),
+        ("m::c", TestStatus::Skipped),
+    ] {
+        app.testing.apply_case(TestCase {
+            name: name.to_string(),
+            status,
+        });
+    }
+    app.testing.on_finished(Some(false));
+    app.tick_test_watch();
+    app.update_announcer();
+    assert!(
+        app.announcer
+            .line
+            .contains("Tests finished: 1 failed, 1 passed, 1 skipped. First failure: m::b"),
+        "said: {}",
+        app.announcer.line
+    );
+}
+
+/// #1547 negative: a run whose outcome already went to the status line
+/// is not read twice; only its first failure is added.
+#[test]
+fn a_run_with_a_status_outcome_adds_only_its_first_failure() {
+    use crate::testing::model::{TestCase, TestStatus};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.screen_reader = true;
+    app.testing.start_filter("m::");
+    app.status = String::from("Running suite m");
+    app.await_test_run_outcome(String::from("suite m"));
+    app.testing.apply_case(TestCase {
+        name: String::from("m::b"),
+        status: TestStatus::Failed,
+    });
+    app.testing.on_finished(Some(false));
+    app.tick_test_watch();
+    assert!(app.status.starts_with("suite m failed"), "{}", app.status);
+    assert_eq!(
+        app.a11y_event.as_ref().map(|(_, e)| e.as_str()),
+        Some("First failure: m::b")
+    );
+}
+
 /// #1117 fixture: `a.rs` open and drawn, `name` selected when `select`,
 /// then a right-click on the word `value`.
 fn editor_menu_1117(select: bool) -> (tempfile::TempDir, App) {
