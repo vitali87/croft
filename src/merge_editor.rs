@@ -124,6 +124,9 @@ pub struct MergeView {
     pub synced_seq: u64,
     /// Per-frame checkbox hit rects: (screen y, x range, conflict, side).
     pub check_spans: Vec<(u16, std::ops::Range<u16>, usize, CheckSide)>,
+    /// Per-frame accept-button hit rects (#1169): (screen y, x range,
+    /// conflict, the state the button sets).
+    pub action_spans: Vec<(u16, std::ops::Range<u16>, usize, ConflictState)>,
     /// Per-frame rect of the source-pane area (mouse routing).
     pub last_panes_area: ratatui::layout::Rect,
     /// The side that deleted the file in a modify/delete conflict (#1244):
@@ -161,6 +164,7 @@ impl MergeView {
             synced_len: result.len().max(1),
             synced_seq: 0,
             check_spans: Vec::new(),
+            action_spans: Vec::new(),
             last_panes_area: ratatui::layout::Rect::default(),
             deleted: None,
             proposal_from: None,
@@ -559,6 +563,7 @@ pub fn view_from_markers(lines: &[String]) -> Option<(MergeView, Vec<String>)> {
         synced_len: result.len().max(1),
         synced_seq: 0,
         check_spans: Vec::new(),
+        action_spans: Vec::new(),
         last_panes_area: ratatui::layout::Rect::default(),
         deleted: None,
         proposal_from: None,

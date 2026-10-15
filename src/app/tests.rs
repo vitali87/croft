@@ -7391,6 +7391,91 @@ fn welcome_tagline_constant_is_present() {
     assert!(WELCOME_TAGLINE.contains("DEVELOPERS"));
 }
 
+/// #1843: the version never shares a cell with the logo or the tagline, at
+/// any window size and whatever height the release-note card takes. The
+/// logo's cells are the image's, edge to edge; the tagline's last column
+/// reaches the badge's first, and once painted over its corner.
+#[test]
+fn the_welcome_version_never_overlaps_the_logo_or_the_tagline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let mut seen_badge = false;
+    let mut seen_below = false;
+    for notes in [Vec::new(), long_test_note()] {
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.welcome.set_test_notes(notes);
+        for w in (30..=200).step_by(3) {
+            for h in (8..=56).step_by(2) {
+                let mut term =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+                term.draw(|f| app.render_welcome(f, f.area())).unwrap();
+                let buf = term.backend().buffer();
+                let rows: Vec<String> = (0..h)
+                    .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
+                    .collect();
+                let logo = *app.overlays.welcome.layout().expect("laid out");
+                // Beside the logo or in the row under it; the release-note
+                // card further down names the version too.
+                let hits: Vec<(u16, u16)> = rows
+                    .iter()
+                    .enumerate()
+                    .take((logo.cell_y + logo.cell_h + 1) as usize)
+                    .filter_map(|(y, r)| {
+                        r.find(&version)
+                            .map(|i| (r[..i].chars().count() as u16, y as u16))
+                    })
+                    .collect();
+                let Some(&(vx, vy)) = hits.first() else {
+                    continue;
+                };
+                assert_eq!(hits.len(), 1, "one version at {w}x{h}");
+                let boxed = vx >= 2 && buf[(vx - 2, vy)].symbol() == "\u{2502}";
+                let (x0, x1, y0, y1) = if boxed {
+                    seen_badge = true;
+                    let x1 = vx + version.chars().count() as u16 + 1;
+                    for (x, y, corner) in [
+                        (vx - 2, vy - 1, "\u{256d}"),
+                        (x1, vy - 1, "\u{256e}"),
+                        (vx - 2, vy + 1, "\u{2570}"),
+                        (x1, vy + 1, "\u{256f}"),
+                    ] {
+                        assert_eq!(buf[(x, y)].symbol(), corner, "badge corner at {w}x{h}");
+                    }
+                    (vx - 2, x1, vy - 1, vy + 1)
+                } else {
+                    seen_below = true;
+                    (vx, vx + version.chars().count() as u16 - 1, vy, vy)
+                };
+                let logo_x1 = logo.cell_x + logo.cell_w - 1;
+                let logo_y1 = logo.cell_y + logo.cell_h - 1;
+                assert!(
+                    x1 < logo.cell_x || x0 > logo_x1 || y1 < logo.cell_y || y0 > logo_y1,
+                    "the version overlaps the logo at {w}x{h}"
+                );
+                if let Some(t) = rows.iter().position(|r| r.contains(WELCOME_TAGLINE)) {
+                    let t = t as u16;
+                    assert!(
+                        t < y0 || t > y1,
+                        "the tagline crosses the version at {w}x{h}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(seen_badge, "the boxed badge must be exercised");
+    assert!(
+        seen_below,
+        "the version under a narrow logo must be exercised"
+    );
+}
+
+#[test]
+fn a_cell_pixel_size_needs_the_terminal_to_report_pixels() {
+    assert_eq!(cell_pixel_of(100, 40, 800, 640), Some((8, 16)));
+    assert_eq!(cell_pixel_of(100, 40, 0, 0), None);
+    assert_eq!(cell_pixel_of(0, 40, 800, 640), None);
+}
+
 #[test]
 fn modified_terminal_keys_keep_their_modifiers() {
     let k = |c, m| key_to_bytes(key(c, m), false);
@@ -28591,11 +28676,21 @@ fn the_update_chord_relaunches_only_when_an_update_is_ready() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let chord = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
 
-    // Not ready: the chord must not arm the re-exec, and says why.
+    // Not ready: the chord must not arm the re-exec. With nothing on offer
+    // it checks now, and says what it found (#1844).
     let _ = app.handle_key(key(KeyCode::F(9), chord));
     assert!(!app.pending_reexec);
     assert!(!app.quit);
-    assert_eq!(app.status, "No croft update is waiting");
+    assert_eq!(app.status, "Checking for croft updates\u{2026}");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the update check to answer",
+        || app.poll_update_watch(),
+    );
+    assert_eq!(
+        app.status,
+        "Could not check for croft updates: tests never ask the network"
+    );
 
     // Ready: the chord arms the re-exec and quits the loop so `run` can
     // exec. Cmd+Shift+F9 is the same chord.
@@ -28606,6 +28701,144 @@ fn the_update_chord_relaunches_only_when_an_update_is_ready() {
     ));
     assert!(app.pending_reexec);
     assert!(app.quit);
+}
+
+/// #1844: Help: Update croft with a version on offer stages it, the way
+/// the popup's Update does: it used to say no update was waiting.
+#[test]
+fn the_update_command_stages_the_offered_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.install_source = crate::update_check::InstallSource::SelfManaged;
+    app.update_toast = Some(super::UpdateToast {
+        version: String::from("9.9.9"),
+        ready: false,
+        failed: None,
+        buttons: Vec::new(),
+    });
+    app.run_command(crate::widgets::command_palette::Command::UpdateCroft);
+    assert_eq!(
+        app.staged_install.as_ref().map(|s| s.version.as_str()),
+        Some("9.9.9")
+    );
+    assert!(app.manual_update_check.is_none(), "{}", app.status);
+}
+
+/// #1844: an update that fails says why in the popup, the network above
+/// all, and offers Retry; it used to come back as a fresh offer, with only
+/// a "could not be built" on the status line.
+#[test]
+fn a_failed_update_says_why_in_the_popup_and_offers_retry() {
+    use crate::update_watch::UpdateEvent;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.install_source = crate::update_check::InstallSource::SelfManaged;
+    app.update_toast = Some(super::UpdateToast {
+        version: String::from("9.9.9"),
+        ready: false,
+        failed: None,
+        buttons: Vec::new(),
+    });
+    // A failure that lands with its start, as an offline one does.
+    app.staged_install = Some(
+        crate::update_check::StagedInstall::preloaded(
+            &[UpdateEvent::InProgress, UpdateEvent::Failed],
+            PathBuf::new(),
+            "9.9.9",
+        )
+        .failing_with(crate::update_check::OFFLINE_REASON),
+    );
+    assert!(app.poll_update_watch());
+    assert!(app.staged_install.is_none());
+    assert!(
+        app.status.contains("not installed: no internet connection"),
+        "{}",
+        app.status
+    );
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let text: String = (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("croft v9.9.9 was not installed: no internet connection"),
+        "{text}"
+    );
+    let retry = app
+        .update_toast
+        .as_ref()
+        .unwrap()
+        .buttons
+        .iter()
+        .find(|(_, a)| *a == super::UpdateToastAction::Update)
+        .map(|(r, _)| *r)
+        .expect("a Retry button");
+    assert_eq!(buf[(retry.x + 1, retry.y)].symbol(), "R", "labelled Retry");
+    left_click(&mut app, retry.x, retry.y);
+    assert!(app.staged_install.is_some(), "Retry stages again");
+    assert_eq!(app.update_toast.as_ref().unwrap().failed, None);
+}
+
+/// #1844: with nothing on offer, Help: Update croft asks the network now
+/// and says what it found: up to date, a newer version (the popup comes
+/// up), or that it could not ask.
+#[test]
+fn the_update_command_checks_now_and_reports_the_answer() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let ask = |app: &mut App, fetch: fn() -> Result<Option<String>, String>| {
+            app.update_fetch = fetch;
+            app.update_croft();
+            assert_eq!(app.status, "Checking for croft updates\u{2026}");
+            crate::test_budget::await_spawned(
+                std::time::Duration::from_millis(500),
+                "the update check to answer",
+                || app.poll_update_watch(),
+            );
+            app.status.clone()
+        };
+        assert_eq!(
+            ask(&mut app, || Err(String::from(
+                crate::update_check::OFFLINE_REASON
+            ))),
+            "Could not check for croft updates: no internet connection"
+        );
+        assert_eq!(
+            ask(&mut app, || Ok(None)),
+            format!("croft v{} is up to date", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(app.update_toast.is_none());
+        assert_eq!(
+            ask(&mut app, || Ok(Some(String::from("999.0.0")))),
+            "croft v999.0.0 is available"
+        );
+        assert_eq!(
+            app.update_toast.as_ref().map(|t| t.version.as_str()),
+            Some("999.0.0")
+        );
+    });
+}
+
+/// #1844: Help: Update croft checks for a release only where the startup
+/// check would: never on a remote-launched croft, which the croft that
+/// launched it updates, nor with `CROFT_NO_UPDATE_CHECK` set.
+#[test]
+fn a_manual_update_check_keeps_to_the_startup_checks_rules() {
+    assert_eq!(super::manual_update_check_refusal(false, false), None);
+    for (remote, disabled) in [(true, false), (false, true), (true, true)] {
+        let why = super::manual_update_check_refusal(remote, disabled)
+            .expect("no check when the startup check is off");
+        assert!(why.starts_with("No croft update is waiting"), "{why}");
+    }
 }
 
 // #865: with croft older than its checkout, the status bar offered a
@@ -33218,6 +33451,7 @@ fn update_events_are_charged_to_their_own_producer_body() {
     app.update_toast = Some(super::UpdateToast {
         version: String::from("9.9.9"),
         ready: true,
+        failed: None,
         buttons: Vec::new(),
     });
     term.draw(|f| app.render(f)).unwrap();
@@ -33245,6 +33479,7 @@ fn the_update_toast_stacks_above_the_port_toast() {
     app.update_toast = Some(super::UpdateToast {
         version: String::from("9.9.9"),
         ready: false,
+        failed: None,
         buttons: Vec::new(),
     });
     app.show_port_toast(3000, Some("node".into()));
@@ -46088,6 +46323,42 @@ fn a_workspace_with_no_test_runner_refuses_every_run_gesture() {
     assert_refused(&mut app, "named run");
 }
 
+/// #1841: switching to the Testing view never waits on finding a runner.
+/// The worker finds it, so a workspace with none opens the view silently;
+/// and reopening the view before the worker answers queues nothing more.
+#[test]
+fn opening_testing_leaves_finding_the_runner_to_the_worker() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("notes.txt"), "no project here\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let sent = app.test_worker.requests_sent();
+    app.open_testing_view();
+    assert_eq!(app.sidebar_view, SidebarView::Testing);
+    assert!(
+        app.test_worker.discover_queued(),
+        "the discovery goes to the worker without a runner check first"
+    );
+    app.open_testing_view();
+    app.set_sidebar_view(SidebarView::Explorer);
+    app.open_testing_view();
+    assert_eq!(
+        app.test_worker.requests_sent(),
+        sent + 1,
+        "reopening before the worker answers must not queue another discovery"
+    );
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the worker to find no runner",
+        || {
+            app.test_worker.drain(&mut app.testing);
+            !app.test_worker.discover_queued()
+        },
+    );
+    assert!(!app.testing.take_refusal(), "opening the view says nothing");
+    assert!(!app.testing.is_busy());
+    assert!(!app.status.contains("No test runner"), "{:?}", app.status);
+}
+
 /// cargo's positional filter is a substring match, so running suite `parse`
 /// with a bare pattern also sweeps `parse_utils::b` and every other
 /// prefix-sharing sibling. The suite gesture must anchor on `parse::`.
@@ -47894,6 +48165,71 @@ fn merge_editor_renders_source_panes_and_result_at_100_columns() {
     assert_eq!(app.editor.lines[1], "mine");
 }
 
+/// #1169: the merge editor's side panes carry labelled accept buttons
+/// above each conflict, not only the `[ ]` checkboxes, and a click on one
+/// resolves the conflict that way and ticks the button.
+#[test]
+fn merge_editor_accept_buttons_resolve_the_conflict_above_which_they_sit() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("plain.txt"),
+        "top\n<<<<<<< HEAD\nmine\n=======\nyours\n>>>>>>> other\nbottom\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_pinned(&tmp.path().join("plain.txt"))
+        .unwrap();
+    app.focus_pane(Pane::Editor);
+    app.run_command(crate::widgets::command_palette::Command::MergeOpenEditor);
+    let backend = ratatui::backend::TestBackend::new(160, 60);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    let screen = |term: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    term.draw(|f| app.render(f)).unwrap();
+    let text = screen(&term);
+    for label in [" Accept Current ", " Accept Incoming ", " Accept Both "] {
+        assert!(text.contains(label), "{label:?} must be painted:\n{text}");
+    }
+    assert!(
+        text.contains("[ ]"),
+        "the checkboxes stay beside the buttons"
+    );
+    let mv = app.editor.merge.as_ref().unwrap();
+    let (y, xs, idx, _) = mv
+        .action_spans
+        .iter()
+        .find(|(_, _, _, s)| *s == crate::merge_editor::ConflictState::Incoming)
+        .cloned()
+        .expect("the incoming pane records its Accept Incoming button");
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: xs.start,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    });
+    let mv = app.editor.merge.as_ref().unwrap();
+    assert_eq!(
+        mv.conflicts[idx].state,
+        crate::merge_editor::ConflictState::Incoming
+    );
+    assert_eq!(app.editor.lines[1], "yours", "the Result took incoming");
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        screen(&term).contains("\u{2713} Accept Incoming"),
+        "the button for the state the conflict is in is ticked"
+    );
+}
+
 #[test]
 fn clicking_an_accept_action_on_the_header_row_resolves_that_block() {
     use crossterm::event::{MouseButton, MouseEventKind};
@@ -47918,8 +48254,8 @@ fn clicking_an_accept_action_on_the_header_row_resolves_that_block() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        text.contains("[Accept Current]") && text.contains("[Accept Incoming]"),
-        "the header row must carry the accept actions"
+        text.contains(" Accept Current ") && text.contains(" Accept Incoming "),
+        "the header row must carry the accept buttons"
     );
     let span = app
         .editor
@@ -85991,6 +86327,46 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     assert!(app.source_control.last_init_repo_button_area.width > 0);
 }
 
+// ── #1490: inlay hints are asked for up to the document's real end ──
+
+#[test]
+fn inlay_hints_are_requested_up_to_the_last_line_not_one_past_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app_with_open_file(
+        tmp.path(),
+        "main.rs",
+        "fn main() {\n    let v = 40 + 2;\n}\n",
+    );
+    let targets = app.inlay_hint_targets();
+    assert_eq!(targets.len(), 1);
+    // The server holds the buffer's lines joined by newlines; its last
+    // position is the end of the closing brace's line, not a line past it.
+    assert_eq!(targets[0].1, lsp_types::Position::new(2, 1));
+    assert_eq!(
+        targets[0].1,
+        crate::lsp::manager::document_end(&app.editor.lines.join("\n"))
+    );
+}
+
+#[test]
+fn inlay_hints_end_after_the_last_line_in_utf16_units() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app_with_open_file(tmp.path(), "main.py", "x = 1\ns = \"é😀\"");
+    // `s = "é😀"` is 9 UTF-16 units: `é` is one and `😀` is two.
+    assert_eq!(
+        app.inlay_hint_targets()[0].1,
+        lsp_types::Position::new(1, 9)
+    );
+}
+
+/// Negative: an editor with no file asks nothing.
+#[test]
+fn inlay_hints_target_no_file_when_none_is_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.inlay_hint_targets().is_empty());
+}
+
 /// `app/` with a submodule `lib` whose checked-out commit moved past the
 /// recorded one and whose working tree is dirty, plus a tracked `a.txt`.
 fn repo_with_moved_dirty_submodule() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -88350,6 +88726,84 @@ fn go_and_lint_rows_reach_problems_only_for_real_files() {
             (String::from("main.go"), 3, String::from("go")),
         ]
     );
+}
+
+/// #1499: zod's `.vscode/settings.json` turns format on save on and names
+/// Biome. croft runs no Biome, so a save writes the file as typed instead
+/// of letting tsserver reformat it, and the first such save says why.
+#[test]
+fn a_project_formatter_croft_does_not_run_saves_the_file_as_typed() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/settings.json"),
+        r#"{ "editor.formatOnSave": true, "editor.defaultFormatter": "biomejs.biome" }"#,
+    )
+    .unwrap();
+    let mut app = app_with_open_file(tmp.path(), "api.ts", "type A =\n  string;\n");
+    app.apply_merged_settings(&crate::config_layers::load_merged(Some(tmp.path())).prefs);
+    assert!(app.format_on_save, "the project's formatOnSave is honoured");
+    assert_eq!(app.default_formatter.as_deref(), Some("biomejs.biome"));
+    let file = app.editor.path.clone().unwrap();
+    app.editor.insert_char('x');
+    app.format_and_save(true);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "xtype A =\n  string;\n"
+    );
+    assert!(!app.editor.dirty);
+    assert!(
+        app.save_after_format.is_none(),
+        "no format request is waited on"
+    );
+    assert!(app.format_request_id.is_none());
+    assert_eq!(
+        app.status,
+        "Saved api.ts without formatting: this project formats with biomejs.biome, which croft does not run"
+    );
+
+    app.editor.insert_char('y');
+    app.format_and_save(true);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "xytype A =\n  string;\n"
+    );
+    assert!(
+        !app.status.contains("biomejs.biome"),
+        "said once: {}",
+        app.status
+    );
+}
+
+/// #1499, negative: with no formatter named, or croft's own server named
+/// for the language, format on save still formats; a language entry for
+/// another language leaves this one alone.
+#[test]
+fn format_on_save_still_formats_when_croft_runs_the_named_formatter() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (global, per_language) in [
+        (None, vec![]),
+        (Some("vscode.typescript-language-features"), vec![]),
+        (None, vec![("python", "charliermarsh.ruff")]),
+        (
+            Some("biomejs.biome"),
+            vec![("typescript", "vscode.typescript-language-features")],
+        ),
+    ] {
+        let mut app = app_with_open_file(tmp.path(), "api.ts", "type A = string;\n");
+        app.format_on_save = true;
+        app.default_formatter = global.map(String::from);
+        app.language_formatters = per_language
+            .iter()
+            .map(|(l, f)| (l.to_string(), f.to_string()))
+            .collect();
+        app.editor.insert_char('x');
+        app.format_and_save(true);
+        assert_eq!(
+            app.save_after_format, app.editor.path,
+            "{global:?} {per_language:?}: the save waits on the formatter"
+        );
+    }
 }
 
 /// #1543: Continue, Step Into, Step Out and Step Into Target are commands:
