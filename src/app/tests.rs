@@ -87715,6 +87715,49 @@ fn a_local_branch_hides_its_remotes_and_switches_plainly() {
     assert_eq!(git_checked(&clone, &["branch", "--show-current"]), "main");
 }
 
+/// An app on `app.txt` in a project whose `.editorconfig` trims trailing
+/// whitespace, with `  # TODO   ` typed at the end of line 1 (#1455).
+fn app_with_trailing_spaces_typed() -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join(".editorconfig"),
+        "root = true\n[*]\ntrim_trailing_whitespace = true\n",
+    )
+    .unwrap();
+    let mut app = app_with_open_file(tmp.path(), "app.txt", "def f():\n    return 1\n");
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    type_str(&mut app, "  # TODO   ");
+    (app, tmp)
+}
+
+/// #1455: Cmd+S trims the line the caret is on, so the stray spaces just
+/// typed never reach the commit.
+#[test]
+fn an_explicit_save_trims_the_line_just_edited() {
+    let (mut app, tmp) = app_with_trailing_spaces_typed();
+    app.save();
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("app.txt")).unwrap(),
+        "def f():  # TODO\n    return 1\n"
+    );
+    assert!(!app.editor.dirty);
+}
+
+/// #1455 negative: auto-save still spares the caret line, since it fires
+/// while the user is mid-typing.
+#[test]
+fn an_auto_save_spares_the_line_being_typed() {
+    let (mut app, tmp) = app_with_trailing_spaces_typed();
+    app.auto_save = true;
+    age_last_edit(&mut app.editor);
+    assert!(app.tick_auto_save());
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("app.txt")).unwrap(),
+        "def f():  # TODO   \n    return 1\n"
+    );
+}
+
 /// `a.py` reading `value = 1`, open in the editor, then `00` typed at the
 /// end of the line and saved: the issue's (#1568) setup.
 fn app_with_a_saved_edit() -> (tempfile::TempDir, std::path::PathBuf, App) {
