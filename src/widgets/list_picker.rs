@@ -116,6 +116,9 @@ pub enum ListPurpose {
     PanelAlignment,
     /// View: Set Quick Input Position… (#852): `id` is `top` or `center`.
     QuickInputPosition,
+    /// A `pickString` input a launch or task asks for (#1424); `id` the
+    /// chosen value.
+    LaunchInput,
     /// Notebook: Select Kernel (#1377): the installed kernelspecs, `id`
     /// the kernel's name.
     NotebookKernel,

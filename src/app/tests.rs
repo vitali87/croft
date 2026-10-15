@@ -27931,6 +27931,7 @@ fn a_launch_json_python_config_runs_under_the_project_venv_unless_it_names_one()
     let ctx = SubstCtx {
         workspace_folder: root.to_path_buf(),
         file: None,
+        inputs: Default::default(),
         folders: Vec::new(),
     };
     let python_of = |json: &str| {
@@ -27984,6 +27985,7 @@ fn a_module_launch_that_also_names_a_program_runs_under_its_cwds_venv() {
     let ctx = SubstCtx {
         workspace_folder: root.to_path_buf(),
         file: None,
+        inputs: Default::default(),
         folders: Vec::new(),
     };
     let request_of = |json: &str| {
@@ -28138,6 +28140,7 @@ fn a_debug_test_configs_interpreter_is_the_one_checked() {
     let ctx = SubstCtx {
         workspace_folder: root.to_path_buf(),
         file: None,
+        inputs: Default::default(),
         folders: Vec::new(),
     };
     let base = |py: &str| {
@@ -65550,6 +65553,7 @@ fn resolved_attach(json: &str) -> crate::dap::configs::ResolvedConfig {
     let ctx = crate::dap::configs::SubstCtx {
         workspace_folder: tmp.path().to_path_buf(),
         file: None,
+        inputs: Default::default(),
         folders: Vec::new(),
     };
     crate::dap::configs::resolve(&cfg, &ctx).expect("resolves")
@@ -88804,6 +88808,210 @@ fn format_on_save_still_formats_when_croft_runs_the_named_formatter() {
             "{global:?} {per_language:?}: the save waits on the formatter"
         );
     }
+}
+
+/// #1424: a launch.json `inputs` workspace. "Run with args" uses
+/// `${input:envName}` twice and `${input:userName}` once, and its
+/// preLaunchTask uses `${input:envName}` too.
+fn inputs_workspace_1424() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/tasks.json"),
+        r#"{ "version": "2.0.0", "tasks": [
+            { "label": "build", "type": "shell", "command": "echo", "args": ["${input:envName}"] },
+            { "label": "greet", "type": "shell", "command": "echo", "args": ["${input:who}"] }
+        ],
+        "inputs": [
+            { "id": "who", "type": "promptString", "description": "Who", "default": "world" }
+        ]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "name": "Run with args", "type": "python", "request": "launch",
+              "program": "${workspaceFolder}/app.py", "preLaunchTask": "build",
+              "args": ["--env", "${input:envName}", "--user", "${input:userName}", "${input:envName}"] },
+            { "name": "Typo", "type": "python", "request": "launch", "program": "app.py",
+              "args": ["${input:nope}"] },
+            { "name": "Secret", "type": "python", "request": "launch", "program": "app.py",
+              "args": ["${input:token}"] }
+        ],
+        "inputs": [
+            { "id": "envName", "type": "pickString", "description": "Environment",
+              "options": ["dev", "staging", "prod"], "default": "staging" },
+            { "id": "userName", "type": "promptString", "description": "User to run as",
+              "default": "alice" },
+            { "id": "token", "type": "promptString", "description": "Token", "password": true }
+        ]}"#,
+    )
+    .unwrap();
+    tmp
+}
+
+fn launch_named_1424(app: &mut App, name: &str) {
+    let cfg = crate::dap::configs::discover_configs(&app.active_workspace_root())
+        .into_iter()
+        .find(|c| c.name == name)
+        .expect("config declared");
+    app.launch_debug_config(&cfg);
+}
+
+/// #1424: each input is asked once, in order, with the existing pickers -
+/// the pick list with its default selected, then the text box prefilled -
+/// and the answers reach the config's args and its preLaunchTask.
+#[test]
+fn a_launch_asks_each_input_once_and_uses_the_answers() {
+    use crate::widgets::input_prompt::InputPurpose;
+    use crate::widgets::list_picker::ListPurpose;
+    let tmp = inputs_workspace_1424();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    launch_named_1424(&mut app, "Run with args");
+
+    let picker = app.list_picker.as_ref().expect("the pick list is open");
+    assert_eq!(picker.purpose, ListPurpose::LaunchInput);
+    assert_eq!(picker.title, "Environment");
+    let labels: Vec<_> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["dev", "staging", "prod"]);
+    assert_eq!(
+        picker.selected_row().map(|r| r.id.as_str()),
+        Some("staging"),
+        "the default is selected"
+    );
+    assert!(app.pending_debug_launch.is_none(), "nothing starts yet");
+    app.list_picker.as_mut().unwrap().selected = 2;
+    app.confirm_list_picker();
+
+    let prompt = app.input_prompt.as_ref().expect("then the text box");
+    assert!(matches!(prompt.purpose, InputPurpose::LaunchInput));
+    assert_eq!(prompt.title, "User to run as");
+    assert_eq!(prompt.value, "alice", "prefilled with the default");
+    assert!(!prompt.masked);
+    app.input_prompt.as_mut().unwrap().value = String::from("bob");
+    app.submit_input_prompt();
+
+    assert!(
+        app.input_prompt.is_none() && app.list_picker.is_none(),
+        "envName, used three times, was asked for once"
+    );
+    let pending = app
+        .pending_debug_launch
+        .as_ref()
+        .unwrap_or_else(|| panic!("the launch waits on its task: {}", app.status));
+    assert_eq!(pending.command, "echo prod", "the task got the answer too");
+    let PendingLaunchStep::Resolved(rc) = &pending.step else {
+        panic!("a resolved config waits on the task");
+    };
+    assert_eq!(rc.args, ["--env", "prod", "--user", "bob", "prod"]);
+}
+
+/// #1424 negatives: Esc on a question starts nothing and shows no error; an
+/// id no `inputs` entry declares is refused naming it, without asking
+/// anything; a `"password": true` input is typed into a masked field.
+#[test]
+fn esc_on_an_input_starts_nothing_and_an_unknown_input_is_named() {
+    let tmp = inputs_workspace_1424();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    launch_named_1424(&mut app, "Run with args");
+    assert!(app.list_picker.is_some(), "precondition: asking");
+    app.handle_list_picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.list_picker.is_none() && app.input_prompt.is_none());
+    assert!(
+        app.pending_debug_launch.is_none() && app.debug_sessions.is_empty(),
+        "nothing started"
+    );
+    assert!(
+        !app.run_debug.feedback_is_error && !app.status.contains("input"),
+        "and no error: {:?} / {}",
+        app.run_debug.feedback,
+        app.status
+    );
+
+    launch_named_1424(&mut app, "Typo");
+    assert!(app.list_picker.is_none() && app.input_prompt.is_none());
+    assert!(app.run_debug.feedback_is_error);
+    assert!(
+        app.status.contains("${input:nope}") && app.status.contains("no \"inputs\" entry"),
+        "{}",
+        app.status
+    );
+    assert!(app.pending_debug_launch.is_none() && app.debug_sessions.is_empty());
+
+    launch_named_1424(&mut app, "Secret");
+    let prompt = app.input_prompt.as_ref().expect("asks for the token");
+    assert!(prompt.masked, "a password is not shown");
+}
+
+/// #1424: tasks.json `inputs` are asked for when the task runs, and the
+/// answer is one shell word whatever it holds.
+#[test]
+fn a_task_asks_its_input_and_quotes_the_answer() {
+    let tmp = inputs_workspace_1424();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let task = crate::tasks::discover_tasks(tmp.path())
+        .into_iter()
+        .find(|t| t.label == "greet")
+        .unwrap();
+    assert!(app.run_project_task(task).is_none(), "asks first");
+    assert_eq!(
+        app.input_prompt.as_ref().map(|p| p.value.as_str()),
+        Some("world")
+    );
+    app.input_prompt.as_mut().unwrap().value = String::from("a b; touch x");
+    app.submit_input_prompt();
+    let ran = app.last_task.clone().expect("the task ran");
+    assert_eq!(
+        app.task_command_line(&ran).unwrap(),
+        "echo 'a b; touch x'",
+        "{}",
+        app.status
+    );
+}
+
+/// #1424: Rerun Last Task asks a task's inputs again instead of reusing the
+/// last run's answers.
+#[test]
+fn rerunning_a_task_asks_its_inputs_again() {
+    let tmp = inputs_workspace_1424();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let task = crate::tasks::discover_tasks(tmp.path())
+        .into_iter()
+        .find(|t| t.label == "greet")
+        .unwrap();
+    app.run_project_task(task);
+    app.input_prompt.as_mut().unwrap().value = String::from("first");
+    app.submit_input_prompt();
+    assert!(app.last_task.is_some(), "precondition: the task ran");
+    app.rerun_last_task();
+    assert_eq!(
+        app.input_prompt.as_ref().map(|p| p.value.as_str()),
+        Some("world"),
+        "asked again, prefilled with the default: {}",
+        app.status
+    );
+}
+
+/// #1424: a several-member compound passes the answers it collected to each
+/// member, rather than resolving them with none.
+#[test]
+fn compound_members_resolve_with_the_compound_answers() {
+    let tmp = inputs_workspace_1424();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut cfg = crate::dap::configs::discover_configs(tmp.path())
+        .into_iter()
+        .find(|c| c.name == "Run with args")
+        .unwrap();
+    cfg.answers
+        .insert(String::from("envName"), String::from("dev"));
+    cfg.answers
+        .insert(String::from("userName"), String::from("bob"));
+    // It resolves, then stops at its preLaunchTask, which a set cannot run.
+    assert!(
+        matches!(app.launch_member_into_set(&cfg), MemberOutcome::TaskUnrun),
+        "the member saw its answers: {}",
+        app.status
+    );
 }
 
 /// #1117 fixture: `a.rs` open and drawn, `name` selected when `select`,

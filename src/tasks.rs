@@ -57,9 +57,29 @@ pub struct VscodeCommand {
     /// or a `dependsOn`-only compound task). The task is still listed, so
     /// its build-default slot is never handed to another task (#1185).
     pub unrunnable: Option<String>,
+    /// tasks.json's `inputs` (#1424): what a `${input:id}` asks for.
+    pub inputs: Vec<crate::dap::configs::LaunchInput>,
+    /// The answers given for this run, by input id.
+    pub answers: std::collections::BTreeMap<String, String>,
 }
 
 impl Task {
+    /// The distinct `${input:id}` ids this task's command, arguments,
+    /// `cwd` and `env` use, in order (#1424).
+    pub fn input_refs(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(v) = &self.vscode {
+            let texts = std::iter::once(&v.command)
+                .chain(&v.args)
+                .chain(&v.cwd)
+                .chain(v.env.iter().map(|(_, value)| value));
+            for text in texts {
+                crate::dap::configs::text_input_refs(text, &mut out);
+            }
+        }
+        out
+    }
+
     /// The line to type into the task's shell. A tasks.json entry gets its
     /// `${workspaceFolder}` / `${file}` variables expanded (the shell would
     /// otherwise expand them to nothing and run `/scripts/build.sh`), each
@@ -74,6 +94,16 @@ impl Task {
         if let Some(why) = &v.unrunnable {
             return Err(why.clone());
         }
+        let mut answered;
+        let ctx = if v.answers.is_empty() {
+            ctx
+        } else {
+            answered = ctx.clone();
+            answered
+                .inputs
+                .extend(v.answers.iter().map(|(k, a)| (k.clone(), a.clone())));
+            &answered
+        };
         // The command's literal text keeps its shell meaning (`&&`, globs);
         // an argument's is quoted only when it must stay one word.
         let mut line = expand_task_text(&v.command, ctx, false)?;
@@ -140,10 +170,11 @@ fn expand_task_text(
             }
             Ok(value) => out.push_str(&value),
             Err(e) if e.contains("no active file") => return Err(e),
-            // VS Code prompts for these; croft cannot, and bash would read
-            // `${input:x}` as a substring expansion and pass nothing.
-            Err(_) if var.starts_with("input:") || var.starts_with("command:") => {
-                return Err(format!("${{{var}}}: croft cannot prompt for task inputs"));
+            // Asked for before the task runs (#1424); unanswered, bash would
+            // read `${input:x}` as a substring expansion and pass nothing.
+            Err(e) if var.starts_with("input:") => return Err(e),
+            Err(_) if var.starts_with("command:") => {
+                return Err(format!("${{{var}}}: croft cannot run commands in tasks"));
             }
             Err(_) if var.starts_with("env:") => {}
             Err(_) => {
@@ -235,6 +266,7 @@ fn vscode_tasks(root: &Path) -> Vec<Task> {
     let Some(tasks) = v.get("tasks").and_then(|t| t.as_array()) else {
         return Vec::new();
     };
+    let inputs = crate::dap::configs::parse_inputs(&v);
     tasks
         .iter()
         .filter_map(|t| {
@@ -261,6 +293,8 @@ fn vscode_tasks(root: &Path) -> Vec<Task> {
                     .map(str::to_string)
                     .or(entry.cwd),
                 unrunnable: entry.unrunnable,
+                inputs: inputs.clone(),
+                answers: Default::default(),
                 env: options
                     .and_then(|o| o.get("env"))
                     .and_then(|e| e.as_object())
@@ -532,6 +566,9 @@ fn package_json_tasks(root: &Path) -> Vec<Task> {
                     cwd: Some(format!("${{workspaceFolder}}/{rel}")),
                     env: Vec::new(),
                     unrunnable: None,
+                    // package.json scripts have no `${input:id}` prompts.
+                    inputs: Vec::new(),
+                    answers: Default::default(),
                 }),
             });
         }
@@ -1257,6 +1294,7 @@ mod tests {
         let ctx = crate::dap::configs::SubstCtx {
             workspace_folder: ws.clone(),
             file: Some(ws.join("a;touch${IFS}pwned.rs")),
+            inputs: Default::default(),
             folders: Vec::new(),
         };
         let build = task("build").command_line(&ctx).unwrap();
@@ -1293,11 +1331,12 @@ mod tests {
             task("input")
                 .command_line(&ctx)
                 .unwrap_err()
-                .contains("cannot prompt")
+                .contains("${input:target}: no answer")
         );
         let no_file = crate::dap::configs::SubstCtx {
             workspace_folder: PathBuf::from("/w"),
             file: None,
+            inputs: Default::default(),
             folders: Vec::new(),
         };
         assert!(
@@ -2047,6 +2086,7 @@ mod tests {
         crate::dap::configs::SubstCtx {
             workspace_folder: root.to_path_buf(),
             file: None,
+            inputs: Default::default(),
             folders: Vec::new(),
         }
     }
