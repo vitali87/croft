@@ -1,1 +1,0 @@
-fix: Java, Ruby, C#, SQL, Makefiles and Dockerfiles open in their own language with syntax colours instead of Plain Text, including the extensionless `Dockerfile`, `Containerfile`, `Makefile`, `GNUmakefile` and `Gemfile` (#1226)
