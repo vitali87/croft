@@ -1,1 +1,0 @@
-fix: A clipboard helper croft gives up on (xclip waiting on an X display that never answers) is now killed with everything it started, so no leftover process keeps croft's copy pipe open after the 2-second deadline.

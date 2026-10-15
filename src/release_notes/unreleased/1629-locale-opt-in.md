@@ -1,1 +1,0 @@
-fix: A German or Spanish system locale no longer switches croft to its partly translated starter catalog, which mixed two languages in the palette and status bar; set `"locale"` to use one, or add your own `locales/<lang>.json`.

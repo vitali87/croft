@@ -1,1 +1,0 @@
-fix: A new status-bar message too long for the space beside Ln/Col and the file facts now takes the whole bar until the next key or click instead of losing its middle, and every message is kept in full in the new Messages output channel, which a click on the message opens.

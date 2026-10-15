@@ -331,7 +331,7 @@ pub fn expand_replacement(
     if !opts.use_regex {
         return line_matches(line, opts, needle)
             .contains(&(col_chars, len_chars))
-            .then(|| replacement.to_string());
+            .then(|| shaped(line, col_chars, len_chars, replacement.to_string(), opts));
     }
     let re = build_find_regex(needle, opts)?;
     for (start, end) in re.spans(line) {
@@ -341,9 +341,27 @@ pub fn expand_replacement(
         if line[start..end].chars().count() != len_chars {
             return None;
         }
-        return re.expand_at(line, start, end, &unescape_escapes(replacement));
+        return re
+            .expand_at(line, start, end, &unescape_escapes(replacement))
+            .map(|dst| shaped(line, col_chars, len_chars, dst, opts));
     }
     None
+}
+
+/// `replacement` in the case of the `len_chars` characters at `col_chars`
+/// when Preserve Case is on (#1612), as typed otherwise.
+fn shaped(
+    line: &str,
+    col_chars: usize,
+    len_chars: usize,
+    replacement: String,
+    opts: SearchOpts,
+) -> String {
+    if !opts.preserve_case {
+        return replacement;
+    }
+    let matched: String = line.chars().skip(col_chars).take(len_chars).collect();
+    crate::widgets::search::preserve_case(&matched, &replacement)
 }
 
 /// Translate VS Code's regex-replacement escapes (`\n`, `\t`, `\r`, `\\`)
@@ -371,6 +389,15 @@ fn unescape_escapes(replacement: &str) -> String {
         }
     }
     out
+}
+
+/// `replacement` shaped after `matched` under Preserve Case (#1612).
+fn case_of(matched: &str, replacement: &str, opts: SearchOpts) -> String {
+    if opts.preserve_case {
+        crate::widgets::search::preserve_case(matched, replacement)
+    } else {
+        replacement.to_string()
+    }
 }
 
 /// Replace every match of `needle` across `lines` — exactly the matches
@@ -446,14 +473,13 @@ pub fn replace_all_in_lines_in(
                     // the segment's offset recovers the capture groups. The
                     // guard falls back to the original text rather than
                     // ever splicing a mismatched span.
-                    Some(re) => new.push_str(
-                        re.expand_at(line, pos, pos + chunk.len(), replacement)
-                            .as_deref()
-                            .unwrap_or(chunk),
-                    ),
+                    Some(re) => match re.expand_at(line, pos, pos + chunk.len(), replacement) {
+                        Some(expanded) => new.push_str(&case_of(chunk, &expanded, opts)),
+                        None => new.push_str(chunk),
+                    },
                     // Literal replacement goes in verbatim: no capture
                     // references, no escapes.
-                    None => new.push_str(replacement),
+                    None => new.push_str(&case_of(chunk, replacement, opts)),
                 }
             }
             pos += chunk.len();
@@ -975,6 +1001,52 @@ mod tests {
             replace_all_in_lines(&buf, "alpha", "x", SearchOpts::default()).unwrap();
         assert_eq!(n, 3);
         assert_eq!(new_lines, lines(&["x x", "beta", "x"]));
+    }
+
+    /// #1612: the editor's Replace / Replace All keep each match's case
+    /// under Preserve Case, literal and regex alike.
+    #[test]
+    fn find_bar_replace_preserves_each_match_s_case() {
+        let opts = SearchOpts {
+            preserve_case: true,
+            ..SearchOpts::default()
+        };
+        let buf = lines(&["UserService USER_TABLE get_user"]);
+        let (new_lines, n) = replace_all_in_lines(&buf, "user", "account", opts).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(
+            new_lines,
+            lines(&["AccountService ACCOUNT_TABLE get_account"])
+        );
+        let got = expand_replacement("x USER_TABLE", 2, 4, "user", "account", opts);
+        assert_eq!(got.as_deref(), Some("ACCOUNT"));
+        let re = SearchOpts {
+            use_regex: true,
+            ..opts
+        };
+        let (new_lines, _) =
+            replace_all_in_lines(&lines(&["User_1"]), r"user_(\d)", "account_$1", re).unwrap();
+        assert_eq!(new_lines, lines(&["Account_1"]));
+        let got = expand_replacement("User_1", 0, 6, r"user_(\d)", "account_$1", re);
+        assert_eq!(got.as_deref(), Some("Account_1"));
+    }
+
+    /// #1612 negative: Preserve Case off, and a stale position, behave as
+    /// before.
+    #[test]
+    fn find_bar_replace_without_preserve_case_is_as_typed() {
+        let buf = lines(&["UserService"]);
+        let (new_lines, _) =
+            replace_all_in_lines(&buf, "user", "account", SearchOpts::default()).unwrap();
+        assert_eq!(new_lines, lines(&["accountService"]));
+        let opts = SearchOpts {
+            preserve_case: true,
+            ..SearchOpts::default()
+        };
+        assert_eq!(
+            expand_replacement("UserService", 3, 4, "user", "x", opts),
+            None
+        );
     }
 
     #[test]
