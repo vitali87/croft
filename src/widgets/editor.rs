@@ -991,13 +991,18 @@ fn render_sheet(
     );
 }
 
+/// The fewest body rows a merge editor source pane needs before it gives
+/// one to the accept buttons above a conflict (#1169).
+const MERGE_BUTTON_ROW_MIN_BODY: usize = 4;
+
 /// Render the merge editor's source panes (#253) into the TOP of `inner`
 /// and return the remaining rect for the ordinary text path — the
 /// editable Result pane. One header row carries the resolved counter,
 /// then Current | (Base) | Incoming as columns (stacked vertically when
 /// the terminal is narrow), then a separator row labelling the Result.
 /// Per-conflict checkboxes are painted in a small gutter on the region's
-/// first row and their hit rects recorded on the view for mouse routing.
+/// first row, accept buttons on a row above it, and their hit rects
+/// recorded on the view for mouse routing.
 fn render_merge_panes(
     mv: &mut crate::merge_editor::MergeView,
     inner: Rect,
@@ -1006,6 +1011,7 @@ fn render_merge_panes(
 ) -> Rect {
     use crate::merge_editor::{CheckSide, ConflictState};
     mv.check_spans.clear();
+    mv.action_spans.clear();
     mv.last_panes_area = Rect::default();
     // Too small for source panes: the Result gets everything, and the
     // commands (F7, accepts) still work off the tracked regions.
@@ -1213,9 +1219,59 @@ fn render_merge_panes(
         );
         let body_h = (rect.height - 1) as usize;
         let text_w = (rect.width - gutter) as usize;
+        // A side pane puts a row of accept buttons above each conflict
+        // (#1169), VS Code's merge editor CodeLens, so the lines below it
+        // move down a row. An empty side (a deletion) still gets its row. A
+        // pane too short to spare the row keeps only its checkboxes, rather
+        // than pushing the conflict itself out of sight.
+        let mut idx = pane.scroll;
+        let mut buttons_drawn: Vec<usize> = Vec::new();
+        let button_rows = body_h >= MERGE_BUTTON_ROW_MIN_BODY;
         for vis in 0..body_h {
-            let idx = pane.scroll + vis;
             let y = rect.y + 1 + vis as u16;
+            let buttons = pane.side.filter(|_| button_rows).and_then(|side| {
+                pane.regions
+                    .iter()
+                    .find(|(start, _, ci, _)| *start == idx && !buttons_drawn.contains(ci))
+                    .map(|&(_, _, ci, _)| (side, ci))
+            });
+            if let Some((side, ci)) = buttons {
+                buttons_drawn.push(ci);
+                let tint = if ci == mv.active {
+                    pane.active_tint
+                } else {
+                    pane.tint
+                };
+                for x in rect.x..rect.x + rect.width {
+                    buf[(x, y)].set_style(text_style.bg(tint));
+                    buf[(x, y)].set_symbol(" ");
+                }
+                let state = mv.conflicts[ci].state;
+                let both = matches!(state, ConflictState::Both | ConflictState::BothReverse);
+                let (own, own_state) = match side {
+                    CheckSide::Current => (
+                        AcceptChip::new("Accept Current", "Current", ACCEPT_CURRENT_FILL)
+                            .ticked(state == ConflictState::Current),
+                        ConflictState::Current,
+                    ),
+                    CheckSide::Incoming => (
+                        AcceptChip::new("Accept Incoming", "Incoming", ACCEPT_INCOMING_FILL)
+                            .ticked(state == ConflictState::Incoming),
+                        ConflictState::Incoming,
+                    ),
+                };
+                let chips = [
+                    own,
+                    AcceptChip::new("Accept Both", "Both", ACCEPT_BOTH_FILL).ticked(both),
+                ];
+                let states = [own_state, ConflictState::Both];
+                for (i, xs) in
+                    paint_accept_chips(buf, &chips, rect.x + 1, rect.x + rect.width, y, theme)
+                {
+                    mv.action_spans.push((y, xs, ci, states[i]));
+                }
+                continue;
+            }
             if idx >= pane.lines.len() {
                 break;
             }
@@ -1243,6 +1299,7 @@ fn render_merge_panes(
                 mv.check_spans.push((y, rect.x..rect.x + 3, ci, side));
             }
             buf.set_stringn(rect.x + gutter, y, &pane.lines[idx], text_w, style);
+            idx += 1;
         }
     }
 
@@ -3121,6 +3178,9 @@ pub struct Editor {
     /// double-click / Ctrl+Enter / typing into the buffer pin the tab
     /// (preview = false) so subsequent previews don't overwrite it.
     pub preview: bool,
+    /// `Some(n)` for a tab made by File: New Untitled Text File (#1580),
+    /// shown as `Untitled-n` until Save As gives it a path.
+    pub untitled: Option<usize>,
     /// The selection Add Selection to Next Find Match last made from the
     /// word at the caret (#1558). While the primary selection is that one,
     /// further matches are whole words, as in VS Code; a selection made by
@@ -3261,6 +3321,10 @@ pub struct Editor {
     /// its language default.
     wrap_override: Option<bool>,
     highlights: Vec<Vec<HiSpan>>,
+    /// tailspin's spans for each distinct line of a plain `.log` buffer
+    /// (#1537), keyed by the line's text so an edit re-highlights only the
+    /// lines it touched. Theme-free: colours resolve on every recompute.
+    log_spans: std::collections::HashMap<String, Vec<crate::ansi_text::AnsiSpan>>,
     /// The background syntax pass in flight, if any (#850). An edit never
     /// waits on tree-sitter for a large file: `recompute_highlights` carries
     /// the current spans through the edit and hands the text to a worker
@@ -3447,6 +3511,11 @@ pub struct Editor {
     /// same-path reloads, so the FS-sync sweep cannot flip the tab back
     /// to a preview, and clears when the tab opens a different file.
     pub force_text: bool,
+    /// Per-tab "Reopen as Preview" on a plain text file (#1537): `open`
+    /// shows it in the rendered log view, tailspin's colours and all, even
+    /// though it carries no escapes. Sticks across same-path reloads and
+    /// clears with a different file, like `force_text`, which wins.
+    pub force_log: bool,
     /// Notebook code cells (indices into `cells`) running or queued in the
     /// notebook's kernel: the preview shows them as `In [*]` (#355).
     pub notebook_running: Vec<usize>,
@@ -3586,6 +3655,7 @@ impl Editor {
             fallback_kind_folds: Vec::new(),
             fallback_folds_seq: None,
             preview: false,
+            untitled: None,
             occurrence_word_sel: None,
             pinned: false,
             undo_stack: Vec::new(),
@@ -3617,6 +3687,7 @@ impl Editor {
             live_run: None,
             wrap_override: None,
             highlights: Vec::new(),
+            log_spans: std::collections::HashMap::new(),
             highlight_job: None,
             highlight_requests: 0,
             highlight_base: PackedLines::default(),
@@ -3664,6 +3735,7 @@ impl Editor {
             merge: None,
             merge_edit_row: 0,
             force_text: false,
+            force_log: false,
             notebook_running: Vec::new(),
             coverage: None,
             diff_prev_arrow: Rect::default(),
@@ -3763,6 +3835,19 @@ impl Editor {
             self.text_row(vis_row)?.0
         };
         (line < self.lines.len()).then_some(line)
+    }
+
+    /// The 0-based line whose breakpoint lane `(col, row)` is on (#1544): the
+    /// sign cell left of the fold chevron, where breakpoints draw, on any
+    /// visual row of a source line. A left click there toggles a breakpoint,
+    /// as a click in VS Code's glyph margin does. The line number and the
+    /// chevron keep their own clicks, and views without source lines (a
+    /// diff, sheet, image, hex or log view, a Markdown preview) have no lane.
+    pub fn breakpoint_lane_line_at(&self, col: u16, row: u16) -> Option<usize> {
+        if col != self.last_inner.x || self.has_non_text_view() || self.markdown_preview.is_some() {
+            return None;
+        }
+        self.gutter_line_at(col, row)
     }
 
     /// If `(col, row)` lands on a fold chevron in the gutter, toggle that fold
@@ -5197,6 +5282,7 @@ impl Editor {
         // change is a different document, which routes normally again.
         if self.path.as_deref() != Some(path) {
             self.force_text = false;
+            self.force_log = false;
         }
         // Why a `.sarif` file is showing as text, when it is: the text path
         // below reports it instead of a bare "Opened".
@@ -5214,7 +5300,7 @@ impl Editor {
             // the theme palette instead of showing raw escapes. Sniffed, so a
             // plain .txt with pytest output routes here too; a failure falls
             // through to the normal text path.
-            if Self::should_open_as_log(path) && self.open_log(path).is_ok() {
+            if (self.force_log || Self::should_open_as_log(path)) && self.open_log(path).is_ok() {
                 return Ok(());
             }
             // Media (#183): header-probed info card; junk with a media
@@ -6873,7 +6959,7 @@ impl Editor {
             None => {
                 self.highlight_job = None;
                 self.highlight_base = PackedLines::default();
-                self.highlights = vec![Vec::new(); self.lines.len()];
+                self.highlights = self.plain_log_highlights();
                 self.protected_ranges.clear();
                 // No grammar means no string/comment knowledge; brackets in
                 // plain text still colorize (VS Code does the same) — unless
@@ -6893,7 +6979,10 @@ impl Editor {
         } else {
             scan_color_swatches(
                 &self.lines,
-                matches!(self.lang, Some(LangKind::Css | LangKind::Html)),
+                matches!(
+                    self.lang,
+                    Some(LangKind::Css | LangKind::Html | LangKind::Vue | LangKind::Svelte)
+                ),
             )
         };
         self.recompute_semantic_overlay();
@@ -6901,23 +6990,84 @@ impl Editor {
         self.recompute_inlay_spans();
     }
 
+    /// Whether this buffer is a plain `.log` file shown as text (#1537): no
+    /// grammar, no rendered view. It gets tailspin's colours, the same ones
+    /// the rendered log view paints, and reads "Log" in the status bar.
+    pub fn is_plain_log(&self) -> bool {
+        self.lang.is_none()
+            && !self.has_non_text_view()
+            && self
+                .path
+                .as_deref()
+                .and_then(|p| p.extension())
+                .is_some_and(|e| e.eq_ignore_ascii_case("log"))
+    }
+
+    /// Recolour a plain `.log` tab after "Log: Highlighting (tailspin)"
+    /// flips (#1537); every other buffer is unaffected by that setting.
+    pub fn refresh_log_highlight(&mut self) {
+        if self.is_plain_log() {
+            self.recompute_highlights();
+        }
+    }
+
+    /// Spans for a grammar-less buffer: none, except on a plain `.log`
+    /// (#1537), where tailspin colours levels, dates, numbers and ids while
+    /// "Log: Highlighting (tailspin)" is on. A log too big to rescan on every
+    /// edit stays uncoloured rather than making typing pay for it.
+    fn plain_log_highlights(&mut self) -> Vec<Vec<HiSpan>> {
+        let bytes: usize = self.lines.iter().map(String::len).sum();
+        if !self.is_plain_log()
+            || !crate::log_view::default_highlight()
+            || bytes > LOG_HIGHLIGHT_MAX_BYTES
+        {
+            self.log_spans.clear();
+            return vec![Vec::new(); self.lines.len()];
+        }
+        let mut seen = std::mem::take(&mut self.log_spans);
+        let mut kept = std::collections::HashMap::with_capacity(seen.len());
+        let theme = self.theme;
+        let out = self
+            .lines
+            .iter()
+            .map(|line| {
+                let spans: &Vec<crate::ansi_text::AnsiSpan> =
+                    kept.entry(line.clone()).or_insert_with(|| {
+                        seen.remove(line)
+                            .unwrap_or_else(|| crate::log_view::plain_line_spans(line))
+                    });
+                spans
+                    .iter()
+                    .map(|s| HiSpan::new(s.start, s.end, log_span_style(&s.style, theme)))
+                    .collect()
+            })
+            .collect();
+        self.log_spans = kept;
+        out
+    }
+
     /// Hand the buffer's text to a worker thread for a syntax pass as `kind`.
     fn start_highlight_pass(&mut self, kind: LangKind) {
         let text = self.lines.join("\n");
+        let line_lens = embedded_line_lens(&self.lines);
         let (tx, rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name(String::from("croft-highlight"))
             .spawn(move || {
                 // Nobody listening (the tab closed, or a newer pass replaced
                 // this one) is fine: the result is simply dropped.
-                let _ = tx.send(run_highlight_pass(kind, text));
+                let _ = tx.send(run_highlight_pass(kind, text, line_lens));
             });
         let request = self.highlight_requests;
         match spawned {
             Ok(_) => self.highlight_job = Some(HighlightJob { kind, request, rx }),
             // No thread to be had: highlight here, as before #850.
             Err(_) => {
-                let pass = run_highlight_pass(kind, self.lines.join("\n"));
+                let pass = run_highlight_pass(
+                    kind,
+                    self.lines.join("\n"),
+                    embedded_line_lens(&self.lines),
+                );
                 self.land_highlight_pass(pass, request);
             }
         }
@@ -7463,9 +7613,14 @@ impl Editor {
             decode_semantic_tokens(&self.semantic_data, legend, bytes, &line_starts);
     }
 
-    /// Number of logical lines in the buffer (the inlay-hint request range).
-    pub fn line_count(&self) -> usize {
-        self.lines.len()
+    /// Where the buffer ends, as an LSP position: the end of an inlay-hint
+    /// request range, which a strict server rejects past it (#1490).
+    pub fn document_end(&self) -> lsp_types::Position {
+        let last = self.lines.last().map_or("", String::as_str);
+        lsp_types::Position::new(
+            self.lines.len().saturating_sub(1) as u32,
+            last.encode_utf16().count() as u32,
+        )
     }
 
     /// Markdown: Toggle Preview (Cmd/Ctrl+Shift+V). Returns false when the
@@ -7665,6 +7820,14 @@ impl Editor {
             return false;
         }
         let byte = self.byte_index(self.cursor_row, self.cursor_col);
+        // A Vue or Svelte component's `<script>` and `<style>` blocks are
+        // script and CSS, not markup: a `>` there is a comparison, a generic
+        // or a child combinator, never the end of a tag.
+        if matches!(self.lang, Some(LangKind::Vue | LangKind::Svelte))
+            && in_sfc_script_or_style(&self.lines, self.cursor_row, byte)
+        {
+            return false;
+        }
         let name = match self.lines.get(self.cursor_row) {
             Some(line) => tag_auto_close_name(line, byte, self.lang).map(str::to_owned),
             None => None,
@@ -7982,6 +8145,10 @@ impl Editor {
 
     /// Human label for the buffer's language mode, for the status bar.
     pub fn language_label(&self) -> &'static str {
+        if self.is_plain_log() {
+            return "Log";
+        }
+
         // SCSS, Less and Sass share the CSS grammar but are their own
         // languages to the reader and to the CSS server (#1532), so the
         // status bar names them the way VS Code does.
@@ -8096,6 +8263,56 @@ impl Editor {
 
     pub fn insert_str(&mut self, s: &str) {
         self.insert_str_as(s, crate::provenance::Seat::Me);
+    }
+
+    /// A paste from the clipboard (#1218). The text goes in verbatim as one
+    /// undo step; then, when `reindent` is on and it spans lines in a code
+    /// buffer, a second step moves lines 2.. under the caret line's
+    /// indentation, keeping their indentation relative to each other (Zed's
+    /// `auto_indent_on_paste`). One Ctrl+Z therefore gives back the verbatim
+    /// text. Pasting a loop into a nested Python block left its body at the
+    /// clipboard's absolute indentation, outside the block.
+    pub fn paste_str(&mut self, s: &str, reindent: bool) {
+        let text = normalize_newlines(s);
+        let (sr, sc) = match self.selection.filter(|sel| sel.has_area()) {
+            Some(sel) => sel.normalised().0,
+            None => (self.cursor_row, self.cursor_col),
+        };
+        let line = self.lines.get(sr).cloned().unwrap_or_default();
+        let before: String = line.chars().take(sc).collect();
+        // A caret inside a string or comment takes the paste as text: shifting
+        // its later lines would change the string's value. Read before the
+        // insert, while the highlight pass still describes this buffer.
+        let protected = self
+            .earlier_construct_end(sr, before.len())
+            .is_none_or(|from| ends_in_string_or_comment(&before[from..], self.lang));
+        self.insert_str(&text);
+        let code = !matches!(self.lang, None | Some(LangKind::Markdown));
+        // At column zero there is no caret indentation to fit, so the paste
+        // keeps the clipboard's own indentation.
+        if !reindent || !code || sc == 0 || protected || !text.contains('\n') {
+            return;
+        }
+        let at_indent = before.chars().all(char::is_whitespace);
+        let base = match at_indent {
+            true => before,
+            false => line.chars().take_while(|c| c.is_whitespace()).collect(),
+        };
+        let (tab, spaces) = self.indent_preference();
+        let edits = paste_reindent_edits(&text, sr, sc, &base, at_indent, tab, spaces);
+        if edits.is_empty() {
+            return;
+        }
+        let last = sr + text.matches('\n').count();
+        let shift: isize = edits
+            .iter()
+            .filter(|e| e.start.0 == last)
+            .map(|e| e.new_text.chars().count() as isize - (e.end.1 - e.start.1) as isize)
+            .sum();
+        self.apply_span_edits(&edits);
+        self.cursor_row = last;
+        self.cursor_col = self.cursor_col.saturating_add_signed(shift);
+        self.clamp_cursor();
     }
 
     /// [`Self::insert_str`], attributing the inserted lines to `seat` (#349).
@@ -10687,6 +10904,8 @@ impl Editor {
         self.disk_conflict = false;
         let outcome = self.write_buffer_to_disk();
         if matches!(outcome, Ok(SaveOutcome::Saved)) {
+            // Named now: its `Untitled-n` is free for the next one (#1580).
+            self.untitled = None;
             let lang = crate::highlight::lang_for_path(path);
             if lang != self.lang {
                 self.set_language(lang);
@@ -14390,9 +14609,11 @@ fn block_comment_tokens(lang: Option<LangKind>) -> Option<(&'static str, &'stati
         | Some(LangKind::Css)
         | Some(LangKind::Ql)
         | Some(LangKind::Dbscheme) => Some(("/*", "*/")),
-        Some(LangKind::Html) | Some(LangKind::Markdown) | Some(LangKind::Xml) => {
-            Some(("<!--", "-->"))
-        }
+        Some(LangKind::Html)
+        | Some(LangKind::Markdown)
+        | Some(LangKind::Xml)
+        | Some(LangKind::Vue)
+        | Some(LangKind::Svelte) => Some(("<!--", "-->")),
         Some(LangKind::Lua) => Some(("--[[", "]]")),
         Some(LangKind::Java) | Some(LangKind::CSharp) | Some(LangKind::Sql) => Some(("/*", "*/")),
         // Python has no true block comment; VS Code's language config maps
@@ -14577,6 +14798,34 @@ fn bracket_col(col: usize) -> u32 {
 /// Grammar-backed buffers are not gated here: their scan runs inside the
 /// syntax pass, on its worker thread (#850).
 const BRACKET_SCAN_MAX_BYTES: usize = 1_000_000;
+
+/// Above this many bytes a plain `.log` buffer is left uncoloured (#1537):
+/// tailspin runs over every line the first time, and the rendered log view,
+/// which windows the file, is the place for logs this big.
+const LOG_HIGHLIGHT_MAX_BYTES: usize = 4_000_000;
+
+/// A tailspin span's style for the text editor (#1537). Foreground and
+/// emphasis only: the highlighter never sets a background, and the editor's
+/// own background, selection and find marks must show through.
+fn log_span_style(s: &crate::ansi_text::AnsiStyle, theme: crate::theme::Theme) -> Style {
+    let mut style = Style::default();
+    if let Some(c) = s.fg {
+        style = style.fg(ansi_color_to_tui(c, theme));
+    }
+    if s.bold {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if s.dim {
+        style = style.add_modifier(Modifier::DIM);
+    }
+    if s.italic {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if s.underline {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    style
+}
 /// Nesting-depth colours cycle through this many entries (VS Code's default
 /// themes define three `editorBracketHighlight` foregrounds).
 const BRACKET_COLOR_CYCLE: usize = 3;
@@ -14660,10 +14909,27 @@ struct HighlightPass {
     cost: std::time::Duration,
 }
 
+/// The byte length of each of `lines`, when one of them holds a `\n` of its
+/// own (one typed as a character), so a pass over their joined text can tell
+/// the editor's lines from the grammar's. `None` in the usual case, where
+/// splitting the joined text on `\n` gives the lines back, so starting a pass
+/// costs no per-line allocation.
+fn embedded_line_lens(lines: &[String]) -> Option<Vec<usize>> {
+    lines
+        .iter()
+        .any(|l| l.contains('\n'))
+        .then(|| lines.iter().map(String::len).collect())
+}
+
 /// Highlight `text` as `kind` and scan its brackets outside the strings and
 /// comments the grammar found: everything `recompute_highlights` used to do
-/// inline, now run on a worker thread (#850).
-fn run_highlight_pass(kind: LangKind, text: String) -> HighlightPass {
+/// inline, now run on a worker thread (#850). `line_lens` is
+/// [`embedded_line_lens`] of the lines `text` joins.
+fn run_highlight_pass(
+    kind: LangKind,
+    text: String,
+    line_lens: Option<Vec<usize>>,
+) -> HighlightPass {
     let started = std::time::Instant::now();
     let line_starts = compute_line_starts(text.as_bytes());
     let (mut spans, protected) = crate::highlight::highlight_text_with_protected(
@@ -14672,7 +14938,44 @@ fn run_highlight_pass(kind: LangKind, text: String) -> HighlightPass {
         text.as_bytes(),
         &line_starts,
     );
-    let mut brackets = scan_bracket_colors(&text.split('\n').collect::<Vec<_>>(), &protected);
+    // A line can hold a `\n` of its own (one typed as a character), which
+    // the grammar reads as a line break. Fold those pieces' spans back onto
+    // their line, so the pass describes the editor's lines exactly: a pass
+    // over text that has not changed since then lands as is, instead of being
+    // carried through a line diff whose time budget makes the result vary run
+    // to run.
+    let lines = match line_lens {
+        None => PackedLines::from_joined(text),
+        Some(lens) => {
+            let mut at = 0;
+            let lines: Vec<&str> = lens
+                .iter()
+                .map(|&len| {
+                    let line = &text[at..at + len];
+                    at += len + 1;
+                    line
+                })
+                .collect();
+            let mut pieces = spans.into_iter();
+            spans = lines
+                .iter()
+                .map(|line| {
+                    let mut out = Vec::new();
+                    let mut offset = 0;
+                    for piece in line.split('\n') {
+                        out.extend(pieces.next().unwrap_or_default().into_iter().map(|s| {
+                            let r = s.range();
+                            HiSpan::new(r.start + offset, r.end + offset, s.style)
+                        }));
+                        offset += piece.len() + 1;
+                    }
+                    out
+                })
+                .collect();
+            PackedLines::from(&lines[..])
+        }
+    };
+    let mut brackets = scan_bracket_colors(&lines.iter().collect::<Vec<_>>(), &protected);
     // The result lives as long as the tab (#1707): each line's list grew by
     // doubling, which left about a third of it spare. Trimmed here, on the
     // worker, rather than on the UI thread that keeps it.
@@ -14680,7 +14983,7 @@ fn run_highlight_pass(kind: LangKind, text: String) -> HighlightPass {
     brackets.iter_mut().for_each(Vec::shrink_to_fit);
     HighlightPass {
         kind,
-        lines: PackedLines::from_joined(text),
+        lines,
         spans,
         brackets,
         protected,
@@ -15325,7 +15628,7 @@ fn emmet_profile_for(
 ) -> Option<crate::emmet::Profile> {
     use crate::emmet::Profile;
     match lang {
-        Some(LangKind::Html) => Some(Profile::Html),
+        Some(LangKind::Html | LangKind::Vue | LangKind::Svelte) => Some(Profile::Html),
         Some(LangKind::Xml) => Some(Profile::Xml),
         Some(LangKind::Tsx) => Some(Profile::Jsx),
         Some(LangKind::JavaScript)
@@ -15369,6 +15672,8 @@ pub fn language_label(lang: Option<LangKind>) -> &'static str {
         Some(LangKind::Sql) => "SQL",
         Some(LangKind::Make) => "Makefile",
         Some(LangKind::Dockerfile) => "Dockerfile",
+        Some(LangKind::Vue) => "Vue",
+        Some(LangKind::Svelte) => "Svelte",
     }
 }
 
@@ -15403,6 +15708,8 @@ pub fn language_scope_id(lang: Option<LangKind>) -> &'static str {
         Some(LangKind::Sql) => "sql",
         Some(LangKind::Make) => "makefile",
         Some(LangKind::Dockerfile) => "dockerfile",
+        Some(LangKind::Vue) => "vue",
+        Some(LangKind::Svelte) => "svelte",
     }
 }
 
@@ -15433,6 +15740,8 @@ pub const SELECTABLE_LANGUAGES: &[LangKind] = &[
     LangKind::Sql,
     LangKind::Make,
     LangKind::Dockerfile,
+    LangKind::Vue,
+    LangKind::Svelte,
 ];
 
 /// Number of leading whitespace bytes to strip for one outdent step, matching
@@ -16186,6 +16495,88 @@ pub(crate) fn split_into_lines(text: &str) -> Vec<String> {
         .lines()
         .map(|s| s.to_string())
         .collect()
+}
+
+/// The edits that re-indent a paste of `text` made at `(row, col)` (#1218):
+/// every later line moves under `base` (the caret line's indentation) by its
+/// indentation relative to the least-indented line, written in the buffer's
+/// style. The first line counts toward that least indentation when the paste
+/// starts in the caret line's leading whitespace, and then keeps only its
+/// indentation beyond that least (the caret's column already indents it). Lines that are
+/// only whitespace are emptied; a final segment that is only whitespace is
+/// left alone, as the rest of the caret's line follows it.
+fn paste_reindent_edits(
+    text: &str,
+    row: usize,
+    col: usize,
+    base: &str,
+    at_indent: bool,
+    tab: u32,
+    spaces: bool,
+) -> Vec<TextSpanEdit> {
+    let tab = tab.max(1) as usize;
+    let segs: Vec<&str> = text.split('\n').collect();
+    let n = segs.len() - 1;
+    let ws_of = |l: &str| -> (usize, usize) {
+        let mut chars = 0;
+        let mut width = 0;
+        for c in l.chars() {
+            match c {
+                ' ' => width += 1,
+                '\t' => width += tab - width % tab,
+                _ => break,
+            }
+            chars += 1;
+        }
+        (chars, width)
+    };
+    let blank = |l: &str| l.trim().is_empty();
+    let counted = segs
+        .iter()
+        .enumerate()
+        .filter(|(i, l)| (*i > 0 || at_indent) && !blank(l))
+        .map(|(_, l)| ws_of(l).1);
+    let Some(least) = counted.min() else {
+        return Vec::new();
+    };
+    let render = |width: usize| match spaces {
+        true => " ".repeat(width),
+        false => format!("{}{}", "\t".repeat(width / tab), " ".repeat(width % tab)),
+    };
+    let edit = |r: usize, from: usize, to: usize, new_text: String| TextSpanEdit {
+        start: (r, from),
+        end: (r, to),
+        new_text,
+        utf16: false,
+    };
+    let mut edits = Vec::new();
+    let (first_chars, first_width) = ws_of(segs[0]);
+    if at_indent && first_chars > 0 {
+        let keep = match blank(segs[0]) {
+            true => String::new(),
+            false => render(first_width - least),
+        };
+        if segs[0].chars().take(first_chars).collect::<String>() != keep {
+            edits.push(edit(row, col, col + first_chars, keep));
+        }
+    }
+    for (i, seg) in segs.iter().enumerate().skip(1) {
+        let (chars, width) = ws_of(seg);
+        let new_ws = match blank(seg) {
+            true if i == n => continue,
+            true => String::new(),
+            false => format!("{base}{}", render(width - least)),
+        };
+        let whole = if blank(seg) {
+            seg.chars().count()
+        } else {
+            chars
+        };
+        if seg.chars().take(whole).collect::<String>() != new_ws {
+            edits.push(edit(row + i, 0, whole, new_ws));
+        }
+    }
+    edits
 }
 
 /// Fold every line-ending convention to `\n` so callers can split on it
@@ -17293,10 +17684,11 @@ impl Widget for &mut Editor {
             if let Some(tint) = conflict_row_tint(&self.conflicts, line_idx, self.theme) {
                 paint_full_row_bg(buf, text_x, y, row_width, tint);
             }
-            // Clickable accept actions on the conflict header row — VS Code's
+            // Clickable accept buttons on the conflict header row — VS Code's
             // merge-conflict CodeLens, drawn after the marker text where the
-            // `<<<<<<<` line is otherwise dead space. Hit spans are recorded
-            // per frame (cleared at render start) so the rects always
+            // `<<<<<<<` line is otherwise dead space (#1169). A narrow row
+            // gets the short labels rather than losing buttons. Hit spans are
+            // recorded per frame (cleared at render start) so the rects always
             // describe the painted frame (#103's invariant).
             if let Some(block_idx) = self.conflicts.iter().position(|b| b.ours_start == line_idx) {
                 let block = self.conflicts[block_idx];
@@ -17306,28 +17698,22 @@ impl Widget for &mut Editor {
                     .map(|l| l.chars().count() as u16)
                     .unwrap_or(0)
                     .saturating_sub(row_start as u16);
-                let mut x = text_x + marker_len.min(row_width) + 2;
-                let actions: [(&str, crate::merge::Resolution); 3] = [
-                    ("[Accept Current]", crate::merge::Resolution::Current),
-                    ("[Accept Incoming]", crate::merge::Resolution::Incoming),
-                    ("[Accept Both]", crate::merge::Resolution::Both),
-                ];
-                for (label, res) in actions {
-                    let w = label.len() as u16;
-                    if x + w > text_x + row_width {
-                        break;
+                // A header that wraps gets them after its last segment only.
+                if marker_len <= row_width {
+                    use crate::merge::Resolution;
+                    let chips = [
+                        AcceptChip::new("Accept Current", "Current", ACCEPT_CURRENT_FILL),
+                        AcceptChip::new("Accept Incoming", "Incoming", ACCEPT_INCOMING_FILL),
+                        AcceptChip::new("Accept Both", "Both", ACCEPT_BOTH_FILL),
+                    ];
+                    let res = [Resolution::Current, Resolution::Incoming, Resolution::Both];
+                    let x0 = text_x + marker_len + 2;
+                    for (i, xs) in
+                        paint_accept_chips(buf, &chips, x0, text_x + row_width, y, self.theme)
+                    {
+                        self.merge_action_spans
+                            .push((y, xs, block.ours_start, res[i]));
                     }
-                    buf.set_string(
-                        x,
-                        y,
-                        label,
-                        Style::default()
-                            .fg(self.theme.ui(Color::Rgb(0x8a, 0xb4, 0xf8)))
-                            .add_modifier(Modifier::UNDERLINED),
-                    );
-                    self.merge_action_spans
-                        .push((y, x..x + w, block.ours_start, res));
-                    x += w + 2;
                 }
             }
 
@@ -18505,8 +18891,57 @@ const VOID_ELEMENTS: &[&str] = &[
 fn lang_auto_closes_tags(lang: Option<LangKind>) -> bool {
     matches!(
         lang,
-        Some(LangKind::Html | LangKind::Xml | LangKind::Tsx | LangKind::JavaScript)
+        Some(
+            LangKind::Html
+                | LangKind::Xml
+                | LangKind::Tsx
+                | LangKind::JavaScript
+                | LangKind::Vue
+                | LangKind::Svelte
+        )
     )
+}
+
+/// Whether the caret at (`row`, `byte`) of a Vue or Svelte component sits
+/// inside a `<script>` or `<style>` block: some earlier opening tag of one,
+/// with its `>` typed, has no matching closing tag before the caret. A
+/// lexical scan, like the rest of tag auto-close, so it errs toward "inside"
+/// only where markup is unlikely anyway.
+fn in_sfc_script_or_style(lines: &[String], row: usize, byte: usize) -> bool {
+    let mut inside = false;
+    for (r, line) in lines.iter().enumerate().take(row + 1) {
+        let text = if r == row {
+            line.get(..byte).unwrap_or(line)
+        } else {
+            line.as_str()
+        };
+        let lower = text.to_ascii_lowercase();
+        let mut from = 0;
+        while let Some(off) = lower[from..].find('<') {
+            let at = from + off;
+            let tail = &lower[at + 1..];
+            let (closing, name_part) = match tail.strip_prefix('/') {
+                Some(t) => (true, t),
+                None => (false, tail),
+            };
+            let named = ["script", "style"].iter().any(|n| {
+                name_part.strip_prefix(n).is_some_and(|after| {
+                    after.is_empty() || after.starts_with(|c: char| c == '>' || c.is_whitespace())
+                })
+            });
+            if named {
+                if closing {
+                    inside = false;
+                } else if tail.contains('>') {
+                    // Only a finished opening tag starts the block; the one
+                    // still being typed (`<script lang="ts"`) does not.
+                    inside = true;
+                }
+            }
+            from = at + 1;
+        }
+    }
+    inside
 }
 
 /// The tag name a `>` typed at `byte` in `line` should close, or `None` when
@@ -18616,8 +19051,10 @@ fn tag_auto_close_name(line: &str, byte: usize, lang: Option<LangKind>) -> Optio
     if rest.contains('>') {
         return None;
     }
-    if matches!(lang, Some(LangKind::Html))
-        && VOID_ELEMENTS.iter().any(|v| v.eq_ignore_ascii_case(name))
+    if matches!(
+        lang,
+        Some(LangKind::Html | LangKind::Vue | LangKind::Svelte)
+    ) && VOID_ELEMENTS.iter().any(|v| v.eq_ignore_ascii_case(name))
     {
         return None;
     }
@@ -18872,6 +19309,92 @@ fn conflict_row_tint(
     } else {
         theme.ui(Color::Rgb(0x16, 0x2b, 0x44))
     })
+}
+
+/// A merge-conflict accept button (#1169): its label, the shorter one a row
+/// too narrow for every full label gets, and its fill.
+struct AcceptChip {
+    label: String,
+    short: String,
+    fill: Color,
+}
+
+impl AcceptChip {
+    fn new(label: &str, short: &str, fill: Color) -> Self {
+        Self {
+            label: label.to_string(),
+            short: short.to_string(),
+            fill,
+        }
+    }
+
+    /// The button for `state`, ticked when the conflict is already resolved
+    /// that way, in both its full and short forms.
+    fn ticked(mut self, ticked: bool) -> Self {
+        if ticked {
+            self.label = format!("\u{2713} {}", self.label);
+            self.short = format!("\u{2713} {}", self.short);
+        }
+        self
+    }
+}
+
+/// The accept buttons' fills, in the hues of the conflict tints they sit
+/// on: green for current, blue for incoming, grey for both.
+const ACCEPT_CURRENT_FILL: Color = Color::Rgb(0x2f, 0x6b, 0x3e);
+const ACCEPT_INCOMING_FILL: Color = Color::Rgb(0x1f, 0x5a, 0x96);
+const ACCEPT_BOTH_FILL: Color = Color::Rgb(0x4b, 0x52, 0x63);
+
+/// Lay `chips` out from column `x0`, ending at or before `limit`, a cell
+/// apart: every full label when they all fit, else every short one, else as
+/// many short ones as fit. Each placed chip comes back, in order, with its
+/// column and the padded text to paint.
+fn lay_out_accept_chips(chips: &[AcceptChip], x0: u16, limit: u16) -> Vec<(u16, String)> {
+    let place = |short: bool| {
+        let mut out = Vec::new();
+        let mut x = x0;
+        for c in chips {
+            let text = format!(" {} ", if short { &c.short } else { &c.label });
+            let w = text.chars().count() as u16;
+            if x.saturating_add(w) > limit {
+                break;
+            }
+            out.push((x, text));
+            x += w + 1;
+        }
+        out
+    };
+    let full = place(false);
+    if full.len() == chips.len() {
+        return full;
+    }
+    place(true)
+}
+
+/// Paint the accept buttons laid out for row `y`, returning each painted
+/// button's index in `chips` and its column range for the click map.
+fn paint_accept_chips(
+    buf: &mut Buffer,
+    chips: &[AcceptChip],
+    x0: u16,
+    limit: u16,
+    y: u16,
+    theme: crate::theme::Theme,
+) -> Vec<(usize, std::ops::Range<u16>)> {
+    let mut spans = Vec::new();
+    for (i, (x, text)) in lay_out_accept_chips(chips, x0, limit)
+        .into_iter()
+        .enumerate()
+    {
+        let w = text.chars().count() as u16;
+        let style = Style::default()
+            .fg(theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
+            .bg(theme.ui(chips[i].fill))
+            .add_modifier(Modifier::BOLD);
+        buf.set_stringn(x, y, &text, w as usize, style);
+        spans.push((i, x..x + w));
+    }
+    spans
 }
 
 /// Tint every cell of one text row, keeping the glyphs and their colours.
@@ -19504,9 +20027,18 @@ impl EditorTabs {
     }
 
     /// Like [`Self::find_tab_with_path`], symbol tabs included: for closing
-    /// every tab of a file, or editing whichever buffer holds it.
+    /// every tab of a file.
     pub fn find_any_tab_with_path(&self, target: &Path) -> Option<usize> {
         self.find_tab_matching(target, |_| true)
+    }
+
+    /// The tab whose buffer holds `target`'s text: its own tab first, else a
+    /// symbol tab over it. A diff tab carries the file's `path` but shows a
+    /// comparison, so an edit sent to it changes nothing (#1113); it never
+    /// counts.
+    pub fn find_buffer_tab(&self, target: &Path) -> Option<usize> {
+        self.find_tab_matching(target, |e| e.diff.is_none() && e.symbol_view.is_none())
+            .or_else(|| self.find_tab_matching(target, |e| e.diff.is_none()))
     }
 
     /// If `path` is open in a tab, apply LSP rename `edits` to that buffer
@@ -19517,9 +20049,7 @@ impl EditorTabs {
         path: &Path,
         edits: &[TextSpanEdit],
     ) -> Option<usize> {
-        let idx = self
-            .find_tab_with_path(path)
-            .or_else(|| self.find_any_tab_with_path(path))?;
+        let idx = self.find_buffer_tab(path)?;
         Some(self.editors[idx].apply_span_edits(edits))
     }
 
@@ -19537,10 +20067,7 @@ impl EditorTabs {
     /// was taken: the edit's positions describe text no longer there. A
     /// file no tab held when `seqs` was taken is never called edited.
     pub fn edited_since(&self, seqs: &[(PathBuf, u64)], path: &Path) -> bool {
-        let Some(idx) = self
-            .find_tab_with_path(path)
-            .or_else(|| self.find_any_tab_with_path(path))
-        else {
+        let Some(idx) = self.find_buffer_tab(path) else {
             return false;
         };
         let e = &self.editors[idx];
@@ -19639,6 +20166,55 @@ impl EditorTabs {
         now_pinned
     }
 
+    /// Move the tab at `from` to position `to` in this group (#1565), as VS
+    /// Code's tab drag and Move Editor Left / Right do. Pinned tabs stay ahead
+    /// of the rest, so `to` is clamped into the moved tab's own block. The
+    /// active tab stays active. Returns the tab's new index, or `None` when
+    /// `from` is out of range.
+    pub fn move_tab(&mut self, from: usize, to: usize) -> Option<usize> {
+        if from >= self.editors.len() {
+            return None;
+        }
+        let pinned = self.editors.iter().filter(|e| e.pinned).count();
+        let to = if self.editors[from].pinned {
+            to.min(pinned - 1)
+        } else {
+            to.clamp(pinned, self.editors.len() - 1)
+        };
+        if to == from {
+            return Some(from);
+        }
+        let active = self.active;
+        let ed = self.editors.remove(from);
+        self.editors.insert(to, ed);
+        self.active = if active == from {
+            to
+        } else if from < active && active <= to {
+            active - 1
+        } else if to <= active && active < from {
+            active + 1
+        } else {
+            active
+        };
+        Some(to)
+    }
+
+    /// View: Move Editor Left / Right (#1565): shift the active tab one place
+    /// within its group. False when it is already at that end (of its pinned
+    /// or unpinned block), so nothing moved.
+    pub fn move_active_tab(&mut self, right: bool) -> bool {
+        let from = self.active;
+        let to = if right {
+            from + 1
+        } else {
+            match from.checked_sub(1) {
+                Some(to) => to,
+                None => return false,
+            }
+        };
+        self.move_tab(from, to).is_some_and(|at| at != from)
+    }
+
     /// Remove and return the active editor (for a Move to another group). When
     /// it was the only tab the group falls back to a single blank tab (like
     /// closing the last tab), so the group stays renderable; the caller can
@@ -19659,7 +20235,8 @@ impl EditorTabs {
 
     /// Add `ed` (moved from another group) and make it active. A blank-initial
     /// group is replaced in place so a Move never leaves a stray blank tab
-    /// beside the moved editor.
+    /// beside the moved editor. A pinned editor lands at the end of the
+    /// pinned block, so pinned tabs stay ahead of the rest.
     pub fn push_editor(&mut self, mut ed: Editor) {
         if self.is_blank_initial() {
             ed.focused = true;
@@ -19667,8 +20244,13 @@ impl EditorTabs {
             self.active = 0;
             return;
         }
-        self.editors.push(ed);
-        self.active = self.editors.len() - 1;
+        let at = if ed.pinned {
+            self.editors.iter().take_while(|e| e.pinned).count()
+        } else {
+            self.editors.len()
+        };
+        self.editors.insert(at, ed);
+        self.active = at;
         for (i, e) in self.editors.iter_mut().enumerate() {
             e.focused = i == self.active;
         }
@@ -19679,7 +20261,11 @@ impl EditorTabs {
     /// switch to it. Otherwise reuse the existing preview slot, or create a
     /// fresh preview tab next to the active one when none exists.
     pub fn open_preview(&mut self, path: &Path) -> Result<()> {
-        if let Some(idx) = self.find_tab_with_path(path) {
+        // A diff of the file is not the file (#1113): opening it lands on
+        // its own tab, or a new one beside the diff.
+        if let Some(idx) =
+            self.find_tab_matching(path, |e| e.diff.is_none() && e.symbol_view.is_none())
+        {
             // Switching to an already-open file: if a stale preview tab
             // exists for some OTHER file, drop it so the user doesn't
             // accumulate ghost tabs from quick "peek" navigations.
@@ -20123,8 +20709,31 @@ impl EditorTabs {
     pub fn is_blank_initial(&self) -> bool {
         self.editors.len() == 1
             && self.editors[0].path.is_none()
+            && self.editors[0].untitled.is_none()
             && !self.editors[0].dirty
             && self.editors[0].lines.iter().all(|l| l.is_empty())
+    }
+
+    /// File: New Untitled Text File (#1580): a pinned, empty tab with no
+    /// path next to the active one, shown as `Untitled-n`. The caller picks
+    /// `n` across every split group, which this group cannot see. The blank
+    /// startup tab becomes it rather than staying behind.
+    pub fn new_untitled(&mut self, n: usize) {
+        if self.is_blank_initial() {
+            let active = self.active;
+            self.editors[active].untitled = Some(n);
+            self.editors[active].preview = false;
+            return;
+        }
+        let mut e = Editor::new();
+        e.focused = self.editors[self.active].focused;
+        e.untitled = Some(n);
+        e.search_highlight = self.search_highlight_term.clone();
+        e.search_highlight_opts = self.search_highlight_opts;
+        let pos = self.active + 1;
+        self.editors.insert(pos, e);
+        self.editors[self.active].focused = false;
+        self.active = pos;
     }
 
     /// Test-only helper that mirrors `open_preview` without going through
@@ -20612,7 +21221,10 @@ fn tab_label(e: &Editor) -> String {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| String::from("untitled")),
-        None => String::from("untitled"),
+        None => match e.untitled {
+            Some(n) => format!("Untitled-{n}"),
+            None => String::from("untitled"),
+        },
     };
     // The merge editor is text underneath (dirty dot still applies), but
     // the tab says which flavour of the file it is showing.
@@ -22275,6 +22887,162 @@ mod tests {
         assert_eq!(e.word_string_at(0, 10), None);
     }
 
+    // ---- Paste keeps relative indentation (#1218) ----
+
+    const SHOP: &str = "class Shop:\n    def total(self, items):\n        if items:\n            n = 0\n            \n        return 0";
+    const LOOP: &str = "for x in items:\n    if x:\n        print(x)";
+
+    fn shop() -> Editor {
+        let mut e = editor_with(SHOP);
+        e.lang = Some(LangKind::Python);
+        e.cursor_row = 4;
+        e.cursor_col = 12;
+        e
+    }
+
+    #[test]
+    fn a_pasted_block_keeps_its_shape_under_the_caret() {
+        let mut e = shop();
+        e.paste_str(LOOP, true);
+        assert_eq!(
+            &e.lines[4..8],
+            &[
+                "            for x in items:",
+                "                if x:",
+                "                    print(x)",
+                "        return 0",
+            ]
+        );
+        assert_eq!(
+            (e.cursor_row, e.cursor_col),
+            (6, 28),
+            "the caret ends after print(x)"
+        );
+    }
+
+    #[test]
+    fn one_undo_restores_the_verbatim_paste_and_a_second_removes_it() {
+        let mut e = shop();
+        e.paste_str(LOOP, true);
+        assert!(e.undo());
+        assert_eq!(
+            &e.lines[4..7],
+            &[
+                "            for x in items:",
+                "    if x:",
+                "        print(x)"
+            ]
+        );
+        assert!(e.undo());
+        assert_eq!(e.lines.join("\n"), SHOP);
+    }
+
+    #[test]
+    fn a_pasted_block_copied_with_its_own_indentation_lands_at_the_caret() {
+        let mut e = shop();
+        e.paste_str(
+            "    for x in items:\n        if x:\n            print(x)\n",
+            true,
+        );
+        assert_eq!(
+            &e.lines[4..8],
+            &[
+                "            for x in items:",
+                "                if x:",
+                "                    print(x)",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn tabs_in_the_paste_follow_the_buffers_spaces() {
+        let mut e = shop();
+        e.paste_str("for x in items:\n\tif x:\n\t\tprint(x)", true);
+        assert_eq!(e.lines[5], "                if x:");
+        assert_eq!(e.lines[6], "                    print(x)");
+    }
+
+    #[test]
+    fn a_paste_at_column_zero_is_unchanged() {
+        let mut e = editor_with("x = 1\n\nz");
+        e.lang = Some(LangKind::Python);
+        e.cursor_row = 1;
+        e.cursor_col = 0;
+        e.paste_str(LOOP, true);
+        assert_eq!(
+            &e.lines[1..4],
+            &["for x in items:", "    if x:", "        print(x)"]
+        );
+        assert!(e.undo());
+        assert_eq!(
+            e.lines[1], "",
+            "a paste needing no re-indent is one undo step"
+        );
+    }
+
+    #[test]
+    fn an_indented_paste_at_column_zero_keeps_its_indentation() {
+        let mut e = editor_with("x = 1\n\nz");
+        e.lang = Some(LangKind::Python);
+        e.cursor_row = 1;
+        e.cursor_col = 0;
+        e.paste_str("    if x:\n        run()", true);
+        assert_eq!(&e.lines[1..3], &["    if x:", "        run()"]);
+    }
+
+    #[test]
+    fn a_first_line_deeper_than_a_later_one_keeps_the_difference() {
+        let mut e = shop();
+        e.paste_str("    if cond:\n        body()\nelse:", true);
+        assert_eq!(
+            &e.lines[4..7],
+            &[
+                "                if cond:",
+                "                    body()",
+                "            else:",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_paste_inside_a_docstring_is_left_verbatim() {
+        let mut e = editor_with("def f():\n    \"\"\"\n    \n    \"\"\"");
+        e.lang = Some(LangKind::Python);
+        e.recompute_highlights();
+        e.cursor_row = 2;
+        e.cursor_col = 4;
+        e.paste_str("hello\nworld", true);
+        assert_eq!(&e.lines[2..4], &["    hello", "world"]);
+        let mut e = editor_with("def f():\n    x = \"\"\"a");
+        e.lang = Some(LangKind::Python);
+        e.cursor_row = 1;
+        e.cursor_col = 14;
+        e.paste_str("hello\nworld", true);
+        assert_eq!(&e.lines[1..3], &["    x = \"\"\"ahello", "world"]);
+    }
+
+    #[test]
+    fn paste_reindent_off_or_in_plain_text_pastes_verbatim() {
+        let mut e = shop();
+        e.paste_str(LOOP, false);
+        assert_eq!(e.lines[5], "    if x:");
+        let mut e = shop();
+        e.lang = None;
+        e.paste_str(LOOP, true);
+        assert_eq!(
+            e.lines[5], "    if x:",
+            "plain text keeps the clipboard's spacing"
+        );
+    }
+
+    #[test]
+    fn a_one_line_paste_is_never_touched() {
+        let mut e = shop();
+        e.paste_str("    total = 1", true);
+        assert_eq!(e.lines[4], "                total = 1");
+    }
+
     fn editor_with(text: &str) -> Editor {
         let mut e = Editor::new();
         e.lines = if text.is_empty() {
@@ -22893,6 +23661,135 @@ mod tests {
         std::fs::write(&rec, "\u{1b}[2J\u{1b}[10;1Hmoved\n").unwrap();
         e.open(&rec).unwrap();
         assert!(e.log.is_none(), "cursor movement alone does not render");
+    }
+
+    /// The fg of the highlight span covering byte `at` of line `row`.
+    fn fg_at(e: &Editor, row: usize, at: usize) -> Option<Color> {
+        e.highlights
+            .get(row)?
+            .iter()
+            .find(|s| s.range().contains(&at))
+            .and_then(|s| s.style.fg)
+    }
+
+    /// #1537: a plain `.log` with no escapes stays an editable text tab but
+    /// reads as Log and wears tailspin's colours: ERROR is not INFO.
+    #[test]
+    fn a_plain_log_gets_log_colours_in_the_text_editor() {
+        let _exclusive = crate::log_view::DEFAULT_HIGHLIGHT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let before = crate::log_view::default_highlight();
+        crate::log_view::set_default_highlight(true);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("app.log");
+        std::fs::write(
+            &p,
+            "2026-10-08T12:00:01Z ERROR worker-1 took 120ms\n2026-10-08T12:00:02Z INFO worker-2 ok\n",
+        )
+        .unwrap();
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+        crate::log_view::set_default_highlight(before);
+        assert!(e.log.is_none(), "still the editable text tab");
+        assert_eq!(e.language_label(), "Log");
+        let error = fg_at(&e, 0, e.lines[0].find("ERROR").unwrap());
+        let info = fg_at(&e, 1, e.lines[1].find("INFO").unwrap());
+        assert!(error.is_some(), "ERROR is coloured: {:?}", e.highlights[0]);
+        assert!(info.is_some(), "INFO is coloured: {:?}", e.highlights[1]);
+        assert_ne!(error, info, "and ERROR does not look like INFO");
+        assert!(
+            fg_at(&e, 0, 0).is_some(),
+            "the timestamp is coloured too: {:?}",
+            e.highlights[0]
+        );
+        let plain = fg_at(&e, 0, e.lines[0].find("worker").unwrap());
+        assert!(plain.is_none(), "a bare word keeps the editor's colour");
+    }
+
+    /// #1537: a line typed into a plain log is coloured like the rest, and
+    /// one whose text changed loses the spans of the text it replaced.
+    #[test]
+    fn an_edit_to_a_plain_log_recolours_the_edited_line() {
+        let _exclusive = crate::log_view::DEFAULT_HIGHLIGHT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let before = crate::log_view::default_highlight();
+        crate::log_view::set_default_highlight(true);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("app.log");
+        std::fs::write(&p, "ERROR one\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+        assert!(fg_at(&e, 0, 0).is_some(), "ERROR is coloured on open");
+        e.cursor_row = 0;
+        e.cursor_col = 0;
+        for c in "xx ".chars() {
+            e.insert_char(c);
+        }
+        let shifted = fg_at(&e, 0, 3);
+        e.cursor_col = 12;
+        e.insert_newline();
+        for c in "WARN two".chars() {
+            e.insert_char(c);
+        }
+        crate::log_view::set_default_highlight(before);
+        assert_eq!(e.lines, vec!["xx ERROR one", "WARN two"]);
+        assert!(shifted.is_some(), "ERROR keeps its colour where it moved");
+        assert!(fg_at(&e, 0, 0).is_none(), "the typed prefix is plain");
+        assert!(fg_at(&e, 1, 0).is_some(), "the typed WARN line is coloured");
+    }
+
+    /// #1537 negatives: the colours belong to `.log` files, and to the
+    /// "Log: Highlighting (tailspin)" setting. The same lines under a
+    /// `.txt` name, or with the setting off, stay plain.
+    #[test]
+    fn only_a_log_with_highlighting_on_gets_log_colours() {
+        let _exclusive = crate::log_view::DEFAULT_HIGHLIGHT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let before = crate::log_view::default_highlight();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let body = "2026-10-08T12:00:01Z ERROR worker-1 took 120ms\n";
+        let txt = tmp.path().join("notes.txt");
+        std::fs::write(&txt, body).unwrap();
+        let log = tmp.path().join("app.log");
+        std::fs::write(&log, body).unwrap();
+
+        crate::log_view::set_default_highlight(true);
+        let mut t = Editor::new();
+        t.open(&txt).unwrap();
+        assert_eq!(t.language_label(), "Plain Text");
+        assert!(t.highlights.iter().all(Vec::is_empty), "a .txt is plain");
+
+        crate::log_view::set_default_highlight(false);
+        let mut l = Editor::new();
+        l.open(&log).unwrap();
+        assert_eq!(l.language_label(), "Log");
+        assert!(
+            l.highlights.iter().all(Vec::is_empty),
+            "the setting off leaves the log plain"
+        );
+        crate::log_view::set_default_highlight(true);
+        l.refresh_log_highlight();
+        assert!(fg_at(&l, 0, 0).is_some(), "and on again colours it");
+        crate::log_view::set_default_highlight(before);
+    }
+
+    /// #1537: a line that would need its text changed to colour it gets no
+    /// spans rather than spans at the wrong offsets.
+    #[test]
+    fn plain_line_spans_cover_the_raw_text_only() {
+        let line = "2026-10-08 ERROR id=7";
+        let spans = crate::log_view::plain_line_spans(line);
+        assert!(!spans.is_empty());
+        assert!(spans.iter().all(|s| s.end <= line.len() && s.start < s.end));
+        assert!(crate::log_view::plain_line_spans("").is_empty());
+        assert!(crate::log_view::plain_line_spans("just words here").is_empty());
+        assert!(
+            crate::log_view::plain_line_spans("\u{1b}[31mERROR\u{1b}[0m").is_empty(),
+            "a line with its own escapes is not re-coloured"
+        );
     }
 
     /// #257 acceptance: a log far past the text size guard still opens,
@@ -28180,6 +29077,27 @@ mod tests {
         assert_eq!(&out[3..6], b"hi!");
     }
 
+    /// #1632: a Vue or Svelte component opens as that language, coloured,
+    /// with HTML's block comment.
+    #[test]
+    fn vue_and_svelte_components_open_in_their_language() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, label) in [("App.vue", "Vue"), ("Counter.svelte", "Svelte")] {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, "<script>\nlet n = 1;\n</script>\n<p>{n}</p>\n").unwrap();
+            let mut e = Editor::new();
+            e.open(&path).unwrap();
+            assert_eq!(e.language_label(), label, "{name}");
+            assert!(
+                !e.highlights[1].is_empty(),
+                "{name}: the script is coloured"
+            );
+            e.cursor_row = 3;
+            assert!(e.toggle_block_comment(), "{name}");
+            assert_eq!(e.lines[3], "<!-- <p>{n}</p> -->", "{name}");
+        }
+    }
+
     /// #1226: a Dockerfile, a Makefile, SQL and Java open in their own
     /// language, so Toggle Line Comment uses that language's marker.
     #[test]
@@ -32675,6 +33593,27 @@ mod tests {
     }
 
     #[test]
+    fn push_editor_puts_a_pinned_editor_at_the_end_of_the_pinned_block() {
+        let mut dst = EditorTabs::new();
+        dst.editors[0].path = Some(std::path::PathBuf::from("/p"));
+        dst.add_tab_with_path(std::path::PathBuf::from("/u"));
+        dst.toggle_pin(0);
+        let mut src = EditorTabs::new();
+        src.editors[0].path = Some(std::path::PathBuf::from("/moved"));
+        src.toggle_pin(0);
+        dst.push_editor(src.take_active_editor());
+        assert_eq!(dst.tab_count(), 3);
+        assert_eq!(
+            dst.tab_path(1).as_deref(),
+            Some(std::path::Path::new("/moved")),
+            "the pinned editor joins the pinned block, ahead of unpinned tabs"
+        );
+        assert!(dst.editors[1].pinned);
+        assert_eq!(dst.tab_path(2).as_deref(), Some(std::path::Path::new("/u")));
+        assert_eq!(dst.active_index(), 1, "the moved editor is active");
+    }
+
+    #[test]
     fn close_others_is_a_noop_when_only_one_tab_is_open() {
         let mut t = EditorTabs::new();
         t.editors[0].path = Some(std::path::PathBuf::from("/only"));
@@ -33047,6 +33986,24 @@ mod tests {
         assert_eq!(t.find_tab_with_path(std::path::Path::new("/missing")), None);
     }
 
+    /// #1113: the buffer for a path is its own tab, never a diff tab
+    /// carrying the same path.
+    #[test]
+    fn the_buffer_tab_of_a_file_is_never_its_diff() {
+        let mut t = EditorTabs::new();
+        let file = std::path::PathBuf::from("/a");
+        t.editors[0].path = Some(file.clone());
+        t.editors[0].diff = Some(crate::widgets::diff::DiffData::build_unified_deletion(
+            file.clone(),
+            "x\n",
+        ));
+        assert_eq!(t.find_buffer_tab(&file), None);
+        assert_eq!(t.find_tab_with_path(&file), Some(0), "still found as a tab");
+        t.add_tab_with_path(file.clone());
+        assert_eq!(t.find_buffer_tab(&file), Some(1), "its own tab");
+        assert_eq!(t.find_buffer_tab(std::path::Path::new("/b")), None);
+    }
+
     #[test]
     fn editor_tabs_deref_exposes_active_editor_state() {
         let mut t = EditorTabs::new();
@@ -33255,6 +34212,92 @@ mod tests {
         e.lang = None;
         assert!(!e.toggle_line_comment());
         assert_eq!(e.lines, vec!["x = 1"]);
+    }
+
+    /// #1161: XML comments are `<!-- -->`, so Toggle Block Comment wraps
+    /// the caret's line in them and a second toggle takes them off.
+    #[test]
+    fn toggle_block_comment_wraps_an_xml_line() {
+        let mut e = editor_with("<root>\n  <item id=\"1\">hello</item>\n</root>");
+        e.lang = Some(LangKind::Xml);
+        e.cursor_row = 1;
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines[1], "  <!-- <item id=\"1\">hello</item> -->");
+        assert_eq!(e.lines[0], "<root>");
+        assert_eq!(e.lines[2], "</root>");
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines[1], "  <item id=\"1\">hello</item>");
+    }
+
+    /// #1161: Toggle Line Comment in a language with only block comments
+    /// (XML, HTML) wraps the lines a selection touches, whole, as VS Code
+    /// does, and toggles back.
+    #[test]
+    fn toggle_line_comment_wraps_whole_lines_where_only_block_comments_exist() {
+        let mut e = editor_with("<root>\n  <item id=\"1\">hello</item>\n</root>");
+        e.lang = Some(LangKind::Xml);
+        e.cursor_row = 1;
+        e.cursor_col = 5;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[1], "  <!-- <item id=\"1\">hello</item> -->");
+        e.cursor_row = 1;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[1], "  <item id=\"1\">hello</item>");
+
+        let mut e = editor_with("<ul>\n  <li>a</li>\n  <li>b</li>\n</ul>");
+        e.lang = Some(LangKind::Html);
+        e.selection = Some(EditorSelection {
+            anchor: (1, 5),
+            head: (2, 3),
+        });
+        assert!(e.toggle_line_comment());
+        assert_eq!(
+            e.lines,
+            vec!["<ul>", "  <!-- <li>a</li>", "  <li>b</li> -->", "</ul>"]
+        );
+        // The lines stay selected, so a second toggle uncomments them all.
+        assert!(e.selection.is_some_and(|s| s.has_area()));
+        assert!(e.toggle_line_comment());
+        assert_eq!(
+            e.lines,
+            vec!["<ul>", "  <li>a</li>", "  <li>b</li>", "</ul>"]
+        );
+        assert!(e.toggle_line_comment());
+        assert_eq!(
+            e.lines,
+            vec!["<ul>", "  <!-- <li>a</li>", "  <li>b</li> -->", "</ul>"]
+        );
+    }
+
+    /// #1161, negative: a selection ending at the start of a line takes that
+    /// line in, as a line comment does, a language with a line comment
+    /// (JSON's `//` since #1181) keeps it, and plain text, with neither,
+    /// still does nothing.
+    #[test]
+    fn toggle_line_comment_falls_back_only_without_a_line_comment() {
+        let mut e = editor_with("<a/>\n<b/>\n<c/>");
+        e.lang = Some(LangKind::Xml);
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (1, 0),
+        });
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["<!-- <a/>", "<b/> -->", "<c/>"]);
+
+        let mut e = editor_with("let x = 1;");
+        e.lang = Some(LangKind::Rust);
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines, vec!["// let x = 1;"]);
+
+        for lang in [Some(LangKind::Json), Some(LangKind::Yaml), None] {
+            let mut e = editor_with("{}");
+            e.lang = lang;
+            let changed = e.toggle_line_comment();
+            assert_eq!(changed, lang.is_some(), "{lang:?}");
+            if lang.is_none() {
+                assert_eq!(e.lines, vec!["{}"]);
+            }
+        }
     }
 
     /// #1157: a file not written yet opens as an empty, clean buffer bound
@@ -34995,6 +36038,40 @@ mod tests {
         );
     }
 
+    /// #1169: accept buttons switch to their short labels instead of being
+    /// dropped when a row cannot fit every full label, and never run past
+    /// the row's end.
+    #[test]
+    fn accept_buttons_shorten_before_they_drop() {
+        let chips = [
+            AcceptChip::new("Accept Current", "Current", ACCEPT_CURRENT_FILL),
+            AcceptChip::new("Accept Incoming", "Incoming", ACCEPT_INCOMING_FILL),
+            AcceptChip::new("Accept Both", "Both", ACCEPT_BOTH_FILL),
+        ];
+        let texts = |limit: u16| -> Vec<String> {
+            lay_out_accept_chips(&chips, 10, limit)
+                .into_iter()
+                .map(|(x, t)| {
+                    assert!(x + t.chars().count() as u16 <= limit, "{t:?} overruns");
+                    t
+                })
+                .collect()
+        };
+        assert_eq!(
+            texts(100),
+            [" Accept Current ", " Accept Incoming ", " Accept Both "]
+        );
+        assert_eq!(texts(40), [" Current ", " Incoming ", " Both "]);
+        assert_eq!(texts(30), [" Current ", " Incoming "]);
+        assert!(texts(12).is_empty());
+        let ticked = AcceptChip::new("Accept Both", "Both", ACCEPT_BOTH_FILL).ticked(true);
+        assert_eq!(ticked.label, "\u{2713} Accept Both");
+        assert_eq!(
+            ticked.short, "\u{2713} Both",
+            "a narrow pane still shows which side was taken"
+        );
+    }
+
     #[test]
     fn sticky_band_erases_accept_spans_it_paints_over() {
         // The band overpaints the topmost content rows AFTER the row loop
@@ -35583,7 +36660,7 @@ mod tests {
         let cpp = "// greet the user (politely\n#include <string>\nint main() {\n    std::string s = \"smile :)\";\n    char c = '(';\n    return s.size() + c;\n}\n";
         let c = "int main() {\n    char c = '(';\n    int v[] = {1};\n    return c;\n}\n";
         for (kind, src) in [(LangKind::Cpp, cpp), (LangKind::C, c)] {
-            let pass = run_highlight_pass(kind, src.to_string());
+            let pass = run_highlight_pass(kind, src.to_string(), None);
             let red: Vec<(usize, usize)> = pass
                 .brackets
                 .iter()
@@ -35608,6 +36685,7 @@ mod tests {
         let pass = run_highlight_pass(
             LangKind::Cpp,
             String::from("int f() {\n    return 0;\n}}\n"),
+            None,
         );
         assert_eq!(pass.brackets[2], vec![(0, 0), (1, UNEXPECTED_BRACKET)]);
     }
@@ -36853,6 +37931,27 @@ mod tests {
         );
     }
 
+    /// #1550: `!` in an empty HTML file becomes the page skeleton, with the
+    /// caret on the indented line inside `<body>`.
+    #[test]
+    fn emmet_turns_an_exclamation_mark_into_a_page() {
+        let mut e = html_editor("!", 1);
+        assert!(e.expand_emmet_abbreviation());
+        assert_eq!(e.lines.first().map(String::as_str), Some("<!DOCTYPE html>"));
+        assert_eq!(e.lines.last().map(String::as_str), Some("</html>"));
+        assert_eq!(e.lines[e.cursor_row - 1], "<body>");
+        assert_eq!(e.lines[e.cursor_row], "    ");
+        assert_eq!(e.cursor_col, 4);
+    }
+
+    /// #1550 negative: an exclamation mark ending a sentence is no snippet.
+    #[test]
+    fn emmet_leaves_an_exclamation_in_prose_alone() {
+        let mut e = html_editor("Hello!", 6);
+        assert!(!e.expand_emmet_abbreviation());
+        assert_eq!(e.lines, vec!["Hello!"]);
+    }
+
     /// The caret has to end up somewhere useful, or the user just has to go
     /// looking for the hole they meant to type into.
     #[test]
@@ -37767,6 +38866,39 @@ mod tests {
     }
 
     #[test]
+    fn the_breakpoint_lane_is_the_sign_cell_of_each_source_line() {
+        // #1544: the lane is the sign cell left of the chevron, on every
+        // visual row of a line.
+        let mut e = editor_with("fn a() {\n    x\n}\nfn b() {}");
+        render_at(&mut e, 40, 10);
+        let x = e.last_inner.x;
+        let y = e.last_inner.y;
+        assert_eq!(e.breakpoint_lane_line_at(x, y), Some(0));
+        assert_eq!(e.breakpoint_lane_line_at(x, y + 3), Some(3));
+    }
+
+    #[test]
+    fn the_chevron_line_number_body_and_rows_past_the_end_are_not_the_lane() {
+        // #1544 negative: only the sign cell is the lane.
+        let mut e = editor_with("fn a() {\n    x\n}\nfn b() {}");
+        render_at(&mut e, 40, 10);
+        let x = e.last_inner.x;
+        let y = e.last_inner.y;
+        let text_x = x + e.last_gutter_width + 1;
+        assert_eq!(e.breakpoint_lane_line_at(x + 1, y), None, "the chevron");
+        assert_eq!(e.breakpoint_lane_line_at(x + 2, y), None, "the number");
+        assert_eq!(e.breakpoint_lane_line_at(text_x, y), None, "the body");
+        assert_eq!(e.breakpoint_lane_line_at(x, y + 6), None, "past the end");
+        e.lang = Some(LangKind::Markdown);
+        assert!(e.toggle_markdown_preview());
+        assert_eq!(
+            e.breakpoint_lane_line_at(x, y),
+            None,
+            "a preview has no source lines"
+        );
+    }
+
+    #[test]
     fn clicking_off_the_chevron_column_is_not_a_fold_toggle() {
         let mut e = editor_with("fn a() {\n    x\n}");
         render_at(&mut e, 40, 10);
@@ -38446,6 +39578,38 @@ mod tests {
             let mut e = tag_editor("<div", lang);
             e.insert_char('>');
             assert_eq!(e.lines[0], "<div>", "{lang:?} must not auto-close tags");
+        }
+    }
+
+    /// #1632: a Vue or Svelte component's template closes tags like HTML,
+    /// but its `<script>` and `<style>` blocks are code, where a `>` after
+    /// a generic or inside a string must stay a single `>`.
+    #[test]
+    fn sfc_script_and_style_blocks_never_auto_close_tags() {
+        for lang in [LangKind::Vue, LangKind::Svelte] {
+            for (open, line) in [
+                ("<script lang=\"ts\">", "const f = <T extends unknown"),
+                ("<script>", "const s = \"<div"),
+                ("<style>", "a <b"),
+            ] {
+                let mut e = editor_with(&format!("{open}\n{line}"));
+                e.lang = Some(lang);
+                e.cursor_row = 1;
+                e.cursor_col = e.lines[1].chars().count();
+                e.insert_char('>');
+                assert_eq!(e.lines[1], format!("{line}>"), "{lang:?} {open} {line}");
+            }
+            // After the block ends, the template closes tags again.
+            let mut e = editor_with("<script>\nlet n = 1;\n</script>\n<div");
+            e.lang = Some(lang);
+            e.cursor_row = 3;
+            e.cursor_col = 4;
+            e.insert_char('>');
+            assert_eq!(e.lines[3], "<div></div>", "{lang:?}");
+            // Typing the `<script>` tag itself still closes it.
+            let mut e = tag_editor("<script lang=\"ts\"", lang);
+            e.insert_char('>');
+            assert_eq!(e.lines[0], "<script lang=\"ts\"></script>", "{lang:?}");
         }
     }
 
