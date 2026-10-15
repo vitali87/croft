@@ -3311,6 +3311,9 @@ pub fn remote_croft_command(path: Option<&str>, env: &[(String, String)], solo: 
         path,
         std::env::var("TERM_PROGRAM").ok().as_deref(),
         std::env::var("TERM").ok().as_deref(),
+        std::env::var(crate::iterm2_inline::CROFT_INLINE_IMAGES_ENV)
+            .ok()
+            .as_deref(),
         crate::iterm2_inline::detect_osk_auto(),
         env,
         solo,
@@ -3321,6 +3324,7 @@ fn remote_croft_command_for_terminal(
     path: Option<&str>,
     term_program: Option<&str>,
     term: Option<&str>,
+    croft_inline_images: Option<&str>,
     osk: bool,
     env: &[(String, String)],
     solo: bool,
@@ -3337,8 +3341,10 @@ fn remote_croft_command_for_terminal(
     // to use whichever inline-image protocol the local terminal speaks. SSH
     // forwards `TERM` but not `TERM_PROGRAM` (absent an `AcceptEnv` opt-in), so
     // export the hint the remote detector needs explicitly rather than relying
-    // on the environment surviving the hop.
-    match crate::iterm2_inline::inline_image_protocol_for(term_program, term) {
+    // on the environment surviving the hop. Launched from a croft pane whose
+    // croft draws no images, the remote must not be forced onto OSC 1337 it
+    // cannot show (#1453), so the pane's `CROFT_INLINE_IMAGES` gate applies.
+    match crate::iterm2_inline::inline_image_protocol_in(term_program, term, croft_inline_images) {
         InlineImageProtocol::ITerm2 => {
             // iTerm2/WezTerm implement OSC 1337 inline images + `SetColors`;
             // force them on and carry `TERM_PROGRAM` so the remote paints the
@@ -4119,7 +4125,7 @@ mod tests {
         assert!(check(home.path(), bin.path()), "dtach");
 
         // The check probes exactly as the launched session does.
-        let launch = remote_croft_command_for_terminal(None, None, None, false, &[], false);
+        let launch = remote_croft_command_for_terminal(None, None, None, None, false, &[], false);
         assert!(launch.contains("croft session-host --probe >/dev/null 2>&1"));
         assert!(launch.contains("command -v dtach >/dev/null 2>&1"));
     }
@@ -4833,6 +4839,7 @@ Host !blocked *.internal
             Some("/tmp/it's here"),
             None,
             None,
+            None,
             false,
             &[],
             false,
@@ -4843,9 +4850,40 @@ Host !blocked *.internal
 
     #[test]
     fn remote_croft_command_forwards_supported_terminal_program() {
-        let command =
-            remote_croft_command_for_terminal(None, Some("iTerm.app"), None, false, &[], false);
+        let command = remote_croft_command_for_terminal(
+            None,
+            Some("iTerm.app"),
+            None,
+            None,
+            false,
+            &[],
+            false,
+        );
         assert!(command.contains("export CROFT_FORCE_INLINE_IMAGES=1 TERM_PROGRAM='iTerm.app';"));
+    }
+
+    #[test]
+    fn remote_croft_command_honors_croft_pane_image_gate() {
+        let blocked = remote_croft_command_for_terminal(
+            None,
+            Some("croft"),
+            None,
+            Some("0"),
+            false,
+            &[],
+            false,
+        );
+        assert!(!blocked.contains("CROFT_FORCE_INLINE_IMAGES"));
+        let allowed = remote_croft_command_for_terminal(
+            None,
+            Some("croft"),
+            None,
+            Some("1"),
+            false,
+            &[],
+            false,
+        );
+        assert!(allowed.contains("export CROFT_FORCE_INLINE_IMAGES=1 TERM_PROGRAM='croft';"));
     }
 
     #[test]
@@ -4855,7 +4893,7 @@ Host !blocked *.internal
         // (Ghostty parses but ignores it); the remote resolves the Kitty
         // protocol from the exported TERM_PROGRAM.
         let command =
-            remote_croft_command_for_terminal(None, Some("ghostty"), None, false, &[], false);
+            remote_croft_command_for_terminal(None, Some("ghostty"), None, None, false, &[], false);
         assert!(command.contains("export TERM_PROGRAM=ghostty;"));
         assert!(!command.contains("CROFT_FORCE_INLINE_IMAGES"));
     }
@@ -4863,8 +4901,15 @@ Host !blocked *.internal
     #[test]
     fn remote_croft_command_exports_kitty_hint_from_term_only() {
         // A bare `kitty` terminal sets no TERM_PROGRAM; detection keys off TERM.
-        let command =
-            remote_croft_command_for_terminal(None, None, Some("xterm-kitty"), false, &[], false);
+        let command = remote_croft_command_for_terminal(
+            None,
+            None,
+            Some("xterm-kitty"),
+            None,
+            false,
+            &[],
+            false,
+        );
         assert!(command.contains("export TERM_PROGRAM=ghostty;"));
     }
 
@@ -4877,7 +4922,7 @@ Host !blocked *.internal
         // never desync the running croft from a fresh pump.
         let id = relay_session_id("");
         let env = vec![(String::from("CROFT_RELAY_KEY"), id.clone())];
-        let command = remote_croft_command_for_terminal(None, None, None, false, &env, false);
+        let command = remote_croft_command_for_terminal(None, None, None, None, false, &env, false);
         assert!(
             command.contains(&format!("export CROFT_RELAY_KEY='{id}'")),
             "launch must export the deterministic relay key, got: {command}",
@@ -4952,16 +4997,23 @@ Host !blocked *.internal
         // SSH from Termux does not forward TERMUX_VERSION, so a remote croft
         // would never auto-arm the on-screen keyboard; the launcher carries
         // the local detection across the hop explicitly.
-        let command = remote_croft_command_for_terminal(None, None, None, true, &[], false);
+        let command = remote_croft_command_for_terminal(None, None, None, None, true, &[], false);
         assert!(command.contains("export CROFT_FORCE_OSK=1;"));
-        let command = remote_croft_command_for_terminal(None, None, None, false, &[], false);
+        let command = remote_croft_command_for_terminal(None, None, None, None, false, &[], false);
         assert!(!command.contains("CROFT_FORCE_OSK"));
     }
 
     #[test]
     fn remote_command_prefers_session_host_and_falls_back_to_dtach() {
-        let command =
-            remote_croft_command_for_terminal(Some("/srv/app"), None, None, false, &[], false);
+        let command = remote_croft_command_for_terminal(
+            Some("/srv/app"),
+            None,
+            None,
+            None,
+            false,
+            &[],
+            false,
+        );
         // Preferred: croft's own session host (multiplayer mux), gated on a
         // probe so an old remote binary is never sent an unknown subcommand.
         assert!(command.contains("if croft session-host --probe"));
@@ -4983,7 +5035,7 @@ Host !blocked *.internal
 
     #[test]
     fn remote_command_omits_workspace_flag_without_a_path() {
-        let command = remote_croft_command_for_terminal(None, None, None, false, &[], false);
+        let command = remote_croft_command_for_terminal(None, None, None, None, false, &[], false);
         assert!(command.contains("exec croft session-host --socket"));
         assert!(!command.contains("--workspace"));
         assert!(command.contains(" -- croft;"));
@@ -5018,6 +5070,7 @@ Host !blocked *.internal
             Some("/srv/app"),
             Some("iTerm.app"),
             Some("xterm-256color"),
+            None,
             false,
             &[],
             true,
@@ -5038,6 +5091,7 @@ Host !blocked *.internal
             Some("/srv/app"),
             Some("iTerm.app"),
             Some("xterm-256color"),
+            None,
             false,
             &[],
             false,

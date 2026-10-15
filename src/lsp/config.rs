@@ -34,9 +34,23 @@ impl Language {
 impl Language {
     /// The language whose manifests map this file extension, or `None`.
     /// Data-driven: the mapping comes from every loaded extension's
-    /// `[[languages]]` blocks.
+    /// `[[languages]]` blocks. Production resolves files through
+    /// [`Language::from_path`], which also honours file-name patterns.
+    #[cfg(test)]
     pub fn from_extension(ext: &str) -> Option<Self> {
         crate::lsp::languages::from_extension(ext)
+    }
+
+    /// The language a file maps to by its name, then its extension (#1084).
+    /// croft's own settings, keybindings and snippets files take comments
+    /// and trailing commas, so a JSON file under its config directory is
+    /// JSON with comments.
+    pub fn from_path(path: &std::path::Path) -> Option<Self> {
+        let lang = crate::lsp::languages::from_path(path)?;
+        if lang.lsp_id() == "json" && path.starts_with(crate::prefs::config_dir()) {
+            return crate::lsp::languages::resolve("jsonc").or(Some(lang));
+        }
+        Some(lang)
     }
 
     /// The LSP `languageId` sent in `initialize`/`didOpen`.
@@ -268,6 +282,28 @@ mod tests {
         assert_eq!(Language::from_extension("go"), Some(Language::GO));
         assert_eq!(Language::from_extension("yml"), Some(Language::YAML));
         assert_eq!(Language::from_extension("lua"), Some(Language::LUA));
+    }
+
+    /// #1084: croft's own settings, keybindings and snippets files, under
+    /// its config directory or a profile, take comments, so they are JSON
+    /// with comments. JSON beside that directory, and other files in it,
+    /// keep their language.
+    #[test]
+    fn croft_config_files_are_json_with_comments() {
+        let jsonc = Language::from_lsp_id("jsonc");
+        let dir = crate::prefs::config_dir();
+        for name in ["config.json", "keybindings.json", "snippets.json"] {
+            assert_eq!(Language::from_path(&dir.join(name)), jsonc, "{name}");
+        }
+        let profile = crate::profiles::profiles_dir().join("work/keybindings.json");
+        assert_eq!(Language::from_path(&profile), jsonc);
+        let beside = dir.with_file_name("other-app").join("config.json");
+        assert_eq!(Language::from_path(&beside), Some(Language::JSON));
+        assert_eq!(
+            Language::from_path(&dir.join("init.lua")),
+            Some(Language::LUA)
+        );
+        assert_eq!(Language::from_path(&dir.join("profile")), None);
     }
 
     #[test]
