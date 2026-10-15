@@ -33923,9 +33923,9 @@ impl App {
                 }
             }
             AdapterKind::JsDebug => {
-                if rc.request == RequestKind::Launch && rc.program.is_none() {
+                if rc.request == RequestKind::Launch && !configs::js_launch_has_target(&rc) {
                     self.debug_error(format!(
-                        "config \"{name}\": a node launch needs a \"program\""
+                        "config \"{name}\": a node launch needs a \"program\", a \"runtimeExecutable\" or a \"command\""
                     ));
                     return;
                 }

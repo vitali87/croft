@@ -88806,6 +88806,31 @@ fn format_on_save_still_formats_when_croft_runs_the_named_formatter() {
     }
 }
 
+/// #1391: a node launch with nothing to run is refused naming every field
+/// that would have given it something.
+#[test]
+fn a_node_launch_with_nothing_to_run_names_what_it_needs() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [ { "name": "Bare", "type": "node", "request": "launch" } ] }"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let cfg = crate::dap::configs::discover_configs(tmp.path()).remove(0);
+    app.launch_debug_config(&cfg);
+    assert!(app.run_debug.feedback_is_error);
+    assert!(
+        app.status.contains(
+            "config \"Bare\": a node launch needs a \"program\", a \"runtimeExecutable\" or a \"command\""
+        ),
+        "{}",
+        app.status
+    );
+    assert!(app.debug_sessions.is_empty());
+}
+
 /// #1117 fixture: `a.rs` open and drawn, `name` selected when `select`,
 /// then a right-click on the word `value`.
 fn editor_menu_1117(select: bool) -> (tempfile::TempDir, App) {
