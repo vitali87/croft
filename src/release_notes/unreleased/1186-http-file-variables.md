@@ -1,1 +1,0 @@
-fix: `.http` files read REST Client file variables: `@base = …` lines fill `{{base}}` in the requests below them (and may use each other and `.http.env.json` values), and Ctrl+Enter on a variable line no longer sends it as a request.
