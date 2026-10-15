@@ -224,6 +224,21 @@ const SETTINGS: &[SettingMap] = &[
         convert: as_string,
     },
     SettingMap {
+        vscode: "files.insertFinalNewline",
+        croft: "insert_final_newline",
+        convert: as_bool,
+    },
+    SettingMap {
+        vscode: "files.trimTrailingWhitespace",
+        croft: "trim_trailing_whitespace",
+        convert: as_bool,
+    },
+    SettingMap {
+        vscode: "files.trimFinalNewlines",
+        croft: "trim_final_newlines",
+        convert: as_bool,
+    },
+    SettingMap {
         vscode: "editor.formatOnType",
         croft: "format_on_type",
         convert: as_bool,

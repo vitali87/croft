@@ -3359,6 +3359,9 @@ pub struct App {
     /// Re-indent a multi-line paste under the caret line (#1218), on unless
     /// `disable_paste_reindent` is set.
     paste_reindent: bool,
+    /// The global on-save clean-ups (#1657), handed to each editor as it
+    /// saves. A `.editorconfig` property still wins for its file.
+    save_cleanup: crate::widgets::editor::SaveCleanup,
     /// LSP inlay hints (inline type / parameter annotations), on by default
     /// like VS Code's `editor.inlayHints.enabled`; toggled from the palette
     /// and persisted as `disable_inlay_hints` in config.json.
@@ -6199,6 +6202,7 @@ impl App {
             save_before_debug: !loaded_prefs.disable_save_before_debug,
             auto_close_pairs: !loaded_prefs.disable_auto_close_pairs,
             paste_reindent: !loaded_prefs.disable_paste_reindent,
+            save_cleanup: crate::widgets::editor::SaveCleanup::from_prefs(&loaded_prefs),
             inlay_hints_enabled: !loaded_prefs.disable_inlay_hints,
             // Keep the suite off the user's real ~/.config/croft/history: a
             // per-process temp root in test builds, the real dir otherwise.
@@ -60306,6 +60310,7 @@ impl App {
         // tab's OWN encoding, which need not be the active tab's.
         let mut lossy: Vec<String> = Vec::new();
         let mut lossy_paths: Vec<PathBuf> = Vec::new();
+        let cleanup = self.save_cleanup;
         let mut sweep = |editors: &mut [crate::widgets::editor::Editor], skip: Option<usize>| {
             for (i, e) in editors
                 .iter_mut()
@@ -60321,6 +60326,7 @@ impl App {
                 // `save_to_disk` re-checks the disk and flags (never
                 // overwrites) an external change; auto save must not
                 // arm the force-overwrite path an explicit Cmd+S offers.
+                e.save_cleanup = cleanup;
                 match e.save_to_disk() {
                     Ok(crate::widgets::editor::SaveOutcome::Saved) => {
                         if let Some(p) = e.path.clone() {
@@ -62104,6 +62110,7 @@ impl App {
         // lingers past the press it was meant for.
         if std::mem::take(&mut self.force_save_armed) {
             use crate::widgets::editor::SaveOutcome;
+            self.editor.save_cleanup = self.save_cleanup;
             match self.editor.save_to_disk_force() {
                 Ok(SaveOutcome::Saved) => {
                     self.status = self.editor.status.clone();
@@ -62431,6 +62438,7 @@ impl App {
         self.editor.auto_close_pairs = self.auto_close_pairs;
         self.paste_reindent = !p.disable_paste_reindent;
 
+        self.save_cleanup = crate::widgets::editor::SaveCleanup::from_prefs(p);
         self.follow_vim_mode_pref(p.vim_mode);
         if !p.disable_inline_blame && !self.inline_blame_enabled {
             // Re-enabling refetches, like toggle_inline_blame.
@@ -62728,6 +62736,7 @@ impl App {
             self.status = String::from("Save skipped: the tab was closed");
             return;
         };
+        editor.save_cleanup = self.save_cleanup;
         match editor.save_to_disk() {
             Ok(SaveOutcome::Saved) => {
                 let seats = editor.provenance_to_record();
@@ -62764,6 +62773,7 @@ impl App {
 
     fn write_current_to_disk(&mut self) {
         use crate::widgets::editor::SaveOutcome;
+        self.editor.save_cleanup = self.save_cleanup;
         match self.editor.save_to_disk() {
             Ok(SaveOutcome::Saved) => {
                 self.status = self.editor.status.clone();
@@ -64740,6 +64750,7 @@ impl App {
     /// blind either, and an untitled buffer has no file to go to. Returns a
     /// line per file still unsaved; empty means everything is on disk.
     fn save_tabs_for_exit(&mut self, only: Option<usize>) -> Vec<String> {
+        let cleanup = self.save_cleanup;
         use crate::widgets::editor::SaveOutcome;
         // The tabs of a file with a symbol tab mirror one text (#369): the
         // first write saves them all, and writing a second would read the
@@ -64837,6 +64848,7 @@ impl App {
             } else if ed.sheet.is_some() {
                 ed.sheet_save(false, false)
             } else {
+                ed.save_cleanup = cleanup;
                 ed.save_to_disk()
             };
             let why = match outcome {
@@ -69925,6 +69937,7 @@ impl App {
     /// error says why not, with the tab left as it was.
     fn save_as(&mut self, path: &Path) -> Result<(), String> {
         use crate::widgets::editor::SaveOutcome;
+        self.editor.save_cleanup = self.save_cleanup;
         match self.editor.save_as(path) {
             Ok(SaveOutcome::Saved) => {
                 self.status = self.editor.status.clone();

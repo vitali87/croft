@@ -2939,6 +2939,8 @@ pub struct Editor {
     /// closers type over, selections surround, and backspace eats an empty
     /// pair. Synced from the app's persisted preference like `blame_enabled`.
     pub auto_close_pairs: bool,
+    /// The global on-save clean-ups (#1657), set by the app before each save.
+    pub save_cleanup: SaveCleanup,
     /// Auto-closing TAGS (VS Code's `html.autoClosingTags` /
     /// `javascript.autoClosingTags`, filling the "no tag auto-close" gap
     /// in `src/vscode_extensions.rs`): typing `>` at the end of an opening
@@ -3592,6 +3594,7 @@ impl Editor {
             git_marks: std::collections::HashMap::new(),
             git_marks_seq: u64::MAX,
             auto_close_pairs: true,
+            save_cleanup: SaveCleanup::default(),
             auto_close_tags: true,
             auto_pair_at: None,
             multi_auto_pair: None,
@@ -12440,19 +12443,32 @@ impl Editor {
         true
     }
 
-    /// Apply the `.editorconfig` properties that act at save time, from the
-    /// single write choke point so every save path (explicit, force, auto,
+    /// Apply the clean-ups that act at save time, from the single write
+    /// choke point so every save path (explicit, force, auto,
     /// format-on-save) gets them.
     ///
-    /// Both are no-ops unless a `.editorconfig` explicitly asked for them:
-    /// rewriting someone's whitespace on an unconfigured project would be a
-    /// surprise, and a noisy diff.
+    /// Each is a no-op unless asked for: by a `.editorconfig` property, or
+    /// by the global setting (#1657), off by default as in VS Code.
+    /// Rewriting someone's whitespace unasked would be a surprise, and a
+    /// noisy diff. A `.editorconfig` value wins over the global one for its
+    /// file, either way, as it does for indentation.
     fn apply_editorconfig_on_save(&mut self) -> bool {
         let mut changed = false;
-        if self.editorconfig.trim_trailing_whitespace == Some(true) {
+        let trim_whitespace = self
+            .editorconfig
+            .trim_trailing_whitespace
+            .unwrap_or(self.save_cleanup.trim_trailing_whitespace);
+        let final_newline = self
+            .editorconfig
+            .insert_final_newline
+            .unwrap_or(self.save_cleanup.insert_final_newline);
+        if trim_whitespace {
             changed |= self.trim_trailing_whitespace_off_caret_lines();
         }
-        if self.editorconfig.insert_final_newline == Some(true) {
+        if self.save_cleanup.trim_final_newlines {
+            changed |= self.trim_final_newlines_on_save();
+        }
+        if final_newline {
             // `lines` joins with the EOL on write, so a trailing empty
             // element IS the final newline. An empty buffer is left alone:
             // a zero-byte file has no last line to terminate.
@@ -12469,6 +12485,35 @@ impl Editor {
             }
         }
         changed
+    }
+
+    /// `files.trimFinalNewlines` for a save (#1657): the empty lines after
+    /// the last line of text go, but the newline that ends that line stays.
+    /// With `final_newline` set it is written from the flag; without, it is
+    /// the one trailing empty element, so that one is kept. As with
+    /// trailing whitespace, no line a caret sits on goes: auto-save runs a
+    /// second after typing stops, and must not eat the line just opened
+    /// with Enter. The command (`trim_final_newlines`) drops them all, as
+    /// it always has.
+    fn trim_final_newlines_on_save(&mut self) -> bool {
+        let mut text_end = self.lines.len();
+        while text_end > 1 && self.lines[text_end - 1].is_empty() {
+            text_end -= 1;
+        }
+        let ends_line = usize::from(!self.final_newline && text_end < self.lines.len());
+        let last_caret = std::iter::once(self.cursor_row)
+            .chain(self.carets.iter().map(|c| c.head.0))
+            .max()
+            .unwrap_or(0);
+        let keep = (text_end + ends_line).max(last_caret + 1);
+        if keep >= self.lines.len() {
+            return false;
+        }
+        self.push_undo(EditKind::TrimFinalNewlines);
+        self.lines.truncate(keep);
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        true
     }
 
     /// The `.editorconfig` properties in force for this buffer.
@@ -14686,6 +14731,26 @@ fn title_case(s: &str) -> String {
         }
     }
     out
+}
+
+/// The global on-save clean-ups (#1657): VS Code's `files.insertFinalNewline`,
+/// `files.trimTrailingWhitespace` and `files.trimFinalNewlines`, all off by
+/// default as they are there.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SaveCleanup {
+    pub insert_final_newline: bool,
+    pub trim_trailing_whitespace: bool,
+    pub trim_final_newlines: bool,
+}
+
+impl SaveCleanup {
+    pub(crate) fn from_prefs(p: &crate::prefs::Prefs) -> Self {
+        Self {
+            insert_final_newline: p.insert_final_newline,
+            trim_trailing_whitespace: p.trim_trailing_whitespace,
+            trim_final_newlines: p.trim_final_newlines,
+        }
+    }
 }
 
 /// Whitespace rendering (#133, VS Code `editor.renderWhitespace`): which

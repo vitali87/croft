@@ -88372,6 +88372,160 @@ fn move_editor_into_next_group_splits_then_previous_brings_it_back() {
     assert_eq!(active_name_1565(&app), "c.py");
 }
 
+/// #1657: an app with `f.txt` holding `text`, open with the caret at the end
+/// of line `row`, `settings` (config.json keys) applied, then one character
+/// typed and Cmd+S pressed. Returns the bytes on disk.
+fn save_with_settings(
+    text: &str,
+    editorconfig: Option<&str>,
+    settings: &str,
+    row: usize,
+) -> String {
+    let tmp = tempfile::tempdir().unwrap();
+    if let Some(ec) = editorconfig {
+        std::fs::write(tmp.path().join(".editorconfig"), ec).unwrap();
+    }
+    let f = tmp.path().join("f.txt");
+    std::fs::write(&f, text).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_merged_settings(&serde_json::from_str(settings).unwrap());
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = row;
+    app.editor.cursor_col = app.editor.lines[row].chars().count();
+    app.handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(!app.editor.dirty, "saved: {}", app.status);
+    std::fs::read_to_string(&f).unwrap()
+}
+
+/// #1657: with `insert_final_newline` on and no `.editorconfig`, a save ends
+/// the file with a newline. Only a `.editorconfig` could ask for one.
+#[test]
+fn insert_final_newline_ends_every_save_with_a_newline() {
+    assert_eq!(
+        save_with_settings(
+            "hello world   \nsecond line",
+            None,
+            r#"{"insert_final_newline": true}"#,
+            1
+        ),
+        "hello world   \nsecond liney\n"
+    );
+}
+
+/// #1657: with `trim_trailing_whitespace` on, a save strips the trailing
+/// spaces of every line the caret is not on.
+#[test]
+fn trim_trailing_whitespace_strips_lines_on_save() {
+    assert_eq!(
+        save_with_settings(
+            "hello world   \nsecond line",
+            None,
+            r#"{"trim_trailing_whitespace": true}"#,
+            1
+        ),
+        "hello world\nsecond liney"
+    );
+}
+
+/// #1657: with `trim_final_newlines` on, a save drops the empty lines after
+/// the text but keeps the newline that ends it.
+#[test]
+fn trim_final_newlines_keeps_one_newline_on_save() {
+    assert_eq!(
+        save_with_settings("a\n\n\n", None, r#"{"trim_final_newlines": true}"#, 0),
+        "ay\n"
+    );
+    assert_eq!(
+        save_with_settings(
+            "a\n\n\n",
+            None,
+            r#"{"trim_final_newlines": true, "insert_final_newline": true}"#,
+            0
+        ),
+        "ay\n",
+        "both on still leaves exactly one"
+    );
+}
+
+/// #1657 negative: with every clean-up off, the default, a save writes the
+/// buffer as it is, trailing spaces, blank tail and missing newline alike.
+#[test]
+fn save_clean_ups_default_off_leave_the_file_as_typed() {
+    assert_eq!(
+        save_with_settings("hello world   \nsecond line", None, "{}", 1),
+        "hello world   \nsecond liney"
+    );
+    assert_eq!(save_with_settings("a\n\n\n", None, "{}", 0), "ay\n\n\n");
+}
+
+/// #1657 negative: a `.editorconfig` value wins over the global setting for
+/// its file, whichever way it points.
+#[test]
+fn an_editorconfig_value_overrides_the_global_clean_up() {
+    let off = "root = true\n[*]\ninsert_final_newline = false\ntrim_trailing_whitespace = false\n";
+    assert_eq!(
+        save_with_settings(
+            "hello world   \nsecond line",
+            Some(off),
+            r#"{"insert_final_newline": true, "trim_trailing_whitespace": true}"#,
+            1
+        ),
+        "hello world   \nsecond liney"
+    );
+    let on = "root = true\n[*]\ninsert_final_newline = true\n";
+    assert_eq!(
+        save_with_settings("second line", Some(on), "{}", 0),
+        "second liney\n"
+    );
+}
+
+/// #1657 negative: the trim spares the line the caret is on, so a save (an
+/// auto-save a second after typing, say) never eats the line just opened
+/// with Enter at the end of the file.
+#[test]
+fn trim_final_newlines_spares_the_caret_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("f.txt");
+    std::fs::write(&f, "a\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_merged_settings(&serde_json::from_str(r#"{"trim_final_newlines": true}"#).unwrap());
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 1;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.editor.cursor_row, 1);
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "a\n\n");
+}
+
+/// #1657: VS Code's `files.*` save settings import onto the croft keys.
+#[test]
+fn vscode_save_clean_up_settings_import() {
+    let (settings, unmapped, _) = crate::import_vscode::map_settings(
+        serde_json::json!({
+            "files.insertFinalNewline": true,
+            "files.trimTrailingWhitespace": true,
+            "files.trimFinalNewlines": false
+        })
+        .as_object()
+        .unwrap(),
+    );
+    assert!(unmapped.is_empty(), "{unmapped:?}");
+    assert_eq!(settings["insert_final_newline"], serde_json::json!(true));
+    assert_eq!(
+        settings["trim_trailing_whitespace"],
+        serde_json::json!(true)
+    );
+    assert_eq!(settings["trim_final_newlines"], serde_json::json!(false));
+}
+
 /// Serve one `croft edit` request for `path` at `at` through a socket pair.
 fn serve_view_request_1606(
     app: &mut App,
