@@ -105,6 +105,8 @@ pub fn layer_of(provenance: &BTreeMap<String, LayerKind>, key: &str) -> LayerKin
 pub const WORKSPACE_ALLOWED_KEYS: &[&str] = &[
     "theme",
     "format_on_save",
+    "default_formatter",
+    "language_formatters",
     "format_on_type",
     "auto_save",
     "auto_save_on_focus_change",
@@ -993,6 +995,82 @@ mod tests {
             layer_of(&m.provenance, "auto_save_on_focus_change"),
             LayerKind::VsCodeWorkspace
         );
+    }
+
+    /// #1499: a repo's `.vscode` names the formatter beside its
+    /// `formatOnSave`, for every file and per language; both reach croft
+    /// from the workspace layer.
+    #[test]
+    fn vscode_default_formatters_reach_the_workspace_layer() {
+        let (_tmp, user, root) = setup();
+        write(
+            &root.join(".vscode/settings.json"),
+            r#"{
+  "editor.formatOnSave": true,
+  "editor.defaultFormatter": "biomejs.biome",
+  "[python]": { "editor.defaultFormatter": "charliermarsh.ruff", "editor.tabSize": 4 },
+  "[javascript][typescript]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+}"#,
+        );
+        let m = load_merged_from(&user, Some(&root), "linux");
+        assert!(m.prefs.format_on_save);
+        assert_eq!(m.prefs.default_formatter.as_deref(), Some("biomejs.biome"));
+        assert_eq!(
+            m.prefs.language_formatters,
+            [
+                ("javascript][typescript", "esbenp.prettier-vscode"),
+                ("python", "charliermarsh.ruff"),
+            ]
+            .iter()
+            .map(|(l, f)| (l.to_string(), f.to_string()))
+            .collect::<BTreeMap<_, _>>()
+        );
+        assert_eq!(
+            layer_of(&m.provenance, "default_formatter"),
+            LayerKind::VsCodeWorkspace
+        );
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+    }
+
+    /// #1499: an imported user `[typescript]` formatter survives a workspace
+    /// `[javascript][typescript]` one, as in VS Code, and a workspace
+    /// `null` clears the user's formatter for every file.
+    #[test]
+    fn a_grouped_workspace_formatter_keeps_a_user_single_language_one() {
+        let (_tmp, user, root) = setup();
+        write(
+            &user.join("config.json"),
+            r#"{ "default_formatter": "esbenp.prettier-vscode", "language_formatters": { "typescript": "vscode.typescript-language-features" } }"#,
+        );
+        write(
+            &root.join(".vscode/settings.json"),
+            r#"{ "editor.defaultFormatter": null, "[javascript][typescript]": { "editor.defaultFormatter": "biomejs.biome" }, "[python]": { "editor.defaultFormatter": null } }"#,
+        );
+        let m = load_merged_from(&user, Some(&root), "linux");
+        assert_eq!(m.prefs.default_formatter, None);
+        let per = &m.prefs.language_formatters;
+        let named = |l| crate::default_formatter::named(None, per, Some(l));
+        assert_eq!(
+            named("typescript"),
+            Some("vscode.typescript-language-features")
+        );
+        assert_eq!(named("javascript"), Some("biomejs.biome"));
+        assert_eq!(named("python"), None);
+        assert_eq!(per.get("python").map(String::as_str), Some(""));
+    }
+
+    /// #1499, negative: a language block without a formatter, or with an
+    /// empty one, names nothing.
+    #[test]
+    fn a_language_block_without_a_formatter_names_none() {
+        let (_tmp, user, root) = setup();
+        write(
+            &root.join(".vscode/settings.json"),
+            r#"{ "editor.defaultFormatter": "", "[go]": { "editor.tabSize": 8 }, "[rust]": {} }"#,
+        );
+        let m = load_merged_from(&user, Some(&root), "linux");
+        assert_eq!(m.prefs.default_formatter, None);
+        assert!(m.prefs.language_formatters.is_empty());
     }
 
     #[test]
