@@ -36957,6 +36957,28 @@ impl App {
                 self.close_input_prompt();
                 self.run_fleet_command(&value);
             }
+            InputPurpose::EmmetWrap => {
+                self.close_input_prompt();
+                self.status = if self.editor.emmet_wrap(&value) {
+                    format!("Emmet: wrapped with {}", value.trim())
+                } else {
+                    format!(
+                        "Emmet: {} is not an abbreviation to wrap with",
+                        value.trim()
+                    )
+                };
+            }
+            InputPurpose::EmmetUpdateTag => {
+                self.close_input_prompt();
+                self.status = if self.editor.emmet_update_tag(&value) {
+                    format!("Emmet: tag renamed to {}", value.trim())
+                } else {
+                    format!(
+                        "Emmet: {} is not a tag name, or no tag is around the cursor",
+                        value.trim()
+                    )
+                };
+            }
             InputPurpose::HexFind => {
                 self.close_input_prompt();
                 match crate::hex::HexView::parse_find_query(&value) {
@@ -44910,6 +44932,65 @@ impl App {
         } else {
             String::from("Emmet: no abbreviation at the cursor")
         };
+    }
+
+    /// Emmet: Wrap with Abbreviation or Update Tag (#1557): ask for the
+    /// abbreviation or the new name in a one-line prompt, as Go to Line
+    /// does. Says so instead where Emmet is not offered.
+    fn open_emmet_prompt(&mut self, wrap: bool) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        if !self.editor_is_text() {
+            return;
+        }
+        if !self.editor.emmet_available() {
+            self.status = format!(
+                "Emmet: not available in {} files",
+                self.editor.language_label()
+            );
+            return;
+        }
+        self.open_input_prompt(if wrap {
+            InputPrompt::new(
+                InputPurpose::EmmetWrap,
+                "Wrap with Abbreviation",
+                "abbreviation, such as div.card or ul>li*",
+            )
+        } else {
+            InputPrompt::new(InputPurpose::EmmetUpdateTag, "Update Tag", "new tag name")
+        });
+    }
+
+    /// Emmet's commands for markup already written that need no input
+    /// (#1557), each saying why when it did nothing.
+    fn run_emmet_edit(&mut self, edit: EmmetEdit) {
+        if !self.editor_is_text() {
+            return;
+        }
+        if !self.editor.emmet_available() {
+            self.status = format!(
+                "Emmet: not available in {} files",
+                self.editor.language_label()
+            );
+            return;
+        }
+        let (done, failed) = match edit {
+            EmmetEdit::RemoveTag => (self.editor.emmet_remove_tag(), "no tag around the cursor"),
+            EmmetEdit::MatchTag => (
+                self.editor.emmet_match_tag(),
+                "the cursor is not on a tag with a pair",
+            ),
+            EmmetEdit::BalanceOutward => (
+                self.editor.emmet_balance(true),
+                "nothing encloses the selection",
+            ),
+            EmmetEdit::BalanceInward => (
+                self.editor.emmet_balance(false),
+                "nothing inside the selection to narrow to",
+            ),
+        };
+        if !done {
+            self.status = format!("Emmet: {failed}");
+        }
     }
 
     /// Markdown: Toggle Preview — flips the active tab between source and the
@@ -52912,6 +52993,12 @@ impl App {
                 }
             }
             Cmd::EmmetExpandAbbreviation => self.expand_emmet_abbreviation(),
+            Cmd::EmmetWrapWithAbbreviation => self.open_emmet_prompt(true),
+            Cmd::EmmetUpdateTag => self.open_emmet_prompt(false),
+            Cmd::EmmetRemoveTag => self.run_emmet_edit(EmmetEdit::RemoveTag),
+            Cmd::EmmetMatchTag => self.run_emmet_edit(EmmetEdit::MatchTag),
+            Cmd::EmmetBalanceOutward => self.run_emmet_edit(EmmetEdit::BalanceOutward),
+            Cmd::EmmetBalanceInward => self.run_emmet_edit(EmmetEdit::BalanceInward),
             Cmd::ExpandSelection => self.expand_selection(),
             Cmd::ShrinkSelection => self.shrink_selection(),
             Cmd::SwitchHeaderSource => self.switch_header_source(),
@@ -72532,6 +72619,15 @@ fn copy_to_clipboard(text: &str) -> bool {
     let _ = out.write_all(&bytes);
     let _ = out.flush();
     false
+}
+
+/// The Emmet commands [`App::run_emmet_edit`] runs (#1557).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EmmetEdit {
+    RemoveTag,
+    MatchTag,
+    BalanceOutward,
+    BalanceInward,
 }
 
 /// Where `App::copy_where_pasted` put a copy.

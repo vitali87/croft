@@ -88372,6 +88372,203 @@ fn move_editor_into_next_group_splits_then_previous_brings_it_back() {
     assert_eq!(active_name_1565(&app), "c.py");
 }
 
+const EMMET_PAGE: &str = "<ul>\n  <li>Home</li>\n  <li>About</li>\n</ul>\n<p>Some text</p>\n";
+
+/// Run palette command `cmd`, then, if it opened a prompt, answer it.
+fn run_emmet(app: &mut App, cmd: crate::widgets::command_palette::Command, answer: Option<&str>) {
+    app.run_command(cmd);
+    if let Some(answer) = answer {
+        assert!(app.input_prompt.is_some(), "a prompt asks first");
+        type_str(app, answer);
+        app.submit_input_prompt();
+    }
+}
+
+/// #1557: the issue's example: Wrap with Abbreviation around the selected
+/// `<ul>` with `nav.menu`.
+#[test]
+fn wrap_with_abbreviation_wraps_the_selected_lines() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "page.html", EMMET_PAGE);
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 0),
+        head: (3, 5),
+    });
+    run_emmet(
+        &mut app,
+        Command::EmmetWrapWithAbbreviation,
+        Some("nav.menu"),
+    );
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "<nav class=\"menu\">\n  <ul>\n    <li>Home</li>\n    <li>About</li>\n  </ul>\n</nav>\n<p>Some text</p>"
+    );
+    assert!(app.status.contains("wrapped"), "{}", app.status);
+    app.editor.undo();
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        EMMET_PAGE.trim_end(),
+        "one undo step"
+    );
+}
+
+/// #1557: with nothing selected, Wrap with Abbreviation takes the element
+/// around the caret, a caret just past `</ul>` included; outside any
+/// element it takes the caret's line.
+#[test]
+fn with_nothing_selected_wrap_takes_the_element_at_the_caret() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "page.html", EMMET_PAGE);
+    app.editor.cursor_row = 3;
+    app.editor.cursor_col = 5;
+    run_emmet(&mut app, Command::EmmetWrapWithAbbreviation, Some("nav"));
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "<nav>\n  <ul>\n    <li>Home</li>\n    <li>About</li>\n  </ul>\n</nav>\n<p>Some text</p>"
+    );
+    let mut app = app_with_open_file(
+        tmp.path(),
+        "page.html",
+        "<ul>\n  <li>Home</li>\n</ul>\nplain words\n",
+    );
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 7;
+    run_emmet(&mut app, Command::EmmetWrapWithAbbreviation, Some("b"));
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "<ul>\n  <b>\n    <li>Home</li>\n  </b>\n</ul>\nplain words"
+    );
+    app.editor.cursor_row = 5;
+    app.editor.cursor_col = 3;
+    run_emmet(&mut app, Command::EmmetWrapWithAbbreviation, Some("p"));
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "<ul>\n  <b>\n    <li>Home</li>\n  </b>\n</ul>\n<p>\n  plain words\n</p>"
+    );
+}
+
+/// #1557: Remove Tag, Update Tag and Go to Matching Pair from the palette,
+/// with the caret in the `<ul>`.
+#[test]
+fn remove_and_update_tag_and_go_to_matching_pair() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "page.html", EMMET_PAGE);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 1;
+    run_emmet(&mut app, Command::EmmetMatchTag, None);
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (3, 0));
+    run_emmet(&mut app, Command::EmmetUpdateTag, Some("ol"));
+    assert_eq!(app.editor.lines[0], "<ol>");
+    assert_eq!(app.editor.lines[3], "</ol>");
+    run_emmet(&mut app, Command::EmmetRemoveTag, None);
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "<li>Home</li>\n<li>About</li>\n<p>Some text</p>"
+    );
+}
+
+/// #1557: Balance outward grows the selection from the caret to the
+/// element's content and then the element; inward walks it back.
+#[test]
+fn balance_outward_and_inward_step_the_selection() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "page.html", EMMET_PAGE);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 7;
+    run_emmet(&mut app, Command::EmmetBalanceOutward, None);
+    assert_eq!(app.editor.selection_text(), "Home");
+    run_emmet(&mut app, Command::EmmetBalanceOutward, None);
+    assert_eq!(app.editor.selection_text(), "<li>Home</li>");
+    run_emmet(&mut app, Command::EmmetBalanceInward, None);
+    assert_eq!(app.editor.selection_text(), "Home");
+}
+
+/// #1557 negative: outside markup the commands say Emmet is not offered,
+/// ask nothing and change nothing; in markup with no tag around the caret,
+/// Remove Tag says so.
+#[test]
+fn emmet_editing_commands_leave_other_files_alone() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.txt", "<ul>\n</ul>\n");
+    for cmd in [
+        Command::EmmetWrapWithAbbreviation,
+        Command::EmmetUpdateTag,
+        Command::EmmetRemoveTag,
+        Command::EmmetMatchTag,
+        Command::EmmetBalanceOutward,
+    ] {
+        app.run_command(cmd);
+        assert!(app.input_prompt.is_none(), "{cmd:?} asks nothing");
+        assert!(
+            app.status.contains("not available"),
+            "{cmd:?}: {}",
+            app.status
+        );
+    }
+    assert_eq!(app.editor.lines.join("\n"), "<ul>\n</ul>");
+    let mut html = app_with_open_file(tmp.path(), "plain.html", "just text\n");
+    run_emmet(&mut html, Command::EmmetRemoveTag, None);
+    assert!(html.status.contains("no tag"), "{}", html.status);
+    assert_eq!(html.editor.lines.join("\n"), "just text");
+}
+
+/// #1557: the commands are in the palette and VS Code's Emmet keybindings
+/// import onto them.
+#[test]
+fn emmet_editing_commands_are_in_the_palette_and_import() {
+    use crate::widgets::command_palette::{ALL_COMMANDS, Command};
+    for (cmd, title, vscode) in [
+        (
+            Command::EmmetWrapWithAbbreviation,
+            "Emmet: Wrap with Abbreviation",
+            "editor.emmet.action.wrapWithAbbreviation",
+        ),
+        (
+            Command::EmmetRemoveTag,
+            "Emmet: Remove Tag",
+            "editor.emmet.action.removeTag",
+        ),
+        (
+            Command::EmmetUpdateTag,
+            "Emmet: Update Tag",
+            "editor.emmet.action.updateTag",
+        ),
+        (
+            Command::EmmetBalanceOutward,
+            "Emmet: Balance (outward)",
+            "editor.emmet.action.balanceOut",
+        ),
+        (
+            Command::EmmetBalanceInward,
+            "Emmet: Balance (inward)",
+            "editor.emmet.action.balanceIn",
+        ),
+        (
+            Command::EmmetMatchTag,
+            "Emmet: Go to Matching Pair",
+            "editor.emmet.action.matchTag",
+        ),
+    ] {
+        assert!(ALL_COMMANDS.contains(&cmd), "{cmd:?}");
+        assert_eq!(cmd.title(), title);
+        let mut report = crate::import_vscode::Report::default();
+        crate::import_vscode::convert_keybindings(
+            &serde_json::json!([{ "key": "ctrl+alt+w", "command": vscode }]),
+            &mut report,
+        );
+        assert_eq!(
+            report.keybindings,
+            vec![(String::from("ctrl+alt+w"), String::from(cmd.id()))],
+            "{vscode}"
+        );
+    }
+}
+
 /// Serve one `croft edit` request for `path` at `at` through a socket pair.
 fn serve_view_request_1606(
     app: &mut App,
