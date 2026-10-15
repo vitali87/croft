@@ -1,1 +1,0 @@
-fix: `croft theme-import` of a theme croft already ships (Nord, Dracula, One Dark Pro...) now labels the import "Nord (imported)" in the Color Theme picker, instead of adding a second row with the same name.
