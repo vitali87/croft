@@ -31,6 +31,7 @@ mod config_sync;
 mod cpp_build;
 mod dap;
 mod deep_link;
+mod default_formatter;
 mod devcontainer;
 mod docx;
 mod editorconfig;
