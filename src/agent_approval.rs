@@ -533,7 +533,12 @@ impl ProposalCheck {
 
     /// Every server's diagnostics, worst first, then by line.
     pub fn diagnostics(&self) -> Vec<crate::lsp::manager::Diagnostic> {
-        let mut all: Vec<_> = self.by_server.values().flatten().cloned().collect();
+        // A server can both push and answer a pull with the same finding
+        // (#1102): count it once, as the editor and PROBLEMS do. The same
+        // finding from two servers, or twice from one, still counts each.
+        let mut all: Vec<_> = crate::lsp::manager::diagnostics_by_source(&self.by_server)
+            .map(|(_, d)| d.clone())
+            .collect();
         all.sort_by_key(|d| (severity_rank(d.severity), d.start_line, d.start_char));
         all
     }
@@ -1070,5 +1075,53 @@ mod tests {
             "nope\nmore",
             "worst, then first"
         );
+    }
+
+    /// #1102: a finding a server both pushed and answered a pull with
+    /// counts once, but the same finding from two servers, or twice in one
+    /// server's report, counts each time, as in the editor and PROBLEMS.
+    #[test]
+    fn a_proposal_check_merges_a_findings_push_and_pull_only_within_one_server() {
+        use crate::lsp::manager::{
+            Diagnostic, DiagnosticSeverity as S, DiagnosticsUpdate, diagnostics_store_key,
+        };
+        let d = Diagnostic {
+            start_line: 2,
+            start_char: 0,
+            end_line: 2,
+            end_char: 1,
+            severity: S::Error,
+            message: "mismatched types".into(),
+            tags: Default::default(),
+            code: None,
+        };
+        let key = |server: &str, pulled| {
+            diagnostics_store_key(&DiagnosticsUpdate {
+                path: PathBuf::from("a.rs"),
+                server: server.into(),
+                diagnostics: Vec::new(),
+                pulled,
+            })
+        };
+        let now = Instant::now();
+        let mut check = ProposalCheck {
+            arrived: now,
+            started: now,
+            path: PathBuf::from("a.rs"),
+            opened: true,
+            by_server: Default::default(),
+        };
+        check
+            .by_server
+            .insert(key("rust-analyzer", false), vec![d.clone()]);
+        check
+            .by_server
+            .insert(key("rust-analyzer", true), vec![d.clone()]);
+        assert_eq!(check.diagnostics().len(), 1, "pushed and pulled: once");
+        check
+            .by_server
+            .insert(key("other-rust-server", false), vec![d.clone(), d.clone()]);
+        assert_eq!(check.diagnostics().len(), 3, "another server's: each");
+        assert_eq!(check.summary(now).split(' ').next(), Some("3"));
     }
 }
