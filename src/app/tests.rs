@@ -88960,6 +88960,85 @@ fn the_editor_menu_without_a_selection_offers_only_paste() {
     );
 }
 
+/// #1576: "View: Change Line Numbers" steps on, relative, interval, off
+/// and back, on every open editor, including tabs opened afterwards.
+#[test]
+fn change_line_numbers_cycles_modes_across_every_editor() {
+    use crate::widgets::editor::LineNumbers;
+    let mut app = editor_app_with_lines(&["a b"]);
+    let all_in =
+        |app: &App, mode: LineNumbers| app.editor.editors.iter().all(|e| e.line_numbers == mode);
+    assert_eq!(app.line_numbers, LineNumbers::On, "on by default");
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        app.run_command(crate::widgets::command_palette::Command::CycleLineNumbers);
+        app.editor
+            .open_text_buffer(std::path::Path::new("later.txt"), "c d")
+            .unwrap();
+        app.sync_focus_flags();
+        assert!(all_in(&app, app.line_numbers), "{:?}", app.line_numbers);
+        seen.push(app.status.clone());
+    }
+    assert_eq!(
+        seen,
+        [
+            "Line Numbers: relative",
+            "Line Numbers: interval",
+            "Line Numbers: off",
+            "Line Numbers: on"
+        ]
+    );
+}
+
+/// #1576: the palette command and a settings reload both reach the split
+/// beside the active one at once, not at the next focus change.
+#[test]
+fn line_numbers_reach_every_split_group() {
+    use crate::widgets::editor::LineNumbers;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "a\nb\n");
+    app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+    let modes = |app: &App| -> Vec<LineNumbers> {
+        std::iter::once(&app.editor)
+            .chain(app.editor_layout.inactive_groups())
+            .flat_map(|group| group.editors.iter().map(|e| e.line_numbers))
+            .collect()
+    };
+    assert_eq!(modes(&app), [LineNumbers::On, LineNumbers::On]);
+
+    app.run_command(crate::widgets::command_palette::Command::CycleLineNumbers);
+    assert_eq!(modes(&app), [LineNumbers::Relative, LineNumbers::Relative]);
+
+    let prefs = crate::prefs::Prefs {
+        line_numbers: String::from("off"),
+        ..Default::default()
+    };
+    app.apply_merged_settings(&prefs);
+    assert_eq!(modes(&app), [LineNumbers::Off, LineNumbers::Off]);
+}
+
+/// #1576: a project's `.vscode/settings.json` `editor.lineNumbers` sets
+/// the gutter; a value croft has no mode for is ignored.
+#[test]
+fn vscode_line_numbers_setting_applies() {
+    use crate::widgets::editor::LineNumbers;
+    for (value, want) in [
+        ("relative", LineNumbers::Relative),
+        ("off", LineNumbers::Off),
+        ("sideways", LineNumbers::On),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(
+            tmp.path().join(".vscode/settings.json"),
+            format!(r#"{{ "editor.lineNumbers": "{value}" }}"#),
+        )
+        .unwrap();
+        let app = App::new(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(app.line_numbers, want, "{value}");
+    }
+}
+
 /// #1392: a CodeLLDB `cargo` launch with no `program` builds with cargo
 /// first instead of being refused; an lldb launch with neither is still
 /// refused.

@@ -3298,6 +3298,9 @@ pub struct Editor {
     pub overview_ruler: bool,
     /// Whitespace glyph rendering (#133); app-synced from prefs.
     pub whitespace_mode: WhitespaceMode,
+    /// What the gutter numbers each line with (#1576, VS Code's
+    /// `editor.lineNumbers`); app-synced from prefs.
+    pub line_numbers: LineNumbers,
     /// Starting ignore-whitespace mode for diffs opened in this editor
     /// (#258, `diff.ignore_whitespace`); app-synced from prefs. Note this is
     /// unrelated to `whitespace_mode` above, which paints glyphs.
@@ -3678,6 +3681,7 @@ impl Editor {
             cell_images: false,
             cell_image: None,
             whitespace_mode: WhitespaceMode::default(),
+            line_numbers: LineNumbers::default(),
             diff_ws_default: crate::widgets::diff::DiffWhitespace::default(),
             inline_values: std::collections::BTreeMap::new(),
             live_run: None,
@@ -10277,6 +10281,43 @@ impl Editor {
             .find(|&h| matches!(self.fold_range(h), Some((_, end)) if line <= end))
     }
 
+    /// The number the gutter shows for `line` (#1576), `None` for none: its
+    /// 1-based number (`on`); nothing (`off`); the caret's line its own
+    /// number and every other line its distance from it, counting a folded
+    /// block as one line as Vim's `relativenumber` does (`relative`); or
+    /// every tenth line and the caret's (`interval`), as VS Code does.
+    pub fn gutter_number(&self, line: usize) -> Option<usize> {
+        match self.line_numbers {
+            LineNumbers::On => Some(line + 1),
+            LineNumbers::Off => None,
+            LineNumbers::Relative if line == self.cursor_row => Some(line + 1),
+            LineNumbers::Relative => Some(self.visible_line_distance(self.cursor_row, line)),
+            LineNumbers::Interval => {
+                ((line + 1).is_multiple_of(10) || line == self.cursor_row).then_some(line + 1)
+            }
+        }
+    }
+
+    /// How many lines apart `a` and `b` are on screen: the lines between
+    /// them, less those a collapsed fold hides.
+    fn visible_line_distance(&self, a: usize, b: usize) -> usize {
+        let (lo, hi) = (a.min(b), a.max(b));
+        let hidden: usize = self
+            .hidden_ranges
+            .iter()
+            .map(|&(header, end)| {
+                let (from, to) = ((header + 1).max(lo + 1), end.min(hi));
+                (to + 1).saturating_sub(from)
+            })
+            .sum();
+        (hi - lo).saturating_sub(hidden)
+    }
+
+    /// Whether the primary caret or an extra one is on `line`.
+    fn is_caret_line(&self, line: usize) -> bool {
+        line == self.cursor_row || self.carets.iter().any(|c| c.head.0 == line)
+    }
+
     /// Whether `line` is hidden inside a collapsed region. A binary search over
     /// the merged spans in [`Self::hidden_ranges`], which the fold writes keep
     /// current — this is called for every rendered row of every frame.
@@ -14688,6 +14729,52 @@ fn title_case(s: &str) -> String {
     out
 }
 
+/// Gutter line numbers (#1576, VS Code `editor.lineNumbers`): `On` (the
+/// default) numbers every line, `Relative` shows each line's distance from
+/// the caret's (for Vim counts such as `5j`), `Interval` every tenth line,
+/// and `Off` no number column at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LineNumbers {
+    #[default]
+    On,
+    Relative,
+    Interval,
+    Off,
+}
+
+impl LineNumbers {
+    /// The persisted config id (`line_numbers` in config.json).
+    pub fn pref_id(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Relative => "relative",
+            Self::Interval => "interval",
+            Self::Off => "off",
+        }
+    }
+
+    /// Parse the persisted id; anything unrecognised (including the empty
+    /// string an older config deserializes to) is `on`.
+    pub fn from_pref(id: &str) -> Self {
+        match id {
+            "relative" => Self::Relative,
+            "interval" => Self::Interval,
+            "off" => Self::Off,
+            _ => Self::On,
+        }
+    }
+
+    /// The palette command's cycle order: on, relative, interval, off.
+    pub fn next(self) -> Self {
+        match self {
+            Self::On => Self::Relative,
+            Self::Relative => Self::Interval,
+            Self::Interval => Self::Off,
+            Self::Off => Self::On,
+        }
+    }
+}
+
 /// Whitespace rendering (#133, VS Code `editor.renderWhitespace`): which
 /// spaces/tabs paint a visible glyph (`·` / `→`). `Selection` — VS Code's
 /// default — shows them only inside selected text; `All` across the whole
@@ -16855,7 +16942,13 @@ impl Widget for &mut Editor {
         // together, so the number-to-code gap is unchanged and click/cursor
         // mapping (which derives from `gutter_width`) stays correct for free.
         const SIGN_MARGIN: u16 = 2;
-        let gutter_width = (self.lines.len() + 1).to_string().len() as u16 + 1 + SIGN_MARGIN;
+        // `off` drops the number column only; the sign margin with its
+        // breakpoints and fold chevrons, and the change bar, stay (#1576).
+        let digits = match self.line_numbers {
+            LineNumbers::Off => 0,
+            _ => (self.lines.len() + 1).to_string().len() as u16,
+        };
+        let gutter_width = digits + 1 + SIGN_MARGIN;
         self.last_gutter_width = gutter_width;
         // Rebuild the git-gutter marks if the buffer moved since last frame
         // (cheap no-op otherwise), so the bars below diff against HEAD.
@@ -17199,11 +17292,15 @@ impl Widget for &mut Editor {
             if !wrap || row_start == 0 {
                 let line_no = format!(
                     "{:>width$} ",
-                    line_idx + 1,
+                    self.gutter_number(line_idx)
+                        .map(|n| n.to_string())
+                        .unwrap_or_default(),
                     width = gutter_width as usize - 1
                 );
                 // Live Run coverage tints the number: green for a statement
-                // that ran, a muted red for one that never did.
+                // that ran, a muted red for one that never did. Otherwise a
+                // caret's line is brighter than the rest (VS Code's
+                // `editorLineNumber.activeForeground`, #1576).
                 let number_fg = match self
                     .live_run
                     .as_ref()
@@ -17213,6 +17310,7 @@ impl Widget for &mut Editor {
                     Some(crate::live_run::Coverage::NeverRan) => {
                         self.theme.ui(Color::Rgb(0xa0, 0x55, 0x55))
                     }
+                    None if self.is_caret_line(line_idx) => self.theme.line_number_active(),
                     None => Color::DarkGray,
                 };
                 let gutter = Line::from(Span::styled(line_no, Style::default().fg(number_fg)));
@@ -18167,7 +18265,9 @@ impl Widget for &mut Editor {
                 }
                 let line_no = format!(
                     "{:>width$} ",
-                    line + 1,
+                    self.gutter_number(line as usize)
+                        .map(|n| n.to_string())
+                        .unwrap_or_default(),
                     width = gutter_width.saturating_sub(1) as usize
                 );
                 buf.set_string(
@@ -23168,6 +23268,114 @@ mod tests {
             "\u{2503}",
             "modified line shows a gutter bar"
         );
+    }
+
+    /// The gutter of a rendered `e` (#1576): each screen row's number
+    /// column, trimmed, and the cell style of each row's number.
+    fn gutter_column(e: &mut Editor, rows: u16) -> (Vec<String>, Vec<ratatui::style::Style>) {
+        use ratatui::buffer::Buffer;
+        let area = Rect::new(0, 0, 40, rows + 2);
+        let mut buf = Buffer::empty(area);
+        e.render(area, &mut buf);
+        let (x0, x1) = (e.last_inner.x + 2, e.last_inner.x + e.last_gutter_width);
+        let ys = e.last_inner.y..e.last_inner.y + rows;
+        let text = ys
+            .clone()
+            .map(|y| (x0..x1).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .map(|t| t.trim().to_string())
+            .collect();
+        let styles = ys.map(|y| buf[(x1 - 2, y)].style()).collect();
+        (text, styles)
+    }
+
+    fn ten_lines() -> Editor {
+        editor_with(
+            &(1..=10)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
+    /// #1576: relative numbers count from the caret's line, which shows its
+    /// own number, as the issue's gutter "4 3 2 1 5 1 2 3 4 5" does.
+    #[test]
+    fn relative_line_numbers_count_from_the_caret() {
+        let mut e = ten_lines();
+        e.cursor_row = 4;
+        e.line_numbers = LineNumbers::Relative;
+        let (numbers, _) = gutter_column(&mut e, 10);
+        assert_eq!(numbers, ["4", "3", "2", "1", "5", "1", "2", "3", "4", "5"]);
+    }
+
+    /// #1576: a collapsed fold counts as one line, as in Vim, so the
+    /// number after it is what `j` needs to reach it.
+    #[test]
+    fn relative_line_numbers_count_a_fold_as_one_line() {
+        let mut e = editor_with("fn a() {\n    one\n    two\n}\nafter\nend");
+        e.line_numbers = LineNumbers::Relative;
+        e.toggle_fold(0);
+        e.cursor_row = 0;
+        assert_eq!(
+            e.gutter_number(4),
+            Some(2),
+            "the brace line is one, `after` two"
+        );
+        assert_eq!(e.gutter_number(5), Some(3));
+        e.cursor_row = 5;
+        assert_eq!(e.gutter_number(0), Some(3), "upwards too");
+    }
+
+    /// #1576: interval numbers every tenth line and the caret's line; off
+    /// shows no numbers and narrows the gutter by the number column.
+    #[test]
+    fn interval_and_off_line_numbers() {
+        let mut e = ten_lines();
+        e.cursor_row = 2;
+        e.line_numbers = LineNumbers::Interval;
+        let (numbers, _) = gutter_column(&mut e, 10);
+        assert_eq!(numbers, ["", "", "3", "", "", "", "", "", "", "10"]);
+        let on_width = e.last_gutter_width;
+        e.line_numbers = LineNumbers::Off;
+        let (numbers, _) = gutter_column(&mut e, 10);
+        assert!(numbers.iter().all(String::is_empty), "{numbers:?}");
+        assert_eq!(e.last_gutter_width, on_width - 2, "two digits fewer");
+    }
+
+    /// #1576: the caret's line number, and each extra caret's, is in the
+    /// active colour; the others stay grey.
+    #[test]
+    fn the_caret_line_number_is_brighter() {
+        let mut e = ten_lines();
+        e.cursor_row = 4;
+        e.carets.push(EditorSelection::new(7, 0));
+        let (numbers, styles) = gutter_column(&mut e, 10);
+        assert_eq!(numbers[4], "5", "absolute numbers by default");
+        let active = Some(e.theme.line_number_active());
+        assert_eq!(styles[4].fg, active);
+        assert_eq!(styles[7].fg, active, "an extra caret's line too");
+        assert_eq!(styles[3].fg, Some(Color::DarkGray));
+    }
+
+    /// Negative (#1576): the default is absolute numbers, and an unknown
+    /// pref falls back to it.
+    #[test]
+    fn line_numbers_default_to_on() {
+        let mut e = ten_lines();
+        e.cursor_row = 4;
+        let (numbers, _) = gutter_column(&mut e, 10);
+        assert_eq!(numbers, ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]);
+        assert_eq!(LineNumbers::from_pref(""), LineNumbers::On);
+        assert_eq!(LineNumbers::from_pref("absolute"), LineNumbers::On);
+        assert_eq!(LineNumbers::from_pref("relative"), LineNumbers::Relative);
+        let mut mode = LineNumbers::On;
+        let cycle: Vec<&str> = (0..4)
+            .map(|_| {
+                mode = mode.next();
+                mode.pref_id()
+            })
+            .collect();
+        assert_eq!(cycle, ["relative", "interval", "off", "on"]);
     }
 
     #[test]
