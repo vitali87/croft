@@ -17254,7 +17254,10 @@ fn go_to_next_change_is_a_palette_command() {
         &mut report,
     );
     assert!(
-        report.keybindings.iter().any(|(_, c)| c == "next_change"),
+        report
+            .keybindings
+            .iter()
+            .any(|(_, c, _)| c == "next_change"),
         "{:?}",
         report.keybindings
     );
@@ -88370,6 +88373,107 @@ fn move_editor_into_next_group_splits_then_previous_brings_it_back() {
     );
     assert_eq!(tab_names_852(&app.editor), ["a.py", "b.py", "c.py"]);
     assert_eq!(active_name_1565(&app), "c.py");
+}
+
+/// Ctrl+Alt+J, the chord the #1436 key tests press.
+fn ctrl_alt_j() -> KeyEvent {
+    key(
+        KeyCode::Char('j'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )
+}
+
+/// #1436: a chord row with `"when": "editor"` fires only while the editor
+/// has focus. The `when` was once ignored on key chords, so the same press
+/// from the Explorer joined lines in the open file behind the user's back.
+#[test]
+fn an_editor_scoped_chord_does_nothing_from_the_file_tree() {
+    let (mut app, _tmp) = tree_app_with_keymap(
+        r#"[{"key": "ctrl+alt+j", "command": "join_lines", "when": "editor"}]"#,
+    );
+    let before = app.editor.lines.clone();
+    app.focus_pane(Pane::Tree);
+    app.handle_key(ctrl_alt_j()).unwrap();
+    assert_eq!(
+        app.editor.lines, before,
+        "the Explorer has focus, so the editor-only row must not edit the file"
+    );
+
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 0;
+    app.handle_key(ctrl_alt_j()).unwrap();
+    assert_eq!(
+        app.editor.lines[0], "let name = value; fn main() {}",
+        "with the editor focused the row runs"
+    );
+}
+
+/// #1436: a scoped row wins in its pane, and an unscoped row for the same
+/// chord still answers everywhere else. Once the later row simply replaced
+/// the earlier one, so the editor's binding ran from the Explorer too.
+#[test]
+fn a_scoped_chord_and_an_unscoped_one_share_a_key() {
+    let (mut app, _tmp) = tree_app_with_keymap(
+        r#"[{"key": "ctrl+alt+j", "command": "quick_open"},
+            {"key": "ctrl+alt+j", "command": "join_lines", "when": "editor"}]"#,
+    );
+    let before = app.editor.lines.clone();
+    app.focus_pane(Pane::Tree);
+    app.handle_key(ctrl_alt_j()).unwrap();
+    assert!(
+        app.file_finder.is_some(),
+        "the Explorer runs the unscoped row"
+    );
+    assert_eq!(app.editor.lines, before, "and not the editor's");
+
+    app.file_finder = None;
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 0;
+    app.handle_key(ctrl_alt_j()).unwrap();
+    assert!(
+        app.file_finder.is_none(),
+        "the editor runs its own row instead"
+    );
+    assert_eq!(app.editor.lines[0], "let name = value; fn main() {}");
+}
+
+/// #1436 negative: a row with no `when` keeps firing from every pane but the
+/// terminal, as before.
+#[test]
+fn an_unscoped_chord_still_fires_from_the_editor_and_the_tree() {
+    for (pane, name) in [(Pane::Editor, "editor"), (Pane::Tree, "tree")] {
+        let (mut app, _tmp) =
+            tree_app_with_keymap(r#"[{"key": "ctrl+alt+j", "command": "quick_open"}]"#);
+        app.focus_pane(pane);
+        app.handle_key(ctrl_alt_j()).unwrap();
+        assert!(app.file_finder.is_some(), "{name}");
+    }
+}
+
+/// #1436 negative: a `file_tree` row fires from the Explorer, and not from
+/// another sidebar view, which has focus as the same pane but is not the
+/// file tree (the rule mouse bindings already follow).
+#[test]
+fn a_file_tree_scoped_chord_fires_only_over_the_explorer() {
+    let (mut app, _tmp) = tree_app_with_keymap(
+        r#"[{"key": "ctrl+alt+j", "command": "quick_open", "when": "file_tree"}]"#,
+    );
+    app.focus_pane(Pane::Tree);
+    app.sidebar_view = SidebarView::Search;
+    app.handle_key(ctrl_alt_j()).unwrap();
+    assert!(app.file_finder.is_none(), "Search is not the file tree");
+
+    // The unbound press fell through to the built-in terminal toggle,
+    // which may have moved focus.
+    app.focus_pane(Pane::Tree);
+    app.sidebar_view = SidebarView::Explorer;
+    app.handle_key(ctrl_alt_j()).unwrap();
+    assert!(app.file_finder.is_some(), "the Explorer is");
+
+    app.file_finder = None;
+    app.focus_pane(Pane::Editor);
+    app.handle_key(ctrl_alt_j()).unwrap();
+    assert!(app.file_finder.is_none(), "and the editor is not");
 }
 
 /// Serve one `croft edit` request for `path` at `at` through a socket pair.
