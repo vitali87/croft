@@ -88806,6 +88806,63 @@ fn format_on_save_still_formats_when_croft_runs_the_named_formatter() {
     }
 }
 
+/// #1414: a js-debug config parked behind its `preLaunchTask` keeps the
+/// workspace folder it was resolved against. Focusing a file in another root
+/// while the task runs must not send js-debug that root, or its source-map
+/// defaults disagree with `program` and `outFiles`.
+#[test]
+fn a_parked_js_launch_keeps_the_workspace_folder_it_was_resolved_against() {
+    use crate::dap::configs;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("alpha");
+    let b = tmp.path().join("beta");
+    std::fs::create_dir_all(a.join(".vscode")).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    std::fs::write(b.join("other.js"), "1;\n").unwrap();
+    std::fs::write(
+        a.join(".vscode/tasks.json"),
+        r#"{ "version": "2.0.0", "tasks": [
+            { "label": "tsc", "type": "shell", "command": "true" }
+        ]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(a.clone()).unwrap();
+    app.add_workspace_folder(b.clone());
+    let root = app.active_workspace_root();
+    let cfg = configs::parse_launch_json(
+        r#"{ "configurations": [
+            { "name": "TS", "type": "node", "request": "launch",
+              "program": "${workspaceFolder}/dist/main.js", "preLaunchTask": "tsc" }
+        ]}"#,
+        "launch.json",
+    )
+    .remove(0);
+
+    app.launch_debug_config(&cfg);
+    let parked = app
+        .pending_debug_launch
+        .take()
+        .expect("the preLaunchTask parked the launch");
+    let crate::app::PendingLaunchStep::Resolved(rc) = parked.step else {
+        panic!("a config's own task parks the resolved config");
+    };
+
+    // The user focuses a file in the other root while the task runs.
+    app.editor.path = Some(b.canonicalize().unwrap().join("other.js"));
+    assert_ne!(
+        app.active_workspace_root(),
+        root,
+        "staging: the active root moved"
+    );
+    let req =
+        configs::with_workspace_folder(configs::js_request(&rc), &app.active_workspace_root());
+    assert_eq!(
+        req["arguments"]["__workspaceFolder"],
+        serde_json::json!(root.to_string_lossy()),
+        "the launch carries the root the config was resolved against"
+    );
+}
+
 /// #1117 fixture: `a.rs` open and drawn, `name` selected when `select`,
 /// then a right-click on the word `value`.
 fn editor_menu_1117(select: bool) -> (tempfile::TempDir, App) {

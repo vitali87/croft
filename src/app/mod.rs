@@ -33275,17 +33275,24 @@ impl App {
             .clone()
             .unwrap_or_else(|| self.active_workspace_root());
         let ctx = crate::dap::configs::SubstCtx {
-            workspace_folder: root,
+            workspace_folder: root.clone(),
             file: self.editor.path.clone(),
             folders: self.workspace_folders(),
         };
-        let rc = match crate::dap::configs::resolve(cfg, &ctx) {
+        let mut rc = match crate::dap::configs::resolve(cfg, &ctx) {
             Ok(rc) => rc,
             Err(e) => {
                 self.debug_error(format!("config \"{}\": {e}", cfg.name));
                 return MemberOutcome::Failed;
             }
         };
+        // js-debug's source-map defaults follow the folder the member was
+        // resolved against (#1414), not the one the active file is in.
+        if rc.kind == crate::dap::session::AdapterKind::JsDebug {
+            rc.extra
+                .entry("__workspaceFolder")
+                .or_insert_with(|| serde_json::json!(root.to_string_lossy()));
+        }
         self.record_post_debug_task(&rc);
         if rc.pre_launch_task.is_some() {
             // NOT launched. Running it anyway would debug whatever the last
@@ -33584,13 +33591,22 @@ impl App {
             file: self.editor.path.clone(),
             folders: self.workspace_folders(),
         };
-        let rc = match configs::resolve(cfg, &ctx) {
+        let mut rc = match configs::resolve(cfg, &ctx) {
             Ok(rc) => rc,
             Err(e) => {
                 self.debug_error(e);
                 return;
             }
         };
+        // Pinned to the root `program`/`outFiles` were resolved against
+        // (#1414): a `preLaunchTask` can run while the user focuses a file in
+        // another root, and recomputing the root at launch would point
+        // js-debug's source-map defaults at the wrong folder.
+        if rc.kind == crate::dap::session::AdapterKind::JsDebug {
+            rc.extra
+                .entry("__workspaceFolder")
+                .or_insert_with(|| serde_json::json!(root.to_string_lossy()));
+        }
         self.record_post_debug_task(&rc);
         if let Some(task_label) = rc.pre_launch_task.clone() {
             let tasks = crate::tasks::discover_tasks(&root);
@@ -33950,7 +33966,10 @@ impl App {
                     &node,
                     &server,
                     &cwd,
-                    configs::js_request(&rc),
+                    configs::with_workspace_folder(
+                        configs::js_request(&rc),
+                        &self.active_workspace_root(),
+                    ),
                     breakpoints,
                 )
             }
