@@ -59,9 +59,9 @@ pub enum TestRequest {
     RunCoverage(Option<CoverageScope>),
     /// List the tests without running them. `quiet` is the Testing view's
     /// own discover (#1841): the worker, not the UI thread, finds the
-    /// runner, which can mean walking the tree for CodeQL test packs, and a
-    /// root no runner claims ends in [`TestResponse::NoRunner`] rather than
-    /// a refusal the status bar reports.
+    /// runner, which can mean walking the tree for CodeQL test packs. It
+    /// answers [`TestResponse::QuietDiscovery`] first, and a root no runner
+    /// claims ends there, without a refusal the status bar reports.
     Discover {
         quiet: bool,
     },
@@ -96,9 +96,11 @@ pub enum TestResponse {
     /// Running marks the `start_*` call painted instead of stranding them,
     /// and the app can say why nothing ran.
     Refused,
-    /// A quiet discovery (#1841) found no runner claiming the root: nothing
-    /// ran and there is nothing to say.
-    NoRunner,
+    /// The worker reached a quiet discovery (#1841). Sent before anything
+    /// else it does, so the drain can tell the request the Testing view
+    /// queued from any other's answers; when no runner claims the root,
+    /// nothing follows it.
+    QuietDiscovery,
     /// A coverage run's report, or why there is none. Sent before its
     /// `Finished`.
     Coverage(Result<super::coverage::Coverage, CoverageError>),
@@ -352,17 +354,11 @@ impl TestWorker {
             if epoch != self.expected_epoch {
                 continue;
             }
-            if matches!(
-                resp,
-                TestResponse::Started(Activity::Discovering)
-                    | TestResponse::NoRunner
-                    | TestResponse::Finished { .. }
-                    | TestResponse::Refused
-            ) {
-                self.discover_queued = false;
-            }
             match resp {
-                TestResponse::NoRunner => continue,
+                TestResponse::QuietDiscovery => {
+                    self.discover_queued = false;
+                    continue;
+                }
                 TestResponse::Started(activity) => panel.on_busy_started(activity),
                 TestResponse::Case(case) => panel.apply_case(case),
                 TestResponse::Progress(line) => panel.set_progress(line),
@@ -1683,13 +1679,14 @@ fn run_filter(root: &Path, tx: &EpochTx, pattern: &str, suite: bool) {
 /// exit 2 on a collection error, a build failure) reads as a failed
 /// discovery rather than a project with no tests (#845).
 fn discover(root: &Path, tx: &EpochTx, quiet: bool) {
+    if quiet {
+        tx.send(TestResponse::QuietDiscovery);
+    }
     // See run_all: refuse before `Started` so the panel keeps its tree.
     let Some(runner) = runner_for(root) else {
-        tx.send(if quiet {
-            TestResponse::NoRunner
-        } else {
-            TestResponse::Refused
-        });
+        if !quiet {
+            tx.send(TestResponse::Refused);
+        }
         return;
     };
     tx.send(TestResponse::Started(Activity::Discovering));
@@ -2256,31 +2253,45 @@ mod tests {
         discover(tmp.path(), &etx, true);
         let msgs: Vec<TestResponse> = rx.try_iter().map(|(_, r)| r).collect();
         assert!(
-            matches!(msgs.as_slice(), [TestResponse::NoRunner]),
-            "a quiet discovery with no runner answers NoRunner and nothing else"
+            matches!(msgs.as_slice(), [TestResponse::QuietDiscovery]),
+            "a quiet discovery with no runner says it was reached and nothing else"
         );
 
         let (mut w, tx) = TestWorker::for_test();
         let mut panel = TestingPanel::new();
         w.discover_quietly();
         assert!(w.discover_queued());
-        tx.send((0, TestResponse::NoRunner)).unwrap();
+        tx.send((0, TestResponse::QuietDiscovery)).unwrap();
         assert!(
             !w.drain(&mut panel),
-            "NoRunner changes nothing on screen, so nothing needs redrawing"
+            "the marker changes nothing on screen, so nothing needs redrawing"
         );
-        assert!(!w.discover_queued(), "NoRunner ends the queued discovery");
+        assert!(!w.discover_queued(), "the marker ends the queued discovery");
         assert!(!panel.take_refusal(), "a quiet discovery never says why");
         assert!(!panel.is_busy());
     }
 
-    /// #1841: a queued quiet discovery is cleared when the worker starts it,
-    /// and by a re-root, whose drain drops the old root's answer.
+    /// #1841: only the quiet discovery's own marker clears the queued flag:
+    /// a regular discovery queued ahead of it answering first must not, or
+    /// a reopen of the Testing view would queue another. A re-root clears
+    /// it too, since its drain drops the old root's answers.
     #[test]
-    fn a_queued_discovery_clears_when_it_starts_or_the_root_changes() {
+    fn only_the_quiet_discovery_itself_clears_the_queued_flag() {
         let (mut w, tx) = TestWorker::for_test();
         let mut panel = TestingPanel::new();
+        w.discover();
         w.discover_quietly();
+        tx.send((0, TestResponse::Started(Activity::Discovering)))
+            .unwrap();
+        tx.send((0, TestResponse::Finished { ok: Some(true) }))
+            .unwrap();
+        tx.send((0, TestResponse::Refused)).unwrap();
+        assert!(w.drain(&mut panel));
+        assert!(
+            w.discover_queued(),
+            "the earlier discovery's answers are not the quiet one starting"
+        );
+        tx.send((0, TestResponse::QuietDiscovery)).unwrap();
         tx.send((0, TestResponse::Started(Activity::Discovering)))
             .unwrap();
         assert!(w.drain(&mut panel));

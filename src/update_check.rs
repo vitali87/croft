@@ -469,14 +469,12 @@ pub fn stage_update(
                     )),
                 }
             }
-            // No network: building from crates.io needs it too, and would
-            // only fail the same way after cargo's own retries (#1844).
-            Err(e) if crate::remote_prebuilt::is_unreachable(&e) => {
-                log.push_str(&format!(
-                    "{OFFLINE_LOG}: the v{version} release binary ({e:#}); not building either\n"
-                ));
-                return (UpdateEvent::Failed, log);
-            }
+            // GitHub out of reach is not crates.io out of reach (a proxy
+            // cargo honours and this client does not, a blocked host), so
+            // the build still runs; the log says why, for the popup (#1844).
+            Err(e) if crate::remote_prebuilt::is_unreachable(&e) => log.push_str(&format!(
+                "{OFFLINE_LOG}: the v{version} release binary ({e:#}); building instead\n"
+            )),
             Err(e) if crate::remote_prebuilt::is_not_published(&e) => log.push_str(&format!(
                 "v{version} has no release binary for {triple}; building instead\n"
             )),
@@ -521,11 +519,16 @@ const CARGO_OFFLINE_MARKERS: [&str; 5] = [
 ];
 
 /// Why a staging that failed did, from its log, said briefly enough for
-/// the update popup (#1844): the network, a missing cargo, or the build.
+/// the update popup (#1844): the network (cargo could not reach crates.io,
+/// or the release binary was out of reach and there is no cargo to build
+/// with), a missing cargo, or the build.
 pub fn failure_reason(log: &str) -> &'static str {
-    if log.contains(OFFLINE_LOG) || CARGO_OFFLINE_MARKERS.iter().any(|m| log.contains(m)) {
+    let no_cargo = log.contains("failed to run cargo");
+    if CARGO_OFFLINE_MARKERS.iter().any(|m| log.contains(m))
+        || (no_cargo && log.contains(OFFLINE_LOG))
+    {
         OFFLINE_REASON
-    } else if log.contains("failed to run cargo") {
+    } else if no_cargo {
         "cargo was not found, and this install has no release binary to fetch"
     } else {
         "the build failed"
@@ -992,19 +995,14 @@ mod tests {
         assert!(log.contains("broken"), "{log}");
     }
 
-    /// #1844: with no network the release download fails before anything
-    /// is fetched. Building from crates.io needs the network as well, so
-    /// the staging stops there and says the network is why.
+    /// #1844: a release server out of reach is not crates.io out of reach
+    /// (cargo honours a proxy this client does not), so the build still
+    /// runs. When it cannot run either, the network is named as the reason.
     #[test]
-    fn an_unreachable_release_server_stops_the_staging_without_building() {
+    fn an_unreachable_release_server_still_builds_and_names_the_network_if_that_fails() {
         use crate::remote_prebuilt::{Signature, Unreachable};
         let tmp = tempfile::tempdir().unwrap();
         let staged = tmp.path().join("staged/bin/croft");
-        let built = std::cell::Cell::new(0);
-        let build = || {
-            built.set(built.get() + 1);
-            std::process::Command::new("true").output()
-        };
         let offline = |_: &str, _: &str| -> anyhow::Result<(PathBuf, Signature)> {
             Err(Unreachable {
                 url: String::from(
@@ -1014,9 +1012,20 @@ mod tests {
             }
             .into())
         };
-        let (event, log) = stage_update("9.0.0", &staged, Some(("t", &offline)), &build);
+        let built = std::cell::Cell::new(0);
+        let build = || {
+            built.set(built.get() + 1);
+            std::process::Command::new("true").output()
+        };
+        let (event, _) = stage_update("9.0.0", &staged, Some(("t", &offline)), &build);
+        assert_eq!(event, UpdateEvent::Ready, "crates.io was reachable");
+        assert_eq!(built.get(), 1);
+
+        let no_cargo = || -> std::io::Result<std::process::Output> {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        };
+        let (event, log) = stage_update("9.0.0", &staged, Some(("t", &offline)), &no_cargo);
         assert_eq!(event, UpdateEvent::Failed);
-        assert_eq!(built.get(), 0, "no build that needs the network too");
         assert_eq!(failure_reason(&log), OFFLINE_REASON, "{log}");
     }
 

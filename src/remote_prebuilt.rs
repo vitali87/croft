@@ -313,9 +313,15 @@ pub fn http_get(url: &str) -> Result<Vec<u8>> {
         Err(e) => return Err(anyhow::Error::new(e).context(format!("GET {url}"))),
     };
     let mut bytes = Vec::new();
+    // A connection that drops mid-download is the network going away too,
+    // not a refusal of what was fetched (#1844).
     resp.into_reader()
         .take(MAX_ARCHIVE_BYTES + 1)
-        .read_to_end(&mut bytes)?;
+        .read_to_end(&mut bytes)
+        .map_err(|e| Unreachable {
+            url: url.to_string(),
+            detail: e.to_string(),
+        })?;
     if bytes.len() as u64 > MAX_ARCHIVE_BYTES {
         bail!("{url} is larger than {MAX_ARCHIVE_BYTES} bytes; refusing it");
     }
