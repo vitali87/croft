@@ -1,1 +1,0 @@
-fix: Run Task in a Poetry, PDM or uv project uses `poetry run`, `pdm run` or `uv run` only when that tool is installed. Otherwise the tasks run through the project's `.venv`, instead of every task failing with "command not found".

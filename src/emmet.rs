@@ -9,12 +9,15 @@
 //! nesting, siblings, climbing up (`^`, #1640), grouping, repetition,
 //! numbering, ids, classes, attributes and text. Deliberately absent:
 //!
-//! * CSS abbreviations (`m10-20`) and the document snippet `!`. They are
-//!   separate features that happen to share a keystroke.
+//! * CSS abbreviations (`m10-20`). They are a separate feature that happens
+//!   to share a keystroke.
 //!
 //! Emmet's HTML aliases (`input:email`, `btn:s`, `link:css`, ...) and lorem
 //! ipsum (`lorem`, `lorem5`) are in (#1230): a form is mostly typed inputs,
 //! and a colon name that is no alias would otherwise become a made-up tag.
+//!
+//! So are the document snippets (#1550): `!` and `html:5` write the HTML5
+//! page skeleton, `doc` its `<html>` element and `!!!` the doctype.
 //!
 //! An abbreviation that does not parse expands to nothing, so the chord is
 //! inert on prose rather than mangling it.
@@ -384,6 +387,11 @@ fn resolve(nodes: &mut [Node], profile: Profile) -> Option<()> {
 /// content position, which is where typing continues. It is a byte offset
 /// into the returned string.
 pub fn expand(abbr: &str, indent: &str, profile: Profile) -> Option<(String, usize)> {
+    if profile == Profile::Html
+        && let Some(page) = document_snippet(abbr, indent)
+    {
+        return Some(page);
+    }
     let mut nodes = parse(abbr)?;
     // An alias on its own is HTML; XML reads the word as a namespaced tag,
     // which a bare word is not allowed to be.
@@ -413,6 +421,41 @@ pub fn expand(abbr: &str, indent: &str, profile: Profile) -> Option<(String, usi
     // expansion in.
     let caret = r.caret.unwrap_or(r.out.len() - 1);
     Some((r.out, caret))
+}
+
+/// Emmet's document snippets (#1550), written out whole rather than parsed:
+/// they are a page, not an element, and Emmet itself formats them with
+/// `<head>` and `<body>` flush against `<html>`. `!` and `html:5` are the
+/// HTML5 skeleton, `doc` the same without the doctype, `!!!` the doctype
+/// alone. The caret goes on an indented line inside `<body>`, as VS Code
+/// leaves it.
+fn document_snippet(abbr: &str, indent: &str) -> Option<(String, usize)> {
+    const DOCTYPE: &str = "<!DOCTYPE html>\n";
+    let doctype = match abbr {
+        "!" | "html:5" => true,
+        "doc" => false,
+        "!!!" => return Some((DOCTYPE.to_string(), DOCTYPE.len() - 1)),
+        _ => return None,
+    };
+    let mut out = String::new();
+    if doctype {
+        out.push_str(DOCTYPE);
+    }
+    out.push_str("<html lang=\"en\">\n<head>\n");
+    for line in [
+        "<meta charset=\"UTF-8\">",
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">",
+        "<title>Document</title>",
+    ] {
+        out.push_str(indent);
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("</head>\n<body>\n");
+    out.push_str(indent);
+    let caret = out.len();
+    out.push_str("\n</body>\n</html>\n");
+    Some((out, caret))
 }
 
 /// How many elements `nodes` renders, saturating rather than overflowing on
@@ -2103,7 +2146,87 @@ mod tests {
         assert!(expand("lorem0", "  ").is_none());
     }
 
-    const PAGE: &str = "<ul>\n  <li>Home</li>\n  <li>About</li>\n</ul>\n<p>Some text</p>\n";
+    /// The page `!` writes in VS Code, with a four-space indent and `|` for
+    /// the caret.
+    const PAGE: &str = "<!DOCTYPE html>
+<html lang=\"en\">
+<head>
+    <meta charset=\"UTF-8\">
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">
+    <title>Document</title>
+</head>
+<body>
+    |
+</body>
+</html>
+";
+
+    /// `expand`'s result with `|` spliced in at the caret.
+    fn with_caret(abbr: &str) -> Option<String> {
+        expand(abbr, "    ").map(|(mut out, caret)| {
+            out.insert(caret, '|');
+            out
+        })
+    }
+
+    /// #1550: `!` was read as a tag name that is no tag, so the page
+    /// skeleton, Emmet's most used snippet, expanded to nothing.
+    #[test]
+    fn an_exclamation_mark_writes_the_page_skeleton() {
+        assert_eq!(with_caret("!").as_deref(), Some(PAGE));
+    }
+
+    /// #1550: `html:5` is the same snippet under its long name.
+    #[test]
+    fn html5_writes_the_same_page() {
+        assert_eq!(with_caret("html:5").as_deref(), Some(PAGE));
+    }
+
+    /// #1550: `doc` is the page without its doctype, `!!!` the doctype alone.
+    #[test]
+    fn doc_and_triple_bang_write_their_parts_of_the_page() {
+        let doc = PAGE.strip_prefix("<!DOCTYPE html>\n").unwrap();
+        assert_eq!(with_caret("doc").as_deref(), Some(doc));
+        assert_eq!(with_caret("!!!").as_deref(), Some("<!DOCTYPE html>|\n"));
+    }
+
+    /// #1550: the skeleton is indented with the buffer's own unit.
+    #[test]
+    fn the_page_is_indented_with_the_buffers_unit() {
+        let (page, _) = expand("!", "\t").unwrap();
+        assert!(page.contains("\n\t<meta charset=\"UTF-8\">\n"), "{page}");
+        assert!(page.contains("<body>\n\t\n</body>"), "{page}");
+    }
+
+    /// #1550 negative: near misses are no snippet, and XML and JSX, where a
+    /// whole HTML page makes no sense, get none.
+    #[test]
+    fn near_misses_and_other_dialects_write_no_page() {
+        for abbr in ["!!", "!!!!", "html:4", "html:5x", "docs", "!div"] {
+            assert!(
+                !expand(abbr, "  ").is_some_and(|(o, _)| o.contains("<head>")),
+                "{abbr:?} wrote a page"
+            );
+        }
+        for profile in [Profile::Xml, Profile::Jsx] {
+            for abbr in ["!", "html:5", "!!!"] {
+                assert_eq!(
+                    super::expand(abbr, "  ", profile),
+                    None,
+                    "{abbr:?} in {profile:?}"
+                );
+            }
+        }
+    }
+
+    /// #1550 negative: ordinary abbreviations are unchanged.
+    #[test]
+    fn abbreviations_that_are_no_snippet_still_expand_as_before() {
+        assert_eq!(ex("html"), "<html></html>\n");
+        assert_eq!(ex("head>title"), "<head>\n  <title></title>\n</head>\n");
+    }
+
+    const NAV_PAGE: &str = "<ul>\n  <li>Home</li>\n  <li>About</li>\n</ul>\n<p>Some text</p>\n";
 
     fn lines(text: &str) -> Vec<String> {
         text.lines().map(String::from).collect()
@@ -2209,19 +2332,19 @@ mod tests {
     /// #1557: Go to Matching Pair hops between an element's two tags.
     #[test]
     fn matching_tag_hops_between_the_two_tags() {
-        let close = PAGE.find("</ul>").unwrap();
-        assert_eq!(matching_tag(PAGE, 1), Some(close));
-        assert_eq!(matching_tag(PAGE, close + 2), Some(0));
-        let li = PAGE.find("<li>").unwrap();
-        assert_eq!(matching_tag(PAGE, li + 1), PAGE.find("</li>"));
+        let close = NAV_PAGE.find("</ul>").unwrap();
+        assert_eq!(matching_tag(NAV_PAGE, 1), Some(close));
+        assert_eq!(matching_tag(NAV_PAGE, close + 2), Some(0));
+        let li = NAV_PAGE.find("<li>").unwrap();
+        assert_eq!(matching_tag(NAV_PAGE, li + 1), NAV_PAGE.find("</li>"));
     }
 
     /// #1557 negative: off a tag, or on one that closes itself, there is no
     /// pair to go to.
     #[test]
     fn matching_tag_needs_a_tag_with_a_pair() {
-        let home = PAGE.find("Home").unwrap();
-        assert_eq!(matching_tag(PAGE, home), None);
+        let home = NAV_PAGE.find("Home").unwrap();
+        assert_eq!(matching_tag(NAV_PAGE, home), None);
         assert_eq!(matching_tag("<br>", 1), None);
     }
 
@@ -2229,12 +2352,12 @@ mod tests {
     /// content out one level.
     #[test]
     fn remove_tag_drops_both_tags_and_dedents_the_content() {
-        let in_ul = PAGE.find("Home").unwrap() - 6;
-        let (out, caret) = remove_tag(PAGE, in_ul, "  ").unwrap();
+        let in_ul = NAV_PAGE.find("Home").unwrap() - 6;
+        let (out, caret) = remove_tag(NAV_PAGE, in_ul, "  ").unwrap();
         assert_eq!(out, "<li>Home</li>\n<li>About</li>\n<p>Some text</p>\n");
         assert_eq!(caret, 0);
-        let p = PAGE.find("Some").unwrap();
-        let (out, caret) = remove_tag(PAGE, p, "  ").unwrap();
+        let p = NAV_PAGE.find("Some").unwrap();
+        let (out, caret) = remove_tag(NAV_PAGE, p, "  ").unwrap();
         assert!(out.ends_with("</ul>\nSome text\n"), "{out}");
         assert_eq!(&out[caret..caret + 4], "Some");
     }
@@ -2242,10 +2365,13 @@ mod tests {
     /// #1557: Update Tag renames both tags and nothing else.
     #[test]
     fn rename_tag_changes_both_tags() {
-        let out = rename_tag(PAGE, 1, "ol").unwrap();
-        assert_eq!(out, PAGE.replace("<ul>", "<ol>").replace("</ul>", "</ol>"));
-        let at = PAGE.find("About").unwrap();
-        let out = rename_tag(PAGE, at, "dt").unwrap();
+        let out = rename_tag(NAV_PAGE, 1, "ol").unwrap();
+        assert_eq!(
+            out,
+            NAV_PAGE.replace("<ul>", "<ol>").replace("</ul>", "</ol>")
+        );
+        let at = NAV_PAGE.find("About").unwrap();
+        let out = rename_tag(NAV_PAGE, at, "dt").unwrap();
         assert!(
             out.contains("<dt>About</dt>") && out.contains("<li>Home</li>"),
             "{out}"
@@ -2256,8 +2382,8 @@ mod tests {
     /// name, changes nothing.
     #[test]
     fn rename_tag_refuses_a_bad_name_or_no_element() {
-        assert_eq!(rename_tag(PAGE, 1, "1x"), None);
-        assert_eq!(rename_tag(PAGE, 1, "a b"), None);
+        assert_eq!(rename_tag(NAV_PAGE, 1, "1x"), None);
+        assert_eq!(rename_tag(NAV_PAGE, 1, "a b"), None);
         assert_eq!(rename_tag("just text", 2, "div"), None);
         assert_eq!(remove_tag("just text", 2, "  "), None);
     }
@@ -2266,19 +2392,22 @@ mod tests {
     /// inward walks it back.
     #[test]
     fn balance_grows_and_shrinks_one_step_at_a_time() {
-        let home = PAGE.find("Home").unwrap();
-        let li = PAGE.find("<li>").unwrap();
-        let li_end = PAGE.find("</li>").unwrap() + 5;
-        let step1 = balance_out(PAGE, home + 1..home + 1).unwrap();
-        assert_eq!(&PAGE[step1.clone()], "Home");
-        let step2 = balance_out(PAGE, step1.clone()).unwrap();
+        let home = NAV_PAGE.find("Home").unwrap();
+        let li = NAV_PAGE.find("<li>").unwrap();
+        let li_end = NAV_PAGE.find("</li>").unwrap() + 5;
+        let step1 = balance_out(NAV_PAGE, home + 1..home + 1).unwrap();
+        assert_eq!(&NAV_PAGE[step1.clone()], "Home");
+        let step2 = balance_out(NAV_PAGE, step1.clone()).unwrap();
         assert_eq!(step2, li..li_end);
-        let step3 = balance_out(PAGE, step2.clone()).unwrap();
-        assert_eq!(&PAGE[step3.clone()], "<li>Home</li>\n  <li>About</li>");
-        let ul = balance_out(PAGE, step3.clone()).unwrap();
-        assert_eq!(&PAGE[ul.clone()], &PAGE[..PAGE.find("</ul>").unwrap() + 5]);
-        assert_eq!(balance_in(PAGE, ul), Some(step3.clone()));
-        assert_eq!(balance_in(PAGE, step3), Some(step2.clone()));
-        assert_eq!(balance_in(PAGE, step2), Some(step1));
+        let step3 = balance_out(NAV_PAGE, step2.clone()).unwrap();
+        assert_eq!(&NAV_PAGE[step3.clone()], "<li>Home</li>\n  <li>About</li>");
+        let ul = balance_out(NAV_PAGE, step3.clone()).unwrap();
+        assert_eq!(
+            &NAV_PAGE[ul.clone()],
+            &NAV_PAGE[..NAV_PAGE.find("</ul>").unwrap() + 5]
+        );
+        assert_eq!(balance_in(NAV_PAGE, ul), Some(step3.clone()));
+        assert_eq!(balance_in(NAV_PAGE, step3), Some(step2.clone()));
+        assert_eq!(balance_in(NAV_PAGE, step2), Some(step1));
     }
 }
