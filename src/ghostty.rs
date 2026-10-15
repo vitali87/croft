@@ -121,6 +121,11 @@ const CHORDS: &[(&str, &str)] = &[
     // Multi-cursor: add cursor above / below.
     ("cmd+alt+arrow_up", pl::CMD_OPT_UP_HEX),
     ("cmd+alt+arrow_down", pl::CMD_OPT_DOWN_HEX),
+    // Column (box) selection (#1560).
+    ("cmd+alt+shift+arrow_up", pl::CMD_OPT_SHIFT_UP_HEX),
+    ("cmd+alt+shift+arrow_down", pl::CMD_OPT_SHIFT_DOWN_HEX),
+    ("cmd+alt+shift+arrow_left", pl::CMD_OPT_SHIFT_LEFT_HEX),
+    ("cmd+alt+shift+arrow_right", pl::CMD_OPT_SHIFT_RIGHT_HEX),
     // Command Palette.
     ("cmd+shift+p", pl::CMD_SHIFT_P_HEX),
     ("cmd+f12", pl::CMD_F12_HEX),
@@ -363,6 +368,17 @@ mod tests {
         assert_eq!(csi_body(pl::CMD_OPT_LEFT_HEX), "1;11D");
         assert_eq!(csi_body(pl::CMD_OPT_RIGHT_HEX), "1;11C");
         assert_eq!(csi_body(pl::CMD_F12_HEX), "24;9~");
+    }
+
+    /// #1560: Cmd+Shift+Opt+arrows forward as the arrow with
+    /// Shift | Alt | Super, for column selection.
+    #[test]
+    fn rendered_block_forwards_cmd_shift_opt_arrows() {
+        let block = render_keybind_block();
+        for (key, end) in [("up", 'A'), ("down", 'B'), ("left", 'D'), ("right", 'C')] {
+            let line = format!("keybind = cmd+alt+shift+arrow_{key}=csi:1;12{end}");
+            assert!(block.contains(&line), "{line} missing:\n{block}");
+        }
     }
 
     #[test]
