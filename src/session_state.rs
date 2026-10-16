@@ -17,6 +17,11 @@ pub struct OpenTabState {
     pub scroll_col: usize,
     pub dirty: bool,
     pub unsaved_text: Option<String>,
+    /// An xlsx grid's unsaved cells (#1593): (worksheet name, body row,
+    /// column, value), applied over the workbook as it opens. A CSV/TSV grid keeps
+    /// its edits as `unsaved_text` instead, the text its save would write.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sheet_cells: Vec<crate::widgets::editor::SheetCellEdit>,
 }
 
 /// The slice of running-croft state worth carrying across a self-re-exec.
@@ -132,6 +137,7 @@ mod tests {
                     scroll_col: 0,
                     dirty: false,
                     unsaved_text: None,
+                    sheet_cells: Vec::new(),
                 },
                 OpenTabState {
                     path: Some(PathBuf::from("/work/repo/README.md")),
@@ -141,6 +147,7 @@ mod tests {
                     scroll_col: 0,
                     dirty: true,
                     unsaved_text: Some(String::from("edited\nbody")),
+                    sheet_cells: Vec::new(),
                 },
             ],
             active_tab: 1,
