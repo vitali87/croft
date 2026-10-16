@@ -869,9 +869,19 @@ pub fn lang_for_extension(ext: &str) -> Option<LangKind> {
     })
 }
 
-/// The language for `path`: its extension, else a well-known file name
-/// with none of its own (`Dockerfile`, `Makefile`, `Gemfile`, #1226).
+/// The language for `path`: what `files_associations` gives it (#1574),
+/// else its extension, else a well-known file name with none of its own
+/// (`Dockerfile`, `Makefile`, `Gemfile`, #1226).
 pub fn lang_for_path(path: &std::path::Path) -> Option<LangKind> {
+    // The user's or the workspace's `files_associations` come first (#1574).
+    if let Some(id) = associated_language_id(path) {
+        if id == "plaintext" {
+            return None;
+        }
+        if let Some(lang) = lang_for_language_id(&id) {
+            return Some(lang);
+        }
+    }
     let name = path.file_name()?.to_str()?;
     let by_name = match name {
         "Dockerfile" | "Containerfile" | "dockerfile" | "containerfile" => {
@@ -889,6 +899,161 @@ pub fn lang_for_path(path: &std::path::Path) -> Option<LangKind> {
         _ => None,
     };
     by_name.or_else(|| path.extension()?.to_str().and_then(lang_for_extension))
+}
+
+/// The highlighter language for a VS Code language id (`html`,
+/// `typescriptreact`, `shellscript`), the ids `files_associations` names
+/// (#1574). None for an id croft has no grammar for.
+pub fn lang_for_language_id(id: &str) -> Option<LangKind> {
+    Some(match normalised_language_id(id).as_str() {
+        "rust" => LangKind::Rust,
+        "python" => LangKind::Python,
+        "javascript" | "javascriptreact" => LangKind::JavaScript,
+        "typescript" => LangKind::TypeScript,
+        "typescriptreact" => LangKind::Tsx,
+        "json" => LangKind::Json,
+        "xml" => LangKind::Xml,
+        "toml" => LangKind::Toml,
+        "yaml" => LangKind::Yaml,
+        "markdown" => LangKind::Markdown,
+        "go" => LangKind::Go,
+        "html" => LangKind::Html,
+        "css" | "scss" | "sass" => LangKind::Css,
+        "shellscript" => LangKind::Bash,
+        "c" => LangKind::C,
+        "cpp" => LangKind::Cpp,
+        "lua" => LangKind::Lua,
+        "ql" => LangKind::Ql,
+        "dbscheme" => LangKind::Dbscheme,
+        "java" => LangKind::Java,
+        "ruby" => LangKind::Ruby,
+        "csharp" => LangKind::CSharp,
+        "sql" => LangKind::Sql,
+        "makefile" => LangKind::Make,
+        "dockerfile" => LangKind::Dockerfile,
+        "vue" => LangKind::Vue,
+        "svelte" => LangKind::Svelte,
+        _ => return None,
+    })
+}
+
+/// A language id as VS Code spells it, from the forms people also write
+/// in `files.associations` (`jsonc`, `bash`, `c++`, `text`).
+pub fn normalised_language_id(id: &str) -> String {
+    let id = id.trim().to_ascii_lowercase();
+    match id.as_str() {
+        "jsonc" | "json5" => "json",
+        "js" => "javascript",
+        "jsx" => "javascriptreact",
+        "ts" => "typescript",
+        "tsx" => "typescriptreact",
+        "sh" | "bash" | "zsh" | "shell" => "shellscript",
+        "c++" => "cpp",
+        "cs" | "c#" => "csharp",
+        "md" => "markdown",
+        "yml" => "yaml",
+        "htm" => "html",
+        "make" => "makefile",
+        "py" => "python",
+        "rs" => "rust",
+        "rb" => "ruby",
+        "text" | "txt" | "plain" => "plaintext",
+        _ => return id,
+    }
+    .to_string()
+}
+
+/// Whether `files_associations` can use the language id `id` (#1574):
+/// `plaintext`, or a language croft highlights or has a server for.
+/// `id` is already [`normalised_language_id`].
+pub fn known_language_id(id: &str) -> bool {
+    id == "plaintext"
+        || lang_for_language_id(id).is_some()
+        || crate::lsp::languages::resolve(id).is_some()
+}
+
+/// One workspace's `files_associations` (#1574), ready to match: each glob
+/// with the language id it names, those with a `/` (matched against the
+/// workspace-relative path) ahead of file-name globs, and a longer glob
+/// ahead of a shorter one, so the most specific match wins.
+struct Associations {
+    root: std::path::PathBuf,
+    rules: Vec<AssociationRule>,
+}
+
+struct AssociationRule {
+    matcher: globset::GlobMatcher,
+    by_path: bool,
+    id: String,
+}
+
+static ASSOCIATIONS: RwLock<Vec<Associations>> = RwLock::new(Vec::new());
+
+/// Set the `files_associations` the settings give the workspace at `root`
+/// (#1574), VS Code's `files.associations`: a glob without a `/` matches
+/// the file name (`*.tpl`, `Jenkinsfile`), one with a `/` the path from the
+/// workspace root (`**/templates/*.txt`). An empty map clears them.
+pub fn set_file_associations(
+    root: &std::path::Path,
+    map: &std::collections::BTreeMap<String, String>,
+) {
+    let mut rules: Vec<(usize, AssociationRule)> = map
+        .iter()
+        .filter_map(|(pattern, id)| {
+            // An id croft knows nothing of is dropped here, before ranking,
+            // so it cannot shadow a less specific glob that names a real
+            // language.
+            let id = normalised_language_id(id);
+            if !known_language_id(&id) {
+                return None;
+            }
+            let pattern = pattern.trim().trim_start_matches("./");
+            let glob = globset::GlobBuilder::new(pattern)
+                .literal_separator(true)
+                .build()
+                .ok()?;
+            Some((
+                pattern.len(),
+                AssociationRule {
+                    matcher: glob.compile_matcher(),
+                    by_path: pattern.contains('/'),
+                    id,
+                },
+            ))
+        })
+        .collect();
+    rules.sort_by(|(a_len, a), (b_len, b)| b.by_path.cmp(&a.by_path).then(b_len.cmp(a_len)));
+    let mut all = ASSOCIATIONS.write().unwrap_or_else(|e| e.into_inner());
+    all.retain(|a| a.root != root);
+    if !rules.is_empty() {
+        all.push(Associations {
+            root: root.to_path_buf(),
+            rules: rules.into_iter().map(|(_, r)| r).collect(),
+        });
+    }
+}
+
+/// The language id `files_associations` gives `path` (#1574), from the
+/// innermost workspace holding it; None when no glob matches.
+pub fn associated_language_id(path: &std::path::Path) -> Option<String> {
+    let all = ASSOCIATIONS.read().unwrap_or_else(|e| e.into_inner());
+    let found = all
+        .iter()
+        .filter(|a| path.starts_with(&a.root))
+        .max_by_key(|a| a.root.as_os_str().len())?;
+    let rel = path.strip_prefix(&found.root).ok()?;
+    let name = path.file_name()?;
+    found
+        .rules
+        .iter()
+        .find(|r| {
+            if r.by_path {
+                r.matcher.is_match(rel)
+            } else {
+                r.matcher.is_match(name)
+            }
+        })
+        .map(|r| r.id.clone())
 }
 
 /// Map a fenced code block's info string to a highlighter language. Accepts
@@ -1765,6 +1930,113 @@ pub fn compute_line_starts(text: &[u8]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1574: `files_associations` for a workspace that exists only for
+    /// one test, so no other test's paths are under it.
+    fn associated(map: &[(&str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let map = map
+            .iter()
+            .map(|(g, id)| (g.to_string(), id.to_string()))
+            .collect();
+        set_file_associations(&root, &map);
+        (tmp, root)
+    }
+
+    #[test]
+    fn an_association_picks_the_language_before_the_extension() {
+        let (_tmp, root) = associated(&[("*.tpl", "html"), ("*.json5", "jsonc")]);
+        assert_eq!(
+            lang_for_path(&root.join("templates/card.tpl")),
+            Some(LangKind::Html)
+        );
+        assert_eq!(lang_for_path(&root.join("a.json5")), Some(LangKind::Json));
+        assert_eq!(
+            lang_for_path(std::path::Path::new("/elsewhere/card.tpl")),
+            None,
+            "outside the workspace"
+        );
+    }
+
+    #[test]
+    fn a_glob_with_a_slash_matches_the_path_in_the_workspace() {
+        let (_tmp, root) = associated(&[("**/templates/*.txt", "html")]);
+        assert_eq!(
+            lang_for_path(&root.join("templates/a.txt")),
+            Some(LangKind::Html)
+        );
+        assert_eq!(
+            lang_for_path(&root.join("site/templates/b.txt")),
+            Some(LangKind::Html)
+        );
+        assert_eq!(lang_for_path(&root.join("a.txt")), None);
+        assert_eq!(lang_for_path(&root.join("templates/deep/c.txt")), None);
+    }
+
+    #[test]
+    fn the_most_specific_association_wins() {
+        let (_tmp, root) = associated(&[
+            ("*.txt", "markdown"),
+            ("**/templates/*.txt", "html"),
+            ("Jenkinsfile", "java"),
+        ]);
+        assert_eq!(
+            lang_for_path(&root.join("templates/a.txt")),
+            Some(LangKind::Html)
+        );
+        assert_eq!(lang_for_path(&root.join("b.txt")), Some(LangKind::Markdown));
+        assert_eq!(
+            associated_language_id(&root.join("ci/Jenkinsfile")).as_deref(),
+            Some("java")
+        );
+    }
+
+    #[test]
+    fn plaintext_switches_highlighting_off_and_an_unknown_id_changes_nothing() {
+        let (_tmp, root) = associated(&[("*.json", "plaintext"), ("*.rs", "klingon")]);
+        assert_eq!(lang_for_path(&root.join("big.json")), None);
+        assert_eq!(lang_for_path(&root.join("main.rs")), Some(LangKind::Rust));
+    }
+
+    #[test]
+    fn an_unknown_id_does_not_shadow_a_less_specific_association() {
+        let (_tmp, root) = associated(&[("*.tpl", "html"), ("templates/*.tpl", "klingon")]);
+        assert_eq!(
+            lang_for_path(&root.join("templates/card.tpl")),
+            Some(LangKind::Html)
+        );
+        assert_eq!(
+            associated_language_id(&root.join("templates/card.tpl")).as_deref(),
+            Some("html")
+        );
+    }
+
+    #[test]
+    fn clearing_the_associations_restores_the_built_in_table() {
+        let (_tmp, root) = associated(&[("*.rs", "python")]);
+        assert_eq!(lang_for_path(&root.join("a.rs")), Some(LangKind::Python));
+        set_file_associations(&root, &std::collections::BTreeMap::new());
+        assert_eq!(lang_for_path(&root.join("a.rs")), Some(LangKind::Rust));
+    }
+
+    #[test]
+    fn every_editor_language_id_maps_back_to_its_language() {
+        for &lang in crate::widgets::editor::SELECTABLE_LANGUAGES {
+            let id = crate::widgets::editor::language_scope_id(Some(lang));
+            assert_eq!(lang_for_language_id(id), Some(lang), "{id}");
+        }
+        for (alias, lang) in [
+            ("jsonc", LangKind::Json),
+            ("bash", LangKind::Bash),
+            ("C++", LangKind::Cpp),
+            ("javascriptreact", LangKind::JavaScript),
+        ] {
+            assert_eq!(lang_for_language_id(alias), Some(lang), "{alias}");
+        }
+        assert_eq!(lang_for_language_id("jinja"), None);
+        assert_eq!(normalised_language_id("Text"), "plaintext");
+    }
 
     #[test]
     fn palette_style_resolves_each_role_against_the_theme() {

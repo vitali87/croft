@@ -7242,7 +7242,23 @@ fn build_client_capabilities() -> ClientCapabilities {
     }
 }
 
-fn path_to_language(path: &Path) -> Option<Language> {
+/// The language server language for `path`: its `files_associations` id
+/// (#1574), else what its name and extension map to (#1084). The app's
+/// sync uses it to decide which tabs go to the servers at all.
+pub(crate) fn path_to_language(path: &Path) -> Option<Language> {
+    // `files_associations` first (#1574), so the server serves the
+    // language the editor highlights: a known id with no server gets none.
+    // An id croft does not know falls through to the name and extension,
+    // as it does for highlighting.
+    if let Some(id) = crate::highlight::associated_language_id(path) {
+        let lang = crate::lsp::languages::resolve(&id);
+        if lang.is_some()
+            || id == "plaintext"
+            || crate::highlight::lang_for_language_id(&id).is_some()
+        {
+            return lang;
+        }
+    }
     Language::from_path(path)
 }
 
@@ -7429,6 +7445,40 @@ mod tests {
         SemanticTokensOptions,
     };
     use std::time::{Duration, Instant};
+
+    /// #1574: the server follows `files_associations`: a `.tpl` associated
+    /// with HTML gets the HTML server, and a file associated with a
+    /// language that has no server gets none, not its extension's.
+    #[test]
+    fn an_associated_file_gets_its_associations_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let map = [
+            ("*.tpl", "html"),
+            ("*.rs", "plaintext"),
+            ("*.py", "klingon"),
+        ]
+        .iter()
+        .map(|(g, id)| (g.to_string(), id.to_string()))
+        .collect();
+        crate::highlight::set_file_associations(tmp.path(), &map);
+        assert_eq!(
+            path_to_language(&tmp.path().join("card.tpl")),
+            crate::lsp::languages::resolve("html")
+        );
+        assert!(crate::lsp::languages::resolve("html").is_some());
+        assert_eq!(path_to_language(&tmp.path().join("main.rs")), None);
+        assert_eq!(
+            path_to_language(&tmp.path().join("lib.py")),
+            crate::lsp::languages::resolve("python"),
+            "an unknown association id keeps its extension's server"
+        );
+        assert!(crate::lsp::languages::resolve("python").is_some());
+        assert_eq!(
+            path_to_language(&tmp.path().join("main.go")),
+            crate::lsp::languages::resolve("go"),
+            "an unassociated file keeps its extension's server"
+        );
+    }
 
     /// #1532: a `.scss` or `.less` file resolves to its own language, which
     /// the CSS server is started for; `.sass` resolves to none.

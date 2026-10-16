@@ -372,6 +372,12 @@ pub struct Prefs {
     /// `files_exclude` (VS Code's `search.exclude`, #1345).
     #[serde(default)]
     pub search_exclude: Vec<String>,
+    /// The language a file opens in, by glob (VS Code's
+    /// `files.associations`, #1574): `{ "*.tpl": "html" }`. A glob without
+    /// a `/` matches the file name, one with a `/` the workspace-relative
+    /// path. Values are VS Code language ids; workspace entries win per glob.
+    #[serde(default)]
+    pub files_associations: std::collections::BTreeMap<String, String>,
     /// Per-language overrides (#1440), keyed by VS Code's language id
     /// (`python`, `c`, `markdown`, `shellscript`, …), VS Code's
     /// `"[python]": { … }` blocks. A value set here wins over the global
