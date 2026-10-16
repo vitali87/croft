@@ -51167,21 +51167,17 @@ impl App {
     /// Write `key = value` into the Settings editor's target layer, re-merge
     /// and apply it live, and refresh the editor's rows.
     fn write_setting(&mut self, key: &str, value: serde_json::Value) {
-        use crate::config_layers::LayerKind;
-        let Some(target) = self.settings_editor.as_ref().map(|e| e.target) else {
+        let Some(path) = self.settings_target_file(key) else {
             return;
         };
-        let path = match target {
-            LayerKind::Workspace => {
-                if !crate::config_layers::WORKSPACE_ALLOWED_KEYS.contains(&key) {
-                    self.status =
-                        format!("{key} can only be set in your user settings (Tab switches layer)");
-                    return;
-                }
-                crate::config_layers::workspace_config_path(self.roots.primary())
-            }
-            _ => self.config_dir.join("config.json"),
-        };
+        // A value croft can't read back as the setting is refused here,
+        // not saved and then ignored (#1555).
+        if let Err(e) =
+            crate::settings_editor::check(&self.merged_settings_here().prefs, key, &value)
+        {
+            self.status = e;
+            return;
+        }
         let text = std::fs::read_to_string(&path).unwrap_or_default();
         let new = match crate::settings_editor::set_key(&text, key, value) {
             Ok(t) => t,
@@ -51210,6 +51206,57 @@ impl App {
             ed.rows = crate::settings_editor::rows(&merged.prefs, &merged.provenance);
         }
         self.status = format!("{key} saved to {}", path.display());
+    }
+
+    /// The layer file the Settings editor writes `key` to: the user's
+    /// `config.json`, or, with the workspace layer chosen, the workspace's,
+    /// for the keys a workspace may set. None, with the status saying why,
+    /// for any other key there.
+    fn settings_target_file(&mut self, key: &str) -> Option<std::path::PathBuf> {
+        use crate::config_layers::LayerKind;
+        let target = self.settings_editor.as_ref()?.target;
+        match target {
+            LayerKind::Workspace => {
+                if !crate::config_layers::WORKSPACE_ALLOWED_KEYS.contains(&key) {
+                    self.status =
+                        format!("{key} can only be set in your user settings (Tab switches layer)");
+                    return None;
+                }
+                Some(crate::config_layers::workspace_config_path(
+                    self.roots.primary(),
+                ))
+            }
+            _ => Some(self.config_dir.join("config.json")),
+        }
+    }
+
+    /// A setting the editor can't edit in place (an object or a list),
+    /// opened in the chosen layer's file with the caret on its key
+    /// (#1555): it used to open the user's file at line 1 whichever layer
+    /// was chosen.
+    fn open_setting_in_json(&mut self, key: &str) {
+        let Some(path) = self.settings_target_file(key) else {
+            return;
+        };
+        let seed = if path == self.config_dir.join("config.json") {
+            ConfigFileSeed::Settings
+        } else {
+            ConfigFileSeed::SettingsLayer
+        };
+        self.settings_editor = None;
+        self.open_config_file_in_editor(path.clone(), seed);
+        if self.editor.path.as_deref() != Some(path.as_path()) {
+            return;
+        }
+        let line = crate::settings_editor::key_line(&self.editor.lines.join("\n"), key);
+        if let Some(line) = line {
+            self.editor.goto_line(line + 1);
+        }
+        let name = key.replace('_', " ");
+        self.status = match line {
+            Some(_) => format!("{name} is edited in the JSON file"),
+            None => format!("{name} is edited in the JSON file: add \"{key}\" here"),
+        };
     }
 
     /// Keys while the Settings editor is open (#612): typing searches, Enter
@@ -51246,7 +51293,15 @@ impl App {
                     }
                     Kind::Number | Kind::Text => {
                         use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
-                        let now = crate::settings_editor::display(&row.value);
+                        // An unset optional setting, or an empty one,
+                        // opens empty, not on the `(default)` label, which
+                        // typing would extend and which, confirmed as is,
+                        // would unset an explicitly empty `review_ai_prefix`.
+                        let now = if row.value.is_null() || row.value == "" {
+                            String::new()
+                        } else {
+                            crate::settings_editor::display(&row.value)
+                        };
                         self.open_input_prompt(
                             InputPrompt::new(
                                 InputPurpose::SettingValue {
@@ -51258,15 +51313,7 @@ impl App {
                             .with_value(now),
                         );
                     }
-                    Kind::Json => {
-                        self.settings_editor = None;
-                        self.status =
-                            format!("{} is edited in the JSON file", row.key.replace('_', " "));
-                        self.open_config_file_in_editor(
-                            self.config_dir.join("config.json"),
-                            ConfigFileSeed::Settings,
-                        );
-                    }
+                    Kind::Json => self.open_setting_in_json(&row.key),
                 }
             }
             (KeyCode::Backspace, _) => {
@@ -51292,18 +51339,10 @@ impl App {
         else {
             return;
         };
-        let v = value.trim();
-        let parsed = match row.kind {
-            crate::settings_editor::Kind::Number => match v.parse::<u64>() {
-                Ok(n) => serde_json::Value::from(n),
-                Err(_) => {
-                    self.status = format!("{key} needs a whole number, not \"{v}\"");
-                    return;
-                }
-            },
-            _ => serde_json::Value::from(v),
-        };
-        self.write_setting(key, parsed);
+        match crate::settings_editor::typed_value(&row, value) {
+            Ok(parsed) => self.write_setting(key, parsed),
+            Err(e) => self.status = e,
+        }
     }
 
     fn render_settings_editor(&mut self, frame: &mut ratatui::Frame) {
