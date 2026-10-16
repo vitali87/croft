@@ -78,6 +78,12 @@ pub enum Command {
     /// Git: Undo Last Commit (#1350): `reset --soft HEAD~1`, its message
     /// back in the Source Control box.
     GitUndoLastCommit,
+    /// Git: Copy Permalink / Copy Head Link / Open on Remote (#1610): the
+    /// selected lines on the remote's web page, at HEAD's commit or branch.
+    GitCopyPermalink,
+    GitCopyHeadLink,
+    GitOpenOnRemote,
+
     /// Pick a stash and open its changes (#1581).
     GitViewStash,
     AddCursorAbove,
@@ -586,6 +592,9 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::UnstageHunk,
     Command::RevertHunk,
     Command::GitUndoLastCommit,
+    Command::GitCopyPermalink,
+    Command::GitCopyHeadLink,
+    Command::GitOpenOnRemote,
     Command::GitViewStash,
     Command::AddCursorAbove,
     Command::AddCursorBelow,
@@ -1013,6 +1022,10 @@ impl Command {
             Command::UnstageHunk => "Git: Unstage Hunk",
             Command::RevertHunk => "Git: Revert Hunk",
             Command::GitUndoLastCommit => "Git: Undo Last Commit",
+            Command::GitCopyPermalink => "Git: Copy Permalink",
+            Command::GitCopyHeadLink => "Git: Copy Head Link",
+            Command::GitOpenOnRemote => "Git: Open on Remote",
+
             Command::GitViewStash => "Git: View Stash\u{2026}",
             Command::AddCursorAbove => "Add Cursor Above",
             Command::AddCursorBelow => "Add Cursor Below",
@@ -1451,6 +1464,8 @@ impl Command {
             Command::UnstageHunk => "U in diff",
             Command::RevertHunk => "R in diff",
             Command::GitUndoLastCommit => "",
+            Command::GitCopyPermalink | Command::GitCopyHeadLink | Command::GitOpenOnRemote => "",
+
             Command::GitViewStash => "",
             Command::AddCursorAbove => "Cmd+Opt+↑",
             Command::AddCursorBelow => "Cmd+Opt+↓",
@@ -1870,6 +1885,10 @@ impl Command {
             Command::UnstageHunk => "unstage_hunk",
             Command::RevertHunk => "revert_hunk",
             Command::GitUndoLastCommit => "git_undo_last_commit",
+            Command::GitCopyPermalink => "git_copy_permalink",
+            Command::GitCopyHeadLink => "git_copy_head_link",
+            Command::GitOpenOnRemote => "git_open_on_remote",
+
             Command::GitViewStash => "git_view_stash",
             Command::AddCursorAbove => "add_cursor_above",
             Command::AddCursorBelow => "add_cursor_below",
@@ -2221,13 +2240,19 @@ impl Command {
 
     /// An extra word the palette matches this command on, beyond its
     /// title: "layout" for the Customize Layout commands (#852), whose
-    /// VS Code names mostly don't say it, and the tab menu's "Keep Open"
-    /// for View: Keep Editor. Empty for the rest.
+    /// VS Code names mostly don't say it, the tab menu's "Keep Open" for
+    /// View: Keep Editor, and the hosts a shared link opens on (#1610).
+    /// Empty for the rest.
     pub fn keyword(self) -> &'static str {
         if LAYOUT_COMMANDS.contains(&self) {
             "layout"
         } else if self == Command::KeepEditor {
             "keep open"
+        } else if matches!(
+            self,
+            Command::GitCopyPermalink | Command::GitCopyHeadLink | Command::GitOpenOnRemote
+        ) {
+            "github gitlab bitbucket share link url"
         } else {
             ""
         }

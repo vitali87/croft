@@ -315,6 +315,12 @@ const SETTINGS: &[SettingMap] = &[
 /// it now maps to the caret-driven `go_to_definition` (#1212).
 const COMMANDS: &[(&str, &str)] = &[
     ("workbench.action.files.save", "save_file"),
+    // The GitHub Pull Requests extension's share commands, and the built-in
+    // GitHub extension's Open on GitHub (#1610).
+    ("issue.copyGithubPermalink", "git_copy_permalink"),
+    ("issue.copyGithubHeadLink", "git_copy_head_link"),
+    ("issue.openGithubPermalink", "git_open_on_remote"),
+    ("github.openOnGitHub", "git_open_on_remote"),
     ("git.createTag", "git_create_tag"),
     ("git.pushTags", "git_push_tags"),
     ("git.deleteRemoteTag", "git_delete_remote_tag"),
