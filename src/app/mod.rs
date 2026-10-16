@@ -31684,19 +31684,21 @@ impl App {
 
     /// A path as typed: `~` expanded, relative to the workspace root.
     fn typed_path(&self, value: &str) -> PathBuf {
-        let v = value.trim();
-        let p = match v.strip_prefix("~/") {
-            Some(rest) => std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_default()
-                .join(rest),
-            None => PathBuf::from(v),
-        };
-        if p.is_absolute() {
-            p
-        } else {
-            self.workspace_root().join(p)
-        }
+        self.typed_path_checked(value).unwrap_or_else(|| {
+            let v = value.trim();
+            self.workspace_root()
+                .join(v.strip_prefix("~/").unwrap_or(v))
+        })
+    }
+
+    /// As `typed_path`, but `None` for `~/…` when HOME is unset, so the
+    /// caller can refuse it rather than write under the workspace.
+    fn typed_path_checked(&self, value: &str) -> Option<PathBuf> {
+        resolve_typed_path(
+            value,
+            std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+            self.workspace_root(),
+        )
     }
 
     /// Add a CodeQL database from `value` (#578): a folder, an archive, a
@@ -36979,15 +36981,31 @@ impl App {
             }
             InputPurpose::SaveWorkspaceAs => {
                 self.close_input_prompt();
-                let dest = PathBuf::from(value.trim());
+                // As the other path prompts read a path (#1602): `~/` is the
+                // home directory and a relative path is under the workspace.
+                // Taken verbatim, `~/team.code-workspace` went into a new
+                // folder named `~` under the launch directory, while the
+                // status line said `~/`. A bare name gets the extension, as
+                // VS Code gives it.
+                let Some(mut dest) = self.typed_path_checked(&value) else {
+                    self.status = String::from("Save workspace: cannot expand ~ (HOME is not set)");
+                    return;
+                };
+                if dest.extension().is_none() {
+                    dest.set_extension("code-workspace");
+                }
+                let new_folder = dest.parent().filter(|p| !p.exists()).map(Path::to_path_buf);
                 let folders: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
                 match crate::workspace::write_workspace_file(&dest, &folders) {
                     Ok(()) => {
                         self.status = format!(
-                            "Saved workspace ({} folder{}): {}",
+                            "Saved workspace ({} folder{}): {}{}",
                             folders.len(),
                             if folders.len() == 1 { "" } else { "s" },
-                            dest.display()
+                            dest.display(),
+                            new_folder
+                                .map(|f| format!(" (created folder {})", f.display()))
+                                .unwrap_or_default()
                         );
                     }
                     Err(e) => self.status = format!("Save workspace: {e}"),
@@ -74678,6 +74696,18 @@ fn moved_path(path: &Path, renames: &[crate::lsp::manager::FileRenameOp]) -> Pat
         .find_map(|r| path.strip_prefix(&r.old).ok().map(|rest| r.new.join(rest)))
         .map(|p| p.components().collect())
         .unwrap_or_else(|| path.to_path_buf())
+}
+
+/// A path typed into a prompt: `~/` is `home`, and a relative path is under
+/// `root`, the workspace, not the directory croft was started from. `None`
+/// for `~/…` with no home: it is not a path under the workspace.
+fn resolve_typed_path(value: &str, home: Option<&Path>, root: &Path) -> Option<PathBuf> {
+    let v = value.trim();
+    let p = match v.strip_prefix("~/") {
+        Some(rest) => home?.join(rest),
+        None => PathBuf::from(v),
+    };
+    Some(if p.is_absolute() { p } else { root.join(p) })
 }
 
 fn sidebar_view_label(view: SidebarView) -> &'static str {
