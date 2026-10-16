@@ -341,6 +341,25 @@ impl lsp_types::request::Request for RawInitialize {
     const METHOD: &'static str = "initialize";
 }
 
+/// A request `lsp-types` has no type for, sent and answered as raw JSON.
+macro_rules! raw_request {
+    ($name:ident, $method:literal) => {
+        enum $name {}
+
+        impl lsp_types::request::Request for $name {
+            type Params = serde_json::Value;
+            type Result = serde_json::Value;
+            const METHOD: &'static str = $method;
+        }
+    };
+}
+
+raw_request!(RaExpandMacro, "rust-analyzer/expandMacro");
+raw_request!(RaParentModule, "experimental/parentModule");
+raw_request!(RaOpenCargoToml, "experimental/openCargoToml");
+raw_request!(RaRebuildProcMacros, "rust-analyzer/rebuildProcMacros");
+raw_request!(RaReloadWorkspace, "rust-analyzer/reloadWorkspace");
+
 /// Whether a raw `initialize` result advertises `typeHierarchyProvider`
 /// (#613): `true` or an options object, but not `false` or `null`.
 fn advertises_type_hierarchy(init: &serde_json::Value) -> bool {
@@ -1258,6 +1277,25 @@ impl LspRequests {
             .code_action_resolve(action)
             .await
             .context("code_action_resolve")
+    }
+
+    /// One of rust-analyzer's own requests (#1626), raw: `params` from
+    /// [`RaRequest::params`], the answer as the server sent it.
+    pub async fn rust_analyzer(
+        &mut self,
+        request: crate::lsp::rust_analyzer::RaRequest,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        use crate::lsp::rust_analyzer::RaRequest;
+        let s = &mut self.server;
+        match request {
+            RaRequest::ExpandMacro => s.request::<RaExpandMacro>(params).await,
+            RaRequest::ParentModule => s.request::<RaParentModule>(params).await,
+            RaRequest::OpenCargoToml => s.request::<RaOpenCargoToml>(params).await,
+            RaRequest::RebuildProcMacros => s.request::<RaRebuildProcMacros>(params).await,
+            RaRequest::ReloadWorkspace => s.request::<RaReloadWorkspace>(params).await,
+        }
+        .context(request.method())
     }
 
     /// `workspace/executeCommand`: run a command a code action asked for (some

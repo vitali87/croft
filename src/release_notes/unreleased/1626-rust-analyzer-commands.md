@@ -1,0 +1,1 @@
+feature: The command palette has rust-analyzer's own commands while it serves the active file: Rust: Expand Macro Recursively at Caret (opens the expansion in a Rust tab), Locate Parent Module, Open Cargo.toml, Rebuild Proc Macros and Build Scripts, and Reload Workspace.

@@ -88372,6 +88372,214 @@ fn move_editor_into_next_group_splits_then_previous_brings_it_back() {
     assert_eq!(active_name_1565(&app), "c.py");
 }
 
+/// The `Rust:` palette rows for the active file, with "Rust:" typed.
+fn rust_palette_rows(app: &mut App) -> Vec<String> {
+    app.open_command_palette();
+    let palette = app.command_palette.as_mut().expect("the palette opens");
+    palette.set_query("Rust:");
+    let mut rows: Vec<String> = palette
+        .results
+        .iter()
+        .map(|i| i.title().to_string())
+        .filter(|t| t.starts_with("Rust: "))
+        .collect();
+    app.command_palette = None;
+    // Which rows, not the palette's ranking of equally good matches.
+    rows.sort();
+    rows
+}
+
+/// #1626: with rust-analyzer serving a Rust file, the palette offers its
+/// Expand Macro, Locate Parent Module, Open Cargo.toml, Rebuild Proc Macros
+/// and Reload Workspace, where it offered none.
+#[test]
+fn rust_analyzer_commands_are_offered_where_it_serves_the_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "main.rs", "fn main() {}\n");
+    let path = app.editor.path.clone().unwrap();
+    app.lsp
+        .as_ref()
+        .expect("a test App has an LSP manager")
+        .set_document_clients_for_test(&path, &["rust-analyzer"]);
+    assert_eq!(
+        rust_palette_rows(&mut app),
+        [
+            "Rust: Expand Macro Recursively at Caret",
+            "Rust: Locate Parent Module",
+            "Rust: Open Cargo.toml",
+            "Rust: Rebuild Proc Macros and Build Scripts",
+            "Rust: Reload Workspace",
+        ]
+    );
+}
+
+/// #1626 negative: a file rust-analyzer does not serve (a Python file, or
+/// a Rust file before it opens on it) lists none of them.
+#[test]
+fn rust_analyzer_commands_are_hidden_where_it_does_not_serve_the_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "m.py", "x = 1\n");
+    let path = app.editor.path.clone().unwrap();
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .set_document_clients_for_test(&path, &["basedpyright"]);
+    assert!(rust_palette_rows(&mut app).is_empty());
+    let mut app = app_with_open_file(tmp.path(), "main.rs", "fn main() {}\n");
+    assert!(rust_palette_rows(&mut app).is_empty());
+}
+
+/// #1626: rust-analyzer retired from diagnostic pulls (one pull timed out)
+/// no longer reports on the file, but its client still runs, so its
+/// commands stay offered and a keybinding still sends the request.
+#[test]
+fn rust_analyzer_commands_stay_offered_after_it_stops_reporting_diagnostics() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "main.rs", "fn main() {}\n");
+    let path = app.editor.path.clone().unwrap();
+    let lsp = app.lsp.as_ref().unwrap();
+    lsp.set_document_clients_for_test(&path, &["rust-analyzer"]);
+    lsp.set_document_servers_for_test(&path, &[]);
+    assert_eq!(rust_palette_rows(&mut app).len(), 5);
+    app.request_rust_analyzer(crate::lsp::rust_analyzer::RaRequest::ParentModule);
+    assert!(app.rust_analyzer_request.is_some(), "{}", app.status);
+}
+
+/// A Rust file rust-analyzer is open on, and an answer to `request` under
+/// the id the app now waits on.
+fn app_awaiting_rust_analyzer(
+    tmp: &std::path::Path,
+    request: crate::lsp::rust_analyzer::RaRequest,
+) -> (App, u64) {
+    let mut app = app_with_open_file(
+        tmp,
+        "main.rs",
+        "macro_rules! sq { ($e:expr) => { $e * $e }; }\nfn main() { let _ = sq!(2 + 1); }\n",
+    );
+    let path = app.editor.path.clone().unwrap();
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .set_document_clients_for_test(&path, &["rust-analyzer"]);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 21;
+    app.request_rust_analyzer(request);
+    let (id, sent) = app.rust_analyzer_request.expect("the request is awaited");
+    assert_eq!(sent, request);
+    (app, id)
+}
+
+/// #1626: Expand Macro opens the expansion as a Rust tab named after the
+/// macro.
+#[test]
+fn an_expand_macro_answer_opens_the_expansion_in_a_rust_tab() {
+    use crate::lsp::rust_analyzer::RaRequest;
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, id) = app_awaiting_rust_analyzer(tmp.path(), RaRequest::ExpandMacro);
+    assert!(
+        app.apply_rust_analyzer_result(crate::lsp::manager::RustAnalyzerResult {
+            request_id: id,
+            request: RaRequest::ExpandMacro,
+            outcome: Ok(serde_json::json!({ "name": "sq", "expansion": "(2 + 1) * (2 + 1)" })),
+        })
+    );
+    assert!(
+        app.editor
+            .path
+            .as_ref()
+            .is_some_and(|p| p.ends_with("Expansion of sq!")),
+        "{:?}",
+        app.editor.path
+    );
+    assert_eq!(app.editor.lines[0], "(2 + 1) * (2 + 1)");
+    assert_eq!(app.editor.language_label(), "Rust");
+    assert!(app.rust_analyzer_request.is_none());
+}
+
+/// #1626: Locate Parent Module and Open Cargo.toml jump to the place the
+/// server names.
+#[test]
+fn parent_module_and_cargo_toml_answers_jump_to_the_location() {
+    use crate::lsp::rust_analyzer::RaRequest;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"rmod\"\n").unwrap();
+    std::fs::write(root.join("lib.rs"), "\n\nmod main;\n").unwrap();
+    let (mut app, id) = app_awaiting_rust_analyzer(&root, RaRequest::ParentModule);
+    let at = |path: &std::path::Path, line: u32, col: u32| {
+        serde_json::json!({
+            "uri": url::Url::from_file_path(path).unwrap().as_str(),
+            "range": { "start": { "line": line, "character": col }, "end": { "line": line, "character": col + 4 } },
+        })
+    };
+    app.apply_rust_analyzer_result(crate::lsp::manager::RustAnalyzerResult {
+        request_id: id,
+        request: RaRequest::ParentModule,
+        outcome: Ok(serde_json::json!([at(&root.join("lib.rs"), 2, 4)])),
+    });
+    assert!(
+        app.editor
+            .path
+            .as_ref()
+            .is_some_and(|p| p.ends_with("lib.rs"))
+    );
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 4));
+
+    app.editor.open_pinned(&root.join("main.rs")).unwrap();
+    app.request_rust_analyzer(RaRequest::OpenCargoToml);
+    let (id, _) = app.rust_analyzer_request.unwrap();
+    app.apply_rust_analyzer_result(crate::lsp::manager::RustAnalyzerResult {
+        request_id: id,
+        request: RaRequest::OpenCargoToml,
+        outcome: Ok(at(&root.join("Cargo.toml"), 0, 0)),
+    });
+    assert!(
+        app.editor
+            .path
+            .as_ref()
+            .is_some_and(|p| p.ends_with("Cargo.toml"))
+    );
+}
+
+/// #1626 negative: an answer to an older request is dropped, and an error
+/// or a `null` expansion reports itself and opens nothing.
+#[test]
+fn stale_failed_or_empty_rust_analyzer_answers_open_nothing() {
+    use crate::lsp::rust_analyzer::RaRequest;
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, id) = app_awaiting_rust_analyzer(tmp.path(), RaRequest::ExpandMacro);
+    let file = app.editor.path.clone();
+    let answer = |request_id, outcome| crate::lsp::manager::RustAnalyzerResult {
+        request_id,
+        request: RaRequest::ExpandMacro,
+        outcome,
+    };
+    assert!(!app.apply_rust_analyzer_result(answer(
+        id + 100,
+        Ok(serde_json::json!({ "name": "sq", "expansion": "x" }))
+    )));
+    assert_eq!(app.editor.path, file);
+    assert!(app.apply_rust_analyzer_result(answer(id, Ok(serde_json::Value::Null))));
+    assert_eq!(app.status, "No macro call at the caret");
+    assert_eq!(app.editor.path, file);
+    app.request_rust_analyzer(RaRequest::ExpandMacro);
+    let (id, _) = app.rust_analyzer_request.unwrap();
+    app.apply_rust_analyzer_result(answer(id, Err(String::from("content modified"))));
+    assert!(app.status.contains("content modified"), "{}", app.status);
+    assert_eq!(app.editor.path, file);
+}
+
+/// #1626 negative: run on a file rust-analyzer does not serve, a `Rust:`
+/// command says so and sends nothing.
+#[test]
+fn a_rust_command_without_rust_analyzer_says_so_and_sends_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "main.rs", "fn main() {}\n");
+    app.run_command(crate::widgets::command_palette::Command::RustExpandMacro);
+    assert!(app.rust_analyzer_request.is_none());
+    assert_eq!(app.status, "rust-analyzer is not running for this file");
+}
+
 /// Serve one `croft edit` request for `path` at `at` through a socket pair.
 fn serve_view_request_1606(
     app: &mut App,

@@ -67,6 +67,15 @@ pub struct CompletionResult {
     pub is_incomplete: bool,
 }
 
+/// The answer to one of rust-analyzer's own requests (#1626), raw; `Err`
+/// says why there is none (no rust-analyzer for the file, or its error).
+#[derive(Debug)]
+pub struct RustAnalyzerResult {
+    pub request_id: u64,
+    pub request: crate::lsp::rust_analyzer::RaRequest,
+    pub outcome: Result<serde_json::Value, String>,
+}
+
 #[derive(Debug)]
 pub struct HoverResult {
     pub request_id: u64,
@@ -857,6 +866,13 @@ enum Cmd {
         line: u32,
         character: u32,
     },
+    RustAnalyzer {
+        request_id: u64,
+        path: PathBuf,
+        request: crate::lsp::rust_analyzer::RaRequest,
+        line: u32,
+        character: u32,
+    },
     RequestDefinition {
         request_id: u64,
         path: PathBuf,
@@ -1019,6 +1035,11 @@ struct LangCapabilitySupport {
     /// lists it was on when it is retired from document pulls or given up
     /// on after crashing.
     document_servers: HashMap<PathBuf, Vec<String>>,
+    /// Every server open on each open document, by name (#1626), retired
+    /// from document pulls or not: a server that let one diagnostic pull
+    /// lapse still answers other requests, so this, not
+    /// `document_servers`, says whether it serves the file.
+    document_clients: HashMap<PathBuf, Vec<String>>,
 }
 type CapabilitySupport = Arc<StdMutex<LangCapabilitySupport>>;
 
@@ -1034,6 +1055,7 @@ pub struct LspManager {
     completion_rx: std_mpsc::Receiver<CompletionResult>,
     signature_help_rx: std_mpsc::Receiver<SignatureHelpResult>,
     hover_rx: std_mpsc::Receiver<HoverResult>,
+    rust_analyzer_rx: std_mpsc::Receiver<RustAnalyzerResult>,
     def_rx: std_mpsc::Receiver<DefinitionResult>,
     /// Test hooks: senders into the three jump channels, so app tests can
     /// answer a definition, declaration or type definition request
@@ -1132,6 +1154,7 @@ impl LspManager {
         let (completion_tx, completion_rx) = std_mpsc::channel();
         let (signature_help_tx, signature_help_rx) = std_mpsc::channel();
         let (hover_tx, hover_rx) = std_mpsc::channel();
+        let (rust_analyzer_tx, rust_analyzer_rx) = std_mpsc::channel();
         let (def_tx, def_rx) = std_mpsc::channel();
         let (doc_symbols_tx, doc_symbols_rx) = std_mpsc::channel();
         let (decl_tx, decl_rx) = std_mpsc::channel();
@@ -1193,6 +1216,7 @@ impl LspManager {
                 completion: completion_tx,
                 signature_help: signature_help_tx,
                 hover: hover_tx,
+                rust_analyzer: rust_analyzer_tx,
                 definition: def_tx,
                 document_symbols: doc_symbols_tx,
                 declaration: decl_tx,
@@ -1232,6 +1256,7 @@ impl LspManager {
             completion_rx,
             signature_help_rx,
             hover_rx,
+            rust_analyzer_rx,
             def_rx,
             #[cfg(test)]
             jump_test_tx,
@@ -1391,6 +1416,32 @@ impl LspManager {
 
     pub fn drain_hover(&self) -> Option<HoverResult> {
         self.hover_rx.try_recv().ok()
+    }
+
+    /// Send one of rust-analyzer's own requests (#1626) for the caret at
+    /// UTF-16 `(line, character)` in `path`; the answer arrives on
+    /// [`LspManager::drain_rust_analyzer`] under the returned id.
+    pub fn request_rust_analyzer(
+        &mut self,
+        path: PathBuf,
+        request: crate::lsp::rust_analyzer::RaRequest,
+        line: u32,
+        character: u32,
+    ) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let _ = self.cmd_tx.send(Cmd::RustAnalyzer {
+            request_id: id,
+            path,
+            request,
+            line,
+            character,
+        });
+        id
+    }
+
+    pub fn drain_rust_analyzer(&self) -> Option<RustAnalyzerResult> {
+        self.rust_analyzer_rx.try_recv().ok()
     }
 
     /// Ask the server for the whole document's semantic tokens. Fire this
@@ -1800,6 +1851,16 @@ impl LspManager {
         })
     }
 
+    /// Whether the server named `name` is open on the document `path`
+    /// (#1626), whether or not it still reports diagnostics on it.
+    pub fn document_served_by(&self, path: &Path, name: &str) -> bool {
+        self.capability_support.lock().is_ok_and(|s| {
+            s.document_clients
+                .get(path)
+                .is_some_and(|names| names.iter().any(|n| n == name))
+        })
+    }
+
     /// Whether any running server has the open document `path` (#1566):
     /// one that does answers its completions, and word completion waits for
     /// that answer instead of opening on the document's words at once.
@@ -1817,6 +1878,18 @@ impl LspManager {
     pub fn set_document_servers_for_test(&self, path: &Path, names: &[&str]) {
         if let Ok(mut support) = self.capability_support.lock() {
             support.document_servers.insert(
+                path.to_path_buf(),
+                names.iter().map(|n| n.to_string()).collect(),
+            );
+        }
+    }
+
+    /// Test hook: record `names` as the servers open on `path` (#1626),
+    /// without starting any or marking them as reporting on it.
+    #[cfg(test)]
+    pub fn set_document_clients_for_test(&self, path: &Path, names: &[&str]) {
+        if let Ok(mut support) = self.capability_support.lock() {
+            support.document_clients.insert(
                 path.to_path_buf(),
                 names.iter().map(|n| n.to_string()).collect(),
             );
@@ -2282,6 +2355,7 @@ struct ResultSenders {
     completion: std_mpsc::Sender<CompletionResult>,
     signature_help: std_mpsc::Sender<SignatureHelpResult>,
     hover: std_mpsc::Sender<HoverResult>,
+    rust_analyzer: std_mpsc::Sender<RustAnalyzerResult>,
     definition: std_mpsc::Sender<DefinitionResult>,
     document_symbols: std_mpsc::Sender<DocumentSymbolsResult>,
     declaration: std_mpsc::Sender<DeclarationResult>,
@@ -2516,6 +2590,23 @@ async fn worker_loop(
             } => {
                 state
                     .request_hover(request_id, path, line, character, &tx.hover)
+                    .await
+            }
+            Cmd::RustAnalyzer {
+                request_id,
+                path,
+                request,
+                line,
+                character,
+            } => {
+                state
+                    .request_rust_analyzer(
+                        request_id,
+                        path,
+                        request,
+                        (line, character),
+                        &tx.rust_analyzer,
+                    )
                     .await
             }
             Cmd::RequestDefinition {
@@ -2852,6 +2943,9 @@ impl WorkerState {
                         if let Some(names) = support.document_servers.get_mut(path) {
                             names.retain(|n| alive.iter().any(|m| &m.name == n));
                         }
+                        if let Some(names) = support.document_clients.get_mut(path) {
+                            names.retain(|n| alive.iter().any(|m| &m.name == n));
+                        }
                     }
                 }
                 self.restarts.incomplete.remove(&key);
@@ -2876,6 +2970,7 @@ impl WorkerState {
                 for (path, doc) in &self.docs {
                     if (doc.language, doc.project_root.clone()) == key {
                         support.document_servers.remove(path);
+                        support.document_clients.remove(path);
                     }
                 }
             }
@@ -3288,8 +3383,16 @@ impl WorkerState {
             .filter(|c| !c.document_pull_stalled.load(Ordering::Relaxed))
             .map(|c| c.name.clone())
             .collect();
+        let open_on: Vec<String> = self
+            .clients
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .map(|c| c.name.clone())
+            .collect();
         if let Ok(mut support) = self.capability_support.lock() {
             support.document_servers.insert(path.clone(), reporting);
+            support.document_clients.insert(path.clone(), open_on);
         }
         self.docs.insert(
             path,
@@ -3382,6 +3485,7 @@ impl WorkerState {
         };
         if let Ok(mut support) = self.capability_support.lock() {
             support.document_servers.remove(&path);
+            support.document_clients.remove(&path);
         }
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
@@ -3598,6 +3702,66 @@ impl WorkerState {
                 path: path_clone,
                 signatures,
                 active_signature,
+            });
+        });
+    }
+
+    /// Send `request` to the rust-analyzer serving `path` (#1626). Every
+    /// path answers: with no rust-analyzer for the file the reply says so,
+    /// so the command that asked never waits on nothing.
+    async fn request_rust_analyzer(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        request: crate::lsp::rust_analyzer::RaRequest,
+        (line, character): (u32, u32),
+        tx: &std_mpsc::Sender<RustAnalyzerResult>,
+    ) {
+        let answer = |outcome: Result<serde_json::Value, String>| RustAnalyzerResult {
+            request_id,
+            request,
+            outcome,
+        };
+        let not_running = || {
+            answer(Err(format!(
+                "{} is not running for this file",
+                crate::lsp::rust_analyzer::SERVER
+            )))
+        };
+        let Some(doc) = self.docs.get(&path) else {
+            let _ = tx.send(not_running());
+            return;
+        };
+        let key = (doc.language, doc.project_root.clone());
+        self.ensure_clients(key.0, &key.1).await;
+        let picked = self.clients.get(&key).and_then(|clients| {
+            clients
+                .iter()
+                .find(|c| c.name == crate::lsp::rust_analyzer::SERVER)
+                .map(|c| c.client.clone())
+        });
+        let (Some(client_arc), Ok(uri)) = (picked, Url::from_file_path(&path)) else {
+            let _ = tx.send(not_running());
+            return;
+        };
+        let params = request.params(&uri, line, character);
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await.requests();
+            let outcome = client
+                .rust_analyzer(request, params)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            if let Err(e) = &outcome {
+                log_file::log(&format!(
+                    "lsp[rust-analyzer] {} error: {e}",
+                    request.method()
+                ));
+            }
+            let _ = tx.send(RustAnalyzerResult {
+                request_id,
+                request,
+                outcome,
             });
         });
     }
@@ -8269,6 +8433,10 @@ while True:
                 file.clone(),
                 vec![String::from("doc-pull"), String::from("other")],
             );
+            support.lock().unwrap().document_clients.insert(
+                file.clone(),
+                vec![String::from("doc-pull"), String::from("other")],
+            );
             let pulls = document_pull_targets(std::iter::once(&managed), &file, &uri, &support);
             let (tx, rx) = std_mpsc::channel();
             spawn_document_pulls_within(
@@ -8305,6 +8473,11 @@ while True:
                 support.lock().unwrap().document_servers[&file],
                 ["other"],
                 "it no longer counts as reporting on the file, and only it left"
+            );
+            assert_eq!(
+                support.lock().unwrap().document_clients[&file],
+                ["doc-pull", "other"],
+                "but its client still runs, so it still serves the file (#1626)"
             );
         });
     }
@@ -10512,6 +10685,187 @@ while True:
             fresh.try_restart(&key, t0);
         }
         assert!(fresh.try_restart(&key, t0 + RESTART_WINDOW + Duration::from_secs(1)));
+    }
+
+    /// A stub rust-analyzer (#1626): answers `initialize`, logs each
+    /// method, and answers `rust-analyzer/expandMacro` with an expansion.
+    const FAKE_RUST_ANALYZER: &str = r#"
+import json, sys
+
+log = open(sys.argv[1], "a")
+
+def read_msg():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    if length is None:
+        return None
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(msg):
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+while True:
+    msg = read_msg()
+    if msg is None:
+        break
+    method = msg.get("method", "")
+    log.write(method + " " + json.dumps(msg.get("params")) + "\n")
+    log.flush()
+    if "id" in msg:
+        if method == "initialize":
+            result = {"capabilities": {}}
+        elif method == "rust-analyzer/expandMacro":
+            result = {"name": "sq", "expansion": "(2 + 1) * (2 + 1)"}
+        else:
+            result = None
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": result})
+    if method == "exit":
+        break
+"#;
+
+    /// A worker for `root` whose only Rust server is `name`, run as the
+    /// stub rust-analyzer logging to `log`.
+    fn worker_with_rust_server(
+        python: &Path,
+        root: &Path,
+        name: &'static str,
+        log: &Path,
+    ) -> WorkerState {
+        let script = root.join("fake_ra.py");
+        std::fs::write(&script, FAKE_RUST_ANALYZER).expect("write fake server");
+        let mut registry = ServerRegistry::new();
+        registry.register(
+            Language::RUST,
+            ServerConfig {
+                name,
+                command: python.display().to_string(),
+                args: vec![script.display().to_string(), log.display().to_string()],
+                language: Language::RUST,
+                initialization_options: None,
+                provision: None,
+            },
+        );
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        WorkerState {
+            workspace_root: root.to_path_buf(),
+            extra_roots: Vec::new(),
+            registry,
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+            restarts: ServerRestarts::default(),
+        }
+    }
+
+    /// #1626: Expand Macro goes to rust-analyzer as its own method, with the
+    /// document and caret, and its raw answer comes back to the app.
+    #[cfg(unix)]
+    #[test]
+    fn a_rust_analyzer_request_reaches_it_and_its_answer_comes_back() {
+        use crate::lsp::rust_analyzer::RaRequest;
+        let Some(python) = python_for_stub_server() else {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let file = root.join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").expect("write main.rs");
+        let log = root.join("methods.log");
+        let mut state = worker_with_rust_server(&python, &root, "rust-analyzer", &log);
+        let runtime = LspRuntime::new().expect("runtime");
+        let handle = runtime.handle().clone();
+        handle.block_on(state.open_doc(file.clone(), String::from("fn main() {}\n")));
+        let (tx, rx) = std_mpsc::channel();
+        handle.block_on(state.request_rust_analyzer(
+            7,
+            file.clone(),
+            RaRequest::ExpandMacro,
+            (0, 3),
+            &tx,
+        ));
+        let got = rx
+            .recv_timeout(crate::test_budget::spawn_budget(Duration::from_secs(10)))
+            .expect("an answer");
+        assert_eq!(got.request_id, 7);
+        assert_eq!(got.request, RaRequest::ExpandMacro);
+        let value = got.outcome.expect("the stub answers");
+        assert_eq!(
+            crate::lsp::rust_analyzer::expansion(&value),
+            Some((String::from("sq"), String::from("(2 + 1) * (2 + 1)")))
+        );
+        let sent = std::fs::read_to_string(&log).unwrap_or_default();
+        let line = sent
+            .lines()
+            .find(|l| l.starts_with("rust-analyzer/expandMacro "))
+            .unwrap_or_else(|| panic!("the method was sent:\n{sent}"));
+        assert!(
+            line.contains("\"line\": 0") && line.contains("\"character\": 3"),
+            "{line}"
+        );
+    }
+
+    /// #1626 negative: a Rust server that is not rust-analyzer is never sent
+    /// its methods; the request answers "not running" at once.
+    #[cfg(unix)]
+    #[test]
+    fn a_rust_analyzer_request_never_goes_to_another_server() {
+        use crate::lsp::rust_analyzer::RaRequest;
+        let Some(python) = python_for_stub_server() else {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let file = root.join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").expect("write main.rs");
+        let log = root.join("methods.log");
+        let mut state = worker_with_rust_server(&python, &root, "other-rust-server", &log);
+        let runtime = LspRuntime::new().expect("runtime");
+        let handle = runtime.handle().clone();
+        handle.block_on(state.open_doc(file.clone(), String::from("fn main() {}\n")));
+        let (tx, rx) = std_mpsc::channel();
+        handle.block_on(state.request_rust_analyzer(
+            8,
+            file.clone(),
+            RaRequest::ExpandMacro,
+            (0, 3),
+            &tx,
+        ));
+        let got = rx.recv_timeout(Duration::from_secs(5)).expect("an answer");
+        assert_eq!(
+            got.outcome,
+            Err(String::from("rust-analyzer is not running for this file"))
+        );
+        let sent = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(!sent.contains("rust-analyzer/"), "{sent}");
+        // And a file that is not open answers the same way.
+        handle.block_on(state.request_rust_analyzer(
+            9,
+            root.join("other.rs"),
+            RaRequest::ExpandMacro,
+            (0, 0),
+            &tx,
+        ));
+        let got = rx.recv_timeout(Duration::from_secs(5)).expect("an answer");
+        assert!(got.outcome.is_err());
     }
 
     /// #694: a language server the kernel kills (croft makes them its first

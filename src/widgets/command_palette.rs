@@ -78,6 +78,13 @@ pub enum Command {
     /// Git: Undo Last Commit (#1350): `reset --soft HEAD~1`, its message
     /// back in the Source Control box.
     GitUndoLastCommit,
+    /// rust-analyzer's own commands (#1626), listed only while it serves
+    /// the active file.
+    RustExpandMacro,
+    RustParentModule,
+    RustOpenCargoToml,
+    RustRebuildProcMacros,
+    RustReloadWorkspace,
     /// Pick a stash and open its changes (#1581).
     GitViewStash,
     AddCursorAbove,
@@ -586,6 +593,11 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::UnstageHunk,
     Command::RevertHunk,
     Command::GitUndoLastCommit,
+    Command::RustExpandMacro,
+    Command::RustParentModule,
+    Command::RustOpenCargoToml,
+    Command::RustRebuildProcMacros,
+    Command::RustReloadWorkspace,
     Command::GitViewStash,
     Command::AddCursorAbove,
     Command::AddCursorBelow,
@@ -1013,6 +1025,11 @@ impl Command {
             Command::UnstageHunk => "Git: Unstage Hunk",
             Command::RevertHunk => "Git: Revert Hunk",
             Command::GitUndoLastCommit => "Git: Undo Last Commit",
+            Command::RustExpandMacro => "Rust: Expand Macro Recursively at Caret",
+            Command::RustParentModule => "Rust: Locate Parent Module",
+            Command::RustOpenCargoToml => "Rust: Open Cargo.toml",
+            Command::RustRebuildProcMacros => "Rust: Rebuild Proc Macros and Build Scripts",
+            Command::RustReloadWorkspace => "Rust: Reload Workspace",
             Command::GitViewStash => "Git: View Stash\u{2026}",
             Command::AddCursorAbove => "Add Cursor Above",
             Command::AddCursorBelow => "Add Cursor Below",
@@ -1451,6 +1468,11 @@ impl Command {
             Command::UnstageHunk => "U in diff",
             Command::RevertHunk => "R in diff",
             Command::GitUndoLastCommit => "",
+            Command::RustExpandMacro
+            | Command::RustParentModule
+            | Command::RustOpenCargoToml
+            | Command::RustRebuildProcMacros
+            | Command::RustReloadWorkspace => "",
             Command::GitViewStash => "",
             Command::AddCursorAbove => "Cmd+Opt+↑",
             Command::AddCursorBelow => "Cmd+Opt+↓",
@@ -1870,6 +1892,11 @@ impl Command {
             Command::UnstageHunk => "unstage_hunk",
             Command::RevertHunk => "revert_hunk",
             Command::GitUndoLastCommit => "git_undo_last_commit",
+            Command::RustExpandMacro => "rust_expand_macro",
+            Command::RustParentModule => "rust_parent_module",
+            Command::RustOpenCargoToml => "rust_open_cargo_toml",
+            Command::RustRebuildProcMacros => "rust_rebuild_proc_macros",
+            Command::RustReloadWorkspace => "rust_reload_workspace",
             Command::GitViewStash => "git_view_stash",
             Command::AddCursorAbove => "add_cursor_above",
             Command::AddCursorBelow => "add_cursor_below",
