@@ -227,8 +227,18 @@ pub struct Snippet {
 
 impl Snippet {
     /// Whether this snippet applies to `language` (its scope is empty or names it).
+    ///
+    /// A `.jsx` file is `javascriptreact` and a `.jsonc` file `jsonc`, as in
+    /// VS Code (#1641), so their own snippets apply there. Snippets scoped to
+    /// the base language still apply too: before, croft called those files
+    /// `javascript` and `json`, and a user's existing snippets keep working.
     fn applies_to(&self, language: &str) -> bool {
-        self.scope.is_empty() || self.scope.iter().any(|s| s == language)
+        let base = match language {
+            "javascriptreact" => "javascript",
+            "jsonc" => "json",
+            other => other,
+        };
+        self.scope.is_empty() || self.scope.iter().any(|s| s == language || s == base)
     }
 }
 
@@ -438,6 +448,25 @@ pub const TEMPLATE: &str = r#"// croft user snippets. Keyed by name; each has a 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1641: `javascriptreact` and `jsonc` snippets apply to their own
+    /// language; snippets scoped to the base language still apply there,
+    /// and not the other way round.
+    #[test]
+    fn react_and_jsonc_scopes_take_their_base_language_too() {
+        let set = SnippetSet::from_json(
+            r#"{
+              "rfc": { "prefix": "rfc", "body": "x", "scope": "javascriptreact" },
+              "clg": { "prefix": "clg", "body": "y", "scope": "javascript" },
+              "key": { "prefix": "key", "body": "z", "scope": "json" }
+            }"#,
+        );
+        assert!(set.exact("rfc", "javascriptreact").is_some());
+        assert!(set.exact("clg", "javascriptreact").is_some());
+        assert!(set.exact("key", "jsonc").is_some());
+        assert!(set.exact("rfc", "javascript").is_none());
+        assert!(set.exact("clg", "typescriptreact").is_none());
+    }
 
     #[test]
     fn snippets_with_a_trailing_comma_or_block_comment_still_load() {
