@@ -2527,6 +2527,58 @@ pub enum SaveOutcome {
     /// undo cannot bring them back). The save was refused; the caller
     /// surfaces it and sets `lossy_save_armed` to write anyway.
     EncodingLoss,
+    /// The file is the user's own but has its write bit cleared (`chmod
+    /// 444`, #1379). The save was refused rather than replace a file its
+    /// owner protected; the caller asks and sets `overwrite_protected_armed`
+    /// to write anyway, with the file's mode put back afterwards.
+    WriteProtected,
+}
+
+/// Why a file refuses this user's writes (#1379).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteProtection {
+    /// The user owns it and has cleared its write bit: they may write it
+    /// once they say so, and croft restores the mode after.
+    Owned,
+    /// Someone else's file the user may not write (root's `/etc/hosts`):
+    /// only an elevated write can save it.
+    NotOwned,
+}
+
+/// Whether the file at `path` refuses this user's writes (#1379). A file
+/// the user owns is judged by its owner write bit, the way vim and VS Code
+/// do, so a `chmod 444` still reads as protected for root; anyone else's
+/// file by whether the kernel would let this process write it. A missing
+/// file is not protected: saving creates it.
+pub fn write_protection(path: &Path) -> Option<WriteProtection> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.uid() == unsafe { libc::geteuid() } {
+            return (meta.mode() & 0o200 == 0).then_some(WriteProtection::Owned);
+        }
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+        (unsafe { libc::access(c.as_ptr(), libc::W_OK) } != 0).then_some(WriteProtection::NotOwned)
+    }
+    #[cfg(not(unix))]
+    {
+        meta.permissions()
+            .readonly()
+            .then_some(WriteProtection::Owned)
+    }
+}
+
+/// Whether a failed save failed for want of permission (#1379), which an
+/// elevated write can get past where no retry would.
+pub fn is_permission_denied(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    })
 }
 
 /// Per-tab results of an FS-sync sweep across all open tabs
@@ -3554,6 +3606,13 @@ pub struct Editor {
     /// answering an `EncodingLoss` refusal. Set by the explicit-save path
     /// only (never by auto save) and consumed by the write it authorises.
     pub lossy_save_armed: bool,
+    /// The file refuses this user's writes (#1379): the tab wears a lock and
+    /// auto save leaves it alone. Read at open and after each save.
+    pub write_protected: bool,
+    /// One-shot consent to overwrite the user's own write-protected file,
+    /// answering a `WriteProtected` refusal. Set by the explicit-save path
+    /// only and consumed by the write it authorises.
+    pub overwrite_protected_armed: bool,
     /// When the buffer last changed, driving the auto-save delay. `None`
     /// until the first edit.
     pub last_edit_at: Option<std::time::Instant>,
@@ -3745,6 +3804,8 @@ impl Editor {
             disk_conflict: false,
             encoding_loss: false,
             lossy_save_armed: false,
+            write_protected: false,
+            overwrite_protected_armed: false,
             last_edit_at: None,
             last_edit_pos: None,
         }
@@ -5611,6 +5672,10 @@ impl Editor {
         // encoded as is no longer this tab's problem.
         self.encoding_loss = false;
         self.lossy_save_armed = false;
+        // Say up front that the file can't be written, not at the first
+        // save after the work is done (#1379).
+        self.write_protected = write_protection(path).is_some();
+        self.overwrite_protected_armed = false;
         self.lang = crate::highlight::lang_for_path(path);
         self.wrap_override = None;
         // Folds are line numbers into the OLD file. A preview tab is reused for
@@ -11089,13 +11154,29 @@ impl Editor {
             self.encoding_loss = true;
             return Ok(SaveOutcome::EncodingLoss);
         }
+        // A file its owner write-protected is not replaced without asking
+        // (#1379): the rename below would otherwise go straight past the
+        // missing write bit. Someone else's file goes on to fail with the
+        // kernel's own "Permission denied", which the caller turns into the
+        // offer of an elevated save.
+        let protection = write_protection(&path);
+        self.write_protected = protection.is_some();
+        let lift = protection == Some(WriteProtection::Owned);
+        if lift && !self.overwrite_protected_armed {
+            return Ok(SaveOutcome::WriteProtected);
+        }
         // The folder can go while the tab is open (a `git checkout` of a
         // branch without it, #1203). Put it back, as VS Code does, rather
         // than strand the edits; a path that can't be a folder still fails.
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)?;
         }
-        if let Err(e) = crate::prefs::replace_file_contents(&path, &encoded) {
+        let written = if lift {
+            Self::write_lifting_protection(&path, &encoded)
+        } else {
+            crate::prefs::replace_file_contents(&path, &encoded)
+        };
+        if let Err(e) = written {
             // Only a write that got as far as changing the file makes what
             // is on disk croft's own doing: a stale stamp then made the sync
             // sweep offer to "reload" it over the only good copy. An
@@ -11109,6 +11190,7 @@ impl Editor {
         self.decode_lossy = false;
         self.encoding_loss = false;
         self.lossy_save_armed = false;
+        self.overwrite_protected_armed = false;
         self.dirty = false;
         // The next keystroke opens a fresh undo step: coalescing across the
         // save point would make one Cmd+Z discard work from both sides.
@@ -11118,6 +11200,69 @@ impl Editor {
         // prior conflict is resolved.
         self.mark_synced_with_disk();
         Ok(SaveOutcome::Saved)
+    }
+
+    /// Overwrite the user's own write-protected file (#1379): give it the
+    /// owner write bit for the length of the write, then put its mode back,
+    /// whether or not the write landed, so the file stays protected.
+    fn write_lifting_protection(
+        path: &Path,
+        bytes: &[u8],
+    ) -> std::result::Result<(), crate::prefs::ReplaceError> {
+        let untouched = |error| crate::prefs::ReplaceError {
+            error,
+            touched: false,
+        };
+        let target = std::fs::canonicalize(path).map_err(untouched)?;
+        let mode = std::fs::metadata(&target).map_err(untouched)?.permissions();
+        let mut writable = mode.clone();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            writable.set_mode(mode.mode() | 0o200);
+        }
+        #[cfg(not(unix))]
+        #[allow(clippy::permissions_set_readonly_false)]
+        writable.set_readonly(false);
+        std::fs::set_permissions(&target, writable).map_err(untouched)?;
+        let written = crate::prefs::replace_file_contents(&target, bytes);
+        let restored = std::fs::set_permissions(&target, mode);
+        written?;
+        restored.map_err(|error| crate::prefs::ReplaceError {
+            error,
+            touched: true,
+        })
+    }
+
+    /// The bytes a save would write now, with the save-time `.editorconfig`
+    /// fixes applied to the buffer first, as a save applies them. None when
+    /// writing them would lose characters (see `SaveOutcome::EncodingLoss`).
+    pub fn prepare_bytes_for_save(&mut self) -> Option<Vec<u8>> {
+        self.apply_editorconfig_on_save();
+        let content = self.content_for_disk();
+        let (encoded, had_errors) = self.encode_for_disk(&content);
+        let writes_replacements = self.decode_lossy && content.contains('\u{fffd}');
+        (!had_errors && !writes_replacements).then_some(encoded)
+    }
+
+    /// Settle a save another process made on this tab's behalf (#1379's
+    /// `sudo tee`): when the file now holds exactly `written`, the buffer is
+    /// in sync with it, and clean unless it was edited since. Returns false,
+    /// changing nothing, while the file holds anything else.
+    pub fn settle_save_made_elsewhere(&mut self, written: &[u8]) -> bool {
+        let Some(path) = self.path.clone() else {
+            return false;
+        };
+        if std::fs::read(&path).ok().as_deref() != Some(written) {
+            return false;
+        }
+        self.dirty = self.bytes_for_disk().as_deref() != Some(written);
+        self.write_protected = write_protection(&path).is_some();
+        // A consent to overwrite was for a save this one has now made.
+        self.overwrite_protected_armed = false;
+        self.last_edit_kind = None;
+        self.mark_synced_with_disk();
+        true
     }
 
     pub fn move_up(&mut self) {
@@ -21287,6 +21432,12 @@ fn tab_label(e: &Editor) -> String {
     } else {
         name
     };
+    // The lock VS Code shows on a file the user can't write (#1379).
+    let name = if e.write_protected {
+        format!("{name} \u{f023}")
+    } else {
+        name
+    };
     if e.dirty {
         format!("\u{25cf} {name}")
     } else {
@@ -29814,6 +29965,140 @@ mod tests {
         e.lossy_save_armed = true;
         assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
         assert!(!e.decode_lossy);
+    }
+
+    /// #1379: a file its owner `chmod 444`ed.
+    #[cfg(unix)]
+    fn protected_file(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("nginx.conf");
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_protected_file_opens_locked_and_its_save_asks_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = protected_file(dir.path(), "listen 80;\n");
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        assert!(e.write_protected, "flagged at open, before any edit");
+        assert_eq!(tab_label(&e), "nginx.conf \u{f023}");
+        e.insert_char('#');
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::WriteProtected);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "listen 80;\n");
+        assert!(e.dirty, "the edit is still only in the buffer");
+        e.overwrite_protected_armed = true;
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "#listen 80;\n");
+        assert_eq!(mode_of(&path), 0o444, "the file stays protected");
+        assert!(
+            !e.overwrite_protected_armed,
+            "the consent was for one write"
+        );
+        assert!(e.write_protected);
+        assert!(!e.dirty);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overwriting_a_protected_file_through_a_symlink_keeps_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = protected_file(dir.path(), "a\n");
+        let link = dir.path().join("link.conf");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut e = Editor::new();
+        e.open(&link).unwrap();
+        assert!(e.write_protected);
+        e.insert_char('b');
+        e.overwrite_protected_armed = true;
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "ba\n");
+        assert_eq!(mode_of(&target), 0o444);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_writable_file_opens_unlocked_and_saves_at_once() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.conf");
+        std::fs::write(&path, "a\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        assert!(!e.write_protected);
+        assert_eq!(tab_label(&e), "site.conf");
+        e.insert_char('b');
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert_eq!(mode_of(&path), 0o644);
+        assert_eq!(write_protection(&dir.path().join("new.conf")), None);
+    }
+
+    #[test]
+    fn only_a_permission_error_reads_as_permission_denied() {
+        let denied =
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                .context("writing /etc/hosts");
+        assert!(is_permission_denied(&denied));
+        for other in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::StorageFull,
+            std::io::ErrorKind::Other,
+        ] {
+            let e = anyhow::Error::from(std::io::Error::from(other));
+            assert!(!is_permission_denied(&e), "{other:?}");
+        }
+        assert!(!is_permission_denied(&anyhow::anyhow!("permission denied")));
+    }
+
+    #[test]
+    fn a_save_made_elsewhere_settles_only_on_the_exact_bytes() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "old\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.insert_char('n');
+        e.overwrite_protected_armed = true;
+        let bytes = e.prepare_bytes_for_save().unwrap();
+        assert_eq!(bytes, b"nold\n");
+        std::fs::write(tmp.path(), "someone else\n").unwrap();
+        assert!(!e.settle_save_made_elsewhere(&bytes));
+        assert!(e.dirty);
+        std::fs::write(tmp.path(), &bytes).unwrap();
+        assert!(e.settle_save_made_elsewhere(&bytes));
+        assert!(!e.dirty);
+        assert!(
+            !e.disk_changed_externally(),
+            "the write is the buffer's own"
+        );
+        assert!(
+            !e.overwrite_protected_armed,
+            "a consent to overwrite does not outlive the save"
+        );
+    }
+
+    #[test]
+    fn an_edit_made_while_a_save_was_elsewhere_stays_dirty() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "old\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.insert_char('n');
+        let bytes = e.prepare_bytes_for_save().unwrap();
+        e.insert_char('m');
+        std::fs::write(tmp.path(), &bytes).unwrap();
+        assert!(e.settle_save_made_elsewhere(&bytes));
+        assert!(e.dirty, "the later edit is not on disk");
     }
 
     #[test]

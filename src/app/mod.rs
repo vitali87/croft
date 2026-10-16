@@ -3435,6 +3435,12 @@ pub struct App {
     /// on disk. The next `save()` overwrites anyway, giving the user a
     /// "press Cmd+S again to overwrite" escape hatch without a modal.
     force_save_armed: bool,
+    /// One-shot latch armed when a save failed for want of permission
+    /// (#1379): the next Cmd+S of that file saves it with sudo instead.
+    sudo_save_armed: Option<PathBuf>,
+    /// Saves handed to `sudo tee` in a terminal pane (#1379): each file and
+    /// the bytes it should end up holding, settled once it holds them.
+    pending_sudo_saves: Vec<(PathBuf, Vec<u8>, Option<i32>)>,
     pub terminals: Vec<PtyTerminal>,
     pub active_terminal: usize,
     perf: PerfHud,
@@ -6223,6 +6229,8 @@ impl App {
             editor,
             editor_layout: editor_layout::EditorLayout::single(),
             force_save_armed: false,
+            sudo_save_armed: None,
+            pending_sudo_saves: Vec::new(),
             terminals: vec![term],
             active_terminal: 0,
             perf: PerfHud::default(),
@@ -8172,6 +8180,7 @@ impl App {
     /// Returns true if any tab reloaded, failed, or entered conflict, so
     /// the caller redraws.
     fn reload_open_file_after_external_change(&mut self) -> bool {
+        let settled = self.settle_sudo_saves();
         let guest = self.is_collab_guest();
         let root = self.tree.root.clone();
         let skip = |p: &Path| guest && collab_file_key(&root, p).is_some();
@@ -8183,7 +8192,7 @@ impl App {
             report.failed.extend(extra.failed);
         }
         if report.is_empty() {
-            return false;
+            return settled;
         }
         // The active file changed on disk under a clean buffer: its coverage
         // marks describe the old text now, so they dim like an edit's (#263).
@@ -21554,9 +21563,15 @@ impl App {
             .unwrap_or_default();
         let mut seg_texts: Vec<String> = vec![
             format!(
-                " Ln {}, Col {}{coverage} ",
+                " Ln {}, Col {}{coverage}{} ",
                 self.editor.cursor_row + 1,
-                self.editor.cursor_col + 1
+                self.editor.cursor_col + 1,
+                // The file refuses this user's writes (#1379).
+                if self.editor.write_protected {
+                    " \u{b7} Read-only"
+                } else {
+                    ""
+                }
             ),
             format!(" {} ", self.editor.indent_style().label()),
             format!(" {} ", self.editor.encoding.name()),
@@ -53264,6 +53279,7 @@ impl App {
             Cmd::ClearBookmarks => self.clear_bookmarks(),
             Cmd::SaveFile => self.save(),
             Cmd::SaveAs => self.open_save_as_prompt(),
+            Cmd::SaveWithSudo => self.save_with_sudo(),
             Cmd::RevertFile => self.revert_file(),
             Cmd::SaveAll => self.save_all(),
             Cmd::NewUntitledFile => self.new_untitled_file(),
@@ -60299,6 +60315,9 @@ impl App {
                 // consent to the lossy write, so retrying here would just
                 // re-refuse every tick.
                 && !e.encoding_loss
+                // A file the user can't write, or protected from writes,
+                // is only ever saved on an explicit Cmd+S (#1379).
+                && !e.write_protected
                 // A merge with conflicts still open: its Result holds only
                 // the base text there, and writing it would drop both
                 // sides from disk. Complete Merge (or an explicit Cmd+S) is
@@ -60360,6 +60379,9 @@ impl App {
                     // this tick is the one chance to say why it stopped
                     // saving. Never arms the lossy write — consent is the
                     // explicit path's alone.
+                    // The refusal set `write_protected`, which keeps the
+                    // tab out of `due`: the lock on its tab says why.
+                    Ok(crate::widgets::editor::SaveOutcome::WriteProtected) => {}
                     Ok(crate::widgets::editor::SaveOutcome::EncodingLoss) => {
                         if let Some(p) = e.path.as_ref()
                             && !lossy_paths.contains(p)
@@ -62119,20 +62141,19 @@ impl App {
         // link down, reconnect pending): with nobody to defer to, blocking
         // strands the offline work in RAM for the whole outage. And when
         // the owner left (#1147): there is nobody to save for this guest.
-        if self.is_collab_guest()
-            && self
-                .editor
-                .path
-                .as_ref()
-                .and_then(|p| collab_file_key(&self.tree.root, p))
-                .is_some_and(|file| {
-                    self.collab
-                        .as_ref()
-                        .is_some_and(|s| !s.is_local_only(&file) && !s.owner_gone())
-                })
-        {
+        if self.owner_saves_active_file() {
             self.status =
                 String::from("Shared file: the session owner saves (your edits are already live)");
+            return;
+        }
+        // A save refused for want of permission arms the sudo route for the
+        // next Cmd+S of that file (#1379).
+        if self
+            .sudo_save_armed
+            .take()
+            .is_some_and(|p| self.editor.path.as_ref() == Some(&p))
+        {
+            self.save_with_sudo();
             return;
         }
         // A previously-refused save arms a one-shot override: the very next
@@ -62159,10 +62180,14 @@ impl App {
                     self.force_save_armed = true;
                     self.prompt_encoding_loss();
                 }
+                Ok(SaveOutcome::WriteProtected) => {
+                    self.force_save_armed = true;
+                    self.prompt_write_protected();
+                }
                 Ok(SaveOutcome::DiskConflict) => {
                     unreachable!("force save never reports a conflict")
                 }
-                Err(e) => self.status = format!("Save failed: {e}"),
+                Err(e) => self.report_save_error(e),
             }
             return;
         }
@@ -62796,6 +62821,12 @@ impl App {
                     editor.encoding.name()
                 );
             }
+            Ok(SaveOutcome::WriteProtected) => {
+                self.status = format!(
+                    "{} not saved: it is write-protected - open the tab and press Cmd+S twice to overwrite it",
+                    path.display()
+                );
+            }
             Err(e) => self.status = format!("Save failed: {e}"),
         }
     }
@@ -62826,8 +62857,212 @@ impl App {
                 );
             }
             Ok(SaveOutcome::EncodingLoss) => self.prompt_encoding_loss(),
-            Err(e) => self.status = format!("Save failed: {e}"),
+            Ok(SaveOutcome::WriteProtected) => self.prompt_write_protected(),
+            Err(e) => self.report_save_error(e),
         }
+    }
+
+    /// A save of the user's own write-protected file was refused (#1379).
+    /// Arm the one-shot consent and say what the next Cmd+S will do, the
+    /// press-again flow a disk conflict uses.
+    fn prompt_write_protected(&mut self) {
+        self.editor.overwrite_protected_armed = true;
+        let name = self
+            .editor
+            .path
+            .as_deref()
+            .map(|p| self.status_path(p))
+            .unwrap_or_default();
+        self.status = format!(
+            "{name} is write-protected - press Cmd+S again to overwrite it (its permissions are put back after), or use File: Save As…"
+        );
+    }
+
+    /// Whether the active tab is a collab-shared file this guest must leave
+    /// to the session owner to write (see `save`).
+    fn owner_saves_active_file(&self) -> bool {
+        self.is_collab_guest()
+            && self
+                .editor
+                .path
+                .as_ref()
+                .and_then(|p| collab_file_key(&self.tree.root, p))
+                .is_some_and(|file| {
+                    self.collab
+                        .as_ref()
+                        .is_some_and(|s| !s.is_local_only(&file) && !s.owner_gone())
+                })
+    }
+
+    /// Report a failed explicit save. One that failed for want of
+    /// permission offers the sudo route on the next Cmd+S (#1379): saving
+    /// again as the same user could only fail again.
+    fn report_save_error(&mut self, e: anyhow::Error) {
+        if cfg!(unix)
+            && crate::widgets::editor::is_permission_denied(&e)
+            && let Some(path) = self.editor.path.clone()
+        {
+            self.status = format!(
+                "Save failed: you can't write {} - press Cmd+S again to save it with sudo in a terminal",
+                self.status_path(&path)
+            );
+            self.sudo_save_armed = Some(path);
+            return;
+        }
+        self.status = format!("Save failed: {e}");
+    }
+
+    /// File: Save with Sudo (#1379): hand the buffer to `sudo tee` in a new
+    /// terminal pane. sudo asks for the password there, so croft never sees
+    /// it, and `tee` writes the file in place, so it keeps its owner and
+    /// mode. The tab turns clean once the file holds the buffer's bytes.
+    fn save_with_sudo(&mut self) {
+        // A consent to overwrite an external change lasts one press, as in
+        // `save`.
+        let overwrite = std::mem::take(&mut self.force_save_armed);
+        if self.owner_saves_active_file() {
+            self.status =
+                String::from("Shared file: the session owner saves (your edits are already live)");
+            return;
+        }
+        if self.editor.has_non_text_view() {
+            self.status = String::from("Save with Sudo works on text tabs");
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Save with Sudo needs a file: use File: Save As… first");
+            return;
+        };
+        if !cfg!(unix) {
+            self.status = String::from("Save with Sudo needs sudo, which this system lacks");
+            return;
+        }
+        // The command line takes the path as text, so a name that is not
+        // valid UTF-8 could only be passed mangled, writing another file.
+        let Some(target) = path.to_str().map(str::to_owned) else {
+            self.status = String::from(
+                "Save with Sudo can't pass this file's name to the shell: it is not valid UTF-8",
+            );
+            return;
+        };
+        // Another process wrote the file since it was read: overwriting
+        // that takes the same press-again consent a plain save asks for.
+        if !overwrite && (self.editor.disk_conflict || self.editor.disk_changed_externally()) {
+            self.editor.disk_conflict = true;
+            self.force_save_armed = true;
+            self.sudo_save_armed = Some(path.clone());
+            self.status = format!(
+                "{} changed on disk since you opened it - press Cmd+S again to overwrite it with sudo, or close the tab to keep the disk version",
+                self.status_path(&path)
+            );
+            return;
+        }
+        // A sudo save of this file still waiting in its terminal could
+        // finish after this one and put the older bytes back.
+        if self
+            .pending_sudo_saves
+            .iter()
+            .find(|(p, ..)| *p == path)
+            .and_then(|(.., pane)| *pane)
+            .is_some_and(|pane| self.terminals.iter().any(|t| t.shell_pid() == Some(pane)))
+        {
+            self.status = format!(
+                "A sudo save of {} is still waiting in its terminal: finish it there, or close that terminal first",
+                self.status_path(&path)
+            );
+            return;
+        }
+        let Some(bytes) = self.editor.prepare_bytes_for_save() else {
+            self.status = format!(
+                "Not saved: {} can't hold every character in this file - switch encoding via the status bar",
+                self.editor.encoding.name()
+            );
+            return;
+        };
+        let staged = match stage_sudo_save(&bytes) {
+            Ok(staged) => staged,
+            Err(e) => {
+                self.status = format!("Save with Sudo failed: {e}");
+                return;
+            }
+        };
+        let command = sudo_save_command(&target, &staged.to_string_lossy());
+        let cwd = self.workspace_root().to_path_buf();
+        match PtyTerminal::new(&cwd) {
+            Ok(mut term) => {
+                term.set_manual_name(Some(String::from("sudo save")));
+                let pane = term.shell_pid();
+                // Tests stop short of running sudo for real.
+                if !cfg!(test) {
+                    term.write_input(format!("{command}\r").as_bytes());
+                }
+                self.insert_terminal(term);
+                self.show_terminal = true;
+                self.bottom_panel_tab = BottomPanelTab::Terminal;
+                self.focus_pane(Pane::Terminal);
+                self.pending_sudo_saves.retain(|(p, ..)| *p != path);
+                self.pending_sudo_saves.push((path.clone(), bytes, pane));
+                self.status = format!(
+                    "Saving {} with sudo: enter your password in the terminal",
+                    self.status_path(&path)
+                );
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&staged);
+                self.status = format!("Could not open a terminal: {e}");
+            }
+        }
+    }
+
+    /// Settle the sudo saves whose file now holds what was handed to `tee`
+    /// (#1379): those tabs are saved, not changed on disk. Runs before the
+    /// external-change sweep, which would otherwise take the write for
+    /// someone else's and raise a conflict over the user's own save. A save
+    /// whose tab is gone is dropped; one still in flight waits. Returns
+    /// whether a tab was settled.
+    fn settle_sudo_saves(&mut self) -> bool {
+        if self.pending_sudo_saves.is_empty() {
+            return false;
+        }
+        let mut saved = Vec::new();
+        for (path, bytes, pane) in std::mem::take(&mut self.pending_sudo_saves) {
+            let mut open = false;
+            let mut settled = None;
+            for e in std::iter::once(&mut self.editor)
+                .chain(self.editor_layout.inactive_groups_mut())
+                .flat_map(|g| g.editors.iter_mut())
+                .filter(|e| e.path.as_ref() == Some(&path))
+            {
+                open = true;
+                if e.settle_save_made_elsewhere(&bytes) && settled.is_none() {
+                    settled = Some((
+                        e.provenance_to_record(),
+                        e.bytes_for_disk(),
+                        e.lines.join("\n"),
+                    ));
+                }
+            }
+            if let Some((seats, described, text)) = settled {
+                saved.push((path, seats, described, text));
+            } else if open {
+                self.pending_sudo_saves.push((path, bytes, pane));
+            }
+        }
+        let Some(last) = saved.last().map(|(path, ..)| path.clone()) else {
+            return false;
+        };
+        // Set first: a reloaded config file reports on itself.
+        self.status = format!("Saved {} with sudo", self.status_path(&last));
+        // The same follow-ups as every other save path.
+        for (path, seats, described, text) in saved {
+            self.reload_config_for_path(&path);
+            self.approve_saved_edit(&path);
+            if let Some(lsp) = self.lsp.as_ref() {
+                lsp.save_doc(path.clone(), text);
+            }
+            self.record_history_snapshot_of(&path, seats, described);
+        }
+        true
     }
 
     /// An explicit save was refused because the encoding cannot represent the
@@ -64889,6 +65124,7 @@ impl App {
                 Ok(SaveOutcome::EncodingLoss) => {
                     format!("{} cannot hold every character", ed.encoding.name())
                 }
+                Ok(SaveOutcome::WriteProtected) => String::from("write-protected"),
                 Err(e) => e.to_string(),
             };
             left.push((Some(path), why));
@@ -69978,6 +70214,10 @@ impl App {
             Ok(SaveOutcome::EncodingLoss) => Err(format!(
                 "Some characters can't be written as {}",
                 self.editor.encoding.name()
+            )),
+            Ok(SaveOutcome::WriteProtected) => Err(format!(
+                "{} is write-protected: choose another name",
+                path.display()
             )),
             Ok(SaveOutcome::DiskConflict) => unreachable!("save_as never checks for a conflict"),
             Err(e) => Err(format!("Save failed: {e}")),
@@ -75299,6 +75539,57 @@ fn repo_relative(repo_root: &Path, path: &Path) -> Option<String> {
             .collect::<Vec<_>>()
             .join("/"),
     )
+}
+
+/// The shell line a sudo save runs (#1379): `tee` copies the staged bytes
+/// into `target` as root, writing in place so the file keeps its owner and
+/// mode, and the staged copy is removed whether or not that worked.
+fn sudo_save_command(target: &str, staged: &str) -> String {
+    let q = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
+    format!(
+        "sudo tee -- {} < {} > /dev/null; rm -f -- {}",
+        q(target),
+        q(staged),
+        q(staged)
+    )
+}
+
+/// Stage the bytes a sudo save writes (#1379) in a fresh file only this
+/// user can read, since they may be a protected file's contents.
+fn stage_sudo_save(bytes: &[u8]) -> std::io::Result<PathBuf> {
+    use std::io::Write as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let dir = std::env::temp_dir();
+    let mut last = None;
+    for seq in 0..16 {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let path = dir.join(format!(
+            "croft-sudo-save-{}-{seq}-{nonce:08x}",
+            std::process::id()
+        ));
+        match opts.open(&path) {
+            Ok(mut file) => {
+                return match file.write_all(bytes).and_then(|()| file.flush()) {
+                    Ok(()) => Ok(path),
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&path);
+                        Err(e)
+                    }
+                };
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("no free staging name")))
 }
 
 /// The workspace-relative key a file replicates under in a collab session
