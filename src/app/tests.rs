@@ -15185,11 +15185,14 @@ fn ctrl_enter_leaves_other_buffers_and_other_enters_alone() {
     app.handle_key(key(KeyCode::Enter, KeyModifiers::CONTROL))
         .unwrap();
     assert!(app.pending_run_block.is_none());
-    assert_eq!(
-        app.editor.lines,
-        ["abc", "def"],
-        "outside Markdown: a line break"
-    );
+    // Outside Markdown it is Insert Line Below (#1571); on macOS `Ctrl`
+    // stays the terminal's, so there it is a plain line break.
+    let want: &[&str] = if cfg!(target_os = "macos") {
+        &["abc", "def"]
+    } else {
+        &["abcdef", ""]
+    };
+    assert_eq!(app.editor.lines, want, "outside Markdown: no run");
 
     for mods in [
         KeyModifiers::CONTROL | KeyModifiers::SHIFT,
@@ -15211,6 +15214,126 @@ fn ctrl_enter_leaves_other_buffers_and_other_enters_alone() {
             );
         }
     }
+}
+
+/// #1571: `Ctrl`+`Enter` (`Cmd`+`Enter` on macOS) is VS Code's Insert Line
+/// Below: the caret mid-line opens an indented line under it and leaves the
+/// current line whole. It used to split the line like `Enter`.
+#[test]
+fn cmd_enter_inserts_a_line_below_without_splitting_the_line() {
+    let chords = if cfg!(target_os = "macos") {
+        vec![KeyModifiers::SUPER]
+    } else {
+        vec![KeyModifiers::CONTROL, KeyModifiers::SUPER]
+    };
+    for mods in chords {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_open_file(tmp.path(), "i.py", "total = price * qty\nprint(total)\n");
+        app.editor.cursor_row = 0;
+        app.editor.cursor_col = 8;
+        app.handle_key(key(KeyCode::Enter, mods)).unwrap();
+        assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 0));
+        app.handle_key(key(KeyCode::Char('X'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(
+            app.editor.lines,
+            ["total = price * qty", "X", "print(total)"],
+            "{mods:?}+Enter"
+        );
+        assert_eq!(app.status, "Opened line below");
+    }
+}
+
+/// #1571: the new line takes the current line's indent, as VS Code's does.
+#[test]
+fn cmd_enter_keeps_the_indent_of_the_current_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "i.py", "def f():\n    x = 1\n");
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 5;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.editor.lines, ["def f():", "    x = 1", "    "]);
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 4));
+}
+
+/// Negatives (#1571): a bare `Enter` still splits the line, `Cmd`+`Shift`+
+/// `Enter` still opens a line above, `Cmd`+`O` stays an alias for below, and
+/// in a Markdown fence `Cmd`+`Enter` still runs the block.
+#[test]
+fn other_enters_and_the_markdown_fence_keep_their_meaning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body = "total = price * qty\nprint(total)\n";
+    for (mods, code, want) in [
+        (
+            KeyModifiers::NONE,
+            KeyCode::Enter,
+            ["total = ", "price * qty", "print(total)"],
+        ),
+        (
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+            KeyCode::Enter,
+            ["", "total = price * qty", "print(total)"],
+        ),
+        (
+            KeyModifiers::SUPER,
+            KeyCode::Char('o'),
+            ["total = price * qty", "", "print(total)"],
+        ),
+    ] {
+        let mut app = app_with_open_file(tmp.path(), "i.py", body);
+        app.editor.cursor_row = 0;
+        app.editor.cursor_col = 8;
+        app.handle_key(key(code, mods)).unwrap();
+        assert_eq!(app.editor.lines, want, "{mods:?}+{code:?}");
+    }
+
+    let mut app = markdown_fence_app(tmp.path());
+    let before = app.editor.lines.clone();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.pending_run_block.is_some(), "the fence still runs");
+    assert_eq!(app.editor.lines, before, "no line inserted");
+}
+
+/// #1571: in Markdown prose, outside every runnable fence, `Cmd`+`Enter`
+/// is Insert Line Below; only a runnable fence under the caret claims it.
+#[test]
+fn cmd_enter_in_markdown_prose_inserts_a_line_below() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = markdown_fence_app(tmp.path());
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 2;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.pending_run_block.is_none());
+    assert_eq!(app.status, "Opened line below");
+    assert_eq!(app.editor.lines[..3], ["# Run", "", ""]);
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 0));
+}
+
+/// #1571: Insert Line Below / Above are palette commands with ids, so they
+/// can be found and rebound.
+#[test]
+fn insert_line_below_and_above_are_palette_commands() {
+    use crate::widgets::command_palette::Command;
+    assert_eq!(
+        Command::from_id("insert_line_below"),
+        Some(Command::InsertLineBelow)
+    );
+    assert_eq!(
+        Command::from_id("insert_line_above"),
+        Some(Command::InsertLineAbove)
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "i.py", "a = 1\nb = 2\n");
+    app.editor.cursor_col = 2;
+    assert!(run_from_palette(&mut app, "Insert Line Below"));
+    assert_eq!(app.editor.lines, ["a = 1", "", "b = 2"]);
+    app.editor.cursor_row = 2;
+    assert!(run_from_palette(&mut app, "Insert Line Above"));
+    assert_eq!(app.editor.lines, ["a = 1", "", "", "b = 2"]);
+    assert_eq!(app.editor.cursor_row, 2);
 }
 
 /// Guard (#843): Cmd+E (vim mode) gets no `Ctrl` form, because `Ctrl`+`E` is
@@ -33668,17 +33791,16 @@ fn clicking_a_fence_play_glyph_runs_it_in_a_named_pane() {
     );
     app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
         .unwrap();
-    // Outside any fence it explains itself instead of running.
+    // Outside any fence it is Insert Line Below (#1571), never a run.
     app.focus_pane(super::Pane::Editor);
     app.editor.cursor_row = 6; // "Text between."
+    let lines = app.editor.lines.len();
     app.handle_key(key(KeyCode::Enter, KeyModifiers::SUPER))
         .unwrap();
     assert!(app.pending_run_block.is_none());
-    assert!(
-        app.status.contains("inside a runnable shell fence"),
-        "{}",
-        app.status
-    );
+    assert_eq!(app.status, "Opened line below");
+    assert_eq!(app.editor.lines.len(), lines + 1);
+    assert_eq!(app.editor.cursor_row, 7);
     // Cmd+Shift+Enter is the editor's "insert line above", never a run.
     assert!(!super::is_run_fence_key(key(
         KeyCode::Enter,
