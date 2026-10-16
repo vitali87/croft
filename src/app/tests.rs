@@ -88372,6 +88372,156 @@ fn move_editor_into_next_group_splits_then_previous_brings_it_back() {
     assert_eq!(active_name_1565(&app), "c.py");
 }
 
+/// The issue's file (#1625) with the caret at the end of `def add(a, b):`
+/// and the stub's suggestion live there.
+fn app_with_body_suggestion(tmp: &std::path::Path) -> App {
+    let mut app = app_with_open_file(tmp, "m.py", "def add(a, b):\n\n\nprint(add(1, 2))\n");
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 14;
+    let seq = app.editor.edit_seq;
+    app.editor.ghost = Some((
+        0,
+        14,
+        seq,
+        String::from("\n    total = a + b\n    return total"),
+    ));
+    app
+}
+
+/// The screen as rows, at `w` x `h`.
+fn screen_rows(app: &mut App, w: u16, h: u16) -> Vec<String> {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    screen_text(&term).lines().map(str::to_string).collect()
+}
+
+/// #1625: every line of a multi-line suggestion is painted under the
+/// caret's line, where only a "(+2 lines)" count stood, and the buffer's
+/// own next lines move down below it.
+#[test]
+fn a_multi_line_suggestion_paints_every_line_under_the_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_body_suggestion(tmp.path());
+    let before = app.editor.lines.clone();
+    let rows = screen_rows(&mut app, 120, 30);
+    let at = |needle: &str| {
+        rows.iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} is on screen:\n{}", rows.join("\n")))
+    };
+    let def = at("def add(a, b):");
+    assert_eq!(at("total = a + b"), def + 1);
+    assert_eq!(at("return total"), def + 2);
+    assert!(
+        at("print(add(1, 2))") > def + 2,
+        "the buffer's lines move down"
+    );
+    assert!(!rows.iter().any(|r| r.contains("(+2 lines)")));
+    assert_eq!(app.editor.lines, before, "nothing is inserted by painting");
+}
+
+/// #1625 negative: a suggestion taller than the rows below the caret
+/// shows what fits and counts only the lines that did not.
+#[test]
+fn a_suggestion_taller_than_the_pane_counts_the_lines_left_over() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_body_suggestion(tmp.path());
+    let seq = app.editor.edit_seq;
+    let body: String = (1..=60).map(|i| format!("\n    x{i} = {i}")).collect();
+    app.editor.ghost = Some((0, 14, seq, body));
+    let rows = screen_rows(&mut app, 120, 30);
+    let shown = (1..=60)
+        .filter(|i| rows.iter().any(|r| r.contains(&format!("x{i} = {i}"))))
+        .count();
+    assert!(shown > 0 && shown < 60, "{shown} shown");
+    let more = 60 - shown;
+    let suffix = format!("(+{more} lines)");
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("def add(a, b):") && r.contains(&suffix)),
+        "{suffix} on the caret row:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// #1625: Ctrl+Right takes the next word of the suggestion (here the line
+/// break, the indent and `total`) and leaves the rest live at the caret.
+#[test]
+fn ctrl_right_takes_the_next_word_and_keeps_the_rest_live() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_body_suggestion(tmp.path());
+    app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "def add(a, b):");
+    assert_eq!(app.editor.lines[1], "    total");
+    assert_eq!(app.editor.live_ghost(), Some(" = a + b\n    return total"));
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[1], "    total = a + b");
+    assert_eq!(app.editor.lines[2], "    return total");
+    assert!(app.editor.live_ghost().is_none());
+}
+
+/// #1625: the caret a Ctrl+Right leaves a remainder at counts as asked,
+/// so Esc on that remainder does not send a fresh request there.
+#[test]
+fn escaping_a_partly_taken_suggestion_does_not_ask_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_body_suggestion(tmp.path());
+    app.inline_config = Some(crate::inline_complete::Config {
+        backend: crate::inline_complete::Backend::Claude {
+            base_url: String::from("http://127.0.0.1:1"),
+            api_key: String::from("test-key"),
+        },
+        model: String::from("claude-opus-5"),
+    });
+    app.inline_worker = Some(crate::inline_complete::Worker::spawn());
+    app.inline_enabled = true;
+    app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.editor.live_ghost().is_some(), "a remainder is live");
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.live_ghost().is_none());
+    app.editor.last_edit_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+    let first = app.inline_next_id;
+    for _ in 0..5 {
+        app.tick_inline_complete();
+    }
+    assert_eq!(app.inline_next_id, first, "no request after Esc");
+}
+
+/// #1625: Ctrl+Down takes one line of the suggestion at a time.
+#[test]
+fn ctrl_down_takes_the_suggestion_a_line_at_a_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_body_suggestion(tmp.path());
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.editor.lines[1], "    total = a + b");
+    assert_eq!(app.editor.live_ghost(), Some("\n    return total"));
+    assert_eq!(app.editor.lines[2], "", "the next line is not taken yet");
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.editor.lines[2], "    return total");
+    assert!(app.editor.live_ghost().is_none(), "nothing is left");
+}
+
+/// #1625 negative: with no suggestion live, Ctrl+Right is the usual word
+/// move and edits nothing.
+#[test]
+fn ctrl_right_without_a_suggestion_moves_by_word_and_edits_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "m.py", "def add(a, b):\n");
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "def add(a, b):");
+    assert!(app.editor.cursor_col > 0, "the caret moved by a word");
+    assert!(!app.editor.dirty);
+}
+
 /// Serve one `croft edit` request for `path` at `at` through a socket pair.
 fn serve_view_request_1606(
     app: &mut App,
