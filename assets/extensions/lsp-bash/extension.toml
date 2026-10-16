@@ -1,8 +1,10 @@
 # Bundled croft extension: Bash / shell language support.
 # bash-language-server is invoked via its `start` subcommand (not a --stdio
 # flag). It optionally shells out to `shellcheck` for linting when shellcheck is
-# on PATH; croft does not provision shellcheck (a system binary), so linting is
-# a no-op until the user installs it. croft owns an npm-installed copy pinned
+# on PATH, and formats only through `shfmt`. croft provisions neither (system
+# binaries), so without them linting and formatting are no-ops; croft says so
+# (a one-time notice on opening a script, and Format Document's status, #1511)
+# rather than report the script as clean or already formatted. croft owns an npm-installed copy pinned
 # for local/remote parity; a global bash-language-server on PATH is the fallback
 # (see src/lsp/install.rs).
 id = "lsp-bash"
