@@ -108,6 +108,8 @@ Per platform:
 | `Cmd+K` `Cmd+0` | Fold All: collapse every foldable block in the buffer |
 | `Cmd+K` `Cmd+J` | Unfold All: expand every collapsed block |
 | `Cmd+K` `Cmd+/` | Fold All Block Comments: collapse every comment-kind fold (the server's comment spans, or runs of ≥2 full-line comments in the fallback) |
+| `Cmd+K` `Cmd+1` … `Cmd+K` `Cmd+7` | Fold Level 1–7: collapse every fold that many levels deep or deeper and leave the outer ones open, so Fold Level 2 on a module shows its classes and their methods' headers with the bodies collapsed |
+| Command Palette: `Fold Recursively` / `Unfold Recursively` | Collapse or expand the fold at the cursor together with every fold inside it. Palette only (VS Code's `Cmd+K Cmd+[` / `]` collapse and restore terminal panes here); bind `fold_recursively` / `unfold_recursively` for a key |
 | `Cmd+K` `Cmd+8` / `Cmd+K` `Cmd+9` | Fold / Unfold All Regions: collapse or expand every `#region … #endregion` pair (`// region` and friends count; nesting pairs innermost-first) |
 | Command Palette: `View: Toggle Indent Guides` | Show/hide the editor's indentation guides (vertical lines at each indent level, the cursor's block highlighted; on by default, persisted, also in Settings) |
 | Command Palette: `Editor: Toggle Bracket Pair Colorization` | Colour brackets by nesting depth, unmatched closers in red; strings and comments keep plain brackets (on by default, persisted, also in Settings) |

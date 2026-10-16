@@ -10477,6 +10477,103 @@ impl Editor {
         }
     }
 
+    /// Every foldable header with its range's end and its nesting level, in
+    /// line order (#1653): level 1 is outermost, and a header inside another
+    /// header's range is one level deeper.
+    fn fold_headers_with_levels(&self) -> Vec<(usize, usize, usize)> {
+        let mut out = Vec::new();
+        // The ends of the ranges enclosing the line being scanned.
+        let mut open: Vec<usize> = Vec::new();
+        for header in 0..self.lines.len() {
+            let Some((_, end)) = self.fold_range(header) else {
+                continue;
+            };
+            while open.last().is_some_and(|&e| e < header) {
+                open.pop();
+            }
+            out.push((header, end, open.len() + 1));
+            open.push(end);
+        }
+        out
+    }
+
+    /// Collapse every fold exactly `level` deep and leave the others as they
+    /// are (VS Code "Fold Level N", Cmd+K Cmd+N, #1653): a deeper fold is
+    /// hidden inside its collapsed parent anyway, and keeping its own state
+    /// means opening the parent again shows it as it was. Fold
+    /// Level 2 on a module keeps its classes and their methods' headers in
+    /// view with the bodies collapsed, the overview Fold All cannot give
+    /// since it collapses the outermost block too. The cursor snaps up to the
+    /// nearest visible line, as for Fold All.
+    pub fn fold_level(&mut self, level: usize) {
+        self.refresh_fold_tables();
+        let headers: Vec<usize> = self
+            .fold_headers_with_levels()
+            .into_iter()
+            .filter(|&(_, _, l)| l == level)
+            .map(|(h, _, _)| h)
+            .collect();
+        if headers.is_empty() {
+            return;
+        }
+        self.folded.extend(headers);
+        self.fold_epoch_lines = self.lines.len();
+        self.rebuild_hidden_ranges();
+        while self.cursor_row > 0 && self.is_line_hidden(self.cursor_row) {
+            self.cursor_row -= 1;
+        }
+        let len = self.line_char_len(self.cursor_row);
+        self.cursor_col = self.cursor_col.min(len);
+    }
+
+    /// Collapse the fold owning `line` and every fold inside it (VS Code
+    /// "Fold Recursively", #1653), so unfolding it later shows its inner
+    /// blocks collapsed. The cursor snaps to the header when it was inside.
+    pub fn fold_recursively(&mut self, line: usize) {
+        self.refresh_fold_tables();
+        let Some(header) = self.enclosing_fold_header(line) else {
+            return;
+        };
+        let Some((start, end)) = self.fold_range(header) else {
+            return;
+        };
+        let inner: Vec<usize> = (start..=end).filter(|&l| self.is_foldable(l)).collect();
+        self.folded.extend(inner);
+        self.fold_epoch_lines = self.lines.len();
+        self.rebuild_hidden_ranges();
+        if self.is_line_hidden(self.cursor_row) {
+            self.cursor_row = header;
+            let len = self.line_char_len(header);
+            self.cursor_col = self.cursor_col.min(len);
+        }
+    }
+
+    /// Expand the fold owning `line` and every fold inside it (VS Code
+    /// "Unfold Recursively", #1653). Folds outside its range stay as they
+    /// are.
+    pub fn unfold_recursively(&mut self, line: usize) {
+        self.refresh_fold_tables();
+        let Some(header) = self.enclosing_fold_header(line) else {
+            return;
+        };
+        let Some((start, end)) = self.fold_range(header) else {
+            return;
+        };
+        let inner: Vec<usize> = self
+            .folded
+            .iter()
+            .copied()
+            .filter(|h| (start..=end).contains(h))
+            .collect();
+        if inner.is_empty() {
+            return;
+        }
+        for h in inner {
+            self.folded.remove(&h);
+        }
+        self.rebuild_hidden_ranges();
+    }
+
     /// Expand every fold (VS Code "Unfold All", Cmd+K Cmd+J).
     pub fn unfold_all(&mut self) {
         self.folded.clear();
