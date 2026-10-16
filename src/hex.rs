@@ -48,6 +48,35 @@ pub struct HexLayout {
     pub ascii_x: u16,
 }
 
+/// A hex tab's find query: the bytes to look for, and whether they were
+/// typed as text, so the status line can say which reading was used
+/// (#1644).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindQuery {
+    pub needle: Vec<u8>,
+    pub as_text: bool,
+}
+
+impl FindQuery {
+    /// What was searched for, as the status line names it: `text "1234"`
+    /// or `bytes 12 34`, the bytes cut short past eight.
+    pub fn describe(&self) -> String {
+        if self.as_text {
+            return format!("text \"{}\"", String::from_utf8_lossy(&self.needle));
+        }
+        let mut hex: Vec<String> = self
+            .needle
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        if self.needle.len() > 8 {
+            hex.push(String::from("\u{2026}"));
+        }
+        format!("bytes {}", hex.join(" "))
+    }
+}
+
 pub struct HexView {
     pub file_len: u64,
     /// First visible 16-byte (or 8-byte) row.
@@ -60,7 +89,7 @@ pub struct HexView {
     /// Bytes-per-row the render actually used; navigation follows it.
     pub bytes_per_row: u64,
     /// Last submitted find query, for "find next".
-    pub last_find: Option<Vec<u8>>,
+    pub last_find: Option<FindQuery>,
     pub layout: HexLayout,
     /// Overwrite-mode edits not yet written to disk (#173): offset →
     /// replacement byte, sparse over the windowed reader so a
@@ -260,22 +289,38 @@ impl HexView {
     /// Parse a find query: whitespace-separated hex byte pairs when the
     /// whole query reads as hex ("de ad be ef", "DEADBEEF"), else the
     /// query's literal UTF-8 bytes.
-    pub fn parse_find_query(q: &str) -> Option<Vec<u8>> {
+    ///
+    /// Text that happens to be hex-shaped ("1234", "2024", "cafe") could
+    /// not be searched as text at all (#1644), so two things read a query
+    /// as text whatever its shape: double quotes around it (`"1234"`), and
+    /// a search started from the text column (`text_side`, the ASCII
+    /// gutter Tab moves typing to), where the user is looking at text.
+    pub fn parse_find_query(q: &str, text_side: bool) -> Option<FindQuery> {
+        let text = |t: &str| {
+            (!t.is_empty()).then(|| FindQuery {
+                needle: t.as_bytes().to_vec(),
+                as_text: true,
+            })
+        };
+        if let Some(quoted) = q.trim().strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+            return text(quoted);
+        }
         let stripped: String = q.chars().filter(|c| !c.is_whitespace()).collect();
-        if !stripped.is_empty()
+        if !text_side
+            && !stripped.is_empty()
             && stripped.len().is_multiple_of(2)
             && stripped.chars().all(|c| c.is_ascii_hexdigit())
         {
-            let bytes = (0..stripped.len())
+            let needle = (0..stripped.len())
                 .step_by(2)
                 .map(|i| u8::from_str_radix(&stripped[i..i + 2], 16).unwrap())
                 .collect();
-            return Some(bytes);
+            return Some(FindQuery {
+                needle,
+                as_text: false,
+            });
         }
-        if q.is_empty() {
-            return None;
-        }
-        Some(q.as_bytes().to_vec())
+        text(q)
     }
 
     /// Streaming forward search from `from` (exclusive of a match AT
@@ -648,22 +693,59 @@ mod tests {
 
     #[test]
     fn parse_find_query_reads_hex_pairs_else_literal_ascii() {
+        let bytes = |q: &str| HexView::parse_find_query(q, false).map(|f| (f.needle, f.as_text));
         assert_eq!(
-            HexView::parse_find_query("de ad BE ef"),
-            Some(vec![0xde, 0xad, 0xbe, 0xef])
+            bytes("de ad BE ef"),
+            Some((vec![0xde, 0xad, 0xbe, 0xef], false))
         );
-        assert_eq!(HexView::parse_find_query("cafe"), Some(vec![0xca, 0xfe]));
+        assert_eq!(bytes("cafe"), Some((vec![0xca, 0xfe], false)));
         assert_eq!(
-            HexView::parse_find_query("hello!"),
-            Some(b"hello!".to_vec()),
+            bytes("hello!"),
+            Some((b"hello!".to_vec(), true)),
             "odd/non-hex falls back to ASCII"
         );
         assert_eq!(
-            HexView::parse_find_query("abz"),
-            Some(b"abz".to_vec()),
+            bytes("abz"),
+            Some((b"abz".to_vec(), true)),
             "non-hex chars force ASCII even at even length"
         );
-        assert_eq!(HexView::parse_find_query(""), None);
+        assert_eq!(bytes(""), None);
+    }
+
+    /// #1644: hex-shaped text can be searched as text: in quotes, or from
+    /// the text column.
+    #[test]
+    fn hex_shaped_text_is_text_in_quotes_or_from_the_text_column() {
+        let text = |t: &str| {
+            Some(FindQuery {
+                needle: t.as_bytes().to_vec(),
+                as_text: true,
+            })
+        };
+        assert_eq!(HexView::parse_find_query("\"1234\"", false), text("1234"));
+        assert_eq!(HexView::parse_find_query(" \"cafe\" ", false), text("cafe"));
+        assert_eq!(HexView::parse_find_query("1234", true), text("1234"));
+        assert_eq!(
+            HexView::parse_find_query("\"de ad\"", true),
+            text("de ad"),
+            "quotes come off in the text column too"
+        );
+        assert_eq!(
+            HexView::parse_find_query("\"\"", false),
+            None,
+            "empty quotes"
+        );
+        assert_eq!(HexView::parse_find_query("", true), None);
+    }
+
+    #[test]
+    fn a_find_query_says_which_reading_it_got() {
+        let q = HexView::parse_find_query("12 34", false).unwrap();
+        assert_eq!(q.describe(), "bytes 12 34");
+        let q = HexView::parse_find_query("\"1234\"", false).unwrap();
+        assert_eq!(q.describe(), "text \"1234\"");
+        let q = HexView::parse_find_query("00112233445566778899", false).unwrap();
+        assert_eq!(q.describe(), "bytes 00 11 22 33 44 55 66 77 \u{2026}");
     }
 
     #[test]
