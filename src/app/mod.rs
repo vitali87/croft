@@ -43799,6 +43799,79 @@ impl App {
         }
     }
 
+    /// "Language Servers: Restart All" (#1621): stop every server and start
+    /// a fresh manager at the same roots, as a re-root does, without
+    /// quitting croft. The next sync re-opens every tab against the new
+    /// servers, which publish their diagnostics afresh.
+    fn restart_language_servers(&mut self) {
+        if self.lsp_paused_for_build {
+            self.status = String::from(LSP_PAUSED_FOR_BUILD);
+            return;
+        }
+        // The old manager's Drop waits for its servers; off the UI thread.
+        if let Some(old) = self.lsp.take() {
+            fs_watch::offload_drop(old);
+        }
+        // A format-on-save in flight dies with its server; save unformatted,
+        // as when a reply fails.
+        if self.format_request_id.take().is_some() {
+            self.complete_pending_save();
+        }
+        self.lsp = match crate::lsp::LspManager::new(self.workspace_root().to_path_buf()) {
+            Ok(m) => {
+                m.set_extra_roots(self.roots.iter().skip(1).map(Path::to_path_buf).collect());
+                Some(m)
+            }
+            Err(e) => {
+                let msg = format!("Language servers could not restart: {e}");
+                crate::output::push("Language Servers", crate::output::OutputLevel::Error, &msg);
+                self.status = msg;
+                None
+            }
+        };
+        self.lsp_last_seen.clear();
+        self.lsp_progress.clear();
+        // The new manager numbers semantic replies from 0 again.
+        self.semantic_generation_seen.clear();
+        self.lsp_diagnostics.clear();
+        self.rebuild_problems();
+        if self.lsp.is_some() {
+            let msg = "Restarted all language servers";
+            crate::output::push("Language Servers", crate::output::OutputLevel::Info, msg);
+            self.status = String::from(msg);
+        }
+    }
+
+    /// "Language Servers: Restart for This File" (#1621): restart only the
+    /// servers serving the active file, so rust-analyzer's index survives a
+    /// restart of ruff. The manager re-opens the tabs once they are back.
+    fn restart_language_servers_for_file(&mut self) {
+        if self.lsp_paused_for_build {
+            self.status = String::from(LSP_PAUSED_FOR_BUILD);
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Restart for This File needs a file open in the editor");
+            return;
+        };
+        let Some(lsp) = self.lsp.as_ref() else {
+            self.status =
+                String::from("No language servers are running; Restart All starts them again");
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let has_language = crate::lsp::Language::from_path(&path).is_some();
+        if !has_language {
+            self.status = format!("No language server serves {name}");
+            return;
+        }
+        lsp.restart_servers_for(path.clone());
+        self.status = format!("Restarting the language servers for {name}");
+    }
+
     /// Start the one-shot local drift probe (#242) on a locally-launched
     /// croft. A remote-launched croft skips it: its binary is re-stamped by
     /// the launching machine on every connect, and its baked manifest dir
@@ -53456,6 +53529,8 @@ impl App {
                 self.notebook_kernel_request(crate::notebook_kernel::Request::Restart)
             }
             Cmd::NotebookSelectKernel => self.select_notebook_kernel(),
+            Cmd::RestartLanguageServers => self.restart_language_servers(),
+            Cmd::RestartLanguageServersForFile => self.restart_language_servers_for_file(),
             Cmd::TestingRunWithCoverage => self.run_all_tests_with_coverage(),
             Cmd::CoverageClear => self.clear_coverage(),
             Cmd::TestingInstallCoverageTool => self.install_coverage_tool(),
@@ -71363,6 +71438,11 @@ fn stage_block(dir: &Path, interpreter: &str, code: &str) -> std::io::Result<Pat
     file.write_all(format!("{code}\n").as_bytes())?;
     Ok(path)
 }
+
+/// What the restart commands say while an update build has the language
+/// servers stopped (#1621): the build's end starts them again.
+const LSP_PAUSED_FOR_BUILD: &str =
+    "Language servers are stopped while croft builds its update; they restart when it finishes";
 
 /// Milliseconds since the Unix epoch, for stamping local-history snapshots
 /// and dating TIMELINE rows.
