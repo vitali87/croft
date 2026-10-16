@@ -1,1 +1,0 @@
-fix: Node launch configs that start a package script now debug: a `node` launch with `runtimeExecutable` (`npm`, `yarn`, `pnpm`, `bun`, `npx`) and `runtimeArgs` and no `program` is started by js-debug, and a `node-terminal` launch runs its `command` (split into words, or under `sh -c` when it uses shell syntax). A node launch with none of these names all three in its error.
