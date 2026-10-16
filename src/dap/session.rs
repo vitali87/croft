@@ -721,6 +721,11 @@ pub struct Variable {
     pub value: String,
     pub type_name: String,
     pub variables_ref: i64,
+    /// The adapter's `evaluateName` (#1546): an expression that evaluates
+    /// to this variable from the frame, such as `obj.items[0]`. What Copy
+    /// as Expression copies and Add to Watch watches. None when the adapter
+    /// sends none (a synthetic row, or an adapter that doesn't know one).
+    pub evaluate_name: Option<String>,
 }
 
 /// Parse the full call stack from a `stackTrace` response. Pure.
@@ -799,6 +804,10 @@ pub fn parse_variables(variables_response: &Value) -> Vec<Variable> {
                             .get("variablesReference")
                             .and_then(Value::as_i64)
                             .unwrap_or(0),
+                        evaluate_name: v
+                            .get("evaluateName")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
                     })
                 })
                 .collect()
@@ -2830,6 +2839,7 @@ while True:
                 value: String::from("0"),
                 type_name: String::new(),
                 variables_ref: 0,
+                evaluate_name: None,
             }],
         );
         vars.insert(
@@ -2839,6 +2849,7 @@ while True:
                 value: String::from("1"),
                 type_name: String::new(),
                 variables_ref: 0,
+                evaluate_name: None,
             }],
         );
         let scopes = vec![
@@ -4248,6 +4259,21 @@ def stopped():"#,
             vars[1].variables_ref, 9,
             "expandable variable keeps its ref"
         );
+    }
+
+    /// #1546: a variable keeps the adapter's `evaluateName`, the expression
+    /// Copy as Expression and Add to Watch use; one without it has none.
+    #[test]
+    fn parse_variables_keeps_the_evaluate_name() {
+        let vars = parse_variables(&json!({
+            "body": { "variables": [
+                { "name": "[0]", "value": "1", "variablesReference": 0,
+                  "evaluateName": "obj.items[0]" },
+                { "name": "special variables", "value": "", "variablesReference": 3 }
+            ]}
+        }));
+        assert_eq!(vars[0].evaluate_name.as_deref(), Some("obj.items[0]"));
+        assert_eq!(vars[1].evaluate_name, None, "no evaluateName, none made up");
     }
 
     /// End-to-end against a real debugpy adapter: launch a script with a

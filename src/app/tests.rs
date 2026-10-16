@@ -88182,6 +88182,350 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
 }
 
+/// A stand-in debug adapter for #1546 that stops at once in `main` (called
+/// from `<module>`), with one local, `payload`, whose shown value is cut.
+/// An `evaluate` in the `clipboard` context answers the whole value, any
+/// other context the cut one. `clipboard` says whether it advertises
+/// `supportsClipboardContext`.
+fn copy_value_adapter(dir: &Path, clipboard: bool) -> crate::dap::session::DapSession {
+    let script = format!(
+        r#"
+import json, sys
+CLIP = {clip}
+seq = [1000]
+def read():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    return json.loads(sys.stdin.buffer.read(length))
+def send(msg):
+    seq[0] += 1
+    msg["seq"] = seq[0]
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+def reply(req, body=None):
+    send({{"type": "response", "request_seq": req["seq"], "success": True,
+          "command": req["command"], "body": body or {{}}}})
+while True:
+    req = read()
+    if req is None:
+        break
+    c = req["command"]
+    if c == "initialize":
+        reply(req, {{"supportsClipboardContext": CLIP}})
+        send({{"type": "event", "event": "initialized"}})
+    elif c == "configurationDone":
+        reply(req)
+        send({{"type": "event", "event": "stopped", "body": {{"reason": "breakpoint", "threadId": 1}}}})
+    elif c == "threads":
+        reply(req, {{"threads": [{{"id": 1, "name": "MainThread"}}]}})
+    elif c == "stackTrace":
+        reply(req, {{"stackFrames": [
+            {{"id": 11, "name": "main", "source": {{"path": "/w/s.py"}}, "line": 6}},
+            {{"id": 12, "name": "<module>", "source": {{"path": "/w/s.py"}}, "line": 9}}]}})
+    elif c == "scopes":
+        reply(req, {{"scopes": [{{"name": "Locals", "variablesReference": 5}}]}})
+    elif c == "variables":
+        reply(req, {{"variables": [{{"name": "payload", "value": "'{{\"user\": \"ada\"...", "type": "str",
+            "variablesReference": 0, "evaluateName": "payload"}}]}})
+    elif c == "evaluate":
+        ctx = req["arguments"].get("context")
+        expr = req["arguments"].get("expression")
+        if ctx != "clipboard":
+            result = "CUT"
+        elif expr == "payload":
+            result = "'{{\"user\": \"ada\", \"token\": \"FULL\"}}'"
+        else:
+            result = "FULL " + expr
+        reply(req, {{"result": result, "variablesReference": 0}})
+    elif c == "disconnect":
+        reply(req)
+        break
+    else:
+        reply(req)
+"#,
+        clip = if clipboard { "True" } else { "False" }
+    );
+    let path = dir.join("fake_dap.py");
+    std::fs::write(&path, script).unwrap();
+    crate::dap::session::DapSession::launch_with(
+        "python3",
+        &[path.display().to_string()],
+        dir,
+        serde_json::json!({"type": "request", "command": "launch", "arguments": {}}),
+        std::collections::BTreeMap::new(),
+    )
+    .expect("python3 spawns")
+}
+
+/// An app paused in [`copy_value_adapter`], its VARIABLES filled in.
+fn app_paused_with_a_payload(dir: &Path, clipboard: bool) -> Option<App> {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return None;
+    }
+    let mut app = App::new(dir.to_path_buf()).unwrap();
+    app.debug_sessions
+        .push("P", copy_value_adapter(dir, clipboard));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the stop and its variables",
+        || {
+            app.poll_dap();
+            app.refresh_debug_panel();
+            debug_row_index(&app, "payload").is_some()
+        },
+    );
+    Some(app)
+}
+
+/// The index of the debug-panel row named `name`: a variable, a watch
+/// expression or a frame.
+fn debug_row_index(app: &App, name: &str) -> Option<usize> {
+    use crate::widgets::run_debug::DebugRowKind;
+    app.run_debug.debug_rows.iter().position(|r| match &r.kind {
+        DebugRowKind::Variable { name: n, .. } => n == name,
+        DebugRowKind::Watch { expression, .. } => expression == name,
+        DebugRowKind::Frame { name: n, .. } => n == name,
+        _ => false,
+    })
+}
+
+fn debug_menu_labels(items: &[(String, MenuAction)]) -> Vec<&str> {
+    items.iter().map(|(label, _)| label.as_str()).collect()
+}
+
+/// Run the menu entry labelled `label` of debug-panel row `idx`.
+fn run_debug_menu_entry(app: &mut App, idx: usize, label: &str) {
+    let action = app
+        .debug_row_menu(idx)
+        .into_iter()
+        .find(|(l, _)| l == label)
+        .unwrap_or_else(|| panic!("no {label} entry"))
+        .1;
+    let root = app.tree.root.clone();
+    app.dispatch_menu_action(action, root);
+}
+
+/// #1546: a variable row's right-click menu is VS Code's: Copy Value,
+/// Copy as Expression and Add to Watch.
+#[test]
+fn a_variable_row_offers_copy_value_copy_as_expression_and_add_to_watch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(mut app) = app_paused_with_a_payload(tmp.path(), true) else {
+        return;
+    };
+    let idx = debug_row_index(&app, "payload").unwrap();
+    let items = app.debug_row_menu(idx);
+    app.debug_stop();
+    assert_eq!(
+        debug_menu_labels(&items),
+        ["Copy Value", "Copy as Expression", "Add to Watch"]
+    );
+}
+
+/// #1546: Copy Value asks the adapter for the value in the `clipboard`
+/// context, so what lands on the clipboard is the whole value, not the
+/// cut one the row shows.
+#[test]
+fn copy_value_copies_the_whole_value_from_the_adapter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(mut app) = app_paused_with_a_payload(tmp.path(), true) else {
+        return;
+    };
+    crate::clipboard::test_clip::mock_write("before");
+    let idx = debug_row_index(&app, "payload").unwrap();
+    run_debug_menu_entry(&mut app, idx, "Copy Value");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the clipboard evaluate",
+        || {
+            app.poll_dap();
+            crate::clipboard::test_clip::mock_read().as_deref() != Some("before")
+        },
+    );
+    let copied = crate::clipboard::test_clip::mock_read();
+    let status = app.status.clone();
+    app.debug_stop();
+    assert_eq!(
+        copied.as_deref(),
+        Some(r#"'{"user": "ada", "token": "FULL"}'"#)
+    );
+    assert!(status.starts_with("Copied value"), "status: {status}");
+}
+
+/// #1546: a second Copy Value sent before the first one's `clipboard`
+/// evaluate answers wins; the first answer, for a request the user has
+/// replaced, does not land on the clipboard.
+#[test]
+fn the_latest_copy_value_wins_over_an_earlier_pending_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(mut app) = app_paused_with_a_payload(tmp.path(), true) else {
+        return;
+    };
+    crate::clipboard::test_clip::mock_write("before");
+    let idx = debug_row_index(&app, "payload").unwrap();
+    run_debug_menu_entry(&mut app, idx, "Copy Value");
+    app.copy_debug_value(Some(String::from("other")), String::from("shown"));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "both clipboard evaluates",
+        || {
+            app.poll_dap();
+            crate::clipboard::test_clip::mock_read().as_deref() != Some("before")
+        },
+    );
+    let copied = crate::clipboard::test_clip::mock_read();
+    app.debug_stop();
+    assert_eq!(copied.as_deref(), Some("FULL other"));
+}
+
+/// #1546 negative: an adapter without `supportsClipboardContext` is sent
+/// no such evaluate; the row's own value is copied at once.
+#[test]
+fn copy_value_without_clipboard_support_copies_the_shown_value() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(mut app) = app_paused_with_a_payload(tmp.path(), false) else {
+        return;
+    };
+    crate::clipboard::test_clip::mock_write("before");
+    let idx = debug_row_index(&app, "payload").unwrap();
+    run_debug_menu_entry(&mut app, idx, "Copy Value");
+    let copied = crate::clipboard::test_clip::mock_read();
+    app.debug_stop();
+    assert_eq!(copied.as_deref(), Some(r#"'{"user": "ada"..."#));
+}
+
+/// #1546: Copy as Expression copies the `evaluateName`, and Add to Watch
+/// watches it.
+#[test]
+fn copy_as_expression_and_add_to_watch_use_the_evaluate_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(mut app) = app_paused_with_a_payload(tmp.path(), true) else {
+        return;
+    };
+    crate::clipboard::test_clip::mock_write("before");
+    let idx = debug_row_index(&app, "payload").unwrap();
+    run_debug_menu_entry(&mut app, idx, "Copy as Expression");
+    let copied = crate::clipboard::test_clip::mock_read();
+    run_debug_menu_entry(&mut app, idx, "Add to Watch");
+    let watching = app.watch_exprs.clone();
+    let watch_row = debug_row_index(&app, "payload");
+    app.debug_stop();
+    assert_eq!(copied.as_deref(), Some("payload"));
+    assert_eq!(watching, ["payload"]);
+    assert!(watch_row.is_some(), "the WATCH section lists it");
+}
+
+/// #1546: a watch row offers Copy Value, Copy Expression and Remove
+/// Expression, and Remove stops watching it.
+#[test]
+fn a_watch_row_can_be_copied_or_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(mut app) = app_paused_with_a_payload(tmp.path(), true) else {
+        return;
+    };
+    app.add_watch_expression(String::from("len(payload)"));
+    app.refresh_debug_panel();
+    let idx = debug_row_index(&app, "len(payload)").unwrap();
+    let labels: Vec<String> = app
+        .debug_row_menu(idx)
+        .into_iter()
+        .map(|(l, _)| l)
+        .collect();
+    crate::clipboard::test_clip::mock_write("before");
+    run_debug_menu_entry(&mut app, idx, "Copy Expression");
+    let copied = crate::clipboard::test_clip::mock_read();
+    run_debug_menu_entry(&mut app, idx, "Remove Expression");
+    let watching = app.watch_exprs.clone();
+    app.debug_stop();
+    assert_eq!(
+        labels,
+        ["Copy Value", "Copy Expression", "Remove Expression"]
+    );
+    assert_eq!(copied.as_deref(), Some("len(payload)"));
+    assert!(watching.is_empty());
+}
+
+/// #1546: a frame row offers Copy Call Stack, which copies every frame,
+/// innermost first, as `name (path:line)`.
+#[test]
+fn copy_call_stack_copies_every_frame() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(mut app) = app_paused_with_a_payload(tmp.path(), true) else {
+        return;
+    };
+    crate::clipboard::test_clip::mock_write("before");
+    let idx = debug_row_index(&app, "<module>").unwrap();
+    run_debug_menu_entry(&mut app, idx, "Copy Call Stack");
+    let copied = crate::clipboard::test_clip::mock_read();
+    app.debug_stop();
+    assert_eq!(
+        copied.as_deref(),
+        Some("main (/w/s.py:6)\n<module> (/w/s.py:9)")
+    );
+}
+
+/// #1546 negative: a variable the adapter gave no `evaluateName` has no
+/// expression to copy or watch, so only Copy Value is offered; a header
+/// or scope row has no menu at all.
+#[test]
+fn rows_without_an_expression_offer_less_or_nothing() {
+    use crate::widgets::run_debug::{DebugRow, DebugRowKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_debug.debug_rows = vec![
+        DebugRow {
+            indent: 0,
+            kind: DebugRowKind::Header {
+                title: String::from("VARIABLES"),
+            },
+        },
+        DebugRow {
+            indent: 1,
+            kind: DebugRowKind::Scope {
+                name: String::from("Locals"),
+                index: 0,
+                open: None,
+            },
+        },
+        DebugRow {
+            indent: 2,
+            kind: DebugRowKind::Variable {
+                reference: 0,
+                expandable: false,
+                expanded: false,
+                name: String::from("n"),
+                value: String::from("42"),
+                type_name: String::from("int"),
+                evaluate_name: None,
+            },
+        },
+    ];
+    assert!(app.debug_row_menu(0).is_empty());
+    assert!(app.debug_row_menu(1).is_empty());
+    assert!(app.debug_row_menu(9).is_empty(), "past the last row");
+    assert_eq!(debug_menu_labels(&app.debug_row_menu(2)), ["Copy Value"]);
+    crate::clipboard::test_clip::mock_write("before");
+    run_debug_menu_entry(&mut app, 2, "Copy Value");
+    assert_eq!(
+        crate::clipboard::test_clip::mock_read().as_deref(),
+        Some("42"),
+        "no session: the shown value is copied as it is"
+    );
+}
+
 // --- #1565: rearranging editor tabs -------------------------------------------
 
 /// An app with `a.py`, `b.py` and `c.py` open as kept tabs, `c.py` active.
