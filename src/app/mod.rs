@@ -4130,6 +4130,11 @@ pub struct App {
     /// instead of mutating the process-wide environment, which this repo
     /// has twice seen take an unrelated test down.
     config_dir: PathBuf,
+    /// The profile whose settings this croft started with (#1587), whose
+    /// `config.json` under `config_dir` is the user layer the Settings
+    /// editor reads and writes. `None` for the Default profile, and always
+    /// under test, so a developer's own profile never steers the suite.
+    settings_profile: Option<String>,
     /// Where "open scrollback in an editor tab" writes the pane's coloured
     /// scrollback so the rendered log view can index it from disk (#257).
     /// `~/.cache/croft/scrollback` normally; a test points it at a temp dir.
@@ -6452,6 +6457,11 @@ impl App {
             terminal_collapse_buttons: Vec::new(),
             consented_extensions: crate::prefs::Prefs::load_or_default().mcp_consented,
             config_dir: crate::prefs::config_dir(),
+            settings_profile: if cfg!(test) {
+                None
+            } else {
+                crate::profiles::active()
+            },
             scrollback_dir: crate::session_state::dirs_cache_croft().join("scrollback"),
             terminal_strip_rects: Vec::new(),
             terminal_max_buttons: Vec::new(),
@@ -51146,11 +51156,24 @@ impl App {
         }
     }
 
+    /// The directory of the user settings layer: the active profile's
+    /// (#1587), as every other reader of that layer resolves it, or the
+    /// config dir itself with no profile. Read through the bare config dir,
+    /// the Settings editor showed and saved the Default profile's
+    /// `config.json` while a profile's was in force.
+    fn user_settings_dir(&self) -> PathBuf {
+        match &self.settings_profile {
+            Some(profile) => self.config_dir.join("profiles").join(profile),
+            None => self.config_dir.clone(),
+        }
+    }
+
     /// The merged settings as the Settings editor sees them: the user layers
-    /// from `self.config_dir`, the workspace layers from the primary root.
+    /// from [`Self::user_settings_dir`], the workspace layers from the
+    /// primary root.
     fn merged_settings_here(&self) -> crate::config_layers::MergedConfig {
         crate::config_layers::load_merged_from(
-            &self.config_dir,
+            &self.user_settings_dir(),
             Some(self.roots.primary()),
             crate::config_layers::current_platform(),
         )
@@ -51159,9 +51182,11 @@ impl App {
     /// Open the Settings editor (#612).
     fn open_settings_editor(&mut self) {
         let merged = self.merged_settings_here();
-        self.settings_editor = Some(crate::widgets::settings_editor::SettingsEditor::new(
+        let mut editor = crate::widgets::settings_editor::SettingsEditor::new(
             crate::settings_editor::rows(&merged.prefs, &merged.provenance),
-        ));
+        );
+        editor.profile = self.settings_profile.clone();
+        self.settings_editor = Some(editor);
     }
 
     /// Write `key = value` into the Settings editor's target layer, re-merge
@@ -51180,7 +51205,7 @@ impl App {
                 }
                 crate::config_layers::workspace_config_path(self.roots.primary())
             }
-            _ => self.config_dir.join("config.json"),
+            _ => self.user_settings_dir().join("config.json"),
         };
         let text = std::fs::read_to_string(&path).unwrap_or_default();
         let new = match crate::settings_editor::set_key(&text, key, value) {
@@ -51263,7 +51288,7 @@ impl App {
                         self.status =
                             format!("{} is edited in the JSON file", row.key.replace('_', " "));
                         self.open_config_file_in_editor(
-                            self.config_dir.join("config.json"),
+                            self.user_settings_dir().join("config.json"),
                             ConfigFileSeed::Settings,
                         );
                     }
@@ -60553,6 +60578,9 @@ impl App {
             self.status = format!("Could not switch profile: {e}");
             return;
         }
+        // The Settings editor reads and writes the new profile's settings
+        // from now on, as every other settings writer does (#1587).
+        self.settings_profile = name.clone();
         // Recorded shortcuts go to the active profile's file from now on.
         if !cfg!(test) {
             self.keybindings_file = crate::keymap::keybindings_path();
