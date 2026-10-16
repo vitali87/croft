@@ -38,6 +38,10 @@ pub struct Task {
     /// array); `problem_matchers::from_tasks_json` translates it when the
     /// task runs (#252). Always None for convention-derived sources.
     pub problem_matcher: Option<serde_json::Value>,
+    /// tasks.json `isBackground`: a watcher (`tsc --watch`) that keeps
+    /// running, so a launch waiting on it waits for its first build rather
+    /// than its exit (#1541). Always false for convention-derived sources.
+    pub is_background: bool,
     /// A tasks.json entry's parts, kept apart so `${...}` variables are
     /// expanded and arguments quoted when the task runs; `command` is only
     /// its display line then. None for convention-derived sources.
@@ -307,6 +311,10 @@ fn vscode_tasks(root: &Path) -> Vec<Task> {
                 is_build,
                 is_default,
                 problem_matcher: t.get("problemMatcher").cloned(),
+                is_background: t
+                    .get("isBackground")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
                 vscode: Some(vscode),
             })
         })
@@ -428,6 +436,7 @@ fn makefile_tasks(root: &Path) -> Vec<Task> {
             is_build: name == "build" || name == "all",
             is_default: false,
             problem_matcher: None,
+            is_background: false,
             vscode: None,
         });
     }
@@ -466,6 +475,7 @@ fn justfile_tasks(root: &Path) -> Vec<Task> {
             is_build: name == "build",
             is_default: false,
             problem_matcher: None,
+            is_background: false,
             vscode: None,
         });
     }
@@ -493,6 +503,7 @@ fn package_json_tasks(root: &Path) -> Vec<Task> {
             is_build: name == "build",
             is_default: false,
             problem_matcher: None,
+            is_background: false,
             vscode: None,
         })
         .collect();
@@ -520,6 +531,7 @@ fn package_json_tasks(root: &Path) -> Vec<Task> {
                 is_build: false,
                 is_default: false,
                 problem_matcher: None,
+                is_background: false,
                 vscode: Some(VscodeCommand {
                     command: runner.to_string(),
                     // A script name can hold shell syntax (`check;false`);
@@ -664,6 +676,7 @@ fn cargo_tasks(root: &Path) -> Vec<Task> {
         is_build,
         is_default: false,
         problem_matcher: None,
+        is_background: false,
         vscode: None,
     })
     .collect()
@@ -679,6 +692,7 @@ fn convention_task(command: String, source: &str, is_build: bool, matcher: Optio
         is_build,
         is_default: false,
         problem_matcher: matcher.map(serde_json::Value::from),
+        is_background: false,
         vscode: None,
     }
 }
@@ -1078,6 +1092,7 @@ fn pyproject_tasks_on(root: &Path, on_path: &dyn Fn(&str) -> bool) -> Vec<Task> 
         is_build: false,
         is_default: false,
         problem_matcher: None,
+        is_background: false,
         vscode: None,
     };
     let mut out: Vec<Task> = names
@@ -1379,6 +1394,34 @@ mod tests {
                 .any(|t| t.command == "pnpm run build" && t.is_build),
             "the build script is the build task"
         );
+    }
+
+    /// #1541: `isBackground` marks a watcher; absent, or not a bool, it
+    /// is an ordinary task.
+    #[test]
+    fn tasks_json_is_background_marks_a_watcher() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(
+            tmp.path().join(".vscode/tasks.json"),
+            r#"{ "tasks": [
+  { "label": "watch", "command": "tsc --watch", "isBackground": true },
+  { "label": "build", "command": "tsc" },
+  { "label": "odd", "command": "tsc", "isBackground": "yes" }
+] }"#,
+        )
+        .unwrap();
+        let tasks = discover_tasks(tmp.path());
+        let background = |label: &str| {
+            tasks
+                .iter()
+                .find(|t| t.label == label)
+                .unwrap()
+                .is_background
+        };
+        assert!(background("watch"));
+        assert!(!background("build"));
+        assert!(!background("odd"));
     }
 
     #[test]
