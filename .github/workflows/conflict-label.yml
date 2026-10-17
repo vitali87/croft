@@ -17,13 +17,18 @@ on:
   # runs the PR's code: the action reads mergeability and edits labels through
   # the API. Keep it that way. It also runs this file as it is on main, so a
   # change here takes effect only once merged.
+  # `edited` is for a PR moved to another base, which can gain or lose
+  # conflicts with no new head and no push to main.
   pull_request_target:
-    types: [opened, reopened, synchronize]
+    types: [opened, reopened, synchronize, edited]
 
 permissions: {}
 
 jobs:
   label:
+    # `edited` also fires for every title or body edit, and bots rewrite PR
+    # bodies often; only a base change can alter mergeability.
+    if: github.event.action != 'edited' || github.event.changes.base
     runs-on: ubuntu-latest
     permissions:
       contents: read
