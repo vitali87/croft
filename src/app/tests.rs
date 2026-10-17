@@ -28862,6 +28862,63 @@ fn the_update_command_stages_the_offered_version() {
     assert!(app.manual_update_check.is_none(), "{}", app.status);
 }
 
+/// #1854: a staged release replaces the croft that is running, the one
+/// PATH found. Relaunch used to copy it over `~/.cargo/bin/croft` whenever
+/// that existed, so a croft installed elsewhere came back as the new
+/// version while `croft --version` on PATH still printed the old one.
+#[test]
+fn a_staged_release_relaunches_the_croft_that_is_running() {
+    let running = std::path::Path::new("/usr/local/bin/croft");
+    assert_eq!(super::relaunch_target(true, Some(running), None), running);
+    assert_ne!(
+        super::relaunch_target(false, Some(running), None),
+        running,
+        "an update that is not a staged release execs what it installed"
+    );
+}
+
+/// #1854: Update on an install this user cannot replace says so at once,
+/// naming the file, rather than building a release that Relaunch cannot
+/// put in place and then relaunching the old version.
+#[test]
+fn update_refuses_an_install_this_user_cannot_replace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.install_source = crate::update_check::InstallSource::SelfManaged;
+    app.update_toast = Some(super::UpdateToast {
+        version: String::from("9.9.9"),
+        ready: false,
+        failed: None,
+        buttons: Vec::new(),
+    });
+    // A directory nobody can add a file to, root included: its path runs
+    // through a regular file.
+    let file = tmp.path().join("not-a-directory");
+    std::fs::write(&file, b"").unwrap();
+    let installed = file.join("croft");
+    app.installed_exe = Some(installed.clone());
+    app.run_command(crate::widgets::command_palette::Command::UpdateCroft);
+    assert!(app.staged_install.is_none(), "nothing is built");
+    assert_eq!(
+        app.update_toast.as_ref().and_then(|t| t.failed),
+        Some(crate::update_check::READ_ONLY_INSTALL_REASON),
+        "the popup says why and offers Retry"
+    );
+    assert!(
+        app.status.contains(&installed.display().to_string()),
+        "the status line names the file: {}",
+        app.status
+    );
+
+    // An install it can replace stages as before.
+    app.installed_exe = Some(tmp.path().join("croft"));
+    app.run_command(crate::widgets::command_palette::Command::UpdateCroft);
+    assert_eq!(
+        app.staged_install.as_ref().map(|s| s.version.as_str()),
+        Some("9.9.9")
+    );
+}
+
 /// #1844: an update that fails says why in the popup, the network above
 /// all, and offers Retry; it used to come back as a fresh offer, with only
 /// a "could not be built" on the status line.

@@ -4864,6 +4864,12 @@ pub struct App {
     /// Whether this binary may update itself, or belongs to a package
     /// manager that must do it (#375). Read once at startup.
     install_source: crate::update_check::InstallSource,
+    /// The binary this process runs, resolved once at startup (#1854). It
+    /// is the croft PATH found, so Relaunch copies a staged release over
+    /// it; replacing any other copy relaunched into the new version while
+    /// every later `croft` still started the old one. `None` in tests,
+    /// which never write beside the test binary.
+    installed_exe: Option<PathBuf>,
     /// A background `cargo install --root <cache>/staged` of the offered
     /// release. Reported through the same UpdateEvent lifecycle as the
     /// remote watcher; the binary on PATH is untouched until Relaunch.
@@ -6607,6 +6613,11 @@ impl App {
             },
             update_toast: None,
             install_source: crate::update_check::current_install_source(),
+            installed_exe: if cfg!(test) {
+                None
+            } else {
+                crate::update_check::current_exe()
+            },
             staged_install: None,
             staged_status: UpdateStatus::Idle,
             update_status: UpdateStatus::Idle,
@@ -44132,6 +44143,25 @@ impl App {
             );
             return;
         }
+        // Relaunch copies the release over this install (#1854): one this
+        // user cannot replace would be built for nothing and then relaunch
+        // the old version, so it is refused here, naming the file.
+        if let Some(target) = self.installed_exe.as_deref()
+            && !crate::update_check::can_replace(target)
+        {
+            self.status = format!(
+                "croft v{version} was not installed: this user cannot replace {} - update croft the way it was installed (still on v{})",
+                target.display(),
+                env!("CARGO_PKG_VERSION")
+            );
+            self.update_toast = Some(UpdateToast {
+                version,
+                ready: false,
+                failed: Some(crate::update_check::READ_ONLY_INSTALL_REASON),
+                buttons: Vec::new(),
+            });
+            return;
+        }
         self.staged_status = UpdateStatus::Idle;
         if let Some(t) = self.update_toast.as_mut() {
             t.failed = None;
@@ -75040,6 +75070,24 @@ fn reexec_binary_path(local_install: Option<&crate::update_watch::SelfInstall>) 
     std::env::current_exe().unwrap_or_else(|_| PathBuf::from("croft"))
 }
 
+/// The binary a relaunch execs. A landed staged release (#333) is copied
+/// over `running`, the croft this process started from, and that is
+/// exec'd (#1854): routing it through [`reexec_binary_path`] replaced
+/// `~/.cargo/bin/croft` whenever one existed, so a croft installed anywhere
+/// else (a release archive in `/usr/local/bin`, say) relaunched into the
+/// new version while the `croft` on PATH stayed the old one. Any other
+/// update execs what it installed.
+fn relaunch_target(
+    staged_ready: bool,
+    running: Option<&Path>,
+    local_install: Option<&crate::update_watch::SelfInstall>,
+) -> PathBuf {
+    match running {
+        Some(running) if staged_ready => running.to_path_buf(),
+        _ => reexec_binary_path(local_install),
+    }
+}
+
 /// How long a Keyboard Shortcuts prompt waits for its chord.
 const SHORTCUT_RECORD_WINDOW: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -76016,7 +76064,11 @@ pub fn run(
         // A staged release (#333) is swapped over the installed binary
         // only now, on the user's Relaunch: until this line PATH still
         // held the old version.
-        let target = reexec_binary_path(app.self_install.as_ref());
+        let target = relaunch_target(
+            app.staged_update_binary().is_some(),
+            app.installed_exe.as_deref(),
+            app.self_install.as_ref(),
+        );
         if let Some(staged) = app.staged_update_binary()
             && let Err(err) = crate::update_check::apply_staged(&staged, &target)
         {

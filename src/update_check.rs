@@ -75,10 +75,14 @@ pub fn install_source(exe: &Path) -> InstallSource {
 /// The running binary's install source, resolving symlinks first so the
 /// `bin/croft` link Homebrew puts on PATH is traced into the Cellar.
 pub fn current_install_source() -> InstallSource {
-    std::env::current_exe()
-        .and_then(|p| p.canonicalize())
-        .map(|p| install_source(&p))
-        .unwrap_or(InstallSource::SelfManaged)
+    current_exe().map_or(InstallSource::SelfManaged, |p| install_source(&p))
+}
+
+/// The canonical path of the running binary: the installed croft a staged
+/// release replaces (#1854), with any symlink on PATH resolved to the file
+/// it names.
+pub fn current_exe() -> Option<PathBuf> {
+    std::env::current_exe().and_then(|p| p.canonicalize()).ok()
 }
 
 /// The on-disk memory of the check, one small JSON file in the cache dir.
@@ -660,6 +664,31 @@ pub fn apply_staged(staged: &Path, target: &Path) -> std::io::Result<()> {
     apply_staged_at(staged, target, &tmp)
 }
 
+/// Why Update refuses to stage a release over an install this user cannot
+/// replace (#1854), said briefly enough for the update popup.
+pub const READ_ONLY_INSTALL_REASON: &str = "this user cannot replace the installed croft";
+
+/// Whether [`apply_staged`] could put a file in place of `target`: it
+/// writes beside the target and renames over it, so its directory must take
+/// a new file. Probed with the same exclusive create, removed at once.
+pub fn can_replace(target: &Path) -> bool {
+    let Some(dir) = target.parent() else {
+        return false;
+    };
+    let tmp = temp_name(dir);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&tmp);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// The temp file beside the target. PIDs recycle: a croft killed between
 /// open and rename would leave a file that every later process drawing
 /// the same PID trips over, so the name carries a clock reading too.
@@ -933,6 +962,37 @@ mod tests {
             "the failed apply left the target alone"
         );
     }
+
+    /// #1854: Update asks first whether Relaunch could replace the install,
+    /// and the asking leaves nothing behind.
+    #[test]
+    fn can_replace_probes_the_install_directory_without_a_trace() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("croft");
+        std::fs::write(&target, b"old").unwrap();
+        assert!(can_replace(&target));
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(entries, ["croft"], "the probe file is removed");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"old",
+            "and the install untouched"
+        );
+
+        // A directory that cannot take a file, as root too: its path runs
+        // through a regular file.
+        let blocked = target.join("croft");
+        assert!(!can_replace(&blocked));
+        assert!(
+            apply_staged(&target, &blocked).is_err(),
+            "the probe agrees with the swap it stands in for"
+        );
+    }
+
     #[test]
     fn a_release_binary_is_staged_without_building() {
         use crate::remote_prebuilt::{NotPublished, Signature};

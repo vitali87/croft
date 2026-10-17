@@ -1,0 +1,2 @@
+fix: Relaunching into an update replaces the croft you started, so `croft --version` and every later launch are the new version too; it used to overwrite `~/.cargo/bin/croft` whenever one existed, leaving a croft installed elsewhere (such as `/usr/local/bin`) on the old version while the welcome card showed the new one.
+fix: Update says at once when this user cannot replace the installed croft, naming the file, instead of building the release and then relaunching the old version.
