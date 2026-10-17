@@ -1496,6 +1496,48 @@ pub(crate) fn sequence_editor_command(exe: &std::path::Path) -> String {
     format!("'{quoted}' edit --wait --sequence-editor")
 }
 
+/// Put `bin` first on the pane's PATH, so `croft` in the pane is this croft
+/// (#1854), and name it to the shell hooks. They put it first again once
+/// the user's startup files have run, because those run after this: a
+/// `.zprofile` running `brew shellenv` puts /opt/homebrew/bin, and a
+/// Homebrew croft, back in front.
+///
+/// With no bin of its own, a pane drops the one it inherited. A croft
+/// launched from a croft pane carries the OUTER croft's, and passing that
+/// on would answer `croft` with a different croft than the window.
+///
+/// An unset PATH stays unset, for the shell to fill with its default: PATH
+/// set to the bin alone would leave the pane without /usr/bin.
+pub(crate) fn apply_pane_bin(cmd: &mut CommandBuilder, bin: Option<&std::path::Path>) {
+    use crate::shell_integration::PANE_BIN_ENV;
+    let inherited = cmd.get_env(PANE_BIN_ENV).map(std::path::PathBuf::from);
+    let path = cmd.get_env("PATH").and_then(|path| {
+        let rest = std::env::split_paths(path)
+            .filter(|d| Some(d.as_path()) != bin && Some(d) != inherited.as_ref());
+        std::env::join_paths(
+            bin.map(std::path::Path::to_path_buf)
+                .into_iter()
+                .chain(rest),
+        )
+        .ok()
+    });
+    if let Some(path) = path {
+        cmd.env("PATH", path);
+    }
+    match bin {
+        Some(bin) => cmd.env(PANE_BIN_ENV, bin),
+        None => cmd.env_remove(PANE_BIN_ENV),
+    }
+}
+
+/// This croft's pane bin, made on first use. None when the running binary
+/// is gone from disk (an upgrade removed it) or the cache cannot be
+/// written; the pane then finds `croft` on the user's PATH, as before.
+fn pane_bin_dir() -> Option<std::path::PathBuf> {
+    let exe = live_exe(std::env::current_exe().ok()?)?;
+    crate::shell_integration::ensure_pane_bin(&crate::app::croft_cache_dir(), &exe).ok()
+}
+
 impl PtyTerminal {
     pub fn new(cwd: &std::path::Path) -> Result<Self> {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
@@ -1885,6 +1927,11 @@ impl PtyTerminal {
             &mut cmd,
             crate::view_ipc::SOCK_PATH.get().map(|p| p.as_path()),
         );
+        // Not under test: the running binary there is the test harness, and
+        // its link would land in the developer's real cache dir.
+        if !cfg!(test) {
+            apply_pane_bin(&mut cmd, pane_bin_dir().as_deref());
+        }
         // An interactive shell may live in a pane host (#694); a task or
         // run pane is croft's own.
         let hosted = run_label.is_none() && persistent_panes_enabled();
@@ -8797,6 +8844,188 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(40));
             waited += 40;
         }
+    }
+
+    #[test]
+    fn the_pane_bin_goes_first_on_the_pane_path() {
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.env("PATH", "/opt/homebrew/bin:/pane-bin:/usr/bin");
+        apply_pane_bin(&mut cmd, Some(std::path::Path::new("/pane-bin")));
+        assert_eq!(
+            cmd.get_env("PATH"),
+            Some(std::ffi::OsStr::new("/pane-bin:/opt/homebrew/bin:/usr/bin"))
+        );
+        assert_eq!(
+            cmd.get_env(crate::shell_integration::PANE_BIN_ENV),
+            Some(std::ffi::OsStr::new("/pane-bin"))
+        );
+    }
+
+    #[test]
+    fn a_pane_with_no_bin_of_its_own_drops_an_inherited_one() {
+        // A croft launched from a croft pane inherits that pane's bin, which
+        // names the OUTER croft. Passing it on would hand this croft's panes
+        // a different croft than the window they run in.
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.env("PATH", "/outer-pane-bin:/usr/bin");
+        cmd.env(crate::shell_integration::PANE_BIN_ENV, "/outer-pane-bin");
+        apply_pane_bin(&mut cmd, None);
+        assert_eq!(cmd.get_env(crate::shell_integration::PANE_BIN_ENV), None);
+        assert_eq!(cmd.get_env("PATH"), Some(std::ffi::OsStr::new("/usr/bin")));
+    }
+
+    #[test]
+    fn an_unset_path_is_left_for_the_shell_to_default() {
+        // PATH=<pane bin> alone would leave the shell without /usr/bin.
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.env_remove("PATH");
+        apply_pane_bin(&mut cmd, Some(std::path::Path::new("/pane-bin")));
+        assert_eq!(cmd.get_env("PATH"), None);
+        assert_eq!(
+            cmd.get_env(crate::shell_integration::PANE_BIN_ENV),
+            Some(std::ffi::OsStr::new("/pane-bin"))
+        );
+    }
+
+    /// A pane bin linking to a stand-in for the running croft, and another
+    /// dir whose `croft` a user rc puts first on PATH (#1854). Each prints
+    /// which one it is.
+    struct TwoCrofts {
+        _tmp: tempfile::TempDir,
+        pane_bin: std::path::PathBuf,
+        other_dir: std::path::PathBuf,
+    }
+
+    fn two_crofts() -> TwoCrofts {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let script = |path: &std::path::Path, name: &str| {
+            std::fs::write(path, format!("#!/bin/sh\necho CROFT_IS={name}\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let running = tmp.path().join("running-croft");
+        script(&running, "running");
+        let other_dir = tmp.path().join("other");
+        std::fs::create_dir(&other_dir).unwrap();
+        script(&other_dir.join("croft"), "other");
+        let pane_bin =
+            crate::shell_integration::ensure_pane_bin(&tmp.path().join("cache"), &running).unwrap();
+        TwoCrofts {
+            _tmp: tmp,
+            pane_bin,
+            other_dir,
+        }
+    }
+
+    /// Type `croft` at the pane's first prompt; the name of the croft that ran.
+    fn croft_that_answers(term: &mut PtyTerminal) -> String {
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(1000),
+            "the shell's first prompt",
+            || !term.prompt_lines().is_empty(),
+        );
+        term.write_input(b"croft\r");
+        let answer = || {
+            term.grid_lines()
+                .0
+                .iter()
+                .find_map(|l| l.trim().strip_prefix("CROFT_IS=").map(str::to_string))
+        };
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(1000),
+            "`croft` to answer",
+            || answer().is_some(),
+        );
+        answer().unwrap()
+    }
+
+    #[test]
+    fn a_zsh_pane_runs_its_own_croft_when_the_user_profile_prepends_another() {
+        // #1854: the window was cargo's croft 0.2.32 while `croft --version`
+        // in its pane printed Homebrew's 0.2.28, because `.zprofile` runs
+        // `brew shellenv`, which puts /opt/homebrew/bin first after croft
+        // set the pane's PATH.
+        let Some(zsh) = zsh_or_skip() else { return };
+        let crofts = two_crofts();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".zprofile"),
+            format!("export PATH=\"{}:$PATH\"\n", crofts.other_dir.display()),
+        )
+        .unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let shim = crate::shell_integration::ensure_zsh_shim(cfg_dir.path()).unwrap();
+        let mut cmd = CommandBuilder::new(zsh);
+        cmd.arg("-l");
+        cmd.arg("-i");
+        cmd.cwd(home.path());
+        cmd.env("HOME", home.path());
+        cmd.env("ZDOTDIR", &shim);
+        cmd.env("CROFT_USER_ZDOTDIR", home.path());
+        apply_pane_bin(&mut cmd, Some(&crofts.pane_bin));
+        let mut term = PtyTerminal::spawn_with(cmd, None).unwrap();
+        assert_eq!(croft_that_answers(&mut term), "running");
+    }
+
+    #[test]
+    fn a_bash_pane_runs_its_own_croft_when_the_user_rc_prepends_another() {
+        // The shim is read through `--rcfile` here, which every bash honours,
+        // so macOS's 3.2 runs the same script `$ENV` hands a modern bash.
+        let bash = "/bin/bash";
+        if !std::path::Path::new(bash).exists() {
+            return;
+        }
+        let crofts = two_crofts();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".bashrc"),
+            format!("export PATH=\"{}:$PATH\"\n", crofts.other_dir.display()),
+        )
+        .unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let shim = crate::shell_integration::ensure_bash_shim(cfg_dir.path()).unwrap();
+        let mut cmd = CommandBuilder::new(bash);
+        cmd.arg("--rcfile");
+        cmd.arg(&shim);
+        cmd.arg("-i");
+        cmd.cwd(home.path());
+        cmd.env("HOME", home.path());
+        cmd.env("CROFT_BASH_INJECT", "1");
+        apply_pane_bin(&mut cmd, Some(&crofts.pane_bin));
+        let mut term = PtyTerminal::spawn_with(cmd, None).unwrap();
+        assert_eq!(croft_that_answers(&mut term), "running");
+    }
+
+    #[test]
+    fn a_fish_pane_runs_its_own_croft_when_the_user_config_prepends_another() {
+        let Some(fish) = find_fish() else {
+            return;
+        };
+        let crofts = two_crofts();
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join(".config");
+        std::fs::create_dir_all(config.join("fish")).unwrap();
+        std::fs::write(
+            config.join("fish").join("config.fish"),
+            format!("set -gx PATH {} $PATH\n", crofts.other_dir.display()),
+        )
+        .unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let dir = crate::shell_integration::ensure_fish_integration(cfg_dir.path()).unwrap();
+        let mut cmd = CommandBuilder::new(&fish);
+        cmd.arg("-i");
+        cmd.arg("-l");
+        cmd.cwd(home.path());
+        cmd.env("HOME", home.path());
+        cmd.env("XDG_CONFIG_HOME", &config);
+        cmd.env(
+            "XDG_DATA_DIRS",
+            crate::shell_integration::fish_xdg_data_dirs(&dir, None),
+        );
+        cmd.env("CROFT_FISH_XDG_DATA_DIR", &dir);
+        apply_pane_bin(&mut cmd, Some(&crofts.pane_bin));
+        let mut term = PtyTerminal::spawn_with(cmd, None).unwrap();
+        assert_eq!(croft_that_answers(&mut term), "running");
     }
 
     #[test]

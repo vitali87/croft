@@ -1,0 +1,1 @@
+fix: `croft` typed in croft's terminal is the croft you are running. Another install earlier on PATH, such as a Homebrew croft that `brew shellenv` puts first, no longer answers instead, so `croft --version` in a pane matches the version on the welcome page.

@@ -530,6 +530,13 @@ const ZSH_SHIM_ZSHRC: &str = r#"# croft shell integration (auto-generated; do no
 _croft_user="${CROFT_USER_ZDOTDIR:-$HOME}"
 [[ "$_croft_user" != "$ZDOTDIR" && -f "$_croft_user/.zshrc" ]] && ZDOTDIR="$_croft_user" builtin source "$_croft_user/.zshrc"
 
+# The croft running this pane first on PATH (#1854). croft put it there,
+# but the user's startup files ran since, and one that prepends its own
+# dirs (`brew shellenv` does) can put another install's croft ahead of it.
+if [[ -n "$CROFT_PANE_BIN" ]]; then
+  path=("$CROFT_PANE_BIN" ${path:#"$CROFT_PANE_BIN"})
+fi
+
 # FinalTerm / OSC 133 semantic prompt marks + OSC 7 cwd, the protocol VS
 # Code, Ghostty, iTerm2 and WezTerm build command navigation on.
 if [[ -o interactive ]] && (( ! ${+_croft_si_installed} )); then
@@ -632,6 +639,20 @@ if [[ -n "$CROFT_BASH_INJECT" ]]; then
     [[ -r "$HOME/.bashrc" ]] && builtin source "$HOME/.bashrc"
   fi
   builtin unset _croft_rc
+fi
+
+# The croft running this pane first on PATH (#1854). croft put it there,
+# but the startup files just replayed can put another install's croft
+# ahead of it.
+if [[ -n "$CROFT_PANE_BIN" ]]; then
+  _croft_path=":$PATH:"
+  while [[ "$_croft_path" == *:"$CROFT_PANE_BIN":* ]]; do
+    _croft_path="${_croft_path//:"$CROFT_PANE_BIN":/:}"
+  done
+  _croft_path="${_croft_path#:}"
+  _croft_path="${_croft_path%:}"
+  PATH="$CROFT_PANE_BIN${_croft_path:+:$_croft_path}"
+  builtin unset _croft_path
 fi
 
 # FinalTerm / OSC 133 semantic prompt marks + OSC 7 cwd, the protocol VS
@@ -740,6 +761,20 @@ if set -q CROFT_FISH_XDG_DATA_DIR
 end
 
 if status is-interactive
+    # The croft running this pane first on PATH (#1854). croft put it there,
+    # but config.fish can put another install's croft ahead of it (`brew
+    # shellenv` does). This file runs before config.fish, so the first
+    # prompt is the earliest point after it.
+    if set -q CROFT_PANE_BIN
+        function _croft_pane_path --on-event fish_prompt
+            functions --erase _croft_pane_path
+            while set --local _croft_i (contains --index -- $CROFT_PANE_BIN $PATH)
+                set --erase PATH[$_croft_i]
+            end
+            set --global --export --prepend PATH $CROFT_PANE_BIN
+        end
+    end
+
     # fish 4.0+ marks prompts natively (OSC 133 + OSC 7 for every
     # terminal); emitting again would double-decorate. Old fish (<= 3.7)
     # lacks the forward-char-passive binding and needs croft's hooks.
@@ -855,6 +890,38 @@ pub fn ensure_zsh_shim(config_dir: &std::path::Path) -> std::io::Result<PathBuf>
             f.write_all(content.as_bytes())?;
         }
     }
+    Ok(dir)
+}
+
+/// Names the pane bin to the shell hooks, which put it back first on PATH
+/// after the user's startup files have run.
+pub const PANE_BIN_ENV: &str = "CROFT_PANE_BIN";
+
+/// The directory a pane puts first on PATH so that `croft` there is the
+/// croft running the pane (#1854), with another install earlier on the
+/// user's PATH (Homebrew's, say) answering nowhere inside croft. It holds
+/// only a `croft` link to `exe`: anything else in it would shadow one of
+/// the user's own tools. Keyed by the binary's path, so windows from two
+/// installs never share one.
+pub fn ensure_pane_bin(
+    cache_dir: &std::path::Path,
+    exe: &std::path::Path,
+) -> std::io::Result<PathBuf> {
+    use sha2::Digest;
+    use std::os::unix::ffi::OsStrExt;
+    let key = format!("{:x}", sha2::Sha256::digest(exe.as_os_str().as_bytes()));
+    let dir = cache_dir.join("pane-bin").join(&key[..16]);
+    let link = dir.join("croft");
+    if std::fs::read_link(&link).ok().as_deref() == Some(exe) {
+        return Ok(dir);
+    }
+    std::fs::create_dir_all(&dir)?;
+    // Made beside and renamed over, so a pane another croft spawns at the
+    // same moment never finds the name missing.
+    let tmp = dir.join(format!(".croft-{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(exe, &tmp)?;
+    std::fs::rename(&tmp, &link)?;
     Ok(dir)
 }
 
@@ -1336,5 +1403,56 @@ mod tests {
                 "/cfg/shell-integration/fish:/usr/local/share:/usr/share"
             );
         }
+    }
+
+    #[test]
+    fn the_pane_bin_holds_only_a_croft_linked_to_the_running_binary() {
+        let cache = tempfile::tempdir().unwrap();
+        let bins = tempfile::tempdir().unwrap();
+        let exe = bins.path().join("croft");
+        std::fs::write(&exe, "").unwrap();
+        let dir = ensure_pane_bin(cache.path(), &exe).unwrap();
+        assert!(dir.starts_with(cache.path()), "{}", dir.display());
+        assert_eq!(std::fs::read_link(dir.join("croft")).unwrap(), exe);
+        // The dir goes FIRST on a pane's PATH, so anything else in it would
+        // shadow one of the user's own tools.
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("croft")]);
+        assert_eq!(ensure_pane_bin(cache.path(), &exe).unwrap(), dir);
+    }
+
+    #[test]
+    fn two_installs_get_two_pane_bins() {
+        // #1854's machine had Homebrew's croft and cargo's: a window from
+        // each must hand its panes its own binary, not whichever wrote last.
+        let cache = tempfile::tempdir().unwrap();
+        let bins = tempfile::tempdir().unwrap();
+        let cargo = bins.path().join("cargo-croft");
+        let brew = bins.path().join("brew-croft");
+        std::fs::write(&cargo, "").unwrap();
+        std::fs::write(&brew, "").unwrap();
+        let cargo_dir = ensure_pane_bin(cache.path(), &cargo).unwrap();
+        let brew_dir = ensure_pane_bin(cache.path(), &brew).unwrap();
+        assert_ne!(cargo_dir, brew_dir);
+        assert_eq!(std::fs::read_link(cargo_dir.join("croft")).unwrap(), cargo);
+        assert_eq!(std::fs::read_link(brew_dir.join("croft")).unwrap(), brew);
+    }
+
+    #[test]
+    fn a_pane_bin_link_naming_another_binary_is_repointed() {
+        let cache = tempfile::tempdir().unwrap();
+        let bins = tempfile::tempdir().unwrap();
+        let exe = bins.path().join("croft");
+        let stranger = bins.path().join("stranger");
+        std::fs::write(&exe, "").unwrap();
+        std::fs::write(&stranger, "").unwrap();
+        let dir = ensure_pane_bin(cache.path(), &exe).unwrap();
+        std::fs::remove_file(dir.join("croft")).unwrap();
+        std::os::unix::fs::symlink(&stranger, dir.join("croft")).unwrap();
+        ensure_pane_bin(cache.path(), &exe).unwrap();
+        assert_eq!(std::fs::read_link(dir.join("croft")).unwrap(), exe);
     }
 }
