@@ -531,10 +531,17 @@ _croft_user="${CROFT_USER_ZDOTDIR:-$HOME}"
 [[ "$_croft_user" != "$ZDOTDIR" && -f "$_croft_user/.zshrc" ]] && ZDOTDIR="$_croft_user" builtin source "$_croft_user/.zshrc"
 
 # The croft running this pane first on PATH (#1854). croft put it there,
-# but the user's startup files ran since, and one that prepends its own
+# but the user's startup files run after, and one that prepends its own
 # dirs (`brew shellenv` does) can put another install's croft ahead of it.
-if [[ -n "$CROFT_PANE_BIN" ]]; then
-  path=("$CROFT_PANE_BIN" ${path:#"$CROFT_PANE_BIN"})
+# A login zsh reads the user's own .zlogin after this file (ZDOTDIR is
+# theirs again by then), so this waits for the first prompt.
+if [[ -o interactive && -n "$CROFT_PANE_BIN" ]]; then
+  builtin autoload -Uz add-zsh-hook
+  _croft_pane_path() {
+    add-zsh-hook -d precmd _croft_pane_path
+    path=("$CROFT_PANE_BIN" ${path:#"$CROFT_PANE_BIN"})
+  }
+  add-zsh-hook precmd _croft_pane_path
 fi
 
 # FinalTerm / OSC 133 semantic prompt marks + OSC 7 cwd, the protocol VS
@@ -620,8 +627,11 @@ if [[ -n "$CROFT_BASH_INJECT" ]]; then
     builtin unset CROFT_BASH_UNEXPORT_HISTFILE
   fi
   # Replay the startup files posix mode skipped, exactly as bash itself
-  # would have chosen them.
-  if builtin shopt -q login_shell; then
+  # would have chosen them. A bash too old for posix-mode `$ENV` reads this
+  # file through `--rcfile` instead, which a login bash ignores, so croft
+  # starts it non-login and asks for the login files with CROFT_BASH_LOGIN.
+  if builtin shopt -q login_shell || [[ -n "$CROFT_BASH_LOGIN" ]]; then
+    builtin unset CROFT_BASH_LOGIN
     [[ -r /etc/profile ]] && builtin source /etc/profile
     for _croft_rc in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
       if [[ -r "$_croft_rc" ]]; then

@@ -967,10 +967,14 @@ pub fn pick_prompt_jump(prompt_lines: &[i32], current_top: i32, forward: bool) -
 }
 
 /// Inject croft's shell-integration environment for supported shells, and
-/// return any argv to prepend before the login flag.
+/// return the shell's argv: `args` (its login flag) with whatever the
+/// integration adds. Long options go first, because bash only recognises
+/// them (`--posix`) ahead of single-character ones (`-l`).
 /// zsh: point `ZDOTDIR` at croft's shim. bash: the kitty/Ghostty trick —
 /// `--posix` plus `ENV` pointing at croft's shim (posix-mode bash reads
 /// only `$ENV`; the shim backs out and replays the real startup files).
+/// Below 4.4 bash ignores that `$ENV`, so it reads the shim through
+/// `--rcfile`, non-login, and the shim replays the login files itself.
 /// fish: prepend a `vendor_conf.d` data dir to `XDG_DATA_DIRS`; the script
 /// defers to fish 4's native marks. Every shim sources the user's real
 /// dotfiles unchanged and emits OSC 133 prompt marks + the OSC 7 cwd
@@ -980,9 +984,10 @@ fn apply_shell_integration_env(
     cmd: &mut CommandBuilder,
     shell_path: &str,
     config_dir: &std::path::Path,
+    args: Vec<String>,
 ) -> Vec<String> {
     if std::env::var("CROFT_SHELL_INTEGRATION").as_deref() == Ok("0") {
-        return Vec::new();
+        return args;
     }
     let base = std::path::Path::new(shell_path)
         .file_name()
@@ -991,7 +996,7 @@ fn apply_shell_integration_env(
     match base {
         "zsh" => {
             let Ok(shim) = crate::shell_integration::ensure_zsh_shim(config_dir) else {
-                return Vec::new();
+                return args;
             };
             // An inherited ZDOTDIR pointing at croft's own shim (croft
             // launched from a croft pane) is poisoned — the user's dotfiles
@@ -1001,7 +1006,7 @@ fn apply_shell_integration_env(
                 .map(std::path::PathBuf::from)
                 .unwrap_or_default();
             if home.as_os_str().is_empty() {
-                return Vec::new();
+                return args;
             }
             let user_zdotdir = crate::shell_integration::resolve_user_zdotdir(
                 inherited.as_deref(),
@@ -1010,21 +1015,28 @@ fn apply_shell_integration_env(
             );
             cmd.env("CROFT_USER_ZDOTDIR", user_zdotdir);
             cmd.env("ZDOTDIR", &shim);
-            Vec::new()
+            args
         }
         "bash" => {
-            if !bash_env_injection_supported(shell_path) {
-                return Vec::new();
-            }
             let Ok(shim) = crate::shell_integration::ensure_bash_shim(config_dir) else {
-                return Vec::new();
+                return args;
             };
             // Preserve a user $ENV (rare for bash) for the shim to restore.
             if let Ok(env) = std::env::var("ENV") {
                 cmd.env("CROFT_BASH_ENV", env);
             }
-            cmd.env("ENV", &shim);
             cmd.env("CROFT_BASH_INJECT", "1");
+            if !bash_env_injection_supported(shell_path) {
+                // No `$ENV` in posix mode (macOS's 3.2), so the shim goes in
+                // as the rcfile, as VS Code does it. A login bash ignores
+                // `--rcfile`, so the shell starts non-login and the shim
+                // replays the login files in its place.
+                if args.iter().any(|a| a == "-l" || a == "--login") {
+                    cmd.env("CROFT_BASH_LOGIN", "1");
+                }
+                return vec!["--rcfile".to_string(), shim.display().to_string()];
+            }
+            cmd.env("ENV", &shim);
             // Posix mode defaults HISTFILE to ~/.sh_history; pre-seed the
             // bash default and let the shim unexport it.
             if std::env::var_os("HISTFILE").is_none()
@@ -1036,11 +1048,11 @@ fn apply_shell_integration_env(
                 );
                 cmd.env("CROFT_BASH_UNEXPORT_HISTFILE", "1");
             }
-            vec!["--posix".to_string()]
+            std::iter::once("--posix".to_string()).chain(args).collect()
         }
         "fish" => {
             let Ok(dir) = crate::shell_integration::ensure_fish_integration(config_dir) else {
-                return Vec::new();
+                return args;
             };
             let inherited = std::env::var("XDG_DATA_DIRS").ok();
             cmd.env(
@@ -1048,10 +1060,21 @@ fn apply_shell_integration_env(
                 crate::shell_integration::fish_xdg_data_dirs(&dir, inherited.as_deref()),
             );
             cmd.env("CROFT_FISH_XDG_DATA_DIR", &dir);
-            Vec::new()
+            args
         }
-        _ => Vec::new(),
+        _ => args,
     }
+}
+
+/// The command for an interactive pane shell: `shell_path` as a login
+/// shell, with croft's shell integration.
+fn interactive_shell_command(shell_path: &str, config_dir: &std::path::Path) -> CommandBuilder {
+    let (program, args) = interactive_shell_invocation(shell_path);
+    let mut cmd = CommandBuilder::new(&program);
+    for a in apply_shell_integration_env(&mut cmd, shell_path, config_dir, args) {
+        cmd.arg(a);
+    }
+    cmd
 }
 
 /// Whether this bash reads `$ENV` in posix mode, i.e. the injection works
@@ -1554,12 +1577,7 @@ impl PtyTerminal {
     /// below or through the prompt instead of above it.
     pub fn new_with_transcript(cwd: &std::path::Path, transcript: &[String]) -> Result<Self> {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-        let (program, args) = interactive_shell_invocation(&shell);
-        let mut cmd = CommandBuilder::new(&program);
-        let pre = apply_shell_integration_env(&mut cmd, &shell, &crate::prefs::config_dir());
-        for a in pre.iter().chain(args.iter()) {
-            cmd.arg(a);
-        }
+        let mut cmd = interactive_shell_command(&shell, &crate::prefs::config_dir());
         cmd.cwd(cwd);
         Self::spawn_with_preamble(cmd, None, &transcript_bytes(transcript))
     }
@@ -1567,14 +1585,7 @@ impl PtyTerminal {
     /// Spawn an interactive login session for a specific shell (a terminal
     /// profile), rather than `$SHELL`. The same login-flag handling as [`new`].
     pub fn new_shell(shell_path: &str, cwd: &std::path::Path) -> Result<Self> {
-        let (program, args) = interactive_shell_invocation(shell_path);
-        let mut cmd = CommandBuilder::new(&program);
-        // Integration args go first: bash only recognises long options
-        // (--posix) when they precede single-character ones (-l).
-        let pre = apply_shell_integration_env(&mut cmd, shell_path, &crate::prefs::config_dir());
-        for a in pre.iter().chain(args.iter()) {
-            cmd.arg(a);
-        }
+        let mut cmd = interactive_shell_command(shell_path, &crate::prefs::config_dir());
         cmd.cwd(cwd);
         Self::spawn_with(cmd, None)
     }
@@ -8550,7 +8561,7 @@ mod tests {
         let mut cmd = CommandBuilder::new(bash);
         cmd.cwd(home.path());
         cmd.env("HOME", home.path());
-        let args = apply_shell_integration_env(&mut cmd, bash, cfg.path());
+        let args = apply_shell_integration_env(&mut cmd, bash, cfg.path(), Vec::new());
         for a in &args {
             cmd.arg(a);
         }
@@ -8581,15 +8592,16 @@ mod tests {
         // bash is injected by inserting `--posix` before `-l` and pointing
         // $ENV at croft's shim — but only from 4.4 (the kitty/Ghostty
         // floor): macOS's system bash 3.2 ignores $ENV in posix mode, so
-        // injecting would strip its startup files for nothing. zsh
-        // (ZDOTDIR) and fish (XDG_DATA_DIRS) are env-only and prepend
-        // nothing.
+        // it reads the shim through `--rcfile` instead (VS Code's way),
+        // non-login, with the shim replaying the login files. zsh
+        // (ZDOTDIR) and fish (XDG_DATA_DIRS) are env-only and add nothing.
+        let login = || vec!["-l".to_string()];
         let cfg = tempfile::tempdir().unwrap();
         if let Some(bash) = modern_bash() {
             let mut cmd = CommandBuilder::new(bash);
             assert_eq!(
-                apply_shell_integration_env(&mut cmd, bash, cfg.path()),
-                vec!["--posix".to_string()]
+                apply_shell_integration_env(&mut cmd, bash, cfg.path(), login()),
+                vec!["--posix".to_string(), "-l".to_string()]
             );
         }
         assert!(!parse_bash_version_supported("3.2"));
@@ -8600,17 +8612,21 @@ mod tests {
         assert!(parse_bash_version_supported("10.0"));
         if std::path::Path::new("/bin/bash").exists() && !bash_env_injection_supported("/bin/bash")
         {
-            // On a macOS box with system bash 3.2: no injection, no args.
+            // On a macOS box with system bash 3.2: the shim as its rcfile,
+            // with no `-l`, which would make bash ignore `--rcfile`.
+            let shim = crate::shell_integration::ensure_bash_shim(cfg.path()).unwrap();
             let mut cmd = CommandBuilder::new("/bin/bash");
-            assert!(
-                apply_shell_integration_env(&mut cmd, "/bin/bash", cfg.path()).is_empty(),
-                "bash 3.2 must spawn clean, without posix injection"
+            assert_eq!(
+                apply_shell_integration_env(&mut cmd, "/bin/bash", cfg.path(), login()),
+                vec!["--rcfile".to_string(), shim.display().to_string()],
+                "bash 3.2 must take the shim as its rcfile, without posix injection"
             );
         }
         for shell in ["/bin/zsh", "/usr/bin/fish", "/bin/dash"] {
             let mut cmd = CommandBuilder::new(shell);
-            assert!(
-                apply_shell_integration_env(&mut cmd, shell, cfg.path()).is_empty(),
+            assert_eq!(
+                apply_shell_integration_env(&mut cmd, shell, cfg.path(), login()),
+                login(),
                 "{shell} must not gain args"
             );
         }
@@ -8917,26 +8933,60 @@ mod tests {
         }
     }
 
-    /// Type `croft` at the pane's first prompt; the name of the croft that ran.
-    fn croft_that_answers(term: &mut PtyTerminal) -> String {
-        crate::test_budget::await_spawned(
-            std::time::Duration::from_millis(1000),
-            "the shell's first prompt",
-            || !term.prompt_lines().is_empty(),
-        );
-        term.write_input(b"croft\r");
+    /// Type `input`; the rest of the first line on screen starting `prefix`.
+    fn pane_answer(term: &mut PtyTerminal, input: &[u8], prefix: &str) -> String {
+        term.write_input(input);
         let answer = || {
             term.grid_lines()
                 .0
                 .iter()
-                .find_map(|l| l.trim().strip_prefix("CROFT_IS=").map(str::to_string))
+                .find_map(|l| l.trim().strip_prefix(prefix).map(str::to_string))
         };
         crate::test_budget::await_spawned(
             std::time::Duration::from_millis(1000),
-            "`croft` to answer",
+            &format!("an answer to {:?}", String::from_utf8_lossy(input)),
             || answer().is_some(),
         );
         answer().unwrap()
+    }
+
+    /// Type `croft` at the pane's first prompt; the name of the croft that ran.
+    fn croft_that_answers(term: &mut PtyTerminal) -> String {
+        // Text on screen, not a prompt mark, so a shell croft does not
+        // integrate is waited for too.
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(1000),
+            "the shell's first prompt",
+            || term.grid_lines().0.iter().any(|l| !l.trim().is_empty()),
+        );
+        pane_answer(term, b"croft\r", "CROFT_IS=")
+    }
+
+    /// A zsh login pane whose user `file` prepends the dir holding the other
+    /// croft, with the pane bin when `pane_bin`.
+    fn zsh_login_pane(
+        crofts: &TwoCrofts,
+        home: &std::path::Path,
+        cfg_dir: &std::path::Path,
+        file: &str,
+        pane_bin: bool,
+    ) -> Option<PtyTerminal> {
+        let zsh = zsh_or_skip()?;
+        std::fs::write(
+            home.join(file),
+            format!("export PATH=\"{}:$PATH\"\n", crofts.other_dir.display()),
+        )
+        .unwrap();
+        let shim = crate::shell_integration::ensure_zsh_shim(cfg_dir).unwrap();
+        let mut cmd = CommandBuilder::new(zsh);
+        cmd.arg("-l");
+        cmd.arg("-i");
+        cmd.cwd(home);
+        cmd.env("HOME", home);
+        cmd.env("ZDOTDIR", &shim);
+        cmd.env("CROFT_USER_ZDOTDIR", home);
+        apply_pane_bin(&mut cmd, pane_bin.then_some(crofts.pane_bin.as_path()));
+        Some(PtyTerminal::spawn_with(cmd, None).unwrap())
     }
 
     #[test]
@@ -8945,26 +8995,133 @@ mod tests {
         // in its pane printed Homebrew's 0.2.28, because `.zprofile` runs
         // `brew shellenv`, which puts /opt/homebrew/bin first after croft
         // set the pane's PATH.
-        let Some(zsh) = zsh_or_skip() else { return };
         let crofts = two_crofts();
-        let home = tempfile::tempdir().unwrap();
+        let (home, cfg_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let Some(mut term) =
+            zsh_login_pane(&crofts, home.path(), cfg_dir.path(), ".zprofile", true)
+        else {
+            return;
+        };
+        assert_eq!(croft_that_answers(&mut term), "running");
+    }
+
+    #[test]
+    fn a_zsh_pane_runs_its_own_croft_when_the_user_login_file_prepends_another() {
+        // A login zsh reads `.zlogin` after `.zshrc`, so a prepend there
+        // lands after the shim's `.zshrc` has put the pane bin first.
+        let crofts = two_crofts();
+        let (home, cfg_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let Some(mut term) = zsh_login_pane(&crofts, home.path(), cfg_dir.path(), ".zlogin", true)
+        else {
+            return;
+        };
+        assert_eq!(croft_that_answers(&mut term), "running");
+    }
+
+    #[test]
+    fn a_zsh_pane_without_a_pane_bin_keeps_the_user_path() {
+        // With no pane bin the shims must leave PATH as the user's files
+        // made it: their own croft first, and no empty entry, which a shell
+        // reads as the current directory.
+        let crofts = two_crofts();
+        let (home, cfg_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let Some(mut term) = zsh_login_pane(&crofts, home.path(), cfg_dir.path(), ".zlogin", false)
+        else {
+            return;
+        };
+        assert_eq!(croft_that_answers(&mut term), "other");
+        assert_eq!(
+            pane_answer(
+                &mut term,
+                b"case :$PATH: in *::*) echo E=1;; *) echo E=0;; esac\r",
+                "E="
+            ),
+            "0"
+        );
+    }
+
+    #[test]
+    fn a_bash_login_pane_runs_its_own_croft_when_the_profile_prepends_another() {
+        // The production argv, so macOS's bash 3.2, which cannot take the
+        // `$ENV` injection, is covered as well as a modern bash.
+        let bash = "/bin/bash";
+        if !std::path::Path::new(bash).exists() {
+            return;
+        }
+        let crofts = two_crofts();
+        let (home, cfg_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         std::fs::write(
-            home.path().join(".zprofile"),
+            home.path().join(".bash_profile"),
             format!("export PATH=\"{}:$PATH\"\n", crofts.other_dir.display()),
         )
         .unwrap();
-        let cfg_dir = tempfile::tempdir().unwrap();
-        let shim = crate::shell_integration::ensure_zsh_shim(cfg_dir.path()).unwrap();
-        let mut cmd = CommandBuilder::new(zsh);
-        cmd.arg("-l");
-        cmd.arg("-i");
+        let mut cmd = interactive_shell_command(bash, cfg_dir.path());
         cmd.cwd(home.path());
         cmd.env("HOME", home.path());
-        cmd.env("ZDOTDIR", &shim);
-        cmd.env("CROFT_USER_ZDOTDIR", home.path());
+        cmd.env("HISTFILE", home.path().join(".bash_history"));
         apply_pane_bin(&mut cmd, Some(&crofts.pane_bin));
         let mut term = PtyTerminal::spawn_with(cmd, None).unwrap();
         assert_eq!(croft_that_answers(&mut term), "running");
+    }
+
+    #[test]
+    fn a_bash_login_pane_without_env_injection_reports_command_exits() {
+        // macOS's bash 3.2 takes the shim through `--rcfile`, so its panes
+        // get the prompt and command marks a modern bash does.
+        if !std::path::Path::new("/bin/bash").exists() || bash_env_injection_supported("/bin/bash")
+        {
+            return;
+        }
+        let (home, cfg_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut cmd = interactive_shell_command("/bin/bash", cfg_dir.path());
+        cmd.cwd(home.path());
+        cmd.env("HOME", home.path());
+        cmd.env("HISTFILE", home.path().join(".bash_history"));
+        let mut term = PtyTerminal::spawn_with(cmd, None).unwrap();
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(1000),
+            "bash 3.2's first prompt mark",
+            || !term.prompt_lines().is_empty(),
+        );
+        term.write_input(b"false\r");
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(1000),
+            "the CommandEnd(1) mark for `false`",
+            || {
+                term.command_marks()
+                    .iter()
+                    .any(|(k, _)| *k == crate::shell_integration::OscEvent::CommandEnd(Some(1)))
+            },
+        );
+    }
+
+    #[test]
+    fn a_non_login_bash_without_env_injection_replays_no_login_files() {
+        // Below 4.4 bash reads the shim as its rcfile, which a login bash
+        // ignores, so the shim replays the login files itself when asked.
+        // Only a login spawn may ask.
+        if !std::path::Path::new("/bin/bash").exists() || bash_env_injection_supported("/bin/bash")
+        {
+            return;
+        }
+        let cfg = tempfile::tempdir().unwrap();
+        let shim = crate::shell_integration::ensure_bash_shim(cfg.path()).unwrap();
+        let rcfile = vec!["--rcfile".to_string(), shim.display().to_string()];
+        let mut cmd = CommandBuilder::new("/bin/bash");
+        assert_eq!(
+            apply_shell_integration_env(&mut cmd, "/bin/bash", cfg.path(), Vec::new()),
+            rcfile
+        );
+        assert_eq!(cmd.get_env("CROFT_BASH_LOGIN"), None);
+        let mut cmd = CommandBuilder::new("/bin/bash");
+        assert_eq!(
+            apply_shell_integration_env(&mut cmd, "/bin/bash", cfg.path(), vec!["-l".to_string()]),
+            rcfile
+        );
+        assert_eq!(
+            cmd.get_env("CROFT_BASH_LOGIN"),
+            Some(std::ffi::OsStr::new("1"))
+        );
     }
 
     #[test]
