@@ -38819,6 +38819,70 @@ fn palette_merge_accept_both_keeps_ours_then_theirs() {
     );
 }
 
+/// Both branches add a function at the same spot, and git's default
+/// conflict style writes the functions' shared `}` once, below the
+/// markers. Accept Both still keeps each function whole and closed.
+#[test]
+fn palette_merge_accept_both_keeps_both_added_functions_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let base = "fn a() {\n    x();\n}\n\nfn tail() {\n    z();\n}\n";
+    let add = |f: &str| {
+        base.replace(
+            "fn tail",
+            &format!("fn {f}() {{\n    {f}();\n}}\n\nfn tail"),
+        )
+    };
+    git_ok(root, &["init", "-q", "-b", "main"]);
+    git_ok(root, &["config", "user.name", "t"]);
+    git_ok(root, &["config", "user.email", "t@t"]);
+    // Git's default style, whatever this machine's config says.
+    git_ok(root, &["config", "merge.conflictStyle", "merge"]);
+    std::fs::write(root.join("a.rs"), base).unwrap();
+    git_ok(root, &["add", "-A"]);
+    git_ok(root, &["commit", "-qm", "base"]);
+    git_ok(root, &["checkout", "-qb", "feature"]);
+    std::fs::write(root.join("a.rs"), add("from_branch")).unwrap();
+    git_ok(root, &["commit", "-qam", "branch"]);
+    git_ok(root, &["checkout", "-q", "main"]);
+    std::fs::write(root.join("a.rs"), add("from_main")).unwrap();
+    git_ok(root, &["commit", "-qam", "main"]);
+    let merge = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["merge", "-q", "feature"])
+        .output()
+        .unwrap();
+    assert!(!merge.status.success(), "the merge must conflict");
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    app.editor.open_pinned(&root.join("a.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    let footer = app
+        .editor
+        .lines
+        .iter()
+        .position(|l| l.starts_with(">>>>>>>"))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines[footer + 1],
+        "}",
+        "git wrote the shared `}}` below the markers"
+    );
+    app.editor.cursor_row = footer - 1;
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptBoth);
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "fn a() {\n    x();\n}\n\nfn from_main() {\n    from_main();\n}\n\n\
+         fn from_branch() {\n    from_branch();\n}\n\nfn tail() {\n    z();\n}"
+    );
+    assert_eq!(
+        app.status,
+        "Accepted both changes — all conflicts resolved; \"Merge: Complete Merge\" stages the file"
+    );
+    assert!(app.editor.undo(), "resolution is one undo step");
+    assert!(app.editor.lines.iter().any(|l| l.starts_with("<<<<<<<")));
+}
+
 #[test]
 fn merge_commands_outside_a_conflict_report_and_leave_the_buffer_alone() {
     let tmp = tempfile::tempdir().unwrap();

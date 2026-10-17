@@ -1,0 +1,1 @@
+fix: Accept Both on a merge conflict keeps both sides whole. When both branches add code at the same spot, git writes the lines they share, such as a closing `}`, only once below the conflict markers; Accept Both now puts them back on each side instead of leaving the first side's function unclosed, with no git setting needed.
