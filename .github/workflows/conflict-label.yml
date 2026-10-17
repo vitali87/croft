@@ -1,0 +1,37 @@
+name: Label merge conflicts
+
+# A PR's check badge reports CI only, so a PR that conflicts with its base still
+# shows all green in the PR list, and GitHub has no column or search qualifier
+# for mergeability. This keeps the `merge_conflict` label on every open PR that
+# has merge conflicts and removes it once they are resolved, so the list shows
+# it beside the title and `is:pr is:open label:merge_conflict` finds them.
+
+on:
+  # A merge into main can put any open PR against main in conflict.
+  push:
+    branches: [main]
+  # A PR opened on a stale base, or a new head that resolves its conflicts.
+  # pull_request_target, not pull_request: under pull_request a fork PR gets a
+  # read-only token and its label could never change. This trigger hands the
+  # job a write token, which is safe only because nothing here checks out or
+  # runs the PR's code: the action reads mergeability and edits labels through
+  # the API. Keep it that way. It also runs this file as it is on main, so a
+  # change here takes effect only once merged.
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Adding and removing the label on a PR. The label already exists in
+      # the repo, so the job never needs issues: write to create it.
+      pull-requests: write
+    steps:
+      - uses: eps1lon/actions-label-merge-conflict@0273be72a0bbd58fcd71d0d6c02c209b50d1e5e1 # v3.1.0
+        with:
+          dirtyLabel: merge_conflict
+          repoToken: ${{ secrets.GITHUB_TOKEN }}
