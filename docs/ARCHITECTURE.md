@@ -113,7 +113,7 @@ src/
 │   ├── overlay.rs       inline-image overlay state + clear-on-hide latches (iTerm2 cell eviction; the Kitty path adds a delete-all on the same clear frames)
 │   ├── perf_hud.rs      F8 performance HUD
 │   ├── welcome.rs       welcome-screen state: the "IN THIS RELEASE" highlights, read synchronously from `release_notes::release_notes()` (no thread, no network)
-│   └── tests.rs         unit / integration tests
+│   └── tests/           whole-app tests, one file per area; `mod.rs` holds the helpers more than one file uses
 ├── dap/                 debugger stack: Debug Adapter Protocol client. debugpy (Python: the adapter on a private 3.14+ venv, the program on the project's own interpreter, #864) is the verified mechanism; Rust/C/C++ route to lldb-dap; JS/TS route to vscode-js-debug; Go routes to delve (`dlv dap` over TCP, single-session, #264). Which file types each handles is a data-driven extension axis (see registry.rs)
 │   ├── mod.rs
 │   ├── transport.rs     DAP wire framing (Content-Length + seq envelope, not JSON-RPC, so async-lsp can't be reused); spawns the adapter detached via setsid (so the debuggee can't tcsetpgrp-background and SIGTTIN-suspend croft, and so teardown can killpg the whole group), blocking reader thread frames stdout into an mpsc channel; Drop signals the process group and reaps the child, except after a `disconnect` (#1536): then a detached teardown thread gives the adapter up to 2 s to answer and end the debuggee, kills the group, and SIGKILLs the debuggee pid from the `process` event if a launched program is still running (debugpy's launcher puts it in its own group, out of `killpg`'s reach); quit stops every session and joins these teardowns
