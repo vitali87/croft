@@ -1,1 +1,0 @@
-feature: A notebook naming a kernel this machine does not have (such as `conda-env-ds-py`) now asks which installed kernel to use instead of failing with "No such kernel", and **Notebook: Select Kernel** switches a notebook's kernel. The choice is saved in the notebook, as in Jupyter.

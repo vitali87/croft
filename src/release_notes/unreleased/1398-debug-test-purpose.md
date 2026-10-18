@@ -1,1 +1,0 @@
-fix: Debug Test at Cursor on a pytest test now uses a launch.json debugpy configuration marked `"purpose": ["debug-test"]`, as VS Code does: its `env`, `envFile`, `cwd`, `args`, `justMyCode` and other debugpy settings reach the test, so a test that needs them no longer fails only under croft's debugger.
