@@ -25,6 +25,8 @@ pub enum Command {
     ToggleLineComment,
     ToggleBlockComment,
     JoinLines,
+    InsertLineBelow,
+    InsertLineAbove,
     DeleteLine,
     KillToEndOfLine,
     TransformUpper,
@@ -85,6 +87,12 @@ pub enum Command {
     RustOpenCargoToml,
     RustRebuildProcMacros,
     RustReloadWorkspace,
+    /// Git: Copy Permalink / Copy Head Link / Open on Remote (#1610): the
+    /// selected lines on the remote's web page, at HEAD's commit or branch.
+    GitCopyPermalink,
+    GitCopyHeadLink,
+    GitOpenOnRemote,
+
     /// Pick a stash and open its changes (#1581).
     GitViewStash,
     AddCursorAbove,
@@ -142,6 +150,8 @@ pub enum Command {
     ToggleIndentGuides,
     ToggleBracketColors,
     ToggleRenderWhitespace,
+    /// View: Change Line Numbers (#1576): on, relative, interval, off.
+    CycleLineNumbers,
     ToggleInlineValues,
     ToggleInlayHints,
     ToggleMarkdownPreview,
@@ -542,6 +552,8 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ToggleLineComment,
     Command::ToggleBlockComment,
     Command::JoinLines,
+    Command::InsertLineBelow,
+    Command::InsertLineAbove,
     Command::DeleteLine,
     Command::KillToEndOfLine,
     Command::TransformUpper,
@@ -596,6 +608,9 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::RustOpenCargoToml,
     Command::RustRebuildProcMacros,
     Command::RustReloadWorkspace,
+    Command::GitCopyPermalink,
+    Command::GitCopyHeadLink,
+    Command::GitOpenOnRemote,
     Command::GitViewStash,
     Command::AddCursorAbove,
     Command::AddCursorBelow,
@@ -644,6 +659,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ToggleIndentGuides,
     Command::ToggleBracketColors,
     Command::ToggleRenderWhitespace,
+    Command::CycleLineNumbers,
     Command::ToggleInlineValues,
     Command::ToggleInlayHints,
     Command::ToggleMarkdownPreview,
@@ -973,6 +989,8 @@ impl Command {
             Command::ToggleLineComment => "Toggle Line Comment",
             Command::ToggleBlockComment => "Toggle Block Comment",
             Command::JoinLines => "Join Lines",
+            Command::InsertLineBelow => "Insert Line Below",
+            Command::InsertLineAbove => "Insert Line Above",
             Command::DeleteLine => "Delete Line",
             Command::KillToEndOfLine => "Kill to End of Line",
             Command::TransformUpper => "Transform to Uppercase",
@@ -1027,6 +1045,10 @@ impl Command {
             Command::RustOpenCargoToml => "Rust: Open Cargo.toml",
             Command::RustRebuildProcMacros => "Rust: Rebuild Proc Macros and Build Scripts",
             Command::RustReloadWorkspace => "Rust: Reload Workspace",
+            Command::GitCopyPermalink => "Git: Copy Permalink",
+            Command::GitCopyHeadLink => "Git: Copy Head Link",
+            Command::GitOpenOnRemote => "Git: Open on Remote",
+
             Command::GitViewStash => "Git: View Stash\u{2026}",
             Command::AddCursorAbove => "Add Cursor Above",
             Command::AddCursorBelow => "Add Cursor Below",
@@ -1075,6 +1097,7 @@ impl Command {
             Command::ToggleIndentGuides => "View: Toggle Indent Guides",
             Command::ToggleBracketColors => "Editor: Toggle Bracket Pair Colorization",
             Command::ToggleRenderWhitespace => "View: Toggle Render Whitespace",
+            Command::CycleLineNumbers => "View: Change Line Numbers (On, Relative, Interval, Off)",
             Command::ToggleInlineValues => "Debug: Toggle Inline Values",
             Command::ToggleInlayHints => "Editor: Toggle Inlay Hints",
             Command::ToggleMarkdownPreview => "Markdown: Toggle Preview",
@@ -1390,6 +1413,8 @@ impl Command {
             Command::MoveLineUp => "Alt+↑",
             Command::MoveLineDown => "Alt+↓",
             Command::JoinLines => "Cmd+Opt+Shift+J",
+            Command::InsertLineBelow => "Cmd+Enter",
+            Command::InsertLineAbove => "Cmd+Shift+Enter",
             Command::DeleteLine => "Cmd+Shift+K",
             // macOS keeps `Ctrl+K`; off it `Ctrl+K` is the `Cmd+K` leader
             // except in vim mode (#843), so the palette is the way there.
@@ -1425,6 +1450,7 @@ impl Command {
             Command::ToggleIndentGuides => "",
             Command::ToggleBracketColors => "",
             Command::ToggleRenderWhitespace => "",
+            Command::CycleLineNumbers => "",
             Command::ToggleInlineValues => "",
             Command::ToggleInlayHints => "",
             Command::ToggleMarkdownPreview => "Cmd+Shift+V",
@@ -1468,6 +1494,8 @@ impl Command {
             | Command::RustOpenCargoToml
             | Command::RustRebuildProcMacros
             | Command::RustReloadWorkspace => "",
+            Command::GitCopyPermalink | Command::GitCopyHeadLink | Command::GitOpenOnRemote => "",
+
             Command::GitViewStash => "",
             Command::AddCursorAbove => "Cmd+Opt+↑",
             Command::AddCursorBelow => "Cmd+Opt+↓",
@@ -1838,6 +1866,8 @@ impl Command {
             Command::ToggleLineComment => "toggle_line_comment",
             Command::ToggleBlockComment => "toggle_block_comment",
             Command::JoinLines => "join_lines",
+            Command::InsertLineBelow => "insert_line_below",
+            Command::InsertLineAbove => "insert_line_above",
             Command::DeleteLine => "delete_line",
             Command::KillToEndOfLine => "kill_to_end_of_line",
             Command::TransformUpper => "transform_upper",
@@ -1892,6 +1922,10 @@ impl Command {
             Command::RustOpenCargoToml => "rust_open_cargo_toml",
             Command::RustRebuildProcMacros => "rust_rebuild_proc_macros",
             Command::RustReloadWorkspace => "rust_reload_workspace",
+            Command::GitCopyPermalink => "git_copy_permalink",
+            Command::GitCopyHeadLink => "git_copy_head_link",
+            Command::GitOpenOnRemote => "git_open_on_remote",
+
             Command::GitViewStash => "git_view_stash",
             Command::AddCursorAbove => "add_cursor_above",
             Command::AddCursorBelow => "add_cursor_below",
@@ -1940,6 +1974,7 @@ impl Command {
             Command::ToggleIndentGuides => "toggle_indent_guides",
             Command::ToggleBracketColors => "toggle_bracket_colors",
             Command::ToggleRenderWhitespace => "toggle_render_whitespace",
+            Command::CycleLineNumbers => "cycle_line_numbers",
             Command::ToggleInlineValues => "toggle_inline_values",
             Command::ToggleInlayHints => "toggle_inlay_hints",
             Command::ToggleMarkdownPreview => "toggle_markdown_preview",
@@ -2242,13 +2277,19 @@ impl Command {
 
     /// An extra word the palette matches this command on, beyond its
     /// title: "layout" for the Customize Layout commands (#852), whose
-    /// VS Code names mostly don't say it, and the tab menu's "Keep Open"
-    /// for View: Keep Editor. Empty for the rest.
+    /// VS Code names mostly don't say it, the tab menu's "Keep Open" for
+    /// View: Keep Editor, and the hosts a shared link opens on (#1610).
+    /// Empty for the rest.
     pub fn keyword(self) -> &'static str {
         if LAYOUT_COMMANDS.contains(&self) {
             "layout"
         } else if self == Command::KeepEditor {
             "keep open"
+        } else if matches!(
+            self,
+            Command::GitCopyPermalink | Command::GitCopyHeadLink | Command::GitOpenOnRemote
+        ) {
+            "github gitlab bitbucket share link url"
         } else {
             ""
         }
