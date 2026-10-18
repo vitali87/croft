@@ -491,6 +491,64 @@ fn session_supervisor_check_command() -> &'static str {
     "export PATH=\"$HOME/.cargo/bin:$PATH\"; croft session-host --probe >/dev/null 2>&1 || command -v dtach >/dev/null 2>&1"
 }
 
+/// The bytes that hand the terminal back when the remote croft lost it
+/// mid-session (#1460). A dropped connection ends the session's ssh without
+/// the remote croft ever running its teardown, so the terminal stays on that
+/// croft's alt screen with mouse tracking on, while ssh puts the tty back in
+/// cooked mode. Each line printed next (the reconnect progress, ssh's own
+/// errors) then scrolled croft's screen up, and every mouse move was echoed
+/// as `^[[<35;…M` text.
+///
+/// The kitty keyboard flags go first, while the alt screen that holds them
+/// is still showing, and are also set to none: a terminal that keeps one
+/// stack for both screens would otherwise send Ctrl+C as an escape code, not
+/// an interrupt. The alt screen goes last. The DECSC in front of it makes
+/// leaving safe when the main screen already shows (the session dropped
+/// before croft drew): leaving restores the main screen's saved cursor, and
+/// that is then where the cursor already is. On the alt screen it saves into
+/// the alt screen's own slot, which the main screen never reads.
+///
+/// The terminal's default colours are reset as well, the same as croft's own
+/// exit does. Nothing runs after a session that is given up (Ctrl+C during
+/// the reconnect, the attempts running out, a host with no session to
+/// resume), so this is the last chance to put the shell's colours back. A
+/// resumed croft sets its theme's colours again with its modes
+/// (`reattach_reassert_seq` in app/mod.rs).
+fn lost_session_release_seq() -> String {
+    let mut seq = String::from(concat!(
+        "\x1b[<u\x1b[=0;1u",
+        "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l",
+        "\x1b[?2004l\x1b[?1004l",
+        "\x1b[0m\x1b[0 q\x1b[?25h",
+    ));
+    seq.push_str(crate::app::reset_host_colors_seq());
+    if crate::iterm2_inline::detect_iterm2_inline_support() {
+        seq.push_str(&crate::app::reset_session_bg_seq());
+    }
+    seq.push_str("\x1b7\x1b[?1049l");
+    seq
+}
+
+/// Give the terminal back after the remote croft lost it (#1460), before
+/// anything else is printed: see [`lost_session_release_seq`]. Mouse reports
+/// already on their way are then dropped from the tty's input, so they reach
+/// neither the shell nor the resumed croft as typed text.
+fn release_lost_session_terminal() {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(lost_session_release_seq().as_bytes());
+    let _ = out.flush();
+    #[cfg(unix)]
+    {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // SAFETY: tcflush only discards queued input on fd 0, and fails
+        // harmlessly when stdin is not a terminal.
+        unsafe {
+            libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+        }
+    }
+}
+
 /// Re-establish the SSH control master after a transport drop (laptop sleep,
 /// network change), printing progress. Each attempt is bounded by the master's
 /// `ConnectTimeout`, then backs off; the user presses Ctrl+C to stop and fall
@@ -581,6 +639,10 @@ fn run_croft_session(
             (String::from("CROFT_CLIENT_NONCE"), client_nonce.clone()),
         ];
         let status = run_remote_croft(&ssh, path, &env, solo)?;
+        // A session that failed may have died holding the terminal (#1460).
+        if classify_remote_status(status.code()) == RemoteStatusClass::Failed {
+            release_lost_session_terminal();
+        }
         match classify_remote_status(status.code()) {
             RemoteStatusClass::ReturnToLocal => return Ok(RemoteOutcome::ReturnToLocal),
             RemoteStatusClass::Exited => return Ok(RemoteOutcome::Exited),
@@ -5109,6 +5171,76 @@ Host !blocked *.internal
         assert!(!is_transport_failure(Some(1)));
         assert!(!is_transport_failure(Some(101)));
         assert!(!is_transport_failure(None));
+    }
+
+    #[test]
+    fn a_lost_session_turns_off_every_mode_croft_turned_on() {
+        // #1460: the remote croft's modes outlived the dropped connection,
+        // so the reconnect lines scrolled its screen and mouse moves typed
+        // `^[[<35;…M`. Whatever croft's takeover turns on, the release
+        // turns off, so a mode added there later cannot be missed here.
+        let release = lost_session_release_seq();
+        let takeover = String::from_utf8(crate::app::takeover_mode_seq()).unwrap();
+        let mut modes = 0;
+        for set in takeover.split("\x1b[?").skip(1) {
+            let Some(mode) = set.split('h').next().filter(|m| set.len() > m.len()) else {
+                continue;
+            };
+            for mode in mode.split(';') {
+                modes += 1;
+                assert!(
+                    release.contains(&format!("\x1b[?{mode}l")),
+                    "mode {mode} is left on: {release:?}"
+                );
+            }
+        }
+        assert!(
+            modes >= 4,
+            "the takeover's modes were all read: {takeover:?}"
+        );
+        assert!(
+            release.contains("\x1b[0 q"),
+            "the terminal's own cursor shape"
+        );
+        assert!(release.contains("\x1b[?25h"), "a visible cursor");
+        let rest = release.replace("\x1b[?25h", "");
+        assert!(
+            !rest.contains("h\x1b") && !rest.ends_with('h'),
+            "nothing else is turned on: {release:?}"
+        );
+    }
+
+    #[test]
+    fn a_lost_session_leaves_the_alt_screen_last_and_its_colours_come_back_on_resume() {
+        let release = lost_session_release_seq();
+        // The kitty flags are cleared on the alt screen that holds them,
+        // before the screen changes.
+        let kitty = release.find("\x1b[=0;1u").expect("the kitty flags cleared");
+        assert!(release.find("\x1b[<u").is_some_and(|pop| pop < kitty));
+        // Leaving is the last thing, right after a DECSC, so it is harmless
+        // when the main screen already shows.
+        assert!(release.ends_with("\x1b7\x1b[?1049l"), "{release:?}");
+        assert!(kitty < release.len() - "\x1b7\x1b[?1049l".len());
+        // A session given up runs nothing after this, so the shell gets its
+        // own colours back here...
+        assert!(
+            release.contains(crate::app::reset_host_colors_seq()),
+            "{release:?}"
+        );
+        // ...and a resumed croft sets its theme's again with its modes.
+        let theme = crate::theme::Theme::BLACK;
+        let reattach = String::from_utf8(crate::app::reattach_reassert_seq(theme)).unwrap();
+        let takeover = String::from_utf8(crate::app::takeover_mode_seq()).unwrap();
+        assert!(reattach.starts_with(&takeover), "{reattach:?}");
+        let (r, g, b) = theme.editor_bg_rgb();
+        assert!(
+            reattach.contains(&format!("\x1b]11;rgb:{r:02x}/{g:02x}/{b:02x}\x07")),
+            "the theme's background: {reattach:?}"
+        );
+        assert!(
+            reattach.contains("\x1b]10;rgb:"),
+            "and foreground: {reattach:?}"
+        );
     }
 
     #[test]
