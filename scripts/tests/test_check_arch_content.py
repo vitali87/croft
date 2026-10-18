@@ -102,6 +102,17 @@ class Gutting(unittest.TestCase):
         after = doc(["src/", "└── b.rs   and b"])
         self.assertEqual(gate.compare(before, after)[1], ["src/a.rs"])
 
+    def test_a_file_row_that_became_a_directory_is_not_dropped(self):
+        """`a.rs` split into `a/` is the same module, not a removed one."""
+        before = doc(["src/", "└── a.rs                 does a thing"])
+        after = doc(["src/", "└── a/                   does a thing, one file per area"])
+        self.assertEqual(gate.compare(before, after), ([], []))
+
+    def test_a_file_row_gutted_on_its_way_into_a_directory_is_reported(self):
+        before = doc(["src/", "└── a.rs                 " + self.LONG])
+        after = doc(["src/", "└── a/                   short"])
+        self.assertEqual([n for n, _, _ in gate.compare(before, after)[0]], ["src/a.rs"])
+
 
 class Threshold(unittest.TestCase):
     """The bound is a measured value; these pin which side of it a shrink lands."""

@@ -33,7 +33,10 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
 * **Keep PRs small.** The PR Split Score check flags anything over about 400
   changed lines. Split bigger work into stacked PRs.
 * **Tests** go beside the code in a `#[cfg(test)]` module. Whole-app behaviour is
-  tested in `src/app/tests.rs`, and the CLI in `tests/`.
+  tested in `src/app/tests/`, one file per area (`terminal.rs`, `scm.rs`,
+  `lsp.rs`, ...), and the CLI in `tests/`. Put a whole-app test in the file for
+  the area it covers, beside the tests closest to it rather than at the end of
+  the file; a helper more than one file needs goes in `src/app/tests/mod.rs`.
 * **Commits** are one imperative sentence saying what changed for the user, for
   example `Keep folds collapsed when lines are added or deleted`. No prefixes.
 * **Keep your branch current by merging `main` into it.** Don't rebase or
@@ -64,7 +67,7 @@ fix: Ctrl+Q asks before throwing away unsaved edits.
 `src/release_notes/<version>.md`. After your PR merges, CI assigns the version,
 folds in the notes, and publishes the release. You don't need a fragment for
 docs, CI or test-only changes. A diff confined to `#[cfg(test)]`,
-`src/app/tests.rs` or `tests/` counts as test-only.
+`src/app/tests/` or `tests/` counts as test-only.
 
 ## Show it
 
