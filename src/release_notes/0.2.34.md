@@ -1,0 +1,1 @@
+fix: Toggle Line Comment (Ctrl+/) and Toggle Block Comment on a line inside JSX children in a `.jsx` or `.tsx` file now write `{/* <p>Welcome</p> */}`, as VS Code does. They used to write `//` or `/* */`, which React renders as text beside the element that was meant to be hidden. Lines of ordinary code, including JSX attributes, keep `//`.
