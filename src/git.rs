@@ -1279,13 +1279,22 @@ pub fn remerge_diff3(root: &Path, rel_path: &str) -> Result<String, String> {
         ("base", read_file_at_stage(root, rel_path, 1)?),
         ("theirs", read_file_at_stage(root, rel_path, 3)?),
     ];
+    // A directory of our own, made fresh: `create_dir_all` would take one
+    // another local user made first at this guessable name, and the writes
+    // below would follow the symlinks they left in it.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
     let dir = std::env::temp_dir().join(format!(
-        "croft-remerge-{}-{}",
+        "croft-remerge-{}-{}-{nanos}",
         std::process::id(),
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(&dir).map_err(|e| e.to_string())?;
     let merged = (|| {
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         for (name, text) in &sides {
             std::fs::write(dir.join(name), text).map_err(|e| e.to_string())?;
         }

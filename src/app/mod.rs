@@ -15360,10 +15360,13 @@ impl App {
     fn untrimmed_both_at(&mut self, row: usize) -> Option<(std::ops::Range<usize>, Vec<String>)> {
         let block = crate::merge::conflict_containing(self.editor.conflicts(), row)?;
         let path = self.editor.path.clone()?;
-        // Stage specs are repo-toplevel-relative (#139): see `repo_rel`.
-        let root = self.scm_root();
+        // Stage specs are relative to the toplevel of the file's own repo
+        // (#139). Not `scm_root`: Source Control can be pinned to another
+        // folder of a multi-root workspace.
+        let root = path.parent().and_then(crate::git::repo_toplevel)?;
         let canon_root = std::fs::canonicalize(&root).unwrap_or(root);
-        let rel = self.repo_rel(&path);
+        let canon_path = std::fs::canonicalize(&path).ok()?;
+        let rel = canon_path.strip_prefix(&canon_root).ok()?.to_string_lossy();
         let merged = crate::git::remerge_diff3(&canon_root, &rel).ok()?;
         let merged: Vec<String> = merged.lines().map(str::to_string).collect();
         crate::merge::untrimmed_both(

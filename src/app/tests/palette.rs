@@ -1370,13 +1370,10 @@ fn palette_merge_accept_both_keeps_ours_then_theirs() {
     );
 }
 
-/// Both branches add a function at the same spot, and git's default
-/// conflict style writes the functions' shared `}` once, below the
-/// markers. Accept Both still keeps each function whole and closed.
-#[test]
-fn palette_merge_accept_both_keeps_both_added_functions_closed() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
+/// A repo at `root` whose `a.rs` is unmerged: both branches add a
+/// function at the same spot, and git's default conflict style writes the
+/// functions' shared `}` once, below the markers.
+fn both_added_conflict(root: &std::path::Path) {
     let base = "fn a() {\n    x();\n}\n\nfn tail() {\n    z();\n}\n";
     let add = |f: &str| {
         base.replace(
@@ -1405,9 +1402,11 @@ fn palette_merge_accept_both_keeps_both_added_functions_closed() {
         .output()
         .unwrap();
     assert!(!merge.status.success(), "the merge must conflict");
-    let mut app = App::new(root.to_path_buf()).unwrap();
-    app.editor.open_pinned(&root.join("a.rs")).unwrap();
-    app.focus_pane(Pane::Editor);
+}
+
+/// The conflict's footer row in `app`'s editor, with the shared `}` git
+/// wrote below it.
+fn shared_brace_footer(app: &App) -> usize {
     let footer = app
         .editor
         .lines
@@ -1419,19 +1418,55 @@ fn palette_merge_accept_both_keeps_both_added_functions_closed() {
         "}",
         "git wrote the shared `}}` below the markers"
     );
-    app.editor.cursor_row = footer - 1;
+    footer
+}
+
+/// Both branches' functions, each whole and closed.
+const BOTH_ADDED_RESOLVED: &str = "fn a() {\n    x();\n}\n\nfn from_main() {\n    from_main();\n}\n\n\
+     fn from_branch() {\n    from_branch();\n}\n\nfn tail() {\n    z();\n}";
+
+/// Both branches add a function at the same spot, and git's default
+/// conflict style writes the functions' shared `}` once, below the
+/// markers. Accept Both still keeps each function whole and closed.
+#[test]
+fn palette_merge_accept_both_keeps_both_added_functions_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    both_added_conflict(root);
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    app.editor.open_pinned(&root.join("a.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = shared_brace_footer(&app) - 1;
     app.run_command(crate::widgets::command_palette::Command::MergeAcceptBoth);
-    assert_eq!(
-        app.editor.lines.join("\n"),
-        "fn a() {\n    x();\n}\n\nfn from_main() {\n    from_main();\n}\n\n\
-         fn from_branch() {\n    from_branch();\n}\n\nfn tail() {\n    z();\n}"
-    );
+    assert_eq!(app.editor.lines.join("\n"), BOTH_ADDED_RESOLVED);
     assert_eq!(
         app.status,
         "Accepted both changes — all conflicts resolved; \"Merge: Complete Merge\" stages the file"
     );
     assert!(app.editor.undo(), "resolution is one undo step");
     assert!(app.editor.lines.iter().any(|l| l.starts_with("<<<<<<<")));
+}
+
+/// Accept Both reads the stages from the file's own repo. With Source
+/// Control showing another folder of the workspace, it still keeps both
+/// functions closed rather than joining the trimmed sections.
+#[test]
+fn accept_both_reads_the_stages_of_the_files_own_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let other = tmp.path().join("other");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::create_dir(&other).unwrap();
+    git_ok(&other, &["init", "-q"]);
+    both_added_conflict(&repo);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.add_workspace_folder(other.clone());
+    app.editor.open_pinned(&repo.join("a.rs")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.active_scm_root = other;
+    app.editor.cursor_row = shared_brace_footer(&app) - 1;
+    app.run_command(crate::widgets::command_palette::Command::MergeAcceptBoth);
+    assert_eq!(app.editor.lines.join("\n"), BOTH_ADDED_RESOLVED);
 }
 
 #[test]
