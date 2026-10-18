@@ -110,6 +110,15 @@ def section_keys(name, ambiguous=frozenset()):
 def compare(old, new):
     """(shrunk-with-no-section, dropped-rows) between two versions of the doc."""
     before, after = tree_descriptions(old), tree_descriptions(new)
+    # A module that moved from `foo.rs` into a `foo/` directory is the same
+    # module, so its directory row inherits the file row's description: it is
+    # compared like any other row rather than reported as dropped.
+    moved = {
+        name: name[: -len(".rs")]
+        for name in before
+        if name.endswith(".rs") and name not in after and name[: -len(".rs")] in after
+    }
+    after = {**after, **{was: after[now] for was, now in moved.items()}}
     # A basename carried by more than one row cannot stand in for a path.
     seen = collections.Counter(p.rstrip("/").split("/")[-1] for p in before)
     ambiguous = frozenset(leaf for leaf, n in seen.items() if n > 1)
