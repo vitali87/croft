@@ -13,4 +13,4 @@ api_version = 1
 id = "test-go"
 label = "go test"
 kind = "go"
-markers = ["go.mod"]
+markers = ["go.mod", "go.work"]
