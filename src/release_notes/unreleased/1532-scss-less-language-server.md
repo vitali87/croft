@@ -1,1 +1,0 @@
-feature: `.scss` and `.less` files now get the CSS language server (problems, outline, colour swatches, hover, go to definition and rename for variables and mixins), `.less` files are highlighted instead of opening as Plain Text, and the status bar says SCSS, Less or Sass.
