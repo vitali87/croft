@@ -246,8 +246,11 @@ pub fn fence_code(info: &str, text: &str) -> Option<String> {
         return Some(text.to_string());
     }
     // `# ` is a root prompt only where the fence says it is a transcript:
-    // in a shell fence it is a comment.
-    let commands = transcript_commands(text, declared);
+    // in a shell fence it is a comment. Beside `$ ` prompts it is a comment
+    // too (`# or, for a release build`): typing it would run its words, and
+    // a quote it opens would swallow the commands after it.
+    let root = declared && !text.lines().any(|l| prompt_command(l, false).is_some());
+    let commands = transcript_commands(text, root);
     (!commands.trim().is_empty()).then_some(commands)
 }
 
@@ -2225,6 +2228,16 @@ mod tests {
         // A bare `$` prompt line is an empty command, not `$`.
         let bare = "```console\n$\n$ pwd\n/home/me\n```\n";
         assert_eq!(run_codes(bare), vec!["pwd\n"]);
+    }
+
+    /// #1473: beside `$ ` prompts a `# ` line is a comment, not a root
+    /// prompt, so it never runs, and an apostrophe in it opens no quote
+    /// that would swallow the commands after it.
+    #[test]
+    fn a_comment_beside_user_prompts_in_a_console_fence_never_runs() {
+        let md = "```console\n# Install the dependencies\n$ npm install\nadded 1 package\n\
+                  # Don't forget the build\n$ npm run build\n```\n";
+        assert_eq!(run_codes(md), vec!["npm install\nnpm run build\n"]);
     }
 
     /// #1473: a command continued onto the next lines keeps them, whether
