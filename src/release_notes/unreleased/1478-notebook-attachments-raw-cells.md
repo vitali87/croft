@@ -1,1 +1,0 @@
-fix: The notebook view now draws images pasted into Markdown cells (`![shot.png](attachment:shot.png)`, stored in the cell's attachments) instead of a placeholder, and shows raw cells' text instead of skipping them.
