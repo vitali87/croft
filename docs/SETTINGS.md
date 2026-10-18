@@ -99,13 +99,13 @@ allowlist — appearance and editor/terminal behavior:
 
 `theme`, `format_on_save`, `format_on_type`, `auto_save`, `auto_save_on_focus_change`,
 `render_whitespace`, `word_based_suggestions`, `disable_inline_blame`, `disable_auto_close_pairs`, `disable_paste_reindent`,
-`disable_inline_values`, `disable_save_before_debug`, `disable_bracket_colors`, `disable_indent_guides`,
+`disable_inline_values`, `disable_save_before_debug`, `disable_bracket_colors`, `disable_indent_guides`, `line_numbers`,
 `disable_inlay_hints`, `copy_on_select`, `disable_secret_redaction`, `disable_log_highlight`, `explorer_views`,
 `files_exclude`, `search_exclude`, `languages` (only its per-language
 editor keys; see below), `files_encoding`.
 
 Everything else — `disabled_extensions`, `mcp_consented`, `disable_remote_offer`, `remote_offer_excluded_hosts`, `config_sync_excluded_hosts`, `config_sync_excluded_files`, `fleet_groups`, `code_scanning`, `lane_agent`,
-`mcp_tool_fingerprints`, `host_accents`, `notifications`, `screen_reader`, `screen_reader_command`, `codeql_cli_path`, `locale`, and any future key not explicitly
+`mcp_tool_fingerprints`, `host_accents`, `notifications`, `screen_reader`, `screen_reader_command`, `codeql_cli_path`, `locale`, `terminal_multiline_paste_warning`, and any future key not explicitly
 allowlisted — is ignored from workspace layers with a visible warning.
 Extending the allowlist is a deliberate review decision, not a default.
 
@@ -128,6 +128,7 @@ means the same thing whichever path reads it.
 | `editor.wordBasedSuggestions` | `word_based_suggestions` (`off` / `currentDocument` / `matchingDocuments` / `allDocuments`; the older `true` / `false` map to `matchingDocuments` / `off`) |
 | `editor.bracketPairColorization.enabled` | `disable_bracket_colors` (negated) |
 | `editor.guides.indentation` | `disable_indent_guides` (negated) |
+| `editor.lineNumbers` | `line_numbers` (`on` / `relative` / `interval` / `off`) |
 | `editor.inlayHints.enabled` | `disable_inlay_hints` (negated) |
 | `editor.autoClosingBrackets: "never"` | `disable_auto_close_pairs` |
 | `debug.saveBeforeStart: "none"` | `disable_save_before_debug` (every other value saves before a launch, a task or a Testing run) |
@@ -317,6 +318,26 @@ recent scrollback redrawn, including what it printed while croft was down.
 - It applies to shell panes opened after the change, not to task or run
   panes, on Linux and macOS.
 - A pane whose host cannot start is an ordinary pane.
+
+## Multi-line paste warning
+
+A paste with a line break in it, into a terminal pane whose program has not
+turned on bracketed paste (sh/dash, Python's REPL before 3.13, psql, a remote
+bash with it off), would run each line the moment it lands. croft asks first
+(#1274): **Y**/Enter pastes as is, **L** pastes the lines joined by spaces
+with no final line break, **N**/Esc cancels. A shell that brackets pastes
+(croft's default bash and zsh) gets the paste straight away, since nothing in
+it runs until you press Enter.
+
+```json
+{
+  "terminal_multiline_paste_warning": "auto"
+}
+```
+
+`"auto"` (the default) asks only in that case, `"always"` asks before every
+multi-line paste, and `"never"` never asks. User config only: a cloned repo
+cannot turn the warning off.
 
 ## Notification sinks
 

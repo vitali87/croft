@@ -82,6 +82,7 @@ mod pair;
 mod pair_host;
 mod pane_host;
 mod pdf;
+mod permalink;
 mod plot;
 mod port_detect;
 mod pr_review;
