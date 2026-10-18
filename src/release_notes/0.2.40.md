@@ -1,0 +1,1 @@
+fix: The SQLite browser now shows rows a running app commits to a WAL-mode database (Rails, Django, Prisma, most Node ORMs): a commit there changes only the `-wal` file, which croft now watches too, so the grid refreshes within the usual delay instead of when the app exits.

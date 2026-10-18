@@ -1,1 +1,0 @@
-feature: Search's replace row has a Preserve Case toggle (`AB`, Alt+P, or "Search: Toggle Preserve Case" in the palette): replacing `user` with `account` writes `Account` over `User`, `ACCOUNT` over `USER` and `account` over `user`, in Replace All, the inline preview and the editor's Find/Replace bar.
