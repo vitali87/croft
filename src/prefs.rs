@@ -67,6 +67,21 @@ impl Default for LayoutPrefs {
     }
 }
 
+/// When a paste of more than one line into a terminal asks first (#1274),
+/// VS Code's `terminal.integrated.enableMultiLinePasteWarning`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MultilinePasteWarning {
+    /// Only when the program in the pane has not turned on bracketed paste,
+    /// so each line would run the moment it lands.
+    #[default]
+    Auto,
+    /// Before every multi-line paste.
+    Always,
+    /// Never.
+    Never,
+}
+
 /// Which of the Explorer's stacked sub-views are shown, toggled from the
 /// "Views and More Actions" (⋯) menu on the EXPLORER header. Mirrors VS Code's
 /// defaults: Open Editors hidden, every other view shown. Each field carries
@@ -259,6 +274,17 @@ pub struct Prefs {
     /// an older config parses straight to disabled.
     #[serde(default)]
     pub format_on_save: bool,
+    /// The formatter a project names for every file, VS Code's
+    /// `editor.defaultFormatter` (#1499), as an extension id such as
+    /// `biomejs.biome`. Format on save skips a file whose named formatter
+    /// croft does not run, rather than formatting it with something else.
+    #[serde(default)]
+    pub default_formatter: Option<String>,
+    /// `editor.defaultFormatter` for one language, keyed by its VS Code
+    /// language id (`"[typescript]": { "editor.defaultFormatter": … }`,
+    /// #1499). Wins over `default_formatter` for that language.
+    #[serde(default)]
+    pub language_formatters: BTreeMap<String, String>,
     /// When true, typing one of the language server's on-type trigger
     /// characters (`}`, `;`, newline, per its capability) runs
     /// `textDocument/onTypeFormatting` on the just-typed spot (VS Code's
@@ -330,6 +356,11 @@ pub struct Prefs {
     /// the derived `Default` and an older config both mean "guides shown".
     #[serde(default)]
     pub disable_indent_guides: bool,
+    /// Gutter line numbers (#1576, VS Code's `editor.lineNumbers`): "on"
+    /// (also what the empty string an older config deserializes to means),
+    /// "relative", "interval" or "off". Parsed by `LineNumbers::from_pref`.
+    #[serde(default)]
+    pub line_numbers: String,
     /// Opt-out for LSP inlay hints (inline type / parameter annotations),
     /// which are on by default like VS Code's `editor.inlayHints.enabled`.
     /// Stored as the disable flag so the derived `Default` and an older
@@ -451,6 +482,13 @@ pub struct Prefs {
     /// macOS; off by default. Applies to panes opened after the change.
     #[serde(default)]
     pub terminal_persistent_panes: bool,
+    /// Whether a multi-line paste into a terminal asks before it is written
+    /// (#1274): `auto` (the default) asks only when the pane's program has
+    /// not turned on bracketed paste, `always` asks for every multi-line
+    /// paste, `never` never asks. User layers only: a cloned repo must not
+    /// switch the guard off.
+    #[serde(default)]
+    pub terminal_multiline_paste_warning: MultilinePasteWarning,
     /// What exported navigator comments start with (#368), marking them as
     /// AI-authored on GitHub. Unset means `[AI, croft navigator] `; an
     /// empty string turns the marker off.
@@ -1359,6 +1397,14 @@ pub fn save_render_whitespace(mode: &str) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load_for_update(&path)?;
     prefs.render_whitespace = mode.to_string();
+    prefs.save(&path)
+}
+
+/// Persist the gutter's line number mode (#1576).
+pub fn save_line_numbers(mode: &str) -> Result<()> {
+    let path = config_path();
+    let mut prefs = Prefs::load_for_update(&path)?;
+    prefs.line_numbers = mode.to_string();
     prefs.save(&path)
 }
 

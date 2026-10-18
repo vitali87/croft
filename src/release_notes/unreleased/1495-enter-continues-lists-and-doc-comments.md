@@ -1,1 +1,0 @@
-feature: Enter continues what you are typing: a Markdown bullet, numbered item (counting up), task box or `>` quote carries onto the new line and Enter on an empty item ends the list, and in Rust, JS/TS, C/C++, Java and C# Enter after `/**` opens a doc comment with ` * ` and its closing ` */`, adds the next ` * ` line inside one, and continues Rust `///` and `//!` comments.

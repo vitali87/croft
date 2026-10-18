@@ -991,13 +991,18 @@ fn render_sheet(
     );
 }
 
+/// The fewest body rows a merge editor source pane needs before it gives
+/// one to the accept buttons above a conflict (#1169).
+const MERGE_BUTTON_ROW_MIN_BODY: usize = 4;
+
 /// Render the merge editor's source panes (#253) into the TOP of `inner`
 /// and return the remaining rect for the ordinary text path — the
 /// editable Result pane. One header row carries the resolved counter,
 /// then Current | (Base) | Incoming as columns (stacked vertically when
 /// the terminal is narrow), then a separator row labelling the Result.
 /// Per-conflict checkboxes are painted in a small gutter on the region's
-/// first row and their hit rects recorded on the view for mouse routing.
+/// first row, accept buttons on a row above it, and their hit rects
+/// recorded on the view for mouse routing.
 fn render_merge_panes(
     mv: &mut crate::merge_editor::MergeView,
     inner: Rect,
@@ -1006,6 +1011,7 @@ fn render_merge_panes(
 ) -> Rect {
     use crate::merge_editor::{CheckSide, ConflictState};
     mv.check_spans.clear();
+    mv.action_spans.clear();
     mv.last_panes_area = Rect::default();
     // Too small for source panes: the Result gets everything, and the
     // commands (F7, accepts) still work off the tracked regions.
@@ -1213,9 +1219,59 @@ fn render_merge_panes(
         );
         let body_h = (rect.height - 1) as usize;
         let text_w = (rect.width - gutter) as usize;
+        // A side pane puts a row of accept buttons above each conflict
+        // (#1169), VS Code's merge editor CodeLens, so the lines below it
+        // move down a row. An empty side (a deletion) still gets its row. A
+        // pane too short to spare the row keeps only its checkboxes, rather
+        // than pushing the conflict itself out of sight.
+        let mut idx = pane.scroll;
+        let mut buttons_drawn: Vec<usize> = Vec::new();
+        let button_rows = body_h >= MERGE_BUTTON_ROW_MIN_BODY;
         for vis in 0..body_h {
-            let idx = pane.scroll + vis;
             let y = rect.y + 1 + vis as u16;
+            let buttons = pane.side.filter(|_| button_rows).and_then(|side| {
+                pane.regions
+                    .iter()
+                    .find(|(start, _, ci, _)| *start == idx && !buttons_drawn.contains(ci))
+                    .map(|&(_, _, ci, _)| (side, ci))
+            });
+            if let Some((side, ci)) = buttons {
+                buttons_drawn.push(ci);
+                let tint = if ci == mv.active {
+                    pane.active_tint
+                } else {
+                    pane.tint
+                };
+                for x in rect.x..rect.x + rect.width {
+                    buf[(x, y)].set_style(text_style.bg(tint));
+                    buf[(x, y)].set_symbol(" ");
+                }
+                let state = mv.conflicts[ci].state;
+                let both = matches!(state, ConflictState::Both | ConflictState::BothReverse);
+                let (own, own_state) = match side {
+                    CheckSide::Current => (
+                        AcceptChip::new("Accept Current", "Current", ACCEPT_CURRENT_FILL)
+                            .ticked(state == ConflictState::Current),
+                        ConflictState::Current,
+                    ),
+                    CheckSide::Incoming => (
+                        AcceptChip::new("Accept Incoming", "Incoming", ACCEPT_INCOMING_FILL)
+                            .ticked(state == ConflictState::Incoming),
+                        ConflictState::Incoming,
+                    ),
+                };
+                let chips = [
+                    own,
+                    AcceptChip::new("Accept Both", "Both", ACCEPT_BOTH_FILL).ticked(both),
+                ];
+                let states = [own_state, ConflictState::Both];
+                for (i, xs) in
+                    paint_accept_chips(buf, &chips, rect.x + 1, rect.x + rect.width, y, theme)
+                {
+                    mv.action_spans.push((y, xs, ci, states[i]));
+                }
+                continue;
+            }
             if idx >= pane.lines.len() {
                 break;
             }
@@ -1243,6 +1299,7 @@ fn render_merge_panes(
                 mv.check_spans.push((y, rect.x..rect.x + 3, ci, side));
             }
             buf.set_stringn(rect.x + gutter, y, &pane.lines[idx], text_w, style);
+            idx += 1;
         }
     }
 
@@ -3255,6 +3312,9 @@ pub struct Editor {
     pub overview_ruler: bool,
     /// Whitespace glyph rendering (#133); app-synced from prefs.
     pub whitespace_mode: WhitespaceMode,
+    /// What the gutter numbers each line with (#1576, VS Code's
+    /// `editor.lineNumbers`); app-synced from prefs.
+    pub line_numbers: LineNumbers,
     /// Starting ignore-whitespace mode for diffs opened in this editor
     /// (#258, `diff.ignore_whitespace`); app-synced from prefs. Note this is
     /// unrelated to `whitespace_mode` above, which paints glyphs.
@@ -3635,6 +3695,7 @@ impl Editor {
             cell_images: false,
             cell_image: None,
             whitespace_mode: WhitespaceMode::default(),
+            line_numbers: LineNumbers::default(),
             diff_ws_default: crate::widgets::diff::DiffWhitespace::default(),
             inline_values: std::collections::BTreeMap::new(),
             live_run: None,
@@ -6010,7 +6071,8 @@ impl Editor {
     /// by extension.
     fn install_sheet_view(&mut self, path: &Path, view: crate::sheet::SheetView) {
         self.path = Some(path.to_path_buf());
-        self.disk_stamp = Self::disk_stamp_of(path);
+        self.disk_stamp =
+            Self::disk_stamp_with_wal(path, view.kind == crate::sheet::SheetKind::Sqlite);
         self.disk_expect_absent = false;
         self.disk_conflict = false;
         // A whole-buffer swap: whatever the previous contents could not be
@@ -7685,9 +7747,14 @@ impl Editor {
             decode_semantic_tokens(&self.semantic_data, legend, bytes, &line_starts);
     }
 
-    /// Number of logical lines in the buffer (the inlay-hint request range).
-    pub fn line_count(&self) -> usize {
-        self.lines.len()
+    /// Where the buffer ends, as an LSP position: the end of an inlay-hint
+    /// request range, which a strict server rejects past it (#1490).
+    pub fn document_end(&self) -> lsp_types::Position {
+        let last = self.lines.last().map_or("", String::as_str);
+        lsp_types::Position::new(
+            self.lines.len().saturating_sub(1) as u32,
+            last.encode_utf16().count() as u32,
+        )
     }
 
     /// Markdown: Toggle Preview (Cmd/Ctrl+Shift+V). Returns false when the
@@ -10348,6 +10415,43 @@ impl Editor {
             .find(|&h| matches!(self.fold_range(h), Some((_, end)) if line <= end))
     }
 
+    /// The number the gutter shows for `line` (#1576), `None` for none: its
+    /// 1-based number (`on`); nothing (`off`); the caret's line its own
+    /// number and every other line its distance from it, counting a folded
+    /// block as one line as Vim's `relativenumber` does (`relative`); or
+    /// every tenth line and the caret's (`interval`), as VS Code does.
+    pub fn gutter_number(&self, line: usize) -> Option<usize> {
+        match self.line_numbers {
+            LineNumbers::On => Some(line + 1),
+            LineNumbers::Off => None,
+            LineNumbers::Relative if line == self.cursor_row => Some(line + 1),
+            LineNumbers::Relative => Some(self.visible_line_distance(self.cursor_row, line)),
+            LineNumbers::Interval => {
+                ((line + 1).is_multiple_of(10) || line == self.cursor_row).then_some(line + 1)
+            }
+        }
+    }
+
+    /// How many lines apart `a` and `b` are on screen: the lines between
+    /// them, less those a collapsed fold hides.
+    fn visible_line_distance(&self, a: usize, b: usize) -> usize {
+        let (lo, hi) = (a.min(b), a.max(b));
+        let hidden: usize = self
+            .hidden_ranges
+            .iter()
+            .map(|&(header, end)| {
+                let (from, to) = ((header + 1).max(lo + 1), end.min(hi));
+                (to + 1).saturating_sub(from)
+            })
+            .sum();
+        (hi - lo).saturating_sub(hidden)
+    }
+
+    /// Whether the primary caret or an extra one is on `line`.
+    fn is_caret_line(&self, line: usize) -> bool {
+        line == self.cursor_row || self.carets.iter().any(|c| c.head.0 == line)
+    }
+
     /// Whether `line` is hidden inside a collapsed region. A binary search over
     /// the merged spans in [`Self::hidden_ranges`], which the fold writes keep
     /// current — this is called for every rendered row of every frame.
@@ -10707,10 +10811,49 @@ impl Editor {
         Some((meta.modified().ok()?, meta.len()))
     }
 
+    /// [`Self::disk_stamp_of`], with a SQLite database's write-ahead log
+    /// folded in when `sqlite` (#1643): in WAL mode a commit lands in
+    /// `<db>-wal` and leaves the database file alone until a checkpoint,
+    /// which can wait until the writing app exits. The log is part of what a
+    /// reader sees, so a commit moves the stamp and the tab reloads. Only a
+    /// SQLite view counts it: a plain file with a `<name>-wal` sibling keeps
+    /// its own stamp, untouched by whatever that sibling is.
+    fn disk_stamp_with_wal(path: &Path, sqlite: bool) -> Option<(SystemTime, u64)> {
+        let stamp = Self::disk_stamp_of(path)?;
+        if !sqlite {
+            return Some(stamp);
+        }
+        Some(
+            match sqlite_wal_path(path).and_then(|w| std::fs::metadata(w).ok()) {
+                Some(wal) => (
+                    wal.modified().map_or(stamp.0, |m| m.max(stamp.0)),
+                    stamp.1 + wal.len(),
+                ),
+                None => stamp,
+            },
+        )
+    }
+
+    /// True when this tab is a SQLite browser, whose stamp covers the log.
+    fn is_sqlite_view(&self) -> bool {
+        self.sheet
+            .as_ref()
+            .is_some_and(|s| s.kind == crate::sheet::SheetKind::Sqlite)
+    }
+
+    /// This tab's stamp of `path` now: [`Self::disk_stamp_with_wal`] for
+    /// whatever view the tab is.
+    fn current_disk_stamp(&self, path: &Path) -> Option<(SystemTime, u64)> {
+        Self::disk_stamp_with_wal(path, self.is_sqlite_view())
+    }
+
     /// Record that this buffer is now in sync with disk. Called at open and
     /// after a successful save so the next external write is detected.
     fn mark_synced_with_disk(&mut self) {
-        self.disk_stamp = self.path.as_deref().and_then(Self::disk_stamp_of);
+        self.disk_stamp = self
+            .path
+            .as_deref()
+            .and_then(|p| self.current_disk_stamp(p));
         self.disk_conflict = false;
         // A new buffer<->disk sync point; undo snapshots from before it
         // restore as dirty (see `restore_snapshot`).
@@ -10726,7 +10869,7 @@ impl Editor {
             return false;
         };
         match self.disk_stamp {
-            Some(known) => Self::disk_stamp_of(path) != Some(known),
+            Some(known) => self.current_disk_stamp(path) != Some(known),
             // A new file not written yet: another process creating it is
             // a change, or the first save would clobber what it wrote.
             None => self.disk_expect_absent && Self::disk_stamp_of(path).is_some(),
@@ -10765,6 +10908,10 @@ impl Editor {
         // A SARIF viewer keeps the reader's place, and the logs added to
         // it, across a rewrite of its log (#577).
         let old_sarif = self.sarif.take();
+        // A SQLite tab keeps its table, page, cell and scroll across a
+        // reload, which a WAL-mode app's every commit now triggers (#1643).
+        let sqlite_place = self.sqlite_place();
+
         // A rendered log keeps its place too, and one viewed at its end
         // follows it, since a log grows while it is read (#1538). A place
         // an earlier reload is still settling is the one to keep: the scroll
@@ -10799,6 +10946,9 @@ impl Editor {
         if let (Some(old), Some(view)) = (old_sarif.as_ref(), self.sarif.as_mut()) {
             view.carry_from(old);
         }
+        if let (Some(place), true) = (sqlite_place, result.is_ok()) {
+            self.restore_sqlite_place(&path, place);
+        }
         // Cleared even when the open bailed before reaching `open_pdf`, so
         // the request can never leak into an unrelated later open.
         self.pdf_restore_page = None;
@@ -10821,6 +10971,74 @@ impl Editor {
             self.settle_log_reload();
         }
         result
+    }
+
+    /// Where the reader is in a SQLite tab, for [`Self::reload_from_disk`]
+    /// to put back on the rebuilt view.
+    fn sqlite_place(&self) -> Option<SqlitePlace> {
+        let view = self.sheet.as_ref().filter(|_| self.is_sqlite_view())?;
+        let data = view.sheets.get(view.current_sheet)?;
+        let (table, page) = view.sqlite_pages.get(view.current_sheet)?.clone();
+        Some(SqlitePlace {
+            sheet: view.current_sheet,
+            table,
+            page,
+            cell: (data.cur_row, data.cur_col),
+            scroll: (data.scroll_row, data.scroll_col),
+        })
+    }
+
+    /// Put a reloaded SQLite view back where [`Self::sqlite_place`] found
+    /// the reader: the same table (found by name, else the same position
+    /// clamped), the same page while the table still reaches it (else its
+    /// last), and the cell and scroll clamped to what that page now holds.
+    fn restore_sqlite_place(&mut self, path: &Path, place: SqlitePlace) {
+        if !self.is_sqlite_view() {
+            return;
+        }
+        let Some(view) = self.sheet.as_mut() else {
+            return;
+        };
+        let Some(last) = view.sheets.len().checked_sub(1) else {
+            return;
+        };
+        let idx = view
+            .sqlite_pages
+            .iter()
+            .position(|(t, _)| *t == place.table)
+            .unwrap_or(place.sheet.min(last));
+        view.current_sheet = idx;
+        let table = view.sqlite_pages[idx].0.clone();
+        let same_table = table == place.table;
+        if same_table && place.page > 0 {
+            // The page as it was; when the table has shrunk short of it, its
+            // last page instead (counting only then, as Ctrl+End does).
+            let fetch = |page| crate::sqlite_view::table_page(path, &table, page).ok();
+            let found = match fetch(place.page) {
+                Some(got) if !got.1.is_empty() => Some((place.page, got)),
+                _ => crate::sqlite_view::last_page(path, &table)
+                    .ok()
+                    .filter(|&l| l > 0 && l < place.page)
+                    .and_then(|l| fetch(l).map(|got| (l, got))),
+            };
+            if let Some((page, (headers, rows, more))) = found {
+                let label = crate::sqlite_view::page_label(&table, page, rows.len(), more);
+                let mut data = crate::sheet::sheet_data_from_parts(label, headers, rows);
+                data.row_base = page * crate::sqlite_view::ROW_CAP;
+                view.sheets[idx] = data;
+                view.sqlite_pages[idx].1 = page;
+            }
+        }
+        if !same_table {
+            return;
+        }
+        let data = &mut view.sheets[idx];
+        let rows = data.row_count().saturating_sub(1);
+        let cols = data.col_count().saturating_sub(1);
+        data.cur_row = place.cell.0.min(rows);
+        data.cur_col = place.cell.1.min(cols);
+        data.scroll_row = place.scroll.0.min(data.cur_row);
+        data.scroll_col = place.scroll.1.min(data.cur_col);
     }
 
     /// Put back the history [`Self::reload_from_disk`] took aside, with the
@@ -11998,9 +12216,15 @@ impl Editor {
             return false;
         }
         self.push_undo(EditKind::ToggleComment);
-        let all_commented = non_blank
-            .iter()
-            .all(|&r| line_comment_prefix_len(self.lines[r].trim_start(), token).is_some());
+        // Rows in JSX children take `{/* … */}`: there `//` is text (#1623).
+        let jsx: std::collections::HashSet<usize> = self.jsx_child_rows(&non_blank);
+        let all_commented = non_blank.iter().all(|&r| {
+            if jsx.contains(&r) {
+                is_jsx_comment(self.lines[r].trim())
+            } else {
+                line_comment_prefix_len(self.lines[r].trim_start(), token).is_some()
+            }
+        });
         // Each changed row with the char column of its edit and the chars it
         // added (negative: removed), to carry the carets on it along.
         let mut edits: Vec<(usize, usize, isize)> = Vec::with_capacity(non_blank.len());
@@ -12008,6 +12232,17 @@ impl Editor {
             for &r in &non_blank {
                 let line = self.lines[r].clone();
                 let off = line.len() - line.trim_start().len();
+                if jsx.contains(&r) {
+                    let core = line[off..].trim_end();
+                    let inner = &core[JSX_COMMENT_OPEN.len()..core.len() - JSX_COMMENT_CLOSE.len()];
+                    let lead_space = usize::from(inner.starts_with(' '));
+                    let inner = &inner[lead_space..];
+                    let inner = inner.strip_suffix(' ').unwrap_or(inner);
+                    self.lines[r] = format!("{}{inner}", &line[..off]);
+                    let removed = JSX_COMMENT_OPEN.chars().count() + lead_space;
+                    edits.push((r, line[..off].chars().count(), -(removed as isize)));
+                    continue;
+                }
                 let mut rest = line[off..].to_string();
                 let len = line_comment_prefix_len(&rest, token).unwrap_or(0);
                 let mut removed = rest[..len].chars().count();
@@ -12038,6 +12273,21 @@ impl Editor {
                     continue;
                 };
                 for &r in &rows {
+                    if jsx.contains(&r) {
+                        // Already `{/* … */}`: wrapping it again would nest
+                        // the comment, and its `*/}` would end the outer one.
+                        if is_jsx_comment(self.lines[r].trim()) {
+                            continue;
+                        }
+                        let end = self.lines[r].trim_end().len();
+                        self.lines[r].truncate(end);
+                        self.lines[r].push_str(&format!(" {JSX_COMMENT_CLOSE}"));
+                        let open = format!("{JSX_COMMENT_OPEN} ");
+                        self.lines[r].insert_str(min_indent, &open);
+                        let at = self.lines[r][..min_indent].chars().count();
+                        edits.push((r, at, open.chars().count() as isize));
+                        continue;
+                    }
                     self.lines[r].insert_str(min_indent, &marker);
                     let at = self.lines[r][..min_indent].chars().count();
                     edits.push((r, at, marker.chars().count() as isize));
@@ -12159,7 +12409,7 @@ impl Editor {
     /// each on its own. Returns false for languages with no block comment
     /// (e.g. YAML).
     pub fn toggle_block_comment(&mut self) -> bool {
-        let Some((open, close)) = block_comment_tokens(self.lang) else {
+        let Some(tokens) = block_comment_tokens(self.lang) else {
             return false;
         };
         let last = self.lines.len().saturating_sub(1);
@@ -12196,9 +12446,32 @@ impl Editor {
             return false;
         }
         self.push_undo(EditKind::ToggleComment);
+        // A range starting in JSX children is wrapped `{/* … */}`, since a
+        // bare `/* */` there is text (#1623). Read before any edit.
+        let jsx_starts: Vec<(usize, usize)> = merged
+            .iter()
+            .map(|&(start, end, _)| {
+                let text = self.char_range_text(start, end);
+                let lead = text
+                    .chars()
+                    .take_while(|c| c.is_whitespace())
+                    .collect::<String>();
+                text_end(start, &lead)
+            })
+            .collect();
+        let standalone: Vec<bool> = merged
+            .iter()
+            .map(|&(start, end, _)| is_jsx_comment(self.char_range_text(start, end).trim()))
+            .collect();
+        let jsx = self.jsx_children_at(&jsx_starts, &standalone);
         // From the bottom up, so an edit never moves a range still to come.
         let mut placed: Vec<(bool, (usize, usize))> = Vec::with_capacity(merged.len());
-        for &(start, end, primary) in merged.iter().rev() {
+        for (i, &(start, end, primary)) in merged.iter().enumerate().rev() {
+            let (open, close) = if jsx[i] {
+                (JSX_COMMENT_OPEN, JSX_COMMENT_CLOSE)
+            } else {
+                tokens
+            };
             let text = self.char_range_text(start, end);
             let trimmed = text.trim();
             let caret = if trimmed.is_empty() {
@@ -12233,6 +12506,62 @@ impl Editor {
         self.recompute_highlights();
         self.ensure_cursor_col_visible();
         true
+    }
+
+    /// The rows among `rows` whose first non-blank character sits in JSX
+    /// children (#1623).
+    fn jsx_child_rows(&self, rows: &[usize]) -> std::collections::HashSet<usize> {
+        let points: Vec<(usize, usize)> = rows
+            .iter()
+            .map(|&r| {
+                let line = &self.lines[r];
+                (r, line.chars().take_while(|c| c.is_whitespace()).count())
+            })
+            .collect();
+        let standalone: Vec<bool> = rows
+            .iter()
+            .map(|&r| is_jsx_comment(self.lines[r].trim()))
+            .collect();
+        rows.iter()
+            .zip(self.jsx_children_at(&points, &standalone))
+            .filter_map(|(&r, jsx)| jsx.then_some(r))
+            .collect()
+    }
+
+    /// Whether each of `points` (char positions) starts something in JSX
+    /// children, an element, a closing tag, text or a `{…}`, where a
+    /// comment must be written `{/* … */}` (#1623). Always false outside
+    /// the JSX-capable grammars, and on a line of plain code or attributes.
+    ///
+    /// Where `standalone[i]` says the text at `points[i]` is one whole
+    /// `{/* … */}`, that point also counts when it sits in JSX or in a parse
+    /// error: commenting out a closing tag leaves the markup unparseable, and
+    /// a second toggle must still take the comment off. In well-formed plain
+    /// code such a line is a block holding a comment, and stays code.
+    fn jsx_children_at(&self, points: &[(usize, usize)], standalone: &[bool]) -> Vec<bool> {
+        let none = vec![false; points.len()];
+        if !matches!(self.lang, Some(LangKind::JavaScript) | Some(LangKind::Tsx)) {
+            return none;
+        }
+        let Some(lang) = self.lang.map(crate::highlight::language_for) else {
+            return none;
+        };
+        let mut parser = tree_sitter::Parser::new();
+        if parser.set_language(&lang).is_err() {
+            return none;
+        }
+        let Some(tree) = parser.parse(self.lines.join("\n"), None) else {
+            return none;
+        };
+        points
+            .iter()
+            .zip(standalone)
+            .map(|(&p, &standalone)| {
+                let byte = self.char_pos_to_byte(p);
+                jsx_child_starts_at(tree.root_node(), byte)
+                    || standalone && in_jsx_or_error(tree.root_node(), byte)
+            })
+            .collect()
     }
 
     /// Put a bare caret at each pinned position, the one marked primary as
@@ -14553,6 +14882,61 @@ fn find_word_occurrences(chars: &[char], word: &[char]) -> Vec<usize> {
     out
 }
 
+/// How a comment is written in JSX children (#1623), where `//` and a bare
+/// `/* */` are text that React renders.
+const JSX_COMMENT_OPEN: &str = "{/*";
+/// The close of a JSX comment, matching [`JSX_COMMENT_OPEN`].
+const JSX_COMMENT_CLOSE: &str = "*/}";
+
+/// Whether the trimmed line is one `{/* … */}` comment.
+fn is_jsx_comment(trimmed: &str) -> bool {
+    trimmed.len() >= JSX_COMMENT_OPEN.len() + JSX_COMMENT_CLOSE.len()
+        && trimmed.starts_with(JSX_COMMENT_OPEN)
+        && trimmed.ends_with(JSX_COMMENT_CLOSE)
+}
+
+/// Whether the text at `byte` is JSX children: inside a JSX element's text,
+/// or at the start of a child element, closing tag or `{…}` expression.
+/// A position in an opening tag's attributes, or in the code inside a
+/// `{…}`, is not.
+fn jsx_child_starts_at(root: tree_sitter::Node, byte: usize) -> bool {
+    let Some(mut node) = root.descendant_for_byte_range(byte, byte) else {
+        return false;
+    };
+    loop {
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        if matches!(parent.kind(), "jsx_element" | "jsx_fragment") {
+            match node.kind() {
+                "jsx_text" => return true,
+                "jsx_element"
+                | "jsx_self_closing_element"
+                | "jsx_expression"
+                | "jsx_closing_element" => return node.start_byte() == byte,
+                // The element's own opening tag: whether the element is
+                // a child is a question for the element's parent.
+                "jsx_opening_element" => {}
+                _ => return false,
+            }
+        }
+        node = parent;
+    }
+}
+
+/// Whether the node at `byte`, or any node around it, is JSX or a parse
+/// error.
+fn in_jsx_or_error(root: tree_sitter::Node, byte: usize) -> bool {
+    let mut node = root.descendant_for_byte_range(byte, byte);
+    while let Some(n) = node {
+        if n.is_error() || n.kind().starts_with("jsx") {
+            return true;
+        }
+        node = n.parent();
+    }
+    false
+}
+
 /// Start char-indices of every case-sensitive occurrence of `text` within
 /// `chars`, as plain text and without overlap (#1558): what VS Code matches
 /// for a selection made by hand, so `oo` is found inside `foo`.
@@ -14757,6 +15141,52 @@ fn title_case(s: &str) -> String {
         }
     }
     out
+}
+
+/// Gutter line numbers (#1576, VS Code `editor.lineNumbers`): `On` (the
+/// default) numbers every line, `Relative` shows each line's distance from
+/// the caret's (for Vim counts such as `5j`), `Interval` every tenth line,
+/// and `Off` no number column at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LineNumbers {
+    #[default]
+    On,
+    Relative,
+    Interval,
+    Off,
+}
+
+impl LineNumbers {
+    /// The persisted config id (`line_numbers` in config.json).
+    pub fn pref_id(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Relative => "relative",
+            Self::Interval => "interval",
+            Self::Off => "off",
+        }
+    }
+
+    /// Parse the persisted id; anything unrecognised (including the empty
+    /// string an older config deserializes to) is `on`.
+    pub fn from_pref(id: &str) -> Self {
+        match id {
+            "relative" => Self::Relative,
+            "interval" => Self::Interval,
+            "off" => Self::Off,
+            _ => Self::On,
+        }
+    }
+
+    /// The palette command's cycle order: on, relative, interval, off.
+    pub fn next(self) -> Self {
+        match self {
+            Self::On => Self::Relative,
+            Self::Relative => Self::Interval,
+            Self::Interval => Self::Off,
+            Self::Off => Self::On,
+        }
+    }
 }
 
 /// Whitespace rendering (#133, VS Code `editor.renderWhitespace`): which
@@ -16926,7 +17356,13 @@ impl Widget for &mut Editor {
         // together, so the number-to-code gap is unchanged and click/cursor
         // mapping (which derives from `gutter_width`) stays correct for free.
         const SIGN_MARGIN: u16 = 2;
-        let gutter_width = (self.lines.len() + 1).to_string().len() as u16 + 1 + SIGN_MARGIN;
+        // `off` drops the number column only; the sign margin with its
+        // breakpoints and fold chevrons, and the change bar, stay (#1576).
+        let digits = match self.line_numbers {
+            LineNumbers::Off => 0,
+            _ => (self.lines.len() + 1).to_string().len() as u16,
+        };
+        let gutter_width = digits + 1 + SIGN_MARGIN;
         self.last_gutter_width = gutter_width;
         // Rebuild the git-gutter marks if the buffer moved since last frame
         // (cheap no-op otherwise), so the bars below diff against HEAD.
@@ -17270,11 +17706,15 @@ impl Widget for &mut Editor {
             if !wrap || row_start == 0 {
                 let line_no = format!(
                     "{:>width$} ",
-                    line_idx + 1,
+                    self.gutter_number(line_idx)
+                        .map(|n| n.to_string())
+                        .unwrap_or_default(),
                     width = gutter_width as usize - 1
                 );
                 // Live Run coverage tints the number: green for a statement
-                // that ran, a muted red for one that never did.
+                // that ran, a muted red for one that never did. Otherwise a
+                // caret's line is brighter than the rest (VS Code's
+                // `editorLineNumber.activeForeground`, #1576).
                 let number_fg = match self
                     .live_run
                     .as_ref()
@@ -17284,6 +17724,7 @@ impl Widget for &mut Editor {
                     Some(crate::live_run::Coverage::NeverRan) => {
                         self.theme.ui(Color::Rgb(0xa0, 0x55, 0x55))
                     }
+                    None if self.is_caret_line(line_idx) => self.theme.line_number_active(),
                     None => Color::DarkGray,
                 };
                 let gutter = Line::from(Span::styled(line_no, Style::default().fg(number_fg)));
@@ -17736,10 +18177,11 @@ impl Widget for &mut Editor {
             if let Some(tint) = conflict_row_tint(&self.conflicts, line_idx, self.theme) {
                 paint_full_row_bg(buf, text_x, y, row_width, tint);
             }
-            // Clickable accept actions on the conflict header row — VS Code's
+            // Clickable accept buttons on the conflict header row — VS Code's
             // merge-conflict CodeLens, drawn after the marker text where the
-            // `<<<<<<<` line is otherwise dead space. Hit spans are recorded
-            // per frame (cleared at render start) so the rects always
+            // `<<<<<<<` line is otherwise dead space (#1169). A narrow row
+            // gets the short labels rather than losing buttons. Hit spans are
+            // recorded per frame (cleared at render start) so the rects always
             // describe the painted frame (#103's invariant).
             if let Some(block_idx) = self.conflicts.iter().position(|b| b.ours_start == line_idx) {
                 let block = self.conflicts[block_idx];
@@ -17749,28 +18191,22 @@ impl Widget for &mut Editor {
                     .map(|l| l.chars().count() as u16)
                     .unwrap_or(0)
                     .saturating_sub(row_start as u16);
-                let mut x = text_x + marker_len.min(row_width) + 2;
-                let actions: [(&str, crate::merge::Resolution); 3] = [
-                    ("[Accept Current]", crate::merge::Resolution::Current),
-                    ("[Accept Incoming]", crate::merge::Resolution::Incoming),
-                    ("[Accept Both]", crate::merge::Resolution::Both),
-                ];
-                for (label, res) in actions {
-                    let w = label.len() as u16;
-                    if x + w > text_x + row_width {
-                        break;
+                // A header that wraps gets them after its last segment only.
+                if marker_len <= row_width {
+                    use crate::merge::Resolution;
+                    let chips = [
+                        AcceptChip::new("Accept Current", "Current", ACCEPT_CURRENT_FILL),
+                        AcceptChip::new("Accept Incoming", "Incoming", ACCEPT_INCOMING_FILL),
+                        AcceptChip::new("Accept Both", "Both", ACCEPT_BOTH_FILL),
+                    ];
+                    let res = [Resolution::Current, Resolution::Incoming, Resolution::Both];
+                    let x0 = text_x + marker_len + 2;
+                    for (i, xs) in
+                        paint_accept_chips(buf, &chips, x0, text_x + row_width, y, self.theme)
+                    {
+                        self.merge_action_spans
+                            .push((y, xs, block.ours_start, res[i]));
                     }
-                    buf.set_string(
-                        x,
-                        y,
-                        label,
-                        Style::default()
-                            .fg(self.theme.ui(Color::Rgb(0x8a, 0xb4, 0xf8)))
-                            .add_modifier(Modifier::UNDERLINED),
-                    );
-                    self.merge_action_spans
-                        .push((y, x..x + w, block.ours_start, res));
-                    x += w + 2;
                 }
             }
 
@@ -18243,7 +18679,9 @@ impl Widget for &mut Editor {
                 }
                 let line_no = format!(
                     "{:>width$} ",
-                    line + 1,
+                    self.gutter_number(line as usize)
+                        .map(|n| n.to_string())
+                        .unwrap_or_default(),
                     width = gutter_width.saturating_sub(1) as usize
                 );
                 buf.set_string(
@@ -19336,6 +19774,92 @@ fn conflict_row_tint(
     })
 }
 
+/// A merge-conflict accept button (#1169): its label, the shorter one a row
+/// too narrow for every full label gets, and its fill.
+struct AcceptChip {
+    label: String,
+    short: String,
+    fill: Color,
+}
+
+impl AcceptChip {
+    fn new(label: &str, short: &str, fill: Color) -> Self {
+        Self {
+            label: label.to_string(),
+            short: short.to_string(),
+            fill,
+        }
+    }
+
+    /// The button for `state`, ticked when the conflict is already resolved
+    /// that way, in both its full and short forms.
+    fn ticked(mut self, ticked: bool) -> Self {
+        if ticked {
+            self.label = format!("\u{2713} {}", self.label);
+            self.short = format!("\u{2713} {}", self.short);
+        }
+        self
+    }
+}
+
+/// The accept buttons' fills, in the hues of the conflict tints they sit
+/// on: green for current, blue for incoming, grey for both.
+const ACCEPT_CURRENT_FILL: Color = Color::Rgb(0x2f, 0x6b, 0x3e);
+const ACCEPT_INCOMING_FILL: Color = Color::Rgb(0x1f, 0x5a, 0x96);
+const ACCEPT_BOTH_FILL: Color = Color::Rgb(0x4b, 0x52, 0x63);
+
+/// Lay `chips` out from column `x0`, ending at or before `limit`, a cell
+/// apart: every full label when they all fit, else every short one, else as
+/// many short ones as fit. Each placed chip comes back, in order, with its
+/// column and the padded text to paint.
+fn lay_out_accept_chips(chips: &[AcceptChip], x0: u16, limit: u16) -> Vec<(u16, String)> {
+    let place = |short: bool| {
+        let mut out = Vec::new();
+        let mut x = x0;
+        for c in chips {
+            let text = format!(" {} ", if short { &c.short } else { &c.label });
+            let w = text.chars().count() as u16;
+            if x.saturating_add(w) > limit {
+                break;
+            }
+            out.push((x, text));
+            x += w + 1;
+        }
+        out
+    };
+    let full = place(false);
+    if full.len() == chips.len() {
+        return full;
+    }
+    place(true)
+}
+
+/// Paint the accept buttons laid out for row `y`, returning each painted
+/// button's index in `chips` and its column range for the click map.
+fn paint_accept_chips(
+    buf: &mut Buffer,
+    chips: &[AcceptChip],
+    x0: u16,
+    limit: u16,
+    y: u16,
+    theme: crate::theme::Theme,
+) -> Vec<(usize, std::ops::Range<u16>)> {
+    let mut spans = Vec::new();
+    for (i, (x, text)) in lay_out_accept_chips(chips, x0, limit)
+        .into_iter()
+        .enumerate()
+    {
+        let w = text.chars().count() as u16;
+        let style = Style::default()
+            .fg(theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
+            .bg(theme.ui(chips[i].fill))
+            .add_modifier(Modifier::BOLD);
+        buf.set_stringn(x, y, &text, w as usize, style);
+        spans.push((i, x..x + w));
+    }
+    spans
+}
+
 /// Tint every cell of one text row, keeping the glyphs and their colours.
 fn paint_full_row_bg(buf: &mut Buffer, text_x: u16, y: u16, text_width: u16, bg: Color) {
     for col in 0..text_width {
@@ -19467,6 +19991,26 @@ pub struct Crumb {
 /// A rendered breadcrumb crumb's hit-test span: `(x_start, width, jump target)`.
 type BreadcrumbRange = (u16, u16, Option<(u32, u32)>);
 
+/// A reader's place in a SQLite tab, carried across a reload (#1643).
+struct SqlitePlace {
+    sheet: usize,
+    table: String,
+    page: usize,
+    cell: (usize, usize),
+    scroll: (usize, usize),
+}
+
+/// Where SQLite keeps `path`'s write-ahead log, if `path` were a database
+/// in WAL mode: the same name with `-wal` after it (#1643).
+///
+/// SQLite keeps the log beside the real database file, so a database opened
+/// through a symlink has its log beside the link's target, not the link.
+pub fn sqlite_wal_path(path: &Path) -> Option<PathBuf> {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut name = path.file_name()?.to_os_string();
+    name.push("-wal");
+    Some(path.with_file_name(name))
+}
 pub struct EditorTabs {
     /// The active editor's rect below the tab strip and breadcrumbs, from
     /// the last frame: where a view standing in for it (the history
@@ -23158,6 +23702,114 @@ mod tests {
             "\u{2503}",
             "modified line shows a gutter bar"
         );
+    }
+
+    /// The gutter of a rendered `e` (#1576): each screen row's number
+    /// column, trimmed, and the cell style of each row's number.
+    fn gutter_column(e: &mut Editor, rows: u16) -> (Vec<String>, Vec<ratatui::style::Style>) {
+        use ratatui::buffer::Buffer;
+        let area = Rect::new(0, 0, 40, rows + 2);
+        let mut buf = Buffer::empty(area);
+        e.render(area, &mut buf);
+        let (x0, x1) = (e.last_inner.x + 2, e.last_inner.x + e.last_gutter_width);
+        let ys = e.last_inner.y..e.last_inner.y + rows;
+        let text = ys
+            .clone()
+            .map(|y| (x0..x1).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .map(|t| t.trim().to_string())
+            .collect();
+        let styles = ys.map(|y| buf[(x1 - 2, y)].style()).collect();
+        (text, styles)
+    }
+
+    fn ten_lines() -> Editor {
+        editor_with(
+            &(1..=10)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
+    /// #1576: relative numbers count from the caret's line, which shows its
+    /// own number, as the issue's gutter "4 3 2 1 5 1 2 3 4 5" does.
+    #[test]
+    fn relative_line_numbers_count_from_the_caret() {
+        let mut e = ten_lines();
+        e.cursor_row = 4;
+        e.line_numbers = LineNumbers::Relative;
+        let (numbers, _) = gutter_column(&mut e, 10);
+        assert_eq!(numbers, ["4", "3", "2", "1", "5", "1", "2", "3", "4", "5"]);
+    }
+
+    /// #1576: a collapsed fold counts as one line, as in Vim, so the
+    /// number after it is what `j` needs to reach it.
+    #[test]
+    fn relative_line_numbers_count_a_fold_as_one_line() {
+        let mut e = editor_with("fn a() {\n    one\n    two\n}\nafter\nend");
+        e.line_numbers = LineNumbers::Relative;
+        e.toggle_fold(0);
+        e.cursor_row = 0;
+        assert_eq!(
+            e.gutter_number(4),
+            Some(2),
+            "the brace line is one, `after` two"
+        );
+        assert_eq!(e.gutter_number(5), Some(3));
+        e.cursor_row = 5;
+        assert_eq!(e.gutter_number(0), Some(3), "upwards too");
+    }
+
+    /// #1576: interval numbers every tenth line and the caret's line; off
+    /// shows no numbers and narrows the gutter by the number column.
+    #[test]
+    fn interval_and_off_line_numbers() {
+        let mut e = ten_lines();
+        e.cursor_row = 2;
+        e.line_numbers = LineNumbers::Interval;
+        let (numbers, _) = gutter_column(&mut e, 10);
+        assert_eq!(numbers, ["", "", "3", "", "", "", "", "", "", "10"]);
+        let on_width = e.last_gutter_width;
+        e.line_numbers = LineNumbers::Off;
+        let (numbers, _) = gutter_column(&mut e, 10);
+        assert!(numbers.iter().all(String::is_empty), "{numbers:?}");
+        assert_eq!(e.last_gutter_width, on_width - 2, "two digits fewer");
+    }
+
+    /// #1576: the caret's line number, and each extra caret's, is in the
+    /// active colour; the others stay grey.
+    #[test]
+    fn the_caret_line_number_is_brighter() {
+        let mut e = ten_lines();
+        e.cursor_row = 4;
+        e.carets.push(EditorSelection::new(7, 0));
+        let (numbers, styles) = gutter_column(&mut e, 10);
+        assert_eq!(numbers[4], "5", "absolute numbers by default");
+        let active = Some(e.theme.line_number_active());
+        assert_eq!(styles[4].fg, active);
+        assert_eq!(styles[7].fg, active, "an extra caret's line too");
+        assert_eq!(styles[3].fg, Some(Color::DarkGray));
+    }
+
+    /// Negative (#1576): the default is absolute numbers, and an unknown
+    /// pref falls back to it.
+    #[test]
+    fn line_numbers_default_to_on() {
+        let mut e = ten_lines();
+        e.cursor_row = 4;
+        let (numbers, _) = gutter_column(&mut e, 10);
+        assert_eq!(numbers, ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]);
+        assert_eq!(LineNumbers::from_pref(""), LineNumbers::On);
+        assert_eq!(LineNumbers::from_pref("absolute"), LineNumbers::On);
+        assert_eq!(LineNumbers::from_pref("relative"), LineNumbers::Relative);
+        let mut mode = LineNumbers::On;
+        let cycle: Vec<&str> = (0..4)
+            .map(|_| {
+                mode = mode.next();
+                mode.pref_id()
+            })
+            .collect();
+        assert_eq!(cycle, ["relative", "interval", "off", "on"]);
     }
 
     #[test]
@@ -34153,6 +34805,158 @@ mod tests {
         assert_eq!(e.lines, vec!["x = 1"]);
     }
 
+    /// The issue's component (#1623).
+    const APP_TSX: &str = "export function App({ name }: { name: string }) {\n  return (\n    <div className=\"app\">\n      <h1>Hello {name}</h1>\n      <p>Welcome</p>\n    </div>\n  );\n}";
+
+    fn jsx_editor(lang: LangKind) -> Editor {
+        let mut e = editor_with(APP_TSX);
+        e.lang = Some(lang);
+        e
+    }
+
+    /// #1623: Ctrl+/ on a line in JSX children writes `{/* … */}`, which
+    /// React does not render, and a second Ctrl+/ takes it off again.
+    #[test]
+    fn toggle_line_comment_in_jsx_children_writes_a_jsx_comment() {
+        for lang in [LangKind::Tsx, LangKind::JavaScript] {
+            let mut e = jsx_editor(lang);
+            e.cursor_row = 4;
+            assert!(e.toggle_line_comment());
+            assert_eq!(e.lines[4], "      {/* <p>Welcome</p> */}", "{lang:?}");
+            assert!(e.toggle_line_comment());
+            assert_eq!(e.lines[4], "      <p>Welcome</p>", "{lang:?}");
+        }
+    }
+
+    /// #1623: the closing tag and a run of child lines comment the same way,
+    /// each line on its own, at the block's indent.
+    #[test]
+    fn toggle_line_comment_on_jsx_child_lines_and_closing_tags() {
+        let mut e = jsx_editor(LangKind::Tsx);
+        e.selection = Some(EditorSelection {
+            anchor: (3, 0),
+            head: (4, 3),
+        });
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[3], "      {/* <h1>Hello {name}</h1> */}");
+        assert_eq!(e.lines[4], "      {/* <p>Welcome</p> */}");
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[3], "      <h1>Hello {name}</h1>");
+        assert_eq!(e.lines[4], "      <p>Welcome</p>");
+        let mut e = jsx_editor(LangKind::Tsx);
+        e.cursor_row = 5;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[5], "    {/* </div> */}");
+    }
+
+    /// #1623: a commented-out closing tag leaves the markup unparseable;
+    /// Ctrl+/ on it, and on the child above it, still takes the JSX
+    /// comments off instead of adding `//`.
+    #[test]
+    fn a_commented_closing_tag_toggles_back() {
+        let mut e = jsx_editor(LangKind::Tsx);
+        e.cursor_row = 4;
+        assert!(e.toggle_line_comment());
+        e.cursor_row = 5;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[5], "    {/* </div> */}");
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[5], "    </div>");
+        e.cursor_row = 5;
+        assert!(e.toggle_line_comment());
+        e.cursor_row = 4;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[4], "      <p>Welcome</p>");
+    }
+
+    /// #1623: commenting a selection that already holds a JSX comment
+    /// leaves that comment as it is instead of nesting it.
+    #[test]
+    fn toggle_line_comment_on_a_mixed_jsx_selection_does_not_nest() {
+        let mut e = jsx_editor(LangKind::Tsx);
+        e.cursor_row = 3;
+        assert!(e.toggle_line_comment());
+        e.selection = Some(EditorSelection {
+            anchor: (3, 0),
+            head: (4, 3),
+        });
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[3], "      {/* <h1>Hello {name}</h1> */}");
+        assert_eq!(e.lines[4], "      {/* <p>Welcome</p> */}");
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[3], "      <h1>Hello {name}</h1>");
+        assert_eq!(e.lines[4], "      <p>Welcome</p>");
+    }
+
+    /// #1623: Toggle Block Comment twice on a closing tag restores it, though
+    /// the first toggle left the markup unparseable.
+    #[test]
+    fn toggle_block_comment_on_a_closing_tag_toggles_back() {
+        let mut e = jsx_editor(LangKind::Tsx);
+        e.cursor_row = 5;
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines[5], "    {/* </div> */}");
+        e.cursor_row = 5;
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines[5], "    </div>");
+    }
+
+    /// #1623: in plain code, `{/* TODO */}` is a block holding a comment;
+    /// Ctrl+/ comments it out with `//` rather than unwrapping it.
+    #[test]
+    fn a_braced_comment_in_plain_code_is_not_a_jsx_comment() {
+        for lang in [LangKind::Tsx, LangKind::JavaScript] {
+            let mut e = editor_with("function f() {\n  {/* TODO */}\n}");
+            e.lang = Some(lang);
+            e.cursor_row = 1;
+            assert!(e.toggle_line_comment());
+            assert_eq!(e.lines[1], "  // {/* TODO */}", "{lang:?}");
+        }
+    }
+
+    /// #1623: Toggle Block Comment in JSX children wraps in braces too.
+    #[test]
+    fn toggle_block_comment_in_jsx_children_wraps_in_braces() {
+        let mut e = jsx_editor(LangKind::Tsx);
+        e.cursor_row = 4;
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines[4], "      {/* <p>Welcome</p> */}");
+        e.cursor_row = 4;
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines[4], "      <p>Welcome</p>");
+    }
+
+    /// Negative (#1623): code around the JSX, the root element's line, an
+    /// attribute line and a plain `.ts` file keep `//`.
+    #[test]
+    fn toggle_line_comment_outside_jsx_children_keeps_slashes() {
+        let mut e = jsx_editor(LangKind::Tsx);
+        e.cursor_row = 1;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[1], "  // return (");
+        let mut e = jsx_editor(LangKind::Tsx);
+        e.cursor_row = 2;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[2], "    // <div className=\"app\">");
+        let mut e = editor_with("const el = (\n  <input\n    disabled\n  />\n);");
+        e.lang = Some(LangKind::Tsx);
+        e.cursor_row = 2;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[2], "    // disabled");
+        let mut e = editor_with("const x = 1;\nconst y = 2;");
+        e.lang = Some(LangKind::TypeScript);
+        e.cursor_row = 0;
+        assert!(e.toggle_line_comment());
+        assert_eq!(e.lines[0], "// const x = 1;");
+        let mut e = jsx_editor(LangKind::Tsx);
+        e.selection = Some(EditorSelection {
+            anchor: (1, 2),
+            head: (1, 8),
+        });
+        assert!(e.toggle_block_comment());
+        assert_eq!(e.lines[1], "  /* return */ (");
+    }
+
     /// #1161: XML comments are `<!-- -->`, so Toggle Block Comment wraps
     /// the caret's line in them and a second toggle takes them off.
     #[test]
@@ -35974,6 +36778,40 @@ mod tests {
             !e.sticky_click_rows.iter().any(|&(y, _)| y == caret.1),
             "the sticky band painted over the caret's own row {}",
             caret.1
+        );
+    }
+
+    /// #1169: accept buttons switch to their short labels instead of being
+    /// dropped when a row cannot fit every full label, and never run past
+    /// the row's end.
+    #[test]
+    fn accept_buttons_shorten_before_they_drop() {
+        let chips = [
+            AcceptChip::new("Accept Current", "Current", ACCEPT_CURRENT_FILL),
+            AcceptChip::new("Accept Incoming", "Incoming", ACCEPT_INCOMING_FILL),
+            AcceptChip::new("Accept Both", "Both", ACCEPT_BOTH_FILL),
+        ];
+        let texts = |limit: u16| -> Vec<String> {
+            lay_out_accept_chips(&chips, 10, limit)
+                .into_iter()
+                .map(|(x, t)| {
+                    assert!(x + t.chars().count() as u16 <= limit, "{t:?} overruns");
+                    t
+                })
+                .collect()
+        };
+        assert_eq!(
+            texts(100),
+            [" Accept Current ", " Accept Incoming ", " Accept Both "]
+        );
+        assert_eq!(texts(40), [" Current ", " Incoming ", " Both "]);
+        assert_eq!(texts(30), [" Current ", " Incoming "]);
+        assert!(texts(12).is_empty());
+        let ticked = AcceptChip::new("Accept Both", "Both", ACCEPT_BOTH_FILL).ticked(true);
+        assert_eq!(ticked.label, "\u{2713} Accept Both");
+        assert_eq!(
+            ticked.short, "\u{2713} Both",
+            "a narrow pane still shows which side was taken"
         );
     }
 

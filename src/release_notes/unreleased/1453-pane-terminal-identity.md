@@ -1,1 +1,0 @@
-fix: Programs in croft's terminal no longer think they run in the host terminal. A pane now sets `TERM_PROGRAM=croft` and drops variables like `KITTY_WINDOW_ID`, so `croft plot` in croft on Ghostty draws its chart instead of blank rows.
