@@ -194,7 +194,7 @@ jobs:
       - name: fs-sync 200 ms invariant (serial, wall clock)
         # The #[ignore]d wall-clock test (see
         # fs_sync_reflects_external_changes_within_200ms_wall_clock in
-        # src/app/tests.rs for why it runs alone, #483). The filter is coupled
+        # src/app/tests/files.rs for why it runs alone, #483). The filter is coupled
         # to that name by nothing but convention, and a filter that selects
         # no test exits 0, so the step requires the bin target to report
         # exactly one test before it counts as run.
