@@ -1,1 +1,0 @@
-fix: The terminal pane's right-click menu now has Split Terminal and Kill Terminal, and docs/LINUX.md no longer offers `Ctrl+Shift+C` / `W` / `T` as the way to copy, close and split terminal panes in GNOME Terminal and Konsole, which keep those chords for their own Copy, Close Tab and New Tab.

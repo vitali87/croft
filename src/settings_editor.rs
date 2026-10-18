@@ -46,6 +46,7 @@ pub fn choices(key: &str) -> Option<Vec<String>> {
         "problems_project_scope" => &["auto", "on", "off"],
         "diff_ignore_whitespace" => &["off", "leading", "all"],
         "render_whitespace" => &["selection", "all", "none"],
+        "line_numbers" => &["on", "relative", "interval", "off"],
         "word_based_suggestions" => &[
             "matchingDocuments",
             "currentDocument",

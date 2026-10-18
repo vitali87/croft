@@ -1,1 +1,0 @@
-fix: Go to Definition, Go to Declaration and Go to Type Definition say "No definition found" (or declaration / type definition) when the language server finds nothing, instead of silently doing nothing.
