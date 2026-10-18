@@ -146,6 +146,13 @@ fn as_whitespace_mode(v: &Value) -> Option<Value> {
     Some(Value::from(mapped))
 }
 
+/// `editor.lineNumbers` (#1576): VS Code's four modes are croft's.
+fn as_line_numbers(v: &Value) -> Option<Value> {
+    v.as_str()
+        .filter(|s| matches!(*s, "on" | "off" | "relative" | "interval"))
+        .map(Value::from)
+}
+
 fn as_scrollback(v: &Value) -> Option<Value> {
     v.as_u64().map(Value::from)
 }
@@ -239,6 +246,11 @@ const SETTINGS: &[SettingMap] = &[
         convert: negated,
     },
     SettingMap {
+        vscode: "editor.lineNumbers",
+        croft: "line_numbers",
+        convert: as_line_numbers,
+    },
+    SettingMap {
         vscode: "editor.inlayHints.enabled",
         croft: "disable_inlay_hints",
         convert: off_means_disabled,
@@ -303,6 +315,12 @@ const SETTINGS: &[SettingMap] = &[
 /// it now maps to the caret-driven `go_to_definition` (#1212).
 const COMMANDS: &[(&str, &str)] = &[
     ("workbench.action.files.save", "save_file"),
+    // The GitHub Pull Requests extension's share commands, and the built-in
+    // GitHub extension's Open on GitHub (#1610).
+    ("issue.copyGithubPermalink", "git_copy_permalink"),
+    ("issue.copyGithubHeadLink", "git_copy_head_link"),
+    ("issue.openGithubPermalink", "git_open_on_remote"),
+    ("github.openOnGitHub", "git_open_on_remote"),
     ("git.createTag", "git_create_tag"),
     ("git.pushTags", "git_push_tags"),
     ("git.deleteRemoteTag", "git_delete_remote_tag"),
@@ -452,6 +470,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("editor.action.deleteLines", "delete_line"),
     ("deleteAllRight", "kill_to_end_of_line"),
     ("editor.action.joinLines", "join_lines"),
+    ("editor.action.insertLineAfter", "insert_line_below"),
+    ("editor.action.insertLineBefore", "insert_line_above"),
     ("editor.action.transformToUppercase", "transform_upper"),
     ("editor.action.transformToLowercase", "transform_lower"),
     ("editor.action.transformToTitlecase", "transform_title"),
@@ -3055,6 +3075,36 @@ mod tests {
         );
     }
 
+    /// #1571: VS Code's Insert Line Below / Above chords import onto croft's
+    /// commands instead of being dropped.
+    #[test]
+    fn insert_line_after_and_before_import() {
+        let doc = json!([
+            { "key": "ctrl+enter", "command": "editor.action.insertLineAfter" },
+            { "key": "ctrl+shift+enter", "command": "editor.action.insertLineBefore" },
+            { "key": "ctrl+alt+enter", "command": "editor.action.insertLineAround" }
+        ]);
+        let mut report = Report::default();
+        convert_keybindings(&doc, &mut report);
+        assert_eq!(
+            report.keybindings,
+            [
+                (
+                    String::from("ctrl+enter"),
+                    String::from("insert_line_below")
+                ),
+                (
+                    String::from("ctrl+shift+enter"),
+                    String::from("insert_line_above")
+                ),
+            ]
+        );
+        assert_eq!(
+            report.dropped_keybindings,
+            ["ctrl+alt+enter: no croft command matches editor.action.insertLineAround"]
+        );
+    }
+
     /// #1580: VS Code's New Untitled Text File chord imports onto croft's.
     #[test]
     fn new_untitled_file_imports() {
@@ -3071,6 +3121,25 @@ mod tests {
             )]
         );
         assert!(report.dropped_keybindings.is_empty());
+    }
+
+    /// #1576: `editor.lineNumbers` maps onto `line_numbers`; a value croft
+    /// has no mode for is reported, not mapped.
+    #[test]
+    fn line_numbers_import_with_their_mode() {
+        for mode in ["on", "off", "relative", "interval"] {
+            let (settings, unmapped, _) =
+                map_settings(json!({ "editor.lineNumbers": mode }).as_object().unwrap());
+            assert_eq!(settings["line_numbers"], json!(mode));
+            assert!(unmapped.is_empty());
+        }
+        let (settings, unmapped, _) = map_settings(
+            json!({ "editor.lineNumbers": "sideways" })
+                .as_object()
+                .unwrap(),
+        );
+        assert!(settings.is_empty());
+        assert_eq!(unmapped.len(), 1, "{unmapped:?}");
     }
 
     /// #1558: VS Code's Select All Occurrences and Add Cursors to Line Ends
