@@ -1155,13 +1155,22 @@ pub fn process_name(pid: i32) -> Option<String> {
 /// while argv is only wanted when the name says the process is worth asking
 /// about (#364 wants it for `ssh` and nothing else).
 pub fn process_cmdline(pid: i32) -> Option<Vec<String>> {
-    use sysinfo::{Pid, ProcessesToUpdate, System};
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
     if pid <= 0 {
         return None;
     }
     let p = Pid::from(pid as usize);
     let mut sys = System::new();
-    sys.refresh_processes(ProcessesToUpdate::Some(&[p]), true);
+    // The argv must be asked for by name (#1846): sysinfo's plain
+    // `refresh_processes` reads memory, CPU, disk use and the executable,
+    // never the command line, so `cmd()` was always empty. Every pane that
+    // ran `ssh box` then read as "not an SSH session": the open-workspace
+    // offer never appeared, and the user stayed in the remote shell.
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[p]),
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
     let cmd: Vec<String> = sys
         .process(p)?
         .cmd()
@@ -3910,6 +3919,12 @@ impl PtyTerminal {
     /// quoting strategy.
     pub fn change_cwd(&mut self, path: &std::path::Path) {
         self.write_input(&format_cd_command(path));
+    }
+
+    /// Whether the program in the pane turned on bracketed paste, so a
+    /// pasted line break waits for Enter instead of running the line (#1274).
+    pub fn bracketed_paste(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::BRACKETED_PASTE)
     }
 
     /// Paste a payload into the embedded shell. Bracketed-paste markers
@@ -10624,6 +10639,23 @@ mod tests {
             name.as_deref().is_some_and(|n| !n.is_empty()),
             "the test process resolves to a non-empty name: {name:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_cmdline_reads_a_live_process_argv() {
+        // #1846: the plain refresh never read the command line, so this was
+        // always `None` and no pane running `ssh box` read as an ssh session.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep runs");
+        let argv = process_cmdline(child.id() as i32);
+        let _ = child.kill();
+        let _ = child.wait();
+        let argv = argv.expect("a live child's argv");
+        assert!(argv[0].ends_with("sleep"), "{argv:?}");
+        assert_eq!(argv.last().map(String::as_str), Some("30"), "{argv:?}");
     }
 
     #[test]
