@@ -1,1 +1,0 @@
-fix: The Explorer lists names the way VS Code does: numbers by value, so `chapter2` comes before `chapter10` and `step2.sql` before `step11.sql`, and letters without regard to case, so `apple.py` comes before `Makefile` and `README.md`. Folders still come first.

@@ -2,7 +2,7 @@
 """Whether one file's change between two revisions ships nothing.
 
 The release gate exempts "docs / CI / test-only changes" and encodes that as a
-path list, so `src/app/tests.rs` and `tests/` are exempt while a change
+path list, so `src/app/tests/` and `tests/` are exempt while a change
 confined to a `#[cfg(test)] mod tests` inside a shipped file is not (#461).
 croft keeps most unit tests beside the code they cover, so that is the ordinary
 shape of a test-only fix here: the release binary is byte-identical, and the

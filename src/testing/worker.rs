@@ -57,7 +57,14 @@ pub enum TestRequest {
     /// Run with the runner's coverage tool on (#263): everything, or only
     /// the tests `scope` names.
     RunCoverage(Option<CoverageScope>),
-    Discover,
+    /// List the tests without running them. `quiet` is the Testing view's
+    /// own discover (#1841): the worker, not the UI thread, finds the
+    /// runner, which can mean walking the tree for CodeQL test packs. It
+    /// answers [`TestResponse::QuietDiscovery`] first, and a root no runner
+    /// claims ends there, without a refusal the status bar reports.
+    Discover {
+        quiet: bool,
+    },
     /// Rebind the worker's working directory (Explorer re-root). Without it the
     /// worker keeps shelling cargo in the launch dir captured at spawn, so after
     /// a Make Root into a child repo `cargo test -- --list` errors with "could
@@ -89,6 +96,11 @@ pub enum TestResponse {
     /// Running marks the `start_*` call painted instead of stranding them,
     /// and the app can say why nothing ran.
     Refused,
+    /// The worker reached a quiet discovery (#1841). Sent before anything
+    /// else it does, so the drain can tell the request the Testing view
+    /// queued from any other's answers; when no runner claims the root,
+    /// nothing follows it.
+    QuietDiscovery,
     /// A coverage run's report, or why there is none. Sent before its
     /// `Finished`.
     Coverage(Result<super::coverage::Coverage, CoverageError>),
@@ -178,6 +190,10 @@ pub struct TestWorker {
     /// streaming when the Explorer re-roots can't pollute the new project's
     /// tree (same idea as the commit graph's root-tagged drain).
     response_rx: Receiver<(u64, TestResponse)>,
+    /// A quiet discovery is queued and has not started yet (#1841). Until
+    /// the worker reaches it the panel is not busy, so without this every
+    /// reopen of the Testing view would queue another.
+    discover_queued: bool,
     /// Bumped on every [`Self::set_root`], in lockstep with the loop's own
     /// counter: the request channel is FIFO, so both sides count the same
     /// `SetRoot`s in the same order.
@@ -205,6 +221,7 @@ impl TestWorker {
             sent: 0,
             cancel_pending: false,
             response_rx,
+            discover_queued: false,
             expected_epoch: 0,
             #[cfg(test)]
             root,
@@ -224,6 +241,7 @@ impl TestWorker {
                 sent: 0,
                 cancel_pending: false,
                 response_rx,
+                discover_queued: false,
                 expected_epoch: 0,
                 root: PathBuf::new(),
             },
@@ -267,7 +285,26 @@ impl TestWorker {
     }
 
     pub fn discover(&mut self) {
-        self.send(TestRequest::Discover);
+        self.send(TestRequest::Discover { quiet: false });
+    }
+
+    /// Discover from the Testing view (#1841): queued without looking for a
+    /// runner first, so opening the view never waits on that search. The
+    /// worker finds the runner and stays silent when there is none.
+    pub fn discover_quietly(&mut self) {
+        self.discover_queued = true;
+        self.send(TestRequest::Discover { quiet: true });
+    }
+
+    /// A quiet discovery is queued and has not started yet.
+    pub fn discover_queued(&self) -> bool {
+        self.discover_queued
+    }
+
+    /// How many requests have been queued, for tests that count them.
+    #[cfg(test)]
+    pub fn requests_sent(&self) -> u64 {
+        self.sent
     }
 
     pub fn set_codeql_program(&mut self, program: PathBuf) {
@@ -291,6 +328,9 @@ impl TestWorker {
             self.root = root.clone();
         }
         self.expected_epoch += 1;
+        // A discovery queued for the old root reports under the old epoch,
+        // which the drain drops: nothing would ever clear it.
+        self.discover_queued = false;
         // Every request a pending cancel covers was sent before this
         // re-root, so its end carries the old epoch and is dropped below:
         // the cancel must not outlive it and swallow the new root's next
@@ -315,6 +355,10 @@ impl TestWorker {
                 continue;
             }
             match resp {
+                TestResponse::QuietDiscovery => {
+                    self.discover_queued = false;
+                    continue;
+                }
                 TestResponse::Started(activity) => panel.on_busy_started(activity),
                 TestResponse::Case(case) => panel.apply_case(case),
                 TestResponse::Progress(line) => panel.set_progress(line),
@@ -389,7 +433,7 @@ fn worker_loop(
             TestRequest::RunMany(names) => run_many(&root, &etx, &names),
             TestRequest::RunFilter(pattern) => run_filter(&root, &etx, &pattern, false),
             TestRequest::RunSuite(suite) => run_filter(&root, &etx, &suite, true),
-            TestRequest::Discover => discover(&root, &etx),
+            TestRequest::Discover { quiet } => discover(&root, &etx, quiet),
             TestRequest::SetRoot(p) => {
                 root = p;
                 epoch += 1;
@@ -612,11 +656,13 @@ fn go_cmd<S: AsRef<std::ffi::OsStr>>(root: &Path, args: &[S]) -> Command {
 }
 
 /// Run `go test -json` and stream its finished tests, showing the text the
-/// tests printed (not the JSON events) in the OUTPUT channel.
-fn run_go<S: AsRef<std::ffi::OsStr>>(tx: &EpochTx, root: &Path, args: &[S]) -> Option<bool> {
-    let module = super::gotest::module_path(root);
-    run_streaming_shown(tx, go_cmd(root, args), super::gotest::shown, |line| {
-        super::gotest::parse_event(module.as_deref(), line)
+/// tests printed (not the JSON events) in the OUTPUT channel. `./...` is
+/// spelled for the root's modules (see [`super::gotest::Modules::expand`]).
+fn run_go<S: AsRef<str>>(tx: &EpochTx, root: &Path, args: &[S]) -> Option<bool> {
+    let modules = super::gotest::Modules::of(root);
+    let cmd = go_cmd(root, &modules.expand(args));
+    run_streaming_shown(tx, cmd, super::gotest::shown, |line| {
+        super::gotest::parse_event(&modules, line)
             .into_iter()
             .collect()
     })
@@ -1475,8 +1521,8 @@ fn run_coverage(root: &Path, tx: &EpochTx, scope: Option<&CoverageScope>) {
     .unwrap_or(false);
     let lcov = if runner == Runner::Go {
         std::fs::read_to_string(go_cover_profile(&dir)).map(|profile| {
-            let module = super::gotest::module_path(root);
-            super::gotest::cover_profile_to_lcov(&profile, module.as_deref())
+            let modules = super::gotest::Modules::of(root);
+            super::gotest::cover_profile_to_lcov(&profile, &modules)
         })
     } else {
         std::fs::read_to_string(coverage_report(&dir))
@@ -1634,10 +1680,15 @@ fn run_filter(root: &Path, tx: &EpochTx, pattern: &str, suite: bool) {
 /// exit status goes back with `Finished`, so a listing that errors (pytest's
 /// exit 2 on a collection error, a build failure) reads as a failed
 /// discovery rather than a project with no tests (#845).
-fn discover(root: &Path, tx: &EpochTx) {
+fn discover(root: &Path, tx: &EpochTx, quiet: bool) {
+    if quiet {
+        tx.send(TestResponse::QuietDiscovery);
+    }
     // See run_all: refuse before `Started` so the panel keeps its tree.
     let Some(runner) = runner_for(root) else {
-        tx.send(TestResponse::Refused);
+        if !quiet {
+            tx.send(TestResponse::Refused);
+        }
         return;
     };
     tx.send(TestResponse::Started(Activity::Discovering));
@@ -1712,10 +1763,10 @@ fn discover(root: &Path, tx: &EpochTx) {
         }
         // `go test -list` compiles each package's tests but runs none.
         Runner::Go => {
-            let module = super::gotest::module_path(root);
-            let cmd = go_cmd(root, &["-list", ".", "./..."]);
+            let modules = super::gotest::Modules::of(root);
+            let cmd = go_cmd(root, &modules.expand(&["-list", ".", "./..."]));
             run_streaming_shown(tx, cmd, super::gotest::shown, |line| {
-                super::gotest::parse_list_event(module.as_deref(), line)
+                super::gotest::parse_list_event(&modules, line)
                     .map(not_run)
                     .into_iter()
                     .collect()
@@ -1759,7 +1810,7 @@ mod tests {
         run_one(tmp.path(), &etx, "a::b");
         run_filter(tmp.path(), &etx, "a", false);
         run_filter(tmp.path(), &etx, "a", true);
-        discover(tmp.path(), &etx);
+        discover(tmp.path(), &etx, false);
         let msgs: Vec<TestResponse> = rx.try_iter().map(|(_, r)| r).collect();
         assert!(
             !msgs.iter().any(|m| matches!(m, TestResponse::Started(_))),
@@ -1971,7 +2022,7 @@ mod tests {
         };
         let log = || std::fs::read_to_string(bin.path().join("calls.log")).unwrap_or_default();
 
-        discover(root, &etx);
+        discover(root, &etx, false);
         let (cases, finished) = drain(&rx);
         assert_eq!(
             cases,
@@ -2066,7 +2117,7 @@ mod tests {
         use TestStatus::*;
         let s = String::from;
 
-        discover(root, &etx);
+        discover(root, &etx, false);
         assert_eq!(
             cases(&rx),
             [
@@ -2184,6 +2235,78 @@ mod tests {
         .unwrap();
         assert!(w.drain(&mut panel));
         assert!(!panel.is_empty());
+    }
+
+    /// #1841: the Testing view's own discover leaves finding the runner to
+    /// the worker, so a root no runner claims must end it without the
+    /// refusal a run gesture reports, and without a Started that would
+    /// wipe the panel.
+    #[test]
+    fn a_quiet_discovery_with_no_runner_ends_silently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let etx = EpochTx {
+            tx: &tx,
+            epoch: 0,
+            codeql: Path::new("codeql"),
+            control: &RunControl::default(),
+            request: 1,
+        };
+        discover(tmp.path(), &etx, true);
+        let msgs: Vec<TestResponse> = rx.try_iter().map(|(_, r)| r).collect();
+        assert!(
+            matches!(msgs.as_slice(), [TestResponse::QuietDiscovery]),
+            "a quiet discovery with no runner says it was reached and nothing else"
+        );
+
+        let (mut w, tx) = TestWorker::for_test();
+        let mut panel = TestingPanel::new();
+        w.discover_quietly();
+        assert!(w.discover_queued());
+        tx.send((0, TestResponse::QuietDiscovery)).unwrap();
+        assert!(
+            !w.drain(&mut panel),
+            "the marker changes nothing on screen, so nothing needs redrawing"
+        );
+        assert!(!w.discover_queued(), "the marker ends the queued discovery");
+        assert!(!panel.take_refusal(), "a quiet discovery never says why");
+        assert!(!panel.is_busy());
+    }
+
+    /// #1841: only the quiet discovery's own marker clears the queued flag:
+    /// a regular discovery queued ahead of it answering first must not, or
+    /// a reopen of the Testing view would queue another. A re-root clears
+    /// it too, since its drain drops the old root's answers.
+    #[test]
+    fn only_the_quiet_discovery_itself_clears_the_queued_flag() {
+        let (mut w, tx) = TestWorker::for_test();
+        let mut panel = TestingPanel::new();
+        w.discover();
+        w.discover_quietly();
+        tx.send((0, TestResponse::Started(Activity::Discovering)))
+            .unwrap();
+        tx.send((0, TestResponse::Finished { ok: Some(true) }))
+            .unwrap();
+        tx.send((0, TestResponse::Refused)).unwrap();
+        assert!(w.drain(&mut panel));
+        assert!(
+            w.discover_queued(),
+            "the earlier discovery's answers are not the quiet one starting"
+        );
+        tx.send((0, TestResponse::QuietDiscovery)).unwrap();
+        tx.send((0, TestResponse::Started(Activity::Discovering)))
+            .unwrap();
+        assert!(w.drain(&mut panel));
+        assert!(!w.discover_queued());
+        assert!(panel.is_busy(), "the panel now shows the discovery");
+
+        let (mut w, _tx) = TestWorker::for_test();
+        w.discover_quietly();
+        w.set_root(PathBuf::from("/new"));
+        assert!(
+            !w.discover_queued(),
+            "the old root's discovery can never report under the new epoch"
+        );
     }
 
     /// A root that is a package with `members` beside it (#1508).
@@ -2867,7 +2990,7 @@ exit 1"#
             let tmp = tempfile::tempdir().unwrap();
             let root = tmp.path();
             pytest_project_with_addopts(root, addopts);
-            let (cases, finished) = collect_responses(root, discover);
+            let (cases, finished) = collect_responses(root, |r, t| discover(r, t, false));
             assert_eq!(
                 cases,
                 vec![
@@ -2922,7 +3045,7 @@ exit 1"#
             request: 1,
         };
         let discovered = || {
-            discover(root, &etx);
+            discover(root, &etx, false);
             let mut cases = Vec::new();
             let mut finished = None;
             for (_, r) in rx.try_iter() {
@@ -3069,7 +3192,7 @@ exit 1"#
             request: 1,
         };
         let finished = || {
-            discover(root, &etx);
+            discover(root, &etx, false);
             rx.try_iter().find_map(|(_, r)| match r {
                 TestResponse::Finished { ok } => Some(ok),
                 _ => None,
@@ -3237,7 +3360,7 @@ exit 1"#
             control: &RunControl::default(),
             request: 1,
         };
-        discover(root, &etx);
+        discover(root, &etx, false);
         let mut cases = Vec::new();
         let mut finished = None;
         for (_, r) in rx.try_iter() {
@@ -3248,6 +3371,61 @@ exit 1"#
             }
         }
         (cases, finished)
+    }
+
+    /// #1505, end to end with the real `go` when it is installed: a
+    /// `go.work` root lists every module's tests and Run All runs them.
+    #[test]
+    fn a_go_work_workspace_lists_and_runs_every_module() {
+        if Command::new(go_binary()).arg("version").output().is_err() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str, text: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        write("lib/go.mod", "module example.com/lib\n\ngo 1.21\n");
+        write(
+            "lib/lib_test.go",
+            "package lib\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {}\n",
+        );
+        write("svc/go.mod", "module example.com/svc\n\ngo 1.21\n");
+        write(
+            "svc/svc_test.go",
+            "package svc\n\nimport \"testing\"\n\nfunc TestSvc(t *testing.T) { t.Fatal(\"svc broken\") }\n",
+        );
+        write("go.work", "go 1.21\n\nuse (\n\t./lib\n\t./svc\n)\n");
+        let (mut listed, finished) = discovery_of(root);
+        listed.sort();
+        assert_eq!(listed, ["./lib::TestAdd", "./svc::TestSvc"], "{finished:?}");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let etx = EpochTx {
+            tx: &tx,
+            epoch: 0,
+            codeql: Path::new("codeql"),
+            control: &RunControl::default(),
+            request: 1,
+        };
+        run_all(root, &etx);
+        let mut ran: Vec<(String, TestStatus)> = rx
+            .try_iter()
+            .filter_map(|(_, r)| match r {
+                TestResponse::Case(c) => Some((c.name, c.status)),
+                _ => None,
+            })
+            .collect();
+        ran.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            ran,
+            [
+                (String::from("./lib::TestAdd"), TestStatus::Passed),
+                (String::from("./svc::TestSvc"), TestStatus::Failed),
+            ]
+        );
     }
 
     /// A JS project whose `runner` (`vitest` or `jest`) is the stand-in
