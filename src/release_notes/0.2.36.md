@@ -1,0 +1,1 @@
+fix: Running `ssh` to a host from a croft terminal pane offers to open the workspace there again (Cmd+K G), and Remote: Open Workspace on This Pane's Host works. croft could not read what the pane was running, so it never saw the ssh session and left you in the remote shell.
