@@ -252,6 +252,23 @@ class Check(unittest.TestCase):
             errors, _ = repo.check()
             self.assertEqual(errors, [])
 
+    def test_whole_app_tests_need_no_fragment_in_either_layout(self):
+        """`src/app/tests.rs` was split into `src/app/tests/`. Both paths are
+        compiled out of release builds, so moving tests from one to the other,
+        or adding to either, ships nothing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.write("src/app/tests.rs", "use super::*;\n\n#[test]\nfn t() {}\n")
+            repo.commit()
+            repo.branch()
+            repo.remove("src/app/tests.rs")
+            repo.write("src/app/tests/mod.rs", "use super::*;\n\nmod editing;\n")
+            repo.write("src/app/tests/editing.rs", "use super::*;\n\n#[test]\nfn t() {}\n")
+            repo.commit()
+            errors, out = repo.check()
+            self.assertEqual(errors, [])
+            self.assertIn("No shipped files changed", out)
+
     def test_editing_a_pending_fragment_alone_needs_no_new_one(self):
         """A typo fix in a note that has not shipped yet changes no code, so
         it does not owe a note of its own."""

@@ -3882,6 +3882,104 @@ pub fn git_worker_loop(
     }
 }
 
+/// Which revision a shared link names (#1610): HEAD's commit for Git: Copy
+/// Permalink, which keeps pointing at these lines as the branch moves, or
+/// the branch for Git: Copy Head Link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkRev {
+    Commit,
+    Branch,
+}
+
+/// The web page for `file` at `rev`, scrolled to `lines` (1-based,
+/// inclusive), on the current branch's remote, else `origin`, else the only
+/// remote (#1610). `Err` says why there is no link rather than handing out
+/// one that would not open: no repository or remote, a remote that is not
+/// GitHub, GitLab or Bitbucket, a file that was never committed, or a
+/// commit or branch that is not on the remote yet.
+pub fn share_link(
+    file: &Path,
+    lines: Option<(usize, usize)>,
+    rev: LinkRev,
+) -> Result<String, String> {
+    let dir = file.parent().ok_or("the file has no folder")?;
+    let top = repo_toplevel(dir).ok_or("the file is not in a git repository")?;
+    let rel = file
+        .canonicalize()
+        .ok()
+        .zip(top.canonicalize().ok())
+        .and_then(|(f, t)| f.strip_prefix(t).ok().map(Path::to_path_buf))
+        .ok_or("the file is not in a git repository")?;
+    let rel = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    let branch = run_git(&top, &["symbolic-ref", "--quiet", "--short", "HEAD"]).ok();
+    let config = |key: String| run_git(&top, &["config", "--get", &key]).ok();
+    let remotes = run_git(&top, &["remote"]).unwrap_or_default();
+    let remotes: Vec<&str> = remotes.lines().collect();
+    let remote = branch
+        .as_ref()
+        .and_then(|b| config(format!("branch.{b}.remote")))
+        .filter(|r| remotes.contains(&r.as_str()))
+        .or_else(|| remotes.contains(&"origin").then(|| String::from("origin")))
+        .or_else(|| (remotes.len() == 1).then(|| remotes[0].to_string()))
+        .ok_or("the repository has no remote to link to")?;
+    let url = run_git(&top, &["remote", "get-url", &remote])
+        .map_err(|_| format!("remote {remote} has no URL"))?;
+    let repo = crate::permalink::web_repo(&url)
+        .ok_or_else(|| format!("{remote} ({url}) is not a GitHub, GitLab or Bitbucket remote"))?;
+    // The file must be in HEAD's tree, which the linked commit or branch
+    // contains; being staged is not enough for the remote to show it.
+    if run_git(&top, &["cat-file", "-e", &format!("HEAD:{rel}")]).is_err() {
+        return Err(format!(
+            "{rel} is not committed, so {remote} has no page for it"
+        ));
+    }
+    let rev = match rev {
+        LinkRev::Commit => {
+            let sha = run_git(&top, &["rev-parse", "HEAD"])
+                .map_err(|_| String::from("the repository has no commits"))?;
+            let pattern = format!("{remote}/*");
+            let pushed = run_git(
+                &top,
+                &["branch", "-r", "--contains", &sha, "--list", &pattern],
+            )
+            .is_ok_and(|out| !out.is_empty());
+            if !pushed {
+                return Err(format!(
+                    "commit {} is not on {remote} yet, so the link would not open: push it first",
+                    &sha[..sha.len().min(7)]
+                ));
+            }
+            sha
+        }
+        LinkRev::Branch => {
+            let branch = branch.ok_or("HEAD is detached, so there is no branch to link to")?;
+            // The branch's name on the remote, which its upstream may spell
+            // differently; else the same name.
+            let name = config(format!("branch.{branch}.merge"))
+                .and_then(|m| m.strip_prefix("refs/heads/").map(str::to_string))
+                .unwrap_or_else(|| branch.clone());
+            let tracking = format!("refs/remotes/{remote}/{name}");
+            if run_git(&top, &["rev-parse", "--verify", "--quiet", &tracking]).is_err() {
+                return Err(format!(
+                    "branch {name} is not on {remote} yet, so the link would not open: push it first"
+                ));
+            }
+            // A tracking branch behind HEAD would show older lines.
+            if run_git(&top, &["merge-base", "--is-ancestor", "HEAD", &tracking]).is_err() {
+                return Err(format!(
+                    "branch {name} on {remote} is behind your commits, so the link would show older lines: push it first"
+                ));
+            }
+            name
+        }
+    };
+    Ok(crate::permalink::file_url(&repo, &rev, &rel, lines))
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -7586,5 +7684,119 @@ git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' README.md >
         let patch = head_vs_work_patch(tmp.path(), "notes.md");
         apply_patch(tmp.path(), &patch, true, false).unwrap();
         assert!(sh_git(tmp.path(), &["diff", "--cached"]).contains("+row FIVE"));
+    }
+
+    /// A repository with `src/main.rs` committed on `main` and `origin` at
+    /// `url`; `pushed` fakes the push with a remote-tracking ref.
+    fn share_repo(url: &str, pushed: bool) -> (tempfile::TempDir, PathBuf, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::create_dir(p.join("src")).unwrap();
+        std::fs::write(
+            p.join("src/main.rs"),
+            "fn main() {\n    println!(\"hi\");\n}\n",
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(p)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "main"]);
+        git(&["remote", "add", "origin", url]);
+        if pushed {
+            git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        }
+        let sha = run_git(p, &["rev-parse", "HEAD"]).unwrap();
+        let file = p.join("src/main.rs");
+        (tmp, file, sha)
+    }
+
+    /// #1610: the permalink names HEAD's commit and the selected lines, the
+    /// same from an ssh or an https origin; the head link names the branch.
+    #[test]
+    fn share_links_name_the_commit_or_branch_and_the_lines() {
+        for url in [
+            "git@github.com:acme/widgets.git",
+            "https://github.com/acme/widgets",
+        ] {
+            let (_tmp, file, sha) = share_repo(url, true);
+            assert_eq!(
+                share_link(&file, Some((2, 4)), LinkRev::Commit).unwrap(),
+                format!("https://github.com/acme/widgets/blob/{sha}/src/main.rs#L2-L4")
+            );
+            assert_eq!(
+                share_link(&file, Some((2, 2)), LinkRev::Branch).unwrap(),
+                "https://github.com/acme/widgets/blob/main/src/main.rs#L2"
+            );
+        }
+        let (_tmp, file, sha) = share_repo("git@gitlab.com:acme/widgets.git", true);
+        assert_eq!(
+            share_link(&file, Some((1, 3)), LinkRev::Commit).unwrap(),
+            format!("https://gitlab.com/acme/widgets/-/blob/{sha}/src/main.rs#L1-3")
+        );
+    }
+
+    /// #1610 negatives: an unpushed commit or branch, an uncommitted file,
+    /// an unknown host and a repository with no remote each say why instead
+    /// of giving a link that would not open.
+    #[test]
+    fn share_links_refuse_what_the_remote_cannot_show() {
+        let (tmp, file, sha) = share_repo("git@github.com:acme/widgets.git", false);
+        let err = share_link(&file, None, LinkRev::Commit).unwrap_err();
+        assert!(
+            err.contains(&sha[..7]) && err.contains("push it first"),
+            "{err}"
+        );
+        let err = share_link(&file, None, LinkRev::Branch).unwrap_err();
+        assert!(err.contains("branch main is not on origin"), "{err}");
+        std::fs::write(tmp.path().join("src/new.rs"), "x\n").unwrap();
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["update-ref", "refs/remotes/origin/main", "HEAD"])
+            .status();
+        let err = share_link(&tmp.path().join("src/new.rs"), None, LinkRev::Commit).unwrap_err();
+        assert!(err.contains("src/new.rs is not committed"), "{err}");
+        // Staged but not committed is still not on the remote.
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(tmp.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["add", "src/new.rs"]);
+        let err = share_link(&tmp.path().join("src/new.rs"), None, LinkRev::Commit).unwrap_err();
+        assert!(err.contains("src/new.rs is not committed"), "{err}");
+        // A local commit the tracking branch does not have yet.
+        git(&["commit", "-q", "-m", "local"]);
+        let err = share_link(&file, None, LinkRev::Branch).unwrap_err();
+        assert!(err.contains("branch main on origin is behind"), "{err}");
+        let (_t, file, _) = share_repo("git@git.example.com:acme/widgets.git", true);
+        let err = share_link(&file, None, LinkRev::Commit).unwrap_err();
+        assert!(
+            err.contains("not a GitHub, GitLab or Bitbucket remote"),
+            "{err}"
+        );
+        let bare = tempfile::tempdir().unwrap();
+        init_repo_with_commit(bare.path());
+        let err = share_link(&bare.path().join("seed.txt"), None, LinkRev::Commit).unwrap_err();
+        assert_eq!(err, "the repository has no remote to link to");
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("a.txt"), "x").unwrap();
+        assert!(share_link(&outside.path().join("a.txt"), None, LinkRev::Commit).is_err());
     }
 }

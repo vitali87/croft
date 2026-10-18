@@ -657,6 +657,17 @@ impl Theme {
         self.blend_over_bg((0x88, 0x88, 0x88), 0.80)
     }
 
+    /// The line number of a caret's line (VS Code
+    /// `editorLineNumber.activeForeground`, #C6C6C6 on dark and #0B216F on
+    /// light), brighter than the other numbers' grey (#1576).
+    pub fn line_number_active(self) -> Color {
+        if self.is_light() {
+            Color::Rgb(0x0b, 0x21, 0x6f)
+        } else {
+            Color::Rgb(0xc6, 0xc6, 0xc6)
+        }
+    }
+
     /// Background wash behind the cursor's line (VS Code
     /// `editor.lineHighlightBackground`): the accent at a whisper (8%) over
     /// the editor surface, spanning gutter through code (#248).
