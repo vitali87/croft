@@ -649,7 +649,11 @@ fn screen_with_catalog(app: &mut App, catalog: &str) -> String {
 #[test]
 fn the_side_bar_and_panel_titles_come_from_the_catalog() {
     let tmp = tempfile::tempdir().unwrap();
+    // A file is open, so the editor area is not the welcome page, whose
+    // release highlights can name these titles in English.
+    std::fs::write(tmp.path().join("a.txt"), "x\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("a.txt")).unwrap();
     for view in [ExplorerView::Outline, ExplorerView::Timeline] {
         if !app.explorer_views.is_visible(view) {
             app.toggle_explorer_view(view);
