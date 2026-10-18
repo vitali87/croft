@@ -1,1 +1,0 @@
-feature: The command palette now has Testing: Run All Tests, Run Tests in Current File, Rerun Failed Tests and Rerun Last Run, and VS Code keybindings for them import. Rerun Failed Tests runs exactly the tests that failed, Rerun Last Run repeats the last run as it was asked, and each says so when there is nothing to run or a run is already going.

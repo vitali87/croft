@@ -1,1 +1,0 @@
-feature: **C/C++: Switch Header/Source** (`Alt+O`, as in VS Code's clangd extension) opens the header of a C, C++ or Objective-C source, or the source of a header, whether it sits beside it, across an `include/` and `src/` split, or elsewhere in the workspace.
