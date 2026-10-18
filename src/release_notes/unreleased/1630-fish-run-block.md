@@ -1,1 +1,0 @@
-fix: Running a python or node code block from a Markdown file now works when the terminal's shell is fish. croft used to type the block as a bash heredoc, which fish rejects with "Expected a string, but found a redirection". It now writes the block to a private file and types `python3 - < 'file'`, which every common shell reads the same way.

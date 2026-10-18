@@ -1,1 +1,0 @@
-fix: View Changes vs the default branch now diffs from where your branch left it, like a pull request, so work merged to the default branch since then no longer shows up as your branch deleting or reverting it.
