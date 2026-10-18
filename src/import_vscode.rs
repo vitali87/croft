@@ -1587,7 +1587,7 @@ mod tests {
             "{unmapped:?}"
         );
         for want in [
-            "[python] editor.rulers",
+            "[python] editor.rulers (croft has rulers only for every language)",
             "[markdown] terminal.integrated.scrollback (croft has terminal_scrollback only for every language)",
             "[c] files.autoSave (croft has auto_save only for every language)",
         ] {
