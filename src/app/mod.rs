@@ -1197,6 +1197,14 @@ fn update_spinner_frame(elapsed_ms: u128) -> &'static str {
     UPDATE_SPINNER_FRAMES[((elapsed_ms / UPDATE_SPINNER_FRAME_MS) % n) as usize]
 }
 
+/// What a share-link command does with the link (#1610).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShareLink {
+    CopyPermalink,
+    CopyHeadLink,
+    OpenOnRemote,
+}
+
 /// What a breadcrumb crumb stands for (#1608).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CrumbTarget {
@@ -1317,6 +1325,10 @@ enum MenuAction {
         row: usize,
         col: usize,
     },
+    /// Editor body: "Copy Permalink" / "Open on Remote" (#1610) for the
+    /// selected lines, else the caret's.
+    CopyPermalink,
+    OpenOnRemote,
     /// Editor body: "Change All Occurrences" of the word at buffer `(row,
     /// col)` (multi-cursor select within the current file).
     ChangeAllOccurrencesAt {
@@ -3344,6 +3356,8 @@ pub struct App {
     /// Whitespace rendering mode (#133), frame-synced to every editor;
     /// "selection" by default, the palette command cycles it.
     whitespace_mode: crate::widgets::editor::WhitespaceMode,
+    /// Gutter line numbers (#1576): on, relative, interval or off.
+    line_numbers: crate::widgets::editor::LineNumbers,
     /// Default ignore-whitespace mode applied to newly opened diffs (#258).
     diff_ws_default: crate::widgets::diff::DiffWhitespace,
     /// Debugger inline values (#135): on by default; rebuilt on every
@@ -3596,6 +3610,12 @@ pub struct App {
     /// is not a focusable `Pane`, so it gets its own drag latch rather than
     /// riding `scrollbar_drag`.
     outline_scrollbar_drag: bool,
+    /// The secondary side bar's own view of the Outline (scroll and hit
+    /// rects), swapped into `outline` around that bar's render and mouse
+    /// handling so the two hosts scroll and click independently (#1326).
+    secondary_outline: crate::widgets::outline::OutlineView,
+    /// The secondary Outline's scrollbar thumb is being dragged.
+    secondary_outline_scrollbar_drag: bool,
     /// Scrollbar-thumb drag latches for the other stacked Explorer sub-views,
     /// matching `outline_scrollbar_drag` (none is a focusable `Pane`).
     open_editors_scrollbar_drag: bool,
@@ -4955,6 +4975,11 @@ pub struct App {
     /// gated: the classic footgun is typing into panes you forgot were
     /// listening).
     pub pending_broadcast_enable: bool,
+    /// A multi-line paste waiting on its confirm popup (#1274): written to
+    /// the pane only once the user picks Paste or Paste as one line.
+    pub pending_terminal_paste: Option<Vec<u8>>,
+    /// The `terminal_multiline_paste_warning` setting (#1274).
+    pub multiline_paste_warning: crate::prefs::MultilinePasteWarning,
     /// A runnable fence waiting on the confirm popup (#353): destructive-
     /// looking blocks and `{confirm}` fences ask before they type.
     pending_run_block: Option<PendingRunBlock>,
@@ -5092,7 +5117,9 @@ pub struct App {
     watch_baseline_pending: bool,
     /// Debug console log: program stdout/stderr (DAP output events) plus REPL
     /// echoes and results. Capped; the tail is shown in the Run & Debug panel.
-    pub debug_console: Vec<String>,
+    /// Each line is escape-free text with the colour spans its SGR sequences
+    /// set (#1501), so search and copy see `FAILED`, not `[31mFAILED[0m`.
+    pub debug_console: Vec<crate::ansi_text::AnsiLine>,
     /// True once the current/just-ended debug session stopped at least once
     /// (breakpoint / step / exception). Drives the "exited without hitting a
     /// breakpoint" end message. Reset when a new session starts.
@@ -6195,6 +6222,9 @@ impl App {
             whitespace_mode: crate::widgets::editor::WhitespaceMode::from_pref(
                 &loaded_prefs.render_whitespace,
             ),
+            line_numbers: crate::widgets::editor::LineNumbers::from_pref(
+                &loaded_prefs.line_numbers,
+            ),
             diff_ws_default: crate::widgets::diff::DiffWhitespace::from_config(
                 &loaded_prefs.diff_ignore_whitespace,
             ),
@@ -6294,6 +6324,8 @@ impl App {
             editor_hscrollbar_drag: false,
             breakpoint_lane_press: false,
             outline_scrollbar_drag: false,
+            secondary_outline: Default::default(),
+            secondary_outline_scrollbar_drag: false,
             open_editors_scrollbar_drag: false,
             timeline_scrollbar_drag: false,
             deps_scrollbar_drag: false,
@@ -6639,6 +6671,8 @@ impl App {
             watch_published_panes: std::collections::HashSet::new(),
             broadcast_input: false,
             pending_broadcast_enable: false,
+            pending_terminal_paste: None,
+            multiline_paste_warning: loaded_prefs.terminal_multiline_paste_warning,
             pending_run_block: None,
             pending_captures: Vec::new(),
             block_outputs: std::collections::HashMap::new(),
@@ -8145,8 +8179,31 @@ impl App {
     }
 
     fn sync_open_file_poll_mtime(&mut self) {
-        let paths = self.open_tab_paths();
+        let paths = self.polled_open_file_paths();
         self.fs_watch.sync_open_file_mtime(&paths);
+    }
+
+    /// What the poll stats for open tabs: each tab's file, and for a SQLite
+    /// tab its write-ahead log too, where a WAL-mode app's commits land
+    /// while the database file stays untouched (#1643). The log may not
+    /// exist yet; its appearing is a change like any other.
+    fn polled_open_file_paths(&self) -> Vec<PathBuf> {
+        let mut paths = self.open_tab_paths();
+        let wal = std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .filter(|e| {
+                e.sheet
+                    .as_ref()
+                    .is_some_and(|s| s.kind == crate::sheet::SheetKind::Sqlite)
+            })
+            .filter_map(|e| {
+                e.path
+                    .as_deref()
+                    .and_then(crate::widgets::editor::sqlite_wal_path)
+            });
+        paths.extend(wal);
+        paths
     }
 
     /// Every file backing an open tab, across all editor groups. The poll
@@ -8270,7 +8327,7 @@ impl App {
         if !self.fs_watch.poll_due() {
             return false;
         }
-        let open_paths = self.open_tab_paths();
+        let open_paths = self.polled_open_file_paths();
         let poll = self.fs_watch.poll(&mut self.tree, &open_paths);
         // Any directory change can also be a write to a file open in some
         // tab (background or active), so sweep all tabs whenever the poll
@@ -14187,12 +14244,7 @@ impl App {
         if !cfg!(test) {
             use std::io::Write;
             let mut out = stdout();
-            // Portable dynamic colors first (all hosts), then the iTerm2
-            // sRGB override where supported.
-            let _ = out.write_all(host_colors_seq(theme).as_bytes());
-            if crate::iterm2_inline::detect_iterm2_inline_support() {
-                let _ = out.write_all(set_session_bg_srgb_seq(theme.editor_bg_rgb()).as_bytes());
-            }
+            let _ = out.write_all(theme_host_colors_seq(theme).as_bytes());
             let _ = out.flush();
         }
         self.rebake_inline_images();
@@ -16682,12 +16734,10 @@ impl App {
     /// collapse state is saved/restored so the Explorer's own OUTLINE section
     /// (which may render the same widget afterward) keeps its toggle.
     fn render_secondary_side_bar(&mut self, frame: &mut ratatui::Frame, area: Option<Rect>) {
-        let Some(area) = area else {
+        let Some(area) = area.filter(|a| a.width > 0 && a.height > 0) else {
+            self.secondary_outline.forget_area();
             return;
         };
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
         // A left border + bg fill so the panel reads as a distinct column,
         // like the primary side bar's seam against the editor.
         let block = ratatui::widgets::Block::default()
@@ -16696,14 +16746,48 @@ impl App {
             .style(Style::default().bg(self.theme.editor_bg()));
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let saved_collapsed = self.outline.collapsed;
-        self.outline.collapsed = false;
         self.outline.theme = self.theme;
         self.outline.focus_gradient = self.theme.gradient();
         self.outline.focused = false;
         self.outline.hover_pointer = self.pointer_cell;
-        frame.render_widget(&mut self.outline, inner);
-        self.outline.collapsed = saved_collapsed;
+        self.with_secondary_outline(|outline| frame.render_widget(outline, inner));
+    }
+
+    /// Run `f` on the Outline as the secondary side bar shows it: that bar's
+    /// own scroll and hit rects swapped in (#1326), and never folded, since
+    /// the Outline is all the bar holds.
+    fn with_secondary_outline<R>(
+        &mut self,
+        f: impl FnOnce(&mut crate::widgets::outline::OutlinePanel) -> R,
+    ) -> R {
+        let mut view = std::mem::take(&mut self.secondary_outline);
+        self.outline.swap_view(&mut view);
+        let collapsed = std::mem::replace(&mut self.outline.collapsed, false);
+        let out = f(&mut self.outline);
+        self.outline.collapsed = collapsed;
+        self.outline.swap_view(&mut view);
+        self.secondary_outline = view;
+        out
+    }
+
+    /// A left click inside the secondary side bar's Outline: the scrollbar
+    /// lane scrolls (and arms a drag), a symbol row jumps the editor there
+    /// like the Explorer's OUTLINE does, and anything else is swallowed.
+    fn click_secondary_outline(&mut self, x: u16, y: u16) {
+        let (on_bar, target) = self.with_secondary_outline(|o| {
+            if rect_contains(o.last_scrollbar, x, y) {
+                o.scroll_to_bar_y(y);
+                (true, None)
+            } else {
+                (false, o.row_at(y).and_then(|idx| o.jump_target(idx)))
+            }
+        });
+        self.secondary_outline_scrollbar_drag = on_bar;
+        if let Some((path, line, col)) = target
+            && !self.jump_in_scrub_view(line)
+        {
+            self.go_to_definition(path, line, col);
+        }
     }
 
     /// Paint the three layout-control icons (Toggle Primary Side Bar, Toggle
@@ -18481,7 +18565,10 @@ impl App {
         self.show_terminal = true;
         self.bottom_panel_tab = BottomPanelTab::Terminal;
         self.reveal_terminal_pane(self.active_terminal);
-        self.paste_terminal_input(text.as_bytes());
+        // Running the selection is the ask, so it skips the multi-line paste
+        // confirm (#1274); held there, the Enter below would reach the shell
+        // without the text.
+        self.paste_terminal_input_now(text.as_bytes());
         self.write_terminal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         self.status = format!(
             "Ran {lines} line{} in {}",
@@ -18494,7 +18581,68 @@ impl App {
     /// aware per pane): normally just the active pane, mirrored to every
     /// non-excluded pane while broadcast is on (the focused pane always
     /// receives its own input).
+    ///
+    /// A multi-line paste a pane would run line by line asks first (#1274).
     fn paste_terminal_input(&mut self, payload: &[u8]) {
+        // A paste while the popup asks about another would replace the
+        // held bytes, or (one line) slip into the shell behind the popup.
+        if self.pending_terminal_paste.is_some() {
+            self.status = String::from("Resolve the pending paste before pasting again");
+            return;
+        }
+        if self.multiline_paste_needs_confirm(payload) {
+            self.pending_terminal_paste = Some(payload.to_vec());
+            // An armed Cmd+K chord would take the popup's next key (Cmd+K I
+            // turning broadcast on behind it), so the popup disarms it.
+            self.cmd_k_leader = None;
+            return;
+        }
+        self.paste_terminal_input_now(payload);
+    }
+
+    /// Whether `payload` waits on the confirm popup: it holds a line break,
+    /// and per `terminal_multiline_paste_warning` either always, or (`auto`)
+    /// when a pane it goes to has not turned on bracketed paste, where every
+    /// line break is an Enter (sh/dash, an old Python REPL, psql).
+    fn multiline_paste_needs_confirm(&self, payload: &[u8]) -> bool {
+        use crate::prefs::MultilinePasteWarning;
+        if !payload.iter().any(|&b| b == b'\n' || b == b'\r') {
+            return false;
+        }
+        match self.multiline_paste_warning {
+            MultilinePasteWarning::Never => false,
+            MultilinePasteWarning::Always => true,
+            MultilinePasteWarning::Auto => {
+                let active = self.active_terminal;
+                self.terminals.iter().enumerate().any(|(i, t)| {
+                    let receives = i == active || (self.broadcast_input && !t.broadcast_excluded);
+                    receives && !t.bracketed_paste()
+                })
+            }
+        }
+    }
+
+    /// The confirm popup's Paste (`one_line` false) or Paste as one line.
+    fn confirm_pending_terminal_paste(&mut self, one_line: bool) {
+        let Some(payload) = self.pending_terminal_paste.take() else {
+            return;
+        };
+        let lines = pasted_lines(&payload);
+        self.status = if one_line {
+            format!("Pasted {} lines as one", lines.len())
+        } else {
+            format!("Pasted {} lines", lines.len())
+        };
+        let payload = if one_line { lines.join(&b' ') } else { payload };
+        self.paste_terminal_input_now(&payload);
+    }
+
+    fn cancel_pending_terminal_paste(&mut self) {
+        self.pending_terminal_paste = None;
+        self.status = String::from("Paste cancelled");
+    }
+
+    fn paste_terminal_input_now(&mut self, payload: &[u8]) {
         if self.broadcast_input {
             let active = self.active_terminal;
             for (i, t) in self.terminals.iter_mut().enumerate() {
@@ -19554,6 +19702,7 @@ impl App {
             ed.show_bracket_colors = self.bracket_colors_enabled;
             ed.provenance_overlay = self.provenance_overlay;
             ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
+            ed.line_numbers = self.line_numbers;
             ed.diff_ws_default = self.diff_ws_default;
         }
         for group in self.editor_layout.inactive_groups_mut() {
@@ -19566,7 +19715,7 @@ impl App {
                 ed.show_bracket_colors = self.bracket_colors_enabled;
                 ed.provenance_overlay = self.provenance_overlay;
                 ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
-                ed.diff_ws_default = self.diff_ws_default;
+                ed.line_numbers = self.line_numbers;
                 ed.diff_ws_default = self.diff_ws_default;
             }
         }
@@ -21827,6 +21976,7 @@ impl App {
         self.render_unsaved_scm_confirm(frame);
         self.render_replace_all_confirm(frame);
         self.render_broadcast_confirm(frame);
+        self.render_terminal_paste_confirm(frame);
         self.render_run_block_confirm(frame);
         self.render_unsaved_confirm(frame);
         // Terminal-pane inline image: sync after the panes have painted so
@@ -22690,6 +22840,87 @@ impl App {
             ratatui::widgets::Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: true }),
             inner,
         );
+    }
+
+    /// The confirm popup for a multi-line terminal paste (#1274): how many
+    /// lines would run, the first few of them, and the three choices.
+    fn render_terminal_paste_confirm(&self, frame: &mut ratatui::Frame) {
+        use ratatui::text::{Line, Span};
+        let Some(payload) = self.pending_terminal_paste.as_ref() else {
+            return;
+        };
+        let lines = pasted_lines(payload);
+        const PREVIEW: usize = 3;
+        let preview = lines.len().min(PREVIEW);
+        let more = lines.len() > PREVIEW;
+        let area = frame.area();
+        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
+        let height = 7 + preview as u16 + u16::from(more);
+        let rect = Rect {
+            x: (area.width.saturating_sub(width)) / 2 + area.x,
+            y: (area.height.saturating_sub(height)) / 2 + area.y,
+            width,
+            height,
+        }
+        .intersection(area);
+        let warn = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
+        let n = lines.len();
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(warn))
+            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
+            .title(Span::styled(
+                format!(
+                    " PASTE {n} LINE{} INTO THE TERMINAL? ",
+                    if n == 1 { "" } else { "S" }
+                ),
+                Style::default()
+                    .fg(Color::White)
+                    .bg(warn)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(block, rect);
+        let inner = Rect {
+            x: rect.x + 2,
+            y: rect.y + 1,
+            width: rect.width.saturating_sub(4),
+            height: rect.height.saturating_sub(2),
+        };
+        let white = Style::default().fg(self.theme.ui(Color::White));
+        let dim = Style::default().fg(self.theme.ui(Color::Rgb(0x8b, 0x93, 0xa5)));
+        let mut body = vec![
+            Line::from(Span::styled(
+                "Each line break is an Enter here, so the lines run as they land:",
+                white,
+            )),
+            Line::from(""),
+        ];
+        for line in &lines[..preview] {
+            body.push(Line::from(Span::styled(
+                format!("  {}", String::from_utf8_lossy(line)),
+                dim,
+            )));
+        }
+        if more {
+            body.push(Line::from(Span::styled(
+                format!("  … and {} more", lines.len() - PREVIEW),
+                dim,
+            )));
+        }
+        let key = |k: &'static str, color: Color| {
+            Span::styled(k, Style::default().fg(color).add_modifier(Modifier::BOLD))
+        };
+        body.push(Line::from(""));
+        body.push(Line::from(vec![
+            key("[Y]", Color::Red),
+            Span::raw(" / Enter paste   "),
+            key("[L]", Color::Yellow),
+            Span::raw(" paste as one line   "),
+            key("[N]", Color::Green),
+            Span::raw(" / Esc cancel"),
+        ]));
+        frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
     }
 
     /// The confirm popup for a runnable fence (#353): the whole block, the
@@ -24302,6 +24533,21 @@ impl App {
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.cancel_pending_broadcast();
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        if self.pending_terminal_paste.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.confirm_pending_terminal_paste(false);
+                }
+                KeyCode::Char('l') | KeyCode::Char('L') => {
+                    self.confirm_pending_terminal_paste(true);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.cancel_pending_terminal_paste();
                 }
                 _ => {}
             }
@@ -32173,7 +32419,7 @@ impl App {
         // while in the background.
         let mut events = self.debug_sessions.take_focused_backlog();
         let mut background_ended: Vec<usize> = Vec::new();
-        let mut background_output: Vec<String> = Vec::new();
+        let mut background_output: Vec<crate::ansi_text::AnsiLine> = Vec::new();
         // By index, not name: a compound can list one configuration twice,
         // so two members can share a name.
         let mut background_stopped: Option<usize> = None;
@@ -32197,11 +32443,15 @@ impl App {
                     DapEvent::Output { category, text }
                         if crate::dap::session::output_is_user_visible(&category) =>
                     {
-                        background_output.extend(
-                            text.split('\n')
-                                .filter(|l| !l.is_empty())
-                                .map(|l| format!("[{}] {l}", named.name)),
-                        );
+                        // Parsed with this member's own stream state, so a
+                        // sibling's colour or cut escape never runs into it.
+                        let prefix = format!("[{}] ", named.name);
+                        background_output.extend(named.console_ansi.feed(&text).into_iter().map(
+                            |mut line| {
+                                line.prefix(&prefix);
+                                line
+                            },
+                        ));
                     }
                     DapEvent::Output { .. } => {}
                     other => {
@@ -32218,7 +32468,7 @@ impl App {
             }
         }
         for line in background_output {
-            self.debug_console_push(line);
+            self.debug_console_push_line(line);
         }
         // Highest index first, so removing one does not move the next.
         let mut ended_names = Vec::new();
@@ -32283,11 +32533,8 @@ impl App {
                 DapEvent::Output { category, text }
                     if crate::dap::session::output_is_user_visible(&category) =>
                 {
-                    for line in text.split('\n') {
-                        if !line.is_empty() {
-                            self.debug_console_push(line.to_string());
-                        }
-                    }
+                    let focused = self.debug_sessions.focused_index();
+                    self.debug_console_push_output(&text, focused);
                 }
                 // REPL submissions echo "❯ expr" then the result; watch/hover
                 // results are consumed elsewhere.
@@ -32700,11 +32947,36 @@ impl App {
     /// "Debug Console" channel (#867), where it reads at full width and can
     /// be searched and copied; that channel keeps its own cap.
     fn debug_console_push(&mut self, line: String) {
+        self.debug_console_push_line(crate::ansi_text::AnsiLine::plain(line));
+    }
+
+    /// Append an output event of the session at `index` to the debug
+    /// console, one line per embedded newline, with its colour sequences
+    /// turned into spans and every other escape dropped (#1501). The parse
+    /// uses that session's own stream state: a sequence the event ends in the
+    /// middle of waits for that session's next event rather than leaking its
+    /// tail as text, and a colour it leaves on carries only into its own
+    /// lines, never a sibling's.
+    fn debug_console_push_output(&mut self, text: &str, index: usize) {
+        let lines = match self
+            .debug_sessions
+            .iter_named_mut_indexed()
+            .find(|(i, _)| *i == index)
+        {
+            Some((_, named)) => named.console_ansi.feed(text),
+            None => crate::ansi_text::AnsiStream::default().feed(text),
+        };
+        for line in lines {
+            self.debug_console_push_line(line);
+        }
+    }
+
+    fn debug_console_push_line(&mut self, line: crate::ansi_text::AnsiLine) {
         const CAP: usize = 1000;
         crate::output::push(
             crate::output::CHANNEL_DEBUG_CONSOLE,
             crate::output::OutputLevel::Info,
-            &line,
+            &line.text,
         );
         self.debug_console.push(line);
         if self.debug_console.len() > CAP {
@@ -33971,9 +34243,9 @@ impl App {
                 }
             }
             AdapterKind::JsDebug => {
-                if rc.request == RequestKind::Launch && rc.program.is_none() {
+                if rc.request == RequestKind::Launch && !configs::js_launch_has_target(&rc) {
                     self.debug_error(format!(
-                        "config \"{name}\": a node launch needs a \"program\""
+                        "config \"{name}\": a node launch needs a \"program\", a \"runtimeExecutable\" or a \"command\""
                     ));
                     return;
                 }
@@ -34875,9 +35147,7 @@ impl App {
                 DapEvent::Output { category, text }
                     if crate::dap::session::output_is_user_visible(&category) =>
                 {
-                    for line in text.split('\n').filter(|l| !l.is_empty()) {
-                        self.debug_console_push(line.to_string());
-                    }
+                    self.debug_console_push_output(&text, old);
                 }
                 DapEvent::Output { .. } => {}
                 other => keep.push(other),
@@ -39708,6 +39978,7 @@ impl App {
                     "toggle:indent_guides" => self.toggle_indent_guides(),
                     "toggle:bracket_colors" => self.toggle_bracket_colors(),
                     "toggle:render_whitespace" => self.toggle_render_whitespace(),
+                    "toggle:line_numbers" => self.cycle_line_numbers(),
                     "toggle:vim_mode" => self.toggle_vim_mode(),
                     "toggle:inline_values" => self.toggle_inline_values(),
                     "toggle:inlay_hints" => self.toggle_inlay_hints(),
@@ -39847,6 +40118,14 @@ impl App {
                     "Editor: Render Whitespace: {}{}",
                     self.whitespace_mode.label(),
                     prov("render_whitespace")
+                ),
+            },
+            ListRow {
+                id: String::from("toggle:line_numbers"),
+                label: format!(
+                    "Editor: Line Numbers: {}{}",
+                    self.line_numbers.pref_id(),
+                    prov("line_numbers")
                 ),
             },
             ListRow {
@@ -45043,7 +45322,9 @@ impl App {
             return;
         }
         // Runnable docs (#353): Cmd+Enter runs the fence under the caret.
-        if is_run_fence_key(key) && self.focus == Pane::Editor && self.run_fence_at_cursor() {
+        // Outside a runnable fence it falls through to Insert Line Below
+        // (#1571).
+        if is_run_fence_key(key) && self.focus == Pane::Editor && self.run_fence_at_cursor(false) {
             return;
         }
         // Markdown: Toggle Preview (Cmd/Ctrl+Shift+V, the VS Code default).
@@ -45598,7 +45879,10 @@ impl App {
             }
             return;
         }
-        if is_editor_open_line_below_key(key) {
+        // Insert Line Below (#1571): VS Code's `Cmd+Enter` (`Ctrl+Enter` off
+        // macOS), with `Cmd+O` kept as an alias. A Markdown fence under the
+        // caret ran above, so here it only opens a line.
+        if is_editor_open_line_below_key(key) || is_run_fence_key(key) {
             self.editor.open_line_below();
             self.status = String::from("Opened line below");
             return;
@@ -47887,7 +48171,10 @@ impl App {
     /// Cmd+Enter in a Markdown SOURCE buffer (#353): the fence under the
     /// caret, found by the parser's own source ranges (the same walk the
     /// preview uses, so the block number - and its pane - agree).
-    fn run_fence_at_cursor(&mut self) -> bool {
+    /// `report_miss`: a Markdown source caret outside every runnable fence
+    /// sets guidance and counts as handled (the palette command); without
+    /// it that case returns false so the key can fall through (#1571).
+    fn run_fence_at_cursor(&mut self, report_miss: bool) -> bool {
         let is_markdown = self
             .editor
             .path
@@ -47911,6 +48198,9 @@ impl App {
             .enumerate()
             .find(|(_, r)| row >= r.lines.0 && row < r.lines.1)
         else {
+            if !report_miss {
+                return false;
+            }
             self.status = String::from(
                 "Run code block: put the caret inside a runnable shell fence (sh/bash/zsh/fish; not {run=false})",
             );
@@ -52946,6 +53236,14 @@ impl App {
                 }
             }
             Cmd::JoinLines => self.editor.join_lines(),
+            Cmd::InsertLineBelow => {
+                self.editor.open_line_below();
+                self.status = String::from("Opened line below");
+            }
+            Cmd::InsertLineAbove => {
+                self.editor.open_line_above();
+                self.status = String::from("Opened line above");
+            }
             Cmd::DeleteLine => self.delete_current_line(),
             Cmd::KillToEndOfLine => self.kill_to_end_of_line(),
             Cmd::TransformUpper => self.editor.transform_selection_case(CaseTransform::Upper),
@@ -53010,12 +53308,13 @@ impl App {
             Cmd::ToggleIndentGuides => self.toggle_indent_guides(),
             Cmd::ToggleBracketColors => self.toggle_bracket_colors(),
             Cmd::ToggleRenderWhitespace => self.toggle_render_whitespace(),
+            Cmd::CycleLineNumbers => self.cycle_line_numbers(),
             Cmd::ToggleInlineValues => self.toggle_inline_values(),
             Cmd::ToggleInlayHints => self.toggle_inlay_hints(),
             Cmd::ToggleMarkdownPreview => self.toggle_markdown_preview(),
             // Cmd+Enter's run from any terminal (#843): the same confirm popup.
             Cmd::RunCodeBlockAtCursor => {
-                if !self.run_fence_at_cursor() {
+                if !self.run_fence_at_cursor(true) {
                     self.status = String::from(
                         "Run code block: open a Markdown file's source (not its preview) and put the caret in a runnable fence",
                     );
@@ -53268,6 +53567,9 @@ impl App {
             Cmd::GitUndoLastCommit => {
                 self.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::UndoLastCommit)
             }
+            Cmd::GitCopyPermalink => self.share_link(ShareLink::CopyPermalink),
+            Cmd::GitCopyHeadLink => self.share_link(ShareLink::CopyHeadLink),
+            Cmd::GitOpenOnRemote => self.share_link(ShareLink::OpenOnRemote),
             Cmd::ToggleFold => {
                 let row = self.editor.cursor_row;
                 self.editor.toggle_fold(row);
@@ -56764,6 +57066,12 @@ impl App {
             self.handle_osk_mouse(m);
             return;
         }
+        // The pending paste was checked against the active pane and the
+        // broadcast set; a click that switched panes would send it to one
+        // that was never checked. Only the popup's keys answer it.
+        if self.pending_terminal_paste.is_some() {
+            return;
+        }
         // A click on the port-detection toast's action buttons is consumed
         // before anything else; clicks elsewhere fall through to normal
         // handling, so the toast never blocks the rest of the UI.
@@ -57066,6 +57374,8 @@ impl App {
         // rather than the tree above.
         let in_outline = self.sidebar_view == SidebarView::Explorer
             && rect_contains(self.outline.last_area, m.column, m.row);
+        let in_secondary_outline = self.secondary_side_bar_visible
+            && rect_contains(self.secondary_outline.area(), m.column, m.row);
         let in_open_editors = self.sidebar_view == SidebarView::Explorer
             && rect_contains(self.open_editors.last_area, m.column, m.row);
         let in_timeline = self.sidebar_view == SidebarView::Explorer
@@ -57952,6 +58262,12 @@ impl App {
                         String::from("Change All Occurrences"),
                         MenuAction::ChangeAllOccurrencesAt { row, col },
                     ));
+                    // Sharing the lines (#1610), for a file on disk; why a
+                    // link cannot be made is said when it is asked for.
+                    if self.editor.path.is_some() {
+                        items.push((String::from("Copy Permalink"), MenuAction::CopyPermalink));
+                        items.push((String::from("Open on Remote"), MenuAction::OpenOnRemote));
+                    }
                     if self.editor_language_supports_code_action() {
                         items.push((
                             String::from("Quick Fix"),
@@ -58004,6 +58320,10 @@ impl App {
                 // A new press starts a new gesture, even if the release of a
                 // breakpoint-lane press never arrived.
                 self.breakpoint_lane_press = false;
+                if in_secondary_outline {
+                    self.click_secondary_outline(m.column, m.row);
+                    return;
+                }
                 // Markdown/rendered preview selection (#215): a press inside
                 // the rendered view starts a drag-selection over what the
                 // user can SEE, not the source buffer beneath it.
@@ -59516,6 +59836,10 @@ impl App {
                     self.outline.scroll_to_bar_y(m.row);
                     return;
                 }
+                if self.secondary_outline_scrollbar_drag {
+                    self.with_secondary_outline(|o| o.scroll_to_bar_y(m.row));
+                    return;
+                }
                 if self.open_editors_scrollbar_drag {
                     self.open_editors.scroll_to_bar_y(m.row);
                     return;
@@ -59874,6 +60198,9 @@ impl App {
                 if std::mem::take(&mut self.outline_scrollbar_drag) {
                     return;
                 }
+                if std::mem::take(&mut self.secondary_outline_scrollbar_drag) {
+                    return;
+                }
                 if std::mem::take(&mut self.open_editors_scrollbar_drag) {
                     return;
                 }
@@ -59932,7 +60259,9 @@ impl App {
                 }
             }
             MouseEventKind::ScrollDown => {
-                if in_outline {
+                if in_secondary_outline {
+                    self.with_secondary_outline(|o| o.scroll_down(3));
+                } else if in_outline {
                     self.outline.scroll_down(3);
                 } else if in_open_editors {
                     self.open_editors.scroll_down(3);
@@ -60005,7 +60334,9 @@ impl App {
                 }
             }
             MouseEventKind::ScrollUp => {
-                if in_outline {
+                if in_secondary_outline {
+                    self.with_secondary_outline(|o| o.scroll_up(3));
+                } else if in_outline {
                     self.outline.scroll_up(3);
                 } else if in_open_editors {
                     self.open_editors.scroll_up(3);
@@ -61805,6 +62136,31 @@ impl App {
         changed
     }
 
+    /// Step the gutter's line numbers through on, relative, interval and
+    /// off (#1576), on every editor, and save the choice.
+    fn cycle_line_numbers(&mut self) {
+        self.line_numbers = self.line_numbers.next();
+        self.apply_line_numbers();
+        if !cfg!(test) {
+            let _ = crate::prefs::save_line_numbers(self.line_numbers.pref_id());
+        }
+        self.status = format!("Line Numbers: {}", self.line_numbers.pref_id());
+    }
+
+    /// Give every open editor, in every split group, the current line
+    /// number mode (#1576). A split beside the active one is on screen
+    /// too, and nothing else resyncs it until focus next moves.
+    fn apply_line_numbers(&mut self) {
+        let mode = self.line_numbers;
+        for group in
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
+        {
+            for ed in &mut group.editors {
+                ed.line_numbers = mode;
+            }
+        }
+    }
+
     fn toggle_render_whitespace(&mut self) {
         self.whitespace_mode = self.whitespace_mode.next();
         self.editor.whitespace_mode = self.whitespace_mode;
@@ -62425,6 +62781,7 @@ impl App {
         // config.json takes effect on the next fleet run without a restart.
         self.fleet_groups = p.fleet_groups.clone();
         self.code_scanning = p.code_scanning;
+        self.multiline_paste_warning = p.terminal_multiline_paste_warning;
         let was_excluded = std::mem::replace(
             &mut self.remote_offer_excluded,
             p.remote_offer_excluded_hosts.clone(),
@@ -62494,6 +62851,8 @@ impl App {
         self.whitespace_mode =
             crate::widgets::editor::WhitespaceMode::from_pref(&p.render_whitespace);
         self.editor.whitespace_mode = self.whitespace_mode;
+        self.line_numbers = crate::widgets::editor::LineNumbers::from_pref(&p.line_numbers);
+        self.apply_line_numbers();
         self.word_suggestions =
             crate::word_suggest::WordSuggestions::from_pref(&p.word_based_suggestions);
         // A per-language `disable_inlay_hints` change (#1440) moves a file's
@@ -63807,6 +64166,8 @@ impl App {
                 self.focus_pane(Pane::Editor);
                 self.start_rename_symbol();
             }
+            MenuAction::CopyPermalink => self.share_link(ShareLink::CopyPermalink),
+            MenuAction::OpenOnRemote => self.share_link(ShareLink::OpenOnRemote),
             MenuAction::ChangeAllOccurrencesAt { row, col } => {
                 self.editor.collapse_carets();
                 self.editor.cursor_row = row;
@@ -64938,6 +65299,56 @@ impl App {
                 None => format!("untitled ({why})"),
             })
             .collect()
+    }
+
+    /// Git: Copy Permalink / Copy Head Link / Open on Remote (#1610): the
+    /// active file's selected lines, else the caret's line, on its remote's
+    /// web page. The status line says the link, or why there is none.
+    fn share_link(&mut self, how: ShareLink) {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Open a file to link to its lines");
+            return;
+        };
+        let rev = match how {
+            ShareLink::CopyHeadLink => crate::git::LinkRev::Branch,
+            ShareLink::CopyPermalink | ShareLink::OpenOnRemote => crate::git::LinkRev::Commit,
+        };
+        let url = match crate::git::share_link(&path, Some(self.share_link_lines()), rev) {
+            Ok(url) => url,
+            Err(why) => {
+                self.status = format!("No link: {why}");
+                return;
+            }
+        };
+        if how == ShareLink::OpenOnRemote {
+            self.open_url_for_user(&url);
+            return;
+        }
+        // The clipboard the user pastes from, as any copy reaches it: the
+        // local one over the relay, else this machine's, else OSC 52.
+        let via_relay = self.is_relay_session && self.push_clipboard_via_relay(&url);
+        self.status = if via_relay || copy_to_clipboard(&url) {
+            format!("Copied {url}")
+        } else {
+            format!("Copied {url} via OSC 52 (the host terminal decides)")
+        };
+    }
+
+    /// The 1-based lines a shared link points at: the selection's, less a
+    /// last line it only reaches the start of (whole lines selected with
+    /// Shift+Down), else the caret's.
+    fn share_link_lines(&self) -> (usize, usize) {
+        let caret = self.editor.cursor_row + 1;
+        let Some(sel) = self.editor.selection.filter(|s| s.has_area()) else {
+            return (caret, caret);
+        };
+        let ((start, _), (end, end_col)) = sel.normalised();
+        let end = if end_col == 0 && end > start {
+            end - 1
+        } else {
+            end
+        };
+        (start + 1, end + 1)
     }
 
     /// Copy `path` (an editor tab's absolute path) to the system clipboard via
@@ -70299,7 +70710,7 @@ fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
 /// inline `execute!` at a call site. The kitty keyboard flags are the one
 /// deliberate exception: startup pushes them (the push pairs with the
 /// teardown pop), while [`mode_reassert_seq`] appends the SET form.
-fn takeover_mode_seq() -> Vec<u8> {
+pub(crate) fn takeover_mode_seq() -> Vec<u8> {
     let mut seq = Vec::new();
     let _ = execute!(
         seq,
@@ -70432,7 +70843,7 @@ fn set_session_bg_srgb_seq(rgb: (u8, u8, u8)) -> String {
 
 /// Revert the iTerm2 session bg to the user's profile default. Emitted on
 /// exit so the user's shell doesn't inherit croft's forced bg colour.
-fn reset_session_bg_seq() -> String {
+pub(crate) fn reset_session_bg_seq() -> String {
     String::from("\x1b]1337;SetColors=bg=default\x07")
 }
 
@@ -70450,9 +70861,31 @@ fn host_colors_seq(theme: crate::theme::Theme) -> String {
     format!("\x1b]11;rgb:{br:02x}/{bg:02x}/{bb:02x}\x07\x1b]10;rgb:{fr:02x}/{fg:02x}/{fb:02x}\x07")
 }
 
+/// The host terminal's default colours set to `theme`'s: the portable
+/// dynamic colours on every host, then iTerm2's sRGB session background
+/// where it has one. Startup, a theme switch and a reattach all send this.
+fn theme_host_colors_seq(theme: crate::theme::Theme) -> String {
+    let mut seq = host_colors_seq(theme);
+    if crate::iterm2_inline::detect_iterm2_inline_support() {
+        seq.push_str(&set_session_bg_srgb_seq(theme.editor_bg_rgb()));
+    }
+    seq
+}
+
+/// What a persistent session's croft sends on every WINCH, which is how a
+/// reattach reaches it: every startup mode ([`mode_reassert_seq`]), then the
+/// theme's default colours. A terminal attaching for the first time never
+/// had those colours, and a `croft remote` client resets them while its
+/// connection is down (#1460), so they come back with the modes.
+pub(crate) fn reattach_reassert_seq(theme: crate::theme::Theme) -> Vec<u8> {
+    let mut seq = mode_reassert_seq();
+    seq.extend_from_slice(theme_host_colors_seq(theme).as_bytes());
+    seq
+}
+
 /// Reset the host terminal's default foreground and background to its own
 /// configuration (OSC 110/111), undoing [`host_colors_seq`] on exit.
-fn reset_host_colors_seq() -> &'static str {
+pub(crate) fn reset_host_colors_seq() -> &'static str {
     "\x1b]110\x07\x1b]111\x07"
 }
 
@@ -75519,11 +75952,7 @@ pub fn run(
         // surrounding pane bg pixel-for-pixel
         // (https://gitlab.com/gnachman/iterm2/-/issues/12529).
         let theme = crate::prefs::Prefs::load_or_default().theme();
-        out.write_all(host_colors_seq(theme).as_bytes()).ok();
-        if crate::iterm2_inline::detect_iterm2_inline_support() {
-            out.write_all(set_session_bg_srgb_seq(theme.editor_bg_rgb()).as_bytes())
-                .ok();
-        }
+        out.write_all(theme_host_colors_seq(theme).as_bytes()).ok();
         out.flush().ok();
     }
     // Env-var-only iTerm2 detection: no stdin queries, so this can't
@@ -75718,6 +76147,28 @@ fn install_terminal_restore_panic_hook() {
             original(info);
         }));
     });
+}
+
+/// A paste's lines (#1274), split at `\n`, `\r\n` or a lone `\r` as a shell
+/// would take them, without the empty lines a trailing break leaves.
+fn pasted_lines(payload: &[u8]) -> Vec<Vec<u8>> {
+    let mut lines: Vec<Vec<u8>> = vec![Vec::new()];
+    let mut bytes = payload.iter().copied().peekable();
+    while let Some(b) = bytes.next() {
+        match b {
+            b'\r' | b'\n' => {
+                if b == b'\r' && bytes.peek() == Some(&b'\n') {
+                    bytes.next();
+                }
+                lines.push(Vec::new());
+            }
+            b => lines.last_mut().expect("never empty").push(b),
+        }
+    }
+    while lines.len() > 1 && lines.last().is_some_and(Vec::is_empty) {
+        lines.pop();
+    }
+    lines
 }
 
 /// Append a panic record (version, thread, location, message, backtrace) to
@@ -76638,7 +77089,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                         if std::env::var_os("CROFT_SESSION_PERSISTENT").is_some() {
                             use std::io::Write;
                             let out = terminal.backend_mut();
-                            let _ = out.write_all(&mode_reassert_seq());
+                            let _ = out.write_all(&reattach_reassert_seq(app.theme));
                             let _ = out.flush();
                         }
                     }

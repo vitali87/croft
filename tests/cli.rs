@@ -1101,10 +1101,12 @@ fn strings_croft_translates() -> std::collections::BTreeMap<String, String> {
         for entry in std::fs::read_dir(&dir).unwrap() {
             let path = entry.unwrap().path();
             if path.is_dir() {
-                dirs.push(path);
+                if !path.ends_with("app/tests") {
+                    dirs.push(path);
+                }
                 continue;
             }
-            if path.extension().is_none_or(|e| e != "rs") || path.ends_with("app/tests.rs") {
+            if path.extension().is_none_or(|e| e != "rs") {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();
