@@ -51,11 +51,11 @@ README = "README.md"
 PACKAGE = "croft-software"
 
 # What ships in the binary: sources, baked-in assets, the build script and the
-# dependency set. src/app/tests.rs and tests/ are compiled out of release
-# builds, and a pending fragment is notes, not code: a typo fix in one changes
-# no binary and owes no note of its own.
+# dependency set. src/app/tests/ (src/app/tests.rs before it was split) and
+# tests/ are compiled out of release builds, and a pending fragment is notes,
+# not code: a typo fix in one changes no binary and owes no note of its own.
 SHIPPED = re.compile(r"^(src/|assets/|build\.rs$|Cargo\.toml$|Cargo\.lock$)")
-NOT_SHIPPED = re.compile(r"^(src/app/tests\.rs$|tests/|src/release_notes/unreleased/)")
+NOT_SHIPPED = re.compile(r"^(src/app/tests\.rs$|src/app/tests/|tests/|src/release_notes/unreleased/)")
 RELEASED_NOTES = re.compile(r"^src/release_notes/[0-9]+\.[0-9]+\.[0-9]+\.md$")
 # A dot-file (an editor's `.#name.md` lock file) is never a note, here, in
 # `fragment_paths` or in the build's `select::fragments`.

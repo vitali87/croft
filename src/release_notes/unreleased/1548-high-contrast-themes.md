@@ -1,1 +1,0 @@
-feature: Two high contrast themes for low vision, High Contrast and High Contrast Light, as in VS Code: pure black or white behind pure white or black text, a code and terminal palette that stays readable, and croft's dim chrome greys resolved to full-strength text. Third-party themes can opt in with `high_contrast = true`.
