@@ -156,6 +156,33 @@ pub fn parse_response(body: &Value) -> Option<String> {
     (!cleaned.trim().is_empty()).then(|| cleaned.to_string())
 }
 
+/// How much of a suggestion Ctrl+Right takes (#1625), as a byte length:
+/// any leading whitespace, line breaks included, then one word (a run of
+/// letters, digits and `_`) or one run of other symbols. VS Code's accept
+/// next word.
+pub fn next_word_len(text: &str) -> usize {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let body = text.trim_start();
+    let lead = text.len() - body.len();
+    let Some(first) = body.chars().next() else {
+        return text.len();
+    };
+    let word = is_word(first);
+    let run = body
+        .char_indices()
+        .find(|&(_, c)| c.is_whitespace() || is_word(c) != word)
+        .map_or(body.len(), |(i, _)| i);
+    lead + run
+}
+
+/// How much of a suggestion Ctrl+Down takes (#1625), as a byte length: the
+/// rest of the caret's line, or, when the suggestion starts a new line,
+/// that line break and the line after it.
+pub fn next_line_len(text: &str) -> usize {
+    let skip = usize::from(text.starts_with('\n'));
+    text[skip..].find('\n').map_or(text.len(), |i| skip + i)
+}
+
 fn strip_fence(text: &str) -> &str {
     let t = text.trim_end();
     let Some(rest) = t.strip_prefix("```") else {
@@ -268,6 +295,36 @@ fn send(config: &Config, prompt: &str) -> Result<Option<String>, String> {
 
 #[cfg(test)]
 mod tests {
+    /// #1625: Ctrl+Right takes the line break and indent with the first
+    /// word, then one symbol run or word at a time.
+    #[test]
+    fn next_word_takes_leading_space_and_one_word() {
+        let text = "\n    total = a + b\n    return total";
+        assert_eq!(&text[..next_word_len(text)], "\n    total");
+        let rest = &text[next_word_len(text)..];
+        assert_eq!(&rest[..next_word_len(rest)], " =");
+        assert_eq!(next_word_len("foo_bar(1)"), 7);
+        assert_eq!(next_word_len("();"), 3);
+    }
+
+    /// #1625 negative: whitespace alone, or nothing, is taken whole, so a
+    /// word accept never leaves an all-blank remainder behind.
+    #[test]
+    fn next_word_of_blank_text_takes_it_all() {
+        assert_eq!(next_word_len("   \n  "), 6);
+        assert_eq!(next_word_len(""), 0);
+    }
+
+    /// #1625: Ctrl+Down takes the rest of the line, or a whole next line
+    /// when the suggestion starts with a line break, never the break after.
+    #[test]
+    fn next_line_takes_one_line_without_the_break_after_it() {
+        let text = "\n    total = a + b\n    return total";
+        assert_eq!(&text[..next_line_len(text)], "\n    total = a + b");
+        assert_eq!(next_line_len("1 + 1;"), 6);
+        assert_eq!(&"x)\ny"[..next_line_len("x)\ny")], "x)");
+    }
+
     use super::*;
 
     fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
