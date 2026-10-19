@@ -2202,6 +2202,7 @@ fn long_task(label: &str) -> crate::tasks::Task {
         is_build: false,
         is_default: false,
         problem_matcher: None,
+        is_background: false,
         vscode: None,
     }
 }

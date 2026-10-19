@@ -85,6 +85,10 @@ struct CompiledPattern {
 pub struct Background {
     begins: Regex,
     ends: Regex,
+    /// VS Code `activeOnStart`: the task starts already inside its first
+    /// window, which may then close on `ends` with no `begins` ever seen
+    /// (#1541). Only a task-assigned matcher opens a window this way.
+    active_on_start: bool,
 }
 
 /// One matcher, from any source, compiled and ready to scan.
@@ -515,6 +519,7 @@ fn compile_row(row: MatcherRow) -> Result<CompiledMatcher, String> {
                 begins: Regex::new(&b.begins)
                     .map_err(|e| format!("{name}: bad begins regex: {e}"))?,
                 ends: Regex::new(&b.ends).map_err(|e| format!("{name}: bad ends regex: {e}"))?,
+                active_on_start: false,
             })
         })
         .transpose()?;
@@ -563,6 +568,7 @@ pub fn well_known(name: &str) -> Option<CompiledMatcher> {
                     )
                     .unwrap(),
                     ends: Regex::new(r"Watching for file changes\.").unwrap(),
+                    active_on_start: false,
                 }),
                 also: Vec::new(),
             });
@@ -669,6 +675,10 @@ fn from_vscode_object(o: &serde_json::Map<String, serde_json::Value>) -> Option<
         Some(Background {
             begins: pattern_str(b.get("beginsPattern"))?,
             ends: pattern_str(b.get("endsPattern"))?,
+            active_on_start: b
+                .get("activeOnStart")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
         })
     });
     if patterns.is_empty() && background.is_none() {
@@ -713,6 +723,34 @@ fn from_vscode_object(o: &serde_json::Map<String, serde_json::Value>) -> Option<
 #[derive(Default)]
 pub struct WatchEngine {
     active: Option<(Arc<CompiledMatcher>, Vec<String>)>,
+    /// A task matcher was just assigned and its command's output has not
+    /// started yet (#1541); see [`Self::assign`].
+    start: Option<TaskStart>,
+}
+
+/// How long a newly assigned task matcher waits for the shell's OSC 133
+/// marks before it takes the pane's lines as they come. A pane whose shell
+/// has no integration never sends one; one that has sends its prompt mark
+/// well inside this.
+pub const TASK_START_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The window between a task matcher's assignment and its command's first
+/// output. The task is typed into a shell, so what the pane prints first is
+/// the shell's echo of the command line (the tty's, and again the line
+/// editor's once the prompt is up), not the task's output; a command line
+/// that names the matcher's `begins` or `ends` text would open or close a
+/// window on that echo and publish a cycle that never ran.
+struct TaskStart {
+    /// When the assignment was seen, for [`TASK_START_GRACE`].
+    since: std::time::Instant,
+    /// Lines seen since, replayed if no mark comes within the grace.
+    held: Vec<String>,
+    /// A mark arrived, so the shell has integration and the command's own
+    /// `133;C` is coming: no grace, wait for it.
+    marked: bool,
+    /// The grace ran out with no mark: lines are fed as they come, but a
+    /// late `133;C` still restarts the engine at the real output.
+    live: bool,
 }
 
 impl WatchEngine {
@@ -724,6 +762,14 @@ impl WatchEngine {
         set: &WatchSet,
         pane_matcher: Option<&Arc<CompiledMatcher>>,
     ) -> Option<Vec<BuildDiag>> {
+        if let Some(start) = &mut self.start
+            && !start.live
+        {
+            if start.held.len() < WATCH_WINDOW_CAP {
+                start.held.push(line.to_string());
+            }
+            return None;
+        }
         if let Some((matcher, window)) = &mut self.active {
             let bg = matcher
                 .background
@@ -772,6 +818,86 @@ impl WatchEngine {
     /// the next `ends` can't scan stale lines with the old matcher.
     pub fn reset(&mut self) {
         self.active = None;
+    }
+
+    /// A new task matcher took over the pane at `now`: drop any half-open
+    /// window, as [`Self::reset`] does, and hold the pane's lines until the
+    /// task's command starts (#1541): the shell's `133;C` mark
+    /// ([`Self::mark`]), or [`TASK_START_GRACE`] with no mark at all
+    /// ([`Self::expire`]). The first window then opens at once when the
+    /// matcher is `activeOnStart`, since its task may print only `ends` for
+    /// its initial build. Clearing the matcher (`None`) feeds lines at once.
+    pub fn assign(&mut self, pane_matcher: Option<&Arc<CompiledMatcher>>, now: std::time::Instant) {
+        self.active = None;
+        self.start = pane_matcher.map(|_| TaskStart {
+            since: now,
+            held: Vec::new(),
+            marked: false,
+            live: false,
+        });
+    }
+
+    /// An OSC 133 mark, in stream order with the lines fed around it. A
+    /// prompt mark means the lines held so far came before the prompt that
+    /// reads the task's command; `133;C` (`command_start`) means its output
+    /// starts here, so the engine starts fresh on it.
+    pub fn mark(&mut self, command_start: bool, pane_matcher: Option<&Arc<CompiledMatcher>>) {
+        let Some(start) = &mut self.start else {
+            return;
+        };
+        if command_start {
+            self.start = None;
+            self.open_first_window(pane_matcher);
+            return;
+        }
+        // A late prompt after the grace ran out: the shell has integration
+        // after all, so what it printed so far was not the task's output.
+        if start.live {
+            self.active = None;
+        }
+        start.held.clear();
+        start.marked = true;
+        start.live = false;
+    }
+
+    /// When the reader must call [`Self::expire`] if no output comes first:
+    /// the end of the grace, while it is still running.
+    pub fn deadline(&self) -> Option<std::time::Instant> {
+        self.start
+            .as_ref()
+            .filter(|s| !s.marked && !s.live)
+            .map(|s| s.since + TASK_START_GRACE)
+    }
+
+    /// The grace ran out at `now` with no mark: the pane's shell has no
+    /// integration, so the held lines are taken as the task's output after
+    /// all and fed through. Returns the batches they publish.
+    pub fn expire(
+        &mut self,
+        now: std::time::Instant,
+        set: &WatchSet,
+        pane_matcher: Option<&Arc<CompiledMatcher>>,
+    ) -> Vec<Vec<BuildDiag>> {
+        if self.deadline().is_none_or(|d| now < d) {
+            return Vec::new();
+        }
+        let Some(start) = &mut self.start else {
+            return Vec::new();
+        };
+        start.live = true;
+        let held = std::mem::take(&mut start.held);
+        self.open_first_window(pane_matcher);
+        held.iter()
+            .filter_map(|line| self.feed(line, set, pane_matcher))
+            .collect()
+    }
+
+    /// The task's output starts: an `activeOnStart` matcher is inside its
+    /// first window already.
+    fn open_first_window(&mut self, pane_matcher: Option<&Arc<CompiledMatcher>>) {
+        self.active = pane_matcher
+            .filter(|m| m.background.as_ref().is_some_and(|b| b.active_on_start))
+            .map(|m| (m.clone(), Vec::new()));
     }
 }
 
@@ -1042,6 +1168,110 @@ mod tests {
             "the restarted window dropped stale lines: {batch:?}"
         );
         assert_eq!(batch[0].file, "fresh.c");
+    }
+
+    /// A task matcher in the shape of the #1541 tests: `t`'s errors,
+    /// between `BUILD START` and `BUILD END`.
+    fn start_end_task(active_on_start: bool) -> Arc<CompiledMatcher> {
+        let json = serde_json::json!({
+            "owner": "t",
+            "pattern": { "regexp": "^(\\S+):(\\d+):(\\d+): (.+)$", "message": 4 },
+            "background": {
+                "activeOnStart": active_on_start,
+                "beginsPattern": "^BUILD START$",
+                "endsPattern": "^BUILD END$"
+            }
+        });
+        Arc::new(from_tasks_json(&json).unwrap())
+    }
+
+    /// #1541: an `activeOnStart` task matcher opens its first window when
+    /// its command starts, so an initial build that prints only `ends`
+    /// still publishes; later cycles wait for `begins` again. Without the
+    /// flag the same lines publish nothing.
+    #[test]
+    fn an_active_on_start_matcher_publishes_a_first_cycle_with_no_begins() {
+        let watch = WatchSet::default();
+        let task = start_end_task(true);
+        let mut engine = WatchEngine::default();
+        engine.assign(Some(&task), std::time::Instant::now());
+        engine.mark(true, Some(&task));
+        assert!(engine.feed("a.c:1:2: boom", &watch, Some(&task)).is_none());
+        let batch = engine.feed("BUILD END", &watch, Some(&task)).unwrap();
+        assert_eq!(batch.len(), 1, "{batch:?}");
+        assert_eq!(batch[0].file, "a.c");
+        // The next cycle is an ordinary one: no begins, no window.
+        assert!(engine.feed("b.c:1:2: boom", &watch, Some(&task)).is_none());
+        assert!(engine.feed("BUILD END", &watch, Some(&task)).is_none());
+
+        let lazy = start_end_task(false);
+        let mut engine = WatchEngine::default();
+        engine.assign(Some(&lazy), std::time::Instant::now());
+        engine.mark(true, Some(&lazy));
+        assert!(engine.feed("a.c:1:2: boom", &watch, Some(&lazy)).is_none());
+        assert!(engine.feed("BUILD END", &watch, Some(&lazy)).is_none());
+    }
+
+    /// #1541: the shell echoes the task's command line before running it,
+    /// once from the tty and again from its line editor once the prompt is
+    /// up. A command line naming `begins` and `ends` published an empty
+    /// cycle from those echoes, which launched past a build with errors.
+    /// Lines before the command's `133;C` mark are not its output.
+    #[test]
+    fn a_task_matcher_ignores_the_echo_of_its_command_line() {
+        let watch = WatchSet::default();
+        let echo = "sh -c 'echo BUILD START; echo a.c:1:2: boom; echo BUILD END'";
+        for active in [false, true] {
+            let task = start_end_task(active);
+            let mut engine = WatchEngine::default();
+            engine.assign(Some(&task), std::time::Instant::now());
+            // The tty's echo, typed before the shell's first prompt.
+            assert!(engine.feed("BUILD START", &watch, Some(&task)).is_none());
+            assert!(engine.feed("BUILD END", &watch, Some(&task)).is_none());
+            engine.mark(false, Some(&task));
+            // The line editor's, after the prompt.
+            assert!(engine.feed(echo, &watch, Some(&task)).is_none());
+            assert!(engine.feed("BUILD END", &watch, Some(&task)).is_none());
+            assert_eq!(engine.deadline(), None, "a marked shell waits for 133;C");
+            engine.mark(true, Some(&task));
+            for line in ["BUILD START", "a.c:1:2: boom"] {
+                assert!(engine.feed(line, &watch, Some(&task)).is_none());
+            }
+            let batch = engine.feed("BUILD END", &watch, Some(&task)).unwrap();
+            assert_eq!(batch.len(), 1, "active={active}: {batch:?}");
+        }
+    }
+
+    /// #1541: a shell with no integration sends no marks, so after the
+    /// grace the held lines are the task's output after all, and a first
+    /// cycle among them publishes; a late `133;C` still starts afresh.
+    #[test]
+    fn a_task_matcher_with_no_marks_feeds_its_lines_after_the_grace() {
+        let watch = WatchSet::default();
+        let task = start_end_task(true);
+        let t0 = std::time::Instant::now();
+        let mut engine = WatchEngine::default();
+        engine.assign(Some(&task), t0);
+        assert!(engine.feed("a.c:1:2: boom", &watch, Some(&task)).is_none());
+        assert!(engine.feed("BUILD END", &watch, Some(&task)).is_none());
+        assert_eq!(engine.deadline(), Some(t0 + TASK_START_GRACE));
+        assert!(
+            engine.expire(t0, &watch, Some(&task)).is_empty(),
+            "too soon"
+        );
+        let batches = engine.expire(t0 + TASK_START_GRACE, &watch, Some(&task));
+        assert_eq!(batches.len(), 1, "{batches:?}");
+        assert_eq!(batches[0].len(), 1, "{batches:?}");
+        assert_eq!(engine.deadline(), None);
+        // Live now: the next cycle publishes as it ends.
+        assert!(engine.feed("BUILD START", &watch, Some(&task)).is_none());
+        assert!(engine.feed("BUILD END", &watch, Some(&task)).is_some());
+        // A slow shell's late command mark restarts at its real output.
+        assert!(engine.feed("BUILD START", &watch, Some(&task)).is_none());
+        engine.mark(true, Some(&task));
+        assert!(engine.feed("b.c:1:2: boom", &watch, Some(&task)).is_none());
+        let batch = engine.feed("BUILD END", &watch, Some(&task)).unwrap();
+        assert_eq!(batch[0].file, "b.c", "{batch:?}");
     }
 
     #[test]

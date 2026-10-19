@@ -2122,7 +2122,11 @@ impl PtyTerminal {
             // Last-seen matcher sources, for detecting a swap mid-window
             // (Arc identity — the app only ever replaces them wholesale).
             let mut last_wset = watch_set_for_thread.lock().unwrap().clone();
-            let mut last_pwatch = pane_watch_for_thread.lock().unwrap().clone();
+            // The engine starts with no task matcher, whatever the slot
+            // holds by the time this thread runs: a task assigned to a new
+            // pane before its first read must still count as an assignment,
+            // or its matcher is never armed (#1541).
+            let mut last_pwatch: Option<Arc<crate::problem_matchers::CompiledMatcher>> = None;
             // Per-pane monotonic id for captured inline images; the overlay
             // layout key uses it to tell a new picture from a moved one.
             let mut image_seq = 0u64;
@@ -2149,7 +2153,27 @@ impl PtyTerminal {
                         }
                     }
                 } else {
-                    wait_pty_readable(pty_fd, &shutdown_r)
+                    match wait_pty_readable(pty_fd, &shutdown_r, watch_engine.deadline()) {
+                        PtyWait::Ready => true,
+                        PtyWait::Closed => false,
+                        PtyWait::Idle => {
+                            // A task matcher's grace ran out with no shell
+                            // mark (#1541): its held lines are output after
+                            // all.
+                            let wset = watch_set_for_thread.lock().unwrap().clone();
+                            let pwatch = pane_watch_for_thread.lock().unwrap().clone();
+                            let batches = watch_engine.expire(
+                                std::time::Instant::now(),
+                                &wset,
+                                pwatch.as_ref(),
+                            );
+                            for batch in batches {
+                                let cwd = osc7_for_thread.lock().unwrap().clone();
+                                let _ = watch_tx.send((cwd, batch));
+                            }
+                            continue;
+                        }
+                    }
                 };
                 if !ready {
                     break;
@@ -2163,6 +2187,23 @@ impl PtyTerminal {
                         // the mark landed (alacritty drops the sequences
                         // themselves as unknown OSC).
                         let osc_events = osc_sniffer.scan(&buf[..n]);
+                        // Where the shell's prompt and command marks fall in
+                        // the chunk, for the watch engine below (#1541): the
+                        // lines before a task's `133;C` are the shell echoing
+                        // its command line, not its output.
+                        let watch_marks: Vec<(usize, bool)> = osc_events
+                            .iter()
+                            .filter_map(|(end, ev)| {
+                                use crate::shell_integration::OscEvent as E;
+                                match ev {
+                                    E::CommandStart => Some((*end, true)),
+                                    E::PromptStart | E::PromptEnd | E::CommandEnd(_) => {
+                                        Some((*end, false))
+                                    }
+                                    _ => None,
+                                }
+                            })
+                            .collect();
                         let mut t = term_for_thread.lock();
                         let (screen_wiped, hist_wiped) =
                             wipe_sniffer.scan(&buf[..n], t.mode().contains(TermMode::ALT_SCREEN));
@@ -2369,27 +2410,46 @@ impl PtyTerminal {
                             (None, None) => true,
                             _ => false,
                         };
-                        if !Arc::ptr_eq(&wset, &last_wset) || !pwatch_same {
+                        // A newly assigned task matcher waits for its
+                        // command's output to start (#1541). A swapped
+                        // global set only matters to a pane with no task
+                        // matcher: the task's matcher owns its pane's
+                        // windows, and dropping one here lost the task's
+                        // first cycle whenever the app's first sync of the
+                        // global set landed mid-build.
+                        if !pwatch_same {
+                            watch_engine.assign(pwatch.as_ref(), std::time::Instant::now());
+                        } else if !Arc::ptr_eq(&wset, &last_wset) && pwatch.is_none() {
                             watch_engine.reset();
-                            last_wset = wset.clone();
-                            last_pwatch = pwatch.clone();
                         }
+                        last_wset = wset.clone();
+                        last_pwatch = pwatch.clone();
                         if wset.matchers.is_empty() && pwatch.is_none() {
                             trigger_scanner.scan(&buf[..n], &trig, &mut trigger_hits);
                         } else {
-                            watch_lines.clear();
-                            trigger_scanner.scan_collect(
-                                &buf[..n],
-                                &trig,
-                                &mut trigger_hits,
-                                Some(&mut watch_lines),
-                            );
-                            for line in watch_lines.drain(..) {
-                                if let Some(batch) =
-                                    watch_engine.feed(&line, &wset, pwatch.as_ref())
-                                {
-                                    let cwd = osc7_for_thread.lock().unwrap().clone();
-                                    let _ = watch_tx.send((cwd, batch));
+                            // Scanned up to each mark, then the mark, so the
+                            // engine sees them in stream order.
+                            let mut from = 0usize;
+                            let ends = watch_marks.iter().map(|&(end, c)| (end, Some(c)));
+                            for (end, mark) in ends.chain(std::iter::once((n, None))) {
+                                watch_lines.clear();
+                                trigger_scanner.scan_collect(
+                                    &buf[from..end],
+                                    &trig,
+                                    &mut trigger_hits,
+                                    Some(&mut watch_lines),
+                                );
+                                from = end;
+                                for line in watch_lines.drain(..) {
+                                    if let Some(batch) =
+                                        watch_engine.feed(&line, &wset, pwatch.as_ref())
+                                    {
+                                        let cwd = osc7_for_thread.lock().unwrap().clone();
+                                        let _ = watch_tx.send((cwd, batch));
+                                    }
+                                }
+                                if let Some(command_start) = mark {
+                                    watch_engine.mark(command_start, pwatch.as_ref());
                                 }
                             }
                         }
@@ -4504,13 +4564,31 @@ impl PaneLink {
 }
 
 /// Block until the pty has data (or EOF/error — the following `read` then
-/// observes it), or until the shutdown pipe signals (its write end closed in
-/// `Drop`). Returns false on shutdown. A bare blocking `read` is not enough
-/// to ever exit: on Linux a background job keeps the pty slave open after
-/// the shell dies, so the read never returns and joining the reader would
-/// freeze the UI for as long as the job runs.
-fn wait_pty_readable(pty_fd: std::os::fd::RawFd, shutdown: &std::io::PipeReader) -> bool {
-    matches!(poll_pty(pty_fd, shutdown, -1), PtyWait::Ready)
+/// observes it), until the shutdown pipe signals (its write end closed in
+/// `Drop`), or until `deadline`, when there is one, passes (#1541). A bare
+/// blocking `read` is not enough to ever exit: on Linux a background job
+/// keeps the pty slave open after the shell dies, so the read never returns
+/// and joining the reader would freeze the UI for as long as the job runs.
+fn wait_pty_readable(
+    pty_fd: std::os::fd::RawFd,
+    shutdown: &std::io::PipeReader,
+    deadline: Option<std::time::Instant>,
+) -> PtyWait {
+    loop {
+        let timeout = match deadline {
+            None => -1,
+            Some(d) => {
+                let left = d.saturating_duration_since(std::time::Instant::now());
+                // Rounded up, so the wake is never early.
+                left.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32
+            }
+        };
+        match poll_pty(pty_fd, shutdown, timeout) {
+            // Woken before `deadline` all the same: wait out the rest.
+            PtyWait::Idle if deadline.is_some_and(|d| std::time::Instant::now() < d) => {}
+            wait => return wait,
+        }
+    }
 }
 
 /// How long the reader waits for more output before sending a held-back
