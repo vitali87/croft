@@ -1226,10 +1226,16 @@ impl Widget for &mut SourceControlPanel {
         }
 
         // Row 0: SOURCE CONTROL header (light grey bold), inside the panel.
+        let header_title = crate::i18n::tr("SOURCE CONTROL");
+        // Header pills must start past the (translated) title plus a gap.
+        let title_end = inner.x
+            + u16::try_from(unicode_width::UnicodeWidthStr::width(header_title.as_ref()))
+                .unwrap_or(u16::MAX)
+                .saturating_add(1);
         buf.set_stringn(
             inner.x,
             inner.y,
-            "SOURCE CONTROL",
+            &header_title,
             inner.width as usize,
             Style::default()
                 .fg(self.theme.ui(Color::Rgb(0xb0, 0xb8, 0xc8)))
@@ -1241,7 +1247,7 @@ impl Widget for &mut SourceControlPanel {
         // misses an edit. Only painted in a repo with room past the title.
         let pill_w: u16 = 2;
         let refresh_x = (inner.x + inner.width).saturating_sub(pill_w + 1);
-        if self.status.in_repo && refresh_x > inner.x + 15 {
+        if self.status.in_repo && refresh_x > title_end {
             let rect = Rect {
                 x: refresh_x,
                 y: inner.y,
@@ -1262,7 +1268,7 @@ impl Widget for &mut SourceControlPanel {
             // opening the full Source Control actions menu (VS Code's title
             // "⋯" menu). cod-ellipsis (U+EA7C).
             let more_x = refresh_x.saturating_sub(pill_w + 1);
-            if more_x > inner.x + 15 {
+            if more_x > title_end {
                 let more_rect = Rect {
                     x: more_x,
                     y: inner.y,
@@ -2116,6 +2122,41 @@ mod tests {
             prepared_message: None,
             operation: None,
             rebasing_branch: None,
+        }
+    }
+
+    #[test]
+    fn header_pills_stay_clear_of_a_translated_title() {
+        use ratatui::buffer::Buffer;
+        let title = "QUELLCODEVERWALTUNG";
+        // From the narrowest panel whose inner row holds the whole title.
+        for width in 21..40u16 {
+            let mut p = SourceControlPanel::new();
+            p.status.in_repo = true;
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: 24,
+            };
+            let mut buf = Buffer::empty(area);
+            crate::i18n::with_test_catalog(&format!(r#"{{"SOURCE CONTROL": "{title}"}}"#), || {
+                (&mut p).render(area, &mut buf);
+            });
+            let inner = p.last_inner;
+            let header: String = (inner.x..inner.x + inner.width)
+                .map(|x| buf[(x, inner.y)].symbol())
+                .collect();
+            assert!(
+                header.contains(title),
+                "width {width}: header pills painted over the title: {header:?}"
+            );
+            for btn in [p.header_refresh_btn, p.header_more_btn] {
+                assert!(
+                    btn.width == 0 || btn.x > inner.x + title.len() as u16,
+                    "width {width}: pill {btn:?} overlaps the title"
+                );
+            }
         }
     }
 
