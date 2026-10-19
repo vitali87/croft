@@ -35,7 +35,9 @@ use tower::ServiceBuilder;
 
 use crate::lsp::config::ServerConfig;
 use crate::lsp::log_file;
-use crate::lsp::manager::{Diagnostic, DiagnosticSeverity, DiagnosticsUpdate, ProgressUpdate};
+use crate::lsp::manager::{
+    Diagnostic, DiagnosticSeverity, DiagnosticsUpdate, ServerEvent, ServerUpdate, message_is_shown,
+};
 use crate::output::{self, OutputLevel};
 
 /// Map an LSP `window/{show,log}Message` severity to an OUTPUT channel level so
@@ -91,8 +93,9 @@ struct ClientState {
     // and forwarded here; the manager owns the receiver and the app drains it.
     diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
     // Server `$/progress` work-done updates (rust-analyzer indexing, etc.)
-    // forwarded here for the status bar.
-    progress_tx: std_mpsc::Sender<ProgressUpdate>,
+    // forwarded here for the status bar, with the `window/*` messages,
+    // questions and documents the user should see (#1599).
+    progress_tx: std_mpsc::Sender<ServerUpdate>,
     // Begin carries the progress title; Report/End don't, so the title is
     // remembered per progress token to keep the status line meaningful.
     progress_titles: std::collections::HashMap<String, String>,
@@ -135,7 +138,7 @@ impl ClientState {
         inlay_refresh: Arc<AtomicBool>,
         diagnostic_refresh: Arc<AtomicBool>,
         diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
-        progress_tx: std_mpsc::Sender<ProgressUpdate>,
+        progress_tx: std_mpsc::Sender<ServerUpdate>,
         workspace_folders: Vec<WorkspaceFolder>,
     ) -> Router<Self> {
         let mut router = Router::new(ClientState {
@@ -193,6 +196,52 @@ impl ClientState {
             .request::<lsp_types::request::WorkspaceFoldersRequest, _>(|this, _params| {
                 std::future::ready(Ok(Some(this.workspace_folders.clone())))
             })
+            // `window/showMessageRequest` (#1599): the question goes to the
+            // app's picker and the pick comes back as the answer. Logged
+            // and kept in OUTPUT like a `showMessage`. Answering `null`
+            // (dismissed, or the app is gone) is what the spec gives a
+            // client that shows no actions.
+            .request::<lsp_types::request::ShowMessageRequest, _>(|this, params| {
+                log_file::log(&format!(
+                    "lsp[{}] asks {:?}: {}",
+                    this.name, params.typ, params.message
+                ));
+                output::push(&this.name, msg_level(params.typ), &params.message);
+                let (reply, answer) = tokio::sync::oneshot::channel();
+                let _ = this.progress_tx.send(ServerUpdate {
+                    server: this.name.clone(),
+                    event: ServerEvent::Question {
+                        text: params.message,
+                        actions: params.actions.unwrap_or_default(),
+                        reply,
+                    },
+                });
+                async move { Ok(answer.await.ok().flatten()) }
+            })
+            // `window/showDocument` (#1599): a file to open at a range, or
+            // a link for the browser. Success is the app's word that it was
+            // shown; an app that is gone, or a file that would not open,
+            // answers false. Focus moves unless the server says
+            // `takeFocus: false`.
+            .request::<lsp_types::request::ShowDocument, _>(|this, params| {
+                log_file::log(&format!("lsp[{}] shows {}", this.name, params.uri));
+                let (reply, shown) = tokio::sync::oneshot::channel();
+                let _ = this.progress_tx.send(ServerUpdate {
+                    server: this.name.clone(),
+                    event: ServerEvent::ShowDocument {
+                        uri: params.uri,
+                        external: params.external.unwrap_or(false),
+                        take_focus: params.take_focus.unwrap_or(true),
+                        selection: params.selection,
+                        reply,
+                    },
+                });
+                async move {
+                    Ok(lsp_types::ShowDocumentResult {
+                        success: shown.await.unwrap_or(false),
+                    })
+                }
+            })
             .notification::<Progress>(|this, params| {
                 let ProgressParamsValue::WorkDone(work) = params.value;
                 let key = progress_token_key(&params.token);
@@ -214,9 +263,9 @@ impl ClientState {
                         None
                     }
                 };
-                let _ = this.progress_tx.send(ProgressUpdate {
+                let _ = this.progress_tx.send(ServerUpdate {
                     server: this.name.clone(),
-                    message,
+                    event: ServerEvent::Progress(message),
                 });
                 ControlFlow::Continue(())
             })
@@ -246,6 +295,15 @@ impl ClientState {
                     this.name, params.typ, params.message
                 ));
                 output::push(&this.name, msg_level(params.typ), &params.message);
+                if message_is_shown(params.typ, &params.message) {
+                    let _ = this.progress_tx.send(ServerUpdate {
+                        server: this.name.clone(),
+                        event: ServerEvent::Message {
+                            level: params.typ,
+                            text: params.message,
+                        },
+                    });
+                }
                 ControlFlow::Continue(())
             })
             .notification::<LogMessage>(|this, params| {
@@ -430,7 +488,7 @@ impl LspClient {
         inlay_refresh: Arc<AtomicBool>,
         diagnostic_refresh: Arc<AtomicBool>,
         diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
-        progress_tx: std_mpsc::Sender<ProgressUpdate>,
+        progress_tx: std_mpsc::Sender<ServerUpdate>,
     ) -> Result<Self> {
         let workspace_uri = Url::from_file_path(workspace_root).map_err(|_| {
             anyhow!(
@@ -1891,6 +1949,183 @@ mod tests {
                 "router must absorb the vendor notification {method} instead of killing the mainloop with an Unhandled-notification routing error"
             );
         }
+    }
+
+    /// A router for `name` and the receiving end of its update channel.
+    fn router_with_updates(name: &str) -> (Router<ClientState>, std_mpsc::Receiver<ServerUpdate>) {
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, prog_rx) = std_mpsc::channel();
+        let router = ClientState::router(
+            name.into(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            diag_tx,
+            prog_tx,
+            Vec::new(),
+        );
+        (router, prog_rx)
+    }
+
+    fn notify(router: &mut Router<ClientState>, method: &str, params: serde_json::Value) {
+        let notif: AnyNotification =
+            serde_json::from_value(json!({ "method": method, "params": params }))
+                .expect("AnyNotification deserialization");
+        assert!(matches!(router.notify(notif), ControlFlow::Continue(())));
+    }
+
+    fn request(
+        router: &mut Router<ClientState>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> impl std::future::Future<Output = Result<serde_json::Value, async_lsp::ResponseError>>
+    {
+        use tower::Service;
+        let req: async_lsp::AnyRequest =
+            serde_json::from_value(json!({ "id": 7, "method": method, "params": params }))
+                .expect("AnyRequest deserialization");
+        router.call(req)
+    }
+
+    /// rust-analyzer reports a broken Cargo.toml as a `showMessage` Error,
+    /// three times; it must reach the app, not only OUTPUT (#1599).
+    #[test]
+    fn a_show_message_error_reaches_the_app() {
+        let (mut router, rx) = router_with_updates("rust-analyzer");
+        notify(
+            &mut router,
+            "window/showMessage",
+            json!({ "type": 1, "message": "Failed to load workspaces." }),
+        );
+        let update = rx.try_recv().expect("the error is forwarded");
+        assert_eq!(update.server, "rust-analyzer");
+        match update.event {
+            ServerEvent::Message { level, text } => {
+                assert_eq!(level, lsp_types::MessageType::ERROR);
+                assert_eq!(text, "Failed to load workspaces.");
+            }
+            other => panic!("expected a message, got {other:?}"),
+        }
+    }
+
+    /// Chatter stays in OUTPUT: an Info without a link, and every
+    /// `logMessage` whatever its level.
+    #[test]
+    fn plain_notes_and_log_messages_stay_in_output() {
+        let (mut router, rx) = router_with_updates("gopls");
+        notify(
+            &mut router,
+            "window/showMessage",
+            json!({ "type": 3, "message": "Loading packages..." }),
+        );
+        notify(
+            &mut router,
+            "window/logMessage",
+            json!({ "type": 1, "message": "go list failed" }),
+        );
+        assert!(rx.try_recv().is_err(), "nothing is forwarded");
+    }
+
+    /// `window/showMessageRequest` used to be declined with
+    /// MethodNotFound; now the question reaches the app and the pick is
+    /// the answer.
+    #[test]
+    fn a_question_is_answered_with_the_picked_action() {
+        let (mut router, rx) = router_with_updates("gopls");
+        let answer = request(
+            &mut router,
+            "window/showMessageRequest",
+            json!({
+                "type": 2,
+                "message": "go.mod needs updating",
+                "actions": [{ "title": "Update" }, { "title": "Ignore" }]
+            }),
+        );
+        let ServerEvent::Question {
+            text,
+            actions,
+            reply,
+            ..
+        } = rx.try_recv().expect("the question is forwarded").event
+        else {
+            panic!("expected a question");
+        };
+        assert_eq!(text, "go.mod needs updating");
+        let titles: Vec<&str> = actions.iter().map(|a| a.title.as_str()).collect();
+        assert_eq!(titles, ["Update", "Ignore"]);
+        reply.send(Some(actions[0].clone())).unwrap();
+        let answer = futures::executor::block_on(answer).expect("answered");
+        assert_eq!(answer, json!({ "title": "Update" }));
+    }
+
+    #[test]
+    fn a_dismissed_question_is_answered_with_null() {
+        let (mut router, rx) = router_with_updates("gopls");
+        let answer = request(
+            &mut router,
+            "window/showMessageRequest",
+            json!({ "type": 3, "message": "Pick one", "actions": [{ "title": "A" }] }),
+        );
+        drop(rx.try_recv().expect("the question is forwarded"));
+        let answer = futures::executor::block_on(answer).expect("answered");
+        assert_eq!(answer, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn show_document_hands_the_link_or_file_to_the_app() {
+        let (mut router, rx) = router_with_updates("gopls");
+        let reply = request(
+            &mut router,
+            "window/showDocument",
+            json!({ "uri": "https://go.dev/gopls", "external": true }),
+        );
+        match rx.try_recv().expect("forwarded").event {
+            ServerEvent::ShowDocument {
+                uri,
+                external,
+                take_focus,
+                selection,
+                reply: shown,
+            } => {
+                assert_eq!(uri.as_str(), "https://go.dev/gopls");
+                assert!(external);
+                assert!(take_focus, "takeFocus defaults to true");
+                assert!(selection.is_none());
+                shown.send(true).unwrap();
+            }
+            other => panic!("expected a document, got {other:?}"),
+        }
+        assert_eq!(
+            futures::executor::block_on(reply).expect("answered"),
+            json!({ "success": true })
+        );
+        let reply = request(
+            &mut router,
+            "window/showDocument",
+            json!({
+                "uri": "file:///tmp/a.go",
+                "takeFocus": false,
+                "selection": { "start": { "line": 4, "character": 2 }, "end": { "line": 4, "character": 6 } }
+            }),
+        );
+        match rx.try_recv().expect("forwarded").event {
+            ServerEvent::ShowDocument {
+                external,
+                take_focus,
+                selection,
+                ..
+            } => {
+                assert!(!external, "external defaults to false");
+                assert!(!take_focus, "takeFocus: false is carried");
+                assert_eq!(selection.map(|r| r.start.line), Some(4));
+            }
+            other => panic!("expected a document, got {other:?}"),
+        }
+        // The app dropped the reply without showing it: not a success.
+        assert_eq!(
+            futures::executor::block_on(reply).expect("answered"),
+            json!({ "success": false })
+        );
     }
 
     #[test]

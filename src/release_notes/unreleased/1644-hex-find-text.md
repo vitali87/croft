@@ -1,0 +1,1 @@
+fix: The hex editor's Find can now search for text that looks like hex, such as "1234", "2024" or "cafe": put it in double quotes, or search from the text column (Tab), and it is found as text. The status line says which was searched for, `Found bytes 12 34 at 0x11A` or `Found text "1234" at 0x115`.

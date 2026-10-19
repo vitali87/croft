@@ -287,7 +287,10 @@ fn go_to_next_change_is_a_palette_command() {
         &mut report,
     );
     assert!(
-        report.keybindings.iter().any(|(_, c)| c == "next_change"),
+        report
+            .keybindings
+            .iter()
+            .any(|(_, c, _)| c == "next_change"),
         "{:?}",
         report.keybindings
     );
