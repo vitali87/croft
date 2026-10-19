@@ -3061,7 +3061,9 @@ type PendingCargoLaunch = (
 enum LastTestRun {
     All,
     One(String),
-    Filter(String),
+    /// A filter run and the file it came from, which picks the runner
+    /// (#1408).
+    Filter(String, Option<PathBuf>),
     Suite(String),
     Many(Vec<String>),
 }
@@ -26354,8 +26356,11 @@ impl App {
             self.test_worker.run_one(run.clone());
         } else {
             self.testing.start_filter(&run);
-            self.last_test_run = Some(LastTestRun::Filter(run.clone()));
-            self.test_worker.run_filter(run.clone());
+            // The caret's file picks the runner where two languages'
+            // tests share the folder (#1408).
+            let file = self.editor.path.clone();
+            self.last_test_run = Some(LastTestRun::Filter(run.clone(), file.clone()));
+            self.test_worker.run_filter(run.clone(), file);
         }
         self.set_sidebar_view(SidebarView::Testing);
         self.status = format!("Running test {run}");
@@ -26439,10 +26444,10 @@ impl App {
             LastTestRun::All => self.run_all_tests(),
             LastTestRun::One(name) => self.run_test(name),
             LastTestRun::Suite(suite) => self.run_suite(suite),
-            LastTestRun::Filter(pattern) => {
+            LastTestRun::Filter(pattern, file) => {
                 self.testing.start_filter(&pattern);
-                self.last_test_run = Some(LastTestRun::Filter(pattern.clone()));
-                self.test_worker.run_filter(pattern);
+                self.last_test_run = Some(LastTestRun::Filter(pattern.clone(), file.clone()));
+                self.test_worker.run_filter(pattern, file);
                 self.set_sidebar_view(SidebarView::Testing);
             }
             LastTestRun::Many(names) => self.start_many_tests(names),
@@ -26580,6 +26585,14 @@ impl App {
         self.debug_named_test(name);
     }
 
+    /// The runner for a test in the focused file under `root` (#1408): the
+    /// one for the file's language, so a pytest test in a maturin crate
+    /// debugs under debugpy, not as a cargo test binary.
+    fn test_runner_for_focused_file(&self, root: &Path) -> Option<crate::testing::worker::Runner> {
+        let runners = crate::testing::worker::runners_for(root);
+        crate::testing::worker::runner_for_file(&runners, self.editor.path.as_deref())
+    }
+
     /// Hand the test `name` to the debugger — the M6 wedge: pytest runs as a
     /// debugpy module launch under the PROJECT's interpreter, a cargo test
     /// binary launches under lldb-dap with the name as its libtest filter.
@@ -26608,7 +26621,7 @@ impl App {
             .iter()
             .map(|(p, lines)| (p.clone(), self.editor.source_breakpoints(p, lines)))
             .collect();
-        match crate::testing::worker::runner_for(&root) {
+        match self.test_runner_for_focused_file(&root) {
             Some(crate::testing::worker::Runner::Pytest) => {
                 // The interpreter F5 and Live Run pick, from the test file's
                 // folder up (#864), not only a root `.venv`; refused before
