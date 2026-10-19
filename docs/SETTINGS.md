@@ -37,7 +37,10 @@ user config decided it.
 The **Preferences: Open Settings** hub is also a searchable editor over the
 settings themselves. Type to filter, Enter flips a toggle or asks for a
 value, and Tab switches which layer the change is written to: your user
-config or the workspace.
+config or the workspace. Del resets the selected setting: it removes the key
+from that layer's file, so the value falls back to the layers below it or
+croft's default. A dot marks every setting whose value differs from croft's
+default.
 
 ![Settings editor: search a setting, flip a toggle, set a number, then write to the workspace layer](images/settings-editor.gif)
 
@@ -98,7 +101,7 @@ never change what croft trusts or executes. They are limited to an explicit
 allowlist — appearance and editor/terminal behavior:
 
 `theme`, `format_on_save`, `format_on_type`, `auto_save`, `auto_save_on_focus_change`,
-`render_whitespace`, `word_based_suggestions`, `disable_inline_blame`, `disable_auto_close_pairs`, `disable_paste_reindent`,
+`render_whitespace`, `rulers`, `word_based_suggestions`, `disable_inline_blame`, `disable_auto_close_pairs`, `disable_paste_reindent`,
 `disable_inline_values`, `disable_save_before_debug`, `disable_bracket_colors`, `disable_indent_guides`, `line_numbers`,
 `disable_inlay_hints`, `copy_on_select`, `disable_secret_redaction`, `disable_log_highlight`, `explorer_views`,
 `files_exclude`, `search_exclude`, `languages` (only its per-language
@@ -125,6 +128,7 @@ means the same thing whichever path reads it.
 | `files.autoSave: "onFocusChange"` / `"onWindowChange"` | `auto_save_on_focus_change: true` |
 | `files.autoSave: "off"` | both auto-save modes off |
 | `editor.renderWhitespace` | `render_whitespace` (`none` / `selection` / `all`; VS Code's `boundary` and `trailing` have no croft mode and map to `none`) |
+| `editor.rulers` | `rulers` (columns such as `[80, 100]`; the object form `{ "column": 100, "color": … }` keeps its column, and croft draws every ruler in one colour) |
 | `editor.wordBasedSuggestions` | `word_based_suggestions` (`off` / `currentDocument` / `matchingDocuments` / `allDocuments`; the older `true` / `false` map to `matchingDocuments` / `off`) |
 | `editor.bracketPairColorization.enabled` | `disable_bracket_colors` (negated) |
 | `editor.guides.indentation` | `disable_indent_guides` (negated) |
@@ -372,9 +376,9 @@ Profiles live in `~/.config/croft/profiles/<name>/`. History, macros and session
 
 ## Accessibility and language
 
-* `"screen_reader": true` (or **Accessibility: Toggle Screen Reader Mode**, also in Settings) stops the caret blinking and keeps the real cursor on the focused text: the editor caret, the shell cursor in a terminal, or the status bar when a picker, menu or the Explorer has focus. The status bar then describes each change in one line: the line the caret moved to, the diagnostic under it, the highlighted completion, palette entry or file, focus changes and status messages, and, whatever has focus, each debugger pause (why, file, line and its text) and how a finished test run went. Terminal screen readers (VoiceOver, Orca, NVDA over WSL) read it from there.
+* `"screen_reader": true` (or **Accessibility: Toggle Screen Reader Mode**, also in Settings) stops the caret blinking and keeps the real cursor on the focused text: the editor caret, the shell cursor in a terminal, or the status bar when a picker, menu, dialog or the Explorer has focus. The status bar then describes each change in one line: the line the caret moved to, the diagnostic under it, the highlighted completion, palette entry or file, focus changes and status messages, and, whatever has focus, each debugger pause (why, file, line and its text) and how a finished test run went. A dialog that waits for a key (Unsaved Changes, Discard Changes, Replace All, the Settings editor, a one-line prompt) is read when it opens: its title, what it says, and which key does what. Terminal screen readers (VoiceOver, Orca, NVDA over WSL) read it from there.
 * `"screen_reader_command": "spd-say"` (or `"say"` on macOS) also speaks each line through that program, with the line as its last argument.
-* `"locale": "de"` picks the UI language; unset, croft follows `LC_ALL`, `LC_MESSAGES` or `LANG`, but only into a language whose built-in catalog translates at least 95% of the strings `croft locale-template` lists, or one you have a `locales/<lang>.json` for, so a partial catalog never mixes two languages on screen unasked. Menus, palette titles and status messages are translated where the catalog has an entry, and the palette matches queries in either language. German (`de`) and Spanish (`es`) ship as starter catalogs, so they are opt-in: set `"locale"` to use them. For another language or to fix a translation, run `croft locale-template <lang> --write` and fill in the values it leaves empty in `~/.config/croft/locales/<lang>.json`; entries there override the built-in ones. Run it again after an upgrade to add new strings: it keeps every value you already wrote. Don't redirect the plain command onto that file, since the shell empties the file before croft can read it. A key with `{}` is a pattern: `"Saved {}": "Gespeichert: {}"`.
+* `"locale": "de"` picks the UI language; unset, croft follows `LC_ALL`, `LC_MESSAGES` or `LANG`, but only into a language whose built-in catalog translates at least 95% of the strings `croft locale-template` lists, or one you have a `locales/<lang>.json` for, so a partial catalog never mixes two languages on screen unasked. Menus, palette titles, status messages and the side bar, panel and prompt titles are translated where the catalog has an entry, and the palette matches queries in either language. German (`de`) and Spanish (`es`) ship as starter catalogs, so they are opt-in: set `"locale"` to use them. For another language or to fix a translation, run `croft locale-template <lang> --write` and fill in the values it leaves empty in `~/.config/croft/locales/<lang>.json`; entries there override the built-in ones. Run it again after an upgrade to add new strings: it keeps every value you already wrote. Don't redirect the plain command onto that file, since the shell empties the file before croft can read it. A key with `{}` is a pattern: `"Saved {}": "Gespeichert: {}"`.
 
 All three are user-config only.
 
