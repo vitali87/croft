@@ -3210,11 +3210,11 @@ mod tests {
             report.dropped_keybindings
         );
         assert!(report.dropped_keybindings.is_empty());
-        assert!(
-            report
-                .keybindings
-                .contains(&(String::from("ctrl+alt+c"), String::from("transform_camel")))
-        );
+        assert!(report.keybindings.contains(&(
+            String::from("ctrl+alt+c"),
+            String::from("transform_camel"),
+            None
+        )));
     }
 
     /// #1571: VS Code's Insert Line Below / Above chords import onto croft's
