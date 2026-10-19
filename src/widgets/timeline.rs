@@ -234,7 +234,7 @@ impl Widget for &mut TimelinePanel {
                 Style::default().fg(self.theme.ui(COLOR_DIM)),
             ),
             Span::styled(
-                "TIMELINE",
+                crate::i18n::tr("TIMELINE"),
                 Style::default()
                     .fg(self.theme.ui(COLOR_HEADER))
                     .add_modifier(Modifier::BOLD),
