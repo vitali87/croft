@@ -46161,7 +46161,8 @@ impl App {
         if self.rebase_todo_key(key) {
             return;
         }
-        // Inline suggestion (#607): Tab accepts, Esc dismisses.
+        // Inline suggestion (#607): Tab accepts, Esc dismisses, Ctrl+Right
+        // and Ctrl+Down take a word or a line of it (#1625).
         if self.inline_suggestion_key(key) {
             return;
         }
@@ -61760,30 +61761,46 @@ impl App {
     }
 
     /// Tab takes a live suggestion (#607), recorded as the navigator's
-    /// writing; Esc drops it. Returns whether the key was used.
+    /// writing; Esc drops it. Ctrl+Right takes its next word and Ctrl+Down
+    /// its next line (#1625), leaving the rest live at the new caret.
+    /// Returns whether the key was used.
     fn inline_suggestion_key(&mut self, key: KeyEvent) -> bool {
-        if !key.modifiers.is_empty()
-            || self.completion_popup.is_some()
-            || self.editor.snippet_active()
-        {
+        if self.completion_popup.is_some() || self.editor.snippet_active() {
             return false;
         }
         let Some(text) = self.editor.live_ghost().map(str::to_string) else {
             return false;
         };
-        match key.code {
-            KeyCode::Tab => {
+        let take = match (key.code, key.modifiers) {
+            (KeyCode::Tab, KeyModifiers::NONE) => text.len(),
+            (KeyCode::Right, KeyModifiers::CONTROL) => crate::inline_complete::next_word_len(&text),
+            (KeyCode::Down, KeyModifiers::CONTROL) => crate::inline_complete::next_line_len(&text),
+            (KeyCode::Esc, KeyModifiers::NONE) => {
                 self.editor.ghost = None;
-                self.editor
-                    .insert_str_as(&text, crate::provenance::Seat::Navigator);
-                true
+                return true;
             }
-            KeyCode::Esc => {
-                self.editor.ghost = None;
-                true
+            _ => return false,
+        };
+        self.editor.ghost = None;
+        self.editor
+            .insert_str_as(&text[..take], crate::provenance::Seat::Navigator);
+        let rest = &text[take..];
+        // The remainder stays live where the caret now is; its position
+        // also counts as asked, so the next tick does not replace it.
+        if !rest.trim().is_empty() {
+            let at = (
+                self.editor.cursor_row,
+                self.editor.cursor_col,
+                self.editor.edit_seq,
+            );
+            self.editor.ghost = Some((at.0, at.1, at.2, rest.to_string()));
+            // Recorded as asked too: once the ghost is Esc'd the tick
+            // would otherwise send a fresh (paid) request at this caret.
+            if let Some(path) = self.editor.path.clone() {
+                self.inline_asked = Some((path, at.2, at.0, at.1));
             }
-            _ => false,
         }
+        true
     }
 
     /// What screen reader mode describes this frame (#621).
