@@ -229,6 +229,8 @@ pub enum Command {
     NotebookInterrupt,
     NotebookRestart,
     NotebookSelectKernel,
+    RestartLanguageServers,
+    RestartLanguageServersForFile,
     TestingRunWithCoverage,
     CoverageClear,
     TestingInstallCoverageTool,
@@ -706,6 +708,8 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::NotebookInterrupt,
     Command::NotebookRestart,
     Command::NotebookSelectKernel,
+    Command::RestartLanguageServers,
+    Command::RestartLanguageServersForFile,
     Command::TestingRunWithCoverage,
     Command::CoverageClear,
     Command::TestingInstallCoverageTool,
@@ -1138,6 +1142,8 @@ impl Command {
             Command::NotebookInterrupt => "Notebook: Interrupt Kernel",
             Command::NotebookRestart => "Notebook: Restart Kernel",
             Command::NotebookSelectKernel => "Notebook: Select Kernel",
+            Command::RestartLanguageServers => "Language Servers: Restart All",
+            Command::RestartLanguageServersForFile => "Language Servers: Restart for This File",
             Command::TestingRunWithCoverage => "Testing: Run All Tests with Coverage",
             Command::CoverageClear => "Coverage: Clear",
             Command::TestingInstallCoverageTool => "Testing: Install Coverage Tool",
@@ -1582,6 +1588,8 @@ impl Command {
             Command::NotebookInterrupt => "",
             Command::NotebookRestart => "",
             Command::NotebookSelectKernel => "",
+            Command::RestartLanguageServers => "",
+            Command::RestartLanguageServersForFile => "",
             Command::TestingRunWithCoverage => "",
             Command::CoverageClear => "",
             Command::TestingInstallCoverageTool => "",
@@ -2005,6 +2013,8 @@ impl Command {
             Command::NotebookInterrupt => "notebook_interrupt",
             Command::NotebookRestart => "notebook_restart",
             Command::NotebookSelectKernel => "notebook_select_kernel",
+            Command::RestartLanguageServers => "restart_language_servers",
+            Command::RestartLanguageServersForFile => "restart_language_servers_for_file",
             Command::TestingRunWithCoverage => "testing_run_with_coverage",
             Command::CoverageClear => "coverage_clear",
             Command::TestingInstallCoverageTool => "testing_install_coverage_tool",
@@ -2251,13 +2261,19 @@ impl Command {
     /// An extra word the palette matches this command on, beyond its
     /// title: "layout" for the Customize Layout commands (#852), whose
     /// VS Code names mostly don't say it, the tab menu's "Keep Open" for
-    /// View: Keep Editor, and the hosts a shared link opens on (#1610).
-    /// Empty for the rest.
+    /// View: Keep Editor, the hosts a shared link opens on (#1610), and VS
+    /// Code's own names for restarting a language server (#1621). Empty for
+    /// the rest.
     pub fn keyword(self) -> &'static str {
         if LAYOUT_COMMANDS.contains(&self) {
             "layout"
         } else if self == Command::KeepEditor {
             "keep open"
+        } else if matches!(
+            self,
+            Command::RestartLanguageServers | Command::RestartLanguageServersForFile
+        ) {
+            "restart language server, restart ts server, restart lsp"
         } else if matches!(
             self,
             Command::GitCopyPermalink | Command::GitCopyHeadLink | Command::GitOpenOnRemote
@@ -3007,6 +3023,47 @@ mod tests {
                 "{title:?}"
             );
         }
+    }
+
+    /// #1621: "restart" and "language server" find both restart commands,
+    /// and so do VS Code's own names for them.
+    #[test]
+    fn restart_queries_find_the_language_server_restarts() {
+        let mut palette = CommandPalette::new();
+        for query in [
+            "restart",
+            "language server",
+            "Restart Language Server",
+            "restart ts server",
+        ] {
+            palette.set_query(query);
+            let titles: Vec<&str> = palette.results.iter().map(PaletteItem::title).collect();
+            for title in [
+                "Language Servers: Restart All",
+                "Language Servers: Restart for This File",
+            ] {
+                assert!(
+                    titles.contains(&title),
+                    "{query:?} must find {title:?}; it found {titles:?}"
+                );
+            }
+        }
+        assert_eq!(
+            Command::from_id("restart_language_servers"),
+            Some(Command::RestartLanguageServers)
+        );
+    }
+
+    /// Negative (#1621): an unrelated query does not surface them.
+    #[test]
+    fn an_unrelated_query_leaves_the_restarts_out() {
+        let mut palette = CommandPalette::new();
+        palette.set_query("toggle word wrap");
+        let titles: Vec<&str> = palette.results.iter().map(PaletteItem::title).collect();
+        assert!(
+            !titles.iter().any(|t| t.starts_with("Language Servers:")),
+            "{titles:?}"
+        );
     }
 
     /// #852 (comment 3): the tab menu's own labels find the same commands,
