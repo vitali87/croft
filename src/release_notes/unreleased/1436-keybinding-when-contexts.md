@@ -1,0 +1,1 @@
+fix: `croft import-vscode` keeps a keybinding's editor or Explorer `when` scope and reports terminal-only or compound conditions instead of turning them into global bindings, and a key chord in `keybindings.json` honours `"when": "editor"` and `"when": "file_tree"`
