@@ -1478,7 +1478,7 @@ fn emmet_editing_commands_are_in_the_palette_and_import() {
         );
         assert_eq!(
             report.keybindings,
-            vec![(String::from("ctrl+alt+w"), String::from(cmd.id()))],
+            vec![(String::from("ctrl+alt+w"), String::from(cmd.id()), None)],
             "{vscode}"
         );
     }
