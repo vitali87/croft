@@ -500,6 +500,15 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     ("editor.action.indentationToSpaces", "indentation_to_spaces"),
     ("editor.action.indentationToTabs", "indentation_to_tabs"),
+    (
+        "editor.emmet.action.wrapWithAbbreviation",
+        "emmet_wrap_with_abbreviation",
+    ),
+    ("editor.emmet.action.removeTag", "emmet_remove_tag"),
+    ("editor.emmet.action.updateTag", "emmet_update_tag"),
+    ("editor.emmet.action.balanceOut", "emmet_balance_outward"),
+    ("editor.emmet.action.balanceIn", "emmet_balance_inward"),
+    ("editor.emmet.action.matchTag", "emmet_match_tag"),
     ("editor.action.insertCursorAbove", "add_cursor_above"),
     ("editor.action.insertCursorBelow", "add_cursor_below"),
     (
