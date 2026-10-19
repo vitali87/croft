@@ -24395,6 +24395,12 @@ impl App {
                 self.poke_cursor();
                 true
             }
+            // Cmd+K Cmd+1 … Cmd+K Cmd+7: Fold Level N (#1653).
+            KeyCode::Char(c @ '1'..='7') if plain => {
+                self.editor.fold_level(c as usize - '0' as usize);
+                self.poke_cursor();
+                true
+            }
             _ => false,
         }
     }
@@ -54146,6 +54152,21 @@ impl App {
             Cmd::UnfoldAllRegions => self
                 .editor
                 .unfold_all_of_kind(crate::lsp::manager::FoldRangeKind::Region),
+            Cmd::FoldLevel1 => self.editor.fold_level(1),
+            Cmd::FoldLevel2 => self.editor.fold_level(2),
+            Cmd::FoldLevel3 => self.editor.fold_level(3),
+            Cmd::FoldLevel4 => self.editor.fold_level(4),
+            Cmd::FoldLevel5 => self.editor.fold_level(5),
+            Cmd::FoldLevel6 => self.editor.fold_level(6),
+            Cmd::FoldLevel7 => self.editor.fold_level(7),
+            Cmd::FoldRecursively => {
+                let row = self.editor.cursor_row;
+                self.editor.fold_recursively(row);
+            }
+            Cmd::UnfoldRecursively => {
+                let row = self.editor.cursor_row;
+                self.editor.unfold_recursively(row);
+            }
             Cmd::TrimFinalNewlines => {
                 if self.editor.trim_final_newlines() {
                     self.status = String::from("Trimmed final newlines");
