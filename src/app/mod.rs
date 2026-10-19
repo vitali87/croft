@@ -1067,8 +1067,9 @@ struct PendingRunBlock {
     pane_name: String,
     cwd: PathBuf,
     command: String,
-    /// The block as written, shown whole in the popup (the fence was
-    /// refused if it carried control characters, so it renders as typed).
+    /// What the block runs, shown whole in the popup: the block as written,
+    /// or a transcript's commands without their prompts (#1473). The fence
+    /// was refused if it carried control characters, so it renders as typed.
     code: String,
     /// Turns the popup red: the block looks destructive or said `{confirm}`.
     destructive: bool,
@@ -4713,6 +4714,13 @@ pub struct App {
     /// Each scrubbed commit's tree under the workspace root, for the
     /// Explorer's dimming (#371); `None` records that the listing failed.
     scrub_trees: std::collections::HashMap<String, Option<std::sync::Arc<crate::git::CommitTree>>>,
+    /// Per workspace-relative path, the name the file had at each commit
+    /// the scrubber walks, so history before a rename reads the old name
+    /// (#1304). One `--follow` walk per file per scrub.
+    scrub_names: std::collections::HashMap<
+        String,
+        std::sync::Arc<std::collections::HashMap<String, String>>,
+    >,
     /// Builds highlighted historical views off the UI thread (#371),
     /// started on the first step.
     scrub_builder: Option<crate::scrubber::ViewBuilder>,
@@ -6885,6 +6893,7 @@ impl App {
             scrub_dragging: false,
             scrub_cache: std::collections::HashMap::new(),
             scrub_trees: std::collections::HashMap::new(),
+            scrub_names: std::collections::HashMap::new(),
             scrub_builder: None,
             scrub_views: std::collections::VecDeque::new(),
             scrub_plain: std::collections::VecDeque::new(),
@@ -22645,14 +22654,11 @@ impl App {
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
     }
 
-    /// The unsaved-changes prompt (#862): what would be lost and the three
-    /// ways out. Amber like Replace All's rather than red, since its default
-    /// (S / Enter) keeps the edits and only D throws anything away.
-    fn render_unsaved_confirm(&self, frame: &mut ratatui::Frame) {
-        let Some(exit) = self.pending_unsaved.as_ref() else {
-            return;
-        };
-        let (headline, names, save, discard) = match exit {
+    /// The unsaved-changes prompt's words: its headline, the files, and
+    /// what S and D do after their key letter ("ave and close"). Shared by
+    /// the modal and what screen reader mode reads out (#1584).
+    fn unsaved_confirm_text(&self, exit: &UnsavedExit) -> (String, String, String, String) {
+        match exit {
             UnsavedExit::CloseTab { idx, .. } => (
                 crate::i18n::tr("This tab has unsaved changes:").into_owned(),
                 self.editor.tab_display_label(*idx),
@@ -22673,7 +22679,17 @@ impl App {
                     format!("iscard and {verb}"),
                 )
             }
+        }
+    }
+
+    /// The unsaved-changes prompt (#862): what would be lost and the three
+    /// ways out. Amber like Replace All's rather than red, since its default
+    /// (S / Enter) keeps the edits and only D throws anything away.
+    fn render_unsaved_confirm(&self, frame: &mut ratatui::Frame) {
+        let Some(exit) = self.pending_unsaved.as_ref() else {
+            return;
         };
+        let (headline, names, save, discard) = self.unsaved_confirm_text(exit);
         let area = frame.area();
         let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
         let height: u16 = 8;
@@ -24399,6 +24415,12 @@ impl App {
                 self.poke_cursor();
                 true
             }
+            // Cmd+K Cmd+1 … Cmd+K Cmd+7: Fold Level N (#1653).
+            KeyCode::Char(c @ '1'..='7') if plain => {
+                self.editor.fold_level(c as usize - '0' as usize);
+                self.poke_cursor();
+                true
+            }
             _ => false,
         }
     }
@@ -24690,13 +24712,15 @@ impl App {
             }
             return Ok(());
         }
-        if self.pending_broadcast_enable {
+        // The confirms answer in the order they are drawn, topmost first
+        // (#1584): the run block over a terminal paste over broadcast.
+        if self.pending_run_block.is_some() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    self.confirm_pending_broadcast();
+                    self.confirm_pending_run_block();
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.cancel_pending_broadcast();
+                    self.cancel_pending_run_block();
                 }
                 _ => {}
             }
@@ -24717,13 +24741,13 @@ impl App {
             }
             return Ok(());
         }
-        if self.pending_run_block.is_some() {
+        if self.pending_broadcast_enable {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    self.confirm_pending_run_block();
+                    self.confirm_pending_broadcast();
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.cancel_pending_run_block();
+                    self.cancel_pending_broadcast();
                 }
                 _ => {}
             }
@@ -24803,12 +24827,15 @@ impl App {
         // only when the terminal is not focused (its raw control keys must pass
         // through) and the chord carries a real modifier or is a function key
         // (so plain typing and bare Enter/Tab/Esc keep their contextual meaning).
-        // This stands in for VS Code's `when: editorTextFocus` without a full
-        // context engine.
+        // A row with `when` fires only while that pane has focus (#1436); an
+        // unscoped row fires wherever the terminal does not.
         if self.focus != Pane::Terminal
             && !self.keymap.is_empty()
             && is_rebindable_chord(key)
-            && let Some(cmd) = self.keymap.command_for(key)
+            && let Some(cmd) = match self.key_context() {
+                Some(ctx) => self.keymap.command_in(key, ctx),
+                None => self.keymap.command_for(key),
+            }
         {
             self.run_command(cmd);
             return Ok(());
@@ -33255,11 +33282,29 @@ impl App {
         if self.editor.hex.is_none() {
             return;
         }
-        self.open_input_prompt(InputPrompt::new(
-            InputPurpose::HexFind,
-            "Find in Hex",
-            "hex bytes (de ad be ef) or text",
-        ));
+        // Which reading a hex-shaped query gets depends on the column the
+        // search starts from (#1644), so the title says it.
+        let text_side = self.editor.hex.as_ref().is_some_and(|v| v.ascii_focus);
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::HexFind,
+                if text_side {
+                    "Find in Hex (text)"
+                } else {
+                    "Find in Hex"
+                },
+                if text_side {
+                    "text"
+                } else {
+                    "hex bytes (de ad be ef) or text"
+                },
+            )
+            .with_hint(if text_side {
+                "Enter finds this text · Esc cancels"
+            } else {
+                "\"1234\" finds hex-looking text · Enter · Esc cancels"
+            }),
+        );
     }
 
     /// The "+ Add Expression" affordance (panel row or palette): a single-line
@@ -33337,7 +33382,7 @@ impl App {
     /// the run in the warning.
     fn run_with_unsaved_saved(&mut self, what: &str, launch: impl FnOnce(&mut Self)) {
         if self.save_before_debug && self.unsaved_count() > 0 {
-            self.sweep_dirty_buffers(false, false);
+            self.sweep_dirty_buffers(false, false, false);
         }
         let unsaved = self.unsaved_editor_names();
         launch(self);
@@ -37625,11 +37670,12 @@ impl App {
             }
             InputPurpose::HexFind => {
                 self.close_input_prompt();
-                match crate::hex::HexView::parse_find_query(&value) {
-                    Some(needle) => {
+                let text_side = self.editor.hex.as_ref().is_some_and(|v| v.ascii_focus);
+                match crate::hex::HexView::parse_find_query(&value, text_side) {
+                    Some(query) => {
                         let from = match self.editor.hex.as_mut() {
                             Some(view) => {
-                                view.last_find = Some(needle);
+                                view.last_find = Some(query);
                                 // The submit searches from the cursor
                                 // INCLUSIVE so a match under it is
                                 // found; F3 then steps past it.
@@ -42231,6 +42277,7 @@ impl App {
         self.scrub_view = None;
         self.scrub_view_key = None;
         self.tree.scrub_tree = None;
+        self.scrub_names.clear();
         if commits.is_empty() {
             self.status = String::from("No commits to scrub through");
             return;
@@ -43720,11 +43767,12 @@ impl App {
             self.status = String::from("The open file is outside the workspace");
             return None;
         };
+        let name = self.scrub_name_at(&rel, &commit.hash);
         let text = self
             .scrub_cache
             .entry((commit.hash.clone(), rel.clone()))
             .or_insert_with(|| {
-                crate::git::read_file_at_rev(&root, &commit.hash, &rel)
+                crate::git::read_file_at_rev(&root, &commit.hash, &name)
                     .ok()
                     .map(std::sync::Arc::from)
             })
@@ -43839,9 +43887,25 @@ impl App {
             width: body.width,
             height: 1,
         };
+        // Before a rename, say what the file was called then (#1304).
+        let rel = self.editor.path.as_ref().and_then(|p| {
+            p.strip_prefix(self.workspace_root())
+                .ok()
+                .map(|r| r.to_string_lossy().into_owned())
+        });
         let label = match (scrub.position(), scrub.commit()) {
             (crate::scrubber::Position::At(i), Some(c)) => {
-                format!(" {} {}/{} ", c.short_hash, scrub.len() - i, scrub.len())
+                let then = rel.as_ref().and_then(|rel| {
+                    self.scrub_names
+                        .get(rel)?
+                        .get(&c.hash)
+                        .filter(|n| *n != rel)
+                });
+                let n = scrub.len() - i;
+                match then {
+                    Some(old) => format!(" {} {n}/{} \u{b7} {old} ", c.short_hash, scrub.len()),
+                    None => format!(" {} {n}/{} ", c.short_hash, scrub.len()),
+                }
             }
             _ => String::from(" working tree "),
         };
@@ -43964,12 +44028,13 @@ impl App {
             None => (take(&mut self.scrub_plain), false),
         };
         // Neither ready (the first step, or a jump): build the stand-in here.
+        let name = self.scrub_name_at(&rel, &commit.hash);
         let view = view.or_else(|| {
             let text = self
                 .scrub_cache
                 .entry((commit.hash.clone(), rel.clone()))
                 .or_insert_with(|| {
-                    crate::git::read_file_at_rev(&root, &commit.hash, &rel)
+                    crate::git::read_file_at_rev(&root, &commit.hash, &name)
                         .ok()
                         .map(std::sync::Arc::from)
                 })
@@ -43986,6 +44051,35 @@ impl App {
         self.scrub_view = Some(view);
         self.scrub_view_key = Some((key, finished));
         self.request_scrub_views(&root, &path, &rel);
+    }
+
+    /// The name `rel` had at each commit the scrubber walks (#1304), keyed
+    /// by full hash; a commit missing from it had no older name.
+    fn scrub_names(
+        &mut self,
+        rel: &str,
+    ) -> std::sync::Arc<std::collections::HashMap<String, String>> {
+        if let Some(names) = self.scrub_names.get(rel) {
+            return std::sync::Arc::clone(names);
+        }
+        let Some(scrub) = self.scrubber.as_ref() else {
+            return Default::default();
+        };
+        let touched = crate::git::follow_names(self.workspace_root(), rel, SCRUB_COMMIT_LIMIT);
+        let names =
+            std::sync::Arc::new(crate::scrubber::names_by_commit(scrub.commits(), &touched));
+        self.scrub_names
+            .insert(rel.to_string(), std::sync::Arc::clone(&names));
+        names
+    }
+
+    /// The name to read `rel` by at commit `hash`: its name there when the
+    /// file was renamed since, else `rel` itself.
+    fn scrub_name_at(&mut self, rel: &str, hash: &str) -> String {
+        self.scrub_names(rel)
+            .get(hash)
+            .cloned()
+            .unwrap_or_else(|| rel.to_string())
     }
 
     /// Put the finished view being left back among the kept ones, so
@@ -44081,6 +44175,7 @@ impl App {
     /// stand-ins for the ones with neither a stand-in nor a finished view,
     /// and finished views for the ones without one; most urgent first.
     fn request_scrub_views(&mut self, root: &Path, path: &Path, rel: &str) {
+        let names = self.scrub_names(rel);
         let Some(scrub) = self.scrubber.as_ref() else {
             return;
         };
@@ -44094,6 +44189,15 @@ impl App {
                 },
                 path: path.to_path_buf(),
                 short: c.short_hash.clone(),
+                read_rel: names.get(&c.hash).map_or(rel, String::as_str).to_string(),
+                // A parent past the walked commits keeps the commit's name.
+                parent_rel: c
+                    .parents
+                    .first()
+                    .and_then(|p| names.get(p))
+                    .or_else(|| names.get(&c.hash))
+                    .map_or(rel, String::as_str)
+                    .to_string(),
                 parent: c.parents.first().cloned(),
                 text: self
                     .scrub_cache
@@ -46165,7 +46269,8 @@ impl App {
         if self.rebase_todo_key(key) {
             return;
         }
-        // Inline suggestion (#607): Tab accepts, Esc dismisses.
+        // Inline suggestion (#607): Tab accepts, Esc dismisses, Ctrl+Right
+        // and Ctrl+Down take a word or a line of it (#1625).
         if self.inline_suggestion_key(key) {
             return;
         }
@@ -49140,7 +49245,40 @@ impl App {
         self.status = format!("Pasted {} chars", s.chars().count());
     }
 
+    /// A terminal paste. While a macro records, a paste into the editor is a
+    /// step of it, on the same terms `handle_key` records a key: not while
+    /// replaying, and only when the editor had focus before and after and
+    /// the text went into it (#1464). Before, the replay silently left the pasted text out.
     fn handle_paste(&mut self, s: &str) {
+        let capture =
+            self.macro_recording.is_some() && !self.macro_replaying && self.focus == Pane::Editor;
+        let into_editor = self.handle_paste_inner(s);
+        if self.macro_recording.is_none() || self.macro_replaying {
+            return;
+        }
+        // A paste the palette, a prompt or the find bar took never reached
+        // the document, so replaying it there would insert stray text.
+        if capture && into_editor && self.focus == Pane::Editor {
+            if let Some(rec) = self.macro_recording.as_mut() {
+                rec.recorded.push_paste(s);
+            }
+        } else if !s.is_empty() {
+            // Logged as skipped keys are, by size only: a paste into a
+            // terminal can be a password.
+            crate::output::push(
+                "Macros",
+                crate::output::OutputLevel::Info,
+                &format!(
+                    "skipped a paste of {} chars: recording captures the editor pane only",
+                    s.chars().count()
+                ),
+            );
+        }
+    }
+
+    /// Route a paste to whatever owns it; true only when it went into the
+    /// editor's text, the one place a recording macro can replay it.
+    fn handle_paste_inner(&mut self, s: &str) -> bool {
         // Modal overlays own paste entirely while open — paste lands in
         // the modal's input field, never in the editor / tree / terminal
         // behind it. Without this, hitting Cmd+V right after Cmd+P pastes
@@ -49153,7 +49291,7 @@ impl App {
                     prompt.push_char(c);
                 }
             }
-            return;
+            return false;
         }
         if let Some(palette) = self.command_palette.as_mut() {
             for c in s.chars() {
@@ -49161,7 +49299,7 @@ impl App {
                     palette.push_char(c);
                 }
             }
-            return;
+            return false;
         }
         if let Some(picker) = self.go_to_symbol.as_mut() {
             for c in s.chars() {
@@ -49169,7 +49307,7 @@ impl App {
                     picker.push_char(c);
                 }
             }
-            return;
+            return false;
         }
         if let Some(picker) = self.workspace_symbols.as_mut() {
             for c in s.chars() {
@@ -49178,7 +49316,7 @@ impl App {
                 }
             }
             self.workspace_symbols_requery();
-            return;
+            return false;
         }
         if let Some(finder) = self.file_finder.as_mut() {
             for c in s.chars() {
@@ -49187,7 +49325,7 @@ impl App {
                 }
             }
             self.follow_quick_open_prefix();
-            return;
+            return false;
         }
         // The in-file find bar is a pane-scoped widget, not a modal: it only
         // owns the paste while the editor itself is focused. Without the focus
@@ -49206,7 +49344,7 @@ impl App {
                 }
             }
             self.editor_find_set_query(new_q);
-            return;
+            return false;
         }
         // Finder drag-and-drop into croft arrives via the host terminal as
         // a bracketed paste containing absolute filesystem path(s). The
@@ -49238,18 +49376,18 @@ impl App {
             .iter()
             .any(|p| p.is_absolute() && is_iterm2_inline_image_drop(p))
         {
-            return;
+            return false;
         }
         let dropped = parse_dropped_paths(s);
         if !dropped.is_empty() {
             match self.sidebar_view {
                 SidebarView::Remote if self.focus == Pane::Tree => {
                     self.import_paths_into_remote(&dropped);
-                    return;
+                    return false;
                 }
                 SidebarView::Explorer if self.focus == Pane::Tree => {
                     self.import_paths_into_explorer(&dropped);
-                    return;
+                    return false;
                 }
                 _ => {}
             }
@@ -49279,14 +49417,14 @@ impl App {
             let foreign = parse_foreign_dropped_paths(s);
             if !foreign.is_empty() {
                 self.request_remote_pulls(&foreign);
-                return;
+                return false;
             }
         }
         if self.sidebar_view == SidebarView::Search && self.focus == Pane::Tree {
             self.search.insert_str_into_query(s);
             self.submit_search_query();
             self.status = format!("Pasted {} chars", s.chars().count());
-            return;
+            return false;
         }
         // Source Control commit message box: bracketed paste must
         // populate it the same way Cmd+V via the key path does
@@ -49301,12 +49439,13 @@ impl App {
         {
             self.source_control.insert_str(s);
             self.status = format!("Pasted {} chars", s.chars().count());
-            return;
+            return false;
         }
         match self.focus {
             Pane::Editor => {
                 self.editor.paste_str(s, self.paste_reindent);
                 self.status = format!("Pasted {} chars", s.chars().count());
+                return true;
             }
             Pane::Terminal => {
                 if self.terminal_find.is_some() {
@@ -49327,6 +49466,7 @@ impl App {
             }
             Pane::Tree => {}
         }
+        false
     }
 
     /// Move every dropped path into the directory the explorer is
@@ -53700,10 +53840,10 @@ impl App {
             return;
         }
         let count = count.max(1);
-        // Budget the keys actually fed, not the recorded step count:
-        // `key_events` drops steps this build cannot replay, so `len()` is an
-        // upper bound rather than the real total.
-        let keys = mac.key_events();
+        // Budget the steps actually fed, not the recorded step count:
+        // `replay_steps` drops steps this build cannot replay, so `len()` is
+        // an upper bound rather than the real total.
+        let keys = mac.replay_steps();
         if keys.is_empty() {
             // Every step was one this build cannot replay (a macro from a
             // newer croft). Say so rather than reporting a successful run
@@ -53711,7 +53851,16 @@ impl App {
             self.status = String::from("Macro has no steps this version can replay");
             return;
         }
-        let total = keys.len().saturating_mul(count);
+        // A paste is one step but inserts all of its text, so its characters
+        // count against the budget like typed ones.
+        let per_run: usize = keys
+            .iter()
+            .map(|step| match step {
+                crate::macros::Replay::Key(_) => 1,
+                crate::macros::Replay::Paste(text) => text.chars().count().max(1),
+            })
+            .sum();
+        let total = per_run.saturating_mul(count);
         if total > MAX_REPLAY_KEYS {
             self.status =
                 format!("Macro would run {total} keys (limit {MAX_REPLAY_KEYS}) — refused");
@@ -53729,10 +53878,16 @@ impl App {
             // one-step-per-iteration guarantee needs an undo-group API the
             // editor does not have (its undo is whole-buffer snapshots).
             self.editor.break_undo_coalescing();
-            for k in &keys {
-                if let Err(e) = self.handle_key(*k) {
-                    aborted = Some((iteration + 1, e.to_string()));
-                    break 'outer;
+            for step in &keys {
+                match step {
+                    crate::macros::Replay::Key(k) => {
+                        if let Err(e) = self.handle_key(*k) {
+                            aborted = Some((iteration + 1, e.to_string()));
+                            break 'outer;
+                        }
+                    }
+                    // Pasted, not typed, as it was recorded (#1464).
+                    crate::macros::Replay::Paste(text) => self.handle_paste(text),
                 }
             }
             done = iteration + 1;
@@ -54149,6 +54304,21 @@ impl App {
             Cmd::UnfoldAllRegions => self
                 .editor
                 .unfold_all_of_kind(crate::lsp::manager::FoldRangeKind::Region),
+            Cmd::FoldLevel1 => self.editor.fold_level(1),
+            Cmd::FoldLevel2 => self.editor.fold_level(2),
+            Cmd::FoldLevel3 => self.editor.fold_level(3),
+            Cmd::FoldLevel4 => self.editor.fold_level(4),
+            Cmd::FoldLevel5 => self.editor.fold_level(5),
+            Cmd::FoldLevel6 => self.editor.fold_level(6),
+            Cmd::FoldLevel7 => self.editor.fold_level(7),
+            Cmd::FoldRecursively => {
+                let row = self.editor.cursor_row;
+                self.editor.fold_recursively(row);
+            }
+            Cmd::UnfoldRecursively => {
+                let row = self.editor.cursor_row;
+                self.editor.unfold_recursively(row);
+            }
             Cmd::TrimFinalNewlines => {
                 if self.editor.trim_final_newlines() {
                     self.status = String::from("Trimmed final newlines");
@@ -55639,6 +55809,18 @@ impl App {
             (KeyCode::Right, _) => prompt.move_cursor_right(),
             (KeyCode::Home, _) => prompt.move_cursor_home(),
             (KeyCode::End, _) => prompt.move_cursor_end(),
+            // Replacing a prefilled value took a Backspace per character,
+            // typed blind (#1601): these select or clear it as the shell
+            // and VS Code do, and a word goes back to a path separator.
+            (KeyCode::Char('a'), KeyModifiers::CONTROL) => prompt.select_all(),
+            (KeyCode::Char('a'), KeyModifiers::SUPER) => prompt.select_all(),
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) => prompt.clear_to_start(),
+            (KeyCode::Char('k'), KeyModifiers::CONTROL) => prompt.clear_to_end(),
+            (KeyCode::Char('w'), KeyModifiers::CONTROL) => prompt.delete_word_back(),
+            (KeyCode::Backspace, m) if m.contains(KeyModifiers::SUPER) => prompt.clear_to_start(),
+            (KeyCode::Backspace, m) if m.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+                prompt.delete_word_back()
+            }
             (KeyCode::Backspace, _) => prompt.pop_char(),
             (KeyCode::Delete, _) => prompt.delete_char(),
             (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
@@ -61161,7 +61343,9 @@ impl App {
         if !self.auto_save_on_focus_change {
             return false;
         }
-        self.sweep_dirty_buffers(false, false)
+        // An auto save: the caret lines keep their trailing whitespace,
+        // since the user may be mid-word when they alt-tab away (#1455).
+        self.sweep_dirty_buffers(false, false, true)
     }
 
     /// Sample the current focus (pane, active tab, active path) and report
@@ -61187,13 +61371,20 @@ impl App {
     /// not lost it yet). Returns true when anything changed on screen.
     fn sweep_auto_save(&mut self, require_delay: bool) -> bool {
         let skip_active = !require_delay && self.focus == Pane::Editor;
-        self.sweep_dirty_buffers(require_delay, skip_active)
+        self.sweep_dirty_buffers(require_delay, skip_active, true)
     }
 
     /// Write every dirty buffer the auto-save rules allow, in every split,
     /// leaving the active tab alone when `skip_active`. Shared by the
-    /// auto-save sweep and File: Save All (#852).
-    fn sweep_dirty_buffers(&mut self, require_delay: bool, skip_active: bool) -> bool {
+    /// auto-save sweep and File: Save All (#852). `automatic` is the
+    /// auto-save sweep, whose writes spare the caret lines' trailing
+    /// whitespace; Save All's are explicit saves (#1455).
+    fn sweep_dirty_buffers(
+        &mut self,
+        require_delay: bool,
+        skip_active: bool,
+        automatic: bool,
+    ) -> bool {
         // Each saved tab's own map rides along (#349): the recorder must not
         // look it up by path afterwards, since a split can hold the same file
         // in a second buffer with a different map.
@@ -61277,7 +61468,12 @@ impl App {
                 // overwrites) an external change; auto save must not
                 // arm the force-overwrite path an explicit Cmd+S offers.
                 e.save_cleanup = cleanup;
-                match e.save_to_disk() {
+                let saved = if automatic {
+                    e.auto_save_to_disk()
+                } else {
+                    e.save_to_disk()
+                };
+                match saved {
                     Ok(crate::widgets::editor::SaveOutcome::Saved) => {
                         if let Some(p) = e.path.clone() {
                             // The bytes this editor just wrote, so the
@@ -61384,7 +61580,7 @@ impl App {
             self.save();
         }
         let active_status = self.status.clone();
-        self.sweep_dirty_buffers(false, true);
+        self.sweep_dirty_buffers(false, true, false);
         // A format-on-save write lands with its formatter reply: it is on
         // its way, not left behind.
         let pending = self
@@ -61754,30 +61950,46 @@ impl App {
     }
 
     /// Tab takes a live suggestion (#607), recorded as the navigator's
-    /// writing; Esc drops it. Returns whether the key was used.
+    /// writing; Esc drops it. Ctrl+Right takes its next word and Ctrl+Down
+    /// its next line (#1625), leaving the rest live at the new caret.
+    /// Returns whether the key was used.
     fn inline_suggestion_key(&mut self, key: KeyEvent) -> bool {
-        if !key.modifiers.is_empty()
-            || self.completion_popup.is_some()
-            || self.editor.snippet_active()
-        {
+        if self.completion_popup.is_some() || self.editor.snippet_active() {
             return false;
         }
         let Some(text) = self.editor.live_ghost().map(str::to_string) else {
             return false;
         };
-        match key.code {
-            KeyCode::Tab => {
+        let take = match (key.code, key.modifiers) {
+            (KeyCode::Tab, KeyModifiers::NONE) => text.len(),
+            (KeyCode::Right, KeyModifiers::CONTROL) => crate::inline_complete::next_word_len(&text),
+            (KeyCode::Down, KeyModifiers::CONTROL) => crate::inline_complete::next_line_len(&text),
+            (KeyCode::Esc, KeyModifiers::NONE) => {
                 self.editor.ghost = None;
-                self.editor
-                    .insert_str_as(&text, crate::provenance::Seat::Navigator);
-                true
+                return true;
             }
-            KeyCode::Esc => {
-                self.editor.ghost = None;
-                true
+            _ => return false,
+        };
+        self.editor.ghost = None;
+        self.editor
+            .insert_str_as(&text[..take], crate::provenance::Seat::Navigator);
+        let rest = &text[take..];
+        // The remainder stays live where the caret now is; its position
+        // also counts as asked, so the next tick does not replace it.
+        if !rest.trim().is_empty() {
+            let at = (
+                self.editor.cursor_row,
+                self.editor.cursor_col,
+                self.editor.edit_seq,
+            );
+            self.editor.ghost = Some((at.0, at.1, at.2, rest.to_string()));
+            // Recorded as asked too: once the ghost is Esc'd the tick
+            // would otherwise send a fresh (paid) request at this caret.
+            if let Some(path) = self.editor.path.clone() {
+                self.inline_asked = Some((path, at.2, at.0, at.1));
             }
-            _ => false,
         }
+        true
     }
 
     /// What screen reader mode describes this frame (#621).
@@ -61785,6 +61997,14 @@ impl App {
         use crate::a11y::Snapshot;
         let tr = |s: &str| crate::i18n::tr(s).into_owned();
         let status = tr(&self.status);
+        if let Some((focus, item)) = self.modal_a11y() {
+            return Snapshot {
+                focus,
+                item: Some(item),
+                status,
+                ..Default::default()
+            };
+        }
         if let Some(p) = &self.prompt {
             return Snapshot {
                 focus: p.label.clone(),
@@ -61896,6 +62116,263 @@ impl App {
                 }
             }
         }
+    }
+
+    /// The dialog waiting for a key, if one is open, as screen reader mode
+    /// reads it (#1584): its title, then what it says and which key does
+    /// what. Without this a confirmation was silent, so a reader heard
+    /// nothing after Ctrl+W and could not know that D throws edits away.
+    /// Topmost first, in the order they are drawn; a new dialog that waits
+    /// for a key belongs here too.
+    fn modal_a11y(&self) -> Option<(String, String)> {
+        let tr = |s: &str| crate::i18n::tr(s).into_owned();
+        // The title, and its sentences joined for speech: a full stop
+        // between them unless one already ends in a question mark.
+        let join = |parts: &[String]| -> String {
+            let mut item = String::new();
+            for part in parts.iter().map(|p| p.trim().trim_end_matches('.')) {
+                if part.is_empty() {
+                    continue;
+                }
+                if !item.is_empty() {
+                    item.push_str(if item.ends_with('?') { " " } else { ". " });
+                }
+                item.push_str(part);
+            }
+            item
+        };
+        // What it says, then which key does what. The announcement is cut
+        // at `a11y::MAX_LINE`, so a long path, command or file list is cut
+        // here instead: the keys at the end are always read.
+        let said = |title: &str, body: &[String], actions: &[String]| -> (String, String) {
+            let actions = join(actions);
+            let mut item = join(body);
+            let room = crate::a11y::MAX_LINE.saturating_sub(actions.chars().count() + 2);
+            if item.chars().count() > room {
+                item = if room < 2 {
+                    String::new()
+                } else {
+                    let mut cut: String = item.chars().take(room - 1).collect();
+                    cut.truncate(cut.trim_end().len());
+                    cut.push('…');
+                    cut
+                };
+            }
+            if !item.is_empty() && !actions.is_empty() {
+                item.push_str(if item.ends_with('?') || item.ends_with('…') {
+                    " "
+                } else {
+                    ". "
+                });
+            }
+            item.push_str(&actions);
+            (tr(title), item)
+        };
+        let yes_no = |yes: &str| format!("{}. {}", tr(yes), tr("N or Escape, no"));
+        if self.pending_terminal_warning {
+            return Some(said(
+                "Unsupported terminal",
+                &[tr(
+                    "Croft's icons and images need an inline-image protocol this terminal does not support",
+                )],
+                &[tr("Any key dismisses. D, don't show again")],
+            ));
+        }
+        // An agent's edit proposal takes every key while it is up, so it is
+        // read before anything it covers: who wants to change which file,
+        // and the keys the popup's footer offers in its current state.
+        if let (Some(ui), Some(head)) = (&self.approval_ui, self.approvals.front()) {
+            let title = crate::widgets::approval_popup::title(
+                head,
+                self.approvals.len(),
+                self.workspace_root(),
+            )
+            .trim()
+            .replace(" · ", ", ");
+            let actions = if ui.reason.is_some() {
+                "Type the reason. Enter, send. Escape, back"
+            } else if ui.target_dirty {
+                "Unsaved edits here. Enter, merge them with the agent's. Escape, deny. R, deny with a reason"
+            } else {
+                "Enter, approve. Escape, deny. A, approve all from this agent for 10 minutes. R, deny with a reason. E, edit, then approve"
+            };
+            return Some((title, tr(actions)));
+        }
+        // The field's own instruction ("Remote URL") is read with the keys,
+        // so a prompt replaced by the next step under the same title is
+        // still heard; what is typed is left to the reader's echo.
+        if let Some(p) = &self.input_prompt {
+            let hint = p
+                .hint
+                .clone()
+                .unwrap_or_else(|| String::from("Enter to confirm, Escape to cancel"));
+            return Some(said(&p.title, &[tr(&p.placeholder)], &[tr(&hint)]));
+        }
+        if let Some(ed) = &self.settings_editor {
+            let target = if ed.target == crate::config_layers::LayerKind::Workspace {
+                tr("Settings, writing to workspace")
+            } else {
+                tr("Settings, writing to user")
+            };
+            let row = ed.selected_row().map_or_else(
+                || tr("No matching setting"),
+                |r| {
+                    format!(
+                        "{}, {}, {}",
+                        r.key.replace('_', " "),
+                        crate::settings_editor::display(&r.value),
+                        tr(r.layer.label())
+                    )
+                },
+            );
+            return Some((target, row));
+        }
+        if let Some(exit) = &self.pending_unsaved {
+            let (headline, names, save, discard) = self.unsaved_confirm_text(exit);
+            // The tab label carries the dirty dot, which a reader would read
+            // out as "bullet"; every file named here is unsaved anyway.
+            let names = names.replace("● ", "");
+            return Some(said(
+                "Unsaved changes",
+                &[format!("{} {names}", tr(&headline))],
+                &[
+                    format!("S, {}", tr(&format!("S{save}"))),
+                    format!("D, {}", tr(&format!("D{discard}"))),
+                    tr("Escape, cancel"),
+                ],
+            ));
+        }
+        if let Some(block) = &self.pending_run_block {
+            let title = if block.destructive {
+                "Run this block? It looks destructive"
+            } else {
+                "Run this block?"
+            };
+            return Some(said(
+                title,
+                &[
+                    format!(
+                        "{} {} {} {}",
+                        tr("in pane"),
+                        block.pane_name,
+                        tr("at"),
+                        block.cwd.display()
+                    ),
+                    block.code.lines().collect::<Vec<_>>().join("; "),
+                ],
+                &[yes_no("Y, yes, run")],
+            ));
+        }
+        if self.pending_broadcast_enable {
+            let receiving = self
+                .terminals
+                .iter()
+                .filter(|t| !t.broadcast_excluded)
+                .count()
+                .max(1);
+            return Some(said(
+                "Broadcast input to all panes?",
+                &[format!(
+                    "{} {receiving} {}",
+                    tr("Every keystroke and paste will go to"),
+                    tr("terminal panes at once")
+                )],
+                &[yes_no("Y, yes, broadcast")],
+            ));
+        }
+        if let Some((occurrences, files, skipped)) = self.pending_replace_all {
+            let mut parts = vec![
+                format!(
+                    "Replace {occurrences} occurrence(s) across {files} file(s) with \"{}\"?",
+                    self.search.replace
+                ),
+                tr("Files are rewritten on disk"),
+            ];
+            if skipped > 0 {
+                parts.push(format!(
+                    "{skipped} open file(s) with unsaved changes will be skipped"
+                ));
+            }
+            return Some(said(
+                "Replace all?",
+                &parts,
+                &[tr("Enter or Y, replace. Escape, cancel")],
+            ));
+        }
+        if let Some(pending) = &self.pending_unsaved_scm {
+            let verb = pending.op.verb();
+            let names: Vec<String> = pending
+                .files
+                .iter()
+                .map(|p| {
+                    p.strip_prefix(&pending.root)
+                        .unwrap_or(p)
+                        .display()
+                        .to_string()
+                })
+                .collect();
+            let n = names.len();
+            return Some(said(
+                "Unsaved changes",
+                &[format!(
+                    "{n} file{} {} unsaved changes: {}",
+                    if n == 1 { "" } else { "s" },
+                    if n == 1 { "has" } else { "have" },
+                    names.join(", ")
+                )],
+                &[
+                    format!("S, Save All & {verb}"),
+                    format!("C, {verb} Anyway"),
+                    tr("Escape, cancel"),
+                ],
+            ));
+        }
+        if self.pending_discard_all {
+            return Some(said(
+                "Discard all changes?",
+                &[tr(
+                    "This reverts every tracked file to HEAD. Untracked files are kept.",
+                )],
+                &[yes_no("Y, yes, discard all")],
+            ));
+        }
+        if let Some(pr) = &self.pending_revert_hunk {
+            return Some(said(
+                "Revert hunk?",
+                &[
+                    tr("This will undo the change hunk under the cursor on disk."),
+                    pr.rel_path.clone(),
+                ],
+                &[yes_no("Y, yes, revert")],
+            ));
+        }
+        if let Some(pd) = &self.pending_discard {
+            let warn = if pd.untracked {
+                "This will permanently delete the file from disk."
+            } else {
+                "This will overwrite your local changes from HEAD."
+            };
+            return Some(said(
+                "Discard changes?",
+                &[tr(warn), pd.rel_path.clone()],
+                &[yes_no("Y, yes, discard")],
+            ));
+        }
+        if let Some(url) = &self.pending_local_open {
+            return Some(said(
+                "Open on local Mac?",
+                &[
+                    tr("This URL will open in YOUR LOCAL MAC's browser via the croft relay."),
+                    url.clone(),
+                ],
+                &[format!(
+                    "{}. {}",
+                    tr("Y, yes once. A, always for this session"),
+                    tr("N or Escape, no")
+                )],
+            ));
+        }
+        None
     }
 
     /// What screen reader mode says for the bottom panel's front tab
@@ -62073,9 +62550,12 @@ impl App {
             return;
         }
         // A picker covers the caret: read its selection from the status bar.
+        // So does a dialog waiting for a key (#1584), except a text prompt,
+        // whose own caret is where the typing is.
         let picker = self.command_palette.is_some()
             || self.file_finder.is_some()
-            || self.list_picker.is_some();
+            || self.list_picker.is_some()
+            || (self.input_prompt.is_none() && self.modal_a11y().is_some());
         if picker && let Some(pos) = self.announce_pos {
             frame.set_cursor_position(pos);
             return;
@@ -70556,22 +71036,26 @@ impl App {
         let Some(view) = self.editor.hex.as_mut() else {
             return;
         };
-        let Some(needle) = view.last_find.clone() else {
+        let Some(query) = view.last_find.clone() else {
             return;
         };
+        let needle = &query.needle;
+        // Which reading the query got (#1644): "1234" as bytes 12 34 and as
+        // text are different searches, and the line says which one ran.
+        let what = query.describe();
         let rows = (view.layout.data_rows as usize).max(1);
-        match view.find_forward(&needle, from) {
+        match view.find_forward(needle, from) {
             Ok(crate::hex::FindOutcome::Found(off)) => {
                 view.set_cursor(off, false, rows);
                 view.sel_anchor = Some(off + needle.len() as u64 - 1);
-                self.status = format!("Found at 0x{off:X}");
+                self.status = format!("Found {what} at 0x{off:X}");
             }
             Ok(crate::hex::FindOutcome::NotFound) => {
-                self.status = String::from("Not found");
+                self.status = format!("Not found: {what}");
             }
             Ok(crate::hex::FindOutcome::Capped) => {
                 self.status = format!(
-                    "Not found in the first {} MB scanned",
+                    "Not found in the first {} MB scanned: {what}",
                     crate::hex::FIND_SCAN_CAP / (1024 * 1024)
                 );
             }
@@ -73609,6 +74093,23 @@ fn snippet_completion_item(snip: &crate::snippets::Snippet) -> crate::lsp::Compl
         kind: Some(lsp_types::CompletionItemKind::SNIPPET),
         is_snippet: true,
         ..Default::default()
+    }
+}
+
+impl App {
+    /// The `when` context a key chord is asked about (#1436): the editor, or
+    /// the file tree while the sidebar shows it, as for the mouse. `None`
+    /// elsewhere (another sidebar view, the bottom panel), where only
+    /// unscoped rows fire.
+    fn key_context(&self) -> Option<crate::keymap::MouseContext> {
+        use crate::keymap::MouseContext;
+        match self.focus {
+            Pane::Editor => Some(MouseContext::Editor),
+            Pane::Tree if self.sidebar_view == SidebarView::Explorer => {
+                Some(MouseContext::FileTree)
+            }
+            _ => None,
+        }
     }
 }
 

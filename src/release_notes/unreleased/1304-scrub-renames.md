@@ -1,0 +1,1 @@
+fix: Scrub History follows a renamed file back past the rename, like TIMELINE and blame: commits before a `git mv` show the file under its old name (named in the scrub bar, e.g. `2/4 · old.py`) instead of "did not exist", and the rename commit no longer marks every line as added.

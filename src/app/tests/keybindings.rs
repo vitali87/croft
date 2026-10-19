@@ -1319,6 +1319,107 @@ fn a_user_chord_for_a_terminal_command_works_in_the_terminal() {
     assert!(!app.terminal().visible_text().contains("bound-1562"));
 }
 
+/// Ctrl+Alt+J, the chord the #1436 key tests press.
+fn ctrl_alt_j() -> KeyEvent {
+    key(
+        KeyCode::Char('j'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )
+}
+
+/// #1436: a chord row with `"when": "editor"` fires only while the editor
+/// has focus. The `when` was once ignored on key chords, so the same press
+/// from the Explorer joined lines in the open file behind the user's back.
+#[test]
+fn an_editor_scoped_chord_does_nothing_from_the_file_tree() {
+    let (mut app, _tmp) = tree_app_with_keymap(
+        r#"[{"key": "ctrl+alt+j", "command": "join_lines", "when": "editor"}]"#,
+    );
+    let before = app.editor.lines.clone();
+    app.focus_pane(Pane::Tree);
+    app.handle_key(ctrl_alt_j()).unwrap();
+    assert_eq!(
+        app.editor.lines, before,
+        "the Explorer has focus, so the editor-only row must not edit the file"
+    );
+
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 0;
+    app.handle_key(ctrl_alt_j()).unwrap();
+    assert_eq!(
+        app.editor.lines[0], "let name = value; fn main() {}",
+        "with the editor focused the row runs"
+    );
+}
+
+/// #1436: a scoped row wins in its pane, and an unscoped row for the same
+/// chord still answers everywhere else. Once the later row simply replaced
+/// the earlier one, so the editor's binding ran from the Explorer too.
+#[test]
+fn a_scoped_chord_and_an_unscoped_one_share_a_key() {
+    let (mut app, _tmp) = tree_app_with_keymap(
+        r#"[{"key": "ctrl+alt+j", "command": "quick_open"},
+            {"key": "ctrl+alt+j", "command": "join_lines", "when": "editor"}]"#,
+    );
+    let before = app.editor.lines.clone();
+    app.focus_pane(Pane::Tree);
+    app.handle_key(ctrl_alt_j()).unwrap();
+    assert!(
+        app.file_finder.is_some(),
+        "the Explorer runs the unscoped row"
+    );
+    assert_eq!(app.editor.lines, before, "and not the editor's");
+
+    app.file_finder = None;
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 0;
+    app.handle_key(ctrl_alt_j()).unwrap();
+    assert!(
+        app.file_finder.is_none(),
+        "the editor runs its own row instead"
+    );
+    assert_eq!(app.editor.lines[0], "let name = value; fn main() {}");
+}
+
+/// #1436 negative: a row with no `when` keeps firing from every pane but the
+/// terminal, as before.
+#[test]
+fn an_unscoped_chord_still_fires_from_the_editor_and_the_tree() {
+    for (pane, name) in [(Pane::Editor, "editor"), (Pane::Tree, "tree")] {
+        let (mut app, _tmp) =
+            tree_app_with_keymap(r#"[{"key": "ctrl+alt+j", "command": "quick_open"}]"#);
+        app.focus_pane(pane);
+        app.handle_key(ctrl_alt_j()).unwrap();
+        assert!(app.file_finder.is_some(), "{name}");
+    }
+}
+
+/// #1436 negative: a `file_tree` row fires from the Explorer, and not from
+/// another sidebar view, which has focus as the same pane but is not the
+/// file tree (the rule mouse bindings already follow).
+#[test]
+fn a_file_tree_scoped_chord_fires_only_over_the_explorer() {
+    let (mut app, _tmp) = tree_app_with_keymap(
+        r#"[{"key": "ctrl+alt+j", "command": "quick_open", "when": "file_tree"}]"#,
+    );
+    app.focus_pane(Pane::Tree);
+    app.sidebar_view = SidebarView::Search;
+    app.handle_key(ctrl_alt_j()).unwrap();
+    assert!(app.file_finder.is_none(), "Search is not the file tree");
+
+    // The unbound press fell through to the built-in terminal toggle,
+    // which may have moved focus.
+    app.focus_pane(Pane::Tree);
+    app.sidebar_view = SidebarView::Explorer;
+    app.handle_key(ctrl_alt_j()).unwrap();
+    assert!(app.file_finder.is_some(), "the Explorer is");
+
+    app.file_finder = None;
+    app.focus_pane(Pane::Editor);
+    app.handle_key(ctrl_alt_j()).unwrap();
+    assert!(app.file_finder.is_none(), "and the editor is not");
+}
+
 /// Guard (#843): a `Ctrl`+`K` that leads, then a key that completes no chord,
 /// drops the leader and the key keeps its meaning: `!` is typed where the
 /// caret was, and nothing is killed.
@@ -1687,6 +1788,26 @@ fn a_replay_aborts_visibly_and_keeps_earlier_iterations() {
     );
 }
 
+/// #1464: a paste is one macro step but inserts all of its text, so its
+/// characters count against the replay budget: a 10 KB paste times 100 is
+/// refused, not a megabyte typed into the buffer.
+#[test]
+fn a_macro_paste_counts_its_characters_against_the_replay_budget() {
+    let (mut app, tmp) = vim_app("one\n");
+    app.macros_path = tmp.path().join("macros.json");
+    let mut big = crate::macros::Macro::default();
+    big.push_paste(&"x".repeat(10_000));
+    app.macro_registers.insert("z".into(), big);
+    let before = app.editor.lines[0].clone();
+    vim_feed_str(&mut app, "100@z");
+    assert!(
+        app.status.contains("refused"),
+        "a replay past the budget is refused visibly, got {:?}",
+        app.status
+    );
+    assert_eq!(app.editor.lines[0], before, "and nothing ran");
+}
+
 #[test]
 fn a_non_register_key_after_q_aborts_the_gesture() {
     // The per-character handlers only see plain chars, so an arrow key after
@@ -1733,6 +1854,143 @@ fn a_replayed_key_is_never_recorded_into_the_macro_producing_it() {
         recorded_len,
         "replaying must not append to the register it is replaying"
     );
+}
+
+/// Record the issue's macro on line one of `lines`: End, `: `, a terminal
+/// paste of `paste`, ` ok`, Down. Then replay it once on the next line.
+fn record_and_replay_a_macro_with_a_paste(lines: &[&str], paste: &str) -> App {
+    use crate::widgets::command_palette::Command;
+    let mut app = editor_app_with_lines(lines);
+    app.run_command(Command::MacroStartStopRecording);
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    type_str(&mut app, ": ");
+    app.handle_paste(paste);
+    type_str(&mut app, " ok");
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    app.run_command(Command::MacroStartStopRecording);
+    app.run_command(Command::MacroReplayLast);
+    app
+}
+
+/// #1464: a terminal paste made while recording is part of the macro, and
+/// replay pastes the same text at the new caret.
+#[test]
+fn a_paste_while_recording_a_macro_replays_at_the_new_caret() {
+    let app = record_and_replay_a_macro_with_a_paste(&["alpha", "beta", "gamma"], "PASTED");
+    assert_eq!(app.editor.lines[0], "alpha: PASTED ok");
+    assert_eq!(
+        app.editor.lines[1], "beta: PASTED ok",
+        "the replay pastes too"
+    );
+    assert_eq!(app.editor.lines[2], "gamma");
+}
+
+/// #1464: a multi-line paste replays as pasted. Typed back key by key, its
+/// newlines would pick up the editor's auto-indent line by line.
+#[test]
+fn a_multi_line_paste_in_a_macro_replays_with_its_indentation() {
+    let paste = "{\n  x: 1,\n}";
+    let app = record_and_replay_a_macro_with_a_paste(&["  a", "  b", "  c"], paste);
+    let first: Vec<&str> = app.editor.lines[0..3].iter().map(String::as_str).collect();
+    assert_eq!(
+        first,
+        ["  a: {", "  x: 1,", "} ok"],
+        "the recording pasted as is"
+    );
+    let replayed: Vec<&str> = app.editor.lines[3..6].iter().map(String::as_str).collect();
+    assert_eq!(
+        replayed,
+        ["  b: {", "  x: 1,", "} ok"],
+        "and so does the replay"
+    );
+}
+
+/// #1464: the paste is one step of its own, between the typing around it.
+#[test]
+fn a_paste_is_recorded_as_one_step_of_its_own() {
+    use crate::macros::Step;
+    use crate::widgets::command_palette::Command;
+    let mut app = editor_app_with_lines(&["alpha"]);
+    app.run_command(Command::MacroStartStopRecording);
+    type_str(&mut app, "ab");
+    app.handle_paste("P\nQ");
+    type_str(&mut app, "c");
+    app.run_command(Command::MacroStartStopRecording);
+    let steps = app.macro_last.as_ref().expect("recorded").steps.clone();
+    assert_eq!(
+        steps,
+        vec![
+            Step::Text { text: "ab".into() },
+            Step::Paste {
+                text: "P\nQ".into()
+            },
+            Step::Text { text: "c".into() },
+        ]
+    );
+}
+
+/// #1464 negative: a paste into another pane while recording is not part
+/// of the macro, which captures the editor only, and the Macros channel
+/// says it was skipped, as it does for keys: by size, never its text.
+#[test]
+fn a_paste_into_another_pane_while_recording_is_skipped_and_logged() {
+    use crate::widgets::command_palette::Command;
+    let mut app = editor_app_with_lines(&["alpha"]);
+    app.run_command(Command::MacroStartStopRecording);
+    type_str(&mut app, "x");
+    app.focus_pane(Pane::Tree);
+    app.handle_paste("SKIPPED-PASTE-1464");
+    app.focus_pane(Pane::Editor);
+    app.run_command(Command::MacroStartStopRecording);
+    let steps = app.macro_last.as_ref().expect("recorded").steps.clone();
+    assert_eq!(steps, vec![crate::macros::Step::Text { text: "x".into() }]);
+    let logged = crate::output::snapshot("Macros").unwrap_or_default();
+    assert!(
+        logged
+            .iter()
+            .any(|l| l.text.contains("skipped a paste of 18 chars")),
+        "{logged:?}"
+    );
+    assert!(
+        !logged.iter().any(|l| l.text.contains("SKIPPED-PASTE-1464")),
+        "the pasted text itself stays out of the log"
+    );
+}
+
+/// #1464 negative: a paste the editor's find bar takes while recording never
+/// reached the document, so the macro does not record it and its replay
+/// does not insert it into the text.
+#[test]
+fn a_paste_into_the_find_bar_is_not_recorded_into_the_macro() {
+    use crate::widgets::command_palette::Command;
+    let mut app = editor_app_with_lines(&["a", "b"]);
+    app.run_command(Command::MacroStartStopRecording);
+    app.open_editor_find();
+    assert!(app.focus == Pane::Editor);
+    app.handle_paste("QUERY");
+    app.editor_find = None;
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    app.run_command(Command::MacroStartStopRecording);
+    app.run_command(Command::MacroReplayLast);
+    assert!(
+        app.editor.lines.iter().all(|l| !l.contains("QUERY")),
+        "{:?}",
+        app.editor.lines
+    );
+}
+
+/// #1464 negative: a replayed paste is not recorded again into the macro
+/// replaying it, and pasting with no recording records nothing.
+#[test]
+fn a_replayed_paste_is_never_recorded_again() {
+    let mut app = record_and_replay_a_macro_with_a_paste(&["a", "b"], "P");
+    let len = app.macro_last.as_ref().unwrap().steps.len();
+    app.handle_paste("Z");
+    assert_eq!(app.macro_last.as_ref().unwrap().steps.len(), len);
+    assert!(app.macro_recording.is_none());
 }
 
 #[test]
