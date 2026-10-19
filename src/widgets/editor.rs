@@ -2527,6 +2527,58 @@ pub enum SaveOutcome {
     /// undo cannot bring them back). The save was refused; the caller
     /// surfaces it and sets `lossy_save_armed` to write anyway.
     EncodingLoss,
+    /// The file is the user's own but has its write bit cleared (`chmod
+    /// 444`, #1379). The save was refused rather than replace a file its
+    /// owner protected; the caller asks and sets `overwrite_protected_armed`
+    /// to write anyway, with the file's mode put back afterwards.
+    WriteProtected,
+}
+
+/// Why a file refuses this user's writes (#1379).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteProtection {
+    /// The user owns it and has cleared its write bit: they may write it
+    /// once they say so, and croft restores the mode after.
+    Owned,
+    /// Someone else's file the user may not write (root's `/etc/hosts`):
+    /// only an elevated write can save it.
+    NotOwned,
+}
+
+/// Whether the file at `path` refuses this user's writes (#1379). A file
+/// the user owns is judged by its owner write bit, the way vim and VS Code
+/// do, so a `chmod 444` still reads as protected for root; anyone else's
+/// file by whether the kernel would let this process write it. A missing
+/// file is not protected: saving creates it.
+pub fn write_protection(path: &Path) -> Option<WriteProtection> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.uid() == unsafe { libc::geteuid() } {
+            return (meta.mode() & 0o200 == 0).then_some(WriteProtection::Owned);
+        }
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+        (unsafe { libc::access(c.as_ptr(), libc::W_OK) } != 0).then_some(WriteProtection::NotOwned)
+    }
+    #[cfg(not(unix))]
+    {
+        meta.permissions()
+            .readonly()
+            .then_some(WriteProtection::Owned)
+    }
+}
+
+/// Whether a failed save failed for want of permission (#1379), which an
+/// elevated write can get past where no retry would.
+pub fn is_permission_denied(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    })
 }
 
 /// Per-tab results of an FS-sync sweep across all open tabs
@@ -3257,6 +3309,9 @@ pub struct Editor {
     /// lines at each indent level in a line's leading whitespace, with the
     /// cursor's block highlighted. App-synced from prefs; on by default.
     pub show_indent_guides: bool,
+    /// Ruler columns (#1524, VS Code `editor.rulers`). App-synced from
+    /// prefs; empty by default.
+    pub rulers: Vec<u16>,
     /// Bracket-pair colorization (#131, VS Code on-by-default since 1.67):
     /// per-line `(char column, colour index)` pairs for every `()[]{}` outside
     /// strings and comments, colour cycling by nesting depth
@@ -3554,6 +3609,13 @@ pub struct Editor {
     /// answering an `EncodingLoss` refusal. Set by the explicit-save path
     /// only (never by auto save) and consumed by the write it authorises.
     pub lossy_save_armed: bool,
+    /// The file refuses this user's writes (#1379): the tab wears a lock and
+    /// auto save leaves it alone. Read at open and after each save.
+    pub write_protected: bool,
+    /// One-shot consent to overwrite the user's own write-protected file,
+    /// answering a `WriteProtected` refusal. Set by the explicit-save path
+    /// only and consumed by the write it authorises.
+    pub overwrite_protected_armed: bool,
     /// When the buffer last changed, driving the auto-save delay. `None`
     /// until the first edit.
     pub last_edit_at: Option<std::time::Instant>,
@@ -3672,6 +3734,7 @@ impl Editor {
             final_newline: false,
             decode_lossy: false,
             show_indent_guides: true,
+            rulers: Vec::new(),
             show_bracket_colors: true,
             bracket_colors: Vec::new(),
             protected_ranges: Vec::new(),
@@ -3745,6 +3808,8 @@ impl Editor {
             disk_conflict: false,
             encoding_loss: false,
             lossy_save_armed: false,
+            write_protected: false,
+            overwrite_protected_armed: false,
             last_edit_at: None,
             last_edit_pos: None,
         }
@@ -5623,6 +5688,10 @@ impl Editor {
         // encoded as is no longer this tab's problem.
         self.encoding_loss = false;
         self.lossy_save_armed = false;
+        // Say up front that the file can't be written, not at the first
+        // save after the work is done (#1379).
+        self.write_protected = write_protection(path).is_some();
+        self.overwrite_protected_armed = false;
         self.lang = crate::highlight::lang_for_path(path);
         self.wrap_override = None;
         // Folds are line numbers into the OLD file. A preview tab is reused for
@@ -11218,13 +11287,29 @@ impl Editor {
             self.encoding_loss = true;
             return Ok(SaveOutcome::EncodingLoss);
         }
+        // A file its owner write-protected is not replaced without asking
+        // (#1379): the rename below would otherwise go straight past the
+        // missing write bit. Someone else's file goes on to fail with the
+        // kernel's own "Permission denied", which the caller turns into the
+        // offer of an elevated save.
+        let protection = write_protection(&path);
+        self.write_protected = protection.is_some();
+        let lift = protection == Some(WriteProtection::Owned);
+        if lift && !self.overwrite_protected_armed {
+            return Ok(SaveOutcome::WriteProtected);
+        }
         // The folder can go while the tab is open (a `git checkout` of a
         // branch without it, #1203). Put it back, as VS Code does, rather
         // than strand the edits; a path that can't be a folder still fails.
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)?;
         }
-        if let Err(e) = crate::prefs::replace_file_contents(&path, &encoded) {
+        let written = if lift {
+            Self::write_lifting_protection(&path, &encoded)
+        } else {
+            crate::prefs::replace_file_contents(&path, &encoded)
+        };
+        if let Err(e) = written {
             // Only a write that got as far as changing the file makes what
             // is on disk croft's own doing: a stale stamp then made the sync
             // sweep offer to "reload" it over the only good copy. An
@@ -11238,6 +11323,7 @@ impl Editor {
         self.decode_lossy = false;
         self.encoding_loss = false;
         self.lossy_save_armed = false;
+        self.overwrite_protected_armed = false;
         self.dirty = false;
         // The next keystroke opens a fresh undo step: coalescing across the
         // save point would make one Cmd+Z discard work from both sides.
@@ -11247,6 +11333,69 @@ impl Editor {
         // prior conflict is resolved.
         self.mark_synced_with_disk();
         Ok(SaveOutcome::Saved)
+    }
+
+    /// Overwrite the user's own write-protected file (#1379): give it the
+    /// owner write bit for the length of the write, then put its mode back,
+    /// whether or not the write landed, so the file stays protected.
+    fn write_lifting_protection(
+        path: &Path,
+        bytes: &[u8],
+    ) -> std::result::Result<(), crate::prefs::ReplaceError> {
+        let untouched = |error| crate::prefs::ReplaceError {
+            error,
+            touched: false,
+        };
+        let target = std::fs::canonicalize(path).map_err(untouched)?;
+        let mode = std::fs::metadata(&target).map_err(untouched)?.permissions();
+        let mut writable = mode.clone();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            writable.set_mode(mode.mode() | 0o200);
+        }
+        #[cfg(not(unix))]
+        #[allow(clippy::permissions_set_readonly_false)]
+        writable.set_readonly(false);
+        std::fs::set_permissions(&target, writable).map_err(untouched)?;
+        let written = crate::prefs::replace_file_contents(&target, bytes);
+        let restored = std::fs::set_permissions(&target, mode);
+        written?;
+        restored.map_err(|error| crate::prefs::ReplaceError {
+            error,
+            touched: true,
+        })
+    }
+
+    /// The bytes a save would write now, with the save-time `.editorconfig`
+    /// fixes applied to the buffer first, as a save applies them. None when
+    /// writing them would lose characters (see `SaveOutcome::EncodingLoss`).
+    pub fn prepare_bytes_for_save(&mut self) -> Option<Vec<u8>> {
+        self.apply_editorconfig_on_save();
+        let content = self.content_for_disk();
+        let (encoded, had_errors) = self.encode_for_disk(&content);
+        let writes_replacements = self.decode_lossy && content.contains('\u{fffd}');
+        (!had_errors && !writes_replacements).then_some(encoded)
+    }
+
+    /// Settle a save another process made on this tab's behalf (#1379's
+    /// `sudo tee`): when the file now holds exactly `written`, the buffer is
+    /// in sync with it, and clean unless it was edited since. Returns false,
+    /// changing nothing, while the file holds anything else.
+    pub fn settle_save_made_elsewhere(&mut self, written: &[u8]) -> bool {
+        let Some(path) = self.path.clone() else {
+            return false;
+        };
+        if std::fs::read(&path).ok().as_deref() != Some(written) {
+            return false;
+        }
+        self.dirty = self.bytes_for_disk().as_deref() != Some(written);
+        self.write_protected = write_protection(&path).is_some();
+        // A consent to overwrite was for a save this one has now made.
+        self.overwrite_protected_armed = false;
+        self.last_edit_kind = None;
+        self.mark_synced_with_disk();
+        true
     }
 
     pub fn move_up(&mut self) {
@@ -13245,6 +13394,244 @@ impl Editor {
         true
     }
 
+    /// The buffer as one string, for the Emmet commands that edit markup
+    /// already written (#1557), and `(row, col)` as a byte offset into it.
+    fn emmet_text_and_offset(&self, row: usize, col: usize) -> (String, usize) {
+        let text = self.lines.join("\n");
+        let before: usize = self.lines[..row.min(self.lines.len())]
+            .iter()
+            .map(|l| l.len() + 1)
+            .sum();
+        let line = self.lines.get(row).map_or("", String::as_str);
+        let in_line = line.char_indices().nth(col).map_or(line.len(), |(i, _)| i);
+        (text, before + in_line)
+    }
+
+    /// Byte offset `at` of `text` as a (row, char column).
+    fn emmet_position(text: &str, at: usize) -> (usize, usize) {
+        let head = &text[..at.min(text.len())];
+        let row = head.matches('\n').count();
+        let start = head.rfind('\n').map_or(0, |i| i + 1);
+        (row, head[start..].chars().count())
+    }
+
+    /// Make the buffer `text`, as one undo step, rewriting only the lines
+    /// that changed.
+    fn emmet_set_text(&mut self, text: &str) {
+        let new: Vec<String> = text.split('\n').map(String::from).collect();
+        let (head, tail) = {
+            let old = &self.lines;
+            let head = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+            let room = old.len().min(new.len()) - head;
+            let tail = old
+                .iter()
+                .rev()
+                .zip(new.iter().rev())
+                .take(room)
+                .take_while(|(a, b)| a == b)
+                .count();
+            (head, tail)
+        };
+        self.pin_on_edit();
+        self.push_undo(EditKind::EmmetExpand);
+        self.last_edit_kind = None;
+        let old_end = self.lines.len() - tail;
+        let added = new.len() - tail - head;
+        self.lines
+            .splice(head..old_end, new[head..new.len() - tail].iter().cloned());
+        // Rows below the rewrite keep their seats; the rewritten rows are
+        // markup croft generated.
+        self.provenance.splice(head, old_end - head, added);
+        self.provenance
+            .record(head..head + added, crate::provenance::Seat::Generated);
+        self.provenance.truncate(self.lines.len());
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+    }
+
+    /// Emmet: Wrap with Abbreviation (#1557): wrap the selected lines in
+    /// `abbr`, one level in, at their own indentation; a selection inside
+    /// one line is wrapped where it stands. With nothing selected it wraps
+    /// the element around the caret, as VS Code does, or the caret's line
+    /// outside any element. Returns whether anything was wrapped.
+    pub fn emmet_wrap(&mut self, abbr: &str) -> bool {
+        use crate::emmet::WrapContent;
+        let Some(profile) = self.emmet_profile() else {
+            return false;
+        };
+        let unit = self.indent_unit();
+        let sel = self
+            .selection
+            .filter(|s| s.has_area())
+            .map(|s| s.normalised())
+            .or_else(|| self.emmet_element_at_caret());
+        if let Some(((r0, c0), (r1, c1))) = sel
+            && r0 == r1
+        {
+            let chars: Vec<char> = self.lines[r0].chars().collect();
+            let before: String = chars[..c0].iter().collect();
+            let after: String = chars[c1.min(chars.len())..].iter().collect();
+            if !before.trim().is_empty() || !after.trim().is_empty() {
+                let picked: String = chars[c0..c1.min(chars.len())].iter().collect();
+                let Some(markup) =
+                    crate::emmet::wrap(abbr, WrapContent::Inline(&picked), &unit, profile)
+                else {
+                    return false;
+                };
+                let markup = markup.trim_end_matches('\n');
+                let (text, at) = self.emmet_text_and_offset(r0, c0);
+                let end = at + picked.len();
+                let new = format!("{}{markup}{}", &text[..at], &text[end..]);
+                self.emmet_set_text(&new);
+                (self.cursor_row, self.cursor_col) = Self::emmet_position(&new, at);
+                self.clear_selection();
+                self.ensure_cursor_col_visible();
+                return true;
+            }
+        }
+        let (first, last) = match sel {
+            // A selection ending at the start of a line leaves that line out.
+            Some(((r0, _), (r1, 0))) if r1 > r0 => (r0, r1 - 1),
+            Some(((r0, _), (r1, _))) => (r0, r1),
+            None => (self.cursor_row, self.cursor_row),
+        };
+        let rows = &self.lines[first..=last.min(self.lines.len() - 1)];
+        if rows.iter().all(|l| l.trim().is_empty()) {
+            return false;
+        }
+        // The lines' shared indentation stays outside the new element.
+        let base: String = rows
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                l.chars()
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .collect::<String>()
+            })
+            .min_by_key(String::len)
+            .unwrap_or_default();
+        let content: Vec<String> = rows
+            .iter()
+            .map(|l| {
+                l.strip_prefix(base.as_str())
+                    .unwrap_or(l.trim_start())
+                    .to_string()
+            })
+            .collect();
+        let Some(markup) = crate::emmet::wrap(abbr, WrapContent::Lines(&content), &unit, profile)
+        else {
+            return false;
+        };
+        let wrapped: Vec<String> = markup
+            .trim_end_matches('\n')
+            .split('\n')
+            .map(|l| {
+                if l.is_empty() {
+                    String::new()
+                } else {
+                    format!("{base}{l}")
+                }
+            })
+            .collect();
+        let mut lines = self.lines.clone();
+        lines.splice(first..=last, wrapped);
+        self.emmet_set_text(&lines.join("\n"));
+        self.cursor_row = first;
+        self.cursor_col = base.chars().count();
+        self.clear_selection();
+        self.ensure_cursor_col_visible();
+        true
+    }
+
+    /// The span of the element around the caret, a caret just past its
+    /// closing `>` included, for a wrap with nothing selected.
+    fn emmet_element_at_caret(&self) -> Option<((usize, usize), (usize, usize))> {
+        let (text, at) = self.emmet_text_and_offset(self.cursor_row, self.cursor_col);
+        let element = crate::emmet::enclosing(&text, at)
+            .or_else(|| crate::emmet::enclosing(&text, at.checked_sub(1)?))?;
+        let span = element.outer();
+        Some((
+            Self::emmet_position(&text, span.start),
+            Self::emmet_position(&text, span.end),
+        ))
+    }
+
+    /// Emmet: Remove Tag (#1557): take away the tags of the element around
+    /// the caret, keeping its content.
+    pub fn emmet_remove_tag(&mut self) -> bool {
+        if self.emmet_profile().is_none() {
+            return false;
+        }
+        let unit = self.indent_unit();
+        let (text, at) = self.emmet_text_and_offset(self.cursor_row, self.cursor_col);
+        let Some((new, caret)) = crate::emmet::remove_tag(&text, at, &unit) else {
+            return false;
+        };
+        self.emmet_set_text(&new);
+        (self.cursor_row, self.cursor_col) = Self::emmet_position(&new, caret);
+        self.clear_selection();
+        self.ensure_cursor_col_visible();
+        true
+    }
+
+    /// Emmet: Update Tag (#1557): rename the element around the caret.
+    pub fn emmet_update_tag(&mut self, name: &str) -> bool {
+        if self.emmet_profile().is_none() {
+            return false;
+        }
+        let (text, at) = self.emmet_text_and_offset(self.cursor_row, self.cursor_col);
+        let Some(new) = crate::emmet::rename_tag(&text, at, name) else {
+            return false;
+        };
+        self.emmet_set_text(&new);
+        true
+    }
+
+    /// Emmet: Go to Matching Pair (#1557): from an opening tag to its
+    /// closing tag, and back.
+    pub fn emmet_match_tag(&mut self) -> bool {
+        if self.emmet_profile().is_none() {
+            return false;
+        }
+        let (text, at) = self.emmet_text_and_offset(self.cursor_row, self.cursor_col);
+        let Some(to) = crate::emmet::matching_tag(&text, at) else {
+            return false;
+        };
+        (self.cursor_row, self.cursor_col) = Self::emmet_position(&text, to);
+        self.clear_selection();
+        self.ensure_cursor_col_visible();
+        true
+    }
+
+    /// Emmet: Balance outward / inward (#1557): grow the selection to the
+    /// enclosing element's content, then the element, and so on outward, or
+    /// walk it back in.
+    pub fn emmet_balance(&mut self, outward: bool) -> bool {
+        if self.emmet_profile().is_none() {
+            return false;
+        }
+        let ((r0, c0), (r1, c1)) = self.selection.map(|s| s.normalised()).unwrap_or((
+            (self.cursor_row, self.cursor_col),
+            (self.cursor_row, self.cursor_col),
+        ));
+        let (text, start) = self.emmet_text_and_offset(r0, c0);
+        let end = self.emmet_text_and_offset(r1, c1).1;
+        let range = if outward {
+            crate::emmet::balance_out(&text, start..end)
+        } else {
+            crate::emmet::balance_in(&text, start..end)
+        };
+        let Some(range) = range else {
+            return false;
+        };
+        let anchor = Self::emmet_position(&text, range.start);
+        let head = Self::emmet_position(&text, range.end);
+        self.selection = Some(EditorSelection { anchor, head });
+        (self.cursor_row, self.cursor_col) = head;
+        self.ensure_cursor_col_visible();
+        true
+    }
+
     /// VS Code "Transpose Characters around the Cursor"
     /// (`editor.action.transpose`): swap the character before the cursor with
     /// the one after it and advance the cursor (emacs `transpose-chars`). At
@@ -15021,6 +15408,21 @@ fn title_case(s: &str) -> String {
             prev_alnum = false;
         }
     }
+    out
+}
+
+/// Most rulers kept (#1524). A repository's `.croft/config.json` may set
+/// `rulers`, and the painter walks them for every visible row, so the list
+/// is bounded before it reaches an editor.
+pub const MAX_RULERS: usize = 16;
+
+/// The `rulers` setting as an editor keeps it: ascending, without
+/// duplicates, and at most `MAX_RULERS` columns.
+pub fn normalize_rulers(rulers: &[u16]) -> Vec<u16> {
+    let mut out = rulers.to_vec();
+    out.sort_unstable();
+    out.dedup();
+    out.truncate(MAX_RULERS);
     out
 }
 
@@ -18464,6 +18866,38 @@ impl Widget for &mut Editor {
             // hides the underlying character.
         }
 
+        // Rulers (#1524, VS Code `editor.rulers`): a dim │ at each ruler
+        // column down the whole text area, past the end of the file too.
+        // Blank cells only, so text always wins, as with the indent guides;
+        // a long line runs over its ruler, which still shows the limit. The
+        // column is fixed on screen: the flat path shifts it by the
+        // horizontal scroll, and in wrap mode every visual row carries it.
+        if !self.rulers.is_empty() {
+            let ruler_fg = self.theme.ruler();
+            let shift = if wrap { 0 } else { self.scroll_col };
+            for row in 0..text_height {
+                if matches!(visual_rows.get(row), Some(VisRow::Box { .. })) {
+                    continue;
+                }
+                let y = inner.y + row as u16;
+                for &ruler in &self.rulers {
+                    let Some(col) = usize::from(ruler).checked_sub(shift) else {
+                        continue;
+                    };
+                    if col >= text_width as usize {
+                        continue;
+                    }
+                    let cell = &mut buf[(text_x + col as u16, y)];
+                    if cell.symbol() != " " {
+                        continue;
+                    }
+                    cell.set_symbol("\u{2502}");
+                    let style = cell.style().fg(ruler_fg);
+                    cell.set_style(style);
+                }
+            }
+        }
+
         // Ghost caret name tags (VS Code Live Share): while a peer's caret is
         // inside its fade window the App feeds a label here, painted on the
         // visual row above the caret — below when the caret sits on the
@@ -21599,6 +22033,12 @@ fn tab_label(e: &Editor) -> String {
     } else if let Some(view) = e.symbol_view.as_ref() {
         // A symbol tab (#369) leads with its symbol; the file says where.
         format!("{} \u{b7} {name}", view.name)
+    } else {
+        name
+    };
+    // The lock VS Code shows on a file the user can't write (#1379).
+    let name = if e.write_protected {
+        format!("{name} \u{f023}")
     } else {
         name
     };
@@ -30259,6 +30699,140 @@ mod tests {
         assert!(!e.decode_lossy);
     }
 
+    /// #1379: a file its owner `chmod 444`ed.
+    #[cfg(unix)]
+    fn protected_file(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("nginx.conf");
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_protected_file_opens_locked_and_its_save_asks_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = protected_file(dir.path(), "listen 80;\n");
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        assert!(e.write_protected, "flagged at open, before any edit");
+        assert_eq!(tab_label(&e), "nginx.conf \u{f023}");
+        e.insert_char('#');
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::WriteProtected);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "listen 80;\n");
+        assert!(e.dirty, "the edit is still only in the buffer");
+        e.overwrite_protected_armed = true;
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "#listen 80;\n");
+        assert_eq!(mode_of(&path), 0o444, "the file stays protected");
+        assert!(
+            !e.overwrite_protected_armed,
+            "the consent was for one write"
+        );
+        assert!(e.write_protected);
+        assert!(!e.dirty);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overwriting_a_protected_file_through_a_symlink_keeps_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = protected_file(dir.path(), "a\n");
+        let link = dir.path().join("link.conf");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut e = Editor::new();
+        e.open(&link).unwrap();
+        assert!(e.write_protected);
+        e.insert_char('b');
+        e.overwrite_protected_armed = true;
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "ba\n");
+        assert_eq!(mode_of(&target), 0o444);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_writable_file_opens_unlocked_and_saves_at_once() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.conf");
+        std::fs::write(&path, "a\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        assert!(!e.write_protected);
+        assert_eq!(tab_label(&e), "site.conf");
+        e.insert_char('b');
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert_eq!(mode_of(&path), 0o644);
+        assert_eq!(write_protection(&dir.path().join("new.conf")), None);
+    }
+
+    #[test]
+    fn only_a_permission_error_reads_as_permission_denied() {
+        let denied =
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                .context("writing /etc/hosts");
+        assert!(is_permission_denied(&denied));
+        for other in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::StorageFull,
+            std::io::ErrorKind::Other,
+        ] {
+            let e = anyhow::Error::from(std::io::Error::from(other));
+            assert!(!is_permission_denied(&e), "{other:?}");
+        }
+        assert!(!is_permission_denied(&anyhow::anyhow!("permission denied")));
+    }
+
+    #[test]
+    fn a_save_made_elsewhere_settles_only_on_the_exact_bytes() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "old\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.insert_char('n');
+        e.overwrite_protected_armed = true;
+        let bytes = e.prepare_bytes_for_save().unwrap();
+        assert_eq!(bytes, b"nold\n");
+        std::fs::write(tmp.path(), "someone else\n").unwrap();
+        assert!(!e.settle_save_made_elsewhere(&bytes));
+        assert!(e.dirty);
+        std::fs::write(tmp.path(), &bytes).unwrap();
+        assert!(e.settle_save_made_elsewhere(&bytes));
+        assert!(!e.dirty);
+        assert!(
+            !e.disk_changed_externally(),
+            "the write is the buffer's own"
+        );
+        assert!(
+            !e.overwrite_protected_armed,
+            "a consent to overwrite does not outlive the save"
+        );
+    }
+
+    #[test]
+    fn an_edit_made_while_a_save_was_elsewhere_stays_dirty() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "old\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.insert_char('n');
+        let bytes = e.prepare_bytes_for_save().unwrap();
+        e.insert_char('m');
+        std::fs::write(tmp.path(), &bytes).unwrap();
+        assert!(e.settle_save_made_elsewhere(&bytes));
+        assert!(e.dirty, "the later edit is not on disk");
+    }
+
     #[test]
     fn a_language_servers_utf16_columns_land_after_an_emoji() {
         let mut lines = vec![String::from("let s = \"😀\"; x + 1")];
@@ -37273,6 +37847,88 @@ mod tests {
         );
     }
 
+    // ---- Rulers (editor.rulers, #1524) ----
+
+    #[test]
+    fn rulers_draw_down_blank_cells_and_past_the_end_of_the_file() {
+        let mut e = editor_with("xxxxxxxxxxxxxxxxxxxx\n\nshort");
+        e.rulers = vec![10, 15];
+        let buf = guide_buf(&mut e, 50, 8);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        let r = e.theme.ruler();
+        assert_eq!(
+            buf[(text_x + 10, y0)].symbol(),
+            "x",
+            "a long line runs over the ruler: text wins"
+        );
+        for row in [1, 2, 4] {
+            for col in [10, 15] {
+                let cell = &buf[(text_x + col, y0 + row)];
+                assert_eq!(cell.symbol(), "\u{2502}", "ruler {col} on row {row}");
+                assert_eq!(cell.fg, r);
+            }
+        }
+        assert_eq!(
+            buf[(text_x + 9, y0 + 1)].symbol(),
+            " ",
+            "only at the column"
+        );
+    }
+
+    #[test]
+    fn rulers_follow_the_horizontal_scroll() {
+        // A long first line, so the pane really scrolls.
+        let mut e = editor_with(&format!("{}\n\nb", "w".repeat(90)));
+        e.rulers = vec![10];
+        e.scroll_col = 4;
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        assert_eq!(buf[(text_x + 6, y0 + 1)].symbol(), "\u{2502}");
+        assert_eq!(buf[(text_x + 10, y0 + 1)].symbol(), " ");
+        e.scroll_col = 12;
+        let buf = guide_buf(&mut e, 40, 6);
+        let row: String = (0..30)
+            .map(|c| buf[(text_x + c, y0 + 1)].symbol().to_string())
+            .collect();
+        assert!(
+            !row.contains('\u{2502}'),
+            "a ruler scrolled off is not drawn: {row:?}"
+        );
+    }
+
+    #[test]
+    fn no_rulers_or_rulers_past_the_pane_draw_nothing() {
+        for rulers in [vec![], vec![500]] {
+            let mut e = editor_with("a\n\nb");
+            e.rulers = rulers.clone();
+            let buf = guide_buf(&mut e, 40, 6);
+            let text_x = e.last_inner.x + e.last_gutter_width + 1;
+            let y0 = e.last_inner.y;
+            for row in 0..4 {
+                let text: String = (0..30)
+                    .map(|c| buf[(text_x + c, y0 + row)].symbol().to_string())
+                    .collect();
+                assert!(
+                    !text.contains('\u{2502}'),
+                    "{rulers:?}, row {row}: {text:?}"
+                );
+            }
+        }
+    }
+
+    /// A repository config can list any number of rulers; an editor keeps
+    /// them sorted, deduplicated, and at most `MAX_RULERS`.
+    #[test]
+    fn ruler_lists_are_sorted_deduplicated_and_capped() {
+        assert_eq!(normalize_rulers(&[100, 80, 100, 80]), vec![80, 100]);
+        let huge: Vec<u16> = (0..50_000u32).map(|i| (i % 4000) as u16).collect();
+        let kept = normalize_rulers(&huge);
+        assert_eq!(kept.len(), MAX_RULERS);
+        assert!(kept.windows(2).all(|w| w[0] < w[1]));
+    }
+
     #[test]
     fn guide_indent_width_resolves_blank_lines_from_neighbours() {
         let e = editor_with("def f():\n    a = 1\n\n    b = 2\n\ndef g():\n    pass");
@@ -38780,6 +39436,30 @@ mod tests {
         e.dirty = false;
         assert!(e.expand_emmet_abbreviation());
         assert!(e.dirty, "an expansion is an edit");
+    }
+
+    /// #1557: a wrap or tag removal that changes the line count moves the
+    /// provenance of the rows below with them, and leaves none past the end.
+    #[test]
+    fn emmet_rewrites_keep_provenance_on_the_rows_below() {
+        use crate::provenance::Seat;
+        let mut e = html_editor("Home\nAbout\ntail", 0);
+        e.cursor_row = 0;
+        e.provenance.record(2..3, Seat::Peer(String::from("ada")));
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (1, 5),
+        });
+        assert!(e.emmet_wrap("ul>li*"));
+        assert_eq!(e.lines.len(), 5);
+        assert_eq!(e.provenance.seat(4), Some(&Seat::Peer(String::from("ada"))));
+        assert_eq!(e.provenance.seat(0), Some(&Seat::Generated));
+        e.cursor_row = 0;
+        e.cursor_col = 1;
+        assert!(e.emmet_remove_tag());
+        assert_eq!(e.lines.len(), 3);
+        assert_eq!(e.provenance.seat(2), Some(&Seat::Peer(String::from("ada"))));
+        assert!(e.provenance.seat(3).is_none() && e.provenance.seat(4).is_none());
     }
 
     #[test]
