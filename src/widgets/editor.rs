@@ -2218,13 +2218,25 @@ pub struct TextSpanEdit {
 /// earlier replacement never shifts the coordinates of a later one. Returns
 /// the number of edits applied. Out-of-range edits are skipped.
 pub fn apply_span_edits_to_lines(lines: &mut Vec<String>, edits: &[TextSpanEdit]) -> usize {
-    let mut applied = 0;
-    for (e, count) in in_application_order(char_span_edits(lines, edits)) {
-        if replace_span(lines, &e) {
-            applied += count;
-        }
-    }
-    applied
+    let converted = char_span_edits(lines, edits);
+    apply_char_span_edits(lines, converted)
+        .iter()
+        .map(|(_, count)| count)
+        .sum()
+}
+
+/// Apply char-column `edits` in [`in_application_order`] and return the
+/// ones that landed, in the order applied, each with the number of edits it
+/// stands for; out-of-range edits are skipped and left out, so the caret is
+/// mapped only through text that actually changed.
+fn apply_char_span_edits(
+    lines: &mut Vec<String>,
+    edits: Vec<TextSpanEdit>,
+) -> Vec<(TextSpanEdit, usize)> {
+    in_application_order(edits)
+        .into_iter()
+        .filter(|(e, _)| replace_span(lines, e))
+        .collect()
 }
 
 /// `edits` with their UTF-16 columns read as chars. Every edit names the
@@ -2268,9 +2280,59 @@ fn in_application_order(mut edits: Vec<TextSpanEdit>) -> Vec<(TextSpanEdit, usiz
     joined
 }
 
+/// Where the text `e` writes ends, in the coordinates after it lands.
+fn span_new_end(e: &TextSpanEdit) -> (usize, usize) {
+    let rows = e.new_text.matches('\n').count();
+    let last = e.new_text.rsplit('\n').next().unwrap_or("").chars().count();
+    match rows {
+        0 => (e.start.0, e.start.1 + last),
+        _ => (e.start.0 + rows, last),
+    }
+}
+
+/// `pos` moved past an edit that ends at or before it: by the rows the edit
+/// added or removed and, when it ends on `pos`'s row, by the change in that
+/// row's text before `pos`.
+fn shift_past_span(
+    pos: (usize, usize),
+    e: &TextSpanEdit,
+    new_end: (usize, usize),
+) -> (usize, usize) {
+    if pos.0 == e.end.0 {
+        (new_end.0, new_end.1 + pos.1 - e.end.1)
+    } else {
+        (pos.0 + new_end.0 - e.end.0, pos.1)
+    }
+}
+
+/// Where `pos` lands once char-column `edits` are applied (#1603): the
+/// caret follows its text. An edit ending at or before `pos` shifts it past
+/// the edit; a `pos` inside a replaced range keeps its row and column,
+/// clamped to the end of the new text, so a whole-document format leaves the
+/// caret on its line number as before and a deletion pulls it to where the
+/// range began; edits after `pos` leave it alone. Mapped bottom-up, the
+/// order the edits are applied in, so each edit's coordinates still name the
+/// text it was written against.
+pub fn map_through_span_edits(pos: (usize, usize), edits: &[TextSpanEdit]) -> (usize, usize) {
+    let mut order: Vec<&TextSpanEdit> = edits.iter().filter(|e| e.end >= e.start).collect();
+    order.sort_by_key(|e| std::cmp::Reverse(e.start));
+    order.into_iter().fold(pos, |p, e| {
+        if p < e.end && p <= e.start {
+            return p;
+        }
+        let new_end = span_new_end(e);
+        match p < e.end {
+            true => p.min(new_end),
+            false => shift_past_span(p, e, new_end),
+        }
+    })
+}
+
 /// Where `pos` (char columns) lands once `edits` apply to `lines`: moved by
 /// the text every edit before it adds or removes. A position inside an edit
-/// lands at the end of its new text.
+/// lands at the end of its new text, unlike [`map_through_span_edits`]:
+/// format on type rewrites the line just typed, and the caret belongs after
+/// the text it typed, not at its old column (#1633).
 pub fn position_after_span_edits(
     lines: &[String],
     pos: (usize, usize),
@@ -2281,18 +2343,10 @@ pub fn position_after_span_edits(
         if pos < e.start || (pos == e.start && e.start != e.end) {
             continue;
         }
-        let rows = e.new_text.matches('\n').count();
-        let last = e.new_text.rsplit('\n').next().unwrap_or("").chars().count();
-        let new_end = match rows {
-            0 => (e.start.0, e.start.1 + last),
-            _ => (e.start.0 + rows, last),
-        };
-        pos = if pos < e.end {
-            new_end
-        } else if pos.0 == e.end.0 {
-            (new_end.0, new_end.1 + pos.1 - e.end.1)
-        } else {
-            (pos.0 + new_end.0 - e.end.0, pos.1)
+        let new_end = span_new_end(&e);
+        pos = match pos < e.end {
+            true => new_end,
+            false => shift_past_span(pos, &e, new_end),
         };
     }
     pos
@@ -8093,9 +8147,12 @@ impl Editor {
         }
         self.pin_on_edit();
         self.push_undo(EditKind::Paste);
-        let n = apply_span_edits_to_lines(&mut self.lines, edits);
+        let edits = char_span_edits(&self.lines, edits);
+        let applied = apply_char_span_edits(&mut self.lines, edits);
+        let n = applied.iter().map(|(_, count)| count).sum();
         if n > 0 {
-            for (e, _) in in_application_order(edits.to_vec()) {
+            self.follow_span_edits(&applied);
+            for (e, _) in &applied {
                 let removed = e.end.0.saturating_sub(e.start.0) + 1;
                 let added = e.new_text.matches('\n').count() + 1;
                 self.provenance.splice(e.start.0, removed, added);
@@ -8145,12 +8202,36 @@ impl Editor {
         }
         self.pin_on_edit();
         self.push_undo_step(EditKind::Paste, group);
-        let n = apply_span_edits_to_lines(&mut self.lines, edits);
+        let edits = char_span_edits(&self.lines, edits);
+        let applied = apply_char_span_edits(&mut self.lines, edits);
+        let n = applied.iter().map(|(_, count)| count).sum();
         if n > 0 {
+            self.follow_span_edits(&applied);
             self.mark_buffer_changed();
             self.recompute_highlights();
         }
         n
+    }
+
+    /// Move the caret, the selection and every extra caret with the text
+    /// they were on through char-column `edits` just applied (#1603): an
+    /// Add import above the caret left it on its old line number, inside
+    /// the grown import block, where the next keystrokes landed.
+    fn follow_span_edits(&mut self, applied: &[(TextSpanEdit, usize)]) {
+        let edits: Vec<TextSpanEdit> = applied.iter().map(|(e, _)| e.clone()).collect();
+        let map = |p: (usize, usize)| map_through_span_edits(p, &edits);
+        (self.cursor_row, self.cursor_col) = map((self.cursor_row, self.cursor_col));
+        let last = self.lines.len().saturating_sub(1);
+        let lines = &self.lines;
+        let clamp = |(r, c): (usize, usize)| {
+            let r = r.min(last);
+            (r, c.min(lines.get(r).map_or(0, |l| l.chars().count())))
+        };
+        for sel in self.selection.iter_mut().chain(self.carets.iter_mut()) {
+            sel.anchor = clamp(map(sel.anchor));
+            sel.head = clamp(map(sel.head));
+        }
+        self.clamp_cursor();
     }
 
     /// Close a remote edit group (#1207): later spans open a new undo step,
@@ -27803,6 +27884,154 @@ mod tests {
         assert_eq!(e.lines[0], "return a - b + c", "an ended group is closed");
         assert!(e.undo());
         assert_eq!(e.lines[0], "return a - b");
+    }
+
+    fn span(start: (usize, usize), end: (usize, usize), new_text: &str) -> TextSpanEdit {
+        TextSpanEdit {
+            start,
+            end,
+            new_text: new_text.to_string(),
+            utf16: false,
+        }
+    }
+
+    /// #1603: lines added above the caret carry it down with its text.
+    #[test]
+    fn an_edit_adding_lines_above_the_caret_moves_it_down_with_its_text() {
+        let mut e = editor_with("0\n1\n2\n3\n4\n\tname := strings.ToUpper()\n6");
+        e.cursor_row = 5;
+        e.cursor_col = 8;
+        e.apply_span_edits(&[span((2, 0), (2, 0), "a\nb\nc\n")]);
+        assert_eq!((e.cursor_row, e.cursor_col), (8, 8));
+        e.insert_char('m');
+        assert_eq!(e.lines[8], "\tname :=m strings.ToUpper()");
+    }
+
+    /// #1603: a longer name earlier on the caret's row moves its column,
+    /// once per occurrence before it.
+    #[test]
+    fn a_longer_name_earlier_on_the_caret_s_row_moves_its_column() {
+        let mut e = editor_with("x = x + 1");
+        e.cursor_col = 8;
+        e.apply_span_edits(&[span((0, 0), (0, 1), "total"), span((0, 4), (0, 5), "total")]);
+        assert_eq!(e.lines[0], "total = total + 1");
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 16));
+    }
+
+    /// #1603: columns a language server sends in UTF-16 units move the
+    /// caret by chars, past an emoji on its row.
+    #[test]
+    fn a_utf16_edit_before_the_caret_moves_it_by_chars() {
+        let mut e = editor_with("😀x = 1");
+        e.cursor_col = 5;
+        let mut edit = span((0, 2), (0, 3), "total");
+        edit.utf16 = true;
+        e.apply_span_edits(&[edit]);
+        assert_eq!(e.lines[0], "😀total = 1");
+        assert_eq!(e.cursor_col, 9, "still before the 1");
+    }
+
+    /// #1603: a caret inside a deleted range lands where the range began.
+    #[test]
+    fn a_caret_inside_a_deleted_range_lands_at_its_start() {
+        let mut e = editor_with("keep\nab-gone\ngone\ngone-cd\nlast");
+        e.cursor_row = 2;
+        e.cursor_col = 3;
+        e.apply_span_edits(&[span((1, 2), (3, 5), "")]);
+        assert_eq!(e.lines, vec!["keep", "abcd", "last"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 2));
+    }
+
+    /// #1603: the selection and every extra caret follow their text too.
+    #[test]
+    fn the_selection_and_extra_carets_follow_an_edit_above_them() {
+        let mut e = editor_with("top\nfoo\nbar\nbaz");
+        e.cursor_row = 1;
+        e.cursor_col = 3;
+        e.selection = Some(EditorSelection {
+            anchor: (1, 0),
+            head: (1, 3),
+        });
+        e.carets = vec![EditorSelection::new(2, 1), EditorSelection::new(3, 2)];
+        e.apply_span_edits(&[span((0, 0), (0, 0), "use x;\nuse y;\n")]);
+        assert_eq!((e.cursor_row, e.cursor_col), (3, 3));
+        assert_eq!(
+            e.selection,
+            Some(EditorSelection {
+                anchor: (3, 0),
+                head: (3, 3),
+            })
+        );
+        assert_eq!(
+            e.carets,
+            vec![EditorSelection::new(4, 1), EditorSelection::new(5, 2)]
+        );
+    }
+
+    /// #1603: a peer's lines arriving above the caret keep it on its text.
+    #[test]
+    fn a_remote_edit_above_the_caret_moves_it_with_its_text() {
+        let mut e = editor_with("one\ntwo");
+        e.cursor_row = 1;
+        e.cursor_col = 2;
+        e.apply_remote_span_edits(&[span((0, 0), (0, 0), "zero\n")], 3);
+        assert_eq!((e.cursor_row, e.cursor_col), (2, 2));
+    }
+
+    /// Negative (#1603): edits after the caret, later on its row or on rows
+    /// below, leave it where it is.
+    #[test]
+    fn edits_after_the_caret_leave_it_where_it_is() {
+        let mut e = editor_with("let a = b;\nlet c = d;");
+        e.cursor_col = 4;
+        e.apply_span_edits(&[
+            span((0, 8), (0, 9), "bee\nbee"),
+            span((1, 0), (1, 0), "// note\n"),
+        ]);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 4));
+    }
+
+    /// #1603: a formatter's one edit replacing the whole document leaves
+    /// the caret on its line, as before, not at the end of the file.
+    #[test]
+    fn a_whole_document_replacement_keeps_the_caret_on_its_line() {
+        let mut e = editor_with("fn a() {\nlet x=1;\nlet y=2;\n}\nfn b() {}");
+        e.cursor_row = 2;
+        e.cursor_col = 4;
+        e.apply_span_edits(&[span(
+            (0, 0),
+            (4, 9),
+            "fn a() {\n    let x = 1;\n    let y = 2;\n}\nfn b() {}\n",
+        )]);
+        assert_eq!(e.lines.len(), 6);
+        assert_eq!((e.cursor_row, e.cursor_col), (2, 4));
+    }
+
+    /// #1603: an out-of-range edit is skipped, so it must not move the
+    /// caret either; only the edit that landed does.
+    #[test]
+    fn a_skipped_out_of_range_edit_does_not_move_the_caret() {
+        let mut e = editor_with("one\ntwo\nthree");
+        e.cursor_row = 2;
+        e.cursor_col = 1;
+        let n = e.apply_span_edits(&[
+            span((0, 0), (0, 0), "zero\n"),
+            span((1, 0), (9, 0), "stale"),
+        ]);
+        assert_eq!(n, 1);
+        assert_eq!(e.lines, vec!["zero", "one", "two", "three"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (3, 1));
+    }
+
+    /// Negative (#1603): a caret at the start of a replaced word stays at
+    /// its start, not carried to the end of the new name.
+    #[test]
+    fn a_caret_at_the_start_of_a_replaced_word_stays_there() {
+        let mut e = editor_with("print(name)");
+        e.cursor_col = 6;
+        e.apply_span_edits(&[span((0, 6), (0, 10), "label")]);
+        assert_eq!(e.lines[0], "print(label)");
+        assert_eq!(e.cursor_col, 6);
     }
 
     #[test]
