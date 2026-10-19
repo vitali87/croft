@@ -3358,6 +3358,9 @@ pub struct App {
     /// Whitespace rendering mode (#133), frame-synced to every editor;
     /// "selection" by default, the palette command cycles it.
     whitespace_mode: crate::widgets::editor::WhitespaceMode,
+    /// Ruler columns (#1524) from the `rulers` setting, synced onto every
+    /// editor each frame like `whitespace_mode`.
+    rulers: Vec<u16>,
     /// Gutter line numbers (#1576): on, relative, interval or off.
     line_numbers: crate::widgets::editor::LineNumbers,
     /// Default ignore-whitespace mode applied to newly opened diffs (#258).
@@ -6228,6 +6231,7 @@ impl App {
             whitespace_mode: crate::widgets::editor::WhitespaceMode::from_pref(
                 &loaded_prefs.render_whitespace,
             ),
+            rulers: crate::widgets::editor::normalize_rulers(&loaded_prefs.rulers),
             line_numbers: crate::widgets::editor::LineNumbers::from_pref(
                 &loaded_prefs.line_numbers,
             ),
@@ -19677,6 +19681,7 @@ impl App {
             ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
             ed.line_numbers = self.line_numbers;
             ed.diff_ws_default = self.diff_ws_default;
+            ed.rulers.clone_from(&self.rulers);
         }
         for group in self.editor_layout.inactive_groups_mut() {
             for ed in group.editors.iter_mut() {
@@ -19690,6 +19695,7 @@ impl App {
                 ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
                 ed.line_numbers = self.line_numbers;
                 ed.diff_ws_default = self.diff_ws_default;
+                ed.rulers.clone_from(&self.rulers);
             }
         }
         self.tree.focus_gradient = gradient;
@@ -63123,6 +63129,18 @@ impl App {
         self.whitespace_mode =
             crate::widgets::editor::WhitespaceMode::from_pref(&p.render_whitespace);
         self.editor.whitespace_mode = self.whitespace_mode;
+        self.rulers = crate::widgets::editor::normalize_rulers(&p.rulers);
+        // Straight onto every open editor: the focus sync that otherwise
+        // carries it does not run per frame, so a reload would leave open
+        // tabs on the old rulers until an unrelated focus change.
+        for ed in self.editor.editors.iter_mut() {
+            ed.rulers.clone_from(&self.rulers);
+        }
+        for group in self.editor_layout.inactive_groups_mut() {
+            for ed in group.editors.iter_mut() {
+                ed.rulers.clone_from(&self.rulers);
+            }
+        }
         self.line_numbers = crate::widgets::editor::LineNumbers::from_pref(&p.line_numbers);
         self.apply_line_numbers();
         self.word_suggestions =
