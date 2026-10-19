@@ -709,6 +709,22 @@ fn clicking_a_fence_play_glyph_runs_it_in_a_named_pane() {
     )));
 }
 
+/// #1473: "Markdown: Run Code Block at Cursor" on a README's `console`
+/// fence parks only its commands behind the confirm box: no `$ ` prompt is
+/// typed, and no line of the sample output runs as a command.
+#[test]
+fn running_a_console_fence_types_only_its_commands() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let readme = "```console\n$ echo installed-ok\ninstalled-ok\n$ ls -1 /tmp/rd\nREADME.md\n```\n";
+    let mut app = app_with_open_file(tmp.path(), "README.md", readme);
+    app.editor.cursor_row = 5;
+    app.run_command(Command::RunCodeBlockAtCursor);
+    let pending = app.pending_run_block.as_ref().expect("the fence runs");
+    assert_eq!(pending.code, "echo installed-ok\nls -1 /tmp/rd\n");
+    assert_eq!(pending.command, "echo installed-ok\nls -1 /tmp/rd\r");
+}
+
 /// #353: the popup never shows a line as complete when it is not - a line
 /// wider than the popup is cut with a visible mark.
 #[test]
