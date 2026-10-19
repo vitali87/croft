@@ -146,6 +146,20 @@ fn as_whitespace_mode(v: &Value) -> Option<Value> {
     Some(Value::from(mapped))
 }
 
+/// VS Code's `editor.rulers` (#1524): each ruler is a column number or an
+/// object with a `column` (and a `color` croft does not carry). An entry
+/// that is neither, or not a usable column, is left out.
+fn as_rulers(v: &Value) -> Option<Value> {
+    let columns: Vec<u16> = v
+        .as_array()?
+        .iter()
+        .filter_map(|r| r.as_u64().or_else(|| r.get("column")?.as_u64()))
+        .filter_map(|c| u16::try_from(c).ok())
+        .filter(|&c| c > 0)
+        .collect();
+    Some(Value::from(columns))
+}
+
 /// `editor.lineNumbers` (#1576): VS Code's four modes are croft's.
 fn as_line_numbers(v: &Value) -> Option<Value> {
     v.as_str()
@@ -274,6 +288,11 @@ const SETTINGS: &[SettingMap] = &[
         vscode: "editor.renderWhitespace",
         croft: "render_whitespace",
         convert: as_whitespace_mode,
+    },
+    SettingMap {
+        vscode: "editor.rulers",
+        croft: "rulers",
+        convert: as_rulers,
     },
     SettingMap {
         vscode: "editor.wordBasedSuggestions",
@@ -481,6 +500,15 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     ("editor.action.indentationToSpaces", "indentation_to_spaces"),
     ("editor.action.indentationToTabs", "indentation_to_tabs"),
+    (
+        "editor.emmet.action.wrapWithAbbreviation",
+        "emmet_wrap_with_abbreviation",
+    ),
+    ("editor.emmet.action.removeTag", "emmet_remove_tag"),
+    ("editor.emmet.action.updateTag", "emmet_update_tag"),
+    ("editor.emmet.action.balanceOut", "emmet_balance_outward"),
+    ("editor.emmet.action.balanceIn", "emmet_balance_inward"),
+    ("editor.emmet.action.matchTag", "emmet_match_tag"),
     ("editor.action.insertCursorAbove", "add_cursor_above"),
     ("editor.action.insertCursorBelow", "add_cursor_below"),
     (
@@ -512,6 +540,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("workbench.action.debug.restart", "restart_debugging"),
     ("workbench.action.debug.pause", "pause_debugging"),
     ("workbench.action.debug.stepOver", "step_over"),
+    ("workbench.action.debug.continue", "continue"),
+    ("workbench.action.debug.stepInto", "step_into"),
+    ("workbench.action.debug.stepOut", "step_out"),
+    ("editor.debug.action.stepIntoTargets", "step_into_target"),
     ("editor.debug.action.toggleBreakpoint", "toggle_breakpoint"),
     ("undo", "undo"),
     ("redo", "redo"),
@@ -1444,6 +1476,23 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// #1524: `editor.rulers` imports in both of VS Code's forms, plain
+    /// columns and `{ "column", "color" }` objects; entries that are not a
+    /// usable column are left out.
+    #[test]
+    fn editor_rulers_import_as_columns() {
+        let doc = json!({
+            "editor.rulers": [80, { "column": 100, "color": "#ff0000" }, "wide", -4, 0, 70000]
+        });
+        let mut report = Report::default();
+        convert_settings(&doc, &mut report);
+        assert_eq!(report.settings["rulers"], json!([80, 100]));
+        let prefs: crate::prefs::Prefs =
+            serde_json::from_value(Value::Object(report.settings.clone().into_iter().collect()))
+                .unwrap();
+        assert_eq!(prefs.rulers, vec![80, 100]);
+    }
+
     #[test]
     fn word_based_suggestions_import_as_vs_code_s_ids() {
         // #1566: the four ids carry over; the boolean older VS Code wrote
@@ -1551,7 +1600,7 @@ mod tests {
             "{unmapped:?}"
         );
         for want in [
-            "[python] editor.rulers",
+            "[python] editor.rulers (croft has rulers only for every language)",
             "[markdown] terminal.integrated.scrollback (croft has terminal_scrollback only for every language)",
             "[c] files.autoSave (croft has auto_save only for every language)",
         ] {

@@ -964,14 +964,15 @@ impl BottomPanelTab {
         BottomPanelTab::Captures,
     ];
 
-    /// The tab's strip label, padded to its click target.
+    /// The tab's strip label in English, the catalog key it is drawn
+    /// through (#1583).
     fn label(self) -> &'static str {
         match self {
-            BottomPanelTab::Problems => " PROBLEMS ",
-            BottomPanelTab::Output => " OUTPUT ",
-            BottomPanelTab::Terminal => " TERMINAL ",
-            BottomPanelTab::Ports => " PORTS ",
-            BottomPanelTab::Captures => " CAPTURES ",
+            BottomPanelTab::Problems => "PROBLEMS",
+            BottomPanelTab::Output => "OUTPUT",
+            BottomPanelTab::Terminal => "TERMINAL",
+            BottomPanelTab::Ports => "PORTS",
+            BottomPanelTab::Captures => "CAPTURES",
         }
     }
 
@@ -3373,6 +3374,9 @@ pub struct App {
     /// Whitespace rendering mode (#133), frame-synced to every editor;
     /// "selection" by default, the palette command cycles it.
     whitespace_mode: crate::widgets::editor::WhitespaceMode,
+    /// Ruler columns (#1524) from the `rulers` setting, synced onto every
+    /// editor each frame like `whitespace_mode`.
+    rulers: Vec<u16>,
     /// Gutter line numbers (#1576): on, relative, interval or off.
     line_numbers: crate::widgets::editor::LineNumbers,
     /// Default ignore-whitespace mode applied to newly opened diffs (#258).
@@ -3464,6 +3468,12 @@ pub struct App {
     /// on disk. The next `save()` overwrites anyway, giving the user a
     /// "press Cmd+S again to overwrite" escape hatch without a modal.
     force_save_armed: bool,
+    /// One-shot latch armed when a save failed for want of permission
+    /// (#1379): the next Cmd+S of that file saves it with sudo instead.
+    sudo_save_armed: Option<PathBuf>,
+    /// Saves handed to `sudo tee` in a terminal pane (#1379): each file and
+    /// the bytes it should end up holding, settled once it holds them.
+    pending_sudo_saves: Vec<(PathBuf, Vec<u8>, Option<i32>)>,
     pub terminals: Vec<PtyTerminal>,
     pub active_terminal: usize,
     perf: PerfHud,
@@ -4414,6 +4424,11 @@ pub struct App {
     /// an active task; the status bar surfaces it so a busy-priming server is
     /// never mistaken for a dead one. Cleared on the server's `End`.
     lsp_progress: std::collections::HashMap<String, String>,
+    /// Language-server questions (`window/showMessageRequest`, #1599)
+    /// waiting for the list picker, oldest first, and the one it shows.
+    /// Dropping one answers the server "no action".
+    lsp_questions: std::collections::VecDeque<LspQuestion>,
+    lsp_question: Option<LspQuestion>,
     /// Active completion popup, when a completion request has been issued
     /// and the user hasn't dismissed the result. Populated by drain_lsp_completion
     /// once the worker sends a CompletionResult back.
@@ -5873,6 +5888,26 @@ const WELCOME_TAGLINE: &str = "LIGHTWEIGHT.  BLAZINGLY FAST.  BUILT FOR DEVELOPE
 
 use crate::gradient::{GRAD_TL, GRAD_TR, POPUP_SEL_BG, paint_gradient_box, rgb_color};
 
+/// A language server's `window/showMessageRequest` waiting for an answer
+/// (#1599). Dropping it answers "no action".
+struct LspQuestion {
+    server: String,
+    text: String,
+    actions: Vec<lsp_types::MessageActionItem>,
+    reply: tokio::sync::oneshot::Sender<Option<lsp_types::MessageActionItem>>,
+}
+
+/// A server's message as one status line, `server: first line`, so a
+/// multi-line cargo error does not spill over the bar.
+fn server_message_status(server: &str, text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    format!("{server}: {line}")
+}
+
 fn open_url(url: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     let mut cmd = {
@@ -6181,7 +6216,7 @@ impl App {
             config_watch: crate::config_sync::ConfigWatch::new(config_watch_paths(
                 &merged_settings.chain,
             )),
-            snippets: load_snippets(&crate::snippets::snippets_path()),
+            snippets: load_all_snippets([root.as_path()]),
             format_on_save: loaded_prefs.format_on_save,
             default_formatter: loaded_prefs.default_formatter.clone(),
             language_formatters: loaded_prefs.language_formatters.clone(),
@@ -6245,6 +6280,7 @@ impl App {
             whitespace_mode: crate::widgets::editor::WhitespaceMode::from_pref(
                 &loaded_prefs.render_whitespace,
             ),
+            rulers: crate::widgets::editor::normalize_rulers(&loaded_prefs.rulers),
             line_numbers: crate::widgets::editor::LineNumbers::from_pref(
                 &loaded_prefs.line_numbers,
             ),
@@ -6274,6 +6310,8 @@ impl App {
             editor,
             editor_layout: editor_layout::EditorLayout::single(),
             force_save_armed: false,
+            sudo_save_armed: None,
+            pending_sudo_saves: Vec::new(),
             terminals: vec![term],
             active_terminal: 0,
             perf: PerfHud::default(),
@@ -6595,6 +6633,8 @@ impl App {
             sarif_step_signature: None,
             sarif_published: Vec::new(),
             lsp_progress: std::collections::HashMap::new(),
+            lsp_questions: std::collections::VecDeque::new(),
+            lsp_question: None,
             completion_popup: None,
             editor_vim_chord: EditorVimChord::default(),
             cmd_k_leader: None,
@@ -6957,6 +6997,7 @@ impl App {
         // The agent review queue as this workspace last left it (#345).
         let root = app.workspace_root().to_path_buf();
         app.apply_project_excludes(&loaded_prefs);
+        app.watch_project_snippets();
         app.agent_ledger = app.load_agent_ledger(&root);
         app.sync_agent_lane_decorations();
         Ok(app)
@@ -8252,6 +8293,7 @@ impl App {
     /// Returns true if any tab reloaded, failed, or entered conflict, so
     /// the caller redraws.
     fn reload_open_file_after_external_change(&mut self) -> bool {
+        let settled = self.settle_sudo_saves();
         let guest = self.is_collab_guest();
         let root = self.tree.root.clone();
         let skip = |p: &Path| guest && collab_file_key(&root, p).is_some();
@@ -8263,7 +8305,7 @@ impl App {
             report.failed.extend(extra.failed);
         }
         if report.is_empty() {
-            return false;
+            return settled;
         }
         // The active file changed on disk under a clean buffer: its coverage
         // marks describe the old text now, so they dim like an edit's (#263).
@@ -11482,25 +11524,148 @@ impl App {
     pub fn drain_lsp_progress(&mut self) -> bool {
         let mut updates = Vec::new();
         if let Some(lsp) = self.lsp.as_ref() {
-            while let Some(u) = lsp.drain_progress() {
+            while let Some(u) = lsp.drain_server_update() {
                 updates.push(u);
             }
         }
         let mut changed = false;
         for u in updates {
-            match u.message {
-                Some(message) => {
-                    self.lsp_progress.insert(u.server, message);
-                    changed = true;
+            changed |= self.apply_server_update(u);
+        }
+        changed | self.ask_next_lsp_question()
+    }
+
+    /// Act on one progress update or `window/*` message from a server.
+    /// Returns true when the screen needs a repaint.
+    fn apply_server_update(&mut self, u: crate::lsp::manager::ServerUpdate) -> bool {
+        use crate::lsp::manager::ServerEvent;
+        match u.event {
+            ServerEvent::Progress(Some(message)) => {
+                self.lsp_progress.insert(u.server, message);
+                true
+            }
+            ServerEvent::Progress(None) => self.lsp_progress.remove(&u.server).is_some(),
+            // An error a server can't recover from on its own, such as
+            // rust-analyzer's "Failed to load workspaces", used to sit in
+            // OUTPUT while the status bar said all was well (#1599).
+            ServerEvent::Message { text, .. } => {
+                self.status = server_message_status(&u.server, &text);
+                true
+            }
+            ServerEvent::Question {
+                text,
+                actions,
+                reply,
+                ..
+            } => {
+                if actions.is_empty() {
+                    // Nothing to pick: a message, answered "no action" by
+                    // dropping `reply`.
+                    self.status = server_message_status(&u.server, &text);
+                    return true;
                 }
-                None => {
-                    if self.lsp_progress.remove(&u.server).is_some() {
-                        changed = true;
-                    }
-                }
+                self.lsp_questions.push_back(LspQuestion {
+                    server: u.server,
+                    text,
+                    actions,
+                    reply,
+                });
+                false
+            }
+            ServerEvent::ShowDocument {
+                uri,
+                external,
+                take_focus,
+                selection,
+                reply,
+            } => {
+                let shown = self.show_server_document(uri, external, take_focus, selection);
+                let _ = reply.send(shown);
+                true
             }
         }
-        changed
+    }
+
+    /// Put the oldest waiting server question in the list picker, once no
+    /// other picker is open. Returns true when one was opened.
+    fn ask_next_lsp_question(&mut self) -> bool {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let asking = self
+            .list_picker
+            .as_ref()
+            .is_some_and(|p| p.purpose == ListPurpose::ServerQuestion);
+        if !asking {
+            // Its picker was replaced or went away without a pick.
+            self.lsp_question = None;
+        }
+        if self.list_picker.is_some() {
+            return false;
+        }
+        let Some(q) = self.lsp_questions.pop_front() else {
+            return false;
+        };
+        let rows = q
+            .actions
+            .iter()
+            .enumerate()
+            .map(|(i, a)| ListRow {
+                id: i.to_string(),
+                label: a.title.clone(),
+            })
+            .collect();
+        let title = server_message_status(&q.server, &q.text);
+        self.status = title.clone();
+        self.lsp_question = Some(q);
+        self.open_list_picker(
+            ListPicker::new(ListPurpose::ServerQuestion, title, rows),
+            "",
+        );
+        true
+    }
+
+    /// `window/showDocument`: a link goes to the browser, a file opens with
+    /// the server's range selected. Without `take_focus` the file still
+    /// opens but keyboard focus stays in the pane that had it. Returns
+    /// whether the document was shown, which is the server's answer.
+    fn show_server_document(
+        &mut self,
+        uri: lsp_types::Url,
+        external: bool,
+        take_focus: bool,
+        selection: Option<lsp_types::Range>,
+    ) -> bool {
+        let path = (!external && uri.scheme() == "file")
+            .then(|| uri.to_file_path().ok())
+            .flatten();
+        let Some(path) = path else {
+            return self.try_open_url_for_user(uri.as_str());
+        };
+        let start = selection.map(|r| r.start).unwrap_or_default();
+        let (focus, maximized) = (self.focus, self.terminal_maximized);
+        if !self.try_go_to_definition(path.clone(), start.line, start.character) {
+            return false;
+        }
+        if !take_focus && focus != Pane::Editor {
+            self.focus_pane(focus);
+            self.terminal_maximized = maximized;
+        }
+        let Some(end) = selection.map(|r| r.end).filter(|&end| end != start) else {
+            return true;
+        };
+        if self.editor.path.as_deref() != Some(path.as_path()) {
+            return true;
+        }
+        let row = (end.line as usize).min(self.editor.lines.len().saturating_sub(1));
+        let col = self.editor.utf16_col_to_char_pub(row, end.character);
+        let anchor = (self.editor.cursor_row, self.editor.cursor_col);
+        self.editor.selection = Some(crate::widgets::editor::EditorSelection {
+            anchor,
+            head: (row, col),
+        });
+        self.editor.cursor_row = row;
+        self.editor.cursor_col = col;
+        self.editor.ensure_cursor_col_visible();
+        true
     }
 
     /// The active LSP progress line for the status bar, if any server is busy
@@ -11638,6 +11803,11 @@ impl App {
     }
 
     fn go_to_definition(&mut self, path: PathBuf, line: u32, col: u32) {
+        self.try_go_to_definition(path, line, col);
+    }
+
+    /// `go_to_definition`, returning whether the file opened.
+    fn try_go_to_definition(&mut self, path: PathBuf, line: u32, col: u32) -> bool {
         let pinned = self.keep_preview_open_for_navigation_to(&path);
         if let Some(from) = self.editor.path.clone() {
             self.nav.record(NavLoc {
@@ -11649,11 +11819,13 @@ impl App {
         // `col` is the server's UTF-16 column, not a character column.
         match self.open_at_utf16(&path, line, col) {
             Ok(()) => {
-                self.status = format!("Jumped to {} line {}", self.status_path(&path), line + 1)
+                self.status = format!("Jumped to {} line {}", self.status_path(&path), line + 1);
+                true
             }
             Err(e) => {
                 self.restore_preview_after_failed_navigation(pinned);
-                self.status = format!("Go to definition failed: {e}")
+                self.status = format!("Go to definition failed: {e}");
+                false
             }
         }
     }
@@ -15925,8 +16097,13 @@ impl App {
             && let (Some(path), Some(lsp)) = (self.editor.path.clone(), self.lsp.as_mut())
         {
             lsp.execute_command(path, cmd.command, cmd.arguments);
+            // A command-only action (gopls's "Browse documentation") does
+            // its work in the server, and anything it has to show arrives
+            // as a message; claiming a fix was applied was wrong (#1599).
+            if !applied {
+                self.status = format!("Ran {}", item.title);
+            }
             applied = true;
-            self.status = format!("Applied quick fix: {}", item.title);
         }
         if !applied {
             self.status = format!("Quick fix had no effect: {}", item.title);
@@ -19695,6 +19872,7 @@ impl App {
             ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
             ed.line_numbers = self.line_numbers;
             ed.diff_ws_default = self.diff_ws_default;
+            ed.rulers.clone_from(&self.rulers);
         }
         for group in self.editor_layout.inactive_groups_mut() {
             for ed in group.editors.iter_mut() {
@@ -19708,6 +19886,7 @@ impl App {
                 ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
                 ed.line_numbers = self.line_numbers;
                 ed.diff_ws_default = self.diff_ws_default;
+                ed.rulers.clone_from(&self.rulers);
             }
         }
         self.tree.focus_gradient = gradient;
@@ -19852,11 +20031,13 @@ impl App {
 
         // VS Code panel-group order: PROBLEMS, OUTPUT, TERMINAL, PORTS. PROBLEMS
         // alone carries the orange count badge after its label.
-        let tabs = BottomPanelTab::ALL.map(|tab| (tab, tab.label()));
+        // Each label is translated and padded to its click target.
+        let tabs =
+            BottomPanelTab::ALL.map(|tab| (tab, format!(" {} ", crate::i18n::tr(tab.label()))));
 
         // Lay each tab out left to right, recording its hit rect (which, for
         // PROBLEMS, spans the label and the pill together).
-        let mut placed: Vec<(BottomPanelTab, &str, Rect, u16)> = Vec::with_capacity(tabs.len());
+        let mut placed: Vec<(BottomPanelTab, String, Rect, u16)> = Vec::with_capacity(tabs.len());
         let mut x = strip.x + 1;
         for (tab, label) in tabs {
             if x >= right {
@@ -19871,7 +20052,7 @@ impl App {
             } else {
                 0
             };
-            let w = label.chars().count() as u16 + badge_w;
+            let w = unicode_width::UnicodeWidthStr::width(label.as_str()) as u16 + badge_w;
             let rect = Rect {
                 x,
                 y: strip.y,
@@ -19918,7 +20099,7 @@ impl App {
             // the cells stay blank strip_bg and we just record the anchor.
             // Otherwise the powerline-cap pill is drawn as text.
             if *badge_w > 0 {
-                let bx = rect.x + label.chars().count() as u16;
+                let bx = rect.x + unicode_width::UnicodeWidthStr::width(label.as_str()) as u16;
                 if images {
                     if bx < right {
                         self.problems_badge_cell = Some((bx, rect.y));
@@ -19952,7 +20133,7 @@ impl App {
             // stopping before the padding spaces and the pill.
             if is_active {
                 let leading = label.chars().take_while(|c| *c == ' ').count() as u16;
-                let word_len = label.trim().chars().count() as u16;
+                let word_len = unicode_width::UnicodeWidthStr::width(label.trim()) as u16;
                 let start = rect.x + leading;
                 for ux in start..(start + word_len).min(right) {
                     buf[(ux, rect.y)].modifier.insert(Modifier::UNDERLINED);
@@ -21730,9 +21911,15 @@ impl App {
             .unwrap_or_default();
         let mut seg_texts: Vec<String> = vec![
             format!(
-                " Ln {}, Col {}{coverage} ",
+                " Ln {}, Col {}{coverage}{} ",
                 self.editor.cursor_row + 1,
-                self.editor.cursor_col + 1
+                self.editor.cursor_col + 1,
+                // The file refuses this user's writes (#1379).
+                if self.editor.write_protected {
+                    " \u{b7} Read-only"
+                } else {
+                    ""
+                }
             ),
             format!(" {} ", self.editor.indent_style().label()),
             format!(" {} ", self.editor.encoding.name()),
@@ -22357,7 +22544,7 @@ impl App {
             .border_style(Style::default().fg(warn))
             .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
             .title(ratatui::text::Span::styled(
-                " DISCARD CHANGES? ",
+                format!(" {} ", crate::i18n::tr("DISCARD CHANGES?")),
                 Style::default()
                     .fg(Color::White)
                     .bg(warn)
@@ -22372,9 +22559,9 @@ impl App {
             height: rect.height.saturating_sub(2),
         };
         let warn_text = if pd.untracked {
-            "This will permanently delete the file from disk."
+            crate::i18n::tr("This will permanently delete the file from disk.")
         } else {
-            "This will overwrite your local changes from HEAD."
+            crate::i18n::tr("This will overwrite your local changes from HEAD.")
         };
         let body = ratatui::text::Text::from(vec![
             ratatui::text::Line::from(ratatui::text::Span::styled(
@@ -22481,7 +22668,7 @@ impl App {
         };
         let (headline, names, save, discard) = match exit {
             UnsavedExit::CloseTab { idx, .. } => (
-                String::from("This tab has unsaved changes:"),
+                crate::i18n::tr("This tab has unsaved changes:").into_owned(),
                 self.editor.tab_display_label(*idx),
                 String::from("ave and close"),
                 String::from("on't save"),
@@ -22517,7 +22704,7 @@ impl App {
             .border_style(Style::default().fg(warn))
             .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
             .title(ratatui::text::Span::styled(
-                " UNSAVED CHANGES ",
+                format!(" {} ", crate::i18n::tr("UNSAVED CHANGES")),
                 Style::default()
                     .fg(Color::Black)
                     .bg(warn)
@@ -22643,7 +22830,7 @@ impl App {
             .border_style(Style::default().fg(accent))
             .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
             .title(ratatui::text::Span::styled(
-                " UNSAVED CHANGES ",
+                format!(" {} ", crate::i18n::tr("UNSAVED CHANGES")),
                 Style::default()
                     .fg(Color::Black)
                     .bg(accent)
@@ -28063,19 +28250,28 @@ impl App {
     /// Open `url` in the user's browser: through the relay or a detected
     /// URL on a remote session, and never from a test.
     fn open_url_for_user(&mut self, url: &str) {
+        self.try_open_url_for_user(url);
+    }
+
+    /// `open_url_for_user`, returning false when the browser could not be
+    /// started.
+    fn try_open_url_for_user(&mut self, url: &str) -> bool {
         if cfg!(test) {
             // Tests never start a browser.
             self.status = format!("Open {url}");
-            return;
+            return true;
         }
         if self.drop_relay_active() || is_remote_session() {
             self.open_detected_url(url);
-            return;
+            return true;
         }
-        self.status = match open_url(url) {
+        let opened = open_url(url);
+        let ok = opened.is_ok();
+        self.status = match opened {
             Ok(()) => format!("Opened {url}"),
             Err(e) => format!("Could not open a browser ({e}): {url}"),
         };
+        ok
     }
 
     /// The store index of the current database, for the palette commands
@@ -32561,6 +32757,11 @@ impl App {
                 }
                 // What the exception stop threw (#864): the panel's pill and
                 // the status line, which has the width the pill lacks.
+                // Step Into Target (#1543): one call steps straight in, several
+                // are offered by label, and a line with none steps in plainly.
+                DapEvent::StepInTargets { targets } => {
+                    self.offer_step_in_targets(targets);
+                }
                 DapEvent::ExceptionInfo { summary } => {
                     self.run_debug.feedback = Some(format!("Paused (exception): {summary}"));
                     self.status = format!("Paused on exception: {summary}");
@@ -35287,6 +35488,82 @@ impl App {
         }
     }
 
+    /// Debug: Continue (#1543): resume a paused session. Unlike F5 it never
+    /// starts one, so a binding for it is inert with nothing to continue.
+    fn debug_continue(&mut self) {
+        use crate::dap::session::SessionPhase;
+        match self.debug_sessions.focused().map(|s| s.phase) {
+            Some(SessionPhase::Stopped) => self.debug_start_or_continue(),
+            Some(_) => self.status = String::from("The program is already running"),
+            None => self.status = String::from("No debug session to continue"),
+        }
+    }
+
+    /// Debug: Step Into Target (#1543): ask the adapter which calls the
+    /// paused line makes; the answer arrives as `StepInTargets`. An adapter
+    /// that cannot say steps in plainly, as F11 does.
+    fn debug_step_into_target(&mut self) {
+        use crate::dap::session::{SessionPhase, StepInTargetsAsk};
+        let Some(session) = self.debug_sessions.focused_mut() else {
+            self.status = String::from("No debug session to step");
+            return;
+        };
+        if session.phase != SessionPhase::Stopped {
+            self.status = String::from("Step Into Target needs a paused program");
+            return;
+        }
+        match session.request_step_in_targets() {
+            StepInTargetsAsk::Sent => {}
+            StepInTargetsAsk::NoFrame => {
+                self.status =
+                    String::from("The paused frame is still loading; try Step Into Target again");
+            }
+            StepInTargetsAsk::Unsupported => {
+                self.status = String::from(
+                    "This debugger cannot list step-in targets; stepping into the first call",
+                );
+                self.debug_step("stepIn");
+            }
+        }
+    }
+
+    /// The adapter's answer to Step Into Target: nothing to choose between
+    /// steps in plainly, one target steps into it, several open a picker.
+    fn offer_step_in_targets(&mut self, targets: Vec<(i64, String)>) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        match targets.as_slice() {
+            [] => self.debug_step_into(None),
+            [(id, _)] => self.debug_step_into(Some(*id)),
+            _ => {
+                let rows = targets
+                    .into_iter()
+                    .map(|(id, label)| ListRow {
+                        id: id.to_string(),
+                        label,
+                    })
+                    .collect();
+                self.open_list_picker(
+                    ListPicker::new(ListPurpose::StepInTarget, "Step Into Target", rows),
+                    "",
+                );
+            }
+        }
+    }
+
+    /// Step into `target` on the paused line, or the first call to run.
+    fn debug_step_into(&mut self, target: Option<i64>) {
+        match target {
+            Some(id) => {
+                if let Some(session) = self.debug_sessions.focused_mut() {
+                    session.step_in_target(id);
+                    self.editor.stop_line = None;
+                    self.clear_inline_values();
+                }
+            }
+            None => self.debug_step("stepIn"),
+        }
+    }
+
     /// F10/F11/Shift+F11: step the paused thread (`next` / `stepIn` / `stepOut`).
     pub fn debug_step(&mut self, command: &str) {
         if let Some(session) = self.debug_sessions.focused_mut() {
@@ -37059,6 +37336,8 @@ impl App {
     }
 
     fn close_list_picker(&mut self) {
+        // A server question closed without a pick is answered "no action".
+        self.lsp_question = None;
         if self.list_picker.take().is_some() {
             self.overlays.list_picker_clear.request();
             self.overlays.activity.mark_dirty();
@@ -37524,6 +37803,28 @@ impl App {
                 // answer they just asked for.
                 self.close_input_prompt();
                 self.run_fleet_command(&value);
+            }
+            InputPurpose::EmmetWrap => {
+                self.close_input_prompt();
+                self.status = if self.editor.emmet_wrap(&value) {
+                    format!("Emmet: wrapped with {}", value.trim())
+                } else {
+                    format!(
+                        "Emmet: {} is not an abbreviation to wrap with",
+                        value.trim()
+                    )
+                };
+            }
+            InputPurpose::EmmetUpdateTag => {
+                self.close_input_prompt();
+                self.status = if self.editor.emmet_update_tag(&value) {
+                    format!("Emmet: tag renamed to {}", value.trim())
+                } else {
+                    format!(
+                        "Emmet: {} is not a tag name, or no tag is around the cursor",
+                        value.trim()
+                    )
+                };
             }
             InputPurpose::HexFind => {
                 self.close_input_prompt();
@@ -39872,9 +40173,18 @@ impl App {
         };
         let purpose = picker.purpose;
         let selected = picker.selected;
+        let question = self.lsp_question.take();
         self.close_list_picker();
         let index = row.id.parse::<usize>().unwrap_or(0);
         match purpose {
+            ListPurpose::ServerQuestion => {
+                if let Some(q) = question
+                    && let Some(action) = q.actions.get(index).cloned()
+                {
+                    self.status = format!("{}: {}", q.server, action.title);
+                    let _ = q.reply.send(Some(action));
+                }
+            }
             ListPurpose::AgentLaneFile => {
                 if let Some((agent, path)) = self.pending_lane_picks.get(index).cloned() {
                     self.diff_agent_lane_row(&agent, &path);
@@ -40072,6 +40382,11 @@ impl App {
             }
             ListPurpose::LaunchInput => {
                 self.answer_input(row.id.clone());
+            }
+            ListPurpose::StepInTarget => {
+                if let Ok(target) = row.id.parse::<i64>() {
+                    self.debug_step_into(Some(target));
+                }
             }
             ListPurpose::DebugConfigRequest => {
                 if let Some(draft) = self.debug_config_draft.as_mut() {
@@ -45604,6 +45919,65 @@ impl App {
         } else {
             String::from("Emmet: no abbreviation at the cursor")
         };
+    }
+
+    /// Emmet: Wrap with Abbreviation or Update Tag (#1557): ask for the
+    /// abbreviation or the new name in a one-line prompt, as Go to Line
+    /// does. Says so instead where Emmet is not offered.
+    fn open_emmet_prompt(&mut self, wrap: bool) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        if !self.editor_is_text() {
+            return;
+        }
+        if !self.editor.emmet_available() {
+            self.status = format!(
+                "Emmet: not available in {} files",
+                self.editor.language_label()
+            );
+            return;
+        }
+        self.open_input_prompt(if wrap {
+            InputPrompt::new(
+                InputPurpose::EmmetWrap,
+                "Wrap with Abbreviation",
+                "abbreviation, such as div.card or ul>li*",
+            )
+        } else {
+            InputPrompt::new(InputPurpose::EmmetUpdateTag, "Update Tag", "new tag name")
+        });
+    }
+
+    /// Emmet's commands for markup already written that need no input
+    /// (#1557), each saying why when it did nothing.
+    fn run_emmet_edit(&mut self, edit: EmmetEdit) {
+        if !self.editor_is_text() {
+            return;
+        }
+        if !self.editor.emmet_available() {
+            self.status = format!(
+                "Emmet: not available in {} files",
+                self.editor.language_label()
+            );
+            return;
+        }
+        let (done, failed) = match edit {
+            EmmetEdit::RemoveTag => (self.editor.emmet_remove_tag(), "no tag around the cursor"),
+            EmmetEdit::MatchTag => (
+                self.editor.emmet_match_tag(),
+                "the cursor is not on a tag with a pair",
+            ),
+            EmmetEdit::BalanceOutward => (
+                self.editor.emmet_balance(true),
+                "nothing encloses the selection",
+            ),
+            EmmetEdit::BalanceInward => (
+                self.editor.emmet_balance(false),
+                "nothing inside the selection to narrow to",
+            ),
+        };
+        if !done {
+            self.status = format!("Emmet: {failed}");
+        }
     }
 
     /// Markdown: Toggle Preview — flips the active tab between source and the
@@ -53690,6 +54064,12 @@ impl App {
                 }
             }
             Cmd::EmmetExpandAbbreviation => self.expand_emmet_abbreviation(),
+            Cmd::EmmetWrapWithAbbreviation => self.open_emmet_prompt(true),
+            Cmd::EmmetUpdateTag => self.open_emmet_prompt(false),
+            Cmd::EmmetRemoveTag => self.run_emmet_edit(EmmetEdit::RemoveTag),
+            Cmd::EmmetMatchTag => self.run_emmet_edit(EmmetEdit::MatchTag),
+            Cmd::EmmetBalanceOutward => self.run_emmet_edit(EmmetEdit::BalanceOutward),
+            Cmd::EmmetBalanceInward => self.run_emmet_edit(EmmetEdit::BalanceInward),
             Cmd::ExpandSelection => self.expand_selection(),
             Cmd::ShrinkSelection => self.shrink_selection(),
             Cmd::SwitchHeaderSource => self.switch_header_source(),
@@ -54035,6 +54415,7 @@ impl App {
             Cmd::ClearBookmarks => self.clear_bookmarks(),
             Cmd::SaveFile => self.save(),
             Cmd::SaveAs => self.open_save_as_prompt(),
+            Cmd::SaveWithSudo => self.save_with_sudo(),
             Cmd::RevertFile => self.revert_file(),
             Cmd::SaveAll => self.save_all(),
             Cmd::NewUntitledFile => self.new_untitled_file(),
@@ -54807,6 +55188,10 @@ impl App {
             Cmd::ShowOutgoingCalls => self.request_call_hierarchy_at_cursor(false),
             Cmd::EditBreakpointCondition => self.debug_edit_condition(),
             Cmd::StepOver => self.debug_step("next"),
+            Cmd::ContinueDebugging => self.debug_continue(),
+            Cmd::StepInto => self.debug_step("stepIn"),
+            Cmd::StepOut => self.debug_step("stepOut"),
+            Cmd::StepIntoTarget => self.debug_step_into_target(),
             Cmd::ToggleRaisedExceptions => self.debug_toggle_raised_exceptions(),
             Cmd::AttachPythonProcess => self.open_attach_python_picker(),
             Cmd::ColorTheme => self.open_theme_picker(),
@@ -61101,6 +61486,9 @@ impl App {
                 // consent to the lossy write, so retrying here would just
                 // re-refuse every tick.
                 && !e.encoding_loss
+                // A file the user can't write, or protected from writes,
+                // is only ever saved on an explicit Cmd+S (#1379).
+                && !e.write_protected
                 // A merge with conflicts still open: its Result holds only
                 // the base text there, and writing it would drop both
                 // sides from disk. Complete Merge (or an explicit Cmd+S) is
@@ -61162,6 +61550,9 @@ impl App {
                     // this tick is the one chance to say why it stopped
                     // saving. Never arms the lossy write — consent is the
                     // explicit path's alone.
+                    // The refusal set `write_protected`, which keeps the
+                    // tab out of `due`: the lock on its tab says why.
+                    Ok(crate::widgets::editor::SaveOutcome::WriteProtected) => {}
                     Ok(crate::widgets::editor::SaveOutcome::EncodingLoss) => {
                         if let Some(p) = e.path.as_ref()
                             && !lossy_paths.contains(p)
@@ -61361,7 +61752,7 @@ impl App {
         }
         let (map, _) = crate::keymap::Keymap::load_with_warnings(&self.keybindings_file);
         self.keymap = map;
-        self.snippets = load_snippets(&crate::snippets::snippets_path());
+        self.snippets = load_all_snippets(self.roots.iter());
         self.status = format!(
             "Profile: {}; keybindings and snippets applied, settings apply at the next launch",
             name.as_deref().unwrap_or("Default")
@@ -62921,20 +63312,19 @@ impl App {
         // link down, reconnect pending): with nobody to defer to, blocking
         // strands the offline work in RAM for the whole outage. And when
         // the owner left (#1147): there is nobody to save for this guest.
-        if self.is_collab_guest()
-            && self
-                .editor
-                .path
-                .as_ref()
-                .and_then(|p| collab_file_key(&self.tree.root, p))
-                .is_some_and(|file| {
-                    self.collab
-                        .as_ref()
-                        .is_some_and(|s| !s.is_local_only(&file) && !s.owner_gone())
-                })
-        {
+        if self.owner_saves_active_file() {
             self.status =
                 String::from("Shared file: the session owner saves (your edits are already live)");
+            return;
+        }
+        // A save refused for want of permission arms the sudo route for the
+        // next Cmd+S of that file (#1379).
+        if self
+            .sudo_save_armed
+            .take()
+            .is_some_and(|p| self.editor.path.as_ref() == Some(&p))
+        {
+            self.save_with_sudo();
             return;
         }
         // A previously-refused save arms a one-shot override: the very next
@@ -62961,10 +63351,14 @@ impl App {
                     self.force_save_armed = true;
                     self.prompt_encoding_loss();
                 }
+                Ok(SaveOutcome::WriteProtected) => {
+                    self.force_save_armed = true;
+                    self.prompt_write_protected();
+                }
                 Ok(SaveOutcome::DiskConflict) => {
                     unreachable!("force save never reports a conflict")
                 }
-                Err(e) => self.status = format!("Save failed: {e}"),
+                Err(e) => self.report_save_error(e),
             }
             return;
         }
@@ -63016,6 +63410,45 @@ impl App {
         !changed.is_empty()
     }
 
+    /// Whether `path` is one of the workspace's project snippets files, or a
+    /// folder's `.vscode` directory, whose change can add or remove one.
+    fn is_project_snippets_path(&self, path: &std::path::Path) -> bool {
+        self.roots.iter().any(|root| {
+            path == root.join(".vscode")
+                || (path.starts_with(root) && crate::snippets::is_project_file(path))
+        })
+    }
+
+    /// Reload every snippet (#1484) and watch any project snippets file
+    /// that has appeared, so a later edit to it, by croft or by `git pull`,
+    /// applies too.
+    fn reload_project_snippets(&mut self) {
+        self.snippets = load_all_snippets(self.roots.iter());
+        self.watch_project_snippets();
+    }
+
+    /// Put each workspace folder's `.vscode` directory and project snippets
+    /// files under the config watch (#1484).
+    fn watch_project_snippets(&mut self) {
+        for path in self.project_snippet_watch_paths() {
+            self.config_watch.watch(path);
+        }
+    }
+
+    /// What [`Self::watch_project_snippets`] watches: each workspace
+    /// folder's `.vscode` directory, its `.croft/snippets.json` and its
+    /// project snippets files.
+    fn project_snippet_watch_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for root in self.roots.iter() {
+            paths.push(root.join(".vscode"));
+            // Watched before it exists, so creating or pulling it applies.
+            paths.push(root.join(".croft").join("snippets.json"));
+            paths.extend(crate::snippets::project_files(root));
+        }
+        paths
+    }
+
     /// After a save, if the file was one of croft's JSON configs, re-read it so
     /// the change applies without a relaunch (VS Code applies keybindings and
     /// snippets on save). settings.json fields are read at startup, so that one
@@ -63051,9 +63484,28 @@ impl App {
             }
             self.status = keybindings_reload_status(&warns);
         } else if path == crate::snippets::snippets_path() {
-            self.snippets = load_snippets(path);
+            self.snippets = load_all_snippets(self.roots.iter());
             self.status =
                 snippets_reload_status(self.snippets.is_broken(), self.snippets.warnings());
+        } else if self.is_project_snippets_path(path) {
+            // A project's snippets file, or its `.vscode` folder gaining or
+            // losing one (#1484).
+            // A `.vscode` change that touched no snippets (settings.json
+            // saved) says nothing.
+            let before = self.snippets.clone();
+            self.reload_project_snippets();
+            if self.snippets != before {
+                self.status = format!(
+                    "Project snippets reloaded{}",
+                    match self.snippets.warnings().len() {
+                        0 => String::new(),
+                        n => format!(
+                            " with {n} warning{} — see OUTPUT · Snippets",
+                            if n == 1 { "" } else { "s" }
+                        ),
+                    }
+                );
+            }
         } else if path == crate::agents::agents_path() {
             self.agents = crate::agents::AgentTable::load(path);
             let dropped = self.agents.dropped_patterns();
@@ -63167,8 +63619,14 @@ impl App {
         self.settings_chain = merged.chain;
         // The chain follows the primary root and the `extends` targets, so
         // the watch follows the chain (#1435).
-        self.config_watch
-            .set_paths(config_watch_paths(&self.settings_chain));
+        // The project snippets stay watched too (#1484).
+        let mut paths = config_watch_paths(&self.settings_chain);
+        for path in self.project_snippet_watch_paths() {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+        self.config_watch.set_paths(paths);
         self.settings_provenance = merged.provenance;
         self.apply_merged_settings(&merged.prefs);
         self.status = if merged.warnings.is_empty() {
@@ -63284,6 +63742,18 @@ impl App {
         self.whitespace_mode =
             crate::widgets::editor::WhitespaceMode::from_pref(&p.render_whitespace);
         self.editor.whitespace_mode = self.whitespace_mode;
+        self.rulers = crate::widgets::editor::normalize_rulers(&p.rulers);
+        // Straight onto every open editor: the focus sync that otherwise
+        // carries it does not run per frame, so a reload would leave open
+        // tabs on the old rulers until an unrelated focus change.
+        for ed in self.editor.editors.iter_mut() {
+            ed.rulers.clone_from(&self.rulers);
+        }
+        for group in self.editor_layout.inactive_groups_mut() {
+            for ed in group.editors.iter_mut() {
+                ed.rulers.clone_from(&self.rulers);
+            }
+        }
         self.line_numbers = crate::widgets::editor::LineNumbers::from_pref(&p.line_numbers);
         self.apply_line_numbers();
         self.word_suggestions =
@@ -63599,6 +64069,12 @@ impl App {
                     editor.encoding.name()
                 );
             }
+            Ok(SaveOutcome::WriteProtected) => {
+                self.status = format!(
+                    "{} not saved: it is write-protected - open the tab and press Cmd+S twice to overwrite it",
+                    path.display()
+                );
+            }
             Err(e) => self.status = format!("Save failed: {e}"),
         }
     }
@@ -63629,8 +64105,212 @@ impl App {
                 );
             }
             Ok(SaveOutcome::EncodingLoss) => self.prompt_encoding_loss(),
-            Err(e) => self.status = format!("Save failed: {e}"),
+            Ok(SaveOutcome::WriteProtected) => self.prompt_write_protected(),
+            Err(e) => self.report_save_error(e),
         }
+    }
+
+    /// A save of the user's own write-protected file was refused (#1379).
+    /// Arm the one-shot consent and say what the next Cmd+S will do, the
+    /// press-again flow a disk conflict uses.
+    fn prompt_write_protected(&mut self) {
+        self.editor.overwrite_protected_armed = true;
+        let name = self
+            .editor
+            .path
+            .as_deref()
+            .map(|p| self.status_path(p))
+            .unwrap_or_default();
+        self.status = format!(
+            "{name} is write-protected - press Cmd+S again to overwrite it (its permissions are put back after), or use File: Save As…"
+        );
+    }
+
+    /// Whether the active tab is a collab-shared file this guest must leave
+    /// to the session owner to write (see `save`).
+    fn owner_saves_active_file(&self) -> bool {
+        self.is_collab_guest()
+            && self
+                .editor
+                .path
+                .as_ref()
+                .and_then(|p| collab_file_key(&self.tree.root, p))
+                .is_some_and(|file| {
+                    self.collab
+                        .as_ref()
+                        .is_some_and(|s| !s.is_local_only(&file) && !s.owner_gone())
+                })
+    }
+
+    /// Report a failed explicit save. One that failed for want of
+    /// permission offers the sudo route on the next Cmd+S (#1379): saving
+    /// again as the same user could only fail again.
+    fn report_save_error(&mut self, e: anyhow::Error) {
+        if cfg!(unix)
+            && crate::widgets::editor::is_permission_denied(&e)
+            && let Some(path) = self.editor.path.clone()
+        {
+            self.status = format!(
+                "Save failed: you can't write {} - press Cmd+S again to save it with sudo in a terminal",
+                self.status_path(&path)
+            );
+            self.sudo_save_armed = Some(path);
+            return;
+        }
+        self.status = format!("Save failed: {e}");
+    }
+
+    /// File: Save with Sudo (#1379): hand the buffer to `sudo tee` in a new
+    /// terminal pane. sudo asks for the password there, so croft never sees
+    /// it, and `tee` writes the file in place, so it keeps its owner and
+    /// mode. The tab turns clean once the file holds the buffer's bytes.
+    fn save_with_sudo(&mut self) {
+        // A consent to overwrite an external change lasts one press, as in
+        // `save`.
+        let overwrite = std::mem::take(&mut self.force_save_armed);
+        if self.owner_saves_active_file() {
+            self.status =
+                String::from("Shared file: the session owner saves (your edits are already live)");
+            return;
+        }
+        if self.editor.has_non_text_view() {
+            self.status = String::from("Save with Sudo works on text tabs");
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Save with Sudo needs a file: use File: Save As… first");
+            return;
+        };
+        if !cfg!(unix) {
+            self.status = String::from("Save with Sudo needs sudo, which this system lacks");
+            return;
+        }
+        // The command line takes the path as text, so a name that is not
+        // valid UTF-8 could only be passed mangled, writing another file.
+        let Some(target) = path.to_str().map(str::to_owned) else {
+            self.status = String::from(
+                "Save with Sudo can't pass this file's name to the shell: it is not valid UTF-8",
+            );
+            return;
+        };
+        // Another process wrote the file since it was read: overwriting
+        // that takes the same press-again consent a plain save asks for.
+        if !overwrite && (self.editor.disk_conflict || self.editor.disk_changed_externally()) {
+            self.editor.disk_conflict = true;
+            self.force_save_armed = true;
+            self.sudo_save_armed = Some(path.clone());
+            self.status = format!(
+                "{} changed on disk since you opened it - press Cmd+S again to overwrite it with sudo, or close the tab to keep the disk version",
+                self.status_path(&path)
+            );
+            return;
+        }
+        // A sudo save of this file still waiting in its terminal could
+        // finish after this one and put the older bytes back.
+        if self
+            .pending_sudo_saves
+            .iter()
+            .find(|(p, ..)| *p == path)
+            .and_then(|(.., pane)| *pane)
+            .is_some_and(|pane| self.terminals.iter().any(|t| t.shell_pid() == Some(pane)))
+        {
+            self.status = format!(
+                "A sudo save of {} is still waiting in its terminal: finish it there, or close that terminal first",
+                self.status_path(&path)
+            );
+            return;
+        }
+        let Some(bytes) = self.editor.prepare_bytes_for_save() else {
+            self.status = format!(
+                "Not saved: {} can't hold every character in this file - switch encoding via the status bar",
+                self.editor.encoding.name()
+            );
+            return;
+        };
+        let staged = match stage_sudo_save(&bytes) {
+            Ok(staged) => staged,
+            Err(e) => {
+                self.status = format!("Save with Sudo failed: {e}");
+                return;
+            }
+        };
+        let command = sudo_save_command(&target, &staged.to_string_lossy());
+        let cwd = self.workspace_root().to_path_buf();
+        match PtyTerminal::new(&cwd) {
+            Ok(mut term) => {
+                term.set_manual_name(Some(String::from("sudo save")));
+                let pane = term.shell_pid();
+                // Tests stop short of running sudo for real.
+                if !cfg!(test) {
+                    term.write_input(format!("{command}\r").as_bytes());
+                }
+                self.insert_terminal(term);
+                self.show_terminal = true;
+                self.bottom_panel_tab = BottomPanelTab::Terminal;
+                self.focus_pane(Pane::Terminal);
+                self.pending_sudo_saves.retain(|(p, ..)| *p != path);
+                self.pending_sudo_saves.push((path.clone(), bytes, pane));
+                self.status = format!(
+                    "Saving {} with sudo: enter your password in the terminal",
+                    self.status_path(&path)
+                );
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&staged);
+                self.status = format!("Could not open a terminal: {e}");
+            }
+        }
+    }
+
+    /// Settle the sudo saves whose file now holds what was handed to `tee`
+    /// (#1379): those tabs are saved, not changed on disk. Runs before the
+    /// external-change sweep, which would otherwise take the write for
+    /// someone else's and raise a conflict over the user's own save. A save
+    /// whose tab is gone is dropped; one still in flight waits. Returns
+    /// whether a tab was settled.
+    fn settle_sudo_saves(&mut self) -> bool {
+        if self.pending_sudo_saves.is_empty() {
+            return false;
+        }
+        let mut saved = Vec::new();
+        for (path, bytes, pane) in std::mem::take(&mut self.pending_sudo_saves) {
+            let mut open = false;
+            let mut settled = None;
+            for e in std::iter::once(&mut self.editor)
+                .chain(self.editor_layout.inactive_groups_mut())
+                .flat_map(|g| g.editors.iter_mut())
+                .filter(|e| e.path.as_ref() == Some(&path))
+            {
+                open = true;
+                if e.settle_save_made_elsewhere(&bytes) && settled.is_none() {
+                    settled = Some((
+                        e.provenance_to_record(),
+                        e.bytes_for_disk(),
+                        e.lines.join("\n"),
+                    ));
+                }
+            }
+            if let Some((seats, described, text)) = settled {
+                saved.push((path, seats, described, text));
+            } else if open {
+                self.pending_sudo_saves.push((path, bytes, pane));
+            }
+        }
+        let Some(last) = saved.last().map(|(path, ..)| path.clone()) else {
+            return false;
+        };
+        // Set first: a reloaded config file reports on itself.
+        self.status = format!("Saved {} with sudo", self.status_path(&last));
+        // The same follow-ups as every other save path.
+        for (path, seats, described, text) in saved {
+            self.reload_config_for_path(&path);
+            self.approve_saved_edit(&path);
+            if let Some(lsp) = self.lsp.as_ref() {
+                lsp.save_doc(path.clone(), text);
+            }
+            self.record_history_snapshot_of(&path, seats, described);
+        }
+        true
     }
 
     /// An explicit save was refused because the encoding cannot represent the
@@ -63880,6 +64560,7 @@ impl App {
             return;
         }
         self.tree.add_root(path.clone());
+        self.reload_project_snippets();
         self.git_extra
             .push((path.clone(), GitWorker::spawn(path.clone())));
         self.rebind_workspace_watchers();
@@ -63901,6 +64582,7 @@ impl App {
             return;
         }
         self.tree.remove_root(&path);
+        self.snippets = load_all_snippets(self.roots.iter());
         // The removed folder's review queue goes with it (#345). Its rows
         // leave the tree, so no stale DOT renders — but the status chip
         // counts the same set, and a count that outlives the folder it
@@ -64147,6 +64829,8 @@ impl App {
         // where the old workspace's next launch would restore it (#862).
         self.remove_own_hot_exit();
         self.roots.replace_primary(new_root.clone());
+        // The old repository's snippets go, the new one's apply (#1484).
+        self.reload_project_snippets();
         // A panel the user never touched — the startup default, one unnamed
         // shell with no input ever typed and no launched program — is swapped
         // for the incoming workspace's saved layout, the same restore startup
@@ -65694,6 +66378,7 @@ impl App {
                 Ok(SaveOutcome::EncodingLoss) => {
                     format!("{} cannot hold every character", ed.encoding.name())
                 }
+                Ok(SaveOutcome::WriteProtected) => String::from("write-protected"),
                 Err(e) => e.to_string(),
             };
             left.push((Some(path), why));
@@ -70834,6 +71519,10 @@ impl App {
                 "Some characters can't be written as {}",
                 self.editor.encoding.name()
             )),
+            Ok(SaveOutcome::WriteProtected) => Err(format!(
+                "{} is write-protected: choose another name",
+                path.display()
+            )),
             Ok(SaveOutcome::DiskConflict) => unreachable!("save_as never checks for a conflict"),
             Err(e) => Err(format!("Save failed: {e}")),
         }
@@ -72259,6 +72948,31 @@ fn load_snippets(path: &std::path::Path) -> crate::snippets::SnippetSet {
     set
 }
 
+/// The user's snippets, then each workspace folder's project snippets
+/// (#1484): `.vscode/*.code-snippets` and `.croft/snippets.json`. The user's
+/// come first, so their own snippet wins a prefix both define. What a
+/// project file could not load goes to OUTPUT · Snippets under its path.
+fn load_all_snippets<'a>(
+    roots: impl IntoIterator<Item = &'a std::path::Path>,
+) -> crate::snippets::SnippetSet {
+    let mut set = load_snippets(&crate::snippets::snippets_path());
+    for root in roots {
+        for file in crate::snippets::project_files(root) {
+            let project = crate::snippets::SnippetSet::load(&file);
+            for w in project.warnings() {
+                let w = w.replacen("snippets.json could not be read", "could not be read", 1);
+                crate::output::push(
+                    "Snippets",
+                    crate::output::OutputLevel::Warn,
+                    &format!("{}: {w}", file.display()),
+                );
+            }
+            set.append(project);
+        }
+    }
+    set
+}
+
 /// The status line shown after a snippets reload, tested the same way. A
 /// file that loaded nothing says so, with the detail in OUTPUT (#1191), as
 /// keybindings.json does; skipped entries are counted (#1483).
@@ -73452,6 +74166,15 @@ fn copy_to_clipboard(text: &str) -> bool {
     let _ = out.write_all(&bytes);
     let _ = out.flush();
     false
+}
+
+/// The Emmet commands [`App::run_emmet_edit`] runs (#1557).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EmmetEdit {
+    RemoveTag,
+    MatchTag,
+    BalanceOutward,
+    BalanceInward,
 }
 
 /// Where `App::copy_where_pasted` put a copy.
@@ -76176,6 +76899,57 @@ fn repo_relative(repo_root: &Path, path: &Path) -> Option<String> {
             .collect::<Vec<_>>()
             .join("/"),
     )
+}
+
+/// The shell line a sudo save runs (#1379): `tee` copies the staged bytes
+/// into `target` as root, writing in place so the file keeps its owner and
+/// mode, and the staged copy is removed whether or not that worked.
+fn sudo_save_command(target: &str, staged: &str) -> String {
+    let q = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
+    format!(
+        "sudo tee -- {} < {} > /dev/null; rm -f -- {}",
+        q(target),
+        q(staged),
+        q(staged)
+    )
+}
+
+/// Stage the bytes a sudo save writes (#1379) in a fresh file only this
+/// user can read, since they may be a protected file's contents.
+fn stage_sudo_save(bytes: &[u8]) -> std::io::Result<PathBuf> {
+    use std::io::Write as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let dir = std::env::temp_dir();
+    let mut last = None;
+    for seq in 0..16 {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let path = dir.join(format!(
+            "croft-sudo-save-{}-{seq}-{nonce:08x}",
+            std::process::id()
+        ));
+        match opts.open(&path) {
+            Ok(mut file) => {
+                return match file.write_all(bytes).and_then(|()| file.flush()) {
+                    Ok(()) => Ok(path),
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&path);
+                        Err(e)
+                    }
+                };
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("no free staging name")))
 }
 
 /// The workspace-relative key a file replicates under in a collab session

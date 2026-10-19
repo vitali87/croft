@@ -1,0 +1,1 @@
+fix: Translations now reach the side bar and panel titles (EXPLORER, OUTLINE, PROBLEMS, OUTPUT, TERMINAL and the rest), the Command Palette title and the unsaved and discard prompts, and `croft locale-template` lists them.

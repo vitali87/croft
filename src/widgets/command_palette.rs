@@ -38,6 +38,12 @@ pub enum Command {
     DecrementNumber,
     TrimTrailingWhitespace,
     EmmetExpandAbbreviation,
+    EmmetWrapWithAbbreviation,
+    EmmetRemoveTag,
+    EmmetUpdateTag,
+    EmmetBalanceOutward,
+    EmmetBalanceInward,
+    EmmetMatchTag,
     ToggleWordWrap,
     ExpandSelection,
     ShrinkSelection,
@@ -121,6 +127,10 @@ pub enum Command {
     // --- File / editor management ---
     SaveFile,
     SaveAs,
+    /// File: Save with Sudo (#1379): write a file this user may not write
+    /// through `sudo tee` in a terminal pane, where sudo asks for the
+    /// password itself.
+    SaveWithSudo,
     /// File: Revert File (#1285): drop the tab's unsaved edits for the
     /// text on disk, as one undo step.
     RevertFile,
@@ -429,6 +439,15 @@ pub enum Command {
     SwitchProfile,
     ToggleInlineSuggestions,
     StepOver,
+    /// Debug: Continue / Step Into / Step Out (#1543): the F5 / F11 /
+    /// Shift+F11 actions as commands, so the palette finds them and
+    /// `keybindings.json` can rebind them.
+    ContinueDebugging,
+    StepInto,
+    StepOut,
+    /// Debug: Step Into Target (#1543): pick which call on the paused line
+    /// to step into (DAP `stepInTargets`).
+    StepIntoTarget,
     ToggleRaisedExceptions,
     AttachPythonProcess,
     ColorTheme,
@@ -560,6 +579,12 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::DecrementNumber,
     Command::TrimTrailingWhitespace,
     Command::EmmetExpandAbbreviation,
+    Command::EmmetWrapWithAbbreviation,
+    Command::EmmetRemoveTag,
+    Command::EmmetUpdateTag,
+    Command::EmmetBalanceOutward,
+    Command::EmmetBalanceInward,
+    Command::EmmetMatchTag,
     Command::ToggleWordWrap,
     Command::ExpandSelection,
     Command::ShrinkSelection,
@@ -632,6 +657,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::UnfoldAllRegions,
     Command::SaveFile,
     Command::SaveAs,
+    Command::SaveWithSudo,
     Command::RevertFile,
     Command::SaveAll,
     Command::NewFile,
@@ -882,6 +908,10 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::SwitchProfile,
     Command::ToggleInlineSuggestions,
     Command::StepOver,
+    Command::ContinueDebugging,
+    Command::StepInto,
+    Command::StepOut,
+    Command::StepIntoTarget,
     Command::ToggleRaisedExceptions,
     Command::AttachPythonProcess,
     Command::RunTask,
@@ -994,6 +1024,12 @@ impl Command {
             Command::DecrementNumber => "Decrement Number Under Cursor",
             Command::TrimTrailingWhitespace => "Trim Trailing Whitespace",
             Command::EmmetExpandAbbreviation => "Emmet: Expand Abbreviation",
+            Command::EmmetWrapWithAbbreviation => "Emmet: Wrap with Abbreviation",
+            Command::EmmetRemoveTag => "Emmet: Remove Tag",
+            Command::EmmetUpdateTag => "Emmet: Update Tag",
+            Command::EmmetBalanceOutward => "Emmet: Balance (outward)",
+            Command::EmmetBalanceInward => "Emmet: Balance (inward)",
+            Command::EmmetMatchTag => "Emmet: Go to Matching Pair",
             Command::ToggleWordWrap => "View: Toggle Word Wrap",
             Command::ExpandSelection => "Expand Selection",
             Command::ShrinkSelection => "Shrink Selection",
@@ -1067,6 +1103,7 @@ impl Command {
             Command::UnfoldAllRegions => "Unfold All Regions",
             Command::SaveFile => "File: Save",
             Command::SaveAs => "File: Save As…",
+            Command::SaveWithSudo => "File: Save with Sudo",
             Command::RevertFile => "File: Revert File",
             Command::SaveAll => "File: Save All",
             Command::NewFile => "File: New File…",
@@ -1321,6 +1358,10 @@ impl Command {
             Command::SwitchProfile => "Profiles: Switch Profile",
             Command::ToggleInlineSuggestions => "Editor: Toggle Inline Suggestions",
             Command::StepOver => "Debug: Step Over",
+            Command::ContinueDebugging => "Debug: Continue",
+            Command::StepInto => "Debug: Step Into",
+            Command::StepOut => "Debug: Step Out",
+            Command::StepIntoTarget => "Debug: Step Into Target",
             Command::ToggleRaisedExceptions => "Debug: Toggle Break on Raised Exceptions",
             Command::AttachPythonProcess => "Debug: Attach to Python Process",
             Command::RunTask => "Tasks: Run Task",
@@ -1423,6 +1464,12 @@ impl Command {
             Command::DecrementNumber => "Cmd+Opt+-",
             Command::TrimTrailingWhitespace => "Cmd+Opt+Shift+W",
             Command::EmmetExpandAbbreviation => "Cmd+Opt+Shift+E",
+            Command::EmmetWrapWithAbbreviation => "",
+            Command::EmmetRemoveTag => "",
+            Command::EmmetUpdateTag => "",
+            Command::EmmetBalanceOutward => "",
+            Command::EmmetBalanceInward => "",
+            Command::EmmetMatchTag => "",
             Command::ToggleLineComment => "Cmd+/",
             Command::ToggleBlockComment => "Shift+Alt+A",
             Command::ToggleWordWrap => "Alt+Z",
@@ -1511,6 +1558,7 @@ impl Command {
             Command::UnfoldAllRegions => "Cmd+K Cmd+9",
             Command::SaveFile => "Cmd+S",
             Command::SaveAs => "",
+            Command::SaveWithSudo => "",
             Command::RevertFile => "",
             // VS Code's macOS chord; its Linux `Ctrl+K S` is Select for
             // Compare here, so Linux takes `Ctrl+Alt+S` instead.
@@ -1736,6 +1784,10 @@ impl Command {
             Command::SwitchDebugSession => "Cmd+Opt+Shift+G",
             Command::ToggleBreakpoint => "F9",
             Command::StepOver => "F10",
+            Command::ContinueDebugging => "F5",
+            Command::StepInto => "F11",
+            Command::StepOut => "Shift+F11",
+            Command::StepIntoTarget => "",
             Command::RestartDebugging => "Shift+Cmd+F5",
             Command::EditBreakpointCondition => "Shift+F9",
             Command::EditLogpoint => "Shift+Alt+F9",
@@ -1865,6 +1917,12 @@ impl Command {
             Command::DecrementNumber => "decrement_number",
             Command::TrimTrailingWhitespace => "trim_trailing_whitespace",
             Command::EmmetExpandAbbreviation => "emmet_expand_abbreviation",
+            Command::EmmetWrapWithAbbreviation => "emmet_wrap_with_abbreviation",
+            Command::EmmetRemoveTag => "emmet_remove_tag",
+            Command::EmmetUpdateTag => "emmet_update_tag",
+            Command::EmmetBalanceOutward => "emmet_balance_outward",
+            Command::EmmetBalanceInward => "emmet_balance_inward",
+            Command::EmmetMatchTag => "emmet_match_tag",
             Command::ToggleWordWrap => "toggle_word_wrap",
             Command::ExpandSelection => "expand_selection",
             Command::ShrinkSelection => "shrink_selection",
@@ -1938,6 +1996,7 @@ impl Command {
             Command::UnfoldAllRegions => "unfold_all_regions",
             Command::SaveFile => "save_file",
             Command::SaveAs => "save_as",
+            Command::SaveWithSudo => "save_with_sudo",
             Command::RevertFile => "revert_file",
             Command::SaveAll => "save_all",
             Command::NewFile => "new_file",
@@ -2188,6 +2247,10 @@ impl Command {
             Command::SwitchProfile => "switch_profile",
             Command::ToggleInlineSuggestions => "toggle_inline_suggestions",
             Command::StepOver => "step_over",
+            Command::ContinueDebugging => "continue",
+            Command::StepInto => "step_into",
+            Command::StepOut => "step_out",
+            Command::StepIntoTarget => "step_into_target",
             Command::ToggleRaisedExceptions => "toggle_raised_exceptions",
             Command::AttachPythonProcess => "attach_python_process",
             Command::ColorTheme => "color_theme",
@@ -2638,7 +2701,10 @@ pub fn render_command_palette(
 
     Widget::render(Clear, rect, buf);
     let title = Span::styled(
-        " Command Palette — Esc to close, ↑/↓ to navigate, Enter to run ",
+        format!(
+            " {} ",
+            crate::i18n::tr("Command Palette — Esc to close, ↑/↓ to navigate, Enter to run")
+        ),
         Style::default()
             .fg(theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
             .add_modifier(Modifier::BOLD),

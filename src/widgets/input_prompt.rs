@@ -162,6 +162,12 @@ pub enum InputPurpose {
     /// Submitting stores the query on the view and jumps to the first
     /// match at or after the cursor; F3 repeats it.
     HexFind,
+    /// Emmet: Wrap with Abbreviation (#1557): the typed abbreviation wraps
+    /// the selection.
+    EmmetWrap,
+    /// Emmet: Update Tag (#1557): the typed name replaces the enclosing
+    /// element's.
+    EmmetUpdateTag,
     /// Save the current folder set as a VS Code-compatible workspace
     /// file (#163): the typed value is the destination path.
     SaveWorkspaceAs,

@@ -1269,6 +1269,32 @@ fn toggle_render_whitespace_cycles_modes_across_every_editor() {
     assert!(all_editors_in(&app, WhitespaceMode::Selection));
 }
 
+/// #1524: a settings reload carries the rulers straight onto every open
+/// editor, without waiting for an unrelated focus sync.
+#[test]
+fn reloaded_rulers_reach_every_open_editor() {
+    let mut app = editor_app_with_lines(&["a b"]);
+    app.editor
+        .open_text_buffer(std::path::Path::new("later.txt"), "c d")
+        .unwrap();
+    app.apply_merged_settings(&crate::prefs::Prefs {
+        rulers: vec![80, 100],
+        ..Default::default()
+    });
+    assert!(app.editor.editors.len() >= 2);
+    assert!(app.editor.editors.iter().all(|e| e.rulers == vec![80, 100]));
+    app.apply_merged_settings(&crate::prefs::Prefs {
+        rulers: vec![100, 80, 100],
+        ..Default::default()
+    });
+    assert!(
+        app.editor.editors.iter().all(|e| e.rulers == vec![80, 100]),
+        "normalized on the way in"
+    );
+    app.apply_merged_settings(&crate::prefs::Prefs::default());
+    assert!(app.editor.editors.iter().all(|e| e.rulers.is_empty()));
+}
+
 #[test]
 fn build_sticky_lines_pins_enclosing_headers_scrolled_above_the_viewport() {
     use crate::lsp::manager::OutlineKind;
