@@ -4409,6 +4409,11 @@ pub struct App {
     /// an active task; the status bar surfaces it so a busy-priming server is
     /// never mistaken for a dead one. Cleared on the server's `End`.
     lsp_progress: std::collections::HashMap<String, String>,
+    /// Language-server questions (`window/showMessageRequest`, #1599)
+    /// waiting for the list picker, oldest first, and the one it shows.
+    /// Dropping one answers the server "no action".
+    lsp_questions: std::collections::VecDeque<LspQuestion>,
+    lsp_question: Option<LspQuestion>,
     /// Active completion popup, when a completion request has been issued
     /// and the user hasn't dismissed the result. Populated by drain_lsp_completion
     /// once the worker sends a CompletionResult back.
@@ -5866,6 +5871,26 @@ const WELCOME_TAGLINE: &str = "LIGHTWEIGHT.  BLAZINGLY FAST.  BUILT FOR DEVELOPE
 
 use crate::gradient::{GRAD_TL, GRAD_TR, POPUP_SEL_BG, paint_gradient_box, rgb_color};
 
+/// A language server's `window/showMessageRequest` waiting for an answer
+/// (#1599). Dropping it answers "no action".
+struct LspQuestion {
+    server: String,
+    text: String,
+    actions: Vec<lsp_types::MessageActionItem>,
+    reply: tokio::sync::oneshot::Sender<Option<lsp_types::MessageActionItem>>,
+}
+
+/// A server's message as one status line, `server: first line`, so a
+/// multi-line cargo error does not spill over the bar.
+fn server_message_status(server: &str, text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    format!("{server}: {line}")
+}
+
 fn open_url(url: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     let mut cmd = {
@@ -6591,6 +6616,8 @@ impl App {
             sarif_step_signature: None,
             sarif_published: Vec::new(),
             lsp_progress: std::collections::HashMap::new(),
+            lsp_questions: std::collections::VecDeque::new(),
+            lsp_question: None,
             completion_popup: None,
             editor_vim_chord: EditorVimChord::default(),
             cmd_k_leader: None,
@@ -11479,25 +11506,148 @@ impl App {
     pub fn drain_lsp_progress(&mut self) -> bool {
         let mut updates = Vec::new();
         if let Some(lsp) = self.lsp.as_ref() {
-            while let Some(u) = lsp.drain_progress() {
+            while let Some(u) = lsp.drain_server_update() {
                 updates.push(u);
             }
         }
         let mut changed = false;
         for u in updates {
-            match u.message {
-                Some(message) => {
-                    self.lsp_progress.insert(u.server, message);
-                    changed = true;
+            changed |= self.apply_server_update(u);
+        }
+        changed | self.ask_next_lsp_question()
+    }
+
+    /// Act on one progress update or `window/*` message from a server.
+    /// Returns true when the screen needs a repaint.
+    fn apply_server_update(&mut self, u: crate::lsp::manager::ServerUpdate) -> bool {
+        use crate::lsp::manager::ServerEvent;
+        match u.event {
+            ServerEvent::Progress(Some(message)) => {
+                self.lsp_progress.insert(u.server, message);
+                true
+            }
+            ServerEvent::Progress(None) => self.lsp_progress.remove(&u.server).is_some(),
+            // An error a server can't recover from on its own, such as
+            // rust-analyzer's "Failed to load workspaces", used to sit in
+            // OUTPUT while the status bar said all was well (#1599).
+            ServerEvent::Message { text, .. } => {
+                self.status = server_message_status(&u.server, &text);
+                true
+            }
+            ServerEvent::Question {
+                text,
+                actions,
+                reply,
+                ..
+            } => {
+                if actions.is_empty() {
+                    // Nothing to pick: a message, answered "no action" by
+                    // dropping `reply`.
+                    self.status = server_message_status(&u.server, &text);
+                    return true;
                 }
-                None => {
-                    if self.lsp_progress.remove(&u.server).is_some() {
-                        changed = true;
-                    }
-                }
+                self.lsp_questions.push_back(LspQuestion {
+                    server: u.server,
+                    text,
+                    actions,
+                    reply,
+                });
+                false
+            }
+            ServerEvent::ShowDocument {
+                uri,
+                external,
+                take_focus,
+                selection,
+                reply,
+            } => {
+                let shown = self.show_server_document(uri, external, take_focus, selection);
+                let _ = reply.send(shown);
+                true
             }
         }
-        changed
+    }
+
+    /// Put the oldest waiting server question in the list picker, once no
+    /// other picker is open. Returns true when one was opened.
+    fn ask_next_lsp_question(&mut self) -> bool {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let asking = self
+            .list_picker
+            .as_ref()
+            .is_some_and(|p| p.purpose == ListPurpose::ServerQuestion);
+        if !asking {
+            // Its picker was replaced or went away without a pick.
+            self.lsp_question = None;
+        }
+        if self.list_picker.is_some() {
+            return false;
+        }
+        let Some(q) = self.lsp_questions.pop_front() else {
+            return false;
+        };
+        let rows = q
+            .actions
+            .iter()
+            .enumerate()
+            .map(|(i, a)| ListRow {
+                id: i.to_string(),
+                label: a.title.clone(),
+            })
+            .collect();
+        let title = server_message_status(&q.server, &q.text);
+        self.status = title.clone();
+        self.lsp_question = Some(q);
+        self.open_list_picker(
+            ListPicker::new(ListPurpose::ServerQuestion, title, rows),
+            "",
+        );
+        true
+    }
+
+    /// `window/showDocument`: a link goes to the browser, a file opens with
+    /// the server's range selected. Without `take_focus` the file still
+    /// opens but keyboard focus stays in the pane that had it. Returns
+    /// whether the document was shown, which is the server's answer.
+    fn show_server_document(
+        &mut self,
+        uri: lsp_types::Url,
+        external: bool,
+        take_focus: bool,
+        selection: Option<lsp_types::Range>,
+    ) -> bool {
+        let path = (!external && uri.scheme() == "file")
+            .then(|| uri.to_file_path().ok())
+            .flatten();
+        let Some(path) = path else {
+            return self.try_open_url_for_user(uri.as_str());
+        };
+        let start = selection.map(|r| r.start).unwrap_or_default();
+        let (focus, maximized) = (self.focus, self.terminal_maximized);
+        if !self.try_go_to_definition(path.clone(), start.line, start.character) {
+            return false;
+        }
+        if !take_focus && focus != Pane::Editor {
+            self.focus_pane(focus);
+            self.terminal_maximized = maximized;
+        }
+        let Some(end) = selection.map(|r| r.end).filter(|&end| end != start) else {
+            return true;
+        };
+        if self.editor.path.as_deref() != Some(path.as_path()) {
+            return true;
+        }
+        let row = (end.line as usize).min(self.editor.lines.len().saturating_sub(1));
+        let col = self.editor.utf16_col_to_char_pub(row, end.character);
+        let anchor = (self.editor.cursor_row, self.editor.cursor_col);
+        self.editor.selection = Some(crate::widgets::editor::EditorSelection {
+            anchor,
+            head: (row, col),
+        });
+        self.editor.cursor_row = row;
+        self.editor.cursor_col = col;
+        self.editor.ensure_cursor_col_visible();
+        true
     }
 
     /// The active LSP progress line for the status bar, if any server is busy
@@ -11635,6 +11785,11 @@ impl App {
     }
 
     fn go_to_definition(&mut self, path: PathBuf, line: u32, col: u32) {
+        self.try_go_to_definition(path, line, col);
+    }
+
+    /// `go_to_definition`, returning whether the file opened.
+    fn try_go_to_definition(&mut self, path: PathBuf, line: u32, col: u32) -> bool {
         let pinned = self.keep_preview_open_for_navigation_to(&path);
         if let Some(from) = self.editor.path.clone() {
             self.nav.record(NavLoc {
@@ -11646,11 +11801,13 @@ impl App {
         // `col` is the server's UTF-16 column, not a character column.
         match self.open_at_utf16(&path, line, col) {
             Ok(()) => {
-                self.status = format!("Jumped to {} line {}", self.status_path(&path), line + 1)
+                self.status = format!("Jumped to {} line {}", self.status_path(&path), line + 1);
+                true
             }
             Err(e) => {
                 self.restore_preview_after_failed_navigation(pinned);
-                self.status = format!("Go to definition failed: {e}")
+                self.status = format!("Go to definition failed: {e}");
+                false
             }
         }
     }
@@ -15922,8 +16079,13 @@ impl App {
             && let (Some(path), Some(lsp)) = (self.editor.path.clone(), self.lsp.as_mut())
         {
             lsp.execute_command(path, cmd.command, cmd.arguments);
+            // A command-only action (gopls's "Browse documentation") does
+            // its work in the server, and anything it has to show arrives
+            // as a message; claiming a fix was applied was wrong (#1599).
+            if !applied {
+                self.status = format!("Ran {}", item.title);
+            }
             applied = true;
-            self.status = format!("Applied quick fix: {}", item.title);
         }
         if !applied {
             self.status = format!("Quick fix had no effect: {}", item.title);
@@ -28069,19 +28231,28 @@ impl App {
     /// Open `url` in the user's browser: through the relay or a detected
     /// URL on a remote session, and never from a test.
     fn open_url_for_user(&mut self, url: &str) {
+        self.try_open_url_for_user(url);
+    }
+
+    /// `open_url_for_user`, returning false when the browser could not be
+    /// started.
+    fn try_open_url_for_user(&mut self, url: &str) -> bool {
         if cfg!(test) {
             // Tests never start a browser.
             self.status = format!("Open {url}");
-            return;
+            return true;
         }
         if self.drop_relay_active() || is_remote_session() {
             self.open_detected_url(url);
-            return;
+            return true;
         }
-        self.status = match open_url(url) {
+        let opened = open_url(url);
+        let ok = opened.is_ok();
+        self.status = match opened {
             Ok(()) => format!("Opened {url}"),
             Err(e) => format!("Could not open a browser ({e}): {url}"),
         };
+        ok
     }
 
     /// The store index of the current database, for the palette commands
@@ -36958,6 +37129,8 @@ impl App {
     }
 
     fn close_list_picker(&mut self) {
+        // A server question closed without a pick is answered "no action".
+        self.lsp_question = None;
         if self.list_picker.take().is_some() {
             self.overlays.list_picker_clear.request();
             self.overlays.activity.mark_dirty();
@@ -39762,9 +39935,18 @@ impl App {
         };
         let purpose = picker.purpose;
         let selected = picker.selected;
+        let question = self.lsp_question.take();
         self.close_list_picker();
         let index = row.id.parse::<usize>().unwrap_or(0);
         match purpose {
+            ListPurpose::ServerQuestion => {
+                if let Some(q) = question
+                    && let Some(action) = q.actions.get(index).cloned()
+                {
+                    self.status = format!("{}: {}", q.server, action.title);
+                    let _ = q.reply.send(Some(action));
+                }
+            }
             ListPurpose::AgentLaneFile => {
                 if let Some((agent, path)) = self.pending_lane_picks.get(index).cloned() {
                     self.diff_agent_lane_row(&agent, &path);

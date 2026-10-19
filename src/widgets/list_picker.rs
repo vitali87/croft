@@ -119,6 +119,9 @@ pub enum ListPurpose {
     PanelAlignment,
     /// View: Set Quick Input Position… (#852): `id` is `top` or `center`.
     QuickInputPosition,
+    /// A language server's `window/showMessageRequest` (#1599): the rows
+    /// are its actions, `id` an index into them; Esc answers no action.
+    ServerQuestion,
     /// Notebook: Select Kernel (#1377): the installed kernelspecs, `id`
     /// the kernel's name.
     NotebookKernel,
