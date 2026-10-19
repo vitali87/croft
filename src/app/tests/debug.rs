@@ -4454,6 +4454,27 @@ fn a_node_launch_with_nothing_to_run_names_what_it_needs() {
     assert!(app.debug_sessions.is_empty());
 }
 
+/// #1410: a browser croft launches has a screen to open on only locally
+/// with a display; over SSH, or on Linux with no X or Wayland display, it
+/// runs headless.
+#[test]
+fn a_browser_runs_headless_only_where_there_is_no_display() {
+    let none = |_: &str| false;
+    let x11 = |k: &str| k == "DISPLAY";
+    let wayland = |k: &str| k == "WAYLAND_DISPLAY";
+    assert!(crate::app::no_display(true, true, x11), "over SSH");
+    assert!(
+        crate::app::no_display(false, true, none),
+        "Linux, no display"
+    );
+    assert!(!crate::app::no_display(false, true, x11));
+    assert!(!crate::app::no_display(false, true, wayland));
+    assert!(
+        !crate::app::no_display(false, false, none),
+        "macOS has a display with no DISPLAY set"
+    );
+}
+
 /// #1392: a CodeLLDB `cargo` launch with no `program` builds with cargo
 /// first instead of being refused; an lldb launch with neither is still
 /// refused.
@@ -4501,6 +4522,189 @@ fn a_cargo_launch_builds_first_and_a_bare_one_is_refused() {
         "{}",
         app.status
     );
+}
+
+/// A CMake project whose `main.cpp` needs its include folder and a second
+/// translation unit (#1359), as the issue's fixture.
+fn cmake_debug_project(root: &Path) -> PathBuf {
+    for (rel, text) in [
+        (
+            "include/geom.hpp",
+            "#pragma once\nnamespace geom { double twice(double); }\n",
+        ),
+        (
+            "src/geom.cpp",
+            "#include \"geom.hpp\"\nnamespace geom { double twice(double x) { return 2*x; } }\n",
+        ),
+        (
+            "src/main.cpp",
+            "#include <cstdio>\n#include \"geom.hpp\"\nint main() { std::printf(\"%f\\n\", geom::twice(2)); }\n",
+        ),
+        (
+            "CMakeLists.txt",
+            "cmake_minimum_required(VERSION 3.10)\nproject(cp CXX)\nset(CMAKE_EXPORT_COMPILE_COMMANDS ON)\nadd_executable(app src/main.cpp src/geom.cpp)\ntarget_include_directories(app PRIVATE include)\n",
+        ),
+    ] {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, text).unwrap();
+    }
+    root.join("src/main.cpp")
+}
+
+/// Wait out F5's C/C++ build (#1359).
+fn finished_debug_build(
+    app: &mut App,
+) -> (
+    PathBuf,
+    Result<crate::cpp_build::Built, crate::cpp_build::Failed>,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        if let Some(done) = app.take_debug_build() {
+            return done;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the debug build never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// #1359: F5 on `src/main.cpp` in a configured CMake project builds the
+/// project's target, off the UI thread, and debugs that program; it no
+/// longer compiles `main.cpp` alone (which cannot find `geom.hpp`) or
+/// leaves a `main.dbg` in `src/`.
+#[test]
+fn f5_in_a_cmake_project_debugs_the_target_that_builds_the_file() {
+    use crate::lsp::manager::is_on_path;
+    if !(is_on_path("cmake") && is_on_path("c++")) {
+        return;
+    }
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    let main = cmake_debug_project(&root);
+    let configured = std::process::Command::new("cmake")
+        .arg("-S")
+        .arg(&root)
+        .arg("-B")
+        .arg(root.join("build"))
+        .output()
+        .unwrap();
+    assert!(configured.status.success(), "{configured:?}");
+    with_relay_home(tmp.path(), || {
+        let mut app = App::new(root.clone()).unwrap();
+        app.begin_debug_build(&main);
+        assert_eq!(app.status, "Building main.cpp for debugging…");
+        let (source, built) = finished_debug_build(&mut app);
+        assert_eq!(source, main);
+        let built = built.unwrap_or_else(|f| panic!("{}\n{}", f.summary, f.output));
+        assert_eq!(
+            built.binary.canonicalize().unwrap(),
+            root.join("build/app").canonicalize().unwrap()
+        );
+        assert!(built.how.starts_with("cmake --build"), "{}", built.how);
+        assert!(built.how.ends_with("(target app)"), "{}", built.how);
+        let ran = std::process::Command::new(&built.binary).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), "4.000000");
+        assert!(!root.join("src/main.dbg").exists(), "nothing lands in src/");
+    });
+}
+
+/// #1359, negative: a build that fails says so on the status line and keeps
+/// the compiler's whole output in OUTPUT, and a new F5 drops a build still
+/// running rather than launching it later.
+#[test]
+fn a_failed_debug_build_says_why_and_keeps_its_output() {
+    use crate::lsp::manager::is_on_path;
+    if !is_on_path("c++") {
+        return;
+    }
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    // Not configured: no build folder, so main.cpp builds alone and
+    // cannot find geom.hpp.
+    let main = cmake_debug_project(&root);
+    with_relay_home(tmp.path(), || {
+        let mut app = App::new(root.clone()).unwrap();
+        app.begin_debug_build(&main);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !app.poll_debug_build() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the build never ended"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            app.status.starts_with("Build for debug failed: c++ failed"),
+            "{}",
+            app.status
+        );
+        assert!(app.status.contains("geom.hpp"), "{}", app.status);
+        assert!(
+            app.status
+                .ends_with("(full output in OUTPUT › Debug Build)")
+        );
+        assert!(app.run_debug.feedback_is_error);
+        let lines = crate::output::snapshot("Debug Build").expect("the build's output is kept");
+        assert!(lines.iter().any(|l| l.text.contains("geom.hpp")));
+        assert!(!root.join("src/main.dbg").exists());
+        assert!(!app.poll_debug_build(), "a finished build reports once");
+
+        app.begin_debug_build(&main);
+        app.editor.path = None;
+        app.start_debug_session();
+        assert!(
+            app.debug_build.is_none(),
+            "a new F5 drops the running build"
+        );
+        assert_eq!(app.status, "Open a file to debug");
+
+        // Stop while the build runs: it never launches.
+        app.begin_debug_build(&main);
+        app.debug_stop_by_user();
+        assert!(app.debug_build.is_none(), "Stop drops the running build");
+        assert!(!app.poll_debug_build());
+    });
+}
+
+/// #1359: F5 on a C++ file in an added workspace folder builds that
+/// folder's CMake project, not the primary root's.
+#[test]
+fn f5_builds_the_project_of_the_files_own_workspace_folder() {
+    use crate::lsp::manager::is_on_path;
+    if !(is_on_path("cmake") && is_on_path("c++")) {
+        return;
+    }
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = tmp.path().join("primary");
+    std::fs::create_dir_all(&primary).unwrap();
+    let second = tmp.path().join("second");
+    let main = cmake_debug_project(&second);
+    let configured = std::process::Command::new("cmake")
+        .arg("-S")
+        .arg(&second)
+        .arg("-B")
+        .arg(second.join("build"))
+        .output()
+        .unwrap();
+    assert!(configured.status.success(), "{configured:?}");
+    with_relay_home(tmp.path(), || {
+        let mut app = App::new(primary.clone()).unwrap();
+        app.roots.add(second.clone());
+        app.begin_debug_build(&main);
+        let (_, built) = finished_debug_build(&mut app);
+        let built = built.unwrap_or_else(|f| panic!("{}\n{}", f.summary, f.output));
+        assert_eq!(
+            built.binary.canonicalize().unwrap(),
+            second.join("build/app").canonicalize().unwrap()
+        );
+    });
 }
 
 /// #1392: Stop Debugging while cargo is still building drops the pending
