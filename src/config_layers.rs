@@ -114,6 +114,7 @@ pub const WORKSPACE_ALLOWED_KEYS: &[&str] = &[
     "auto_save",
     "auto_save_on_focus_change",
     "render_whitespace",
+    "rulers",
     "word_based_suggestions",
     "disable_inline_blame",
     "disable_auto_close_pairs",
@@ -833,6 +834,19 @@ mod tests {
         assert_eq!(m.prefs.languages["c"].format_on_save, Some(true));
         assert!(m.prefs.mcp_consented.is_empty());
         assert_eq!(layer_of(&m.provenance, "languages"), LayerKind::Workspace);
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+    }
+
+    /// #1524: rulers are display only, so a repository's `.croft/config.json`
+    /// may set them (a project's line-length limit), over the user's own.
+    #[test]
+    fn a_workspace_layer_may_set_rulers() {
+        let (_tmp, user, root) = setup();
+        write(&user.join("config.json"), r#"{"rulers":[120]}"#);
+        write(&root.join(".croft/config.json"), r#"{"rulers":[88]}"#);
+        let m = load_merged_from(&user, Some(&root), "linux");
+        assert_eq!(m.prefs.rulers, vec![88]);
+        assert_eq!(layer_of(&m.provenance, "rulers"), LayerKind::Workspace);
         assert!(m.warnings.is_empty(), "{:?}", m.warnings);
     }
 

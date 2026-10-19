@@ -351,6 +351,11 @@ pub struct Prefs {
     /// "all", or "none". Parsed by `WhitespaceMode::from_pref`.
     #[serde(default)]
     pub render_whitespace: String,
+    /// Vertical rulers (#1524), VS Code's `editor.rulers`: a dim line down
+    /// the editor at each of these columns marks a line-length limit, such
+    /// as 80 or 100. Empty draws none.
+    #[serde(default)]
+    pub rulers: Vec<u16>,
     /// Word-based completion (#1566), VS Code's
     /// `editor.wordBasedSuggestions`: which open documents' words Ctrl+Space
     /// offers when no language server has suggestions. "off",
