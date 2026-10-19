@@ -10650,7 +10650,20 @@ mod tests {
             .arg("30")
             .spawn()
             .expect("sleep runs");
-        let argv = process_cmdline(child.id() as i32);
+        // `spawn` can return while the child still reads as the test binary
+        // that forked it, before its exec lands; a loaded runner caught that.
+        // Read until the argv is sleep's: a process_cmdline that never reads
+        // the command line still fails here, when the budget runs out.
+        let mut argv = None;
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(200),
+            "the child's argv to read as sleep's",
+            || {
+                argv = process_cmdline(child.id() as i32);
+                argv.as_ref()
+                    .is_some_and(|a| a.last().map(String::as_str) == Some("30"))
+            },
+        );
         let _ = child.kill();
         let _ = child.wait();
         let argv = argv.expect("a live child's argv");
