@@ -15179,19 +15179,29 @@ impl Editor {
     }
 
     /// Like [`Self::word_at`], but over the identifier runs the naming-style
-    /// transforms rewrite: letters, digits, `_` and `-` (#1573).
+    /// transforms rewrite: letters, digits, `_` and `-` (#1573). A `-` joins
+    /// the run only between a letter or digit and a letter, so the minus in
+    /// `total-5` or `-count` stays an operator.
     fn identifier_run_at(&self, line: usize, col: usize) -> Option<(usize, usize)> {
-        let ident = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
         let chars: Vec<char> = self.lines.get(line)?.chars().collect();
-        if col >= chars.len() || !ident(chars[col]) {
+        let ident = |i: usize| {
+            let c = chars[i];
+            c.is_alphanumeric()
+                || c == '_'
+                || (c == '-'
+                    && i > 0
+                    && chars[i - 1].is_alphanumeric()
+                    && chars.get(i + 1).is_some_and(|n| n.is_alphabetic()))
+        };
+        if col >= chars.len() || !ident(col) {
             return None;
         }
         let mut start = col;
-        while start > 0 && ident(chars[start - 1]) {
+        while start > 0 && ident(start - 1) {
             start -= 1;
         }
         let mut end = col + 1;
-        while end < chars.len() && ident(chars[end]) {
+        while end < chars.len() && ident(end) {
             end += 1;
         }
         Some((start, end))
@@ -36553,6 +36563,19 @@ mod tests {
             e.cursor_col = col;
             e.transform_selection_case(CaseTransform::Snake);
             assert_eq!(e.lines, vec!["let user_name = 1;"], "caret at {col}");
+        }
+    }
+
+    /// #1573: with no selection, a minus is not part of the identifier, so
+    /// a transform on `total` in `total-5` leaves the subtraction alone.
+    #[test]
+    fn camel_case_caret_stops_at_a_minus() {
+        for (text, col) in [("let x = total-5;", 9), ("let x = -count;", 10)] {
+            let mut e = editor_with(text);
+            e.cursor_row = 0;
+            e.cursor_col = col;
+            e.transform_selection_case(CaseTransform::Camel);
+            assert_eq!(e.lines, vec![text], "caret at {col} in {text}");
         }
     }
 
