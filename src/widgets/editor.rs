@@ -2218,13 +2218,25 @@ pub struct TextSpanEdit {
 /// earlier replacement never shifts the coordinates of a later one. Returns
 /// the number of edits applied. Out-of-range edits are skipped.
 pub fn apply_span_edits_to_lines(lines: &mut Vec<String>, edits: &[TextSpanEdit]) -> usize {
-    let mut applied = 0;
-    for (e, count) in in_application_order(char_span_edits(lines, edits)) {
-        if replace_span(lines, &e) {
-            applied += count;
-        }
-    }
-    applied
+    let converted = char_span_edits(lines, edits);
+    apply_char_span_edits(lines, converted)
+        .iter()
+        .map(|(_, count)| count)
+        .sum()
+}
+
+/// Apply char-column `edits` in [`in_application_order`] and return the
+/// ones that landed, in the order applied, each with the number of edits it
+/// stands for; out-of-range edits are skipped and left out, so the caret is
+/// mapped only through text that actually changed.
+fn apply_char_span_edits(
+    lines: &mut Vec<String>,
+    edits: Vec<TextSpanEdit>,
+) -> Vec<(TextSpanEdit, usize)> {
+    in_application_order(edits)
+        .into_iter()
+        .filter(|(e, _)| replace_span(lines, e))
+        .collect()
 }
 
 /// `edits` with their UTF-16 columns read as chars. Every edit names the
@@ -2268,9 +2280,59 @@ fn in_application_order(mut edits: Vec<TextSpanEdit>) -> Vec<(TextSpanEdit, usiz
     joined
 }
 
+/// Where the text `e` writes ends, in the coordinates after it lands.
+fn span_new_end(e: &TextSpanEdit) -> (usize, usize) {
+    let rows = e.new_text.matches('\n').count();
+    let last = e.new_text.rsplit('\n').next().unwrap_or("").chars().count();
+    match rows {
+        0 => (e.start.0, e.start.1 + last),
+        _ => (e.start.0 + rows, last),
+    }
+}
+
+/// `pos` moved past an edit that ends at or before it: by the rows the edit
+/// added or removed and, when it ends on `pos`'s row, by the change in that
+/// row's text before `pos`.
+fn shift_past_span(
+    pos: (usize, usize),
+    e: &TextSpanEdit,
+    new_end: (usize, usize),
+) -> (usize, usize) {
+    if pos.0 == e.end.0 {
+        (new_end.0, new_end.1 + pos.1 - e.end.1)
+    } else {
+        (pos.0 + new_end.0 - e.end.0, pos.1)
+    }
+}
+
+/// Where `pos` lands once char-column `edits` are applied (#1603): the
+/// caret follows its text. An edit ending at or before `pos` shifts it past
+/// the edit; a `pos` inside a replaced range keeps its row and column,
+/// clamped to the end of the new text, so a whole-document format leaves the
+/// caret on its line number as before and a deletion pulls it to where the
+/// range began; edits after `pos` leave it alone. Mapped bottom-up, the
+/// order the edits are applied in, so each edit's coordinates still name the
+/// text it was written against.
+pub fn map_through_span_edits(pos: (usize, usize), edits: &[TextSpanEdit]) -> (usize, usize) {
+    let mut order: Vec<&TextSpanEdit> = edits.iter().filter(|e| e.end >= e.start).collect();
+    order.sort_by_key(|e| std::cmp::Reverse(e.start));
+    order.into_iter().fold(pos, |p, e| {
+        if p < e.end && p <= e.start {
+            return p;
+        }
+        let new_end = span_new_end(e);
+        match p < e.end {
+            true => p.min(new_end),
+            false => shift_past_span(p, e, new_end),
+        }
+    })
+}
+
 /// Where `pos` (char columns) lands once `edits` apply to `lines`: moved by
 /// the text every edit before it adds or removes. A position inside an edit
-/// lands at the end of its new text.
+/// lands at the end of its new text, unlike [`map_through_span_edits`]:
+/// format on type rewrites the line just typed, and the caret belongs after
+/// the text it typed, not at its old column (#1633).
 pub fn position_after_span_edits(
     lines: &[String],
     pos: (usize, usize),
@@ -2281,18 +2343,10 @@ pub fn position_after_span_edits(
         if pos < e.start || (pos == e.start && e.start != e.end) {
             continue;
         }
-        let rows = e.new_text.matches('\n').count();
-        let last = e.new_text.rsplit('\n').next().unwrap_or("").chars().count();
-        let new_end = match rows {
-            0 => (e.start.0, e.start.1 + last),
-            _ => (e.start.0 + rows, last),
-        };
-        pos = if pos < e.end {
-            new_end
-        } else if pos.0 == e.end.0 {
-            (new_end.0, new_end.1 + pos.1 - e.end.1)
-        } else {
-            (pos.0 + new_end.0 - e.end.0, pos.1)
+        let new_end = span_new_end(&e);
+        pos = match pos < e.end {
+            true => new_end,
+            false => shift_past_span(pos, &e, new_end),
         };
     }
     pos
@@ -2513,6 +2567,14 @@ pub enum ExternalChange {
     Conflict,
 }
 
+/// Why a buffer is written. Only an auto-save, which fires mid-typing,
+/// leaves the caret lines' trailing whitespace for later (#1455).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaveReason {
+    Explicit,
+    Auto,
+}
+
 /// Outcome of a guarded `save_to_disk`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaveOutcome {
@@ -2527,6 +2589,58 @@ pub enum SaveOutcome {
     /// undo cannot bring them back). The save was refused; the caller
     /// surfaces it and sets `lossy_save_armed` to write anyway.
     EncodingLoss,
+    /// The file is the user's own but has its write bit cleared (`chmod
+    /// 444`, #1379). The save was refused rather than replace a file its
+    /// owner protected; the caller asks and sets `overwrite_protected_armed`
+    /// to write anyway, with the file's mode put back afterwards.
+    WriteProtected,
+}
+
+/// Why a file refuses this user's writes (#1379).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteProtection {
+    /// The user owns it and has cleared its write bit: they may write it
+    /// once they say so, and croft restores the mode after.
+    Owned,
+    /// Someone else's file the user may not write (root's `/etc/hosts`):
+    /// only an elevated write can save it.
+    NotOwned,
+}
+
+/// Whether the file at `path` refuses this user's writes (#1379). A file
+/// the user owns is judged by its owner write bit, the way vim and VS Code
+/// do, so a `chmod 444` still reads as protected for root; anyone else's
+/// file by whether the kernel would let this process write it. A missing
+/// file is not protected: saving creates it.
+pub fn write_protection(path: &Path) -> Option<WriteProtection> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.uid() == unsafe { libc::geteuid() } {
+            return (meta.mode() & 0o200 == 0).then_some(WriteProtection::Owned);
+        }
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+        (unsafe { libc::access(c.as_ptr(), libc::W_OK) } != 0).then_some(WriteProtection::NotOwned)
+    }
+    #[cfg(not(unix))]
+    {
+        meta.permissions()
+            .readonly()
+            .then_some(WriteProtection::Owned)
+    }
+}
+
+/// Whether a failed save failed for want of permission (#1379), which an
+/// elevated write can get past where no retry would.
+pub fn is_permission_denied(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    })
 }
 
 /// Per-tab results of an FS-sync sweep across all open tabs
@@ -2611,6 +2725,10 @@ pub(crate) enum VisRow {
     },
     /// Row `box_row` (0-based within the block) of `comment_boxes[box_idx]`.
     Box { box_idx: usize, box_row: usize },
+    /// Line `index` (1-based; line 0 is the ghost text at the caret) of the
+    /// live inline suggestion (#1625), shown under the caret's line so a
+    /// multi-line suggestion is read before Tab takes it.
+    Ghost { index: usize },
 }
 
 /// The line-ending style of the open buffer, shown in the status bar and
@@ -3257,6 +3375,9 @@ pub struct Editor {
     /// lines at each indent level in a line's leading whitespace, with the
     /// cursor's block highlighted. App-synced from prefs; on by default.
     pub show_indent_guides: bool,
+    /// Ruler columns (#1524, VS Code `editor.rulers`). App-synced from
+    /// prefs; empty by default.
+    pub rulers: Vec<u16>,
     /// Bracket-pair colorization (#131, VS Code on-by-default since 1.67):
     /// per-line `(char column, colour index)` pairs for every `()[]{}` outside
     /// strings and comments, colour cycling by nesting depth
@@ -3554,6 +3675,13 @@ pub struct Editor {
     /// answering an `EncodingLoss` refusal. Set by the explicit-save path
     /// only (never by auto save) and consumed by the write it authorises.
     pub lossy_save_armed: bool,
+    /// The file refuses this user's writes (#1379): the tab wears a lock and
+    /// auto save leaves it alone. Read at open and after each save.
+    pub write_protected: bool,
+    /// One-shot consent to overwrite the user's own write-protected file,
+    /// answering a `WriteProtected` refusal. Set by the explicit-save path
+    /// only and consumed by the write it authorises.
+    pub overwrite_protected_armed: bool,
     /// When the buffer last changed, driving the auto-save delay. `None`
     /// until the first edit.
     pub last_edit_at: Option<std::time::Instant>,
@@ -3672,6 +3800,7 @@ impl Editor {
             final_newline: false,
             decode_lossy: false,
             show_indent_guides: true,
+            rulers: Vec::new(),
             show_bracket_colors: true,
             bracket_colors: Vec::new(),
             protected_ranges: Vec::new(),
@@ -3745,6 +3874,8 @@ impl Editor {
             disk_conflict: false,
             encoding_loss: false,
             lossy_save_armed: false,
+            write_protected: false,
+            overwrite_protected_armed: false,
             last_edit_at: None,
             last_edit_pos: None,
         }
@@ -4755,7 +4886,7 @@ impl Editor {
     fn text_row(&self, i: usize) -> Option<(usize, usize, usize)> {
         match self.last_wrap_rows.get(i)? {
             VisRow::Text { line, start, end } => Some((*line, *start, *end)),
-            VisRow::Box { .. } => None,
+            VisRow::Box { .. } | VisRow::Ghost { .. } => None,
         }
     }
 
@@ -5611,6 +5742,10 @@ impl Editor {
         // encoded as is no longer this tab's problem.
         self.encoding_loss = false;
         self.lossy_save_armed = false;
+        // Say up front that the file can't be written, not at the first
+        // save after the work is done (#1379).
+        self.write_protected = write_protection(path).is_some();
+        self.overwrite_protected_armed = false;
         self.lang = crate::highlight::lang_for_path(path);
         self.wrap_override = None;
         // Folds are line numbers into the OLD file. A preview tab is reused for
@@ -8024,9 +8159,12 @@ impl Editor {
         }
         self.pin_on_edit();
         self.push_undo(EditKind::Paste);
-        let n = apply_span_edits_to_lines(&mut self.lines, edits);
+        let edits = char_span_edits(&self.lines, edits);
+        let applied = apply_char_span_edits(&mut self.lines, edits);
+        let n = applied.iter().map(|(_, count)| count).sum();
         if n > 0 {
-            for (e, _) in in_application_order(edits.to_vec()) {
+            self.follow_span_edits(&applied);
+            for (e, _) in &applied {
                 let removed = e.end.0.saturating_sub(e.start.0) + 1;
                 let added = e.new_text.matches('\n').count() + 1;
                 self.provenance.splice(e.start.0, removed, added);
@@ -8076,12 +8214,36 @@ impl Editor {
         }
         self.pin_on_edit();
         self.push_undo_step(EditKind::Paste, group);
-        let n = apply_span_edits_to_lines(&mut self.lines, edits);
+        let edits = char_span_edits(&self.lines, edits);
+        let applied = apply_char_span_edits(&mut self.lines, edits);
+        let n = applied.iter().map(|(_, count)| count).sum();
         if n > 0 {
+            self.follow_span_edits(&applied);
             self.mark_buffer_changed();
             self.recompute_highlights();
         }
         n
+    }
+
+    /// Move the caret, the selection and every extra caret with the text
+    /// they were on through char-column `edits` just applied (#1603): an
+    /// Add import above the caret left it on its old line number, inside
+    /// the grown import block, where the next keystrokes landed.
+    fn follow_span_edits(&mut self, applied: &[(TextSpanEdit, usize)]) {
+        let edits: Vec<TextSpanEdit> = applied.iter().map(|(e, _)| e.clone()).collect();
+        let map = |p: (usize, usize)| map_through_span_edits(p, &edits);
+        (self.cursor_row, self.cursor_col) = map((self.cursor_row, self.cursor_col));
+        let last = self.lines.len().saturating_sub(1);
+        let lines = &self.lines;
+        let clamp = |(r, c): (usize, usize)| {
+            let r = r.min(last);
+            (r, c.min(lines.get(r).map_or(0, |l| l.chars().count())))
+        };
+        for sel in self.selection.iter_mut().chain(self.carets.iter_mut()) {
+            sel.anchor = clamp(map(sel.anchor));
+            sel.head = clamp(map(sel.head));
+        }
+        self.clamp_cursor();
     }
 
     /// Close a remote edit group (#1207): later spans open a new undo step,
@@ -10152,6 +10314,54 @@ impl Editor {
         }
     }
 
+    /// Paint line `index` of the live inline suggestion (#1625) as its own
+    /// row under the caret's line: no line number, the suggestion's text in
+    /// the dim italic ghost style, scrolled with the buffer when not
+    /// wrapping and clipped at the pane edge.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_ghost_row(
+        &self,
+        buf: &mut Buffer,
+        inner: Rect,
+        y: u16,
+        gutter_width: u16,
+        text_x: u16,
+        text_width: u16,
+        index: usize,
+        wrap: bool,
+    ) {
+        buf.set_line(
+            inner.x,
+            y,
+            &Line::from(" ".repeat(gutter_width as usize)),
+            gutter_width,
+        );
+        let Some(line) = self.live_ghost().and_then(|t| t.split('\n').nth(index)) else {
+            return;
+        };
+        let skip = if wrap { 0 } else { self.scroll_col };
+        // Clipped by terminal cells, not chars: a wide character takes two,
+        // and `set_string` would paint past the text column otherwise.
+        let mut cells = 0usize;
+        let shown: String = line
+            .replace('\t', &" ".repeat(self.indent_style().width.max(1) as usize))
+            .chars()
+            .skip(skip)
+            .take_while(|&c| {
+                cells += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+                cells <= text_width as usize
+            })
+            .collect();
+        buf.set_string(
+            text_x,
+            y,
+            &shown,
+            Style::default()
+                .fg(self.theme.ignored_fg())
+                .add_modifier(Modifier::ITALIC),
+        );
+    }
+
     /// The inline suggestion (#607) when it still applies: the caret where it
     /// was asked for and no edit since.
     pub fn live_ghost(&self) -> Option<&str> {
@@ -10476,6 +10686,103 @@ impl Editor {
         while self.cursor_row > 0 && self.is_line_hidden(self.cursor_row) {
             self.cursor_row -= 1;
         }
+    }
+
+    /// Every foldable header with its range's end and its nesting level, in
+    /// line order (#1653): level 1 is outermost, and a header inside another
+    /// header's range is one level deeper.
+    fn fold_headers_with_levels(&self) -> Vec<(usize, usize, usize)> {
+        let mut out = Vec::new();
+        // The ends of the ranges enclosing the line being scanned.
+        let mut open: Vec<usize> = Vec::new();
+        for header in 0..self.lines.len() {
+            let Some((_, end)) = self.fold_range(header) else {
+                continue;
+            };
+            while open.last().is_some_and(|&e| e < header) {
+                open.pop();
+            }
+            out.push((header, end, open.len() + 1));
+            open.push(end);
+        }
+        out
+    }
+
+    /// Collapse every fold exactly `level` deep and leave the others as they
+    /// are (VS Code "Fold Level N", Cmd+K Cmd+N, #1653): a deeper fold is
+    /// hidden inside its collapsed parent anyway, and keeping its own state
+    /// means opening the parent again shows it as it was. Fold
+    /// Level 2 on a module keeps its classes and their methods' headers in
+    /// view with the bodies collapsed, the overview Fold All cannot give
+    /// since it collapses the outermost block too. The cursor snaps up to the
+    /// nearest visible line, as for Fold All.
+    pub fn fold_level(&mut self, level: usize) {
+        self.refresh_fold_tables();
+        let headers: Vec<usize> = self
+            .fold_headers_with_levels()
+            .into_iter()
+            .filter(|&(_, _, l)| l == level)
+            .map(|(h, _, _)| h)
+            .collect();
+        if headers.is_empty() {
+            return;
+        }
+        self.folded.extend(headers);
+        self.fold_epoch_lines = self.lines.len();
+        self.rebuild_hidden_ranges();
+        while self.cursor_row > 0 && self.is_line_hidden(self.cursor_row) {
+            self.cursor_row -= 1;
+        }
+        let len = self.line_char_len(self.cursor_row);
+        self.cursor_col = self.cursor_col.min(len);
+    }
+
+    /// Collapse the fold owning `line` and every fold inside it (VS Code
+    /// "Fold Recursively", #1653), so unfolding it later shows its inner
+    /// blocks collapsed. The cursor snaps to the header when it was inside.
+    pub fn fold_recursively(&mut self, line: usize) {
+        self.refresh_fold_tables();
+        let Some(header) = self.enclosing_fold_header(line) else {
+            return;
+        };
+        let Some((start, end)) = self.fold_range(header) else {
+            return;
+        };
+        let inner: Vec<usize> = (start..=end).filter(|&l| self.is_foldable(l)).collect();
+        self.folded.extend(inner);
+        self.fold_epoch_lines = self.lines.len();
+        self.rebuild_hidden_ranges();
+        if self.is_line_hidden(self.cursor_row) {
+            self.cursor_row = header;
+            let len = self.line_char_len(header);
+            self.cursor_col = self.cursor_col.min(len);
+        }
+    }
+
+    /// Expand the fold owning `line` and every fold inside it (VS Code
+    /// "Unfold Recursively", #1653). Folds outside its range stay as they
+    /// are.
+    pub fn unfold_recursively(&mut self, line: usize) {
+        self.refresh_fold_tables();
+        let Some(header) = self.enclosing_fold_header(line) else {
+            return;
+        };
+        let Some((start, end)) = self.fold_range(header) else {
+            return;
+        };
+        let inner: Vec<usize> = self
+            .folded
+            .iter()
+            .copied()
+            .filter(|h| (start..=end).contains(h))
+            .collect();
+        if inner.is_empty() {
+            return;
+        }
+        for h in inner {
+            self.folded.remove(&h);
+        }
+        self.rebuild_hidden_ranges();
     }
 
     /// Expand every fold (VS Code "Unfold All", Cmd+K Cmd+J).
@@ -11025,11 +11332,21 @@ impl Editor {
     /// `DiskConflict` instead of writing in that case; the caller surfaces
     /// the conflict and may call `save_to_disk_force` to overwrite anyway.
     pub fn save_to_disk(&mut self) -> Result<SaveOutcome> {
+        self.save_to_disk_for(SaveReason::Explicit)
+    }
+
+    /// `save_to_disk` for auto-save: the one save that leaves the caret
+    /// lines' trailing whitespace alone, since it fires mid-typing (#1455).
+    pub fn auto_save_to_disk(&mut self) -> Result<SaveOutcome> {
+        self.save_to_disk_for(SaveReason::Auto)
+    }
+
+    fn save_to_disk_for(&mut self, reason: SaveReason) -> Result<SaveOutcome> {
         if self.disk_changed_externally() {
             self.disk_conflict = true;
             return Ok(SaveOutcome::DiskConflict);
         }
-        self.write_buffer_to_disk()
+        self.write_buffer_to_disk(reason)
     }
 
     /// Save past a disk conflict, overwriting the external change. The
@@ -11040,7 +11357,7 @@ impl Editor {
     /// buffer with both problems still reports `EncodingLoss` here and needs
     /// `lossy_save_armed` on top.
     pub fn save_to_disk_force(&mut self) -> Result<SaveOutcome> {
-        self.write_buffer_to_disk()
+        self.write_buffer_to_disk(SaveReason::Explicit)
     }
 
     /// File: Save As… (#1203): write the buffer to `path` and make this tab
@@ -11054,7 +11371,7 @@ impl Editor {
         );
         self.disk_stamp = Self::disk_stamp_of(path);
         self.disk_conflict = false;
-        let outcome = self.write_buffer_to_disk();
+        let outcome = self.write_buffer_to_disk(SaveReason::Explicit);
         if matches!(outcome, Ok(SaveOutcome::Saved)) {
             // Named now: its `Untitled-n` is free for the next one (#1580).
             self.untitled = None;
@@ -11177,7 +11494,7 @@ impl Editor {
         content
     }
 
-    fn write_buffer_to_disk(&mut self) -> Result<SaveOutcome> {
+    fn write_buffer_to_disk(&mut self, reason: SaveReason) -> Result<SaveOutcome> {
         // Preview tabs (image/PDF, sheet, diff, hex) hold the whole-
         // buffer-swap PLACEHOLDER in `lines`, not the file's content:
         // serialising it truncated the previewed file to nothing (#185).
@@ -11186,7 +11503,7 @@ impl Editor {
         if self.has_non_text_view() {
             anyhow::bail!("This tab is a read-only preview; nothing to save");
         }
-        self.apply_editorconfig_on_save();
+        self.apply_editorconfig_on_save(reason);
         let path = self
             .path
             .as_ref()
@@ -11204,13 +11521,29 @@ impl Editor {
             self.encoding_loss = true;
             return Ok(SaveOutcome::EncodingLoss);
         }
+        // A file its owner write-protected is not replaced without asking
+        // (#1379): the rename below would otherwise go straight past the
+        // missing write bit. Someone else's file goes on to fail with the
+        // kernel's own "Permission denied", which the caller turns into the
+        // offer of an elevated save.
+        let protection = write_protection(&path);
+        self.write_protected = protection.is_some();
+        let lift = protection == Some(WriteProtection::Owned);
+        if lift && !self.overwrite_protected_armed {
+            return Ok(SaveOutcome::WriteProtected);
+        }
         // The folder can go while the tab is open (a `git checkout` of a
         // branch without it, #1203). Put it back, as VS Code does, rather
         // than strand the edits; a path that can't be a folder still fails.
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)?;
         }
-        if let Err(e) = crate::prefs::replace_file_contents(&path, &encoded) {
+        let written = if lift {
+            Self::write_lifting_protection(&path, &encoded)
+        } else {
+            crate::prefs::replace_file_contents(&path, &encoded)
+        };
+        if let Err(e) = written {
             // Only a write that got as far as changing the file makes what
             // is on disk croft's own doing: a stale stamp then made the sync
             // sweep offer to "reload" it over the only good copy. An
@@ -11224,6 +11557,7 @@ impl Editor {
         self.decode_lossy = false;
         self.encoding_loss = false;
         self.lossy_save_armed = false;
+        self.overwrite_protected_armed = false;
         self.dirty = false;
         // The next keystroke opens a fresh undo step: coalescing across the
         // save point would make one Cmd+Z discard work from both sides.
@@ -11233,6 +11567,69 @@ impl Editor {
         // prior conflict is resolved.
         self.mark_synced_with_disk();
         Ok(SaveOutcome::Saved)
+    }
+
+    /// Overwrite the user's own write-protected file (#1379): give it the
+    /// owner write bit for the length of the write, then put its mode back,
+    /// whether or not the write landed, so the file stays protected.
+    fn write_lifting_protection(
+        path: &Path,
+        bytes: &[u8],
+    ) -> std::result::Result<(), crate::prefs::ReplaceError> {
+        let untouched = |error| crate::prefs::ReplaceError {
+            error,
+            touched: false,
+        };
+        let target = std::fs::canonicalize(path).map_err(untouched)?;
+        let mode = std::fs::metadata(&target).map_err(untouched)?.permissions();
+        let mut writable = mode.clone();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            writable.set_mode(mode.mode() | 0o200);
+        }
+        #[cfg(not(unix))]
+        #[allow(clippy::permissions_set_readonly_false)]
+        writable.set_readonly(false);
+        std::fs::set_permissions(&target, writable).map_err(untouched)?;
+        let written = crate::prefs::replace_file_contents(&target, bytes);
+        let restored = std::fs::set_permissions(&target, mode);
+        written?;
+        restored.map_err(|error| crate::prefs::ReplaceError {
+            error,
+            touched: true,
+        })
+    }
+
+    /// The bytes a save would write now, with the save-time `.editorconfig`
+    /// fixes applied to the buffer first, as a save applies them. None when
+    /// writing them would lose characters (see `SaveOutcome::EncodingLoss`).
+    pub fn prepare_bytes_for_save(&mut self) -> Option<Vec<u8>> {
+        self.apply_editorconfig_on_save();
+        let content = self.content_for_disk();
+        let (encoded, had_errors) = self.encode_for_disk(&content);
+        let writes_replacements = self.decode_lossy && content.contains('\u{fffd}');
+        (!had_errors && !writes_replacements).then_some(encoded)
+    }
+
+    /// Settle a save another process made on this tab's behalf (#1379's
+    /// `sudo tee`): when the file now holds exactly `written`, the buffer is
+    /// in sync with it, and clean unless it was edited since. Returns false,
+    /// changing nothing, while the file holds anything else.
+    pub fn settle_save_made_elsewhere(&mut self, written: &[u8]) -> bool {
+        let Some(path) = self.path.clone() else {
+            return false;
+        };
+        if std::fs::read(&path).ok().as_deref() != Some(written) {
+            return false;
+        }
+        self.dirty = self.bytes_for_disk().as_deref() != Some(written);
+        self.write_protected = write_protection(&path).is_some();
+        // A consent to overwrite was for a save this one has now made.
+        self.overwrite_protected_armed = false;
+        self.last_edit_kind = None;
+        self.mark_synced_with_disk();
+        true
     }
 
     pub fn move_up(&mut self) {
@@ -12679,16 +13076,21 @@ impl Editor {
         true
     }
 
-    /// `trim_trailing_whitespace` for a save: every line except the ones a
-    /// caret sits on (primary and extra carets). Auto-save runs a second
-    /// after typing stops, so trimming the caret's own line would eat the
-    /// space just typed and glue the next word onto the previous one. The
-    /// caret lines are normalised by a later save once the caret has moved;
-    /// the explicit Trim Trailing Whitespace command still trims them all.
-    fn trim_trailing_whitespace_off_caret_lines(&mut self) -> bool {
-        let spared: std::collections::HashSet<usize> = std::iter::once(self.cursor_row)
-            .chain(self.carets.iter().map(|c| c.head.0))
-            .collect();
+    /// `trim_trailing_whitespace` for a save. An auto-save spares every line
+    /// a caret sits on (primary and extra carets): it runs a second after
+    /// typing stops, so trimming the caret's own line would eat the space
+    /// just typed and glue the next word onto the previous one. The caret
+    /// lines are normalised by a later save once the caret has moved. Any
+    /// other save trims them too, as VS Code does (#1455): the line just
+    /// edited is the one with the stray spaces. Unlike the command, it keeps
+    /// the extra carets, clamped to their trimmed lines.
+    fn trim_trailing_whitespace_on_save(&mut self, reason: SaveReason) -> bool {
+        let spared: std::collections::HashSet<usize> = match reason {
+            SaveReason::Auto => std::iter::once(self.cursor_row)
+                .chain(self.carets.iter().map(|c| c.head.0))
+                .collect(),
+            SaveReason::Explicit => std::collections::HashSet::new(),
+        };
         let dirty = |(i, l): (usize, &String)| {
             !spared.contains(&i) && l.trim_end_matches([' ', '\t']).len() != l.len()
         };
@@ -12702,6 +13104,7 @@ impl Editor {
                 line.truncate(trimmed_len);
             }
         }
+        self.remap_carets(|p| p);
         self.mark_buffer_changed();
         self.recompute_highlights();
         true
@@ -12709,15 +13112,16 @@ impl Editor {
 
     /// Apply the `.editorconfig` properties that act at save time, from the
     /// single write choke point so every save path (explicit, force, auto,
-    /// format-on-save) gets them.
+    /// format-on-save) gets them. Only an auto-save spares the caret lines
+    /// from the trim.
     ///
     /// Both are no-ops unless a `.editorconfig` explicitly asked for them:
     /// rewriting someone's whitespace on an unconfigured project would be a
     /// surprise, and a noisy diff.
-    fn apply_editorconfig_on_save(&mut self) -> bool {
+    fn apply_editorconfig_on_save(&mut self, reason: SaveReason) -> bool {
         let mut changed = false;
         if self.editorconfig.trim_trailing_whitespace == Some(true) {
-            changed |= self.trim_trailing_whitespace_off_caret_lines();
+            changed |= self.trim_trailing_whitespace_on_save(reason);
         }
         if self.editorconfig.insert_final_newline == Some(true) {
             // `lines` joins with the EOL on write, so a trailing empty
@@ -13227,6 +13631,244 @@ impl Editor {
         self.clear_selection();
         self.mark_buffer_changed();
         self.recompute_highlights();
+        self.ensure_cursor_col_visible();
+        true
+    }
+
+    /// The buffer as one string, for the Emmet commands that edit markup
+    /// already written (#1557), and `(row, col)` as a byte offset into it.
+    fn emmet_text_and_offset(&self, row: usize, col: usize) -> (String, usize) {
+        let text = self.lines.join("\n");
+        let before: usize = self.lines[..row.min(self.lines.len())]
+            .iter()
+            .map(|l| l.len() + 1)
+            .sum();
+        let line = self.lines.get(row).map_or("", String::as_str);
+        let in_line = line.char_indices().nth(col).map_or(line.len(), |(i, _)| i);
+        (text, before + in_line)
+    }
+
+    /// Byte offset `at` of `text` as a (row, char column).
+    fn emmet_position(text: &str, at: usize) -> (usize, usize) {
+        let head = &text[..at.min(text.len())];
+        let row = head.matches('\n').count();
+        let start = head.rfind('\n').map_or(0, |i| i + 1);
+        (row, head[start..].chars().count())
+    }
+
+    /// Make the buffer `text`, as one undo step, rewriting only the lines
+    /// that changed.
+    fn emmet_set_text(&mut self, text: &str) {
+        let new: Vec<String> = text.split('\n').map(String::from).collect();
+        let (head, tail) = {
+            let old = &self.lines;
+            let head = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+            let room = old.len().min(new.len()) - head;
+            let tail = old
+                .iter()
+                .rev()
+                .zip(new.iter().rev())
+                .take(room)
+                .take_while(|(a, b)| a == b)
+                .count();
+            (head, tail)
+        };
+        self.pin_on_edit();
+        self.push_undo(EditKind::EmmetExpand);
+        self.last_edit_kind = None;
+        let old_end = self.lines.len() - tail;
+        let added = new.len() - tail - head;
+        self.lines
+            .splice(head..old_end, new[head..new.len() - tail].iter().cloned());
+        // Rows below the rewrite keep their seats; the rewritten rows are
+        // markup croft generated.
+        self.provenance.splice(head, old_end - head, added);
+        self.provenance
+            .record(head..head + added, crate::provenance::Seat::Generated);
+        self.provenance.truncate(self.lines.len());
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+    }
+
+    /// Emmet: Wrap with Abbreviation (#1557): wrap the selected lines in
+    /// `abbr`, one level in, at their own indentation; a selection inside
+    /// one line is wrapped where it stands. With nothing selected it wraps
+    /// the element around the caret, as VS Code does, or the caret's line
+    /// outside any element. Returns whether anything was wrapped.
+    pub fn emmet_wrap(&mut self, abbr: &str) -> bool {
+        use crate::emmet::WrapContent;
+        let Some(profile) = self.emmet_profile() else {
+            return false;
+        };
+        let unit = self.indent_unit();
+        let sel = self
+            .selection
+            .filter(|s| s.has_area())
+            .map(|s| s.normalised())
+            .or_else(|| self.emmet_element_at_caret());
+        if let Some(((r0, c0), (r1, c1))) = sel
+            && r0 == r1
+        {
+            let chars: Vec<char> = self.lines[r0].chars().collect();
+            let before: String = chars[..c0].iter().collect();
+            let after: String = chars[c1.min(chars.len())..].iter().collect();
+            if !before.trim().is_empty() || !after.trim().is_empty() {
+                let picked: String = chars[c0..c1.min(chars.len())].iter().collect();
+                let Some(markup) =
+                    crate::emmet::wrap(abbr, WrapContent::Inline(&picked), &unit, profile)
+                else {
+                    return false;
+                };
+                let markup = markup.trim_end_matches('\n');
+                let (text, at) = self.emmet_text_and_offset(r0, c0);
+                let end = at + picked.len();
+                let new = format!("{}{markup}{}", &text[..at], &text[end..]);
+                self.emmet_set_text(&new);
+                (self.cursor_row, self.cursor_col) = Self::emmet_position(&new, at);
+                self.clear_selection();
+                self.ensure_cursor_col_visible();
+                return true;
+            }
+        }
+        let (first, last) = match sel {
+            // A selection ending at the start of a line leaves that line out.
+            Some(((r0, _), (r1, 0))) if r1 > r0 => (r0, r1 - 1),
+            Some(((r0, _), (r1, _))) => (r0, r1),
+            None => (self.cursor_row, self.cursor_row),
+        };
+        let rows = &self.lines[first..=last.min(self.lines.len() - 1)];
+        if rows.iter().all(|l| l.trim().is_empty()) {
+            return false;
+        }
+        // The lines' shared indentation stays outside the new element.
+        let base: String = rows
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                l.chars()
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .collect::<String>()
+            })
+            .min_by_key(String::len)
+            .unwrap_or_default();
+        let content: Vec<String> = rows
+            .iter()
+            .map(|l| {
+                l.strip_prefix(base.as_str())
+                    .unwrap_or(l.trim_start())
+                    .to_string()
+            })
+            .collect();
+        let Some(markup) = crate::emmet::wrap(abbr, WrapContent::Lines(&content), &unit, profile)
+        else {
+            return false;
+        };
+        let wrapped: Vec<String> = markup
+            .trim_end_matches('\n')
+            .split('\n')
+            .map(|l| {
+                if l.is_empty() {
+                    String::new()
+                } else {
+                    format!("{base}{l}")
+                }
+            })
+            .collect();
+        let mut lines = self.lines.clone();
+        lines.splice(first..=last, wrapped);
+        self.emmet_set_text(&lines.join("\n"));
+        self.cursor_row = first;
+        self.cursor_col = base.chars().count();
+        self.clear_selection();
+        self.ensure_cursor_col_visible();
+        true
+    }
+
+    /// The span of the element around the caret, a caret just past its
+    /// closing `>` included, for a wrap with nothing selected.
+    fn emmet_element_at_caret(&self) -> Option<((usize, usize), (usize, usize))> {
+        let (text, at) = self.emmet_text_and_offset(self.cursor_row, self.cursor_col);
+        let element = crate::emmet::enclosing(&text, at)
+            .or_else(|| crate::emmet::enclosing(&text, at.checked_sub(1)?))?;
+        let span = element.outer();
+        Some((
+            Self::emmet_position(&text, span.start),
+            Self::emmet_position(&text, span.end),
+        ))
+    }
+
+    /// Emmet: Remove Tag (#1557): take away the tags of the element around
+    /// the caret, keeping its content.
+    pub fn emmet_remove_tag(&mut self) -> bool {
+        if self.emmet_profile().is_none() {
+            return false;
+        }
+        let unit = self.indent_unit();
+        let (text, at) = self.emmet_text_and_offset(self.cursor_row, self.cursor_col);
+        let Some((new, caret)) = crate::emmet::remove_tag(&text, at, &unit) else {
+            return false;
+        };
+        self.emmet_set_text(&new);
+        (self.cursor_row, self.cursor_col) = Self::emmet_position(&new, caret);
+        self.clear_selection();
+        self.ensure_cursor_col_visible();
+        true
+    }
+
+    /// Emmet: Update Tag (#1557): rename the element around the caret.
+    pub fn emmet_update_tag(&mut self, name: &str) -> bool {
+        if self.emmet_profile().is_none() {
+            return false;
+        }
+        let (text, at) = self.emmet_text_and_offset(self.cursor_row, self.cursor_col);
+        let Some(new) = crate::emmet::rename_tag(&text, at, name) else {
+            return false;
+        };
+        self.emmet_set_text(&new);
+        true
+    }
+
+    /// Emmet: Go to Matching Pair (#1557): from an opening tag to its
+    /// closing tag, and back.
+    pub fn emmet_match_tag(&mut self) -> bool {
+        if self.emmet_profile().is_none() {
+            return false;
+        }
+        let (text, at) = self.emmet_text_and_offset(self.cursor_row, self.cursor_col);
+        let Some(to) = crate::emmet::matching_tag(&text, at) else {
+            return false;
+        };
+        (self.cursor_row, self.cursor_col) = Self::emmet_position(&text, to);
+        self.clear_selection();
+        self.ensure_cursor_col_visible();
+        true
+    }
+
+    /// Emmet: Balance outward / inward (#1557): grow the selection to the
+    /// enclosing element's content, then the element, and so on outward, or
+    /// walk it back in.
+    pub fn emmet_balance(&mut self, outward: bool) -> bool {
+        if self.emmet_profile().is_none() {
+            return false;
+        }
+        let ((r0, c0), (r1, c1)) = self.selection.map(|s| s.normalised()).unwrap_or((
+            (self.cursor_row, self.cursor_col),
+            (self.cursor_row, self.cursor_col),
+        ));
+        let (text, start) = self.emmet_text_and_offset(r0, c0);
+        let end = self.emmet_text_and_offset(r1, c1).1;
+        let range = if outward {
+            crate::emmet::balance_out(&text, start..end)
+        } else {
+            crate::emmet::balance_in(&text, start..end)
+        };
+        let Some(range) = range else {
+            return false;
+        };
+        let anchor = Self::emmet_position(&text, range.start);
+        let head = Self::emmet_position(&text, range.end);
+        self.selection = Some(EditorSelection { anchor, head });
+        (self.cursor_row, self.cursor_col) = head;
         self.ensure_cursor_col_visible();
         true
     }
@@ -15007,6 +15649,21 @@ fn title_case(s: &str) -> String {
             prev_alnum = false;
         }
     }
+    out
+}
+
+/// Most rulers kept (#1524). A repository's `.croft/config.json` may set
+/// `rulers`, and the painter walks them for every visible row, so the list
+/// is bounded before it reaches an editor.
+pub const MAX_RULERS: usize = 16;
+
+/// The `rulers` setting as an editor keeps it: ascending, without
+/// duplicates, and at most `MAX_RULERS` columns.
+pub fn normalize_rulers(rulers: &[u16]) -> Vec<u16> {
+    let mut out = rulers.to_vec();
+    out.sort_unstable();
+    out.dedup();
+    out.truncate(MAX_RULERS);
     out
 }
 
@@ -17460,6 +18117,24 @@ impl Widget for &mut Editor {
                 }
             }
         };
+        // The lines of a live inline suggestion after its first (#1625),
+        // hung under the caret's line as their own rows: only the first fits
+        // at the caret, and a "(+2 lines)" count let Tab insert a function
+        // body nobody had read. The caret row says how many did not fit.
+        let ghost_tail = if self.focused {
+            self.live_ghost()
+                .map_or(0, |t| t.split('\n').count().saturating_sub(1))
+        } else {
+            0
+        };
+        let push_ghost_rows = |rows: &mut Vec<VisRow>| {
+            for index in 1..=ghost_tail {
+                if rows.len() >= text_height {
+                    break;
+                }
+                rows.push(VisRow::Ghost { index });
+            }
+        };
         // A symbol tab stops painting at its symbol's last line.
         let clip_end = self.symbol_clip().map_or(self.lines.len(), |(_, end)| end);
         if wrap {
@@ -17485,6 +18160,9 @@ impl Widget for &mut Editor {
                         end: e,
                     });
                 }
+                if line == self.cursor_row && skip < segs.len() {
+                    push_ghost_rows(&mut visual_rows);
+                }
                 push_box_rows(&mut visual_rows, self, line, skip, segs.len(), tw);
                 skip = 0;
                 line += 1;
@@ -17506,6 +18184,9 @@ impl Widget for &mut Editor {
                             start: self.scroll_col,
                             end: self.scroll_col + text_width as usize,
                         });
+                        if line == self.cursor_row {
+                            push_ghost_rows(&mut visual_rows);
+                        }
                     }
                     push_box_rows(&mut visual_rows, self, line, skip, 1, tw);
                     skip = 0;
@@ -17550,6 +18231,19 @@ impl Widget for &mut Editor {
                         text_width,
                         box_idx,
                         box_row,
+                    );
+                    continue;
+                }
+                VisRow::Ghost { index } => {
+                    self.paint_ghost_row(
+                        buf,
+                        inner,
+                        y,
+                        gutter_width,
+                        text_x,
+                        text_width,
+                        index,
+                        wrap,
                     );
                     continue;
                 }
@@ -18332,9 +19026,10 @@ impl Widget for &mut Editor {
             }
 
             // Inline suggestion (#607): the first line as ghost text right at
-            // the caret (suggestions are only asked for at a line's end), with
-            // a count of the lines that come with it. It owns the line's tail,
-            // so the trailers below stand aside.
+            // the caret (suggestions are only asked for at a line's end); the
+            // rest hang below as `VisRow::Ghost` rows (#1625), and only lines
+            // that found no row are counted here. It owns the line's tail, so
+            // the trailers below stand aside.
             let ghost_here = self.focused
                 && line_idx == self.cursor_row
                 && row_end >= line_len
@@ -18344,9 +19039,12 @@ impl Widget for &mut Editor {
                 let x = text_x + text_cols as u16;
                 let right = inner.x + inner.width;
                 if x < right {
-                    let mut lines = text.split('\n');
-                    let first = lines.next().unwrap_or("");
-                    let more = lines.count();
+                    let first = text.split('\n').next().unwrap_or("");
+                    let shown_rows = visual_rows
+                        .iter()
+                        .filter(|r| matches!(r, VisRow::Ghost { .. }))
+                        .count();
+                    let more = text.split('\n').count() - 1 - shown_rows;
                     let shown = if more > 0 {
                         format!(
                             "{first}  (+{more} line{})",
@@ -18448,6 +19146,38 @@ impl Widget for &mut Editor {
             // caret (DECSCUSR `BlinkingBar`); App calls
             // `frame.set_cursor_position(...)` so the blink/overlay never
             // hides the underlying character.
+        }
+
+        // Rulers (#1524, VS Code `editor.rulers`): a dim │ at each ruler
+        // column down the whole text area, past the end of the file too.
+        // Blank cells only, so text always wins, as with the indent guides;
+        // a long line runs over its ruler, which still shows the limit. The
+        // column is fixed on screen: the flat path shifts it by the
+        // horizontal scroll, and in wrap mode every visual row carries it.
+        if !self.rulers.is_empty() {
+            let ruler_fg = self.theme.ruler();
+            let shift = if wrap { 0 } else { self.scroll_col };
+            for row in 0..text_height {
+                if matches!(visual_rows.get(row), Some(VisRow::Box { .. })) {
+                    continue;
+                }
+                let y = inner.y + row as u16;
+                for &ruler in &self.rulers {
+                    let Some(col) = usize::from(ruler).checked_sub(shift) else {
+                        continue;
+                    };
+                    if col >= text_width as usize {
+                        continue;
+                    }
+                    let cell = &mut buf[(text_x + col as u16, y)];
+                    if cell.symbol() != " " {
+                        continue;
+                    }
+                    cell.set_symbol("\u{2502}");
+                    let style = cell.style().fg(ruler_fg);
+                    cell.set_style(style);
+                }
+            }
         }
 
         // Ghost caret name tags (VS Code Live Share): while a peer's caret is
@@ -21588,6 +22318,12 @@ fn tab_label(e: &Editor) -> String {
     } else {
         name
     };
+    // The lock VS Code shows on a file the user can't write (#1379).
+    let name = if e.write_protected {
+        format!("{name} \u{f023}")
+    } else {
+        name
+    };
     if e.dirty {
         format!("\u{25cf} {name}")
     } else {
@@ -23061,6 +23797,32 @@ mod tests {
             !e.is_bookmarked(5),
             "off-by-one would light up the wrong row"
         );
+    }
+
+    /// #1625: a ghost continuation row of wide (CJK) characters is clipped
+    /// by terminal cells, so it never paints past the editor's own area.
+    #[test]
+    fn a_wide_character_ghost_row_stays_inside_the_editor() {
+        let mut e = editor_with("x = 1");
+        e.focused = true;
+        e.cursor_row = 0;
+        e.cursor_col = 5;
+        let wide: String = "\u{4e2d}".repeat(60);
+        e.ghost = Some((0, 5, e.edit_seq, format!("\n{wide}")));
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(Rect { width: 80, ..area });
+        ratatui::widgets::Widget::render(&mut e, area, &mut buf);
+        let row = (0..area.height)
+            .find(|&y| (0..area.width).any(|x| buf[(x, y)].symbol() == "\u{4e2d}"))
+            .expect("the ghost row is painted");
+        for x in area.width..80 {
+            assert_eq!(buf[(x, row)].symbol(), " ", "nothing painted at column {x}");
+        }
     }
 
     #[test]
@@ -27365,6 +28127,154 @@ mod tests {
         assert_eq!(e.lines[0], "return a - b");
     }
 
+    fn span(start: (usize, usize), end: (usize, usize), new_text: &str) -> TextSpanEdit {
+        TextSpanEdit {
+            start,
+            end,
+            new_text: new_text.to_string(),
+            utf16: false,
+        }
+    }
+
+    /// #1603: lines added above the caret carry it down with its text.
+    #[test]
+    fn an_edit_adding_lines_above_the_caret_moves_it_down_with_its_text() {
+        let mut e = editor_with("0\n1\n2\n3\n4\n\tname := strings.ToUpper()\n6");
+        e.cursor_row = 5;
+        e.cursor_col = 8;
+        e.apply_span_edits(&[span((2, 0), (2, 0), "a\nb\nc\n")]);
+        assert_eq!((e.cursor_row, e.cursor_col), (8, 8));
+        e.insert_char('m');
+        assert_eq!(e.lines[8], "\tname :=m strings.ToUpper()");
+    }
+
+    /// #1603: a longer name earlier on the caret's row moves its column,
+    /// once per occurrence before it.
+    #[test]
+    fn a_longer_name_earlier_on_the_caret_s_row_moves_its_column() {
+        let mut e = editor_with("x = x + 1");
+        e.cursor_col = 8;
+        e.apply_span_edits(&[span((0, 0), (0, 1), "total"), span((0, 4), (0, 5), "total")]);
+        assert_eq!(e.lines[0], "total = total + 1");
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 16));
+    }
+
+    /// #1603: columns a language server sends in UTF-16 units move the
+    /// caret by chars, past an emoji on its row.
+    #[test]
+    fn a_utf16_edit_before_the_caret_moves_it_by_chars() {
+        let mut e = editor_with("😀x = 1");
+        e.cursor_col = 5;
+        let mut edit = span((0, 2), (0, 3), "total");
+        edit.utf16 = true;
+        e.apply_span_edits(&[edit]);
+        assert_eq!(e.lines[0], "😀total = 1");
+        assert_eq!(e.cursor_col, 9, "still before the 1");
+    }
+
+    /// #1603: a caret inside a deleted range lands where the range began.
+    #[test]
+    fn a_caret_inside_a_deleted_range_lands_at_its_start() {
+        let mut e = editor_with("keep\nab-gone\ngone\ngone-cd\nlast");
+        e.cursor_row = 2;
+        e.cursor_col = 3;
+        e.apply_span_edits(&[span((1, 2), (3, 5), "")]);
+        assert_eq!(e.lines, vec!["keep", "abcd", "last"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 2));
+    }
+
+    /// #1603: the selection and every extra caret follow their text too.
+    #[test]
+    fn the_selection_and_extra_carets_follow_an_edit_above_them() {
+        let mut e = editor_with("top\nfoo\nbar\nbaz");
+        e.cursor_row = 1;
+        e.cursor_col = 3;
+        e.selection = Some(EditorSelection {
+            anchor: (1, 0),
+            head: (1, 3),
+        });
+        e.carets = vec![EditorSelection::new(2, 1), EditorSelection::new(3, 2)];
+        e.apply_span_edits(&[span((0, 0), (0, 0), "use x;\nuse y;\n")]);
+        assert_eq!((e.cursor_row, e.cursor_col), (3, 3));
+        assert_eq!(
+            e.selection,
+            Some(EditorSelection {
+                anchor: (3, 0),
+                head: (3, 3),
+            })
+        );
+        assert_eq!(
+            e.carets,
+            vec![EditorSelection::new(4, 1), EditorSelection::new(5, 2)]
+        );
+    }
+
+    /// #1603: a peer's lines arriving above the caret keep it on its text.
+    #[test]
+    fn a_remote_edit_above_the_caret_moves_it_with_its_text() {
+        let mut e = editor_with("one\ntwo");
+        e.cursor_row = 1;
+        e.cursor_col = 2;
+        e.apply_remote_span_edits(&[span((0, 0), (0, 0), "zero\n")], 3);
+        assert_eq!((e.cursor_row, e.cursor_col), (2, 2));
+    }
+
+    /// Negative (#1603): edits after the caret, later on its row or on rows
+    /// below, leave it where it is.
+    #[test]
+    fn edits_after_the_caret_leave_it_where_it_is() {
+        let mut e = editor_with("let a = b;\nlet c = d;");
+        e.cursor_col = 4;
+        e.apply_span_edits(&[
+            span((0, 8), (0, 9), "bee\nbee"),
+            span((1, 0), (1, 0), "// note\n"),
+        ]);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 4));
+    }
+
+    /// #1603: a formatter's one edit replacing the whole document leaves
+    /// the caret on its line, as before, not at the end of the file.
+    #[test]
+    fn a_whole_document_replacement_keeps_the_caret_on_its_line() {
+        let mut e = editor_with("fn a() {\nlet x=1;\nlet y=2;\n}\nfn b() {}");
+        e.cursor_row = 2;
+        e.cursor_col = 4;
+        e.apply_span_edits(&[span(
+            (0, 0),
+            (4, 9),
+            "fn a() {\n    let x = 1;\n    let y = 2;\n}\nfn b() {}\n",
+        )]);
+        assert_eq!(e.lines.len(), 6);
+        assert_eq!((e.cursor_row, e.cursor_col), (2, 4));
+    }
+
+    /// #1603: an out-of-range edit is skipped, so it must not move the
+    /// caret either; only the edit that landed does.
+    #[test]
+    fn a_skipped_out_of_range_edit_does_not_move_the_caret() {
+        let mut e = editor_with("one\ntwo\nthree");
+        e.cursor_row = 2;
+        e.cursor_col = 1;
+        let n = e.apply_span_edits(&[
+            span((0, 0), (0, 0), "zero\n"),
+            span((1, 0), (9, 0), "stale"),
+        ]);
+        assert_eq!(n, 1);
+        assert_eq!(e.lines, vec!["zero", "one", "two", "three"]);
+        assert_eq!((e.cursor_row, e.cursor_col), (3, 1));
+    }
+
+    /// Negative (#1603): a caret at the start of a replaced word stays at
+    /// its start, not carried to the end of the new name.
+    #[test]
+    fn a_caret_at_the_start_of_a_replaced_word_stays_there() {
+        let mut e = editor_with("print(name)");
+        e.cursor_col = 6;
+        e.apply_span_edits(&[span((0, 6), (0, 10), "label")]);
+        assert_eq!(e.lines[0], "print(label)");
+        assert_eq!(e.cursor_col, 6);
+    }
+
     #[test]
     fn editor_apply_span_edits_marks_dirty_and_one_undo() {
         let mut e = editor_with("name = 1\nprint(name)");
@@ -30115,6 +31025,140 @@ mod tests {
         e.lossy_save_armed = true;
         assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
         assert!(!e.decode_lossy);
+    }
+
+    /// #1379: a file its owner `chmod 444`ed.
+    #[cfg(unix)]
+    fn protected_file(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("nginx.conf");
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_protected_file_opens_locked_and_its_save_asks_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = protected_file(dir.path(), "listen 80;\n");
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        assert!(e.write_protected, "flagged at open, before any edit");
+        assert_eq!(tab_label(&e), "nginx.conf \u{f023}");
+        e.insert_char('#');
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::WriteProtected);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "listen 80;\n");
+        assert!(e.dirty, "the edit is still only in the buffer");
+        e.overwrite_protected_armed = true;
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "#listen 80;\n");
+        assert_eq!(mode_of(&path), 0o444, "the file stays protected");
+        assert!(
+            !e.overwrite_protected_armed,
+            "the consent was for one write"
+        );
+        assert!(e.write_protected);
+        assert!(!e.dirty);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overwriting_a_protected_file_through_a_symlink_keeps_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = protected_file(dir.path(), "a\n");
+        let link = dir.path().join("link.conf");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut e = Editor::new();
+        e.open(&link).unwrap();
+        assert!(e.write_protected);
+        e.insert_char('b');
+        e.overwrite_protected_armed = true;
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "ba\n");
+        assert_eq!(mode_of(&target), 0o444);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_writable_file_opens_unlocked_and_saves_at_once() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.conf");
+        std::fs::write(&path, "a\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        assert!(!e.write_protected);
+        assert_eq!(tab_label(&e), "site.conf");
+        e.insert_char('b');
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert_eq!(mode_of(&path), 0o644);
+        assert_eq!(write_protection(&dir.path().join("new.conf")), None);
+    }
+
+    #[test]
+    fn only_a_permission_error_reads_as_permission_denied() {
+        let denied =
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                .context("writing /etc/hosts");
+        assert!(is_permission_denied(&denied));
+        for other in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::StorageFull,
+            std::io::ErrorKind::Other,
+        ] {
+            let e = anyhow::Error::from(std::io::Error::from(other));
+            assert!(!is_permission_denied(&e), "{other:?}");
+        }
+        assert!(!is_permission_denied(&anyhow::anyhow!("permission denied")));
+    }
+
+    #[test]
+    fn a_save_made_elsewhere_settles_only_on_the_exact_bytes() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "old\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.insert_char('n');
+        e.overwrite_protected_armed = true;
+        let bytes = e.prepare_bytes_for_save().unwrap();
+        assert_eq!(bytes, b"nold\n");
+        std::fs::write(tmp.path(), "someone else\n").unwrap();
+        assert!(!e.settle_save_made_elsewhere(&bytes));
+        assert!(e.dirty);
+        std::fs::write(tmp.path(), &bytes).unwrap();
+        assert!(e.settle_save_made_elsewhere(&bytes));
+        assert!(!e.dirty);
+        assert!(
+            !e.disk_changed_externally(),
+            "the write is the buffer's own"
+        );
+        assert!(
+            !e.overwrite_protected_armed,
+            "a consent to overwrite does not outlive the save"
+        );
+    }
+
+    #[test]
+    fn an_edit_made_while_a_save_was_elsewhere_stays_dirty() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "old\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        e.insert_char('n');
+        let bytes = e.prepare_bytes_for_save().unwrap();
+        e.insert_char('m');
+        std::fs::write(tmp.path(), &bytes).unwrap();
+        assert!(e.settle_save_made_elsewhere(&bytes));
+        assert!(e.dirty, "the later edit is not on disk");
     }
 
     #[test]
@@ -37129,6 +38173,88 @@ mod tests {
         );
     }
 
+    // ---- Rulers (editor.rulers, #1524) ----
+
+    #[test]
+    fn rulers_draw_down_blank_cells_and_past_the_end_of_the_file() {
+        let mut e = editor_with("xxxxxxxxxxxxxxxxxxxx\n\nshort");
+        e.rulers = vec![10, 15];
+        let buf = guide_buf(&mut e, 50, 8);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        let r = e.theme.ruler();
+        assert_eq!(
+            buf[(text_x + 10, y0)].symbol(),
+            "x",
+            "a long line runs over the ruler: text wins"
+        );
+        for row in [1, 2, 4] {
+            for col in [10, 15] {
+                let cell = &buf[(text_x + col, y0 + row)];
+                assert_eq!(cell.symbol(), "\u{2502}", "ruler {col} on row {row}");
+                assert_eq!(cell.fg, r);
+            }
+        }
+        assert_eq!(
+            buf[(text_x + 9, y0 + 1)].symbol(),
+            " ",
+            "only at the column"
+        );
+    }
+
+    #[test]
+    fn rulers_follow_the_horizontal_scroll() {
+        // A long first line, so the pane really scrolls.
+        let mut e = editor_with(&format!("{}\n\nb", "w".repeat(90)));
+        e.rulers = vec![10];
+        e.scroll_col = 4;
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        assert_eq!(buf[(text_x + 6, y0 + 1)].symbol(), "\u{2502}");
+        assert_eq!(buf[(text_x + 10, y0 + 1)].symbol(), " ");
+        e.scroll_col = 12;
+        let buf = guide_buf(&mut e, 40, 6);
+        let row: String = (0..30)
+            .map(|c| buf[(text_x + c, y0 + 1)].symbol().to_string())
+            .collect();
+        assert!(
+            !row.contains('\u{2502}'),
+            "a ruler scrolled off is not drawn: {row:?}"
+        );
+    }
+
+    #[test]
+    fn no_rulers_or_rulers_past_the_pane_draw_nothing() {
+        for rulers in [vec![], vec![500]] {
+            let mut e = editor_with("a\n\nb");
+            e.rulers = rulers.clone();
+            let buf = guide_buf(&mut e, 40, 6);
+            let text_x = e.last_inner.x + e.last_gutter_width + 1;
+            let y0 = e.last_inner.y;
+            for row in 0..4 {
+                let text: String = (0..30)
+                    .map(|c| buf[(text_x + c, y0 + row)].symbol().to_string())
+                    .collect();
+                assert!(
+                    !text.contains('\u{2502}'),
+                    "{rulers:?}, row {row}: {text:?}"
+                );
+            }
+        }
+    }
+
+    /// A repository config can list any number of rulers; an editor keeps
+    /// them sorted, deduplicated, and at most `MAX_RULERS`.
+    #[test]
+    fn ruler_lists_are_sorted_deduplicated_and_capped() {
+        assert_eq!(normalize_rulers(&[100, 80, 100, 80]), vec![80, 100]);
+        let huge: Vec<u16> = (0..50_000u32).map(|i| (i % 4000) as u16).collect();
+        let kept = normalize_rulers(&huge);
+        assert_eq!(kept.len(), MAX_RULERS);
+        assert!(kept.windows(2).all(|w| w[0] < w[1]));
+    }
+
     #[test]
     fn guide_indent_width_resolves_blank_lines_from_neighbours() {
         let e = editor_with("def f():\n    a = 1\n\n    b = 2\n\ndef g():\n    pass");
@@ -38633,6 +39759,30 @@ mod tests {
         assert!(e.dirty, "an expansion is an edit");
     }
 
+    /// #1557: a wrap or tag removal that changes the line count moves the
+    /// provenance of the rows below with them, and leaves none past the end.
+    #[test]
+    fn emmet_rewrites_keep_provenance_on_the_rows_below() {
+        use crate::provenance::Seat;
+        let mut e = html_editor("Home\nAbout\ntail", 0);
+        e.cursor_row = 0;
+        e.provenance.record(2..3, Seat::Peer(String::from("ada")));
+        e.selection = Some(EditorSelection {
+            anchor: (0, 0),
+            head: (1, 5),
+        });
+        assert!(e.emmet_wrap("ul>li*"));
+        assert_eq!(e.lines.len(), 5);
+        assert_eq!(e.provenance.seat(4), Some(&Seat::Peer(String::from("ada"))));
+        assert_eq!(e.provenance.seat(0), Some(&Seat::Generated));
+        e.cursor_row = 0;
+        e.cursor_col = 1;
+        assert!(e.emmet_remove_tag());
+        assert_eq!(e.lines.len(), 3);
+        assert_eq!(e.provenance.seat(2), Some(&Seat::Peer(String::from("ada"))));
+        assert!(e.provenance.seat(3).is_none() && e.provenance.seat(4).is_none());
+    }
+
     #[test]
     fn emmet_drops_any_active_selection() {
         let mut e = html_editor("div", 3);
@@ -38873,13 +40023,66 @@ mod tests {
         e.cursor_row = 0;
         e.cursor_col = 4;
         e.carets.push(EditorSelection::new(2, 4));
-        e.save_to_disk().unwrap();
+        e.auto_save_to_disk().unwrap();
         assert_eq!(
             std::fs::read_to_string(&f).unwrap(),
             "foo \nbar\nbaz\t",
             "only the line without a caret is trimmed"
         );
         assert_eq!((e.cursor_row, e.cursor_col), (0, 4), "the caret stays put");
+    }
+
+    /// #1455: an explicit save (Cmd+S, Save All) trims the caret lines too,
+    /// as VS Code does: sparing them is for auto-save only, and the line
+    /// just edited is the one with the stray spaces. The carets stay,
+    /// clamped to their trimmed lines.
+    #[test]
+    fn editorconfig_trim_on_an_explicit_save_includes_the_caret_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\ntrim_trailing_whitespace = true\n",
+        )
+        .unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "foo \nbar  \nbaz\t").unwrap();
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.cursor_row = 0;
+        e.cursor_col = 4;
+        e.carets.push(EditorSelection::new(2, 4));
+        e.save_to_disk().unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "foo\nbar\nbaz");
+        assert_eq!(
+            (e.cursor_row, e.cursor_col),
+            (0, 3),
+            "clamped to the line end"
+        );
+        assert_eq!(e.carets.len(), 1, "the extra caret is kept");
+        assert_eq!(e.carets[0].head, (2, 3));
+        assert!(e.undo(), "the trim is one undo step");
+        assert_eq!(e.lines[0], "foo ");
+    }
+
+    /// #1455 negative: an auto-save after an explicit one still spares the
+    /// caret line: the explicit save leaves no mode behind.
+    #[test]
+    fn an_auto_save_after_an_explicit_save_still_spares_the_caret_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\ntrim_trailing_whitespace = true\n",
+        )
+        .unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "foo\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&f).unwrap();
+        e.save_to_disk().unwrap();
+        e.cursor_col = 3;
+        e.insert_char(' ');
+        e.auto_save_to_disk().unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "foo \n");
     }
 
     /// Neither save-time property fires unless a `.editorconfig` asked for
