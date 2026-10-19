@@ -11605,7 +11605,7 @@ impl Editor {
     /// fixes applied to the buffer first, as a save applies them. None when
     /// writing them would lose characters (see `SaveOutcome::EncodingLoss`).
     pub fn prepare_bytes_for_save(&mut self) -> Option<Vec<u8>> {
-        self.apply_editorconfig_on_save();
+        self.apply_editorconfig_on_save(SaveReason::Explicit);
         let content = self.content_for_disk();
         let (encoded, had_errors) = self.encode_for_disk(&content);
         let writes_replacements = self.decode_lossy && content.contains('\u{fffd}');
