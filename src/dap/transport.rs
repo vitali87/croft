@@ -602,9 +602,11 @@ mod tests {
     /// than sitting out the spawn-retry window with the UI held.
     #[test]
     fn connect_once_fails_fast_when_nothing_listens() {
-        let port = free_port().unwrap();
+        // Port 1 is below the ephemeral range, so no test binding port 0
+        // can be handed it, as one was the port `free_port` let go: the
+        // connect then landed on that test's listener and succeeded.
         let started = std::time::Instant::now();
-        assert!(connect_once("127.0.0.1", port).is_err());
+        assert!(connect_once("127.0.0.1", 1).is_err());
         assert!(started.elapsed() < std::time::Duration::from_secs(3));
     }
 
