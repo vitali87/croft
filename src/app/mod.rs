@@ -15514,7 +15514,18 @@ impl App {
             return;
         }
         let row = self.editor.cursor_row;
-        if !self.editor.resolve_conflict_at(row, res) {
+        let untrimmed = match res {
+            crate::merge::Resolution::Both => self.untrimmed_both_at(row),
+            _ => None,
+        };
+        let resolved = match untrimmed {
+            Some((rows, both)) => {
+                self.editor.splice_result_rows(rows.start, rows.end, both);
+                true
+            }
+            None => self.editor.resolve_conflict_at(row, res),
+        };
+        if !resolved {
             self.status = String::from("No merge conflict at the cursor");
             return;
         }
@@ -15530,6 +15541,30 @@ impl App {
         } else {
             format!("{accepted} — {} left", self.editor.conflicts().len())
         };
+    }
+
+    /// Accept Both for the conflict at `row` with what git trimmed off it
+    /// put back (see `merge::untrimmed_both`), from the file's git stages
+    /// merged again in diff3 style. None for a file git does not hold
+    /// unmerged, an add/add with no base, or a block no conflict fits;
+    /// Accept Both then joins the sections as written.
+    fn untrimmed_both_at(&mut self, row: usize) -> Option<(std::ops::Range<usize>, Vec<String>)> {
+        let block = crate::merge::conflict_containing(self.editor.conflicts(), row)?;
+        let path = self.editor.path.clone()?;
+        // Stage specs are relative to the toplevel of the file's own repo
+        // (#139). Not `scm_root`: Source Control can be pinned to another
+        // folder of a multi-root workspace.
+        let root = path.parent().and_then(crate::git::repo_toplevel)?;
+        let canon_root = std::fs::canonicalize(&root).unwrap_or(root);
+        let canon_path = std::fs::canonicalize(&path).ok()?;
+        let rel = canon_path.strip_prefix(&canon_root).ok()?.to_string_lossy();
+        let merged = crate::git::remerge_diff3(&canon_root, &rel).ok()?;
+        let merged: Vec<String> = merged.lines().map(str::to_string).collect();
+        crate::merge::untrimmed_both(
+            &self.editor.lines,
+            &block,
+            &crate::merge::whole_sides(&merged),
+        )
     }
 
     /// VS Code's "Accept All Current / Incoming": resolve every block in the

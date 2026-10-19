@@ -977,6 +977,8 @@ Merge-conflict machinery. It scans VS Code-regex markers (`<<<<<<<`, `|||||||` d
 
 **Bulk accept and completion.** "Accept All Current/Incoming" splices every block back-to-front, one undo step each. "Merge: Complete Merge" refuses while blocks remain, then saves and `git add`s the file so it rejoins the staged flow.
 
+**Accept Both puts back what git trimmed.** Git's default conflict style moves the lines both sides share at a conflict's ends out of the markers and writes them once. Two functions added at the same spot then share one closing `}` below `>>>>>>>`, and joining the sections as written leaves the first one unclosed; shared lines in the middle can also split one conflict into several blocks. For a file git holds unmerged, Accept Both re-merges the index stages with `git merge-file --diff3` (`git::remerge_diff3`), whose conflicts keep each side whole, and `untrimmed_both` finds the conflict the block was cut from by walking out over the lines and neighbouring blocks that read as its sides. Both whole sides replace that span in one undo step. When nothing fits (a plain marker file, an add/add with no base, two different edits of the same lines), the sections are joined as written.
+
 ### merge_editor.rs
 
 A three-way merge editor following VS Code's 2022 merge-editor model. `MergeView` diffs base→ours and base→theirs with `build_diff_rows`, clusters transitively overlapping hunks in doubled coordinates so that same-point insertions conflict while adjacent hunks stay independent, auto-resolves one-sided clusters straight into the initial Result, and keeps base text in the conflict regions.
