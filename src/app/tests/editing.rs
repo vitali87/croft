@@ -1427,6 +1427,174 @@ fn tab_expands_a_user_snippet_and_places_the_caret() {
     );
 }
 
+// ── #1484: a repo's own snippets expand ──
+
+const TEAM_SNIPPETS_1484: &str = r#"{
+  // committed by the team
+  "Team logger": {
+    "scope": "python",
+    "prefix": "tlog",
+    "body": ["log = get_logger(__name__)", "log.info(\"$1\")$0"]
+  }
+}"#;
+
+/// Open `name` in an app on `root` and expand `typed` with Tab; the first
+/// line after.
+fn expand_in_project_1484(root: &std::path::Path, name: &str, typed: &str) -> String {
+    let f = root.join(name);
+    std::fs::write(&f, "").unwrap();
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.editor.insert_str(typed);
+    app.handle_editor_tab();
+    app.editor.lines[0].clone()
+}
+
+#[test]
+fn a_vscode_code_snippets_file_expands_in_its_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/team.code-snippets"),
+        TEAM_SNIPPETS_1484,
+    )
+    .unwrap();
+    assert_eq!(
+        expand_in_project_1484(tmp.path(), "app.py", "tlog"),
+        "log = get_logger(__name__)"
+    );
+}
+
+#[test]
+fn a_croft_snippets_json_in_the_repo_expands() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(tmp.path().join(".croft/snippets.json"), TEAM_SNIPPETS_1484).unwrap();
+    assert_eq!(
+        expand_in_project_1484(tmp.path(), "app.py", "tlog"),
+        "log = get_logger(__name__)"
+    );
+}
+
+/// #1484 negative: a project snippet keeps its scope, and only files in
+/// the two project places count.
+#[test]
+fn project_snippets_keep_their_scope_and_their_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/team.code-snippets"),
+        TEAM_SNIPPETS_1484,
+    )
+    .unwrap();
+    // Tab with nothing to expand indents instead.
+    assert_eq!(
+        expand_in_project_1484(tmp.path(), "main.rs", "tlog").trim_end(),
+        "tlog"
+    );
+
+    let other = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(other.path().join(".vscode")).unwrap();
+    std::fs::write(other.path().join("team.code-snippets"), TEAM_SNIPPETS_1484).unwrap();
+    std::fs::write(other.path().join(".vscode/team.json"), TEAM_SNIPPETS_1484).unwrap();
+    assert_eq!(
+        expand_in_project_1484(other.path(), "app.py", "tlog").trim_end(),
+        "tlog"
+    );
+}
+
+/// #1484: a snippets file pulled into `.vscode` while croft runs applies
+/// within the config watch's interval, and the next check is quiet.
+#[test]
+fn a_project_snippets_file_added_later_is_picked_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("app.py");
+    std::fs::write(&f, "").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_watch = crate::config_sync::ConfigWatch::new(Vec::new());
+    app.watch_project_snippets();
+    app.editor.open(&f).unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/team.code-snippets"),
+        TEAM_SNIPPETS_1484,
+    )
+    .unwrap();
+    let t0 = std::time::Instant::now();
+    assert!(app.tick_config_watch_at(t0 + crate::config_sync::ConfigWatch::INTERVAL * 2));
+    assert_eq!(app.status, "Project snippets reloaded");
+    app.editor.insert_str("tlog");
+    app.handle_editor_tab();
+    assert_eq!(app.editor.lines[0], "log = get_logger(__name__)");
+    assert!(!app.tick_config_watch_at(t0 + crate::config_sync::ConfigWatch::INTERVAL * 4));
+}
+
+/// #1484 negative: saving `.vscode/settings.json` touches the folder the
+/// watch looks at, but no snippet changed, so the status says nothing
+/// about snippets.
+#[test]
+fn a_settings_change_in_vscode_does_not_announce_snippets() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_watch = crate::config_sync::ConfigWatch::new(Vec::new());
+    app.watch_project_snippets();
+    app.status = String::from("Ready");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(tmp.path().join(".vscode/settings.json"), "{}").unwrap();
+    let t0 = std::time::Instant::now();
+    app.tick_config_watch_at(t0 + crate::config_sync::ConfigWatch::INTERVAL * 2);
+    assert_eq!(app.status, "Ready");
+}
+
+/// #1484: re-rooting swaps the old repository's snippets for the new one's.
+#[test]
+fn changing_the_workspace_root_reloads_project_snippets() {
+    let old = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(old.path().join(".vscode")).unwrap();
+    std::fs::write(
+        old.path().join(".vscode/team.code-snippets"),
+        TEAM_SNIPPETS_1484,
+    )
+    .unwrap();
+    let new = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(new.path().join(".croft")).unwrap();
+    std::fs::write(
+        new.path().join(".croft/snippets.json"),
+        TEAM_SNIPPETS_1484.replace("tlog", "nlog"),
+    )
+    .unwrap();
+    let mut app = App::new(old.path().to_path_buf()).unwrap();
+    app.change_workspace_root(new.path().to_path_buf());
+    let f = new.path().join("app.py");
+    std::fs::write(&f, "").unwrap();
+    app.editor.open(&f).unwrap();
+    app.editor.insert_str("tlog");
+    app.handle_editor_tab();
+    assert_eq!(app.editor.lines[0].trim_end(), "tlog");
+    let g = new.path().join("b.py");
+    std::fs::write(&g, "").unwrap();
+    app.editor.open(&g).unwrap();
+    app.editor.insert_str("nlog");
+    app.handle_editor_tab();
+    assert_eq!(app.editor.lines[0], "log = get_logger(__name__)");
+}
+
+/// #1484: a `.croft/snippets.json` created while croft runs applies, though
+/// it did not exist when the watch began.
+#[test]
+fn a_croft_snippets_json_created_later_is_picked_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_watch = crate::config_sync::ConfigWatch::new(Vec::new());
+    app.watch_project_snippets();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(tmp.path().join(".croft/snippets.json"), TEAM_SNIPPETS_1484).unwrap();
+    let t0 = std::time::Instant::now();
+    assert!(app.tick_config_watch_at(t0 + crate::config_sync::ConfigWatch::INTERVAL * 2));
+    assert_eq!(app.status, "Project snippets reloaded");
+}
+
 #[test]
 fn a_multi_line_validated_range_falls_back_to_the_word_prompt() {
     // The server may validate a span crossing lines; there is no single-line
