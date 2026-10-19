@@ -68,6 +68,12 @@ struct Node {
     group: bool,
     /// Lorem ipsum (#1230): `text` on a line of its own, with no tag.
     bare_text: bool,
+    /// Wrap with Abbreviation (#1557): lines this element holds, one level
+    /// in, in place of children.
+    wrapped: Option<Vec<String>>,
+    /// Wrap with Abbreviation's `li*` (#1557): repetition `i` holds line
+    /// `i` as its text.
+    per_line: Option<Vec<String>>,
 }
 
 /// One alias: the colon name, the tag it stands for, and that tag's attributes.
@@ -982,6 +988,411 @@ impl Parser<'_> {
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
+// Editing existing markup (#1557): Wrap with Abbreviation, Remove Tag,
+// Update Tag, Go to Matching Pair and Balance, VS Code's Emmet commands for
+// markup already written.
+
+/// What Wrap with Abbreviation puts in the abbreviation's innermost element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrapContent<'a> {
+    /// Whole lines, already without their shared indentation: they go one
+    /// level inside the element, each on its own line.
+    Lines(&'a [String]),
+    /// Part of one line: it becomes the element's text, on the same line.
+    Inline(&'a str),
+}
+
+/// `abbr` expanded around `content` (#1557), VS Code's Emmet: Wrap with
+/// Abbreviation. The content goes in the abbreviation's innermost last
+/// element, so `nav.menu` around a `<ul>` gives a `<nav class="menu">`
+/// holding it, one level in. A bare `*` repeats that element once per
+/// line, each holding its line as text, so `ul>li*` around three lines
+/// gives three `li`. Lines are indented with `indent` per level and the
+/// result ends in a newline. `None` when `abbr` is not an abbreviation or
+/// its innermost element can hold nothing (`img`).
+pub fn wrap(
+    abbr: &str,
+    content: WrapContent<'_>,
+    indent: &str,
+    profile: Profile,
+) -> Option<String> {
+    let lines: Vec<String> = match content {
+        WrapContent::Lines(lines) => lines.to_vec(),
+        WrapContent::Inline(text) => vec![text.to_string()],
+    };
+    // `li*` names no count: it is one repetition per line.
+    let chars: Vec<char> = abbr.trim().chars().collect();
+    let mut spelled = String::new();
+    let mut per_line = false;
+    // A `*` inside `[...]`, `{...}` or quotes is literal text, not the
+    // repetition operator.
+    let mut quote: Option<char> = None;
+    let mut depth = 0usize;
+    for (i, &c) in chars.iter().enumerate() {
+        spelled.push(c);
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') if depth > 0 => quote = Some(c),
+            (None, '[' | '{') => depth += 1,
+            (None, ']' | '}') => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if quote.is_none()
+            && depth == 0
+            && c == '*'
+            && !chars.get(i + 1).is_some_and(char::is_ascii_digit)
+        {
+            spelled.push_str(&lines.len().max(1).to_string());
+            per_line = true;
+        }
+    }
+    let chars: Vec<char> = spelled.chars().collect();
+    let mut p = Parser {
+        src: &chars,
+        pos: 0,
+        climb: 0,
+        stray_caret: false,
+    };
+    // Not `parse`: a lone word is refused there only because, typed in
+    // prose, it is more likely a word than a tag. Here it was asked for,
+    // so a stray `^` is read as `+`, as Emmet does, not taken for math.
+    let mut nodes = p.sequence(true)?;
+    if p.pos != p.src.len() || (nodes.len() == 1 && nodes[0].is_bare()) {
+        return None;
+    }
+    resolve(&mut nodes, profile)?;
+    if element_count(&nodes) > MAX_ELEMENTS {
+        return None;
+    }
+    let target = innermost_last(&mut nodes)?;
+    // A void element (`img`, `br`) holds nothing, so it wraps nothing.
+    if target.is_text_only()
+        || target.bare_text
+        || VOID_ELEMENTS.contains(&target.name.to_ascii_lowercase().as_str())
+    {
+        return None;
+    }
+    match content {
+        WrapContent::Inline(text) => target.text = Some(text.to_string()),
+        WrapContent::Lines(_) if per_line && target.repeat == lines.len().max(1) => {
+            target.per_line = Some(lines.iter().map(|l| l.trim().to_string()).collect());
+        }
+        WrapContent::Lines(_) => target.wrapped = Some(lines),
+    }
+    let mut r = Renderer {
+        indent,
+        profile,
+        out: String::new(),
+        caret: None,
+    };
+    r.render_all(&nodes, None, 0, 1)?;
+    (!r.out.is_empty()).then_some(r.out)
+}
+
+/// The element the wrapped content goes in: the last one, at the deepest
+/// level, as Emmet places it.
+fn innermost_last(nodes: &mut [Node]) -> Option<&mut Node> {
+    let last = nodes.last_mut()?;
+    if !last.children.is_empty() {
+        return innermost_last(&mut last.children);
+    }
+    (!last.group).then_some(last)
+}
+
+/// One element of existing markup, by byte range: its opening tag and,
+/// unless it closes itself (`<br>`, `<img/>`), its closing tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Element {
+    pub name: String,
+    pub open: std::ops::Range<usize>,
+    pub close: Option<std::ops::Range<usize>>,
+}
+
+impl Element {
+    /// From the start of its opening tag to the end of its closing one.
+    pub fn outer(&self) -> std::ops::Range<usize> {
+        self.open.start..self.close.as_ref().map_or(self.open.end, |c| c.end)
+    }
+
+    /// Between its tags; empty for an element that closes itself.
+    pub fn inner(&self) -> std::ops::Range<usize> {
+        self.open.end..self.close.as_ref().map_or(self.open.end, |c| c.start)
+    }
+}
+
+/// Every element of `text`, its tags paired, in document order of their
+/// opening tags. Comments, `<!doctype>`, `<?xml?>`, quoted attribute values
+/// and JSX `{...}` attributes are skipped, the bodies of `<script>` and
+/// `<style>` are not read as markup, and HTML's void elements need no
+/// closing tag, though one given a closing tag (as XML may) is paired. A closing tag with no opening one is ignored, and an
+/// opening tag never closed is left out.
+pub fn elements(text: &str) -> Vec<Element> {
+    let b = text.as_bytes();
+    let mut out: Vec<Element> = Vec::new();
+    let mut open: Vec<(String, std::ops::Range<usize>)> = Vec::new();
+    let mut i = 0;
+    while let Some(off) = text[i..].find('<') {
+        let start = i + off;
+        let rest = &text[start..];
+        if rest.starts_with("<!--") {
+            i = rest.find("-->").map_or(text.len(), |e| start + e + 3);
+            continue;
+        }
+        if rest.starts_with("<!") || rest.starts_with("<?") {
+            i = rest.find('>').map_or(text.len(), |e| start + e + 1);
+            continue;
+        }
+        let closing = rest.starts_with("</");
+        let name_at = start + if closing { 2 } else { 1 };
+        let name_len = text[name_at..]
+            .find(|c: char| !(c.is_alphanumeric() || matches!(c, '-' | '_' | ':' | '.')))
+            .unwrap_or(text.len() - name_at);
+        if name_len == 0 || !b[name_at].is_ascii_alphabetic() {
+            i = start + 1;
+            continue;
+        }
+        let name = text[name_at..name_at + name_len].to_string();
+        let Some(end) = tag_end(text, name_at + name_len) else {
+            break;
+        };
+        if closing {
+            if let Some(at) = open
+                .iter()
+                .rposition(|(n, _)| n.eq_ignore_ascii_case(&name))
+            {
+                // Elements left open inside this one never closed; they
+                // are dropped, not matched with a later stray tag.
+                open.truncate(at + 1);
+                let (name, range) = open.pop().expect("found above");
+                out.push(Element {
+                    name,
+                    open: range,
+                    close: Some(start..end),
+                });
+            } else if let Some(void) = out
+                .iter_mut()
+                .filter(|e| {
+                    e.close.is_none()
+                        && e.name.eq_ignore_ascii_case(&name)
+                        && !text[..e.open.end - 1].ends_with('/')
+                })
+                .max_by_key(|e| e.open.start)
+                .filter(|e| open.last().is_none_or(|(_, r)| r.start < e.open.start))
+            {
+                // An HTML void name given a closing tag (`<input>v</input>`,
+                // as XML allows) is an ordinary element after all.
+                void.close = Some(start..end);
+            }
+            i = end;
+            continue;
+        }
+        let self_closing = text[..end - 1].ends_with('/')
+            || VOID_ELEMENTS.contains(&name.to_ascii_lowercase().as_str());
+        if self_closing {
+            out.push(Element {
+                name,
+                open: start..end,
+                close: None,
+            });
+            i = end;
+            continue;
+        }
+        let raw = ["script", "style"]
+            .iter()
+            .any(|r| name.eq_ignore_ascii_case(r));
+        open.push((name.clone(), start..end));
+        i = end;
+        if raw {
+            let needle = format!("</{}", name.to_ascii_lowercase());
+            i = text[end..]
+                .to_ascii_lowercase()
+                .find(&needle)
+                .map_or(text.len(), |e| end + e);
+        }
+    }
+    out.sort_by_key(|e| e.open.start);
+    out
+}
+
+/// The byte after the `>` that ends the tag whose name ends at `from`,
+/// stepping over quoted values and `{...}` expressions.
+fn tag_end(text: &str, from: usize) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut braces = 0usize;
+    for (off, c) in text[from..].char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') if braces == 0 => quote = Some(c),
+            (None, '{') => braces += 1,
+            (None, '}') => braces = braces.saturating_sub(1),
+            (None, '>') if braces == 0 => return Some(from + off + 1),
+            (None, '<') if braces == 0 => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The innermost element of `text` whose span holds byte `at`.
+pub fn enclosing(text: &str, at: usize) -> Option<Element> {
+    elements(text)
+        .into_iter()
+        .filter(|e| e.outer().contains(&at))
+        .min_by_key(|e| e.outer().len())
+}
+
+/// Go to Matching Pair (#1557): from inside an opening tag, the start of
+/// its closing tag, and back. `None` off a tag, or on one that closes
+/// itself.
+pub fn matching_tag(text: &str, at: usize) -> Option<usize> {
+    elements(text).into_iter().find_map(|e| {
+        let close = e.close?;
+        if e.open.contains(&at) {
+            Some(close.start)
+        } else if close.contains(&at) {
+            Some(e.open.start)
+        } else {
+            None
+        }
+    })
+}
+
+/// `range` without the whitespace at either end.
+fn trimmed(text: &str, range: std::ops::Range<usize>) -> std::ops::Range<usize> {
+    let s = &text[range.clone()];
+    let start = range.start + (s.len() - s.trim_start().len());
+    let end = range.end - (s.len() - s.trim_end().len());
+    start..end.max(start)
+}
+
+/// Balance outward (#1557): the smallest of the enclosing elements'
+/// contents and whole spans that holds `sel` and is larger than it, so
+/// repeating it grows the selection one step: the element's content, then
+/// the element, then its parent's content.
+pub fn balance_out(text: &str, sel: std::ops::Range<usize>) -> Option<std::ops::Range<usize>> {
+    elements(text)
+        .into_iter()
+        .flat_map(|e| {
+            let inner = trimmed(text, e.inner());
+            [inner, e.outer()]
+        })
+        .filter(|r| r.start <= sel.start && sel.end <= r.end && *r != sel)
+        .min_by_key(|r| r.len())
+}
+
+/// Balance inward (#1557): back down a step: from a whole element to its
+/// content, and from content to the first element inside it.
+pub fn balance_in(text: &str, sel: std::ops::Range<usize>) -> Option<std::ops::Range<usize>> {
+    let all = elements(text);
+    if let Some(e) = all.iter().find(|e| e.outer() == sel && e.close.is_some()) {
+        let inner = trimmed(text, e.inner());
+        if !inner.is_empty() {
+            return Some(inner);
+        }
+    }
+    all.iter()
+        .map(Element::outer)
+        .filter(|r| sel.start <= r.start && r.end <= sel.end && *r != sel)
+        .min_by_key(|r| r.start)
+}
+
+/// The byte range of `text`'s line holding `at`, with its line break.
+fn line_span(text: &str, at: usize) -> std::ops::Range<usize> {
+    let start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[at..].find('\n').map_or(text.len(), |i| at + i + 1);
+    start..end
+}
+
+/// Whether `range` is all its line holds but whitespace.
+fn alone_on_line(text: &str, range: &std::ops::Range<usize>) -> bool {
+    let line = line_span(text, range.start);
+    line.end >= range.end
+        && text[line.start..range.start].trim().is_empty()
+        && text[range.end..line.end].trim().is_empty()
+}
+
+/// `line` one `indent` shallower: that unit, or as much leading whitespace
+/// as it has up to its width.
+fn dedent_line(line: &str, indent: &str) -> String {
+    if let Some(rest) = line.strip_prefix(indent) {
+        return rest.to_string();
+    }
+    let width = indent.chars().count().max(1);
+    let lead = line
+        .chars()
+        .take(width)
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .count();
+    line.chars().skip(lead).collect()
+}
+
+/// Remove Tag (#1557): `text` without the tags of the element around byte
+/// `at`, and where its opening tag was. A tag alone on its line takes its
+/// line with it, and the content between two such tags moves out one
+/// `indent` level, as VS Code leaves it.
+pub fn remove_tag(text: &str, at: usize, indent: &str) -> Option<(String, usize)> {
+    let e = enclosing(text, at)?;
+    let Some(close) = e.close.clone() else {
+        let span = if alone_on_line(text, &e.open) {
+            line_span(text, e.open.start)
+        } else {
+            e.open.clone()
+        };
+        let mut out = String::with_capacity(text.len());
+        out.push_str(&text[..span.start]);
+        out.push_str(&text[span.end..]);
+        return Some((out, span.start));
+    };
+    let block = alone_on_line(text, &e.open) && alone_on_line(text, &close);
+    let mut out = String::with_capacity(text.len());
+    if block {
+        let first = line_span(text, e.open.start);
+        let last = line_span(text, close.start);
+        out.push_str(&text[..first.start]);
+        for line in text[first.end..last.start].split_inclusive('\n') {
+            out.push_str(&dedent_line(line, indent));
+        }
+        out.push_str(&text[last.end..]);
+        // The caret on the first line that moved out, at its text.
+        let moved = dedent_line(
+            text[first.end..last.start].split('\n').next().unwrap_or(""),
+            indent,
+        );
+        Some((out, first.start + (moved.len() - moved.trim_start().len())))
+    } else {
+        out.push_str(&text[..e.open.start]);
+        out.push_str(&text[e.open.end..close.start]);
+        out.push_str(&text[close.end..]);
+        Some((out, e.open.start))
+    }
+}
+
+/// Update Tag (#1557): `text` with the element around byte `at` renamed
+/// to `name` in both its tags. `None` when `name` is not a tag name.
+pub fn rename_tag(text: &str, at: usize, name: &str) -> Option<String> {
+    let name = name.trim();
+    let valid = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'));
+    if !valid {
+        return None;
+    }
+    let e = enclosing(text, at)?;
+    let old = e.name.len();
+    let mut out = text.to_string();
+    // The closing tag first: it sits later, so the opening tag's offsets
+    // still hold after it changes.
+    if let Some(close) = &e.close {
+        out.replace_range(close.start + 2..close.start + 2 + old, name);
+    }
+    out.replace_range(e.open.start + 1..e.open.start + 1 + old, name);
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------
 
 /// The tag an implicit name resolves to, given its parent. `ul>.item` means
 /// `li.item`, which is the whole reason the shorthand is worth having.
@@ -1103,12 +1514,28 @@ impl Renderer<'_> {
         }
         self.out.push('>');
 
-        if !node.children.is_empty() {
+        if let Some(lines) = &node.wrapped {
+            self.out.push('\n');
+            let inner = self.indent.repeat(depth + 1);
+            for line in lines {
+                if !line.is_empty() {
+                    self.out.push_str(&inner);
+                    self.out.push_str(line);
+                }
+                self.out.push('\n');
+            }
+            self.out.push_str(&pad);
+        } else if !node.children.is_empty() {
             self.out.push('\n');
             self.render_all(&node.children, Some(&name), depth + 1, index)?;
             self.out.push_str(&pad);
         } else {
-            let text = node.text.as_deref().map(|t| number(t, index));
+            let own = node
+                .per_line
+                .as_ref()
+                .and_then(|lines| lines.get(index.saturating_sub(1)))
+                .cloned();
+            let text = own.or_else(|| node.text.as_deref().map(|t| number(t, index)));
             if text.as_deref().unwrap_or("").is_empty() && self.caret.is_none() {
                 self.caret = Some(self.out.len());
             }
@@ -1797,5 +2224,190 @@ mod tests {
     fn abbreviations_that_are_no_snippet_still_expand_as_before() {
         assert_eq!(ex("html"), "<html></html>\n");
         assert_eq!(ex("head>title"), "<head>\n  <title></title>\n</head>\n");
+    }
+
+    const NAV_PAGE: &str = "<ul>\n  <li>Home</li>\n  <li>About</li>\n</ul>\n<p>Some text</p>\n";
+
+    fn lines(text: &str) -> Vec<String> {
+        text.lines().map(String::from).collect()
+    }
+
+    /// #1557: the issue's example: the `<ul>` wrapped in `nav.menu`, one
+    /// level in.
+    #[test]
+    fn wrap_puts_the_lines_one_level_inside_the_new_element() {
+        let ul = lines("<ul>\n  <li>Home</li>\n  <li>About</li>\n</ul>");
+        assert_eq!(
+            wrap("nav.menu", WrapContent::Lines(&ul), "  ", Profile::Html).unwrap(),
+            "<nav class=\"menu\">\n  <ul>\n    <li>Home</li>\n    <li>About</li>\n  </ul>\n</nav>\n"
+        );
+    }
+
+    /// #1557: the content goes in the innermost last element, and a bare
+    /// `*` repeats that element once per line.
+    #[test]
+    fn wrap_nests_in_the_innermost_element_and_repeats_per_line() {
+        let three = lines("Home\nAbout\nContact");
+        assert_eq!(
+            wrap("ul>li*", WrapContent::Lines(&three), "  ", Profile::Html).unwrap(),
+            "<ul>\n  <li>Home</li>\n  <li>About</li>\n  <li>Contact</li>\n</ul>\n"
+        );
+        let one = lines("<p>hi</p>");
+        assert_eq!(
+            wrap("div>section", WrapContent::Lines(&one), "\t", Profile::Html).unwrap(),
+            "<div>\n\t<section>\n\t\t<p>hi</p>\n\t</section>\n</div>\n"
+        );
+        assert_eq!(
+            wrap("b", WrapContent::Inline("Home"), "  ", Profile::Html).unwrap(),
+            "<b>Home</b>\n",
+            "part of a line stays on its line; a lone word is a tag here"
+        );
+    }
+
+    /// #1557: a `*` inside an attribute or text value is literal, not the
+    /// per-line repetition.
+    #[test]
+    fn wrap_leaves_a_quoted_asterisk_alone() {
+        let two = lines("a\nb");
+        assert_eq!(
+            wrap(
+                "div[title='*']",
+                WrapContent::Lines(&two),
+                "  ",
+                Profile::Html
+            )
+            .unwrap(),
+            "<div title=\"*\">\n  a\n  b\n</div>\n"
+        );
+    }
+
+    /// #1557: an HTML void name given a closing tag, as XML allows, pairs
+    /// with it, so Update Tag renames both tags.
+    #[test]
+    fn a_void_name_with_a_closing_tag_pairs_up() {
+        let text = "<form><input>value</input><br></form>";
+        let all = elements(text);
+        let input = all.iter().find(|e| e.name == "input").unwrap();
+        assert_eq!(input.outer(), 6..text.find("<br>").unwrap());
+        assert_eq!(all.iter().find(|e| e.name == "br").unwrap().close, None);
+        assert_eq!(
+            rename_tag(text, 8, "field").unwrap(),
+            "<form><field>value</field><br></form>"
+        );
+    }
+
+    /// #1557 negative: nothing to wrap with, or an element that can hold
+    /// nothing, wraps nothing.
+    #[test]
+    fn wrap_refuses_what_is_not_an_abbreviation_or_holds_nothing() {
+        let one = lines("x");
+        assert_eq!(
+            wrap("", WrapContent::Lines(&one), "  ", Profile::Html),
+            None
+        );
+        assert_eq!(
+            wrap("div>", WrapContent::Lines(&one), "  ", Profile::Html),
+            None
+        );
+        assert_eq!(
+            wrap("img", WrapContent::Lines(&one), "  ", Profile::Html),
+            None
+        );
+    }
+
+    /// #1557: tags pair up past comments, quoted `>`, void elements and a
+    /// script body.
+    #[test]
+    fn elements_pair_tags_and_skip_what_is_not_markup() {
+        let text =
+            "<div a=\"x>y\"><!-- <p> --><br><img src=x/><script>if (a < b) {}</script></div>";
+        let all = elements(text);
+        let names: Vec<&str> = all.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["div", "br", "img", "script"]);
+        assert_eq!(all[0].outer(), 0..text.len());
+        assert_eq!(all[1].close, None);
+        assert!(all[3].close.is_some(), "the script closes, its `<` aside");
+    }
+
+    /// #1557: Go to Matching Pair hops between an element's two tags.
+    #[test]
+    fn matching_tag_hops_between_the_two_tags() {
+        let close = NAV_PAGE.find("</ul>").unwrap();
+        assert_eq!(matching_tag(NAV_PAGE, 1), Some(close));
+        assert_eq!(matching_tag(NAV_PAGE, close + 2), Some(0));
+        let li = NAV_PAGE.find("<li>").unwrap();
+        assert_eq!(matching_tag(NAV_PAGE, li + 1), NAV_PAGE.find("</li>"));
+    }
+
+    /// #1557 negative: off a tag, or on one that closes itself, there is no
+    /// pair to go to.
+    #[test]
+    fn matching_tag_needs_a_tag_with_a_pair() {
+        let home = NAV_PAGE.find("Home").unwrap();
+        assert_eq!(matching_tag(NAV_PAGE, home), None);
+        assert_eq!(matching_tag("<br>", 1), None);
+    }
+
+    /// #1557: Remove Tag takes both tags and their lines, and moves the
+    /// content out one level.
+    #[test]
+    fn remove_tag_drops_both_tags_and_dedents_the_content() {
+        let in_ul = NAV_PAGE.find("Home").unwrap() - 6;
+        let (out, caret) = remove_tag(NAV_PAGE, in_ul, "  ").unwrap();
+        assert_eq!(out, "<li>Home</li>\n<li>About</li>\n<p>Some text</p>\n");
+        assert_eq!(caret, 0);
+        let p = NAV_PAGE.find("Some").unwrap();
+        let (out, caret) = remove_tag(NAV_PAGE, p, "  ").unwrap();
+        assert!(out.ends_with("</ul>\nSome text\n"), "{out}");
+        assert_eq!(&out[caret..caret + 4], "Some");
+    }
+
+    /// #1557: Update Tag renames both tags and nothing else.
+    #[test]
+    fn rename_tag_changes_both_tags() {
+        let out = rename_tag(NAV_PAGE, 1, "ol").unwrap();
+        assert_eq!(
+            out,
+            NAV_PAGE.replace("<ul>", "<ol>").replace("</ul>", "</ol>")
+        );
+        let at = NAV_PAGE.find("About").unwrap();
+        let out = rename_tag(NAV_PAGE, at, "dt").unwrap();
+        assert!(
+            out.contains("<dt>About</dt>") && out.contains("<li>Home</li>"),
+            "{out}"
+        );
+    }
+
+    /// #1557 negative: no tag around the caret, or a name that is no tag
+    /// name, changes nothing.
+    #[test]
+    fn rename_tag_refuses_a_bad_name_or_no_element() {
+        assert_eq!(rename_tag(NAV_PAGE, 1, "1x"), None);
+        assert_eq!(rename_tag(NAV_PAGE, 1, "a b"), None);
+        assert_eq!(rename_tag("just text", 2, "div"), None);
+        assert_eq!(remove_tag("just text", 2, "  "), None);
+    }
+
+    /// #1557: Balance outward grows the selection a step at a time, and
+    /// inward walks it back.
+    #[test]
+    fn balance_grows_and_shrinks_one_step_at_a_time() {
+        let home = NAV_PAGE.find("Home").unwrap();
+        let li = NAV_PAGE.find("<li>").unwrap();
+        let li_end = NAV_PAGE.find("</li>").unwrap() + 5;
+        let step1 = balance_out(NAV_PAGE, home + 1..home + 1).unwrap();
+        assert_eq!(&NAV_PAGE[step1.clone()], "Home");
+        let step2 = balance_out(NAV_PAGE, step1.clone()).unwrap();
+        assert_eq!(step2, li..li_end);
+        let step3 = balance_out(NAV_PAGE, step2.clone()).unwrap();
+        assert_eq!(&NAV_PAGE[step3.clone()], "<li>Home</li>\n  <li>About</li>");
+        let ul = balance_out(NAV_PAGE, step3.clone()).unwrap();
+        assert_eq!(
+            &NAV_PAGE[ul.clone()],
+            &NAV_PAGE[..NAV_PAGE.find("</ul>").unwrap() + 5]
+        );
+        assert_eq!(balance_in(NAV_PAGE, ul), Some(step3.clone()));
+        assert_eq!(balance_in(NAV_PAGE, step3), Some(step2.clone()));
+        assert_eq!(balance_in(NAV_PAGE, step2), Some(step1));
     }
 }

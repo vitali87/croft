@@ -750,14 +750,60 @@ pub fn diagnostics_by_source(
     })
 }
 
-/// A server's work-done progress update, forwarded from a `$/progress`
-/// notification. `message` is `Some(text)` while a task is running (Begin /
-/// Report) and `None` when it ends (End), so the app can show or clear the
-/// per-server status (e.g. "rust-analyzer: Indexing 112/340 33%").
-#[derive(Debug, Clone)]
-pub struct ProgressUpdate {
+/// Something a server tells the user rather than the editor: its work-done
+/// progress and its `window/*` messages, in the order it sent them.
+#[derive(Debug)]
+pub struct ServerUpdate {
     pub server: String,
-    pub message: Option<String>,
+    pub event: ServerEvent,
+}
+
+#[derive(Debug)]
+pub enum ServerEvent {
+    /// A `$/progress` update: `Some(text)` while a task is running (Begin /
+    /// Report) and `None` when it ends (End), so the app can show or clear
+    /// the per-server status (e.g. "rust-analyzer: Indexing 112/340 33%").
+    Progress(Option<String>),
+    /// A `window/showMessage` the user should see (#1599): an error, a
+    /// warning, or a note with a link in it, such as rust-analyzer's
+    /// "Failed to load workspaces" or gopls's "open your browser to …".
+    /// Other notes and every `window/logMessage` stay in OUTPUT.
+    Message {
+        /// Read by the tests, to prove the level is forwarded.
+        #[cfg_attr(not(test), allow(dead_code))]
+        level: lsp_types::MessageType,
+        text: String,
+    },
+    /// A `window/showMessageRequest`: a question with `actions` to pick
+    /// from. The pick, or `None` when the user dismisses it, goes back on
+    /// `reply`; dropping `reply` answers `None` too.
+    Question {
+        text: String,
+        actions: Vec<lsp_types::MessageActionItem>,
+        reply: oneshot::Sender<Option<lsp_types::MessageActionItem>>,
+    },
+    /// A `window/showDocument`: open `uri` in a tab, or in the browser when
+    /// `external`, with `selection` selected, moving keyboard focus to it
+    /// only when `take_focus`. Whether it was shown goes back on `reply`;
+    /// dropping `reply` answers "not shown".
+    ShowDocument {
+        uri: lsp_types::Url,
+        external: bool,
+        take_focus: bool,
+        selection: Option<lsp_types::Range>,
+        reply: oneshot::Sender<bool>,
+    },
+}
+
+/// Whether a `window/showMessage` is worth interrupting the user for: an
+/// error or a warning, or a note that points somewhere (gopls answers
+/// "Browse documentation" with "open your browser to <url>"). Anything else
+/// is chatter that OUTPUT keeps.
+pub fn message_is_shown(level: lsp_types::MessageType, text: &str) -> bool {
+    use lsp_types::MessageType as MT;
+    level == MT::ERROR
+        || level == MT::WARNING
+        || (level == MT::INFO && (text.contains("https://") || text.contains("http://")))
 }
 
 enum Cmd {
@@ -770,6 +816,11 @@ enum Cmd {
     OpenDoc {
         path: PathBuf,
         text: String,
+    },
+    /// Stop and start again the servers that serve `path` (#1621), leaving
+    /// every other language's servers running.
+    RestartServersFor {
+        path: PathBuf,
     },
     /// Spawn the servers for every language whose project-root marker sits
     /// in the workspace root, before any file of theirs is opened (#27):
@@ -1072,7 +1123,7 @@ pub struct LspManager {
     colors_rx: std_mpsc::Receiver<DocumentColorsUpdate>,
     color_presentations_rx: std_mpsc::Receiver<ColorPresentationsResult>,
     diagnostics_rx: std_mpsc::Receiver<DiagnosticsUpdate>,
-    progress_rx: std_mpsc::Receiver<ProgressUpdate>,
+    progress_rx: std_mpsc::Receiver<ServerUpdate>,
     capability_support: CapabilitySupport,
     semantic_refresh: Arc<AtomicBool>,
     inlay_refresh: Arc<AtomicBool>,
@@ -1322,6 +1373,13 @@ impl LspManager {
         let _ = self.cmd_tx.send(Cmd::CloseDoc { path });
     }
 
+    /// Restart the servers serving `path` (#1621): the user's "Language
+    /// Servers: Restart for This File". The app re-opens its tabs when they
+    /// are back, as after a crash restart.
+    pub fn restart_servers_for(&self, path: PathBuf) {
+        let _ = self.cmd_tx.send(Cmd::RestartServersFor { path });
+    }
+
     pub fn request_completion(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
         self.send_completion_request(path, line, character, false)
     }
@@ -1534,10 +1592,10 @@ impl LspManager {
         self.diagnostics_rx.try_recv().ok()
     }
 
-    /// Pop the next server work-done progress update, if any. `message` is
-    /// `Some` while a task runs and `None` when it ends; the app keeps a
-    /// per-server map so the status bar can show or clear "Indexing…".
-    pub fn drain_progress(&self) -> Option<ProgressUpdate> {
+    /// Pop the next server progress update or `window/*` message, if any.
+    /// The app keeps a per-server progress map so the status bar can show or
+    /// clear "Indexing…", and shows the messages.
+    pub fn drain_server_update(&self) -> Option<ServerUpdate> {
         self.progress_rx.try_recv().ok()
     }
 
@@ -2217,7 +2275,7 @@ struct WorkerState {
     diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
     // Cloned into every spawned client's router so server `$/progress`
     // notifications (rust-analyzer indexing, etc.) reach the status bar.
-    progress_tx: std_mpsc::Sender<ProgressUpdate>,
+    progress_tx: std_mpsc::Sender<ServerUpdate>,
     restarts: ServerRestarts,
 }
 
@@ -2307,7 +2365,7 @@ struct ResultSenders {
     document_colors: std_mpsc::Sender<DocumentColorsUpdate>,
     color_presentations: std_mpsc::Sender<ColorPresentationsResult>,
     diagnostics: std_mpsc::Sender<DiagnosticsUpdate>,
-    progress: std_mpsc::Sender<ProgressUpdate>,
+    progress: std_mpsc::Sender<ServerUpdate>,
 }
 
 // Every flag and channel here is an independent worker input, the same shape
@@ -2354,6 +2412,7 @@ async fn worker_loop(
                 return;
             }
             Cmd::OpenDoc { path, text } => state.open_doc(path, text).await,
+            Cmd::RestartServersFor { path } => state.restart_servers_for(&path).await,
             Cmd::PrewarmWorkspace => state.prewarm_workspace().await,
             Cmd::SetExtraRoots { roots } => {
                 for root in &roots {
@@ -2888,6 +2947,96 @@ impl WorkerState {
             self.ensure_clients(key.0, &key.1).await;
             self.restarts.restarted.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Restart the servers serving `path` at the user's request (#1621): the
+    /// (language, root) its document was opened under, else the one its
+    /// language and project root would open it under, so the servers of
+    /// other roots keep running. Unlike a crash restart this spends no
+    /// budget and lifts a give-up, since the user asked for it.
+    async fn restart_servers_for(&mut self, path: &Path) {
+        let keys: Vec<ClientKey> = match self.docs.get(path) {
+            Some(doc) => vec![(doc.language, doc.project_root.clone())],
+            None => path_to_language(path)
+                .map(|lang| {
+                    (
+                        lang,
+                        project_root_for_roots(path, lang, &self.workspace_root, &self.extra_roots),
+                    )
+                })
+                .filter(|key| self.clients.contains_key(key))
+                .into_iter()
+                .collect(),
+        };
+        if keys.is_empty() {
+            crate::output::push(
+                "Language Servers",
+                crate::output::OutputLevel::Info,
+                &format!("No language server serves {}", path.display()),
+            );
+            return;
+        }
+        for key in keys {
+            self.restart_key(key).await;
+        }
+        self.restarts.restarted.store(true, Ordering::Relaxed);
+    }
+
+    /// Shut the servers of `key` down and start them again, forgetting its
+    /// documents, which the new servers never saw.
+    async fn restart_key(&mut self, key: ClientKey) {
+        let clients = self.clients.remove(&key).unwrap_or_default();
+        let names: Vec<String> = clients.iter().map(|c| c.name.clone()).collect();
+        // Withdraw what the old servers published or answered to a pull
+        // (#1102) for their documents: a server that does not come back
+        // would never clear it, and one that does reports again once the
+        // app re-opens the tabs.
+        for (path, doc) in &self.docs {
+            if (doc.language, doc.project_root.clone()) != key {
+                continue;
+            }
+            for name in &names {
+                for pulled in [false, true] {
+                    let _ = self.diagnostics_tx.send(DiagnosticsUpdate {
+                        path: path.clone(),
+                        server: name.clone(),
+                        diagnostics: Vec::new(),
+                        pulled,
+                    });
+                }
+            }
+        }
+        for managed in clients {
+            let mut client = managed.client.lock().await;
+            if !client.has_exited() {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(3), client.shutdown())
+                    .await;
+            }
+        }
+        if let Ok(mut support) = self.capability_support.lock() {
+            for (path, doc) in &self.docs {
+                if (doc.language, doc.project_root.clone()) == key {
+                    support.document_servers.remove(path);
+                }
+            }
+        }
+        self.docs
+            .retain(|_, doc| (doc.language, doc.project_root.clone()) != key);
+        self.restarts.gave_up.remove(&key);
+        self.restarts.attempts.remove(&key);
+        let expected = self.restarts.incomplete.remove(&key).unwrap_or(names);
+        self.clients.insert(key.clone(), Vec::new());
+        if !expected.is_empty() {
+            self.restarts.respawn = Some(expected.clone());
+        }
+        self.ensure_clients(key.0, &key.1).await;
+        let msg = if expected.is_empty() {
+            format!("Started the language servers for {}", key.1.display())
+        } else {
+            format!("Restarted {} for {}", expected.join(", "), key.1.display())
+        };
+        log_file::log(&format!("lsp restart: {msg}"));
+        crate::output::push("Language Servers", crate::output::OutputLevel::Info, &msg);
     }
 
     async fn ensure_clients(&mut self, lang: Language, root: &Path) -> &[ManagedClient] {
@@ -7222,9 +7371,18 @@ fn build_client_capabilities() -> ClientCapabilities {
         // (rust-analyzer's "Indexing…", "Building CrateGraph", "Roots
         // Scanned"). The router forwards it to the status bar, so a server
         // that is busy priming is never silently mistaken for a dead one.
+        // `showMessage` and `showDocument` (#1599): croft answers a server's
+        // questions from a picker and opens the documents and links it
+        // points at, so gopls sends "Browse documentation" as a link to
+        // open rather than a line in OUTPUT.
         window: Some(WindowClientCapabilities {
             work_done_progress: Some(true),
-            ..Default::default()
+            show_message: Some(lsp_types::ShowMessageRequestClientCapabilities {
+                message_action_item: Some(lsp_types::MessageActionItemCapabilities {
+                    additional_properties_support: Some(true),
+                }),
+            }),
+            show_document: Some(lsp_types::ShowDocumentClientCapabilities { support: true }),
         }),
         // rust-analyzer emits its Run / Debug / references lenses only for
         // client-side commands the client says it can run (#608), and these
@@ -7792,6 +7950,40 @@ mod tests {
         let caps = build_client_capabilities();
         let window = caps.window.expect("window capabilities must be set");
         assert_eq!(window.work_done_progress, Some(true));
+    }
+
+    /// gopls only sends "Browse documentation" as a link to open, rather
+    /// than as a line nobody sees, to a client that says it can show
+    /// documents; servers only ask questions with actions of one that says
+    /// it can answer them (#1599).
+    #[test]
+    fn client_capabilities_offer_show_document_and_message_actions() {
+        let window = build_client_capabilities().window.expect("window");
+        assert_eq!(
+            window.show_document.map(|d| d.support),
+            Some(true),
+            "window.showDocument"
+        );
+        assert!(
+            window
+                .show_message
+                .and_then(|m| m.message_action_item)
+                .is_some(),
+            "window.showMessage.messageActionItem"
+        );
+    }
+
+    #[test]
+    fn only_errors_warnings_and_links_interrupt_the_user() {
+        use lsp_types::MessageType as MT;
+        assert!(message_is_shown(MT::ERROR, "Failed to load workspaces."));
+        assert!(message_is_shown(MT::WARNING, "cargo check failed"));
+        assert!(message_is_shown(
+            MT::INFO,
+            "Gopls: open your browser to https://go.dev/gopls"
+        ));
+        assert!(!message_is_shown(MT::INFO, "Indexing done"));
+        assert!(!message_is_shown(MT::LOG, "https://example.com"));
     }
 
     /// Without `linkSupport` a server turns each `LocationLink` into a
@@ -10562,6 +10754,222 @@ while True:
             fresh.try_restart(&key, t0);
         }
         assert!(fresh.try_restart(&key, t0 + RESTART_WINDOW + Duration::from_secs(1)));
+    }
+
+    /// A worker whose python and go servers are fake recorders that log
+    /// their pid to `<root>/<lang>.pids` (#1621).
+    fn two_language_worker(root: &Path, python: &Path) -> (WorkerState, Arc<AtomicBool>) {
+        let script = root.join("fake_lsp.py");
+        std::fs::write(
+            &script,
+            format!(
+                "import os, sys\nopen(sys.argv[2], 'a').write(str(os.getpid()) + '\\n')\n{FAKE_LSP_RECORDER}"
+            ),
+        )
+        .expect("write fake server");
+        let mut registry = ServerRegistry::new();
+        for (lang, name, tag) in [
+            (Language::PYTHON, "fake-python", "python"),
+            (Language::GO, "fake-go", "go"),
+        ] {
+            registry.register(
+                lang,
+                ServerConfig {
+                    name,
+                    command: python.display().to_string(),
+                    args: vec![
+                        script.display().to_string(),
+                        root.join(format!("{tag}.log")).display().to_string(),
+                        root.join(format!("{tag}.pids")).display().to_string(),
+                    ],
+                    language: lang,
+                    initialization_options: None,
+                    provision: None,
+                },
+            );
+        }
+        let restarted = Arc::new(AtomicBool::new(false));
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let state = WorkerState {
+            workspace_root: root.to_path_buf(),
+            extra_roots: Vec::new(),
+            registry,
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+            restarts: ServerRestarts::reporting_to(restarted.clone()),
+        };
+        (state, restarted)
+    }
+
+    /// The pids a fake server of `tag` has logged under `root`, waiting up to
+    /// ten seconds for `n` of them.
+    fn logged_pids(root: &Path, tag: &str, n: usize) -> Vec<i32> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let seen: Vec<i32> = std::fs::read_to_string(root.join(format!("{tag}.pids")))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect();
+            if seen.len() >= n || Instant::now() >= deadline {
+                return seen;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Whether process `pid` is gone, waiting up to ten seconds for it.
+    fn process_exits(pid: i32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            // SAFETY: signal 0 only asks whether the pid exists.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// #1621: "Restart for This File" stops the file's server and starts a
+    /// new one, even one croft had given up on, and leaves the servers of
+    /// other languages running.
+    #[cfg(unix)]
+    #[test]
+    fn restarting_a_file_s_servers_leaves_other_languages_running() {
+        let Some(python) = python_for_stub_server() else {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let py = root.join("demo.py");
+        let go = root.join("main.go");
+        std::fs::write(&py, "x = 1\n").unwrap();
+        std::fs::write(&go, "package main\n").unwrap();
+        let (mut state, restarted) = two_language_worker(&root, &python);
+        let (diag_tx, diag_rx) = std_mpsc::channel();
+        state.diagnostics_tx = diag_tx;
+        let runtime = LspRuntime::new().expect("runtime");
+        let handle = runtime.handle().clone();
+        handle.block_on(state.open_doc(py.clone(), String::from("x = 1\n")));
+        handle.block_on(state.open_doc(go.clone(), String::from("package main\n")));
+        let first_py = logged_pids(&root, "python", 1);
+        let first_go = logged_pids(&root, "go", 1);
+        assert_eq!((first_py.len(), first_go.len()), (1, 1));
+        // A key croft gave up on after a crash loop still restarts on request.
+        let py_key: ClientKey = (Language::PYTHON, root.clone());
+        state.restarts.gave_up.insert(py_key.clone());
+
+        handle.block_on(state.restart_servers_for(&py));
+        let py_pids = logged_pids(&root, "python", 2);
+        assert_eq!(py_pids.len(), 2, "a new python server started");
+        assert!(process_exits(py_pids[0]), "the old python server exited");
+        assert!(
+            restarted.load(Ordering::Relaxed),
+            "the app re-opens its tabs"
+        );
+        assert!(!state.docs.contains_key(&py), "the new server never saw it");
+        let withdrawn: Vec<DiagnosticsUpdate> = diag_rx.try_iter().collect();
+        assert!(
+            withdrawn
+                .iter()
+                .any(|u| u.path == py && u.server == "fake-python" && u.diagnostics.is_empty()),
+            "the old server's diagnostics are withdrawn: {withdrawn:?}"
+        );
+        assert!(
+            !withdrawn.iter().any(|u| u.path == go),
+            "go keeps its diagnostics"
+        );
+        assert!(
+            state.clients[&py_key]
+                .iter()
+                .all(|m| m.client.try_lock().is_ok_and(|c| !c.has_exited()))
+        );
+        assert!(!state.restarts.gave_up.contains(&py_key));
+
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            logged_pids(&root, "go", 1),
+            first_go,
+            "go was not restarted"
+        );
+        // SAFETY: signal 0 only asks whether the pid exists.
+        assert_eq!(unsafe { libc::kill(first_go[0], 0) }, 0, "go still runs");
+        assert!(state.docs.contains_key(&go), "go keeps its document");
+    }
+
+    /// #1621: a file whose document is not open restarts only the servers
+    /// of its own project root, not every root of its language.
+    #[cfg(unix)]
+    #[test]
+    fn restarting_for_an_unopened_file_restarts_only_its_root() {
+        let Some(python) = python_for_stub_server() else {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let (a, b) = (root.join("a"), root.join("b"));
+        for dir in [&a, &b] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("pyproject.toml"), "").unwrap();
+        }
+        let (in_a, in_b) = (a.join("x.py"), b.join("y.py"));
+        let (mut state, _restarted) = two_language_worker(&root, &python);
+        let runtime = LspRuntime::new().expect("runtime");
+        let handle = runtime.handle().clone();
+        handle.block_on(state.open_doc(in_a.clone(), String::from("x = 1\n")));
+        let first_a = logged_pids(&root, "python", 1);
+        handle.block_on(state.open_doc(in_b.clone(), String::from("y = 1\n")));
+        let both = logged_pids(&root, "python", 2);
+        assert_eq!((first_a.len(), both.len()), (1, 2));
+        let first_b = both[1];
+        // As when its open failed: the worker holds no document for it.
+        state.docs.remove(&in_a);
+
+        handle.block_on(state.restart_servers_for(&in_a));
+        let pids = logged_pids(&root, "python", 3);
+        assert_eq!(pids.len(), 3, "root a's server started again");
+        assert!(process_exits(first_a[0]), "root a's old server exited");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(logged_pids(&root, "python", 3).len(), 3);
+        // SAFETY: signal 0 only asks whether the pid exists.
+        assert_eq!(unsafe { libc::kill(first_b, 0) }, 0, "root b still runs");
+        assert!(state.docs.contains_key(&in_b), "root b keeps its document");
+    }
+
+    /// Negative (#1621): a file no server serves restarts nothing.
+    #[cfg(unix)]
+    #[test]
+    fn restarting_for_a_file_no_server_serves_restarts_nothing() {
+        let Some(python) = python_for_stub_server() else {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let py = root.join("demo.py");
+        std::fs::write(&py, "x = 1\n").unwrap();
+        let (mut state, restarted) = two_language_worker(&root, &python);
+        let runtime = LspRuntime::new().expect("runtime");
+        let handle = runtime.handle().clone();
+        handle.block_on(state.open_doc(py.clone(), String::from("x = 1\n")));
+        let first = logged_pids(&root, "python", 1);
+        handle.block_on(state.restart_servers_for(&root.join("notes.txt")));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(logged_pids(&root, "python", 1), first);
+        assert!(!restarted.load(Ordering::Relaxed));
+        assert!(state.docs.contains_key(&py));
     }
 
     /// #694: a language server the kernel kills (croft makes them its first

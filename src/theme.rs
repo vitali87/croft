@@ -643,6 +643,13 @@ impl Theme {
         self.blend_over_bg((0x88, 0x88, 0x88), 0.38)
     }
 
+    /// An editor ruler's line (#1524; VS Code `editorRuler.foreground`,
+    /// #5A5A5A on the dark default): the indent guides' grey, a step
+    /// stronger so a ruler reads as a limit rather than structure.
+    pub fn ruler(self) -> Color {
+        self.blend_over_bg((0x88, 0x88, 0x88), 0.57)
+    }
+
     /// Foreground of the active indentation guide — the guide of the block
     /// containing the cursor (VS Code `editorIndentGuide.activeBackground1`,
     /// #707070 on the dark default). Same grey, blended stronger.
