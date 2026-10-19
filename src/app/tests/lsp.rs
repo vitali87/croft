@@ -2530,6 +2530,79 @@ fn format_on_type_moves_the_caret_only_for_edits_before_it() {
     assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 10));
 }
 
+/// #1603: an Add import quick fix grows the import block above the caret;
+/// typing straight after it lands on the line the caret was on, not in the
+/// import block that took its line number.
+#[test]
+fn typing_after_an_add_import_lands_on_the_caret_s_own_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("main.go");
+    std::fs::write(
+        &file,
+        "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tname := strings.ToUpper(\"croft\")\n\tfmt.Println(name)\n}\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&file).unwrap();
+    app.focus = Pane::Editor;
+    app.editor.cursor_row = 5;
+    app.editor.cursor_col = 9;
+    let edits = vec![(
+        file.clone(),
+        vec![crate::widgets::editor::TextSpanEdit {
+            start: (2, 0),
+            end: (2, 12),
+            new_text: String::from("import (\n\t\"fmt\"\n\t\"strings\"\n)"),
+            utf16: true,
+        }],
+    )];
+    app.apply_rename_edits(&edits).unwrap();
+    for c in ['m', 'y'] {
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(c),
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        .unwrap();
+    }
+    assert_eq!(app.editor.lines[5], ")", "the import block is intact");
+    assert_eq!(
+        app.editor.lines[8], "\tname := mystrings.ToUpper(\"croft\")",
+        "{:#?}",
+        app.editor.lines
+    );
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (8, 11));
+}
+
+/// Negative (#1603): an edit to another file leaves this tab's caret alone.
+#[test]
+fn an_edit_to_another_file_leaves_the_caret_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.go");
+    let other = tmp.path().join("b.go");
+    std::fs::write(&file, "package a\n\nvar x = 1\n").unwrap();
+    std::fs::write(&other, "package a\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&file).unwrap();
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 4;
+    let edits = vec![(
+        other.clone(),
+        vec![crate::widgets::editor::TextSpanEdit {
+            start: (0, 0),
+            end: (0, 0),
+            new_text: String::from("// one\n// two\n"),
+            utf16: false,
+        }],
+    )];
+    app.apply_rename_edits(&edits).unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 4));
+    assert!(
+        std::fs::read_to_string(&other)
+            .unwrap()
+            .starts_with("// one")
+    );
+}
+
 #[test]
 fn a_rename_reply_for_a_buffer_typed_into_since_the_request_is_refused() {
     let tmp = tempfile::tempdir().unwrap();

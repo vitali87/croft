@@ -2064,6 +2064,49 @@ fn auto_save_stays_off_by_default() {
     assert!(app.editor.dirty, "nothing saves while the pref is off");
 }
 
+/// An app on `app.txt` in a project whose `.editorconfig` trims trailing
+/// whitespace, with `  # TODO   ` typed at the end of line 1 (#1455).
+fn app_with_trailing_spaces_typed() -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join(".editorconfig"),
+        "root = true\n[*]\ntrim_trailing_whitespace = true\n",
+    )
+    .unwrap();
+    let mut app = app_with_open_file(tmp.path(), "app.txt", "def f():\n    return 1\n");
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    type_str(&mut app, "  # TODO   ");
+    (app, tmp)
+}
+
+/// #1455: Cmd+S trims the line the caret is on, so the stray spaces just
+/// typed never reach the commit.
+#[test]
+fn an_explicit_save_trims_the_line_just_edited() {
+    let (mut app, tmp) = app_with_trailing_spaces_typed();
+    app.save();
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("app.txt")).unwrap(),
+        "def f():  # TODO\n    return 1\n"
+    );
+    assert!(!app.editor.dirty);
+}
+
+/// #1455 negative: auto-save still spares the caret line, since it fires
+/// while the user is mid-typing.
+#[test]
+fn an_auto_save_spares_the_line_being_typed() {
+    let (mut app, tmp) = app_with_trailing_spaces_typed();
+    app.auto_save = true;
+    age_last_edit(&mut app.editor);
+    assert!(app.tick_auto_save());
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("app.txt")).unwrap(),
+        "def f():  # TODO   \n    return 1\n"
+    );
+}
+
 #[test]
 fn auto_save_never_overwrites_an_external_disk_change() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2368,6 +2411,65 @@ fn create_prompt_labels_speak_workspace_relative() {
         label, "New Folder in .",
         "the workspace root itself reads as '.'"
     );
+}
+
+/// #1601: Save Workspace As opens with its suggested path selected, so a
+/// typed path replaces it rather than being appended to it.
+#[test]
+fn save_workspace_as_replaces_the_suggested_path_with_what_is_typed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::SaveWorkspaceAs);
+    for c in "team.code-workspace".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.input_prompt.as_ref().unwrap().value,
+        "team.code-workspace"
+    );
+}
+
+/// #1601: Ctrl+U, Ctrl+W and Alt+Backspace reach the prompt; a paste
+/// replaces a selected value.
+#[test]
+fn prompt_chords_clear_the_value_and_a_paste_replaces_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::SaveWorkspaceAs);
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::ALT))
+        .unwrap();
+    let v = app.input_prompt.as_ref().unwrap().value.clone();
+    assert!(v.ends_with('/') || v.ends_with('\\'), "{v}");
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.input_prompt.as_ref().unwrap().value.len() < v.len());
+    app.handle_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.input_prompt.as_ref().unwrap().value, "");
+    app.handle_paste("/tmp/x.code-workspace");
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL))
+        .unwrap();
+    app.handle_paste("/tmp/y.code-workspace");
+    assert_eq!(
+        app.input_prompt.as_ref().unwrap().value,
+        "/tmp/y.code-workspace"
+    );
+}
+
+/// Negative (#1601): Ctrl+A in a prompt never reaches the editor behind it.
+#[test]
+fn prompt_chords_leave_the_editor_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha beta");
+    app.run_command(crate::widgets::command_palette::Command::SaveWorkspaceAs);
+    for (c, m) in [('a', KeyModifiers::CONTROL), ('u', KeyModifiers::CONTROL)] {
+        app.handle_key(key(KeyCode::Char(c), m)).unwrap();
+    }
+    assert_eq!(app.editor.lines, vec!["alpha beta"]);
+    assert!(app.editor.selection.is_none_or(|s| !s.has_area()));
 }
 
 /// The sweep's auto-enable is capped by workspace size, and the setting
