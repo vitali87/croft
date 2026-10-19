@@ -121,6 +121,10 @@ pub enum Command {
     // --- File / editor management ---
     SaveFile,
     SaveAs,
+    /// File: Save with Sudo (#1379): write a file this user may not write
+    /// through `sudo tee` in a terminal pane, where sudo asks for the
+    /// password itself.
+    SaveWithSudo,
     /// File: Revert File (#1285): drop the tab's unsaved edits for the
     /// text on disk, as one undo step.
     RevertFile,
@@ -641,6 +645,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::UnfoldAllRegions,
     Command::SaveFile,
     Command::SaveAs,
+    Command::SaveWithSudo,
     Command::RevertFile,
     Command::SaveAll,
     Command::NewFile,
@@ -1080,6 +1085,7 @@ impl Command {
             Command::UnfoldAllRegions => "Unfold All Regions",
             Command::SaveFile => "File: Save",
             Command::SaveAs => "File: Save As…",
+            Command::SaveWithSudo => "File: Save with Sudo",
             Command::RevertFile => "File: Revert File",
             Command::SaveAll => "File: Save All",
             Command::NewFile => "File: New File…",
@@ -1528,6 +1534,7 @@ impl Command {
             Command::UnfoldAllRegions => "Cmd+K Cmd+9",
             Command::SaveFile => "Cmd+S",
             Command::SaveAs => "",
+            Command::SaveWithSudo => "",
             Command::RevertFile => "",
             // VS Code's macOS chord; its Linux `Ctrl+K S` is Select for
             // Compare here, so Linux takes `Ctrl+Alt+S` instead.
@@ -1959,6 +1966,7 @@ impl Command {
             Command::UnfoldAllRegions => "unfold_all_regions",
             Command::SaveFile => "save_file",
             Command::SaveAs => "save_as",
+            Command::SaveWithSudo => "save_with_sudo",
             Command::RevertFile => "revert_file",
             Command::SaveAll => "save_all",
             Command::NewFile => "new_file",
