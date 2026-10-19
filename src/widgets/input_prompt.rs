@@ -271,6 +271,10 @@ pub struct InputPrompt {
     /// The line under the field; `None` is the generic "Enter to confirm ·
     /// Esc to cancel".
     pub hint: Option<String>,
+    /// The whole value is selected (#1601): a prefilled value opens this
+    /// way, as VS Code's input boxes do, so typing or pasting replaces it
+    /// and Backspace clears it, where before every key appended to it.
+    pub selected: bool,
 }
 
 impl InputPrompt {
@@ -288,6 +292,7 @@ impl InputPrompt {
             last_rect: Rect::default(),
             allow_blank: false,
             hint: None,
+            selected: false,
         }
     }
 
@@ -309,7 +314,65 @@ impl InputPrompt {
     pub fn with_value(mut self, value: impl Into<String>) -> Self {
         self.value = value.into();
         self.cursor = self.value.chars().count();
+        self.selected = !self.value.is_empty();
         self
+    }
+
+    /// Select the whole value (Ctrl+A), caret at its end.
+    pub fn select_all(&mut self) {
+        self.cursor = self.char_count();
+        self.selected = !self.value.is_empty();
+    }
+
+    /// Drop a selected value, for the key about to replace or delete it.
+    /// True when there was one.
+    fn take_selection(&mut self) -> bool {
+        if !std::mem::take(&mut self.selected) {
+            return false;
+        }
+        self.value.clear();
+        self.cursor = 0;
+        true
+    }
+
+    /// Delete from the start of the value to the caret (Ctrl+U).
+    pub fn clear_to_start(&mut self) {
+        if self.take_selection() {
+            return;
+        }
+        let at = self.byte_offset(self.cursor);
+        self.value.replace_range(..at, "");
+        self.cursor = 0;
+    }
+
+    /// Delete from the caret to the end of the value (Ctrl+K).
+    pub fn clear_to_end(&mut self) {
+        if self.take_selection() {
+            return;
+        }
+        let at = self.byte_offset(self.cursor);
+        self.value.truncate(at);
+    }
+
+    /// Delete the word before the caret (Ctrl+W, Alt/Ctrl+Backspace): the
+    /// separators after it, then back to the previous space or path
+    /// separator, so `/a/b/c.txt` goes to `/a/b/`.
+    pub fn delete_word_back(&mut self) {
+        if self.take_selection() {
+            return;
+        }
+        let chars: Vec<char> = self.value.chars().collect();
+        let is_sep = |c: char| c.is_whitespace() || c == '/' || c == '\\';
+        let mut start = self.cursor.min(chars.len());
+        while start > 0 && is_sep(chars[start - 1]) {
+            start -= 1;
+        }
+        while start > 0 && !is_sep(chars[start - 1]) {
+            start -= 1;
+        }
+        let (from, to) = (self.byte_offset(start), self.byte_offset(self.cursor));
+        self.value.replace_range(from..to, "");
+        self.cursor = start;
     }
 
     fn char_count(&self) -> usize {
@@ -328,13 +391,14 @@ impl InputPrompt {
         if c == '\n' || c == '\r' {
             return;
         }
+        self.take_selection();
         let at = self.byte_offset(self.cursor);
         self.value.insert(at, c);
         self.cursor += 1;
     }
 
     pub fn pop_char(&mut self) {
-        if self.cursor == 0 {
+        if self.take_selection() || self.cursor == 0 {
             return;
         }
         let at = self.byte_offset(self.cursor - 1);
@@ -343,26 +407,36 @@ impl InputPrompt {
     }
 
     pub fn delete_char(&mut self) {
-        if self.cursor >= self.char_count() {
+        if self.take_selection() || self.cursor >= self.char_count() {
             return;
         }
         let at = self.byte_offset(self.cursor);
         self.value.remove(at);
     }
 
+    /// Left on a selected value goes to its start, as in a text field.
     pub fn move_cursor_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        self.cursor = match std::mem::take(&mut self.selected) {
+            true => 0,
+            false => self.cursor.saturating_sub(1),
+        };
     }
 
+    /// Right on a selected value goes to its end.
     pub fn move_cursor_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.char_count());
+        self.cursor = match std::mem::take(&mut self.selected) {
+            true => self.char_count(),
+            false => (self.cursor + 1).min(self.char_count()),
+        };
     }
 
     pub fn move_cursor_home(&mut self) {
+        self.selected = false;
         self.cursor = 0;
     }
 
     pub fn move_cursor_end(&mut self) {
+        self.selected = false;
         self.cursor = self.char_count();
     }
 
@@ -372,6 +446,30 @@ impl InputPrompt {
         let v = self.value.trim();
         (self.allow_blank || !v.is_empty()).then(|| v.to_string())
     }
+}
+
+/// Where a field `width` cells wide starts showing `value` so the caret
+/// at char `cursor` is in view (#1601): the chars skipped, and whether a
+/// leading `…` takes the first cell to say so. Measured in terminal cells,
+/// so wide (CJK) chars count as two.
+fn field_scroll(value: &str, cursor: usize, width: usize) -> (usize, bool) {
+    use unicode_width::UnicodeWidthChar;
+    let cells: Vec<usize> = value.chars().map(|c| c.width().unwrap_or(0)).collect();
+    let cursor = cursor.min(cells.len());
+    // The caret's own cell: the char under it, or one blank past the end.
+    let caret = cells.get(cursor).copied().unwrap_or(1).max(1);
+    let before: usize = cells[..cursor].iter().sum();
+    if width < 2 || before + caret <= width {
+        return (0, false);
+    }
+    // `…`, then as many chars before the caret as fit, then the caret.
+    let room = width.saturating_sub(1 + caret);
+    let (mut skip, mut used) = (cursor, 0);
+    while skip > 0 && used + cells[skip - 1] <= room {
+        skip -= 1;
+        used += cells[skip];
+    }
+    (skip, true)
 }
 
 pub fn render_input_prompt(
@@ -434,16 +532,30 @@ pub fn render_input_prompt(
         );
     } else {
         let cursor = prompt.cursor.min(prompt.value.chars().count());
-        let before: String = prompt.value.chars().take(cursor).collect();
+        // The field scrolls to keep the caret in view (#1601): a value wider
+        // than the box, any real path, hid its end and the caret, which
+        // starts there. A `…` marks the hidden start.
+        let (skip, lead) = field_scroll(&prompt.value, cursor, inner.width as usize);
+        let before: String = prompt
+            .value
+            .chars()
+            .skip(skip)
+            .take(cursor - skip)
+            .collect();
         let at: String = prompt.value.chars().skip(cursor).take(1).collect();
         let after: String = prompt.value.chars().skip(cursor + 1).collect();
         let caret = if at.is_empty() { " ".to_string() } else { at };
-        let value_style = Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)));
+        let mut value_style = Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)));
+        if prompt.selected {
+            value_style = value_style.bg(theme.ui(Color::Rgb(0x26, 0x4f, 0x78)));
+        }
         let caret_style = Style::default()
             .fg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f)))
             .bg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
             .add_modifier(Modifier::SLOW_BLINK);
+        let dim = Style::default().fg(theme.ui(Color::Rgb(0x6c, 0x7d, 0x9c)));
         let line = Line::from(vec![
+            Span::styled(if lead { "\u{2026}" } else { "" }, dim),
             Span::styled(before, value_style),
             Span::styled(caret, caret_style),
             Span::styled(after, value_style),
@@ -497,6 +609,157 @@ mod tests {
         for x in r.x + r.width..screen.width {
             assert_eq!(buf[(x, r.y)].symbol(), " ", "column {x} of the title row");
         }
+    }
+
+    fn prefilled(value: &str) -> InputPrompt {
+        InputPrompt::new(InputPurpose::CreateTag, "Tag", "name").with_value(value)
+    }
+
+    /// #1601: a prefilled value opens selected, so typing replaces it.
+    #[test]
+    fn typing_over_a_prefilled_value_replaces_it() {
+        let mut p = prefilled("abc");
+        assert!(p.selected);
+        p.push_char('x');
+        p.push_char('y');
+        assert_eq!((p.value.as_str(), p.cursor), ("xy", 2));
+    }
+
+    /// #1601: Backspace or Delete on a selected value clears all of it.
+    #[test]
+    fn backspace_or_delete_clears_a_selected_value() {
+        let mut p = prefilled("abc");
+        p.pop_char();
+        assert_eq!(p.value, "");
+        let mut p = prefilled("abc");
+        p.delete_char();
+        assert_eq!(p.value, "");
+    }
+
+    /// #1601: Ctrl+U clears to the start and Ctrl+K to the end.
+    #[test]
+    fn clearing_to_the_start_or_the_end_of_the_value() {
+        let mut p = prefilled("abcdef");
+        p.move_cursor_left();
+        for _ in 0..3 {
+            p.move_cursor_right();
+        }
+        p.clear_to_start();
+        assert_eq!((p.value.as_str(), p.cursor), ("def", 0));
+        p.move_cursor_right();
+        p.clear_to_end();
+        assert_eq!((p.value.as_str(), p.cursor), ("d", 1));
+        let mut p = prefilled("abc");
+        p.clear_to_start();
+        assert_eq!(p.value, "", "a selected value goes whole");
+    }
+
+    /// #1601: a word delete stops at a path separator.
+    #[test]
+    fn a_word_delete_goes_back_to_the_path_separator() {
+        let mut p = prefilled("/a/b/c.txt");
+        p.move_cursor_end();
+        p.delete_word_back();
+        assert_eq!(p.value, "/a/b/");
+        p.delete_word_back();
+        assert_eq!(p.value, "/a/");
+        let mut p = prefilled("git tag v1");
+        p.move_cursor_end();
+        p.delete_word_back();
+        assert_eq!(p.value, "git tag ");
+    }
+
+    /// #1601: Ctrl+A selects the value again after it was deselected.
+    #[test]
+    fn select_all_selects_the_value_again() {
+        let mut p = prefilled("abc");
+        p.move_cursor_end();
+        assert!(!p.selected);
+        p.select_all();
+        p.push_char('z');
+        assert_eq!(p.value, "z");
+    }
+
+    /// Negative (#1601): an arrow key deselects and keeps the value, so
+    /// typing then edits it in place.
+    #[test]
+    fn an_arrow_key_keeps_a_prefilled_value_to_edit() {
+        let mut p = prefilled("abc");
+        p.move_cursor_left();
+        p.push_char('x');
+        assert_eq!(p.value, "xabc");
+        let mut p = prefilled("abc");
+        p.move_cursor_end();
+        p.push_char('d');
+        assert_eq!(p.value, "abcd");
+    }
+
+    /// Negative (#1601): an empty prompt is not selected; typing builds it.
+    #[test]
+    fn an_empty_prompt_types_as_before() {
+        let mut p = InputPrompt::new(InputPurpose::CreateTag, "Tag", "name").with_value("");
+        assert!(!p.selected);
+        p.push_char('a');
+        p.push_char('b');
+        p.pop_char();
+        assert_eq!(p.value, "a");
+    }
+
+    fn value_row(p: &mut InputPrompt, width: u16) -> String {
+        let screen = Rect::new(0, 0, width, 12);
+        let mut buf = Buffer::empty(screen);
+        render_input_prompt(p, screen, &mut buf, crate::theme::Theme::BLACK);
+        let r = p.last_rect;
+        (r.x + 2..r.x + r.width - 2)
+            .map(|x| buf[(x, r.y + 1)].symbol().to_string())
+            .collect()
+    }
+
+    /// #1601: a value wider than the field scrolls to keep the caret, at
+    /// its end, in view, with a `…` for the hidden start.
+    #[test]
+    fn a_long_value_scrolls_to_keep_the_caret_in_view() {
+        let long = format!("/work/{}/end.code-workspace", "dir/".repeat(40));
+        let mut p = prefilled(&long);
+        let row = value_row(&mut p, 50);
+        assert!(row.starts_with('\u{2026}'), "{row}");
+        assert!(row.trim_end().ends_with("end.code-workspace"), "{row}");
+        p.move_cursor_home();
+        let row = value_row(&mut p, 50);
+        assert!(row.starts_with("/work/dir/"), "{row}");
+    }
+
+    /// #1601: scrolling is measured in cells, so a value of wide chars
+    /// that is fewer chars than the field but more cells still scrolls and
+    /// keeps the end caret inside the field.
+    #[test]
+    fn a_wide_char_value_scrolls_by_display_width() {
+        let mut p = prefilled(&"\u{4e2d}".repeat(20));
+        let screen = Rect::new(0, 0, 50, 12);
+        let mut buf = Buffer::empty(screen);
+        render_input_prompt(&mut p, screen, &mut buf, crate::theme::Theme::BLACK);
+        let r = p.last_rect;
+        let (left, right) = (r.x + 2, r.x + r.width - 2);
+        assert!(
+            20 < right - left && right - left < 40,
+            "field is {}",
+            right - left
+        );
+        let caret = (left..right)
+            .find(|&x| buf[(x, r.y + 1)].modifier.contains(Modifier::SLOW_BLINK))
+            .expect("caret drawn inside the field");
+        assert!(caret < right);
+        assert_eq!(buf[(left, r.y + 1)].symbol(), "\u{2026}");
+        p.move_cursor_home();
+        assert!(value_row(&mut p, 50).starts_with('\u{4e2d}'));
+    }
+
+    /// Negative (#1601): a value that fits is drawn from its first char.
+    #[test]
+    fn a_short_value_is_drawn_whole() {
+        let mut p = prefilled("v1.2.3");
+        let row = value_row(&mut p, 50);
+        assert!(row.starts_with("v1.2.3"), "{row}");
     }
 
     #[test]

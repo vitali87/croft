@@ -2294,6 +2294,65 @@ fn create_prompt_labels_speak_workspace_relative() {
     );
 }
 
+/// #1601: Save Workspace As opens with its suggested path selected, so a
+/// typed path replaces it rather than being appended to it.
+#[test]
+fn save_workspace_as_replaces_the_suggested_path_with_what_is_typed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::SaveWorkspaceAs);
+    for c in "team.code-workspace".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert_eq!(
+        app.input_prompt.as_ref().unwrap().value,
+        "team.code-workspace"
+    );
+}
+
+/// #1601: Ctrl+U, Ctrl+W and Alt+Backspace reach the prompt; a paste
+/// replaces a selected value.
+#[test]
+fn prompt_chords_clear_the_value_and_a_paste_replaces_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::SaveWorkspaceAs);
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::ALT))
+        .unwrap();
+    let v = app.input_prompt.as_ref().unwrap().value.clone();
+    assert!(v.ends_with('/') || v.ends_with('\\'), "{v}");
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.input_prompt.as_ref().unwrap().value.len() < v.len());
+    app.handle_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.input_prompt.as_ref().unwrap().value, "");
+    app.handle_paste("/tmp/x.code-workspace");
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL))
+        .unwrap();
+    app.handle_paste("/tmp/y.code-workspace");
+    assert_eq!(
+        app.input_prompt.as_ref().unwrap().value,
+        "/tmp/y.code-workspace"
+    );
+}
+
+/// Negative (#1601): Ctrl+A in a prompt never reaches the editor behind it.
+#[test]
+fn prompt_chords_leave_the_editor_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha beta");
+    app.run_command(crate::widgets::command_palette::Command::SaveWorkspaceAs);
+    for (c, m) in [('a', KeyModifiers::CONTROL), ('u', KeyModifiers::CONTROL)] {
+        app.handle_key(key(KeyCode::Char(c), m)).unwrap();
+    }
+    assert_eq!(app.editor.lines, vec!["alpha beta"]);
+    assert!(app.editor.selection.is_none_or(|s| !s.has_area()));
+}
+
 /// The sweep's auto-enable is capped by workspace size, and the setting
 /// overrides the cap in both directions (#256, criterion 5).
 ///
