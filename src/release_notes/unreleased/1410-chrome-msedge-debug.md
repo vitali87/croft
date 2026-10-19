@@ -1,0 +1,1 @@
+feature: Browser JavaScript and TypeScript can be debugged: launch.json `chrome` and `msedge` configs (and their `pwa-` forms) run on croft's bundled js-debug instead of being refused as an unsupported type, and with no display the browser runs headless.
