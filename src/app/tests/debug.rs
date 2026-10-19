@@ -4397,6 +4397,27 @@ fn a_node_launch_with_nothing_to_run_names_what_it_needs() {
     assert!(app.debug_sessions.is_empty());
 }
 
+/// #1410: a browser croft launches has a screen to open on only locally
+/// with a display; over SSH, or on Linux with no X or Wayland display, it
+/// runs headless.
+#[test]
+fn a_browser_runs_headless_only_where_there_is_no_display() {
+    let none = |_: &str| false;
+    let x11 = |k: &str| k == "DISPLAY";
+    let wayland = |k: &str| k == "WAYLAND_DISPLAY";
+    assert!(crate::app::no_display(true, true, x11), "over SSH");
+    assert!(
+        crate::app::no_display(false, true, none),
+        "Linux, no display"
+    );
+    assert!(!crate::app::no_display(false, true, x11));
+    assert!(!crate::app::no_display(false, true, wayland));
+    assert!(
+        !crate::app::no_display(false, false, none),
+        "macOS has a display with no DISPLAY set"
+    );
+}
+
 /// #1392: a CodeLLDB `cargo` launch with no `program` builds with cargo
 /// first instead of being refused; an lldb launch with neither is still
 /// refused.
