@@ -70,7 +70,15 @@ fn decl_matches(decl: &TestRunnerDecl, root: &Path) -> bool {
 /// runners, then pytest — a mixed repo's root is usually the crate). Pure over
 /// sources/prefs (testable against a tempdir without touching real prefs).
 fn resolve(sources: &[String], disabled: &BTreeSet<String>, root: &Path) -> Option<Runner> {
-    sources
+    resolve_all(sources, disabled, root).first().copied()
+}
+
+/// Every runner that claims `root`, in [`resolve`]'s order and each once
+/// (#1408): a maturin crate is a Cargo and a pytest project at once, and a
+/// Python backend with a JS frontend is both pytest and Vitest or Jest.
+fn resolve_all(sources: &[String], disabled: &BTreeSet<String>, root: &Path) -> Vec<Runner> {
+    let mut found = Vec::new();
+    let matching = sources
         .iter()
         .filter_map(|s| manifest::parse(s).ok())
         .flat_map(|m| {
@@ -78,8 +86,14 @@ fn resolve(sources: &[String], disabled: &BTreeSet<String>, root: &Path) -> Opti
             m.test_runners.into_iter().map(move |d| (id.clone(), d))
         })
         .filter(|(id, _)| !disabled.contains(id))
-        .find(|(_, d)| decl_matches(d, root))
-        .map(|(_, d)| kind_of(d.kind))
+        .filter(|(_, d)| decl_matches(d, root))
+        .map(|(_, d)| kind_of(d.kind));
+    for runner in matching {
+        if !found.contains(&runner) {
+            found.push(runner);
+        }
+    }
+    found
 }
 
 /// Bundled + user manifest sources, in load order.
@@ -211,6 +225,12 @@ pub fn test_root_for(root: &Path, file: Option<&Path>) -> PathBuf {
     resolve_test_root(&all_sources(), &disabled, root, file)
 }
 
+/// Every enabled runner that claims `root` (#1408), [`runner_for`]'s first.
+pub fn runners_for(root: &Path) -> Vec<Runner> {
+    let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
+    resolve_all(&all_sources(), &disabled, root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +244,52 @@ mod tests {
 
     fn none() -> BTreeSet<String> {
         BTreeSet::new()
+    }
+
+    /// #1408: a folder with `Cargo.toml` and `pyproject.toml` (a maturin
+    /// crate) has both runners, Cargo first; Python with a Vitest frontend
+    /// has both too.
+    #[test]
+    fn a_folder_with_two_languages_has_both_runners() {
+        let s = bundled();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(tmp.path().join("pyproject.toml"), "[project]\n").unwrap();
+        assert_eq!(
+            resolve_all(&s, &none(), tmp.path()),
+            vec![Runner::Cargo, Runner::Pytest]
+        );
+        assert_eq!(resolve(&s, &none(), tmp.path()), Some(Runner::Cargo));
+
+        let web = tempfile::tempdir().unwrap();
+        std::fs::write(web.path().join("pyproject.toml"), "[project]\n").unwrap();
+        std::fs::write(
+            web.path().join("package.json"),
+            r#"{ "devDependencies": { "vitest": "^2" } }"#,
+        )
+        .unwrap();
+        let both = resolve_all(&s, &none(), web.path());
+        assert!(
+            both.contains(&Runner::Pytest) && both.contains(&Runner::Vitest),
+            "{both:?}"
+        );
+    }
+
+    /// #1408, negative: one language is one runner, a runner two markers
+    /// claim is listed once, and a disabled runner is not listed at all.
+    #[test]
+    fn one_language_is_one_runner_and_a_disabled_one_is_left_out() {
+        let s = bundled();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("pyproject.toml"), "[project]\n").unwrap();
+        std::fs::write(tmp.path().join("pytest.ini"), "[pytest]\n").unwrap();
+        assert_eq!(resolve_all(&s, &none(), tmp.path()), vec![Runner::Pytest]);
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\n").unwrap();
+        let cargo_off = BTreeSet::from([String::from("test-cargo")]);
+        assert_eq!(
+            resolve_all(&s, &cargo_off, tmp.path()),
+            vec![Runner::Pytest]
+        );
     }
 
     #[test]

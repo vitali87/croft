@@ -3061,7 +3061,9 @@ type PendingCargoLaunch = (
 enum LastTestRun {
     All,
     One(String),
-    Filter(String),
+    /// A filter run and the file it came from, which picks the runner
+    /// (#1408).
+    Filter(String, Option<PathBuf>),
     Suite(String),
     Many(Vec<String>),
 }
@@ -5086,6 +5088,13 @@ pub struct App {
     /// (non-zero) when the matching command completes. Replaced by a newer
     /// F5, so only one launch can be pending.
     pending_debug_launch: Option<PendingDebugLaunch>,
+    /// F5's C/C++ build running off the UI thread (#1359): the source it
+    /// debugs and where the build's result arrives. `poll_debug_build`
+    /// launches lldb-dap on the program once it is built.
+    debug_build: Option<(
+        PathBuf,
+        std::sync::mpsc::Receiver<Result<crate::cpp_build::Built, crate::cpp_build::Failed>>,
+    )>,
     /// An attach launch waiting for the user to pick its process (#250):
     /// the resolved config and where it launches once `processId` is known.
     pending_attach: Option<(crate::dap::configs::ResolvedConfig, LaunchSlot)>,
@@ -6702,6 +6711,7 @@ impl App {
             debug_post_tasks: Vec::new(),
             debug_compound: None,
             pending_debug_launch: None,
+            debug_build: None,
             pending_attach: None,
             pending_test_debug: None,
             pending_cargo_launches: Vec::new(),
@@ -26388,8 +26398,11 @@ impl App {
             self.test_worker.run_one(run.clone());
         } else {
             self.testing.start_filter(&run);
-            self.last_test_run = Some(LastTestRun::Filter(run.clone()));
-            self.test_worker.run_filter(run.clone());
+            // The caret's file picks the runner where two languages'
+            // tests share the folder (#1408).
+            let file = self.editor.path.clone();
+            self.last_test_run = Some(LastTestRun::Filter(run.clone(), file.clone()));
+            self.test_worker.run_filter(run.clone(), file);
         }
         self.set_sidebar_view(SidebarView::Testing);
         self.status = format!("Running test {run}");
@@ -26473,10 +26486,10 @@ impl App {
             LastTestRun::All => self.run_all_tests(),
             LastTestRun::One(name) => self.run_test(name),
             LastTestRun::Suite(suite) => self.run_suite(suite),
-            LastTestRun::Filter(pattern) => {
+            LastTestRun::Filter(pattern, file) => {
                 self.testing.start_filter(&pattern);
-                self.last_test_run = Some(LastTestRun::Filter(pattern.clone()));
-                self.test_worker.run_filter(pattern);
+                self.last_test_run = Some(LastTestRun::Filter(pattern.clone(), file.clone()));
+                self.test_worker.run_filter(pattern, file);
                 self.set_sidebar_view(SidebarView::Testing);
             }
             LastTestRun::Many(names) => self.start_many_tests(names),
@@ -26614,6 +26627,14 @@ impl App {
         self.debug_named_test(name);
     }
 
+    /// The runner for a test in the focused file under `root` (#1408): the
+    /// one for the file's language, so a pytest test in a maturin crate
+    /// debugs under debugpy, not as a cargo test binary.
+    fn test_runner_for_focused_file(&self, root: &Path) -> Option<crate::testing::worker::Runner> {
+        let runners = crate::testing::worker::runners_for(root);
+        crate::testing::worker::runner_for_file(&runners, self.editor.path.as_deref())
+    }
+
     /// Hand the test `name` to the debugger — the M6 wedge: pytest runs as a
     /// debugpy module launch under the PROJECT's interpreter, a cargo test
     /// binary launches under lldb-dap with the name as its libtest filter.
@@ -26642,7 +26663,7 @@ impl App {
             .iter()
             .map(|(p, lines)| (p.clone(), self.editor.source_breakpoints(p, lines)))
             .collect();
-        match crate::testing::worker::runner_for(&root) {
+        match self.test_runner_for_focused_file(&root) {
             Some(crate::testing::worker::Runner::Pytest) => {
                 // The interpreter F5 and Live Run pick, from the test file's
                 // folder up (#864), not only a root `.venv`; refused before
@@ -33708,6 +33729,7 @@ impl App {
         // this set (#567). The task-gated path reaches here via `take()`, so
         // this only ever drops a STALE parking.
         self.pending_debug_launch = None;
+        self.debug_build = None;
         let total = members.len();
         let mut started = 0usize;
         let mut building: Vec<String> = Vec::new();
@@ -33854,6 +33876,7 @@ impl App {
             self.debug_stop();
         }
         self.pending_debug_launch = None;
+        self.debug_build = None;
         let root = self.active_workspace_root();
         let tasks = crate::tasks::discover_tasks(&root);
         let Some(task) = tasks.into_iter().find(|t| t.label == task_label) else {
@@ -33891,6 +33914,7 @@ impl App {
             self.debug_stop();
         }
         self.pending_debug_launch = None;
+        self.debug_build = None;
         self.pending_cargo_launches.clear();
         // A new run: the previous run's cleanup is not this one's.
         self.debug_post_tasks.clear();
@@ -34103,8 +34127,9 @@ impl App {
             .clone()
             .unwrap_or_else(|| self.active_workspace_root());
         let name = rc.name.clone();
-        // The debuggee interpreter's note (#864), for a Python launch.
-        let mut python_note = None;
+        // A note for the status: the debuggee interpreter's (#864) for a
+        // Python launch, or a browser run headless (#1410).
+        let mut launch_note = None;
         let result = match rc.kind {
             AdapterKind::Debugpy => {
                 if rc.request == RequestKind::Launch && rc.program.is_none() && rc.module.is_none()
@@ -34128,7 +34153,7 @@ impl App {
                                 .as_deref()
                                 .map_or(Ok(None), debuggee_python_note)
                             {
-                                Ok(note) => python_note = note,
+                                Ok(note) => launch_note = note,
                                 Err(refusal) => {
                                     self.debug_error(format!("config \"{name}\": {refusal}"));
                                     return;
@@ -34243,16 +34268,11 @@ impl App {
                 }
             }
             AdapterKind::JsDebug => {
-                if rc.request == RequestKind::Launch && !configs::js_launch_has_target(&rc) {
-                    self.debug_error(format!(
-                        "config \"{name}\": a node launch needs a \"program\", a \"runtimeExecutable\" or a \"command\""
-                    ));
+                if let Some(e) = configs::js_config_error(&rc) {
+                    self.debug_error(format!("config \"{name}\": {e}"));
                     return;
                 }
-                if rc.request == RequestKind::Attach && rc.port.is_none() {
-                    self.debug_error(format!("config \"{name}\": a node attach needs a \"port\""));
-                    return;
-                }
+                let browser = configs::browser_type(&rc.type_name).is_some();
                 let node = match crate::dap::install::node_program() {
                     Ok(n) => n,
                     Err(e) => {
@@ -34267,11 +34287,20 @@ impl App {
                         return;
                     }
                 };
+                let mut request = configs::js_request(&rc);
+                // A browser croft has no screen for would open where no one
+                // sees it (#1410): it runs headless, and the status says so.
+                if browser && rc.request == RequestKind::Launch && no_display_for_a_browser() {
+                    request = configs::with_headless_browser(request);
+                    launch_note = Some(String::from(
+                        "(no display here, so the browser runs headless)",
+                    ));
+                }
                 crate::dap::session::DapSession::launch_js_with(
                     &node,
                     &server,
                     &cwd,
-                    configs::js_request(&rc),
+                    request,
                     breakpoints,
                 )
             }
@@ -34290,10 +34319,10 @@ impl App {
                 };
                 self.run_debug.feedback = Some(format!("{verb} {name}"));
                 self.run_debug.feedback_is_error = false;
-                let lead = with_python_note(format!("{verb} {name}"), python_note.as_deref());
+                let lead = with_python_note(format!("{verb} {name}"), launch_note.as_deref());
                 self.status = format!("{lead} — F5 continue · F10 step over · Shift+F5 stop");
                 self.reveal_debug_view();
-                if python_note.is_some() {
+                if launch_note.is_some() {
                     self.debug_console_push(lead);
                 }
                 // A cppdbg configuration runs under lldb-dap (#1394): say
@@ -34319,6 +34348,7 @@ impl App {
         // Same as every other launch path: a parked older launch must not
         // fire later and replace this one (#567).
         self.pending_debug_launch = None;
+        self.debug_build = None;
         // Zero-config "Debug active file" declares no postDebugTask.
         self.debug_post_tasks.clear();
         let Some(path) = self.editor.path.clone() else {
@@ -34578,6 +34608,13 @@ impl App {
             self.debug_error(lldb_dap_missing_message());
             return;
         }
+        let is_rust = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("rs"));
+        if !is_rust {
+            self.begin_debug_build(path);
+            return;
+        }
         // Compiled source: build a debuggable binary first, then debug it.
         let binary = match self.build_debuggable_binary(path) {
             Ok(b) => b,
@@ -34587,6 +34624,89 @@ impl App {
             }
         };
         self.launch_lldb(&binary, path);
+    }
+
+    /// Start building the program F5 on the C/C++ file `path` debugs
+    /// (#1359): the project's CMake target, else the file with its
+    /// `compile_commands.json` flags, else the file alone. The build runs
+    /// on its own thread so a long one leaves the UI live; F5 again
+    /// replaces it.
+    fn begin_debug_build(&mut self, path: &Path) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        // The root that owns the file: an added folder's project, not the
+        // primary's.
+        let workspace = self
+            .roots
+            .owning_root(path)
+            .unwrap_or_else(|| self.roots.primary())
+            .to_path_buf();
+        let source = path.to_path_buf();
+        let cache = croft_cache_dir().join("debug-builds");
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::cpp_build::build_for_debug(
+                &workspace, &source, &cache,
+            ));
+        });
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let msg = format!("Building {name} for debugging…");
+        self.run_debug.feedback = Some(msg.clone());
+        self.run_debug.feedback_is_error = false;
+        self.status = msg;
+        self.debug_build = Some((path.to_path_buf(), rx));
+    }
+
+    /// F5's C/C++ build, once it is done: the source it debugs and the
+    /// build's result. `None` while it runs or when none was started.
+    fn take_debug_build(
+        &mut self,
+    ) -> Option<(
+        PathBuf,
+        Result<crate::cpp_build::Built, crate::cpp_build::Failed>,
+    )> {
+        let (_, rx) = self.debug_build.as_ref()?;
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(crate::cpp_build::Failed {
+                summary: String::from("the build stopped without a result"),
+                output: String::new(),
+            }),
+        };
+        let (source, _) = self.debug_build.take()?;
+        Some((source, result))
+    }
+
+    /// Launch lldb-dap once F5's C/C++ build is done, or report why it
+    /// failed with the build's whole output in OUTPUT's "Debug Build"
+    /// channel. True when the build finished this tick.
+    fn poll_debug_build(&mut self) -> bool {
+        let Some((source, result)) = self.take_debug_build() else {
+            return false;
+        };
+        match result {
+            Ok(built) => {
+                self.launch_lldb(&built.binary, &source);
+                if !self.run_debug.feedback_is_error {
+                    let line = self.run_debug.feedback.take().unwrap_or_default();
+                    self.run_debug.feedback = Some(format!("{line}, built by {}", built.how));
+                }
+            }
+            Err(failed) => {
+                const CHANNEL: &str = "Debug Build";
+                crate::output::clear(CHANNEL);
+                for line in failed.output.lines() {
+                    crate::output::push(CHANNEL, crate::output::OutputLevel::Error, line);
+                }
+                self.debug_error(format!(
+                    "Build for debug failed: {} (full output in OUTPUT › {CHANNEL})",
+                    failed.summary
+                ));
+            }
+        }
+        true
     }
 
     /// Launch lldb-dap on an already-built `binary`, attributing status to
@@ -34628,56 +34748,24 @@ impl App {
         }
     }
 
-    /// Compile `path` to a debuggable binary (with debug info, no optimisation)
-    /// and return the binary path. C via `cc`, C++ via `c++`, Rust via `rustc`
-    /// for a single file. The binary lands next to the source as `<stem>.dbg`.
+    /// Compile the single Rust file `path` with debug info and return the
+    /// binary, next to the source as `<stem>.dbg`. C and C++ build through
+    /// their project instead (`begin_debug_build`, #1359).
     fn build_debuggable_binary(&self, path: &Path) -> std::io::Result<PathBuf> {
-        use std::process::Command;
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
         let out = path.with_extension("dbg");
-        let (program, args): (&str, Vec<String>) = match ext.as_str() {
-            "rs" => (
-                "rustc",
-                vec![
-                    String::from("-g"),
-                    String::from("-o"),
-                    out.to_string_lossy().into_owned(),
-                    path.to_string_lossy().into_owned(),
-                ],
-            ),
-            "c" | "h" | "m" => (
-                "cc",
-                vec![
-                    String::from("-g"),
-                    String::from("-O0"),
-                    path.to_string_lossy().into_owned(),
-                    String::from("-o"),
-                    out.to_string_lossy().into_owned(),
-                ],
-            ),
-            _ => (
-                "c++",
-                vec![
-                    String::from("-g"),
-                    String::from("-O0"),
-                    path.to_string_lossy().into_owned(),
-                    String::from("-o"),
-                    out.to_string_lossy().into_owned(),
-                ],
-            ),
-        };
         // .output(), never .status(): the compiler must not inherit croft's
         // TTY - a compile error would spray its diagnostics over the UI
         // (same class as the pdftoppm trailer-dictionary spray).
-        let cmd_out = Command::new(program).args(&args).output()?;
+        let cmd_out = std::process::Command::new("rustc")
+            .arg("-g")
+            .arg("-o")
+            .arg(&out)
+            .arg(path)
+            .output()?;
         if !cmd_out.status.success() {
             let stderr = String::from_utf8_lossy(&cmd_out.stderr);
             return Err(std::io::Error::other(format!(
-                "{program} exited with {}: {}",
+                "rustc exited with {}: {}",
                 cmd_out.status,
                 stderr.trim()
             )));
@@ -35405,6 +35493,9 @@ impl App {
         // its debuggee after the user stopped debugging.
         self.pending_cargo_launches.clear();
         self.debug_compound = None;
+        // A C/C++ build still running must not launch once it finishes
+        // (#1359): Stop means stop.
+        self.debug_build = None;
         self.reset_watch_runtime();
         // Sweep js-debug's detached watchdog (and any leftover tree) once it has
         // reparented to init after the server dies. See the Terminated arm in
@@ -44117,6 +44208,79 @@ impl App {
         }
     }
 
+    /// "Language Servers: Restart All" (#1621): stop every server and start
+    /// a fresh manager at the same roots, as a re-root does, without
+    /// quitting croft. The next sync re-opens every tab against the new
+    /// servers, which publish their diagnostics afresh.
+    fn restart_language_servers(&mut self) {
+        if self.lsp_paused_for_build {
+            self.status = String::from(LSP_PAUSED_FOR_BUILD);
+            return;
+        }
+        // The old manager's Drop waits for its servers; off the UI thread.
+        if let Some(old) = self.lsp.take() {
+            fs_watch::offload_drop(old);
+        }
+        // A format-on-save in flight dies with its server; save unformatted,
+        // as when a reply fails.
+        if self.format_request_id.take().is_some() {
+            self.complete_pending_save();
+        }
+        self.lsp = match crate::lsp::LspManager::new(self.workspace_root().to_path_buf()) {
+            Ok(m) => {
+                m.set_extra_roots(self.roots.iter().skip(1).map(Path::to_path_buf).collect());
+                Some(m)
+            }
+            Err(e) => {
+                let msg = format!("Language servers could not restart: {e}");
+                crate::output::push("Language Servers", crate::output::OutputLevel::Error, &msg);
+                self.status = msg;
+                None
+            }
+        };
+        self.lsp_last_seen.clear();
+        self.lsp_progress.clear();
+        // The new manager numbers semantic replies from 0 again.
+        self.semantic_generation_seen.clear();
+        self.lsp_diagnostics.clear();
+        self.rebuild_problems();
+        if self.lsp.is_some() {
+            let msg = "Restarted all language servers";
+            crate::output::push("Language Servers", crate::output::OutputLevel::Info, msg);
+            self.status = String::from(msg);
+        }
+    }
+
+    /// "Language Servers: Restart for This File" (#1621): restart only the
+    /// servers serving the active file, so rust-analyzer's index survives a
+    /// restart of ruff. The manager re-opens the tabs once they are back.
+    fn restart_language_servers_for_file(&mut self) {
+        if self.lsp_paused_for_build {
+            self.status = String::from(LSP_PAUSED_FOR_BUILD);
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Restart for This File needs a file open in the editor");
+            return;
+        };
+        let Some(lsp) = self.lsp.as_ref() else {
+            self.status =
+                String::from("No language servers are running; Restart All starts them again");
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let has_language = crate::lsp::Language::from_path(&path).is_some();
+        if !has_language {
+            self.status = format!("No language server serves {name}");
+            return;
+        }
+        lsp.restart_servers_for(path.clone());
+        self.status = format!("Restarting the language servers for {name}");
+    }
+
     /// Start the one-shot local drift probe (#242) on a locally-launched
     /// croft. A remote-launched croft skips it: its binary is re-stamped by
     /// the launching machine on every connect, and its baked manifest dir
@@ -51541,9 +51705,69 @@ impl App {
         self.status = format!("{key} saved to {}", path.display());
     }
 
+    /// Reset Setting (#1655): remove `key` from the layer the Settings
+    /// editor writes to, so the value falls back to the layers below it or
+    /// croft's default, and re-merge. Once only a hand edit of `config.json`
+    /// could undo a setting, and toggling one back left a redundant entry.
+    fn reset_setting(&mut self, key: &str) {
+        use crate::config_layers::LayerKind;
+        let Some(target) = self.settings_editor.as_ref().map(|e| e.target) else {
+            return;
+        };
+        let (path, layer) = match target {
+            LayerKind::Workspace => (
+                crate::config_layers::workspace_config_path(self.roots.primary()),
+                "workspace",
+            ),
+            _ => (self.config_dir.join("config.json"), "user"),
+        };
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let new = match crate::settings_editor::remove_key(
+            &text,
+            key,
+            crate::config_layers::current_platform(),
+        ) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                self.status =
+                    format!("{key} is not set in your {layer} settings (Tab switches layer)");
+                return;
+            }
+            Err(e) => {
+                self.status = format!("{}: {e}", path.display());
+                return;
+            }
+        };
+        if let Err(e) = std::fs::write(&path, new) {
+            self.status = format!("{}: {e}", path.display());
+            return;
+        }
+        let merged = self.merged_settings_here();
+        for w in &merged.warnings {
+            crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
+        }
+        self.apply_merged_settings(&merged.prefs);
+        self.settings_provenance = merged.provenance.clone();
+        let rows = crate::settings_editor::rows(&merged.prefs, &merged.provenance);
+        let now = rows.iter().find(|r| r.key == key).map(|r| {
+            format!(
+                "{} ({})",
+                crate::settings_editor::display(&r.value),
+                r.layer.label()
+            )
+        });
+        if let Some(ed) = self.settings_editor.as_mut() {
+            ed.rows = rows;
+        }
+        self.status = match now {
+            Some(now) => format!("{key} reset in {}: now {now}", path.display()),
+            None => format!("{key} reset in {}", path.display()),
+        };
+    }
+
     /// Keys while the Settings editor is open (#612): typing searches, Enter
-    /// edits the selected setting, Tab switches between the user and the
-    /// workspace layer.
+    /// edits the selected setting, Del resets it (#1655), Tab switches
+    /// between the user and the workspace layer.
     fn handle_settings_editor_key(&mut self, key: KeyEvent) {
         use crate::config_layers::LayerKind;
         use crate::settings_editor::Kind;
@@ -51596,6 +51820,11 @@ impl App {
                             ConfigFileSeed::Settings,
                         );
                     }
+                }
+            }
+            (KeyCode::Delete, _) => {
+                if let Some(key) = ed.selected_row().map(|r| r.key.clone()) {
+                    self.reset_setting(&key);
                 }
             }
             (KeyCode::Backspace, _) => {
@@ -53796,6 +54025,8 @@ impl App {
                 self.notebook_kernel_request(crate::notebook_kernel::Request::Restart)
             }
             Cmd::NotebookSelectKernel => self.select_notebook_kernel(),
+            Cmd::RestartLanguageServers => self.restart_language_servers(),
+            Cmd::RestartLanguageServersForFile => self.restart_language_servers_for_file(),
             Cmd::TestingRunWithCoverage => self.run_all_tests_with_coverage(),
             Cmd::CoverageClear => self.clear_coverage(),
             Cmd::TestingInstallCoverageTool => self.install_coverage_tool(),
@@ -71786,6 +72017,11 @@ fn stage_block(dir: &Path, interpreter: &str, code: &str) -> std::io::Result<Pat
     Ok(path)
 }
 
+/// What the restart commands say while an update build has the language
+/// servers stopped (#1621): the build's end starts them again.
+const LSP_PAUSED_FOR_BUILD: &str =
+    "Language servers are stopped while croft builds its update; they restart when it finishes";
+
 /// Milliseconds since the Unix epoch, for stamping local-history snapshots
 /// and dating TIMELINE rows.
 fn now_millis() -> u64 {
@@ -74404,6 +74640,23 @@ fn debuggee_python_note(python: &Path) -> Result<Option<String>, String> {
     Ok(None)
 }
 
+/// Whether a browser croft launches would have no screen to open on
+/// (#1410): croft is reached over SSH, or on Linux no X or Wayland display
+/// is set. macOS and Windows always have one locally.
+fn no_display_for_a_browser() -> bool {
+    no_display(
+        crate::remote::running_over_ssh(),
+        cfg!(target_os = "linux"),
+        |k| std::env::var_os(k).is_some_and(|v| !v.is_empty()),
+    )
+}
+
+/// Whether there is no display, given whether croft runs over SSH, whether
+/// it is on Linux, and which environment variables are `set` (#1410).
+pub(crate) fn no_display(over_ssh: bool, linux: bool, set: impl Fn(&str) -> bool) -> bool {
+    over_ssh || (linux && !set("DISPLAY") && !set("WAYLAND_DISPLAY"))
+}
+
 /// `lead` followed by the note on the debuggee's interpreter, if any (#864).
 fn with_python_note(lead: String, note: Option<&str>) -> String {
     match note {
@@ -76675,7 +76928,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let color_pres_changed = app.drain_lsp_color_presentations();
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let progress_changed = app.drain_lsp_progress();
-        let dap_changed = app.poll_dap();
+        let dap_changed = app.poll_dap() | app.poll_debug_build();
         let tests_changed = app.test_worker.drain(&mut app.testing)
             | app.drain_pending_test_debug()
             | app.drain_pending_cargo_launch();
