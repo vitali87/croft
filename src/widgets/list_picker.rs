@@ -61,6 +61,9 @@ pub enum ListPurpose {
     DebugConfigType,
     /// Second step: `id` is `launch` or `attach`.
     DebugConfigRequest,
+    /// Debug: Step Into Target (#1543): the calls on the paused line, `id`
+    /// the adapter's `targetId`.
+    StepInTarget,
     /// The searchable Settings hub (Preferences: Open Settings). Rows toggle a
     /// boolean setting (`id` = `toggle:<field>`) or run a follow-up command
     /// (`id` = `cmd:<command_id>`, e.g. open a JSON file or the theme picker).
@@ -116,6 +119,9 @@ pub enum ListPurpose {
     PanelAlignment,
     /// View: Set Quick Input Position… (#852): `id` is `top` or `center`.
     QuickInputPosition,
+    /// A language server's `window/showMessageRequest` (#1599): the rows
+    /// are its actions, `id` an index into them; Esc answers no action.
+    ServerQuestion,
     /// Notebook: Select Kernel (#1377): the installed kernelspecs, `id`
     /// the kernel's name.
     NotebookKernel,

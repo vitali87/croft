@@ -1,0 +1,1 @@
+fix: In a folder with tests in two languages, such as a maturin crate (Cargo.toml and pyproject.toml) or a Python backend with a JS frontend, the Testing view lists both runners' tests, and Run or Debug Test at Cursor uses the runner for the file's language instead of the first one found.
