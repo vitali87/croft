@@ -2762,15 +2762,18 @@ mod tests {
             vec![
                 (
                     String::from("ctrl+alt+c"),
-                    String::from("toggle_column_selection")
+                    String::from("toggle_column_selection"),
+                    None
                 ),
                 (
                     String::from("ctrl+shift+alt+down"),
-                    String::from("column_select_down")
+                    String::from("column_select_down"),
+                    None
                 ),
                 (
                     String::from("ctrl+shift+alt+pagedown"),
-                    String::from("column_select_page_down")
+                    String::from("column_select_page_down"),
+                    None
                 ),
             ]
         );
