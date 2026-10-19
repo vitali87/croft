@@ -2836,33 +2836,6 @@ fn the_mcp_tool_gate_refuses_a_changed_definition() {
     assert!(err.contains("toggle the extension off and on"), "{err}");
 }
 
-/// Queue an agent's `Edit` of `file` (`old` -> `new`) through the hook
-/// socket, as Claude Code's hook would; the returned stream is the hook's
-/// end, kept open for the answer.
-fn queue_edit_proposal(
-    app: &mut App,
-    dir: &Path,
-    file: &Path,
-    old: &str,
-    new: &str,
-) -> std::os::unix::net::UnixStream {
-    use std::io::Write;
-    let sock = dir.join("hook.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-    listener.set_nonblocking(true).unwrap();
-    app.hook_listener = Some(listener);
-    let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
-    let req = crate::agent_hook::EditRequest {
-        agent: "claude-code".into(),
-        tool: "Edit".into(),
-        input: serde_json::json!({"file_path": file, "old_string": old, "new_string": new}),
-        cwd: dir.into(),
-    };
-    writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
-    assert!(app.drain_hook_requests());
-    hook
-}
-
 fn popup_screen(app: &mut App, w: u16, h: u16) -> String {
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
