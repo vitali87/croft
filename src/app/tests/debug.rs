@@ -3301,6 +3301,133 @@ fn an_exception_answer_after_continue_does_not_say_paused() {
     assert!(!feedback.contains("KeyError"), "feedback: {feedback}");
 }
 
+/// #1543: Continue, Step Into, Step Out and Step Into Target are commands:
+/// the palette lists them, `keybindings.json` names them by id, and VS
+/// Code's own chords for them carry over in `croft import-vscode`.
+#[test]
+fn the_step_commands_are_in_the_palette_and_bindable() {
+    use crate::widgets::command_palette::{ALL_COMMANDS, Command};
+    for (title, id) in [
+        ("Debug: Continue", "continue"),
+        ("Debug: Step Into", "step_into"),
+        ("Debug: Step Out", "step_out"),
+        ("Debug: Step Into Target", "step_into_target"),
+    ] {
+        let cmd = Command::from_id(id).unwrap_or_else(|| panic!("no command {id}"));
+        assert_eq!(cmd.title(), title);
+        assert!(ALL_COMMANDS.contains(&cmd));
+    }
+    assert_eq!(
+        Command::from_id("step_into").unwrap().keybinding_hint(),
+        "F11"
+    );
+    assert_eq!(
+        Command::from_id("step_out").unwrap().keybinding_hint(),
+        "Shift+F11"
+    );
+}
+
+/// #1543: with a session paused on thread 1, the palette's Step Into and
+/// Step Out send `stepIn` / `stepOut`, and Step Into Target's picker sends
+/// `stepIn` with the chosen call's `targetId`.
+#[test]
+fn step_into_target_steps_into_the_picked_call() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let log = tmp.path().join("requests.log");
+    let mut session = crate::dap::session::DapSession::launch_with(
+        "sh",
+        &[String::from("-c"), format!("cat > '{}'", log.display())],
+        std::path::Path::new("."),
+        serde_json::json!({"seq": 2, "type": "request", "command": "launch", "arguments": {}}),
+        std::collections::BTreeMap::new(),
+    )
+    .expect("sh spawns");
+    session.phase = crate::dap::session::SessionPhase::Stopped;
+    session.stopped_thread = Some(1);
+    app.debug_sessions.push("app.py", session);
+    let sent = |needle: &str| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if std::fs::read_to_string(&log).is_ok_and(|s| s.contains(needle)) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    };
+    assert!(run_from_palette(&mut app, "Debug: Step Out"));
+    assert!(sent("\"command\":\"stepOut\""));
+
+    app.offer_step_in_targets(vec![
+        (1, String::from("load('data.csv')")),
+        (2, String::from("scale(2)")),
+        (3, String::from("transform(...)")),
+    ]);
+    let picker = app
+        .list_picker
+        .as_ref()
+        .expect("several calls open a picker");
+    assert_eq!(picker.title, "Step Into Target");
+    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["load('data.csv')", "scale(2)", "transform(...)"]);
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        sent("\"targetId\":2"),
+        "{:?}",
+        std::fs::read_to_string(&log)
+    );
+}
+
+/// #1543 negative: a line with one call steps straight into it and a line
+/// with none steps in plainly; neither opens a picker.
+#[test]
+fn one_or_no_step_in_target_needs_no_picker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let log = tmp.path().join("requests.log");
+    let mut session = crate::dap::session::DapSession::launch_with(
+        "sh",
+        &[String::from("-c"), format!("cat > '{}'", log.display())],
+        std::path::Path::new("."),
+        serde_json::json!({"seq": 2, "type": "request", "command": "launch", "arguments": {}}),
+        std::collections::BTreeMap::new(),
+    )
+    .expect("sh spawns");
+    session.phase = crate::dap::session::SessionPhase::Stopped;
+    session.stopped_thread = Some(1);
+    app.debug_sessions.push("app.py", session);
+    app.offer_step_in_targets(vec![(9, String::from("only()"))]);
+    assert!(app.list_picker.is_none());
+    app.offer_step_in_targets(Vec::new());
+    assert!(app.list_picker.is_none());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut text = String::new();
+    while std::time::Instant::now() < deadline {
+        text = std::fs::read_to_string(&log).unwrap_or_default();
+        if text.matches("\"command\":\"stepIn\"").count() >= 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(text.contains("\"targetId\":9"), "{text}");
+    assert_eq!(text.matches("\"command\":\"stepIn\"").count(), 2, "{text}");
+}
+
+/// #1543 negative: Debug: Continue resumes only a paused session; with no
+/// session it says so instead of starting one (F5 still starts).
+#[test]
+fn continue_with_no_session_starts_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(run_from_palette(&mut app, "Debug: Continue"));
+    assert!(app.debug_sessions.is_empty());
+    assert_eq!(app.status, "No debug session to continue");
+}
+
 /// #864 guard: an answer that arrives while the program is still stopped
 /// names the exception, on the status line and in the panel.
 #[test]
@@ -4576,6 +4703,27 @@ fn a_node_launch_with_nothing_to_run_names_what_it_needs() {
     assert!(app.debug_sessions.is_empty());
 }
 
+/// #1410: a browser croft launches has a screen to open on only locally
+/// with a display; over SSH, or on Linux with no X or Wayland display, it
+/// runs headless.
+#[test]
+fn a_browser_runs_headless_only_where_there_is_no_display() {
+    let none = |_: &str| false;
+    let x11 = |k: &str| k == "DISPLAY";
+    let wayland = |k: &str| k == "WAYLAND_DISPLAY";
+    assert!(crate::app::no_display(true, true, x11), "over SSH");
+    assert!(
+        crate::app::no_display(false, true, none),
+        "Linux, no display"
+    );
+    assert!(!crate::app::no_display(false, true, x11));
+    assert!(!crate::app::no_display(false, true, wayland));
+    assert!(
+        !crate::app::no_display(false, false, none),
+        "macOS has a display with no DISPLAY set"
+    );
+}
+
 /// #1392: a CodeLLDB `cargo` launch with no `program` builds with cargo
 /// first instead of being refused; an lldb launch with neither is still
 /// refused.
@@ -4623,6 +4771,189 @@ fn a_cargo_launch_builds_first_and_a_bare_one_is_refused() {
         "{}",
         app.status
     );
+}
+
+/// A CMake project whose `main.cpp` needs its include folder and a second
+/// translation unit (#1359), as the issue's fixture.
+fn cmake_debug_project(root: &Path) -> PathBuf {
+    for (rel, text) in [
+        (
+            "include/geom.hpp",
+            "#pragma once\nnamespace geom { double twice(double); }\n",
+        ),
+        (
+            "src/geom.cpp",
+            "#include \"geom.hpp\"\nnamespace geom { double twice(double x) { return 2*x; } }\n",
+        ),
+        (
+            "src/main.cpp",
+            "#include <cstdio>\n#include \"geom.hpp\"\nint main() { std::printf(\"%f\\n\", geom::twice(2)); }\n",
+        ),
+        (
+            "CMakeLists.txt",
+            "cmake_minimum_required(VERSION 3.10)\nproject(cp CXX)\nset(CMAKE_EXPORT_COMPILE_COMMANDS ON)\nadd_executable(app src/main.cpp src/geom.cpp)\ntarget_include_directories(app PRIVATE include)\n",
+        ),
+    ] {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, text).unwrap();
+    }
+    root.join("src/main.cpp")
+}
+
+/// Wait out F5's C/C++ build (#1359).
+fn finished_debug_build(
+    app: &mut App,
+) -> (
+    PathBuf,
+    Result<crate::cpp_build::Built, crate::cpp_build::Failed>,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        if let Some(done) = app.take_debug_build() {
+            return done;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the debug build never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// #1359: F5 on `src/main.cpp` in a configured CMake project builds the
+/// project's target, off the UI thread, and debugs that program; it no
+/// longer compiles `main.cpp` alone (which cannot find `geom.hpp`) or
+/// leaves a `main.dbg` in `src/`.
+#[test]
+fn f5_in_a_cmake_project_debugs_the_target_that_builds_the_file() {
+    use crate::lsp::manager::is_on_path;
+    if !(is_on_path("cmake") && is_on_path("c++")) {
+        return;
+    }
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    let main = cmake_debug_project(&root);
+    let configured = std::process::Command::new("cmake")
+        .arg("-S")
+        .arg(&root)
+        .arg("-B")
+        .arg(root.join("build"))
+        .output()
+        .unwrap();
+    assert!(configured.status.success(), "{configured:?}");
+    with_relay_home(tmp.path(), || {
+        let mut app = App::new(root.clone()).unwrap();
+        app.begin_debug_build(&main);
+        assert_eq!(app.status, "Building main.cpp for debugging…");
+        let (source, built) = finished_debug_build(&mut app);
+        assert_eq!(source, main);
+        let built = built.unwrap_or_else(|f| panic!("{}\n{}", f.summary, f.output));
+        assert_eq!(
+            built.binary.canonicalize().unwrap(),
+            root.join("build/app").canonicalize().unwrap()
+        );
+        assert!(built.how.starts_with("cmake --build"), "{}", built.how);
+        assert!(built.how.ends_with("(target app)"), "{}", built.how);
+        let ran = std::process::Command::new(&built.binary).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), "4.000000");
+        assert!(!root.join("src/main.dbg").exists(), "nothing lands in src/");
+    });
+}
+
+/// #1359, negative: a build that fails says so on the status line and keeps
+/// the compiler's whole output in OUTPUT, and a new F5 drops a build still
+/// running rather than launching it later.
+#[test]
+fn a_failed_debug_build_says_why_and_keeps_its_output() {
+    use crate::lsp::manager::is_on_path;
+    if !is_on_path("c++") {
+        return;
+    }
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    // Not configured: no build folder, so main.cpp builds alone and
+    // cannot find geom.hpp.
+    let main = cmake_debug_project(&root);
+    with_relay_home(tmp.path(), || {
+        let mut app = App::new(root.clone()).unwrap();
+        app.begin_debug_build(&main);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !app.poll_debug_build() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the build never ended"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            app.status.starts_with("Build for debug failed: c++ failed"),
+            "{}",
+            app.status
+        );
+        assert!(app.status.contains("geom.hpp"), "{}", app.status);
+        assert!(
+            app.status
+                .ends_with("(full output in OUTPUT › Debug Build)")
+        );
+        assert!(app.run_debug.feedback_is_error);
+        let lines = crate::output::snapshot("Debug Build").expect("the build's output is kept");
+        assert!(lines.iter().any(|l| l.text.contains("geom.hpp")));
+        assert!(!root.join("src/main.dbg").exists());
+        assert!(!app.poll_debug_build(), "a finished build reports once");
+
+        app.begin_debug_build(&main);
+        app.editor.path = None;
+        app.start_debug_session();
+        assert!(
+            app.debug_build.is_none(),
+            "a new F5 drops the running build"
+        );
+        assert_eq!(app.status, "Open a file to debug");
+
+        // Stop while the build runs: it never launches.
+        app.begin_debug_build(&main);
+        app.debug_stop_by_user();
+        assert!(app.debug_build.is_none(), "Stop drops the running build");
+        assert!(!app.poll_debug_build());
+    });
+}
+
+/// #1359: F5 on a C++ file in an added workspace folder builds that
+/// folder's CMake project, not the primary root's.
+#[test]
+fn f5_builds_the_project_of_the_files_own_workspace_folder() {
+    use crate::lsp::manager::is_on_path;
+    if !(is_on_path("cmake") && is_on_path("c++")) {
+        return;
+    }
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = tmp.path().join("primary");
+    std::fs::create_dir_all(&primary).unwrap();
+    let second = tmp.path().join("second");
+    let main = cmake_debug_project(&second);
+    let configured = std::process::Command::new("cmake")
+        .arg("-S")
+        .arg(&second)
+        .arg("-B")
+        .arg(second.join("build"))
+        .output()
+        .unwrap();
+    assert!(configured.status.success(), "{configured:?}");
+    with_relay_home(tmp.path(), || {
+        let mut app = App::new(primary.clone()).unwrap();
+        app.roots.add(second.clone());
+        app.begin_debug_build(&main);
+        let (_, built) = finished_debug_build(&mut app);
+        let built = built.unwrap_or_else(|f| panic!("{}\n{}", f.summary, f.output));
+        assert_eq!(
+            built.binary.canonicalize().unwrap(),
+            second.join("build/app").canonicalize().unwrap()
+        );
+    });
 }
 
 /// #1392: Stop Debugging while cargo is still building drops the pending

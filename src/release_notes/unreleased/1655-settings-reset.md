@@ -1,0 +1,1 @@
+feature: The Settings editor resets a setting with Del, removing it from the layer's file so the value falls back to the layers below or croft's default, and marks every setting changed from the default with a dot.

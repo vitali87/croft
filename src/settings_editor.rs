@@ -32,6 +32,9 @@ pub struct Row {
     pub value: Value,
     pub kind: Kind,
     pub layer: LayerKind,
+    /// The value differs from croft's built-in default (#1655), whichever
+    /// layer set it: what "what have I changed?" lists.
+    pub modified: bool,
 }
 
 /// The string settings whose values come from a fixed set. An empty
@@ -69,6 +72,10 @@ pub fn rows(prefs: &crate::prefs::Prefs, provenance: &BTreeMap<String, LayerKind
     let Ok(Value::Object(map)) = serde_json::to_value(prefs) else {
         return Vec::new();
     };
+    let defaults = match serde_json::to_value(crate::prefs::Prefs::default()) {
+        Ok(Value::Object(d)) => d,
+        _ => serde_json::Map::new(),
+    };
     let mut out: Vec<Row> = map
         .into_iter()
         .map(|(key, value)| {
@@ -79,11 +86,13 @@ pub fn rows(prefs: &crate::prefs::Prefs, provenance: &BTreeMap<String, LayerKind
                 _ => Kind::Json,
             };
             let layer = crate::config_layers::layer_of(provenance, &key);
+            let modified = defaults.get(&key) != Some(&value);
             Row {
                 key,
                 value,
                 kind,
                 layer,
+                modified,
             }
         })
         .collect();
@@ -149,6 +158,33 @@ pub fn set_key(text: &str, key: &str, value: Value) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
+/// `text` (a layer file's JSON object) without `key` (#1655), pretty-printed
+/// like [`set_key`]; `Ok(None)` when the file does not set it, so nothing
+/// is written. Reads JSONC like the layer loader, and also drops `key`
+/// from the active `platform` scope block (`"linux"` / `"macos"` /
+/// `"android"`), which the loader merges over the flat keys. An error when
+/// the text is not a JSON object.
+pub fn remove_key(text: &str, key: &str, platform: &str) -> Result<Option<String>, String> {
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let mut map = match serde_json::from_str::<Value>(&crate::tasks::strip_jsonc(text)) {
+        Ok(Value::Object(m)) => m,
+        Ok(_) => return Err(String::from("the settings file is not a JSON object")),
+        Err(e) => return Err(format!("the settings file does not parse: {e}")),
+    };
+    let mut removed = map.remove(key).is_some();
+    if let Some(Value::Object(block)) = map.get_mut(platform) {
+        removed |= block.remove(key).is_some();
+    }
+    if !removed {
+        return Ok(None);
+    }
+    serde_json::to_string_pretty(&Value::Object(map))
+        .map(|s| Some(s + "\n"))
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +237,7 @@ mod tests {
             value,
             kind,
             layer: LayerKind::Default,
+            modified: false,
         }
     }
 
@@ -249,5 +286,30 @@ mod tests {
         );
         assert!(set_key("[1, 2]", "k", json!(1)).is_err());
         assert!(set_key("{ broken", "k", json!(1)).is_err());
+    }
+
+    #[test]
+    fn remove_key_reads_jsonc_and_clears_the_active_platform_block() {
+        let jsonc = "{\n  // mine\n  \"theme\": \"dark\",\n  \"auto_save\": true,\n}";
+        let out = remove_key(jsonc, "auto_save", "linux").unwrap().unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v, json!({"theme": "dark"}));
+
+        let scoped = r#"{"theme":"dark","linux":{"theme":"nord"},"macos":{"theme":"x"}}"#;
+        let out = remove_key(scoped, "theme", "linux").unwrap().unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v, json!({"linux": {}, "macos": {"theme": "x"}}));
+
+        let only_scoped = r#"{"linux":{"auto_save":true}}"#;
+        let out = remove_key(only_scoped, "auto_save", "linux")
+            .unwrap()
+            .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v, json!({"linux": {}}));
+
+        assert_eq!(remove_key(only_scoped, "auto_save", "macos").unwrap(), None);
+        assert_eq!(remove_key("", "k", "linux").unwrap(), None);
+        assert!(remove_key("[1, 2]", "k", "linux").is_err());
+        assert!(remove_key("{ broken", "k", "linux").is_err());
     }
 }
