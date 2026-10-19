@@ -38633,9 +38633,14 @@ mod tests {
         let started = std::time::Instant::now();
         carry_highlights(&mut base, &mut spans, &mut carried, &[after]);
         let took = started.elapsed();
+        // The one pass takes a few hundred milliseconds in a debug build,
+        // more on a loaded runner, where a fixed 500 ms failed one run in
+        // four. The per-bracket count it replaced took seconds, so a budget
+        // scaled for the load still catches it.
+        let budget = crate::test_budget::spawn_budget(std::time::Duration::from_millis(250));
         assert!(
-            took < std::time::Duration::from_millis(500),
-            "one keystroke's carry took {took:?}"
+            took < budget,
+            "one keystroke's carry took {took:?}, over its {budget:?} budget"
         );
         let shifted: Vec<(u32, u8)> = brackets.iter().map(|&(c, d)| (c + 1, d)).collect();
         assert_eq!(carried[0], shifted, "every bracket moved one column right");
