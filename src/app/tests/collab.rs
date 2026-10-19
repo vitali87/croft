@@ -180,6 +180,12 @@ fn collab_solo_apps_bootstrap_edit_and_gate_saves() {
         "guest gets a hint, got: {}",
         guest.status
     );
+    // Nor does File: Save with Sudo (#1379).
+    let panes = guest.terminals.len();
+    guest.run_command(crate::widgets::command_palette::Command::SaveWithSudo);
+    assert_eq!(guest.terminals.len(), panes);
+    assert!(guest.pending_sudo_saves.is_empty());
+    assert!(guest.status.contains("owner saves"), "{}", guest.status);
 
     // The owner writes the converged text.
     owner.save();

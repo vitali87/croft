@@ -112,7 +112,9 @@ pub fn render(ed: &mut SettingsEditor, area: Rect, buf: &mut Buffer, theme: crat
     buf.set_stringn(
         inner.x,
         inner.y + 1,
-        format!("Writing to {target} \u{b7} Tab switch \u{b7} Enter edit \u{b7} Esc close"),
+        format!(
+            "Writing to {target} \u{b7} Tab switch \u{b7} Enter edit \u{b7} Del reset \u{b7} Esc close"
+        ),
         w,
         dim.add_modifier(Modifier::ITALIC),
     );
@@ -126,7 +128,7 @@ pub fn render(ed: &mut SettingsEditor, area: Rect, buf: &mut Buffer, theme: crat
     }
     let key_w = (w / 3).max(16).min(w);
     let layer_w = 16usize.min(w);
-    let value_w = w.saturating_sub(key_w + layer_w + 2);
+    let value_w = w.saturating_sub(key_w + layer_w + 4);
     for (n, &i) in visible.iter().enumerate().skip(ed.scroll).take(rows_h) {
         let row = &ed.rows[i];
         let style = if n == ed.selected { sel } else { text };
@@ -138,8 +140,11 @@ pub fn render(ed: &mut SettingsEditor, area: Rect, buf: &mut Buffer, theme: crat
                 .collect::<String>()
                 + "\u{2026}";
         }
+        // A dot marks a value changed from croft's default (#1655), as
+        // VS Code marks a modified setting.
         let line = format!(
-            "{:<key_w$} {:<value_w$} {}",
+            "{} {:<key_w$} {:<value_w$} {}",
+            if row.modified { '\u{2022}' } else { ' ' },
             row.key.replace('_', " "),
             value,
             row.layer.label()
