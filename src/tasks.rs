@@ -446,6 +446,7 @@ fn tsconfig_tasks(root: &Path) -> Vec<Task> {
                 is_build: true,
                 is_default: false,
                 problem_matcher: Some(serde_json::Value::String(String::from("$tsc"))),
+                is_background: false,
                 vscode: None,
             }
         })
