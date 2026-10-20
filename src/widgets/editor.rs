@@ -7851,6 +7851,18 @@ impl Editor {
         &self.diagnostic_spans
     }
 
+    /// A diagnostic position as a row of this buffer (#911): the final
+    /// newline the server is sent ends the document on an empty row past
+    /// the last one stored, so a position there (a missing token at the end
+    /// of the file) is drawn and found at the end of the last row.
+    fn diagnostic_row(&self, line: u32, ch: u32) -> (usize, u32) {
+        let line = line as usize;
+        match line == self.lines.len() && self.sends_final_newline() {
+            true => (line - 1, u32::MAX),
+            false => (line, ch),
+        }
+    }
+
     /// Re-decode the retained diagnostics into per-logical-line character runs
     /// against the current buffer. A no-op (clears the runs) unless the batch
     /// belongs to the loaded file, so stale squiggles never bleed across a tab
@@ -7876,8 +7888,8 @@ impl Editor {
             vec![Vec::new(); self.lines.len()];
         for d in &self.diagnostics {
             let hint = d.severity == DiagnosticSeverity::Hint;
-            let start_line = d.start_line as usize;
-            let end_line = d.end_line as usize;
+            let (start_line, start_char) = self.diagnostic_row(d.start_line, d.start_char);
+            let (end_line, end_char) = self.diagnostic_row(d.end_line, d.end_char);
             // Zip bounds the walk to the buffer, replacing the per-line
             // `lines.get` check a stale diagnostic range would otherwise need.
             for (line, ((text, line_spans), line_tags)) in self
@@ -7891,12 +7903,12 @@ impl Editor {
             {
                 let line_chars = text.chars().count();
                 let from = if line == start_line {
-                    utf16_to_char_col(text, d.start_char)
+                    utf16_to_char_col(text, start_char)
                 } else {
                     0
                 };
                 let to = if line == end_line {
-                    utf16_to_char_col(text, d.end_char)
+                    utf16_to_char_col(text, end_char)
                 } else {
                     line_chars
                 };
@@ -15588,8 +15600,8 @@ impl Editor {
         }
         let mut out = Vec::new();
         for d in &self.diagnostics {
-            let start_line = d.start_line as usize;
-            let end_line = d.end_line as usize;
+            let (start_line, start_char) = self.diagnostic_row(d.start_line, d.start_char);
+            let (end_line, end_char) = self.diagnostic_row(d.end_line, d.end_char);
             if line < start_line || line > end_line {
                 continue;
             }
@@ -15597,12 +15609,12 @@ impl Editor {
                 continue;
             };
             let from = if line == start_line {
-                utf16_to_char_col(text, d.start_char)
+                utf16_to_char_col(text, start_char)
             } else {
                 0
             };
             let to = if line == end_line {
-                utf16_to_char_col(text, d.end_char)
+                utf16_to_char_col(text, end_char)
             } else {
                 text.chars().count()
             };
@@ -15628,19 +15640,19 @@ impl Editor {
             return None;
         }
         for d in &self.diagnostics {
-            let start_line = d.start_line as usize;
-            let end_line = d.end_line as usize;
+            let (start_line, start_char) = self.diagnostic_row(d.start_line, d.start_char);
+            let (end_line, end_char) = self.diagnostic_row(d.end_line, d.end_char);
             if line < start_line || line > end_line {
                 continue;
             }
             let text = self.lines.get(line)?;
             let from = if line == start_line {
-                utf16_to_char_col(text, d.start_char)
+                utf16_to_char_col(text, start_char)
             } else {
                 0
             };
             let to = if line == end_line {
-                utf16_to_char_col(text, d.end_char)
+                utf16_to_char_col(text, end_char)
             } else {
                 text.chars().count()
             };
@@ -31670,6 +31682,27 @@ mod tests {
             e.open(tmp.path()).unwrap();
             assert_eq!(e.document_text(), disk);
         }
+    }
+
+    /// #911: the text the server reads ends in the final newline, so its
+    /// last position is on an empty row past the buffer's last. A
+    /// diagnostic there (a missing token at the end of the file) is drawn
+    /// and hovered at the end of the last row instead of dropped.
+    #[test]
+    fn a_diagnostic_at_the_end_of_the_document_marks_the_last_row() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "fn main() {\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        assert_eq!(e.lines, vec!["fn main() {"]);
+        let path = tmp.path().to_path_buf();
+        e.apply_diagnostics(path, vec![diag(1, 0, 1, 0, DiagnosticSeverity::Error)]);
+        assert_eq!(
+            e.diagnostic_spans[0],
+            vec![(11, 12, DiagnosticSeverity::Error)]
+        );
+        assert_eq!(e.diagnostics_at(0, 11).len(), 1, "hovered at the row's end");
     }
 
     /// #911: a formatter's edit up to the end of that text keeps the final
