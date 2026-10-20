@@ -461,9 +461,8 @@ fn render_log(
                 &line.text,
                 needle,
                 opts,
-                0,
+                &RowCells::default(),
                 active_on_line,
-                &[],
                 Some(&cells),
                 None,
                 theme,
@@ -1720,9 +1719,8 @@ fn render_diff(
                     &l_text,
                     needle,
                     find_opts,
-                    diff.scroll_x,
+                    &RowCells::of_line(&l_text, diff.scroll_x),
                     active,
-                    &[],
                     None,
                     None,
                     theme,
@@ -1740,9 +1738,8 @@ fn render_diff(
                     &r_text,
                     needle,
                     find_opts,
-                    diff.scroll_x,
+                    &RowCells::of_line(&r_text, diff.scroll_x),
                     active,
-                    &[],
                     None,
                     None,
                     theme,
@@ -1763,8 +1760,7 @@ fn render_diff(
                     l_text_w,
                     &l_text,
                     needle,
-                    diff.scroll_x,
-                    &[],
+                    &RowCells::of_line(&l_text, diff.scroll_x),
                     theme,
                 );
             }
@@ -1776,8 +1772,7 @@ fn render_diff(
                     r_text_w,
                     &r_text,
                     needle,
-                    diff.scroll_x,
-                    &[],
+                    &RowCells::of_line(&r_text, diff.scroll_x),
                     theme,
                 );
             }
@@ -18704,6 +18699,8 @@ impl Widget for &mut Editor {
             .flatten();
         let guide_fg = self.theme.indent_guide();
         let guide_active_fg = self.theme.indent_guide_active();
+        // Each text row's geometry, refilled per row (#873).
+        let mut row_cells = RowCells::default();
 
         for (row_idx, vis_row) in visual_rows.iter().enumerate() {
             let y = inner.y + row_idx as u16;
@@ -19004,27 +19001,24 @@ impl Widget for &mut Editor {
             // has an opinion, syntax fills the gaps (the "combined" model).
             let sem_spans = self.semantic_overlay.get(line_idx).unwrap_or(&empty);
             let merged = merge_overlay(line_spans, sem_spans);
-            // Inlay hints anchored inside this row's window, as (anchor col,
+            // The row's geometry: its text by display width (#873) and the
+            // inlay hints anchored inside its window, as (anchor col,
             // display cells) pairs. A hint's label is spliced into the row
             // BEFORE the character at its anchor; every buffer column at or
             // past an anchor therefore paints `inlay_cells_before` cells
             // further right, and each overlay painter below translates its
-            // columns through that same map so highlights, underlines, and
+            // columns through `row_cells` so highlights, underlines, and
             // carets stay glued to their glyphs.
             let hint_cap = row_end.min(line_len);
-            let hint_cells: Vec<(usize, usize)> = self
-                .row_inlay_spans(line_idx)
-                .iter()
-                .filter(|(hc, _, _)| *hc >= row_start && *hc <= hint_cap)
-                .map(|(hc, l, _)| (*hc, l.chars().count()))
-                .collect();
-            let ex = |c: usize| inlay_cells_before(&hint_cells, c);
-            // Caret placement uses the strictly-before rule instead: a
-            // caret AT a hint's anchor sits left of the hint (the
-            // `cursor_screen_pos` / VS Code convention), while a CHARACTER
-            // at the anchor paints right of it (`ex` above).
-            let ex_caret = |c: usize| inlay_cells_strictly_before(&hint_cells, c);
-            if hint_cells.is_empty() {
+            row_cells.fill(
+                visible_raw,
+                row_start,
+                self.row_inlay_spans(line_idx)
+                    .iter()
+                    .filter(|(hc, _, _)| *hc >= row_start && *hc <= hint_cap)
+                    .map(|(hc, l, _)| (*hc, l.chars().count())),
+            );
+            if row_cells.hints.is_empty() {
                 // Shift highlight spans to the row origin and clip them to the
                 // segment so build_line_spans never slices past `visible_raw`.
                 let shifted: Vec<HiSpan> = shift_spans_for_view(&merged, byte_start)
@@ -19082,18 +19076,14 @@ impl Widget for &mut Editor {
                     if c < row_start {
                         continue;
                     }
-                    let col = (c + ex(c) - row_start) as u16;
-                    if col >= row_width {
-                        break;
-                    }
                     let fg = if ci == UNEXPECTED_BRACKET {
                         self.theme.bracket_unexpected_fg()
                     } else {
                         self.theme.bracket_pair_color(usize::from(ci))
                     };
-                    let cell = &mut buf[(text_x + col, y)];
-                    let style = cell.style().fg(fg);
-                    cell.set_style(style);
+                    if !paint_row_cells(buf, text_x, y, row_width, &row_cells, c, |s| s.fg(fg)) {
+                        break;
+                    }
                 }
             }
 
@@ -19114,13 +19104,10 @@ impl Widget for &mut Editor {
                     }
                     let from = start_c.max(row_start);
                     for c in from..end_c {
-                        let col = (c + ex(c) - row_start) as u16;
-                        if col >= row_width {
+                        let tint = |s: Style| s.bg(bg).fg(fg);
+                        if !paint_row_cells(buf, text_x, y, row_width, &row_cells, c, tint) {
                             break;
                         }
-                        let cell = &mut buf[(text_x + col, y)];
-                        let style = cell.style().bg(bg).fg(fg);
-                        cell.set_style(style);
                     }
                 }
             }
@@ -19139,11 +19126,11 @@ impl Widget for &mut Editor {
                     if c < row_start {
                         continue;
                     }
-                    let col = (c + ex(c) - row_start) as u16;
-                    if col >= row_width {
+                    let col = row_cells.cell(c);
+                    if col >= usize::from(row_width) {
                         break;
                     }
-                    let cell = &mut buf[(text_x + col, y)];
+                    let cell = &mut buf[(text_x + col as u16, y)];
                     if cell.symbol() != " " {
                         continue;
                     }
@@ -19207,11 +19194,11 @@ impl Widget for &mut Editor {
                             '\t' => "\u{2192}",
                             _ => continue,
                         };
-                        let col = (ci + ex(ci) - row_start) as u16;
-                        if col >= row_width {
+                        let col = row_cells.cell(ci);
+                        if col >= usize::from(row_width) {
                             break;
                         }
-                        let cell = &mut buf[(text_x + col, y)];
+                        let cell = &mut buf[(text_x + col as u16, y)];
                         cell.set_symbol(glyph);
                         let style = cell.style().fg(ws_fg);
                         cell.set_style(style);
@@ -19233,12 +19220,7 @@ impl Widget for &mut Editor {
             // describe the painted frame (#103's invariant).
             if let Some(block_idx) = self.conflicts.iter().position(|b| b.ours_start == line_idx) {
                 let block = self.conflicts[block_idx];
-                let marker_len = self
-                    .lines
-                    .get(line_idx)
-                    .map(|l| l.chars().count() as u16)
-                    .unwrap_or(0)
-                    .saturating_sub(row_start as u16);
+                let marker_len = row_cells.text_before(line_len) as u16;
                 // A header that wraps gets them after its last segment only.
                 if marker_len <= row_width {
                     use crate::merge::Resolution;
@@ -19267,10 +19249,10 @@ impl Widget for &mut Editor {
             let empty_diag: Vec<(usize, usize, crate::lsp::manager::DiagnosticSeverity)> =
                 Vec::new();
             for &(sc, ec, severity) in self.diagnostic_spans.get(line_idx).unwrap_or(&empty_diag) {
-                let vs = (sc + ex(sc)).saturating_sub(row_start);
+                let vs = row_cells.cell(sc);
                 // The exclusive end shifts by the hints before its LAST char,
                 // so an underline never swallows a hint anchored right at it.
-                let ve = (ec + ex(ec.saturating_sub(1))).saturating_sub(row_start);
+                let ve = row_cells.end(ec);
                 if ve > vs {
                     paint_diagnostic_underline(
                         buf, text_x, y, row_width, vs, ve, severity, self.theme,
@@ -19283,8 +19265,8 @@ impl Widget for &mut Editor {
                 .get(line_idx)
                 .unwrap_or(&empty_tags)
             {
-                let vs = (sc + ex(sc)).saturating_sub(row_start);
-                let ve = (ec + ex(ec.saturating_sub(1))).saturating_sub(row_start);
+                let vs = row_cells.cell(sc);
+                let ve = row_cells.end(ec);
                 if ve > vs {
                     paint_diagnostic_tags(buf, text_x, y, row_width, vs, ve, tags);
                 }
@@ -19305,16 +19287,10 @@ impl Widget for &mut Editor {
                 } else {
                     self.theme.occurrence_bg()
                 };
-                for c in occ_start..occ_end {
-                    if c < row_start {
-                        continue;
-                    }
-                    let col = (c + inlay_cells_before(&hint_cells, c) - row_start) as u16;
-                    if col >= row_width {
+                for c in occ_start.max(row_start)..occ_end {
+                    if !paint_row_cells(buf, text_x, y, row_width, &row_cells, c, |s| s.bg(bg)) {
                         break;
                     }
-                    let cell = &mut buf[(text_x + col, y)];
-                    cell.set_style(cell.style().bg(bg));
                 }
             }
 
@@ -19335,9 +19311,8 @@ impl Widget for &mut Editor {
                     raw,
                     term,
                     self.search_highlight_opts,
-                    row_start,
+                    &row_cells,
                     active_on_line,
-                    &hint_cells,
                     None,
                     find_window(self.find_range, line_idx),
                     self.theme,
@@ -19346,15 +19321,7 @@ impl Widget for &mut Editor {
 
             if let Some(needle) = occ_needle.as_deref() {
                 paint_selection_occurrences(
-                    buf,
-                    text_x,
-                    y,
-                    row_width,
-                    raw,
-                    needle,
-                    row_start,
-                    &hint_cells,
-                    self.theme,
+                    buf, text_x, y, row_width, raw, needle, &row_cells, self.theme,
                 );
             }
 
@@ -19366,9 +19333,8 @@ impl Widget for &mut Editor {
                 // For non-final selected rows, paint past the content by one
                 // cell to make the trailing newline visible.
                 let sel_end = if line_idx == er { ec } else { line_len + 1 };
-                let visible_start = (sel_start + ex(sel_start)).saturating_sub(row_start);
-                let visible_end =
-                    (sel_end + ex(sel_end.saturating_sub(1))).saturating_sub(row_start);
+                let visible_start = row_cells.cell(sel_start);
+                let visible_end = row_cells.end(sel_end);
                 if visible_end > visible_start {
                     paint_selection_band(
                         buf,
@@ -19386,14 +19352,13 @@ impl Widget for &mut Editor {
             // fall on this visual row, honouring horizontal scroll.
             if let Some((open, close)) = bracket_pair {
                 for pos in [open, close] {
-                    if pos.0 == line_idx {
+                    if pos.0 == line_idx && pos.1 >= row_start {
                         paint_bracket_match(
                             buf,
                             text_x,
                             y,
                             row_width,
-                            pos.1 + ex(pos.1),
-                            row_start,
+                            row_cells.cell(pos.1),
                             self.theme,
                         );
                     }
@@ -19409,8 +19374,8 @@ impl Widget for &mut Editor {
                 if line_idx >= cr0 && line_idx <= cr1 {
                     let cs = if line_idx == cr0 { cc0 } else { 0 };
                     let ce = if line_idx == cr1 { cc1 } else { line_len + 1 };
-                    let vs = (cs + ex(cs)).saturating_sub(row_start);
-                    let ve = (ce + ex(ce.saturating_sub(1))).saturating_sub(row_start);
+                    let vs = row_cells.cell(cs);
+                    let ve = row_cells.end(ce);
                     if ve > vs {
                         paint_selection_band(buf, text_x, y, row_width, vs, ve, self.theme);
                     }
@@ -19421,19 +19386,9 @@ impl Widget for &mut Editor {
                     && c >= row_start
                     && (c < row_end || (c == row_end && row_end == line_len));
                 if on_row {
-                    // Strictly-before, not `ex`: a caret AT a hint's anchor
-                    // sits left of the hint like the primary caret
-                    // (`cursor_screen_pos`), marking the cell its typed
-                    // character will land on, inside its own band.
-                    paint_block_cursor(
-                        buf,
-                        text_x,
-                        y,
-                        row_width,
-                        c + ex_caret(c),
-                        row_start,
-                        self.theme,
-                    );
+                    // `caret`, not `cell`: a caret AT a hint's anchor sits
+                    // left of the hint, inside its own band.
+                    paint_block_cursor(buf, text_x, y, row_width, row_cells.caret(c), self.theme);
                 }
             }
 
@@ -19446,15 +19401,7 @@ impl Widget for &mut Editor {
                     && gc >= row_start
                     && (gc < row_end || (gc == row_end && row_end == line_len));
                 if on_row {
-                    paint_ghost_caret(
-                        buf,
-                        text_x,
-                        y,
-                        row_width,
-                        gc + ex_caret(gc),
-                        row_start,
-                        color,
-                    );
+                    paint_ghost_caret(buf, text_x, y, row_width, row_cells.caret(gc), color);
                 }
             }
 
@@ -19471,7 +19418,7 @@ impl Widget for &mut Editor {
                 && self.live_ghost().is_none()
                 && let Some(note) = self.current_line_blame_annotation()
             {
-                let text_cols = (line_len + ex(line_len)).saturating_sub(row_start);
+                let text_cols = row_cells.cell(line_len);
                 let start_x = text_x + text_cols as u16 + 2;
                 let right = inner.x + inner.width;
                 if start_x < right {
@@ -19495,7 +19442,7 @@ impl Widget for &mut Editor {
             if row_end >= line_len
                 && let Some(note) = self.inline_values.get(&line_idx)
             {
-                let text_cols = (line_len + ex(line_len)).saturating_sub(row_start);
+                let text_cols = row_cells.cell(line_len);
                 let start_x = text_x + text_cols as u16 + 2;
                 let right = inner.x + inner.width;
                 if start_x < right {
@@ -19522,7 +19469,7 @@ impl Widget for &mut Editor {
                 && row_end >= line_len
                 && self.live_ghost().is_some();
             if ghost_here && let Some(text) = self.live_ghost() {
-                let text_cols = (line_len + ex(line_len)).saturating_sub(row_start);
+                let text_cols = row_cells.cell(line_len);
                 let x = text_x + text_cols as u16;
                 let right = inner.x + inner.width;
                 if x < right {
@@ -19562,7 +19509,7 @@ impl Widget for &mut Editor {
             {
                 let lenses = self.lenses_on_line(line_idx);
                 if !lenses.is_empty() {
-                    let text_cols = (line_len + ex(line_len)).saturating_sub(row_start);
+                    let text_cols = row_cells.cell(line_len);
                     let mut x = text_x + text_cols as u16 + 2;
                     let right = inner.x + inner.width;
                     let style = Style::default()
@@ -19599,7 +19546,7 @@ impl Widget for &mut Editor {
                 && !self.inline_values.contains_key(&line_idx)
                 && let Some(note) = self.live_note(line_idx)
             {
-                let text_cols = (line_len + ex(line_len)).saturating_sub(row_start);
+                let text_cols = row_cells.cell(line_len);
                 let mut x = text_x + text_cols as u16 + 2;
                 let right = inner.x + inner.width;
                 for (text, kind) in note {
@@ -19699,18 +19646,21 @@ impl Widget for &mut Editor {
             else {
                 continue;
             };
-            let hint_cap = caret_end.min(self.line_char_len(*cl));
-            let hint_cells: Vec<(usize, usize)> = self
-                .row_inlay_spans(*cl)
-                .iter()
-                .filter(|(hc, _, _)| *hc >= caret_start && *hc <= hint_cap)
-                .map(|(hc, l, _)| (*hc, l.chars().count()))
-                .collect();
-            let col_cells = cc + inlay_cells_before(&hint_cells, *cc);
-            if col_cells < caret_start {
+            if *cc < caret_start {
                 continue;
             }
-            let x0 = (col_cells - caret_start) as u16;
+            let caret_raw = &self.lines[*cl];
+            let hint_cap = caret_end.min(self.line_char_len(*cl));
+            row_cells.fill(
+                &caret_raw[byte_index_of_char(caret_raw, caret_start)
+                    ..byte_index_of_char(caret_raw, caret_end)],
+                caret_start,
+                self.row_inlay_spans(*cl)
+                    .iter()
+                    .filter(|(hc, _, _)| *hc >= caret_start && *hc <= hint_cap)
+                    .map(|(hc, l, _)| (*hc, l.chars().count())),
+            );
+            let x0 = row_cells.caret(*cc) as u16;
             let y = inner.y + label_vidx as u16;
             let style = Style::default()
                 .fg(Color::Black)
@@ -20165,6 +20115,113 @@ fn inlay_cells_strictly_before(hints: &[(usize, usize)], c: usize) -> usize {
     hints.iter().filter(|(hc, _)| *hc < c).map(|(_, n)| n).sum()
 }
 
+/// Where buffer columns land on one painted text row (#873): the text is
+/// drawn by display width, a CJK character or most emoji taking two cells
+/// ([`char_cells`]), with inlay-hint labels spliced between characters.
+/// Every overlay laid over the text maps its columns through this, or it
+/// lands one cell left of its glyph per wide character before it.
+#[derive(Debug, Default)]
+struct RowCells {
+    /// Buffer column of the row's first character: the horizontal scroll, or
+    /// a wrapped segment's start.
+    start: usize,
+    /// Cells of the row's text before each of its characters, plus one entry
+    /// for where that text ends. Empty means one cell per character.
+    before: Vec<usize>,
+    /// The row's inlay hints as (anchor column, label cells).
+    hints: Vec<(usize, usize)>,
+}
+
+impl RowCells {
+    /// The geometry of a row showing `line` from buffer column `start`, with
+    /// no inlay hints.
+    fn of_line(line: &str, start: usize) -> Self {
+        let mut row = Self::default();
+        row.fill(&line[byte_index_of_char(line, start)..], start, []);
+        row
+    }
+
+    /// Refill for a row painting `text` from buffer column `start` with
+    /// `hints` spliced in, reusing the allocations.
+    fn fill(&mut self, text: &str, start: usize, hints: impl IntoIterator<Item = (usize, usize)>) {
+        self.start = start;
+        self.before.clear();
+        self.before.push(0);
+        let mut cells = 0;
+        for c in text.chars() {
+            cells += char_cells(c);
+            self.before.push(cells);
+        }
+        self.hints.clear();
+        self.hints.extend(hints);
+    }
+
+    /// Cells of the row's own text before buffer column `col`: none at or
+    /// before the row's start, and one per column past the end of its text,
+    /// where the selection's newline cell sits.
+    fn text_before(&self, col: usize) -> usize {
+        let i = col.saturating_sub(self.start);
+        match self.before.get(i) {
+            Some(&cells) => cells,
+            None => {
+                let end = self.before.len().saturating_sub(1);
+                self.before.last().copied().unwrap_or(0) + (i - end)
+            }
+        }
+    }
+
+    /// The first cell of the character at `col`: right of a hint anchored at
+    /// or before it.
+    fn cell(&self, col: usize) -> usize {
+        self.text_before(col) + inlay_cells_before(&self.hints, col)
+    }
+
+    /// The cell a caret at `col` sits on: left of a hint anchored exactly
+    /// there, like the primary caret (`cursor_screen_pos`), marking the cell
+    /// its typed character will land on.
+    fn caret(&self, col: usize) -> usize {
+        self.text_before(col) + inlay_cells_strictly_before(&self.hints, col)
+    }
+
+    /// The cell just past a range ending before `col`: shifted by the hints
+    /// before its LAST character, so a hint anchored at `col` stays outside.
+    fn end(&self, col: usize) -> usize {
+        self.text_before(col) + inlay_cells_before(&self.hints, col.saturating_sub(1))
+    }
+
+    /// Cells the character at `col` takes: two for a wide one, none for a
+    /// combining mark, one past the end of the text.
+    fn width(&self, col: usize) -> usize {
+        self.text_before(col + 1) - self.text_before(col)
+    }
+}
+
+/// Restyle every cell the character at buffer column `col` occupies on a
+/// text row: [`paint_log_cells`] for the editor's row geometry. Returns false
+/// once the row's right edge is reached, so a caller walking columns can stop.
+fn paint_row_cells(
+    buf: &mut Buffer,
+    text_x: u16,
+    y: u16,
+    text_width: u16,
+    row: &RowCells,
+    col: usize,
+    restyle: impl Fn(Style) -> Style,
+) -> bool {
+    let first = row.cell(col);
+    let width = row.width(col);
+    // A character that does not fit WHOLE was never painted (`set_line`
+    // stops before it), so its band would colour an empty cell.
+    if first >= usize::from(text_width) || first + width > usize::from(text_width) {
+        return false;
+    }
+    for x in first..first + width {
+        let cell = &mut buf[(text_x + x as u16, y)];
+        cell.set_style(restyle(cell.style()));
+    }
+    true
+}
+
 /// The syntax-highlighted spans of `raw`'s character range `[from, to)`,
 /// clipped out of the line's merged highlight spans. Paints the text
 /// segments between spliced inlay-hint labels.
@@ -20237,9 +20294,8 @@ fn paint_search_highlight(
     raw_line: &str,
     needle: &str,
     opts: crate::widgets::search::SearchOpts,
-    scroll_col: usize,
+    row: &RowCells,
     active_match_on_line: Option<(usize, usize)>,
-    hints: &[(usize, usize)],
     cells: Option<&crate::cell_map::CellMap>,
     window: Option<(usize, usize)>,
     theme: crate::theme::Theme,
@@ -20250,8 +20306,8 @@ fn paint_search_highlight(
     let (inactive_style, active_style) = search_highlight_styles(theme);
     let segments = crate::widgets::search::split_for_highlight(raw_line, needle, opts);
     // `abs_col` tracks the absolute character index in the original line.
-    // Visible columns are `abs_col - scroll_col`, painted only when
-    // non-negative and inside `text_width`.
+    // Columns before the row's start are scrolled out; the rest map
+    // through the row's geometry and are painted inside `text_width`.
     let mut abs_col: usize = 0;
     for (chunk, is_match) in segments {
         let chunk_cols = chunk.chars().count();
@@ -20267,12 +20323,12 @@ fn paint_search_highlight(
             };
             for c in 0..chunk_cols {
                 let absolute = abs_col + c;
-                if absolute < scroll_col {
+                if absolute < row.start {
                     continue;
                 }
-                // A rendered log paints by display width (#404), so its
-                // band goes through the same cell map the text did; the
-                // editor's text path is one cell per character.
+                // A rendered log paints by ratatui's grapheme rules (#404),
+                // so its band goes through the same cell map the text did;
+                // the editor's text path goes through its row geometry.
                 if let Some(cells) = cells {
                     if !paint_log_cells(
                         buf,
@@ -20287,15 +20343,13 @@ fn paint_search_highlight(
                     }
                     continue;
                 }
-                let col = (absolute + inlay_cells_before(hints, absolute) - scroll_col) as u16;
-                if col >= text_width {
+                if !paint_row_cells(buf, text_x, y, text_width, row, absolute, |_| style) {
                     break;
                 }
-                buf[(text_x + col, y)].set_style(style);
             }
         }
         abs_col = abs_col.saturating_add(chunk_cols);
-        if abs_col >= scroll_col + text_width as usize {
+        if row.cell(abs_col) >= usize::from(text_width) {
             break;
         }
     }
@@ -20318,8 +20372,7 @@ fn paint_selection_occurrences(
     text_width: u16,
     raw_line: &str,
     needle: &str,
-    scroll_col: usize,
-    hints: &[(usize, usize)],
+    row: &RowCells,
     theme: crate::theme::Theme,
 ) {
     if needle.is_empty() {
@@ -20331,39 +20384,27 @@ fn paint_selection_occurrences(
     while let Some(rel) = raw_line[search_from..].find(needle) {
         let byte_start = search_from + rel;
         let char_start = raw_line[..byte_start].chars().count();
-        for c in 0..needle_cols {
-            let absolute = char_start + c;
-            if absolute < scroll_col {
-                continue;
-            }
-            let col = (absolute + inlay_cells_before(hints, absolute) - scroll_col) as u16;
-            if col >= text_width {
+        for absolute in char_start.max(row.start)..char_start + needle_cols {
+            if !paint_row_cells(buf, text_x, y, text_width, row, absolute, |s| s.bg(bg)) {
                 break;
             }
-            let cell = &mut buf[(text_x + col, y)];
-            cell.set_style(cell.style().bg(bg));
         }
         search_from = byte_start + needle.len();
     }
 }
 
-/// Paint a software block cursor for a secondary multi-cursor caret at char
-/// column `col_char` of row `y`. Uses a reversed bar so it reads as a caret
+/// Paint a software block cursor for a secondary multi-cursor caret on cell
+/// `col` of row `y`'s text. Uses a reversed bar so it reads as a caret
 /// distinct from the host terminal's hardware caret on the primary cursor.
 fn paint_block_cursor(
     buf: &mut Buffer,
     text_x: u16,
     y: u16,
     text_width: u16,
-    col_char: usize,
-    scroll_col: usize,
+    col: usize,
     theme: crate::theme::Theme,
 ) {
-    if col_char < scroll_col {
-        return;
-    }
-    let col = col_char - scroll_col;
-    if col as u16 >= text_width {
+    if col >= usize::from(text_width) {
         return;
     }
     let cell = &mut buf[(text_x + col as u16, y)];
@@ -20383,15 +20424,10 @@ fn paint_ghost_caret(
     text_x: u16,
     y: u16,
     text_width: u16,
-    col_char: usize,
-    scroll_col: usize,
+    col: usize,
     color: Color,
 ) {
-    if col_char < scroll_col {
-        return;
-    }
-    let col = col_char - scroll_col;
-    if col as u16 >= text_width {
+    if col >= usize::from(text_width) {
         return;
     }
     let cell = &mut buf[(text_x + col as u16, y)];
@@ -20403,26 +20439,21 @@ fn paint_ghost_caret(
     );
 }
 
-/// Tint the single bracket cell at char column `col_char` of row `y` with the
+/// Tint the single bracket cell on cell `col` of row `y`'s text with the
 /// theme's bracket-match background, leaving the glyph's foreground intact so
-/// the bracket stays readable. No-op when the cell is scrolled out of view.
+/// the bracket stays readable. No-op when the cell is past the row's edge.
 fn paint_bracket_match(
     buf: &mut Buffer,
     text_x: u16,
     y: u16,
     text_width: u16,
-    col_char: usize,
-    scroll_col: usize,
+    col: usize,
     theme: crate::theme::Theme,
 ) {
-    if col_char < scroll_col {
+    if col >= usize::from(text_width) {
         return;
     }
-    let col = (col_char - scroll_col) as u16;
-    if col >= text_width {
-        return;
-    }
-    let cell = &mut buf[(text_x + col, y)];
+    let cell = &mut buf[(text_x + col as u16, y)];
     cell.set_style(cell.style().bg(theme.bracket_match_bg()));
 }
 
@@ -39846,6 +39877,76 @@ mod tests {
             buf[(text_x + 1, e.last_inner.y)].fg,
             e.theme.bracket_pair_color(0)
         );
+    }
+
+    // ---- Overlays after wide characters (#873) ----
+
+    /// The glyphs on the first text row whose cells `pick` selects, left to
+    /// right: what an overlay covers on screen.
+    fn glyphs_where(
+        e: &Editor,
+        buf: &Buffer,
+        pick: impl Fn(&ratatui::buffer::Cell) -> bool,
+    ) -> String {
+        let y = e.last_inner.y;
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        (text_x..e.last_inner.x + e.last_inner.width)
+            .filter(|&x| pick(&buf[(x, y)]))
+            .map(|x| buf[(x, y)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn row_cells_count_a_wide_character_as_two_cells_and_splice_hints() {
+        let mut row = RowCells::default();
+        row.fill("a\u{8cbb}b", 0, [(2, 3)]);
+        assert_eq!((row.cell(1), row.width(1)), (1, 2), "費 takes two cells");
+        assert_eq!(row.cell(2), 6, "b sits past 費 and the hint anchored at it");
+        assert_eq!(row.caret(2), 3, "a caret at the anchor is left of it");
+        assert_eq!(row.end(2), 3, "a range ending there leaves it out");
+        assert_eq!(row.end(4), 8, "the newline cell follows the text");
+        row.fill("\u{8cbb}b", 1, []);
+        assert_eq!((row.cell(0), row.cell(2)), (0, 2), "scrolled to 費");
+    }
+
+    #[test]
+    fn find_and_occurrence_highlights_cover_their_glyphs_after_wide_characters() {
+        let mut e = editor_with("label = \"\u{98df}\u{8cbb}\"  # food (groceries)");
+        e.set_search_highlight(Some("food".into()));
+        e.occurrences = vec![(0, 22, 31, false)];
+        let buf = guide_buf(&mut e, 60, 5);
+        let find_bg = Color::Rgb(0xff, 0xd7, 0x4a);
+        assert_eq!(glyphs_where(&e, &buf, |c| c.bg == find_bg), "food");
+        let occ_bg = e.theme.occurrence_bg();
+        assert_eq!(glyphs_where(&e, &buf, |c| c.bg == occ_bg), "groceries");
+    }
+
+    #[test]
+    fn the_selection_band_and_its_whitespace_dots_cover_the_selected_glyphs_after_wide_characters()
+    {
+        let mut e = editor_with("label = \"\u{98df}\u{8cbb}\"  # food");
+        e.selection = Some(EditorSelection {
+            anchor: (0, 14),
+            head: (0, 18),
+        });
+        let buf = guide_buf(&mut e, 60, 5);
+        let band = Color::Rgb(0x26, 0x4f, 0x78);
+        assert_eq!(glyphs_where(&e, &buf, |c| c.bg == band), "#\u{b7}fo");
+    }
+
+    #[test]
+    fn bracket_colours_and_squiggles_land_on_their_glyphs_after_wide_characters() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let mut e = editor_with("items = {\"\u{8cbb}\": (1, x)}");
+        e.recompute_highlights();
+        let p = std::path::PathBuf::from("/tmp/diag.ts");
+        e.path = Some(p.clone());
+        e.apply_diagnostics(p, vec![diag(0, 18, 0, 19, DiagnosticSeverity::Error)]);
+        let buf = guide_buf(&mut e, 60, 5);
+        let pair = [e.theme.bracket_pair_color(0), e.theme.bracket_pair_color(1)];
+        assert_eq!(glyphs_where(&e, &buf, |c| pair.contains(&c.fg)), "{()}");
+        let squiggle = |c: &ratatui::buffer::Cell| c.modifier.contains(Modifier::UNDERLINED);
+        assert_eq!(glyphs_where(&e, &buf, squiggle), "x");
     }
 
     // ---- Render whitespace (#133) ----
