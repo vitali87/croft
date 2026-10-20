@@ -3126,7 +3126,9 @@ pub struct Editor {
     /// The `edit_seq` and every caret's selection, the primary first, after
     /// the last multi-cursor keystroke that typed a character and left no
     /// selection (#913): the next one joins its undo step only while nothing
-    /// has edited or moved since, as one caret's typing burst does.
+    /// has edited or moved since, as one caret's typing burst does. Every
+    /// command that edits the caret set clears it, so the burst ends even
+    /// when the carets come back to the same places (collapse, then add).
     multi_typing: Option<(u64, Vec<EditorSelection>)>,
     /// Merge-conflict blocks in the buffer, lazily recomputed whenever
     /// `edit_seq` moves (same pattern as the git-gutter marks).
@@ -9226,6 +9228,7 @@ impl Editor {
     /// Drop every secondary caret, leaving just the primary cursor. Called on
     /// Esc, mouse clicks, and any movement that isn't a multi-cursor edit.
     pub fn collapse_carets(&mut self) {
+        self.multi_typing = None;
         self.carets.clear();
     }
 
@@ -9236,6 +9239,7 @@ impl Editor {
     /// the rest become secondary carets. Returns the number of occurrences
     /// selected (0 when the cursor isn't on a word, leaving state untouched).
     pub fn select_all_occurrences_of_word_at_cursor(&mut self) -> usize {
+        self.multi_typing = None;
         let Some((start, end)) = self.word_at(self.cursor_row, self.cursor_col) else {
             return 0;
         };
@@ -9312,6 +9316,7 @@ impl Editor {
     /// Occurrences). The selection the caret is in stays primary. Returns
     /// the number of selections, 0 when there is nothing to match.
     pub fn select_all_occurrences(&mut self) -> usize {
+        self.multi_typing = None;
         let Some(sel) = self.selection.filter(|s| s.anchor != s.head) else {
             return self.select_all_occurrences_of_word_at_cursor();
         };
@@ -9355,6 +9360,7 @@ impl Editor {
     /// VS Code does. The last line's caret is the primary. Returns the
     /// number of carets, 0 with no selection.
     pub fn add_cursors_to_line_ends(&mut self) -> usize {
+        self.multi_typing = None;
         let Some(sel) = self.selection.filter(|s| s.anchor != s.head) else {
             return 0;
         };
@@ -9388,6 +9394,7 @@ impl Editor {
     /// it so the view follows. Returns the number of cursors (0 when the first
     /// press lands off a word, leaving state untouched).
     pub fn select_next_occurrence(&mut self) -> usize {
+        self.multi_typing = None;
         // First press with no selection: select the word under the cursor.
         let Some(sel) = self.selection else {
             let Some((s, e)) = self.word_at(self.cursor_row, self.cursor_col) else {
@@ -14377,6 +14384,7 @@ impl Editor {
     /// the row below the lowest current caret, at the same column (clamped to
     /// that line's length). No-op at the last row.
     pub fn add_cursor_below(&mut self) {
+        self.multi_typing = None;
         let max_row = self
             .carets
             .iter()
@@ -14401,6 +14409,7 @@ impl Editor {
     /// existing zero-width caret removes it (toggle). Returns false when the
     /// click misses the text area.
     pub fn add_caret_at_screen(&mut self, col: u16, row: u16) -> bool {
+        self.multi_typing = None;
         let Some((r, c)) = self.buffer_pos_at(col, row) else {
             return false;
         };
@@ -14435,6 +14444,7 @@ impl Editor {
     /// (VS Code's Shift+Alt+drag). Clears any existing selection/carets and
     /// parks the primary at the anchor. Returns false if the cell misses text.
     pub fn begin_box_select(&mut self, col: u16, row: u16) -> bool {
+        self.multi_typing = None;
         let Some((r, c)) = self.buffer_pos_at(col, row) else {
             return false;
         };
@@ -14467,6 +14477,7 @@ impl Editor {
     /// over the shared column span (clamped to that line's length); the head
     /// row is the primary. Zero-width columns become bare carets.
     fn box_select_to(&mut self, head_row: usize, head_col: usize) {
+        self.multi_typing = None;
         let Some((ar, ac)) = self.box_anchor else {
             return;
         };
@@ -14553,6 +14564,7 @@ impl Editor {
     /// VS Code "Add Cursor Above" (Cmd+Alt+Up): mirror of `add_cursor_below`.
     /// No-op at the first row.
     pub fn add_cursor_above(&mut self) {
+        self.multi_typing = None;
         let min_row = self
             .carets
             .iter()
@@ -28242,6 +28254,25 @@ mod tests {
             undone.push(e.lines.join("|"));
         }
         assert_eq!(undone, ["axz|bxz", "ax|bx", "axy|bxy", "a|b"]);
+    }
+
+    /// #913: collapsing the carets and adding them back where they were
+    /// (Cmd+Alt+Down does both) ends the burst like any caret command, so
+    /// the typing either side of it undoes in two steps.
+    #[test]
+    fn multi_caret_typing_burst_ends_when_the_carets_are_rebuilt_in_place() {
+        let mut e = editor_with("a\nb");
+        e.cursor_col = 1;
+        e.add_cursor_below();
+        e.multi_insert_char('x');
+        e.collapse_carets();
+        e.add_cursor_below();
+        e.multi_insert_char('y');
+        assert_eq!(e.lines, ["axy", "bxy"]);
+        assert!(e.undo());
+        assert_eq!(e.lines, ["ax", "bx"]);
+        assert!(e.undo());
+        assert_eq!(e.lines, ["a", "b"]);
     }
 
     #[test]
