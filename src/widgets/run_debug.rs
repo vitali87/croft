@@ -34,6 +34,76 @@ const DBG_FRAME_SEL_FG: Color = Color::Rgb(0xff, 0xff, 0xff);
 const DBG_FIELD_BG: Color = Color::Rgb(0x0d, 0x11, 0x17); // REPL input field fill
 const DBG_PLACEHOLDER: Color = Color::Rgb(0x4b, 0x55, 0x63); // ghost hint text
 
+/// One button of the debug toolbar (#1545): VS Code's debug toolbar,
+/// docked at the top of the Run and Debug panel while a session is live,
+/// so a session can be driven by mouse when the F-keys never arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugControl {
+    Continue,
+    Pause,
+    StepOver,
+    StepInto,
+    StepOut,
+    Restart,
+    Stop,
+}
+
+impl DebugControl {
+    /// The toolbar left to right: Continue while paused, Pause while
+    /// running, then the steps, Restart and Stop.
+    pub fn toolbar(paused: bool) -> [DebugControl; 6] {
+        [
+            if paused {
+                DebugControl::Continue
+            } else {
+                DebugControl::Pause
+            },
+            DebugControl::StepOver,
+            DebugControl::StepInto,
+            DebugControl::StepOut,
+            DebugControl::Restart,
+            DebugControl::Stop,
+        ]
+    }
+
+    /// The codicon VS Code draws for it (`debug-continue`, `debug-pause`,
+    /// `debug-step-over`, `debug-step-into`, `debug-step-out`,
+    /// `debug-restart`, `debug-stop`).
+    pub fn glyph(self) -> char {
+        match self {
+            DebugControl::Continue => '\u{eacf}',
+            DebugControl::Pause => '\u{ead1}',
+            DebugControl::StepOver => '\u{ead6}',
+            DebugControl::StepInto => '\u{ead4}',
+            DebugControl::StepOut => '\u{ead5}',
+            DebugControl::Restart => '\u{ead2}',
+            DebugControl::Stop => '\u{ead7}',
+        }
+    }
+
+    /// The button's name and key, shown while the pointer is over it.
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            DebugControl::Continue => "Continue (F5)",
+            DebugControl::Pause => "Pause (F6)",
+            DebugControl::StepOver => "Step Over (F10)",
+            DebugControl::StepInto => "Step Into (F11)",
+            DebugControl::StepOut => "Step Out (Shift+F11)",
+            DebugControl::Restart => "Restart (Ctrl+Shift+F5)",
+            DebugControl::Stop => "Stop (Shift+F5)",
+        }
+    }
+
+    /// Whether it acts in this state: the steps need a paused thread.
+    pub fn enabled(self, paused: bool) -> bool {
+        paused
+            || !matches!(
+                self,
+                DebugControl::StepOver | DebugControl::StepInto | DebugControl::StepOut
+            )
+    }
+}
+
 /// Write `s` at `(x, y)` styled, clipped to the half-open column range
 /// `[x, right)`, and return the column just past what was drawn. Lets the
 /// renderer lay coloured segments left-to-right without overflowing the panel.
@@ -307,6 +377,12 @@ pub struct RunDebugPanel {
     breakpoint_row_rects: Vec<(u16, usize)>,
     breakpoint_remove_rects: Vec<(u16, u16, usize)>,
     pub debug_status: String,
+    /// Whether the live session is paused (set by the app with the rows),
+    /// which decides Continue vs Pause and whether the steps act (#1545).
+    pub debug_paused: bool,
+    /// The debug toolbar's buttons this frame: `(y, x, control)`, each
+    /// button three cells wide from `x`. Cleared at every render.
+    debug_control_rects: Vec<(u16, u16, DebugControl)>,
     pub debug_rows: Vec<DebugRow>,
     pub debug_scroll: usize,
     /// Screen y of the first rendered debug row and how many rows were drawn,
@@ -353,6 +429,8 @@ impl RunDebugPanel {
             breakpoint_row_rects: Vec::new(),
             breakpoint_remove_rects: Vec::new(),
             debug_status: String::new(),
+            debug_paused: false,
+            debug_control_rects: Vec::new(),
             debug_rows: Vec::new(),
             debug_scroll: 0,
             last_debug_row_y0: 0,
@@ -374,6 +452,22 @@ impl RunDebugPanel {
             .iter()
             .find(|&&(ry, rx, _)| ry == y && (x == rx || x == rx + 1))
             .map(|&(_, _, idx)| idx)
+    }
+
+    /// The debug toolbar button painted at `(x, y)`, if it acts in the
+    /// session's state; a greyed-out step button is not one (#1545).
+    pub fn debug_control_at(&self, x: u16, y: u16) -> Option<DebugControl> {
+        self.debug_control_painted_at(x, y)
+            .filter(|c| c.enabled(self.debug_paused))
+    }
+
+    /// The debug toolbar button painted at `(x, y)`, greyed out or not: the
+    /// one whose name and key the pointer's tooltip shows.
+    pub fn debug_control_painted_at(&self, x: u16, y: u16) -> Option<DebugControl> {
+        self.debug_control_rects
+            .iter()
+            .find(|&&(ry, rx, _)| ry == y && (rx..rx + 3).contains(&x))
+            .map(|&(_, _, c)| c)
     }
 
     /// Map a click to a painted breakpoint (#250): the index into
@@ -546,17 +640,48 @@ impl RunDebugPanel {
         self.watch_remove_rects.clear();
         self.breakpoint_row_rects.clear();
         self.breakpoint_remove_rects.clear();
+        self.debug_control_rects.clear();
         let right = inner.x + inner.width;
         let mut y = inner.y;
 
-        // Status pill, e.g. " ⏸ Paused (breakpoint) ".
+        // The debug toolbar (#1545): Continue / Pause, Step Over, Step Into,
+        // Step Out, Restart, Stop, then the status pill, e.g.
+        // " Paused (breakpoint) ". Each button's name and key is its tooltip.
+        // A sidebar too narrow for all six wraps them onto further rows, so
+        // Stop and the rest stay clickable at the minimum width.
         if !self.debug_status.is_empty() {
-            let pill = format!(" ⏸ {} ", self.debug_status);
-            let pill: String = pill.chars().take(inner.width as usize).collect();
-            buf.set_string(
-                inner.x + 1,
+            let bottom = inner.y + inner.height;
+            let mut x = inner.x + 1;
+            for control in DebugControl::toolbar(self.debug_paused) {
+                if x + 3 > right && x > inner.x + 1 {
+                    x = inner.x + 1;
+                    y += 1;
+                }
+                if x + 3 > right || y >= bottom {
+                    break;
+                }
+                let fg = if control.enabled(self.debug_paused) {
+                    self.theme.ui(DBG_PILL_FG)
+                } else {
+                    self.theme.ui(DBG_PLACEHOLDER)
+                };
+                let bg = self.theme.ui(DBG_BAR_BG);
+                buf.set_string(
+                    x,
+                    y,
+                    format!(" {} ", control.glyph()),
+                    Style::default().fg(fg).bg(bg),
+                );
+                self.debug_control_rects.push((y, x, control));
+                x += 3;
+            }
+            let text = format!(" {} ", self.debug_status);
+            put(
+                buf,
+                x + 1,
                 y,
-                &pill,
+                right,
+                &text,
                 Style::default()
                     .fg(self.theme.ui(DBG_PILL_FG))
                     .bg(self.theme.ui(DBG_PILL_BG))
@@ -1050,6 +1175,7 @@ impl Widget for &mut RunDebugPanel {
         let show_ended_console = self.session_ended && !self.console_tail.is_empty();
         self.breakpoint_row_rects.clear();
         self.breakpoint_remove_rects.clear();
+        self.debug_control_rects.clear();
         let top_pad = if show_ended_console || !self.breakpoints.is_empty() {
             0
         } else if inner.height > cluster {
