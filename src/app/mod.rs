@@ -8469,6 +8469,7 @@ impl App {
             report.reloaded.extend(extra.reloaded);
             report.conflicts.extend(extra.conflicts);
             report.failed.extend(extra.failed);
+            report.deleted.extend(extra.deleted);
         }
         if report.is_empty() {
             return settled;
@@ -8491,6 +8492,20 @@ impl App {
             // decision, so it gets the modal.
             (_, c, _) if c > 0 => {
                 self.prompt_disk_conflict(report.conflicts.clone());
+            }
+            // Gone is not a failed read (#900): the tab keeps its text, its
+            // label says `(deleted)`, and a save puts the file back.
+            _ if !report.deleted.is_empty() => {
+                self.status = match report.deleted.as_slice() {
+                    [one] => format!(
+                        "{} was deleted on disk; save to recreate it",
+                        self.status_path(one)
+                    ),
+                    many => format!(
+                        "{} open files were deleted on disk; save to recreate them",
+                        many.len()
+                    ),
+                };
             }
             // A failed reload used to be silently discarded (#37): the tab
             // keeps its last good view, and the status must say so instead
@@ -62724,6 +62739,9 @@ impl App {
                 // an implicit exclusion structural - #191 review.)
                 && !e.has_non_text_view()
                 && !e.disk_conflict
+                // A file deleted on disk stays deleted until the user saves
+                // it (#900): a checkout or `git stash` may have meant it.
+                && !(automatic && e.deleted_on_disk())
                 // A latched encoding refusal: only an explicit Cmd+S can
                 // consent to the lossy write, so retrying here would just
                 // re-refuse every tick.
