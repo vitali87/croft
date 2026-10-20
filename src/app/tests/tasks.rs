@@ -722,7 +722,10 @@ fn running_a_console_fence_types_only_its_commands() {
     app.run_command(Command::RunCodeBlockAtCursor);
     let pending = app.pending_run_block.as_ref().expect("the fence runs");
     assert_eq!(pending.code, "echo installed-ok\nls -1 /tmp/rd\n");
-    assert_eq!(pending.command, "echo installed-ok\nls -1 /tmp/rd\r");
+    assert_eq!(
+        pending.command,
+        "eval \"$(printf '%b' 'echo installed-ok\\nls -1 /tmp/rd\\n')\"\r"
+    );
 }
 
 /// #353: the popup never shows a line as complete when it is not - a line
@@ -788,10 +791,8 @@ fn staged_block_path(cmd: &str) -> std::path::PathBuf {
 fn fence_command_shapes_the_typed_block() {
     let tmp = tempfile::tempdir().unwrap();
     let scripts = tmp.path().join("blocks");
-    assert_eq!(
-        super::fence_command("sh", "echo a\necho b\n", &scripts),
-        "echo a\necho b\r"
-    );
+    assert_eq!(super::fence_command("sh", "echo a\n", &scripts), "echo a\r");
+    assert!(super::fence_command("sh", "echo a\necho b\n", &scripts).starts_with("eval "));
     assert!(!scripts.exists(), "a shell block is typed, not written");
     // #1630: any other language is read from a private file on stdin, never
     // typed as a heredoc, which fish has no syntax for.
@@ -852,6 +853,28 @@ fn fence_blocks_with_tabs_or_bangs_run_exactly_as_shown() {
     assert!(sh.starts_with("eval \"$(printf '%b' "), "{sh}");
     let probe = format!("{}; pwd", sh.trim_end_matches('\r'));
     assert_eq!(run_typed_line(&probe, tmp.path()), "hi!\n/\n");
+}
+
+/// #920: a shell block of several lines reaches the shell as ONE command
+/// line, so the shell reports one outcome for it: every line's output and
+/// the status the block ends with, as `sh` running it as a script would.
+#[test]
+fn a_multi_line_shell_block_is_typed_as_one_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scripts = tmp.path().join("blocks");
+    let code = "echo step-1\nls does-not-exist-920\necho step-3\n(exit 3)\n";
+    let cmd = super::fence_command("sh", code, &scripts);
+    assert_eq!(cmd.matches(['\r', '\n']).count(), 1, "{cmd:?}");
+    assert!(cmd.ends_with('\r'), "{cmd:?}");
+    let probe = format!("{}; echo exit=$?", cmd.trim_end_matches('\r'));
+    let out = run_typed_line(&probe, tmp.path());
+    assert!(out.starts_with("step-1\nstep-3\nexit=3\n"), "{out:?}");
+    assert!(out.contains("does-not-exist-920"), "{out:?}");
+    // A `\` continuation survives. The backslash travels as an octal
+    // escape, never as `\\`, which fish's single quotes would fold to one.
+    let cont = super::fence_command("sh", "echo one \\\n  two\n", &scripts);
+    assert!(!cont.contains("\\\\"), "{cont:?}");
+    assert_eq!(run_typed_line(&cont, tmp.path()), "one two\n");
 }
 
 /// Negative (#1630): when the file cannot be written the block is still
@@ -1293,6 +1316,64 @@ fn a_finished_fenced_block_replaces_its_running_status_with_the_outcome() {
         .uid();
     finish_pane_command(&mut app, pane, Some(1), 300);
     assert_eq!(app.status, "README.md:1 failed (exit 1, 0.3 s)");
+}
+
+/// #920: a block of several lines settles its capture on the WHOLE block.
+/// The pane reads typed lines as an interactive shell does, one command per
+/// line between OSC 133 marks. Typed line by line, the block finished three
+/// times, and its box and `{persist}` fence held only the first command's
+/// output and exit.
+#[test]
+fn a_multi_line_blocks_capture_holds_every_line_and_the_blocks_exit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let doc = tmp.path().join("BUILD.md");
+    let code = "echo step-1\nprintf 'a\\nb\\nc\\n' | sort -r\n(exit 3)\n";
+    std::fs::write(&doc, format!("```sh {{persist}}\n{code}```\n")).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let shell = "while :; do printf '\\033]133;A\\007$ \\033]133;B\\007'; \
+                 IFS= read -r line || exit; printf '\\033]133;C\\007'; \
+                 eval \"$line\"; printf '\\033]133;D;%d\\007' $?; done";
+    let mut pane = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), shell.into()],
+        tmp.path(),
+    )
+    .unwrap();
+    pane.set_manual_name(Some(String::from("BUILD.md:1")));
+    app.insert_terminal(pane);
+    let idx = app.terminals.len() - 1;
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the pane's first prompt",
+        || !app.terminals[idx].prompt_lines().is_empty(),
+    );
+    let panes = app.terminals.len();
+    app.run_block_in_pane(PendingRunBlock {
+        pane_name: String::from("BUILD.md:1"),
+        cwd: tmp.path().to_path_buf(),
+        command: super::fence_command("sh", code, &tmp.path().join("blocks")),
+        code: code.to_string(),
+        destructive: false,
+        doc: Some(doc.clone()),
+        block_line: 0,
+        persist: true,
+        capture_timeout: None,
+    });
+    assert_eq!(app.terminals.len(), panes, "the idle pane ran the block");
+    let key = (String::from("BUILD.md:1"), 0);
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the block's capture to settle",
+        || {
+            app.settle_block_captures();
+            app.block_outputs.contains_key(&key)
+        },
+    );
+    let out = &app.block_outputs[&key];
+    assert_eq!(out.text, "step-1\nc\nb\na", "every line's output");
+    assert_eq!(out.exit, Some(3), "the exit the block ended with");
+    let written = std::fs::read_to_string(&doc).unwrap();
+    assert!(written.contains("step-1\nc\nb\na\n"), "{written}");
 }
 
 /// #856 guard: a task's finish settles only a status that still shows its

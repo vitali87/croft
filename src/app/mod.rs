@@ -74787,8 +74787,8 @@ fn is_run_fence_key(key: KeyEvent) -> bool {
             .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
 }
 
-/// The command typed into a pane for a fenced block (#353): a shell block
-/// as written (a trailing newline runs its last line). Any other language
+/// The command typed into a pane for a fenced block (#353): a one-line shell
+/// block as written (a trailing newline runs it). Any other language
 /// is written to a private file under `scripts` and read from it on stdin,
 /// `python3 - < 'file'` (#1630): the heredoc it used to be typed as is
 /// POSIX shell syntax, so with fish as the pane's shell every python or
@@ -74798,11 +74798,16 @@ fn is_run_fence_key(key: KeyEvent) -> bool {
 /// with the pane's directory on its import path, as before. Should the file
 /// not be written, the heredoc is the fallback.
 ///
-/// A shell block holding a tab or `!` goes as one single-quoted
-/// `printf '%b'` argument instead: typed into an interactive shell, a tab
-/// is completion and bash expands `!` as history, so what ran was not what
+/// A shell block of several lines, or holding a tab or `!`, goes as one
+/// single-quoted `printf '%b'` argument instead. Typed line by line, each
+/// line was a command of its own, so the capture under the fence and the
+/// pane's outcome described only the first one to finish (#920); as one
+/// command the shell reports the whole block: every line's output and the
+/// status it ends with. Typed into an interactive shell, a tab is
+/// completion and bash expands `!` as history, so what ran was not what
 /// the confirm popup showed. Inside single quotes neither happens, and the
-/// tab travels as `\t`.
+/// tab travels as `\t`. A backslash travels as `\0134`, since fish folds
+/// `\\` inside single quotes to one backslash where bash and zsh keep both.
 fn fence_command(interpreter: &str, code: &str, scripts: &Path) -> String {
     let code = code.trim_end_matches('\n');
     if interpreter != "sh" {
@@ -74817,9 +74822,9 @@ fn fence_command(interpreter: &str, code: &str, scripts: &Path) -> String {
         }
         return format!("{interpreter} - <<'{end}'\n{code}\n{end}\r");
     }
-    if code.contains(['\t', '!']) {
+    if code.contains(['\n', '\t', '!']) {
         let escaped = format!("{code}\n")
-            .replace('\\', "\\\\")
+            .replace('\\', "\\0134")
             .replace('\n', "\\n")
             .replace('\t', "\\t")
             .replace('\'', "'\\''");
