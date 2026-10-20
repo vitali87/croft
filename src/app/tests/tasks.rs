@@ -911,6 +911,64 @@ fn a_multi_line_shell_block_in_a_fish_pane_is_sourced() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "hi! back\\slash\n/\n");
 }
 
+/// #920: a block of several lines settles its capture on the WHOLE block.
+/// The pane reads typed lines as an interactive shell does, one command per
+/// line between OSC 133 marks. Typed line by line, the block finished three
+/// times, and its box and `{persist}` fence held only the first command's
+/// output and exit.
+#[test]
+fn a_multi_line_blocks_capture_holds_every_line_and_the_blocks_exit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let doc = tmp.path().join("BUILD.md");
+    let code = "echo step-1\nprintf 'a\\nb\\nc\\n' | sort -r\n(exit 3)\n";
+    std::fs::write(&doc, format!("```sh {{persist}}\n{code}```\n")).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let shell = "while :; do printf '\\033]133;A\\007$ \\033]133;B\\007'; \
+                 IFS= read -r line || exit; printf '\\033]133;C\\007'; \
+                 eval \"$line\"; printf '\\033]133;D;%d\\007' $?; done";
+    let mut pane = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), shell.into()],
+        tmp.path(),
+    )
+    .unwrap();
+    pane.set_manual_name(Some(String::from("BUILD.md:1")));
+    app.insert_terminal(pane);
+    let idx = app.terminals.len() - 1;
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the pane's first prompt",
+        || !app.terminals[idx].prompt_lines().is_empty(),
+    );
+    let panes = app.terminals.len();
+    app.run_block_in_pane(PendingRunBlock {
+        pane_name: String::from("BUILD.md:1"),
+        cwd: tmp.path().to_path_buf(),
+        command: super::fence_command("sh", code, &tmp.path().join("blocks"), "/bin/sh"),
+        code: code.to_string(),
+        destructive: false,
+        doc: Some(doc.clone()),
+        block_line: 0,
+        persist: true,
+        capture_timeout: None,
+    });
+    assert_eq!(app.terminals.len(), panes, "the idle pane ran the block");
+    let key = (String::from("BUILD.md:1"), 0);
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the block's capture to settle",
+        || {
+            app.settle_block_captures();
+            app.block_outputs.contains_key(&key)
+        },
+    );
+    let out = &app.block_outputs[&key];
+    assert_eq!(out.text, "step-1\nc\nb\na", "every line's output");
+    assert_eq!(out.exit, Some(3), "the exit the block ended with");
+    let written = std::fs::read_to_string(&doc).unwrap();
+    assert!(written.contains("step-1\nc\nb\na\n"), "{written}");
+}
+
 /// Negative (#1630): when the file cannot be written the block is still
 /// typed whole, as the heredoc it was, rather than not run at all.
 #[test]
@@ -1350,64 +1408,6 @@ fn a_finished_fenced_block_replaces_its_running_status_with_the_outcome() {
         .uid();
     finish_pane_command(&mut app, pane, Some(1), 300);
     assert_eq!(app.status, "README.md:1 failed (exit 1, 0.3 s)");
-}
-
-/// #920: a block of several lines settles its capture on the WHOLE block.
-/// The pane reads typed lines as an interactive shell does, one command per
-/// line between OSC 133 marks. Typed line by line, the block finished three
-/// times, and its box and `{persist}` fence held only the first command's
-/// output and exit.
-#[test]
-fn a_multi_line_blocks_capture_holds_every_line_and_the_blocks_exit() {
-    let tmp = tempfile::tempdir().unwrap();
-    let doc = tmp.path().join("BUILD.md");
-    let code = "echo step-1\nprintf 'a\\nb\\nc\\n' | sort -r\n(exit 3)\n";
-    std::fs::write(&doc, format!("```sh {{persist}}\n{code}```\n")).unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let shell = "while :; do printf '\\033]133;A\\007$ \\033]133;B\\007'; \
-                 IFS= read -r line || exit; printf '\\033]133;C\\007'; \
-                 eval \"$line\"; printf '\\033]133;D;%d\\007' $?; done";
-    let mut pane = crate::widgets::terminal::PtyTerminal::new_running(
-        "/bin/sh",
-        &[String::from("-c"), shell.into()],
-        tmp.path(),
-    )
-    .unwrap();
-    pane.set_manual_name(Some(String::from("BUILD.md:1")));
-    app.insert_terminal(pane);
-    let idx = app.terminals.len() - 1;
-    crate::test_budget::await_spawned(
-        crate::test_budget::tests::SHELL_PAINT_BASE,
-        "the pane's first prompt",
-        || !app.terminals[idx].prompt_lines().is_empty(),
-    );
-    let panes = app.terminals.len();
-    app.run_block_in_pane(PendingRunBlock {
-        pane_name: String::from("BUILD.md:1"),
-        cwd: tmp.path().to_path_buf(),
-        command: super::fence_command("sh", code, &tmp.path().join("blocks"), "/bin/sh"),
-        code: code.to_string(),
-        destructive: false,
-        doc: Some(doc.clone()),
-        block_line: 0,
-        persist: true,
-        capture_timeout: None,
-    });
-    assert_eq!(app.terminals.len(), panes, "the idle pane ran the block");
-    let key = (String::from("BUILD.md:1"), 0);
-    crate::test_budget::await_spawned(
-        crate::test_budget::tests::SHELL_PAINT_BASE,
-        "the block's capture to settle",
-        || {
-            app.settle_block_captures();
-            app.block_outputs.contains_key(&key)
-        },
-    );
-    let out = &app.block_outputs[&key];
-    assert_eq!(out.text, "step-1\nc\nb\na", "every line's output");
-    assert_eq!(out.exit, Some(3), "the exit the block ended with");
-    let written = std::fs::read_to_string(&doc).unwrap();
-    assert!(written.contains("step-1\nc\nb\na\n"), "{written}");
 }
 
 /// #856 guard: a task's finish settles only a status that still shows its
