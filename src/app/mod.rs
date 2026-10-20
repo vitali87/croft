@@ -15523,7 +15523,10 @@ impl App {
             }
             file_count += 1;
         }
-        self.forward_disk_changes_to_lsp(&written, &Default::default());
+        self.forward_disk_changes_to_lsp(&fs_watch::FsDrain {
+            changed_files: written,
+            ..Default::default()
+        });
         Ok((file_count, occ_count))
     }
 
@@ -16804,9 +16807,11 @@ impl App {
             // review queue for every folder but the first (#345).
             drain.changed_files.extend(d.changed_files);
             drain.created_files.extend(d.created_files);
+            drain.moved_in.extend(d.moved_in);
+            drain.vanished.extend(d.vanished);
             drain.rescan_dropped_events |= d.rescan_dropped_events;
         }
-        self.forward_disk_changes_to_lsp(&drain.changed_files, &drain.created_files);
+        self.forward_disk_changes_to_lsp(&drain);
         if drain.dirs_changed {
             self.refresh_git_status_debounced();
             if drain.finder_relevant {
@@ -16857,22 +16862,16 @@ impl App {
     /// Tell the language servers about files that changed on disk (#908):
     /// a server like ty watches nothing itself, so a `git checkout` or an
     /// agent's edit to a file no tab holds stayed stale in it.
-    fn forward_disk_changes_to_lsp(
-        &mut self,
-        changed: &std::collections::BTreeSet<PathBuf>,
-        created: &std::collections::BTreeSet<PathBuf>,
-    ) {
-        let Some(lsp) = self.lsp.as_mut().filter(|_| !changed.is_empty()) else {
+    fn forward_disk_changes_to_lsp(&mut self, drain: &fs_watch::FsDrain) {
+        if self.lsp.is_none() {
             return;
-        };
-        let changes = changed
-            .iter()
-            .map(|path| match created.contains(path) {
-                true => (path.clone(), lsp_types::FileChangeType::CREATED),
-                false => (path.clone(), lsp_types::FileChangeType::CHANGED),
-            })
-            .collect();
-        lsp.did_change_watched_files(changes);
+        }
+        let known = self.file_finder_index.clone();
+        let known = known.as_deref().map_or(&[][..], Vec::as_slice);
+        let changes = fs_watch::watched_file_changes(drain, known);
+        if let Some(lsp) = self.lsp.as_mut().filter(|_| !changes.is_empty()) {
+            lsp.did_change_watched_files(changes);
+        }
     }
 
     fn cycle_focus(&mut self) {

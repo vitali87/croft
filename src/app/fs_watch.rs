@@ -51,9 +51,17 @@ pub struct FsDrain {
     /// the ledger asks "what content changed", and a chmod is not a change
     /// a reviewer needs to see.
     pub changed_files: BTreeSet<PathBuf>,
-    /// The `changed_files` that were created or moved into place, which the
-    /// language servers hear about as created rather than changed (#908).
+    /// The `changed_files` that were created, which the language servers
+    /// hear about as created rather than changed (#908).
     pub created_files: BTreeSet<PathBuf>,
+    /// The `changed_files` a rename put in place (#908): an atomic save
+    /// renames a temporary file over the one it replaces, so these are
+    /// created or changed by whether the file was there before.
+    pub moved_in: BTreeSet<PathBuf>,
+    /// Paths a removal or a rename took away (#908). The watcher reports a
+    /// directory moved or removed as the directory alone, so the files it
+    /// held are found in what the workspace had before.
+    pub vanished: BTreeSet<PathBuf>,
     /// The watcher reported a RESCAN: it overflowed its queue and events
     /// were dropped, so `changed_files` is a lower bound rather than the
     /// whole story (#345). A ledger that quietly showed a short list would
@@ -263,7 +271,12 @@ impl FsWatch {
                 }
                 let mutates_content = event_mutates_content(&ev.event.kind);
                 let arrives = arrives_at_path(&ev.event.kind);
+                let created = matches!(ev.event.kind, notify::EventKind::Create(_));
+                let leaves = leaves_path(&ev.event.kind);
                 for path in &ev.event.paths {
+                    if leaves && !self.is_noise_event_path(path) && !path.exists() {
+                        out.vanished.insert(path.clone());
+                    }
                     if arrives && path.is_dir() && !self.is_noise_event_path(path) {
                         new_dirs.push(path.clone());
                     }
@@ -280,8 +293,10 @@ impl FsWatch {
                         && !path.is_dir()
                     {
                         out.changed_files.insert(path.clone());
-                        if arrives {
+                        if created {
                             out.created_files.insert(path.clone());
+                        } else if arrives {
+                            out.moved_in.insert(path.clone());
                         }
                     }
                     if let Some(dir) =
@@ -744,6 +759,50 @@ impl Drop for FsWatch {
 // UI never joins; `T: Send + 'static` lets the watcher move across the boundary.
 pub(super) fn offload_drop<T: Send + 'static>(value: T) {
     std::thread::spawn(move || drop(value));
+}
+
+/// A path an event can take away: removed, or renamed from (#908).
+fn leaves_path(kind: &notify::EventKind) -> bool {
+    use notify::EventKind;
+    use notify::event::ModifyKind;
+    matches!(
+        kind,
+        EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+    )
+}
+
+/// The `workspace/didChangeWatchedFiles` events `drain` makes (#908).
+/// `known` is the workspace's files as the Quick Open index last saw them,
+/// which is before this drain: a file renamed onto one it knew is an atomic
+/// save, so changed, where one moved into a new place is created; and a
+/// path that vanished takes every file it knew under it, which the watcher
+/// reports only as the directory. A path that is gone goes out as deleted
+/// whatever it is listed as here (`LspManager::did_change_watched_files`).
+pub fn watched_file_changes(
+    drain: &FsDrain,
+    known: &[crate::widgets::file_finder::FileEntry],
+) -> Vec<(PathBuf, lsp_types::FileChangeType)> {
+    use lsp_types::FileChangeType;
+    let existed = |p: &Path| known.iter().any(|e| e.path == p);
+    let mut out = BTreeMap::new();
+    for path in &drain.changed_files {
+        let created =
+            drain.created_files.contains(path) || (drain.moved_in.contains(path) && !existed(path));
+        let typ = match created {
+            true => FileChangeType::CREATED,
+            false => FileChangeType::CHANGED,
+        };
+        out.insert(path.clone(), typ);
+    }
+    for gone in &drain.vanished {
+        for e in known
+            .iter()
+            .filter(|e| e.path != *gone && e.path.starts_with(gone))
+        {
+            out.entry(e.path.clone()).or_insert(FileChangeType::DELETED);
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// Whether the event is the removal of a path known to have been a
