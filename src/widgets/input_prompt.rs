@@ -7,6 +7,9 @@
 //! caret. The App holds it inside `Option<InputPrompt>` with a `purpose`
 //! tag so a single key/mouse/render path serves every prompt, and decides
 //! what to do with the submitted string.
+//!
+//! A yes/no question ([`InputPrompt::confirm`]) uses the same box with no
+//! field, so nothing typed can look like an answer the App then ignores.
 
 use std::path::PathBuf;
 
@@ -51,13 +54,13 @@ pub enum InputPurpose {
         source: CodeqlDbSource,
     },
     /// Confirm removing the CodeQL database at `path` (#578). Submitting
-    /// (Enter) removes it; Esc keeps it. The value is a sentinel.
+    /// (Enter) removes it; Esc keeps it. A Y/N confirm, with no value.
     CodeqlRemoveDatabase {
         path: PathBuf,
     },
     /// Confirm deleting the unused CodeQL databases at `paths` (#578), all
     /// copies in croft's cache. Submitting (Enter) deletes them; Esc keeps
-    /// them. The value is a sentinel.
+    /// them. A Y/N confirm, with no value.
     CodeqlDeleteUnusedDatabases {
         paths: Vec<PathBuf>,
     },
@@ -66,8 +69,8 @@ pub enum InputPurpose {
         path: PathBuf,
     },
     /// Confirm removing the query history entry whose run wrote `output`
-    /// (#578). Submitting (Enter) removes it; Esc keeps it. The value is a
-    /// sentinel.
+    /// (#578). Submitting (Enter) removes it; Esc keeps it. A Y/N confirm,
+    /// with no value.
     CodeqlRemoveHistory {
         output: PathBuf,
     },
@@ -116,7 +119,8 @@ pub enum InputPurpose {
         name: String,
     },
     /// Confirm removing the variant analysis list called `name` (#578).
-    /// Submitting (Enter) removes it; Esc keeps it. The value is a sentinel.
+    /// Submitting (Enter) removes it; Esc keeps it. A Y/N confirm, with no
+    /// value.
     CodeqlRemoveVariantList {
         name: String,
     },
@@ -192,7 +196,7 @@ pub enum InputPurpose {
         name: String,
     },
     /// Confirm deleting tag `name` from `remote` (#1582). Submitting (Enter)
-    /// deletes it there; Esc keeps it. The value is a sentinel. `root` is
+    /// deletes it there; Esc keeps it. A Y/N confirm, with no value. `root` is
     /// the repository whose remote was listed: the deletion is dropped if
     /// Source Control has moved to another one by then.
     DeleteRemoteTag {
@@ -232,12 +236,14 @@ pub enum InputPurpose {
         kind: crate::git::StashKind,
     },
     /// Confirm uninstalling an installed extension. Submitting (Enter) performs
-    /// the removal; Esc keeps it. The submitted value is a sentinel, ignored.
+    /// the removal; Esc keeps it. A Y/N confirm, with no value.
     ExtensionUninstall {
         id: String,
     },
     /// Confirm moving Explorer file-tree entries to the OS Trash. Submitting
-    /// (Enter) trashes `paths`; Esc keeps them. The value is a sentinel.
+    /// (Enter) trashes `paths`; Esc keeps them. A Y/N confirm, with no value:
+    /// a prefilled `trash` read as type-to-confirm, yet any answer trashed
+    /// (#855).
     TreeDelete {
         paths: Vec<PathBuf>,
     },
@@ -285,6 +291,10 @@ pub struct InputPrompt {
     /// way, as VS Code's input boxes do, so typing or pasting replaces it
     /// and Backspace clears it, where before every key appended to it.
     pub selected: bool,
+    /// A yes/no question with no field (#855): Enter or Y answers yes, Esc
+    /// or N no, and typing goes nowhere. A sentinel value in an editable
+    /// field read as type-to-confirm, yet `no` + Enter still went ahead.
+    pub confirm: bool,
 }
 
 impl InputPrompt {
@@ -304,6 +314,21 @@ impl InputPrompt {
             hint: None,
             masked: false,
             selected: false,
+            confirm: false,
+        }
+    }
+
+    /// A yes/no question (#855): `title` asks it and `hint` says which keys
+    /// answer it. Submitting carries an empty value.
+    pub fn confirm(
+        purpose: InputPurpose,
+        title: impl Into<String>,
+        hint: impl Into<String>,
+    ) -> Self {
+        Self {
+            hint: Some(hint.into()),
+            confirm: true,
+            ..Self::new(purpose, title, "")
         }
     }
 
@@ -404,8 +429,9 @@ impl InputPrompt {
             .unwrap_or(self.value.len())
     }
 
+    /// Type `c` at the caret; a confirm has no field, so it takes none.
     pub fn push_char(&mut self, c: char) {
-        if c == '\n' || c == '\r' {
+        if self.confirm || c == '\n' || c == '\r' {
             return;
         }
         self.take_selection();
@@ -458,10 +484,11 @@ impl InputPrompt {
     }
 
     /// The trimmed submitted value, or `None` when blank (Enter on an empty
-    /// field is a no-op the caller treats as "keep waiting").
+    /// field is a no-op the caller treats as "keep waiting"). A confirm's
+    /// answer is always the empty value.
     pub fn submit_value(&self) -> Option<String> {
         let v = self.value.trim();
-        (self.allow_blank || !v.is_empty()).then(|| v.to_string())
+        (self.allow_blank || self.confirm || !v.is_empty()).then(|| v.to_string())
     }
 }
 
@@ -498,7 +525,8 @@ pub fn render_input_prompt(
     let width = (screen.width.saturating_mul(6) / 10)
         .clamp(30, 90)
         .min(screen.width);
-    let height: u16 = 5;
+    // A confirm is the title and one line of keys: it has no field.
+    let height: u16 = if prompt.confirm { 3 } else { 5 };
     let rect = Rect {
         x: screen.x + (screen.width.saturating_sub(width)) / 2,
         y: screen.y + (screen.height.saturating_sub(height)) / 3,
@@ -532,6 +560,16 @@ pub fn render_input_prompt(
         buf.set_span(rect.x + 1, rect.y, &title, rect.width.saturating_sub(2));
     }
     if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    if prompt.confirm {
+        buf.set_stringn(
+            inner.x,
+            inner.y,
+            prompt.hint.as_deref().unwrap_or_default(),
+            inner.width as usize,
+            Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4))),
+        );
         return;
     }
 
@@ -810,5 +848,48 @@ mod tests {
         assert_eq!((p.value.as_str(), p.cursor), ("abc", 2));
         p.delete_char();
         assert_eq!(p.value.as_str(), "ab");
+    }
+
+    fn trash_confirm() -> InputPrompt {
+        InputPrompt::confirm(
+            InputPurpose::TreeDelete { paths: Vec::new() },
+            "Move 'scratch.py' to Trash?",
+            "Enter or Y to trash · Esc or N to keep",
+        )
+    }
+
+    /// #855: a confirm takes nothing typed or pasted, so `no` cannot sit in
+    /// a field that Enter then ignores; Enter answers with no value.
+    #[test]
+    fn a_confirm_has_no_field_to_type_into() {
+        let mut p = trash_confirm();
+        for c in "no".chars() {
+            p.push_char(c);
+        }
+        assert_eq!(p.value, "");
+        assert_eq!(p.submit_value().as_deref(), Some(""));
+    }
+
+    /// #855: the box shows which keys answer it, where the prefilled value
+    /// hid that hint, and draws no caret.
+    #[test]
+    fn a_confirm_draws_its_keys_and_no_caret() {
+        let mut p = trash_confirm();
+        let screen = Rect::new(0, 0, 80, 12);
+        let mut buf = Buffer::empty(screen);
+        render_input_prompt(&mut p, screen, &mut buf, crate::theme::Theme::BLACK);
+        let r = p.last_rect;
+        assert_eq!(r.height, 3, "the title and one line of keys");
+        let row: String = (r.x + 2..r.x + r.width - 2)
+            .map(|x| buf[(x, r.y + 1)].symbol().to_string())
+            .collect();
+        assert!(
+            row.starts_with("Enter or Y to trash · Esc or N to keep"),
+            "{row}"
+        );
+        let caret = (r.y..r.y + r.height).any(|y| {
+            (r.x..r.x + r.width).any(|x| buf[(x, y)].modifier.contains(Modifier::SLOW_BLINK))
+        });
+        assert!(!caret, "a confirm has no caret");
     }
 }

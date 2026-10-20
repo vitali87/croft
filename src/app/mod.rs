@@ -26355,17 +26355,13 @@ impl App {
         }
         // Confirm before removing: uninstall is destructive and must never fire
         // from a single Delete keypress (or trash click) without asking. Enter in
-        // the popup performs it; Esc keeps the extension. (Seed a sentinel value
-        // so Enter on the empty field still submits — submit_value() ignores blanks.)
+        // the popup performs it; Esc keeps the extension.
         use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
-        self.open_input_prompt(
-            InputPrompt::new(
-                InputPurpose::ExtensionUninstall { id: id.clone() },
-                format!("Uninstall '{id}'?  It returns to Available."),
-                "Enter to uninstall · Esc to keep",
-            )
-            .with_value("uninstall"),
-        );
+        self.open_input_prompt(InputPrompt::confirm(
+            InputPurpose::ExtensionUninstall { id: id.clone() },
+            format!("Uninstall '{id}'?  It returns to Available."),
+            "Enter or Y to uninstall · Esc or N to keep",
+        ));
     }
 
     /// Perform the confirmed uninstall (the popup's Enter path). Removes the
@@ -28650,14 +28646,11 @@ impl App {
                 1 => String::from(" and its 1 repository"),
                 n => format!(" and its {n} repositories"),
             };
-            self.open_input_prompt(
-                InputPrompt::new(
-                    InputPurpose::CodeqlRemoveVariantList { name: name.clone() },
-                    format!("Remove repository list '{name}'{what}?"),
-                    "Enter to remove · Esc to keep",
-                )
-                .with_value("remove"),
-            );
+            self.open_input_prompt(InputPrompt::confirm(
+                InputPurpose::CodeqlRemoveVariantList { name: name.clone() },
+                format!("Remove repository list '{name}'{what}?"),
+                "Enter or Y to remove · Esc or N to keep",
+            ));
             return;
         }
         let saved = self.edit_codeql_variant(|c| {
@@ -28827,16 +28820,13 @@ impl App {
         } else {
             "Its folder stays on disk."
         };
-        self.open_input_prompt(
-            InputPrompt::new(
-                InputPurpose::CodeqlRemoveDatabase {
-                    path: db.path.clone(),
-                },
-                format!("Remove CodeQL database '{}'?  {what}", db.name),
-                "Enter to remove · Esc to keep",
-            )
-            .with_value("remove"),
-        );
+        self.open_input_prompt(InputPrompt::confirm(
+            InputPurpose::CodeqlRemoveDatabase {
+                path: db.path.clone(),
+            },
+            format!("Remove CodeQL database '{}'?  {what}", db.name),
+            "Enter or Y to remove · Esc or N to keep",
+        ));
     }
 
     /// The folder to delete with the database at `path`: the entry under
@@ -29335,14 +29325,11 @@ impl App {
             1 => String::from("Delete 1 unused CodeQL database?"),
             n => format!("Delete {n} unused CodeQL databases?"),
         };
-        self.open_input_prompt(
-            InputPrompt::new(
-                InputPurpose::CodeqlDeleteUnusedDatabases { paths },
-                title,
-                "Enter to delete · Esc to keep",
-            )
-            .with_value("delete"),
-        );
+        self.open_input_prompt(InputPrompt::confirm(
+            InputPurpose::CodeqlDeleteUnusedDatabases { paths },
+            title,
+            "Enter or Y to delete · Esc or N to keep",
+        ));
     }
 
     /// Remove the databases at `paths` from the list, delete their cached
@@ -29467,19 +29454,16 @@ impl App {
         } else {
             "Its results stay on disk."
         };
-        self.open_input_prompt(
-            InputPrompt::new(
-                InputPurpose::CodeqlRemoveHistory {
-                    output: entry.output.clone(),
-                },
-                format!(
-                    "Remove query history entry '{}'?  {what}",
-                    entry.display_name()
-                ),
-                "Enter to remove · Esc to keep",
-            )
-            .with_value("remove"),
-        );
+        self.open_input_prompt(InputPrompt::confirm(
+            InputPurpose::CodeqlRemoveHistory {
+                output: entry.output.clone(),
+            },
+            format!(
+                "Remove query history entry '{}'?  {what}",
+                entry.display_name()
+            ),
+            "Enter or Y to remove · Esc or N to keep",
+        ));
     }
 
     /// Remove the history entry whose run wrote `output`, deleting its
@@ -41058,18 +41042,15 @@ impl App {
                 }
                 if let Some((remote, name)) = row.id.split_once('\t') {
                     use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
-                    self.open_input_prompt(
-                        InputPrompt::new(
-                            InputPurpose::DeleteRemoteTag {
-                                root,
-                                remote: remote.to_string(),
-                                name: name.to_string(),
-                            },
-                            format!("Delete tag '{name}' from {remote}?"),
-                            "Enter to delete · Esc to keep",
-                        )
-                        .with_value("delete"),
-                    );
+                    self.open_input_prompt(InputPrompt::confirm(
+                        InputPurpose::DeleteRemoteTag {
+                            root,
+                            remote: remote.to_string(),
+                            name: name.to_string(),
+                        },
+                        format!("Delete tag '{name}' from {remote}?"),
+                        "Enter or Y to delete · Esc or N to keep",
+                    ));
                 }
             }
             ListPurpose::PushToRemote => {
@@ -54728,17 +54709,14 @@ impl App {
                 .chain(viewer.args.iter().map(|a| a.replace("{file}", &file)))
                 .collect::<Vec<_>>()
                 .join(" ");
-            self.open_input_prompt(
-                InputPrompt::new(
-                    InputPurpose::ViewerConsent {
-                        key: viewer.key(),
-                        path: path.to_path_buf(),
-                    },
-                    format!("Allow {} to run:  {}", viewer.ext_id, spawn_line),
-                    "Enter to allow · Esc to cancel",
-                )
-                .with_value("allow"),
-            );
+            self.open_input_prompt(InputPrompt::confirm(
+                InputPurpose::ViewerConsent {
+                    key: viewer.key(),
+                    path: path.to_path_buf(),
+                },
+                format!("Allow {} to run:  {}", viewer.ext_id, spawn_line),
+                "Enter or Y to allow · Esc or N to cancel",
+            ));
             return;
         }
         let install_name = viewer.install_name();
@@ -54865,16 +54843,13 @@ impl App {
                 .chain(resolved.server.args.iter().cloned())
                 .collect::<Vec<_>>()
                 .join(" ");
-            self.open_input_prompt(
-                InputPrompt::new(
-                    InputPurpose::McpConsent {
-                        command_id: command_id.to_string(),
-                    },
-                    format!("Allow {} to run:  {}", resolved.ext_id, spawn_line),
-                    "Enter to allow · Esc to cancel",
-                )
-                .with_value("allow"),
-            );
+            self.open_input_prompt(InputPrompt::confirm(
+                InputPurpose::McpConsent {
+                    command_id: command_id.to_string(),
+                },
+                format!("Allow {} to run:  {}", resolved.ext_id, spawn_line),
+                "Enter or Y to allow · Esc or N to cancel",
+            ));
             return;
         }
         // Collect the declared argument, if any, then run.
@@ -57061,6 +57036,19 @@ impl App {
         let Some(prompt) = self.input_prompt.as_mut() else {
             return;
         };
+        // A yes/no question (#855) has no field: letters answer it, and
+        // only unmodified ones (Shift aside), so a chord cannot.
+        if prompt.confirm {
+            let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
+            match key.code {
+                KeyCode::Enter => self.submit_input_prompt(),
+                KeyCode::Char('y' | 'Y') if plain => self.submit_input_prompt(),
+                KeyCode::Esc => self.close_input_prompt(),
+                KeyCode::Char('n' | 'N') if plain => self.close_input_prompt(),
+                _ => {}
+            }
+            return;
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => self.close_input_prompt(),
             (KeyCode::Enter, _) => self.submit_input_prompt(),
@@ -72893,8 +72881,10 @@ impl App {
             return;
         }
         // Confirm before trashing — Delete (or the context menu's Delete) must
-        // not remove files from a single action. Enter performs it; Esc keeps
-        // them. Files go to the OS Trash (recoverable), so the wording reflects that.
+        // not remove files from a single action. Enter or Y performs it; Esc
+        // or N keeps them, and there is no field to type a different answer
+        // into (#855). Files go to the OS Trash (recoverable), so the wording
+        // reflects that.
         use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
         let title = if total == 1 {
             let name = paths[0]
@@ -72905,14 +72895,11 @@ impl App {
         } else {
             format!("Move {total} items to Trash?")
         };
-        self.open_input_prompt(
-            InputPrompt::new(
-                InputPurpose::TreeDelete { paths },
-                title,
-                "Enter to trash · Esc to keep",
-            )
-            .with_value("trash"),
-        );
+        self.open_input_prompt(InputPrompt::confirm(
+            InputPurpose::TreeDelete { paths },
+            title,
+            "Enter or Y to trash · Esc or N to keep",
+        ));
     }
 
     /// The encoding `path`'s open tab decodes it with, in any group; UTF-8
