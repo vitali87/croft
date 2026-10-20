@@ -181,6 +181,11 @@ pub enum InputPurpose {
         name: String,
     },
     CreateTag,
+    /// Create Tag Here on a COMMITS row (#1627): the tag goes on `target`,
+    /// the clicked commit, rather than on HEAD.
+    CreateTagAt {
+        target: String,
+    },
     /// The optional message for tag `name` (#1582): one makes an annotated
     /// tag, none (Enter on a blank field) a lightweight one.
     CreateTagMessage {

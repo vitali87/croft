@@ -3566,6 +3566,99 @@ pub fn rebase_branch(root: &Path, branch: &str) -> Result<String, String> {
     run_mutation_keeping_conflicts(root, &["rebase", branch])
 }
 
+// --- Commit actions (the COMMITS graph's right-click menu, #1627) ---------
+
+/// Apply `hash` on top of HEAD (`git cherry-pick <hash>`). A conflict
+/// leaves `CHERRY_PICK_HEAD`, so Git: Continue / Skip / Abort take over.
+pub fn cherry_pick(root: &Path, hash: &str) -> Result<String, String> {
+    run_mutation_keeping_conflicts(root, &["cherry-pick", hash])
+}
+
+/// Commit the inverse of `hash` with git's own "Revert ..." message
+/// (`git revert --no-edit <hash>`); a conflict leaves `REVERT_HEAD`.
+pub fn revert_commit(root: &Path, hash: &str) -> Result<String, String> {
+    run_mutation_keeping_conflicts(root, &["revert", "--no-edit", hash])
+}
+
+/// Check out `hash` with no branch (`git switch --detach <hash>`).
+pub fn checkout_detached(root: &Path, hash: &str) -> Result<String, String> {
+    run_mutation(root, &["switch", "--detach", hash])
+}
+
+/// Create a lightweight tag at `target` (`git tag <name> <target>`).
+pub fn create_tag_at(root: &Path, name: &str, target: &str) -> Result<String, String> {
+    run_mutation(root, &["tag", name, target])
+}
+
+/// How far [`reset_to`] rewinds: HEAD only, HEAD and the index, or HEAD,
+/// the index and the working tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetMode {
+    Soft,
+    Mixed,
+    Hard,
+}
+
+impl ResetMode {
+    fn flag(self) -> &'static str {
+        match self {
+            ResetMode::Soft => "--soft",
+            ResetMode::Mixed => "--mixed",
+            ResetMode::Hard => "--hard",
+        }
+    }
+}
+
+/// Move the current branch to `hash` (`git reset --soft|--mixed|--hard`).
+pub fn reset_to(root: &Path, hash: &str, mode: ResetMode) -> Result<String, String> {
+    run_mutation(root, &["reset", "-q", mode.flag(), hash])
+}
+
+/// A snapshot of what a hard reset would throw away: HEAD and the branch
+/// it is on (empty when detached), the index (each entry's blob, so
+/// staging another hunk of an already-staged file changes it), the status
+/// of every changed or untracked path, and each such file's size and
+/// mtime, so a save to an already-modified file changes it too. A warned
+/// Reset --hard (#1627) is confirmed only while this is unchanged.
+pub fn worktree_fingerprint(root: &Path) -> String {
+    let head = run_git(root, &["rev-parse", "HEAD"]).unwrap_or_default();
+    let branch = run_git(root, &["symbolic-ref", "-q", "HEAD"]).unwrap_or_default();
+    let index = run_git(root, &["ls-files", "-s", "-z"]).unwrap_or_default();
+    // Not `run_git`: its trim would eat the first entry's leading status
+    // space (" M path"), and with it where that path starts.
+    let status = Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let top = repo_toplevel(root).unwrap_or_else(|| root.to_path_buf());
+    let mut out = format!("{head}\n{branch}\n{index}\n");
+    for entry in status.split('\0').filter(|e| !e.is_empty()) {
+        out.push_str(entry);
+        let path = entry.get(3..).unwrap_or(entry);
+        if let Ok(meta) = std::fs::metadata(top.join(path)) {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            out.push_str(&format!(" {} {mtime}", meta.len()));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// The full message of `hash` (`git log -1 --format=%B`), trimmed.
+pub fn commit_message(root: &Path, hash: &str) -> Result<String, String> {
+    run_git(root, &["log", "-1", "--format=%B", hash])
+        .map(|m| m.trim().to_string())
+        .map_err(|e| e.to_string())
+}
+
 // --- Remotes -------------------------------------------------------------
 
 /// A configured remote: its name and fetch URL, for the Remote submenu's

@@ -1583,6 +1583,26 @@ enum MenuAction {
     /// Status-bar indentation picker: rewrite existing leading indentation.
     /// `true` converts tabs to spaces, `false` converts spaces to tabs.
     ConvertIndentation(bool),
+    /// A COMMITS graph row's right-click menu (#1627): act on the clicked
+    /// commit, by full hash, with its short hash for the status line.
+    CommitAction {
+        action: CommitAction,
+        hash: String,
+        short: String,
+    },
+}
+
+/// What the COMMITS graph's right-click menu can do to a commit (#1627).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CommitAction {
+    CherryPick,
+    Revert,
+    CheckoutDetached,
+    CreateBranch,
+    CreateTag,
+    Reset(crate::git::ResetMode),
+    CopyHash,
+    CopyMessage,
 }
 
 /// Return the macOS-style keyboard shortcut hint to display on the right
@@ -5448,6 +5468,12 @@ pub struct App {
     /// The HEAD a warned Undo Last Commit (#1350) is armed for: a commit
     /// already on its upstream is undone on the second ask at that HEAD.
     undo_pushed_commit_armed: Option<String>,
+    /// What a warned Reset Current Branch to Here > Hard (#1627) is armed
+    /// for: the repo root, the commit, and the working tree's
+    /// [`crate::git::worktree_fingerprint`] when it warned. It runs on the
+    /// second ask only while all three still match, so work made since the
+    /// warning is warned about afresh.
+    reset_hard_armed: Option<(PathBuf, String, String)>,
     /// True while the "Discard All Changes" confirmation modal is up.
     pub pending_discard_all: bool,
     /// Drop Stash, picked but not yet confirmed (#1128).
@@ -6950,6 +6976,7 @@ impl App {
             build_diagnostics: std::collections::HashMap::new(),
             build_diag_files_by_pane: std::collections::HashMap::new(),
             undo_pushed_commit_armed: None,
+            reset_hard_armed: None,
             pending_discard_all: false,
             pending_stash_drop: None,
             pending_replace_all: None,
@@ -38688,6 +38715,11 @@ impl App {
                 let r = crate::git::create_tag(&self.scm_root(), &name, message);
                 self.run_scm_op("tag", r, "Created tag", "Create tag");
             }
+            InputPurpose::CreateTagAt { target } => {
+                self.close_input_prompt();
+                let r = crate::git::create_tag_at(&self.scm_root(), &value, &target);
+                self.run_scm_op("tag (at)", r, "Created tag", "Create tag");
+            }
             InputPurpose::DeleteRemoteTag { root, remote, name } => {
                 self.close_input_prompt();
                 if self.remote_tag_root_moved(&root) {
@@ -59722,6 +59754,18 @@ impl App {
                     self.open_minimap_menu(m.column, m.row);
                     return;
                 }
+                // A COMMITS graph row (#1627): the commit's actions.
+                if self.show_tree
+                    && self.sidebar_view == SidebarView::SourceControl
+                    && rect_contains(self.commit_graph.last_area, m.column, m.row)
+                    && !rect_contains(self.commit_graph.last_scrollbar, m.column, m.row)
+                    && let Some(commit) = self.commit_graph.commit_at(m.row)
+                {
+                    let menu = self.commit_graph_menu((m.column, m.row), commit);
+                    self.focus_pane(Pane::Tree);
+                    self.context_menu = Some(menu);
+                    return;
+                }
                 // A PROBLEMS diagnostic row: Fix with Navigator (#374).
                 // Offered whether or not a navigator is seated, like the
                 // CAPTURES ask: the menu model has no disabled state, and a
@@ -67137,6 +67181,167 @@ impl App {
                     self.editor.indentation_to_tabs();
                     self.status = String::from("Converted indentation to tabs");
                 }
+            }
+            MenuAction::CommitAction {
+                action,
+                hash,
+                short,
+            } => self.run_commit_action(action, &hash, &short),
+        }
+    }
+
+    /// The right-click menu of a COMMITS graph row (#1627), VS Code's
+    /// Source Control Graph menu: start a cherry-pick or revert from the
+    /// commit, check it out, branch, tag or reset there, or copy it.
+    fn commit_graph_menu(
+        &self,
+        origin: (u16, u16),
+        commit: &crate::git::GraphCommit,
+    ) -> ContextMenu {
+        use crate::git::ResetMode;
+        let item = |label: &str, action: CommitAction| MenuEntry::Item {
+            label: label.to_string(),
+            action: MenuAction::CommitAction {
+                action,
+                hash: commit.hash.clone(),
+                short: commit.short_hash.clone(),
+            },
+        };
+        let items = vec![
+            item("Cherry-Pick", CommitAction::CherryPick),
+            item("Revert", CommitAction::Revert),
+            MenuEntry::Separator,
+            item("Checkout (Detached)", CommitAction::CheckoutDetached),
+            item("Create Branch Here...", CommitAction::CreateBranch),
+            item("Create Tag Here...", CommitAction::CreateTag),
+            MenuEntry::Submenu {
+                label: String::from("Reset Current Branch to Here"),
+                items: vec![
+                    item(
+                        "Soft (keep changes staged)",
+                        CommitAction::Reset(ResetMode::Soft),
+                    ),
+                    item(
+                        "Mixed (keep changes unstaged)",
+                        CommitAction::Reset(ResetMode::Mixed),
+                    ),
+                    item(
+                        "Hard (discard changes)",
+                        CommitAction::Reset(ResetMode::Hard),
+                    ),
+                ],
+            },
+            MenuEntry::Separator,
+            item("Copy Commit Hash", CommitAction::CopyHash),
+            item("Copy Commit Message", CommitAction::CopyMessage),
+        ];
+        ContextMenu {
+            origin,
+            items,
+            selected: 0,
+            open_submenu: None,
+            submenu_selected: 0,
+            target_dir: self.tree.root.clone(),
+            crumb: None,
+            scroll: Default::default(),
+        }
+    }
+
+    /// Run one entry of [`App::commit_graph_menu`] on `hash`. A cherry-pick
+    /// or revert that conflicts stops like one started in a terminal, so
+    /// Git: Continue / Skip / Abort take it from there; a hard reset asks
+    /// first, the way Undo Last Commit does for a pushed commit.
+    fn run_commit_action(&mut self, action: CommitAction, hash: &str, short: &str) {
+        use crate::git::ResetMode;
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let root = self.scm_root();
+        if action != CommitAction::Reset(ResetMode::Hard) {
+            self.reset_hard_armed = None;
+        }
+        match action {
+            // Both commit, so signing and the commit hooks run: on the git
+            // worker, like a plain commit (#1153), not in the click.
+            CommitAction::CherryPick => {
+                let (hash, ok) = (hash.to_string(), format!("Cherry-picked {short}"));
+                self.spawn_git_net("cherry-pick", move || {
+                    let r = crate::git::cherry_pick(&root, &hash);
+                    Box::new(move |app: &mut App| {
+                        app.run_scm_op("cherry-pick", r, &ok, "Cherry-pick")
+                    })
+                });
+            }
+            CommitAction::Revert => {
+                let (hash, ok) = (hash.to_string(), format!("Reverted {short}"));
+                self.spawn_git_net("revert", move || {
+                    let r = crate::git::revert_commit(&root, &hash);
+                    Box::new(move |app: &mut App| app.run_scm_op("revert", r, &ok, "Revert"))
+                });
+            }
+            // A big checkout or a slow `post-checkout` hook would freeze
+            // the click, so this and reset run on the git worker too.
+            CommitAction::CheckoutDetached => {
+                let (hash, ok) = (hash.to_string(), format!("Checked out {short} (detached)"));
+                self.spawn_git_net("switch --detach", move || {
+                    let r = crate::git::checkout_detached(&root, &hash);
+                    Box::new(move |app: &mut App| {
+                        app.run_scm_op("switch --detach", r, &ok, "Checkout")
+                    })
+                });
+            }
+            CommitAction::CreateBranch => self.open_input_prompt(InputPrompt::new(
+                InputPurpose::CreateBranchFrom {
+                    base: hash.to_string(),
+                },
+                format!("Create Branch at {short}"),
+                "New branch name",
+            )),
+            CommitAction::CreateTag => self.open_input_prompt(InputPrompt::new(
+                InputPurpose::CreateTagAt {
+                    target: hash.to_string(),
+                },
+                format!("Create Tag at {short}"),
+                "Tag name (e.g. v1.0.0)",
+            )),
+            CommitAction::Reset(mode) => {
+                let armed = (mode == ResetMode::Hard).then(|| {
+                    (
+                        root.clone(),
+                        hash.to_string(),
+                        crate::git::worktree_fingerprint(&root),
+                    )
+                });
+                if armed.is_some() && self.reset_hard_armed != armed {
+                    self.reset_hard_armed = armed;
+                    let warning = format!(
+                        "Reset --hard to {short} discards every uncommitted change. Choose Hard again to reset anyway"
+                    );
+                    self.source_control.commit_feedback = Some(warning.clone());
+                    self.source_control.commit_feedback_is_error = true;
+                    self.status = warning;
+                    return;
+                }
+                self.reset_hard_armed = None;
+                let (hash, ok) = (hash.to_string(), format!("Reset to {short}"));
+                self.spawn_git_net("reset", move || {
+                    let r = crate::git::reset_to(&root, &hash, mode);
+                    Box::new(move |app: &mut App| app.run_scm_op("reset", r, &ok, "Reset"))
+                });
+            }
+            CommitAction::CopyHash => {
+                self.status = if copy_to_clipboard(hash) {
+                    format!("Copied commit hash {short}")
+                } else {
+                    String::from("Could not copy the commit hash to the clipboard")
+                };
+            }
+            CommitAction::CopyMessage => {
+                self.status = match crate::git::commit_message(&root, hash) {
+                    Ok(message) if copy_to_clipboard(&message) => {
+                        format!("Copied the message of {short}")
+                    }
+                    Ok(_) => String::from("Could not copy the commit message to the clipboard"),
+                    Err(e) => format!("Could not read the message of {short}: {e}"),
+                };
             }
         }
     }
