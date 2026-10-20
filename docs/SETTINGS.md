@@ -104,8 +104,8 @@ allowlist — appearance and editor/terminal behavior:
 `render_whitespace`, `rulers`, `word_based_suggestions`, `disable_inline_blame`, `disable_auto_close_pairs`, `disable_paste_reindent`,
 `disable_inline_values`, `disable_save_before_debug`, `disable_bracket_colors`, `disable_indent_guides`, `line_numbers`,
 `disable_inlay_hints`, `copy_on_select`, `disable_secret_redaction`, `disable_log_highlight`, `explorer_views`,
-`files_exclude`, `search_exclude`, `languages` (only its per-language
-editor keys; see below), `files_encoding`.
+`files_exclude`, `search_exclude`, `files_associations`, `languages` (only its
+per-language editor keys; see below), `files_encoding`.
 
 Everything else — `disabled_extensions`, `mcp_consented`, `disable_remote_offer`, `remote_offer_excluded_hosts`, `config_sync_excluded_hosts`, `config_sync_excluded_files`, `fleet_groups`, `code_scanning`, `lane_agent`,
 `mcp_tool_fingerprints`, `host_accents`, `notifications`, `screen_reader`, `screen_reader_command`, `codeql_cli_path`, `locale`, `terminal_multiline_paste_warning`, and any future key not explicitly
@@ -142,6 +142,7 @@ means the same thing whichever path reads it.
 | `terminal.integrated.copyOnSelection` | `copy_on_select` |
 | `files.exclude` | `files_exclude` (the globs set to `true`; a glob set to `false` becomes `!glob`, which takes it back from an earlier layer; `when` clauses are left out). VS Code reads a bare glob such as `build` from the workspace root, so it arrives anchored, as `/build`, and `scripts/build/` stays visible |
 | `search.exclude` | `search_exclude` (same) |
+| `files.associations` | `files_associations` (ids normalised, so `jsonc` becomes `json`; an entry naming a language croft has neither a grammar nor a server for is left out) |
 | `files.encoding` | `files_encoding` (when croft knows the encoding) |
 
 Keys croft honours only as user config (a terminal scrollback, say) are
@@ -227,6 +228,24 @@ Search adds what you type in "files to exclude" to these. With the box
 open, a `[x] project excludes: ...` row under it names the active globs;
 click it to search every folder for a while (VS Code's "Use Exclude
 Settings and Ignore Files"), and again to turn them back on.
+
+## File associations
+
+`files_associations` maps a glob to the language a file opens in (VS Code's
+`files.associations`), for templates and configs with an extension croft
+does not know, or knows as something else:
+
+```json
+{ "files_associations": { "*.tpl": "html", "**/templates/*.txt": "html", "*.json5": "json" } }
+```
+
+A glob without a `/` matches the file name; one with a `/` matches the path
+from the workspace root. When several match, a path glob beats a name glob
+and a longer glob beats a shorter one. Values are VS Code language ids
+(`html`, `typescriptreact`, `shellscript`); `plaintext` turns highlighting
+off. The language server follows the same choice. User and workspace
+entries merge glob by glob, the workspace winning. Open tabs follow a
+change, except one whose language was picked from the status bar.
 
 ## File encoding
 

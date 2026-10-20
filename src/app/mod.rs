@@ -3359,6 +3359,11 @@ pub struct App {
     /// The project's `files_exclude` globs (#1345), as last applied to the
     /// Explorer, so a settings reload re-lists the tree only on a change.
     files_exclude: Vec<String>,
+    /// The `files_associations` in effect (#1574), to tell a change.
+    files_associations: std::collections::BTreeMap<String, String>,
+    /// The workspace roots `files_associations` were installed for, so a
+    /// root added, removed or replaced gets them or loses them (#1574).
+    files_associations_roots: Vec<PathBuf>,
     /// The `files_encoding` default (#1432) as last applied, for a folder
     /// added to the workspace later.
     files_encoding: Option<crate::file_encoding::Charset>,
@@ -6332,6 +6337,8 @@ impl App {
             language_prefs: loaded_prefs.languages.clone(),
             copy_on_select: loaded_prefs.copy_on_select,
             files_exclude: Vec::new(),
+            files_associations: std::collections::BTreeMap::new(),
+            files_associations_roots: Vec::new(),
             files_encoding: None,
             log_highlight: !loaded_prefs.disable_log_highlight,
             secret_redaction: !loaded_prefs.disable_secret_redaction,
@@ -7119,6 +7126,7 @@ impl App {
         // The agent review queue as this workspace last left it (#345).
         let root = app.workspace_root().to_path_buf();
         app.apply_project_excludes(&loaded_prefs);
+        app.apply_file_associations(&loaded_prefs);
         app.apply_files_encoding(&loaded_prefs);
         app.watch_project_snippets();
         app.agent_ledger = app.load_agent_ledger(&root);
@@ -9114,7 +9122,9 @@ impl App {
             let Some(path) = tab.path.as_ref() else {
                 continue;
             };
-            if crate::lsp::Language::from_path(path).is_none() {
+            // `files_associations` count (#1574): a `.tpl` associated with
+            // HTML goes to the HTML server though its extension has none.
+            if crate::lsp::manager::path_to_language(path).is_none() {
                 continue;
             }
             if i != active && active_path.as_ref() == Some(path) {
@@ -65060,6 +65070,83 @@ impl App {
         }
     }
 
+    /// Apply `files_associations` (#1574): a file opens in the language a
+    /// glob names for it. Open tabs still in the language croft picked for
+    /// them follow a change; one whose language was picked by hand keeps it.
+    fn apply_file_associations(&mut self, p: &crate::prefs::Prefs) {
+        self.install_file_associations(p.files_associations.clone());
+    }
+
+    /// Install `map` for every workspace root (#1574), clearing it from a
+    /// root that left the workspace. Runs again when the roots change, so
+    /// a folder added gets the associations too. An open file whose
+    /// language server changes with them is closed on the old server; the
+    /// next sync opens it on the new one.
+    fn install_file_associations(&mut self, map: std::collections::BTreeMap<String, String>) {
+        let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
+        if map == self.files_associations && roots == self.files_associations_roots {
+            return;
+        }
+        let picked = |e: &crate::widgets::editor::Editor| {
+            let path = e.path.as_ref()?;
+            (!e.has_non_text_view()
+                && !e.language_picked_by_hand()
+                && e.language() == crate::highlight::lang_for_path(path))
+            .then(|| path.clone())
+        };
+        let following: Vec<PathBuf> = std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .filter_map(picked)
+            .collect();
+        let servers_before: Vec<(PathBuf, Option<crate::lsp::Language>)> = self
+            .lsp_last_seen
+            .keys()
+            .map(|p| (p.clone(), crate::lsp::manager::path_to_language(p)))
+            .collect();
+        let empty = std::collections::BTreeMap::new();
+        for gone in self
+            .files_associations_roots
+            .iter()
+            .filter(|r| !roots.contains(r))
+        {
+            crate::highlight::set_file_associations(gone, &empty);
+        }
+        for root in &roots {
+            crate::highlight::set_file_associations(root, &map);
+        }
+        self.files_associations = map;
+        self.files_associations_roots = roots;
+        let mut dropped_any = false;
+        for (path, before) in servers_before {
+            if crate::lsp::manager::path_to_language(&path) == before {
+                continue;
+            }
+            if let Some(lsp) = self.lsp.as_ref() {
+                lsp.close_doc(path.clone());
+            }
+            self.lsp_last_seen.remove(&path);
+            dropped_any |= self.lsp_diagnostics.remove(&path).is_some();
+            self.code_lens_requested.remove(&path);
+        }
+        if dropped_any {
+            self.rebuild_problems();
+            self.refresh_problems_badge();
+        }
+        for e in std::iter::once(&mut self.editor)
+            .chain(self.editor_layout.inactive_groups_mut())
+            .flat_map(|g| g.editors.iter_mut())
+        {
+            let Some(path) = e.path.clone().filter(|p| following.contains(p)) else {
+                continue;
+            };
+            let lang = crate::highlight::lang_for_path(&path);
+            if lang != e.language() {
+                e.set_language(lang);
+            }
+        }
+    }
+
     /// Apply `files_encoding` (#1432) to every folder of the workspace: the
     /// next file opened there without a BOM decodes in it. Open tabs keep
     /// the encoding they were decoded with, so a settings change never
@@ -65151,6 +65238,7 @@ impl App {
         self.auto_save_on_focus_change = p.auto_save_on_focus_change;
         self.copy_on_select = p.copy_on_select;
         self.apply_project_excludes(p);
+        self.apply_file_associations(p);
         self.apply_files_encoding(p);
         // The ssh-pane offer's switches apply live like every other pref
         // here (#364); turning it off also takes down an offer on screen.
@@ -66063,6 +66151,7 @@ impl App {
         self.sync_workspace_fanout();
         self.refresh_workspace_title();
         self.save_workspace_folders();
+        self.install_file_associations(self.files_associations.clone());
         self.status = format!("Added folder: {}", path.display());
     }
 
@@ -66078,6 +66167,7 @@ impl App {
             return;
         }
         self.tree.remove_root(&path);
+        self.install_file_associations(self.files_associations.clone());
         crate::file_encoding::set_workspace_default(&path, None);
         self.snippets = load_all_snippets(self.roots.iter());
         // The removed folder's review queue goes with it (#345). Its rows
@@ -67000,7 +67090,7 @@ impl App {
                 self.disable_minimap_image();
             }
             MenuAction::SetLanguage(lang) => {
-                self.editor.set_language(lang);
+                self.editor.pick_language(lang);
                 self.status = format!("Language Mode: {}", self.editor.language_label());
             }
             MenuAction::SetLineEnding(eol) => {

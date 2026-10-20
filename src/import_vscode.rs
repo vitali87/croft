@@ -218,6 +218,38 @@ fn as_string(v: &Value) -> Option<Value> {
     v.as_str().filter(|s| !s.is_empty()).map(Value::from)
 }
 
+/// VS Code's `files.associations` object (#1574): each glob with the
+/// language id it names, kept where croft can highlight or serve that
+/// language (or it is `plaintext`). An entry naming a language croft has
+/// neither is left out, so the file keeps the language croft picks for it.
+fn as_associations(v: &Value) -> Option<Value> {
+    let obj = v.as_object()?;
+    let kept: Map<String, Value> = obj
+        .iter()
+        .filter_map(|(glob, id)| {
+            let id = crate::highlight::normalised_language_id(id.as_str()?);
+            crate::highlight::known_language_id(&id).then(|| (glob.clone(), Value::from(id)))
+        })
+        .collect();
+    (!kept.is_empty()).then_some(Value::Object(kept))
+}
+
+/// The `files.associations` entries [`as_associations`] leaves out, one
+/// report line each, so the import lists every language croft lacks.
+fn rejected_associations(v: &Value) -> Vec<String> {
+    let Some(obj) = v.as_object() else {
+        return Vec::new();
+    };
+    obj.iter()
+        .filter(|(_, id)| {
+            id.as_str().is_none_or(|id| {
+                !crate::highlight::known_language_id(&crate::highlight::normalised_language_id(id))
+            })
+        })
+        .map(|(glob, id)| format!("files.associations {glob} (croft has no language {id})"))
+        .collect()
+}
+
 /// `files.encoding` (#1432), kept as written when croft can decode it, so
 /// an id croft has no encoding for is reported rather than imported.
 fn as_encoding(v: &Value) -> Option<Value> {
@@ -340,6 +372,11 @@ const SETTINGS: &[SettingMap] = &[
         vscode: "search.exclude",
         croft: "search_exclude",
         convert: as_enabled_globs,
+    },
+    SettingMap {
+        vscode: "files.associations",
+        croft: "files_associations",
+        convert: as_associations,
     },
     SettingMap {
         vscode: "files.encoding",
@@ -834,6 +871,16 @@ pub fn map_settings(
                 &mut warnings,
             );
             continue;
+        }
+        if key == "files.associations" {
+            let rejected = rejected_associations(value);
+            if !rejected.is_empty() {
+                let none_kept = as_associations(value).is_none();
+                unmapped.extend(rejected);
+                if none_kept {
+                    continue;
+                }
+            }
         }
         match SETTINGS.iter().find(|m| m.vscode == key) {
             Some(map) => match (map.convert)(value) {
@@ -1829,6 +1876,56 @@ mod tests {
                 "{key} is not a field of Prefs, so croft would ignore it"
             );
         }
+    }
+
+    /// #1574: `files.associations` maps to `files_associations`, with
+    /// VS Code's ids normalised and a language croft has neither a grammar
+    /// nor a server for left out.
+    #[test]
+    fn files_associations_keep_the_languages_croft_knows() {
+        let mut report = Report::default();
+        convert_settings(
+            &json!({
+                "files.associations": {
+                    "*.tpl": "html",
+                    "*.json5": "jsonc",
+                    "**/templates/*.txt": "jinja",
+                    "*.log": "plaintext"
+                }
+            }),
+            &mut report,
+        );
+        assert_eq!(
+            report.settings["files_associations"],
+            json!({ "*.tpl": "html", "*.json5": "json", "*.log": "plaintext" })
+        );
+        let parsed: crate::prefs::Prefs = serde_json::from_value(serde_json::Value::Object(
+            report.settings.clone().into_iter().collect(),
+        ))
+        .unwrap();
+        assert_eq!(parsed.files_associations["*.tpl"], "html");
+        assert_eq!(
+            report.unmapped_settings,
+            vec![String::from(
+                "files.associations **/templates/*.txt (croft has no language \"jinja\")"
+            )]
+        );
+    }
+
+    #[test]
+    fn files_associations_naming_nothing_croft_knows_import_nothing() {
+        let mut report = Report::default();
+        convert_settings(
+            &json!({ "files.associations": { "*.j2": "jinja" } }),
+            &mut report,
+        );
+        assert!(!report.settings.contains_key("files_associations"));
+        assert_eq!(
+            report.unmapped_settings,
+            vec![String::from(
+                "files.associations *.j2 (croft has no language \"jinja\")"
+            )]
+        );
     }
 
     /// #1345: `files.exclude` / `search.exclude` carry the globs set to

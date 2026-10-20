@@ -3362,6 +3362,9 @@ pub struct Editor {
     /// instead of opening their own. Any other edit, undo or redo ends it.
     remote_undo_group: Option<u64>,
     lang: Option<LangKind>,
+    /// The language came from "Change Language Mode" (#1574), not from the
+    /// file's name, so a `files_associations` change leaves it alone.
+    language_by_hand: bool,
     /// Explicit indentation preference set from the status-bar pill. `None`
     /// falls back to the language default (2 spaces for YAML, 4 otherwise);
     /// `Some` pins spaces-vs-tabs and width for newly typed indentation.
@@ -3816,6 +3819,7 @@ impl Editor {
             last_edit_kind: None,
             remote_undo_group: None,
             lang: None,
+            language_by_hand: false,
             indent_override: None,
             detected_indent: None,
             editorconfig: crate::editorconfig::Props::default(),
@@ -5784,6 +5788,7 @@ impl Editor {
         self.write_protected = write_protection(path).is_some();
         self.overwrite_protected_armed = false;
         self.lang = crate::highlight::lang_for_path(path);
+        self.language_by_hand = false;
         self.wrap_override = None;
         // Folds are line numbers into the OLD file. A preview tab is reused for
         // the next single-click, so without this the incoming file arrives with
@@ -5917,6 +5922,7 @@ impl Editor {
         // edit_seq (conflicts, git marks) must not survive into this tab.
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.lang = None;
+        self.language_by_hand = false;
         self.scroll = 0;
         self.cursor_row = 0;
         self.cursor_col = 0;
@@ -5988,6 +5994,7 @@ impl Editor {
         self.provenance = crate::provenance::Provenance::new();
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.lang = None;
+        self.language_by_hand = false;
         self.scroll = 0;
         self.cursor_row = 0;
         self.cursor_col = 0;
@@ -6067,6 +6074,7 @@ impl Editor {
         self.provenance = crate::provenance::Provenance::new();
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.lang = None;
+        self.language_by_hand = false;
         self.scroll = 0;
         self.cursor_row = 0;
         self.cursor_col = 0;
@@ -6132,6 +6140,7 @@ impl Editor {
         self.provenance = crate::provenance::Provenance::new();
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.lang = None;
+        self.language_by_hand = false;
         self.scroll = 0;
         self.cursor_row = 0;
         self.cursor_col = 0;
@@ -6184,6 +6193,7 @@ impl Editor {
         // edit_seq (conflicts, git marks) must not survive into this tab.
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.lang = None;
+        self.language_by_hand = false;
         self.scroll = 0;
         self.cursor_row = 0;
         self.cursor_col = 0;
@@ -6246,6 +6256,7 @@ impl Editor {
         // edit_seq (conflicts, git marks) must not survive into this tab.
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.lang = None;
+        self.language_by_hand = false;
         self.scroll = 0;
         self.cursor_row = 0;
         self.cursor_col = 0;
@@ -6311,6 +6322,7 @@ impl Editor {
         // edit_seq (conflicts, git marks) must not survive into this tab.
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.lang = None;
+        self.language_by_hand = false;
         self.scroll = 0;
         self.cursor_row = 0;
         self.cursor_col = 0;
@@ -6540,6 +6552,7 @@ impl Editor {
         self.provenance = crate::provenance::Provenance::new();
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.lang = None;
+        self.language_by_hand = false;
         self.scroll = 0;
         self.cursor_row = 0;
         self.cursor_col = 0;
@@ -6637,6 +6650,7 @@ impl Editor {
         self.provenance = crate::provenance::Provenance::new();
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.lang = None;
+        self.language_by_hand = false;
         self.scroll = 0;
         self.cursor_row = 0;
         self.cursor_col = 0;
@@ -6741,6 +6755,7 @@ impl Editor {
         // edit_seq (conflicts, git marks) must not survive into this tab.
         self.edit_seq = self.edit_seq.wrapping_add(1);
         self.lang = None;
+        self.language_by_hand = false;
         self.scroll = 0;
         self.cursor_row = 0;
         self.cursor_col = 0;
@@ -8499,7 +8514,21 @@ impl Editor {
     /// the LSP separately off the changed language.
     pub fn set_language(&mut self, lang: Option<LangKind>) {
         self.lang = lang;
+        self.language_by_hand = false;
         self.recompute_highlights();
+    }
+
+    /// [`Self::set_language`] for a language the user picked (#1574): the
+    /// tab keeps it when `files_associations` change, even when it is the
+    /// language the file's name would give it anyway.
+    pub fn pick_language(&mut self, lang: Option<LangKind>) {
+        self.set_language(lang);
+        self.language_by_hand = true;
+    }
+
+    /// Whether the language was picked by hand ([`Self::pick_language`]).
+    pub fn language_picked_by_hand(&self) -> bool {
+        self.language_by_hand
     }
 
     /// Re-read the open file and decode it with `enc` (status-bar "Reopen with

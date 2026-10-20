@@ -130,6 +130,7 @@ pub const WORKSPACE_ALLOWED_KEYS: &[&str] = &[
     "explorer_views",
     "files_exclude",
     "search_exclude",
+    "files_associations",
     // Per-language overrides (#1440), which hold only the editor settings
     // in `crate::prefs::LANGUAGE_KEYS`; any other key in a block is dropped.
     "languages",
@@ -940,6 +941,38 @@ mod tests {
         let mac = load_merged_from(&user, Some(&root), "macos");
         assert_eq!(mac.prefs.theme, "dark");
         assert!(mac.prefs.format_on_save);
+    }
+
+    /// #1574: a workspace's `files_associations` merge with the user's,
+    /// the workspace winning per glob, and `.vscode/settings.json`'s
+    /// `files.associations` count too.
+    #[test]
+    fn file_associations_merge_per_glob_with_the_workspace_winning() {
+        let (_tmp, user, root) = setup();
+        write(
+            &user.join("config.json"),
+            r#"{"files_associations":{"*.tpl":"html","*.tmpl":"go"}}"#,
+        );
+        write(
+            &root.join(".croft/config.json"),
+            r#"{"files_associations":{"*.tpl":"xml"}}"#,
+        );
+        write(
+            &root.join(".vscode/settings.json"),
+            r#"{"files.associations":{"*.j2":"html"}}"#,
+        );
+        let m = load_merged_from(&user, Some(&root), "linux");
+        let got: Vec<(&str, &str)> = m
+            .prefs
+            .files_associations
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("*.j2", "html"), ("*.tmpl", "go"), ("*.tpl", "xml")]
+        );
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
     }
 
     #[test]

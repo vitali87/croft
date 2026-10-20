@@ -930,6 +930,148 @@ fn a_language_block_applies_to_files_that_share_another_language_s_grammar() {
     }
 }
 
+/// #1574: a workspace's `files_associations` open `card.tpl` as HTML, and
+/// again after the tab is closed and the file reopened.
+#[test]
+fn an_associated_template_opens_in_its_language_every_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/config.json"),
+        r#"{ "files_associations": { "*.tpl": "html" } }"#,
+    )
+    .unwrap();
+    let mut app = app_with_open_file(tmp.path(), "card.tpl", "<h1>{{ title }}</h1>\n");
+    assert_eq!(
+        app.editor.language(),
+        Some(crate::highlight::LangKind::Html)
+    );
+    assert_eq!(app.editor.language_label(), "HTML");
+    app.editor.close_active();
+    app.editor
+        .open_pinned(&tmp.path().join("card.tpl"))
+        .unwrap();
+    assert_eq!(
+        app.editor.language(),
+        Some(crate::highlight::LangKind::Html)
+    );
+}
+
+/// #1574: a settings change re-languages the open tabs croft chose a
+/// language for, and leaves one whose language was picked by hand.
+#[test]
+fn a_new_association_relanguages_open_tabs_but_not_a_hand_picked_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.tpl", "<b>x</b>\n");
+    assert_eq!(app.editor.language(), None, "no association yet");
+    std::fs::write(tmp.path().join("b.tpl"), "<i>y</i>\n").unwrap();
+    app.editor.open_pinned(&tmp.path().join("b.tpl")).unwrap();
+    app.editor
+        .pick_language(Some(crate::highlight::LangKind::Xml));
+    let mut prefs = crate::prefs::Prefs::default();
+    prefs
+        .files_associations
+        .insert(String::from("*.tpl"), String::from("html"));
+    app.apply_file_associations(&prefs);
+    let langs: Vec<_> = app
+        .editor
+        .editors
+        .iter()
+        .map(|e| (e.path.clone().unwrap(), e.language()))
+        .collect();
+    assert!(
+        langs.contains(&(
+            tmp.path().join("a.tpl"),
+            Some(crate::highlight::LangKind::Html)
+        )),
+        "{langs:?}"
+    );
+    assert!(
+        langs.contains(&(
+            tmp.path().join("b.tpl"),
+            Some(crate::highlight::LangKind::Xml)
+        )),
+        "{langs:?}"
+    );
+}
+
+/// #1574: a language picked by hand stays picked even when it is the one
+/// the file's name gave it, so a later association does not replace it.
+#[test]
+fn a_hand_picked_language_matching_the_inferred_one_survives_an_association() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.tpl", "<b>x</b>\n");
+    assert_eq!(app.editor.language(), None);
+    app.dispatch_menu_action(MenuAction::SetLanguage(None), tmp.path().to_path_buf());
+    let mut prefs = crate::prefs::Prefs::default();
+    prefs
+        .files_associations
+        .insert(String::from("*.tpl"), String::from("html"));
+    app.apply_file_associations(&prefs);
+    assert_eq!(app.editor.language(), None, "Plain Text was picked by hand");
+}
+
+/// #1574: an association that moves an open file to another language
+/// server closes it on the old one, so the next sync opens it on the new.
+#[test]
+fn an_association_change_reopens_the_file_on_its_new_server() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "fn main() {}\n");
+    let rs = app.editor.path.clone().unwrap();
+    std::fs::write(tmp.path().join("b.go"), "package b\n").unwrap();
+    let go = tmp.path().join("b.go");
+    app.lsp_last_seen.insert(rs.clone(), 3);
+    app.lsp_last_seen.insert(go.clone(), 4);
+    let mut prefs = crate::prefs::Prefs::default();
+    prefs
+        .files_associations
+        .insert(String::from("*.rs"), String::from("python"));
+    app.apply_file_associations(&prefs);
+    assert!(
+        !app.lsp_last_seen.contains_key(&rs),
+        "rerouted file is resent"
+    );
+    assert_eq!(app.lsp_last_seen.get(&go), Some(&4), "untouched file stays");
+}
+
+/// #1574: a folder added to the workspace gets the associations, and one
+/// removed loses them, though the settings themselves did not change.
+#[test]
+fn associations_follow_workspace_folders_in_and_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let extra = tempfile::tempdir().unwrap();
+    let extra_root = extra.path().canonicalize().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "x\n");
+    let mut prefs = crate::prefs::Prefs::default();
+    prefs
+        .files_associations
+        .insert(String::from("*.tpl"), String::from("html"));
+    app.apply_file_associations(&prefs);
+    let card = extra_root.join("card.tpl");
+    assert_eq!(crate::highlight::associated_language_id(&card), None);
+    app.add_workspace_folder(extra_root.clone());
+    assert_eq!(
+        crate::highlight::associated_language_id(&card).as_deref(),
+        Some("html")
+    );
+    app.remove_workspace_folder(extra_root.clone());
+    assert_eq!(crate::highlight::associated_language_id(&card), None);
+}
+
+/// #1574 negative: with no association, an unknown extension stays Plain
+/// Text and a known one keeps its language.
+#[test]
+fn without_an_association_files_keep_the_built_in_languages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app_with_open_file(tmp.path(), "card.tpl", "<h1>x</h1>\n");
+    assert_eq!(app.editor.language(), None);
+    let app = app_with_open_file(tmp.path(), "main.rs", "fn main() {}\n");
+    assert_eq!(
+        app.editor.language(),
+        Some(crate::highlight::LangKind::Rust)
+    );
+}
+
 #[test]
 fn settings_view_toggle_flips_the_setting_and_stays_open() {
     let tmp = tempfile::tempdir().unwrap();
