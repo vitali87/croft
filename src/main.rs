@@ -72,6 +72,7 @@ mod media;
 mod mem_relief;
 mod merge;
 mod merge_editor;
+mod net;
 mod notebook;
 mod notebook_kernel;
 mod notifications;

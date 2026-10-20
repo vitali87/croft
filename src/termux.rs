@@ -54,7 +54,7 @@ fn looks_like_ttf(bytes: &[u8]) -> bool {
 /// sfnt-flavored font file.
 fn download_font() -> anyhow::Result<Vec<u8>> {
     use std::io::Read;
-    let resp = ureq::get(FONT_URL).call()?;
+    let resp = crate::net::get(FONT_URL).call()?;
     let mut bytes = Vec::new();
     resp.into_reader()
         .take(MAX_FONT_BYTES)

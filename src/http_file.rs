@@ -387,7 +387,7 @@ impl HttpResponse {
 /// transport failure (refused, DNS, TLS, timeout) is `Err`.
 pub fn send(req: &ResolvedRequest, timeout: Duration) -> Result<HttpResponse, String> {
     use std::io::Read;
-    let agent = ureq::AgentBuilder::new()
+    let agent = crate::net::builder(&req.url)
         .timeout(timeout)
         .redirects(4)
         .build();

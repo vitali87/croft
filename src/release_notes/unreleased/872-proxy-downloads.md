@@ -1,0 +1,2 @@
+fix: Language server, debugger, theme and update downloads work behind a TLS-inspecting corporate proxy: croft now goes through HTTPS_PROXY (honouring NO_PROXY) and trusts the system's certificate store and SSL_CERT_FILE as well as its built-in roots.
+fix: A failed language server download says why in the status bar and in OUTPUT › Server Provisioning (an HTTP status, a refused connection, a timeout or an untrusted certificate) instead of only "download error".
