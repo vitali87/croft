@@ -39,6 +39,7 @@ mod emmet;
 mod file_encoding;
 mod file_ref;
 mod fleet;
+mod gh;
 mod ghostty;
 mod git;
 mod gradient;

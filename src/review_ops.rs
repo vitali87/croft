@@ -104,22 +104,30 @@ fn flatten_pages(json: &str) -> String {
     serde_json::Value::Array(all).to_string()
 }
 
-/// The PR number for the branch checked out in `root`.
-fn pr_number(program: &str, root: &Path) -> Option<String> {
-    gh(
+/// The PR number for the branch checked out in `root`, if it has one; or
+/// why gh could not tell (#917).
+fn pr_number(program: &str, root: &Path) -> Result<Option<String>, String> {
+    match gh(
         program,
         root,
         &["pr", "view", "--json", "number", "--jq", ".number"],
         None,
-    )
-    .ok()
-    .map(|n| n.trim().to_string())
-    .filter(|n| !n.is_empty())
+    ) {
+        Ok(n) => Ok(Some(n.trim().to_string()).filter(|n| !n.is_empty())),
+        Err(why) if crate::gh::unusable(&why) => {
+            Err(format!("Could not find this branch's PR: {why}"))
+        }
+        Err(_) => Ok(None),
+    }
 }
 
 /// gh's first stderr line, which names the problem (scope, rate limit, a
-/// line outside the diff) better than anything croft could say.
+/// line outside the diff) better than anything croft could say; or that
+/// gh has no account signed in (#917).
 fn gh_error(out: &std::process::Output) -> String {
+    if crate::gh::signed_out(out.status) {
+        return String::from(crate::gh::SIGNED_OUT);
+    }
     let err = String::from_utf8_lossy(&out.stderr);
     err.trim().lines().next().unwrap_or("gh failed").to_string()
 }
@@ -163,7 +171,8 @@ fn gh(program: &str, root: &Path, args: &[&str], stdin: Option<&str>) -> Result<
         } else {
             Stdio::null()
         });
-    let mut child = spawn_retrying_busy(&mut cmd).map_err(|e| format!("could not run gh: {e}"))?;
+    let mut child =
+        spawn_retrying_busy(&mut cmd).map_err(|e| crate::gh::spawn_error(&e, Some(root)))?;
     if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
         let _ = pipe.write_all(input.as_bytes());
     }
@@ -257,8 +266,10 @@ pub fn run(program: &str, root: &Path, job: Job) -> Outcome {
             }
         }
         Job::LoadThreads { path, rel } => {
-            let Some(number) = pr_number(program, root) else {
-                return Outcome::NoPr;
+            let number = match pr_number(program, root) {
+                Ok(Some(number)) => number,
+                Ok(None) => return Outcome::NoPr,
+                Err(why) => return Outcome::Failed(why),
             };
             let endpoint = format!("repos/{{owner}}/{{repo}}/pulls/{number}/comments");
             let json = match gh(program, root, &["api", &endpoint, "--paginate"], None) {
@@ -314,8 +325,10 @@ pub fn run(program: &str, root: &Path, job: Job) -> Outcome {
             }
         }
         Job::ExportPreview { comments, notes } => {
-            let Some(number) = pr_number(program, root) else {
-                return Outcome::NoPr;
+            let number = match pr_number(program, root) {
+                Ok(Some(number)) => number,
+                Ok(None) => return Outcome::NoPr,
+                Err(why) => return Outcome::Failed(why),
             };
             // Which comments GitHub will take inline, so one folded into the
             // summary is no surprise after posting.
@@ -494,5 +507,39 @@ mod tests {
             out,
             Outcome::Failed("Could not change the thread: HTTP 422: Unprocessable".into())
         );
+    }
+
+    /// #917: a missing or signed-out gh is named as such, not reported as
+    /// a branch without a PR or as "No such file or directory".
+    #[test]
+    fn a_missing_or_signed_out_gh_says_how_to_fix_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let signed_out = tmp.path().join("signed-out-gh");
+        std::fs::write(&signed_out, "#!/bin/sh\necho 'gh auth login' >&2\nexit 4\n").unwrap();
+        std::fs::set_permissions(&signed_out, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for (gh, why) in [
+            (tmp.path().join("gh"), crate::gh::MISSING),
+            (signed_out, crate::gh::SIGNED_OUT),
+        ] {
+            let gh = gh.display().to_string();
+            let load = Job::LoadThreads {
+                path: tmp.path().join("a.rs"),
+                rel: "a.rs".into(),
+            };
+            assert_eq!(
+                run(&gh, tmp.path(), load),
+                Outcome::Failed(format!("Could not find this branch's PR: {why}"))
+            );
+            let reply = Job::Reply {
+                number: "7".into(),
+                thread: 42,
+                text: "fixed".into(),
+            };
+            assert_eq!(
+                run(&gh, tmp.path(), reply),
+                Outcome::Failed(format!("Reply failed: {why}"))
+            );
+        }
     }
 }

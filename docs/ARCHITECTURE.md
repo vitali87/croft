@@ -21,6 +21,7 @@ src/
 ├── clipboard.rs         native macOS clipboard read/write (NSPasteboard) with pbpaste fallback
 ├── command_history.rs    durable cross-session shell command history as JSONL under `~/.config/croft/command_history.jsonl` (cwd / exit / duration), read off OSC 133 marks with no shell hooks; Ctrl+Shift+H opens the search popup
 ├── fleet.rs              running one command across N ssh hosts and diffing the results, behind "Terminal: Fleet Run"; the fleet must be named (`hosts: command`, `*` for explicit broadcast)
+├── gh.rs                what croft says when the GitHub CLI is missing or signed out: one shared message for every `gh` caller (`croft pr`, PR review, code scanning, CodeQL), plus the installed-and-signed-in check `croft pr` runs before taking the terminal (offline `gh auth token` first)
 ├── ghostty.rs           Ghostty config keybinds (setup-ghostty): re-emit every croft chord as its CSI-u sequence so Ghostty's own binds don't swallow them
 ├── docx.rs               docx/odt read-only preview: walks the zip+XML and emits markdown (headings, runs, lists, pipe tables, extracted images) for the markdown renderer; structure fidelity, not layout; 50MB source cap
 ├── file_ref.rs          `path:line[:col]` references detected in terminal text (rustc / grep / pytest / Python-traceback forms); backs Cmd/Ctrl+click-to-jump from any terminal pane with zero per-tool problem-matcher config

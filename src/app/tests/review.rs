@@ -1628,6 +1628,30 @@ esac
     });
 }
 
+/// #917: a PR review that cannot load because gh is missing or signed out
+/// says how to fix that, not "No such file or directory (os error 2)".
+#[test]
+fn a_pr_review_without_a_usable_gh_says_how_to_fix_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let signed_out = tmp.path().join("signed-out-gh");
+    std::fs::write(&signed_out, "#!/bin/sh\necho 'gh auth login' >&2\nexit 4\n").unwrap();
+    std::fs::set_permissions(&signed_out, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for (gh, why) in [
+        (tmp.path().join("gh"), crate::gh::MISSING),
+        (signed_out, crate::gh::SIGNED_OUT),
+    ] {
+        app.review_gh = gh.display().to_string();
+        app.submit_pr_number("42");
+        crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "gh pr view", || {
+            app.poll_pr_gh();
+            app.pr_gh.is_none()
+        });
+        assert_eq!(app.status, format!("Could not load PR 42: {why}"));
+    }
+}
+
 /// Load x/y#42 through `gh` and wait for its viewed-state read to settle.
 fn open_synced_pr(app: &mut App) {
     app.submit_pr_number("42");

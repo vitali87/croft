@@ -32887,8 +32887,18 @@ impl App {
                     "--jq",
                     ".[].language",
                 ]);
-                let out = crate::review_ops::output_retrying_busy(&mut cmd)
-                    .map_err(|e| format!("could not run gh: {e}"))?;
+                let out = crate::review_ops::output_retrying_busy(&mut cmd).map_err(|e| {
+                    format!(
+                        "Could not look up {repo}'s CodeQL databases: {}",
+                        crate::gh::spawn_error(&e, None)
+                    )
+                })?;
+                if crate::gh::signed_out(out.status) {
+                    return Err(format!(
+                        "Could not look up {repo}'s CodeQL databases: {}",
+                        crate::gh::SIGNED_OUT
+                    ));
+                }
                 if !out.status.success() {
                     return Err(format!(
                         "{repo} has no CodeQL databases on GitHub: {}",
@@ -32924,13 +32934,18 @@ impl App {
             .stderr(std::process::Stdio::piped());
         let out = crate::review_ops::spawn_retrying_busy(&mut cmd)
             .and_then(std::process::Child::wait_with_output)
-            .map_err(|e| format!("could not run gh: {e}"))?;
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                format!("Download failed: {}", crate::gh::spawn_error(&e, None))
+            })?;
         if !out.status.success() {
             let _ = std::fs::remove_file(&tmp);
-            return Err(format!(
-                "Download failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+            let why = if crate::gh::signed_out(out.status) {
+                std::borrow::Cow::Borrowed(crate::gh::SIGNED_OUT)
+            } else {
+                String::from_utf8_lossy(&out.stderr)
+            };
+            return Err(format!("Download failed: {}", why.trim()));
         }
         let result = Self::extract_codeql_zip(cache, &tmp, &name);
         let _ = std::fs::remove_file(&tmp);
@@ -71426,15 +71441,19 @@ impl App {
 
     /// Run `gh` with `args` in the active workspace root. Its stdout, or
     /// the first line of what it said went wrong: GitHub's own message when
-    /// the API sent one, else gh's.
+    /// the API sent one, else gh's; or that gh is missing or signed out.
     fn run_gh(&self, args: &[String]) -> Result<String, String> {
+        let root = self.active_workspace_root();
         let mut cmd = std::process::Command::new(&self.gh_program);
-        cmd.args(args).current_dir(self.active_workspace_root());
+        cmd.args(args).current_dir(&root);
         let out = crate::review_ops::output_retrying_busy(&mut cmd)
-            .map_err(|e| format!("could not run gh: {e}"))?;
+            .map_err(|e| crate::gh::spawn_error(&e, Some(root.as_path())))?;
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         if out.status.success() {
             return Ok(stdout);
+        }
+        if crate::gh::signed_out(out.status) {
+            return Err(String::from(crate::gh::SIGNED_OUT));
         }
         let api_message = serde_json::from_str::<serde_json::Value>(&stdout)
             .ok()
@@ -71526,7 +71545,10 @@ impl App {
                     .current_dir(&root)
                     .stdin(std::process::Stdio::null());
                 let out = crate::review_ops::output_retrying_busy(&mut cmd)
-                    .map_err(|e| format!("could not run gh: {e}"))?;
+                    .map_err(|e| crate::gh::spawn_error(&e, Some(root.as_path())))?;
+                if crate::gh::signed_out(out.status) {
+                    return Err(String::from(crate::gh::SIGNED_OUT));
+                }
                 Ok(String::from_utf8_lossy(&out.stdout).into_owned())
             };
             let result = (|| {
@@ -71640,7 +71662,10 @@ impl App {
                         .current_dir(&root)
                         .stdin(std::process::Stdio::null());
                     let out = crate::review_ops::output_retrying_busy(&mut cmd)
-                        .map_err(|e| format!("could not run gh: {e}"))?;
+                        .map_err(|e| crate::gh::spawn_error(&e, Some(root.as_path())))?;
+                    if crate::gh::signed_out(out.status) {
+                        return Err(String::from(crate::gh::SIGNED_OUT));
+                    }
                     if !out.status.success() {
                         return Err(format!("analysis #{} could not be downloaded", a.id));
                     }
