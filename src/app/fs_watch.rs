@@ -51,6 +51,9 @@ pub struct FsDrain {
     /// the ledger asks "what content changed", and a chmod is not a change
     /// a reviewer needs to see.
     pub changed_files: BTreeSet<PathBuf>,
+    /// The `changed_files` that were created or moved into place, which the
+    /// language servers hear about as created rather than changed (#908).
+    pub created_files: BTreeSet<PathBuf>,
     /// The watcher reported a RESCAN: it overflowed its queue and events
     /// were dropped, so `changed_files` is a lower bound rather than the
     /// whole story (#345). A ledger that quietly showed a short list would
@@ -277,6 +280,9 @@ impl FsWatch {
                         && !path.is_dir()
                     {
                         out.changed_files.insert(path.clone());
+                        if arrives {
+                            out.created_files.insert(path.clone());
+                        }
                     }
                     if let Some(dir) =
                         affected_dir_for_event(path, &self.watch_root, &self.canon_watch_root)
@@ -355,7 +361,8 @@ impl FsWatch {
                         stack.push(path);
                     }
                 } else if ft.is_file() && !noise(&path) {
-                    out.changed_files.insert(path);
+                    out.changed_files.insert(path.clone());
+                    out.created_files.insert(path);
                 }
             }
         }

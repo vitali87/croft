@@ -15493,14 +15493,16 @@ impl App {
     /// Apply an LSP rename `WorkspaceEdit` (already normalised to per-file
     /// char-indexed spans). Open tabs, in any split group, are edited
     /// in-memory as one undo step and left dirty; closed files are rewritten
-    /// on disk (the fs watcher refreshes the tree). Returns (files touched,
-    /// occurrences replaced).
+    /// on disk (the fs watcher refreshes the tree) and the servers are told
+    /// at once (#908), so the next Go to Definition sees the new name.
+    /// Returns (files touched, occurrences replaced).
     fn apply_rename_edits(
         &mut self,
         files: &[(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)],
     ) -> Result<(usize, usize)> {
         let mut file_count = 0;
         let mut occ_count = 0;
+        let mut written = std::collections::BTreeSet::new();
         for (path, edits) in files {
             if edits.is_empty() {
                 continue;
@@ -15517,9 +15519,11 @@ impl App {
                 let mut lines: Vec<String> = content.split('\n').map(str::to_string).collect();
                 occ_count += crate::widgets::editor::apply_span_edits_to_lines(&mut lines, edits);
                 std::fs::write(path, lines.join("\n"))?;
+                written.insert(path.clone());
             }
             file_count += 1;
         }
+        self.forward_disk_changes_to_lsp(&written, &Default::default());
         Ok((file_count, occ_count))
     }
 
@@ -16799,8 +16803,10 @@ impl App {
             // them here would silently give a multi-root workspace an empty
             // review queue for every folder but the first (#345).
             drain.changed_files.extend(d.changed_files);
+            drain.created_files.extend(d.created_files);
             drain.rescan_dropped_events |= d.rescan_dropped_events;
         }
+        self.forward_disk_changes_to_lsp(&drain.changed_files, &drain.created_files);
         if drain.dirs_changed {
             self.refresh_git_status_debounced();
             if drain.finder_relevant {
@@ -16846,6 +16852,27 @@ impl App {
         }
         let polled = self.poll_filesystem_changes();
         drain.got_any || init_changed || polled
+    }
+
+    /// Tell the language servers about files that changed on disk (#908):
+    /// a server like ty watches nothing itself, so a `git checkout` or an
+    /// agent's edit to a file no tab holds stayed stale in it.
+    fn forward_disk_changes_to_lsp(
+        &mut self,
+        changed: &std::collections::BTreeSet<PathBuf>,
+        created: &std::collections::BTreeSet<PathBuf>,
+    ) {
+        let Some(lsp) = self.lsp.as_mut().filter(|_| !changed.is_empty()) else {
+            return;
+        };
+        let changes = changed
+            .iter()
+            .map(|path| match created.contains(path) {
+                true => (path.clone(), lsp_types::FileChangeType::CREATED),
+                false => (path.clone(), lsp_types::FileChangeType::CHANGED),
+            })
+            .collect();
+        lsp.did_change_watched_files(changes);
     }
 
     fn cycle_focus(&mut self) {

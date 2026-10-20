@@ -154,7 +154,8 @@ src/
 │   ├── registry.rs      ServerRegistry (language -> ordered servers); built from the bundled manifests in assets/extensions/* plus user-installed extensions, instead of hardcoding configs
 │   ├── runtime.rs       Tokio runtime owned by the LSP manager
 │   ├── semantic_cache.rs content-keyed disk cache of semantic-token batches at `~/.croft/sem-cache`; a batch is applied or stored only while its `seq` still matches the live buffer, so a stale reply is never decoded over rewritten lines
-│   └── trace.rs         raw JSON-RPC trace tee (OUTPUT panel RPC toggle): TraceRead/TraceWrite wrap a server's stdio and, only while tracing is enabled, reassemble Content-Length frames each way into the server's "<name> (trace)" channel (Zed's RPC-messages equivalent)
+│   ├── trace.rs         raw JSON-RPC trace tee (OUTPUT panel RPC toggle): TraceRead/TraceWrite wrap a server's stdio and, only while tracing is enabled, reassemble Content-Length frames each way into the server's "<name> (trace)" channel (Zed's RPC-messages equivalent)
+│   └── watched_files.rs the globs each server registers for `workspace/didChangeWatchedFiles` (#908); the manager forwards the workspace watcher's file events to every server whose globs cover them, less the documents it has open
 └── widgets/
     ├── mod.rs
     ├── command_palette.rs   VS Code Command Palette (Cmd/Ctrl+Shift+P): a static command registry + fuzzy-filtered picker; the App's run_command dispatches each entry
