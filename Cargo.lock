@@ -644,6 +644,7 @@ dependencies = [
  "ratatui",
  "rayon",
  "regex",
+ "regex-syntax",
  "resvg",
  "ring",
  "rusqlite",
