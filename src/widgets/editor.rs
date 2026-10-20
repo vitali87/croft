@@ -8479,6 +8479,10 @@ impl Editor {
             let live = self.lines.join("\n");
             rebase_history(&mut self.undo_stack, &live, splice.clone());
             rebase_history(&mut self.redo_stack, &live, splice);
+            // The peer's text now sits in every state held: a large paste
+            // over a deep history must not lift it past the cap.
+            self.trim_undo_stack();
+            self.trim_redo_stack();
         }
         self.pin_on_edit();
         // The pre-edit text, for bookmarks to be diffed against afterwards.
@@ -11137,6 +11141,20 @@ impl Editor {
             drop += 1;
         }
         self.undo_stack.drain(..drop);
+    }
+
+    /// Drop the redo steps furthest from the live text while the history
+    /// holds more than [`UNDO_BYTES_LIMIT`] bytes, as a peer's edit carried
+    /// into every state can make it (#919).
+    fn trim_redo_stack(&mut self) {
+        let held = self.undo_stack.iter().chain(&self.redo_stack);
+        let mut total: usize = held.map(|s| s.bytes).sum();
+        let mut drop = 0;
+        while drop < self.redo_stack.len() && total > UNDO_BYTES_LIMIT {
+            total -= self.redo_stack[drop].bytes;
+            drop += 1;
+        }
+        self.redo_stack.drain(..drop);
     }
 
     /// Undo and redo steps held, and the bytes of text they hold, for the
@@ -28737,6 +28755,30 @@ mod tests {
         assert!(e.redo());
         assert_eq!(e.lines[0], "def f():");
         assert_eq!(e.lines[1], "    return 1  # A-edit");
+    }
+
+    /// #919: a peer's edit lands in every held state, so a large paste over
+    /// a deep history is trimmed back under the cap, not kept many times.
+    #[test]
+    fn a_peers_large_edit_keeps_the_history_under_its_cap() {
+        let mut e = editor_with("x");
+        for _ in 0..40 {
+            e.insert_str("y");
+            e.break_undo_coalescing();
+        }
+        let paste = "z".repeat(50 * 1024);
+        e.apply_peer_span_edit(&span((0, 0), (0, 0), &paste));
+        let (steps, bytes) = e.undo_history_size();
+        assert!(
+            bytes <= UNDO_BYTES_LIMIT,
+            "{steps} steps hold {bytes} bytes"
+        );
+        assert!(e.undo_stack.len() >= UNDO_MIN_STEPS);
+        assert!(e.undo());
+        assert!(
+            e.lines[0].starts_with(&paste),
+            "the kept steps took the paste"
+        );
     }
 
     fn span(start: (usize, usize), end: (usize, usize), new_text: &str) -> TextSpanEdit {

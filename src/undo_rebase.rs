@@ -75,12 +75,39 @@ fn map_offset(runs: &[(usize, usize, usize)], x: usize, start: bool) -> usize {
     gap_start
 }
 
-/// The lines `target` and `source` share, as `(target offset, source
-/// offset, length)` byte ranges in order.
+/// The text `target` and `source` share, as `(target offset, source
+/// offset, length)` byte ranges in order: the lines they share, and in the
+/// lines the step changed, the characters it left alone, so an edit between
+/// two changes on one line keeps its place.
 fn line_runs(target: &str, source: &str) -> Vec<(usize, usize, usize)> {
+    use similar::DiffTag;
     let diff = similar::TextDiff::configure()
         .timeout(STEP_DIFF_TIMEOUT)
         .diff_lines(target, source);
+    let mut runs = Vec::new();
+    for (tag, (t0, t1), (s0, s1)) in byte_ops(&diff) {
+        match tag {
+            DiffTag::Equal => runs.push((t0, s0, t1 - t0)),
+            DiffTag::Replace => {
+                let chars = similar::TextDiff::configure()
+                    .timeout(STEP_DIFF_TIMEOUT)
+                    .diff_chars(&target[t0..t1], &source[s0..s1]);
+                let equal = byte_ops(&chars)
+                    .into_iter()
+                    .filter(|&(tag, ..)| tag == DiffTag::Equal);
+                runs.extend(equal.map(|(_, (t, e), (s, _))| (t0 + t, s0 + s, e - t)));
+            }
+            _ => {}
+        }
+    }
+    runs
+}
+
+/// One diff op with the byte ranges it covers in the old and new texts.
+type ByteOp = (similar::DiffTag, (usize, usize), (usize, usize));
+
+/// `diff`'s ops with the byte ranges they cover in its old and new texts.
+fn byte_ops(diff: &similar::TextDiff<'_, '_, str>) -> Vec<ByteOp> {
     let offsets = |lens: &mut dyn Iterator<Item = usize>| -> Vec<usize> {
         std::iter::once(0)
             .chain(lens.scan(0, |sum, n| {
@@ -93,11 +120,9 @@ fn line_runs(target: &str, source: &str) -> Vec<(usize, usize, usize)> {
     let new = offsets(&mut diff.iter_new_slices().map(str::len));
     diff.ops()
         .iter()
-        .filter_map(|op| match op.as_tag_tuple() {
-            (similar::DiffTag::Equal, o, n) => {
-                Some((old[o.start], new[n.start], old[o.end] - old[o.start]))
-            }
-            _ => None,
+        .map(|op| {
+            let (tag, o, n) = op.as_tag_tuple();
+            (tag, (old[o.start], old[o.end]), (new[n.start], new[n.end]))
         })
         .collect()
 }
@@ -178,6 +203,18 @@ mod tests {
         let at = after.find("b = x").unwrap() + 4;
         let got = rebase(before, after, &splice(at, 1, "z")).unwrap();
         assert_eq!(apply(before, &got), "let a = x;\nlet b = z;\nlet c = x;");
+    }
+
+    /// A step that changed two places on one line left the text between
+    /// them alone, and a peer's edit there keeps its place instead of being
+    /// dropped (so undo would bring the deleted text back).
+    #[test]
+    fn an_edit_between_two_changes_on_one_line_maps_exactly() {
+        let before = "a x middle x z";
+        let after = "a y middle y z";
+        let at = after.find("idd").unwrap();
+        let got = rebase(before, after, &splice(at, 3, "")).unwrap();
+        assert_eq!(apply(before, &got), "a x mle x z");
     }
 
     /// Text the step wrote does not exist in the older state: deleting it
