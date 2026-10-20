@@ -16810,8 +16810,9 @@ impl App {
         // `touched_open_file` only tracks the ACTIVE tab; a background tab's
         // file change still arrives as a watcher event (got_any), so sweep
         // every tab whenever any event lands. The sweep is stamp-based, so
-        // a benign Access/Metadata event that didn't move mtime+len is a
-        // no-op and won't clobber selection or reload spuriously.
+        // a benign Metadata event that didn't move mtime+len is a no-op and
+        // won't clobber selection or reload spuriously. Read-only Access
+        // events never get here: `FsWatch::drain` drops them (#898).
         if drain.got_any {
             self.reload_open_file_after_external_change();
             // An open diff view follows the file the same way a buffer does
