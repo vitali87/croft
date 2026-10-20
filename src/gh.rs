@@ -77,11 +77,29 @@ pub fn check_ready(program: &str) -> Result<(), String> {
     if succeeds(program, &["auth", "token"])? || env_token() {
         return Ok(());
     }
-    if succeeds(program, &["auth", "status"])? {
+    if any_host_signed_in(program)? {
         Ok(())
     } else {
         Err(String::from(SIGNED_OUT))
     }
+}
+
+/// Whether `gh auth status` finds a working account on any host. It exits 1
+/// when an account on any host has a problem (`gh auth status --help`), so a
+/// stale token for one host failed it with another signed in; a host it
+/// says is logged in is enough here, and a PR on one that is not fails
+/// later with gh's own message.
+fn any_host_signed_in(program: &str) -> Result<bool, String> {
+    let mut cmd = Command::new(program);
+    cmd.args(["auth", "status"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = crate::review_ops::spawn_retrying_busy(&mut cmd)
+        .and_then(|child| child.wait_with_output())
+        .map_err(|e| spawn_error(&e, None))?;
+    let says = |b: &[u8]| String::from_utf8_lossy(b).contains("Logged in to");
+    Ok(out.status.success() || says(&out.stdout) || says(&out.stderr))
 }
 
 #[cfg(test)]
@@ -123,6 +141,33 @@ mod tests {
         assert_eq!(check_ready(&gh.display().to_string()), Ok(()));
         let asked = std::fs::read_to_string(&log).unwrap();
         assert!(asked.starts_with("auth token\n"), "offline first: {asked}");
+    }
+
+    /// #917: `gh auth status` fails when any host's account has a problem,
+    /// so one stale host must not read as signed out while another host is
+    /// logged in; with no host logged in it is signed out. Asked directly:
+    /// [`check_ready`] would take a token in the environment first.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_host_beside_a_signed_in_one_is_ready() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = |name: &str, status: &str| {
+            let gh = dir.path().join(name);
+            let script = format!(
+                "#!/bin/sh\n[ \"$2\" = token ] && exit 1\nprintf '%s\\n' {status}\nexit 1\n"
+            );
+            std::fs::write(&gh, script).unwrap();
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            gh.display().to_string()
+        };
+        let mixed = fake(
+            "mixed",
+            "'X Failed to log in to github.com account old' 'Logged in to ghe.example.com account me'",
+        );
+        assert_eq!(any_host_signed_in(&mixed), Ok(true));
+        let stale = fake("stale", "'X Failed to log in to github.com account old'");
+        assert_eq!(any_host_signed_in(&stale), Ok(false));
     }
 
     #[test]

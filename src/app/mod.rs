@@ -43865,8 +43865,27 @@ impl App {
             Some((status, stdout)) if status.success() => {
                 String::from_utf8_lossy(&stdout).trim().to_string()
             }
-            _ => {
-                self.status = String::from("No PR for this branch — check it out first");
+            // A gh that is missing or signed out says how to fix it, as the
+            // review tab does (#917), not that the branch has no PR.
+            failed => {
+                let why = match failed {
+                    Some((status, _)) => {
+                        crate::gh::signed_out(status).then(|| String::from(crate::gh::SIGNED_OUT))
+                    }
+                    // No output: gh did not start, or ran past the budget.
+                    None => std::process::Command::new(&self.review_gh)
+                        .arg("--version")
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .err()
+                        .map(|e| crate::gh::spawn_error(&e, Some(root))),
+                };
+                self.status = match why {
+                    Some(why) => format!("Could not find this branch's PR: {why}"),
+                    None => String::from("No PR for this branch — check it out first"),
+                };
                 return None;
             }
         };
