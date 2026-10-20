@@ -100,12 +100,18 @@ pub fn own_path(dir: &Path, root: &Path) -> PathBuf {
 /// croft's of the same pid, so a later launch still finds it. `None` when
 /// it could not be moved: it is then left where it is.
 pub fn move_aside(own: &Path) -> Option<PathBuf> {
+    free_path_beside(own).filter(|aside| std::fs::rename(own, aside).is_ok())
+}
+
+/// A name of its own beside this croft's backup at `own`, free now: one a
+/// later launch reads as a dead croft's, so what is saved there is
+/// restored by it (#1593). `None` when no such name is free.
+pub fn free_path_beside(own: &Path) -> Option<PathBuf> {
     let pid = std::process::id();
     (0..1000u64)
         .map(|n| own.with_file_name(format!("{pid}-{n}.json")))
-        .filter(|aside| aside.as_path() != own)
-        .find(|aside| std::fs::symlink_metadata(aside).is_err())
-        .filter(|aside| std::fs::rename(own, aside).is_ok())
+        .filter(|path| path.as_path() != own)
+        .find(|path| std::fs::symlink_metadata(path).is_err())
 }
 
 /// When process `pid` started, in whole seconds since the epoch, or `None`
@@ -330,6 +336,7 @@ mod tests {
                     scroll_col: 0,
                     dirty: true,
                     unsaved_text: Some(String::from("xalpha")),
+                    sheet_cells: Vec::new(),
                 },
                 disk_stamp: Some((SystemTime::UNIX_EPOCH, 6)),
             }],

@@ -1,0 +1,1 @@
+fix: Python: Remote Attach (`"request": "attach"` with `connect`, or `host`/`port`) to a process started with `python -m debugpy --listen` or `debugpy.listen()` now works: croft talks to that port directly, as VS Code does, instead of putting its own debugpy adapter in front of it, so breakpoints stop and Pause pauses. The `listen` form of attach still runs croft's adapter.

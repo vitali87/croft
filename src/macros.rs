@@ -15,6 +15,10 @@
 //! completion popups, and vim's own state machine, none of which a
 //! command-level replay reproduces faithfully.
 //!
+//! A terminal paste (bracketed paste, a middle click, Cmd+V where the
+//! terminal handles it) reaches croft as one paste event, not keys, so it is
+//! a step of its own, [`Step::Paste`], and replays as a paste (#1464).
+//!
 //! **What it deliberately does not record.** Recording control itself (so a
 //! macro cannot contain its own `q`), and anything typed while the focus is
 //! not the editor — a macro that replayed terminal input or window management
@@ -34,6 +38,10 @@ pub enum Step {
     Text { text: String },
     /// Any other key: a named code plus its modifier bits.
     Key { code: String, mods: u8 },
+    /// A terminal paste, replayed as a paste rather than typed: its
+    /// newlines must not pick up auto-indent, and it is one undo step,
+    /// as the original was (#1464).
+    Paste { text: String },
     /// A step kind this build does not know, from a macros.json written by a
     /// newer croft. Without a catch-all, serde fails the WHOLE file on one
     /// unknown tag, so a single future step would make every register
@@ -83,6 +91,15 @@ impl<'de> serde::Deserialize<'de> for Step {
                     text: text.to_string(),
                 })
             }
+            "Paste" => {
+                let text = obj
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| D::Error::missing_field("text"))?;
+                Ok(Step::Paste {
+                    text: text.to_string(),
+                })
+            }
             "Key" => {
                 let code = obj
                     .get("code")
@@ -129,6 +146,12 @@ impl serde::Serialize for Step {
                 st.serialize_field("text", text)?;
                 st.end()
             }
+            Step::Paste { text } => {
+                let mut st = s.serialize_struct("Step", 2)?;
+                st.serialize_field("kind", "Paste")?;
+                st.serialize_field("text", text)?;
+                st.end()
+            }
             Step::Key { code, mods } => {
                 let mut st = s.serialize_struct("Step", 3)?;
                 st.serialize_field("kind", "Key")?;
@@ -151,6 +174,14 @@ impl Step {
         let code = parse_code(code)?;
         Some(KeyEvent::new(code, KeyModifiers::from_bits_truncate(*mods)))
     }
+}
+
+/// One thing a replay feeds back: a key through `handle_key`, or a paste
+/// through `handle_paste`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Replay {
+    Key(KeyEvent),
+    Paste(String),
 }
 
 /// A named recording. `steps` is replayed in order; an empty macro is legal
@@ -187,26 +218,52 @@ impl Macro {
         }
     }
 
-    /// The key events this macro replays, in order. Steps naming a key this
-    /// build does not know are skipped, not fatal.
-    pub fn key_events(&self) -> Vec<KeyEvent> {
+    /// Append a terminal paste as a step of its own (#1464). An empty
+    /// paste changes nothing, so it records nothing.
+    pub fn push_paste(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.steps.push(Step::Paste {
+                text: text.to_string(),
+            });
+        }
+    }
+
+    /// What this macro replays, in order. Steps naming a key this build does
+    /// not know are skipped, not fatal.
+    pub fn replay_steps(&self) -> Vec<Replay> {
         let mut out = Vec::new();
         for step in &self.steps {
             match step {
                 Step::Text { text } => {
                     for c in text.chars() {
-                        out.push(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+                        out.push(Replay::Key(KeyEvent::new(
+                            KeyCode::Char(c),
+                            KeyModifiers::NONE,
+                        )));
                     }
                 }
                 Step::Key { .. } => {
                     if let Some(k) = step.to_key_event() {
-                        out.push(k);
+                        out.push(Replay::Key(k));
                     }
                 }
+                Step::Paste { text } => out.push(Replay::Paste(text.clone())),
                 Step::Unknown(_) => {}
             }
         }
         out
+    }
+
+    /// The keys among [`Macro::replay_steps`].
+    #[cfg(test)]
+    pub fn key_events(&self) -> Vec<KeyEvent> {
+        self.replay_steps()
+            .into_iter()
+            .filter_map(|r| match r {
+                Replay::Key(k) => Some(k),
+                Replay::Paste(_) => None,
+            })
+            .collect()
     }
 
     /// Total keys a replay will feed, for the step budget.
@@ -214,7 +271,7 @@ impl Macro {
         self.steps
             .iter()
             .map(|s| match s {
-                Step::Text { text } => text.chars().count(),
+                Step::Text { text } | Step::Paste { text } => text.chars().count().max(1),
                 Step::Key { .. } => 1,
                 Step::Unknown(_) => 0,
             })
@@ -529,5 +586,45 @@ mod tests {
             "a save must not treat an unparsable store as empty and wipe it"
         );
         assert!(load(&path).is_empty(), "but a read degrades to empty");
+    }
+
+    /// #1464: a paste is a step of its own, stored as `Paste` with its text
+    /// whole, and it round-trips through the store.
+    #[test]
+    fn a_paste_step_has_its_own_shape_and_round_trips() {
+        let mut m = Macro::default();
+        m.push_key(ch('a'));
+        m.push_paste("x\n  y");
+        m.push_key(ch('b'));
+        assert_eq!(
+            m.steps,
+            vec![
+                Step::Text { text: "a".into() },
+                Step::Paste {
+                    text: "x\n  y".into()
+                },
+                Step::Text { text: "b".into() },
+            ],
+            "the paste splits the typing around it"
+        );
+        assert_eq!(
+            serde_json::to_string(&m.steps[1]).unwrap(),
+            r#"{"kind":"Paste","text":"x\n  y"}"#
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("macros.json");
+        save_register(&path, "p", m.clone()).unwrap();
+        assert_eq!(load(&path).get("p"), Some(&m));
+        assert_eq!(m.len(), 7, "the budget counts the paste's characters too");
+    }
+
+    /// #1464 negative: a `Paste` that lost its text is a corrupt store, not
+    /// a step from the future, and an empty paste records nothing.
+    #[test]
+    fn a_malformed_paste_is_corrupt_and_an_empty_one_is_not_recorded() {
+        assert!(serde_json::from_str::<Step>(r#"{"kind":"Paste"}"#).is_err());
+        let mut m = Macro::default();
+        m.push_paste("");
+        assert!(m.is_empty());
     }
 }

@@ -620,6 +620,151 @@ fn black_theme_sidebar_titles_are_chipless_brand_headers() {
     assert_eq!(buf[(remote.x + 2, remote.y)].fg, rgb_color(PANEL_TITLE_FG));
 }
 
+/// #1583: a German catalog for the frame's own titles, as a translator
+/// would write it.
+const CHROME_DE: &str = r#"{
+    "EXPLORER": "ERKUNDER",
+    "OUTLINE": "GLIEDERUNG",
+    "TIMELINE": "ZEITACHSE",
+    "SOURCE CONTROL": "QUELLCODEVERWALTUNG",
+    "PROBLEMS": "PROBLEME",
+    "OUTPUT": "AUSGABE",
+    "TERMINAL": "KONSOLE",
+    "Command Palette — Esc to close, ↑/↓ to navigate, Enter to run": "Befehlspalette — Esc schließt",
+    "UNSAVED CHANGES": "NICHT GESPEICHERT",
+    "This tab has unsaved changes:": "Dieser Tab ist nicht gespeichert:",
+    "DISCARD CHANGES?": "ÄNDERUNGEN VERWERFEN?",
+    "This will overwrite your local changes from HEAD.": "Lokale Änderungen werden überschrieben."
+}"#;
+
+/// Render `app` at 140x50 with `catalog` active and return the screen.
+fn screen_with_catalog(app: &mut App, catalog: &str) -> String {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 50)).unwrap();
+    crate::i18n::with_test_catalog(catalog, || term.draw(|f| app.render(f)).unwrap());
+    screen_text(&term)
+}
+
+/// #1583: the side bar and panel titles were literals drawn without `tr`,
+/// so a catalog entry for them changed nothing.
+#[test]
+fn the_side_bar_and_panel_titles_come_from_the_catalog() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A file is open, so the editor area is not the welcome page, whose
+    // release highlights can name these titles in English.
+    std::fs::write(tmp.path().join("a.txt"), "x\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("a.txt")).unwrap();
+    for view in [ExplorerView::Outline, ExplorerView::Timeline] {
+        if !app.explorer_views.is_visible(view) {
+            app.toggle_explorer_view(view);
+        }
+    }
+    let screen = screen_with_catalog(&mut app, CHROME_DE);
+    for want in [
+        " ERKUNDER ",
+        "GLIEDERUNG",
+        "ZEITACHSE",
+        " PROBLEME ",
+        " AUSGABE ",
+        " KONSOLE ",
+    ] {
+        assert!(screen.contains(want), "{want:?} missing:\n{screen}");
+    }
+    for gone in [" EXPLORER ", " PROBLEMS ", " OUTPUT ", " TERMINAL "] {
+        assert!(!screen.contains(gone), "{gone:?} still drawn:\n{screen}");
+    }
+}
+
+/// #1583: the Source Control view's title.
+#[test]
+fn the_source_control_title_comes_from_the_catalog() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_view = SidebarView::SourceControl;
+    let screen = screen_with_catalog(&mut app, CHROME_DE);
+    assert!(screen.contains("QUELLCODEVERWALTUNG"), "{screen}");
+    assert!(!screen.contains("SOURCE CONTROL"), "{screen}");
+}
+
+/// #1583: the Command Palette's title line.
+#[test]
+fn the_palette_title_comes_from_the_catalog() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_command_palette();
+    let screen = screen_with_catalog(&mut app, CHROME_DE);
+    assert!(
+        screen.contains(" Befehlspalette — Esc schließt "),
+        "{screen}"
+    );
+    assert!(
+        !screen.contains("Command Palette — Esc to close"),
+        "{screen}"
+    );
+}
+
+/// #1583: the unsaved-changes and discard prompts' titles and text.
+#[test]
+fn the_unsaved_and_discard_prompts_come_from_the_catalog() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "x = 1\n");
+    app.pending_unsaved = Some(UnsavedExit::CloseTab { idx: 0, path: None });
+    let screen = screen_with_catalog(&mut app, CHROME_DE);
+    assert!(screen.contains(" NICHT GESPEICHERT "), "{screen}");
+    assert!(
+        screen.contains("Dieser Tab ist nicht gespeichert:"),
+        "{screen}"
+    );
+    assert!(!screen.contains("UNSAVED CHANGES"), "{screen}");
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.pending_discard = Some(PendingDiscard {
+        rel_path: String::from("a.txt"),
+        untracked: false,
+        staged: false,
+    });
+    let screen = screen_with_catalog(&mut app, CHROME_DE);
+    assert!(screen.contains(" ÄNDERUNGEN VERWERFEN? "), "{screen}");
+    assert!(
+        screen.contains("Lokale Änderungen werden überschrieben."),
+        "{screen}"
+    );
+    assert!(!screen.contains("DISCARD CHANGES?"), "{screen}");
+}
+
+/// #1583: a panel tab's click target is as wide as its translated label,
+/// measured in cells: a CJK label is twice as wide as its char count, and
+/// the next tab starts after it rather than on top of it.
+#[test]
+fn a_translated_panel_tab_is_clickable_across_its_whole_label() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    screen_with_catalog(
+        &mut app,
+        r#"{"PROBLEMS": "問題", "OUTPUT": "AUSGABE-UND-PROTOKOLL"}"#,
+    );
+    let problems = app.problems_tab_rect;
+    let output = app.output_tab_rect;
+    assert_eq!(problems.width, 6, "' 問題 ' is six cells wide");
+    assert_eq!(output.x, problems.x + problems.width + 1);
+    assert_eq!(output.width, " AUSGABE-UND-PROTOKOLL ".len() as u16);
+    left_click(&mut app, output.x + output.width - 2, output.y);
+    assert_eq!(app.bottom_panel_tab, BottomPanelTab::Output);
+}
+
+/// #1583 negative: with no entry for them the titles stay English, and a
+/// tab's click target keeps its English width.
+#[test]
+fn titles_without_a_catalog_entry_stay_english() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let screen = screen_with_catalog(&mut app, r#"{"Move Line Up": "Zeile nach oben"}"#);
+    for want in [" EXPLORER ", " PROBLEMS ", " OUTPUT ", " TERMINAL "] {
+        assert!(screen.contains(want), "{want:?} missing:\n{screen}");
+    }
+    assert_eq!(app.output_tab_rect.width, " OUTPUT ".len() as u16);
+}
+
 #[test]
 fn black_theme_remote_header_buttons_are_near_white_icons() {
     use crate::gradient::{PANEL_TITLE_FG, rgb_color};
@@ -1368,6 +1513,181 @@ fn the_settings_editor_flips_a_setting_into_the_user_layer_and_applies_it() {
     assert_eq!(row.layer, crate::config_layers::LayerKind::User);
 }
 
+/// #1655: the user `config.json` the Settings editor test app reads.
+fn user_config(cfg: &std::path::Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(cfg.join("config.json")).unwrap()).unwrap()
+}
+
+/// #1655: the selected Settings editor row.
+fn selected_setting(app: &App) -> crate::settings_editor::Row {
+    app.settings_editor
+        .as_ref()
+        .unwrap()
+        .selected_row()
+        .cloned()
+        .unwrap()
+}
+
+/// #1655: Del removes a toggled setting from `config.json`, where toggling it
+/// back only wrote the default value explicitly, and the row returns to
+/// `default`. Other keys in the file stay.
+#[test]
+fn del_resets_a_toggled_setting_and_drops_its_key() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        cfg.path().join("config.json"),
+        "{\n  \"auto_save_on_focus_change\": false,\n  \"copy_on_select\": true\n}\n",
+    )
+    .unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "auto save on focus change");
+    assert_eq!(
+        selected_setting(&app).layer,
+        crate::config_layers::LayerKind::User
+    );
+    app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
+        .unwrap();
+    let written = user_config(cfg.path());
+    assert!(
+        written.get("auto_save_on_focus_change").is_none(),
+        "{written}"
+    );
+    assert_eq!(written["copy_on_select"], serde_json::json!(true));
+    let row = selected_setting(&app);
+    assert_eq!(row.key, "auto_save_on_focus_change");
+    assert_eq!(row.layer, crate::config_layers::LayerKind::Default);
+    assert!(app.status.contains("reset"), "{}", app.status);
+}
+
+/// #1655: a number setting, which Enter could only overwrite, resets too,
+/// and the live session takes the default again.
+#[test]
+fn del_resets_a_number_setting_to_its_default() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        cfg.path().join("config.json"),
+        "{ \"terminal_scrollback\": 5000, \"auto_save\": true }",
+    )
+    .unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "terminal scrollback");
+    app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
+        .unwrap();
+    let written = user_config(cfg.path());
+    assert!(written.get("terminal_scrollback").is_none(), "{written}");
+    let default = serde_json::to_value(crate::prefs::Prefs::default()).unwrap();
+    assert_eq!(selected_setting(&app).value, default["terminal_scrollback"]);
+    assert!(app.auto_save, "the other key still applies");
+}
+
+/// #1655: resetting the user value of a key the workspace also sets leaves
+/// the workspace value in force, with the row naming the workspace.
+#[test]
+fn resetting_the_user_value_leaves_the_workspace_one_in_force() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        cfg.path().join("config.json"),
+        "{ \"copy_on_select\": false }",
+    )
+    .unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(
+        tmp.path().join(".croft/config.json"),
+        "{ \"copy_on_select\": true }",
+    )
+    .unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "copy on select");
+    app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
+        .unwrap();
+    assert!(user_config(cfg.path()).get("copy_on_select").is_none());
+    let row = selected_setting(&app);
+    assert_eq!(row.layer, crate::config_layers::LayerKind::Workspace);
+    assert_eq!(row.value, serde_json::json!(true));
+    let ws = std::fs::read_to_string(tmp.path().join(".croft/config.json")).unwrap();
+    assert!(
+        ws.contains("copy_on_select"),
+        "the workspace layer is untouched: {ws}"
+    );
+}
+
+/// #1655 negative: Del on a setting the target layer does not set writes
+/// nothing (no file is created, another layer's file is untouched) and says
+/// so, rather than failing silently.
+#[test]
+fn del_on_a_setting_the_layer_does_not_set_writes_nothing() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "copy on select");
+    app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!cfg.path().join("config.json").exists());
+    assert!(app.status.contains("not set"), "{}", app.status);
+
+    std::fs::write(
+        cfg.path().join("config.json"),
+        "{ \"copy_on_select\": true }",
+    )
+    .unwrap();
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        !tmp.path().join(".croft/config.json").exists(),
+        "the workspace layer has nothing to reset"
+    );
+    assert_eq!(
+        user_config(cfg.path())["copy_on_select"],
+        serde_json::json!(true),
+        "and the user layer is not the target"
+    );
+}
+
+/// #1655: a row whose value differs from croft's default carries a dot,
+/// whichever layer set it, and the footer names Del reset. A value set
+/// explicitly to its default carries none (negative).
+#[test]
+fn the_settings_editor_marks_changed_rows_and_shows_del_reset() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        cfg.path().join("config.json"),
+        "{ \"auto_save\": true, \"auto_save_on_focus_change\": false }",
+    )
+    .unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "auto save");
+    let buf = render_buf(&mut app);
+    let lines: Vec<String> = (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect();
+    let line_of = |needle: &str| {
+        lines
+            .iter()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} not drawn:\n{}", lines.join("\n")))
+            .clone()
+    };
+    assert!(line_of("Esc close").contains("Del reset"));
+    let changed = lines
+        .iter()
+        .find(|l| l.contains("auto save ") && !l.contains("focus") && !l.contains("> auto"))
+        .cloned()
+        .unwrap_or_default();
+    assert!(changed.contains("\u{2022} auto save "), "{changed}");
+    let same = line_of("auto save on focus change");
+    assert!(!same.contains('\u{2022}'), "{same}");
+}
+
 #[test]
 fn the_settings_editor_writes_the_workspace_layer_only_for_allowed_keys() {
     let cfg = tempfile::tempdir().unwrap();
@@ -1572,6 +1892,167 @@ fn the_settings_editor_asks_for_a_number_and_refuses_one_that_is_not() {
         serde_json::from_str(&std::fs::read_to_string(cfg.path().join("config.json")).unwrap())
             .unwrap();
     assert_eq!(written["terminal_scrollback"], serde_json::json!(5000));
+}
+
+fn written_settings(cfg: &std::path::Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(cfg.join("config.json")).unwrap()).unwrap()
+}
+
+/// #1555: Enter on the unset UI language picks a language in place; it used
+/// to close the editor and open `config.json` at line 1.
+#[test]
+fn enter_on_the_unset_language_picks_one_in_the_editor() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "locale");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.settings_editor.is_some(), "still in the editor");
+    let lang = written_settings(cfg.path())["locale"].clone();
+    assert!(lang.is_string(), "a language was set: {lang}");
+    let row = app
+        .settings_editor
+        .as_ref()
+        .unwrap()
+        .selected_row()
+        .cloned()
+        .unwrap();
+    assert_eq!(row.value, lang, "and the row shows it");
+}
+
+/// #1555: an unset number setting asks for a number, saves it as one, and
+/// an empty entry unsets it again.
+#[test]
+fn an_unset_number_setting_takes_a_number_and_an_empty_entry_unsets_it() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "terminal rewind");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(matches!(
+        app.input_prompt.as_ref().map(|p| &p.purpose),
+        Some(crate::widgets::input_prompt::InputPurpose::SettingValue { key }) if key == "terminal_rewind_mb"
+    ));
+    assert_eq!(
+        app.input_prompt.as_ref().unwrap().value,
+        "",
+        "an unset setting's prompt opens empty, not on (default)"
+    );
+    app.close_input_prompt();
+    app.submit_setting_value("terminal_rewind_mb", "500");
+    assert_eq!(
+        written_settings(cfg.path())["terminal_rewind_mb"],
+        serde_json::json!(500)
+    );
+    app.submit_setting_value("terminal_rewind_mb", "");
+    let written = written_settings(cfg.path());
+    assert!(
+        written.get("terminal_rewind_mb").is_none(),
+        "unset, so its default applies: {written}"
+    );
+}
+
+/// #1555: a value the setting can't hold is refused and nothing is
+/// written; `code_scanning` took `enabled`, said it was saved, and
+/// ignored it.
+#[test]
+fn a_value_the_setting_cannot_hold_is_refused() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    app.write_setting("code_scanning", serde_json::json!("enabled"));
+    assert!(app.status.contains("can't be enabled"), "{}", app.status);
+    assert!(!cfg.path().join("config.json").exists());
+    type_query(&mut app, "code scanning");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.input_prompt.is_none(), "a choice: no free text to type");
+    assert_eq!(
+        written_settings(cfg.path())["code_scanning"],
+        serde_json::json!("on")
+    );
+}
+
+/// #1555: a list setting opens the chosen layer's file with the caret on
+/// its key, the workspace's when Tab has chosen it.
+#[test]
+fn a_list_setting_opens_its_layer_file_at_the_key() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    let ws_file = tmp.path().join(".croft/config.json");
+    std::fs::write(
+        &ws_file,
+        "{\n  \"auto_save\": true,\n  \"files_exclude\": [\"target\"]\n}\n",
+    )
+    .unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    type_query(&mut app, "files_exclude");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.settings_editor.is_none());
+    let opened = app.editor.path.clone().unwrap();
+    assert!(
+        opened.ends_with(".croft/config.json"),
+        "{}",
+        opened.display()
+    );
+    assert_eq!(app.editor.cursor_row, 2, "on the key's line");
+    assert!(app.status.contains("files exclude"), "{}", app.status);
+}
+
+/// #1555 negative: with the user layer chosen, a list setting opens the
+/// user's file, at its key too.
+#[test]
+fn a_list_setting_in_the_user_layer_opens_the_user_file_at_the_key() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        cfg.path().join("config.json"),
+        "{\n  \"theme\": \"dark\",\n  \"auto_save\": true,\n  \"search_exclude\": []\n}\n",
+    )
+    .unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "search exclude");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let opened = app.editor.path.clone().unwrap();
+    assert_eq!(opened.file_name().unwrap(), "config.json");
+    assert!(
+        opened.starts_with(cfg.path()) || opened.starts_with(cfg.path().canonicalize().unwrap())
+    );
+    assert_eq!(app.editor.cursor_row, 3);
+}
+
+/// #1555: an explicitly empty `review_ai_prefix` (no marker) opens its
+/// prompt empty, so confirming it unchanged keeps it empty instead of
+/// unsetting it back to the default marker.
+#[test]
+fn confirming_an_empty_review_prefix_keeps_it_empty() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        cfg.path().join("config.json"),
+        "{\n  \"review_ai_prefix\": \"\"\n}\n",
+    )
+    .unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    type_query(&mut app, "review_ai_prefix");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let prompt = app.input_prompt.as_ref().expect("a text prompt");
+    assert_eq!(prompt.value, "", "opens empty, not on (default)");
+    let value = prompt.value.clone();
+    app.close_input_prompt();
+    app.submit_setting_value("review_ai_prefix", &value);
+    assert_eq!(
+        written_settings(cfg.path())["review_ai_prefix"],
+        serde_json::json!("")
+    );
 }
 
 #[test]

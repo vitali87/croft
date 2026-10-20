@@ -1,6 +1,7 @@
 //! Localization (#621): a catalog of UI strings keyed by their English text.
 //!
-//! Menus, command palette titles and status messages pass through [`tr`].
+//! Menus, command palette titles, status messages and the frame's own
+//! titles (side bar, panel tabs, prompts) pass through [`tr`].
 //! With no catalog loaded (English, or no locale set) it returns its input
 //! unchanged at the cost of one atomic load, so untranslated croft pays for
 //! nothing.
@@ -84,6 +85,25 @@ impl Catalog {
 
 static CATALOG: OnceLock<Catalog> = OnceLock::new();
 
+#[cfg(test)]
+thread_local! {
+    /// A catalog for this test thread only, so a test can render translated
+    /// chrome without loading one for every other test in the process.
+    static TEST_CATALOG: std::cell::RefCell<Option<Catalog>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with `json` as the active catalog on this thread.
+#[cfg(test)]
+pub fn with_test_catalog<R>(json: &str, f: impl FnOnce() -> R) -> R {
+    let mut c = Catalog::default();
+    c.add_json(json);
+    TEST_CATALOG.with(|t| *t.borrow_mut() = Some(c));
+    let out = f();
+    TEST_CATALOG.with(|t| *t.borrow_mut() = None);
+    out
+}
+
 /// The language code for a locale string: `de_DE.UTF-8` -> `de`. `C`,
 /// `POSIX` and English read as `None` (no translation).
 pub fn language_of(locale: &str) -> Option<String> {
@@ -125,6 +145,25 @@ pub fn catalog_for(lang: &str, user_file: Option<&str>) -> Catalog {
         c.add_json(json);
     }
     c
+}
+
+/// Every language croft can be shown in, for the Settings editor's
+/// `locale` row (#1555): English, the built-in catalogs and the user's
+/// `<config>/locales/<lang>.json`, sorted.
+pub fn languages(config_dir: &std::path::Path) -> Vec<String> {
+    let mut out: Vec<String> = std::iter::once("en")
+        .chain(BUILT_IN.iter().map(|(lang, _)| *lang))
+        .map(String::from)
+        .collect();
+    if let Ok(dir) = std::fs::read_dir(config_dir.join("locales")) {
+        out.extend(dir.flatten().filter_map(|e| {
+            let path = e.path();
+            (path.extension()? == "json").then_some(path.file_stem()?.to_str()?.to_string())
+        }));
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// The share of [`template`]'s strings a built-in catalog must translate
@@ -184,6 +223,10 @@ pub fn init(setting: Option<&str>) {
 
 /// `s` in the active language, or `s` itself.
 pub fn tr(s: &str) -> Cow<'_, str> {
+    #[cfg(test)]
+    if let Some(t) = TEST_CATALOG.with(|t| t.borrow().as_ref().map(|c| c.lookup(s).into_owned())) {
+        return Cow::Owned(t);
+    }
     match CATALOG.get() {
         Some(c) => c.lookup(s),
         None => Cow::Borrowed(s),
@@ -203,10 +246,12 @@ pub fn active() -> bool {
 /// such string that is neither here nor a palette title (#849).
 pub const TRANSLATABLE: &[&str] = &[
     "Add Folder to Workspace",
+    "Add to Watch",
     "Ask Navigator",
     "Ask Navigator About Selection",
     "Ask Navigator About This Line",
     "blank",
+    "CAPTURES",
     "Change All Occurrences",
     "Close",
     "Close All",
@@ -216,15 +261,22 @@ pub const TRANSLATABLE: &[&str] = &[
     "CodeQL",
     "Color Theme",
     "Command Palette",
+    "Command Palette — Esc to close, ↑/↓ to navigate, Enter to run",
     "Compare Selected",
     "Copy",
+    "Copy as Expression",
+    "Copy Call Stack",
+    "Copy Expression",
     "Copy into New Window",
     "Copy Path",
     "Copy Permalink",
     "Copy Relative Path",
+    "Copy Value",
     "Customize Layout",
     "Cut",
+    "DISCARD CHANGES?",
     "Editor",
+    "EXPLORER",
     "Explorer",
     "Extensions",
     "Fix with Navigator",
@@ -243,14 +295,19 @@ pub const TRANSLATABLE: &[&str] = &[
     "New File",
     "New Folder",
     "Open Symbol in Its Own Tab",
+    "OUTLINE",
+    "OUTPUT",
     "Open on Remote",
     "Output",
     "Panel Alignment",
     "Paste",
     "Pin",
+    "PORTS",
     "Primary Side Bar Position",
+    "PROBLEMS",
     "Quick Input Position",
     "Remote",
+    "Remove Expression",
     "Remove Folder from Workspace",
     "Rename",
     "Reveal in Explorer View",
@@ -261,6 +318,7 @@ pub const TRANSLATABLE: &[&str] = &[
     "Show Incoming Calls",
     "Show Outgoing Calls",
     "Side",
+    "SOURCE CONTROL",
     "Source Control",
     "Split & Move",
     "Split Down",
@@ -268,10 +326,31 @@ pub const TRANSLATABLE: &[&str] = &[
     "Split Left",
     "Split Right",
     "Split Up",
+    "TERMINAL",
     "Terminal",
     "Testing",
+    "This tab has unsaved changes:",
+    "This will overwrite your local changes from HEAD.",
+    "This will permanently delete the file from disk.",
+    "TIMELINE",
     "Unpin",
+    "UNSAVED CHANGES",
     "Untitled",
+    "Any key dismisses. D, don't show again",
+    "Enter or Y, replace. Escape, cancel",
+    "Escape, cancel",
+    "Every keystroke and paste will go to",
+    "Files are rewritten on disk",
+    "N or Escape, no",
+    "No matching setting",
+    "Settings, writing to user",
+    "Settings, writing to workspace",
+    "This URL will open in YOUR LOCAL MAC's browser via the croft relay.",
+    "This will undo the change hunk under the cursor on disk.",
+    "Y, yes once. A, always for this session",
+    "at",
+    "in pane",
+    "terminal panes at once",
 ];
 
 /// A JSON template for translating into `lang`: every palette title, every
@@ -645,6 +724,48 @@ mod tests {
             fresh.len(),
             "every language's template lists the same strings"
         );
+    }
+
+    /// #1583: the frame's own titles are offered to a translator, and the
+    /// built-in catalogs translate them.
+    #[test]
+    fn the_template_offers_the_frames_titles() {
+        let fresh: HashMap<String, String> =
+            serde_json::from_str(&template("xx", None, TRANSLATABLE)).unwrap();
+        let de: HashMap<String, String> =
+            serde_json::from_str(&template("de", None, TRANSLATABLE)).unwrap();
+        for title in [
+            "EXPLORER",
+            "OUTLINE",
+            "SOURCE CONTROL",
+            "PROBLEMS",
+            "OUTPUT",
+            "UNSAVED CHANGES",
+            "DISCARD CHANGES?",
+            "Command Palette — Esc to close, ↑/↓ to navigate, Enter to run",
+        ] {
+            assert!(fresh.contains_key(title), "{title:?}");
+        }
+        assert_eq!(de["PROBLEMS"], "PROBLEME");
+        assert_eq!(de["OUTPUT"], "AUSGABE");
+        assert_eq!(de["OUTLINE"], "GLIEDERUNG");
+    }
+
+    /// #1583 negative: a test catalog is this thread's alone and ends with
+    /// its closure.
+    #[test]
+    fn a_test_catalog_ends_with_its_closure() {
+        let inside = with_test_catalog(r#"{"PROBLEMS": "PROBLEME"}"#, || {
+            tr("PROBLEMS").into_owned()
+        });
+        assert_eq!(inside, "PROBLEME");
+        assert_eq!(tr("PROBLEMS"), "PROBLEMS");
+        let other = with_test_catalog(r#"{"PROBLEMS": "PROBLEME"}"#, || {
+            std::thread::spawn(|| tr("PROBLEMS").into_owned())
+                .join()
+                .unwrap()
+        });
+        assert_eq!(other, "PROBLEMS");
     }
 
     /// #849 guard: `TRANSLATABLE` holds what the palette does not. A palette

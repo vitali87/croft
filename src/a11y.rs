@@ -25,10 +25,14 @@ pub struct Snapshot {
     pub item: Option<String>,
     /// The transient status message.
     pub status: String,
+    /// The latest thing that happened rather than something looked at (a
+    /// debugger pause, a finished test run), numbered so that the same
+    /// words said twice in a row are still two events (#1547).
+    pub event: Option<(u64, String)>,
 }
 
 /// The longest line text read out; beyond this a reader drones.
-const MAX_LINE: usize = 160;
+pub const MAX_LINE: usize = 160;
 
 fn clip(s: &str) -> String {
     let s = s.trim();
@@ -47,6 +51,11 @@ pub fn announce(prev: &Snapshot, cur: &Snapshot) -> Option<String> {
     let focus_changed = prev.focus != cur.focus;
     if focus_changed && !cur.focus.is_empty() {
         parts.push(cur.focus.clone());
+    }
+    if cur.event != prev.event
+        && let Some((_, event)) = &cur.event
+    {
+        parts.push(clip(event));
     }
     let line_moved = cur.line.as_ref().map(|(n, _)| n) != prev.line.as_ref().map(|(n, _)| n);
     if let Some(item) = cur
@@ -224,5 +233,39 @@ mod tests {
         assert_eq!(a.line, "Editor main.rs. Line 1: a");
         assert!(!a.update(editor(1, "ab"), None));
         assert_eq!(a.line, "Editor main.rs. Line 1: a");
+    }
+
+    /// #1547: an event (a debugger pause) is read wherever focus is, ahead
+    /// of the status, even though nothing the user looks at moved.
+    #[test]
+    fn an_event_is_read_without_a_change_of_focus() {
+        let prev = editor(3, "total += n");
+        let cur = Snapshot {
+            event: Some((0, "Paused on breakpoint, app.py line 3: total += n".into())),
+            ..prev.clone()
+        };
+        assert_eq!(
+            announce(&prev, &cur).as_deref(),
+            Some("Paused on breakpoint, app.py line 3: total += n")
+        );
+    }
+
+    /// #1547: the same words as a new event (a second stop on the same
+    /// line) are read again; the same event seen twice is not.
+    #[test]
+    fn a_repeated_event_is_read_but_a_seen_one_is_not() {
+        let first = Snapshot {
+            event: Some((0, "Paused on step, app.py line 3".into())),
+            ..editor(3, "total += n")
+        };
+        let again = Snapshot {
+            event: Some((1, "Paused on step, app.py line 3".into())),
+            ..first.clone()
+        };
+        assert_eq!(
+            announce(&first, &again).as_deref(),
+            Some("Paused on step, app.py line 3")
+        );
+        assert_eq!(announce(&again, &again), None);
     }
 }

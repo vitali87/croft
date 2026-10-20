@@ -39,6 +39,9 @@ pub struct Props {
     pub eol: Option<Eol>,
     pub trim_trailing_whitespace: Option<bool>,
     pub insert_final_newline: Option<bool>,
+    /// `charset` (#1432): the encoding a file without a BOM opens and saves
+    /// in. `utf-8-bom` also asks for the mark on save.
+    pub charset: Option<crate::file_encoding::Charset>,
 }
 
 impl Props {
@@ -167,6 +170,7 @@ fn set_prop(raw: &mut Raw, key: &str, value: &str) {
             "end_of_line" => props.eol = None,
             "trim_trailing_whitespace" => props.trim_trailing_whitespace = None,
             "insert_final_newline" => props.insert_final_newline = None,
+            "charset" => props.charset = None,
             _ => {}
         }
         return;
@@ -205,6 +209,12 @@ fn set_prop(raw: &mut Raw, key: &str, value: &str) {
         }
         "trim_trailing_whitespace" => props.trim_trailing_whitespace = parse_bool(value),
         "insert_final_newline" => props.insert_final_newline = parse_bool(value),
+        // A value naming no encoding is ignored like any unknown value.
+        "charset" => {
+            if let Some(charset) = crate::file_encoding::parse(value) {
+                props.charset = Some(charset);
+            }
+        }
         _ => {}
     }
 }
@@ -757,6 +767,28 @@ mod tests {
         let p = for_file(&sub.join("main.rs"));
         assert_eq!(p.use_spaces, Some(true));
         assert_eq!(p.indent_width, Some(2));
+    }
+
+    /// #1432: `charset` names the encoding; `utf-8-bom` asks for the mark,
+    /// a nearer `unset` clears it and an unknown value leaves it alone.
+    #[test]
+    fn charset_is_read_and_unset_and_bad_values_are_ignored() {
+        let f = files(&[
+            (
+                "/w/.editorconfig",
+                "root = true\n[*]\ncharset = latin1\n[*.cs]\ncharset = utf-8-bom\n[*.md]\ncharset = klingon\n",
+            ),
+            ("/w/gen/.editorconfig", "[*]\ncharset = unset\n"),
+        ]);
+        let name = |p: &str| {
+            for_file_with(&f, Path::new(p))
+                .charset
+                .map(|c| (c.encoding.name(), c.bom))
+        };
+        assert_eq!(name("/w/a.txt"), Some(("windows-1252", false)));
+        assert_eq!(name("/w/a.cs"), Some(("UTF-8", true)));
+        assert_eq!(name("/w/a.md"), Some(("windows-1252", false)));
+        assert_eq!(name("/w/gen/a.txt"), None);
     }
 
     #[test]

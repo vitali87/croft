@@ -1267,6 +1267,56 @@ pub fn read_file_at_stage(root: &Path, rel_path: &str, stage: u8) -> Result<Stri
         .map_err(|_| format!("{rel_path} at stage {stage} is not UTF-8"))
 }
 
+/// The unmerged `rel_path`'s three index stages merged again by
+/// `git merge-file --diff3`, whose conflicts keep each side whole where
+/// git's default style trims what the sides share (the inline Accept
+/// Both's source, see `merge::untrimmed_both`). Errors when a stage is
+/// missing (not unmerged, or an add/add with no base) or git fails.
+pub fn remerge_diff3(root: &Path, rel_path: &str) -> Result<String, String> {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let sides = [
+        ("ours", read_file_at_stage(root, rel_path, 2)?),
+        ("base", read_file_at_stage(root, rel_path, 1)?),
+        ("theirs", read_file_at_stage(root, rel_path, 3)?),
+    ];
+    // A directory of our own, made fresh: `create_dir_all` would take one
+    // another local user made first at this guessable name, and the writes
+    // below would follow the symlinks they left in it.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let dir = std::env::temp_dir().join(format!(
+        "croft-remerge-{}-{}-{nanos}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(&dir).map_err(|e| e.to_string())?;
+    let merged = (|| {
+        for (name, text) in &sides {
+            std::fs::write(dir.join(name), text).map_err(|e| e.to_string())?;
+        }
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["merge-file", "-p", "-q", "--diff3"])
+            .args(sides.iter().map(|(name, _)| dir.join(name)))
+            .output()
+            .map_err(|e| format!("failed to spawn git: {e}"))?;
+        // The exit code is the conflict count (at most 127); an error
+        // exits negative, which reads as 255.
+        match output.status.code() {
+            Some(0..=127) => String::from_utf8(output.stdout)
+                .map_err(|_| format!("{rel_path} merged is not UTF-8")),
+            _ => Err(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+        }
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    merged
+}
+
 #[derive(Clone, Copy)]
 enum HunkSide {
     Old,
@@ -1949,6 +1999,40 @@ pub fn show_commit_file_diff(root: &Path, hash: &str, rel_path: &str) -> Result<
         Some(old) if old != rel_path => diff_text(root, &["show", hash, "--", &old]),
         _ => Ok(raw),
     }
+}
+
+/// The commits that touched `rel_path`, newest first, each with the name
+/// the file had there: `git log --follow`, so the walk carries on past a
+/// rename under the old name (#1304). Paths are relative to `root`, as
+/// [`read_file_at_rev`] takes them. Empty when git fails.
+pub fn follow_names(root: &Path, rel_path: &str, limit: usize) -> Vec<(String, String)> {
+    let Ok(out) = run_git(
+        root,
+        &[
+            "log",
+            "--follow",
+            // The scrubber walks first parents: a rename merged from a side
+            // branch then lands on the merge, which a full walk skips for
+            // the side branch's own commits (#1304).
+            "--first-parent",
+            &format!("-n{limit}"),
+            "--name-only",
+            "--relative",
+            "--format=%x1e%H",
+            "--",
+            rel_path,
+        ],
+    ) else {
+        return Vec::new();
+    };
+    out.split('\x1e')
+        .filter_map(|record| {
+            let mut lines = record.lines();
+            let hash = lines.next()?.trim();
+            let path = lines.map(str::trim).find(|l| !l.is_empty())?;
+            (!hash.is_empty()).then(|| (hash.to_string(), unquote_porcelain_path(path)))
+        })
+        .collect()
 }
 
 /// [`show_commit_file_diff`] for a filtered file (#1338). `git show` diffs
@@ -6735,6 +6819,89 @@ mod tests {
         // A summary containing the field separator is impossible (git emits the
         // literal subject), but a malformed line missing fields is dropped.
         assert!(parse_file_history("oops-no-fields", now).is_empty());
+    }
+
+    #[test]
+    fn follow_names_lists_the_old_name_before_a_rename() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(p)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "a@b"]);
+        git(&["config", "user.name", "a"]);
+        std::fs::create_dir(p.join("sub")).unwrap();
+        std::fs::write(p.join("sub/old.py"), "a = 1\nb = 2\nc = 3\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "add"]);
+        git(&["mv", "sub/old.py", "sub/new.py"]);
+        git(&["commit", "-q", "-m", "rename"]);
+        let names: Vec<String> = follow_names(p, "sub/new.py", 10)
+            .into_iter()
+            .map(|(hash, path)| {
+                assert_eq!(hash.len(), 40, "full hashes, as the scrubber keys them");
+                path
+            })
+            .collect();
+        assert_eq!(names, ["sub/new.py", "sub/old.py"]);
+        // From a workspace rooted in the subfolder, paths are relative to it.
+        let names: Vec<String> = follow_names(&p.join("sub"), "new.py", 10)
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+        assert_eq!(names, ["new.py", "old.py"]);
+        assert!(follow_names(p, "missing.py", 10).is_empty());
+    }
+
+    /// #1304: a rename merged from a side branch is listed on the merge,
+    /// one of the first-parent commits the scrubber walks. A full walk
+    /// went down the side branch and skipped the merge, so the scrubber
+    /// read the merge under the old name, which did not exist there.
+    #[test]
+    fn follow_names_lists_a_rename_merged_from_a_side_branch_on_the_merge() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "a@b"]);
+        git(&["config", "user.name", "a"]);
+        std::fs::write(p.join("old.py"), "a = 1\nb = 2\nc = 3\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "add"]);
+        let added = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "-q", "-b", "side"]);
+        git(&["mv", "old.py", "new.py"]);
+        git(&["commit", "-q", "-m", "rename"]);
+        git(&["checkout", "-q", "main"]);
+        std::fs::write(p.join("other.txt"), "x\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "other"]);
+        git(&["merge", "-q", "--no-ff", "side", "-m", "merge"]);
+        let merge = git(&["rev-parse", "HEAD"]);
+        assert_eq!(
+            follow_names(p, "new.py", 10),
+            [(merge, "new.py".to_string()), (added, "old.py".to_string())]
+        );
     }
 
     #[test]
