@@ -2406,11 +2406,15 @@ fn replace_span(lines: &mut Vec<String>, e: &TextSpanEdit) -> bool {
 }
 
 /// Coarse classification of the most recent edit, used so consecutive
-/// `InsertChar` ops coalesce into a single undo step (typing burst) but
-/// any other edit kind always opens a new step.
+/// `InsertChar` (or `MultiInsertChar`) ops coalesce into a single undo step
+/// (typing burst) but any other edit kind always opens a new step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EditKind {
     InsertChar,
+    /// A character typed at every multi-cursor caret. Coalesces like
+    /// `InsertChar` while the carets stay where the last keystroke left
+    /// them, so a multi-cursor rename undoes in one step (#913).
+    MultiInsertChar,
     Newline,
     Backspace,
     DeleteForward,
@@ -2424,8 +2428,8 @@ enum EditKind {
     /// Block indent / outdent (Tab / Shift+Tab over a line range). Never
     /// coalesces, so each Tab press is its own undo step like VS Code.
     Indent,
-    /// A single keystroke applied simultaneously across every multi-cursor
-    /// caret. Never coalesces, so each multi-edit is its own undo step.
+    /// A Backspace or Delete applied simultaneously across every
+    /// multi-cursor caret. Never coalesces, so each is its own undo step.
     MultiEdit,
     /// Move a line / block up or down (Alt+Up / Alt+Down). Its own step.
     MoveLines,
@@ -3119,6 +3123,11 @@ pub struct Editor {
     /// pre-existing `()` keeps its closer, as with one caret (#122 review),
     /// even when another caret of the same keystroke paired.
     multi_auto_pair: Option<(u64, CaretPlaces, CaretPlaces)>,
+    /// The `edit_seq` and every caret's selection, the primary first, after
+    /// the last multi-cursor keystroke that typed a character and left no
+    /// selection (#913): the next one joins its undo step only while nothing
+    /// has edited or moved since, as one caret's typing burst does.
+    multi_typing: Option<(u64, Vec<EditorSelection>)>,
     /// Merge-conflict blocks in the buffer, lazily recomputed whenever
     /// `edit_seq` moves (same pattern as the git-gutter marks).
     conflicts: Vec<crate::merge::ConflictBlock>,
@@ -3782,6 +3791,7 @@ impl Editor {
             auto_close_tags: true,
             auto_pair_at: None,
             multi_auto_pair: None,
+            multi_typing: None,
             conflicts: Vec::new(),
             merge_action_spans: Vec::new(),
             code_lenses: Vec::new(),
@@ -9440,7 +9450,8 @@ impl Editor {
         self.carets.len() + 1
     }
 
-    /// Insert a character at every caret. One undo step.
+    /// Insert a character at every caret. Consecutive characters typed
+    /// with the carets left where they were form one undo step (#913).
     ///
     /// Deliberately does not set `last_typed`: an on-type formatting reply
     /// (#254) is computed at ONE position and would be wrong at the other
@@ -9460,7 +9471,8 @@ impl Editor {
     }
 
     /// Apply `edit` at the primary caret and every secondary caret as a
-    /// single undo step. Carets are processed bottom-to-top so an edit never
+    /// single undo step, which a typed character extends when it continues
+    /// a typing burst. Carets are processed bottom-to-top so an edit never
     /// shifts the coordinates of a caret still to be processed.
     fn multi_apply(&mut self, edit: CaretEdit) {
         // A Backspace right after a keystroke that paired at every caret
@@ -9476,6 +9488,9 @@ impl Editor {
             }
             _ => Vec::new(),
         };
+        // A typed character joins the open typing burst only while the
+        // carets sit where its last keystroke left them, with no edit since.
+        let burst = self.multi_typing.take() == Some((self.edit_seq, self.caret_selections()));
         // A closer or quote stepped over at every caret edits nothing, so it
         // records no undo step, as one caret's type-over does.
         if let CaretEdit::Insert(c) = edit
@@ -9489,10 +9504,20 @@ impl Editor {
                 s.anchor = s.head;
             }
             self.ensure_cursor_col_visible();
+            if burst {
+                self.multi_typing = Some((self.edit_seq, self.caret_selections()));
+            }
             return;
         }
         self.pin_on_edit();
-        self.push_undo(EditKind::MultiEdit);
+        let kind = match edit {
+            CaretEdit::Insert(_) => EditKind::MultiInsertChar,
+            CaretEdit::Backspace | CaretEdit::DeleteForward => EditKind::MultiEdit,
+        };
+        if !burst {
+            self.break_undo_coalescing();
+        }
+        self.push_undo(kind);
 
         let primary = self
             .selection
@@ -9587,6 +9612,12 @@ impl Editor {
         if !paired_places.is_empty() {
             self.multi_auto_pair = Some((self.edit_seq, self.caret_places(), paired_places));
         }
+        // A surround keeps its selections and is its own step, as one
+        // caret's is: the next keystroke opens a new one.
+        let carets = self.caret_selections();
+        if kind == EditKind::MultiInsertChar && !carets.iter().any(|s| s.has_area()) {
+            self.multi_typing = Some((self.edit_seq, carets));
+        }
     }
 
     /// True when `c` typed at every caret only steps over the same closer
@@ -9608,6 +9639,17 @@ impl Editor {
     fn caret_places(&self) -> Vec<(usize, usize)> {
         std::iter::once((self.cursor_row, self.cursor_col))
             .chain(self.carets.iter().map(|c| c.head))
+            .collect()
+    }
+
+    /// Every caret's selection, the primary first, the extra carets in
+    /// order; the primary's is empty at the cursor when it has none.
+    fn caret_selections(&self) -> Vec<EditorSelection> {
+        let primary = self
+            .selection
+            .unwrap_or_else(|| EditorSelection::new(self.cursor_row, self.cursor_col));
+        std::iter::once(primary)
+            .chain(self.carets.iter().copied())
             .collect()
     }
 
@@ -11066,8 +11108,9 @@ impl Editor {
     }
 
     /// Push an undo entry tagged with the kind of edit about to happen.
-    /// Coalesces consecutive `InsertChar` ops into one step so a typing
-    /// burst is undone as one unit; everything else opens a new step.
+    /// Coalesces consecutive `InsertChar` (or `MultiInsertChar`) ops into
+    /// one step so a typing burst is undone as one unit; everything else
+    /// opens a new step.
     fn push_undo(&mut self, kind: EditKind) {
         self.push_undo_step(kind, None);
     }
@@ -11083,8 +11126,8 @@ impl Editor {
         // Where the edit about to happen begins — the merge editor's
         // region tracker reads this when it reconciles (#253).
         self.merge_edit_row = self.cursor_row;
-        let coalesce = (kind == EditKind::InsertChar
-            && self.last_edit_kind == Some(EditKind::InsertChar))
+        let typing = matches!(kind, EditKind::InsertChar | EditKind::MultiInsertChar);
+        let coalesce = (typing && self.last_edit_kind == Some(kind))
             || (group.is_some() && group == self.remote_undo_group && !self.undo_stack.is_empty());
         self.remote_undo_group = group;
         if !coalesce {
@@ -28155,6 +28198,50 @@ mod tests {
         // One undo restores the whole batch at once.
         assert!(e.undo());
         assert_eq!(e.lines, vec!["foo bar foo".to_string(), "foo".to_string()]);
+    }
+
+    /// #913: a word typed at several carets undoes in one step, as one
+    /// caret's typing burst does, and brings the selections back.
+    #[test]
+    fn multi_caret_typing_burst_undoes_in_one_step() {
+        let mut e = editor_with("total = 0\ntotal += 5\nprint(total)");
+        for _ in 0..3 {
+            e.select_next_occurrence();
+        }
+        let (selection, carets) = (e.selection, e.carets.clone());
+        assert_eq!(carets.len(), 2);
+        for c in "grand".chars() {
+            e.multi_insert_char(c);
+        }
+        assert_eq!(e.lines, ["grand = 0", "grand += 5", "print(grand)"]);
+        e.collapse_carets();
+        assert!(e.undo());
+        assert_eq!(e.lines, ["total = 0", "total += 5", "print(total)"]);
+        assert_eq!(e.selection, selection);
+        assert_eq!(e.carets, carets);
+        assert!(!e.undo(), "the rename was the only step");
+    }
+
+    /// #913: the burst ends at a Backspace and when the carets change, as
+    /// one caret's ends at a Backspace or a move.
+    #[test]
+    fn multi_caret_typing_burst_ends_at_backspace_or_caret_change() {
+        let mut e = editor_with("a\nb");
+        e.cursor_col = 1;
+        e.carets = vec![EditorSelection::new(1, 1)];
+        e.multi_insert_char('x');
+        e.multi_insert_char('y');
+        e.multi_backspace();
+        e.multi_insert_char('z');
+        assert_eq!(e.lines, ["axz", "bxz"]);
+        e.carets = vec![EditorSelection::new(1, 0)];
+        e.multi_insert_char('w');
+        assert_eq!(e.lines, ["axzw", "wbxz"]);
+        let mut undone = Vec::new();
+        while e.undo() {
+            undone.push(e.lines.join("|"));
+        }
+        assert_eq!(undone, ["axz|bxz", "ax|bx", "axy|bxy", "a|b"]);
     }
 
     #[test]

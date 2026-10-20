@@ -55100,7 +55100,7 @@ impl App {
             // Break coalescing so a new iteration's opening keystrokes never
             // merge into the previous iteration's typing run. This bounds
             // iterations apart; it does NOT make one iteration one undo step
-            // — `push_undo` coalesces only InsertChar→InsertChar, so a macro
+            // — `push_undo` coalesces only a typing run, so a macro
             // holding a delete plus an insert still undoes in two. A real
             // one-step-per-iteration guarantee needs an undo-group API the
             // editor does not have (its undo is whole-buffer snapshots).
