@@ -132,8 +132,10 @@ impl KernelSession {
         (session, ev_tx, req_rx)
     }
 
-    pub fn send(&self, request: Request) {
-        let _ = self.requests.send(request);
+    /// Send `request`; false when the bridge is gone (#878), so nothing
+    /// will ever answer it.
+    pub fn send(&self, request: Request) -> bool {
+        self.requests.send(request).is_ok()
     }
 
     pub fn try_events(&self) -> Vec<Event> {
@@ -262,6 +264,9 @@ pub struct NotebookRun {
     /// Set when the notebook's kernel is not installed: the cells sent so
     /// far wait for the user to pick another (#1377).
     pub choice: Option<KernelChoice>,
+    /// Set when the kernel never came up (#878): its bridge has exited, so
+    /// this run answers nothing more and the next run needs a new kernel.
+    start_failed: bool,
     sent: u64,
 }
 
@@ -274,6 +279,7 @@ impl NotebookRun {
             backlog: Vec::new(),
             kernel: None,
             choice: None,
+            start_failed: false,
             sent: 0,
         }
     }
@@ -301,8 +307,14 @@ impl NotebookRun {
         self.pending.push((id, cell));
     }
 
-    pub fn send(&self, request: Request) {
-        self.session.send(request);
+    /// Send `request` to the kernel; false when its bridge is gone.
+    pub fn send(&self, request: Request) -> bool {
+        self.session.send(request)
+    }
+
+    /// Whether the kernel failed to start (#878).
+    pub fn start_failed(&self) -> bool {
+        self.start_failed
     }
 
     /// Run on `session`'s kernel from now on: the old one is shut down and
@@ -362,15 +374,27 @@ impl NotebookRun {
                     // is the backstop if it could not.
                     if self.kernel.is_some() {
                         self.pending.clear();
+                    } else {
+                        // The kernel is up, so the cells waiting for it
+                        // start now and their old outputs go now: a kernel
+                        // that never starts leaves them as they were (#878).
+                        for (_, cell) in &self.pending {
+                            if let Some(next) = apply(&doc, cell, CellEdit::Begin) {
+                                doc = next;
+                                changed = true;
+                            }
+                        }
                     }
                     notes.push(format!("Kernel ready: {display}"));
                     self.kernel = Some(display);
                     continue;
                 }
                 Event::Error { message } => {
-                    // A kernel that never came up will answer nothing.
+                    // A kernel that never came up will answer nothing: its
+                    // bridge has exited (#878).
                     if self.kernel.is_none() {
                         self.pending.clear();
+                        self.start_failed = true;
                     }
                     notes.push(format!("Kernel: {message}"));
                     continue;
@@ -930,10 +954,10 @@ mod tests {
         let outputs = doc["cells"][1]["outputs"].as_array().unwrap();
         assert_eq!(
             outputs.len(),
-            2,
-            "the old output and the new one; no stray: {outputs:?}"
+            1,
+            "the kernel coming up cleared the old output; no stray: {outputs:?}"
         );
-        assert_eq!(outputs[1]["text"][0], "2\n");
+        assert_eq!(outputs[0]["text"][0], "2\n");
         assert_eq!(notes, vec!["Kernel ready: Python 3".to_string()]);
         assert!(run.running_indices().is_empty());
         assert_eq!(run.kernel.as_deref(), Some("Python 3"));
@@ -947,9 +971,24 @@ mod tests {
             message: "no Python".into(),
         }];
         let (text, notes) = run.fold(NB);
-        assert!(text.is_none());
+        assert!(text.is_none(), "the cell keeps its outputs and count");
         assert_eq!(notes, vec!["Kernel: no Python".to_string()]);
         assert!(run.running_indices().is_empty());
+        assert!(run.start_failed(), "#878: the next run needs a new kernel");
+        // Negative: a failed request on a kernel that is up is not a
+        // failed start; the kernel keeps serving.
+        let mut up = run_without_kernel();
+        up.backlog = vec![
+            Event::Ready {
+                kernel: "python3".into(),
+                display: "Python 3".into(),
+            },
+            Event::Error {
+                message: "restart: Invalid Signature".into(),
+            },
+        ];
+        up.fold(NB);
+        assert!(!up.start_failed());
     }
 
     #[test]

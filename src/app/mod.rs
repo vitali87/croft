@@ -49676,10 +49676,12 @@ impl App {
     }
 
     /// Send `cells` to the active notebook's kernel, starting it on the
-    /// first run. Each cell's old outputs are cleared now, in one edit,
-    /// so what the file shows is always this run's.
+    /// first run. Each cell's old outputs are cleared in one edit, so what
+    /// the file shows is always this run's: now when the kernel is up,
+    /// else once it is (`NotebookRun::fold`), so a kernel that fails to
+    /// start leaves the notebook as it was (#878).
     fn run_notebook_cells(&mut self, cells: Vec<crate::notebook_kernel::CellRef>) {
-        use crate::notebook_kernel::{CellEdit, KernelSession, NotebookRun, apply, kernel_name};
+        use crate::notebook_kernel::{CellEdit, NotebookRun, apply, kernel_name};
         let Some(path) = self.editor.path.clone() else {
             return;
         };
@@ -49688,24 +49690,28 @@ impl App {
             return;
         }
         let mut text = self.editor.lines.join("\n");
-        let root = self.workspace_root().to_path_buf();
         let starting = !self.notebook_kernels.contains_key(&path);
-        let run = self
-            .notebook_kernels
-            .entry(path.clone())
-            .or_insert_with(|| {
-                let dir = path.parent().unwrap_or(&root);
-                NotebookRun::new(KernelSession::start(&root, dir, &kernel_name(&text)))
-            });
+        if starting {
+            let session = self.start_kernel_session(&path, &kernel_name(&text));
+            self.notebook_kernels
+                .insert(path.clone(), NotebookRun::new(session));
+        }
+        let Some(run) = self.notebook_kernels.get_mut(&path) else {
+            return;
+        };
+        let up = run.kernel.is_some();
         for cell in cells {
-            if let Some(next) = apply(&text, &cell, CellEdit::Begin) {
+            if up && let Some(next) = apply(&text, &cell, CellEdit::Begin) {
                 text = next;
             }
             run.execute(cell);
         }
-        self.editor.notebook_running = run.running_indices();
-        self.editor
-            .replace_all_lines(text.split('\n').map(str::to_string).collect());
+        let running = run.running_indices();
+        if up {
+            self.editor
+                .replace_all_lines(text.split('\n').map(str::to_string).collect());
+        }
+        self.editor.set_notebook_running(running);
         if starting {
             self.status = String::from("Starting kernel…");
         }
@@ -49717,24 +49723,33 @@ impl App {
         let active = self.editor.path.clone();
         let mut changed = self.poll_kernel_listing();
         let mut choice = None;
+        let mut failed = None;
         for (path, run) in self.notebook_kernels.iter_mut() {
             if !run.collect() || active.as_ref() != Some(path) {
                 continue;
             }
             let text = self.editor.lines.join("\n");
             let (next, notes) = run.fold(&text);
-            self.editor.notebook_running = run.running_indices();
             if let Some(next) = next {
                 self.editor
                     .replace_all_lines(next.split('\n').map(str::to_string).collect());
             }
+            self.editor.set_notebook_running(run.running_indices());
             if let Some(note) = notes.last() {
                 self.status = note.clone();
             }
             if let Some(c) = run.choice.take() {
                 choice = Some((path.clone(), c));
             }
+            if run.start_failed() {
+                failed = Some(path.clone());
+            }
             changed = true;
+        }
+        // A kernel that never started is forgotten (#878), so the next run
+        // starts a new one and finds an ipykernel installed since.
+        if let Some(path) = failed {
+            self.notebook_kernels.remove(&path);
         }
         if let Some((path, c)) = choice {
             self.open_kernel_picker(path, c.specs, Some(c.requested));
@@ -49863,7 +49878,7 @@ impl App {
         let session = self.start_kernel_session(&path, &spec.name);
         if let Some(run) = self.notebook_kernels.get_mut(&path) {
             run.restart_with(session);
-            self.editor.notebook_running = run.running_indices();
+            self.editor.set_notebook_running(run.running_indices());
             self.status = format!("Starting kernel {}…", spec.display);
         }
     }
@@ -49876,23 +49891,45 @@ impl App {
         };
         if self.notebook_kernels.remove(&path).is_some() && self.editor.path.as_ref() == Some(&path)
         {
-            self.editor.notebook_running.clear();
+            self.editor.set_notebook_running(Vec::new());
         }
         self.status = format!(
             "Kernel '{missing}' is not installed: run Notebook: Select Kernel to pick another"
         );
     }
 
-    /// Interrupt or restart the active notebook's kernel.
+    /// Interrupt or restart the active notebook's kernel. A kernel whose
+    /// bridge is gone takes neither (#878): its cells stop waiting, and a
+    /// restart starts a new kernel.
     fn notebook_kernel_request(&mut self, request: crate::notebook_kernel::Request) {
-        let run = self
+        use crate::notebook_kernel::{NotebookRun, Request, kernel_name};
+        let Some(path) = self
             .editor
             .path
-            .as_ref()
-            .and_then(|p| self.notebook_kernels.get(p));
-        match run {
-            Some(run) => run.send(request),
-            None => self.status = String::from("This notebook has no running kernel"),
+            .clone()
+            .filter(|p| self.notebook_kernels.contains_key(p))
+        else {
+            self.status = String::from("This notebook has no running kernel");
+            return;
+        };
+        let restart = matches!(request, Request::Restart);
+        if self
+            .notebook_kernels
+            .get(&path)
+            .is_some_and(|run| run.send(request))
+        {
+            return;
+        }
+        self.notebook_kernels.remove(&path);
+        self.editor.set_notebook_running(Vec::new());
+        if restart {
+            let text = self.editor.lines.join("\n");
+            let session = self.start_kernel_session(&path, &kernel_name(&text));
+            self.notebook_kernels
+                .insert(path, NotebookRun::new(session));
+            self.status = String::from("Starting kernel…");
+        } else {
+            self.status = String::from("The kernel had stopped: the next run starts it again");
         }
     }
 
