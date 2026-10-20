@@ -628,6 +628,7 @@ fn push_variable_rows(
                 name: v.name.clone(),
                 value: v.value.clone(),
                 type_name: v.type_name.clone(),
+                evaluate_name: v.evaluate_name.clone(),
             },
         });
         if is_open && let Some(children) = session.variables.get(&v.variables_ref) {
@@ -1431,6 +1432,22 @@ enum MenuAction {
     /// CAPTURES row: ask the navigator about the selected captured line,
     /// with the pane rows around it (#372).
     AskNavigatorAboutCapture,
+    /// VARIABLES or WATCH row: copy its value (#1546). With `expression`
+    /// and an adapter that offers it, the full value comes from an
+    /// `evaluate` in the `clipboard` context, which is not cut as the
+    /// row's `value` may be; otherwise `value` itself is copied.
+    CopyDebugValue {
+        expression: Option<String>,
+        value: String,
+    },
+    /// VARIABLES row: copy its `evaluateName`; WATCH row: its expression.
+    CopyDebugExpression(String),
+    /// VARIABLES row: watch its `evaluateName`.
+    AddDebugWatch(String),
+    /// WATCH row: stop watching expression `index`.
+    RemoveDebugWatch(usize),
+    /// CALL STACK row: copy the whole stack, a frame a line.
+    CopyCallStack,
     /// PROBLEMS row: have the navigator fix this diagnostic as a streamed,
     /// cancellable edit (#374).
     FixProblemWithNavigator {
@@ -1618,6 +1635,11 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::AskNavigatorSelection { .. } => Some("⌘K Q"),
         MenuAction::AskNavigatorAboutCapture => Some("n"),
         MenuAction::FixProblemWithNavigator { .. } => None,
+        MenuAction::CopyDebugValue { .. }
+        | MenuAction::CopyDebugExpression(_)
+        | MenuAction::AddDebugWatch(_)
+        | MenuAction::RemoveDebugWatch(_)
+        | MenuAction::CopyCallStack => None,
         MenuAction::OpenSymbolTab { .. } => Some("⌘K ⇧V"),
         MenuAction::GoToOutlineSymbol { .. } => Some("Enter"),
         MenuAction::ShowCallsAt { incoming: true, .. } => Some("⌘K H"),
@@ -5193,6 +5215,12 @@ pub struct App {
     /// clobbered the baseline with the stop's own values — the changed
     /// highlight never fired (#112).
     watch_baseline_pending: bool,
+    /// The latest Copy Value waiting on the adapter's `clipboard` evaluate
+    /// (#1546): the expression asked for and the row's shown value, copied
+    /// instead if the evaluate fails. A response for any other expression
+    /// answers an earlier Copy Value the user has since replaced, and is
+    /// dropped.
+    debug_copy_pending: Option<(String, String)>,
     /// Debug console log: program stdout/stderr (DAP output events) plus REPL
     /// echoes and results. Capped; the tail is shown in the Run & Debug panel.
     /// Each line is escape-free text with the colour spans its SGR sequences
@@ -6818,6 +6846,7 @@ impl App {
             watch_vals: std::collections::HashMap::new(),
             watch_prev: std::collections::HashMap::new(),
             watch_baseline_pending: false,
+            debug_copy_pending: None,
             debug_console: Vec::new(),
             debug_ever_stopped: false,
             zoxide_jump: None,
@@ -32913,6 +32942,24 @@ impl App {
                 } if context == "watch" => {
                     self.watch_vals.insert(expression, (result, success));
                 }
+                // Copy Value's whole value (#1546), or, when the adapter
+                // could not give it, the value the row showed.
+                DapEvent::Evaluated {
+                    context,
+                    expression,
+                    result,
+                    success,
+                } if context == "clipboard" => {
+                    if self
+                        .debug_copy_pending
+                        .as_ref()
+                        .is_some_and(|(expr, _)| *expr == expression)
+                        && let Some((_, fallback)) = self.debug_copy_pending.take()
+                    {
+                        let text = if success { result } else { fallback };
+                        self.status = self.copy_where_pasted(&text).status("value");
+                    }
+                }
                 // Fresh stack + frame selection just landed: this is the
                 // moment each watch expression re-evaluates against the new
                 // top frame (#112).
@@ -33457,6 +33504,109 @@ impl App {
             _ => {}
         }
         self.refresh_debug_panel();
+    }
+
+    /// The right-click menu of debug-panel row `idx` (#1546), VS Code's:
+    /// a variable's Copy Value, Copy as Expression and Add to Watch, a
+    /// watch's Copy Value, Copy Expression and Remove, and a frame's Copy
+    /// Call Stack. Empty for a row that has none (a header, a scope).
+    fn debug_row_menu(&self, idx: usize) -> Vec<(String, MenuAction)> {
+        use crate::widgets::run_debug::DebugRowKind;
+        let Some(row) = self.run_debug.debug_rows.get(idx) else {
+            return Vec::new();
+        };
+        match &row.kind {
+            DebugRowKind::Variable {
+                value,
+                evaluate_name,
+                ..
+            } => {
+                let mut items = vec![(
+                    String::from("Copy Value"),
+                    MenuAction::CopyDebugValue {
+                        expression: evaluate_name.clone(),
+                        value: value.clone(),
+                    },
+                )];
+                if let Some(expr) = evaluate_name {
+                    items.push((
+                        String::from("Copy as Expression"),
+                        MenuAction::CopyDebugExpression(expr.clone()),
+                    ));
+                    items.push((
+                        String::from("Add to Watch"),
+                        MenuAction::AddDebugWatch(expr.clone()),
+                    ));
+                }
+                items
+            }
+            DebugRowKind::Watch {
+                index,
+                expression,
+                value,
+                ..
+            } => vec![
+                (
+                    String::from("Copy Value"),
+                    MenuAction::CopyDebugValue {
+                        expression: Some(expression.clone()),
+                        value: value.clone(),
+                    },
+                ),
+                (
+                    String::from("Copy Expression"),
+                    MenuAction::CopyDebugExpression(expression.clone()),
+                ),
+                (
+                    String::from("Remove Expression"),
+                    MenuAction::RemoveDebugWatch(*index),
+                ),
+            ],
+            DebugRowKind::Frame { .. } => {
+                vec![(String::from("Copy Call Stack"), MenuAction::CopyCallStack)]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Copy Value (#1546). The row's `value` can be cut short by the
+    /// adapter (debugpy elides a long string), so while paused, with an
+    /// expression and an adapter that offers it, the value is asked for
+    /// again in the `clipboard` context, which is not cut, and copied when
+    /// it lands (`poll_dap`). Otherwise the row's value is copied at once.
+    fn copy_debug_value(&mut self, expression: Option<String>, value: String) {
+        use crate::dap::session::SessionPhase;
+        if let Some(expr) = expression
+            && let Some(session) = self
+                .debug_sessions
+                .focused_mut()
+                .filter(|s| s.phase == SessionPhase::Stopped)
+            && session.supports("supportsClipboardContext")
+        {
+            session.evaluate(&expr, "clipboard");
+            self.debug_copy_pending = Some((expr, value));
+            self.status = String::from("Copying value…");
+            return;
+        }
+        self.status = self.copy_where_pasted(&value).status("value");
+    }
+
+    /// Copy Call Stack (#1546): every frame of the paused thread, innermost
+    /// first, as `name (path:line)`, VS Code's form.
+    fn copy_call_stack(&mut self) {
+        let Some(session) = self.debug_sessions.focused() else {
+            return;
+        };
+        let text = session
+            .stack_frames
+            .iter()
+            .map(|f| match &f.path {
+                Some(p) => format!("{} ({}:{})", f.name, p.display(), f.line),
+                None => f.name.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.status = self.copy_where_pasted(&text).status("call stack");
     }
 
     /// Cmd+F on a hex tab (#172): a single-line input popup, per croft's
@@ -58925,6 +59075,22 @@ impl App {
                     ));
                     return;
                 }
+                // A Run and Debug row: copy a variable's value or
+                // expression, watch it, or copy the call stack (#1546).
+                if in_tree
+                    && self.sidebar_view == SidebarView::RunDebug
+                    && let Some(idx) = self.run_debug.debug_row_at(m.row)
+                {
+                    let items = self.debug_row_menu(idx);
+                    if !items.is_empty() {
+                        self.context_menu = Some(ContextMenu::flat(
+                            (m.column, m.row),
+                            items,
+                            self.tree.root.clone(),
+                        ));
+                    }
+                    return;
+                }
                 // An OUTLINE row: go to the symbol, or open it as its own
                 // tab (#369).
                 if rect_contains(self.outline.last_area, m.column, m.row)
@@ -66040,6 +66206,21 @@ impl App {
                 self.open_ask_navigator((start, end), selection);
             }
             MenuAction::AskNavigatorAboutCapture => self.ask_navigator_about_capture(),
+            MenuAction::CopyDebugValue { expression, value } => {
+                self.copy_debug_value(expression, value)
+            }
+            MenuAction::CopyDebugExpression(expr) => {
+                self.status = self.copy_where_pasted(&expr).status("expression");
+            }
+            MenuAction::AddDebugWatch(expr) => {
+                self.add_watch_expression(expr);
+                self.refresh_debug_panel();
+            }
+            MenuAction::RemoveDebugWatch(index) => {
+                self.remove_watch_expression(index);
+                self.refresh_debug_panel();
+            }
+            MenuAction::CopyCallStack => self.copy_call_stack(),
             MenuAction::FixProblemWithNavigator { path, item } => {
                 self.fix_problem_with_navigator(path, item, Vec::new());
             }

@@ -289,6 +289,9 @@ pub enum DebugRowKind {
         name: String,
         value: String,
         type_name: String,
+        /// The adapter's `evaluateName`, for Copy as Expression and Add to
+        /// Watch (#1546).
+        evaluate_name: Option<String>,
     },
     /// A watch expression (#112). `available` false renders `<not available>`
     /// (the adapter rejected it); `changed` highlights a value that differs
@@ -1445,6 +1448,7 @@ mod tests {
                     name: "x".into(),
                     value: "1".into(),
                     type_name: "int".into(),
+                    evaluate_name: None,
                 },
             },
             DebugRow {
@@ -1456,6 +1460,7 @@ mod tests {
                     name: "obj".into(),
                     value: "<Foo>".into(),
                     type_name: "Foo".into(),
+                    evaluate_name: None,
                 },
             },
         ];
