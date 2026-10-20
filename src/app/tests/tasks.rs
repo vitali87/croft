@@ -887,28 +887,37 @@ fn a_multi_line_shell_block_is_typed_as_one_command() {
     assert_eq!(run_typed_line(&cont, tmp.path()), "one two\n");
 }
 
-/// #920: fish before 3.4 rejects `$(...)` as syntax, so a fish pane gets the
-/// block piped to `source`, which runs it in the pane's own shell (a `cd`
-/// persists) on every fish.
+/// #920: fish before 3.4 rejects `$(...)` as syntax, so a fish pane
+/// `source`s the block from a `psub` file, which runs it in the pane's own
+/// shell (a `cd` persists) on every fish, and leaves the block's stdin the
+/// pane's: a `read` in it still gets what the user types.
 #[test]
 fn a_multi_line_shell_block_in_a_fish_pane_is_sourced() {
     let tmp = tempfile::tempdir().unwrap();
-    let code = "cd /\necho 'hi!'\t'back\\slash'\n";
+    let code = "cd /\nread x; echo got $x\necho 'hi!'\t'back\\slash'\n";
     let cmd = super::fence_command("sh", code, &tmp.path().join("blocks"), "/usr/bin/fish");
-    assert!(cmd.starts_with("printf '%b' '"), "{cmd:?}");
-    assert!(cmd.ends_with("' | source\r"), "{cmd:?}");
+    assert!(cmd.starts_with("source (printf '%b' '"), "{cmd:?}");
+    assert!(cmd.ends_with("' | psub)\r"), "{cmd:?}");
     assert!(!cmd.contains("$("), "{cmd:?}");
     // Not `--no-config`, which fish before 3.3 lacks: an empty config home.
-    let Ok(out) = std::process::Command::new("fish")
+    let Ok(mut fish) = std::process::Command::new("fish")
         .arg("-c")
         .arg(format!("{}; pwd", cmd.trim_end_matches('\r')))
         .env("XDG_CONFIG_HOME", tmp.path())
         .current_dir(tmp.path())
-        .output()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
     else {
         return;
     };
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi! back\\slash\n/\n");
+    use std::io::Write;
+    fish.stdin.take().unwrap().write_all(b"typed\n").unwrap();
+    let out = fish.wait_with_output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "got typed\nhi! back\\slash\n/\n"
+    );
 }
 
 /// #920: a block of several lines settles its capture on the WHOLE block.

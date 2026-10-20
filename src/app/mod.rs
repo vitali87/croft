@@ -74816,8 +74816,10 @@ fn is_run_fence_key(key: KeyEvent) -> bool {
 /// tab travels as `\t`. A backslash travels as `\0134`, since fish folds
 /// `\\` inside single quotes to one backslash where bash and zsh keep both.
 /// `shell` is the pane's shell: fish before 3.4 rejects `$(...)` as
-/// syntax, so a fish pane pipes the decoded block to `source` rather than
-/// `eval`ing it, which every fish reads alike.
+/// syntax, so a fish pane `source`s the decoded block from a `psub` file
+/// rather than `eval`ing it, which every fish reads alike. Not piped to
+/// `source`: the block's own stdin would be the pipe, and a `read` or an
+/// install's "continue? [Y/n]" would get nothing from the pane.
 fn fence_command(interpreter: &str, code: &str, scripts: &Path, shell: &str) -> String {
     let code = code.trim_end_matches('\n');
     if interpreter != "sh" {
@@ -74842,7 +74844,7 @@ fn fence_command(interpreter: &str, code: &str, scripts: &Path, shell: &str) -> 
         // `cd` or `export` persists, bash-isms still work): `eval` of the
         // decoded text, or fish's `source` of it.
         if Path::new(shell).file_name().is_some_and(|n| n == "fish") {
-            return format!("printf '%b' '{escaped}' | source\r");
+            return format!("source (printf '%b' '{escaped}' | psub)\r");
         }
         return format!("eval \"$(printf '%b' '{escaped}')\"\r");
     }
