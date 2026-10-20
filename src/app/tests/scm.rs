@@ -2932,6 +2932,168 @@ fn view_stash_without_stashes_opens_nothing() {
     assert!(app.git_view_job.is_none());
 }
 
+/// #1128 fixture: a repository with two stashes, `stash@{0}: quick
+/// experiment` and `stash@{1}: WIP payment retries`, and the Drop Stash
+/// picker open on the second.
+fn drop_stash_picker_1128() -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(tmp.path().join("billing.py"), "v1\n").unwrap();
+    git(&["add", "billing.py"]);
+    git(&["commit", "-qm", "billing"]);
+    std::fs::write(tmp.path().join("billing.py"), "half-finished refactor\n").unwrap();
+    git(&["stash", "push", "-q", "-m", "WIP payment retries"]);
+    std::fs::write(tmp.path().join("billing.py"), "v2\n").unwrap();
+    git(&["stash", "push", "-q", "-m", "quick experiment"]);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_stash_picker(crate::widgets::list_picker::ListPurpose::StashDrop);
+    app.list_picker.as_mut().unwrap().select_next();
+    (tmp, app)
+}
+
+fn stash_messages_1128(root: &Path) -> Vec<String> {
+    crate::git::list_stashes(root)
+        .unwrap()
+        .into_iter()
+        .map(|s| s.message)
+        .collect()
+}
+
+/// #1128: picking a stash in Drop Stash asks first, naming it; Enter does
+/// not answer (a second stray Enter must not drop it), and only Y drops.
+#[test]
+fn drop_stash_asks_before_it_deletes_the_stash() {
+    let (tmp, mut app) = drop_stash_picker_1128();
+    app.confirm_list_picker();
+    assert_eq!(
+        stash_messages_1128(tmp.path()).len(),
+        2,
+        "nothing dropped yet"
+    );
+    let screen = draw_screen(&mut app);
+    assert!(screen.contains("DROP STASH?"), "{screen}");
+    assert!(screen.contains("WIP payment retries"), "{screen}");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(stash_messages_1128(tmp.path()).len(), 2, "Enter keeps it");
+    app.handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE))
+        .unwrap();
+    let left = stash_messages_1128(tmp.path());
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(
+        left[0].contains("quick experiment"),
+        "the picked one went: {left:?}"
+    );
+    assert!(app.status.starts_with("Dropped stash"), "{}", app.status);
+    assert!(!draw_screen(&mut app).contains("DROP STASH?"));
+}
+
+/// #1128 negative: N or Esc closes the question and keeps every stash.
+#[test]
+fn drop_stash_answered_no_keeps_the_stash() {
+    for answer in [KeyCode::Char('n'), KeyCode::Esc] {
+        let (tmp, mut app) = drop_stash_picker_1128();
+        app.confirm_list_picker();
+        app.handle_key(key(answer, KeyModifiers::NONE)).unwrap();
+        assert_eq!(stash_messages_1128(tmp.path()).len(), 2, "{answer:?}");
+        assert_eq!(app.status, "Kept the stash");
+        assert!(!draw_screen(&mut app).contains("DROP STASH?"), "{answer:?}");
+    }
+}
+
+/// Runs `git` in `root` for the #1128 tests, failing the test on error.
+fn git_1128(root: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+/// #1128: only a plain (or shifted) Y answers. Ctrl+Shift+Y is terminal copy
+/// mode, and pressing it with the question up must not drop the stash.
+#[test]
+fn drop_stash_ignores_a_modified_y() {
+    let (tmp, mut app) = drop_stash_picker_1128();
+    app.confirm_list_picker();
+    app.handle_key(key(
+        KeyCode::Char('Y'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert_eq!(
+        stash_messages_1128(tmp.path()).len(),
+        2,
+        "Ctrl+Shift+Y kept it"
+    );
+    assert!(
+        draw_screen(&mut app).contains("DROP STASH?"),
+        "still asking"
+    );
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::SHIFT))
+        .unwrap();
+    let left = stash_messages_1128(tmp.path());
+    assert_eq!(left.len(), 1, "Shift+Y answers: {left:?}");
+    assert!(left[0].contains("quick experiment"), "{left:?}");
+}
+
+/// #1128: a stash pushed while the question is up shifts every
+/// `stash@{N}`; Y still drops the stash the question named, not the one
+/// that slid into its old index.
+#[test]
+fn drop_stash_drops_the_named_stash_after_the_list_moves() {
+    let (tmp, mut app) = drop_stash_picker_1128();
+    app.confirm_list_picker();
+    std::fs::write(tmp.path().join("billing.py"), "v3\n").unwrap();
+    git_1128(
+        tmp.path(),
+        &["stash", "push", "-q", "-m", "pushed meanwhile"],
+    );
+    app.handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE))
+        .unwrap();
+    let left = stash_messages_1128(tmp.path());
+    assert_eq!(left.len(), 2, "{left:?}");
+    assert!(
+        left.iter().all(|m| !m.contains("WIP payment retries")),
+        "the named stash went: {left:?}"
+    );
+    assert!(
+        left.iter().any(|m| m.contains("quick experiment")),
+        "the one now at its old index stayed: {left:?}"
+    );
+    assert!(app.status.starts_with("Dropped stash"), "{}", app.status);
+}
+
+/// #1128 negative: when the named stash is dropped elsewhere while the
+/// question is up, Y drops nothing and says why.
+#[test]
+fn drop_stash_refuses_when_the_named_stash_is_gone() {
+    let (tmp, mut app) = drop_stash_picker_1128();
+    app.confirm_list_picker();
+    git_1128(tmp.path(), &["stash", "drop", "-q", "stash@{1}"]);
+    app.handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE))
+        .unwrap();
+    let left = stash_messages_1128(tmp.path());
+    assert_eq!(left.len(), 1, "nothing else dropped: {left:?}");
+    assert!(left[0].contains("quick experiment"), "{left:?}");
+    assert!(
+        app.status.contains("no longer in the stash list"),
+        "{}",
+        app.status
+    );
+}
+
 /// A pasted multi-line message is committed with its subject, blank line
 /// and body intact, not glued into one line.
 #[test]

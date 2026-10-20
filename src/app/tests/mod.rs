@@ -436,6 +436,16 @@ fn sheet_cell_on_screen(app: &App, row: usize, col: usize) -> (u16, u16) {
         .expect("the cell is on screen")
 }
 
+fn xlsx_value(p: &std::path::Path, col: u32, row: u32) -> String {
+    let book = umya_spreadsheet::reader::xlsx::read(p).unwrap();
+    book.sheet(0)
+        .unwrap()
+        .cell((col, row))
+        .unwrap()
+        .value()
+        .to_string()
+}
+
 /// Type `text` into the focused editor, which leaves its buffer dirty.
 fn type_into_editor(app: &mut App, text: &str) {
     for c in text.chars() {
@@ -2202,6 +2212,7 @@ fn long_task(label: &str) -> crate::tasks::Task {
         is_build: false,
         is_default: false,
         problem_matcher: None,
+        is_background: false,
         vscode: None,
     }
 }

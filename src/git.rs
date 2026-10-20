@@ -1267,6 +1267,56 @@ pub fn read_file_at_stage(root: &Path, rel_path: &str, stage: u8) -> Result<Stri
         .map_err(|_| format!("{rel_path} at stage {stage} is not UTF-8"))
 }
 
+/// The unmerged `rel_path`'s three index stages merged again by
+/// `git merge-file --diff3`, whose conflicts keep each side whole where
+/// git's default style trims what the sides share (the inline Accept
+/// Both's source, see `merge::untrimmed_both`). Errors when a stage is
+/// missing (not unmerged, or an add/add with no base) or git fails.
+pub fn remerge_diff3(root: &Path, rel_path: &str) -> Result<String, String> {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let sides = [
+        ("ours", read_file_at_stage(root, rel_path, 2)?),
+        ("base", read_file_at_stage(root, rel_path, 1)?),
+        ("theirs", read_file_at_stage(root, rel_path, 3)?),
+    ];
+    // A directory of our own, made fresh: `create_dir_all` would take one
+    // another local user made first at this guessable name, and the writes
+    // below would follow the symlinks they left in it.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let dir = std::env::temp_dir().join(format!(
+        "croft-remerge-{}-{}-{nanos}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(&dir).map_err(|e| e.to_string())?;
+    let merged = (|| {
+        for (name, text) in &sides {
+            std::fs::write(dir.join(name), text).map_err(|e| e.to_string())?;
+        }
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["merge-file", "-p", "-q", "--diff3"])
+            .args(sides.iter().map(|(name, _)| dir.join(name)))
+            .output()
+            .map_err(|e| format!("failed to spawn git: {e}"))?;
+        // The exit code is the conflict count (at most 127); an error
+        // exits negative, which reads as 255.
+        match output.status.code() {
+            Some(0..=127) => String::from_utf8(output.stdout)
+                .map_err(|_| format!("{rel_path} merged is not UTF-8")),
+            _ => Err(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+        }
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    merged
+}
+
 #[derive(Clone, Copy)]
 enum HunkSide {
     Old,
@@ -3717,6 +3767,33 @@ pub fn stash_pop_at(root: &Path, index: usize) -> Result<String, String> {
 /// Drop a stash without applying it (`git stash drop stash@{N}`).
 pub fn stash_drop(root: &Path, index: usize) -> Result<String, String> {
     run_mutation(root, &["stash", "drop", &format!("stash@{{{index}}}")])
+}
+
+/// The commit a stash entry records (`git rev-parse stash@{N}`). Unlike its
+/// index, it keeps naming the same stash while others are pushed or dropped.
+pub fn stash_oid(root: &Path, index: usize) -> Result<String, String> {
+    run_git(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("stash@{{{index}}}"),
+        ],
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Drop the stash whose commit is `oid`, at whatever index it holds now: a
+/// stash pushed or dropped since it was picked shifts every index, and the
+/// old one would name a different stash. Refuses when it is gone.
+pub fn stash_drop_oid(root: &Path, oid: &str) -> Result<String, String> {
+    let list = run_git(root, &["stash", "list", "--format=%H"]).map_err(|e| e.to_string())?;
+    let index = list
+        .lines()
+        .position(|hash| hash.trim() == oid)
+        .ok_or_else(|| String::from("that stash is no longer in the stash list"))?;
+    stash_drop(root, index)
 }
 
 // --- Tags ----------------------------------------------------------------

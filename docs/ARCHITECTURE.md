@@ -145,6 +145,7 @@ src/
 │   ├── mod.rs
 │   ├── client.rs             async-lsp client wrapper: routes diagnostics (pushed and pulled) and `$/progress` to the status bar, acknowledges refresh requests into shared re-pull flags, declares `workspace.workspaceFolders` and answers the server→client folder request from the same list initialize carried
 │   ├── config.rs             per-language LSP config (basedpyright, ruff, ty, vtsls, rust-analyzer, gopls); the ServerConfig factories are the executable spec the bundled manifests reproduce, and Language is an open newtype so extensions can add one
+│   ├── rust_analyzer.rs      rust-analyzer's non-LSP requests (expandMacro, parentModule, openCargoToml, rebuildProcMacros, reloadWorkspace) sent as raw JSON, their params and how their answers read
 │   ├── install.rs            croft-managed server provisioning: lazy background installs into `~/.croft/servers` via three backends — npm, uv (rerouted to Termux `pkg` on Android), and Binary (per-platform release download, PATH-first)
 │   ├── languages.rs     language table: file-extension -> language, root markers, and server family, all built from extension manifests' [[languages]] blocks (replaces the old hardcoded Language enum match arms)
 │   ├── log_file.rs      LSP stderr / debug log sink at ~/.croft/lsp.log
@@ -976,6 +977,8 @@ Merge-conflict machinery. It scans VS Code-regex markers (`<<<<<<<`, `|||||||` d
 **The guided flow.** Source Control classifies unmerged porcelain codes into a MERGE CONFLICTS section whose entries open the working file parked on the first conflict. F7 and Shift+F7 wrap between blocks. Each header row paints clickable Accept Current / Incoming / Both buttons (#1169), shortened to Current / Incoming / Both on a narrow row rather than dropped, with hit spans cleared per render — the frame-truth invariant — and the inline blame annotation is suppressed inside blocks so it cannot overpaint them.
 
 **Bulk accept and completion.** "Accept All Current/Incoming" splices every block back-to-front, one undo step each. "Merge: Complete Merge" refuses while blocks remain, then saves and `git add`s the file so it rejoins the staged flow.
+
+**Accept Both puts back what git trimmed.** Git's default conflict style moves the lines both sides share at a conflict's ends out of the markers and writes them once. Two functions added at the same spot then share one closing `}` below `>>>>>>>`, and joining the sections as written leaves the first one unclosed; shared lines in the middle can also split one conflict into several blocks. For a file git holds unmerged, Accept Both re-merges the index stages with `git merge-file --diff3` (`git::remerge_diff3`), whose conflicts keep each side whole, and `untrimmed_both` finds the conflict the block was cut from by walking out over the lines and neighbouring blocks that read as its sides. Both whole sides replace that span in one undo step. When nothing fits (a plain marker file, an add/add with no base, two different edits of the same lines), the sections are joined as written.
 
 ### merge_editor.rs
 

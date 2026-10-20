@@ -86,6 +86,13 @@ pub enum Command {
     /// Git: Undo Last Commit (#1350): `reset --soft HEAD~1`, its message
     /// back in the Source Control box.
     GitUndoLastCommit,
+    /// rust-analyzer's own commands (#1626), listed only while it serves
+    /// the active file.
+    RustExpandMacro,
+    RustParentModule,
+    RustOpenCargoToml,
+    RustRebuildProcMacros,
+    RustReloadWorkspace,
     /// Git: Copy Permalink / Copy Head Link / Open on Remote (#1610): the
     /// selected lines on the remote's web page, at HEAD's commit or branch.
     GitCopyPermalink,
@@ -634,6 +641,11 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::UnstageHunk,
     Command::RevertHunk,
     Command::GitUndoLastCommit,
+    Command::RustExpandMacro,
+    Command::RustParentModule,
+    Command::RustOpenCargoToml,
+    Command::RustRebuildProcMacros,
+    Command::RustReloadWorkspace,
     Command::GitCopyPermalink,
     Command::GitCopyHeadLink,
     Command::GitOpenOnRemote,
@@ -1088,6 +1100,11 @@ impl Command {
             Command::UnstageHunk => "Git: Unstage Hunk",
             Command::RevertHunk => "Git: Revert Hunk",
             Command::GitUndoLastCommit => "Git: Undo Last Commit",
+            Command::RustExpandMacro => "Rust: Expand Macro Recursively at Caret",
+            Command::RustParentModule => "Rust: Locate Parent Module",
+            Command::RustOpenCargoToml => "Rust: Open Cargo.toml",
+            Command::RustRebuildProcMacros => "Rust: Rebuild Proc Macros and Build Scripts",
+            Command::RustReloadWorkspace => "Rust: Reload Workspace",
             Command::GitCopyPermalink => "Git: Copy Permalink",
             Command::GitCopyHeadLink => "Git: Copy Head Link",
             Command::GitOpenOnRemote => "Git: Open on Remote",
@@ -1554,6 +1571,11 @@ impl Command {
             Command::UnstageHunk => "U in diff",
             Command::RevertHunk => "R in diff",
             Command::GitUndoLastCommit => "",
+            Command::RustExpandMacro
+            | Command::RustParentModule
+            | Command::RustOpenCargoToml
+            | Command::RustRebuildProcMacros
+            | Command::RustReloadWorkspace => "",
             Command::GitCopyPermalink | Command::GitCopyHeadLink | Command::GitOpenOnRemote => "",
 
             Command::GitViewStash => "",
@@ -2001,6 +2023,11 @@ impl Command {
             Command::UnstageHunk => "unstage_hunk",
             Command::RevertHunk => "revert_hunk",
             Command::GitUndoLastCommit => "git_undo_last_commit",
+            Command::RustExpandMacro => "rust_expand_macro",
+            Command::RustParentModule => "rust_parent_module",
+            Command::RustOpenCargoToml => "rust_open_cargo_toml",
+            Command::RustRebuildProcMacros => "rust_rebuild_proc_macros",
+            Command::RustReloadWorkspace => "rust_reload_workspace",
             Command::GitCopyPermalink => "git_copy_permalink",
             Command::GitCopyHeadLink => "git_copy_head_link",
             Command::GitOpenOnRemote => "git_open_on_remote",

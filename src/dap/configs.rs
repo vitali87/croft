@@ -1252,6 +1252,35 @@ pub fn debugpy_request(rc: &ResolvedConfig, project_python: &Path) -> Value {
     }
 }
 
+/// Where a debugpy `attach` with `connect` goes (#1417): the address a
+/// `debugpy --listen` / `debugpy.listen()` process serves. That port is
+/// the debuggee's own adapter, so croft talks DAP to it directly, as VS
+/// Code does, rather than putting a second adapter in front of it. `None`
+/// for a launch, and for the `listen` form, where the debuggee connects
+/// back to an adapter croft runs.
+pub fn debugpy_connect_address(request: &Value) -> Option<(String, u16)> {
+    if request.get("command").and_then(Value::as_str) != Some("attach") {
+        return None;
+    }
+    let args = request.get("arguments")?;
+    if args.get("listen").is_some() {
+        return None;
+    }
+    let connect = args.get("connect")?;
+    let port = match connect.get("port")? {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+    .and_then(|p| u16::try_from(p).ok())?;
+    let host = connect
+        .get("host")
+        .and_then(Value::as_str)
+        .filter(|h| !h.trim().is_empty())
+        .unwrap_or("127.0.0.1");
+    Some((host.to_string(), port))
+}
+
 /// Build the lldb-dap `launch`/`attach` request. `env` uses the
 /// `"VAR=VALUE"` string-array format lldb-dap has accepted since
 /// lldb-vscode. Attach targets `pid`.
@@ -1493,6 +1522,19 @@ pub fn delve_request(rc: &ResolvedConfig) -> Value {
             request_value("attach", args)
         }
     }
+}
+
+/// `request` with `__workspaceFolder` set to `root` unless the config set it
+/// (#1414). VS Code sends it with every js-debug launch and attach; js-debug
+/// resolves its `${workspaceFolder}` defaults (`rootPath`,
+/// `resolveSourceMapLocations`) against it, and without it a breakpoint in a
+/// compiled TypeScript file is bound only after startup code has run past it.
+pub fn with_workspace_folder(mut request: Value, root: &Path) -> Value {
+    if let Some(args) = request.get_mut("arguments").and_then(Value::as_object_mut) {
+        args.entry("__workspaceFolder")
+            .or_insert_with(|| json!(root.to_string_lossy()));
+    }
+    request
 }
 
 /// Build the vscode-js-debug `launch`/`attach` request (`pwa-node`, the
@@ -2436,6 +2478,37 @@ mod tests {
         assert_eq!(req["command"], "attach");
         assert_eq!(req["arguments"]["port"], 9229);
         assert_eq!(req["arguments"]["address"], "127.0.0.1");
+    }
+
+    /// #1414: js-debug launches and attaches carry the workspace folder, and
+    /// one the config sets is kept.
+    #[test]
+    fn js_requests_carry_the_workspace_folder_unless_the_config_sets_one() {
+        let root = Path::new("/work/proj");
+        for text in [
+            r#"[{ "name": "L", "type": "node", "program": "${workspaceFolder}/dist/main.js", "outFiles": ["${workspaceFolder}/dist/**/*.js"] }]"#,
+            r#"[{ "name": "A", "type": "node", "request": "attach", "port": 9229 }]"#,
+        ] {
+            let rc = resolve(&config(text), &ctx()).unwrap();
+            let req = with_workspace_folder(js_request(&rc), root);
+            assert_eq!(
+                req["arguments"]["__workspaceFolder"], "/work/proj",
+                "{text}"
+            );
+        }
+        let rc = resolve(
+            &config(r#"[{ "name": "W", "type": "node", "program": "a.js", "__workspaceFolder": "/elsewhere" }]"#),
+            &ctx(),
+        )
+        .unwrap();
+        let req = with_workspace_folder(js_request(&rc), root);
+        assert_eq!(
+            req["arguments"]["__workspaceFolder"], "/elsewhere",
+            "the config's own value wins"
+        );
+        // Negative: a request without arguments is left as it is.
+        let bare = json!({ "type": "request", "command": "launch" });
+        assert_eq!(with_workspace_folder(bare.clone(), root), bare);
     }
 
     /// #1410: VS Code's browser types run on js-debug, which croft already
@@ -3823,6 +3896,60 @@ mod tests {
             .map(|c| c.name)
             .collect();
         assert_eq!(names, ["First", "Web"], "and the file is whole: {before}");
+    }
+
+    fn attach_address(cfg: &str) -> Option<(String, u16)> {
+        let rc = resolve(&config(cfg), &ctx()).unwrap();
+        debugpy_connect_address(&debugpy_request(&rc, Path::new("python3")))
+    }
+
+    /// #1417: a debugpy attach with `connect` (or the older `host`/`port`)
+    /// goes to that address, the `debugpy --listen` process's own adapter.
+    #[test]
+    fn a_debugpy_connect_attach_goes_to_the_listening_port() {
+        assert_eq!(
+            attach_address(
+                r#"[{ "name": "R", "type": "debugpy", "request": "attach",
+                     "connect": { "host": "127.0.0.1", "port": 5679 } }]"#
+            ),
+            Some((String::from("127.0.0.1"), 5679))
+        );
+        assert_eq!(
+            attach_address(
+                r#"[{ "name": "R", "type": "debugpy", "request": "attach",
+                     "connect": { "host": "box", "port": "5680" } }]"#
+            ),
+            Some((String::from("box"), 5680))
+        );
+        assert_eq!(
+            attach_address(
+                r#"[{ "name": "R", "type": "python", "request": "attach",
+                     "host": "10.0.0.5", "port": 5678 }]"#
+            ),
+            Some((String::from("10.0.0.5"), 5678))
+        );
+        assert_eq!(
+            attach_address(
+                r#"[{ "name": "R", "type": "debugpy", "request": "attach", "connect": { "port": 5678 } }]"#
+            ),
+            Some((String::from("127.0.0.1"), 5678)),
+            "no host is this machine"
+        );
+    }
+
+    /// #1417 negatives: the `listen` form (the debuggee connects back), a
+    /// launch, an attach by process id and a port that is not one keep the
+    /// local adapter.
+    #[test]
+    fn a_debugpy_listen_attach_or_launch_keeps_the_local_adapter() {
+        for cfg in [
+            r#"[{ "name": "L", "type": "debugpy", "request": "attach", "listen": { "host": "0.0.0.0", "port": 5678 } }]"#,
+            r#"[{ "name": "P", "type": "debugpy", "request": "launch", "program": "a.py", "connect": { "port": 5678 } }]"#,
+            r#"[{ "name": "I", "type": "debugpy", "request": "attach", "processId": 4242 }]"#,
+            r#"[{ "name": "B", "type": "debugpy", "request": "attach", "connect": { "port": 70000 } }]"#,
+        ] {
+            assert_eq!(attach_address(cfg), None, "{cfg}");
+        }
     }
 
     /// #1391: a node launch that starts an npm script names no `program`;

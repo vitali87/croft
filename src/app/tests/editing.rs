@@ -1524,6 +1524,88 @@ fn tab_switches_focus_between_the_find_and_replace_fields() {
     );
 }
 
+const LOG_PY: &str = "import logging\nlog = logging.getLogger(__name__)\n\nlog.debug(\"start\")\nlog.info(\"loaded config\")\nlog.debug(\"done\")\nlog.info(\"ready\")\n";
+
+/// #1592: with the caret in a word and nothing selected, Replace starts in
+/// the Find field with the word selected, so "debug, Tab, info" changes
+/// debug to info and not the other way round.
+#[test]
+fn replace_from_a_caret_in_a_word_starts_in_the_find_field() {
+    use crate::widgets::editor_find::FindField;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "app.py", LOG_PY);
+    app.editor.cursor_row = 3;
+    app.editor.cursor_col = 12;
+    app.handle_key(replace_chord()).unwrap();
+    let s = app.editor_find.as_ref().unwrap();
+    assert_eq!(s.query, "start", "the word at the caret is still the seed");
+    assert_eq!(s.focus, FindField::Query);
+    type_keys(&mut app, "debug");
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    type_keys(&mut app, "info");
+    let s = app.editor_find.as_ref().unwrap();
+    assert_eq!((s.query.as_str(), s.replace.as_str()), ("debug", "info"));
+    app.editor_find_replace_all();
+    assert_eq!(app.editor.lines[3], "log.info(\"start\")");
+    assert_eq!(app.editor.lines[5], "log.info(\"done\")");
+    assert_eq!(app.editor.lines[4], "log.info(\"loaded config\")");
+}
+
+/// Negative (#1592): a one-line selection is a chosen find text, so Replace
+/// still starts in the Replace field.
+#[test]
+fn replace_from_a_selection_starts_in_the_replace_field() {
+    use crate::widgets::editor_find::FindField;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "app.py", LOG_PY);
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (3, 4),
+        head: (3, 9),
+    });
+    app.editor.cursor_row = 3;
+    app.editor.cursor_col = 9;
+    app.handle_key(replace_chord()).unwrap();
+    let s = app.editor_find.as_ref().unwrap();
+    assert_eq!(s.query, "debug");
+    assert_eq!(s.focus, FindField::Replace);
+}
+
+/// Negative (#1592): a find text typed in an open bar is chosen too, so
+/// the Replace chord moves on to the Replace field.
+#[test]
+fn replace_on_an_open_find_bar_moves_to_the_replace_field() {
+    use crate::widgets::editor_find::FindField;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "app.py", LOG_PY);
+    app.editor.cursor_row = 3;
+    app.editor.cursor_col = 12;
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    type_keys(&mut app, "debug");
+    app.handle_key(replace_chord()).unwrap();
+    let s = app.editor_find.as_ref().unwrap();
+    assert_eq!(s.query, "debug");
+    assert_eq!(s.focus, FindField::Replace);
+}
+
+/// Negative (#1592): a multi-line selection seeds nothing, so Replace
+/// starts in an empty Find field.
+#[test]
+fn replace_from_a_multi_line_selection_starts_in_an_empty_find_field() {
+    use crate::widgets::editor_find::FindField;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "app.py", LOG_PY);
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (3, 0),
+        head: (4, 3),
+    });
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 3;
+    app.handle_key(replace_chord()).unwrap();
+    assert_eq!(app.editor_find.as_ref().unwrap().focus, FindField::Query);
+}
+
 /// #1577: a replacement longer than the needle moves the range's end with
 /// it, so a range ending mid-line still holds every replaced match and
 /// nothing past it.
@@ -2326,6 +2408,53 @@ fn expand_with_array_prefix_snippets(typed: &str) -> String {
     app.editor.insert_str(typed);
     app.handle_editor_tab();
     app.editor.lines[0].clone()
+}
+
+/// Snippets the way `croft import-vscode` writes them from VS Code's
+/// per-language files (#1641).
+fn react_snippets() -> crate::snippets::SnippetSet {
+    crate::snippets::SnippetSet::from_json(
+        r#"{
+          "Component": { "prefix": "rfc", "body": "function $1() {}", "scope": "javascriptreact" },
+          "TS component": { "prefix": "tfc", "body": "const $1: FC = () => null", "scope": "typescriptreact" },
+          "Log": { "prefix": "clg", "body": "console.log($1)", "scope": "javascript" },
+          "Main": { "prefix": "ifm", "body": "if __name__ == '__main__':", "scope": "python" },
+          "Key": { "prefix": "key", "body": "\"$1\": ", "scope": "jsonc" }
+        }"#,
+    )
+}
+
+/// Open `name` (empty) with the snippets above, type `prefix`, press Tab,
+/// and return the line.
+fn tab_after(name: &str, prefix: &str) -> String {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join(name);
+    std::fs::write(&p, "\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    app.snippets = react_snippets();
+    app.editor.insert_str(prefix);
+    app.handle_editor_tab();
+    app.editor.lines[app.editor.cursor_row].clone()
+}
+
+/// #1641: a `javascriptreact` snippet expands in a `.jsx` file, and a
+/// `jsonc` one in a `.jsonc` file, as in VS Code.
+#[test]
+fn a_javascriptreact_snippet_expands_in_a_jsx_file() {
+    assert_eq!(tab_after("App.jsx", "rfc"), "function () {}");
+    assert_eq!(tab_after("tsconfig.jsonc", "key"), "\"\": ");
+}
+
+/// Negative (#1641): `.tsx` keeps `typescriptreact`, a `javascript`
+/// snippet keeps working in `.jsx` as it did, a `.js` file does not take
+/// `javascriptreact` ones, and other languages' snippets stay out.
+#[test]
+fn jsx_snippet_scopes_leave_other_files_and_languages_alone() {
+    assert_eq!(tab_after("App.tsx", "tfc"), "const : FC = () => null");
+    assert_eq!(tab_after("App.jsx", "clg"), "console.log()");
+    assert!(!tab_after("app.js", "rfc").contains("function"));
+    assert!(!tab_after("App.jsx", "ifm").contains("__main__"));
 }
 
 #[test]
