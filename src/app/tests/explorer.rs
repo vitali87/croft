@@ -2048,6 +2048,109 @@ fn opening_a_workspace_file_installs_its_exact_folder_set() {
     assert_eq!(before, after, "a bad file changes nothing");
 }
 
+/// #1602: `~/` in a typed path is the home directory, and a relative path
+/// is under the workspace.
+#[test]
+fn a_typed_path_expands_the_home_and_sits_under_the_workspace() {
+    let home = std::path::Path::new("/home/h");
+    let root = std::path::Path::new("/work/ws");
+    assert_eq!(
+        resolve_typed_path("~/team.code-workspace", Some(home), root),
+        Some(home.join("team.code-workspace"))
+    );
+    assert_eq!(
+        resolve_typed_path(" sub/x.code-workspace ", Some(home), root),
+        Some(root.join("sub/x.code-workspace"))
+    );
+    assert_eq!(
+        resolve_typed_path("/abs/x.code-workspace", Some(home), root),
+        Some(std::path::Path::new("/abs/x.code-workspace").to_path_buf())
+    );
+    assert_eq!(
+        resolve_typed_path("~user/x", Some(home), root),
+        Some(root.join("~user/x")),
+        "only `~/` is the home directory"
+    );
+    assert_eq!(
+        resolve_typed_path("~/team.code-workspace", None, root),
+        None,
+        "with no home, `~/` is refused, not put under the workspace"
+    );
+}
+
+/// Removes a path made relative to the process directory, if a run made it:
+/// a path that was already there when the guard was made is never touched.
+struct RemoveOnDrop(Option<PathBuf>);
+
+impl RemoveOnDrop {
+    fn new(path: PathBuf) -> Self {
+        Self((!path.exists()).then_some(path))
+    }
+}
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+/// #1602: Save Workspace As with a relative path writes under the workspace
+/// root, not the directory croft was started from, and the status line
+/// names the file as written.
+#[test]
+fn save_workspace_as_writes_a_relative_path_under_the_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rel = format!("croft-1602-{}", std::process::id());
+    let _cleanup = RemoveOnDrop::new(std::env::current_dir().unwrap().join(&rel));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::SaveWorkspaceAs);
+    app.input_prompt.as_mut().unwrap().value = format!("{rel}/team.code-workspace");
+    app.submit_input_prompt();
+    let dest = tmp.path().join(&rel).join("team.code-workspace");
+    assert!(dest.is_file(), "{}", app.status);
+    assert!(
+        !std::env::current_dir().unwrap().join(&rel).exists(),
+        "nothing under the launch directory"
+    );
+    assert!(
+        app.status.contains(&dest.display().to_string()),
+        "{}",
+        app.status
+    );
+    assert!(app.status.contains("created folder"), "{}", app.status);
+}
+
+/// #1602: a bare name gets the `.code-workspace` extension.
+#[test]
+fn save_workspace_as_adds_the_extension_to_a_bare_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::SaveWorkspaceAs);
+    app.input_prompt.as_mut().unwrap().value = tmp.path().join("team").display().to_string();
+    app.submit_input_prompt();
+    assert!(
+        tmp.path().join("team.code-workspace").is_file(),
+        "{}",
+        app.status
+    );
+    assert!(!tmp.path().join("team").exists());
+}
+
+/// Negative (#1602): the suggested absolute path is written where it says,
+/// with no "created folder" note for a folder that exists.
+#[test]
+fn save_workspace_as_keeps_the_suggested_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::SaveWorkspaceAs);
+    let suggested = PathBuf::from(&app.input_prompt.as_ref().unwrap().value);
+    app.submit_input_prompt();
+    assert!(suggested.is_file(), "{}", app.status);
+    assert!(!app.status.contains("created folder"), "{}", app.status);
+}
+
 #[test]
 fn workspace_folder_set_persists_across_sessions_and_reroots() {
     // #153: the folder set lived only in memory — reopening the same
