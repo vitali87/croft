@@ -2531,6 +2531,51 @@ struct Snapshot {
     bytes: usize,
 }
 
+impl Snapshot {
+    /// Take a collab peer's edit, given in this state's own text (#919):
+    /// the caret, selection and extra carets move with their text.
+    fn take_peer_splice(&mut self, s: &crate::undo_rebase::Splice) {
+        let edit = TextSpanEdit {
+            start: self.lines.position(s.at),
+            end: self.lines.position(s.at + s.deleted),
+            new_text: s.inserted.clone(),
+            utf16: false,
+        };
+        let map = |p| map_through_span_edits(p, std::slice::from_ref(&edit));
+        (self.cursor_row, self.cursor_col) = map((self.cursor_row, self.cursor_col));
+        for sel in self.selection.iter_mut().chain(self.carets.iter_mut()) {
+            sel.anchor = map(sel.anchor);
+            sel.head = map(sel.head);
+        }
+        self.lines
+            .replace_range(s.at..s.at + s.deleted, &s.inserted);
+        self.bytes = self.lines.heap_bytes();
+        // No save so far wrote the peer's edit, which arrives only now.
+        self.dirty = true;
+    }
+}
+
+/// Carry a peer's `edit`, written against the `live` text, into every state
+/// of an undo or redo `stack` (#919). Each state is one step from the one
+/// nearer the live text, so the edit is rebased state by state from the
+/// top, and stops at the first state it leaves alone.
+fn rebase_history(stack: &mut [Snapshot], live: &str, edit: crate::undo_rebase::Splice) {
+    let mut edits = Vec::new();
+    let mut source = live;
+    let mut edit = edit;
+    for snap in stack.iter().rev() {
+        let Some(next) = crate::undo_rebase::rebase(snap.lines.as_str(), source, &edit) else {
+            break;
+        };
+        edits.push(next.clone());
+        edit = next;
+        source = snap.lines.as_str();
+    }
+    for (snap, edit) in stack.iter_mut().rev().zip(&edits) {
+        snap.take_peer_splice(edit);
+    }
+}
+
 const UNDO_STACK_LIMIT: usize = 500;
 
 /// Bytes of text the undo steps of one buffer may hold (#694). Every step is
@@ -3387,7 +3432,8 @@ pub struct Editor {
     last_edit_kind: Option<EditKind>,
     /// The group of the remote edit that opened the undo step on top of
     /// the stack (#1207): further remote spans of that group join the step
-    /// instead of opening their own. Any other edit, undo or redo ends it.
+    /// instead of opening their own. Any other step, undo or redo ends it; a
+    /// peer's edit, which opens no step (#919), does not.
     remote_undo_group: Option<u64>,
     lang: Option<LangKind>,
     /// The language came from "Change Language Mode" (#1574), not from the
@@ -8400,13 +8446,51 @@ impl Editor {
         self.apply_span_edits_grouped(edits, None)
     }
 
-    /// [`Self::apply_span_edits`] for text a collab peer wrote (#1207). Every
-    /// call with the same `group` lands in one undo step while nothing else
-    /// edits the buffer in between: the runs of one peer edit, which arrive
-    /// one span at a time, and the fragments of one AI stream. Undo then
-    /// restores the text from before the group, never a mix of halves.
+    /// [`Self::apply_span_edits`] for text an AI stream wrote over collab
+    /// (#1207). Every call with the same `group` lands in one undo step
+    /// while no other step opens in between: the fragments of one stream,
+    /// which arrive one span at a time. Undo then restores the text from
+    /// before the group, never a mix of halves.
     pub fn apply_remote_span_edits(&mut self, edits: &[TextSpanEdit], group: u64) -> usize {
         self.apply_span_edits_grouped(edits, Some(group))
+    }
+
+    /// Apply a collab peer's edit without an undo step of its own (#919):
+    /// every undo and redo state takes the edit instead, so Ctrl+Z reverts
+    /// only this user's steps and keeps the peer's text, as in Zed or Live
+    /// Share. Returns the number of edits applied.
+    pub fn apply_peer_span_edit(&mut self, edit: &TextSpanEdit) -> usize {
+        let edit = char_span_edits(&self.lines, std::slice::from_ref(edit)).remove(0);
+        let (start, end) = (edit.start, edit.end);
+        if end < start || end.0 >= self.lines.len() {
+            return 0;
+        }
+        if !self.undo_stack.is_empty() || !self.redo_stack.is_empty() {
+            let offset = |(row, col): (usize, usize)| {
+                let above: usize = self.lines[..row].iter().map(|l| l.len() + 1).sum();
+                above + char_byte(&self.lines[row], col)
+            };
+            let at = offset(start);
+            let splice = crate::undo_rebase::Splice {
+                at,
+                deleted: offset(end) - at,
+                inserted: edit.new_text.clone(),
+            };
+            let live = self.lines.join("\n");
+            rebase_history(&mut self.undo_stack, &live, splice.clone());
+            rebase_history(&mut self.redo_stack, &live, splice);
+        }
+        self.pin_on_edit();
+        // The pre-edit text, for bookmarks to be diffed against afterwards.
+        self.seed_bookmark_shadow();
+        let applied = apply_char_span_edits(&mut self.lines, vec![edit]);
+        let n = applied.iter().map(|(_, count)| count).sum();
+        if n > 0 {
+            self.follow_span_edits(&applied);
+            self.mark_buffer_changed();
+            self.recompute_highlights();
+        }
+        n
     }
 
     fn apply_span_edits_grouped(&mut self, edits: &[TextSpanEdit], group: Option<u64>) -> usize {
@@ -28533,8 +28617,8 @@ mod tests {
         }
     }
 
-    /// #1207: every span of one remote group (the runs of a peer's edit,
-    /// the fragments of an AI stream) is one undo step.
+    /// #1207: every span of one remote group (the fragments of an AI
+    /// stream) is one undo step.
     #[test]
     fn remote_spans_of_one_group_undo_as_one_step() {
         let mut e = editor_with("def add(a, b):");
@@ -28612,6 +28696,47 @@ mod tests {
         assert_eq!(e.lines[0], "return a - b + c", "an ended group is closed");
         assert!(e.undo());
         assert_eq!(e.lines[0], "return a - b");
+    }
+
+    /// #919: a peer's edit opens no undo step. Undo reverts this user's own
+    /// typing and keeps the peer's lines, redo brings the typing back beside
+    /// them, and the restored caret sits where the typing was although the
+    /// peer added a line above it.
+    #[test]
+    fn undo_and_redo_keep_a_peers_edit() {
+        let mut e = editor_with("def f():\n    return 1\n\ndef g():\n    return 2");
+        e.cursor_row = 1;
+        e.cursor_col = 12;
+        e.insert_str("  # A-edit");
+        assert_eq!(
+            e.apply_peer_span_edit(&span((0, 0), (0, 0), "import os\n")),
+            1
+        );
+        e.apply_peer_span_edit(&span((5, 12), (5, 12), "  # B-edit"));
+        let typed = e.lines.clone();
+        assert!(e.undo());
+        assert_eq!(
+            e.lines,
+            [
+                "import os",
+                "def f():",
+                "    return 1",
+                "",
+                "def g():",
+                "    return 2  # B-edit"
+            ],
+            "only this user's typing is undone"
+        );
+        assert_eq!((e.cursor_row, e.cursor_col), (2, 12));
+        assert!(!e.undo(), "the peer's edits are not this user's steps");
+        assert!(e.redo());
+        assert_eq!(e.lines, typed);
+        // A peer edit while a step waits in redo lands in it too.
+        assert!(e.undo());
+        e.apply_peer_span_edit(&span((0, 0), (1, 0), ""));
+        assert!(e.redo());
+        assert_eq!(e.lines[0], "def f():");
+        assert_eq!(e.lines[1], "    return 1  # A-edit");
     }
 
     fn span(start: (usize, usize), end: (usize, usize), new_text: &str) -> TextSpanEdit {

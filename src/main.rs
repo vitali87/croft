@@ -128,6 +128,7 @@ mod tex_text;
 mod theme;
 mod tour;
 mod triggers;
+mod undo_rebase;
 mod update_check;
 mod update_watch;
 mod view_ipc;
