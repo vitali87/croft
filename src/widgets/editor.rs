@@ -7193,20 +7193,7 @@ impl Editor {
                 md.scroll = scroll;
             }
         } else if self.markdown_preview.as_ref().is_some_and(|md| md.notebook) {
-            let scroll = self
-                .markdown_preview
-                .as_ref()
-                .map(|m| m.scroll)
-                .unwrap_or(0);
-            if self.build_notebook_preview() {
-                if let Some(md) = self.markdown_preview.as_mut() {
-                    md.scroll = scroll;
-                }
-            } else {
-                // Same fallback as the stale path (#199 review): an
-                // invalid document drops to the raw text.
-                self.markdown_preview = None;
-            }
+            self.rebuild_notebook_preview();
         } else if self.markdown_preview.is_some() {
             self.rebuild_markdown_preview();
         }
@@ -8062,6 +8049,35 @@ impl Editor {
             scroll_to_source: None,
         });
         true
+    }
+
+    /// Rebuild the notebook view (#180) from the buffer, keeping its
+    /// scroll. A document that no longer parses drops to the raw text
+    /// (#199 review): keeping the stale render would repaint and re-fail
+    /// every frame.
+    fn rebuild_notebook_preview(&mut self) {
+        let scroll = self.markdown_preview.as_ref().map_or(0, |m| m.scroll);
+        if self.build_notebook_preview() {
+            if let Some(md) = self.markdown_preview.as_mut() {
+                md.scroll = scroll;
+            }
+        } else {
+            self.markdown_preview = None;
+        }
+    }
+
+    /// Mark the notebook cells running or queued in its kernel (#355). The
+    /// view redraws their `In [*]` marks at once: it otherwise rebuilds only
+    /// on an edit, and a run can end without one, as when the kernel never
+    /// starts (#878), which left the cells marked running for good.
+    pub fn set_notebook_running(&mut self, running: Vec<usize>) {
+        if self.notebook_running == running {
+            return;
+        }
+        self.notebook_running = running;
+        if self.markdown_preview.as_ref().is_some_and(|md| md.notebook) {
+            self.rebuild_notebook_preview();
+        }
     }
 
     /// Scroll the active Markdown preview; returns false when none is open
@@ -19767,23 +19783,8 @@ impl Editor {
             .is_some_and(|md| md.built_seq != self.edit_seq);
         let is_nb = self.markdown_preview.as_ref().is_some_and(|md| md.notebook);
         if stale && is_nb {
-            // Notebook rebuild (#180): keep the scroll, refresh the rest.
-            // A JSON made invalid by the edit clears the preview and
-            // falls back to the raw text (#199 review) - retaining the
-            // stale render would repaint and re-fail every frame.
-            let scroll = self
-                .markdown_preview
-                .as_ref()
-                .map(|m| m.scroll)
-                .unwrap_or(0);
-            if self.build_notebook_preview() {
-                if let Some(md) = self.markdown_preview.as_mut() {
-                    md.scroll = scroll;
-                }
-            } else {
-                self.markdown_preview = None;
-                return;
-            }
+            // A JSON made invalid by the edit drops to the raw text.
+            self.rebuild_notebook_preview();
         } else if stale {
             // The image-aware builder (#176): the plain one here left the
             // images list pointing at STALE anchors after a live edit.

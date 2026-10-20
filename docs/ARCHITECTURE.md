@@ -996,7 +996,7 @@ The Jupyter rendered view. An `.ipynb` file parses into the same `(lines, images
 
 **Dispatch.** The preview carries a `notebook` flag so the stale-rebuild and theme-switch paths route to this builder rather than the plain Markdown one.
 
-**Kernels (#355, `notebook_kernel.rs`).** Each code cell is an `MdRunnable` with `kernel_cell` set, so the run glyph, its hit-testing and its row mapping are the runnable-docs machinery. `run_markdown_block` sends a kernel cell to the notebook's `NotebookRun`, not to a pane. The kernel runs behind `assets/jupyter/bridge.py`, a `jupyter_client` script croft talks to in JSON lines, so croft carries no ZMQ client. The bridge sends outputs in nbformat v4 shape. `NotebookRun::fold` writes them into the buffer by cell id (or by index when the file has no ids) as one edit per tick, re-serialised in nbformat's layout (one-space indent, sorted keys).
+**Kernels (#355, `notebook_kernel.rs`).** Each code cell is an `MdRunnable` with `kernel_cell` set, so the run glyph, its hit-testing and its row mapping are the runnable-docs machinery. `run_markdown_block` sends a kernel cell to the notebook's `NotebookRun`, not to a pane. The kernel runs behind `assets/jupyter/bridge.py`, a `jupyter_client` script croft talks to in JSON lines, so croft carries no ZMQ client. The bridge sends outputs in nbformat v4 shape. `NotebookRun::fold` writes them into the buffer by cell id (or by index when the file has no ids) as one edit per tick, re-serialised in nbformat's layout (one-space indent, sorted keys). A run clears its cells' old outputs only once the kernel is up, and a kernel that fails to start drops its `NotebookRun`, so the notebook stays as it was and the next run starts a new kernel (#878).
 
 ### outline.rs
 

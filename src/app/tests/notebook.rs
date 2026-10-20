@@ -74,8 +74,8 @@ fn click_first_cell_glyph(
 
 /// A notebook cell's run glyph, end to end through the App with the test
 /// standing in for the kernel: the click sends the cell's code, the cell
-/// shows `In [*]` while it runs, and the kernel's output and count land in
-/// the buffer as an edit.
+/// shows `In [*]` while it runs, the kernel coming up clears the old
+/// output, and the kernel's output and count land in the buffer as an edit.
 #[test]
 fn clicking_a_cells_run_glyph_runs_it_and_writes_the_output_into_the_notebook() {
     let tmp = tempfile::tempdir().unwrap();
@@ -104,14 +104,20 @@ fn clicking_a_cells_run_glyph_runs_it_and_writes_the_output_into_the_notebook() 
     };
     assert_eq!(app.editor.notebook_running, vec![0]);
     assert!(
-        !app.editor.lines.join("\n").contains("stale"),
-        "the run clears the old output"
+        app.editor.lines.join("\n").contains("stale"),
+        "#878: the old output stays until the kernel is up"
     );
     term.draw(|f| app.render(f)).unwrap();
     let md = app.editor.markdown_preview.as_ref().unwrap();
     let frame = &md.lines[md.runnables[0].first_line];
     assert_eq!(frame.spans[1].content.as_ref(), "In [*]:");
 
+    kernel
+        .send(crate::notebook_kernel::Event::Ready {
+            kernel: "python3".into(),
+            display: "Python 3".into(),
+        })
+        .unwrap();
     kernel
         .send(crate::notebook_kernel::Event::Output {
             id: id.clone(),
@@ -128,7 +134,11 @@ fn clicking_a_cells_run_glyph_runs_it_and_writes_the_output_into_the_notebook() 
     assert!(app.poll_notebook_kernels());
     let doc: serde_json::Value = serde_json::from_str(&app.editor.lines.join("\n")).unwrap();
     assert_eq!(doc["cells"][0]["execution_count"], 1);
-    assert_eq!(doc["cells"][0]["outputs"][0]["text"][0], "2\n");
+    assert_eq!(
+        doc["cells"][0]["outputs"],
+        serde_json::json!([{"output_type": "stream", "name": "stdout", "text": ["2\n"]}]),
+        "the run's output replaced the old one"
+    );
     assert!(app.editor.notebook_running.is_empty());
     assert!(app.editor.dirty, "outputs are an edit; Save writes them");
 }
@@ -293,6 +303,136 @@ fn a_kernel_that_is_installed_opens_no_picker() {
     assert!(app.list_picker.is_none());
     assert!(started.borrow().is_empty());
     assert_eq!(app.editor.notebook_running, vec![0]);
+}
+
+/// The `In [..]` label the rendered view draws on the notebook's first cell.
+fn first_cell_label(
+    app: &mut App,
+    term: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+) -> String {
+    term.draw(|f| app.render(f)).unwrap();
+    let md = app.editor.markdown_preview.as_ref().unwrap();
+    md.lines[md.runnables[0].first_line].spans[1]
+        .content
+        .to_string()
+}
+
+/// #878: Run All with no Python that has ipykernel leaves the notebook
+/// byte-identical and clean, with nothing left at `In [*]`, and once
+/// ipykernel is installed the next Run All starts a new kernel instead of
+/// sending its cells to the one that never started.
+#[test]
+fn a_kernel_that_fails_to_start_leaves_the_notebook_as_it_was_and_the_next_run_starts_afresh() {
+    use crate::notebook_kernel::{Event, Request};
+    let (_tmp, mut app, path, _kernel, started) = notebook_with_kernel("python3");
+    // No kernel yet, and saved outputs and a count for a failed start to wipe.
+    app.notebook_kernels.remove(&path);
+    let saved = NOTEBOOK_355
+        .replace("\"execution_count\": null", "\"execution_count\": 7")
+        .replace(
+            "\"outputs\": [],",
+            "\"outputs\": [{\"output_type\": \"stream\", \"name\": \"stdout\", \"text\": [\"hello\\n\"]}],",
+        );
+    std::fs::write(&path, &saved).unwrap();
+    app.editor.open(&path).unwrap();
+    let before = app.editor.lines.join("\n");
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    assert_eq!(first_cell_label(&mut app, &mut term), "In [7]:");
+
+    app.run_command(crate::widgets::command_palette::Command::NotebookRunAll);
+    assert_eq!(app.status, "Starting kernel…");
+    assert_eq!(first_cell_label(&mut app, &mut term), "In [*]:");
+    started.borrow()[0]
+        .1
+        .send(Event::Error {
+            message: "no Python with jupyter_client and ipykernel found".into(),
+        })
+        .unwrap();
+    app.poll_notebook_kernels();
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        before,
+        "outputs and count kept"
+    );
+    assert!(!app.editor.dirty, "nothing for Save to write");
+    assert!(app.editor.notebook_running.is_empty());
+    assert_eq!(first_cell_label(&mut app, &mut term), "In [7]:");
+    assert_eq!(
+        app.status,
+        "Kernel: no Python with jupyter_client and ipykernel found"
+    );
+    assert!(!app.notebook_kernels.contains_key(&path));
+
+    app.run_command(crate::widgets::command_palette::Command::NotebookRunAll);
+    let started = started.borrow();
+    assert_eq!(started.len(), 2, "the second run starts a new kernel");
+    match started[1].2.try_iter().collect::<Vec<_>>().as_slice() {
+        [Request::Execute { code, .. }] => assert_eq!(code, "print(1+1)"),
+        other => panic!("the cell goes to the new kernel: {other:?}"),
+    }
+    assert_eq!(app.status, "Starting kernel…");
+}
+
+/// #878: Restart Kernel on a kernel whose bridge has gone starts a new one,
+/// and the cells it owed stop waiting; on a live kernel it is only sent.
+#[test]
+fn restart_kernel_starts_a_new_kernel_once_the_bridge_is_gone() {
+    use crate::notebook_kernel::{Event, NotebookRun, Request};
+    let (_tmp, mut app, path, _kernel, started) = notebook_with_kernel("python3");
+    let (run, kernel, requests) = NotebookRun::for_test();
+    app.notebook_kernels.insert(path.clone(), run);
+    kernel
+        .send(Event::Ready {
+            kernel: "python3".into(),
+            display: "Python 3".into(),
+        })
+        .unwrap();
+    app.poll_notebook_kernels();
+    app.run_command(crate::widgets::command_palette::Command::NotebookRunAll);
+    assert_eq!(app.editor.notebook_running, vec![0]);
+    app.run_command(crate::widgets::command_palette::Command::NotebookRestart);
+    assert!(
+        requests.try_iter().any(|r| matches!(r, Request::Restart)),
+        "a live kernel gets the restart"
+    );
+    assert!(started.borrow().is_empty());
+
+    drop(requests);
+    app.run_command(crate::widgets::command_palette::Command::NotebookRestart);
+    assert_eq!(started.borrow().len(), 1, "a new kernel starts");
+    assert!(app.editor.notebook_running.is_empty());
+    assert_eq!(app.status, "Starting kernel…");
+}
+
+/// #878: a kernel whose bridge exits after it came up is noticed when its
+/// output closes, not by a request lost to it: the cells it owed stop
+/// waiting, and the next run starts a new kernel.
+#[test]
+fn a_kernel_whose_bridge_exits_is_forgotten_and_the_next_run_starts_afresh() {
+    use crate::notebook_kernel::{Event, NotebookRun};
+    let (_tmp, mut app, path, _kernel, started) = notebook_with_kernel("python3");
+    let (run, kernel, _requests) = NotebookRun::for_test();
+    app.notebook_kernels.insert(path.clone(), run);
+    kernel
+        .send(Event::Ready {
+            kernel: "python3".into(),
+            display: "Python 3".into(),
+        })
+        .unwrap();
+    app.poll_notebook_kernels();
+    app.run_command(crate::widgets::command_palette::Command::NotebookRunAll);
+    assert_eq!(app.editor.notebook_running, vec![0]);
+    kernel.send(Event::Exited).unwrap();
+    app.poll_notebook_kernels();
+    assert!(app.editor.notebook_running.is_empty());
+    assert!(!app.notebook_kernels.contains_key(&path));
+    assert_eq!(app.status, "Kernel exited: the next run starts a new one");
+    app.run_command(crate::widgets::command_palette::Command::NotebookRunAll);
+    assert_eq!(
+        started.borrow().len(),
+        1,
+        "the next run starts a new kernel"
+    );
 }
 
 /// #1377: Notebook: Select Kernel lists the installed kernels, opened on
