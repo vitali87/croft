@@ -224,8 +224,10 @@ impl<'v> Parser<'v> {
         match value {
             Some(value) if !value.is_empty() => {
                 if default {
-                    // Read past the default, keeping none of it.
-                    Parser::new(self.vars).seq(chars, true);
+                    // Read past the default, keeping none of it and looking
+                    // up nothing in it: a variable there (`$CLIPBOARD`) can
+                    // be slow to read, and its value would go nowhere.
+                    Parser::new(&|_| Some(String::new())).seq(chars, true);
                 }
                 value.chars().for_each(|c| self.push(c));
             }
@@ -819,6 +821,21 @@ mod tests {
             len: 0,
         };
         assert_eq!(p.stops, [stop]);
+    }
+
+    /// #914: the default of a variable with a value is skipped unread: a
+    /// variable inside it is never looked up, so `${TM_FILENAME:$CLIPBOARD}`
+    /// does not wait on a clipboard read for a value it drops.
+    #[test]
+    fn a_skipped_default_looks_up_none_of_its_variables() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let vars = |name: &str| {
+            asked.borrow_mut().push(name.to_string());
+            (name == "TM_FILENAME").then(|| String::from("t.py"))
+        };
+        let p = super::parse_body("${TM_FILENAME:${CLIPBOARD:$UUID}}", &vars);
+        assert_eq!(p.text, "t.py");
+        assert_eq!(*asked.borrow(), ["TM_FILENAME"]);
     }
 
     #[test]
