@@ -17707,6 +17707,9 @@ impl App {
             }
             SidebarView::SourceControl => {
                 self.refresh_source_control();
+                // Opening the view lands in the message box, so typing a
+                // message never stages or discards from the list (#871).
+                self.source_control.list_focused = false;
                 self.focus_pane(Pane::Tree);
             }
             SidebarView::Remote => self.focus_pane(Pane::Tree),
@@ -26083,6 +26086,10 @@ impl App {
             self.stage_selected_source_control_entries();
             return;
         }
+        if self.source_control.list_focused {
+            self.handle_source_control_list_key(key);
+            return;
+        }
         if is_clipboard_paste_key(key) {
             if let Some(text) = (self.clipboard_reader)() {
                 self.source_control.insert_str(&text);
@@ -26126,7 +26133,8 @@ impl App {
                 self.poke_cursor();
             }
             // In a multi-line message Up/Down move between its lines; on
-            // its first/last line they scroll the change list as before.
+            // its first line Up scrolls the change list, and on its last
+            // line Down steps into the list (#871), as Tab does.
             KeyCode::Up => {
                 if self.source_control.move_cursor_up() {
                     self.poke_cursor();
@@ -26137,9 +26145,12 @@ impl App {
             KeyCode::Down => {
                 if self.source_control.move_cursor_down() {
                     self.poke_cursor();
-                } else {
+                } else if !self.source_control.focus_list() {
                     self.source_control.scroll_down(1);
                 }
+            }
+            KeyCode::Tab => {
+                self.source_control.focus_list();
             }
             // Shift/Alt+Enter start a new message line (the commit body),
             // VS Code's multi-line SCM input; plain Enter commits.
@@ -26159,6 +26170,32 @@ impl App {
             {
                 self.source_control.insert_char(c);
                 self.poke_cursor();
+            }
+            _ => {}
+        }
+    }
+
+    /// Keys while the change list holds the keyboard (#871): Up/Down move
+    /// the selection, Enter opens its diff, Space or `s` stages it, `u`
+    /// unstages it, and Backspace, Delete or `d` asks before discarding it.
+    /// Tab, or Up from the first row, returns to the message box.
+    fn handle_source_control_list_key(&mut self, key: KeyEvent) {
+        let has_mod = key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+        let selected = self.source_control.selected_change.filter(|_| !has_mod);
+        let sc = &mut self.source_control;
+        match (key.code, selected) {
+            (KeyCode::Tab | KeyCode::BackTab, _) => sc.list_focused = false,
+            (KeyCode::Up, _) => sc.list_focused = sc.move_selection(true),
+            (KeyCode::Down, _) => {
+                sc.move_selection(false);
+            }
+            (KeyCode::Enter, Some(idx)) => self.open_source_control_entry(idx),
+            (KeyCode::Char(' ' | 's'), Some(idx)) => self.stage_source_control_entry(idx),
+            (KeyCode::Char('u'), Some(idx)) => self.unstage_source_control_entry(idx),
+            (KeyCode::Backspace | KeyCode::Delete | KeyCode::Char('d'), Some(idx)) => {
+                self.request_discard_source_control_entry(idx)
             }
             _ => {}
         }
@@ -56353,6 +56390,14 @@ impl App {
             Cmd::GitDeleteRemoteTag => {
                 self.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::DeleteRemoteTag)
             }
+            Cmd::GitCommit => self.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::Commit),
+            Cmd::GitPush => self.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::Push),
+            Cmd::GitPull => self.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::Pull),
+            Cmd::GitSync => self.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::Sync),
+            Cmd::GitCheckoutTo => {
+                self.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::CheckoutTo)
+            }
+            Cmd::GitStash => self.dispatch_scm_action(crate::widgets::scm_menu::ScmAction::Stash),
             Cmd::ToggleTerminalSuggestions => self.toggle_terminal_suggestions(),
             Cmd::ToggleScreenReader => self.toggle_screen_reader(),
             Cmd::OpenKeyboardShortcuts => self.open_keyboard_shortcuts(),
@@ -61098,6 +61143,7 @@ impl App {
                         return;
                     }
                     if self.source_control.click_input(m.column, m.row) {
+                        self.source_control.list_focused = false;
                         return;
                     }
                     if self.source_control.click_branch(m.column, m.row) {
@@ -61117,6 +61163,7 @@ impl App {
                         return;
                     }
                     if let Some(idx) = self.source_control.entry_at_y(m.row) {
+                        self.source_control.list_focused = true;
                         self.open_source_control_entry(idx);
                     }
                     return;

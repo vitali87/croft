@@ -218,6 +218,11 @@ pub struct SourceControlPanel {
     /// The Stage shortcut (Cmd+S) acts on this set; click on an action icon
     /// still acts on just that row.
     pub multi_selection: BTreeSet<usize>,
+    /// The change list holds the keyboard instead of the message box
+    /// (#871), as in VS Code: arrows move `selected_change` and Enter opens
+    /// its diff. Tab, or Down on the message's last line, moves here; Tab,
+    /// or Up on the first row, goes back.
+    pub list_focused: bool,
     /// Status / error line painted below the button after a commit attempt.
     /// Cleared on the next refresh.
     pub commit_feedback: Option<String>,
@@ -276,6 +281,7 @@ impl SourceControlPanel {
             scroll: 0,
             selected_change: None,
             multi_selection: BTreeSet::new(),
+            list_focused: false,
             commit_feedback: None,
             commit_feedback_is_error: false,
             last_row_actions: None,
@@ -331,15 +337,35 @@ impl SourceControlPanel {
     pub fn set_status(&mut self, status: GitStatus, entries: Vec<ChangeEntry>) {
         self.status = status;
         self.seed_prepared_message();
+        let selected = self
+            .selected_change
+            .and_then(|i| self.entries.get(i))
+            .map(|e| (e.path.clone(), e.kind.section()));
         self.entries = entries;
-        // A change set refresh can re-order entries; clear stale selection
-        // state rather than risk pointing it at the wrong file.
-        if let Some(idx) = self.selected_change
+        // A change set refresh can re-order entries (staging an untracked
+        // file moves it up): the selection follows its file, so the next
+        // key acts on the row the user picked (#871), and on a partly
+        // staged file's row in the same section while it has one. A file
+        // that left the list hands its slot to the row that took its
+        // place, and a slot past the end clears.
+        let follow = selected.and_then(|(path, section)| {
+            let rows = &self.entries;
+            let same_row = |e: &ChangeEntry| e.path == path && e.kind.section() == section;
+            rows.iter()
+                .position(same_row)
+                .or_else(|| rows.iter().position(|e| e.path == path))
+        });
+        if let Some(idx) = follow {
+            self.selected_change = Some(idx);
+        } else if let Some(idx) = self.selected_change
             && idx >= self.entries.len()
         {
             self.selected_change = None;
         }
         self.multi_selection.retain(|i| *i < self.entries.len());
+        if self.entries.is_empty() {
+            self.list_focused = false;
+        }
     }
 
     /// Click-to-select: returns the entry index now selected, if the
@@ -367,6 +393,84 @@ impl SourceControlPanel {
 
     pub fn changes_count(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Hand the keyboard to the change list (#871), selecting its first
+    /// row when no row is selected. False, leaving the message box
+    /// focused, when the list is empty.
+    pub fn focus_list(&mut self) -> bool {
+        let Some(&first) = self.entry_order().first() else {
+            return false;
+        };
+        self.list_focused = true;
+        if self.selected_change.is_none() {
+            self.select_only(first);
+        }
+        self.reveal_selected();
+        true
+    }
+
+    /// Move the selection one row up or down the list as it is drawn
+    /// (sections first, so not `entries` order), scrolling it into view.
+    /// False on Up from the first row, where the list ends.
+    pub fn move_selection(&mut self, up: bool) -> bool {
+        let order = self.entry_order();
+        let pos = self
+            .selected_change
+            .and_then(|s| order.iter().position(|&i| i == s));
+        let next = match pos {
+            None => order.first(),
+            Some(0) if up => return false,
+            Some(p) if up => order.get(p - 1),
+            Some(p) => order.get(p + 1),
+        };
+        if let Some(&idx) = next {
+            self.select_only(idx);
+            self.reveal_selected();
+        }
+        true
+    }
+
+    /// Entry indices in the order the list draws them.
+    fn entry_order(&self) -> Vec<usize> {
+        self.list_layout()
+            .into_iter()
+            .filter_map(|line| match line {
+                ListLine::Entry(i) => Some(i),
+                ListLine::Header(_) => None,
+            })
+            .collect()
+    }
+
+    fn select_only(&mut self, idx: usize) {
+        self.selected_change = Some(idx);
+        self.multi_selection.clear();
+        self.multi_selection.insert(idx);
+    }
+
+    /// Scroll so the selected row is on screen, with its section header
+    /// when that is the row above it.
+    fn reveal_selected(&mut self) {
+        let viewport = self.last_list_area.height as usize;
+        let lines = self.list_layout();
+        let Some(line) = self
+            .selected_change
+            .and_then(|s| lines.iter().position(|l| *l == ListLine::Entry(s)))
+        else {
+            return;
+        };
+        if viewport == 0 {
+            return;
+        }
+        let top = match line.checked_sub(1).map(|l| lines[l]) {
+            Some(ListLine::Header(_)) => line - 1,
+            _ => line,
+        };
+        if top < self.scroll {
+            self.scroll = top;
+        } else if line >= self.scroll + viewport {
+            self.scroll = line + 1 - viewport;
+        }
     }
 
     /// Insert at the caret. A newline starts a new message line (the
@@ -654,7 +758,7 @@ impl SourceControlPanel {
     /// Absolute (col, row) of the commit-message caret in screen
     /// coordinates, matching the pattern `Editor::cursor_screen_pos` uses
     /// to drive the host terminal's hardware caret. Returns `None` when
-    /// the panel isn't focused, isn't in a repo (no input box painted),
+    /// the message box isn't focused, isn't in a repo (no input box painted),
     /// hasn't been laid out yet, or the cursor would land outside the
     /// visible inner width of the input box. The render path paints
     /// message line `n` at `input_inner.x + 1` on `input_inner.y + n`
@@ -662,7 +766,7 @@ impl SourceControlPanel {
     /// column `input_box.x + 2 + col`, row `input_box.y + 1 + line`
     /// (rounded border occupies one cell on each side).
     pub fn cursor_screen_pos(&self) -> Option<(u16, u16)> {
-        if !self.focused {
+        if !self.focused || self.list_focused {
             return None;
         }
         let r = self.last_input_area;
@@ -1388,7 +1492,7 @@ impl Widget for &mut SourceControlPanel {
                 .min(left),
         };
         self.last_input_area = input_box;
-        let input_border_style = if self.focused {
+        let input_border_style = if self.focused && !self.list_focused {
             Style::default().fg(accent)
         } else {
             Style::default().fg(self.theme.ui(Color::Rgb(0x60, 0x68, 0x78)))
@@ -3783,6 +3887,84 @@ mod tests {
             1,
             "single click narrows to one row"
         );
+    }
+
+    fn change(path: &str, kind: ChangeKind) -> ChangeEntry {
+        ChangeEntry {
+            path: path.into(),
+            kind,
+            ..Default::default()
+        }
+    }
+
+    /// #871: Up/Down walk the rows as drawn (Staged, Changes, Untracked,
+    /// not `entries` order) and keep the selection in view; Up from the
+    /// first row reports the end so the App hands back the message box.
+    #[test]
+    fn arrows_walk_the_change_list_in_drawn_order_and_keep_it_in_view() {
+        let mut p = SourceControlPanel::new();
+        p.set_status(
+            dummy_status_with_branch("main"),
+            vec![
+                change("new.txt", ChangeKind::Untracked),
+                change("edit.txt", ChangeKind::Modified),
+                change("added.txt", ChangeKind::StagedAdded),
+            ],
+        );
+        p.focused = true;
+        p.last_input_area = Rect::new(0, 0, 20, 3);
+        p.last_list_area = Rect::new(0, 10, 20, 2);
+        assert!(p.cursor_screen_pos().is_some());
+        assert!(p.focus_list());
+        assert!(p.cursor_screen_pos().is_none(), "the list hides the caret");
+        assert_eq!(p.selected_change, Some(2), "the staged row is drawn first");
+        let mut walked = Vec::new();
+        for _ in 0..3 {
+            assert!(p.move_selection(false));
+            walked.push((p.selected_change, p.scroll));
+        }
+        // Six lines (a header above each row) in a two-row viewport.
+        assert_eq!(walked, [(Some(1), 2), (Some(0), 4), (Some(0), 4)]);
+        assert!(p.move_selection(true) && p.move_selection(true));
+        assert_eq!((p.selected_change, p.scroll), (Some(2), 0));
+        assert!(!p.move_selection(true), "Up from the first row leaves");
+    }
+
+    /// #871: staging an untracked file moves it up git's order; the
+    /// selection follows the file, so the next key acts on the same row.
+    #[test]
+    fn a_refresh_keeps_the_selection_on_its_file() {
+        let mut p = SourceControlPanel::new();
+        let main = || dummy_status_with_branch("main");
+        p.set_status(
+            main(),
+            vec![
+                change("seed.txt", ChangeKind::Modified),
+                change("scratch.txt", ChangeKind::Untracked),
+            ],
+        );
+        p.selected_change = Some(1);
+        p.list_focused = true;
+        p.set_status(
+            main(),
+            vec![
+                change("scratch.txt", ChangeKind::StagedAdded),
+                change("seed.txt", ChangeKind::Modified),
+            ],
+        );
+        assert_eq!(p.selected_change, Some(0));
+        // A partly staged file stays on the row in the same section.
+        let seed = |kind| change("seed.txt", kind);
+        let rows = vec![seed(ChangeKind::StagedModified), seed(ChangeKind::Modified)];
+        p.set_status(main(), rows.clone());
+        p.selected_change = Some(1);
+        p.set_status(
+            main(),
+            [vec![change("a", ChangeKind::Untracked)], rows].concat(),
+        );
+        assert_eq!(p.selected_change, Some(2));
+        p.set_status(main(), Vec::new());
+        assert!(!p.list_focused, "an empty list gives the keyboard back");
     }
 
     #[test]
