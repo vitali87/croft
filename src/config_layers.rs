@@ -294,7 +294,26 @@ const LAYER_FILE_MAX: u64 = 1024 * 1024;
 /// startup, a device file would read forever) and oversized ones, both with
 /// a warning. A missing file stays silent — absent layers are normal.
 fn read_layer_file(path: &Path, warnings: &mut Vec<String>) -> Option<String> {
-    let meta = std::fs::metadata(path).ok()?;
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return None;
+        }
+        // A file croft cannot even stat (a parent it may not search, a
+        // symlink loop) is as unreadable as one it cannot open.
+        Err(e) => {
+            warnings.push(format!(
+                "{}: could not be read ({e}) — layer ignored",
+                path.display()
+            ));
+            return None;
+        }
+    };
     if !meta.is_file() {
         warnings.push(format!(
             "{}: not a regular file — layer ignored",
@@ -1266,6 +1285,18 @@ mod tests {
         std::fs::write(user.join("config.json"), b"{\"theme\": \"\xff\"}").unwrap();
         let m = load_merged_from(&user, Some(&root), "linux");
         let error = m.user_config_error.expect("the unreadable file is named");
+        assert!(error.contains("could not be read"), "{error}");
+    }
+
+    /// #923: a `config.json` croft cannot even stat is named too, not
+    /// taken for a missing one. A symlink loop stands in for a parent
+    /// without search permission, which a test run as root would pass.
+    #[test]
+    fn a_user_config_that_cannot_be_statted_is_named() {
+        let (_tmp, user, root) = setup();
+        std::os::unix::fs::symlink("config.json", user.join("config.json")).unwrap();
+        let m = load_merged_from(&user, Some(&root), "linux");
+        let error = m.user_config_error.expect("the unreachable file is named");
         assert!(error.contains("could not be read"), "{error}");
     }
 
