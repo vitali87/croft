@@ -1295,6 +1295,40 @@ fn a_finished_fenced_block_replaces_its_running_status_with_the_outcome() {
     assert_eq!(app.status, "README.md:1 failed (exit 1, 0.3 s)");
 }
 
+/// #912 (comment): a task typed into a shell that it then ends (`echo
+/// boom; exit 3`) kept "Running fail" for good: a shell that exits sends
+/// no command-finished mark. Its exit code is now the task's outcome, and
+/// the pane stays so the output can be read.
+#[test]
+fn a_task_that_exits_its_shell_reports_the_exit_code() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut task = long_task("fail");
+    task.command = String::from("echo out_$((40 + 2)); exit 3");
+    let pane = app.run_project_task(task).unwrap();
+    assert_eq!(app.status, "Running fail");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(1500),
+        "the task's shell to exit",
+        || {
+            app.drain_terminal_bells();
+            app.status != "Running fail"
+        },
+    );
+    assert!(
+        app.status.starts_with("fail failed (exit 3, "),
+        "{}",
+        app.status
+    );
+    let t = app
+        .terminals
+        .iter()
+        .find(|t| t.uid() == pane)
+        .expect("the task's pane stays");
+    assert!(t.has_exited());
+    assert!(t.visible_text().contains("out_42"), "the output stays");
+}
+
 /// #856 guard: a task's finish settles only a status that still shows its
 /// run. Something newer in the bar (a save) stays.
 #[test]

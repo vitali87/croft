@@ -508,6 +508,13 @@ pub struct PtyTerminal {
     /// prompt is its own foreground process-group leader, so this is the
     /// value `foreground_is_shell` compares `tcgetpgrp(master)` against.
     shell_pid: Option<i32>,
+    /// The shell's exit once [`Self::poll_exit`] has reported it (#912):
+    /// its exit code, or None when a pane host went away without one.
+    exit: Option<Option<i32>>,
+    /// When the shell was first found reaped with its output still open. A
+    /// background job it left running can hold the pty open for good, so
+    /// the exit is reported after [`EXIT_OUTPUT_GRACE`] all the same.
+    reaped_at: Option<std::time::Instant>,
     /// Process-wide stable identity for this pane, assigned at spawn. Vec
     /// positions shift on close/insert/reorder; anything keying long-lived
     /// state to a pane (the build-diagnostic ownership, #119) uses this.
@@ -2491,6 +2498,8 @@ impl PtyTerminal {
             reader_thread: Some(reader_thread),
             reader_shutdown: Some(shutdown_w),
             shell_pid,
+            exit: None,
+            reaped_at: None,
             uid: {
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -3187,9 +3196,51 @@ impl PtyTerminal {
 
     /// Process ID of the shell running inside this terminal, when the
     /// platform exposes one. Used to look up the live cwd so a new split
-    /// inherits the directory the user has `cd`'d into.
+    /// inherits the directory the user has `cd`'d into. None once the shell
+    /// has exited: a reaped pid may already name another process.
     pub fn pid(&self) -> Option<u32> {
-        self.backend.pid()
+        self.backend.pid().filter(|_| self.exit.is_none())
+    }
+
+    /// Notice that the pane's shell has exited (#912): `exit`, Ctrl+D, a
+    /// task that ran `exit 3`. The shell is reaped (it stayed a zombie for
+    /// as long as the pane lived), and once the reader has painted all it
+    /// wrote, the exit goes under its output and the pane is marked
+    /// exited. Returns the exit code the first time only.
+    pub fn poll_exit(&mut self) -> Option<Option<i32>> {
+        if self.exit.is_some() {
+            return None;
+        }
+        let output_closed = self.reader_thread.as_ref().is_none_or(|h| h.is_finished());
+        let code = self.backend.try_exit(output_closed)?;
+        if !output_closed {
+            let since = *self.reaped_at.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() < EXIT_OUTPUT_GRACE {
+                return None;
+            }
+        }
+        self.exit = Some(code);
+        // A run pane's reader paints its own footer.
+        if !self.run_pane {
+            let footer = match code {
+                Some(c) => format!("\r\n\x1b[2m[Process exited with code {c}]\x1b[22m\r\n"),
+                None => String::from("\r\n\x1b[2m[Process exited]\x1b[22m\r\n"),
+            };
+            Processor::<StdSyncHandler>::new().advance(&mut *self.term.lock(), footer.as_bytes());
+            self.pty_dirty.store(true, Ordering::Release);
+        }
+        Some(code)
+    }
+
+    /// Whether [`Self::poll_exit`] has found the shell exited: the pane
+    /// then takes no input.
+    pub fn has_exited(&self) -> bool {
+        self.exit.is_some()
+    }
+
+    /// Whether this is a `new_running` program pane rather than a shell.
+    pub fn is_run_pane(&self) -> bool {
+        self.run_pane
     }
 
     /// The pane host holding this pane's shell, when one does (#694): what
@@ -4079,8 +4130,12 @@ impl PtyTerminal {
     /// because that is an app reading the tty in raw mode; a missing
     /// foreground group (the brief window after spawn, before the shell
     /// claims the tty) means nothing has grabbed input, so a `cd` is
-    /// still safe. `tcgetpgrp` is identical on macOS and Linux.
+    /// still safe. `tcgetpgrp` is identical on macOS and Linux. A shell
+    /// that has exited (#912) owns nothing.
     pub fn foreground_is_shell(&self) -> bool {
+        if self.exit.is_some() {
+            return false;
+        }
         match (self.backend.process_group_leader(), self.shell_pid) {
             (Some(fg), Some(pid)) => fg == pid,
             _ if self.input_seen => {
@@ -4284,11 +4339,13 @@ enum PaneBackend {
         child: Box<dyn portable_pty::Child + Send + Sync>,
     },
     /// A pane host (#694): the shell outlives croft. `conn` carries input,
-    /// resizes and the kill; the pid comes from the host's greeting.
+    /// resizes and the kill; the pid comes from the host's greeting, and
+    /// `exit` from its notice that the shell ended.
     Hosted {
         conn: Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>,
         socket: std::path::PathBuf,
         pid: Option<u32>,
+        exit: Arc<std::sync::Mutex<Option<i32>>>,
     },
 }
 
@@ -4329,11 +4386,30 @@ impl PaneBackend {
         }
     }
 
+    /// The shell's exit code once it has ended, reaping it on a PTY croft
+    /// holds (#912). A pane host reaps its own shell and sends the code
+    /// before the pane's output closes, so it is read once
+    /// `output_closed`; a host gone without sending one gives `Some(None)`.
+    fn try_exit(&mut self, output_closed: bool) -> Option<Option<i32>> {
+        match self {
+            PaneBackend::Local { child, .. } => {
+                let status = child.try_wait().ok()??;
+                Some(Some(status.exit_code() as i32))
+            }
+            PaneBackend::Hosted { exit, .. } => output_closed.then(|| *exit.lock().unwrap()),
+        }
+    }
+
     /// End the shell: kill and reap it, or ask its host to (which ends the
     /// host too), then drop the connection so the demux thread ends.
     fn end(&mut self) {
         match self {
             PaneBackend::Local { child, .. } => {
+                // A shell already reaped is never signalled: its pid may
+                // name another process by now.
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    return;
+                }
                 let _ = child.kill();
                 let _ = child.wait();
             }
@@ -4525,6 +4601,8 @@ impl PaneLink {
         }
         rd.set_read_timeout(None)?;
         let (pipe_r, mut pipe_w) = std::io::pipe().context("pane host pipe")?;
+        let exit = Arc::new(std::sync::Mutex::new(None));
+        let exit_for_demux = exit.clone();
         std::thread::spawn(move || {
             if pipe_w.write_all(&pending).is_err() {
                 return;
@@ -4542,7 +4620,10 @@ impl PaneLink {
                                 return;
                             }
                         }
-                        Frame::Control(Control::Exit { .. }) => return,
+                        Frame::Control(Control::Exit { code }) => {
+                            *exit_for_demux.lock().unwrap() = Some(code);
+                            return;
+                        }
                         _ => {}
                     }
                 }
@@ -4558,6 +4639,7 @@ impl PaneLink {
                 conn,
                 socket: socket.to_path_buf(),
                 pid,
+                exit,
             },
         })
     }
@@ -4594,6 +4676,11 @@ fn wait_pty_readable(
 /// How long the reader waits for more output before sending a held-back
 /// dev-server URL as it stands.
 const PORT_URL_SETTLE_MS: i32 = 150;
+
+/// How long a pane whose shell was reaped waits for its output to close
+/// before reporting the exit anyway: on Linux a background job the shell
+/// left running keeps the pty open (see [`wait_pty_readable`]).
+const EXIT_OUTPUT_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// What [`poll_pty`] saw.
 #[derive(Debug, PartialEq, Eq)]
@@ -6928,6 +7015,38 @@ mod tests {
         assert!(
             r < 0,
             "the shell was left as an unreaped zombie (waitpid still found it: r={r})"
+        );
+    }
+
+    /// #912: a shell that exits while its pane lives is reaped then, not
+    /// left a zombie until the pane is dropped, and its exit code goes
+    /// under its output.
+    #[test]
+    fn a_shell_that_exits_is_reaped_and_its_exit_code_shown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = PtyTerminal::new(tmp.path()).unwrap();
+        let pid = term.pid().expect("spawned shell has a pid") as i32;
+        term.write_input(b"exit 3\n");
+        let mut code = None;
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(1500),
+            "the pane to notice its shell exited",
+            || {
+                code = term.poll_exit();
+                code.is_some()
+            },
+        );
+        assert_eq!(code, Some(Some(3)));
+        assert!(term.has_exited());
+        assert_eq!(term.poll_exit(), None, "the exit is reported once");
+        let mut status = 0i32;
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        assert!(r < 0, "the exited shell is still a zombie (r={r})");
+        assert_eq!(term.pid(), None, "a reaped pid may name another process");
+        let text = term.visible_text();
+        assert!(
+            text.contains("[Process exited with code 3]"),
+            "no exit footer:\n{text}"
         );
     }
 

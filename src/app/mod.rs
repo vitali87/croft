@@ -18187,7 +18187,7 @@ impl App {
                 Ok(()) => {
                     self.terminal_status(format!(
                         "Split terminal: {} active",
-                        self.terminals.len()
+                        self.live_terminal_count()
                     ));
                 }
                 Err(e) => {
@@ -18808,7 +18808,10 @@ impl App {
     fn split_terminal_reporting(&mut self) {
         match self.split_terminal() {
             Ok(()) => {
-                self.terminal_status(format!("Split terminal: {} active", self.terminals.len()));
+                self.terminal_status(format!(
+                    "Split terminal: {} active",
+                    self.live_terminal_count()
+                ));
             }
             Err(e) => {
                 self.status = format!("Split terminal failed: {e}");
@@ -18827,6 +18830,32 @@ impl App {
         } else {
             self.status = String::from("Cannot close the last terminal; press Ctrl+J to hide");
         }
+    }
+
+    /// A key typed in the active pane after its shell exited (#912): close
+    /// the pane, or start a new shell in its place when it is the last.
+    fn dismiss_exited_terminal(&mut self) {
+        let idx = self.active_terminal;
+        let last = self.terminals.len() == 1;
+        if last && let Err(e) = self.split_terminal() {
+            self.status = format!("Could not start a new shell: {e}");
+            return;
+        }
+        if self.close_terminal_at(idx) {
+            // Not parked for undo-close: there is no shell to bring back.
+            self.closed_terminals.pop();
+        }
+        self.terminal_status(if last {
+            String::from("Started a new shell")
+        } else {
+            format!("Closed terminal: {} remaining", self.terminals.len())
+        });
+    }
+
+    /// Panes whose shell is still running: one kept after its shell exited
+    /// (#912) is not an active terminal.
+    fn live_terminal_count(&self) -> usize {
+        self.terminals.iter().filter(|t| !t.has_exited()).count()
     }
 
     /// Cmd+K ⇧T: bring back the most recently closed terminal pane while it
@@ -25572,7 +25601,7 @@ impl App {
                 Ok(()) => {
                     self.terminal_status(format!(
                         "Split terminal: {} active",
-                        self.terminals.len()
+                        self.live_terminal_count()
                     ));
                 }
                 Err(e) => {
@@ -49271,6 +49300,14 @@ impl App {
             self.paste_clipboard_into_terminal();
             return;
         }
+        // A pane whose shell exited takes no input (#912): a key that would
+        // type closes it instead, or starts a new shell in the last pane.
+        if self.terminal().has_exited() {
+            if !key_to_bytes(key, false).is_empty() {
+                self.dismiss_exited_terminal();
+            }
+            return;
+        }
         // Any other keystroke clears the selection so the user's input is
         // sent without the previous highlight lingering on screen.
         if self.terminal().selection().is_some() {
@@ -51439,6 +51476,8 @@ impl App {
                 }
             }
         }
+        // A shell that exited ends the run it was awaited for (#912).
+        run_settled |= self.settle_exited_terminals();
         // A pane that closed will never report its run's end.
         let terminals = &self.terminals;
         self.pane_run_statuses
@@ -51542,6 +51581,51 @@ impl App {
         };
         self.status = format!("Bell in terminal: {label}");
         true
+    }
+
+    /// Act on panes whose shell has exited (#912). A task or fenced block
+    /// typed into the shell ended with it (`make || exit 1`): the exit code
+    /// is the run's outcome, and the pane stays so its output can be read.
+    /// Any other shell pane closes, as VS Code closes a terminal whose shell
+    /// exits, except the last, which waits for a key to start a new shell.
+    /// A program pane keeps its `[Process exited]` footer, as before.
+    /// Whether any pane's shell exited.
+    fn settle_exited_terminals(&mut self) -> bool {
+        let exited: Vec<(u64, Option<i32>)> = self
+            .terminals
+            .iter_mut()
+            .filter_map(|t| Some((t.uid(), t.poll_exit()?)))
+            .collect();
+        for &(uid, code) in &exited {
+            if let Some(i) = self.pane_run_statuses.iter().position(|(u, _)| *u == uid) {
+                let (_, run) = self.pane_run_statuses.remove(i);
+                run.settle(&mut self.status, |label, dur| {
+                    pane_run_outcome(label, code, dur)
+                });
+                continue;
+            }
+            let Some(idx) = self.terminals.iter().position(|t| t.uid() == uid) else {
+                continue;
+            };
+            if self.terminals[idx].is_run_pane() {
+                continue;
+            }
+            let mut exited = match self.terminals[idx].label() {
+                "" => String::from("Terminal exited"),
+                label => format!("Terminal {label} exited"),
+            };
+            if let Some(c) = code.filter(|&c| c != 0) {
+                exited.push_str(&format!(" with code {c}"));
+            }
+            if self.close_terminal_at(idx) {
+                // Not parked for undo-close: there is no shell to bring back.
+                self.closed_terminals.pop();
+                self.terminal_status(exited);
+            } else {
+                self.status = format!("{exited}; press a key in it to start a new shell");
+            }
+        }
+        !exited.is_empty()
     }
 
     /// Cmd+Opt+Up / Cmd+Opt+Down in the terminal: scroll the previous / next
@@ -56320,7 +56404,7 @@ impl App {
                 Ok(()) => {
                     self.terminal_status(format!(
                         "Split terminal: {} active",
-                        self.terminals.len()
+                        self.live_terminal_count()
                     ));
                 }
                 Err(e) => {
@@ -60838,7 +60922,7 @@ impl App {
                     match self.split_terminal() {
                         Ok(()) => {
                             self.status =
-                                format!("Split terminal: {} active", self.terminals.len());
+                                format!("Split terminal: {} active", self.live_terminal_count());
                         }
                         Err(e) => {
                             self.status = format!("Split terminal failed: {e}");

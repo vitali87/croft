@@ -303,6 +303,60 @@ fn close_active_terminal_refuses_to_drop_the_last_one() {
     assert_eq!(app.active_terminal, 0);
 }
 
+/// #912: `exit` in a pane left it open, dead and swallowing input. It now
+/// closes, as VS Code closes a terminal whose shell exits, and is not
+/// parked for undo-close: there is no shell to bring back.
+#[test]
+fn a_pane_whose_shell_exits_closes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.split_terminal().unwrap();
+    let survivor = app.terminals[0].uid();
+    app.terminals[1].write_input(b"exit 2\n");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(1500),
+        "the exited pane to close",
+        || {
+            app.drain_terminal_bells();
+            app.terminals.len() == 1
+        },
+    );
+    assert_eq!(app.terminals[0].uid(), survivor);
+    assert_eq!(app.active_terminal, 0);
+    assert!(app.closed_terminals.is_empty(), "parked for undo-close");
+    assert!(app.status.ends_with("exited with code 2"), "{}", app.status);
+}
+
+/// #912: the last pane cannot close, so when its shell exits it stays,
+/// takes no input, and is not counted active; a key starts a new shell in
+/// its place.
+#[test]
+fn the_last_pane_whose_shell_exits_waits_for_a_key_to_start_a_new_shell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let dead = app.terminals[0].uid();
+    app.terminals[0].write_input(b"exit\n");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(1500),
+        "the last pane's shell to exit",
+        || {
+            app.drain_terminal_bells();
+            app.terminals[0].has_exited()
+        },
+    );
+    assert_eq!(app.terminals.len(), 1);
+    assert_eq!(app.live_terminal_count(), 0);
+    assert!(app.status.ends_with("start a new shell"), "{}", app.status);
+    app.focus_pane(Pane::Terminal);
+    app.handle_key(key(KeyCode::Char('l'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.terminals.len(), 1);
+    assert_ne!(app.terminals[0].uid(), dead, "a new shell's pane");
+    assert!(!app.terminals[0].has_exited());
+    assert!(app.closed_terminals.is_empty());
+    assert_eq!(app.status, "Started a new shell");
+}
+
 #[test]
 fn cycle_terminal_wraps_around() {
     let tmp = tempfile::tempdir().unwrap();
