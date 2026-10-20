@@ -1,1 +1,0 @@
-feature: A repository's own snippets now expand: croft loads every `.vscode/*.code-snippets` file (VS Code's project snippets) and `.croft/snippets.json` in each workspace folder, after your own `snippets.json` so your snippet wins a prefix both define, and picks up changes to them while it runs (#1484).

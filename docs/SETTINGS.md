@@ -100,12 +100,12 @@ Workspace files (4–6 above) are repo-controlled input: cloning a repo must
 never change what croft trusts or executes. They are limited to an explicit
 allowlist — appearance and editor/terminal behavior:
 
-`theme`, `format_on_save`, `format_on_type`, `auto_save`, `auto_save_on_focus_change`,
+`theme`, `format_on_save`, `insert_final_newline`, `trim_trailing_whitespace`, `trim_final_newlines`, `format_on_type`, `auto_save`, `auto_save_on_focus_change`,
 `render_whitespace`, `rulers`, `word_based_suggestions`, `disable_inline_blame`, `disable_auto_close_pairs`, `disable_paste_reindent`,
 `disable_inline_values`, `disable_save_before_debug`, `disable_bracket_colors`, `disable_indent_guides`, `line_numbers`,
 `disable_inlay_hints`, `copy_on_select`, `disable_secret_redaction`, `disable_log_highlight`, `explorer_views`,
 `files_exclude`, `search_exclude`, `files_associations`, `languages` (only its
-per-language editor keys; see below).
+per-language editor keys; see below), `files_encoding`.
 
 Everything else — `disabled_extensions`, `mcp_consented`, `disable_remote_offer`, `remote_offer_excluded_hosts`, `config_sync_excluded_hosts`, `config_sync_excluded_files`, `fleet_groups`, `code_scanning`, `lane_agent`,
 `mcp_tool_fingerprints`, `host_accents`, `notifications`, `screen_reader`, `screen_reader_command`, `codeql_cli_path`, `locale`, `terminal_multiline_paste_warning`, and any future key not explicitly
@@ -124,6 +124,9 @@ means the same thing whichever path reads it.
 |---------|-------|
 | `editor.formatOnSave` | `format_on_save` |
 | `editor.formatOnType` | `format_on_type` |
+| `files.insertFinalNewline` | `insert_final_newline` |
+| `files.trimTrailingWhitespace` | `trim_trailing_whitespace` |
+| `files.trimFinalNewlines` | `trim_final_newlines` |
 | `files.autoSave: "afterDelay"` | `auto_save: true` |
 | `files.autoSave: "onFocusChange"` / `"onWindowChange"` | `auto_save_on_focus_change: true` |
 | `files.autoSave: "off"` | both auto-save modes off |
@@ -140,6 +143,7 @@ means the same thing whichever path reads it.
 | `files.exclude` | `files_exclude` (the globs set to `true`; a glob set to `false` becomes `!glob`, which takes it back from an earlier layer; `when` clauses are left out). VS Code reads a bare glob such as `build` from the workspace root, so it arrives anchored, as `/build`, and `scripts/build/` stays visible |
 | `search.exclude` | `search_exclude` (same) |
 | `files.associations` | `files_associations` (ids normalised, so `jsonc` becomes `json`; an entry naming a language croft has neither a grammar nor a server for is left out) |
+| `files.encoding` | `files_encoding` (when croft knows the encoding) |
 
 Keys croft honours only as user config (a terminal scrollback, say) are
 mapped by `croft import-vscode` but ignored here, since a workspace may not
@@ -177,6 +181,22 @@ VS Code's `"[python]": { … }` blocks map here, from a repo's
 applied to the keys inside. `"[javascript][typescript]"` sets both. A key
 inside a block that croft has only globally, or not at all, is listed by
 `import-vscode` with its block, as `[python] editor.rulers`.
+
+## Clean-up on save
+
+Three settings, all off by default as in VS Code, act on every save
+(explicit, auto-save, format-on-save, Save All), with no `.editorconfig`
+needed:
+
+| Setting | Effect |
+|---------|--------|
+| `insert_final_newline` | ends the file with a newline |
+| `trim_trailing_whitespace` | strips trailing spaces and tabs, sparing the lines a caret is on so auto-save never eats a space just typed |
+| `trim_final_newlines` | drops the empty lines after the last line of text, keeping the newline that ends it and any line a caret is on |
+
+A `.editorconfig` `insert_final_newline` or `trim_trailing_whitespace`
+wins over the setting for its files, whether it turns the clean-up on or
+off. All three appear in **Preferences: Open Settings (UI)**.
 
 ## Project exclusions
 
@@ -226,6 +246,28 @@ and a longer glob beats a shorter one. Values are VS Code language ids
 off. The language server follows the same choice. User and workspace
 entries merge glob by glob, the workspace winning. Open tabs follow a
 change, except one whose language was picked from the status bar.
+
+## File encoding
+
+A file with a byte-order mark always opens in the encoding the mark names.
+A file without one opens in, first to last:
+
+1. the encoding last picked for that file with the status bar's encoding
+   menu (Reopen with Encoding), remembered in `~/.cache/croft/encodings.json`;
+2. the `.editorconfig` `charset` for the file (`latin1`, `utf-8`,
+   `utf-8-bom`, `utf-16le`, `utf-16be`);
+3. `files_encoding`, VS Code's `files.encoding` ids such as `windows1252`,
+   `iso88591`, `shiftjis`, `gbk`, `utf16le` or `utf8bom`;
+4. UTF-8.
+
+```json
+{ "files_encoding": "windows1252" }
+```
+
+`latin1` and `iso88591` decode as windows-1252, as browsers and
+`encoding_rs` do. `utf-8-bom` and `utf8bom` also add the mark on the next
+save. A value croft has no encoding for is ignored. Changing the setting
+applies to files opened afterwards; open tabs keep their encoding.
 
 ## Config sync to remotes
 
@@ -395,7 +437,7 @@ Profiles live in `~/.config/croft/profiles/<name>/`. History, macros and session
 
 ## Accessibility and language
 
-* `"screen_reader": true` (or **Accessibility: Toggle Screen Reader Mode**, also in Settings) stops the caret blinking and keeps the real cursor on the focused text: the editor caret, the shell cursor in a terminal, or the status bar when a picker, menu, dialog or the Explorer has focus. The status bar then describes each change in one line: the line the caret moved to, the diagnostic under it, the highlighted completion, palette entry or file, focus changes and status messages. A dialog that waits for a key (Unsaved Changes, Discard Changes, Replace All, the Settings editor, a one-line prompt) is read when it opens: its title, what it says, and which key does what. Terminal screen readers (VoiceOver, Orca, NVDA over WSL) read it from there.
+* `"screen_reader": true` (or **Accessibility: Toggle Screen Reader Mode**, also in Settings) stops the caret blinking and keeps the real cursor on the focused text: the editor caret, the shell cursor in a terminal, or the status bar when a picker, menu, dialog or the Explorer has focus. The status bar then describes each change in one line: the line the caret moved to, the diagnostic under it, the highlighted completion, palette entry or file, focus changes and status messages, and, whatever has focus, each debugger pause (why, file, line and its text) and how a finished test run went. A dialog that waits for a key (Unsaved Changes, Discard Changes, Replace All, the Settings editor, a one-line prompt) is read when it opens: its title, what it says, and which key does what. Terminal screen readers (VoiceOver, Orca, NVDA over WSL) read it from there.
 * `"screen_reader_command": "spd-say"` (or `"say"` on macOS) also speaks each line through that program, with the line as its last argument.
 * `"locale": "de"` picks the UI language; unset, croft follows `LC_ALL`, `LC_MESSAGES` or `LANG`, but only into a language whose built-in catalog translates at least 95% of the strings `croft locale-template` lists, or one you have a `locales/<lang>.json` for, so a partial catalog never mixes two languages on screen unasked. Menus, palette titles, status messages and the side bar, panel and prompt titles are translated where the catalog has an entry, and the palette matches queries in either language. German (`de`) and Spanish (`es`) ship as starter catalogs, so they are opt-in: set `"locale"` to use them. For another language or to fix a translation, run `croft locale-template <lang> --write` and fill in the values it leaves empty in `~/.config/croft/locales/<lang>.json`; entries there override the built-in ones. Run it again after an upgrade to add new strings: it keeps every value you already wrote. Don't redirect the plain command onto that file, since the shell empties the file before croft can read it. A key with `{}` is a pattern: `"Saved {}": "Gespeichert: {}"`.
 

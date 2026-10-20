@@ -1,1 +1,0 @@
-fix: An inline AI suggestion that runs over several lines now shows every line under the caret before Tab takes it, where a body after `def …:` showed only "(+2 lines)". Ctrl+Right takes its next word and Ctrl+Down its next line, keeping the rest.

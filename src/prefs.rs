@@ -285,6 +285,20 @@ pub struct Prefs {
     /// #1499). Wins over `default_formatter` for that language.
     #[serde(default)]
     pub language_formatters: BTreeMap<String, String>,
+    /// When true, every save ends the file with a newline (VS Code's
+    /// `files.insertFinalNewline`, #1657). Off by default, matching VS Code;
+    /// a `.editorconfig` `insert_final_newline` wins for its file.
+    #[serde(default)]
+    pub insert_final_newline: bool,
+    /// When true, every save strips trailing spaces and tabs from the lines
+    /// no caret is on (VS Code's `files.trimTrailingWhitespace`, #1657). Off
+    /// by default; a `.editorconfig` `trim_trailing_whitespace` wins.
+    #[serde(default)]
+    pub trim_trailing_whitespace: bool,
+    /// When true, every save drops the empty lines after the last line of
+    /// text (VS Code's `files.trimFinalNewlines`, #1657). Off by default.
+    #[serde(default)]
+    pub trim_final_newlines: bool,
     /// When true, typing one of the language server's on-type trigger
     /// characters (`}`, `;`, newline, per its capability) runs
     /// `textDocument/onTypeFormatting` on the just-typed spot (VS Code's
@@ -404,6 +418,12 @@ pub struct Prefs {
     /// one for a file in that language; see [`LanguagePrefs`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub languages: BTreeMap<String, LanguagePrefs>,
+    /// The encoding files without a byte-order mark open in (VS Code's
+    /// `files.encoding`, #1432): `windows1252`, `latin1`, `shiftjis`,
+    /// `utf8bom` and the like. Empty means UTF-8. A BOM, an `.editorconfig`
+    /// `charset` and a per-file "Reopen with Encoding" choice all win.
+    #[serde(default)]
+    pub files_encoding: String,
     /// Opt-out for tailspin highlighting in the rendered log view (#466):
     /// dates, numbers, UUIDs, IPs, URLs, paths, quotes and severity keywords
     /// are coloured on lines that carry no colour of their own. Stored as
