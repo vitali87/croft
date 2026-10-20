@@ -11,7 +11,7 @@
 //! the region is in.
 
 use crate::merge::ConflictBlock;
-use crate::widgets::diff::{DiffRow, build_diff_rows};
+use crate::widgets::diff::{DIFF_DEADLINE, DiffRow, build_diff_rows, build_diff_rows_within};
 
 /// What the user decided for one conflict region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -325,7 +325,23 @@ impl MergeView {
     /// share, and its state is the side (or both sides) the text there
     /// matches, Unresolved while it still reads as base, else Manual.
     fn adopt_result(&mut self, result: &[String], current: &[String]) {
-        let shared: Vec<(usize, usize)> = build_diff_rows(result, current)
+        self.adopt_result_within(result, current, DIFF_DEADLINE);
+    }
+
+    /// [`Self::adopt_result`] with the line diff bounded by `budget`. A
+    /// diff cut short by it (#1152) matches only the lines the two texts
+    /// open and close with, so a region's nearest shared line can lie past
+    /// the next conflict: a region not pinned on both sides by the lines
+    /// around it in `result` then takes no lines, and reads as Manual, so
+    /// an accept on it cannot replace hand-resolved text it does not own.
+    fn adopt_result_within(
+        &mut self,
+        result: &[String],
+        current: &[String],
+        budget: std::time::Duration,
+    ) {
+        let (rows, coarse) = build_diff_rows_within(result, current, budget);
+        let shared: Vec<(usize, usize)> = rows
             .into_iter()
             .filter_map(|row| match row {
                 DiffRow::Equal { left, right } => Some((left, right)),
@@ -344,6 +360,20 @@ impl MergeView {
                 .get(after)
                 .map_or(current.len(), |&(_, r)| r)
                 .max(start);
+            let c_end = c.result_start + c.result_len;
+            let pinned = before
+                .checked_sub(1)
+                .map_or(c.result_start == 0, |i| shared[i].0 + 1 == c.result_start)
+                && shared
+                    .get(after)
+                    .map_or(c_end == result.len(), |&(l, _)| l == c_end);
+            if coarse && !pinned {
+                c.state = ConflictState::Manual;
+                c.result_start = start;
+                c.result_len = 0;
+                floor = start;
+                continue;
+            }
             let text = &current[start..end];
             c.state = if text == c.base.as_slice() {
                 ConflictState::Unresolved
@@ -945,6 +975,47 @@ mod tests {
                 (state, 2, region.len())
             );
         }
+    }
+
+    /// #906: a diff cut short by its deadline matches only the shared
+    /// first and last lines, so the first conflict's nearest shared line
+    /// after it was the file's last, and its region swallowed the line
+    /// between the conflicts and the second conflict's hand resolution. A
+    /// region the cut-short diff cannot pin takes nothing instead.
+    #[test]
+    fn a_cut_short_diff_leaves_no_region_over_text_it_does_not_own() {
+        let (base, ours, theirs) = (
+            lines(&["a", "x = 1", "b", "y = 1", "c"]),
+            lines(&["a", "x = 2", "b", "y = 2", "c"]),
+            lines(&["a", "x = 3", "b", "y = 3", "c"]),
+        );
+        let file = lines(&["a", "x = 9", "b", "y = 9", "c"]);
+        let spans = |budget| {
+            let (mut view, result) =
+                MergeView::new(base.clone(), ours.clone(), theirs.clone(), false);
+            view.adopt_result_within(&result, &file, budget);
+            view.conflicts
+                .iter()
+                .map(|c| (c.result_start, c.result_len, c.state))
+                .collect::<Vec<_>>()
+        };
+        let manual = ConflictState::Manual;
+        assert_eq!(
+            spans(DIFF_DEADLINE),
+            vec![(1, 1, manual), (3, 1, manual)],
+            "the full diff pins each region on the lines around it"
+        );
+        let cut = spans(std::time::Duration::ZERO);
+        assert!(
+            cut.iter()
+                .all(|&(start, len, _)| !(start..start + len).contains(&2)),
+            "no region owns `b`: {cut:?}"
+        );
+        assert!(
+            cut.iter()
+                .all(|&(_, len, state)| len <= 1 && state == manual),
+            "{cut:?}"
+        );
     }
 
     #[test]
