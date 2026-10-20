@@ -55164,6 +55164,8 @@ impl App {
         match cmd {
             Cmd::MoveLineUp => self.editor.move_lines_up(),
             Cmd::MoveLineDown => self.editor.move_lines_down(),
+            Cmd::CopyLineUp => self.editor.duplicate_lines_up(),
+            Cmd::CopyLineDown => self.editor.duplicate_lines_down(),
             Cmd::ToggleLineComment => {
                 if !self.editor.toggle_line_comment() && !self.editor.has_line_comment_syntax() {
                     self.status = String::from("Toggle Line Comment: no comment for this language");
@@ -55392,6 +55394,8 @@ impl App {
             | Cmd::GoToTypeDefinition
             | Cmd::GoToImplementations
             | Cmd::RenameSymbol
+            | Cmd::TriggerSuggest
+            | Cmd::TriggerParameterHints
                 if self.editor.has_non_text_view() =>
             {
                 self.status = format!("{} needs a text file", cmd.title());
@@ -55402,6 +55406,8 @@ impl App {
             Cmd::GoToTypeDefinition => self.request_type_definition_at_cursor(),
             Cmd::GoToImplementations => self.request_implementation_at_cursor(),
             Cmd::RenameSymbol => self.start_rename_symbol(),
+            Cmd::TriggerSuggest => self.trigger_completion(),
+            Cmd::TriggerParameterHints => self.trigger_signature_help(),
             // Position-carrying commands (#259). They read the click the
             // dispatcher set, and do nothing from the keyboard: invoked from
             // the palette there is no click to act on, and guessing the

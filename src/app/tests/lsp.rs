@@ -987,6 +987,38 @@ fn ctrl_space_in_a_file_no_server_takes_offers_the_words_already_in_it() {
     assert_eq!(app.editor.lines, ["configuration loader", "configuration"]);
 }
 
+/// #916: Trigger Suggest has a command id, so a chord bound to it (what
+/// `import-vscode` writes for `editor.action.triggerSuggest`) opens the
+/// popup Ctrl+Space does.
+#[test]
+fn a_chord_bound_to_trigger_suggest_opens_the_completion_popup() {
+    let (_tmp, mut app) = word_completion_app(&[("notes.txt", "configuration loader\nconfigu")]);
+    app.keymap =
+        crate::keymap::Keymap::from_json(r#"[{"key": "alt+/", "command": "trigger_suggest"}]"#);
+    app.handle_key(key(KeyCode::Char('/'), KeyModifiers::ALT))
+        .unwrap();
+    assert_eq!(popup_labels(&app), ["configuration"]);
+}
+
+/// #916: Trigger Parameter Hints has a command id, so a chord bound to it
+/// asks for the hints at the caret, as typing `(` does.
+#[test]
+fn a_chord_bound_to_trigger_parameter_hints_asks_at_the_caret() {
+    let (_tmp, mut app) = word_completion_app(&[("notes.txt", "call(")]);
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "alt+,", "command": "trigger_parameter_hints"}]"#,
+    );
+    assert!(app.signature_help_request_id.is_none());
+    app.handle_key(key(KeyCode::Char(','), KeyModifiers::ALT))
+        .unwrap();
+    assert!(app.signature_help_request_id.is_some());
+    assert_eq!(
+        app.signature_help_anchor,
+        Some((0, 5, app.editor.edit_seq)),
+        "anchored at the caret, with nothing typed"
+    );
+}
+
 #[test]
 fn a_makefile_variable_completes_from_its_definition() {
     let (_tmp, mut app) = word_completion_app(&[(

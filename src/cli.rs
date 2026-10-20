@@ -1621,7 +1621,11 @@ fn import_vscode(from: Option<PathBuf>, dry_run: bool) -> Result<()> {
                     dir.display()
                 );
             }
-            dir
+            let user = crate::import_vscode::user_dir_in(&dir);
+            if user != dir {
+                println!("Reading {}", user.display());
+            }
+            user
         }
         None => {
             let found = crate::import_vscode::discover_profiles();

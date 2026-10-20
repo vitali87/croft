@@ -22,6 +22,10 @@ pub enum Command {
     // --- Editor: line / selection ops (the new VS Code parity features) ---
     MoveLineUp,
     MoveLineDown,
+    /// Copy Line Up/Down (#916): VS Code's `copyLinesUpAction` /
+    /// `copyLinesDownAction`, by default Shift+Alt+Up/Down.
+    CopyLineUp,
+    CopyLineDown,
     ToggleLineComment,
     ToggleBlockComment,
     JoinLines,
@@ -80,6 +84,10 @@ pub enum Command {
     GoToImplementations,
     SwitchHeaderSource,
     RenameSymbol,
+    /// Trigger Suggest / Trigger Parameter Hints (#916): the completion
+    /// popup Ctrl+Space opens, and the parameter hints typing `(` asks for.
+    TriggerSuggest,
+    TriggerParameterHints,
     MouseAddCursorAtClick,
     MouseGoToDefinitionAtClick,
     MouseOpenLinkAtClick,
@@ -592,6 +600,8 @@ pub enum Command {
 pub const ALL_COMMANDS: &[Command] = &[
     Command::MoveLineUp,
     Command::MoveLineDown,
+    Command::CopyLineUp,
+    Command::CopyLineDown,
     Command::ToggleLineComment,
     Command::ToggleBlockComment,
     Command::JoinLines,
@@ -648,6 +658,8 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::GoToImplementations,
     Command::SwitchHeaderSource,
     Command::RenameSymbol,
+    Command::TriggerSuggest,
+    Command::TriggerParameterHints,
     Command::MouseAddCursorAtClick,
     Command::MouseGoToDefinitionAtClick,
     Command::MouseOpenLinkAtClick,
@@ -1062,6 +1074,8 @@ impl Command {
         match self {
             Command::MoveLineUp => "Move Line Up",
             Command::MoveLineDown => "Move Line Down",
+            Command::CopyLineUp => "Copy Line Up",
+            Command::CopyLineDown => "Copy Line Down",
             Command::ToggleLineComment => "Toggle Line Comment",
             Command::ToggleBlockComment => "Toggle Block Comment",
             Command::JoinLines => "Join Lines",
@@ -1118,6 +1132,8 @@ impl Command {
             Command::GoToImplementations => "Go to Implementations",
             Command::SwitchHeaderSource => "C/C++: Switch Header/Source",
             Command::RenameSymbol => "Rename Symbol",
+            Command::TriggerSuggest => "Trigger Suggest",
+            Command::TriggerParameterHints => "Trigger Parameter Hints",
             Command::MouseAddCursorAtClick => "Mouse: Add Cursor at Click",
             Command::MouseGoToDefinitionAtClick => "Mouse: Go to Definition at Click",
             Command::MouseOpenLinkAtClick => "Mouse: Open Link at Click",
@@ -1521,6 +1537,8 @@ impl Command {
         match self {
             Command::MoveLineUp => "Alt+↑",
             Command::MoveLineDown => "Alt+↓",
+            Command::CopyLineUp => "Shift+Alt+↑",
+            Command::CopyLineDown => "Shift+Alt+↓",
             Command::JoinLines => "Cmd+Opt+Shift+J",
             Command::InsertLineBelow => "Cmd+Enter",
             Command::InsertLineAbove => "Cmd+Shift+Enter",
@@ -1600,6 +1618,10 @@ impl Command {
             Command::GoToImplementations => "Cmd+F12",
             Command::SwitchHeaderSource => "Alt+O",
             Command::RenameSymbol => "F2",
+            Command::TriggerSuggest => "Ctrl+Space",
+            // No chord of its own: VS Code's Ctrl+Shift+Space is the
+            // terminal's Quick Select here. Typing `(` or `,` asks too.
+            Command::TriggerParameterHints => "",
             Command::MouseAddCursorAtClick => "",
             Command::MouseGoToDefinitionAtClick => "",
             Command::MouseOpenLinkAtClick => "",
@@ -2007,6 +2029,8 @@ impl Command {
         match self {
             Command::MoveLineUp => "move_line_up",
             Command::MoveLineDown => "move_line_down",
+            Command::CopyLineUp => "copy_line_up",
+            Command::CopyLineDown => "copy_line_down",
             Command::ToggleLineComment => "toggle_line_comment",
             Command::ToggleBlockComment => "toggle_block_comment",
             Command::JoinLines => "join_lines",
@@ -2063,6 +2087,8 @@ impl Command {
             Command::GoToImplementations => "go_to_implementations",
             Command::SwitchHeaderSource => "switch_header_source",
             Command::RenameSymbol => "rename_symbol",
+            Command::TriggerSuggest => "trigger_suggest",
+            Command::TriggerParameterHints => "trigger_parameter_hints",
             Command::MouseAddCursorAtClick => "mouse_add_cursor_at_click",
             Command::MouseGoToDefinitionAtClick => "mouse_go_to_definition_at_click",
             Command::MouseOpenLinkAtClick => "mouse_open_link_at_click",
