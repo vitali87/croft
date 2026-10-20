@@ -1110,6 +1110,165 @@ fn shift_alt_i_adds_a_cursor_at_each_line_end() {
     );
 }
 
+const COLUMN_PY: &str = "alpha = 1\nbeta  = 2\ngamma = 3\n";
+
+fn column_chord(code: KeyCode, cmd: KeyModifiers) -> KeyEvent {
+    key(code, cmd | KeyModifiers::SHIFT | KeyModifiers::ALT)
+}
+
+/// #1560: Ctrl+Shift+Alt+Down twice then Right twice makes a three-row,
+/// two-column box, and typing replaces those columns on every row.
+#[test]
+fn column_select_keys_make_a_box_that_typing_fills() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "s.py", COLUMN_PY);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    for code in [KeyCode::Down, KeyCode::Down, KeyCode::Right, KeyCode::Right] {
+        app.handle_key(column_chord(code, KeyModifiers::CONTROL))
+            .unwrap();
+    }
+    assert_eq!(app.editor.carets.len(), 2, "one selection per row");
+    type_keys(&mut app, "Y");
+    assert_eq!(&app.editor.lines[..3], ["Ypha = 1", "Yta  = 2", "Ymma = 3"]);
+}
+
+/// #1560: macOS's Cmd+Shift+Opt arrows do the same.
+#[test]
+fn cmd_shift_opt_arrows_make_the_same_box() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "s.py", COLUMN_PY);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 1;
+    for code in [KeyCode::Down, KeyCode::Right, KeyCode::Right] {
+        app.handle_key(column_chord(code, KeyModifiers::SUPER))
+            .unwrap();
+    }
+    assert_eq!(app.editor.selection.unwrap().normalised(), ((1, 1), (1, 3)));
+    assert_eq!(app.editor.carets.len(), 1);
+    assert_eq!(app.editor.carets[0].normalised(), ((0, 1), (0, 3)));
+}
+
+/// Negative (#1560): Ctrl+Alt+Down without Shift still adds one caret
+/// below and selects nothing.
+#[test]
+fn ctrl_alt_down_without_shift_still_adds_a_caret_below() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "s.py", COLUMN_PY);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    app.handle_key(key(
+        KeyCode::Down,
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert_eq!(app.editor.carets.len(), 1);
+    assert_eq!(app.editor.carets[0].head, (1, 0));
+    assert_eq!(app.editor.cursor_row, 0);
+    assert!(app.editor.selection.is_none());
+}
+
+/// Negative (#1560): Up from the first row has nowhere to go, so the box
+/// stays one row.
+#[test]
+fn column_select_up_from_the_first_row_keeps_one_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "s.py", COLUMN_PY);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    app.handle_key(column_chord(KeyCode::Right, KeyModifiers::CONTROL))
+        .unwrap();
+    app.handle_key(column_chord(KeyCode::Up, KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.editor.carets.is_empty());
+    assert_eq!(app.editor.selection.unwrap().normalised(), ((0, 0), (0, 1)));
+}
+
+/// #1560: with Column Selection Mode on, plain Shift+arrows grow a box;
+/// turned off again, they extend a stream selection as before.
+#[test]
+fn column_selection_mode_turns_shift_arrows_into_a_box() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "s.py", COLUMN_PY);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    app.run_command(Command::ToggleColumnSelection);
+    assert!(app.editor.column_selection_mode);
+    for code in [KeyCode::Down, KeyCode::Right] {
+        app.handle_key(key(code, KeyModifiers::SHIFT)).unwrap();
+    }
+    assert_eq!(app.editor.carets.len(), 1, "a box over two rows");
+    assert_eq!(app.editor.selection.unwrap().normalised(), ((1, 0), (1, 1)));
+
+    app.run_command(Command::ToggleColumnSelection);
+    assert!(!app.editor.column_selection_mode);
+    app.editor.carets.clear();
+    app.editor.selection = None;
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    for code in [KeyCode::Down, KeyCode::Right] {
+        app.handle_key(key(code, KeyModifiers::SHIFT)).unwrap();
+    }
+    assert!(app.editor.carets.is_empty(), "a stream selection again");
+    assert_eq!(app.editor.selection.unwrap().normalised(), ((0, 0), (1, 1)));
+}
+
+/// #1560: the status bar says when Column Selection Mode is on.
+#[test]
+fn the_status_bar_shows_column_selection_mode() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "s.py", COLUMN_PY);
+    let backend = ratatui::backend::TestBackend::new(140, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    let status_row = |term: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+        let buf = term.backend().buffer();
+        let y = buf.area.height - 1;
+        (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect::<String>()
+    };
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(!status_row(&term).contains("Column Selection"));
+    app.run_command(Command::ToggleColumnSelection);
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        status_row(&term).contains("Column Selection"),
+        "{}",
+        status_row(&term)
+    );
+}
+
+/// #1560: every column-select key and the mode toggle are palette commands
+/// that drive the editor.
+#[test]
+fn column_select_commands_are_in_the_palette() {
+    use crate::widgets::command_palette::{ALL_COMMANDS, Command};
+    for (cmd, title) in [
+        (Command::ColumnSelectUp, "Column Select Up"),
+        (Command::ColumnSelectDown, "Column Select Down"),
+        (Command::ColumnSelectLeft, "Column Select Left"),
+        (Command::ColumnSelectRight, "Column Select Right"),
+        (Command::ColumnSelectPageUp, "Column Select Page Up"),
+        (Command::ColumnSelectPageDown, "Column Select Page Down"),
+        (
+            Command::ToggleColumnSelection,
+            "View: Toggle Column Selection Mode",
+        ),
+    ] {
+        assert!(ALL_COMMANDS.contains(&cmd), "{title}");
+        assert_eq!(cmd.title(), title);
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "s.py", COLUMN_PY);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    app.run_command(Command::ColumnSelectDown);
+    app.run_command(Command::ColumnSelectRight);
+    assert_eq!(app.editor.carets.len(), 1);
+}
+
 #[test]
 fn cmd_shift_k_deletes_the_current_line() {
     let tmp = tempfile::tempdir().unwrap();

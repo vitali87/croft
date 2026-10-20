@@ -298,6 +298,8 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Alt`+`↑` / `Alt`+`↓` | Move the current line (or selected block) up / down, carrying the cursor and selection |
 | `Shift`+`Alt`+`↑` / `↓` | Copy the current line (or selected block) up / down |
 | `Cmd`/`Ctrl`+`Opt`+`↑` / `↓` | Add a cursor above / below the current one (multi-cursor) |
+| `Cmd`/`Ctrl`+`Shift`+`Opt`+arrows / `PageUp` / `PageDown` | Column (box) selection from the keyboard, like `Shift`+`Opt`+drag: grow the box one row, one column or one screen, with one selection per row, so typing edits the same columns of every line. The box starts at the caret and keeps growing while the carets are the ones it made |
+| View: Toggle Column Selection Mode (palette) | While on, plain `Shift`+arrows and `Shift`+`PageUp` / `PageDown` grow a column selection; the status bar shows "Column Selection" beside Ln/Col |
 | `Cmd`+`/` / `Ctrl`+`/` | Toggle line comment for the current line or every line the selection touches (language-aware; comments at the block's common indent) |
 | `Shift`+`Alt`+`A` | Toggle block comment around the selection (languages with a block comment) |
 | `Alt`+`Z` | Toggle soft word wrap for this file (overrides the per-language default until the file is reopened) |
@@ -720,6 +722,7 @@ With a row selected, `n` (or right-click → "Ask Navigator About This Line", or
 | `⌘⇧K` | Delete Line |
 | `⌥`+click / `⇧⌥`+drag | Add a caret / column (box) selection |
 | `⌥⌘←` / `⌥⌘→` | Focus the left / right editor group |
+| `⇧⌥⌘` + arrows | Column (box) selection |
 | `⌘F12` | Go to Implementations |
 | `⌃⇧F12` | Go to Declaration |
 | `⌘S` / `⌘C` / `⌘X` / `⌘Z` / `⌘A` | Save / Copy / Cut / Undo / Select All |

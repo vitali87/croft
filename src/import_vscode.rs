@@ -587,6 +587,16 @@ const COMMANDS: &[(&str, &str)] = &[
     ("editor.emmet.action.matchTag", "emmet_match_tag"),
     ("editor.action.insertCursorAbove", "add_cursor_above"),
     ("editor.action.insertCursorBelow", "add_cursor_below"),
+    ("cursorColumnSelectUp", "column_select_up"),
+    ("cursorColumnSelectDown", "column_select_down"),
+    ("cursorColumnSelectLeft", "column_select_left"),
+    ("cursorColumnSelectRight", "column_select_right"),
+    ("cursorColumnSelectPageUp", "column_select_page_up"),
+    ("cursorColumnSelectPageDown", "column_select_page_down"),
+    (
+        "editor.action.toggleColumnSelection",
+        "toggle_column_selection",
+    ),
     (
         "editor.action.addSelectionToNextFindMatch",
         "add_selection_to_next_match",
@@ -2868,6 +2878,46 @@ mod tests {
             vec![(String::from("ctrl+s"), String::from("save_file"), None)]
         );
         assert_eq!(report.snippets["Test"]["scope"], json!("rust"));
+    }
+
+    /// #1560: VS Code's column selection keybindings import onto croft's
+    /// commands instead of being dropped.
+    #[test]
+    fn column_selection_keybindings_import() {
+        let mut report = Report::default();
+        convert_keybindings(
+            &json!([
+                { "key": "ctrl+shift+alt+down", "command": "cursorColumnSelectDown" },
+                { "key": "ctrl+shift+alt+pagedown", "command": "cursorColumnSelectPageDown" },
+                { "key": "ctrl+alt+c", "command": "editor.action.toggleColumnSelection" },
+            ]),
+            &mut report,
+        );
+        assert_eq!(
+            report.keybindings,
+            vec![
+                (
+                    String::from("ctrl+alt+c"),
+                    String::from("toggle_column_selection"),
+                    None
+                ),
+                (
+                    String::from("ctrl+shift+alt+down"),
+                    String::from("column_select_down"),
+                    None
+                ),
+                (
+                    String::from("ctrl+shift+alt+pagedown"),
+                    String::from("column_select_page_down"),
+                    None
+                ),
+            ]
+        );
+        assert!(
+            report.dropped_keybindings.is_empty(),
+            "{:?}",
+            report.dropped_keybindings
+        );
     }
 
     /// #1285: VS Code's Save As and Revert File keybindings import onto

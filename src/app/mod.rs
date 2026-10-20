@@ -22260,9 +22260,16 @@ impl App {
             .and_then(|l| l.percent)
             .map(|p| format!(" \u{b7} {p:.0}% covered"))
             .unwrap_or_default();
+        // Column Selection Mode (#1560) rides the same segment, as VS Code
+        // shows it beside the position.
+        let column_mode = if self.editor.column_selection_mode {
+            " \u{b7} Column Selection"
+        } else {
+            ""
+        };
         let mut seg_texts: Vec<String> = vec![
             format!(
-                " Ln {}, Col {}{coverage}{} ",
+                " Ln {}, Col {}{coverage}{}{column_mode} ",
                 self.editor.cursor_row + 1,
                 self.editor.cursor_col + 1,
                 // The file refuses this user's writes (#1379).
@@ -47429,6 +47436,16 @@ impl App {
             }
             return;
         }
+        // Column (box) selection from the keyboard (#1560): VS Code's
+        // Cmd+Shift+Opt (Ctrl+Shift+Alt) arrows and PageUp/PageDown, and
+        // plain Shift+arrows while Column Selection Mode is on. Ahead of the
+        // multi-cursor collapse below, since the box is carets it keeps
+        // growing, and of Add Cursor, which used to take the Up/Down chords
+        // and leave one caret.
+        if let Some((rows, cols)) = self.column_select_key(key) {
+            self.editor.column_select(rows, cols);
+            return;
+        }
         // While multi-cursor mode is live, printable typing / backspace /
         // delete fan out to every caret and Esc collapses back to one cursor.
         // Any other key collapses the carets and falls through to normal
@@ -47642,7 +47659,7 @@ impl App {
         // VS Code "Add Cursor Above/Below" (Cmd+Opt+Up / Cmd+Opt+Down). Must
         // come before the plain-Alt move-line check so the cmd+alt combo is
         // routed here, not there.
-        if cmd && alt && matches!(key.code, KeyCode::Up | KeyCode::Down) {
+        if cmd && alt && !shift && matches!(key.code, KeyCode::Up | KeyCode::Down) {
             match key.code {
                 KeyCode::Up => self.editor.add_cursor_above(),
                 KeyCode::Down => self.editor.add_cursor_below(),
@@ -55172,6 +55189,19 @@ impl App {
             }
             Cmd::AddCursorAbove => self.editor.add_cursor_above(),
             Cmd::AddCursorBelow => self.editor.add_cursor_below(),
+            Cmd::ColumnSelectUp => self.editor.column_select(-1, 0),
+            Cmd::ColumnSelectDown => self.editor.column_select(1, 0),
+            Cmd::ColumnSelectLeft => self.editor.column_select(0, -1),
+            Cmd::ColumnSelectRight => self.editor.column_select(0, 1),
+            Cmd::ColumnSelectPageUp => {
+                let page = self.editor.column_select_page();
+                self.editor.column_select(-page, 0);
+            }
+            Cmd::ColumnSelectPageDown => {
+                let page = self.editor.column_select_page();
+                self.editor.column_select(page, 0);
+            }
+            Cmd::ToggleColumnSelection => self.toggle_column_selection_mode(),
             Cmd::AddSelectionToNextMatch => self.start_select_next_occurrence(),
             Cmd::SelectAllOccurrences => self.select_all_occurrences(),
             Cmd::AddCursorsToLineEnds => self.add_cursors_to_line_ends(),
@@ -64490,6 +64520,46 @@ impl App {
             });
         }
         changed
+    }
+
+    /// The `(rows, cols)` a column-select key moves the box head (#1560):
+    /// Cmd/Ctrl+Shift+Alt with an arrow moves one row or column and with
+    /// PageUp/PageDown one screen; while Column Selection Mode is on, plain
+    /// Shift does the same. `None` for every other key.
+    fn column_select_key(&self, key: KeyEvent) -> Option<(isize, isize)> {
+        let m = key.modifiers;
+        let shift = m.contains(KeyModifiers::SHIFT);
+        let alt = m.contains(KeyModifiers::ALT);
+        let cmd = m.contains(KeyModifiers::SUPER) || m.contains(KeyModifiers::CONTROL);
+        let chord = cmd && shift && alt;
+        let mode = self.editor.column_selection_mode && shift && !cmd && !alt;
+        if !chord && !mode {
+            return None;
+        }
+        let page = self.editor.column_select_page();
+        Some(match key.code {
+            KeyCode::Up => (-1, 0),
+            KeyCode::Down => (1, 0),
+            KeyCode::Left => (0, -1),
+            KeyCode::Right => (0, 1),
+            KeyCode::PageUp => (-page, 0),
+            KeyCode::PageDown => (page, 0),
+            _ => return None,
+        })
+    }
+
+    /// View: Toggle Column Selection Mode (#1560): while on, Shift+arrows
+    /// grow a column selection.
+    fn toggle_column_selection_mode(&mut self) {
+        self.editor.column_selection_mode = !self.editor.column_selection_mode;
+        self.status = format!(
+            "Column Selection Mode {}",
+            if self.editor.column_selection_mode {
+                "on"
+            } else {
+                "off"
+            }
+        );
     }
 
     /// Step the gutter's line numbers through on, relative, interval and
@@ -75374,7 +75444,10 @@ fn is_focus_group_left_key(key: KeyEvent) -> bool {
     let KeyCode::Left = key.code else {
         return false;
     };
-    has_cmd(key.modifiers) && key.modifiers.contains(KeyModifiers::ALT)
+    // With Shift it is column selection (#1560), not a group switch.
+    has_cmd(key.modifiers)
+        && key.modifiers.contains(KeyModifiers::ALT)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
 /// `Cmd+Opt+Right`: move keyboard focus to the RIGHT editor group while
@@ -75384,7 +75457,10 @@ fn is_focus_group_right_key(key: KeyEvent) -> bool {
     let KeyCode::Right = key.code else {
         return false;
     };
-    has_cmd(key.modifiers) && key.modifiers.contains(KeyModifiers::ALT)
+    // With Shift it is column selection (#1560), not a group switch.
+    has_cmd(key.modifiers)
+        && key.modifiers.contains(KeyModifiers::ALT)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
 /// `Cmd+Shift+T` (Mac SUPER+SHIFT+T): focus the Terminal pane from any

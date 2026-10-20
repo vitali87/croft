@@ -328,6 +328,19 @@ const CMD_OPT_UP_KEY: &str = "0xf700-0x180000";
 const CMD_OPT_UP_HEX: &str = "0x1b 0x5b 0x31 0x3b 0x31 0x31 0x41";
 const CMD_OPT_DOWN_KEY: &str = "0xf701-0x180000";
 const CMD_OPT_DOWN_HEX: &str = "0x1b 0x5b 0x31 0x3b 0x31 0x31 0x42";
+/// `Cmd+Shift+Opt+arrows` -> column (box) selection (#1560), VS Code's
+/// `cursorColumnSelect*`. Same function-key form with the Cmd+Shift+Opt
+/// mask 0x1a0000; payload `ESC [ 1 ; 12 (A|B|D|C)` (12 is 1 base plus
+/// Shift 1, Alt 2 and Super 8) decodes to the arrow + SHIFT | ALT | SUPER,
+/// which `handle_editor_key` routes to `column_select`.
+const CMD_OPT_SHIFT_UP_KEY: &str = "0xf700-0x1a0000";
+const CMD_OPT_SHIFT_UP_HEX: &str = "0x1b 0x5b 0x31 0x3b 0x31 0x32 0x41";
+const CMD_OPT_SHIFT_DOWN_KEY: &str = "0xf701-0x1a0000";
+const CMD_OPT_SHIFT_DOWN_HEX: &str = "0x1b 0x5b 0x31 0x3b 0x31 0x32 0x42";
+const CMD_OPT_SHIFT_LEFT_KEY: &str = "0xf702-0x1a0000";
+const CMD_OPT_SHIFT_LEFT_HEX: &str = "0x1b 0x5b 0x31 0x3b 0x31 0x32 0x44";
+const CMD_OPT_SHIFT_RIGHT_KEY: &str = "0xf703-0x1a0000";
+const CMD_OPT_SHIFT_RIGHT_HEX: &str = "0x1b 0x5b 0x31 0x3b 0x31 0x32 0x43";
 /// `Cmd+Shift+P` -> Command Palette. Mirrors the `Cmd+Shift+F` forwarder:
 /// `kVK_ANSI_P` = 0x23, char 'P' = 0x50, modifier mask 0x120000 (Cmd | Shift).
 /// CSI-u `ESC [ 80 ; 10 u` (codepoint 80 = 'P', modifier 10 = Super(8) +
@@ -542,6 +555,10 @@ pub(crate) mod payloads {
     pub(crate) const CMD_OPT_RIGHT_HEX: &str = super::CMD_OPT_RIGHT_HEX;
     pub(crate) const CMD_OPT_UP_HEX: &str = super::CMD_OPT_UP_HEX;
     pub(crate) const CMD_OPT_DOWN_HEX: &str = super::CMD_OPT_DOWN_HEX;
+    pub(crate) const CMD_OPT_SHIFT_UP_HEX: &str = super::CMD_OPT_SHIFT_UP_HEX;
+    pub(crate) const CMD_OPT_SHIFT_DOWN_HEX: &str = super::CMD_OPT_SHIFT_DOWN_HEX;
+    pub(crate) const CMD_OPT_SHIFT_LEFT_HEX: &str = super::CMD_OPT_SHIFT_LEFT_HEX;
+    pub(crate) const CMD_OPT_SHIFT_RIGHT_HEX: &str = super::CMD_OPT_SHIFT_RIGHT_HEX;
     pub(crate) const CMD_SHIFT_P_HEX: &str = super::CMD_SHIFT_P_HEX;
     pub(crate) const CMD_P_HEX: &str = super::CMD_P_HEX;
     pub(crate) const CMD_R_HEX: &str = super::CMD_R_HEX;
@@ -853,6 +870,10 @@ pub fn apply_croft_key_settings(plist: &mut Value) -> Result<(), ITerm2Error> {
         (CMD_OPT_RIGHT_KEY, CMD_OPT_RIGHT_HEX),
         (CMD_OPT_UP_KEY, CMD_OPT_UP_HEX),
         (CMD_OPT_DOWN_KEY, CMD_OPT_DOWN_HEX),
+        (CMD_OPT_SHIFT_UP_KEY, CMD_OPT_SHIFT_UP_HEX),
+        (CMD_OPT_SHIFT_DOWN_KEY, CMD_OPT_SHIFT_DOWN_HEX),
+        (CMD_OPT_SHIFT_LEFT_KEY, CMD_OPT_SHIFT_LEFT_HEX),
+        (CMD_OPT_SHIFT_RIGHT_KEY, CMD_OPT_SHIFT_RIGHT_HEX),
         (CMD_SHIFT_P_KEY, CMD_SHIFT_P_HEX),
         (CMD_DOT_KEY, CMD_DOT_HEX),
     ] {
@@ -1859,6 +1880,24 @@ mod tests {
             CMD_OPT_DOWN_HEX,
             "GlobalKeyMap must forward Cmd+Opt+Down as `ESC [ 1 ; 11 B` so croft adds a cursor below"
         );
+    }
+
+    /// #1560: Cmd+Shift+Opt+arrows reach croft as the arrow with
+    /// SHIFT | ALT | SUPER, for column selection.
+    #[test]
+    fn apply_croft_key_settings_forwards_cmd_shift_opt_arrows_for_column_select() {
+        let mut plist = synth_plist("GUID-1", &["GUID-1"]);
+        apply_croft_key_settings(&mut plist).unwrap();
+        let top = plist.as_dictionary().unwrap();
+        let global = dict_in(top, "GlobalKeyMap");
+        for (key, hex) in [
+            (CMD_OPT_SHIFT_UP_KEY, CMD_OPT_SHIFT_UP_HEX),
+            (CMD_OPT_SHIFT_DOWN_KEY, CMD_OPT_SHIFT_DOWN_HEX),
+            (CMD_OPT_SHIFT_LEFT_KEY, CMD_OPT_SHIFT_LEFT_HEX),
+            (CMD_OPT_SHIFT_RIGHT_KEY, CMD_OPT_SHIFT_RIGHT_HEX),
+        ] {
+            assert_eq!(action_text(global, key), hex, "{key}");
+        }
     }
 
     #[test]
