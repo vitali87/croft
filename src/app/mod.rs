@@ -3617,6 +3617,9 @@ pub struct App {
     /// The workspace root the Testing panel and worker are bound to —
     /// follows the focused file's folder like the SCM surfaces (#151).
     active_test_root: PathBuf,
+    /// The last `followed_test_root` answer and the workspace folder and
+    /// focused file it was for (#1520).
+    test_root_follow: Option<((PathBuf, Option<PathBuf>), PathBuf)>,
     /// Folder set from an explicitly opened `.code-workspace` (#163):
     /// consumed by `change_workspace_root` INSTEAD of the automatic
     /// per-primary restore, so the file defines the arrangement exactly.
@@ -6403,6 +6406,7 @@ impl App {
             scm_pin: None,
             scm_follow_root: root.clone(),
             active_test_root: root.clone(),
+            test_root_follow: None,
             pending_workspace_folders: None,
             git_head_oids: std::collections::BTreeMap::new(),
             git,
@@ -8509,8 +8513,9 @@ impl App {
         if active != self.active_scm_root {
             self.seed_active_scm(active);
         }
-        if follow != self.active_test_root {
-            self.rebind_test_root(follow);
+        let test_root = self.followed_test_root(follow);
+        if test_root != self.active_test_root {
+            self.rebind_test_root(test_root);
         }
         // Ship any refresh the debounce window coalesced once the gap clears,
         // so the trailing edge of an edit burst lands without another FS event.
@@ -9482,6 +9487,36 @@ impl App {
             .repo_root
             .clone()
             .unwrap_or(ws)
+    }
+
+    /// The folder the Testing view follows for workspace folder `root`
+    /// (#1520): `root`, or in a monorepo whose root no runner claims, the
+    /// package of the focused file that one does. Resolved again only when
+    /// the folder or the focused file changes, since it reads manifests.
+    fn followed_test_root(&mut self, root: PathBuf) -> PathBuf {
+        let key = (root, self.editor.path.clone());
+        if let Some((k, v)) = &self.test_root_follow
+            && *k == key
+        {
+            return v.clone();
+        }
+        let found = crate::testing::registry::test_root_for(&key.0, key.1.as_deref());
+        self.test_root_follow = Some((key, found.clone()));
+        found
+    }
+
+    /// Resolve the followed Testing folder afresh and rebind to it if it
+    /// moved (#1520): a runner enabled or a package marker added since the
+    /// focus last changed can change the answer the cache still holds.
+    /// Whether it rebound.
+    fn refollow_test_root(&mut self) -> bool {
+        self.test_root_follow = None;
+        let root = self.followed_test_root(self.active_workspace_root());
+        if root == self.active_test_root {
+            return false;
+        }
+        self.rebind_test_root(root);
+        true
     }
 
     /// The workspace root the focus-following surfaces resolve against:
@@ -17418,6 +17453,8 @@ impl App {
     /// view is shown or a toggle flips, so the list always reflects the manifests
     /// on disk and the current disable set.
     fn refresh_extensions(&mut self) {
+        // A runner toggled on or off changes which folder Testing follows.
+        self.test_root_follow = None;
         let mut vscode: Vec<String> = self
             .roots
             .iter()
@@ -26109,6 +26146,11 @@ impl App {
         if crate::testing::worker::runner_for(&self.active_test_root).is_some() {
             return true;
         }
+        if self.refollow_test_root()
+            && crate::testing::worker::runner_for(&self.active_test_root).is_some()
+        {
+            return true;
+        }
         self.status = String::from(crate::testing::NO_RUNNER_STATUS);
         false
     }
@@ -27217,6 +27259,13 @@ impl App {
     /// can walk the whole tree for CodeQL test packs, which stalled the
     /// switch to the Testing view.
     fn discover_tests(&mut self) {
+        // The rebind re-discovers on its own while the view is showing.
+        if !self.testing.is_busy()
+            && self.refollow_test_root()
+            && self.sidebar_view == SidebarView::Testing
+        {
+            return;
+        }
         if self.testing.is_busy() || self.test_worker.discover_queued() {
             return;
         }
