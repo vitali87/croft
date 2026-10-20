@@ -49644,7 +49644,14 @@ impl App {
         PendingRunBlock {
             pane_name: format!("{file}:{}", idx + 1),
             cwd,
-            command: fence_command(block.interpreter, &block.code, &block_script_dir()),
+            command: fence_command(
+                block.interpreter,
+                &block.code,
+                &block_script_dir(),
+                // The shell `run_block_in_pane` spawns, or spawned the pane
+                // it reuses.
+                &std::env::var("SHELL").unwrap_or_default(),
+            ),
             code: block.code.clone(),
             destructive: block.destructive,
             doc: doc.clone(),
@@ -74808,7 +74815,10 @@ fn is_run_fence_key(key: KeyEvent) -> bool {
 /// the confirm popup showed. Inside single quotes neither happens, and the
 /// tab travels as `\t`. A backslash travels as `\0134`, since fish folds
 /// `\\` inside single quotes to one backslash where bash and zsh keep both.
-fn fence_command(interpreter: &str, code: &str, scripts: &Path) -> String {
+/// `shell` is the pane's shell: fish before 3.4 rejects `$(...)` as
+/// syntax, so a fish pane pipes the decoded block to `source` rather than
+/// `eval`ing it, which every fish reads alike.
+fn fence_command(interpreter: &str, code: &str, scripts: &Path, shell: &str) -> String {
     let code = code.trim_end_matches('\n');
     if interpreter != "sh" {
         if let Ok(file) = stage_block(scripts, interpreter, code) {
@@ -74830,7 +74840,10 @@ fn fence_command(interpreter: &str, code: &str, scripts: &Path) -> String {
             .replace('\'', "'\\''");
         // A shell block runs IN the pane's shell, as a typed one does (a
         // `cd` or `export` persists, bash-isms still work): `eval` of the
-        // decoded text.
+        // decoded text, or fish's `source` of it.
+        if Path::new(shell).file_name().is_some_and(|n| n == "fish") {
+            return format!("printf '%b' '{escaped}' | source\r");
+        }
         return format!("eval \"$(printf '%b' '{escaped}')\"\r");
     }
     format!("{code}\r")
