@@ -12388,7 +12388,7 @@ impl Editor {
     pub fn move_word_right(&mut self) {
         loop {
             let chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
-            while self.cursor_col < chars.len() && !is_word_char(chars[self.cursor_col]) {
+            while self.cursor_col < chars.len() && !word_char_at(&chars, self.cursor_col) {
                 self.cursor_col += 1;
             }
             if self.cursor_col < chars.len() {
@@ -12404,7 +12404,7 @@ impl Editor {
             }
         }
         let chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
-        while self.cursor_col < chars.len() && is_word_char(chars[self.cursor_col]) {
+        while self.cursor_col < chars.len() && word_char_at(&chars, self.cursor_col) {
             self.cursor_col += 1;
         }
         self.ensure_cursor_col_visible();
@@ -14728,7 +14728,7 @@ impl Editor {
         loop {
             let chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
             self.cursor_col = self.cursor_col.min(chars.len());
-            while self.cursor_col > 0 && !is_word_char(chars[self.cursor_col - 1]) {
+            while self.cursor_col > 0 && !word_char_at(&chars, self.cursor_col - 1) {
                 self.cursor_col -= 1;
             }
             if self.cursor_col > 0 {
@@ -14744,7 +14744,7 @@ impl Editor {
             }
         }
         let chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
-        while self.cursor_col > 0 && is_word_char(chars[self.cursor_col - 1]) {
+        while self.cursor_col > 0 && word_char_at(&chars, self.cursor_col - 1) {
             self.cursor_col -= 1;
         }
         self.ensure_cursor_col_visible();
@@ -15760,16 +15760,29 @@ pub(crate) fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// Whether `chars[i]` belongs to a word for the word motions and deletes
+/// (#909): a word char, or a zero-width mark riding on one (a combining
+/// accent in decomposed text, a variation selector), so `Ctrl+Right` never
+/// stops between `e` and its accent for `Ctrl+Backspace` to split them.
+fn word_char_at(chars: &[char], i: usize) -> bool {
+    let joins = |c: char| !c.is_control() && unicode_width::UnicodeWidthChar::width(c) == Some(0);
+    let base = (0..=i)
+        .rev()
+        .find(|&j| j == 0 || !joins(chars[j]))
+        .unwrap_or(0);
+    is_word_char(chars[base])
+}
+
 /// Where Delete Word Left stops on `line`, going back from char `col`: over
 /// any non-word chars, then over the word before them (`move_word_left`'s
 /// stop within a line), moved back to a grapheme boundary.
 fn word_start_before(line: &str, col: usize) -> usize {
     let chars: Vec<char> = line.chars().collect();
     let mut i = col.min(chars.len());
-    while i > 0 && !is_word_char(chars[i - 1]) {
+    while i > 0 && !word_char_at(&chars, i - 1) {
         i -= 1;
     }
-    while i > 0 && is_word_char(chars[i - 1]) {
+    while i > 0 && word_char_at(&chars, i - 1) {
         i -= 1;
     }
     floor_grapheme_col(line, i)
@@ -15781,10 +15794,10 @@ fn word_start_before(line: &str, col: usize) -> usize {
 fn word_end_after(line: &str, col: usize) -> usize {
     let chars: Vec<char> = line.chars().collect();
     let mut i = col.min(chars.len());
-    while i < chars.len() && !is_word_char(chars[i]) {
+    while i < chars.len() && !word_char_at(&chars, i) {
         i += 1;
     }
-    while i < chars.len() && is_word_char(chars[i]) {
+    while i < chars.len() && word_char_at(&chars, i) {
         i += 1;
     }
     match floor_grapheme_col(line, i) {
@@ -30066,6 +30079,29 @@ mod tests {
         assert_eq!(e.lines[0], "alpha ");
     }
 
+    /// #909: a combining accent in decomposed text stays with its letter:
+    /// Ctrl+Left / Ctrl+Right step over `e\u{301}x` whole, and Ctrl+Backspace
+    /// and Ctrl+Delete take the letter and its accent together.
+    #[test]
+    fn word_motion_and_deletes_keep_a_combining_accent_with_its_letter() {
+        let mut e = editor_with("e\u{301}x yz");
+        e.move_word_right();
+        assert_eq!(e.cursor_col, 3, "past the whole word");
+        e.delete_word_left();
+        assert_eq!((e.lines[0].as_str(), e.cursor_col), (" yz", 0));
+        assert!(e.undo());
+        e.cursor_col = 0;
+        e.delete_word_right();
+        assert_eq!(e.lines[0], " yz");
+        let mut e = editor_with("ab e\u{301}");
+        e.cursor_col = 5;
+        e.move_word_left();
+        assert_eq!(
+            e.cursor_col, 3,
+            "back to the letter, not between it and its accent"
+        );
+    }
+
     #[test]
     fn delete_word_left_at_line_start_only_joins_the_line_above() {
         let mut e = editor_with("one two\nthree");
@@ -30102,11 +30138,15 @@ mod tests {
         assert_eq!(e.lines[0], "a gammanext");
     }
 
+    /// Decomposed `e\u{301}x` is the one word `éx` reads as, so the whole
+    /// word goes, as it does for the precomposed `éx`.
     #[test]
     fn delete_word_right_never_splits_a_letter_from_its_accent() {
-        let mut e = editor_with("e\u{301}x");
-        e.delete_word_right();
-        assert_eq!(e.lines[0], "x");
+        for word in ["e\u{301}x", "\u{e9}x"] {
+            let mut e = editor_with(word);
+            e.delete_word_right();
+            assert_eq!(e.lines[0], "", "{word:?}");
+        }
     }
 
     #[test]
