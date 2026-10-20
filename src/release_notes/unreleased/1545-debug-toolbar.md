@@ -1,1 +1,0 @@
-feature: The Run and Debug panel has VS Code's debug toolbar while a session is live: Continue (Pause while running), Step Over, Step Into, Step Out, Restart and Stop as clickable buttons beside the status, each naming its key on hover, so a session can be stepped where the terminal or desktop takes the F-keys.

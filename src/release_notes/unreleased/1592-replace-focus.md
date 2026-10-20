@@ -1,1 +1,0 @@
-fix: Replace in File (Ctrl+Alt+F) now starts in the Find field when the caret is merely in a word, with that word selected so typing replaces it. It starts in the Replace field only when the find text came from a one-line selection or the find bar was already open, so typing the search text and then the replacement no longer swaps them.

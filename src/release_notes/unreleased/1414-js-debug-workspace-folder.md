@@ -1,1 +1,0 @@
-fix: JavaScript/TypeScript debugging: croft now sends js-debug the workspace folder, as VS Code does, so a breakpoint in a compiled TypeScript file (`outDir` plus source maps) is hit in code that runs at startup instead of being skipped with "Program exited without hitting a breakpoint".

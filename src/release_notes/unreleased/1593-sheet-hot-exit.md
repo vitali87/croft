@@ -1,1 +1,0 @@
-fix: Hot exit now backs up unsaved edits in the CSV, TSV and xlsx grid, so cells edited before the terminal closed or croft was killed come back, unsaved, on the next launch, as edits in a text tab already did.
