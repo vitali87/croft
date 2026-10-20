@@ -3309,6 +3309,9 @@ pub struct App {
     /// The project's `files_exclude` globs (#1345), as last applied to the
     /// Explorer, so a settings reload re-lists the tree only on a change.
     files_exclude: Vec<String>,
+    /// The `files_encoding` default (#1432) as last applied, for a folder
+    /// added to the workspace later.
+    files_encoding: Option<crate::file_encoding::Charset>,
     /// Tailspin highlighting in rendered log views (#466): the inverse of
     /// the `disable_log_highlight` preference. Pushed into `log_view`'s
     /// default for views opened later and into every open view on toggle.
@@ -6249,6 +6252,7 @@ impl App {
             language_prefs: loaded_prefs.languages.clone(),
             copy_on_select: loaded_prefs.copy_on_select,
             files_exclude: Vec::new(),
+            files_encoding: None,
             log_highlight: !loaded_prefs.disable_log_highlight,
             secret_redaction: !loaded_prefs.disable_secret_redaction,
             redaction_reveal_until: None,
@@ -7022,6 +7026,7 @@ impl App {
         // The agent review queue as this workspace last left it (#345).
         let root = app.workspace_root().to_path_buf();
         app.apply_project_excludes(&loaded_prefs);
+        app.apply_files_encoding(&loaded_prefs);
         app.watch_project_snippets();
         app.agent_ledger = app.load_agent_ledger(&root);
         app.sync_agent_lane_decorations();
@@ -63948,6 +63953,18 @@ impl App {
         }
     }
 
+    /// Apply `files_encoding` (#1432) to every folder of the workspace: the
+    /// next file opened there without a BOM decodes in it. Open tabs keep
+    /// the encoding they were decoded with, so a settings change never
+    /// re-reads a buffer from under unsaved edits.
+    fn apply_files_encoding(&mut self, p: &crate::prefs::Prefs) {
+        let charset = crate::file_encoding::parse(&p.files_encoding);
+        self.files_encoding = charset;
+        for root in self.roots.iter() {
+            crate::file_encoding::set_workspace_default(root, charset);
+        }
+    }
+
     /// The Go to File index without the files the project excludes
     /// (#1345): VS Code's file search honours both exclude settings.
     fn without_project_excludes(
@@ -64027,6 +64044,7 @@ impl App {
         self.auto_save_on_focus_change = p.auto_save_on_focus_change;
         self.copy_on_select = p.copy_on_select;
         self.apply_project_excludes(p);
+        self.apply_files_encoding(p);
         // The ssh-pane offer's switches apply live like every other pref
         // here (#364); turning it off also takes down an offer on screen.
         self.remote_offer_disabled = p.disable_remote_offer;
@@ -64927,6 +64945,7 @@ impl App {
             return;
         }
         self.tree.add_root(path.clone());
+        crate::file_encoding::set_workspace_default(&path, self.files_encoding);
         self.reload_project_snippets();
         self.git_extra
             .push((path.clone(), GitWorker::spawn(path.clone())));
@@ -64949,6 +64968,7 @@ impl App {
             return;
         }
         self.tree.remove_root(&path);
+        crate::file_encoding::set_workspace_default(&path, None);
         self.snippets = load_all_snippets(self.roots.iter());
         // The removed folder's review queue goes with it (#345). Its rows
         // leave the tree, so no stale DOT renders — but the status chip
@@ -65195,6 +65215,13 @@ impl App {
         // with it to the new root at the next tick, rather than staying
         // where the old workspace's next launch would restore it (#862).
         self.remove_own_hot_exit();
+        // The `files_encoding` defaults of the folders being left go with
+        // them (#1432). The settings merge below sets only the new roots,
+        // and a default left on a parent folder would still prefix-match
+        // every file of a nested new root and decode it in the old encoding.
+        for root in self.roots.iter() {
+            crate::file_encoding::set_workspace_default(root, None);
+        }
         self.roots.replace_primary(new_root.clone());
         // The old repository's snippets go, the new one's apply (#1484).
         self.reload_project_snippets();

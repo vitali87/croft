@@ -5669,9 +5669,19 @@ impl Editor {
         sarif_refusal: Option<String>,
     ) -> Result<()> {
         // Decode with the file's BOM-declared encoding if it has one, else
-        // UTF-8. A later "Reopen with Encoding" overrides this.
+        // the one the user last picked for it, the `.editorconfig` charset or
+        // the `files_encoding` setting (#1432), else UTF-8. A later "Reopen
+        // with Encoding" overrides this.
         let sniffed = encoding_rs::Encoding::for_bom(bytes);
-        let enc = sniffed.map(|(e, _)| e).unwrap_or(encoding_rs::UTF_8);
+        let editorconfig = crate::editorconfig::for_file(path);
+        let declared = sniffed
+            .is_none()
+            .then(|| crate::file_encoding::declared_for(path, &editorconfig))
+            .flatten();
+        let enc = sniffed
+            .map(|(e, _)| e)
+            .or(declared.map(|c| c.encoding))
+            .unwrap_or(encoding_rs::UTF_8);
         // The BOM sniff comes FIRST: UTF-16 text is half NUL bytes, so the
         // binary heuristic would reject every UTF-16 file — including the ones
         // croft itself writes when the user picks UTF-16 from the encoding
@@ -5696,7 +5706,9 @@ impl Editor {
         };
         self.encoding = enc;
         // `decode` strips the BOM, so remember it or the next save drops it.
-        self.bom = sniffed.is_some();
+        // A `utf-8-bom` charset asks for one on a file that has none yet.
+        self.bom =
+            sniffed.is_some() || (enc == encoding_rs::UTF_8 && declared.is_some_and(|c| c.bom));
         let (decoded, _, decode_lossy) = enc.decode(bytes);
         let text = decoded.into_owned();
         self.decode_lossy = decode_lossy;
@@ -5724,7 +5736,7 @@ impl Editor {
         // relied on: a project that states `end_of_line` means it, and a
         // file whose current content disagrees is exactly the case the
         // property exists to fix.
-        self.editorconfig = crate::editorconfig::for_file(path);
+        self.editorconfig = editorconfig;
         if let Some(eol) = self.editorconfig.eol {
             self.eol = match eol {
                 crate::editorconfig::Eol::Lf => LineEnding::Lf,
@@ -8362,6 +8374,8 @@ impl Editor {
         let (decoded, used, decode_lossy) = enc.decode(&bytes);
         let text = decoded.into_owned();
         self.encoding = used;
+        // Keep the choice for the next time this file opens (#1432).
+        crate::file_encoding::remember(&path, used);
         self.decode_lossy = decode_lossy;
         // Re-sniff against the bytes just read: reinterpreting the file under a
         // new encoding must not carry the previous one's BOM answer over.
@@ -30345,6 +30359,134 @@ mod tests {
         assert_eq!(e.encoding, encoding_rs::WINDOWS_1252);
     }
 
+    /// The issue's bytes: windows-1252 for "Grüße aus Köln\nCafé crème\n".
+    const LEGACY_1432: &[u8] = b"Gr\xfc\xdfe aus K\xf6ln\nCaf\xe9 cr\xe8me\n";
+
+    fn project_1432(editorconfig: Option<&str>, bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        if let Some(ec) = editorconfig {
+            std::fs::write(dir.path().join(".editorconfig"), ec).unwrap();
+        }
+        let file = dir.path().join("notes.txt");
+        std::fs::write(&file, bytes).unwrap();
+        (dir, file)
+    }
+
+    /// #1432: `charset = latin1` decodes a BOM-less file as windows-1252, and
+    /// saving it unchanged writes back exactly the bytes it was read from.
+    #[test]
+    fn an_editorconfig_charset_decodes_a_file_without_a_bom() {
+        let (_dir, file) = project_1432(Some("root = true\n[*]\ncharset = latin1\n"), LEGACY_1432);
+        let mut e = Editor::new();
+        e.open(&file).unwrap();
+        assert_eq!(e.lines[0], "Grüße aus Köln");
+        assert_eq!(e.lines[1], "Café crème");
+        assert_eq!(e.encoding, encoding_rs::WINDOWS_1252);
+        assert!(!e.decode_lossy);
+        e.save_to_disk().unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), LEGACY_1432);
+    }
+
+    /// #1432: the issue's smallest case, `47 72 FC 44 65` under latin1.
+    #[test]
+    fn latin1_decodes_the_issue_s_five_bytes() {
+        let (_dir, file) = project_1432(Some("[*]\ncharset = latin1\n"), b"\x47\x72\xFC\x44\x65");
+        let mut e = Editor::new();
+        e.open(&file).unwrap();
+        assert_eq!(e.lines[0], "GrüDe");
+    }
+
+    /// #1432: `charset = utf-8-bom` gives a file without the mark one on
+    /// its next save.
+    #[test]
+    fn a_utf_8_bom_charset_adds_the_mark_on_save() {
+        let (_dir, file) = project_1432(Some("[*.txt]\ncharset = utf-8-bom\n"), b"");
+        let mut e = Editor::new();
+        e.open(&file).unwrap();
+        e.insert_char('h');
+        e.insert_char('i');
+        e.save_to_disk().unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"\xEF\xBB\xBFhi");
+    }
+
+    /// #1432 negative: a BOM wins over the charset, which only speaks for
+    /// files that do not say what they are.
+    #[test]
+    fn a_bom_beats_the_editorconfig_charset() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice("Grüße\n".as_bytes());
+        let (_dir, file) = project_1432(Some("[*]\ncharset = latin1\n"), &bytes);
+        let mut e = Editor::new();
+        e.open(&file).unwrap();
+        assert_eq!(e.lines[0], "Grüße");
+        assert_eq!(e.encoding, encoding_rs::UTF_8);
+        assert!(e.bom);
+    }
+
+    /// #1432 negative: a charset for other files, a value naming no
+    /// encoding, or no `.editorconfig` at all leaves the file UTF-8.
+    #[test]
+    fn without_a_charset_for_the_file_it_stays_utf_8() {
+        for ec in [
+            Some("[*.cs]\ncharset = latin1\n"),
+            Some("[*]\ncharset = latin9000\n"),
+            None,
+        ] {
+            let (_dir, file) = project_1432(ec, LEGACY_1432);
+            let mut e = Editor::new();
+            e.open(&file).unwrap();
+            assert_eq!(e.encoding, encoding_rs::UTF_8, "{ec:?}");
+            assert!(e.decode_lossy, "{ec:?}");
+            assert!(!e.bom, "{ec:?}");
+        }
+    }
+
+    /// #1432: a workspace's `files_encoding` decodes the file when no
+    /// `.editorconfig` says otherwise, and a charset that does wins.
+    #[test]
+    fn the_workspace_encoding_applies_below_the_editorconfig_charset() {
+        let (dir, file) = project_1432(None, LEGACY_1432);
+        crate::file_encoding::set_workspace_default(
+            dir.path(),
+            crate::file_encoding::parse("windows1252"),
+        );
+        let mut e = Editor::new();
+        e.open(&file).unwrap();
+        assert_eq!(e.lines[0], "Grüße aus Köln");
+        std::fs::write(dir.path().join(".editorconfig"), "[*]\ncharset = utf-8\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&file).unwrap();
+        assert_eq!(e.encoding, encoding_rs::UTF_8);
+        crate::file_encoding::set_workspace_default(dir.path(), None);
+    }
+
+    /// #1432: Reopen with Encoding is remembered for the file, so closing the
+    /// tab and opening it again keeps Shift_JIS instead of mojibake.
+    #[test]
+    fn a_reopen_with_encoding_choice_is_kept_for_the_next_open() {
+        // "日本語" in Shift_JIS.
+        let sjis: &[u8] = b"\x93\xfa\x96\x7b\x8c\xea\n";
+        let (dir, file) = project_1432(Some("[*]\ncharset = latin1\n"), sjis);
+        let other = dir.path().join("other.txt");
+        std::fs::write(&other, sjis).unwrap();
+        let mut e = Editor::new();
+        e.open(&file).unwrap();
+        e.reopen_with_encoding(encoding_rs::SHIFT_JIS).unwrap();
+        assert_eq!(e.lines[0], "日本語");
+        let mut again = Editor::new();
+        again.open(&file).unwrap();
+        assert_eq!(
+            again.encoding,
+            encoding_rs::SHIFT_JIS,
+            "the choice beats the charset"
+        );
+        assert_eq!(again.lines[0], "日本語");
+        // Negative: only that file. Its neighbour follows the charset.
+        let mut neighbour = Editor::new();
+        neighbour.open(&other).unwrap();
+        assert_eq!(neighbour.encoding, encoding_rs::WINDOWS_1252);
+    }
+
     /// A same-path reload (the FS-sync sweep on a clean buffer, or an explicit
     /// revert) re-enters `open`, which auto-detects. Without a guard that
     /// throws away the encoding the user picked through "Reopen with
@@ -31956,9 +32098,11 @@ mod tests {
         assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
         assert_eq!(std::fs::read(tmp.path()).unwrap(), b"caf\xE9\n");
         assert!(e.unmappable_chars().is_empty());
-        // The same text in UTF-8 is always representable.
+        // The same text in UTF-8 is always representable. A fresh file: the
+        // one above now opens in the encoding picked for it (#1432).
+        let fresh = NamedTempFile::new().unwrap();
         let mut u = Editor::new();
-        u.open(tmp.path()).unwrap();
+        u.open(fresh.path()).unwrap();
         u.lines = vec![String::from("日本語")];
         assert_eq!(u.encoding, encoding_rs::UTF_8);
         assert_eq!(u.save_to_disk().unwrap(), SaveOutcome::Saved);

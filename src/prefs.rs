@@ -398,6 +398,12 @@ pub struct Prefs {
     /// one for a file in that language; see [`LanguagePrefs`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub languages: BTreeMap<String, LanguagePrefs>,
+    /// The encoding files without a byte-order mark open in (VS Code's
+    /// `files.encoding`, #1432): `windows1252`, `latin1`, `shiftjis`,
+    /// `utf8bom` and the like. Empty means UTF-8. A BOM, an `.editorconfig`
+    /// `charset` and a per-file "Reopen with Encoding" choice all win.
+    #[serde(default)]
+    pub files_encoding: String,
     /// Opt-out for tailspin highlighting in the rendered log view (#466):
     /// dates, numbers, UUIDs, IPs, URLs, paths, quotes and severity keywords
     /// are coloured on lines that carry no colour of their own. Stored as
