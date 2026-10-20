@@ -1,0 +1,1 @@
+fix: A tab character takes a cell in the editor, the diff view and the merge editor, so text after a tab no longer slides left under the caret, the selection and the whitespace markers, and tab-indented code is no longer drawn flush-left.
