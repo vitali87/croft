@@ -18,6 +18,9 @@ pub struct SettingsEditor {
     pub scroll: usize,
     /// The layer edits are written to: `User` or `Workspace`.
     pub target: LayerKind,
+    /// The active profile whose `config.json` is the user layer (#1587),
+    /// named in the header; `None` for the Default profile.
+    pub profile: Option<String>,
     pub last_rect: Rect,
 }
 
@@ -29,6 +32,7 @@ impl SettingsEditor {
             selected: 0,
             scroll: 0,
             target: LayerKind::User,
+            profile: None,
             last_rect: Rect::default(),
         }
     }
@@ -104,10 +108,10 @@ pub fn render(ed: &mut SettingsEditor, area: Rect, buf: &mut Buffer, theme: crat
     }
     let w = inner.width as usize;
     buf.set_stringn(inner.x, inner.y, format!("> {}", ed.query), w, text);
-    let target = if ed.target == LayerKind::Workspace {
-        "workspace (.croft/config.json)"
-    } else {
-        "user (config.json)"
+    let target = match (&ed.target, &ed.profile) {
+        (LayerKind::Workspace, _) => String::from("workspace (.croft/config.json)"),
+        (_, Some(profile)) => format!("user (profile {profile}, config.json)"),
+        (_, None) => String::from("user (config.json)"),
     };
     buf.set_stringn(
         inner.x,

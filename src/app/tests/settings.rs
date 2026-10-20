@@ -1724,6 +1724,153 @@ fn the_settings_editor_writes_the_workspace_layer_only_for_allowed_keys() {
     assert!(!ws.contains("sidebar_auto_hide"), "{ws}");
 }
 
+/// A Settings editor app over `tmp` whose user config is `cfg`, with the
+/// `work` profile active and setting the light theme.
+fn settings_editor_app_in_profile(cfg: &std::path::Path, tmp: &std::path::Path) -> App {
+    let work = cfg.join("profiles/work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(
+        work.join("config.json"),
+        "{\n  \"theme\": \"light\",\n  \"auto_save\": true\n}\n",
+    )
+    .unwrap();
+    std::fs::write(cfg.join("config.json"), "{\n  \"auto_save\": false\n}\n").unwrap();
+    let mut app = App::new(tmp.to_path_buf()).unwrap();
+    app.config_dir = cfg.to_path_buf();
+    app.settings_profile = Some(String::from("work"));
+    app.run_command(crate::widgets::command_palette::Command::OpenSettingsEditor);
+    assert!(app.settings_editor.is_some(), "the editor opens");
+    app
+}
+
+fn settings_row(app: &App, key: &str) -> crate::settings_editor::Row {
+    app.settings_editor
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .find(|r| r.key == key)
+        .cloned()
+        .unwrap()
+}
+
+/// #1587: with a profile active, the Settings editor shows the values the
+/// profile's config.json sets, not the Default profile's.
+#[test]
+fn the_settings_editor_shows_the_active_profile_s_settings() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let app = settings_editor_app_in_profile(cfg.path(), tmp.path());
+    let theme = settings_row(&app, "theme");
+    assert_eq!(theme.value, serde_json::json!("light"));
+    assert_eq!(theme.layer, crate::config_layers::LayerKind::User);
+    assert_eq!(
+        settings_row(&app, "auto_save").value,
+        serde_json::json!(true),
+        "the profile's value, not the Default profile's false"
+    );
+    assert_eq!(
+        app.settings_editor.as_ref().unwrap().profile.as_deref(),
+        Some("work")
+    );
+}
+
+/// #1587: a change saved from the Settings editor lands in the active
+/// profile's config.json, keeps the profile's other settings, and leaves the
+/// Default profile's file alone.
+#[test]
+fn the_settings_editor_writes_the_active_profile_s_config() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app_in_profile(cfg.path(), tmp.path());
+    type_query(&mut app, "auto save");
+    assert_eq!(
+        app.settings_editor
+            .as_ref()
+            .unwrap()
+            .selected_row()
+            .unwrap()
+            .key,
+        "auto_save"
+    );
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let work: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(cfg.path().join("profiles/work/config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        work["auto_save"],
+        serde_json::json!(false),
+        "{}",
+        app.status
+    );
+    assert_eq!(
+        work["theme"],
+        serde_json::json!("light"),
+        "the rest is kept"
+    );
+    assert_eq!(
+        std::fs::read_to_string(cfg.path().join("config.json")).unwrap(),
+        "{\n  \"auto_save\": false\n}\n",
+        "the Default profile's file is untouched"
+    );
+    assert!(!app.auto_save, "applied to the live session");
+    assert_eq!(
+        settings_row(&app, "theme").value,
+        serde_json::json!("light"),
+        "the re-merge after the write still reads the profile"
+    );
+}
+
+/// #1587: the header names the profile the user layer belongs to.
+#[test]
+fn the_settings_editor_header_names_the_active_profile() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = settings_editor_app_in_profile(cfg.path(), tmp.path());
+    let text = screen_text_863(&mut app, 140, 40);
+    assert!(text.contains("profile work"), "{text}");
+}
+
+/// Negative (#1587): with no profile active, the Settings editor still
+/// reads and writes the config dir's own config.json.
+#[test]
+fn without_a_profile_the_settings_editor_keeps_the_default_config() {
+    let cfg = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(cfg.path().join("profiles/work")).unwrap();
+    std::fs::write(
+        cfg.path().join("profiles/work/config.json"),
+        "{ \"auto_save\": true }",
+    )
+    .unwrap();
+    std::fs::write(
+        cfg.path().join("config.json"),
+        "{\n  \"auto_save\": false\n}\n",
+    )
+    .unwrap();
+    let mut app = settings_editor_app(cfg.path(), tmp.path());
+    assert_eq!(
+        settings_row(&app, "auto_save").value,
+        serde_json::json!(false)
+    );
+    type_query(&mut app, "auto save");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cfg.path().join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(written["auto_save"], serde_json::json!(true));
+    assert_eq!(
+        std::fs::read_to_string(cfg.path().join("profiles/work/config.json")).unwrap(),
+        "{ \"auto_save\": true }",
+        "the profile's file is untouched"
+    );
+    let text = screen_text_863(&mut app, 140, 40);
+    assert!(text.contains("Writing to user (config.json)"), "{text}");
+}
+
 #[test]
 fn the_settings_editor_asks_for_a_number_and_refuses_one_that_is_not() {
     let cfg = tempfile::tempdir().unwrap();
