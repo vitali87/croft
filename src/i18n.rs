@@ -147,6 +147,25 @@ pub fn catalog_for(lang: &str, user_file: Option<&str>) -> Catalog {
     c
 }
 
+/// Every language croft can be shown in, for the Settings editor's
+/// `locale` row (#1555): English, the built-in catalogs and the user's
+/// `<config>/locales/<lang>.json`, sorted.
+pub fn languages(config_dir: &std::path::Path) -> Vec<String> {
+    let mut out: Vec<String> = std::iter::once("en")
+        .chain(BUILT_IN.iter().map(|(lang, _)| *lang))
+        .map(String::from)
+        .collect();
+    if let Ok(dir) = std::fs::read_dir(config_dir.join("locales")) {
+        out.extend(dir.flatten().filter_map(|e| {
+            let path = e.path();
+            (path.extension()? == "json").then_some(path.file_stem()?.to_str()?.to_string())
+        }));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// The share of [`template`]'s strings a built-in catalog must translate
 /// before croft switches to it just because the system locale names its
 /// language (#1629). Below it the UI would flip language from one palette
@@ -227,6 +246,7 @@ pub fn active() -> bool {
 /// such string that is neither here nor a palette title (#849).
 pub const TRANSLATABLE: &[&str] = &[
     "Add Folder to Workspace",
+    "Add to Watch",
     "Ask Navigator",
     "Ask Navigator About Selection",
     "Ask Navigator About This Line",
@@ -248,12 +268,16 @@ pub const TRANSLATABLE: &[&str] = &[
     "Copy",
     "Copy Commit Hash",
     "Copy Commit Message",
+    "Copy as Expression",
+    "Copy Call Stack",
+    "Copy Expression",
     "Copy into New Window",
     "Copy Path",
     "Copy Permalink",
     "Copy Relative Path",
     "Create Branch Here...",
     "Create Tag Here...",
+    "Copy Value",
     "Customize Layout",
     "Cut",
     "DISCARD CHANGES?",
@@ -291,6 +315,7 @@ pub const TRANSLATABLE: &[&str] = &[
     "PROBLEMS",
     "Quick Input Position",
     "Remote",
+    "Remove Expression",
     "Remove Folder from Workspace",
     "Rename",
     "Reset Current Branch to Here",

@@ -747,6 +747,82 @@ fn reopen_with_encoding_refuses_to_discard_unsaved_edits() {
     );
 }
 
+/// #1432: the issue's repo without the `.editorconfig`: `.vscode/settings.json`
+/// says `"files.encoding": "windows1252"`, and the file opens as written.
+#[test]
+fn vs_code_files_encoding_decodes_a_legacy_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/settings.json"),
+        r#"{ "files.encoding": "windows1252" }"#,
+    )
+    .unwrap();
+    let f = tmp.path().join("notes.txt");
+    std::fs::write(&f, b"Gr\xfc\xdfe aus K\xf6ln\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    assert_eq!(app.editor.lines[0], "Grüße aus Köln");
+    assert_eq!(app.editor.encoding, encoding_rs::WINDOWS_1252);
+}
+
+/// #1432 negative: with no encoding declared anywhere the same bytes open
+/// as UTF-8, as before, with the lossy decode flagged.
+#[test]
+fn without_a_declared_encoding_a_legacy_file_opens_as_utf_8() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("notes.txt");
+    std::fs::write(&f, b"Gr\xfc\xdfe aus K\xf6ln\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    assert_eq!(app.editor.encoding, encoding_rs::UTF_8);
+    assert!(app.editor.decode_lossy);
+}
+
+/// #1432: the issue's steps 2 and 3. A status-bar encoding pick survives
+/// closing the tab and opening the file again.
+#[test]
+fn the_status_bar_encoding_pick_survives_closing_the_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("notes.txt");
+    std::fs::write(&f, b"Gr\xfc\xdfe aus K\xf6ln\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.dispatch_menu_action(
+        MenuAction::SetEncoding(encoding_rs::WINDOWS_1252),
+        tmp.path().to_path_buf(),
+    );
+    assert_eq!(app.editor.lines[0], "Grüße aus Köln");
+    app.editor.close_active();
+    app.editor.open_pinned(&f).unwrap();
+    assert_eq!(app.editor.encoding, encoding_rs::WINDOWS_1252);
+    assert_eq!(app.editor.lines[0], "Grüße aus Köln");
+}
+
+/// #1432: Make Root into a nested folder that declares no encoding drops
+/// the parent's `files_encoding`. Left registered, the parent's default
+/// still matched the nested files by prefix and opened UTF-8 text as
+/// windows-1252 mojibake, which the next save would write back.
+#[test]
+fn make_root_into_a_nested_folder_drops_the_parent_files_encoding() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/settings.json"),
+        r#"{ "files.encoding": "windows1252" }"#,
+    )
+    .unwrap();
+    let inner = tmp.path().join("inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    let f = inner.join("notes.txt");
+    std::fs::write(&f, "Grüße aus Köln\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.change_workspace_root(inner.clone());
+    app.editor.open_pinned(&f).unwrap();
+    assert_eq!(app.editor.encoding, encoding_rs::UTF_8);
+    assert_eq!(app.editor.lines[0], "Grüße aus Köln");
+}
+
 /// The external-change sweep has to reach every editor GROUP, not just the
 /// focused one. The poll stats each open tab exactly once and re-baselines its
 /// stamp, so a change it reports and the sweep then misses is burned: no later
@@ -3944,6 +4020,160 @@ fn a_save_as_that_fails_leaves_the_tab_where_it_was() {
     assert!(app.editor.dirty);
     let error = app.prompt.as_ref().and_then(|p| p.error.clone());
     assert!(error.is_some(), "the prompt stays open with the reason");
+}
+
+/// #1657: an app with `f.txt` holding `text`, open with the caret at the end
+/// of line `row`, `settings` (config.json keys) applied, then one character
+/// typed and Cmd+S pressed. Returns the bytes on disk.
+fn save_with_settings(
+    text: &str,
+    editorconfig: Option<&str>,
+    settings: &str,
+    row: usize,
+) -> String {
+    let tmp = tempfile::tempdir().unwrap();
+    if let Some(ec) = editorconfig {
+        std::fs::write(tmp.path().join(".editorconfig"), ec).unwrap();
+    }
+    let f = tmp.path().join("f.txt");
+    std::fs::write(&f, text).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_merged_settings(&serde_json::from_str(settings).unwrap());
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = row;
+    app.editor.cursor_col = app.editor.lines[row].chars().count();
+    app.handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(!app.editor.dirty, "saved: {}", app.status);
+    std::fs::read_to_string(&f).unwrap()
+}
+
+/// #1657: with `insert_final_newline` on and no `.editorconfig`, a save ends
+/// the file with a newline. Only a `.editorconfig` could ask for one.
+#[test]
+fn insert_final_newline_ends_every_save_with_a_newline() {
+    assert_eq!(
+        save_with_settings(
+            "hello world   \nsecond line",
+            None,
+            r#"{"insert_final_newline": true}"#,
+            1
+        ),
+        "hello world   \nsecond liney\n"
+    );
+}
+
+/// #1657: with `trim_trailing_whitespace` on, a save strips the trailing
+/// spaces of every line the caret is not on.
+#[test]
+fn trim_trailing_whitespace_strips_lines_on_save() {
+    assert_eq!(
+        save_with_settings(
+            "hello world   \nsecond line",
+            None,
+            r#"{"trim_trailing_whitespace": true}"#,
+            1
+        ),
+        "hello world\nsecond liney"
+    );
+}
+
+/// #1657: with `trim_final_newlines` on, a save drops the empty lines after
+/// the text but keeps the newline that ends it.
+#[test]
+fn trim_final_newlines_keeps_one_newline_on_save() {
+    assert_eq!(
+        save_with_settings("a\n\n\n", None, r#"{"trim_final_newlines": true}"#, 0),
+        "ay\n"
+    );
+    assert_eq!(
+        save_with_settings(
+            "a\n\n\n",
+            None,
+            r#"{"trim_final_newlines": true, "insert_final_newline": true}"#,
+            0
+        ),
+        "ay\n",
+        "both on still leaves exactly one"
+    );
+}
+
+/// #1657 negative: with every clean-up off, the default, a save writes the
+/// buffer as it is, trailing spaces, blank tail and missing newline alike.
+#[test]
+fn save_clean_ups_default_off_leave_the_file_as_typed() {
+    assert_eq!(
+        save_with_settings("hello world   \nsecond line", None, "{}", 1),
+        "hello world   \nsecond liney"
+    );
+    assert_eq!(save_with_settings("a\n\n\n", None, "{}", 0), "ay\n\n\n");
+}
+
+/// #1657 negative: a `.editorconfig` value wins over the global setting for
+/// its file, whichever way it points.
+#[test]
+fn an_editorconfig_value_overrides_the_global_clean_up() {
+    let off = "root = true\n[*]\ninsert_final_newline = false\ntrim_trailing_whitespace = false\n";
+    assert_eq!(
+        save_with_settings(
+            "hello world   \nsecond line",
+            Some(off),
+            r#"{"insert_final_newline": true, "trim_trailing_whitespace": true}"#,
+            1
+        ),
+        "hello world   \nsecond liney"
+    );
+    let on = "root = true\n[*]\ninsert_final_newline = true\n";
+    assert_eq!(
+        save_with_settings("second line", Some(on), "{}", 0),
+        "second liney\n"
+    );
+}
+
+/// #1657 negative: the trim spares the line the caret is on, so a save (an
+/// auto-save a second after typing, say) never eats the line just opened
+/// with Enter at the end of the file.
+#[test]
+fn trim_final_newlines_spares_the_caret_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("f.txt");
+    std::fs::write(&f, "a\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_merged_settings(&serde_json::from_str(r#"{"trim_final_newlines": true}"#).unwrap());
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 1;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.editor.cursor_row, 1);
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "a\n\n");
+}
+
+/// #1657: VS Code's `files.*` save settings import onto the croft keys.
+#[test]
+fn vscode_save_clean_up_settings_import() {
+    let (settings, unmapped, _) = crate::import_vscode::map_settings(
+        serde_json::json!({
+            "files.insertFinalNewline": true,
+            "files.trimTrailingWhitespace": true,
+            "files.trimFinalNewlines": false
+        })
+        .as_object()
+        .unwrap(),
+    );
+    assert!(unmapped.is_empty(), "{unmapped:?}");
+    assert_eq!(settings["insert_final_newline"], serde_json::json!(true));
+    assert_eq!(
+        settings["trim_trailing_whitespace"],
+        serde_json::json!(true)
+    );
+    assert_eq!(settings["trim_final_newlines"], serde_json::json!(false));
 }
 
 /// #852: `Ctrl+Alt+S` is File: Save All: every dirty tab reaches disk, not

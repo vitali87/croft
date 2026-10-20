@@ -128,6 +128,10 @@ pub struct SheetData {
     /// Rows of the source above this batch (#1222): a SQLite page holds
     /// rows `row_base + 1 ..` of its table, and is numbered so. 0 elsewhere.
     pub row_base: usize,
+    /// Bumped by every edit of the data (#1593), so hot exit, which backs
+    /// up only what changed since its last write, sees a grid change
+    /// without comparing the cells.
+    pub revision: u64,
 }
 
 impl SheetData {
@@ -157,6 +161,7 @@ pub fn sheet_data_from_parts(
         cur_col: 0,
         origin: (0, 0),
         row_base: 0,
+        revision: 0,
     }
 }
 
@@ -328,6 +333,7 @@ pub fn parse_delimited(bytes: &[u8], delim: u8, sheet_name: &str) -> Result<Shee
         cur_col: 0,
         origin: (0, 0),
         row_base: 0,
+        revision: 0,
     })
 }
 
@@ -339,6 +345,7 @@ impl SheetData {
     /// as text without case. The sort is stable, and the cursor stays on
     /// the row it was on. Returns whether the order is now ascending.
     pub fn sort_by_column(&mut self, col: usize) -> bool {
+        self.revision += 1;
         // Numbers sort before text. Comparing a mixed pair as text instead
         // made the order cyclic (2 < 10 < "1a" < 2), and the standard sort
         // panics on a comparator that is not a total order (#1134). Each
@@ -389,6 +396,7 @@ impl SheetData {
     /// reader is `flexible`, so ragged rows are real) and refreshing the
     /// column widths so the grid re-lays-out immediately.
     pub fn set_cell(&mut self, row: usize, col: usize, value: String) {
+        self.revision += 1;
         let Some(r) = self.rows.get_mut(row) else {
             return;
         };
@@ -408,6 +416,7 @@ impl SheetData {
     }
 
     pub fn insert_row(&mut self, at: usize) {
+        self.revision += 1;
         let cols = self.col_count().max(1);
         let at = at.min(self.rows.len());
         self.rows.insert(at, vec![String::new(); cols]);
@@ -415,6 +424,7 @@ impl SheetData {
     }
 
     pub fn delete_row(&mut self, at: usize) -> bool {
+        self.revision += 1;
         if at >= self.rows.len() {
             return false;
         }
@@ -424,6 +434,7 @@ impl SheetData {
     }
 
     pub fn insert_col(&mut self, at: usize) {
+        self.revision += 1;
         // A fully EMPTY sheet gains its header cell too (#193 review):
         // without one, the first saved body row would be re-read as the
         // header on reopen and vanish from the editable grid.
@@ -444,6 +455,7 @@ impl SheetData {
     }
 
     pub fn delete_col(&mut self, at: usize) -> bool {
+        self.revision += 1;
         if at >= self.col_count() {
             return false;
         }
@@ -1069,6 +1081,7 @@ fn read_calamine_workbook(path: &Path, kind: SheetKind) -> Result<Vec<SheetData>
             cur_col: 0,
             origin,
             row_base: 0,
+            revision: 0,
         });
     }
     let _ = Data::Empty; // keeps the import explicit even if unused above

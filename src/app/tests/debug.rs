@@ -520,6 +520,185 @@ fn click_on_run_debug_icon_switches_sidebar_to_run_debug() {
     assert_eq!(app.sidebar_view, SidebarView::RunDebug);
 }
 
+/// A stand-in adapter that writes every request croft sends it to `log`
+/// and never answers, so a test reads exactly what a click asked for.
+fn recording_member(log: &std::path::Path) -> crate::dap::session::DapSession {
+    crate::dap::session::DapSession::launch_with(
+        "sh",
+        &[String::from("-c"), format!("cat > '{}'", log.display())],
+        std::path::Path::new("."),
+        serde_json::json!({"seq": 2, "type": "request", "command": "launch", "arguments": {}}),
+        std::collections::BTreeMap::new(),
+    )
+    .expect("sh spawns")
+}
+
+/// An app on the Run and Debug view with one session, paused (thread 1
+/// stopped) or running, its requests recorded to the returned log.
+fn debug_toolbar_app(
+    paused: bool,
+) -> (
+    tempfile::TempDir,
+    App,
+    ratatui::Terminal<ratatui::backend::TestBackend>,
+    std::path::PathBuf,
+) {
+    use crate::dap::session::SessionPhase;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let log = tmp.path().join("requests.log");
+    let mut session = recording_member(&log);
+    // Thread 1 is known either way, so a step the toolbar let through
+    // while running would reach the adapter.
+    session.stopped_thread = Some(1);
+    session.phase = if paused {
+        SessionPhase::Stopped
+    } else {
+        SessionPhase::Running
+    };
+    app.debug_sessions.push("app.py", session);
+    app.set_sidebar_view(SidebarView::RunDebug);
+    app.refresh_debug_panel();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 32)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    (tmp, app, term, log)
+}
+
+/// The screen cell of a toolbar button, found the way a pointer finds it.
+fn debug_control_cell(
+    app: &App,
+    control: crate::widgets::run_debug::DebugControl,
+) -> Option<(u16, u16)> {
+    let area = app.run_debug.last_area;
+    (area.y..area.y + area.height)
+        .flat_map(|y| (area.x..area.x + area.width).map(move |x| (x, y)))
+        .find(|&(x, y)| app.run_debug.debug_control_painted_at(x, y) == Some(control))
+}
+
+/// Wait for the adapter's log to hold a request for `command`.
+fn adapter_got(log: &std::path::Path, command: &str) -> bool {
+    let needle = format!("\"command\":\"{command}\"");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if std::fs::read_to_string(log).is_ok_and(|s| s.contains(&needle)) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    false
+}
+
+/// #1545: while paused the Run and Debug panel has VS Code's debug
+/// toolbar, and a click on each button sends the same DAP request as its
+/// key: Step Over `next`, Step Into `stepIn`, Step Out `stepOut`, Continue
+/// `continue`.
+#[test]
+fn the_debug_toolbar_steps_and_continues_a_paused_session() {
+    use crate::widgets::run_debug::DebugControl;
+    use crossterm::event::{MouseButton, MouseEventKind};
+    for (control, command) in [
+        (DebugControl::StepOver, "next"),
+        (DebugControl::StepInto, "stepIn"),
+        (DebugControl::StepOut, "stepOut"),
+        (DebugControl::Continue, "continue"),
+    ] {
+        let (_tmp, mut app, _term, log) = debug_toolbar_app(true);
+        let (x, y) = debug_control_cell(&app, control)
+            .unwrap_or_else(|| panic!("{control:?} is on the toolbar"));
+        assert!(
+            debug_control_cell(&app, DebugControl::Pause).is_none(),
+            "a paused session offers Continue, not Pause"
+        );
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        assert!(adapter_got(&log, command), "{control:?} sends {command}");
+    }
+}
+
+/// #1545: while running the first button is Pause, which sends `pause`,
+/// and the steps are greyed out: a click on one sends nothing.
+#[test]
+fn a_running_sessions_toolbar_pauses_and_its_steps_do_nothing() {
+    use crate::widgets::run_debug::DebugControl;
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (_tmp, mut app, _term, log) = debug_toolbar_app(false);
+    assert!(debug_control_cell(&app, DebugControl::Continue).is_none());
+    let (sx, sy) = debug_control_cell(&app, DebugControl::StepOver).expect("Step Over is shown");
+    assert_eq!(app.run_debug.debug_control_at(sx, sy), None, "greyed out");
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), sx, sy));
+    let (x, y) = debug_control_cell(&app, DebugControl::Pause).expect("Pause leads while running");
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+    assert!(adapter_got(&log, "pause"));
+    let sent = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(!sent.contains("\"command\":\"next\""), "{sent}");
+}
+
+/// #1545: Stop ends the session as Shift+F5 does, and each button names
+/// itself and its key in the pointer's tooltip.
+#[test]
+fn the_debug_toolbar_stops_and_names_its_keys() {
+    use crate::widgets::run_debug::DebugControl;
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (_tmp, mut app, _term, log) = debug_toolbar_app(true);
+    for (control, tip) in [
+        (DebugControl::Continue, "Continue (F5)"),
+        (DebugControl::StepOver, "Step Over (F10)"),
+        (DebugControl::StepInto, "Step Into (F11)"),
+        (DebugControl::StepOut, "Step Out (Shift+F11)"),
+        (DebugControl::Restart, "Restart (Ctrl+Shift+F5)"),
+        (DebugControl::Stop, "Stop (Shift+F5)"),
+    ] {
+        let (x, y) = debug_control_cell(&app, control).unwrap();
+        assert_eq!(app.ui_tooltip_at(x, y), Some(tip));
+    }
+    let (x, y) = debug_control_cell(&app, DebugControl::Stop).unwrap();
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+    assert!(adapter_got(&log, "disconnect"));
+}
+
+/// #1545: at the sidebar's minimum width the toolbar wraps instead of
+/// dropping its rightmost buttons, so every control stays clickable.
+#[test]
+fn the_debug_toolbar_wraps_at_the_minimum_sidebar_width() {
+    use crate::widgets::run_debug::DebugControl;
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (_tmp, mut app, mut term, log) = debug_toolbar_app(true);
+    app.sidebar_width = SIDEBAR_WIDTH_MIN;
+    term.draw(|f| app.render(f)).unwrap();
+    let cells: Vec<_> = DebugControl::toolbar(true)
+        .into_iter()
+        .map(|control| {
+            debug_control_cell(&app, control)
+                .unwrap_or_else(|| panic!("{control:?} is on the narrow toolbar"))
+        })
+        .collect();
+    assert!(
+        cells.iter().any(|&(_, y)| y != cells[0].1),
+        "the buttons wrap onto a second row: {cells:?}"
+    );
+    let (x, y) = debug_control_cell(&app, DebugControl::Stop).unwrap();
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+    assert!(adapter_got(&log, "disconnect"));
+}
+
+/// #1545 negative: with no session there is no toolbar; the panel shows
+/// its Run and Debug button as before.
+#[test]
+fn no_session_no_debug_toolbar() {
+    use crate::widgets::run_debug::DebugControl;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::RunDebug);
+    app.refresh_debug_panel();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 32)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    for control in DebugControl::toolbar(true)
+        .into_iter()
+        .chain([DebugControl::Pause])
+    {
+        assert_eq!(debug_control_cell(&app, control), None, "{control:?}");
+    }
+}
+
 /// #864: F5 on a script ran it under croft's private debug venv, where the
 /// project's packages are missing, so `import requests` stopped the run on
 /// line 1. The program runs under the interpreter Run picks: the nearest
@@ -1826,6 +2005,70 @@ fn a_compounds_own_pre_launch_task_runs_before_its_member_starts() {
     assert!(pair.debug_sessions.is_empty(), "and still nothing ran");
 }
 
+/// #1412: a preLaunchTask written the way VS Code labels auto-detected
+/// tasks (`npm: build`, `tsc: build - tsconfig.json`) runs the task croft
+/// detected, with no tasks.json; a label that names nothing still refuses,
+/// and suggests the near match.
+#[test]
+fn a_pre_launch_task_with_a_vs_code_label_runs_the_detected_task() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    std::fs::write(
+        p.join("package.json"),
+        r#"{ "name": "ts1", "scripts": { "build": "tsc" } }"#,
+    )
+    .unwrap();
+    std::fs::write(p.join("tsconfig.json"), "{}").unwrap();
+    std::fs::create_dir_all(p.join(".vscode")).unwrap();
+    std::fs::write(
+        p.join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "type": "node", "request": "launch", "name": "Npm",
+              "program": "${workspaceFolder}/dist/main.js", "preLaunchTask": "npm: build" },
+            { "type": "node", "request": "launch", "name": "Tsc",
+              "program": "${workspaceFolder}/dist/main.js", "preLaunchTask": "tsc: build - tsconfig.json" },
+            { "type": "node", "request": "launch", "name": "Bare",
+              "program": "${workspaceFolder}/dist/main.js", "preLaunchTask": "build" }
+        ]}"#,
+    )
+    .unwrap();
+    let launch = |name: &str| {
+        let mut app = App::new(p.to_path_buf()).unwrap();
+        let cfg = crate::dap::configs::discover_configs(p)
+            .into_iter()
+            .find(|c| c.name == name)
+            .unwrap();
+        app.launch_debug_config(&cfg);
+        app
+    };
+    let app = launch("Npm");
+    assert_eq!(
+        app.pending_debug_launch
+            .as_ref()
+            .map(|l| l.command.as_str()),
+        Some("npm run build"),
+        "{}",
+        app.status
+    );
+    let app = launch("Tsc");
+    assert_eq!(
+        app.pending_debug_launch
+            .as_ref()
+            .map(|l| l.command.as_str()),
+        Some("tsc -p tsconfig.json"),
+        "{}",
+        app.status
+    );
+    let app = launch("Bare");
+    assert!(app.pending_debug_launch.is_none());
+    assert!(
+        app.status
+            .contains("preLaunchTask \"build\" not found (did you mean \"npm run build\"?)"),
+        "{}",
+        app.status
+    );
+}
+
 /// #318, the half a parked-launch assertion cannot see: what happens when the
 /// compound's task FINISHES.
 ///
@@ -1914,6 +2157,211 @@ fn a_finished_compound_task_starts_its_member_and_chains_the_members_own_task() 
         app.status
     );
     assert!(app.debug_sessions.is_empty(), "and nothing was debugged");
+}
+
+/// #1541: a workspace whose launch config waits on a `watch` task, as the
+/// usual TypeScript setup does. The stand-in watcher prints tsc's watch
+/// banners around `build`'s lines and then keeps running, as `tsc --watch`
+/// does. The config debugs a program that is not there, so a launch that
+/// went ahead is told apart by its "does not exist" error.
+fn watch_task_workspace(background: bool, build: &str) -> (tempfile::TempDir, App) {
+    let script = format!(
+        "sleep 1; echo 'Starting compilation in watch mode...'; {build} echo 'Found 0 errors. Watching for file changes.'; sleep 30"
+    );
+    watch_task_workspace_with(background, &script, serde_json::json!("$tsc-watch"))
+}
+
+/// [`watch_task_workspace`] with the watcher's whole script and matcher.
+fn watch_task_workspace_with(
+    background: bool,
+    script: &str,
+    matcher: serde_json::Value,
+) -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    let task = serde_json::json!({
+        "version": "2.0.0",
+        "tasks": [{
+            "label": "watch", "type": "shell", "command": "sh", "args": ["-c", script],
+            "isBackground": background, "problemMatcher": matcher
+        }]
+    });
+    std::fs::write(tmp.path().join(".vscode/tasks.json"), task.to_string()).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        r#"{ "configurations": [ { "name": "Built", "type": "lldb", "request": "launch",
+             "program": "/nope/bin", "preLaunchTask": "watch" } ] }"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_debug_config_picker();
+    let idx = app
+        .list_picker
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .position(|r| r.label.starts_with("Built"))
+        .expect("Built is listed");
+    app.list_picker.as_mut().unwrap().selected = idx;
+    app.confirm_list_picker();
+    (tmp, app)
+}
+
+/// #1541: the watch task's first build ended with no errors, so the launch
+/// goes ahead while the watcher keeps running. It waited for an exit that
+/// never comes.
+#[test]
+fn a_watch_pre_launch_task_launches_once_its_first_build_ends() {
+    let (_tmp, mut app) = watch_task_workspace(true, "");
+    assert!(app.pending_debug_launch.is_some(), "{}", app.status);
+    assert!(
+        app.status.contains("when its first build ends"),
+        "{}",
+        app.status
+    );
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE * 4,
+        "the watcher's first build to settle the launch",
+        || {
+            app.drain_terminal_bells();
+            app.pending_debug_launch.is_none()
+        },
+    );
+    assert!(
+        app.status.contains("program /nope/bin does not exist"),
+        "the launch went ahead: {}",
+        app.status
+    );
+    assert!(
+        app.terminals.iter().any(|t| t.label().contains("watch")),
+        "the watcher's pane is left open"
+    );
+}
+
+/// #1541: a first build with errors does not launch against them; it says
+/// so, and the watcher keeps running to rebuild once they are fixed.
+#[test]
+fn a_watch_pre_launch_task_with_build_errors_does_not_launch() {
+    let (_tmp, mut app) = watch_task_workspace(
+        true,
+        r#"echo "src/index.ts(1,5): error TS2322: Type 'string' is not assignable to type 'number'.";"#,
+    );
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE * 4,
+        "the watcher's first build to settle the launch",
+        || {
+            app.drain_terminal_bells();
+            app.pending_debug_launch.is_none()
+        },
+    );
+    assert!(app.run_debug.feedback_is_error);
+    assert!(
+        app.status.contains("finished with 1 error"),
+        "{}",
+        app.status
+    );
+    assert!(!app.status.contains("does not exist"), "{}", app.status);
+}
+
+/// #1541: an `activeOnStart` watcher starts inside its first build, and
+/// may print only the end of it; that still settles the launch, which
+/// otherwise waited for a `beginsPattern` that never comes.
+#[test]
+fn an_active_on_start_watch_pre_launch_task_launches_on_its_first_end() {
+    let (_tmp, mut app) = watch_task_workspace_with(
+        true,
+        "echo 'Found 0 errors. Watching for file changes.'; sleep 300",
+        serde_json::json!({
+            "base": "$tsc",
+            "background": {
+                "activeOnStart": true,
+                "beginsPattern": "^File change detected",
+                "endsPattern": "Watching for file changes\\."
+            }
+        }),
+    );
+    assert!(
+        app.status.contains("when its first build ends"),
+        "{}",
+        app.status
+    );
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE * 4,
+        "the watcher's first build end to settle the launch",
+        || {
+            app.drain_terminal_bells();
+            app.pending_debug_launch.is_none()
+        },
+    );
+    assert!(
+        app.status.contains("program /nope/bin does not exist"),
+        "the launch went ahead: {}",
+        app.status
+    );
+}
+
+/// #1541 negative: a task that is not `isBackground` still waits for its
+/// exit, whatever its output says.
+#[test]
+fn an_ordinary_pre_launch_task_still_waits_for_its_exit() {
+    let (_tmp, mut app) = watch_task_workspace(
+        false,
+        r#"echo "src/index.ts(1,5): error TS2322: Type 'string' is not assignable to type 'number'.";"#,
+    );
+    assert!(app.status.contains("when it exits 0"), "{}", app.status);
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE * 4,
+        "the watcher's build to reach PROBLEMS",
+        || {
+            app.drain_terminal_bells();
+            !app.build_diagnostics.is_empty()
+        },
+    );
+    assert!(
+        app.pending_debug_launch.is_some(),
+        "still waiting: {}",
+        app.status
+    );
+    assert!(
+        !app.run_debug.feedback_is_error,
+        "{:?}",
+        app.run_debug.feedback
+    );
+}
+
+/// #1541: how a launch waits, by the task's `isBackground` and whether its
+/// matcher can say when a build ends.
+#[test]
+fn a_pre_launch_wait_follows_is_background_and_the_matcher() {
+    let task = |background: bool, matcher: Option<serde_json::Value>| crate::tasks::Task {
+        label: String::from("t"),
+        command: String::from("t"),
+        source: String::from("tasks.json"),
+        is_build: false,
+        is_default: false,
+        problem_matcher: matcher,
+        is_background: background,
+        vscode: None,
+    };
+    let watch = Some(serde_json::json!("$tsc-watch"));
+    assert_eq!(
+        PreLaunchWait::of(&task(false, watch.clone())),
+        PreLaunchWait::Exit
+    );
+    assert_eq!(
+        PreLaunchWait::of(&task(true, watch)),
+        PreLaunchWait::FirstBuild
+    );
+    assert_eq!(
+        PreLaunchWait::of(&task(true, Some(serde_json::json!("$tsc")))),
+        PreLaunchWait::Untracked
+    );
+    assert_eq!(
+        PreLaunchWait::of(&task(true, None)),
+        PreLaunchWait::Untracked
+    );
+    assert_eq!(PreLaunchWait::of(&task(false, None)), PreLaunchWait::Exit);
 }
 
 /// #373: "Debug This Test" breaks where the test last failed, without the
@@ -2740,6 +3188,350 @@ fn expensive_scopes_sharing_a_name_open_separately() {
     assert_eq!(scope_rows(&app), vec![Some(false), Some(true)]);
 }
 
+/// A stand-in debug adapter for #1546 that stops at once in `main` (called
+/// from `<module>`), with one local, `payload`, whose shown value is cut.
+/// An `evaluate` in the `clipboard` context answers the whole value, any
+/// other context the cut one. `clipboard` says whether it advertises
+/// `supportsClipboardContext`.
+fn copy_value_adapter(dir: &Path, clipboard: bool) -> crate::dap::session::DapSession {
+    let script = format!(
+        r#"
+import json, sys
+CLIP = {clip}
+seq = [1000]
+def read():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    return json.loads(sys.stdin.buffer.read(length))
+def send(msg):
+    seq[0] += 1
+    msg["seq"] = seq[0]
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+def reply(req, body=None):
+    send({{"type": "response", "request_seq": req["seq"], "success": True,
+          "command": req["command"], "body": body or {{}}}})
+while True:
+    req = read()
+    if req is None:
+        break
+    c = req["command"]
+    if c == "initialize":
+        reply(req, {{"supportsClipboardContext": CLIP}})
+        send({{"type": "event", "event": "initialized"}})
+    elif c == "configurationDone":
+        reply(req)
+        send({{"type": "event", "event": "stopped", "body": {{"reason": "breakpoint", "threadId": 1}}}})
+    elif c == "threads":
+        reply(req, {{"threads": [{{"id": 1, "name": "MainThread"}}]}})
+    elif c == "stackTrace":
+        reply(req, {{"stackFrames": [
+            {{"id": 11, "name": "main", "source": {{"path": "/w/s.py"}}, "line": 6}},
+            {{"id": 12, "name": "<module>", "source": {{"path": "/w/s.py"}}, "line": 9}}]}})
+    elif c == "scopes":
+        reply(req, {{"scopes": [{{"name": "Locals", "variablesReference": 5}}]}})
+    elif c == "variables":
+        reply(req, {{"variables": [{{"name": "payload", "value": "'{{\"user\": \"ada\"...", "type": "str",
+            "variablesReference": 0, "evaluateName": "payload"}}]}})
+    elif c == "evaluate":
+        ctx = req["arguments"].get("context")
+        expr = req["arguments"].get("expression")
+        if ctx != "clipboard":
+            result = "CUT"
+        elif expr == "payload":
+            result = "'{{\"user\": \"ada\", \"token\": \"FULL\"}}'"
+        else:
+            result = "FULL " + expr
+        reply(req, {{"result": result, "variablesReference": 0}})
+    elif c == "disconnect":
+        reply(req)
+        break
+    else:
+        reply(req)
+"#,
+        clip = if clipboard { "True" } else { "False" }
+    );
+    let path = dir.join("fake_dap.py");
+    std::fs::write(&path, script).unwrap();
+    crate::dap::session::DapSession::launch_with(
+        "python3",
+        &[path.display().to_string()],
+        dir,
+        serde_json::json!({"type": "request", "command": "launch", "arguments": {}}),
+        std::collections::BTreeMap::new(),
+    )
+    .expect("python3 spawns")
+}
+
+/// An app paused in [`copy_value_adapter`], its VARIABLES filled in.
+fn app_paused_with_a_payload(dir: &Path, clipboard: bool) -> Option<App> {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return None;
+    }
+    let mut app = App::new(dir.to_path_buf()).unwrap();
+    app.debug_sessions
+        .push("P", copy_value_adapter(dir, clipboard));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the stop and its variables",
+        || {
+            app.poll_dap();
+            app.refresh_debug_panel();
+            debug_row_index(&app, "payload").is_some()
+        },
+    );
+    Some(app)
+}
+
+/// The index of the debug-panel row named `name`: a variable, a watch
+/// expression or a frame.
+fn debug_row_index(app: &App, name: &str) -> Option<usize> {
+    use crate::widgets::run_debug::DebugRowKind;
+    app.run_debug.debug_rows.iter().position(|r| match &r.kind {
+        DebugRowKind::Variable { name: n, .. } => n == name,
+        DebugRowKind::Watch { expression, .. } => expression == name,
+        DebugRowKind::Frame { name: n, .. } => n == name,
+        _ => false,
+    })
+}
+
+fn debug_menu_labels(items: &[(String, MenuAction)]) -> Vec<&str> {
+    items.iter().map(|(label, _)| label.as_str()).collect()
+}
+
+/// Run the menu entry labelled `label` of debug-panel row `idx`.
+fn run_debug_menu_entry(app: &mut App, idx: usize, label: &str) {
+    let action = app
+        .debug_row_menu(idx)
+        .into_iter()
+        .find(|(l, _)| l == label)
+        .unwrap_or_else(|| panic!("no {label} entry"))
+        .1;
+    let root = app.tree.root.clone();
+    app.dispatch_menu_action(action, root);
+}
+
+/// #1546: a variable row's right-click menu is VS Code's: Copy Value,
+/// Copy as Expression and Add to Watch.
+#[test]
+fn a_variable_row_offers_copy_value_copy_as_expression_and_add_to_watch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(mut app) = app_paused_with_a_payload(tmp.path(), true) else {
+        return;
+    };
+    let idx = debug_row_index(&app, "payload").unwrap();
+    let items = app.debug_row_menu(idx);
+    app.debug_stop();
+    assert_eq!(
+        debug_menu_labels(&items),
+        ["Copy Value", "Copy as Expression", "Add to Watch"]
+    );
+}
+
+/// #1546: Copy Value asks the adapter for the value in the `clipboard`
+/// context, so what lands on the clipboard is the whole value, not the
+/// cut one the row shows.
+#[test]
+fn copy_value_copies_the_whole_value_from_the_adapter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(mut app) = app_paused_with_a_payload(tmp.path(), true) else {
+        return;
+    };
+    crate::clipboard::test_clip::mock_write("before");
+    let idx = debug_row_index(&app, "payload").unwrap();
+    run_debug_menu_entry(&mut app, idx, "Copy Value");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the clipboard evaluate",
+        || {
+            app.poll_dap();
+            crate::clipboard::test_clip::mock_read().as_deref() != Some("before")
+        },
+    );
+    let copied = crate::clipboard::test_clip::mock_read();
+    let status = app.status.clone();
+    app.debug_stop();
+    assert_eq!(
+        copied.as_deref(),
+        Some(r#"'{"user": "ada", "token": "FULL"}'"#)
+    );
+    assert!(status.starts_with("Copied value"), "status: {status}");
+}
+
+/// #1546: a second Copy Value sent before the first one's `clipboard`
+/// evaluate answers wins; the first answer, for a request the user has
+/// replaced, does not land on the clipboard.
+#[test]
+fn the_latest_copy_value_wins_over_an_earlier_pending_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(mut app) = app_paused_with_a_payload(tmp.path(), true) else {
+        return;
+    };
+    crate::clipboard::test_clip::mock_write("before");
+    let idx = debug_row_index(&app, "payload").unwrap();
+    run_debug_menu_entry(&mut app, idx, "Copy Value");
+    app.copy_debug_value(Some(String::from("other")), String::from("shown"));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "both clipboard evaluates",
+        || {
+            app.poll_dap();
+            crate::clipboard::test_clip::mock_read().as_deref() != Some("before")
+        },
+    );
+    let copied = crate::clipboard::test_clip::mock_read();
+    app.debug_stop();
+    assert_eq!(copied.as_deref(), Some("FULL other"));
+}
+
+/// #1546 negative: an adapter without `supportsClipboardContext` is sent
+/// no such evaluate; the row's own value is copied at once.
+#[test]
+fn copy_value_without_clipboard_support_copies_the_shown_value() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(mut app) = app_paused_with_a_payload(tmp.path(), false) else {
+        return;
+    };
+    crate::clipboard::test_clip::mock_write("before");
+    let idx = debug_row_index(&app, "payload").unwrap();
+    run_debug_menu_entry(&mut app, idx, "Copy Value");
+    let copied = crate::clipboard::test_clip::mock_read();
+    app.debug_stop();
+    assert_eq!(copied.as_deref(), Some(r#"'{"user": "ada"..."#));
+}
+
+/// #1546: Copy as Expression copies the `evaluateName`, and Add to Watch
+/// watches it.
+#[test]
+fn copy_as_expression_and_add_to_watch_use_the_evaluate_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(mut app) = app_paused_with_a_payload(tmp.path(), true) else {
+        return;
+    };
+    crate::clipboard::test_clip::mock_write("before");
+    let idx = debug_row_index(&app, "payload").unwrap();
+    run_debug_menu_entry(&mut app, idx, "Copy as Expression");
+    let copied = crate::clipboard::test_clip::mock_read();
+    run_debug_menu_entry(&mut app, idx, "Add to Watch");
+    let watching = app.watch_exprs.clone();
+    let watch_row = debug_row_index(&app, "payload");
+    app.debug_stop();
+    assert_eq!(copied.as_deref(), Some("payload"));
+    assert_eq!(watching, ["payload"]);
+    assert!(watch_row.is_some(), "the WATCH section lists it");
+}
+
+/// #1546: a watch row offers Copy Value, Copy Expression and Remove
+/// Expression, and Remove stops watching it.
+#[test]
+fn a_watch_row_can_be_copied_or_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(mut app) = app_paused_with_a_payload(tmp.path(), true) else {
+        return;
+    };
+    app.add_watch_expression(String::from("len(payload)"));
+    app.refresh_debug_panel();
+    let idx = debug_row_index(&app, "len(payload)").unwrap();
+    let labels: Vec<String> = app
+        .debug_row_menu(idx)
+        .into_iter()
+        .map(|(l, _)| l)
+        .collect();
+    crate::clipboard::test_clip::mock_write("before");
+    run_debug_menu_entry(&mut app, idx, "Copy Expression");
+    let copied = crate::clipboard::test_clip::mock_read();
+    run_debug_menu_entry(&mut app, idx, "Remove Expression");
+    let watching = app.watch_exprs.clone();
+    app.debug_stop();
+    assert_eq!(
+        labels,
+        ["Copy Value", "Copy Expression", "Remove Expression"]
+    );
+    assert_eq!(copied.as_deref(), Some("len(payload)"));
+    assert!(watching.is_empty());
+}
+
+/// #1546: a frame row offers Copy Call Stack, which copies every frame,
+/// innermost first, as `name (path:line)`.
+#[test]
+fn copy_call_stack_copies_every_frame() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(mut app) = app_paused_with_a_payload(tmp.path(), true) else {
+        return;
+    };
+    crate::clipboard::test_clip::mock_write("before");
+    let idx = debug_row_index(&app, "<module>").unwrap();
+    run_debug_menu_entry(&mut app, idx, "Copy Call Stack");
+    let copied = crate::clipboard::test_clip::mock_read();
+    app.debug_stop();
+    assert_eq!(
+        copied.as_deref(),
+        Some("main (/w/s.py:6)\n<module> (/w/s.py:9)")
+    );
+}
+
+/// #1546 negative: a variable the adapter gave no `evaluateName` has no
+/// expression to copy or watch, so only Copy Value is offered; a header
+/// or scope row has no menu at all.
+#[test]
+fn rows_without_an_expression_offer_less_or_nothing() {
+    use crate::widgets::run_debug::{DebugRow, DebugRowKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_debug.debug_rows = vec![
+        DebugRow {
+            indent: 0,
+            kind: DebugRowKind::Header {
+                title: String::from("VARIABLES"),
+            },
+        },
+        DebugRow {
+            indent: 1,
+            kind: DebugRowKind::Scope {
+                name: String::from("Locals"),
+                index: 0,
+                open: None,
+            },
+        },
+        DebugRow {
+            indent: 2,
+            kind: DebugRowKind::Variable {
+                reference: 0,
+                expandable: false,
+                expanded: false,
+                name: String::from("n"),
+                value: String::from("42"),
+                type_name: String::from("int"),
+                evaluate_name: None,
+            },
+        },
+    ];
+    assert!(app.debug_row_menu(0).is_empty());
+    assert!(app.debug_row_menu(1).is_empty());
+    assert!(app.debug_row_menu(9).is_empty(), "past the last row");
+    assert_eq!(debug_menu_labels(&app.debug_row_menu(2)), ["Copy Value"]);
+    crate::clipboard::test_clip::mock_write("before");
+    run_debug_menu_entry(&mut app, 2, "Copy Value");
+    assert_eq!(
+        crate::clipboard::test_clip::mock_read().as_deref(),
+        Some("42"),
+        "no session: the shown value is copied as it is"
+    );
+}
+
 /// #567 item 1: a background member's program output used to be drained and
 /// dropped. It reaches the debug console, tagged with the member's name.
 #[test]
@@ -3381,6 +4173,46 @@ fn a_go_connect_to_server_attach_reaches_the_headless_delve() {
     assert!(!app.debug_sessions.is_empty(), "{}", app.status);
 }
 
+/// #1417: Python: Remote Attach (`attach` + `connect`) to a `debugpy
+/// --listen` process attaches to that port directly: croft's `initialize`
+/// and `attach` reach it, and the session is up.
+#[test]
+fn a_python_remote_attach_talks_to_the_listening_port() {
+    // The stand-in accepts within a deadline, so a session routed anywhere
+    // but this port fails here instead of hanging the join below.
+    let (port, server) = crate::dap::session::tests::listening_adapter(1);
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        format!(
+            r#"{{ "configurations": [ {{ "name": "Python: Remote Attach", "type": "debugpy",
+                 "request": "attach", "connect": {{ "host": "127.0.0.1", "port": {port} }} }} ] }}"#
+        ),
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let cfg = crate::dap::configs::discover_configs(tmp.path()).remove(0);
+    app.launch_debug_config(&cfg);
+    assert!(
+        !app.debug_sessions.is_empty() && !app.run_debug.feedback_is_error,
+        "{}",
+        app.status
+    );
+    assert!(
+        app.status.contains("Attached: Python: Remote Attach"),
+        "{}",
+        app.status
+    );
+    let got = server.join().unwrap();
+    assert_eq!(
+        got.first().map(|m| m["command"].clone()),
+        Some(serde_json::json!("initialize")),
+        "croft's own initialize reached the port"
+    );
+    app.debug_stop();
+}
+
 fn resolved_attach(json: &str) -> crate::dap::configs::ResolvedConfig {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
@@ -3567,6 +4399,281 @@ fn a_session_ending_on_its_own_says_so_on_the_status_line() {
         Some("Debug session ended")
     );
     assert_eq!(app.status, "Debug session ended");
+}
+
+/// #1547: a stand-in adapter for a program paused in `app.py`: the first
+/// stop is a breakpoint on line 3, and every `next` or `continue` stops on
+/// line 3 again, as a loop body does.
+fn loop_stop_adapter(dir: &Path) -> crate::dap::session::DapSession {
+    stop_adapter(dir, false)
+}
+
+/// [`loop_stop_adapter`], where with `sourceless_step` a `next` stops in a
+/// frame with no source, as native code does.
+fn stop_adapter(dir: &Path, sourceless_step: bool) -> crate::dap::session::DapSession {
+    let app_py = dir.join("app.py");
+    std::fs::write(
+        &app_py,
+        "total = 0\nfor n in range(3):\n    total += n\nprint(total)\n",
+    )
+    .unwrap();
+    let script = format!(
+        r#"
+import json, sys
+seq = [1000]
+stepped = [False]
+sourceless = {sourceless}
+def read():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    return json.loads(sys.stdin.buffer.read(length))
+def send(msg):
+    seq[0] += 1
+    msg["seq"] = seq[0]
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+def reply(req, body=None):
+    send({{"type": "response", "request_seq": req["seq"], "success": True,
+          "command": req["command"], "body": body or {{}}}})
+def stop(reason):
+    send({{"type": "event", "event": "stopped", "body": {{"reason": reason, "threadId": 1}}}})
+while True:
+    req = read()
+    if req is None:
+        break
+    c = req["command"]
+    if c == "initialize":
+        reply(req)
+        send({{"type": "event", "event": "initialized"}})
+    elif c == "configurationDone":
+        reply(req)
+        stop("breakpoint")
+    elif c == "threads":
+        reply(req, {{"threads": [{{"id": 1, "name": "main"}}]}})
+    elif c == "stackTrace":
+        if sourceless and stepped[0]:
+            reply(req, {{"stackFrames": [{{"id": 2, "name": "memcpy", "line": 0, "column": 0}}],
+                        "totalFrames": 1}})
+        else:
+            reply(req, {{"stackFrames": [{{"id": 1, "name": "<module>", "line": 3, "column": 1,
+                        "source": {{"path": {path}}}}}], "totalFrames": 1}})
+    elif c == "next":
+        stepped[0] = True
+        reply(req)
+        stop("step")
+    elif c == "continue":
+        reply(req)
+        stop("breakpoint")
+    elif c == "disconnect":
+        reply(req)
+        break
+    else:
+        reply(req)
+"#,
+        path = serde_json::to_string(&app_py.display().to_string()).unwrap(),
+        sourceless = if sourceless_step { "True" } else { "False" },
+    );
+    let path = dir.join("loop_dap.py");
+    std::fs::write(&path, script).unwrap();
+    crate::dap::session::DapSession::launch_with(
+        "python3",
+        &[path.display().to_string()],
+        dir,
+        serde_json::json!({"type": "request", "command": "launch", "arguments": {}}),
+        std::collections::BTreeMap::new(),
+    )
+    .expect("python3 spawns")
+}
+
+fn has_python3() -> bool {
+    std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+/// Poll the adapter until screen reader mode has a new event past `seen`,
+/// and return it.
+fn await_a11y_event(app: &mut App, seen: Option<u64>) -> String {
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the pause's announcement",
+        || {
+            app.poll_dap();
+            app.a11y_event.as_ref().map(|(n, _)| *n) > seen
+        },
+    );
+    app.update_announcer();
+    app.announcer.line.clone()
+}
+
+/// #1547: hitting a breakpoint was silent in screen reader mode: a stop
+/// set only the panel's pill. It now reads why, where and the line.
+#[test]
+fn a_breakpoint_pause_is_read_out_with_its_file_line_and_text() {
+    if !has_python3() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.screen_reader = true;
+    app.debug_sessions.push("P", loop_stop_adapter(tmp.path()));
+    let said = await_a11y_event(&mut app, None);
+    app.debug_stop();
+    assert!(
+        said.contains("Paused on breakpoint, app.py line 3: total += n"),
+        "said: {said}"
+    );
+}
+
+/// #1547: a step that lands on the line it left, and a continue back to
+/// the same breakpoint, are each read again, and Continue says so.
+#[test]
+fn every_stop_is_read_even_on_the_same_line() {
+    if !has_python3() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.screen_reader = true;
+    app.debug_sessions.push("P", loop_stop_adapter(tmp.path()));
+    await_a11y_event(&mut app, None);
+    let first = app.a11y_event.as_ref().map(|(n, _)| *n);
+
+    app.debug_step("next");
+    let said = await_a11y_event(&mut app, first);
+    assert!(
+        said.contains("Paused on step, app.py line 3"),
+        "said: {said}"
+    );
+    let stepped = app.a11y_event.as_ref().map(|(n, _)| *n);
+
+    app.debug_start_or_continue();
+    assert_eq!(
+        app.a11y_event.as_ref().map(|(_, e)| e.as_str()),
+        Some("Continued")
+    );
+    app.update_announcer();
+    assert!(
+        app.announcer.line.contains("Continued"),
+        "{}",
+        app.announcer.line
+    );
+    let continued = app.a11y_event.as_ref().map(|(n, _)| *n);
+    assert!(continued > stepped);
+
+    let said = await_a11y_event(&mut app, continued);
+    app.debug_stop();
+    assert!(
+        said.contains("Paused on breakpoint, app.py line 3: total += n"),
+        "said: {said}"
+    );
+}
+
+/// #1547: a stop whose top frame has no source keeps the last stop's
+/// location in the session; the pause is read with the frame's name, not
+/// that stale file and line.
+#[test]
+fn a_sourceless_stop_is_not_read_with_the_last_stops_location() {
+    if !has_python3() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.screen_reader = true;
+    app.debug_sessions.push("P", stop_adapter(tmp.path(), true));
+    await_a11y_event(&mut app, None);
+    let first = app.a11y_event.as_ref().map(|(n, _)| *n);
+
+    app.debug_step("next");
+    let said = await_a11y_event(&mut app, first);
+    app.debug_stop();
+    assert!(said.contains("Paused on step, in memcpy"), "said: {said}");
+    assert!(!said.contains("app.py"), "said: {said}");
+}
+
+/// #1547 negative: with screen reader mode off a pause records nothing,
+/// so turning the mode on later never reads out a stale stop.
+#[test]
+fn a_pause_with_screen_reader_mode_off_is_not_kept() {
+    if !has_python3() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.screen_reader = false;
+    app.debug_sessions.push("P", loop_stop_adapter(tmp.path()));
+    crate::test_budget::await_spawned(std::time::Duration::from_millis(500), "the stop", || {
+        app.poll_dap();
+        app.editor.stop_line.is_some()
+    });
+    app.debug_stop();
+    assert_eq!(app.a11y_event, None);
+}
+
+/// #1547 (comment): a Run All that finished was silent; it sets no
+/// "Running …" status for the outcome to replace. Its counts and first
+/// failure are now read out.
+#[test]
+fn a_finished_run_all_is_read_out_with_its_first_failure() {
+    use crate::testing::model::{Activity, TestCase, TestStatus};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.screen_reader = true;
+    app.testing.on_busy_started(Activity::Running);
+    for (name, status) in [
+        ("m::a", TestStatus::Passed),
+        ("m::b", TestStatus::Failed),
+        ("m::c", TestStatus::Skipped),
+    ] {
+        app.testing.apply_case(TestCase {
+            name: name.to_string(),
+            status,
+        });
+    }
+    app.testing.on_finished(Some(false));
+    app.tick_test_watch();
+    app.update_announcer();
+    assert!(
+        app.announcer
+            .line
+            .contains("Tests finished: 1 failed, 1 passed, 1 skipped. First failure: m::b"),
+        "said: {}",
+        app.announcer.line
+    );
+}
+
+/// #1547 negative: a run whose outcome already went to the status line
+/// is not read twice; only its first failure is added.
+#[test]
+fn a_run_with_a_status_outcome_adds_only_its_first_failure() {
+    use crate::testing::model::{TestCase, TestStatus};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.screen_reader = true;
+    app.testing.start_filter("m::");
+    app.status = String::from("Running suite m");
+    app.await_test_run_outcome(String::from("suite m"));
+    app.testing.apply_case(TestCase {
+        name: String::from("m::b"),
+        status: TestStatus::Failed,
+    });
+    app.testing.on_finished(Some(false));
+    app.tick_test_watch();
+    assert!(app.status.starts_with("suite m failed"), "{}", app.status);
+    assert_eq!(
+        app.a11y_event.as_ref().map(|(_, e)| e.as_str()),
+        Some("First failure: m::b")
+    );
 }
 
 /// #867: the run that never reached its breakpoint says that on the
@@ -4307,6 +5414,63 @@ fn a_launch_json_node_attach_config_attaches_by_port() {
         )
     });
     assert!(label.contains("tick "), "{label}");
+}
+
+/// #1414: a js-debug config parked behind its `preLaunchTask` keeps the
+/// workspace folder it was resolved against. Focusing a file in another root
+/// while the task runs must not send js-debug that root, or its source-map
+/// defaults disagree with `program` and `outFiles`.
+#[test]
+fn a_parked_js_launch_keeps_the_workspace_folder_it_was_resolved_against() {
+    use crate::dap::configs;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("alpha");
+    let b = tmp.path().join("beta");
+    std::fs::create_dir_all(a.join(".vscode")).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    std::fs::write(b.join("other.js"), "1;\n").unwrap();
+    std::fs::write(
+        a.join(".vscode/tasks.json"),
+        r#"{ "version": "2.0.0", "tasks": [
+            { "label": "tsc", "type": "shell", "command": "true" }
+        ]}"#,
+    )
+    .unwrap();
+    let mut app = App::new(a.clone()).unwrap();
+    app.add_workspace_folder(b.clone());
+    let root = app.active_workspace_root();
+    let cfg = configs::parse_launch_json(
+        r#"{ "configurations": [
+            { "name": "TS", "type": "node", "request": "launch",
+              "program": "${workspaceFolder}/dist/main.js", "preLaunchTask": "tsc" }
+        ]}"#,
+        "launch.json",
+    )
+    .remove(0);
+
+    app.launch_debug_config(&cfg);
+    let parked = app
+        .pending_debug_launch
+        .take()
+        .expect("the preLaunchTask parked the launch");
+    let crate::app::PendingLaunchStep::Resolved(rc) = parked.step else {
+        panic!("a config's own task parks the resolved config");
+    };
+
+    // The user focuses a file in the other root while the task runs.
+    app.editor.path = Some(b.canonicalize().unwrap().join("other.js"));
+    assert_ne!(
+        app.active_workspace_root(),
+        root,
+        "staging: the active root moved"
+    );
+    let req =
+        configs::with_workspace_folder(configs::js_request(&rc), &app.active_workspace_root());
+    assert_eq!(
+        req["arguments"]["__workspaceFolder"],
+        serde_json::json!(root.to_string_lossy()),
+        "the launch carries the root the config was resolved against"
+    );
 }
 
 /// Feed `events` (DAP `output` bodies' `output` strings, JSON-escaped) to a

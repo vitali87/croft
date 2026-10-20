@@ -16,7 +16,7 @@
 //! runner without Rust — exactly the boundary the debug adapters draw.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::worker::Runner;
 use crate::lsp::manifest::{self, RunnerKindDecl, TestRunnerDecl};
@@ -116,6 +116,113 @@ fn all_sources() -> Vec<String> {
 pub fn runner_for(root: &Path) -> Option<Runner> {
     let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
     resolve(&all_sources(), &disabled, root)
+}
+
+/// The package folders a JS monorepo at `root` declares (#1520): the root
+/// `package.json`'s `workspaces` (a list, or `{ "packages": [...] }`), else
+/// `pnpm-workspace.yaml`'s `packages:` list, else `packages/*` and `apps/*`.
+/// A pattern is a folder or a folder ending in `/*`; `node_modules` and
+/// negated (`!`) patterns are skipped. Sorted, existing folders only.
+fn workspace_packages(root: &Path) -> Vec<PathBuf> {
+    let mut patterns: Vec<String> = std::fs::read_to_string(root.join("package.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|pkg| {
+            let ws = pkg.get("workspaces")?;
+            let list = ws.as_array().or_else(|| ws.get("packages")?.as_array())?;
+            Some(
+                list.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect(),
+            )
+        })
+        .unwrap_or_default();
+    if patterns.is_empty()
+        && let Ok(text) = std::fs::read_to_string(root.join("pnpm-workspace.yaml"))
+    {
+        let mut in_packages = false;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if !line.starts_with([' ', '\t', '-']) {
+                in_packages = trimmed == "packages:";
+                continue;
+            }
+            if in_packages && let Some(item) = trimmed.strip_prefix('-') {
+                patterns.push(item.trim().trim_matches(['\'', '"']).to_owned());
+            }
+        }
+    }
+    if patterns.is_empty() {
+        patterns = vec![String::from("packages/*"), String::from("apps/*")];
+    }
+    let mut dirs = BTreeSet::new();
+    for pattern in &patterns {
+        let pattern = pattern.trim_start_matches("./").trim_end_matches('/');
+        if pattern.starts_with('!') || pattern.split('/').any(|c| c == "node_modules") {
+            continue;
+        }
+        match pattern.strip_suffix("/*") {
+            Some(parent) if !parent.contains('*') => {
+                let Ok(entries) = std::fs::read_dir(root.join(parent)) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() && entry.file_name() != "node_modules" {
+                        dirs.insert(path);
+                    }
+                }
+            }
+            None if !pattern.contains('*') => {
+                let path = root.join(pattern);
+                if path.is_dir() {
+                    dirs.insert(path);
+                }
+            }
+            _ => {}
+        }
+    }
+    dirs.into_iter().collect()
+}
+
+/// The folder the Testing view runs in for workspace folder `root` with
+/// `file` focused (#1520). `root` itself when a runner claims it, as
+/// always. Otherwise, as in a monorepo whose packages each declare their
+/// own vitest or jest: the nearest folder between `file` and `root` that a
+/// runner claims, else the first workspace package one claims, else `root`
+/// (which then reports no runner). Pure over `sources` and `disabled`.
+fn resolve_test_root(
+    sources: &[String],
+    disabled: &BTreeSet<String>,
+    root: &Path,
+    file: Option<&Path>,
+) -> PathBuf {
+    if resolve(sources, disabled, root).is_some() {
+        return root.to_path_buf();
+    }
+    let claimed = |dir: &Path| resolve(sources, disabled, dir).is_some();
+    let in_package = file
+        .and_then(Path::parent)
+        .filter(|dir| dir.starts_with(root))
+        .and_then(|dir| {
+            dir.ancestors()
+                .take_while(|d| *d != root)
+                .filter(|d| {
+                    d.strip_prefix(root)
+                        .is_ok_and(|rel| !rel.components().any(|c| c.as_os_str() == "node_modules"))
+                })
+                .find(|d| claimed(d))
+                .map(Path::to_path_buf)
+        });
+    in_package
+        .or_else(|| workspace_packages(root).into_iter().find(|d| claimed(d)))
+        .unwrap_or_else(|| root.to_path_buf())
+}
+
+/// [`resolve_test_root`] over the enabled extensions.
+pub fn test_root_for(root: &Path, file: Option<&Path>) -> PathBuf {
+    let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
+    resolve_test_root(&all_sources(), &disabled, root, file)
 }
 
 /// Every enabled runner that claims `root` (#1408), [`runner_for`]'s first.
@@ -327,5 +434,148 @@ markers = ["noxfile.py"]
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("noxfile.py"), "").unwrap();
         assert_eq!(resolve(&s, &none(), tmp.path()), Some(Runner::Pytest));
+    }
+
+    /// The issue's monorepo: vitest only in `packages/math`.
+    fn vitest_monorepo(root: &Path) -> PathBuf {
+        let math = root.join("packages/math");
+        std::fs::create_dir_all(math.join("src")).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"vmono","private":true,"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            math.join("package.json"),
+            r#"{"name":"math","type":"module","devDependencies":{"vitest":"^5.0.3"}}"#,
+        )
+        .unwrap();
+        std::fs::write(math.join("vitest.config.ts"), "export default {};\n").unwrap();
+        std::fs::write(math.join("src/add.test.ts"), "test('adds', () => {});\n").unwrap();
+        std::fs::create_dir_all(root.join("packages/docs")).unwrap();
+        std::fs::write(
+            root.join("packages/docs/package.json"),
+            r#"{"name":"docs"}"#,
+        )
+        .unwrap();
+        math
+    }
+
+    /// #1520: a monorepo whose root declares no runner tests in the package
+    /// that declares one: the focused file's, else the first such package.
+    #[test]
+    fn a_package_that_declares_its_own_runner_is_the_test_root() {
+        let s = bundled();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let math = vitest_monorepo(root);
+        assert_eq!(resolve(&s, &none(), root), None);
+        let test = math.join("src/add.test.ts");
+        assert_eq!(resolve_test_root(&s, &none(), root, Some(&test)), math);
+        assert_eq!(resolve_test_root(&s, &none(), root, None), math);
+        let readme = root.join("README.md");
+        assert_eq!(resolve_test_root(&s, &none(), root, Some(&readme)), math);
+    }
+
+    /// #1520: jest in a pnpm workspace's `apps/web`, and the focused file
+    /// picks between two packages on different runners.
+    #[test]
+    fn pnpm_packages_and_the_focused_package_pick_the_runner() {
+        let s = bundled();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let math = vitest_monorepo(root);
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"vmono","private":true}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'apps/*'\n  - \"packages/*\"\n  - '!**/test/**'\n",
+        )
+        .unwrap();
+        let web = root.join("apps/web");
+        std::fs::create_dir_all(&web).unwrap();
+        std::fs::write(web.join("jest.config.js"), "module.exports = {};\n").unwrap();
+        assert_eq!(
+            workspace_packages(root),
+            vec![web.clone(), root.join("packages/docs"), math.clone()]
+        );
+        assert_eq!(resolve_test_root(&s, &none(), root, None), web);
+        assert_eq!(resolve(&s, &none(), &web), Some(Runner::Jest));
+        let test = math.join("src/add.test.ts");
+        assert_eq!(resolve_test_root(&s, &none(), root, Some(&test)), math);
+        assert_eq!(resolve(&s, &none(), &math), Some(Runner::Vitest));
+    }
+
+    /// #1520, negative: a root a runner claims stays the test root; a
+    /// package under `node_modules`, a disabled runner, a file outside the
+    /// folder and a repo with no runner anywhere all leave the root.
+    #[test]
+    fn the_root_stays_the_test_root_unless_only_a_package_has_a_runner() {
+        let s = bundled();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let math = vitest_monorepo(root);
+        let test = math.join("src/add.test.ts");
+
+        let disabled: BTreeSet<String> = s
+            .iter()
+            .filter_map(|m| manifest::parse(m).ok())
+            .filter(|m| {
+                m.test_runners
+                    .iter()
+                    .any(|d| d.kind == RunnerKindDecl::Vitest)
+            })
+            .map(|m| m.id)
+            .collect();
+        assert!(!disabled.is_empty());
+        assert_eq!(resolve_test_root(&s, &disabled, root, Some(&test)), root);
+
+        let other = tempfile::tempdir().unwrap();
+        let dep = other.path().join("node_modules/lib");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::write(dep.join("vitest.config.ts"), "export default {};\n").unwrap();
+        std::fs::write(dep.join("x.test.ts"), "").unwrap();
+        assert_eq!(
+            resolve_test_root(&s, &none(), other.path(), Some(&dep.join("x.test.ts"))),
+            other.path()
+        );
+        assert_eq!(
+            resolve_test_root(&s, &none(), other.path(), Some(&test)),
+            other.path(),
+            "a file in another folder is not this folder's package"
+        );
+
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"private":true,"workspaces":["packages/*"],"devDependencies":{"jest":"29"}}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve(&s, &none(), root), Some(Runner::Jest));
+        assert_eq!(resolve_test_root(&s, &none(), root, Some(&test)), root);
+    }
+
+    /// #1520: `workspaces` in its object form, and patterns croft does not
+    /// expand, are read without guessing.
+    #[test]
+    fn workspace_packages_reads_the_object_form_and_skips_what_it_cannot_expand() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for d in ["libs/a", "libs/b", "tools", "deep/x/y"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"workspaces":{"packages":["libs/*","./tools/","deep/**","!libs/b","node_modules/*"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            workspace_packages(root),
+            vec![root.join("libs/a"), root.join("libs/b"), root.join("tools")]
+        );
+        let bare = tempfile::tempdir().unwrap();
+        assert!(workspace_packages(bare.path()).is_empty());
     }
 }

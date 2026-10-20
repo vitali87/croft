@@ -188,11 +188,15 @@ pub fn output_is_user_visible(category: &str) -> bool {
 
 /// Build the `initialize` request body (sans `seq`, which the transport stamps).
 ///
-/// `supportsStartDebuggingRequest` is advertised because vscode-js-debug only
-/// issues the `startDebugging` reverse request (the one that spawns the child
-/// session that actually binds breakpoints) to a client that claims support;
-/// debugpy and lldb-dap simply never send it, so it is harmless for them.
-pub fn initialize_request() -> Value {
+/// `child_sessions` says whether the session can open a child session, and
+/// so whether `supportsStartDebuggingRequest` is advertised. vscode-js-debug
+/// only issues the `startDebugging` reverse request (the one that spawns the
+/// child session that actually binds breakpoints) to a client that claims
+/// support, and a js-debug session can open that child. debugpy also sends
+/// it when offered, once per subprocess of the debuggee, and falls back to
+/// its own `debugpyAttach` event when not; croft has no child path for
+/// debugpy (or any other adapter), so those sessions must not claim one.
+pub fn initialize_request(child_sessions: bool) -> Value {
     json!({
         "type": "request",
         "command": "initialize",
@@ -202,7 +206,7 @@ pub fn initialize_request() -> Value {
             "columnsStartAt1": true,
             "pathFormat": "path",
             "supportsRunInTerminalRequest": true,
-            "supportsStartDebuggingRequest": true
+            "supportsStartDebuggingRequest": child_sessions
         }
     })
 }
@@ -362,6 +366,10 @@ pub fn js_launch_request(program: &Path, cwd: &Path, stop_on_entry: bool) -> Val
             "request": "launch",
             "program": program.to_string_lossy(),
             "cwd": cwd.to_string_lossy(),
+            // js-debug resolves its `${workspaceFolder}` defaults (rootPath,
+            // resolveSourceMapLocations) against this, as VS Code sends it
+            // (#1414); `cwd` is the file's workspace root here.
+            "__workspaceFolder": cwd.to_string_lossy(),
             "console": "internalConsole",
             "sourceMaps": true,
             "stopOnEntry": stop_on_entry
@@ -772,6 +780,11 @@ pub struct Variable {
     pub value: String,
     pub type_name: String,
     pub variables_ref: i64,
+    /// The adapter's `evaluateName` (#1546): an expression that evaluates
+    /// to this variable from the frame, such as `obj.items[0]`. What Copy
+    /// as Expression copies and Add to Watch watches. None when the adapter
+    /// sends none (a synthetic row, or an adapter that doesn't know one).
+    pub evaluate_name: Option<String>,
 }
 
 /// Parse the full call stack from a `stackTrace` response. Pure.
@@ -850,6 +863,10 @@ pub fn parse_variables(variables_response: &Value) -> Vec<Variable> {
                             .get("variablesReference")
                             .and_then(Value::as_i64)
                             .unwrap_or(0),
+                        evaluate_name: v
+                            .get("evaluateName")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
                     })
                 })
                 .collect()
@@ -1244,11 +1261,29 @@ impl DapSession {
         breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
     ) -> Result<DapSession> {
         let transport = DapTransport::spawn(adapter_program, adapter_args, cwd)?;
-        transport.send(initialize_request())?;
+        transport.send(initialize_request(false))?;
         let attached = is_attach(&launch_request);
         transport.send(launch_request)?;
         let mut session = Self::new_with_transport(transport, breakpoints, None);
         session.attached = attached;
+        Ok(session)
+    }
+
+    /// Attach to a DAP server that is already listening at `host:port`
+    /// (#1417): a `debugpy --listen` process, whose port is its own adapter.
+    /// No adapter is spawned; `initialize` and `attach_request` go straight
+    /// to the socket.
+    pub fn attach_tcp(
+        host: &str,
+        port: u16,
+        attach_request: Value,
+        breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
+    ) -> Result<DapSession> {
+        let transport = DapTransport::connect_tcp_once(host, port)?;
+        transport.send(initialize_request(false))?;
+        transport.send(attach_request)?;
+        let mut session = Self::new_with_transport(transport, breakpoints, None);
+        session.attached = true;
         Ok(session)
     }
 
@@ -1294,7 +1329,7 @@ impl DapSession {
         let node_dir = super::install::node_bin_dir(node);
         let transport =
             DapTransport::connect_tcp_server(node, &args, cwd, host, port, node_dir.as_deref())?;
-        transport.send(initialize_request())?;
+        transport.send(initialize_request(true))?;
         transport.send(start_request)?;
         Ok(Self::new_with_transport(
             transport,
@@ -1324,7 +1359,7 @@ impl DapSession {
         let args = vec![String::from("dap"), format!("--listen={host}:{port}")];
         let transport =
             DapTransport::connect_tcp_server(&dlv.to_string_lossy(), &args, cwd, host, port, None)?;
-        transport.send(initialize_request())?;
+        transport.send(initialize_request(false))?;
         let attached = is_attach(&start_request);
         transport.send(with_remote_output(start_request))?;
         let mut session = Self::new_with_transport(transport, breakpoints, None);
@@ -1347,7 +1382,7 @@ impl DapSession {
         breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
     ) -> Result<DapSession> {
         let transport = DapTransport::connect_tcp(host, port)?;
-        transport.send(initialize_request())?;
+        transport.send(initialize_request(false))?;
         transport.send(attach_request)?;
         let mut session = Self::new_with_transport(transport, breakpoints, None);
         session.attached = true;
@@ -1604,9 +1639,12 @@ impl DapSession {
     fn handle_message(&mut self, msg: Value, from_child: bool, out: &mut Vec<DapEvent>) {
         // Reverse requests (adapter -> client) MUST be answered or the adapter
         // blocks. vscode-js-debug's `startDebugging` asks us to open the child
-        // session; everything else croft declines (it debugs in-process).
+        // session; everything else croft declines (it debugs in-process). So
+        // is a `startDebugging` on a session with no child path (anything but
+        // js-debug, see `initialize_request`): acknowledging it would promise
+        // a subprocess session that never opens.
         if msg.get("type").and_then(Value::as_str) == Some("request") {
-            if let Some(req) = start_debugging_request(&msg) {
+            if let Some(req) = start_debugging_request(&msg).filter(|_| self.js_server.is_some()) {
                 let _ = self.transport.send(reverse_request_response(
                     req.request_seq,
                     "startDebugging",
@@ -1891,7 +1929,7 @@ impl DapSession {
         };
         match DapTransport::connect_tcp(&host, port) {
             Ok(child) => {
-                let _ = child.send(initialize_request());
+                let _ = child.send(initialize_request(true));
                 let _ = child.send(js_child_launch_request(config, outer_request));
                 self.child = Some(child);
             }
@@ -2935,6 +2973,7 @@ while True:
                 value: String::from("0"),
                 type_name: String::new(),
                 variables_ref: 0,
+                evaluate_name: None,
             }],
         );
         vars.insert(
@@ -2944,6 +2983,7 @@ while True:
                 value: String::from("1"),
                 type_name: String::new(),
                 variables_ref: 0,
+                evaluate_name: None,
             }],
         );
         let scopes = vec![
@@ -3014,6 +3054,8 @@ while True:
         assert_eq!(req["arguments"]["request"], "launch");
         assert_eq!(req["arguments"]["program"], "/proj/app.ts");
         assert_eq!(req["arguments"]["cwd"], "/proj");
+        // #1414: js-debug's source-map defaults need the workspace folder.
+        assert_eq!(req["arguments"]["__workspaceFolder"], "/proj");
         // TypeScript debugging rides on source maps (matches Zed's defaults).
         assert_eq!(req["arguments"]["sourceMaps"], true);
         assert_eq!(req["arguments"]["console"], "internalConsole");
@@ -3024,8 +3066,11 @@ while True:
         // js-debug only sends the `startDebugging` reverse request to a client
         // that advertises support for it; without this it never spawns the
         // child session that actually binds breakpoints.
-        let req = initialize_request();
+        let req = initialize_request(true);
         assert_eq!(req["arguments"]["supportsStartDebuggingRequest"], true);
+        // A session with no child path claims no support (#1417).
+        let req = initialize_request(false);
+        assert_eq!(req["arguments"]["supportsStartDebuggingRequest"], false);
     }
 
     #[test]
@@ -4517,6 +4562,21 @@ def stopped():"#,
         );
     }
 
+    /// #1546: a variable keeps the adapter's `evaluateName`, the expression
+    /// Copy as Expression and Add to Watch use; one without it has none.
+    #[test]
+    fn parse_variables_keeps_the_evaluate_name() {
+        let vars = parse_variables(&json!({
+            "body": { "variables": [
+                { "name": "[0]", "value": "1", "variablesReference": 0,
+                  "evaluateName": "obj.items[0]" },
+                { "name": "special variables", "value": "", "variablesReference": 3 }
+            ]}
+        }));
+        assert_eq!(vars[0].evaluate_name.as_deref(), Some("obj.items[0]"));
+        assert_eq!(vars[1].evaluate_name, None, "no evaluateName, none made up");
+    }
+
     /// End-to-end against a real debugpy adapter: launch a script with a
     /// breakpoint and confirm the session reaches `Stopped` at that line.
     /// Ignored by default — needs `~/.croft/debug-venv` (uv + debugpy on 3.14);
@@ -4908,40 +4968,142 @@ def stopped():"#,
         }
     }
 
+    /// Accept the one client a test's stand-in DAP server expects, within a
+    /// load-scaled budget (#1417). A client that never connects (a routing
+    /// regression sending the session somewhere else) then fails the test
+    /// with a message, where a blocking `accept` would hang the server
+    /// thread, and the test's `join` on it, forever.
+    fn accept_within(listener: &std::net::TcpListener) -> std::net::TcpStream {
+        let budget = crate::test_budget::spawn_budget(std::time::Duration::from_secs(2));
+        let started = std::time::Instant::now();
+        listener.set_nonblocking(true).unwrap();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                        .unwrap();
+                    return stream;
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock && started.elapsed() < budget =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => {
+                    panic!("no client connected to the stand-in DAP server in {budget:?}: {e}")
+                }
+            }
+        }
+    }
+
+    /// The next `Content-Length`-framed DAP message on `reader`, or `None`
+    /// once the client hangs up or goes quiet past the read timeout.
+    fn read_dap_message(reader: &mut impl std::io::BufRead) -> Option<Value> {
+        let mut len = 0;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                return None;
+            }
+            if let Some(v) = line.trim().strip_prefix("Content-Length:") {
+                len = v.trim().parse().ok()?;
+            }
+            if line.trim().is_empty() {
+                break;
+            }
+        }
+        let mut body = vec![0; len];
+        reader.read_exact(&mut body).ok()?;
+        serde_json::from_slice(&body).ok()
+    }
+
     /// The first `n` DAP messages a client sends to a socket listening on a
-    /// free port (#1418): a stand-in for `dlv --headless --listen`.
-    pub(crate) fn headless_delve(n: usize) -> (u16, std::thread::JoinHandle<Vec<Value>>) {
-        use std::io::{BufRead, Read};
+    /// free port (#1417): a stand-in for `debugpy --listen`.
+    pub(crate) fn listening_adapter(n: usize) -> (u16, std::thread::JoinHandle<Vec<Value>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-                .unwrap();
-            let mut reader = std::io::BufReader::new(stream);
-            let mut out = Vec::new();
-            while out.len() < n {
-                let mut len = 0;
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                        return out;
-                    }
-                    if let Some(v) = line.trim().strip_prefix("Content-Length:") {
-                        len = v.trim().parse().unwrap();
-                    }
-                    if line.trim().is_empty() {
-                        break;
-                    }
-                }
-                let mut body = vec![0; len];
-                reader.read_exact(&mut body).unwrap();
-                out.push(serde_json::from_slice(&body).unwrap());
-            }
-            out
+            let mut reader = std::io::BufReader::new(accept_within(&listener));
+            std::iter::from_fn(|| read_dap_message(&mut reader))
+                .take(n)
+                .collect()
         });
         (port, handle)
+    }
+
+    /// #1417: a Remote Attach talks DAP to the listening port itself: the
+    /// `initialize` and the `attach` arrive there, from croft, with no
+    /// adapter process in between.
+    #[test]
+    fn attach_tcp_talks_to_the_listening_adapter_directly() {
+        let (port, server) = listening_adapter(2);
+        let attach = serde_json::json!({
+            "type": "request", "command": "attach",
+            "arguments": { "request": "attach", "connect": { "host": "127.0.0.1", "port": port } }
+        });
+        let session =
+            DapSession::attach_tcp("127.0.0.1", port, attach, BTreeMap::new()).expect("connects");
+        let got = server.join().unwrap();
+        let commands: Vec<_> = got.iter().map(|m| m["command"].as_str().unwrap()).collect();
+        assert_eq!(commands, ["initialize", "attach"]);
+        assert_eq!(got[1]["arguments"]["connect"]["port"], port);
+        assert!(session.attached);
+        drop(session);
+    }
+
+    /// #1417: a session with no child path (anything but js-debug, here a
+    /// direct debugpy attach) offers no `startDebugging`, and declines one
+    /// an adapter sends anyway. debugpy asks for one per subprocess of the
+    /// program when offered; acknowledging it promised a subprocess session,
+    /// with its breakpoints, that never opened.
+    #[test]
+    fn a_session_without_a_child_path_declines_start_debugging() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let stream = accept_within(&listener);
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let init = read_dap_message(&mut reader);
+            let _attach = read_dap_message(&mut reader);
+            let ask = json!({"type": "request", "seq": 5, "command": "startDebugging",
+                "arguments": {"request": "attach",
+                    "configuration": {"name": "Subprocess 4242", "subProcessId": 4242}}});
+            writer
+                .write_all(&crate::dap::transport::encode(&ask))
+                .unwrap();
+            (init, read_dap_message(&mut reader))
+        });
+        let attach = json!({"type": "request", "command": "attach",
+            "arguments": {"connect": {"host": "127.0.0.1", "port": port}}});
+        let mut session =
+            DapSession::attach_tcp("127.0.0.1", port, attach, BTreeMap::new()).expect("connects");
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "croft's reply to the startDebugging request",
+            || {
+                session.poll();
+                server.is_finished()
+            },
+        );
+        let (init, reply) = server.join().unwrap();
+        let init = init.expect("croft's initialize");
+        assert_eq!(init["arguments"]["supportsStartDebuggingRequest"], false);
+        let reply = reply.expect("croft answers the reverse request");
+        assert_eq!(reply["type"], "response");
+        assert_eq!(reply["command"], "startDebugging");
+        assert_eq!(reply["request_seq"], 5);
+        assert_eq!(reply["success"], false);
+        assert!(session.child.is_none());
+    }
+
+    /// The first `n` DAP messages a client sends to a socket listening on a
+    /// free port (#1418): a stand-in for `dlv --headless --listen`.
+    pub(crate) fn headless_delve(n: usize) -> (u16, std::thread::JoinHandle<Vec<Value>>) {
+        listening_adapter(n)
     }
 
     /// #1418: a remote Go attach connects to the headless delve's own port
