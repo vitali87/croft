@@ -404,6 +404,37 @@ fn restart_kernel_starts_a_new_kernel_once_the_bridge_is_gone() {
     assert_eq!(app.status, "Starting kernel…");
 }
 
+/// #878: a kernel whose bridge exits after it came up is noticed when its
+/// output closes, not by a request lost to it: the cells it owed stop
+/// waiting, and the next run starts a new kernel.
+#[test]
+fn a_kernel_whose_bridge_exits_is_forgotten_and_the_next_run_starts_afresh() {
+    use crate::notebook_kernel::{Event, NotebookRun};
+    let (_tmp, mut app, path, _kernel, started) = notebook_with_kernel("python3");
+    let (run, kernel, _requests) = NotebookRun::for_test();
+    app.notebook_kernels.insert(path.clone(), run);
+    kernel
+        .send(Event::Ready {
+            kernel: "python3".into(),
+            display: "Python 3".into(),
+        })
+        .unwrap();
+    app.poll_notebook_kernels();
+    app.run_command(crate::widgets::command_palette::Command::NotebookRunAll);
+    assert_eq!(app.editor.notebook_running, vec![0]);
+    kernel.send(Event::Exited).unwrap();
+    app.poll_notebook_kernels();
+    assert!(app.editor.notebook_running.is_empty());
+    assert!(!app.notebook_kernels.contains_key(&path));
+    assert_eq!(app.status, "Kernel exited: the next run starts a new one");
+    app.run_command(crate::widgets::command_palette::Command::NotebookRunAll);
+    assert_eq!(
+        started.borrow().len(),
+        1,
+        "the next run starts a new kernel"
+    );
+}
+
 /// #1377: Notebook: Select Kernel lists the installed kernels, opened on
 /// the notebook's own, and the choice is written into the notebook for its
 /// next run.

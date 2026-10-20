@@ -49741,7 +49741,7 @@ impl App {
             if let Some(c) = run.choice.take() {
                 choice = Some((path.clone(), c));
             }
-            if run.start_failed() {
+            if run.ended() {
                 failed = Some(path.clone());
             }
             changed = true;

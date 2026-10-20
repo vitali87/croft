@@ -79,6 +79,10 @@ pub enum Event {
     Specs {
         specs: Vec<KernelSpec>,
     },
+    /// The bridge exited (#878). Sent by croft itself when the bridge's
+    /// output closes, not by the bridge, so a kernel that is gone is known
+    /// before a request is handed to it and lost.
+    Exited,
 }
 
 /// An installed kernelspec, as `jupyter kernelspec list` knows it.
@@ -228,6 +232,7 @@ fn run_bridge(
                 break;
             }
         }
+        let _ = reader_events.send(Event::Exited);
     });
     // The session hanging up (its notebook closed) is a shutdown too.
     for request in requests.iter().chain(std::iter::once(Request::Shutdown)) {
@@ -264,9 +269,9 @@ pub struct NotebookRun {
     /// Set when the notebook's kernel is not installed: the cells sent so
     /// far wait for the user to pick another (#1377).
     pub choice: Option<KernelChoice>,
-    /// Set when the kernel never came up (#878): its bridge has exited, so
-    /// this run answers nothing more and the next run needs a new kernel.
-    start_failed: bool,
+    /// Set when the kernel never came up or its bridge exited (#878): this
+    /// run answers nothing more and the next run needs a new kernel.
+    ended: bool,
     sent: u64,
 }
 
@@ -279,7 +284,7 @@ impl NotebookRun {
             backlog: Vec::new(),
             kernel: None,
             choice: None,
-            start_failed: false,
+            ended: false,
             sent: 0,
         }
     }
@@ -312,9 +317,9 @@ impl NotebookRun {
         self.session.send(request)
     }
 
-    /// Whether the kernel failed to start (#878).
-    pub fn start_failed(&self) -> bool {
-        self.start_failed
+    /// Whether the kernel failed to start or its bridge exited (#878).
+    pub fn ended(&self) -> bool {
+        self.ended
     }
 
     /// Run on `session`'s kernel from now on: the old one is shut down and
@@ -394,9 +399,19 @@ impl NotebookRun {
                     // bridge has exited (#878).
                     if self.kernel.is_none() {
                         self.pending.clear();
-                        self.start_failed = true;
+                        self.ended = true;
                     }
                     notes.push(format!("Kernel: {message}"));
+                    continue;
+                }
+                Event::Exited => {
+                    // Nothing will answer the cells still waiting, and a
+                    // request sent now would be queued for nobody (#878).
+                    self.pending.clear();
+                    self.ended = true;
+                    if self.kernel.take().is_some() {
+                        notes.push(String::from("Kernel exited: the next run starts a new one"));
+                    }
                     continue;
                 }
                 Event::Missing { kernel, specs } => {
@@ -974,7 +989,7 @@ mod tests {
         assert!(text.is_none(), "the cell keeps its outputs and count");
         assert_eq!(notes, vec!["Kernel: no Python".to_string()]);
         assert!(run.running_indices().is_empty());
-        assert!(run.start_failed(), "#878: the next run needs a new kernel");
+        assert!(run.ended(), "#878: the next run needs a new kernel");
         // Negative: a failed request on a kernel that is up is not a
         // failed start; the kernel keeps serving.
         let mut up = run_without_kernel();
@@ -988,7 +1003,18 @@ mod tests {
             },
         ];
         up.fold(NB);
-        assert!(!up.start_failed());
+        assert!(!up.ended());
+        // A bridge that exits after its kernel came up ends the run too:
+        // the cells it owed stop waiting and the next run starts afresh.
+        up.execute(code_cell(NB, 1).unwrap());
+        up.backlog = vec![Event::Exited];
+        let (_, notes) = up.fold(NB);
+        assert!(up.ended());
+        assert!(up.running_indices().is_empty());
+        assert_eq!(
+            notes,
+            vec!["Kernel exited: the next run starts a new one".to_string()]
+        );
     }
 
     #[test]
