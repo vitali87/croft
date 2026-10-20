@@ -19978,12 +19978,8 @@ impl Editor {
             // text column: past the pane edge or onto the vertical scrollbar.
             // In cells, as the row was painted: wide characters before the
             // caret push it right by two each.
-            let visible_col: usize = self.lines[self.cursor_row]
-                .chars()
-                .skip(start)
-                .take(self.cursor_col - start)
-                .map(char_cells)
-                .sum();
+            let visible_col =
+                RowCells::of_line(&self.lines[self.cursor_row], start).text_before(self.cursor_col);
             let x = text_x as usize + visible_col;
             let right = (self.last_inner.x + self.last_inner.width)
                 .saturating_sub(u16::from(self.last_scrollbar.width > 0))
@@ -20144,13 +20140,26 @@ impl RowCells {
     /// Refill for a row painting `text` from buffer column `start` with
     /// `hints` spliced in, reusing the allocations.
     fn fill(&mut self, text: &str, start: usize, hints: impl IntoIterator<Item = (usize, usize)>) {
+        use unicode_segmentation::UnicodeSegmentation;
         self.start = start;
         self.before.clear();
         self.before.push(0);
         let mut cells = 0;
-        for c in text.chars() {
-            cells += char_cells(c);
+        // ratatui paints a grapheme cluster as one glyph sized by the whole
+        // cluster (`crate::cell_map`): `👍🏽` is two cells, not four, and `❤️`
+        // two, not one. The cluster's first character takes those cells and
+        // the rest none; a lone character keeps `char_cells`.
+        for cluster in text.graphemes(true) {
+            let mut chars = cluster.chars();
+            let first = chars.next().map_or(0, char_cells);
+            cells += match chars.clone().next() {
+                None => first,
+                Some(_) => unicode_width::UnicodeWidthStr::width(cluster),
+            };
             self.before.push(cells);
+            for _ in chars {
+                self.before.push(cells);
+            }
         }
         self.hints.clear();
         self.hints.extend(hints);
@@ -39907,6 +39916,33 @@ mod tests {
         assert_eq!(row.end(4), 8, "the newline cell follows the text");
         row.fill("\u{8cbb}b", 1, []);
         assert_eq!((row.cell(0), row.cell(2)), (0, 2), "scrolled to 費");
+    }
+
+    /// #873: a grapheme cluster is one glyph sized as a whole, as ratatui
+    /// paints it, so the row agrees with the painter's own `CellMap` after
+    /// an emoji with a skin tone, one with VS16, a ZWJ family and a
+    /// combining mark, not only after a lone wide character.
+    #[test]
+    fn row_cells_size_a_grapheme_cluster_as_ratatui_paints_it() {
+        let line = "a\u{8cbb} \u{1f44d}\u{1f3fd} \u{2764}\u{fe0f} \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} e\u{301} z";
+        let row = RowCells::of_line(line, 0);
+        let painted = crate::cell_map::CellMap::new(line);
+        for col in 0..=line.chars().count() {
+            assert_eq!(
+                row.text_before(col),
+                usize::from(painted.cell_of_char(col)),
+                "column {col}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_highlight_covers_its_glyphs_after_emoji_sequences() {
+        let mut e = editor_with("x = \"\u{1f44d}\u{1f3fd}\u{2764}\u{fe0f}\"  # food");
+        e.set_search_highlight(Some("food".into()));
+        let buf = guide_buf(&mut e, 60, 5);
+        let find_bg = Color::Rgb(0xff, 0xd7, 0x4a);
+        assert_eq!(glyphs_where(&e, &buf, |c| c.bg == find_bg), "food");
     }
 
     #[test]
