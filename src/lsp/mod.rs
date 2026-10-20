@@ -8,6 +8,7 @@ pub mod manager;
 pub mod manifest;
 pub mod registry;
 pub mod runtime;
+pub mod rust_analyzer;
 pub mod semantic_cache;
 pub mod trace;
 
