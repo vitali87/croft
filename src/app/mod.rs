@@ -1929,6 +1929,21 @@ fn list_user_processes() -> Vec<(i64, String)> {
     }
 }
 
+/// `${input:…}` questions waiting on the user (#1424): asked one at a
+/// time, then `then` runs with the answers.
+struct InputRun {
+    ask: Vec<crate::dap::configs::LaunchInput>,
+    answers: std::collections::BTreeMap<String, String>,
+    then: InputThen,
+}
+
+/// What an [`InputRun`] does once every question is answered (#1424).
+enum InputThen {
+    Launch(Box<crate::dap::configs::DebugConfig>),
+    Compound(Box<crate::dap::configs::Compound>),
+    Task(Box<crate::tasks::Task>),
+}
+
 /// A launch.json config launch parked behind its `preLaunchTask` (#250): the
 /// task runs in a terminal pane, and the FinishedCommand sweep decides.
 struct PendingDebugLaunch {
@@ -5200,6 +5215,8 @@ pub struct App {
     /// (non-zero) when the matching command completes. Replaced by a newer
     /// F5, so only one launch can be pending.
     pending_debug_launch: Option<PendingDebugLaunch>,
+    /// The `${input:…}` values a launch or task is asking for (#1424).
+    input_run: Option<InputRun>,
     /// F5's C/C++ build running off the UI thread (#1359): the source it
     /// debugs and where the build's result arrives. `poll_debug_build`
     /// launches lldb-dap on the program once it is built.
@@ -6865,6 +6882,7 @@ impl App {
             debug_post_tasks: Vec::new(),
             debug_compound: None,
             pending_debug_launch: None,
+            input_run: None,
             debug_build: None,
             pending_attach: None,
             pending_test_debug: None,
@@ -27287,6 +27305,7 @@ impl App {
                     let ctx = crate::dap::configs::SubstCtx {
                         workspace_folder: root.clone(),
                         file: self.editor.path.clone(),
+                        inputs: cfg.answers.clone(),
                         folders: self.workspace_folders(),
                     };
                     match crate::dap::configs::resolve(cfg, &ctx) {
@@ -34098,6 +34117,32 @@ impl App {
         // naming that name has to bind.
         let all = crate::dap::configs::discover_configs_all(&self.active_workspace_root());
         let folders = self.workspace_folders();
+        // Every `${input:…}` the members and the compound's task use is asked
+        // once, up front, and shared (#1424).
+        if let Ok(members) = crate::dap::configs::resolve_compound(compound, &all, &folders) {
+            let mut refs = Vec::new();
+            let mut defs = Vec::new();
+            for m in &members {
+                for r in m.input_refs() {
+                    if !refs.contains(&r) {
+                        refs.push(r);
+                    }
+                }
+                defs.extend(m.inputs.iter().cloned());
+            }
+            if let Some(label) = &compound.pre_launch_task {
+                self.task_inputs(label, &mut refs, &mut defs);
+            }
+            let then = InputThen::Compound(Box::new(compound.clone()));
+            match self.ask_inputs(&refs, &defs, &compound.answers, then) {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(e) => {
+                    self.debug_error(format!("compound \"{}\": {e}", compound.name));
+                    return;
+                }
+            }
+        }
         // #310 defers compounds that need SEVERAL sessions at
         // once. A compound naming ONE configuration needs one,
         // which croft has run since #250 — so the arity has to
@@ -34178,7 +34223,8 @@ impl App {
                 ));
             }
             Ok(members) if members.len() == 1 => {
-                let cfg = members[0].clone();
+                let mut cfg = members[0].clone();
+                cfg.answers.extend(compound.answers.clone());
                 // One member has no siblings to stop, so its `stopAll` is set
                 // false rather than inherited from whatever ran before.
                 self.debug_stop_all = false;
@@ -34200,6 +34246,15 @@ impl App {
                 // for and the order a client-then-server
                 // compound depends on.
                 let label = compound.name.clone();
+                // Each member carries the answers asked once for
+                // the whole compound (#1424).
+                let members: Vec<_> = members
+                    .into_iter()
+                    .map(|mut m| {
+                        m.answers.extend(compound.answers.clone());
+                        m
+                    })
+                    .collect();
                 match compound.pre_launch_task.clone() {
                     Some(task) => self.launch_after_compound_task_all(
                         &task,
@@ -34390,6 +34445,7 @@ impl App {
         let ctx = crate::dap::configs::SubstCtx {
             workspace_folder: root.clone(),
             file: self.editor.path.clone(),
+            inputs: cfg.answers.clone(),
             folders: self.workspace_folders(),
         };
         let mut rc = match crate::dap::configs::resolve(cfg, &ctx) {
@@ -34458,6 +34514,11 @@ impl App {
                 return;
             }
         };
+        let answers = members
+            .first()
+            .map(|m| m.answers.clone())
+            .unwrap_or_default();
+        let task = with_answers(task, &answers);
         let command = self
             .task_command_line(&task)
             .unwrap_or_else(|_| task.command.clone());
@@ -34679,6 +34740,133 @@ impl App {
         }
     }
 
+    /// The `${input:…}` ids the task labelled `label` uses, added to
+    /// `refs`, and its file's `inputs` to `defs` (#1424).
+    fn task_inputs(
+        &self,
+        label: &str,
+        refs: &mut Vec<String>,
+        defs: &mut Vec<crate::dap::configs::LaunchInput>,
+    ) {
+        let tasks = crate::tasks::discover_tasks(&self.active_workspace_root());
+        let Some(task) = tasks.into_iter().find(|t| t.label == label) else {
+            return;
+        };
+        for r in task.input_refs() {
+            if !refs.contains(&r) {
+                refs.push(r);
+            }
+        }
+        if let Some(v) = task.vscode {
+            defs.extend(v.inputs);
+        }
+    }
+
+    /// Whether every id in `refs` already has an answer. When some do not,
+    /// their questions are asked one at a time and `then` runs once the
+    /// last is answered (`Ok(false)`); Esc on any of them drops the run
+    /// with no error. An id no `inputs` entry declares is an error naming
+    /// it (#1424).
+    fn ask_inputs(
+        &mut self,
+        refs: &[String],
+        defs: &[crate::dap::configs::LaunchInput],
+        answers: &std::collections::BTreeMap<String, String>,
+        then: InputThen,
+    ) -> Result<bool, String> {
+        let ask = crate::dap::configs::inputs_to_ask(refs, answers, defs)?;
+        if ask.is_empty() {
+            return Ok(true);
+        }
+        self.input_run = Some(InputRun {
+            ask,
+            answers: answers.clone(),
+            then,
+        });
+        self.ask_next_input();
+        Ok(false)
+    }
+
+    /// Open the question for the next unanswered input, or run what the
+    /// answers were for once there are none left.
+    fn ask_next_input(&mut self) {
+        use crate::dap::configs::InputKind;
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let Some(run) = self.input_run.as_ref() else {
+            return;
+        };
+        let Some(input) = run.ask.first().cloned() else {
+            let Some(run) = self.input_run.take() else {
+                return;
+            };
+            match run.then {
+                InputThen::Launch(mut cfg) => {
+                    cfg.answers = run.answers;
+                    self.launch_debug_config(&cfg);
+                }
+                InputThen::Compound(mut compound) => {
+                    compound.answers = run.answers;
+                    self.launch_compound(&compound);
+                }
+                InputThen::Task(task) => {
+                    self.run_project_task(with_answers(*task, &run.answers));
+                }
+            }
+            return;
+        };
+        match input.kind {
+            InputKind::Prompt { password } => {
+                let mut prompt = InputPrompt::new(InputPurpose::LaunchInput, input.description, "")
+                    .allowing_blank();
+                if let Some(default) = input.default {
+                    prompt = prompt.with_value(default);
+                }
+                if password {
+                    prompt = prompt.masked();
+                }
+                self.open_input_prompt(prompt);
+            }
+            InputKind::Pick { options } => {
+                let selected = input
+                    .default
+                    .and_then(|d| options.iter().position(|(_, value)| *value == d))
+                    .unwrap_or(0);
+                let rows = options
+                    .into_iter()
+                    .map(|(label, value)| ListRow { id: value, label })
+                    .collect();
+                let mut picker = ListPicker::new(ListPurpose::LaunchInput, input.description, rows);
+                picker.selected = selected;
+                self.open_list_picker(picker, "");
+            }
+            InputKind::Command { command } => {
+                let task = matches!(run.then, InputThen::Task(_));
+                self.input_run = None;
+                let msg = format!(
+                    "${{input:{}}} runs the command \"{command}\", which croft cannot run",
+                    input.id
+                );
+                if task {
+                    self.status = msg;
+                } else {
+                    self.debug_error(msg);
+                }
+            }
+        }
+    }
+
+    /// The user answered the input being asked.
+    fn answer_input(&mut self, value: String) {
+        if let Some(run) = self.input_run.as_mut()
+            && !run.ask.is_empty()
+        {
+            let input = run.ask.remove(0);
+            run.answers.insert(input.id, value);
+        }
+        self.ask_next_input();
+    }
+
     /// Run a COMPOUND's own `preLaunchTask`, then launch its single member
     /// (#318).
     ///
@@ -34714,6 +34902,7 @@ impl App {
                 return;
             }
         };
+        let task = with_answers(task, &member.answers);
         let command = self
             .task_command_line(&task)
             .unwrap_or_else(|_| task.command.clone());
@@ -34733,6 +34922,22 @@ impl App {
     /// behind its `preLaunchTask`.
     fn launch_debug_config(&mut self, cfg: &crate::dap::configs::DebugConfig) {
         use crate::dap::configs;
+        // Asked before anything running is stopped, so Esc on a question
+        // leaves the current session alone (#1424).
+        let mut refs = cfg.input_refs();
+        let mut defs = cfg.inputs.clone();
+        if let Some(label) = cfg.pre_launch_task() {
+            self.task_inputs(label, &mut refs, &mut defs);
+        }
+        let then = InputThen::Launch(Box::new(cfg.clone()));
+        match self.ask_inputs(&refs, &defs, &cfg.answers, then) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => {
+                self.debug_error(format!("config \"{}\": {e}", cfg.name));
+                return;
+            }
+        }
         if !self.debug_sessions.is_empty() {
             self.debug_stop();
         }
@@ -34750,6 +34955,7 @@ impl App {
         let ctx = configs::SubstCtx {
             workspace_folder: root.clone(),
             file: self.editor.path.clone(),
+            inputs: cfg.answers.clone(),
             folders: self.workspace_folders(),
         };
         let mut rc = match configs::resolve(cfg, &ctx) {
@@ -34781,6 +34987,7 @@ impl App {
                     return;
                 }
             };
+            let task = with_answers(task, &cfg.answers);
             let command = self
                 .task_command_line_in(&task, root.clone())
                 .unwrap_or_else(|_| task.command.clone());
@@ -38424,6 +38631,15 @@ impl App {
                 self.close_input_prompt();
                 self.submit_debug_config_field(field, &value);
             }
+            InputPurpose::LaunchInput => {
+                // The typed text as is: a prompt's answer may mean its spaces.
+                let value = self
+                    .input_prompt
+                    .as_ref()
+                    .map_or(value, |p| p.value.clone());
+                self.close_input_prompt();
+                self.answer_input(value);
+            }
             InputPurpose::AddRemoteName => {
                 // First step: capture the name, then re-prompt for the URL.
                 self.close_input_prompt();
@@ -40918,6 +41134,9 @@ impl App {
                     "",
                 );
             }
+            ListPurpose::LaunchInput => {
+                self.answer_input(row.id.clone());
+            }
             ListPurpose::StepInTarget => {
                 if let Ok(target) = row.id.parse::<i64>() {
                     self.debug_step_into(Some(target));
@@ -41414,6 +41633,7 @@ impl App {
         task.command_line(&crate::dap::configs::SubstCtx {
             workspace_folder: root,
             file: self.editor.path.clone(),
+            inputs: Default::default(),
             folders: self.workspace_folders(),
         })
     }
@@ -41425,6 +41645,30 @@ impl App {
     /// correlate the task's FinishedCommand (the preLaunchTask gate, #250);
     /// `None` when no pane could be started (already reported in `status`).
     pub fn run_project_task(&mut self, task: crate::tasks::Task) -> Option<u64> {
+        // Its `${input:…}` values first (#1424); the task runs once they
+        // are answered.
+        let refs = task.input_refs();
+        if !refs.is_empty() {
+            let (defs, answers) = task
+                .vscode
+                .as_ref()
+                .map(|v| (v.inputs.clone(), v.answers.clone()))
+                .unwrap_or_default();
+            let label = task.label.clone();
+            match self.ask_inputs(
+                &refs,
+                &defs,
+                &answers,
+                InputThen::Task(Box::new(task.clone())),
+            ) {
+                Ok(true) => {}
+                Ok(false) => return None,
+                Err(e) => {
+                    self.status = format!("Task \u{201c}{label}\u{201d} not run: {e}");
+                    return None;
+                }
+            }
+        }
         let root = self.active_workspace_root();
         self.run_project_task_in(task, root)
     }
@@ -41547,7 +41791,14 @@ impl App {
     /// Tasks: Rerun Last Task.
     pub fn rerun_last_task(&mut self) {
         match self.last_task.clone() {
-            Some(task) => self.start_project_task(task),
+            Some(mut task) => {
+                // The last run's `${input:…}` answers are asked again rather
+                // than reused, as VS Code does (#1424).
+                if let Some(v) = task.vscode.as_mut() {
+                    v.answers.clear();
+                }
+                self.start_project_task(task)
+            }
             None => self.status = "No task has run yet".to_string(),
         }
     }
@@ -78732,6 +78983,18 @@ fn install_terminal_restore_panic_hook() {
             original(info);
         }));
     });
+}
+
+/// `task` with `answers` for its `${input:…}` variables (#1424).
+fn with_answers(
+    mut task: crate::tasks::Task,
+    answers: &std::collections::BTreeMap<String, String>,
+) -> crate::tasks::Task {
+    if let Some(v) = task.vscode.as_mut() {
+        v.answers
+            .extend(answers.iter().map(|(k, a)| (k.clone(), a.clone())));
+    }
+    task
 }
 
 /// ` (did you mean "npm run build"?)` for a task label that was not found

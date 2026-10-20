@@ -50,11 +50,149 @@ pub struct DebugConfig {
     /// sorts BOTH kinds in one list, so a config that asks for a group must
     /// be able to sort against a compound that asks for the same one.
     pub presentation: Option<Presentation>,
+    /// The file's `inputs` (#1424): what a `${input:id}` in this
+    /// configuration asks for.
+    pub inputs: Vec<LaunchInput>,
+    /// The answers given for this launch, by input id; filled in once the
+    /// user has answered every input the configuration uses.
+    pub answers: BTreeMap<String, String>,
     /// The workspace folder this configuration belongs to when it is not
     /// the active one: a compound member named with `"folder"` (#1425)
     /// resolves `${workspaceFolder}` against its own folder.
     pub root: Option<PathBuf>,
     raw: Map<String, Value>,
+}
+
+impl DebugConfig {
+    /// The `preLaunchTask` label, as written.
+    pub fn pre_launch_task(&self) -> Option<&str> {
+        self.raw.get("preLaunchTask").and_then(Value::as_str)
+    }
+
+    /// The distinct `${input:id}` ids this configuration uses, in the order
+    /// they first appear.
+    pub fn input_refs(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        value_input_refs(&Value::Object(self.raw.clone()), &mut out);
+        out
+    }
+}
+
+/// One entry of a launch.json or tasks.json `inputs` array (#1424).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchInput {
+    pub id: String,
+    pub description: String,
+    pub default: Option<String>,
+    pub kind: InputKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputKind {
+    /// `promptString`: a text field, masked for `"password": true`.
+    Prompt { password: bool },
+    /// `pickString`: one of `options`, as (label, value) pairs.
+    Pick { options: Vec<(String, String)> },
+    /// `command`: the value comes from running a command.
+    Command { command: String },
+}
+
+/// The `inputs` array of a launch.json or tasks.json body. Entries without
+/// an `id` or with a type croft does not know are skipped, as is a
+/// `pickString` with no options.
+pub fn parse_inputs(v: &Value) -> Vec<LaunchInput> {
+    let Some(list) = v.get("inputs").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|i| {
+            let id = i.get("id")?.as_str()?.to_string();
+            let text = |key: &str| i.get(key).and_then(Value::as_str).map(str::to_string);
+            let kind = match i.get("type")?.as_str()? {
+                "promptString" => InputKind::Prompt {
+                    password: i.get("password").and_then(Value::as_bool) == Some(true),
+                },
+                "pickString" => {
+                    let options: Vec<(String, String)> = i
+                        .get("options")?
+                        .as_array()?
+                        .iter()
+                        .filter_map(|o| match o {
+                            Value::String(s) => Some((s.clone(), s.clone())),
+                            Value::Object(o) => {
+                                let value = o.get("value")?.as_str()?.to_string();
+                                let label = o
+                                    .get("label")
+                                    .and_then(Value::as_str)
+                                    .map_or_else(|| value.clone(), str::to_string);
+                                Some((label, value))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    if options.is_empty() {
+                        return None;
+                    }
+                    InputKind::Pick { options }
+                }
+                "command" => InputKind::Command {
+                    command: text("command")?,
+                },
+                _ => return None,
+            };
+            Some(LaunchInput {
+                description: text("description").unwrap_or_else(|| id.clone()),
+                default: text("default"),
+                id,
+                kind,
+            })
+        })
+        .collect()
+}
+
+/// The inputs still to ask for: each id in `refs` with no answer yet, in
+/// order, looked up in `defs` (the first entry with that id wins). An id no
+/// entry declares is an error naming it.
+pub fn inputs_to_ask(
+    refs: &[String],
+    answers: &BTreeMap<String, String>,
+    defs: &[LaunchInput],
+) -> Result<Vec<LaunchInput>, String> {
+    refs.iter()
+        .filter(|id| !answers.contains_key(*id))
+        .map(|id| {
+            defs.iter()
+                .find(|d| d.id == *id)
+                .cloned()
+                .ok_or_else(|| format!("${{input:{id}}}: no \"inputs\" entry has the id \"{id}\""))
+        })
+        .collect()
+}
+
+/// Add the `${input:id}` ids in `text` to `out`, skipping ones already
+/// there.
+pub fn text_input_refs(text: &str, out: &mut Vec<String>) {
+    let mut rest = text;
+    while let Some(start) = rest.find("${input:") {
+        let after = &rest[start + "${input:".len()..];
+        let Some(end) = after.find('}') else {
+            return;
+        };
+        let id = after[..end].trim();
+        if !id.is_empty() && !out.iter().any(|o| o == id) {
+            out.push(id.to_string());
+        }
+        rest = &after[end + 1..];
+    }
+}
+
+fn value_input_refs(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) => text_input_refs(s, out),
+        Value::Array(a) => a.iter().for_each(|x| value_input_refs(x, out)),
+        Value::Object(o) => o.values().for_each(|x| value_input_refs(x, out)),
+        _ => {}
+    }
 }
 
 /// Compounds declared beside the configurations, in the same precedence order
@@ -128,6 +266,7 @@ pub fn parse_launch_json(text: &str, source: &'static str) -> Vec<DebugConfig> {
         (Value::Array(a), _) => a.clone(),
         _ => return Vec::new(),
     };
+    let inputs = parse_inputs(&v);
     list.into_iter()
         .filter_map(|c| {
             let obj = c.as_object()?;
@@ -144,6 +283,8 @@ pub fn parse_launch_json(text: &str, source: &'static str) -> Vec<DebugConfig> {
                 request,
                 source,
                 presentation: parse_presentation(obj),
+                inputs: inputs.clone(),
+                answers: BTreeMap::new(),
                 root: None,
                 raw: obj.clone(),
             })
@@ -395,6 +536,9 @@ pub struct Compound {
     /// `stopAll: true` (#567): one member ending stops the whole set. VS
     /// Code's default, `false`, lets the siblings keep running.
     pub stop_all: bool,
+    /// The answers given for this launch to its members' `${input:…}`
+    /// variables (#1424).
+    pub answers: BTreeMap<String, String>,
 }
 
 impl Compound {
@@ -544,6 +688,7 @@ pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
                 presentation,
                 unsupported_keys,
                 stop_all,
+                answers: BTreeMap::new(),
             })
         })
         .collect()
@@ -709,6 +854,8 @@ pub struct SubstCtx {
     pub workspace_folder: PathBuf,
     /// Active editor file; `None` makes `${file}`-family variables error.
     pub file: Option<PathBuf>,
+    /// The user's answers to `${input:id}` (#1424), by id.
+    pub inputs: BTreeMap<String, String>,
     /// The workspace's folders as `(name, root)`, for
     /// `${workspaceFolder:name}` (#1425).
     pub folders: Vec<(String, PathBuf)>,
@@ -772,6 +919,13 @@ fn expand_variable(var: &str, ctx: &SubstCtx) -> Result<String, String> {
         "cwd" => Ok(ctx.workspace_folder.to_string_lossy().into_owned()),
         "pathSeparator" => Ok(String::from(std::path::MAIN_SEPARATOR_STR)),
         _ => {
+            if let Some(id) = var.strip_prefix("input:") {
+                return ctx
+                    .inputs
+                    .get(id.trim())
+                    .cloned()
+                    .ok_or_else(|| format!("${{{var}}}: no answer for this input"));
+            }
             if let Some(name) = var.strip_prefix("env:") {
                 return std::env::var(name)
                     .map_err(|_| format!("${{env:{name}}}: environment variable not set"));
@@ -1954,6 +2108,7 @@ mod tests {
         SubstCtx {
             workspace_folder: PathBuf::from("/work/proj"),
             file: Some(PathBuf::from("/work/proj/src/main.py")),
+            inputs: Default::default(),
             folders: Vec::new(),
         }
     }
@@ -2210,6 +2365,7 @@ mod tests {
         let no_file = SubstCtx {
             workspace_folder: PathBuf::from("/w"),
             file: None,
+            inputs: Default::default(),
             folders: Vec::new(),
         };
         assert!(substitute("${fileBasename}", &no_file).is_err());
@@ -2281,6 +2437,7 @@ mod tests {
         let c = SubstCtx {
             workspace_folder: tmp.path().to_path_buf(),
             file: None,
+            inputs: Default::default(),
             folders: Vec::new(),
         };
         let rc = resolve(&cfg, &c).unwrap();
@@ -3605,6 +3762,7 @@ mod tests {
         let ctx = SubstCtx {
             workspace_folder: members[1].root.clone().unwrap(),
             file: None,
+            inputs: Default::default(),
             folders: folders.clone(),
         };
         let rc = resolve(&members[1], &ctx).unwrap();
@@ -3654,6 +3812,7 @@ mod tests {
         let ctx = SubstCtx {
             workspace_folder: tmp.path().join("api"),
             file: None,
+            inputs: Default::default(),
             folders,
         };
         assert_eq!(
@@ -3896,6 +4055,94 @@ mod tests {
             .map(|c| c.name)
             .collect();
         assert_eq!(names, ["First", "Web"], "and the file is whole: {before}");
+    }
+
+    /// #1424: `${input:id}` takes the answer for `id`, each id is listed
+    /// once in the order it first appears, and the file's `inputs` say how
+    /// to ask: `pickString` options (strings or label/value), defaults and
+    /// `password`.
+    #[test]
+    fn input_variables_take_the_answers() {
+        let text = r#"{ "configurations": [
+            { "name": "Run", "type": "python", "program": "app.py",
+              "args": ["--env", "${input:envName}", "--user", "${input:userName}"],
+              "env": { "ENV": "${input:envName}" } }
+        ],
+        "inputs": [
+            { "id": "envName", "type": "pickString", "description": "Environment",
+              "options": ["dev", { "label": "Staging", "value": "stg" }], "default": "dev" },
+            { "id": "userName", "type": "promptString", "default": "alice", "password": true },
+            { "id": "branch", "type": "command", "command": "git.branch" }
+        ]}"#;
+        let cfg = config(text);
+        assert_eq!(cfg.input_refs(), ["envName", "userName"]);
+        let ask = inputs_to_ask(&cfg.input_refs(), &BTreeMap::new(), &cfg.inputs).unwrap();
+        assert_eq!(ask.len(), 2);
+        assert_eq!(ask[0].description, "Environment");
+        assert_eq!(ask[0].default.as_deref(), Some("dev"));
+        assert_eq!(
+            ask[0].kind,
+            InputKind::Pick {
+                options: vec![
+                    (String::from("dev"), String::from("dev")),
+                    (String::from("Staging"), String::from("stg")),
+                ]
+            }
+        );
+        assert_eq!(ask[1].description, "userName", "no description: the id");
+        assert_eq!(ask[1].kind, InputKind::Prompt { password: true });
+        assert_eq!(
+            cfg.inputs[2].kind,
+            InputKind::Command {
+                command: String::from("git.branch")
+            }
+        );
+        let mut c = ctx();
+        c.inputs
+            .insert(String::from("envName"), String::from("stg"));
+        c.inputs
+            .insert(String::from("userName"), String::from("bob"));
+        let rc = resolve(&cfg, &c).unwrap();
+        assert_eq!(rc.args, ["--env", "stg", "--user", "bob"]);
+        assert_eq!(rc.env.get("ENV").map(String::as_str), Some("stg"));
+        let answered = BTreeMap::from([(String::from("envName"), String::from("x"))]);
+        let ask = inputs_to_ask(&cfg.input_refs(), &answered, &cfg.inputs).unwrap();
+        assert_eq!(ask.len(), 1, "an answered input is not asked again");
+        assert_eq!(ask[0].id, "userName");
+    }
+
+    /// #1424 negatives: an id no entry declares is an error naming it; an
+    /// unanswered input refuses the config rather than passing its text;
+    /// entries with no id, an unknown type or no options are not inputs;
+    /// `${input:}` text outside a variable is no reference.
+    #[test]
+    fn an_unknown_or_unanswered_input_is_refused() {
+        let text = r#"{ "configurations": [
+            { "name": "Run", "type": "python", "program": "app.py",
+              "args": ["${input:nope}", "$input:plain", "${inputs:x}"] }
+        ],
+        "inputs": [
+            { "type": "promptString" },
+            { "id": "odd", "type": "colorPicker" },
+            { "id": "empty", "type": "pickString", "options": [] },
+            { "id": "nope2", "type": "promptString" }
+        ]}"#;
+        let cfg = config(text);
+        assert!(
+            cfg.inputs.len() == 1 && cfg.inputs[0].id == "nope2",
+            "{:?}",
+            cfg.inputs
+        );
+        assert_eq!(cfg.input_refs(), ["nope"]);
+        let err = inputs_to_ask(&cfg.input_refs(), &BTreeMap::new(), &cfg.inputs).unwrap_err();
+        assert!(
+            err.contains("${input:nope}") && err.contains("\"nope\""),
+            "{err}"
+        );
+        let err = resolve(&cfg, &ctx()).unwrap_err();
+        assert!(err.contains("${input:nope}: no answer"), "{err}");
+        let none = config(r#"[{ "name": "Plain", "type": "python", "program": "a.py" }]"#);
+        assert!(none.input_refs().is_empty() && none.inputs.is_empty());
     }
 
     fn attach_address(cfg: &str) -> Option<(String, u16)> {
