@@ -4585,6 +4585,10 @@ impl PaneLink {
         let mut frames = FrameReader::new();
         let mut pending: Vec<u8> = Vec::new();
         let mut pid = None;
+        // A shell that exits while it attaches can have its exit arrive in
+        // the same read as the greeting (#912): kept, not dropped with the
+        // frames the greeting has no use for.
+        let mut greeting_exit = None;
         let mut buf = [0u8; 65536];
         while pid.is_none() {
             let n = rd
@@ -4595,16 +4599,18 @@ impl PaneLink {
                 match frame {
                     Frame::Control(Control::PaneInfo { pid: p }) => pid = Some(p),
                     Frame::Bytes(b) => pending.extend_from_slice(&b),
+                    Frame::Control(Control::Exit { code }) => greeting_exit = Some(code),
                     _ => {}
                 }
             }
         }
         rd.set_read_timeout(None)?;
         let (pipe_r, mut pipe_w) = std::io::pipe().context("pane host pipe")?;
-        let exit = Arc::new(std::sync::Mutex::new(None));
+        let exited = greeting_exit.is_some();
+        let exit = Arc::new(std::sync::Mutex::new(greeting_exit));
         let exit_for_demux = exit.clone();
         std::thread::spawn(move || {
-            if pipe_w.write_all(&pending).is_err() {
+            if pipe_w.write_all(&pending).is_err() || exited {
                 return;
             }
             let mut buf = [0u8; 65536];
@@ -7016,6 +7022,33 @@ mod tests {
             r < 0,
             "the shell was left as an unreaped zombie (waitpid still found it: r={r})"
         );
+    }
+
+    /// #912: a hosted shell that exits while croft attaches can have its
+    /// exit arrive in the same read as the greeting. Its code is kept, and
+    /// the output before it still reaches the pane.
+    #[test]
+    fn an_exit_in_the_pane_hosts_greeting_keeps_its_code() {
+        use crate::session_host::{Control, encode_bytes_frame, encode_control_frame};
+        use std::io::{Read, Write};
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("pane.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let host = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut hello = [0u8; 512];
+            let _ = conn.read(&mut hello);
+            let mut greeting = encode_control_frame(&Control::PaneInfo { pid: 4242 });
+            greeting.extend(encode_bytes_frame(b"bye\r\n"));
+            greeting.extend(encode_control_frame(&Control::Exit { code: 7 }));
+            conn.write_all(&greeting).unwrap();
+        });
+        let mut link = PaneLink::attach(&socket, 80, 24).unwrap();
+        host.join().unwrap();
+        let mut out = Vec::new();
+        link.reader.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"bye\r\n");
+        assert_eq!(link.backend.try_exit(true), Some(Some(7)));
     }
 
     /// #912: a shell that exits while its pane lives is reaped then, not

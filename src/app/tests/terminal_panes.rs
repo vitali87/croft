@@ -357,6 +357,34 @@ fn the_last_pane_whose_shell_exits_waits_for_a_key_to_start_a_new_shell() {
     assert_eq!(app.status, "Started a new shell");
 }
 
+/// #912: a paste is input like a key, so into the last pane after its shell
+/// exited it starts a new shell, as a typed key does, instead of going to
+/// the shell that is gone.
+#[test]
+fn a_paste_into_the_last_exited_pane_starts_a_new_shell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let dead = app.terminals[0].uid();
+    app.terminals[0].write_input(b"exit\n");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(1500),
+        "the last pane's shell to exit",
+        || {
+            app.drain_terminal_bells();
+            app.terminals[0].has_exited()
+        },
+    );
+    app.focus_pane(Pane::Terminal);
+    app.paste_terminal_input(b"ls\n");
+    assert_eq!(app.terminals.len(), 1);
+    assert_ne!(app.terminals[0].uid(), dead, "a new shell's pane");
+    assert!(
+        app.pending_terminal_paste.is_none(),
+        "no paste prompt for a dead shell"
+    );
+    assert_eq!(app.status, "Started a new shell");
+}
+
 #[test]
 fn cycle_terminal_wraps_around() {
     let tmp = tempfile::tempdir().unwrap();

@@ -19165,6 +19165,17 @@ impl App {
     ///
     /// A multi-line paste a pane would run line by line asks first (#1274).
     fn paste_terminal_input(&mut self, payload: &[u8]) {
+        // A paste is input, so on a pane whose shell exited it does what a
+        // typed key does (#912): close the pane, or start a new shell in the
+        // last one, instead of going to a shell that is gone.
+        if self
+            .terminals
+            .get(self.active_terminal)
+            .is_some_and(|t| t.has_exited())
+        {
+            self.dismiss_exited_terminal();
+            return;
+        }
         // A paste while the popup asks about another would replace the
         // held bytes, or (one line) slip into the shell behind the popup.
         if self.pending_terminal_paste.is_some() {
