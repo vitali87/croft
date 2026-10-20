@@ -1,1 +1,0 @@
-feature: Right-clicking a commit in the Source Control COMMITS graph opens its actions: Cherry-Pick, Revert, Checkout (Detached), Create Branch Here, Create Tag Here, Reset Current Branch to Here (Soft, Mixed or Hard, which asks first), Copy Commit Hash and Copy Commit Message.
