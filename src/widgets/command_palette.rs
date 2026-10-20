@@ -2513,6 +2513,10 @@ const HINTS_WITHOUT_A_CTRL_FORM: &[(&str, &str)] = &[
     ("Cmd+A", "Super+A"),
     ("Cmd+E", "Super+E"),
     ("Cmd+F12", "Super+F12"),
+    // A legacy terminal sends `Ctrl+\` as `Ctrl+4`; the leader's second key
+    // works without a modifier.
+    ("Cmd+K Cmd+\\", "Ctrl+K \\"),
+    ("Cmd+K Cmd+Shift+\\", "Ctrl+K Shift+\\"),
 ];
 
 /// `hint` spelled for the platform croft runs on: [`hint_for_platform`].
@@ -2538,6 +2542,34 @@ pub fn hint_for_platform(hint: &str, macos: bool) -> std::borrow::Cow<'_, str> {
         return Cow::Borrowed(there);
     }
     Cow::Owned(hint.replace("Cmd", "Ctrl").replace("Opt", "Alt"))
+}
+
+/// A shortcut written in the Mac's menu glyphs (`⌥⌘R`, `⌘K ⇧P`, as the
+/// context menus show them) as a Mac (`macos`) or anything else spells it
+/// (#885). Elsewhere each step is first written in the palette's names
+/// (`Cmd+Opt+R`) and then spelled by [`hint_for_platform`], so a menu and
+/// the palette agree on `Ctrl`, `Alt` and `Super` (`Ctrl+Alt+R`, `Super+\`).
+/// `⌫` reads `Delete`, as the key is named there.
+pub fn glyph_hint_for_platform(glyphs: &str, macos: bool) -> std::borrow::Cow<'_, str> {
+    if macos {
+        return std::borrow::Cow::Borrowed(glyphs);
+    }
+    let names = glyphs
+        .split(' ')
+        .map(|step| {
+            let key = step.trim_start_matches(['⌃', '⌘', '⌥', '⇧']);
+            let held = &step[..step.len() - key.len()];
+            let mut words: Vec<&str> = [('⌃', "Ctrl"), ('⌘', "Cmd"), ('⌥', "Opt"), ('⇧', "Shift")]
+                .into_iter()
+                .filter(|(glyph, _)| held.contains(*glyph))
+                .map(|(_, word)| word)
+                .collect();
+            words.push(if key == "⌫" { "Delete" } else { key });
+            words.join("+")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    std::borrow::Cow::Owned(hint_for_platform(&names, false).into_owned())
 }
 
 /// A palette command contributed by an MCP sidecar extension. Carries its own
@@ -3377,6 +3409,46 @@ mod tests {
             ("Cmd+F12", "Super+F12"),
         ] {
             assert_eq!(hint_for_platform(mac, false), linux);
+        }
+    }
+
+    /// #885: a menu's glyph chord reads the palette's names off macOS, by
+    /// the same `Ctrl` / `Super` rules, and stays as drawn on a Mac.
+    #[test]
+    fn a_glyph_chord_reads_as_the_palette_names_it_off_macos() {
+        for (mac, linux) in [
+            ("⌘B", "Ctrl+B"),
+            ("⌥⌘M", "Ctrl+Alt+M"),
+            ("⌥⇧⌘C", "Ctrl+Alt+Shift+C"),
+            ("⌘⇧N", "Ctrl+Shift+N"),
+            ("⇧⌥F9", "Alt+Shift+F9"),
+            ("⌃⇧Space", "Ctrl+Shift+Space"),
+            ("⌘K Z", "Ctrl+K Z"),
+            ("⌘K ⇧P", "Ctrl+K Shift+P"),
+            ("⌘K ⌘T", "Ctrl+K Ctrl+T"),
+            ("⌘\\", "Super+\\"),
+            ("⌥⌘\u{2190}", "Super+Alt+\u{2190}"),
+            ("⌘T", "Ctrl+Shift+T"),
+            ("⌘F12", "Super+F12"),
+            ("⌘K ⌘\\", "Ctrl+K \\"),
+            ("⌘K ⇧⌘\\", "Ctrl+K Shift+\\"),
+            ("⌫", "Delete"),
+            ("F2", "F2"),
+            ("Enter", "Enter"),
+        ] {
+            assert_eq!(glyph_hint_for_platform(mac, false), linux);
+            assert_eq!(glyph_hint_for_platform(mac, true), mac);
+        }
+    }
+
+    /// #885: off macOS no palette or Keyboard Shortcuts row names a Mac key.
+    #[test]
+    fn off_macos_no_palette_hint_names_a_mac_key() {
+        for cmd in ALL_COMMANDS {
+            let hint = hint_for_platform(cmd.keybinding_hint(), false);
+            for mac in ["Cmd", "Opt", "⌘", "⌥"] {
+                assert!(!hint.contains(mac), "{cmd:?} reads {hint:?}");
+            }
         }
     }
 }
