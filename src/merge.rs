@@ -138,6 +138,172 @@ pub fn resolution_lines(lines: &[String], block: &ConflictBlock, res: Resolution
     }
 }
 
+/// Each conflict in `merged`, a `git merge-file --diff3` result, as its
+/// (ours, theirs) sections: diff3 output never trims the lines both
+/// sides share off a conflict's ends, so these are the sides whole.
+pub fn whole_sides(merged: &[String]) -> Vec<(Vec<String>, Vec<String>)> {
+    find_conflicts(merged)
+        .iter()
+        .map(|b| {
+            (
+                resolution_lines(merged, b, Resolution::Current),
+                resolution_lines(merged, b, Resolution::Incoming),
+            )
+        })
+        .collect()
+}
+
+/// Accept Both for `block` with what git trimmed put back. Git's default
+/// conflict style moves the lines both sides share at a conflict's ends
+/// out of the markers and writes them once: two functions added at the
+/// same spot lose their common closing `}` and blank line to below
+/// `>>>>>>>`, so joining the sections as written leaves the first function
+/// unclosed. Lines the sides share in the middle can split one conflict
+/// into several blocks the same way. `whole` holds every conflict with
+/// both sides whole (see `whole_sides`); the one this block was cut from
+/// is found by walking out from the block over the lines and neighbouring
+/// blocks that read as that conflict's sides. Returns the buffer rows the
+/// conflict spans, now to hold both whole sides; None when no single
+/// conflict fits, and the caller joins the sections as written.
+pub fn untrimmed_both(
+    lines: &[String],
+    block: &ConflictBlock,
+    whole: &[(Vec<String>, Vec<String>)],
+) -> Option<(std::ops::Range<usize>, Vec<String>)> {
+    let blocks = find_conflicts(lines);
+    let idx = blocks.iter().position(|b| b == block)?;
+    // Walk on a side the block has text for; the other side checks.
+    let side = [Resolution::Current, Resolution::Incoming]
+        .into_iter()
+        .find(|&s| !resolution_lines(lines, block, s).is_empty())?;
+    let own = resolution_lines(lines, block, side);
+    let mut found: Option<(std::ops::Range<usize>, Vec<String>)> = None;
+    for (ours, theirs) in whole {
+        let text = if side == Resolution::Current {
+            ours
+        } else {
+            theirs
+        };
+        if text.len() < own.len() {
+            continue;
+        }
+        for at in (0..=text.len() - own.len()).filter(|&at| text[at..at + own.len()] == own) {
+            let starts = walk_out(lines, &blocks, idx, side, &text[..at], true);
+            let ends = walk_out(lines, &blocks, idx, side, &text[at + own.len()..], false);
+            for (&start, &end) in starts.iter().flat_map(|s| ends.iter().map(move |e| (s, e))) {
+                if span_side(lines, &blocks, start..end, Resolution::Current) != *ours
+                    || span_side(lines, &blocks, start..end, Resolution::Incoming) != *theirs
+                {
+                    continue;
+                }
+                let both: Vec<String> = ours.iter().chain(theirs).cloned().collect();
+                match &found {
+                    None => found = Some((start..end, both)),
+                    Some((r, b)) if *r == (start..end) && *b == both => {}
+                    Some(_) => return None,
+                }
+            }
+        }
+    }
+    found
+}
+
+/// From `blocks[idx]`, walk up (`up`) or down over lines and whole blocks
+/// whose `side` reads as `want`, and return the rows where the walk can
+/// stop: right after `want` is used up, and past each block with nothing
+/// on `side` that sits next in line.
+fn walk_out(
+    lines: &[String],
+    blocks: &[ConflictBlock],
+    idx: usize,
+    side: Resolution,
+    want: &[String],
+    up: bool,
+) -> Vec<usize> {
+    let mut row = if up {
+        blocks[idx].ours_start
+    } else {
+        blocks[idx].theirs_end + 1
+    };
+    let mut left = want.len();
+    // The block walked over next, if it touches `row`.
+    let next = |row: usize| -> Option<&ConflictBlock> {
+        if up {
+            blocks[..idx].iter().rev().find(|b| b.theirs_end + 1 == row)
+        } else {
+            blocks[idx + 1..].iter().find(|b| b.ours_start == row)
+        }
+    };
+    let mut stops = Vec::new();
+    loop {
+        if let Some(b) = next(row) {
+            let sec = resolution_lines(lines, b, side);
+            if left == 0 && !sec.is_empty() {
+                break;
+            }
+            if sec.len() > left {
+                return stops;
+            }
+            let fits = if up {
+                want[left - sec.len()..left] == *sec
+            } else {
+                let done = want.len() - left;
+                want[done..done + sec.len()] == *sec
+            };
+            if !fits {
+                return stops;
+            }
+            if left == 0 {
+                stops.push(row);
+            }
+            left -= sec.len();
+            row = if up { b.ours_start } else { b.theirs_end + 1 };
+            continue;
+        }
+        if left == 0 {
+            break;
+        }
+        let line = if up {
+            row.checked_sub(1).map(|r| (r, &want[left - 1]))
+        } else {
+            (row < lines.len()).then(|| (row, &want[want.len() - left]))
+        };
+        match line {
+            Some((r, w)) if lines[r] == *w => {
+                left -= 1;
+                row = if up { r } else { r + 1 };
+            }
+            _ => return stops,
+        }
+    }
+    stops.push(row);
+    stops
+}
+
+/// `side` of `lines[span]`, with each block inside reading as its section.
+fn span_side(
+    lines: &[String],
+    blocks: &[ConflictBlock],
+    span: std::ops::Range<usize>,
+    side: Resolution,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut row = span.start;
+    while row < span.end {
+        match blocks.iter().find(|b| b.ours_start == row) {
+            Some(b) => {
+                out.extend(resolution_lines(lines, b, side));
+                row = b.theirs_end + 1;
+            }
+            None => {
+                out.push(lines[row].clone());
+                row += 1;
+            }
+        }
+    }
+    out
+}
+
 /// The next conflict strictly after `from_row`, wrapping to the first —
 /// `(index into blocks, header row)`. F7's jump order, VS Code's "Go to
 /// Next Conflict".
@@ -308,6 +474,128 @@ mod tests {
             resolution_lines(&buf, &block, Resolution::Both),
             lines(&["ours", "theirs"])
         );
+    }
+
+    /// Accept Both on the block holding `row`, the way the app applies it:
+    /// both whole sides over the span `untrimmed_both` finds.
+    fn untrimmed_accept(buf: &[String], row: usize, diff3: &[String]) -> Option<Vec<String>> {
+        let block = conflict_containing(&find_conflicts(buf), row)?;
+        let (span, both) = untrimmed_both(buf, &block, &whole_sides(diff3))?;
+        let mut out = buf.to_vec();
+        out.splice(span, both);
+        Some(out)
+    }
+
+    #[test]
+    fn accept_both_puts_back_the_closing_brace_git_trimmed() {
+        // Both sides added a function at the same spot. Git's default style
+        // wrote their shared `}` and blank line once, below the footer.
+        let buf = lines(&[
+            "fn a() {}",
+            "",
+            "<<<<<<< HEAD",
+            "fn from_main() {",
+            "    m();",
+            "=======",
+            "fn from_branch() {",
+            "    b();",
+            ">>>>>>> branch",
+            "}",
+            "",
+            "fn tail() {}",
+        ]);
+        let diff3 = lines(&[
+            "<<<<<<< ours",
+            "fn from_main() {",
+            "    m();",
+            "}",
+            "",
+            "||||||| base",
+            "=======",
+            "fn from_branch() {",
+            "    b();",
+            "}",
+            "",
+            ">>>>>>> theirs",
+        ]);
+        assert_eq!(
+            resolution_lines(&buf, &find_conflicts(&buf)[0], Resolution::Both).len(),
+            4,
+            "joined as written, from_main is left without its `}}`"
+        );
+        assert_eq!(
+            untrimmed_accept(&buf, 4, &diff3),
+            Some(lines(&[
+                "fn a() {}",
+                "",
+                "fn from_main() {",
+                "    m();",
+                "}",
+                "",
+                "fn from_branch() {",
+                "    b();",
+                "}",
+                "",
+                "fn tail() {}",
+            ]))
+        );
+    }
+
+    #[test]
+    fn accept_both_takes_a_conflict_git_split_in_two_whole() {
+        // Four shared lines in the middle split one conflict into two
+        // blocks; Accept Both on either keeps each side in one piece.
+        let shared = [
+            "    let tmp = dir();",
+            "    let app = open(&tmp);",
+            "    app.run();",
+            "    app.wait();",
+        ];
+        let mut buf = lines(&[
+            "<<<<<<< HEAD",
+            "fn one() {",
+            "=======",
+            "fn two() {",
+            ">>>>>>> b",
+        ]);
+        buf.extend(lines(&shared));
+        buf.extend(lines(&[
+            "<<<<<<< HEAD",
+            "    check_one();",
+            "=======",
+            "    check_two();",
+            ">>>>>>> b",
+            "}",
+        ]));
+        let side = |head: &str, check: &str| {
+            let mut s = lines(&[head]);
+            s.extend(lines(&shared));
+            s.extend(lines(&[check, "}"]));
+            s
+        };
+        let mut diff3 = lines(&["<<<<<<< ours"]);
+        diff3.extend(side("fn one() {", "    check_one();"));
+        diff3.extend(lines(&["||||||| base", "======="]));
+        diff3.extend(side("fn two() {", "    check_two();"));
+        diff3.push(String::from(">>>>>>> theirs"));
+        let mut want = side("fn one() {", "    check_one();");
+        want.extend(side("fn two() {", "    check_two();"));
+        assert_eq!(untrimmed_accept(&buf, 1, &diff3), Some(want.clone()));
+        assert_eq!(untrimmed_accept(&buf, 11, &diff3), Some(want));
+    }
+
+    #[test]
+    fn accept_both_with_no_conflict_to_match_is_left_to_the_caller() {
+        let buf = conflicted();
+        let other = lines(&[
+            "<<<<<<< ours",
+            "elsewhere();",
+            "=======",
+            "unrelated();",
+            ">>>>>>> theirs",
+        ]);
+        assert_eq!(untrimmed_accept(&buf, 2, &other), None);
+        assert_eq!(untrimmed_accept(&buf, 2, &[]), None);
     }
 }
 

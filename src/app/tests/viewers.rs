@@ -725,16 +725,6 @@ fn a_cell_edit_cancelled_with_esc_is_not_saved() {
     );
 }
 
-fn xlsx_value(p: &std::path::Path, col: u32, row: u32) -> String {
-    let book = umya_spreadsheet::reader::xlsx::read(p).unwrap();
-    book.sheet(0)
-        .unwrap()
-        .cell((col, row))
-        .unwrap()
-        .value()
-        .to_string()
-}
-
 /// #1141: an xlsx cell committed by clicking another cell is saved.
 #[test]
 fn an_xlsx_cell_committed_by_a_click_is_saved() {
@@ -874,6 +864,82 @@ fn hex_typing_edits_bytes_and_cmd_s_writes_them_in_place() {
         "status reports the write: {}",
         app.status
     );
+}
+
+/// The firmware image from #1644: the text "1234" at 0x115 and 0x137, and
+/// the bytes 12 34 at 0x11A.
+fn app_with_firmware_in_hex(tmp: &std::path::Path) -> App {
+    let f = tmp.join("fw.bin");
+    // 256 bytes of non-ASCII lead-in, so no digits come before the text.
+    let mut bytes: Vec<u8> = (0x80..=0xff).chain(0x80..=0xff).collect();
+    bytes.extend_from_slice(b"version 2024.1 build 1234\x00\x12\x34");
+    bytes.extend_from_slice(&[0; 20]);
+    bytes.extend_from_slice(b"serial 1234\x00");
+    std::fs::write(&f, bytes).unwrap();
+    let mut app = App::new(tmp.to_path_buf()).unwrap();
+    app.editor.open_hex(&f).unwrap();
+    app
+}
+
+fn hex_find(app: &mut App, query: &str) {
+    app.open_hex_find_prompt();
+    app.input_prompt.as_mut().unwrap().value = query.to_string();
+    app.submit_input_prompt();
+}
+
+/// #1644: `"1234"` in quotes finds the text, then the next one on F3, and
+/// the status line says it searched for text.
+#[test]
+fn hex_find_of_quoted_digits_finds_the_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_firmware_in_hex(tmp.path());
+    hex_find(&mut app, "\"1234\"");
+    assert_eq!(app.editor.hex.as_ref().unwrap().cursor, 0x115);
+    assert_eq!(app.status, "Found text \"1234\" at 0x115");
+    app.hex_find_next();
+    assert_eq!(app.editor.hex.as_ref().unwrap().cursor, 0x137);
+}
+
+/// #1644: from the text column (Tab), a hex-shaped query is text, and the
+/// prompt's title says so.
+#[test]
+fn hex_find_from_the_text_column_reads_digits_as_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_firmware_in_hex(tmp.path());
+    app.editor.hex.as_mut().unwrap().ascii_focus = true;
+    app.open_hex_find_prompt();
+    assert_eq!(
+        app.input_prompt.as_ref().unwrap().title,
+        "Find in Hex (text)"
+    );
+    app.input_prompt.as_mut().unwrap().value = String::from("2024");
+    app.submit_input_prompt();
+    assert_eq!(app.editor.hex.as_ref().unwrap().cursor, 0x108);
+    assert_eq!(app.status, "Found text \"2024\" at 0x108");
+}
+
+/// Negative (#1644): in the hex grid a hex-shaped query is still bytes,
+/// now named in the status line, and a query that is not hex-shaped is
+/// found the same from either column.
+#[test]
+fn hex_find_in_the_grid_still_reads_hex_pairs_as_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_firmware_in_hex(tmp.path());
+    hex_find(&mut app, "12 34");
+    assert_eq!(app.editor.hex.as_ref().unwrap().cursor, 0x11A);
+    assert_eq!(app.status, "Found bytes 12 34 at 0x11A");
+    for text_side in [false, true] {
+        let mut app = app_with_firmware_in_hex(tmp.path());
+        app.editor.hex.as_mut().unwrap().ascii_focus = text_side;
+        hex_find(&mut app, "serial");
+        assert_eq!(
+            app.editor.hex.as_ref().unwrap().cursor,
+            0x130,
+            "{text_side}"
+        );
+    }
+    hex_find(&mut app, "\"no such text\"");
+    assert_eq!(app.status, "Not found: text \"no such text\"");
 }
 
 /// #1438: a spreadsheet cell still being typed into is an unsaved edit:

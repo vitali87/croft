@@ -436,6 +436,16 @@ fn sheet_cell_on_screen(app: &App, row: usize, col: usize) -> (u16, u16) {
         .expect("the cell is on screen")
 }
 
+fn xlsx_value(p: &std::path::Path, col: u32, row: u32) -> String {
+    let book = umya_spreadsheet::reader::xlsx::read(p).unwrap();
+    book.sheet(0)
+        .unwrap()
+        .cell((col, row))
+        .unwrap()
+        .value()
+        .to_string()
+}
+
 /// Type `text` into the focused editor, which leaves its buffer dirty.
 fn type_into_editor(app: &mut App, text: &str) {
     for c in text.chars() {
@@ -1866,6 +1876,33 @@ fn init_lane_repo(dir: &std::path::Path) {
     git(&["commit", "-q", "-m", "init"]);
 }
 
+/// Queue an agent's `Edit` of `file` (`old` -> `new`) through the hook
+/// socket, as Claude Code's hook would; the returned stream is the hook's
+/// end, kept open for the answer.
+fn queue_edit_proposal(
+    app: &mut App,
+    dir: &Path,
+    file: &Path,
+    old: &str,
+    new: &str,
+) -> std::os::unix::net::UnixStream {
+    use std::io::Write;
+    let sock = dir.join("hook.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    app.hook_listener = Some(listener);
+    let mut hook = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    let req = crate::agent_hook::EditRequest {
+        agent: "claude-code".into(),
+        tool: "Edit".into(),
+        input: serde_json::json!({"file_path": file, "old_string": old, "new_string": new}),
+        cwd: dir.into(),
+    };
+    writeln!(hook, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+    assert!(app.drain_hook_requests());
+    hook
+}
+
 /// Stand up a `croft view` listener on `app` without touching process env.
 ///
 /// The real `bind_view_socket` also exports `CROFT_VIEW_SOCK`, which is
@@ -2175,6 +2212,7 @@ fn long_task(label: &str) -> crate::tasks::Task {
         is_build: false,
         is_default: false,
         problem_matcher: None,
+        is_background: false,
         vscode: None,
     }
 }

@@ -628,6 +628,7 @@ fn push_variable_rows(
                 name: v.name.clone(),
                 value: v.value.clone(),
                 type_name: v.type_name.clone(),
+                evaluate_name: v.evaluate_name.clone(),
             },
         });
         if is_open && let Some(children) = session.variables.get(&v.variables_ref) {
@@ -964,14 +965,15 @@ impl BottomPanelTab {
         BottomPanelTab::Captures,
     ];
 
-    /// The tab's strip label, padded to its click target.
+    /// The tab's strip label in English, the catalog key it is drawn
+    /// through (#1583).
     fn label(self) -> &'static str {
         match self {
-            BottomPanelTab::Problems => " PROBLEMS ",
-            BottomPanelTab::Output => " OUTPUT ",
-            BottomPanelTab::Terminal => " TERMINAL ",
-            BottomPanelTab::Ports => " PORTS ",
-            BottomPanelTab::Captures => " CAPTURES ",
+            BottomPanelTab::Problems => "PROBLEMS",
+            BottomPanelTab::Output => "OUTPUT",
+            BottomPanelTab::Terminal => "TERMINAL",
+            BottomPanelTab::Ports => "PORTS",
+            BottomPanelTab::Captures => "CAPTURES",
         }
     }
 
@@ -1066,8 +1068,9 @@ struct PendingRunBlock {
     pane_name: String,
     cwd: PathBuf,
     command: String,
-    /// The block as written, shown whole in the popup (the fence was
-    /// refused if it carried control characters, so it renders as typed).
+    /// What the block runs, shown whole in the popup: the block as written,
+    /// or a transcript's commands without their prompts (#1473). The fence
+    /// was refused if it carried control characters, so it renders as typed.
     code: String,
     /// Turns the popup red: the block looks destructive or said `{confirm}`.
     destructive: bool,
@@ -1429,6 +1432,22 @@ enum MenuAction {
     /// CAPTURES row: ask the navigator about the selected captured line,
     /// with the pane rows around it (#372).
     AskNavigatorAboutCapture,
+    /// VARIABLES or WATCH row: copy its value (#1546). With `expression`
+    /// and an adapter that offers it, the full value comes from an
+    /// `evaluate` in the `clipboard` context, which is not cut as the
+    /// row's `value` may be; otherwise `value` itself is copied.
+    CopyDebugValue {
+        expression: Option<String>,
+        value: String,
+    },
+    /// VARIABLES row: copy its `evaluateName`; WATCH row: its expression.
+    CopyDebugExpression(String),
+    /// VARIABLES row: watch its `evaluateName`.
+    AddDebugWatch(String),
+    /// WATCH row: stop watching expression `index`.
+    RemoveDebugWatch(usize),
+    /// CALL STACK row: copy the whole stack, a frame a line.
+    CopyCallStack,
     /// PROBLEMS row: have the navigator fix this diagnostic as a streamed,
     /// cancellable edit (#374).
     FixProblemWithNavigator {
@@ -1616,6 +1635,11 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::AskNavigatorSelection { .. } => Some("⌘K Q"),
         MenuAction::AskNavigatorAboutCapture => Some("n"),
         MenuAction::FixProblemWithNavigator { .. } => None,
+        MenuAction::CopyDebugValue { .. }
+        | MenuAction::CopyDebugExpression(_)
+        | MenuAction::AddDebugWatch(_)
+        | MenuAction::RemoveDebugWatch(_)
+        | MenuAction::CopyCallStack => None,
         MenuAction::OpenSymbolTab { .. } => Some("⌘K ⇧V"),
         MenuAction::GoToOutlineSymbol { .. } => Some("Enter"),
         MenuAction::ShowCallsAt { incoming: true, .. } => Some("⌘K H"),
@@ -1917,6 +1941,40 @@ struct PendingDebugLaunch {
     step: PendingLaunchStep,
     /// When the task was written, for the no-command-mark fallback below.
     started: std::time::Instant,
+    /// A background task (#1541): settled by the end of its first build
+    /// cycle, which its watch matcher reports, since it never exits.
+    watch: bool,
+}
+
+/// How a launch waits on its `preLaunchTask` (#1541), as VS Code does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreLaunchWait {
+    /// An ordinary task: until it exits, and only exit 0 launches.
+    Exit,
+    /// A background task with a watch matcher: until its first build
+    /// cycle ends, and only a cycle with no errors launches.
+    FirstBuild,
+    /// A background task with no matcher to say when a build ends: it is
+    /// never going to exit, so the launch goes ahead at once.
+    Untracked,
+}
+
+impl PreLaunchWait {
+    fn of(task: &crate::tasks::Task) -> Self {
+        if !task.is_background {
+            return Self::Exit;
+        }
+        let watches = task
+            .problem_matcher
+            .as_ref()
+            .and_then(crate::problem_matchers::from_tasks_json)
+            .is_some_and(|m| m.background.is_some());
+        if watches {
+            Self::FirstBuild
+        } else {
+            Self::Untracked
+        }
+    }
 }
 
 /// Whether a finished pane command settles the pending preLaunchTask: same
@@ -3061,7 +3119,9 @@ type PendingCargoLaunch = (
 enum LastTestRun {
     All,
     One(String),
-    Filter(String),
+    /// A filter run and the file it came from, which picks the runner
+    /// (#1408).
+    Filter(String, Option<PathBuf>),
     Suite(String),
     Many(Vec<String>),
 }
@@ -3271,6 +3331,9 @@ pub struct App {
     /// The project's `files_exclude` globs (#1345), as last applied to the
     /// Explorer, so a settings reload re-lists the tree only on a change.
     files_exclude: Vec<String>,
+    /// The `files_encoding` default (#1432) as last applied, for a folder
+    /// added to the workspace later.
+    files_encoding: Option<crate::file_encoding::Charset>,
     /// Tailspin highlighting in rendered log views (#466): the inverse of
     /// the `disable_log_highlight` preference. Pushed into `log_view`'s
     /// default for views opened later and into every open view on toggle.
@@ -3356,6 +3419,9 @@ pub struct App {
     /// Whitespace rendering mode (#133), frame-synced to every editor;
     /// "selection" by default, the palette command cycles it.
     whitespace_mode: crate::widgets::editor::WhitespaceMode,
+    /// Ruler columns (#1524) from the `rulers` setting, synced onto every
+    /// editor each frame like `whitespace_mode`.
+    rulers: Vec<u16>,
     /// Gutter line numbers (#1576): on, relative, interval or off.
     line_numbers: crate::widgets::editor::LineNumbers,
     /// Default ignore-whitespace mode applied to newly opened diffs (#258).
@@ -3373,6 +3439,9 @@ pub struct App {
     /// Re-indent a multi-line paste under the caret line (#1218), on unless
     /// `disable_paste_reindent` is set.
     paste_reindent: bool,
+    /// The global on-save clean-ups (#1657), handed to each editor as it
+    /// saves. A `.editorconfig` property still wins for its file.
+    save_cleanup: crate::widgets::editor::SaveCleanup,
     /// LSP inlay hints (inline type / parameter annotations), on by default
     /// like VS Code's `editor.inlayHints.enabled`; toggled from the palette
     /// and persisted as `disable_inlay_hints` in config.json.
@@ -3447,6 +3516,12 @@ pub struct App {
     /// on disk. The next `save()` overwrites anyway, giving the user a
     /// "press Cmd+S again to overwrite" escape hatch without a modal.
     force_save_armed: bool,
+    /// One-shot latch armed when a save failed for want of permission
+    /// (#1379): the next Cmd+S of that file saves it with sudo instead.
+    sudo_save_armed: Option<PathBuf>,
+    /// Saves handed to `sudo tee` in a terminal pane (#1379): each file and
+    /// the bytes it should end up holding, settled once it holds them.
+    pending_sudo_saves: Vec<(PathBuf, Vec<u8>, Option<i32>)>,
     pub terminals: Vec<PtyTerminal>,
     pub active_terminal: usize,
     perf: PerfHud,
@@ -3564,6 +3639,9 @@ pub struct App {
     /// The workspace root the Testing panel and worker are bound to —
     /// follows the focused file's folder like the SCM surfaces (#151).
     active_test_root: PathBuf,
+    /// The last `followed_test_root` answer and the workspace folder and
+    /// focused file it was for (#1520).
+    test_root_follow: Option<((PathBuf, Option<PathBuf>), PathBuf)>,
     /// Folder set from an explicitly opened `.code-workspace` (#163):
     /// consumed by `change_workspace_root` INSTEAD of the automatic
     /// per-primary restore, so the file defines the arrangement exactly.
@@ -4348,6 +4426,12 @@ pub struct App {
     screen_reader_command: Option<String>,
     announcer: crate::a11y::Announcer,
     announce_pos: Option<(u16, u16)>,
+    /// The latest event screen reader mode reads out whatever has focus
+    /// (#1547), numbered so a repeat is still read.
+    a11y_event: Option<(u64, String)>,
+    /// Why the focused debug session last stopped, until the stop's
+    /// location is known and the pause can be announced (#1547).
+    debug_pause_reason: Option<String>,
     /// Terminal command suggestions (#614): on or off, and the one painted
     /// this frame as (pane index, the text Right arrow would type).
     term_suggest_enabled: bool,
@@ -4397,6 +4481,11 @@ pub struct App {
     /// an active task; the status bar surfaces it so a busy-priming server is
     /// never mistaken for a dead one. Cleared on the server's `End`.
     lsp_progress: std::collections::HashMap<String, String>,
+    /// Language-server questions (`window/showMessageRequest`, #1599)
+    /// waiting for the list picker, oldest first, and the one it shows.
+    /// Dropping one answers the server "no action".
+    lsp_questions: std::collections::VecDeque<LspQuestion>,
+    lsp_question: Option<LspQuestion>,
     /// Active completion popup, when a completion request has been issued
     /// and the user hasn't dismissed the result. Populated by drain_lsp_completion
     /// once the worker sends a CompletionResult back.
@@ -4693,6 +4782,13 @@ pub struct App {
     /// Each scrubbed commit's tree under the workspace root, for the
     /// Explorer's dimming (#371); `None` records that the listing failed.
     scrub_trees: std::collections::HashMap<String, Option<std::sync::Arc<crate::git::CommitTree>>>,
+    /// Per workspace-relative path, the name the file had at each commit
+    /// the scrubber walks, so history before a rename reads the old name
+    /// (#1304). One `--follow` walk per file per scrub.
+    scrub_names: std::collections::HashMap<
+        String,
+        std::sync::Arc<std::collections::HashMap<String, String>>,
+    >,
     /// Builds highlighted historical views off the UI thread (#371),
     /// started on the first step.
     scrub_builder: Option<crate::scrubber::ViewBuilder>,
@@ -5083,6 +5179,13 @@ pub struct App {
     /// (non-zero) when the matching command completes. Replaced by a newer
     /// F5, so only one launch can be pending.
     pending_debug_launch: Option<PendingDebugLaunch>,
+    /// F5's C/C++ build running off the UI thread (#1359): the source it
+    /// debugs and where the build's result arrives. `poll_debug_build`
+    /// launches lldb-dap on the program once it is built.
+    debug_build: Option<(
+        PathBuf,
+        std::sync::mpsc::Receiver<Result<crate::cpp_build::Built, crate::cpp_build::Failed>>,
+    )>,
     /// An attach launch waiting for the user to pick its process (#250):
     /// the resolved config and where it launches once `processId` is known.
     pending_attach: Option<(crate::dap::configs::ResolvedConfig, LaunchSlot)>,
@@ -5112,6 +5215,12 @@ pub struct App {
     /// clobbered the baseline with the stop's own values — the changed
     /// highlight never fired (#112).
     watch_baseline_pending: bool,
+    /// The latest Copy Value waiting on the adapter's `clipboard` evaluate
+    /// (#1546): the expression asked for and the row's shown value, copied
+    /// instead if the evaluate fails. A response for any other expression
+    /// answers an earlier Copy Value the user has since replaced, and is
+    /// dropped.
+    debug_copy_pending: Option<(String, String)>,
     /// Debug console log: program stdout/stderr (DAP output events) plus REPL
     /// echoes and results. Capped; the tail is shown in the Run & Debug panel.
     /// Each line is escape-free text with the colour spans its SGR sequences
@@ -5847,6 +5956,26 @@ const WELCOME_TAGLINE: &str = "LIGHTWEIGHT.  BLAZINGLY FAST.  BUILT FOR DEVELOPE
 
 use crate::gradient::{GRAD_TL, GRAD_TR, POPUP_SEL_BG, paint_gradient_box, rgb_color};
 
+/// A language server's `window/showMessageRequest` waiting for an answer
+/// (#1599). Dropping it answers "no action".
+struct LspQuestion {
+    server: String,
+    text: String,
+    actions: Vec<lsp_types::MessageActionItem>,
+    reply: tokio::sync::oneshot::Sender<Option<lsp_types::MessageActionItem>>,
+}
+
+/// A server's message as one status line, `server: first line`, so a
+/// multi-line cargo error does not spill over the bar.
+fn server_message_status(server: &str, text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    format!("{server}: {line}")
+}
+
 fn open_url(url: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     let mut cmd = {
@@ -6155,7 +6284,7 @@ impl App {
             config_watch: crate::config_sync::ConfigWatch::new(config_watch_paths(
                 &merged_settings.chain,
             )),
-            snippets: load_snippets(&crate::snippets::snippets_path()),
+            snippets: load_all_snippets([root.as_path()]),
             format_on_save: loaded_prefs.format_on_save,
             default_formatter: loaded_prefs.default_formatter.clone(),
             language_formatters: loaded_prefs.language_formatters.clone(),
@@ -6163,6 +6292,7 @@ impl App {
             language_prefs: loaded_prefs.languages.clone(),
             copy_on_select: loaded_prefs.copy_on_select,
             files_exclude: Vec::new(),
+            files_encoding: None,
             log_highlight: !loaded_prefs.disable_log_highlight,
             secret_redaction: !loaded_prefs.disable_secret_redaction,
             redaction_reveal_until: None,
@@ -6219,6 +6349,7 @@ impl App {
             whitespace_mode: crate::widgets::editor::WhitespaceMode::from_pref(
                 &loaded_prefs.render_whitespace,
             ),
+            rulers: crate::widgets::editor::normalize_rulers(&loaded_prefs.rulers),
             line_numbers: crate::widgets::editor::LineNumbers::from_pref(
                 &loaded_prefs.line_numbers,
             ),
@@ -6229,6 +6360,7 @@ impl App {
             save_before_debug: !loaded_prefs.disable_save_before_debug,
             auto_close_pairs: !loaded_prefs.disable_auto_close_pairs,
             paste_reindent: !loaded_prefs.disable_paste_reindent,
+            save_cleanup: crate::widgets::editor::SaveCleanup::from_prefs(&loaded_prefs),
             inlay_hints_enabled: !loaded_prefs.disable_inlay_hints,
             // Keep the suite off the user's real ~/.config/croft/history: a
             // per-process temp root in test builds, the real dir otherwise.
@@ -6248,6 +6380,8 @@ impl App {
             editor,
             editor_layout: editor_layout::EditorLayout::single(),
             force_save_armed: false,
+            sudo_save_armed: None,
+            pending_sudo_saves: Vec::new(),
             terminals: vec![term],
             active_terminal: 0,
             perf: PerfHud::default(),
@@ -6306,6 +6440,7 @@ impl App {
             scm_pin: None,
             scm_follow_root: root.clone(),
             active_test_root: root.clone(),
+            test_root_follow: None,
             pending_workspace_folders: None,
             git_head_oids: std::collections::BTreeMap::new(),
             git,
@@ -6543,6 +6678,8 @@ impl App {
             screen_reader_command: loaded_prefs.screen_reader_command.clone(),
             announcer: crate::a11y::Announcer::default(),
             announce_pos: None,
+            a11y_event: None,
+            debug_pause_reason: None,
             term_suggest_enabled: true,
             term_suggestion: None,
             recording_shortcut: None,
@@ -6569,6 +6706,8 @@ impl App {
             sarif_step_signature: None,
             sarif_published: Vec::new(),
             lsp_progress: std::collections::HashMap::new(),
+            lsp_questions: std::collections::VecDeque::new(),
+            lsp_question: None,
             completion_popup: None,
             editor_vim_chord: EditorVimChord::default(),
             cmd_k_leader: None,
@@ -6698,6 +6837,7 @@ impl App {
             debug_post_tasks: Vec::new(),
             debug_compound: None,
             pending_debug_launch: None,
+            debug_build: None,
             pending_attach: None,
             pending_test_debug: None,
             pending_cargo_launches: Vec::new(),
@@ -6706,6 +6846,7 @@ impl App {
             watch_vals: std::collections::HashMap::new(),
             watch_prev: std::collections::HashMap::new(),
             watch_baseline_pending: false,
+            debug_copy_pending: None,
             debug_console: Vec::new(),
             debug_ever_stopped: false,
             zoxide_jump: None,
@@ -6831,6 +6972,7 @@ impl App {
             scrub_dragging: false,
             scrub_cache: std::collections::HashMap::new(),
             scrub_trees: std::collections::HashMap::new(),
+            scrub_names: std::collections::HashMap::new(),
             scrub_builder: None,
             scrub_views: std::collections::VecDeque::new(),
             scrub_plain: std::collections::VecDeque::new(),
@@ -6929,6 +7071,8 @@ impl App {
         // The agent review queue as this workspace last left it (#345).
         let root = app.workspace_root().to_path_buf();
         app.apply_project_excludes(&loaded_prefs);
+        app.apply_files_encoding(&loaded_prefs);
+        app.watch_project_snippets();
         app.agent_ledger = app.load_agent_ledger(&root);
         app.sync_agent_lane_decorations();
         Ok(app)
@@ -8224,6 +8368,7 @@ impl App {
     /// Returns true if any tab reloaded, failed, or entered conflict, so
     /// the caller redraws.
     fn reload_open_file_after_external_change(&mut self) -> bool {
+        let settled = self.settle_sudo_saves();
         let guest = self.is_collab_guest();
         let root = self.tree.root.clone();
         let skip = |p: &Path| guest && collab_file_key(&root, p).is_some();
@@ -8235,7 +8380,7 @@ impl App {
             report.failed.extend(extra.failed);
         }
         if report.is_empty() {
-            return false;
+            return settled;
         }
         // The active file changed on disk under a clean buffer: its coverage
         // marks describe the old text now, so they dim like an edit's (#263).
@@ -8405,8 +8550,9 @@ impl App {
         if active != self.active_scm_root {
             self.seed_active_scm(active);
         }
-        if follow != self.active_test_root {
-            self.rebind_test_root(follow);
+        let test_root = self.followed_test_root(follow);
+        if test_root != self.active_test_root {
+            self.rebind_test_root(test_root);
         }
         // Ship any refresh the debounce window coalesced once the gap clears,
         // so the trailing edge of an edit burst lands without another FS event.
@@ -9380,6 +9526,36 @@ impl App {
             .unwrap_or(ws)
     }
 
+    /// The folder the Testing view follows for workspace folder `root`
+    /// (#1520): `root`, or in a monorepo whose root no runner claims, the
+    /// package of the focused file that one does. Resolved again only when
+    /// the folder or the focused file changes, since it reads manifests.
+    fn followed_test_root(&mut self, root: PathBuf) -> PathBuf {
+        let key = (root, self.editor.path.clone());
+        if let Some((k, v)) = &self.test_root_follow
+            && *k == key
+        {
+            return v.clone();
+        }
+        let found = crate::testing::registry::test_root_for(&key.0, key.1.as_deref());
+        self.test_root_follow = Some((key, found.clone()));
+        found
+    }
+
+    /// Resolve the followed Testing folder afresh and rebind to it if it
+    /// moved (#1520): a runner enabled or a package marker added since the
+    /// focus last changed can change the answer the cache still holds.
+    /// Whether it rebound.
+    fn refollow_test_root(&mut self) -> bool {
+        self.test_root_follow = None;
+        let root = self.followed_test_root(self.active_workspace_root());
+        if root == self.active_test_root {
+            return false;
+        }
+        self.rebind_test_root(root);
+        true
+    }
+
     /// The workspace root the focus-following surfaces resolve against:
     /// the root owning the focused editor's file, else the primary
     /// (#149 git, #151 testing/tasks/run).
@@ -10021,6 +10197,11 @@ impl App {
             SidebarView::Search => {
                 if let Some(label) = self.search.tooltip_at(col, row) {
                     return Some(label);
+                }
+            }
+            SidebarView::RunDebug if self.run_debug.debug_active => {
+                if let Some(control) = self.run_debug.debug_control_painted_at(col, row) {
+                    return Some(control.tooltip());
                 }
             }
             SidebarView::Explorer => {
@@ -11454,25 +11635,148 @@ impl App {
     pub fn drain_lsp_progress(&mut self) -> bool {
         let mut updates = Vec::new();
         if let Some(lsp) = self.lsp.as_ref() {
-            while let Some(u) = lsp.drain_progress() {
+            while let Some(u) = lsp.drain_server_update() {
                 updates.push(u);
             }
         }
         let mut changed = false;
         for u in updates {
-            match u.message {
-                Some(message) => {
-                    self.lsp_progress.insert(u.server, message);
-                    changed = true;
+            changed |= self.apply_server_update(u);
+        }
+        changed | self.ask_next_lsp_question()
+    }
+
+    /// Act on one progress update or `window/*` message from a server.
+    /// Returns true when the screen needs a repaint.
+    fn apply_server_update(&mut self, u: crate::lsp::manager::ServerUpdate) -> bool {
+        use crate::lsp::manager::ServerEvent;
+        match u.event {
+            ServerEvent::Progress(Some(message)) => {
+                self.lsp_progress.insert(u.server, message);
+                true
+            }
+            ServerEvent::Progress(None) => self.lsp_progress.remove(&u.server).is_some(),
+            // An error a server can't recover from on its own, such as
+            // rust-analyzer's "Failed to load workspaces", used to sit in
+            // OUTPUT while the status bar said all was well (#1599).
+            ServerEvent::Message { text, .. } => {
+                self.status = server_message_status(&u.server, &text);
+                true
+            }
+            ServerEvent::Question {
+                text,
+                actions,
+                reply,
+                ..
+            } => {
+                if actions.is_empty() {
+                    // Nothing to pick: a message, answered "no action" by
+                    // dropping `reply`.
+                    self.status = server_message_status(&u.server, &text);
+                    return true;
                 }
-                None => {
-                    if self.lsp_progress.remove(&u.server).is_some() {
-                        changed = true;
-                    }
-                }
+                self.lsp_questions.push_back(LspQuestion {
+                    server: u.server,
+                    text,
+                    actions,
+                    reply,
+                });
+                false
+            }
+            ServerEvent::ShowDocument {
+                uri,
+                external,
+                take_focus,
+                selection,
+                reply,
+            } => {
+                let shown = self.show_server_document(uri, external, take_focus, selection);
+                let _ = reply.send(shown);
+                true
             }
         }
-        changed
+    }
+
+    /// Put the oldest waiting server question in the list picker, once no
+    /// other picker is open. Returns true when one was opened.
+    fn ask_next_lsp_question(&mut self) -> bool {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let asking = self
+            .list_picker
+            .as_ref()
+            .is_some_and(|p| p.purpose == ListPurpose::ServerQuestion);
+        if !asking {
+            // Its picker was replaced or went away without a pick.
+            self.lsp_question = None;
+        }
+        if self.list_picker.is_some() {
+            return false;
+        }
+        let Some(q) = self.lsp_questions.pop_front() else {
+            return false;
+        };
+        let rows = q
+            .actions
+            .iter()
+            .enumerate()
+            .map(|(i, a)| ListRow {
+                id: i.to_string(),
+                label: a.title.clone(),
+            })
+            .collect();
+        let title = server_message_status(&q.server, &q.text);
+        self.status = title.clone();
+        self.lsp_question = Some(q);
+        self.open_list_picker(
+            ListPicker::new(ListPurpose::ServerQuestion, title, rows),
+            "",
+        );
+        true
+    }
+
+    /// `window/showDocument`: a link goes to the browser, a file opens with
+    /// the server's range selected. Without `take_focus` the file still
+    /// opens but keyboard focus stays in the pane that had it. Returns
+    /// whether the document was shown, which is the server's answer.
+    fn show_server_document(
+        &mut self,
+        uri: lsp_types::Url,
+        external: bool,
+        take_focus: bool,
+        selection: Option<lsp_types::Range>,
+    ) -> bool {
+        let path = (!external && uri.scheme() == "file")
+            .then(|| uri.to_file_path().ok())
+            .flatten();
+        let Some(path) = path else {
+            return self.try_open_url_for_user(uri.as_str());
+        };
+        let start = selection.map(|r| r.start).unwrap_or_default();
+        let (focus, maximized) = (self.focus, self.terminal_maximized);
+        if !self.try_go_to_definition(path.clone(), start.line, start.character) {
+            return false;
+        }
+        if !take_focus && focus != Pane::Editor {
+            self.focus_pane(focus);
+            self.terminal_maximized = maximized;
+        }
+        let Some(end) = selection.map(|r| r.end).filter(|&end| end != start) else {
+            return true;
+        };
+        if self.editor.path.as_deref() != Some(path.as_path()) {
+            return true;
+        }
+        let row = (end.line as usize).min(self.editor.lines.len().saturating_sub(1));
+        let col = self.editor.utf16_col_to_char_pub(row, end.character);
+        let anchor = (self.editor.cursor_row, self.editor.cursor_col);
+        self.editor.selection = Some(crate::widgets::editor::EditorSelection {
+            anchor,
+            head: (row, col),
+        });
+        self.editor.cursor_row = row;
+        self.editor.cursor_col = col;
+        self.editor.ensure_cursor_col_visible();
+        true
     }
 
     /// The active LSP progress line for the status bar, if any server is busy
@@ -11610,6 +11914,11 @@ impl App {
     }
 
     fn go_to_definition(&mut self, path: PathBuf, line: u32, col: u32) {
+        self.try_go_to_definition(path, line, col);
+    }
+
+    /// `go_to_definition`, returning whether the file opened.
+    fn try_go_to_definition(&mut self, path: PathBuf, line: u32, col: u32) -> bool {
         let pinned = self.keep_preview_open_for_navigation_to(&path);
         if let Some(from) = self.editor.path.clone() {
             self.nav.record(NavLoc {
@@ -11621,11 +11930,13 @@ impl App {
         // `col` is the server's UTF-16 column, not a character column.
         match self.open_at_utf16(&path, line, col) {
             Ok(()) => {
-                self.status = format!("Jumped to {} line {}", self.status_path(&path), line + 1)
+                self.status = format!("Jumped to {} line {}", self.status_path(&path), line + 1);
+                true
             }
             Err(e) => {
                 self.restore_preview_after_failed_navigation(pinned);
-                self.status = format!("Go to definition failed: {e}")
+                self.status = format!("Go to definition failed: {e}");
+                false
             }
         }
     }
@@ -15323,7 +15634,18 @@ impl App {
             return;
         }
         let row = self.editor.cursor_row;
-        if !self.editor.resolve_conflict_at(row, res) {
+        let untrimmed = match res {
+            crate::merge::Resolution::Both => self.untrimmed_both_at(row),
+            _ => None,
+        };
+        let resolved = match untrimmed {
+            Some((rows, both)) => {
+                self.editor.splice_result_rows(rows.start, rows.end, both);
+                true
+            }
+            None => self.editor.resolve_conflict_at(row, res),
+        };
+        if !resolved {
             self.status = String::from("No merge conflict at the cursor");
             return;
         }
@@ -15339,6 +15661,30 @@ impl App {
         } else {
             format!("{accepted} — {} left", self.editor.conflicts().len())
         };
+    }
+
+    /// Accept Both for the conflict at `row` with what git trimmed off it
+    /// put back (see `merge::untrimmed_both`), from the file's git stages
+    /// merged again in diff3 style. None for a file git does not hold
+    /// unmerged, an add/add with no base, or a block no conflict fits;
+    /// Accept Both then joins the sections as written.
+    fn untrimmed_both_at(&mut self, row: usize) -> Option<(std::ops::Range<usize>, Vec<String>)> {
+        let block = crate::merge::conflict_containing(self.editor.conflicts(), row)?;
+        let path = self.editor.path.clone()?;
+        // Stage specs are relative to the toplevel of the file's own repo
+        // (#139). Not `scm_root`: Source Control can be pinned to another
+        // folder of a multi-root workspace.
+        let root = path.parent().and_then(crate::git::repo_toplevel)?;
+        let canon_root = std::fs::canonicalize(&root).unwrap_or(root);
+        let canon_path = std::fs::canonicalize(&path).ok()?;
+        let rel = canon_path.strip_prefix(&canon_root).ok()?.to_string_lossy();
+        let merged = crate::git::remerge_diff3(&canon_root, &rel).ok()?;
+        let merged: Vec<String> = merged.lines().map(str::to_string).collect();
+        crate::merge::untrimmed_both(
+            &self.editor.lines,
+            &block,
+            &crate::merge::whole_sides(&merged),
+        )
     }
 
     /// VS Code's "Accept All Current / Incoming": resolve every block in the
@@ -15897,8 +16243,13 @@ impl App {
             && let (Some(path), Some(lsp)) = (self.editor.path.clone(), self.lsp.as_mut())
         {
             lsp.execute_command(path, cmd.command, cmd.arguments);
+            // A command-only action (gopls's "Browse documentation") does
+            // its work in the server, and anything it has to show arrives
+            // as a message; claiming a fix was applied was wrong (#1599).
+            if !applied {
+                self.status = format!("Ran {}", item.title);
+            }
             applied = true;
-            self.status = format!("Applied quick fix: {}", item.title);
         }
         if !applied {
             self.status = format!("Quick fix had no effect: {}", item.title);
@@ -17144,6 +17495,8 @@ impl App {
     /// view is shown or a toggle flips, so the list always reflects the manifests
     /// on disk and the current disable set.
     fn refresh_extensions(&mut self) {
+        // A runner toggled on or off changes which folder Testing follows.
+        self.test_root_follow = None;
         let mut vscode: Vec<String> = self
             .roots
             .iter()
@@ -19667,6 +20020,7 @@ impl App {
             ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
             ed.line_numbers = self.line_numbers;
             ed.diff_ws_default = self.diff_ws_default;
+            ed.rulers.clone_from(&self.rulers);
         }
         for group in self.editor_layout.inactive_groups_mut() {
             for ed in group.editors.iter_mut() {
@@ -19680,6 +20034,7 @@ impl App {
                 ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
                 ed.line_numbers = self.line_numbers;
                 ed.diff_ws_default = self.diff_ws_default;
+                ed.rulers.clone_from(&self.rulers);
             }
         }
         self.tree.focus_gradient = gradient;
@@ -19824,11 +20179,13 @@ impl App {
 
         // VS Code panel-group order: PROBLEMS, OUTPUT, TERMINAL, PORTS. PROBLEMS
         // alone carries the orange count badge after its label.
-        let tabs = BottomPanelTab::ALL.map(|tab| (tab, tab.label()));
+        // Each label is translated and padded to its click target.
+        let tabs =
+            BottomPanelTab::ALL.map(|tab| (tab, format!(" {} ", crate::i18n::tr(tab.label()))));
 
         // Lay each tab out left to right, recording its hit rect (which, for
         // PROBLEMS, spans the label and the pill together).
-        let mut placed: Vec<(BottomPanelTab, &str, Rect, u16)> = Vec::with_capacity(tabs.len());
+        let mut placed: Vec<(BottomPanelTab, String, Rect, u16)> = Vec::with_capacity(tabs.len());
         let mut x = strip.x + 1;
         for (tab, label) in tabs {
             if x >= right {
@@ -19843,7 +20200,7 @@ impl App {
             } else {
                 0
             };
-            let w = label.chars().count() as u16 + badge_w;
+            let w = unicode_width::UnicodeWidthStr::width(label.as_str()) as u16 + badge_w;
             let rect = Rect {
                 x,
                 y: strip.y,
@@ -19890,7 +20247,7 @@ impl App {
             // the cells stay blank strip_bg and we just record the anchor.
             // Otherwise the powerline-cap pill is drawn as text.
             if *badge_w > 0 {
-                let bx = rect.x + label.chars().count() as u16;
+                let bx = rect.x + unicode_width::UnicodeWidthStr::width(label.as_str()) as u16;
                 if images {
                     if bx < right {
                         self.problems_badge_cell = Some((bx, rect.y));
@@ -19924,7 +20281,7 @@ impl App {
             // stopping before the padding spaces and the pill.
             if is_active {
                 let leading = label.chars().take_while(|c| *c == ' ').count() as u16;
-                let word_len = label.trim().chars().count() as u16;
+                let word_len = unicode_width::UnicodeWidthStr::width(label.trim()) as u16;
                 let start = rect.x + leading;
                 for ux in start..(start + word_len).min(right) {
                     buf[(ux, rect.y)].modifier.insert(Modifier::UNDERLINED);
@@ -21702,9 +22059,15 @@ impl App {
             .unwrap_or_default();
         let mut seg_texts: Vec<String> = vec![
             format!(
-                " Ln {}, Col {}{coverage} ",
+                " Ln {}, Col {}{coverage}{} ",
                 self.editor.cursor_row + 1,
-                self.editor.cursor_col + 1
+                self.editor.cursor_col + 1,
+                // The file refuses this user's writes (#1379).
+                if self.editor.write_protected {
+                    " \u{b7} Read-only"
+                } else {
+                    ""
+                }
             ),
             format!(" {} ", self.editor.indent_style().label()),
             format!(" {} ", self.editor.encoding.name()),
@@ -22329,7 +22692,7 @@ impl App {
             .border_style(Style::default().fg(warn))
             .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
             .title(ratatui::text::Span::styled(
-                " DISCARD CHANGES? ",
+                format!(" {} ", crate::i18n::tr("DISCARD CHANGES?")),
                 Style::default()
                     .fg(Color::White)
                     .bg(warn)
@@ -22344,9 +22707,9 @@ impl App {
             height: rect.height.saturating_sub(2),
         };
         let warn_text = if pd.untracked {
-            "This will permanently delete the file from disk."
+            crate::i18n::tr("This will permanently delete the file from disk.")
         } else {
-            "This will overwrite your local changes from HEAD."
+            crate::i18n::tr("This will overwrite your local changes from HEAD.")
         };
         let body = ratatui::text::Text::from(vec![
             ratatui::text::Line::from(ratatui::text::Span::styled(
@@ -22444,16 +22807,13 @@ impl App {
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
     }
 
-    /// The unsaved-changes prompt (#862): what would be lost and the three
-    /// ways out. Amber like Replace All's rather than red, since its default
-    /// (S / Enter) keeps the edits and only D throws anything away.
-    fn render_unsaved_confirm(&self, frame: &mut ratatui::Frame) {
-        let Some(exit) = self.pending_unsaved.as_ref() else {
-            return;
-        };
-        let (headline, names, save, discard) = match exit {
+    /// The unsaved-changes prompt's words: its headline, the files, and
+    /// what S and D do after their key letter ("ave and close"). Shared by
+    /// the modal and what screen reader mode reads out (#1584).
+    fn unsaved_confirm_text(&self, exit: &UnsavedExit) -> (String, String, String, String) {
+        match exit {
             UnsavedExit::CloseTab { idx, .. } => (
-                String::from("This tab has unsaved changes:"),
+                crate::i18n::tr("This tab has unsaved changes:").into_owned(),
                 self.editor.tab_display_label(*idx),
                 String::from("ave and close"),
                 String::from("on't save"),
@@ -22472,7 +22832,17 @@ impl App {
                     format!("iscard and {verb}"),
                 )
             }
+        }
+    }
+
+    /// The unsaved-changes prompt (#862): what would be lost and the three
+    /// ways out. Amber like Replace All's rather than red, since its default
+    /// (S / Enter) keeps the edits and only D throws anything away.
+    fn render_unsaved_confirm(&self, frame: &mut ratatui::Frame) {
+        let Some(exit) = self.pending_unsaved.as_ref() else {
+            return;
         };
+        let (headline, names, save, discard) = self.unsaved_confirm_text(exit);
         let area = frame.area();
         let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
         let height: u16 = 8;
@@ -22489,7 +22859,7 @@ impl App {
             .border_style(Style::default().fg(warn))
             .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
             .title(ratatui::text::Span::styled(
-                " UNSAVED CHANGES ",
+                format!(" {} ", crate::i18n::tr("UNSAVED CHANGES")),
                 Style::default()
                     .fg(Color::Black)
                     .bg(warn)
@@ -22615,7 +22985,7 @@ impl App {
             .border_style(Style::default().fg(accent))
             .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
             .title(ratatui::text::Span::styled(
-                " UNSAVED CHANGES ",
+                format!(" {} ", crate::i18n::tr("UNSAVED CHANGES")),
                 Style::default()
                     .fg(Color::Black)
                     .bg(accent)
@@ -24198,6 +24568,12 @@ impl App {
                 self.poke_cursor();
                 true
             }
+            // Cmd+K Cmd+1 … Cmd+K Cmd+7: Fold Level N (#1653).
+            KeyCode::Char(c @ '1'..='7') if plain => {
+                self.editor.fold_level(c as usize - '0' as usize);
+                self.poke_cursor();
+                true
+            }
             _ => false,
         }
     }
@@ -24489,13 +24865,15 @@ impl App {
             }
             return Ok(());
         }
-        if self.pending_broadcast_enable {
+        // The confirms answer in the order they are drawn, topmost first
+        // (#1584): the run block over a terminal paste over broadcast.
+        if self.pending_run_block.is_some() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    self.confirm_pending_broadcast();
+                    self.confirm_pending_run_block();
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.cancel_pending_broadcast();
+                    self.cancel_pending_run_block();
                 }
                 _ => {}
             }
@@ -24516,13 +24894,13 @@ impl App {
             }
             return Ok(());
         }
-        if self.pending_run_block.is_some() {
+        if self.pending_broadcast_enable {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    self.confirm_pending_run_block();
+                    self.confirm_pending_broadcast();
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.cancel_pending_run_block();
+                    self.cancel_pending_broadcast();
                 }
                 _ => {}
             }
@@ -24602,12 +24980,15 @@ impl App {
         // only when the terminal is not focused (its raw control keys must pass
         // through) and the chord carries a real modifier or is a function key
         // (so plain typing and bare Enter/Tab/Esc keep their contextual meaning).
-        // This stands in for VS Code's `when: editorTextFocus` without a full
-        // context engine.
+        // A row with `when` fires only while that pane has focus (#1436); an
+        // unscoped row fires wherever the terminal does not.
         if self.focus != Pane::Terminal
             && !self.keymap.is_empty()
             && is_rebindable_chord(key)
-            && let Some(cmd) = self.keymap.command_for(key)
+            && let Some(cmd) = match self.key_context() {
+                Some(ctx) => self.keymap.command_in(key, ctx),
+                None => self.keymap.command_for(key),
+            }
         {
             self.run_command(cmd);
             return Ok(());
@@ -25807,6 +26188,11 @@ impl App {
         if crate::testing::worker::runner_for(&self.active_test_root).is_some() {
             return true;
         }
+        if self.refollow_test_root()
+            && crate::testing::worker::runner_for(&self.active_test_root).is_some()
+        {
+            return true;
+        }
         self.status = String::from(crate::testing::NO_RUNNER_STATUS);
         false
     }
@@ -26116,6 +26502,7 @@ impl App {
         // "Running …" status (#856).
         let finished = self.testing.take_finished();
         let mut changed = self.announce_test_run_end(finished);
+        self.speak_test_run_end(finished, changed);
         if let Some(ok) = finished
             && self.testing.watch.finished(ok) == WatchNotice::NewlyRed
         {
@@ -26346,8 +26733,11 @@ impl App {
             self.test_worker.run_one(run.clone());
         } else {
             self.testing.start_filter(&run);
-            self.last_test_run = Some(LastTestRun::Filter(run.clone()));
-            self.test_worker.run_filter(run.clone());
+            // The caret's file picks the runner where two languages'
+            // tests share the folder (#1408).
+            let file = self.editor.path.clone();
+            self.last_test_run = Some(LastTestRun::Filter(run.clone(), file.clone()));
+            self.test_worker.run_filter(run.clone(), file);
         }
         self.set_sidebar_view(SidebarView::Testing);
         self.status = format!("Running test {run}");
@@ -26431,10 +26821,10 @@ impl App {
             LastTestRun::All => self.run_all_tests(),
             LastTestRun::One(name) => self.run_test(name),
             LastTestRun::Suite(suite) => self.run_suite(suite),
-            LastTestRun::Filter(pattern) => {
+            LastTestRun::Filter(pattern, file) => {
                 self.testing.start_filter(&pattern);
-                self.last_test_run = Some(LastTestRun::Filter(pattern.clone()));
-                self.test_worker.run_filter(pattern);
+                self.last_test_run = Some(LastTestRun::Filter(pattern.clone(), file.clone()));
+                self.test_worker.run_filter(pattern, file);
                 self.set_sidebar_view(SidebarView::Testing);
             }
             LastTestRun::Many(names) => self.start_many_tests(names),
@@ -26475,6 +26865,28 @@ impl App {
         run.settle(&mut self.status, |label, took| {
             testing.run_outcome(label, ok, took.as_secs_f64())
         })
+    }
+
+    /// Screen reader mode reads out how a finished test run went (#1547),
+    /// Run All included, which sets no "Running …" status to settle. When
+    /// [`Self::announce_test_run_end`] already put the counts in the status
+    /// (`settled`), which is read too, only the first failure is added.
+    fn speak_test_run_end(&mut self, finished: Option<Option<bool>>, settled: bool) {
+        let Some(Some(ok)) = finished else {
+            return;
+        };
+        if self.testing.is_busy() {
+            return;
+        }
+        let said = if settled {
+            match self.testing.run_first_failure() {
+                Some(name) => format!("First failure: {name}"),
+                None => return,
+            }
+        } else {
+            self.testing.spoken_outcome(ok)
+        };
+        self.announce_event(said);
     }
 
     /// Keep the "Running …" status a task or fenced block just set until
@@ -26572,6 +26984,14 @@ impl App {
         self.debug_named_test(name);
     }
 
+    /// The runner for a test in the focused file under `root` (#1408): the
+    /// one for the file's language, so a pytest test in a maturin crate
+    /// debugs under debugpy, not as a cargo test binary.
+    fn test_runner_for_focused_file(&self, root: &Path) -> Option<crate::testing::worker::Runner> {
+        let runners = crate::testing::worker::runners_for(root);
+        crate::testing::worker::runner_for_file(&runners, self.editor.path.as_deref())
+    }
+
     /// Hand the test `name` to the debugger — the M6 wedge: pytest runs as a
     /// debugpy module launch under the PROJECT's interpreter, a cargo test
     /// binary launches under lldb-dap with the name as its libtest filter.
@@ -26600,7 +27020,7 @@ impl App {
             .iter()
             .map(|(p, lines)| (p.clone(), self.editor.source_breakpoints(p, lines)))
             .collect();
-        match crate::testing::worker::runner_for(&root) {
+        match self.test_runner_for_focused_file(&root) {
             Some(crate::testing::worker::Runner::Pytest) => {
                 // The interpreter F5 and Live Run pick, from the test file's
                 // folder up (#864), not only a root `.venv`; refused before
@@ -26904,6 +27324,13 @@ impl App {
     /// can walk the whole tree for CodeQL test packs, which stalled the
     /// switch to the Testing view.
     fn discover_tests(&mut self) {
+        // The rebind re-discovers on its own while the view is showing.
+        if !self.testing.is_busy()
+            && self.refollow_test_root()
+            && self.sidebar_view == SidebarView::Testing
+        {
+            return;
+        }
         if self.testing.is_busy() || self.test_worker.discover_queued() {
             return;
         }
@@ -28023,19 +28450,28 @@ impl App {
     /// Open `url` in the user's browser: through the relay or a detected
     /// URL on a remote session, and never from a test.
     fn open_url_for_user(&mut self, url: &str) {
+        self.try_open_url_for_user(url);
+    }
+
+    /// `open_url_for_user`, returning false when the browser could not be
+    /// started.
+    fn try_open_url_for_user(&mut self, url: &str) -> bool {
         if cfg!(test) {
             // Tests never start a browser.
             self.status = format!("Open {url}");
-            return;
+            return true;
         }
         if self.drop_relay_active() || is_remote_session() {
             self.open_detected_url(url);
-            return;
+            return true;
         }
-        self.status = match open_url(url) {
+        let opened = open_url(url);
+        let ok = opened.is_ok();
+        self.status = match opened {
             Ok(()) => format!("Opened {url}"),
             Err(e) => format!("Could not open a browser ({e}): {url}"),
         };
+        ok
     }
 
     /// The store index of the current database, for the palette commands
@@ -32508,6 +32944,24 @@ impl App {
                 } if context == "watch" => {
                     self.watch_vals.insert(expression, (result, success));
                 }
+                // Copy Value's whole value (#1546), or, when the adapter
+                // could not give it, the value the row showed.
+                DapEvent::Evaluated {
+                    context,
+                    expression,
+                    result,
+                    success,
+                } if context == "clipboard" => {
+                    if self
+                        .debug_copy_pending
+                        .as_ref()
+                        .is_some_and(|(expr, _)| *expr == expression)
+                        && let Some((_, fallback)) = self.debug_copy_pending.take()
+                    {
+                        let text = if success { result } else { fallback };
+                        self.status = self.copy_where_pasted(&text).status("value");
+                    }
+                }
                 // Fresh stack + frame selection just landed: this is the
                 // moment each watch expression re-evaluates against the new
                 // top frame (#112).
@@ -32520,9 +32974,15 @@ impl App {
                     self.run_debug.feedback = Some(format!("Paused ({reason})"));
                     self.run_debug.feedback_is_error = false;
                     self.watch_baseline_pending = true;
+                    self.debug_pause_reason = Some(reason);
                 }
                 // What the exception stop threw (#864): the panel's pill and
                 // the status line, which has the width the pill lacks.
+                // Step Into Target (#1543): one call steps straight in, several
+                // are offered by label, and a line with none steps in plainly.
+                DapEvent::StepInTargets { targets } => {
+                    self.offer_step_in_targets(targets);
+                }
                 DapEvent::ExceptionInfo { summary } => {
                     self.run_debug.feedback = Some(format!("Paused (exception): {summary}"));
                     self.status = format!("Paused on exception: {summary}");
@@ -32559,6 +33019,25 @@ impl App {
                     .debug_sessions
                     .focused()
                     .and_then(|s| s.current_location.clone());
+                // Said once this stop's stack trace has placed it, so the
+                // announcement names the file and line (#1547). The frames
+                // are cleared at each stop and the location is not, so an
+                // empty stack means the location is still the last stop's,
+                // and so does a top frame without a source: that stop is
+                // read without a file and line rather than with stale ones.
+                let top = self
+                    .debug_sessions
+                    .focused()
+                    .and_then(|s| s.stack_frames.first())
+                    .map(|f| (f.name.clone(), f.path.is_some()));
+                if let Some((frame, has_source)) = top
+                    && let Some(reason) = self.debug_pause_reason.take()
+                {
+                    let at = if has_source { loc.as_ref() } else { None };
+                    let said = self.debug_pause_announcement(&reason, at, &frame);
+                    self.announce_event(said);
+                    changed = true;
+                }
                 if let Some(loc) = loc
                     && self.editor.stop_line.as_ref() != Some(&loc)
                 {
@@ -32572,6 +33051,7 @@ impl App {
                 }
             }
             Some(SessionPhase::Terminated) => {
+                self.debug_pause_reason = None;
                 self.editor.stop_line = None;
                 self.editor.unverified_breakpoints.clear();
                 // A session that ends on its own must take croft's own
@@ -32676,6 +33156,10 @@ impl App {
     fn refresh_debug_panel(&mut self) {
         let (active, status, rows) = self.build_debug_view();
         self.run_debug.debug_active = active;
+        self.run_debug.debug_paused = self
+            .debug_sessions
+            .focused()
+            .is_some_and(|s| s.phase == crate::dap::session::SessionPhase::Stopped);
         if active {
             self.run_debug.debug_status = status;
             self.run_debug.debug_rows = rows;
@@ -33024,6 +33508,109 @@ impl App {
         self.refresh_debug_panel();
     }
 
+    /// The right-click menu of debug-panel row `idx` (#1546), VS Code's:
+    /// a variable's Copy Value, Copy as Expression and Add to Watch, a
+    /// watch's Copy Value, Copy Expression and Remove, and a frame's Copy
+    /// Call Stack. Empty for a row that has none (a header, a scope).
+    fn debug_row_menu(&self, idx: usize) -> Vec<(String, MenuAction)> {
+        use crate::widgets::run_debug::DebugRowKind;
+        let Some(row) = self.run_debug.debug_rows.get(idx) else {
+            return Vec::new();
+        };
+        match &row.kind {
+            DebugRowKind::Variable {
+                value,
+                evaluate_name,
+                ..
+            } => {
+                let mut items = vec![(
+                    String::from("Copy Value"),
+                    MenuAction::CopyDebugValue {
+                        expression: evaluate_name.clone(),
+                        value: value.clone(),
+                    },
+                )];
+                if let Some(expr) = evaluate_name {
+                    items.push((
+                        String::from("Copy as Expression"),
+                        MenuAction::CopyDebugExpression(expr.clone()),
+                    ));
+                    items.push((
+                        String::from("Add to Watch"),
+                        MenuAction::AddDebugWatch(expr.clone()),
+                    ));
+                }
+                items
+            }
+            DebugRowKind::Watch {
+                index,
+                expression,
+                value,
+                ..
+            } => vec![
+                (
+                    String::from("Copy Value"),
+                    MenuAction::CopyDebugValue {
+                        expression: Some(expression.clone()),
+                        value: value.clone(),
+                    },
+                ),
+                (
+                    String::from("Copy Expression"),
+                    MenuAction::CopyDebugExpression(expression.clone()),
+                ),
+                (
+                    String::from("Remove Expression"),
+                    MenuAction::RemoveDebugWatch(*index),
+                ),
+            ],
+            DebugRowKind::Frame { .. } => {
+                vec![(String::from("Copy Call Stack"), MenuAction::CopyCallStack)]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Copy Value (#1546). The row's `value` can be cut short by the
+    /// adapter (debugpy elides a long string), so while paused, with an
+    /// expression and an adapter that offers it, the value is asked for
+    /// again in the `clipboard` context, which is not cut, and copied when
+    /// it lands (`poll_dap`). Otherwise the row's value is copied at once.
+    fn copy_debug_value(&mut self, expression: Option<String>, value: String) {
+        use crate::dap::session::SessionPhase;
+        if let Some(expr) = expression
+            && let Some(session) = self
+                .debug_sessions
+                .focused_mut()
+                .filter(|s| s.phase == SessionPhase::Stopped)
+            && session.supports("supportsClipboardContext")
+        {
+            session.evaluate(&expr, "clipboard");
+            self.debug_copy_pending = Some((expr, value));
+            self.status = String::from("Copying value…");
+            return;
+        }
+        self.status = self.copy_where_pasted(&value).status("value");
+    }
+
+    /// Copy Call Stack (#1546): every frame of the paused thread, innermost
+    /// first, as `name (path:line)`, VS Code's form.
+    fn copy_call_stack(&mut self) {
+        let Some(session) = self.debug_sessions.focused() else {
+            return;
+        };
+        let text = session
+            .stack_frames
+            .iter()
+            .map(|f| match &f.path {
+                Some(p) => format!("{} ({}:{})", f.name, p.display(), f.line),
+                None => f.name.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.status = self.copy_where_pasted(&text).status("call stack");
+    }
+
     /// Cmd+F on a hex tab (#172): a single-line input popup, per croft's
     /// inputs-in-popups rule. Hex byte pairs or literal ASCII.
     fn open_hex_find_prompt(&mut self) {
@@ -33031,11 +33618,29 @@ impl App {
         if self.editor.hex.is_none() {
             return;
         }
-        self.open_input_prompt(InputPrompt::new(
-            InputPurpose::HexFind,
-            "Find in Hex",
-            "hex bytes (de ad be ef) or text",
-        ));
+        // Which reading a hex-shaped query gets depends on the column the
+        // search starts from (#1644), so the title says it.
+        let text_side = self.editor.hex.as_ref().is_some_and(|v| v.ascii_focus);
+        self.open_input_prompt(
+            InputPrompt::new(
+                InputPurpose::HexFind,
+                if text_side {
+                    "Find in Hex (text)"
+                } else {
+                    "Find in Hex"
+                },
+                if text_side {
+                    "text"
+                } else {
+                    "hex bytes (de ad be ef) or text"
+                },
+            )
+            .with_hint(if text_side {
+                "Enter finds this text · Esc cancels"
+            } else {
+                "\"1234\" finds hex-looking text · Enter · Esc cancels"
+            }),
+        );
     }
 
     /// The "+ Add Expression" affordance (panel row or palette): a single-line
@@ -33113,7 +33718,7 @@ impl App {
     /// the run in the warning.
     fn run_with_unsaved_saved(&mut self, what: &str, launch: impl FnOnce(&mut Self)) {
         if self.save_before_debug && self.unsaved_count() > 0 {
-            self.sweep_dirty_buffers(false, false);
+            self.sweep_dirty_buffers(false, false, false);
         }
         let unsaved = self.unsaved_editor_names();
         launch(self);
@@ -33193,6 +33798,7 @@ impl App {
                 session.continue_execution();
                 self.editor.stop_line = None;
                 self.clear_inline_values();
+                self.announce_event(String::from("Continued"));
             }
             return;
         }
@@ -33549,17 +34155,24 @@ impl App {
             .clone()
             .unwrap_or_else(|| self.active_workspace_root());
         let ctx = crate::dap::configs::SubstCtx {
-            workspace_folder: root,
+            workspace_folder: root.clone(),
             file: self.editor.path.clone(),
             folders: self.workspace_folders(),
         };
-        let rc = match crate::dap::configs::resolve(cfg, &ctx) {
+        let mut rc = match crate::dap::configs::resolve(cfg, &ctx) {
             Ok(rc) => rc,
             Err(e) => {
                 self.debug_error(format!("config \"{}\": {e}", cfg.name));
                 return MemberOutcome::Failed;
             }
         };
+        // js-debug's source-map defaults follow the folder the member was
+        // resolved against (#1414), not the one the active file is in.
+        if rc.kind == crate::dap::session::AdapterKind::JsDebug {
+            rc.extra
+                .entry("__workspaceFolder")
+                .or_insert_with(|| serde_json::json!(root.to_string_lossy()));
+        }
         self.record_post_debug_task(&rc);
         if rc.pre_launch_task.is_some() {
             // NOT launched. Running it anyway would debug whatever the last
@@ -33602,34 +34215,81 @@ impl App {
         self.pending_debug_launch = None;
         let root = self.active_workspace_root();
         let tasks = crate::tasks::discover_tasks(&root);
-        let Some(task) = tasks.into_iter().find(|t| t.label == task_label) else {
-            self.debug_error(format!(
-                "compound preLaunchTask \"{task_label}\" not found — Tasks: Run Task lists what the workspace declares"
-            ));
-            return;
+        let task = match crate::tasks::find_task(tasks, task_label) {
+            Ok(task) => task,
+            Err(near) => {
+                self.debug_error(format!(
+                    "compound preLaunchTask \"{task_label}\" not found{} — Tasks: Run Task lists what the workspace declares",
+                    did_you_mean(near)
+                ));
+                return;
+            }
         };
         let command = self
             .task_command_line(&task)
             .unwrap_or_else(|_| task.command.clone());
-        let Some(pane) = self.run_project_task(task) else {
+        let step = PendingLaunchStep::Members(Box::new(CompoundLaunch {
+            members,
+            compound,
+            stop_all,
+        }));
+        let folder = self.active_workspace_root();
+        self.park_launch_behind(
+            task,
+            folder,
+            command,
+            step,
+            "compound preLaunchTask",
+            "its sessions start",
+        );
+    }
+
+    /// Run `task` in `folder` and park `step` until it is done, as its [`PreLaunchWait`]
+    /// says (#250, #1541). `what` names the task in the status ("preLaunchTask",
+    /// "compound preLaunchTask") and `starts` says what follows it.
+    fn park_launch_behind(
+        &mut self,
+        task: crate::tasks::Task,
+        folder: PathBuf,
+        command: String,
+        step: PendingLaunchStep,
+        what: &str,
+        starts: &str,
+    ) {
+        let task_label = task.label.clone();
+        let wait = PreLaunchWait::of(&task);
+        let Some(pane) = self.run_project_task_in(task, folder) else {
             // run_project_task already reported why the pane failed.
             return;
         };
+        if wait == PreLaunchWait::Untracked {
+            // VS Code warns that such a task cannot be tracked; waiting for
+            // an exit that never comes is the hang this avoids.
+            crate::output::push(
+                "Tasks",
+                crate::output::OutputLevel::Warn,
+                &format!(
+                    "{what} \"{task_label}\" is a background task with no problem matcher that marks when its build ends, so debugging started without waiting for it"
+                ),
+            );
+            self.resume_pending_launch(Some(0), step);
+            return;
+        }
         self.pending_debug_launch = Some(PendingDebugLaunch {
             pane,
             command,
-            step: PendingLaunchStep::Members(Box::new(CompoundLaunch {
-                members,
-                compound,
-                stop_all,
-            })),
+            step,
             started: std::time::Instant::now(),
+            watch: wait == PreLaunchWait::FirstBuild,
         });
-        self.run_debug.feedback = Some(format!("compound preLaunchTask \"{task_label}\" running…"));
+        self.run_debug.feedback = Some(format!("{what} \"{task_label}\" running…"));
         self.run_debug.feedback_is_error = false;
-        self.status = format!(
-            "compound preLaunchTask \"{task_label}\" running — its sessions start when it exits 0"
-        );
+        let when = if wait == PreLaunchWait::FirstBuild {
+            "when its first build ends"
+        } else {
+            "when it exits 0"
+        };
+        self.status = format!("{what} \"{task_label}\" running — {starts} {when}");
     }
 
     /// Launch every member of a compound, in declaration order (#310).
@@ -33661,6 +34321,7 @@ impl App {
         // this set (#567). The task-gated path reaches here via `take()`, so
         // this only ever drops a STALE parking.
         self.pending_debug_launch = None;
+        self.debug_build = None;
         let total = members.len();
         let mut started = 0usize;
         let mut building: Vec<String> = Vec::new();
@@ -33807,31 +34468,30 @@ impl App {
             self.debug_stop();
         }
         self.pending_debug_launch = None;
+        self.debug_build = None;
         let root = self.active_workspace_root();
         let tasks = crate::tasks::discover_tasks(&root);
-        let Some(task) = tasks.into_iter().find(|t| t.label == task_label) else {
-            self.debug_error(format!(
-                "compound preLaunchTask \"{task_label}\" not found — Tasks: Run Task lists what the workspace declares"
-            ));
-            return;
+        let task = match crate::tasks::find_task(tasks, task_label) {
+            Ok(task) => task,
+            Err(near) => {
+                self.debug_error(format!(
+                    "compound preLaunchTask \"{task_label}\" not found{} — Tasks: Run Task lists what the workspace declares",
+                    did_you_mean(near)
+                ));
+                return;
+            }
         };
         let command = self
             .task_command_line(&task)
             .unwrap_or_else(|_| task.command.clone());
-        let Some(pane) = self.run_project_task(task) else {
-            // run_project_task already reported why the pane failed.
-            return;
-        };
-        self.pending_debug_launch = Some(PendingDebugLaunch {
-            pane,
+        let folder = self.active_workspace_root();
+        self.park_launch_behind(
+            task,
+            folder,
             command,
-            step: PendingLaunchStep::Member(Box::new(member)),
-            started: std::time::Instant::now(),
-        });
-        self.run_debug.feedback = Some(format!("compound preLaunchTask \"{task_label}\" running…"));
-        self.run_debug.feedback_is_error = false;
-        self.status = format!(
-            "compound preLaunchTask \"{task_label}\" running — debug starts when it exits 0"
+            PendingLaunchStep::Member(Box::new(member)),
+            "compound preLaunchTask",
+            "debug starts",
         );
     }
 
@@ -33844,6 +34504,7 @@ impl App {
             self.debug_stop();
         }
         self.pending_debug_launch = None;
+        self.debug_build = None;
         self.pending_cargo_launches.clear();
         // A new run: the previous run's cleanup is not this one's.
         self.debug_post_tasks.clear();
@@ -33858,39 +34519,46 @@ impl App {
             file: self.editor.path.clone(),
             folders: self.workspace_folders(),
         };
-        let rc = match configs::resolve(cfg, &ctx) {
+        let mut rc = match configs::resolve(cfg, &ctx) {
             Ok(rc) => rc,
             Err(e) => {
                 self.debug_error(e);
                 return;
             }
         };
+        // Pinned to the root `program`/`outFiles` were resolved against
+        // (#1414): a `preLaunchTask` can run while the user focuses a file in
+        // another root, and recomputing the root at launch would point
+        // js-debug's source-map defaults at the wrong folder.
+        if rc.kind == crate::dap::session::AdapterKind::JsDebug {
+            rc.extra
+                .entry("__workspaceFolder")
+                .or_insert_with(|| serde_json::json!(root.to_string_lossy()));
+        }
         self.record_post_debug_task(&rc);
         if let Some(task_label) = rc.pre_launch_task.clone() {
             let tasks = crate::tasks::discover_tasks(&root);
-            let Some(task) = tasks.into_iter().find(|t| t.label == task_label) else {
-                self.debug_error(format!(
-                    "preLaunchTask \"{task_label}\" not found — Tasks: Run Task lists what the workspace declares"
-                ));
-                return;
+            let task = match crate::tasks::find_task(tasks, &task_label) {
+                Ok(task) => task,
+                Err(near) => {
+                    self.debug_error(format!(
+                        "preLaunchTask \"{task_label}\" not found{} — Tasks: Run Task lists what the workspace declares",
+                        did_you_mean(near)
+                    ));
+                    return;
+                }
             };
             let command = self
                 .task_command_line_in(&task, root.clone())
                 .unwrap_or_else(|_| task.command.clone());
-            let Some(pane) = self.run_project_task_in(task, root) else {
-                // run_project_task already reported why the pane failed.
-                return;
-            };
-            self.pending_debug_launch = Some(PendingDebugLaunch {
-                pane,
+            self.park_launch_behind(
+                task,
+                root,
                 command,
-                step: PendingLaunchStep::Resolved(Box::new(rc)),
-                started: std::time::Instant::now(),
-            });
-            self.run_debug.feedback = Some(format!("preLaunchTask \"{task_label}\" running…"));
-            self.run_debug.feedback_is_error = false;
-            self.status =
-                format!("preLaunchTask \"{task_label}\" running — debug starts when it exits 0");
+                PendingLaunchStep::Resolved(Box::new(rc)),
+                "preLaunchTask",
+                "debug starts",
+            );
             return;
         }
         self.launch_resolved_config(rc);
@@ -34056,8 +34724,9 @@ impl App {
             .clone()
             .unwrap_or_else(|| self.active_workspace_root());
         let name = rc.name.clone();
-        // The debuggee interpreter's note (#864), for a Python launch.
-        let mut python_note = None;
+        // A note for the status: the debuggee interpreter's (#864) for a
+        // Python launch, or a browser run headless (#1410).
+        let mut launch_note = None;
         let result = match rc.kind {
             AdapterKind::Debugpy => {
                 if rc.request == RequestKind::Launch && rc.program.is_none() && rc.module.is_none()
@@ -34067,38 +34736,59 @@ impl App {
                     ));
                     return;
                 }
-                match crate::dap::install::ensure_debug_venv() {
-                    Ok(py) => {
-                        let adapter_args =
-                            vec![String::from("-m"), String::from("debugpy.adapter")];
-                        let program_py =
-                            config_project_python(&rc, &cwd, &self.active_workspace_root(), &py);
-                        let request = configs::debugpy_request(&rc, &program_py);
-                        // Whichever interpreter runs the program, the
-                        // config's own included (#864).
-                        if rc.request == RequestKind::Launch {
-                            match launch_request_python(&request, &cwd)
-                                .as_deref()
-                                .map_or(Ok(None), debuggee_python_note)
-                            {
-                                Ok(note) => python_note = note,
-                                Err(refusal) => {
-                                    self.debug_error(format!("config \"{name}\": {refusal}"));
-                                    return;
+                // Remote Attach (#1417): the port a `debugpy --listen`
+                // process serves is its own adapter, so the session talks to
+                // it directly; a second, local adapter in front of it waits
+                // for a debug server that never comes.
+                let attach = (rc.request == RequestKind::Attach)
+                    .then(|| configs::debugpy_request(&rc, Path::new("python3")));
+                let direct = attach
+                    .and_then(|r| configs::debugpy_connect_address(&r).map(|address| (r, address)));
+                if let Some((request, (host, port))) = direct {
+                    crate::dap::session::DapSession::attach_tcp(&host, port, request, breakpoints)
+                        .map_err(|e| {
+                            e.context(format!(
+                                "nothing answered on {host}:{port}; start the program with `python -m debugpy --listen {host}:{port}` first"
+                            ))
+                        })
+                } else {
+                    match crate::dap::install::ensure_debug_venv() {
+                        Ok(py) => {
+                            let adapter_args =
+                                vec![String::from("-m"), String::from("debugpy.adapter")];
+                            let program_py = config_project_python(
+                                &rc,
+                                &cwd,
+                                &self.active_workspace_root(),
+                                &py,
+                            );
+                            let request = configs::debugpy_request(&rc, &program_py);
+                            // Whichever interpreter runs the program, the
+                            // config's own included (#864).
+                            if rc.request == RequestKind::Launch {
+                                match launch_request_python(&request, &cwd)
+                                    .as_deref()
+                                    .map_or(Ok(None), debuggee_python_note)
+                                {
+                                    Ok(note) => launch_note = note,
+                                    Err(refusal) => {
+                                        self.debug_error(format!("config \"{name}\": {refusal}"));
+                                        return;
+                                    }
                                 }
                             }
+                            crate::dap::session::DapSession::launch_with(
+                                &py.to_string_lossy(),
+                                &adapter_args,
+                                &cwd,
+                                request,
+                                breakpoints,
+                            )
                         }
-                        crate::dap::session::DapSession::launch_with(
-                            &py.to_string_lossy(),
-                            &adapter_args,
-                            &cwd,
-                            request,
-                            breakpoints,
-                        )
-                    }
-                    Err(e) => {
-                        self.debug_error(format!("Debugger setup failed: {e}"));
-                        return;
+                        Err(e) => {
+                            self.debug_error(format!("Debugger setup failed: {e}"));
+                            return;
+                        }
                     }
                 }
             }
@@ -34196,16 +34886,11 @@ impl App {
                 }
             }
             AdapterKind::JsDebug => {
-                if rc.request == RequestKind::Launch && !configs::js_launch_has_target(&rc) {
-                    self.debug_error(format!(
-                        "config \"{name}\": a node launch needs a \"program\", a \"runtimeExecutable\" or a \"command\""
-                    ));
+                if let Some(e) = configs::js_config_error(&rc) {
+                    self.debug_error(format!("config \"{name}\": {e}"));
                     return;
                 }
-                if rc.request == RequestKind::Attach && rc.port.is_none() {
-                    self.debug_error(format!("config \"{name}\": a node attach needs a \"port\""));
-                    return;
-                }
+                let browser = configs::browser_type(&rc.type_name).is_some();
                 let node = match crate::dap::install::node_program() {
                     Ok(n) => n,
                     Err(e) => {
@@ -34220,11 +34905,20 @@ impl App {
                         return;
                     }
                 };
+                let mut request = configs::js_request(&rc);
+                // A browser croft has no screen for would open where no one
+                // sees it (#1410): it runs headless, and the status says so.
+                if browser && rc.request == RequestKind::Launch && no_display_for_a_browser() {
+                    request = configs::with_headless_browser(request);
+                    launch_note = Some(String::from(
+                        "(no display here, so the browser runs headless)",
+                    ));
+                }
                 crate::dap::session::DapSession::launch_js_with(
                     &node,
                     &server,
                     &cwd,
-                    configs::js_request(&rc),
+                    configs::with_workspace_folder(request, &self.active_workspace_root()),
                     breakpoints,
                 )
             }
@@ -34243,10 +34937,10 @@ impl App {
                 };
                 self.run_debug.feedback = Some(format!("{verb} {name}"));
                 self.run_debug.feedback_is_error = false;
-                let lead = with_python_note(format!("{verb} {name}"), python_note.as_deref());
+                let lead = with_python_note(format!("{verb} {name}"), launch_note.as_deref());
                 self.status = format!("{lead} — F5 continue · F10 step over · Shift+F5 stop");
                 self.reveal_debug_view();
-                if python_note.is_some() {
+                if launch_note.is_some() {
                     self.debug_console_push(lead);
                 }
                 // A cppdbg configuration runs under lldb-dap (#1394): say
@@ -34272,6 +34966,7 @@ impl App {
         // Same as every other launch path: a parked older launch must not
         // fire later and replace this one (#567).
         self.pending_debug_launch = None;
+        self.debug_build = None;
         // Zero-config "Debug active file" declares no postDebugTask.
         self.debug_post_tasks.clear();
         let Some(path) = self.editor.path.clone() else {
@@ -34531,6 +35226,13 @@ impl App {
             self.debug_error(lldb_dap_missing_message());
             return;
         }
+        let is_rust = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("rs"));
+        if !is_rust {
+            self.begin_debug_build(path);
+            return;
+        }
         // Compiled source: build a debuggable binary first, then debug it.
         let binary = match self.build_debuggable_binary(path) {
             Ok(b) => b,
@@ -34540,6 +35242,89 @@ impl App {
             }
         };
         self.launch_lldb(&binary, path);
+    }
+
+    /// Start building the program F5 on the C/C++ file `path` debugs
+    /// (#1359): the project's CMake target, else the file with its
+    /// `compile_commands.json` flags, else the file alone. The build runs
+    /// on its own thread so a long one leaves the UI live; F5 again
+    /// replaces it.
+    fn begin_debug_build(&mut self, path: &Path) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        // The root that owns the file: an added folder's project, not the
+        // primary's.
+        let workspace = self
+            .roots
+            .owning_root(path)
+            .unwrap_or_else(|| self.roots.primary())
+            .to_path_buf();
+        let source = path.to_path_buf();
+        let cache = croft_cache_dir().join("debug-builds");
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::cpp_build::build_for_debug(
+                &workspace, &source, &cache,
+            ));
+        });
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let msg = format!("Building {name} for debugging…");
+        self.run_debug.feedback = Some(msg.clone());
+        self.run_debug.feedback_is_error = false;
+        self.status = msg;
+        self.debug_build = Some((path.to_path_buf(), rx));
+    }
+
+    /// F5's C/C++ build, once it is done: the source it debugs and the
+    /// build's result. `None` while it runs or when none was started.
+    fn take_debug_build(
+        &mut self,
+    ) -> Option<(
+        PathBuf,
+        Result<crate::cpp_build::Built, crate::cpp_build::Failed>,
+    )> {
+        let (_, rx) = self.debug_build.as_ref()?;
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(crate::cpp_build::Failed {
+                summary: String::from("the build stopped without a result"),
+                output: String::new(),
+            }),
+        };
+        let (source, _) = self.debug_build.take()?;
+        Some((source, result))
+    }
+
+    /// Launch lldb-dap once F5's C/C++ build is done, or report why it
+    /// failed with the build's whole output in OUTPUT's "Debug Build"
+    /// channel. True when the build finished this tick.
+    fn poll_debug_build(&mut self) -> bool {
+        let Some((source, result)) = self.take_debug_build() else {
+            return false;
+        };
+        match result {
+            Ok(built) => {
+                self.launch_lldb(&built.binary, &source);
+                if !self.run_debug.feedback_is_error {
+                    let line = self.run_debug.feedback.take().unwrap_or_default();
+                    self.run_debug.feedback = Some(format!("{line}, built by {}", built.how));
+                }
+            }
+            Err(failed) => {
+                const CHANNEL: &str = "Debug Build";
+                crate::output::clear(CHANNEL);
+                for line in failed.output.lines() {
+                    crate::output::push(CHANNEL, crate::output::OutputLevel::Error, line);
+                }
+                self.debug_error(format!(
+                    "Build for debug failed: {} (full output in OUTPUT › {CHANNEL})",
+                    failed.summary
+                ));
+            }
+        }
+        true
     }
 
     /// Launch lldb-dap on an already-built `binary`, attributing status to
@@ -34581,56 +35366,24 @@ impl App {
         }
     }
 
-    /// Compile `path` to a debuggable binary (with debug info, no optimisation)
-    /// and return the binary path. C via `cc`, C++ via `c++`, Rust via `rustc`
-    /// for a single file. The binary lands next to the source as `<stem>.dbg`.
+    /// Compile the single Rust file `path` with debug info and return the
+    /// binary, next to the source as `<stem>.dbg`. C and C++ build through
+    /// their project instead (`begin_debug_build`, #1359).
     fn build_debuggable_binary(&self, path: &Path) -> std::io::Result<PathBuf> {
-        use std::process::Command;
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
         let out = path.with_extension("dbg");
-        let (program, args): (&str, Vec<String>) = match ext.as_str() {
-            "rs" => (
-                "rustc",
-                vec![
-                    String::from("-g"),
-                    String::from("-o"),
-                    out.to_string_lossy().into_owned(),
-                    path.to_string_lossy().into_owned(),
-                ],
-            ),
-            "c" | "h" | "m" => (
-                "cc",
-                vec![
-                    String::from("-g"),
-                    String::from("-O0"),
-                    path.to_string_lossy().into_owned(),
-                    String::from("-o"),
-                    out.to_string_lossy().into_owned(),
-                ],
-            ),
-            _ => (
-                "c++",
-                vec![
-                    String::from("-g"),
-                    String::from("-O0"),
-                    path.to_string_lossy().into_owned(),
-                    String::from("-o"),
-                    out.to_string_lossy().into_owned(),
-                ],
-            ),
-        };
         // .output(), never .status(): the compiler must not inherit croft's
         // TTY - a compile error would spray its diagnostics over the UI
         // (same class as the pdftoppm trailer-dictionary spray).
-        let cmd_out = Command::new(program).args(&args).output()?;
+        let cmd_out = std::process::Command::new("rustc")
+            .arg("-g")
+            .arg("-o")
+            .arg(&out)
+            .arg(path)
+            .output()?;
         if !cmd_out.status.success() {
             let stderr = String::from_utf8_lossy(&cmd_out.stderr);
             return Err(std::io::Error::other(format!(
-                "{program} exited with {}: {}",
+                "rustc exited with {}: {}",
                 cmd_out.status,
                 stderr.trim()
             )));
@@ -34994,6 +35747,98 @@ impl App {
         }
     }
 
+    /// A click on the Run and Debug panel's debug toolbar (#1545): the same
+    /// action as the button's key.
+    fn run_debug_control(&mut self, control: crate::widgets::run_debug::DebugControl) {
+        use crate::widgets::run_debug::DebugControl;
+        match control {
+            DebugControl::Continue => self.debug_start_or_continue(),
+            DebugControl::Pause => self.debug_pause(),
+            DebugControl::StepOver => self.debug_step("next"),
+            DebugControl::StepInto => self.debug_step("stepIn"),
+            DebugControl::StepOut => self.debug_step("stepOut"),
+            DebugControl::Restart => self.debug_restart(),
+            DebugControl::Stop => self.debug_stop_by_user(),
+        }
+        self.refresh_debug_panel();
+    }
+
+    /// Debug: Continue (#1543): resume a paused session. Unlike F5 it never
+    /// starts one, so a binding for it is inert with nothing to continue.
+    fn debug_continue(&mut self) {
+        use crate::dap::session::SessionPhase;
+        match self.debug_sessions.focused().map(|s| s.phase) {
+            Some(SessionPhase::Stopped) => self.debug_start_or_continue(),
+            Some(_) => self.status = String::from("The program is already running"),
+            None => self.status = String::from("No debug session to continue"),
+        }
+    }
+
+    /// Debug: Step Into Target (#1543): ask the adapter which calls the
+    /// paused line makes; the answer arrives as `StepInTargets`. An adapter
+    /// that cannot say steps in plainly, as F11 does.
+    fn debug_step_into_target(&mut self) {
+        use crate::dap::session::{SessionPhase, StepInTargetsAsk};
+        let Some(session) = self.debug_sessions.focused_mut() else {
+            self.status = String::from("No debug session to step");
+            return;
+        };
+        if session.phase != SessionPhase::Stopped {
+            self.status = String::from("Step Into Target needs a paused program");
+            return;
+        }
+        match session.request_step_in_targets() {
+            StepInTargetsAsk::Sent => {}
+            StepInTargetsAsk::NoFrame => {
+                self.status =
+                    String::from("The paused frame is still loading; try Step Into Target again");
+            }
+            StepInTargetsAsk::Unsupported => {
+                self.status = String::from(
+                    "This debugger cannot list step-in targets; stepping into the first call",
+                );
+                self.debug_step("stepIn");
+            }
+        }
+    }
+
+    /// The adapter's answer to Step Into Target: nothing to choose between
+    /// steps in plainly, one target steps into it, several open a picker.
+    fn offer_step_in_targets(&mut self, targets: Vec<(i64, String)>) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        match targets.as_slice() {
+            [] => self.debug_step_into(None),
+            [(id, _)] => self.debug_step_into(Some(*id)),
+            _ => {
+                let rows = targets
+                    .into_iter()
+                    .map(|(id, label)| ListRow {
+                        id: id.to_string(),
+                        label,
+                    })
+                    .collect();
+                self.open_list_picker(
+                    ListPicker::new(ListPurpose::StepInTarget, "Step Into Target", rows),
+                    "",
+                );
+            }
+        }
+    }
+
+    /// Step into `target` on the paused line, or the first call to run.
+    fn debug_step_into(&mut self, target: Option<i64>) {
+        match target {
+            Some(id) => {
+                if let Some(session) = self.debug_sessions.focused_mut() {
+                    session.step_in_target(id);
+                    self.editor.stop_line = None;
+                    self.clear_inline_values();
+                }
+            }
+            None => self.debug_step("stepIn"),
+        }
+    }
+
     /// F10/F11/Shift+F11: step the paused thread (`next` / `stepIn` / `stepOut`).
     pub fn debug_step(&mut self, command: &str) {
         if let Some(session) = self.debug_sessions.focused_mut() {
@@ -35318,13 +36163,14 @@ impl App {
         }
         let tasks = crate::tasks::discover_tasks(&self.active_workspace_root());
         for label in labels {
-            match tasks.iter().find(|t| t.label == label) {
-                Some(task) => {
-                    self.run_project_task(task.clone());
+            match crate::tasks::find_task(tasks.clone(), &label) {
+                Ok(task) => {
+                    self.run_project_task(task);
                 }
-                None => {
+                Err(near) => {
                     self.status = format!(
-                        "postDebugTask \"{label}\" not found — Tasks: Run Task lists what the workspace declares"
+                        "postDebugTask \"{label}\" not found{} — Tasks: Run Task lists what the workspace declares",
+                        did_you_mean(near)
                     );
                 }
             }
@@ -35358,6 +36204,9 @@ impl App {
         // its debuggee after the user stopped debugging.
         self.pending_cargo_launches.clear();
         self.debug_compound = None;
+        // A C/C++ build still running must not launch once it finishes
+        // (#1359): Stop means stop.
+        self.debug_build = None;
         self.reset_watch_runtime();
         // Sweep js-debug's detached watchdog (and any leftover tree) once it has
         // reparented to init after the server dies. See the Terminated arm in
@@ -36763,6 +37612,8 @@ impl App {
     }
 
     fn close_list_picker(&mut self) {
+        // A server question closed without a pick is answered "no action".
+        self.lsp_question = None;
         if self.list_picker.take().is_some() {
             self.overlays.list_picker_clear.request();
             self.overlays.activity.mark_dirty();
@@ -37229,13 +38080,36 @@ impl App {
                 self.close_input_prompt();
                 self.run_fleet_command(&value);
             }
+            InputPurpose::EmmetWrap => {
+                self.close_input_prompt();
+                self.status = if self.editor.emmet_wrap(&value) {
+                    format!("Emmet: wrapped with {}", value.trim())
+                } else {
+                    format!(
+                        "Emmet: {} is not an abbreviation to wrap with",
+                        value.trim()
+                    )
+                };
+            }
+            InputPurpose::EmmetUpdateTag => {
+                self.close_input_prompt();
+                self.status = if self.editor.emmet_update_tag(&value) {
+                    format!("Emmet: tag renamed to {}", value.trim())
+                } else {
+                    format!(
+                        "Emmet: {} is not a tag name, or no tag is around the cursor",
+                        value.trim()
+                    )
+                };
+            }
             InputPurpose::HexFind => {
                 self.close_input_prompt();
-                match crate::hex::HexView::parse_find_query(&value) {
-                    Some(needle) => {
+                let text_side = self.editor.hex.as_ref().is_some_and(|v| v.ascii_focus);
+                match crate::hex::HexView::parse_find_query(&value, text_side) {
+                    Some(query) => {
                         let from = match self.editor.hex.as_mut() {
                             Some(view) => {
-                                view.last_find = Some(needle);
+                                view.last_find = Some(query);
                                 // The submit searches from the cursor
                                 // INCLUSIVE so a match under it is
                                 // found; F3 then steps past it.
@@ -39583,9 +40457,18 @@ impl App {
         };
         let purpose = picker.purpose;
         let selected = picker.selected;
+        let question = self.lsp_question.take();
         self.close_list_picker();
         let index = row.id.parse::<usize>().unwrap_or(0);
         match purpose {
+            ListPurpose::ServerQuestion => {
+                if let Some(q) = question
+                    && let Some(action) = q.actions.get(index).cloned()
+                {
+                    self.status = format!("{}: {}", q.server, action.title);
+                    let _ = q.reply.send(Some(action));
+                }
+            }
             ListPurpose::AgentLaneFile => {
                 if let Some((agent, path)) = self.pending_lane_picks.get(index).cloned() {
                     self.diff_agent_lane_row(&agent, &path);
@@ -39780,6 +40663,11 @@ impl App {
                     ),
                     "",
                 );
+            }
+            ListPurpose::StepInTarget => {
+                if let Ok(target) = row.id.parse::<i64>() {
+                    self.debug_step_into(Some(target));
+                }
             }
             ListPurpose::DebugConfigRequest => {
                 if let Some(draft) = self.debug_config_draft.as_mut() {
@@ -40330,22 +41218,28 @@ impl App {
             // a pane that is never rendered runs invisibly under a status line
             // saying it started.
             self.reveal_terminal_pane(idx);
+            // The matcher goes in before the command does: a watcher whose
+            // first cycle comes at once would otherwise be read with no
+            // matcher, and a launch parked on that cycle (#1541) never ends.
+            let uid = self.terminals[idx].uid();
+            self.assign_task_matcher(uid, matcher);
             self.terminals[idx].write_input(command.as_bytes());
             self.show_terminal = true;
             self.focus_pane(Pane::Terminal);
             self.status = format!("Running {}", task.label);
-            let uid = self.terminals[idx].uid();
             self.await_pane_outcome(uid, task.label);
-            self.assign_task_matcher(uid, matcher);
             return Some(uid);
         }
         match crate::widgets::terminal::PtyTerminal::new(&folder) {
             Ok(mut term) => {
                 term.set_manual_name(Some(pane_name));
-                term.write_input(command.as_bytes());
                 let uid = term.uid();
                 self.insert_terminal(term);
+                // Matcher first, then the command, as above.
                 self.assign_task_matcher(uid, matcher);
+                if let Some(t) = self.terminals.iter_mut().find(|t| t.uid() == uid) {
+                    t.write_input(command.as_bytes());
+                }
                 self.status = format!("Running {}", task.label);
                 self.await_pane_outcome(uid, task.label);
                 Some(uid)
@@ -41839,6 +42733,7 @@ impl App {
         self.scrub_view = None;
         self.scrub_view_key = None;
         self.tree.scrub_tree = None;
+        self.scrub_names.clear();
         if commits.is_empty() {
             self.status = String::from("No commits to scrub through");
             return;
@@ -43328,11 +44223,12 @@ impl App {
             self.status = String::from("The open file is outside the workspace");
             return None;
         };
+        let name = self.scrub_name_at(&rel, &commit.hash);
         let text = self
             .scrub_cache
             .entry((commit.hash.clone(), rel.clone()))
             .or_insert_with(|| {
-                crate::git::read_file_at_rev(&root, &commit.hash, &rel)
+                crate::git::read_file_at_rev(&root, &commit.hash, &name)
                     .ok()
                     .map(std::sync::Arc::from)
             })
@@ -43447,9 +44343,25 @@ impl App {
             width: body.width,
             height: 1,
         };
+        // Before a rename, say what the file was called then (#1304).
+        let rel = self.editor.path.as_ref().and_then(|p| {
+            p.strip_prefix(self.workspace_root())
+                .ok()
+                .map(|r| r.to_string_lossy().into_owned())
+        });
         let label = match (scrub.position(), scrub.commit()) {
             (crate::scrubber::Position::At(i), Some(c)) => {
-                format!(" {} {}/{} ", c.short_hash, scrub.len() - i, scrub.len())
+                let then = rel.as_ref().and_then(|rel| {
+                    self.scrub_names
+                        .get(rel)?
+                        .get(&c.hash)
+                        .filter(|n| *n != rel)
+                });
+                let n = scrub.len() - i;
+                match then {
+                    Some(old) => format!(" {} {n}/{} \u{b7} {old} ", c.short_hash, scrub.len()),
+                    None => format!(" {} {n}/{} ", c.short_hash, scrub.len()),
+                }
             }
             _ => String::from(" working tree "),
         };
@@ -43572,12 +44484,13 @@ impl App {
             None => (take(&mut self.scrub_plain), false),
         };
         // Neither ready (the first step, or a jump): build the stand-in here.
+        let name = self.scrub_name_at(&rel, &commit.hash);
         let view = view.or_else(|| {
             let text = self
                 .scrub_cache
                 .entry((commit.hash.clone(), rel.clone()))
                 .or_insert_with(|| {
-                    crate::git::read_file_at_rev(&root, &commit.hash, &rel)
+                    crate::git::read_file_at_rev(&root, &commit.hash, &name)
                         .ok()
                         .map(std::sync::Arc::from)
                 })
@@ -43594,6 +44507,35 @@ impl App {
         self.scrub_view = Some(view);
         self.scrub_view_key = Some((key, finished));
         self.request_scrub_views(&root, &path, &rel);
+    }
+
+    /// The name `rel` had at each commit the scrubber walks (#1304), keyed
+    /// by full hash; a commit missing from it had no older name.
+    fn scrub_names(
+        &mut self,
+        rel: &str,
+    ) -> std::sync::Arc<std::collections::HashMap<String, String>> {
+        if let Some(names) = self.scrub_names.get(rel) {
+            return std::sync::Arc::clone(names);
+        }
+        let Some(scrub) = self.scrubber.as_ref() else {
+            return Default::default();
+        };
+        let touched = crate::git::follow_names(self.workspace_root(), rel, SCRUB_COMMIT_LIMIT);
+        let names =
+            std::sync::Arc::new(crate::scrubber::names_by_commit(scrub.commits(), &touched));
+        self.scrub_names
+            .insert(rel.to_string(), std::sync::Arc::clone(&names));
+        names
+    }
+
+    /// The name to read `rel` by at commit `hash`: its name there when the
+    /// file was renamed since, else `rel` itself.
+    fn scrub_name_at(&mut self, rel: &str, hash: &str) -> String {
+        self.scrub_names(rel)
+            .get(hash)
+            .cloned()
+            .unwrap_or_else(|| rel.to_string())
     }
 
     /// Put the finished view being left back among the kept ones, so
@@ -43689,6 +44631,7 @@ impl App {
     /// stand-ins for the ones with neither a stand-in nor a finished view,
     /// and finished views for the ones without one; most urgent first.
     fn request_scrub_views(&mut self, root: &Path, path: &Path, rel: &str) {
+        let names = self.scrub_names(rel);
         let Some(scrub) = self.scrubber.as_ref() else {
             return;
         };
@@ -43702,6 +44645,15 @@ impl App {
                 },
                 path: path.to_path_buf(),
                 short: c.short_hash.clone(),
+                read_rel: names.get(&c.hash).map_or(rel, String::as_str).to_string(),
+                // A parent past the walked commits keeps the commit's name.
+                parent_rel: c
+                    .parents
+                    .first()
+                    .and_then(|p| names.get(p))
+                    .or_else(|| names.get(&c.hash))
+                    .map_or(rel, String::as_str)
+                    .to_string(),
                 parent: c.parents.first().cloned(),
                 text: self
                     .scrub_cache
@@ -44084,6 +45036,79 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    /// "Language Servers: Restart All" (#1621): stop every server and start
+    /// a fresh manager at the same roots, as a re-root does, without
+    /// quitting croft. The next sync re-opens every tab against the new
+    /// servers, which publish their diagnostics afresh.
+    fn restart_language_servers(&mut self) {
+        if self.lsp_paused_for_build {
+            self.status = String::from(LSP_PAUSED_FOR_BUILD);
+            return;
+        }
+        // The old manager's Drop waits for its servers; off the UI thread.
+        if let Some(old) = self.lsp.take() {
+            fs_watch::offload_drop(old);
+        }
+        // A format-on-save in flight dies with its server; save unformatted,
+        // as when a reply fails.
+        if self.format_request_id.take().is_some() {
+            self.complete_pending_save();
+        }
+        self.lsp = match crate::lsp::LspManager::new(self.workspace_root().to_path_buf()) {
+            Ok(m) => {
+                m.set_extra_roots(self.roots.iter().skip(1).map(Path::to_path_buf).collect());
+                Some(m)
+            }
+            Err(e) => {
+                let msg = format!("Language servers could not restart: {e}");
+                crate::output::push("Language Servers", crate::output::OutputLevel::Error, &msg);
+                self.status = msg;
+                None
+            }
+        };
+        self.lsp_last_seen.clear();
+        self.lsp_progress.clear();
+        // The new manager numbers semantic replies from 0 again.
+        self.semantic_generation_seen.clear();
+        self.lsp_diagnostics.clear();
+        self.rebuild_problems();
+        if self.lsp.is_some() {
+            let msg = "Restarted all language servers";
+            crate::output::push("Language Servers", crate::output::OutputLevel::Info, msg);
+            self.status = String::from(msg);
+        }
+    }
+
+    /// "Language Servers: Restart for This File" (#1621): restart only the
+    /// servers serving the active file, so rust-analyzer's index survives a
+    /// restart of ruff. The manager re-opens the tabs once they are back.
+    fn restart_language_servers_for_file(&mut self) {
+        if self.lsp_paused_for_build {
+            self.status = String::from(LSP_PAUSED_FOR_BUILD);
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Restart for This File needs a file open in the editor");
+            return;
+        };
+        let Some(lsp) = self.lsp.as_ref() else {
+            self.status =
+                String::from("No language servers are running; Restart All starts them again");
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let has_language = crate::lsp::Language::from_path(&path).is_some();
+        if !has_language {
+            self.status = format!("No language server serves {name}");
+            return;
+        }
+        lsp.restart_servers_for(path.clone());
+        self.status = format!("Restarting the language servers for {name}");
     }
 
     /// Start the one-shot local drift probe (#242) on a locally-launched
@@ -44520,8 +45545,16 @@ impl App {
         let mut active_path: Option<PathBuf> = None;
         for (idx, ed) in self.editor.editors.iter().enumerate() {
             // Only plain text file tabs survive a re-exec; diff / sheet /
-            // image tabs are derived views with no path to reopen from.
+            // image tabs are derived views with no path to reopen from. A
+            // grid with unsaved edits is the exception (#1593): its edits
+            // are kept, and the file reopens in the grid under them.
             if ed.has_non_text_view() {
+                if let Some(tab) = sheet_tab_state(ed) {
+                    if idx == self.editor.active_index() {
+                        active_tab = tabs.len();
+                    }
+                    tabs.push(tab);
+                }
                 continue;
             }
             // An untitled buffer has no file to reopen, so it is carried only
@@ -44566,6 +45599,7 @@ impl App {
                 scroll_col: ed.scroll_col,
                 dirty,
                 unsaved_text,
+                sheet_cells: Vec::new(),
             });
         }
         // The other editor groups too: their tabs are not in `self.editor`,
@@ -44574,6 +45608,17 @@ impl App {
         // (the same file open in two splits) keeps the dirty copy.
         for group in self.editor_layout.inactive_groups() {
             for ed in &group.editors {
+                if let Some(tab) = sheet_tab_state(ed) {
+                    // A clean tab of the same file (the focused split's,
+                    // or one reopened as text) gives way to the grid's
+                    // unsaved edits rather than drop them.
+                    match tabs.iter_mut().find(|t| t.path == tab.path) {
+                        Some(existing) if !existing.dirty => *existing = tab,
+                        Some(_) => {}
+                        None => tabs.push(tab),
+                    }
+                    continue;
+                }
                 if ed.has_non_text_view()
                     || !ed.dirty
                     || (!keep_merge_results && ed.merge.is_some())
@@ -44600,6 +45645,7 @@ impl App {
                     scroll_col: ed.scroll_col,
                     dirty: true,
                     unsaved_text: unsaved,
+                    sheet_cells: Vec::new(),
                 });
             }
         }
@@ -44619,9 +45665,26 @@ impl App {
         }
     }
 
-    fn apply_session_state(&mut self, state: &crate::session_state::SessionState) {
+    /// Returns the xlsx cells (#1593) it could not put back, as the tabs
+    /// they belong to: their workbook did not open in the grid, or lacks
+    /// their worksheet or row. The caller keeps them for a later launch.
+    fn apply_session_state(
+        &mut self,
+        state: &crate::session_state::SessionState,
+    ) -> Vec<crate::session_state::OpenTabState> {
+        let mut left = Vec::new();
         for tab in &state.tabs {
-            self.restore_open_tab(tab);
+            let has_cells = tab.dirty && !tab.sheet_cells.is_empty();
+            let unapplied = match self.restore_open_tab(tab) {
+                Some((_, unapplied)) => unapplied,
+                None if has_cells => tab.sheet_cells.clone(),
+                None => Vec::new(),
+            };
+            if has_cells && !unapplied.is_empty() {
+                let mut kept = tab.clone();
+                kept.sheet_cells = unapplied;
+                left.push(kept);
+            }
         }
         if state.active_tab < self.editor.tab_count() {
             self.editor.select(state.active_tab);
@@ -44640,16 +45703,44 @@ impl App {
         } else {
             Pane::Tree
         };
+        left
+    }
+
+    /// Keep the xlsx cells an update relaunch could not put back (#1593)
+    /// in a hot-exit backup of their own, which the next launch restores
+    /// from as it would a killed croft's. Returns whether they are on disk.
+    fn hold_unrestored_tabs(&mut self, tabs: Vec<crate::session_state::OpenTabState>) -> bool {
+        if tabs.is_empty() {
+            return true;
+        }
+        let Some(own) = self.hot_exit_path() else {
+            return false;
+        };
+        let Some(path) = crate::hot_exit::free_path_beside(&own) else {
+            return false;
+        };
+        let backup = crate::hot_exit::Backup {
+            workspace_root: self.workspace_root().to_path_buf(),
+            buffers: tabs
+                .into_iter()
+                .map(|tab| crate::hot_exit::Buffer {
+                    tab,
+                    disk_stamp: None,
+                })
+                .collect(),
+        };
+        backup.save(&path).is_ok()
     }
 
     /// Reopen one captured tab, the update relaunch's or hot exit's (#862):
     /// its file at the saved cursor and scroll, with its unsaved text over
-    /// what the file holds now. Returns the tab, or `None` when there was
-    /// nothing to bring back.
+    /// what the file holds now. Returns the tab, with the xlsx cells of
+    /// `tab` it could not put back (#1593), or `None` when there was nothing
+    /// to bring back.
     fn restore_open_tab(
         &mut self,
         tab: &crate::session_state::OpenTabState,
-    ) -> Option<&mut Editor> {
+    ) -> Option<(&mut Editor, Vec<crate::widgets::editor::SheetCellEdit>)> {
         let unsaved = tab.unsaved_text.as_deref().filter(|_| tab.dirty);
         let opened = tab
             .path
@@ -44670,6 +45761,17 @@ impl App {
         } else {
             return None;
         };
+        if ed.sheet.is_some() {
+            // A grid's edits go back into the grid (#1593); the text side
+            // of a sheet tab is never its content.
+            let unapplied = ed.restore_sheet_edits(unsaved, &tab.sheet_cells);
+            return Some((ed, unapplied));
+        }
+        if tab.dirty && !tab.sheet_cells.is_empty() {
+            // An xlsx that opened as text or hex (no longer readable as a
+            // workbook): none of its cells went back.
+            return Some((ed, tab.sheet_cells.clone()));
+        }
         if let Some(text) = unsaved {
             // As an edit, not a bare assignment: the text is re-highlighted
             // (it kept the disk file's colours) and the LSP and the rest
@@ -44682,7 +45784,7 @@ impl App {
         ed.cursor_col = tab.cursor_col.min(max_col);
         ed.scroll = tab.scroll;
         ed.scroll_col = tab.scroll_col;
-        Some(ed)
+        Some((ed, Vec::new()))
     }
 
     fn tear_down_connect_auth(&mut self) {
@@ -45209,6 +46311,65 @@ impl App {
         };
     }
 
+    /// Emmet: Wrap with Abbreviation or Update Tag (#1557): ask for the
+    /// abbreviation or the new name in a one-line prompt, as Go to Line
+    /// does. Says so instead where Emmet is not offered.
+    fn open_emmet_prompt(&mut self, wrap: bool) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        if !self.editor_is_text() {
+            return;
+        }
+        if !self.editor.emmet_available() {
+            self.status = format!(
+                "Emmet: not available in {} files",
+                self.editor.language_label()
+            );
+            return;
+        }
+        self.open_input_prompt(if wrap {
+            InputPrompt::new(
+                InputPurpose::EmmetWrap,
+                "Wrap with Abbreviation",
+                "abbreviation, such as div.card or ul>li*",
+            )
+        } else {
+            InputPrompt::new(InputPurpose::EmmetUpdateTag, "Update Tag", "new tag name")
+        });
+    }
+
+    /// Emmet's commands for markup already written that need no input
+    /// (#1557), each saying why when it did nothing.
+    fn run_emmet_edit(&mut self, edit: EmmetEdit) {
+        if !self.editor_is_text() {
+            return;
+        }
+        if !self.editor.emmet_available() {
+            self.status = format!(
+                "Emmet: not available in {} files",
+                self.editor.language_label()
+            );
+            return;
+        }
+        let (done, failed) = match edit {
+            EmmetEdit::RemoveTag => (self.editor.emmet_remove_tag(), "no tag around the cursor"),
+            EmmetEdit::MatchTag => (
+                self.editor.emmet_match_tag(),
+                "the cursor is not on a tag with a pair",
+            ),
+            EmmetEdit::BalanceOutward => (
+                self.editor.emmet_balance(true),
+                "nothing encloses the selection",
+            ),
+            EmmetEdit::BalanceInward => (
+                self.editor.emmet_balance(false),
+                "nothing inside the selection to narrow to",
+            ),
+        };
+        if !done {
+            self.status = format!("Emmet: {failed}");
+        }
+    }
+
     /// Markdown: Toggle Preview — flips the active tab between source and the
     /// rendered view; explains itself on a non-Markdown tab.
     fn toggle_markdown_preview(&mut self) {
@@ -45641,7 +46802,8 @@ impl App {
         if self.rebase_todo_key(key) {
             return;
         }
-        // Inline suggestion (#607): Tab accepts, Esc dismisses.
+        // Inline suggestion (#607): Tab accepts, Esc dismisses, Ctrl+Right
+        // and Ctrl+Down take a word or a line of it (#1625).
         if self.inline_suggestion_key(key) {
             return;
         }
@@ -48616,7 +49778,40 @@ impl App {
         self.status = format!("Pasted {} chars", s.chars().count());
     }
 
+    /// A terminal paste. While a macro records, a paste into the editor is a
+    /// step of it, on the same terms `handle_key` records a key: not while
+    /// replaying, and only when the editor had focus before and after and
+    /// the text went into it (#1464). Before, the replay silently left the pasted text out.
     fn handle_paste(&mut self, s: &str) {
+        let capture =
+            self.macro_recording.is_some() && !self.macro_replaying && self.focus == Pane::Editor;
+        let into_editor = self.handle_paste_inner(s);
+        if self.macro_recording.is_none() || self.macro_replaying {
+            return;
+        }
+        // A paste the palette, a prompt or the find bar took never reached
+        // the document, so replaying it there would insert stray text.
+        if capture && into_editor && self.focus == Pane::Editor {
+            if let Some(rec) = self.macro_recording.as_mut() {
+                rec.recorded.push_paste(s);
+            }
+        } else if !s.is_empty() {
+            // Logged as skipped keys are, by size only: a paste into a
+            // terminal can be a password.
+            crate::output::push(
+                "Macros",
+                crate::output::OutputLevel::Info,
+                &format!(
+                    "skipped a paste of {} chars: recording captures the editor pane only",
+                    s.chars().count()
+                ),
+            );
+        }
+    }
+
+    /// Route a paste to whatever owns it; true only when it went into the
+    /// editor's text, the one place a recording macro can replay it.
+    fn handle_paste_inner(&mut self, s: &str) -> bool {
         // Modal overlays own paste entirely while open — paste lands in
         // the modal's input field, never in the editor / tree / terminal
         // behind it. Without this, hitting Cmd+V right after Cmd+P pastes
@@ -48629,7 +49824,7 @@ impl App {
                     prompt.push_char(c);
                 }
             }
-            return;
+            return false;
         }
         if let Some(palette) = self.command_palette.as_mut() {
             for c in s.chars() {
@@ -48637,7 +49832,7 @@ impl App {
                     palette.push_char(c);
                 }
             }
-            return;
+            return false;
         }
         if let Some(picker) = self.go_to_symbol.as_mut() {
             for c in s.chars() {
@@ -48645,7 +49840,7 @@ impl App {
                     picker.push_char(c);
                 }
             }
-            return;
+            return false;
         }
         if let Some(picker) = self.workspace_symbols.as_mut() {
             for c in s.chars() {
@@ -48654,7 +49849,7 @@ impl App {
                 }
             }
             self.workspace_symbols_requery();
-            return;
+            return false;
         }
         if let Some(finder) = self.file_finder.as_mut() {
             for c in s.chars() {
@@ -48663,7 +49858,7 @@ impl App {
                 }
             }
             self.follow_quick_open_prefix();
-            return;
+            return false;
         }
         // The in-file find bar is a pane-scoped widget, not a modal: it only
         // owns the paste while the editor itself is focused. Without the focus
@@ -48682,7 +49877,7 @@ impl App {
                 }
             }
             self.editor_find_set_query(new_q);
-            return;
+            return false;
         }
         // Finder drag-and-drop into croft arrives via the host terminal as
         // a bracketed paste containing absolute filesystem path(s). The
@@ -48714,18 +49909,18 @@ impl App {
             .iter()
             .any(|p| p.is_absolute() && is_iterm2_inline_image_drop(p))
         {
-            return;
+            return false;
         }
         let dropped = parse_dropped_paths(s);
         if !dropped.is_empty() {
             match self.sidebar_view {
                 SidebarView::Remote if self.focus == Pane::Tree => {
                     self.import_paths_into_remote(&dropped);
-                    return;
+                    return false;
                 }
                 SidebarView::Explorer if self.focus == Pane::Tree => {
                     self.import_paths_into_explorer(&dropped);
-                    return;
+                    return false;
                 }
                 _ => {}
             }
@@ -48755,14 +49950,14 @@ impl App {
             let foreign = parse_foreign_dropped_paths(s);
             if !foreign.is_empty() {
                 self.request_remote_pulls(&foreign);
-                return;
+                return false;
             }
         }
         if self.sidebar_view == SidebarView::Search && self.focus == Pane::Tree {
             self.search.insert_str_into_query(s);
             self.submit_search_query();
             self.status = format!("Pasted {} chars", s.chars().count());
-            return;
+            return false;
         }
         // Source Control commit message box: bracketed paste must
         // populate it the same way Cmd+V via the key path does
@@ -48777,12 +49972,13 @@ impl App {
         {
             self.source_control.insert_str(s);
             self.status = format!("Pasted {} chars", s.chars().count());
-            return;
+            return false;
         }
         match self.focus {
             Pane::Editor => {
                 self.editor.paste_str(s, self.paste_reindent);
                 self.status = format!("Pasted {} chars", s.chars().count());
+                return true;
             }
             Pane::Terminal => {
                 if self.terminal_find.is_some() {
@@ -48803,6 +49999,7 @@ impl App {
             }
             Pane::Tree => {}
         }
+        false
     }
 
     /// Move every dropped path into the directory the explorer is
@@ -49484,6 +50681,8 @@ impl App {
         // A preLaunchTask completing settles the parked debug launch (#250);
         // recorded here and acted on after the sweep (launching mutates self).
         let mut settled_launch: Option<Option<i32>> = None;
+        // A watch preLaunchTask's first build ended, with this many errors.
+        let mut settled_watch: Option<usize> = None;
         // The newest OSC 52 copy any pane's program made this tick (#678).
         let mut copied: Option<String> = None;
         // A task's or fenced block's command ended (#856): (pane uid, exit,
@@ -49498,6 +50697,19 @@ impl App {
             t.set_triggers(self.triggers.clone());
             t.set_watch_set(self.watch_set.clone());
             for (cwd, batch) in t.drain_watch_batches() {
+                // A watch task's first build settles the launch parked on
+                // it (#1541): it will never exit to do so.
+                if settled_watch.is_none()
+                    && let Some(p) = self.pending_debug_launch.as_ref()
+                    && p.watch
+                    && p.pane == t.uid()
+                {
+                    let errors = batch
+                        .iter()
+                        .filter(|d| d.severity == crate::lsp::manager::DiagnosticSeverity::Error)
+                        .count();
+                    settled_watch = Some(errors);
+                }
                 watch_installs.push((t.uid(), cwd, batch));
             }
             for h in t.drain_trigger_hits() {
@@ -49638,6 +50850,19 @@ impl App {
             && let Some(pending) = self.pending_debug_launch.take()
         {
             self.resume_pending_launch(exit, pending.step);
+        } else if let Some(errors) = settled_watch
+            && let Some(pending) = self.pending_debug_launch.take()
+        {
+            if errors == 0 {
+                self.resume_pending_launch(Some(0), pending.step);
+            } else {
+                // The watcher keeps running: fixing the errors rebuilds,
+                // and F5 then launches against a clean build.
+                self.debug_error(format!(
+                    "preLaunchTask build finished with {errors} error{} — debug launch aborted (PROBLEMS lists them; the task keeps watching)",
+                    if errors == 1 { "" } else { "s" }
+                ));
+            }
         }
         // Liveness fallback for a still-parked launch: the FinishedCommand
         // match depends on OSC 133 marks, and a pane without integration (or
@@ -49682,8 +50907,11 @@ impl App {
         }
         // Captures collect silently (iTerm2's model: the panel is the
         // surface, not the status bar), but still trigger a redraw.
-        let had_captures =
-            !captured.is_empty() || build_changed || settled_launch.is_some() || pending_aborted;
+        let had_captures = !captured.is_empty()
+            || build_changed
+            || settled_launch.is_some()
+            || settled_watch.is_some()
+            || pending_aborted;
         for c in captured {
             self.captures.push(c);
         }
@@ -51465,21 +52693,17 @@ impl App {
     /// Write `key = value` into the Settings editor's target layer, re-merge
     /// and apply it live, and refresh the editor's rows.
     fn write_setting(&mut self, key: &str, value: serde_json::Value) {
-        use crate::config_layers::LayerKind;
-        let Some(target) = self.settings_editor.as_ref().map(|e| e.target) else {
+        let Some(path) = self.settings_target_file(key) else {
             return;
         };
-        let path = match target {
-            LayerKind::Workspace => {
-                if !crate::config_layers::WORKSPACE_ALLOWED_KEYS.contains(&key) {
-                    self.status =
-                        format!("{key} can only be set in your user settings (Tab switches layer)");
-                    return;
-                }
-                crate::config_layers::workspace_config_path(self.roots.primary())
-            }
-            _ => self.config_dir.join("config.json"),
-        };
+        // A value croft can't read back as the setting is refused here,
+        // not saved and then ignored (#1555).
+        if let Err(e) =
+            crate::settings_editor::check(&self.merged_settings_here().prefs, key, &value)
+        {
+            self.status = e;
+            return;
+        }
         let text = std::fs::read_to_string(&path).unwrap_or_default();
         let new = match crate::settings_editor::set_key(&text, key, value) {
             Ok(t) => t,
@@ -51510,9 +52734,120 @@ impl App {
         self.status = format!("{key} saved to {}", path.display());
     }
 
+    /// The layer file the Settings editor writes `key` to: the user's
+    /// `config.json`, or, with the workspace layer chosen, the workspace's,
+    /// for the keys a workspace may set. None, with the status saying why,
+    /// for any other key there.
+    fn settings_target_file(&mut self, key: &str) -> Option<std::path::PathBuf> {
+        use crate::config_layers::LayerKind;
+        let target = self.settings_editor.as_ref()?.target;
+        match target {
+            LayerKind::Workspace => {
+                if !crate::config_layers::WORKSPACE_ALLOWED_KEYS.contains(&key) {
+                    self.status =
+                        format!("{key} can only be set in your user settings (Tab switches layer)");
+                    return None;
+                }
+                Some(crate::config_layers::workspace_config_path(
+                    self.roots.primary(),
+                ))
+            }
+            _ => Some(self.config_dir.join("config.json")),
+        }
+    }
+
+    /// A setting the editor can't edit in place (an object or a list),
+    /// opened in the chosen layer's file with the caret on its key
+    /// (#1555): it used to open the user's file at line 1 whichever layer
+    /// was chosen.
+    fn open_setting_in_json(&mut self, key: &str) {
+        let Some(path) = self.settings_target_file(key) else {
+            return;
+        };
+        let seed = if path == self.config_dir.join("config.json") {
+            ConfigFileSeed::Settings
+        } else {
+            ConfigFileSeed::SettingsLayer
+        };
+        self.settings_editor = None;
+        self.open_config_file_in_editor(path.clone(), seed);
+        if self.editor.path.as_deref() != Some(path.as_path()) {
+            return;
+        }
+        let line = crate::settings_editor::key_line(&self.editor.lines.join("\n"), key);
+        if let Some(line) = line {
+            self.editor.goto_line(line + 1);
+        }
+        let name = key.replace('_', " ");
+        self.status = match line {
+            Some(_) => format!("{name} is edited in the JSON file"),
+            None => format!("{name} is edited in the JSON file: add \"{key}\" here"),
+        };
+    }
+
+    /// Reset Setting (#1655): remove `key` from the layer the Settings
+    /// editor writes to, so the value falls back to the layers below it or
+    /// croft's default, and re-merge. Once only a hand edit of `config.json`
+    /// could undo a setting, and toggling one back left a redundant entry.
+    fn reset_setting(&mut self, key: &str) {
+        use crate::config_layers::LayerKind;
+        let Some(target) = self.settings_editor.as_ref().map(|e| e.target) else {
+            return;
+        };
+        let (path, layer) = match target {
+            LayerKind::Workspace => (
+                crate::config_layers::workspace_config_path(self.roots.primary()),
+                "workspace",
+            ),
+            _ => (self.config_dir.join("config.json"), "user"),
+        };
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let new = match crate::settings_editor::remove_key(
+            &text,
+            key,
+            crate::config_layers::current_platform(),
+        ) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                self.status =
+                    format!("{key} is not set in your {layer} settings (Tab switches layer)");
+                return;
+            }
+            Err(e) => {
+                self.status = format!("{}: {e}", path.display());
+                return;
+            }
+        };
+        if let Err(e) = std::fs::write(&path, new) {
+            self.status = format!("{}: {e}", path.display());
+            return;
+        }
+        let merged = self.merged_settings_here();
+        for w in &merged.warnings {
+            crate::output::push("Settings", crate::output::OutputLevel::Warn, w);
+        }
+        self.apply_merged_settings(&merged.prefs);
+        self.settings_provenance = merged.provenance.clone();
+        let rows = crate::settings_editor::rows(&merged.prefs, &merged.provenance);
+        let now = rows.iter().find(|r| r.key == key).map(|r| {
+            format!(
+                "{} ({})",
+                crate::settings_editor::display(&r.value),
+                r.layer.label()
+            )
+        });
+        if let Some(ed) = self.settings_editor.as_mut() {
+            ed.rows = rows;
+        }
+        self.status = match now {
+            Some(now) => format!("{key} reset in {}: now {now}", path.display()),
+            None => format!("{key} reset in {}", path.display()),
+        };
+    }
+
     /// Keys while the Settings editor is open (#612): typing searches, Enter
-    /// edits the selected setting, Tab switches between the user and the
-    /// workspace layer.
+    /// edits the selected setting, Del resets it (#1655), Tab switches
+    /// between the user and the workspace layer.
     fn handle_settings_editor_key(&mut self, key: KeyEvent) {
         use crate::config_layers::LayerKind;
         use crate::settings_editor::Kind;
@@ -51544,7 +52879,15 @@ impl App {
                     }
                     Kind::Number | Kind::Text => {
                         use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
-                        let now = crate::settings_editor::display(&row.value);
+                        // An unset optional setting, or an empty one,
+                        // opens empty, not on the `(default)` label, which
+                        // typing would extend and which, confirmed as is,
+                        // would unset an explicitly empty `review_ai_prefix`.
+                        let now = if row.value.is_null() || row.value == "" {
+                            String::new()
+                        } else {
+                            crate::settings_editor::display(&row.value)
+                        };
                         self.open_input_prompt(
                             InputPrompt::new(
                                 InputPurpose::SettingValue {
@@ -51556,15 +52899,12 @@ impl App {
                             .with_value(now),
                         );
                     }
-                    Kind::Json => {
-                        self.settings_editor = None;
-                        self.status =
-                            format!("{} is edited in the JSON file", row.key.replace('_', " "));
-                        self.open_config_file_in_editor(
-                            self.config_dir.join("config.json"),
-                            ConfigFileSeed::Settings,
-                        );
-                    }
+                    Kind::Json => self.open_setting_in_json(&row.key),
+                }
+            }
+            (KeyCode::Delete, _) => {
+                if let Some(key) = ed.selected_row().map(|r| r.key.clone()) {
+                    self.reset_setting(&key);
                 }
             }
             (KeyCode::Backspace, _) => {
@@ -51590,18 +52930,10 @@ impl App {
         else {
             return;
         };
-        let v = value.trim();
-        let parsed = match row.kind {
-            crate::settings_editor::Kind::Number => match v.parse::<u64>() {
-                Ok(n) => serde_json::Value::from(n),
-                Err(_) => {
-                    self.status = format!("{key} needs a whole number, not \"{v}\"");
-                    return;
-                }
-            },
-            _ => serde_json::Value::from(v),
-        };
-        self.write_setting(key, parsed);
+        match crate::settings_editor::typed_value(&row, value) {
+            Ok(parsed) => self.write_setting(key, parsed),
+            Err(e) => self.status = e,
+        }
     }
 
     fn render_settings_editor(&mut self, frame: &mut ratatui::Frame) {
@@ -53111,10 +54443,10 @@ impl App {
             return;
         }
         let count = count.max(1);
-        // Budget the keys actually fed, not the recorded step count:
-        // `key_events` drops steps this build cannot replay, so `len()` is an
-        // upper bound rather than the real total.
-        let keys = mac.key_events();
+        // Budget the steps actually fed, not the recorded step count:
+        // `replay_steps` drops steps this build cannot replay, so `len()` is
+        // an upper bound rather than the real total.
+        let keys = mac.replay_steps();
         if keys.is_empty() {
             // Every step was one this build cannot replay (a macro from a
             // newer croft). Say so rather than reporting a successful run
@@ -53122,7 +54454,16 @@ impl App {
             self.status = String::from("Macro has no steps this version can replay");
             return;
         }
-        let total = keys.len().saturating_mul(count);
+        // A paste is one step but inserts all of its text, so its characters
+        // count against the budget like typed ones.
+        let per_run: usize = keys
+            .iter()
+            .map(|step| match step {
+                crate::macros::Replay::Key(_) => 1,
+                crate::macros::Replay::Paste(text) => text.chars().count().max(1),
+            })
+            .sum();
+        let total = per_run.saturating_mul(count);
         if total > MAX_REPLAY_KEYS {
             self.status =
                 format!("Macro would run {total} keys (limit {MAX_REPLAY_KEYS}) — refused");
@@ -53140,10 +54481,16 @@ impl App {
             // one-step-per-iteration guarantee needs an undo-group API the
             // editor does not have (its undo is whole-buffer snapshots).
             self.editor.break_undo_coalescing();
-            for k in &keys {
-                if let Err(e) = self.handle_key(*k) {
-                    aborted = Some((iteration + 1, e.to_string()));
-                    break 'outer;
+            for step in &keys {
+                match step {
+                    crate::macros::Replay::Key(k) => {
+                        if let Err(e) = self.handle_key(*k) {
+                            aborted = Some((iteration + 1, e.to_string()));
+                            break 'outer;
+                        }
+                    }
+                    // Pasted, not typed, as it was recorded (#1464).
+                    crate::macros::Replay::Paste(text) => self.handle_paste(text),
                 }
             }
             done = iteration + 1;
@@ -53228,6 +54575,12 @@ impl App {
                 }
             }
             Cmd::EmmetExpandAbbreviation => self.expand_emmet_abbreviation(),
+            Cmd::EmmetWrapWithAbbreviation => self.open_emmet_prompt(true),
+            Cmd::EmmetUpdateTag => self.open_emmet_prompt(false),
+            Cmd::EmmetRemoveTag => self.run_emmet_edit(EmmetEdit::RemoveTag),
+            Cmd::EmmetMatchTag => self.run_emmet_edit(EmmetEdit::MatchTag),
+            Cmd::EmmetBalanceOutward => self.run_emmet_edit(EmmetEdit::BalanceOutward),
+            Cmd::EmmetBalanceInward => self.run_emmet_edit(EmmetEdit::BalanceInward),
             Cmd::ExpandSelection => self.expand_selection(),
             Cmd::ShrinkSelection => self.shrink_selection(),
             Cmd::SwitchHeaderSource => self.switch_header_source(),
@@ -53554,6 +54907,21 @@ impl App {
             Cmd::UnfoldAllRegions => self
                 .editor
                 .unfold_all_of_kind(crate::lsp::manager::FoldRangeKind::Region),
+            Cmd::FoldLevel1 => self.editor.fold_level(1),
+            Cmd::FoldLevel2 => self.editor.fold_level(2),
+            Cmd::FoldLevel3 => self.editor.fold_level(3),
+            Cmd::FoldLevel4 => self.editor.fold_level(4),
+            Cmd::FoldLevel5 => self.editor.fold_level(5),
+            Cmd::FoldLevel6 => self.editor.fold_level(6),
+            Cmd::FoldLevel7 => self.editor.fold_level(7),
+            Cmd::FoldRecursively => {
+                let row = self.editor.cursor_row;
+                self.editor.fold_recursively(row);
+            }
+            Cmd::UnfoldRecursively => {
+                let row = self.editor.cursor_row;
+                self.editor.unfold_recursively(row);
+            }
             Cmd::TrimFinalNewlines => {
                 if self.editor.trim_final_newlines() {
                     self.status = String::from("Trimmed final newlines");
@@ -53573,6 +54941,7 @@ impl App {
             Cmd::ClearBookmarks => self.clear_bookmarks(),
             Cmd::SaveFile => self.save(),
             Cmd::SaveAs => self.open_save_as_prompt(),
+            Cmd::SaveWithSudo => self.save_with_sudo(),
             Cmd::RevertFile => self.revert_file(),
             Cmd::SaveAll => self.save_all(),
             Cmd::NewUntitledFile => self.new_untitled_file(),
@@ -53765,6 +55134,8 @@ impl App {
                 self.notebook_kernel_request(crate::notebook_kernel::Request::Restart)
             }
             Cmd::NotebookSelectKernel => self.select_notebook_kernel(),
+            Cmd::RestartLanguageServers => self.restart_language_servers(),
+            Cmd::RestartLanguageServersForFile => self.restart_language_servers_for_file(),
             Cmd::TestingRunWithCoverage => self.run_all_tests_with_coverage(),
             Cmd::CoverageClear => self.clear_coverage(),
             Cmd::TestingInstallCoverageTool => self.install_coverage_tool(),
@@ -54343,6 +55714,10 @@ impl App {
             Cmd::ShowOutgoingCalls => self.request_call_hierarchy_at_cursor(false),
             Cmd::EditBreakpointCondition => self.debug_edit_condition(),
             Cmd::StepOver => self.debug_step("next"),
+            Cmd::ContinueDebugging => self.debug_continue(),
+            Cmd::StepInto => self.debug_step("stepIn"),
+            Cmd::StepOut => self.debug_step("stepOut"),
+            Cmd::StepIntoTarget => self.debug_step_into_target(),
             Cmd::ToggleRaisedExceptions => self.debug_toggle_raised_exceptions(),
             Cmd::AttachPythonProcess => self.open_attach_python_picker(),
             Cmd::ColorTheme => self.open_theme_picker(),
@@ -55037,6 +56412,18 @@ impl App {
             (KeyCode::Right, _) => prompt.move_cursor_right(),
             (KeyCode::Home, _) => prompt.move_cursor_home(),
             (KeyCode::End, _) => prompt.move_cursor_end(),
+            // Replacing a prefilled value took a Backspace per character,
+            // typed blind (#1601): these select or clear it as the shell
+            // and VS Code do, and a word goes back to a path separator.
+            (KeyCode::Char('a'), KeyModifiers::CONTROL) => prompt.select_all(),
+            (KeyCode::Char('a'), KeyModifiers::SUPER) => prompt.select_all(),
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) => prompt.clear_to_start(),
+            (KeyCode::Char('k'), KeyModifiers::CONTROL) => prompt.clear_to_end(),
+            (KeyCode::Char('w'), KeyModifiers::CONTROL) => prompt.delete_word_back(),
+            (KeyCode::Backspace, m) if m.contains(KeyModifiers::SUPER) => prompt.clear_to_start(),
+            (KeyCode::Backspace, m) if m.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+                prompt.delete_word_back()
+            }
             (KeyCode::Backspace, _) => prompt.pop_char(),
             (KeyCode::Delete, _) => prompt.delete_char(),
             (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
@@ -55897,6 +57284,15 @@ impl App {
             self.open_editor_find();
             return;
         }
+        // The cursor starts in Replace only when the query is already the
+        // user's choice, as in VS Code: the bar was open (they typed or took
+        // the find text there) or the text came from a one-line selection.
+        // A word merely under the caret is a guess: starting in Replace put
+        // what they typed to find into Replace, and Replace All then made
+        // the opposite edit (#1592).
+        let selection = self.editor.selection_text();
+        let chosen =
+            self.editor_find.is_some() || (!selection.is_empty() && !selection.contains('\n'));
         if self.editor_find.is_none() {
             self.open_editor_find();
         }
@@ -55904,7 +57300,7 @@ impl App {
             return;
         };
         state.replace_visible = !state.replace_visible;
-        state.focus = if state.replace_visible && !state.query.is_empty() {
+        state.focus = if state.replace_visible && !state.query.is_empty() && chosen {
             crate::widgets::editor_find::FindField::Replace
         } else {
             crate::widgets::editor_find::FindField::Query
@@ -57783,6 +59179,22 @@ impl App {
                     ));
                     return;
                 }
+                // A Run and Debug row: copy a variable's value or
+                // expression, watch it, or copy the call stack (#1546).
+                if in_tree
+                    && self.sidebar_view == SidebarView::RunDebug
+                    && let Some(idx) = self.run_debug.debug_row_at(m.row)
+                {
+                    let items = self.debug_row_menu(idx);
+                    if !items.is_empty() {
+                        self.context_menu = Some(ContextMenu::flat(
+                            (m.column, m.row),
+                            items,
+                            self.tree.root.clone(),
+                        ));
+                    }
+                    return;
+                }
                 // An OUTLINE row: go to the symbol, or open it as its own
                 // tab (#369).
                 if rect_contains(self.outline.last_area, m.column, m.row)
@@ -59048,7 +60460,9 @@ impl App {
                         return;
                     }
                     if self.run_debug.debug_active {
-                        if let Some(widx) = self.run_debug.watch_remove_at(m.column, m.row) {
+                        if let Some(control) = self.run_debug.debug_control_at(m.column, m.row) {
+                            self.run_debug_control(control);
+                        } else if let Some(widx) = self.run_debug.watch_remove_at(m.column, m.row) {
                             self.remove_watch_expression(widx);
                             self.refresh_debug_panel();
                         } else if let Some(idx) = self.run_debug.debug_row_at(m.row) {
@@ -60559,7 +61973,9 @@ impl App {
         if !self.auto_save_on_focus_change {
             return false;
         }
-        self.sweep_dirty_buffers(false, false)
+        // An auto save: the caret lines keep their trailing whitespace,
+        // since the user may be mid-word when they alt-tab away (#1455).
+        self.sweep_dirty_buffers(false, false, true)
     }
 
     /// Sample the current focus (pane, active tab, active path) and report
@@ -60585,13 +62001,20 @@ impl App {
     /// not lost it yet). Returns true when anything changed on screen.
     fn sweep_auto_save(&mut self, require_delay: bool) -> bool {
         let skip_active = !require_delay && self.focus == Pane::Editor;
-        self.sweep_dirty_buffers(require_delay, skip_active)
+        self.sweep_dirty_buffers(require_delay, skip_active, true)
     }
 
     /// Write every dirty buffer the auto-save rules allow, in every split,
     /// leaving the active tab alone when `skip_active`. Shared by the
-    /// auto-save sweep and File: Save All (#852).
-    fn sweep_dirty_buffers(&mut self, require_delay: bool, skip_active: bool) -> bool {
+    /// auto-save sweep and File: Save All (#852). `automatic` is the
+    /// auto-save sweep, whose writes spare the caret lines' trailing
+    /// whitespace; Save All's are explicit saves (#1455).
+    fn sweep_dirty_buffers(
+        &mut self,
+        require_delay: bool,
+        skip_active: bool,
+        automatic: bool,
+    ) -> bool {
         // Each saved tab's own map rides along (#349): the recorder must not
         // look it up by path afterwards, since a split can hold the same file
         // in a second buffer with a different map.
@@ -60637,6 +62060,9 @@ impl App {
                 // consent to the lossy write, so retrying here would just
                 // re-refuse every tick.
                 && !e.encoding_loss
+                // A file the user can't write, or protected from writes,
+                // is only ever saved on an explicit Cmd+S (#1379).
+                && !e.write_protected
                 // A merge with conflicts still open: its Result holds only
                 // the base text there, and writing it would drop both
                 // sides from disk. Complete Merge (or an explicit Cmd+S) is
@@ -60655,6 +62081,7 @@ impl App {
         // tab's OWN encoding, which need not be the active tab's.
         let mut lossy: Vec<String> = Vec::new();
         let mut lossy_paths: Vec<PathBuf> = Vec::new();
+        let cleanup = self.save_cleanup;
         let mut sweep = |editors: &mut [crate::widgets::editor::Editor], skip: Option<usize>| {
             for (i, e) in editors
                 .iter_mut()
@@ -60670,7 +62097,13 @@ impl App {
                 // `save_to_disk` re-checks the disk and flags (never
                 // overwrites) an external change; auto save must not
                 // arm the force-overwrite path an explicit Cmd+S offers.
-                match e.save_to_disk() {
+                e.save_cleanup = cleanup;
+                let saved = if automatic {
+                    e.auto_save_to_disk()
+                } else {
+                    e.save_to_disk()
+                };
+                match saved {
                     Ok(crate::widgets::editor::SaveOutcome::Saved) => {
                         if let Some(p) = e.path.clone() {
                             // The bytes this editor just wrote, so the
@@ -60698,6 +62131,9 @@ impl App {
                     // this tick is the one chance to say why it stopped
                     // saving. Never arms the lossy write — consent is the
                     // explicit path's alone.
+                    // The refusal set `write_protected`, which keeps the
+                    // tab out of `due`: the lock on its tab says why.
+                    Ok(crate::widgets::editor::SaveOutcome::WriteProtected) => {}
                     Ok(crate::widgets::editor::SaveOutcome::EncodingLoss) => {
                         if let Some(p) = e.path.as_ref()
                             && !lossy_paths.contains(p)
@@ -60774,7 +62210,7 @@ impl App {
             self.save();
         }
         let active_status = self.status.clone();
-        self.sweep_dirty_buffers(false, true);
+        self.sweep_dirty_buffers(false, true, false);
         // A format-on-save write lands with its formatter reply: it is on
         // its way, not left behind.
         let pending = self
@@ -60897,7 +62333,7 @@ impl App {
         }
         let (map, _) = crate::keymap::Keymap::load_with_warnings(&self.keybindings_file);
         self.keymap = map;
-        self.snippets = load_snippets(&crate::snippets::snippets_path());
+        self.snippets = load_all_snippets(self.roots.iter());
         self.status = format!(
             "Profile: {}; keybindings and snippets applied, settings apply at the next launch",
             name.as_deref().unwrap_or("Default")
@@ -61144,30 +62580,46 @@ impl App {
     }
 
     /// Tab takes a live suggestion (#607), recorded as the navigator's
-    /// writing; Esc drops it. Returns whether the key was used.
+    /// writing; Esc drops it. Ctrl+Right takes its next word and Ctrl+Down
+    /// its next line (#1625), leaving the rest live at the new caret.
+    /// Returns whether the key was used.
     fn inline_suggestion_key(&mut self, key: KeyEvent) -> bool {
-        if !key.modifiers.is_empty()
-            || self.completion_popup.is_some()
-            || self.editor.snippet_active()
-        {
+        if self.completion_popup.is_some() || self.editor.snippet_active() {
             return false;
         }
         let Some(text) = self.editor.live_ghost().map(str::to_string) else {
             return false;
         };
-        match key.code {
-            KeyCode::Tab => {
+        let take = match (key.code, key.modifiers) {
+            (KeyCode::Tab, KeyModifiers::NONE) => text.len(),
+            (KeyCode::Right, KeyModifiers::CONTROL) => crate::inline_complete::next_word_len(&text),
+            (KeyCode::Down, KeyModifiers::CONTROL) => crate::inline_complete::next_line_len(&text),
+            (KeyCode::Esc, KeyModifiers::NONE) => {
                 self.editor.ghost = None;
-                self.editor
-                    .insert_str_as(&text, crate::provenance::Seat::Navigator);
-                true
+                return true;
             }
-            KeyCode::Esc => {
-                self.editor.ghost = None;
-                true
+            _ => return false,
+        };
+        self.editor.ghost = None;
+        self.editor
+            .insert_str_as(&text[..take], crate::provenance::Seat::Navigator);
+        let rest = &text[take..];
+        // The remainder stays live where the caret now is; its position
+        // also counts as asked, so the next tick does not replace it.
+        if !rest.trim().is_empty() {
+            let at = (
+                self.editor.cursor_row,
+                self.editor.cursor_col,
+                self.editor.edit_seq,
+            );
+            self.editor.ghost = Some((at.0, at.1, at.2, rest.to_string()));
+            // Recorded as asked too: once the ghost is Esc'd the tick
+            // would otherwise send a fresh (paid) request at this caret.
+            if let Some(path) = self.editor.path.clone() {
+                self.inline_asked = Some((path, at.2, at.0, at.1));
             }
-            _ => false,
         }
+        true
     }
 
     /// What screen reader mode describes this frame (#621).
@@ -61175,6 +62627,14 @@ impl App {
         use crate::a11y::Snapshot;
         let tr = |s: &str| crate::i18n::tr(s).into_owned();
         let status = tr(&self.status);
+        if let Some((focus, item)) = self.modal_a11y() {
+            return Snapshot {
+                focus,
+                item: Some(item),
+                status,
+                ..Default::default()
+            };
+        }
         if let Some(p) = &self.prompt {
             return Snapshot {
                 focus: p.label.clone(),
@@ -61250,6 +62710,7 @@ impl App {
                         .and_then(|c| c.selected_item())
                         .map(|c| c.label.clone()),
                     status,
+                    event: None,
                 }
             }
             Pane::Terminal => {
@@ -61286,6 +62747,263 @@ impl App {
                 }
             }
         }
+    }
+
+    /// The dialog waiting for a key, if one is open, as screen reader mode
+    /// reads it (#1584): its title, then what it says and which key does
+    /// what. Without this a confirmation was silent, so a reader heard
+    /// nothing after Ctrl+W and could not know that D throws edits away.
+    /// Topmost first, in the order they are drawn; a new dialog that waits
+    /// for a key belongs here too.
+    fn modal_a11y(&self) -> Option<(String, String)> {
+        let tr = |s: &str| crate::i18n::tr(s).into_owned();
+        // The title, and its sentences joined for speech: a full stop
+        // between them unless one already ends in a question mark.
+        let join = |parts: &[String]| -> String {
+            let mut item = String::new();
+            for part in parts.iter().map(|p| p.trim().trim_end_matches('.')) {
+                if part.is_empty() {
+                    continue;
+                }
+                if !item.is_empty() {
+                    item.push_str(if item.ends_with('?') { " " } else { ". " });
+                }
+                item.push_str(part);
+            }
+            item
+        };
+        // What it says, then which key does what. The announcement is cut
+        // at `a11y::MAX_LINE`, so a long path, command or file list is cut
+        // here instead: the keys at the end are always read.
+        let said = |title: &str, body: &[String], actions: &[String]| -> (String, String) {
+            let actions = join(actions);
+            let mut item = join(body);
+            let room = crate::a11y::MAX_LINE.saturating_sub(actions.chars().count() + 2);
+            if item.chars().count() > room {
+                item = if room < 2 {
+                    String::new()
+                } else {
+                    let mut cut: String = item.chars().take(room - 1).collect();
+                    cut.truncate(cut.trim_end().len());
+                    cut.push('…');
+                    cut
+                };
+            }
+            if !item.is_empty() && !actions.is_empty() {
+                item.push_str(if item.ends_with('?') || item.ends_with('…') {
+                    " "
+                } else {
+                    ". "
+                });
+            }
+            item.push_str(&actions);
+            (tr(title), item)
+        };
+        let yes_no = |yes: &str| format!("{}. {}", tr(yes), tr("N or Escape, no"));
+        if self.pending_terminal_warning {
+            return Some(said(
+                "Unsupported terminal",
+                &[tr(
+                    "Croft's icons and images need an inline-image protocol this terminal does not support",
+                )],
+                &[tr("Any key dismisses. D, don't show again")],
+            ));
+        }
+        // An agent's edit proposal takes every key while it is up, so it is
+        // read before anything it covers: who wants to change which file,
+        // and the keys the popup's footer offers in its current state.
+        if let (Some(ui), Some(head)) = (&self.approval_ui, self.approvals.front()) {
+            let title = crate::widgets::approval_popup::title(
+                head,
+                self.approvals.len(),
+                self.workspace_root(),
+            )
+            .trim()
+            .replace(" · ", ", ");
+            let actions = if ui.reason.is_some() {
+                "Type the reason. Enter, send. Escape, back"
+            } else if ui.target_dirty {
+                "Unsaved edits here. Enter, merge them with the agent's. Escape, deny. R, deny with a reason"
+            } else {
+                "Enter, approve. Escape, deny. A, approve all from this agent for 10 minutes. R, deny with a reason. E, edit, then approve"
+            };
+            return Some((title, tr(actions)));
+        }
+        // The field's own instruction ("Remote URL") is read with the keys,
+        // so a prompt replaced by the next step under the same title is
+        // still heard; what is typed is left to the reader's echo.
+        if let Some(p) = &self.input_prompt {
+            let hint = p
+                .hint
+                .clone()
+                .unwrap_or_else(|| String::from("Enter to confirm, Escape to cancel"));
+            return Some(said(&p.title, &[tr(&p.placeholder)], &[tr(&hint)]));
+        }
+        if let Some(ed) = &self.settings_editor {
+            let target = if ed.target == crate::config_layers::LayerKind::Workspace {
+                tr("Settings, writing to workspace")
+            } else {
+                tr("Settings, writing to user")
+            };
+            let row = ed.selected_row().map_or_else(
+                || tr("No matching setting"),
+                |r| {
+                    format!(
+                        "{}, {}, {}",
+                        r.key.replace('_', " "),
+                        crate::settings_editor::display(&r.value),
+                        tr(r.layer.label())
+                    )
+                },
+            );
+            return Some((target, row));
+        }
+        if let Some(exit) = &self.pending_unsaved {
+            let (headline, names, save, discard) = self.unsaved_confirm_text(exit);
+            // The tab label carries the dirty dot, which a reader would read
+            // out as "bullet"; every file named here is unsaved anyway.
+            let names = names.replace("● ", "");
+            return Some(said(
+                "Unsaved changes",
+                &[format!("{} {names}", tr(&headline))],
+                &[
+                    format!("S, {}", tr(&format!("S{save}"))),
+                    format!("D, {}", tr(&format!("D{discard}"))),
+                    tr("Escape, cancel"),
+                ],
+            ));
+        }
+        if let Some(block) = &self.pending_run_block {
+            let title = if block.destructive {
+                "Run this block? It looks destructive"
+            } else {
+                "Run this block?"
+            };
+            return Some(said(
+                title,
+                &[
+                    format!(
+                        "{} {} {} {}",
+                        tr("in pane"),
+                        block.pane_name,
+                        tr("at"),
+                        block.cwd.display()
+                    ),
+                    block.code.lines().collect::<Vec<_>>().join("; "),
+                ],
+                &[yes_no("Y, yes, run")],
+            ));
+        }
+        if self.pending_broadcast_enable {
+            let receiving = self
+                .terminals
+                .iter()
+                .filter(|t| !t.broadcast_excluded)
+                .count()
+                .max(1);
+            return Some(said(
+                "Broadcast input to all panes?",
+                &[format!(
+                    "{} {receiving} {}",
+                    tr("Every keystroke and paste will go to"),
+                    tr("terminal panes at once")
+                )],
+                &[yes_no("Y, yes, broadcast")],
+            ));
+        }
+        if let Some((occurrences, files, skipped)) = self.pending_replace_all {
+            let mut parts = vec![
+                format!(
+                    "Replace {occurrences} occurrence(s) across {files} file(s) with \"{}\"?",
+                    self.search.replace
+                ),
+                tr("Files are rewritten on disk"),
+            ];
+            if skipped > 0 {
+                parts.push(format!(
+                    "{skipped} open file(s) with unsaved changes will be skipped"
+                ));
+            }
+            return Some(said(
+                "Replace all?",
+                &parts,
+                &[tr("Enter or Y, replace. Escape, cancel")],
+            ));
+        }
+        if let Some(pending) = &self.pending_unsaved_scm {
+            let verb = pending.op.verb();
+            let names: Vec<String> = pending
+                .files
+                .iter()
+                .map(|p| {
+                    p.strip_prefix(&pending.root)
+                        .unwrap_or(p)
+                        .display()
+                        .to_string()
+                })
+                .collect();
+            let n = names.len();
+            return Some(said(
+                "Unsaved changes",
+                &[format!(
+                    "{n} file{} {} unsaved changes: {}",
+                    if n == 1 { "" } else { "s" },
+                    if n == 1 { "has" } else { "have" },
+                    names.join(", ")
+                )],
+                &[
+                    format!("S, Save All & {verb}"),
+                    format!("C, {verb} Anyway"),
+                    tr("Escape, cancel"),
+                ],
+            ));
+        }
+        if self.pending_discard_all {
+            return Some(said(
+                "Discard all changes?",
+                &[tr(
+                    "This reverts every tracked file to HEAD. Untracked files are kept.",
+                )],
+                &[yes_no("Y, yes, discard all")],
+            ));
+        }
+        if let Some(pr) = &self.pending_revert_hunk {
+            return Some(said(
+                "Revert hunk?",
+                &[
+                    tr("This will undo the change hunk under the cursor on disk."),
+                    pr.rel_path.clone(),
+                ],
+                &[yes_no("Y, yes, revert")],
+            ));
+        }
+        if let Some(pd) = &self.pending_discard {
+            let warn = if pd.untracked {
+                "This will permanently delete the file from disk."
+            } else {
+                "This will overwrite your local changes from HEAD."
+            };
+            return Some(said(
+                "Discard changes?",
+                &[tr(warn), pd.rel_path.clone()],
+                &[yes_no("Y, yes, discard")],
+            ));
+        }
+        if let Some(url) = &self.pending_local_open {
+            return Some(said(
+                "Open on local Mac?",
+                &[
+                    tr("This URL will open in YOUR LOCAL MAC's browser via the croft relay."),
+                    url.clone(),
+                ],
+                &[format!(
+                    "{}. {}",
+                    tr("Y, yes once. A, always for this session"),
+                    tr("N or Escape, no")
+                )],
+            ));
+        }
+        None
     }
 
     /// What screen reader mode says for the bottom panel's front tab
@@ -61437,15 +63155,72 @@ impl App {
         if !self.screen_reader {
             return;
         }
-        let snap = self.a11y_snapshot();
+        let mut snap = self.a11y_snapshot();
+        snap.event = self.a11y_event.clone();
         let speak = self.screen_reader_command.clone();
         self.announcer.update(snap, speak.as_deref());
+    }
+
+    /// Have screen reader mode read `text` out whatever has focus (#1547):
+    /// something that happened, like a debugger pause, rather than
+    /// something the user moved to. Kept only while the mode is on, so
+    /// turning it on never reads out an old event.
+    fn announce_event(&mut self, text: String) {
+        if !self.screen_reader {
+            return;
+        }
+        let n = self.a11y_event.as_ref().map_or(0, |(n, _)| n + 1);
+        self.a11y_event = Some((n, crate::i18n::tr(&text).into_owned()));
+    }
+
+    /// What a debugger pause reads as (#1547): why it stopped, where, and
+    /// the line's text, as in `Paused on breakpoint, app.py line 3: total
+    /// += n`. The line comes from the buffer when the file is the one being
+    /// edited, else from disk. A stop with no source location (`at` is
+    /// `None`) names its frame instead, as in `Paused on step, in memcpy`.
+    fn debug_pause_announcement(
+        &self,
+        reason: &str,
+        at: Option<&(PathBuf, usize)>,
+        frame: &str,
+    ) -> String {
+        let what = match reason {
+            "" | "pause" => String::from("Paused"),
+            r => format!("Paused on {r}"),
+        };
+        let Some((path, line)) = at else {
+            return match frame.trim() {
+                "" => what,
+                f => format!("{what}, in {f}"),
+            };
+        };
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let index = line.saturating_sub(1);
+        let text = if self.editor.path.as_deref() == Some(path.as_path()) {
+            self.editor.lines.get(index).cloned()
+        } else {
+            use std::io::BufRead;
+            std::fs::File::open(path).ok().and_then(|f| {
+                std::io::BufReader::new(f)
+                    .lines()
+                    .nth(index)
+                    .and_then(Result::ok)
+            })
+        };
+        match text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            Some(t) => format!("{what}, {name} line {line}: {t}"),
+            None => format!("{what}, {name} line {line}"),
+        }
     }
 
     /// Accessibility: Toggle Screen Reader Mode (#621), persisted.
     fn toggle_screen_reader(&mut self) {
         self.screen_reader = !self.screen_reader;
         self.announcer.reset();
+        self.a11y_event = None;
         self.status = String::from(if self.screen_reader {
             "Screen reader mode: on"
         } else {
@@ -61463,9 +63238,12 @@ impl App {
             return;
         }
         // A picker covers the caret: read its selection from the status bar.
+        // So does a dialog waiting for a key (#1584), except a text prompt,
+        // whose own caret is where the typing is.
         let picker = self.command_palette.is_some()
             || self.file_finder.is_some()
-            || self.list_picker.is_some();
+            || self.list_picker.is_some()
+            || (self.input_prompt.is_none() && self.modal_a11y().is_some());
         if picker && let Some(pos) = self.announce_pos {
             frame.set_cursor_position(pos);
             return;
@@ -61877,6 +63655,7 @@ impl App {
                     is_build: false,
                     is_default: false,
                     problem_matcher: None,
+                    is_background: false,
                     vscode: None,
                 });
             }
@@ -62457,20 +64236,19 @@ impl App {
         // link down, reconnect pending): with nobody to defer to, blocking
         // strands the offline work in RAM for the whole outage. And when
         // the owner left (#1147): there is nobody to save for this guest.
-        if self.is_collab_guest()
-            && self
-                .editor
-                .path
-                .as_ref()
-                .and_then(|p| collab_file_key(&self.tree.root, p))
-                .is_some_and(|file| {
-                    self.collab
-                        .as_ref()
-                        .is_some_and(|s| !s.is_local_only(&file) && !s.owner_gone())
-                })
-        {
+        if self.owner_saves_active_file() {
             self.status =
                 String::from("Shared file: the session owner saves (your edits are already live)");
+            return;
+        }
+        // A save refused for want of permission arms the sudo route for the
+        // next Cmd+S of that file (#1379).
+        if self
+            .sudo_save_armed
+            .take()
+            .is_some_and(|p| self.editor.path.as_ref() == Some(&p))
+        {
+            self.save_with_sudo();
             return;
         }
         // A previously-refused save arms a one-shot override: the very next
@@ -62478,6 +64256,7 @@ impl App {
         // lingers past the press it was meant for.
         if std::mem::take(&mut self.force_save_armed) {
             use crate::widgets::editor::SaveOutcome;
+            self.editor.save_cleanup = self.save_cleanup;
             match self.editor.save_to_disk_force() {
                 Ok(SaveOutcome::Saved) => {
                     self.status = self.editor.status.clone();
@@ -62497,10 +64276,14 @@ impl App {
                     self.force_save_armed = true;
                     self.prompt_encoding_loss();
                 }
+                Ok(SaveOutcome::WriteProtected) => {
+                    self.force_save_armed = true;
+                    self.prompt_write_protected();
+                }
                 Ok(SaveOutcome::DiskConflict) => {
                     unreachable!("force save never reports a conflict")
                 }
-                Err(e) => self.status = format!("Save failed: {e}"),
+                Err(e) => self.report_save_error(e),
             }
             return;
         }
@@ -62552,6 +64335,45 @@ impl App {
         !changed.is_empty()
     }
 
+    /// Whether `path` is one of the workspace's project snippets files, or a
+    /// folder's `.vscode` directory, whose change can add or remove one.
+    fn is_project_snippets_path(&self, path: &std::path::Path) -> bool {
+        self.roots.iter().any(|root| {
+            path == root.join(".vscode")
+                || (path.starts_with(root) && crate::snippets::is_project_file(path))
+        })
+    }
+
+    /// Reload every snippet (#1484) and watch any project snippets file
+    /// that has appeared, so a later edit to it, by croft or by `git pull`,
+    /// applies too.
+    fn reload_project_snippets(&mut self) {
+        self.snippets = load_all_snippets(self.roots.iter());
+        self.watch_project_snippets();
+    }
+
+    /// Put each workspace folder's `.vscode` directory and project snippets
+    /// files under the config watch (#1484).
+    fn watch_project_snippets(&mut self) {
+        for path in self.project_snippet_watch_paths() {
+            self.config_watch.watch(path);
+        }
+    }
+
+    /// What [`Self::watch_project_snippets`] watches: each workspace
+    /// folder's `.vscode` directory, its `.croft/snippets.json` and its
+    /// project snippets files.
+    fn project_snippet_watch_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for root in self.roots.iter() {
+            paths.push(root.join(".vscode"));
+            // Watched before it exists, so creating or pulling it applies.
+            paths.push(root.join(".croft").join("snippets.json"));
+            paths.extend(crate::snippets::project_files(root));
+        }
+        paths
+    }
+
     /// After a save, if the file was one of croft's JSON configs, re-read it so
     /// the change applies without a relaunch (VS Code applies keybindings and
     /// snippets on save). settings.json fields are read at startup, so that one
@@ -62587,9 +64409,28 @@ impl App {
             }
             self.status = keybindings_reload_status(&warns);
         } else if path == crate::snippets::snippets_path() {
-            self.snippets = load_snippets(path);
+            self.snippets = load_all_snippets(self.roots.iter());
             self.status =
                 snippets_reload_status(self.snippets.is_broken(), self.snippets.warnings());
+        } else if self.is_project_snippets_path(path) {
+            // A project's snippets file, or its `.vscode` folder gaining or
+            // losing one (#1484).
+            // A `.vscode` change that touched no snippets (settings.json
+            // saved) says nothing.
+            let before = self.snippets.clone();
+            self.reload_project_snippets();
+            if self.snippets != before {
+                self.status = format!(
+                    "Project snippets reloaded{}",
+                    match self.snippets.warnings().len() {
+                        0 => String::new(),
+                        n => format!(
+                            " with {n} warning{} — see OUTPUT · Snippets",
+                            if n == 1 { "" } else { "s" }
+                        ),
+                    }
+                );
+            }
         } else if path == crate::agents::agents_path() {
             self.agents = crate::agents::AgentTable::load(path);
             let dropped = self.agents.dropped_patterns();
@@ -62665,6 +64506,18 @@ impl App {
         }
     }
 
+    /// Apply `files_encoding` (#1432) to every folder of the workspace: the
+    /// next file opened there without a BOM decodes in it. Open tabs keep
+    /// the encoding they were decoded with, so a settings change never
+    /// re-reads a buffer from under unsaved edits.
+    fn apply_files_encoding(&mut self, p: &crate::prefs::Prefs) {
+        let charset = crate::file_encoding::parse(&p.files_encoding);
+        self.files_encoding = charset;
+        for root in self.roots.iter() {
+            crate::file_encoding::set_workspace_default(root, charset);
+        }
+    }
+
     /// The Go to File index without the files the project excludes
     /// (#1345): VS Code's file search honours both exclude settings.
     fn without_project_excludes(
@@ -62703,8 +64556,14 @@ impl App {
         self.settings_chain = merged.chain;
         // The chain follows the primary root and the `extends` targets, so
         // the watch follows the chain (#1435).
-        self.config_watch
-            .set_paths(config_watch_paths(&self.settings_chain));
+        // The project snippets stay watched too (#1484).
+        let mut paths = config_watch_paths(&self.settings_chain);
+        for path in self.project_snippet_watch_paths() {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+        self.config_watch.set_paths(paths);
         self.settings_provenance = merged.provenance;
         self.apply_merged_settings(&merged.prefs);
         self.status = if merged.warnings.is_empty() {
@@ -62738,6 +64597,7 @@ impl App {
         self.auto_save_on_focus_change = p.auto_save_on_focus_change;
         self.copy_on_select = p.copy_on_select;
         self.apply_project_excludes(p);
+        self.apply_files_encoding(p);
         // The ssh-pane offer's switches apply live like every other pref
         // here (#364); turning it off also takes down an offer on screen.
         self.remote_offer_disabled = p.disable_remote_offer;
@@ -62806,6 +64666,7 @@ impl App {
         self.editor.auto_close_pairs = self.auto_close_pairs;
         self.paste_reindent = !p.disable_paste_reindent;
 
+        self.save_cleanup = crate::widgets::editor::SaveCleanup::from_prefs(p);
         self.follow_vim_mode_pref(p.vim_mode);
         if !p.disable_inline_blame && !self.inline_blame_enabled {
             // Re-enabling refetches, like toggle_inline_blame.
@@ -62820,6 +64681,18 @@ impl App {
         self.whitespace_mode =
             crate::widgets::editor::WhitespaceMode::from_pref(&p.render_whitespace);
         self.editor.whitespace_mode = self.whitespace_mode;
+        self.rulers = crate::widgets::editor::normalize_rulers(&p.rulers);
+        // Straight onto every open editor: the focus sync that otherwise
+        // carries it does not run per frame, so a reload would leave open
+        // tabs on the old rulers until an unrelated focus change.
+        for ed in self.editor.editors.iter_mut() {
+            ed.rulers.clone_from(&self.rulers);
+        }
+        for group in self.editor_layout.inactive_groups_mut() {
+            for ed in group.editors.iter_mut() {
+                ed.rulers.clone_from(&self.rulers);
+            }
+        }
         self.line_numbers = crate::widgets::editor::LineNumbers::from_pref(&p.line_numbers);
         self.apply_line_numbers();
         self.word_suggestions =
@@ -63105,6 +64978,7 @@ impl App {
             self.status = String::from("Save skipped: the tab was closed");
             return;
         };
+        editor.save_cleanup = self.save_cleanup;
         match editor.save_to_disk() {
             Ok(SaveOutcome::Saved) => {
                 let seats = editor.provenance_to_record();
@@ -63135,12 +65009,19 @@ impl App {
                     editor.encoding.name()
                 );
             }
+            Ok(SaveOutcome::WriteProtected) => {
+                self.status = format!(
+                    "{} not saved: it is write-protected - open the tab and press Cmd+S twice to overwrite it",
+                    path.display()
+                );
+            }
             Err(e) => self.status = format!("Save failed: {e}"),
         }
     }
 
     fn write_current_to_disk(&mut self) {
         use crate::widgets::editor::SaveOutcome;
+        self.editor.save_cleanup = self.save_cleanup;
         match self.editor.save_to_disk() {
             Ok(SaveOutcome::Saved) => {
                 self.status = self.editor.status.clone();
@@ -63165,8 +65046,212 @@ impl App {
                 );
             }
             Ok(SaveOutcome::EncodingLoss) => self.prompt_encoding_loss(),
-            Err(e) => self.status = format!("Save failed: {e}"),
+            Ok(SaveOutcome::WriteProtected) => self.prompt_write_protected(),
+            Err(e) => self.report_save_error(e),
         }
+    }
+
+    /// A save of the user's own write-protected file was refused (#1379).
+    /// Arm the one-shot consent and say what the next Cmd+S will do, the
+    /// press-again flow a disk conflict uses.
+    fn prompt_write_protected(&mut self) {
+        self.editor.overwrite_protected_armed = true;
+        let name = self
+            .editor
+            .path
+            .as_deref()
+            .map(|p| self.status_path(p))
+            .unwrap_or_default();
+        self.status = format!(
+            "{name} is write-protected - press Cmd+S again to overwrite it (its permissions are put back after), or use File: Save As…"
+        );
+    }
+
+    /// Whether the active tab is a collab-shared file this guest must leave
+    /// to the session owner to write (see `save`).
+    fn owner_saves_active_file(&self) -> bool {
+        self.is_collab_guest()
+            && self
+                .editor
+                .path
+                .as_ref()
+                .and_then(|p| collab_file_key(&self.tree.root, p))
+                .is_some_and(|file| {
+                    self.collab
+                        .as_ref()
+                        .is_some_and(|s| !s.is_local_only(&file) && !s.owner_gone())
+                })
+    }
+
+    /// Report a failed explicit save. One that failed for want of
+    /// permission offers the sudo route on the next Cmd+S (#1379): saving
+    /// again as the same user could only fail again.
+    fn report_save_error(&mut self, e: anyhow::Error) {
+        if cfg!(unix)
+            && crate::widgets::editor::is_permission_denied(&e)
+            && let Some(path) = self.editor.path.clone()
+        {
+            self.status = format!(
+                "Save failed: you can't write {} - press Cmd+S again to save it with sudo in a terminal",
+                self.status_path(&path)
+            );
+            self.sudo_save_armed = Some(path);
+            return;
+        }
+        self.status = format!("Save failed: {e}");
+    }
+
+    /// File: Save with Sudo (#1379): hand the buffer to `sudo tee` in a new
+    /// terminal pane. sudo asks for the password there, so croft never sees
+    /// it, and `tee` writes the file in place, so it keeps its owner and
+    /// mode. The tab turns clean once the file holds the buffer's bytes.
+    fn save_with_sudo(&mut self) {
+        // A consent to overwrite an external change lasts one press, as in
+        // `save`.
+        let overwrite = std::mem::take(&mut self.force_save_armed);
+        if self.owner_saves_active_file() {
+            self.status =
+                String::from("Shared file: the session owner saves (your edits are already live)");
+            return;
+        }
+        if self.editor.has_non_text_view() {
+            self.status = String::from("Save with Sudo works on text tabs");
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Save with Sudo needs a file: use File: Save As… first");
+            return;
+        };
+        if !cfg!(unix) {
+            self.status = String::from("Save with Sudo needs sudo, which this system lacks");
+            return;
+        }
+        // The command line takes the path as text, so a name that is not
+        // valid UTF-8 could only be passed mangled, writing another file.
+        let Some(target) = path.to_str().map(str::to_owned) else {
+            self.status = String::from(
+                "Save with Sudo can't pass this file's name to the shell: it is not valid UTF-8",
+            );
+            return;
+        };
+        // Another process wrote the file since it was read: overwriting
+        // that takes the same press-again consent a plain save asks for.
+        if !overwrite && (self.editor.disk_conflict || self.editor.disk_changed_externally()) {
+            self.editor.disk_conflict = true;
+            self.force_save_armed = true;
+            self.sudo_save_armed = Some(path.clone());
+            self.status = format!(
+                "{} changed on disk since you opened it - press Cmd+S again to overwrite it with sudo, or close the tab to keep the disk version",
+                self.status_path(&path)
+            );
+            return;
+        }
+        // A sudo save of this file still waiting in its terminal could
+        // finish after this one and put the older bytes back.
+        if self
+            .pending_sudo_saves
+            .iter()
+            .find(|(p, ..)| *p == path)
+            .and_then(|(.., pane)| *pane)
+            .is_some_and(|pane| self.terminals.iter().any(|t| t.shell_pid() == Some(pane)))
+        {
+            self.status = format!(
+                "A sudo save of {} is still waiting in its terminal: finish it there, or close that terminal first",
+                self.status_path(&path)
+            );
+            return;
+        }
+        let Some(bytes) = self.editor.prepare_bytes_for_save() else {
+            self.status = format!(
+                "Not saved: {} can't hold every character in this file - switch encoding via the status bar",
+                self.editor.encoding.name()
+            );
+            return;
+        };
+        let staged = match stage_sudo_save(&bytes) {
+            Ok(staged) => staged,
+            Err(e) => {
+                self.status = format!("Save with Sudo failed: {e}");
+                return;
+            }
+        };
+        let command = sudo_save_command(&target, &staged.to_string_lossy());
+        let cwd = self.workspace_root().to_path_buf();
+        match PtyTerminal::new(&cwd) {
+            Ok(mut term) => {
+                term.set_manual_name(Some(String::from("sudo save")));
+                let pane = term.shell_pid();
+                // Tests stop short of running sudo for real.
+                if !cfg!(test) {
+                    term.write_input(format!("{command}\r").as_bytes());
+                }
+                self.insert_terminal(term);
+                self.show_terminal = true;
+                self.bottom_panel_tab = BottomPanelTab::Terminal;
+                self.focus_pane(Pane::Terminal);
+                self.pending_sudo_saves.retain(|(p, ..)| *p != path);
+                self.pending_sudo_saves.push((path.clone(), bytes, pane));
+                self.status = format!(
+                    "Saving {} with sudo: enter your password in the terminal",
+                    self.status_path(&path)
+                );
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&staged);
+                self.status = format!("Could not open a terminal: {e}");
+            }
+        }
+    }
+
+    /// Settle the sudo saves whose file now holds what was handed to `tee`
+    /// (#1379): those tabs are saved, not changed on disk. Runs before the
+    /// external-change sweep, which would otherwise take the write for
+    /// someone else's and raise a conflict over the user's own save. A save
+    /// whose tab is gone is dropped; one still in flight waits. Returns
+    /// whether a tab was settled.
+    fn settle_sudo_saves(&mut self) -> bool {
+        if self.pending_sudo_saves.is_empty() {
+            return false;
+        }
+        let mut saved = Vec::new();
+        for (path, bytes, pane) in std::mem::take(&mut self.pending_sudo_saves) {
+            let mut open = false;
+            let mut settled = None;
+            for e in std::iter::once(&mut self.editor)
+                .chain(self.editor_layout.inactive_groups_mut())
+                .flat_map(|g| g.editors.iter_mut())
+                .filter(|e| e.path.as_ref() == Some(&path))
+            {
+                open = true;
+                if e.settle_save_made_elsewhere(&bytes) && settled.is_none() {
+                    settled = Some((
+                        e.provenance_to_record(),
+                        e.bytes_for_disk(),
+                        e.lines.join("\n"),
+                    ));
+                }
+            }
+            if let Some((seats, described, text)) = settled {
+                saved.push((path, seats, described, text));
+            } else if open {
+                self.pending_sudo_saves.push((path, bytes, pane));
+            }
+        }
+        let Some(last) = saved.last().map(|(path, ..)| path.clone()) else {
+            return false;
+        };
+        // Set first: a reloaded config file reports on itself.
+        self.status = format!("Saved {} with sudo", self.status_path(&last));
+        // The same follow-ups as every other save path.
+        for (path, seats, described, text) in saved {
+            self.reload_config_for_path(&path);
+            self.approve_saved_edit(&path);
+            if let Some(lsp) = self.lsp.as_ref() {
+                lsp.save_doc(path.clone(), text);
+            }
+            self.record_history_snapshot_of(&path, seats, described);
+        }
+        true
     }
 
     /// An explicit save was refused because the encoding cannot represent the
@@ -63416,6 +65501,8 @@ impl App {
             return;
         }
         self.tree.add_root(path.clone());
+        crate::file_encoding::set_workspace_default(&path, self.files_encoding);
+        self.reload_project_snippets();
         self.git_extra
             .push((path.clone(), GitWorker::spawn(path.clone())));
         self.rebind_workspace_watchers();
@@ -63437,6 +65524,8 @@ impl App {
             return;
         }
         self.tree.remove_root(&path);
+        crate::file_encoding::set_workspace_default(&path, None);
+        self.snippets = load_all_snippets(self.roots.iter());
         // The removed folder's review queue goes with it (#345). Its rows
         // leave the tree, so no stale DOT renders — but the status chip
         // counts the same set, and a count that outlives the folder it
@@ -63682,7 +65771,16 @@ impl App {
         // with it to the new root at the next tick, rather than staying
         // where the old workspace's next launch would restore it (#862).
         self.remove_own_hot_exit();
+        // The `files_encoding` defaults of the folders being left go with
+        // them (#1432). The settings merge below sets only the new roots,
+        // and a default left on a parent folder would still prefix-match
+        // every file of a nested new root and decode it in the old encoding.
+        for root in self.roots.iter() {
+            crate::file_encoding::set_workspace_default(root, None);
+        }
         self.roots.replace_primary(new_root.clone());
+        // The old repository's snippets go, the new one's apply (#1484).
+        self.reload_project_snippets();
         // A panel the user never touched — the startup default, one unnamed
         // shell with no input ever typed and no launched program — is swapped
         // for the incoming workspace's saved layout, the same restore startup
@@ -64212,6 +66310,21 @@ impl App {
                 self.open_ask_navigator((start, end), selection);
             }
             MenuAction::AskNavigatorAboutCapture => self.ask_navigator_about_capture(),
+            MenuAction::CopyDebugValue { expression, value } => {
+                self.copy_debug_value(expression, value)
+            }
+            MenuAction::CopyDebugExpression(expr) => {
+                self.status = self.copy_where_pasted(&expr).status("expression");
+            }
+            MenuAction::AddDebugWatch(expr) => {
+                self.add_watch_expression(expr);
+                self.refresh_debug_panel();
+            }
+            MenuAction::RemoveDebugWatch(index) => {
+                self.remove_watch_expression(index);
+                self.refresh_debug_panel();
+            }
+            MenuAction::CopyCallStack => self.copy_call_stack(),
             MenuAction::FixProblemWithNavigator { path, item } => {
                 self.fix_problem_with_navigator(path, item, Vec::new());
             }
@@ -64723,11 +66836,19 @@ impl App {
         for ed in std::iter::once(&self.editor)
             .chain(self.editor_layout.inactive_groups())
             .flat_map(|g| g.editors.iter())
-            .filter(|e| holds_unsaved(e))
+            .filter(|e| holds_unsaved(e) || e.sheet_pending_cell().is_some())
         {
             any = true;
             ed.path.hash(&mut h);
             ed.edit_seq.hash(&mut h);
+            // A grid's edits leave the text untouched (#1593), and the cell
+            // being typed into is in no cell yet.
+            if let Some(view) = &ed.sheet {
+                for data in &view.sheets {
+                    data.revision.hash(&mut h);
+                }
+            }
+            ed.sheet_pending_cell().hash(&mut h);
         }
         any.then(|| h.finish())
     }
@@ -64851,15 +66972,19 @@ impl App {
             .into_iter()
             .filter(|t| {
                 t.dirty
-                    && t.unsaved_text
-                        .as_deref()
-                        .is_some_and(|text| t.path.is_some() || !text.is_empty())
+                    && (!t.sheet_cells.is_empty()
+                        || t.unsaved_text
+                            .as_deref()
+                            .is_some_and(|text| t.path.is_some() || !text.is_empty()))
             })
             .map(|tab| {
                 let disk_stamp = tab.path.as_deref().and_then(|p| {
                     editors
                         .iter()
-                        .find(|e| e.dirty && e.path.as_deref() == Some(p))
+                        .find(|e| {
+                            (e.dirty || e.sheet_pending_cell().is_some())
+                                && e.path.as_deref() == Some(p)
+                        })
                         .and_then(|e| e.disk_stamp())
                 });
                 crate::hot_exit::Buffer { tab, disk_stamp }
@@ -64999,9 +67124,28 @@ impl App {
                     held.push(buffer.clone());
                     continue;
                 }
-                let Some(ed) = self.restore_open_tab(&buffer.tab) else {
+                let has_cells = buffer.tab.dirty && !buffer.tab.sheet_cells.is_empty();
+                let Some((ed, unapplied)) = self.restore_open_tab(&buffer.tab) else {
+                    // An xlsx's cells whose workbook did not open (gone,
+                    // unreadable, unmounted) are kept for a later launch
+                    // rather than dropped with the backup (#1593).
+                    if has_cells {
+                        held.push(buffer.clone());
+                    }
                     continue;
                 };
+                if !unapplied.is_empty() {
+                    // Cells whose sheet or row the workbook no longer has
+                    // stay backed up too; a tab none of them reached was
+                    // not restored at all.
+                    let all = unapplied.len() == buffer.tab.sheet_cells.len();
+                    let mut kept = buffer.clone();
+                    kept.tab.sheet_cells = unapplied;
+                    held.push(kept);
+                    if all {
+                        continue;
+                    }
+                }
                 restored += 1;
                 let Some(path) = buffer.tab.path.clone() else {
                     continue;
@@ -65119,6 +67263,7 @@ impl App {
     /// blind either, and an untitled buffer has no file to go to. Returns a
     /// line per file still unsaved; empty means everything is on disk.
     fn save_tabs_for_exit(&mut self, only: Option<usize>) -> Vec<String> {
+        let cleanup = self.save_cleanup;
         use crate::widgets::editor::SaveOutcome;
         // The tabs of a file with a symbol tab mirror one text (#369): the
         // first write saves them all, and writing a second would read the
@@ -65216,6 +67361,7 @@ impl App {
             } else if ed.sheet.is_some() {
                 ed.sheet_save(false, false)
             } else {
+                ed.save_cleanup = cleanup;
                 ed.save_to_disk()
             };
             let why = match outcome {
@@ -65230,6 +67376,7 @@ impl App {
                 Ok(SaveOutcome::EncodingLoss) => {
                     format!("{} cannot hold every character", ed.encoding.name())
                 }
+                Ok(SaveOutcome::WriteProtected) => String::from("write-protected"),
                 Err(e) => e.to_string(),
             };
             left.push((Some(path), why));
@@ -69646,22 +71793,26 @@ impl App {
         let Some(view) = self.editor.hex.as_mut() else {
             return;
         };
-        let Some(needle) = view.last_find.clone() else {
+        let Some(query) = view.last_find.clone() else {
             return;
         };
+        let needle = &query.needle;
+        // Which reading the query got (#1644): "1234" as bytes 12 34 and as
+        // text are different searches, and the line says which one ran.
+        let what = query.describe();
         let rows = (view.layout.data_rows as usize).max(1);
-        match view.find_forward(&needle, from) {
+        match view.find_forward(needle, from) {
             Ok(crate::hex::FindOutcome::Found(off)) => {
                 view.set_cursor(off, false, rows);
                 view.sel_anchor = Some(off + needle.len() as u64 - 1);
-                self.status = format!("Found at 0x{off:X}");
+                self.status = format!("Found {what} at 0x{off:X}");
             }
             Ok(crate::hex::FindOutcome::NotFound) => {
-                self.status = String::from("Not found");
+                self.status = format!("Not found: {what}");
             }
             Ok(crate::hex::FindOutcome::Capped) => {
                 self.status = format!(
-                    "Not found in the first {} MB scanned",
+                    "Not found in the first {} MB scanned: {what}",
                     crate::hex::FIND_SCAN_CAP / (1024 * 1024)
                 );
             }
@@ -70354,6 +72505,7 @@ impl App {
     /// error says why not, with the tab left as it was.
     fn save_as(&mut self, path: &Path) -> Result<(), String> {
         use crate::widgets::editor::SaveOutcome;
+        self.editor.save_cleanup = self.save_cleanup;
         match self.editor.save_as(path) {
             Ok(SaveOutcome::Saved) => {
                 self.status = self.editor.status.clone();
@@ -70369,6 +72521,10 @@ impl App {
             Ok(SaveOutcome::EncodingLoss) => Err(format!(
                 "Some characters can't be written as {}",
                 self.editor.encoding.name()
+            )),
+            Ok(SaveOutcome::WriteProtected) => Err(format!(
+                "{} is write-protected: choose another name",
+                path.display()
             )),
             Ok(SaveOutcome::DiskConflict) => unreachable!("save_as never checks for a conflict"),
             Err(e) => Err(format!("Save failed: {e}")),
@@ -71755,6 +73911,11 @@ fn stage_block(dir: &Path, interpreter: &str, code: &str) -> std::io::Result<Pat
     Ok(path)
 }
 
+/// What the restart commands say while an update build has the language
+/// servers stopped (#1621): the build's end starts them again.
+const LSP_PAUSED_FOR_BUILD: &str =
+    "Language servers are stopped while croft builds its update; they restart when it finishes";
+
 /// Milliseconds since the Unix epoch, for stamping local-history snapshots
 /// and dating TIMELINE rows.
 fn now_millis() -> u64 {
@@ -71786,6 +73947,31 @@ fn load_snippets(path: &std::path::Path) -> crate::snippets::SnippetSet {
     let set = crate::snippets::SnippetSet::load(path);
     for w in set.warnings() {
         crate::output::push("Snippets", crate::output::OutputLevel::Warn, w);
+    }
+    set
+}
+
+/// The user's snippets, then each workspace folder's project snippets
+/// (#1484): `.vscode/*.code-snippets` and `.croft/snippets.json`. The user's
+/// come first, so their own snippet wins a prefix both define. What a
+/// project file could not load goes to OUTPUT · Snippets under its path.
+fn load_all_snippets<'a>(
+    roots: impl IntoIterator<Item = &'a std::path::Path>,
+) -> crate::snippets::SnippetSet {
+    let mut set = load_snippets(&crate::snippets::snippets_path());
+    for root in roots {
+        for file in crate::snippets::project_files(root) {
+            let project = crate::snippets::SnippetSet::load(&file);
+            for w in project.warnings() {
+                let w = w.replacen("snippets.json could not be read", "could not be read", 1);
+                crate::output::push(
+                    "Snippets",
+                    crate::output::OutputLevel::Warn,
+                    &format!("{}: {w}", file.display()),
+                );
+            }
+            set.append(project);
+        }
     }
     set
 }
@@ -72667,6 +74853,23 @@ fn snippet_completion_item(snip: &crate::snippets::Snippet) -> crate::lsp::Compl
     }
 }
 
+impl App {
+    /// The `when` context a key chord is asked about (#1436): the editor, or
+    /// the file tree while the sidebar shows it, as for the mouse. `None`
+    /// elsewhere (another sidebar view, the bottom panel), where only
+    /// unscoped rows fire.
+    fn key_context(&self) -> Option<crate::keymap::MouseContext> {
+        use crate::keymap::MouseContext;
+        match self.focus {
+            Pane::Editor => Some(MouseContext::Editor),
+            Pane::Tree if self.sidebar_view == SidebarView::Explorer => {
+                Some(MouseContext::FileTree)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Which mouse region a binding's `when` context refers to, or `None` when
 /// the pointer is somewhere no context covers (a panel, a seam, the status
 /// bar) — a user binding must not fire there.
@@ -72983,6 +75186,15 @@ fn copy_to_clipboard(text: &str) -> bool {
     let _ = out.write_all(&bytes);
     let _ = out.flush();
     false
+}
+
+/// The Emmet commands [`App::run_emmet_edit`] runs (#1557).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EmmetEdit {
+    RemoveTag,
+    MatchTag,
+    BalanceOutward,
+    BalanceInward,
 }
 
 /// Where `App::copy_where_pasted` put a copy.
@@ -74373,6 +76585,23 @@ fn debuggee_python_note(python: &Path) -> Result<Option<String>, String> {
     Ok(None)
 }
 
+/// Whether a browser croft launches would have no screen to open on
+/// (#1410): croft is reached over SSH, or on Linux no X or Wayland display
+/// is set. macOS and Windows always have one locally.
+fn no_display_for_a_browser() -> bool {
+    no_display(
+        crate::remote::running_over_ssh(),
+        cfg!(target_os = "linux"),
+        |k| std::env::var_os(k).is_some_and(|v| !v.is_empty()),
+    )
+}
+
+/// Whether there is no display, given whether croft runs over SSH, whether
+/// it is on Linux, and which environment variables are `set` (#1410).
+pub(crate) fn no_display(over_ssh: bool, linux: bool, set: impl Fn(&str) -> bool) -> bool {
+    over_ssh || (linux && !set("DISPLAY") && !set("WAYLAND_DISPLAY"))
+}
+
 /// `lead` followed by the note on the debuggee's interpreter, if any (#864).
 fn with_python_note(lead: String, note: Option<&str>) -> String {
     match note {
@@ -75083,6 +77312,23 @@ fn resolve_typed_path(value: &str, home: Option<&Path>, root: &Path) -> Option<P
     Some(if p.is_absolute() { p } else { root.join(p) })
 }
 
+/// A grid tab with unsaved edits as a session tab (#1593): its file, with
+/// the edits [`Editor::sheet_backup`] keeps. `None` for any other tab.
+fn sheet_tab_state(ed: &Editor) -> Option<crate::session_state::OpenTabState> {
+    let path = ed.path.clone()?;
+    let (unsaved_text, sheet_cells) = ed.sheet_backup()?;
+    Some(crate::session_state::OpenTabState {
+        path: Some(path),
+        cursor_row: 0,
+        cursor_col: 0,
+        scroll: 0,
+        scroll_col: 0,
+        dirty: true,
+        unsaved_text,
+        sheet_cells,
+    })
+}
+
 fn sidebar_view_label(view: SidebarView) -> &'static str {
     match view {
         SidebarView::Explorer => "Explorer",
@@ -75704,6 +77950,57 @@ fn repo_relative(repo_root: &Path, path: &Path) -> Option<String> {
     )
 }
 
+/// The shell line a sudo save runs (#1379): `tee` copies the staged bytes
+/// into `target` as root, writing in place so the file keeps its owner and
+/// mode, and the staged copy is removed whether or not that worked.
+fn sudo_save_command(target: &str, staged: &str) -> String {
+    let q = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
+    format!(
+        "sudo tee -- {} < {} > /dev/null; rm -f -- {}",
+        q(target),
+        q(staged),
+        q(staged)
+    )
+}
+
+/// Stage the bytes a sudo save writes (#1379) in a fresh file only this
+/// user can read, since they may be a protected file's contents.
+fn stage_sudo_save(bytes: &[u8]) -> std::io::Result<PathBuf> {
+    use std::io::Write as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let dir = std::env::temp_dir();
+    let mut last = None;
+    for seq in 0..16 {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let path = dir.join(format!(
+            "croft-sudo-save-{}-{seq}-{nonce:08x}",
+            std::process::id()
+        ));
+        match opts.open(&path) {
+            Ok(mut file) => {
+                return match file.write_all(bytes).and_then(|()| file.flush()) {
+                    Ok(()) => Ok(path),
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&path);
+                        Err(e)
+                    }
+                };
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("no free staging name")))
+}
+
 /// The workspace-relative key a file replicates under in a collab session
 /// (docs/MULTIPLAYER.md, Phase D). None outside the workspace: only
 /// workspace files are shared.
@@ -75818,8 +78115,16 @@ pub fn run(
     if let Some(session_path) = restore_session.as_ref() {
         match crate::session_state::SessionState::load(session_path) {
             Ok(state) => {
-                app.apply_session_state(&state);
-                let _ = std::fs::remove_file(session_path);
+                let left = app.apply_session_state(&state);
+                if app.hold_unrestored_tabs(left) {
+                    let _ = std::fs::remove_file(session_path);
+                } else {
+                    // Kept: it holds the only copy of cells not put back.
+                    app.status = format!(
+                        "Some unsaved xlsx cells could not be restored; the session is kept at {}",
+                        session_path.display()
+                    );
+                }
                 // The hot-exit backup follows what the relaunch brought
                 // back (#862), at once rather than after the first edit.
                 let _ = app.write_hot_exit();
@@ -76128,6 +78433,13 @@ fn install_terminal_restore_panic_hook() {
             original(info);
         }));
     });
+}
+
+/// ` (did you mean "npm run build"?)` for a task label that was not found
+/// but has a near match (#1412), else nothing.
+fn did_you_mean(near: Option<String>) -> String {
+    near.map(|n| format!(" (did you mean \"{n}\"?)"))
+        .unwrap_or_default()
 }
 
 /// A paste's lines (#1274), split at `\n`, `\r\n` or a lone `\r` as a shell
@@ -76656,7 +78968,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let color_pres_changed = app.drain_lsp_color_presentations();
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let progress_changed = app.drain_lsp_progress();
-        let dap_changed = app.poll_dap();
+        let dap_changed = app.poll_dap() | app.poll_debug_build();
         let tests_changed = app.test_worker.drain(&mut app.testing)
             | app.drain_pending_test_debug()
             | app.drain_pending_cargo_launch();

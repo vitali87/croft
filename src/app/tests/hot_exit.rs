@@ -86,6 +86,299 @@ fn d_at_the_quit_prompt_quits_without_saving() {
     assert_eq!(std::fs::read_to_string(&a).unwrap(), "alpha\n");
 }
 
+/// Draw one frame of `app` and return the terminal and where the real
+/// cursor was left, which is what a screen reader follows.
+fn draw_and_cursor(
+    app: &mut App,
+) -> (
+    ratatui::Terminal<ratatui::backend::TestBackend>,
+    ratatui::layout::Position,
+) {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let pos = term.get_cursor_position().unwrap();
+    (term, pos)
+}
+
+/// #1584: Ctrl+W on an edited tab opens the unsaved-changes prompt, and
+/// screen reader mode reads its title, the file and what S, D and Escape
+/// do, once, with the cursor on that line rather than behind the dialog.
+#[test]
+fn the_unsaved_changes_prompt_is_announced_with_its_file_and_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    app.screen_reader = true;
+    draw_and_cursor(&mut app);
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.pending_unsaved.is_some(), "setup: the prompt opened");
+    let (_term, cursor) = draw_and_cursor(&mut app);
+    let said = app.announcer.line.clone();
+    for part in [
+        "Unsaved changes",
+        "This tab has unsaved changes: a.txt",
+        "S, Save and close",
+        "D, Don't save",
+        "Escape, cancel",
+    ] {
+        assert!(said.contains(part), "{part:?} missing from {said:?}");
+    }
+    let (x, y) = app.announce_pos.expect("the status bar shows the line");
+    assert_eq!((cursor.x, cursor.y), (x, y), "the cursor sits on the line");
+    // Said once: the next frame, with nothing changed, says nothing new.
+    let snap = app.a11y_snapshot();
+    assert!(!app.announcer.update(snap, None));
+}
+
+/// #1584: the quit prompt names the files and its own verbs.
+#[test]
+fn the_quit_prompt_is_announced_with_its_files_and_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    press_ctrl_q(&mut app);
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Unsaved changes");
+    let item = snap.item.unwrap_or_default();
+    for part in [
+        "1 file has unsaved changes: a.txt",
+        "S, Save all and quit",
+        "D, Discard and quit",
+    ] {
+        assert!(item.contains(part), "{part:?} missing from {item:?}");
+    }
+}
+
+/// #1584: the Source Control and Replace All confirmations say what they
+/// will do and which key does it.
+#[test]
+fn discard_and_replace_all_confirmations_are_announced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.pending_discard = Some(PendingDiscard {
+        rel_path: String::from("src/seed.txt"),
+        untracked: false,
+        staged: false,
+    });
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Discard changes?");
+    assert_eq!(
+        snap.item.as_deref(),
+        Some(
+            "This will overwrite your local changes from HEAD. src/seed.txt. \
+             Y, yes, discard. N or Escape, no"
+        )
+    );
+    app.pending_discard = None;
+    app.request_discard_all_source_control();
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Discard all changes?");
+    assert!(
+        snap.item
+            .as_deref()
+            .unwrap_or_default()
+            .ends_with("Y, yes, discard all. N or Escape, no"),
+        "{:?}",
+        snap.item
+    );
+    app.pending_discard_all = false;
+    app.search.replace = String::from("total");
+    app.pending_replace_all = Some((3, 2, 1));
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Replace all?");
+    // Longer than an announcement holds: the middle is cut, not the keys.
+    let item = snap.item.unwrap_or_default();
+    assert!(
+        item.starts_with(
+            "Replace 3 occurrence(s) across 2 file(s) with \"total\"? \
+             Files are rewritten on disk. \
+             1 open file(s) with unsaved changes"
+        ),
+        "{item}"
+    );
+    assert!(
+        item.ends_with("… Enter or Y, replace. Escape, cancel"),
+        "{item}"
+    );
+    assert!(item.chars().count() <= crate::a11y::MAX_LINE, "{item}");
+}
+
+/// #1584 (comment): the Settings editor reads its target layer and the
+/// selected row, and a one-line prompt reads its title and keys; typing
+/// into the prompt is left to the reader's own echo, not re-read.
+#[test]
+fn the_settings_editor_and_an_input_prompt_are_announced() {
+    use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_settings_editor();
+    let ed = app.settings_editor.as_mut().unwrap();
+    ed.set_query(String::from("auto save"));
+    let key_name = ed.selected_row().unwrap().key.replace('_', " ");
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Settings, writing to user");
+    let item = snap.item.unwrap_or_default();
+    assert!(item.starts_with(&format!("{key_name}, ")), "{item}");
+    // The layer that set the value closes the line: the default here, or
+    // the user layer when the machine running the suite sets it.
+    assert!(
+        [", default", ", user"].iter().any(|l| item.ends_with(l)),
+        "{item}"
+    );
+    app.settings_editor.as_mut().unwrap().target = crate::config_layers::LayerKind::Workspace;
+    assert_eq!(app.a11y_snapshot().focus, "Settings, writing to workspace");
+    app.settings_editor = None;
+    app.input_prompt = Some(InputPrompt::new(
+        InputPurpose::PullRequestNumber,
+        "Review Pull Request",
+        "number or URL",
+    ));
+    let before = app.a11y_snapshot();
+    assert_eq!(before.focus, "Review Pull Request");
+    assert_eq!(
+        before.item.as_deref(),
+        Some("number or URL. Enter to confirm, Escape to cancel")
+    );
+    app.input_prompt.as_mut().unwrap().value = String::from("12");
+    assert_eq!(app.a11y_snapshot(), before, "typing is not re-read");
+}
+
+/// #1584 (comment): Add Remote asks for the name, then replaces that
+/// prompt with one for the URL under the same title and keys. The field's
+/// instruction tells the two apart, so the second step is announced; the
+/// typed name is not part of either.
+#[test]
+fn a_prompt_replaced_by_the_next_step_under_the_same_title_is_announced() {
+    use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.screen_reader = true;
+    app.open_input_prompt(InputPrompt::new(
+        InputPurpose::AddRemoteName,
+        "Add Remote",
+        "Remote name (e.g. origin)",
+    ));
+    draw_and_cursor(&mut app);
+    let first = app.announcer.line.clone();
+    assert!(first.contains("Remote name (e.g. origin)"), "{first}");
+    app.input_prompt.as_mut().unwrap().value = String::from("upstream");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let p = app.input_prompt.as_ref().expect("the URL step opened");
+    assert_eq!(p.title, "Add Remote");
+    let snap = app.a11y_snapshot();
+    assert_eq!(
+        snap.item.as_deref(),
+        Some("Remote URL. Enter to confirm, Escape to cancel")
+    );
+    draw_and_cursor(&mut app);
+    let second = app.announcer.line.clone();
+    assert_ne!(second, first);
+    assert!(second.contains("Remote URL"), "{second}");
+    assert!(!second.contains("upstream"), "the typed value is not read");
+}
+
+/// #1584 (comment): a long command, path or file list is cut so the keys
+/// at the end of a confirmation still fit the announcement.
+#[test]
+fn a_long_confirmation_still_announces_its_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.screen_reader = true;
+    app.pending_discard = Some(PendingDiscard {
+        rel_path: format!("src/{}/seed.txt", "deeply/nested".repeat(30)),
+        untracked: false,
+        staged: false,
+    });
+    draw_and_cursor(&mut app);
+    let said = app.announcer.line.clone();
+    assert!(said.starts_with("Discard changes?"), "{said}");
+    assert!(
+        said.contains("… Y, yes, discard. N or Escape, no"),
+        "the keys survive: {said}"
+    );
+    assert!(said.contains('…'), "the path is what was cut: {said}");
+    app.pending_discard = None;
+    app.search.replace = "x".repeat(400);
+    app.pending_replace_all = Some((3, 2, 0));
+    let item = app.a11y_snapshot().item.unwrap_or_default();
+    assert!(item.chars().count() <= crate::a11y::MAX_LINE, "{item}");
+    assert!(
+        item.ends_with("Enter or Y, replace. Escape, cancel"),
+        "{item}"
+    );
+}
+
+/// #1584 (comment): an agent's edit proposal takes every key, so screen
+/// reader mode reads it, not the editor behind it: who wants to change
+/// which file, and the popup's keys in its current state.
+#[test]
+fn an_incoming_approval_is_announced_with_its_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.rs");
+    std::fs::write(&file, "let x = 1;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let _hook = queue_edit_proposal(&mut app, tmp.path(), &file, "1", "2");
+    assert!(app.approval_ui.is_some(), "setup: the popup opened");
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "claude-code wants to edit a.rs");
+    assert_eq!(snap.line, None, "not the editor under the popup");
+    let item = snap.item.unwrap_or_default();
+    for part in ["Enter, approve", "Escape, deny", "R, deny with a reason"] {
+        assert!(item.contains(part), "{part:?} missing from {item:?}");
+    }
+    app.approval_ui.as_mut().unwrap().reason = Some(String::from("no"));
+    assert_eq!(
+        app.a11y_snapshot().item.as_deref(),
+        Some("Type the reason. Enter, send. Escape, back")
+    );
+}
+
+/// Negative (#1584): with no dialog open the snapshot is the focused
+/// pane's as before, and screen reader mode off still says nothing and
+/// leaves the caret where it was.
+#[test]
+fn without_a_dialog_the_editor_is_announced_and_mode_off_stays_quiet() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Editor a.txt");
+    assert_eq!(snap.line.map(|(n, _)| n), Some(1));
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.pending_unsaved.is_some());
+    draw_and_cursor(&mut app);
+    assert!(app.announcer.line.is_empty(), "mode off announces nothing");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.pending_unsaved.is_none());
+    assert_eq!(app.a11y_snapshot().focus, "Editor a.txt");
+}
+
+/// #1584 (review): with Cmd+K I's broadcast confirm open behind a
+/// run-block confirm, the key answers the run-block one, which is drawn on
+/// top and announced; the broadcast question is then announced and answered.
+#[test]
+fn a_run_block_confirm_over_the_broadcast_one_takes_the_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = markdown_fence_app(tmp.path());
+    assert!(run_from_palette(
+        &mut app,
+        "Markdown: Run Code Block at Cursor"
+    ));
+    assert!(app.pending_run_block.is_some(), "setup: the block confirms");
+    app.pending_broadcast_enable = true;
+    assert_eq!(app.a11y_snapshot().focus, "Run this block?");
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.pending_run_block.is_none(), "N answered the block");
+    assert!(app.pending_broadcast_enable, "the broadcast question stays");
+    assert_eq!(app.a11y_snapshot().focus, "Broadcast input to all panes?");
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.pending_broadcast_enable);
+    assert!(!app.broadcast_input);
+}
+
 /// #862: Esc (or N, which never means "don't save") cancels: croft stays,
 /// the edits stay, and the disk is untouched. A modified D does not discard.
 #[test]
@@ -442,6 +735,429 @@ fn hot_exit_restores_deleted_and_untitled_buffers() {
     assert_eq!(scratch.lines, vec![String::from("scratch note")]);
 }
 
+/// A CSV of widgets open in the grid, with hot exit backing up to `cache`.
+fn csv_grid_app(root: &std::path::Path, cache: &std::path::Path) -> (App, PathBuf) {
+    let p = root.join("d.csv");
+    std::fs::write(&p, "name,qty\nwidget,3\ngadget,5\n").unwrap();
+    let mut app = with_hot_exit(App::new(root.to_path_buf()).unwrap(), cache);
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.sheet.is_some(), "the CSV opens in the grid");
+    (app, p)
+}
+
+/// Type `value` into the grid's selected cell and commit it with Enter.
+fn type_into_cell(app: &mut App, value: &str) {
+    for c in value.chars() {
+        app.handle_sheet_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    app.handle_sheet_key(key(KeyCode::Enter, KeyModifiers::NONE));
+}
+
+/// The tab holding `path` after a relaunch, by path.
+fn tab_for<'a>(app: &'a App, path: &std::path::Path) -> &'a Editor {
+    app.editor
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(path))
+        .expect("the file's tab is back")
+}
+
+/// #1593: an unsaved cell edit in a CSV grid survives a kill: the next
+/// croft reopens the grid with the edited value, dirty, and the file is
+/// untouched until saved.
+#[test]
+fn hot_exit_restores_a_csv_grid_s_unsaved_cell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (mut app, p) = csv_grid_app(tmp.path(), cache.path());
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_cell(&mut app, "99");
+    assert!(app.editor.dirty);
+    settle_hot_exit(&mut app);
+    assert_eq!(
+        hot_exit_files(cache.path(), tmp.path()).len(),
+        1,
+        "backed up"
+    );
+    drop(app);
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    let ed = tab_for(&next, &p);
+    let view = ed.sheet.as_ref().expect("reopened in the grid");
+    assert_eq!(view.sheets[0].cell(0, 1), "99");
+    assert_eq!(view.sheets[0].cell(1, 1), "5");
+    assert!(ed.dirty && view.dirty, "restored as unsaved");
+    assert!(
+        next.status.contains("restored 1 unsaved tab"),
+        "{}",
+        next.status
+    );
+    assert_eq!(
+        std::fs::read_to_string(&p).unwrap(),
+        "name,qty\nwidget,3\ngadget,5\n",
+        "nothing is written to the file"
+    );
+    let idx = next
+        .editor
+        .editors
+        .iter()
+        .position(|e| e.path.as_deref() == Some(p.as_path()))
+        .unwrap();
+    next.editor.select(idx);
+    next.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&p).unwrap(),
+        "name,qty\nwidget,99\ngadget,5\n",
+        "{}",
+        next.status
+    );
+}
+
+/// #1593: a later edit to the same grid rewrites the backup, though the
+/// grid's edits never touch its text.
+#[test]
+fn a_second_grid_edit_rewrites_the_backup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (mut app, p) = csv_grid_app(tmp.path(), cache.path());
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_cell(&mut app, "99");
+    settle_hot_exit(&mut app);
+    type_into_cell(&mut app, "7");
+    settle_hot_exit(&mut app);
+    drop(app);
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    let view = tab_for(&next, &p).sheet.as_ref().unwrap();
+    assert_eq!(
+        (view.sheets[0].cell(0, 1), view.sheets[0].cell(1, 1)),
+        ("99", "7")
+    );
+}
+
+/// #1593: an xlsx grid keeps its edited cells, applied over the workbook
+/// as it reopens and saved through the workbook's own save.
+#[test]
+fn hot_exit_restores_an_xlsx_grid_s_unsaved_cell() {
+    let (tmp, p, app) = prices_xlsx_app();
+    let cache = tempfile::tempdir().unwrap();
+    let mut app = with_hot_exit(app, cache.path());
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_cell(&mut app, "5");
+    settle_hot_exit(&mut app);
+    drop(app);
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    let ed = tab_for(&next, &p);
+    let view = ed.sheet.as_ref().expect("reopened in the grid");
+    assert_eq!(view.sheets[0].cell(0, 1), "5");
+    assert!(ed.dirty && view.dirty);
+    assert_eq!(view.cell_edits, vec![(0, 0, 1)], "queued for the save");
+    assert_eq!(xlsx_value(&p, 2, 2), "4", "the workbook is untouched");
+    let idx = next
+        .editor
+        .editors
+        .iter()
+        .position(|e| e.path.as_deref() == Some(p.as_path()))
+        .unwrap();
+    next.editor.select(idx);
+    next.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(xlsx_value(&p, 2, 2), "5", "{}", next.status);
+}
+
+/// #1593: a value still being typed into a cell, never committed, is
+/// backed up too: a kill mid-typing does not lose it.
+#[test]
+fn hot_exit_keeps_a_cell_still_being_typed_into() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (mut app, p) = csv_grid_app(tmp.path(), cache.path());
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    for c in "99".chars() {
+        app.handle_sheet_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    assert!(app.editor.sheet.as_ref().unwrap().editing.is_some());
+    settle_hot_exit(&mut app);
+    drop(app);
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    let ed = tab_for(&next, &p);
+    let view = ed.sheet.as_ref().expect("reopened in the grid");
+    assert_eq!(view.sheets[0].cell(0, 1), "99");
+    assert!(ed.dirty);
+}
+
+/// All the backed-up sheet cells across the hot-exit backups of `root`.
+fn backed_up_sheet_cells(
+    cache: &std::path::Path,
+    root: &std::path::Path,
+) -> Vec<crate::widgets::editor::SheetCellEdit> {
+    hot_exit_files(cache, root)
+        .iter()
+        .filter_map(|f| crate::hot_exit::Backup::load(f).ok())
+        .flat_map(|b| b.buffers)
+        .flat_map(|b| b.tab.sheet_cells)
+        .collect()
+}
+
+/// #1593: an xlsx's backed-up cells stay backed up while the workbook
+/// cannot be opened, rather than going with a backup thought empty.
+#[test]
+fn hot_exit_keeps_xlsx_cells_while_the_workbook_is_gone() {
+    let (tmp, p, app) = prices_xlsx_app();
+    let cache = tempfile::tempdir().unwrap();
+    let mut app = with_hot_exit(app, cache.path());
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_cell(&mut app, "5");
+    settle_hot_exit(&mut app);
+    drop(app);
+    std::fs::remove_file(&p).unwrap();
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    settle_hot_exit(&mut next);
+    assert_eq!(
+        backed_up_sheet_cells(cache.path(), tmp.path()),
+        vec![(String::from("Sheet1"), 0, 1, String::from("5"))]
+    );
+}
+
+/// #1593: a backed-up xlsx cell whose row the workbook no longer has is
+/// kept in the backup; the cells that do fit are restored.
+#[test]
+fn hot_exit_keeps_xlsx_cells_the_workbook_no_longer_has_room_for() {
+    let (tmp, p, app) = prices_xlsx_app();
+    let cache = tempfile::tempdir().unwrap();
+    let mut app = with_hot_exit(app, cache.path());
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_cell(&mut app, "5");
+    settle_hot_exit(&mut app);
+    drop(app);
+    let file = hot_exit_files(cache.path(), tmp.path()).remove(0);
+    let mut backup = crate::hot_exit::Backup::load(&file).unwrap();
+    backup.buffers[0]
+        .tab
+        .sheet_cells
+        .push((String::from("Sheet1"), 99, 1, String::from("7")));
+    backup.save(&file).unwrap();
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    let view = tab_for(&next, &p).sheet.as_ref().unwrap();
+    assert_eq!(view.sheets[0].cell(0, 1), "5");
+    assert_eq!(view.cell_edits, vec![(0, 0, 1)], "only the cell that fit");
+    let cells = backed_up_sheet_cells(cache.path(), tmp.path());
+    assert!(
+        cells.contains(&(String::from("Sheet1"), 99, 1, String::from("7"))),
+        "the unplaced cell stays backed up: {cells:?}"
+    );
+}
+
+/// #1593: a backed-up xlsx cell goes back on the worksheet it was typed
+/// into, found by name: one naming a worksheet the workbook no longer has
+/// (renamed, or the sheets reordered and that one removed) is kept, not
+/// put on whichever worksheet now sits at its old position.
+#[test]
+fn hot_exit_matches_xlsx_cells_to_their_worksheet_by_name() {
+    let (tmp, p, app) = prices_xlsx_app();
+    let cache = tempfile::tempdir().unwrap();
+    let mut app = with_hot_exit(app, cache.path());
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_cell(&mut app, "5");
+    settle_hot_exit(&mut app);
+    drop(app);
+    let file = hot_exit_files(cache.path(), tmp.path()).remove(0);
+    let mut backup = crate::hot_exit::Backup::load(&file).unwrap();
+    assert_eq!(
+        backup.buffers[0].tab.sheet_cells,
+        vec![(String::from("Sheet1"), 0, 1, String::from("5"))]
+    );
+    backup.buffers[0]
+        .tab
+        .sheet_cells
+        .push((String::from("Archive"), 1, 1, String::from("7")));
+    backup.save(&file).unwrap();
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    let view = tab_for(&next, &p).sheet.as_ref().unwrap();
+    assert_eq!(view.sheets[0].cell(0, 1), "5");
+    assert_eq!(view.sheets[0].cell(1, 1), "9", "not put on Sheet1");
+    assert_eq!(view.cell_edits, vec![(0, 0, 1)]);
+    let cells = backed_up_sheet_cells(cache.path(), tmp.path());
+    assert!(
+        cells.contains(&(String::from("Archive"), 1, 1, String::from("7"))),
+        "{cells:?}"
+    );
+}
+
+/// #1593: an xlsx no longer readable as a workbook opens as text or hex,
+/// with none of its cells put back; they stay backed up rather than go
+/// with a tab counted as restored.
+#[test]
+fn hot_exit_keeps_xlsx_cells_when_the_file_opens_outside_the_grid() {
+    let (tmp, p, app) = prices_xlsx_app();
+    let cache = tempfile::tempdir().unwrap();
+    let mut app = with_hot_exit(app, cache.path());
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_cell(&mut app, "5");
+    settle_hot_exit(&mut app);
+    drop(app);
+    std::fs::write(&p, "not a workbook\n").unwrap();
+
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    next.restore_hot_exit();
+    assert!(
+        tab_for(&next, &p).sheet.is_none(),
+        "setup: opened outside the grid"
+    );
+    assert!(!next.status.contains("restored 1"), "{}", next.status);
+    settle_hot_exit(&mut next);
+    assert_eq!(
+        backed_up_sheet_cells(cache.path(), tmp.path()),
+        vec![(String::from("Sheet1"), 0, 1, String::from("5"))]
+    );
+}
+
+/// #1593: a value still being typed into an xlsx cell, with the tab not
+/// yet dirty, is backed up with the workbook's disk stamp, so a change to
+/// the workbook before the restore is still told.
+#[test]
+fn a_pending_xlsx_cell_s_backup_keeps_the_disk_stamp() {
+    let (_tmp, _p, mut app) = prices_xlsx_app();
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    app.handle_sheet_key(key(KeyCode::Char('5'), KeyModifiers::NONE));
+    assert!(!app.editor.dirty, "setup: only the pending cell");
+    let backup = app.capture_hot_exit();
+    assert_eq!(backup.buffers.len(), 1);
+    assert!(backup.buffers[0].disk_stamp.is_some());
+}
+
+/// #1593: a grid's unsaved edits in one split are kept over a clean tab
+/// of the same file in the focused split, here reopened as text.
+#[test]
+fn a_split_s_dirty_grid_wins_over_a_clean_tab_of_the_same_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (mut app, p) = csv_grid_app(tmp.path(), cache.path());
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_cell(&mut app, "99");
+    app.split_editor();
+    app.editor.force_text = true;
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.sheet.is_none() && !app.editor.dirty, "setup");
+    let state = app.capture_session_state();
+    let tabs: Vec<_> = state
+        .tabs
+        .iter()
+        .filter(|t| t.path.as_deref() == Some(p.as_path()))
+        .collect();
+    assert_eq!(tabs.len(), 1, "{:?}", state.tabs);
+    assert!(tabs[0].dirty);
+    assert!(
+        tabs[0]
+            .unsaved_text
+            .as_deref()
+            .unwrap()
+            .contains("widget,99"),
+        "{:?}",
+        tabs[0]
+    );
+}
+
+/// #1593: xlsx cells an update relaunch cannot put back (the workbook is
+/// gone) are kept in a hot-exit backup the next launch restores from,
+/// rather than lost with the deleted handoff.
+#[test]
+fn a_relaunch_keeps_xlsx_cells_it_could_not_restore() {
+    let (tmp, p, mut app) = prices_xlsx_app();
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_cell(&mut app, "5");
+    let state = app.capture_session_state();
+    drop(app);
+    let bytes = std::fs::read(&p).unwrap();
+    std::fs::remove_file(&p).unwrap();
+
+    let cache = tempfile::tempdir().unwrap();
+    let mut next = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    let left = next.apply_session_state(&state);
+    assert_eq!(left.len(), 1);
+    assert!(next.hold_unrestored_tabs(left));
+    assert_eq!(
+        backed_up_sheet_cells(cache.path(), tmp.path()),
+        vec![(String::from("Sheet1"), 0, 1, String::from("5"))]
+    );
+    // Once the workbook is back, a later launch puts the cell back.
+    drop(next);
+    std::fs::write(&p, bytes).unwrap();
+    let mut later = with_hot_exit(App::new(tmp.path().to_path_buf()).unwrap(), cache.path());
+    later.restore_hot_exit();
+    let ed = tab_for(&later, &p);
+    assert_eq!(ed.sheet.as_ref().unwrap().sheets[0].cell(0, 1), "5");
+    assert!(ed.dirty, "{}", later.status);
+}
+
+/// #1593: the update relaunch carries a TSV grid's edits the same way.
+#[test]
+fn a_relaunch_keeps_a_tsv_grid_s_unsaved_cell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("t.tsv");
+    std::fs::write(&p, "name\tqty\nwidget\t3\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_cell(&mut app, "12");
+    let state = app.capture_session_state();
+
+    let mut next = App::new(tmp.path().to_path_buf()).unwrap();
+    next.apply_session_state(&state);
+    let ed = tab_for(&next, &p);
+    let view = ed.sheet.as_ref().expect("reopened in the grid");
+    assert_eq!(view.sheets[0].cell(0, 1), "12");
+    assert!(ed.dirty);
+}
+
+/// Negative (#1593): a grid with no unsaved edits leaves no backup, and
+/// one saved after its backup was written takes the backup away.
+#[test]
+fn a_clean_or_saved_grid_leaves_no_backup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (mut app, p) = csv_grid_app(tmp.path(), cache.path());
+    settle_hot_exit(&mut app);
+    assert!(hot_exit_files(cache.path(), tmp.path()).is_empty());
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_cell(&mut app, "99");
+    settle_hot_exit(&mut app);
+    assert_eq!(hot_exit_files(cache.path(), tmp.path()).len(), 1);
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(!app.editor.dirty, "{}", app.status);
+    settle_hot_exit(&mut app);
+    assert!(hot_exit_files(cache.path(), tmp.path()).is_empty());
+    assert!(std::fs::read_to_string(&p).unwrap().contains("widget,99"));
+}
+
+/// Negative (#1593): a text tab's backup is unchanged: its text, no cells.
+#[test]
+fn a_text_tab_s_backup_carries_no_sheet_cells() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (app, _a) = app_with_unsaved_file(tmp.path());
+    let mut app = with_hot_exit(app, cache.path());
+    settle_hot_exit(&mut app);
+    let backup = the_hot_exit_backup(cache.path(), tmp.path());
+    assert!(backup.buffers[0].tab.sheet_cells.is_empty());
+    let raw = std::fs::read_to_string(&hot_exit_files(cache.path(), tmp.path())[0]).unwrap();
+    assert!(!raw.contains("sheet_cells"), "{raw}");
+}
+
 /// #862 review (CodeRabbit): a tab restored for a file deleted since keeps
 /// the stamp its edits were made against. It came back with none, so once
 /// something made the file again, the first save wrote over that without
@@ -556,6 +1272,7 @@ fn a_backup_at_this_crofts_own_path_is_moved_aside_before_restoring() {
             scroll: 0,
             scroll_col: 0,
             unsaved_text: Some(String::from("zbravo\n")),
+            sheet_cells: Vec::new(),
         },
         disk_stamp: None,
     };
@@ -912,6 +1629,7 @@ fn hot_exit_restores_the_rest_of_a_backup_that_also_held_a_second_copy() {
             scroll: 0,
             scroll_col: 0,
             unsaved_text: Some(String::from("zbravo\n")),
+            sheet_cells: Vec::new(),
         },
         disk_stamp: None,
     };

@@ -1287,6 +1287,203 @@ fn the_emmet_chord_names_an_unsupported_language() {
     assert_eq!(app.status, "Emmet: not available in Rust files");
 }
 
+const EMMET_PAGE: &str = "<ul>\n  <li>Home</li>\n  <li>About</li>\n</ul>\n<p>Some text</p>\n";
+
+/// Run palette command `cmd`, then, if it opened a prompt, answer it.
+fn run_emmet(app: &mut App, cmd: crate::widgets::command_palette::Command, answer: Option<&str>) {
+    app.run_command(cmd);
+    if let Some(answer) = answer {
+        assert!(app.input_prompt.is_some(), "a prompt asks first");
+        type_str(app, answer);
+        app.submit_input_prompt();
+    }
+}
+
+/// #1557: the issue's example: Wrap with Abbreviation around the selected
+/// `<ul>` with `nav.menu`.
+#[test]
+fn wrap_with_abbreviation_wraps_the_selected_lines() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "page.html", EMMET_PAGE);
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 0),
+        head: (3, 5),
+    });
+    run_emmet(
+        &mut app,
+        Command::EmmetWrapWithAbbreviation,
+        Some("nav.menu"),
+    );
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "<nav class=\"menu\">\n  <ul>\n    <li>Home</li>\n    <li>About</li>\n  </ul>\n</nav>\n<p>Some text</p>"
+    );
+    assert!(app.status.contains("wrapped"), "{}", app.status);
+    app.editor.undo();
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        EMMET_PAGE.trim_end(),
+        "one undo step"
+    );
+}
+
+/// #1557: with nothing selected, Wrap with Abbreviation takes the element
+/// around the caret, a caret just past `</ul>` included; outside any
+/// element it takes the caret's line.
+#[test]
+fn with_nothing_selected_wrap_takes_the_element_at_the_caret() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "page.html", EMMET_PAGE);
+    app.editor.cursor_row = 3;
+    app.editor.cursor_col = 5;
+    run_emmet(&mut app, Command::EmmetWrapWithAbbreviation, Some("nav"));
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "<nav>\n  <ul>\n    <li>Home</li>\n    <li>About</li>\n  </ul>\n</nav>\n<p>Some text</p>"
+    );
+    let mut app = app_with_open_file(
+        tmp.path(),
+        "page.html",
+        "<ul>\n  <li>Home</li>\n</ul>\nplain words\n",
+    );
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 7;
+    run_emmet(&mut app, Command::EmmetWrapWithAbbreviation, Some("b"));
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "<ul>\n  <b>\n    <li>Home</li>\n  </b>\n</ul>\nplain words"
+    );
+    app.editor.cursor_row = 5;
+    app.editor.cursor_col = 3;
+    run_emmet(&mut app, Command::EmmetWrapWithAbbreviation, Some("p"));
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "<ul>\n  <b>\n    <li>Home</li>\n  </b>\n</ul>\n<p>\n  plain words\n</p>"
+    );
+}
+
+/// #1557: Remove Tag, Update Tag and Go to Matching Pair from the palette,
+/// with the caret in the `<ul>`.
+#[test]
+fn remove_and_update_tag_and_go_to_matching_pair() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "page.html", EMMET_PAGE);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 1;
+    run_emmet(&mut app, Command::EmmetMatchTag, None);
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (3, 0));
+    run_emmet(&mut app, Command::EmmetUpdateTag, Some("ol"));
+    assert_eq!(app.editor.lines[0], "<ol>");
+    assert_eq!(app.editor.lines[3], "</ol>");
+    run_emmet(&mut app, Command::EmmetRemoveTag, None);
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        "<li>Home</li>\n<li>About</li>\n<p>Some text</p>"
+    );
+}
+
+/// #1557: Balance outward grows the selection from the caret to the
+/// element's content and then the element; inward walks it back.
+#[test]
+fn balance_outward_and_inward_step_the_selection() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "page.html", EMMET_PAGE);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 7;
+    run_emmet(&mut app, Command::EmmetBalanceOutward, None);
+    assert_eq!(app.editor.selection_text(), "Home");
+    run_emmet(&mut app, Command::EmmetBalanceOutward, None);
+    assert_eq!(app.editor.selection_text(), "<li>Home</li>");
+    run_emmet(&mut app, Command::EmmetBalanceInward, None);
+    assert_eq!(app.editor.selection_text(), "Home");
+}
+
+/// #1557 negative: outside markup the commands say Emmet is not offered,
+/// ask nothing and change nothing; in markup with no tag around the caret,
+/// Remove Tag says so.
+#[test]
+fn emmet_editing_commands_leave_other_files_alone() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.txt", "<ul>\n</ul>\n");
+    for cmd in [
+        Command::EmmetWrapWithAbbreviation,
+        Command::EmmetUpdateTag,
+        Command::EmmetRemoveTag,
+        Command::EmmetMatchTag,
+        Command::EmmetBalanceOutward,
+    ] {
+        app.run_command(cmd);
+        assert!(app.input_prompt.is_none(), "{cmd:?} asks nothing");
+        assert!(
+            app.status.contains("not available"),
+            "{cmd:?}: {}",
+            app.status
+        );
+    }
+    assert_eq!(app.editor.lines.join("\n"), "<ul>\n</ul>");
+    let mut html = app_with_open_file(tmp.path(), "plain.html", "just text\n");
+    run_emmet(&mut html, Command::EmmetRemoveTag, None);
+    assert!(html.status.contains("no tag"), "{}", html.status);
+    assert_eq!(html.editor.lines.join("\n"), "just text");
+}
+
+/// #1557: the commands are in the palette and VS Code's Emmet keybindings
+/// import onto them.
+#[test]
+fn emmet_editing_commands_are_in_the_palette_and_import() {
+    use crate::widgets::command_palette::{ALL_COMMANDS, Command};
+    for (cmd, title, vscode) in [
+        (
+            Command::EmmetWrapWithAbbreviation,
+            "Emmet: Wrap with Abbreviation",
+            "editor.emmet.action.wrapWithAbbreviation",
+        ),
+        (
+            Command::EmmetRemoveTag,
+            "Emmet: Remove Tag",
+            "editor.emmet.action.removeTag",
+        ),
+        (
+            Command::EmmetUpdateTag,
+            "Emmet: Update Tag",
+            "editor.emmet.action.updateTag",
+        ),
+        (
+            Command::EmmetBalanceOutward,
+            "Emmet: Balance (outward)",
+            "editor.emmet.action.balanceOut",
+        ),
+        (
+            Command::EmmetBalanceInward,
+            "Emmet: Balance (inward)",
+            "editor.emmet.action.balanceIn",
+        ),
+        (
+            Command::EmmetMatchTag,
+            "Emmet: Go to Matching Pair",
+            "editor.emmet.action.matchTag",
+        ),
+    ] {
+        assert!(ALL_COMMANDS.contains(&cmd), "{cmd:?}");
+        assert_eq!(cmd.title(), title);
+        let mut report = crate::import_vscode::Report::default();
+        crate::import_vscode::convert_keybindings(
+            &serde_json::json!([{ "key": "ctrl+alt+w", "command": vscode }]),
+            &mut report,
+        );
+        assert_eq!(
+            report.keybindings,
+            vec![(String::from("ctrl+alt+w"), String::from(cmd.id()), None)],
+            "{vscode}"
+        );
+    }
+}
+
 #[test]
 fn tab_switches_focus_between_the_find_and_replace_fields() {
     use crate::widgets::editor_find::FindField;
@@ -1325,6 +1522,88 @@ fn tab_switches_focus_between_the_find_and_replace_fields() {
         "alpha",
         "the query is untouched by replace-row typing"
     );
+}
+
+const LOG_PY: &str = "import logging\nlog = logging.getLogger(__name__)\n\nlog.debug(\"start\")\nlog.info(\"loaded config\")\nlog.debug(\"done\")\nlog.info(\"ready\")\n";
+
+/// #1592: with the caret in a word and nothing selected, Replace starts in
+/// the Find field with the word selected, so "debug, Tab, info" changes
+/// debug to info and not the other way round.
+#[test]
+fn replace_from_a_caret_in_a_word_starts_in_the_find_field() {
+    use crate::widgets::editor_find::FindField;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "app.py", LOG_PY);
+    app.editor.cursor_row = 3;
+    app.editor.cursor_col = 12;
+    app.handle_key(replace_chord()).unwrap();
+    let s = app.editor_find.as_ref().unwrap();
+    assert_eq!(s.query, "start", "the word at the caret is still the seed");
+    assert_eq!(s.focus, FindField::Query);
+    type_keys(&mut app, "debug");
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    type_keys(&mut app, "info");
+    let s = app.editor_find.as_ref().unwrap();
+    assert_eq!((s.query.as_str(), s.replace.as_str()), ("debug", "info"));
+    app.editor_find_replace_all();
+    assert_eq!(app.editor.lines[3], "log.info(\"start\")");
+    assert_eq!(app.editor.lines[5], "log.info(\"done\")");
+    assert_eq!(app.editor.lines[4], "log.info(\"loaded config\")");
+}
+
+/// Negative (#1592): a one-line selection is a chosen find text, so Replace
+/// still starts in the Replace field.
+#[test]
+fn replace_from_a_selection_starts_in_the_replace_field() {
+    use crate::widgets::editor_find::FindField;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "app.py", LOG_PY);
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (3, 4),
+        head: (3, 9),
+    });
+    app.editor.cursor_row = 3;
+    app.editor.cursor_col = 9;
+    app.handle_key(replace_chord()).unwrap();
+    let s = app.editor_find.as_ref().unwrap();
+    assert_eq!(s.query, "debug");
+    assert_eq!(s.focus, FindField::Replace);
+}
+
+/// Negative (#1592): a find text typed in an open bar is chosen too, so
+/// the Replace chord moves on to the Replace field.
+#[test]
+fn replace_on_an_open_find_bar_moves_to_the_replace_field() {
+    use crate::widgets::editor_find::FindField;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "app.py", LOG_PY);
+    app.editor.cursor_row = 3;
+    app.editor.cursor_col = 12;
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    type_keys(&mut app, "debug");
+    app.handle_key(replace_chord()).unwrap();
+    let s = app.editor_find.as_ref().unwrap();
+    assert_eq!(s.query, "debug");
+    assert_eq!(s.focus, FindField::Replace);
+}
+
+/// Negative (#1592): a multi-line selection seeds nothing, so Replace
+/// starts in an empty Find field.
+#[test]
+fn replace_from_a_multi_line_selection_starts_in_an_empty_find_field() {
+    use crate::widgets::editor_find::FindField;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "app.py", LOG_PY);
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (3, 0),
+        head: (4, 3),
+    });
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 3;
+    app.handle_key(replace_chord()).unwrap();
+    assert_eq!(app.editor_find.as_ref().unwrap().focus, FindField::Query);
 }
 
 /// #1577: a replacement longer than the needle moves the range's end with
@@ -1425,6 +1704,174 @@ fn tab_expands_a_user_snippet_and_places_the_caret() {
         app.editor.cursor_col, 12,
         "caret lands inside the parentheses at $1"
     );
+}
+
+// ── #1484: a repo's own snippets expand ──
+
+const TEAM_SNIPPETS_1484: &str = r#"{
+  // committed by the team
+  "Team logger": {
+    "scope": "python",
+    "prefix": "tlog",
+    "body": ["log = get_logger(__name__)", "log.info(\"$1\")$0"]
+  }
+}"#;
+
+/// Open `name` in an app on `root` and expand `typed` with Tab; the first
+/// line after.
+fn expand_in_project_1484(root: &std::path::Path, name: &str, typed: &str) -> String {
+    let f = root.join(name);
+    std::fs::write(&f, "").unwrap();
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.editor.insert_str(typed);
+    app.handle_editor_tab();
+    app.editor.lines[0].clone()
+}
+
+#[test]
+fn a_vscode_code_snippets_file_expands_in_its_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/team.code-snippets"),
+        TEAM_SNIPPETS_1484,
+    )
+    .unwrap();
+    assert_eq!(
+        expand_in_project_1484(tmp.path(), "app.py", "tlog"),
+        "log = get_logger(__name__)"
+    );
+}
+
+#[test]
+fn a_croft_snippets_json_in_the_repo_expands() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(tmp.path().join(".croft/snippets.json"), TEAM_SNIPPETS_1484).unwrap();
+    assert_eq!(
+        expand_in_project_1484(tmp.path(), "app.py", "tlog"),
+        "log = get_logger(__name__)"
+    );
+}
+
+/// #1484 negative: a project snippet keeps its scope, and only files in
+/// the two project places count.
+#[test]
+fn project_snippets_keep_their_scope_and_their_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/team.code-snippets"),
+        TEAM_SNIPPETS_1484,
+    )
+    .unwrap();
+    // Tab with nothing to expand indents instead.
+    assert_eq!(
+        expand_in_project_1484(tmp.path(), "main.rs", "tlog").trim_end(),
+        "tlog"
+    );
+
+    let other = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(other.path().join(".vscode")).unwrap();
+    std::fs::write(other.path().join("team.code-snippets"), TEAM_SNIPPETS_1484).unwrap();
+    std::fs::write(other.path().join(".vscode/team.json"), TEAM_SNIPPETS_1484).unwrap();
+    assert_eq!(
+        expand_in_project_1484(other.path(), "app.py", "tlog").trim_end(),
+        "tlog"
+    );
+}
+
+/// #1484: a snippets file pulled into `.vscode` while croft runs applies
+/// within the config watch's interval, and the next check is quiet.
+#[test]
+fn a_project_snippets_file_added_later_is_picked_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("app.py");
+    std::fs::write(&f, "").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_watch = crate::config_sync::ConfigWatch::new(Vec::new());
+    app.watch_project_snippets();
+    app.editor.open(&f).unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/team.code-snippets"),
+        TEAM_SNIPPETS_1484,
+    )
+    .unwrap();
+    let t0 = std::time::Instant::now();
+    assert!(app.tick_config_watch_at(t0 + crate::config_sync::ConfigWatch::INTERVAL * 2));
+    assert_eq!(app.status, "Project snippets reloaded");
+    app.editor.insert_str("tlog");
+    app.handle_editor_tab();
+    assert_eq!(app.editor.lines[0], "log = get_logger(__name__)");
+    assert!(!app.tick_config_watch_at(t0 + crate::config_sync::ConfigWatch::INTERVAL * 4));
+}
+
+/// #1484 negative: saving `.vscode/settings.json` touches the folder the
+/// watch looks at, but no snippet changed, so the status says nothing
+/// about snippets.
+#[test]
+fn a_settings_change_in_vscode_does_not_announce_snippets() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_watch = crate::config_sync::ConfigWatch::new(Vec::new());
+    app.watch_project_snippets();
+    app.status = String::from("Ready");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(tmp.path().join(".vscode/settings.json"), "{}").unwrap();
+    let t0 = std::time::Instant::now();
+    app.tick_config_watch_at(t0 + crate::config_sync::ConfigWatch::INTERVAL * 2);
+    assert_eq!(app.status, "Ready");
+}
+
+/// #1484: re-rooting swaps the old repository's snippets for the new one's.
+#[test]
+fn changing_the_workspace_root_reloads_project_snippets() {
+    let old = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(old.path().join(".vscode")).unwrap();
+    std::fs::write(
+        old.path().join(".vscode/team.code-snippets"),
+        TEAM_SNIPPETS_1484,
+    )
+    .unwrap();
+    let new = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(new.path().join(".croft")).unwrap();
+    std::fs::write(
+        new.path().join(".croft/snippets.json"),
+        TEAM_SNIPPETS_1484.replace("tlog", "nlog"),
+    )
+    .unwrap();
+    let mut app = App::new(old.path().to_path_buf()).unwrap();
+    app.change_workspace_root(new.path().to_path_buf());
+    let f = new.path().join("app.py");
+    std::fs::write(&f, "").unwrap();
+    app.editor.open(&f).unwrap();
+    app.editor.insert_str("tlog");
+    app.handle_editor_tab();
+    assert_eq!(app.editor.lines[0].trim_end(), "tlog");
+    let g = new.path().join("b.py");
+    std::fs::write(&g, "").unwrap();
+    app.editor.open(&g).unwrap();
+    app.editor.insert_str("nlog");
+    app.handle_editor_tab();
+    assert_eq!(app.editor.lines[0], "log = get_logger(__name__)");
+}
+
+/// #1484: a `.croft/snippets.json` created while croft runs applies, though
+/// it did not exist when the watch began.
+#[test]
+fn a_croft_snippets_json_created_later_is_picked_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_watch = crate::config_sync::ConfigWatch::new(Vec::new());
+    app.watch_project_snippets();
+    std::fs::create_dir_all(tmp.path().join(".croft")).unwrap();
+    std::fs::write(tmp.path().join(".croft/snippets.json"), TEAM_SNIPPETS_1484).unwrap();
+    let t0 = std::time::Instant::now();
+    assert!(app.tick_config_watch_at(t0 + crate::config_sync::ConfigWatch::INTERVAL * 2));
+    assert_eq!(app.status, "Project snippets reloaded");
 }
 
 #[test]
