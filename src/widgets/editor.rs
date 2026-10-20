@@ -2507,6 +2507,9 @@ enum PairAction {
 struct Snapshot {
     /// Packed (#1707): a step held as a `Vec<String>` cost twice its text.
     lines: PackedLines,
+    /// Whether that text ended in a newline: a language server's edit can
+    /// add or remove it (#911), and an undo brings it back with the text.
+    final_newline: bool,
     cursor_row: usize,
     cursor_col: usize,
     selection: Option<EditorSelection>,
@@ -7787,7 +7790,7 @@ impl Editor {
     /// the wrong content. Returns the same normalised (`\n`-joined) text the
     /// app sends to the server, so the key matches on both store and load.
     pub fn clean_cache_text(&self) -> Option<String> {
-        (!self.dirty).then(|| self.lines.join("\n"))
+        (!self.dirty).then(|| self.document_text())
     }
 
     #[cfg(test)]
@@ -8360,8 +8363,7 @@ impl Editor {
         }
         self.pin_on_edit();
         self.push_undo(EditKind::Paste);
-        let edits = char_span_edits(&self.lines, edits);
-        let applied = apply_char_span_edits(&mut self.lines, edits);
+        let applied = self.apply_document_edits(edits);
         let n = applied.iter().map(|(_, count)| count).sum();
         if n > 0 {
             self.follow_span_edits(&applied);
@@ -8415,8 +8417,7 @@ impl Editor {
         }
         self.pin_on_edit();
         self.push_undo_step(EditKind::Paste, group);
-        let edits = char_span_edits(&self.lines, edits);
-        let applied = apply_char_span_edits(&mut self.lines, edits);
+        let applied = self.apply_document_edits(edits);
         let n = applied.iter().map(|(_, count)| count).sum();
         if n > 0 {
             self.follow_span_edits(&applied);
@@ -8424,6 +8425,30 @@ impl Editor {
             self.recompute_highlights();
         }
         n
+    }
+
+    /// Apply `edits`, positioned in [`Self::document_text`], to the lines.
+    /// The final newline that text ends in opens an empty last row there,
+    /// which a language server's edit may reach (#911): a formatter that
+    /// rewrites the whole file replaces up to it. The row is added for the
+    /// edits and folded back into `final_newline` after, so a newline the
+    /// edits keep never stays as a blank row the save writes a second
+    /// newline after; edits that remove it clear `final_newline`.
+    fn apply_document_edits(&mut self, edits: &[TextSpanEdit]) -> Vec<(TextSpanEdit, usize)> {
+        let newline_row = self.sends_final_newline();
+        if newline_row {
+            self.lines.push(String::new());
+        }
+        let edits = char_span_edits(&self.lines, edits);
+        let applied = apply_char_span_edits(&mut self.lines, edits);
+        if newline_row {
+            if self.lines.len() > 1 && self.lines.last().is_some_and(String::is_empty) {
+                self.lines.pop();
+            } else {
+                self.final_newline = false;
+            }
+        }
+        applied
     }
 
     /// Move the caret, the selection and every extra caret with the text
@@ -11029,6 +11054,7 @@ impl Editor {
         Snapshot {
             lines,
             bytes,
+            final_newline: self.final_newline,
             cursor_row: self.cursor_row,
             cursor_col: self.cursor_col,
             selection: self.selection,
@@ -11131,6 +11157,7 @@ impl Editor {
     /// the caret into the restored buffer and refreshing highlights.
     fn restore_snapshot(&mut self, snap: Snapshot) {
         self.lines = snap.lines.iter().map(String::from).collect();
+        self.final_newline = snap.final_newline;
         // The map that described this text comes back with it (#349): an
         // undo re-credits the lines it restores to the seats that wrote
         // them, a redo re-credits the edit to its seat. Truncated below to
@@ -11701,14 +11728,23 @@ impl Editor {
         out
     }
 
-    /// The buffer as `\n`-joined text with the final newline the file has,
-    /// for an external formatter that reads the whole file (#1255).
-    pub fn text_for_formatter(&self) -> String {
+    /// The buffer as `\n`-joined text with the final newline the file has:
+    /// what language servers are sent (#911), and an external formatter
+    /// that reads the whole file (#1255). Sent without it, every formatter
+    /// added a newline the save then wrote a second one after.
+    pub fn document_text(&self) -> String {
         let mut text = self.lines.join("\n");
-        if self.final_newline && !text.is_empty() {
+        if self.sends_final_newline() {
             text.push('\n');
         }
         text
+    }
+
+    /// Whether [`Self::document_text`] ends in a newline: the file has one
+    /// and the buffer is not empty, which a save writes as nothing.
+    fn sends_final_newline(&self) -> bool {
+        self.final_newline
+            && (self.lines.len() > 1 || self.lines.first().is_some_and(|l| !l.is_empty()))
     }
 
     /// Whether the buffer's last line ends in a line break on disk.
@@ -31621,6 +31657,41 @@ mod tests {
                 "from {disk:?}"
             );
         }
+    }
+
+    /// #911: language servers read the text a save writes, final newline
+    /// included, so a formatter has no newline to add.
+    #[test]
+    fn the_document_text_is_what_a_save_writes() {
+        for disk in ["a\nb\n", "a\n\n", "a", ""] {
+            let tmp = NamedTempFile::new().unwrap();
+            std::fs::write(tmp.path(), disk).unwrap();
+            let mut e = Editor::new();
+            e.open(tmp.path()).unwrap();
+            assert_eq!(e.document_text(), disk);
+        }
+    }
+
+    /// #911: a formatter's edit up to the end of that text keeps the final
+    /// newline in the flag, not as a blank row the save writes a second
+    /// newline after. An edit that removes it saves none, and undo brings
+    /// it back.
+    #[test]
+    fn an_edit_reaching_the_final_newline_keeps_one() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "x=1\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        assert_eq!(e.apply_span_edits(&[span((0, 0), (1, 0), "x = 1\n")]), 1);
+        assert_eq!(e.lines, vec!["x = 1"]);
+        e.save_to_disk().unwrap();
+        assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), "x = 1\n");
+
+        assert_eq!(e.apply_span_edits(&[span((0, 5), (1, 0), "")]), 1);
+        assert_eq!(e.lines, vec!["x = 1"]);
+        assert_eq!(e.document_text(), "x = 1");
+        assert!(e.undo());
+        assert_eq!(e.document_text(), "x = 1\n");
     }
 
     #[test]

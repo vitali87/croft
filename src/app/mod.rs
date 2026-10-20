@@ -9111,9 +9111,10 @@ impl App {
 
     /// Per-tick LSP doc sync. Diffs every text-buffer tab's edit_seq
     /// against `lsp_last_seen` and forwards did_open / did_change /
-    /// did_close to the LspManager. Building `lines.join("\n")` only
+    /// did_close to the LspManager. Building the document text only
     /// happens when a tab's edit_seq has actually moved, so the cost
-    /// scales with edits, not with frames.
+    /// scales with edits, not with frames. The text keeps the file's final
+    /// newline (#911), or every formatter adds one the save doubles.
     pub fn sync_lsp(&mut self) {
         let Some(lsp) = self.lsp.as_ref() else {
             return;
@@ -9186,7 +9187,7 @@ impl App {
                     // before the full-document reply lands.
                     let start = tab.scroll as u32;
                     let end = (tab.scroll + tab.page_size() + 16) as u32;
-                    let text = tab.lines.join("\n");
+                    let text = tab.document_text();
                     // Paint the last-known semantic colours instantly from the
                     // disk cache, so an import-heavy file does not flash grey
                     // then snap to the server's class/namespace colours seconds
@@ -9198,7 +9199,7 @@ impl App {
                     to_send.push((true, path.clone(), text, seq, Some((start, end))));
                 }
                 Some(p) if p != seq => {
-                    to_send.push((false, path.clone(), tab.lines.join("\n"), seq, None))
+                    to_send.push((false, path.clone(), tab.document_text(), seq, None))
                 }
                 _ => {}
             }
@@ -15538,7 +15539,7 @@ impl App {
         // VS Code's Prettier extension does; tsserver's formatter knows
         // neither (#1255).
         if let Some(bin) = crate::prettier::for_file(&path) {
-            let sent = self.editor.text_for_formatter();
+            let sent = self.editor.document_text();
             self.prettier_job = Some(crate::prettier::Job::spawn(bin, path, sent));
             self.status = String::from("Formatting document with Prettier");
             return;
@@ -15629,13 +15630,9 @@ impl App {
             }
         };
         let tab = self.editor.find_buffer_tab(&job.path);
-        let buffer = tab.map(|i| &self.editor.editors[i]).map(|e| {
-            (
-                e.text_for_formatter(),
-                e.lines.clone(),
-                e.has_final_newline(),
-            )
-        });
+        let buffer = tab
+            .map(|i| &self.editor.editors[i])
+            .map(|e| (e.document_text(), e.lines.clone(), e.has_final_newline()));
         self.status = match buffer {
             Some((text, lines, final_newline)) if text == job.sent => {
                 if formatted == job.sent {
@@ -62778,7 +62775,7 @@ impl App {
                             // recorder can tell whether they are still the
                             // ones on disk when its worker reads (#349).
                             saved_paths.push((p, e.provenance_to_record(), e.bytes_for_disk()));
-                            saved_texts.push(e.lines.join("\n"));
+                            saved_texts.push(e.document_text());
                         }
                     }
                     // The latch also removes the tab from `due`, so this is
@@ -65529,7 +65526,7 @@ impl App {
     /// panel never refreshes after a save (issue #37).
     fn lsp_notify_saved(&mut self) {
         if let (Some(lsp), Some(path)) = (self.lsp.as_ref(), self.editor.path.clone()) {
-            lsp.save_doc(path, self.editor.lines.join("\n"));
+            lsp.save_doc(path, self.editor.document_text());
         }
     }
 
@@ -65772,7 +65769,7 @@ impl App {
             Ok(SaveOutcome::Saved) => {
                 let seats = editor.provenance_to_record();
                 let described = editor.bytes_for_disk();
-                let text = editor.lines.join("\n");
+                let text = editor.document_text();
                 self.status = editor.status.clone();
                 self.record_history_snapshot_of(path, seats, described);
                 if let Some(lsp) = self.lsp.as_ref() {
@@ -66016,7 +66013,7 @@ impl App {
                     settled = Some((
                         e.provenance_to_record(),
                         e.bytes_for_disk(),
-                        e.lines.join("\n"),
+                        e.document_text(),
                     ));
                 }
             }
@@ -68319,7 +68316,7 @@ impl App {
             let why = match outcome {
                 Ok(SaveOutcome::Saved) if !ed.dirty => {
                     saved.push((path, ed.provenance_to_record(), ed.bytes_for_disk()));
-                    saved_texts.push(ed.lines.join("\n"));
+                    saved_texts.push(ed.document_text());
                     return;
                 }
                 // A workbook save that held formula cells back names them.
