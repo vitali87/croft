@@ -4564,6 +4564,58 @@ fn accept_all_incoming_then_complete_merge_stages_the_resolved_file() {
     );
 }
 
+/// #906: a file resolved by hand in the text flow is still unmerged in git,
+/// so its MERGE CONFLICTS row stays. Opening it keeps that resolution as the
+/// Result, reads each conflict's state off it, and Complete Merge stages it.
+#[test]
+fn a_hand_resolved_conflict_opens_as_its_own_result_and_completes() {
+    use crate::merge_editor::ConflictState;
+    let tmp = tempfile::tempdir().unwrap();
+    conflicted_repo(tmp.path());
+    let resolved = "alpha\nboth-one\nm1\nm2\nm3\nm4\nm5\nfeature-two\nomega\n";
+    std::fs::write(tmp.path().join("shared.txt"), resolved).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let idx = wait_for_conflicted_entry(&mut app);
+    app.open_source_control_entry(idx);
+    let mv = app.editor.merge.as_ref().expect("the merge editor is up");
+    let states: Vec<_> = mv.conflicts.iter().map(|c| c.state).collect();
+    assert_eq!(states, [ConflictState::Manual, ConflictState::Incoming]);
+    assert_eq!(app.editor.lines.join("\n") + "\n", resolved);
+    assert!(!app.editor.dirty, "nothing in the file was replaced");
+    app.complete_merge();
+    assert!(app.status.contains("staged shared.txt"), "{}", app.status);
+    assert_eq!(git_out(tmp.path(), &["show", ":shared.txt"]), resolved);
+}
+
+/// #906: with one block resolved and a line added beside it, the merge
+/// editor keeps both and asks only about the block still marked.
+#[test]
+fn a_partly_resolved_conflict_keeps_its_edits_in_the_merge_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    conflicted_repo(tmp.path());
+    let file = tmp.path().join("shared.txt");
+    let lines: Vec<String> = std::fs::read_to_string(&file)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let block = crate::merge::find_conflicts(&lines)[0];
+    let mut edited = lines[..block.ours_start].to_vec();
+    edited.extend(["feature-one".to_string(), "# reviewed".to_string()]);
+    edited.extend_from_slice(&lines[block.theirs_end + 1..]);
+    std::fs::write(&file, edited.join("\n") + "\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let idx = wait_for_conflicted_entry(&mut app);
+    app.open_source_control_entry(idx);
+    let mv = app.editor.merge.as_ref().expect("the merge editor is up");
+    assert_eq!(mv.conflicts.len(), 1, "only the marked block is left");
+    assert_eq!(mv.conflicts[0].ours, ["main-two"]);
+    assert_eq!(
+        app.editor.lines[..3],
+        ["alpha", "feature-one", "# reviewed"]
+    );
+}
+
 #[test]
 fn keeping_the_modified_side_of_a_modify_delete_stages_it() {
     // Negative: the side that kept the file still wins as before.

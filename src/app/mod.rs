@@ -16064,7 +16064,10 @@ impl App {
     /// works on a plain marker file outside any merge. The tab is opened
     /// through the normal text route first (language, LSP, undo all
     /// attach), then the buffer is transformed into the initial Result
-    /// in one undo step — the marker text stays one Undo away.
+    /// in one undo step — the marker text stays one Undo away. Work the
+    /// user already did in the file is kept (#906): a file resolved by
+    /// hand is the Result as it stands, and a partly resolved one opens
+    /// on the markers it still has.
     fn open_merge_editor_for(&mut self, path: &Path) -> bool {
         // Stage specs are repo-toplevel-relative (#139): see `repo_rel`.
         let root = self.scm_root();
@@ -16117,13 +16120,27 @@ impl App {
             return false;
         }
         self.focus_pane(Pane::Editor);
-        let end = self.editor.lines.len();
-        self.editor.splice_result_rows(0, end, result);
+        // Git keeps listing a file the user resolved in the text flow as
+        // conflicted, and the stages alone would throw that work away. The
+        // buffer, not the disk, holds it, unsaved edits included. A
+        // modify/delete keeps the stages: its file is just the side that
+        // kept it, with no markers to tell a decision from git's copy.
+        let (mut mv, result) = if mv.from_markers || mv.deleted.is_some() {
+            (mv, Some(result))
+        } else {
+            mv.open_on_file(result, &self.editor.lines)
+        };
+        if let Some(result) = result {
+            let end = self.editor.lines.len();
+            self.editor.splice_result_rows(0, end, result);
+        }
         mv.synced_len = self.editor.lines.len();
         mv.synced_seq = self.editor.edit_seq;
         let n = mv.conflicts.len();
-        let first = mv.conflicts.first().map(|c| c.result_start);
-        mv.anchor_panes_on(0);
+        let left = mv.unresolved_count();
+        let idx = mv.conflicts.iter().position(|c| !c.state.resolved());
+        let first = mv.conflicts.get(idx.unwrap_or(0)).map(|c| c.result_start);
+        mv.anchor_panes_on(idx.unwrap_or(0));
         self.editor.merge = Some(mv);
         if let Some(row) = first {
             self.editor.clear_selection();
@@ -16131,8 +16148,12 @@ impl App {
             self.editor.cursor_col = 0;
             self.editor.ensure_cursor_col_visible();
         }
+        let done = match n - left {
+            0 => String::new(),
+            k => format!(", {k} already resolved in the file"),
+        };
         self.status = format!(
-            "Merge editor: {n} conflict{} — F7 jumps, checkboxes or Merge commands accept, \"Reopen as Text\" for the marker flow",
+            "Merge editor: {n} conflict{}{done} — F7 jumps, checkboxes or Merge commands accept, \"Reopen as Text\" for the marker flow",
             if n == 1 { "" } else { "s" }
         );
         true

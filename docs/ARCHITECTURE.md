@@ -988,6 +988,8 @@ A three-way merge editor following VS Code's 2022 merge-editor model. `MergeView
 
 **Where the sides come from.** Inputs are `git show :1:/:2:/:3:` via `git::read_file_at_stage`, where missing stages are empty sides (AA/DU/UD), or synthesized from the marker scan for a plain conflicted file. SCM's MERGE CONFLICTS entries open this editor, and "Reopen as Text" reaches the unchanged in-buffer marker flow.
 
+**The working file's work is kept (#906).** Git lists a file as conflicted until it is staged, even after the user resolved it in the marker flow, so `open_on_file` checks the buffer before the stages' Result replaces it. A marker-free file becomes the Result as is: each region is bounded by the lines it shares with the stages' Result, and its state is read off its text (a side or combination, Unresolved while it is still base, else Manual), so Complete Merge stages it. A file that is still git's marker rendering of the merge (compared as all-ours and as all-theirs, which tolerates git's narrowed blocks) opens on the stages. Anything else opens on its remaining markers, so resolved blocks and typed lines survive. A modify/delete always opens on the stages, since its file carries no markers to tell.
+
 ### notebook.rs
 
 The Jupyter rendered view. An `.ipynb` file parses into the same `(lines, images)` state the Markdown preview machinery already renders, so wrap, scroll, the inline-image overlay and Reopen as Text (the raw JSON, sticky via `force_text`) all come for free.
