@@ -2722,6 +2722,48 @@ fn list_keys_stage_unstage_and_discard_the_selected_change() {
     assert!(app.source_control.message.is_empty(), "no key was typed");
 }
 
+/// #871: a partly staged file has a row in Staged and one in Changes; `s`
+/// on the Staged row and `u` on the Changes row leave both halves where
+/// they are, as the mouse's row actions do, instead of `git add` or `git
+/// reset` on the whole file.
+#[test]
+fn list_keys_keep_a_partly_staged_files_halves_apart() {
+    use crate::git::ChangeSection;
+    let tmp = make_committed_repo();
+    let git_ok = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(args)
+            .status()
+            .unwrap()
+            .success()
+    };
+    std::fs::write(tmp.path().join("seed.txt"), b"staged\n").unwrap();
+    assert!(git_ok(&["add", "seed.txt"]));
+    std::fs::write(tmp.path().join("seed.txt"), b"staged\nunstaged\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    wait_for_changes(&mut app, |a| a.source_control.entries.len() >= 2);
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    let row = |app: &App, section| {
+        let entries = &app.source_control.entries;
+        entries.iter().position(|e| e.kind.section() == section)
+    };
+    app.source_control.selected_change = row(&app, ChangeSection::Staged);
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!git_ok(&["diff", "--quiet"]), "s staged the unstaged half");
+    app.source_control.selected_change = row(&app, ChangeSection::Changes);
+    app.handle_key(key(KeyCode::Char('u'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        !git_ok(&["diff", "--cached", "--quiet"]),
+        "u unstaged the staged half"
+    );
+}
+
 /// #871: the Commit button's and menus' actions are on the palette, so
 /// they need no click: Git: Checkout to… opens the branch picker, Git:
 /// Stash asks for a name, and Git: Commit commits the message.

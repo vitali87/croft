@@ -26184,6 +26184,13 @@ impl App {
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
         let selected = self.source_control.selected_change.filter(|_| !has_mod);
+        // Stage acts on a row outside Staged and Unstage on a Staged one, as
+        // the mouse's row actions do: a partly staged file has a row in
+        // each, and `git add` from its Staged row (or `git reset` from its
+        // Changes row) would undo the half the user kept apart.
+        let staged = selected
+            .and_then(|i| self.source_control.entries.get(i))
+            .is_some_and(|e| e.kind.section() == crate::git::ChangeSection::Staged);
         let sc = &mut self.source_control;
         match (key.code, selected) {
             (KeyCode::Tab | KeyCode::BackTab, _) => sc.list_focused = false,
@@ -26192,8 +26199,10 @@ impl App {
                 sc.move_selection(false);
             }
             (KeyCode::Enter, Some(idx)) => self.open_source_control_entry(idx),
-            (KeyCode::Char(' ' | 's'), Some(idx)) => self.stage_source_control_entry(idx),
-            (KeyCode::Char('u'), Some(idx)) => self.unstage_source_control_entry(idx),
+            (KeyCode::Char(' ' | 's'), Some(idx)) if !staged => {
+                self.stage_source_control_entry(idx)
+            }
+            (KeyCode::Char('u'), Some(idx)) if staged => self.unstage_source_control_entry(idx),
             (KeyCode::Backspace | KeyCode::Delete | KeyCode::Char('d'), Some(idx)) => {
                 self.request_discard_source_control_entry(idx)
             }

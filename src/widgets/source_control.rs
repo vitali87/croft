@@ -337,10 +337,17 @@ impl SourceControlPanel {
     pub fn set_status(&mut self, status: GitStatus, entries: Vec<ChangeEntry>) {
         self.status = status;
         self.seed_prepared_message();
-        let selected = self
-            .selected_change
-            .and_then(|i| self.entries.get(i))
-            .map(|e| (e.path.clone(), e.kind.section()));
+        let row_of = |i: usize| {
+            self.entries
+                .get(i)
+                .map(|e| (e.path.clone(), e.kind.section()))
+        };
+        let selected = self.selected_change.and_then(row_of);
+        let multi: Vec<_> = self
+            .multi_selection
+            .iter()
+            .filter_map(|&i| row_of(i))
+            .collect();
         self.entries = entries;
         // A change set refresh can re-order entries (staging an untracked
         // file moves it up): the selection follows its file, so the next
@@ -348,21 +355,24 @@ impl SourceControlPanel {
         // staged file's row in the same section while it has one. A file
         // that left the list hands its slot to the row that took its
         // place, and a slot past the end clears.
-        let follow = selected.and_then(|(path, section)| {
-            let rows = &self.entries;
-            let same_row = |e: &ChangeEntry| e.path == path && e.kind.section() == section;
+        let rows = &self.entries;
+        let follow = |(path, section): &(String, crate::git::ChangeSection)| {
+            let same_row = |e: &ChangeEntry| &e.path == path && e.kind.section() == *section;
             rows.iter()
                 .position(same_row)
-                .or_else(|| rows.iter().position(|e| e.path == path))
-        });
-        if let Some(idx) = follow {
+                .or_else(|| rows.iter().position(|e| &e.path == path))
+        };
+        // The multi-selection follows its files the same way, so Ctrl+S
+        // stages what is highlighted; a file that left the list leaves it.
+        let multi_selection = multi.iter().filter_map(follow).collect();
+        if let Some(idx) = selected.as_ref().and_then(follow) {
             self.selected_change = Some(idx);
         } else if let Some(idx) = self.selected_change
             && idx >= self.entries.len()
         {
             self.selected_change = None;
         }
-        self.multi_selection.retain(|i| *i < self.entries.len());
+        self.multi_selection = multi_selection;
         if self.entries.is_empty() {
             self.list_focused = false;
         }
@@ -3965,6 +3975,32 @@ mod tests {
         assert_eq!(p.selected_change, Some(2));
         p.set_status(main(), Vec::new());
         assert!(!p.list_focused, "an empty list gives the keyboard back");
+    }
+
+    /// #871: the multi-selection follows its files through a refresh that
+    /// re-orders them, as the selection does, so Ctrl+S stages the rows
+    /// still highlighted; a file that left the list leaves it.
+    #[test]
+    fn a_refresh_keeps_the_multi_selection_on_its_files() {
+        let mut p = SourceControlPanel::new();
+        let main = || dummy_status_with_branch("main");
+        p.set_status(
+            main(),
+            vec![
+                change("seed.txt", ChangeKind::Modified),
+                change("scratch.txt", ChangeKind::Untracked),
+                change("gone.txt", ChangeKind::Untracked),
+            ],
+        );
+        p.multi_selection = [1, 2].into_iter().collect();
+        p.set_status(
+            main(),
+            vec![
+                change("scratch.txt", ChangeKind::StagedAdded),
+                change("seed.txt", ChangeKind::Modified),
+            ],
+        );
+        assert_eq!(p.multi_selection, [0].into_iter().collect());
     }
 
     #[test]
