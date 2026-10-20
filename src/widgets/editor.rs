@@ -2199,6 +2199,12 @@ struct ExpandStack {
     pos: usize,
 }
 
+/// An xlsx grid's edited cell as hot exit keeps it (#1593):
+/// `(sheet name, row, col, value)`. The worksheet goes by its name, which
+/// a workbook keeps unique, so a reorder since the backup does not put the
+/// value on another worksheet.
+pub type SheetCellEdit = (String, usize, usize, String);
+
 /// A single text replacement in char-indexed `(row, col)` coordinates, as
 /// produced by an LSP rename `WorkspaceEdit`. Applied by
 /// [`apply_span_edits_to_lines`] and [`Editor::apply_span_edits`].
@@ -2350,6 +2356,14 @@ pub fn position_after_span_edits(
         };
     }
     pos
+}
+
+/// The delimiter a CSV or TSV grid was read and is written with.
+fn sheet_delim(kind: crate::sheet::SheetKind) -> u8 {
+    match kind {
+        crate::sheet::SheetKind::Tsv => b'\t',
+        _ => b',',
+    }
 }
 
 fn replace_span(lines: &mut Vec<String>, e: &TextSpanEdit) -> bool {
@@ -3057,6 +3071,8 @@ pub struct Editor {
     /// closers type over, selections surround, and backspace eats an empty
     /// pair. Synced from the app's persisted preference like `blame_enabled`.
     pub auto_close_pairs: bool,
+    /// The global on-save clean-ups (#1657), set by the app before each save.
+    pub save_cleanup: SaveCleanup,
     /// Auto-closing TAGS (VS Code's `html.autoClosingTags` /
     /// `javascript.autoClosingTags`, filling the "no tag auto-close" gap
     /// in `src/vscode_extensions.rs`): typing `>` at the end of an opening
@@ -3723,6 +3739,7 @@ impl Editor {
             git_marks: std::collections::HashMap::new(),
             git_marks_seq: u64::MAX,
             auto_close_pairs: true,
+            save_cleanup: SaveCleanup::default(),
             auto_close_tags: true,
             auto_pair_at: None,
             multi_auto_pair: None,
@@ -5669,9 +5686,19 @@ impl Editor {
         sarif_refusal: Option<String>,
     ) -> Result<()> {
         // Decode with the file's BOM-declared encoding if it has one, else
-        // UTF-8. A later "Reopen with Encoding" overrides this.
+        // the one the user last picked for it, the `.editorconfig` charset or
+        // the `files_encoding` setting (#1432), else UTF-8. A later "Reopen
+        // with Encoding" overrides this.
         let sniffed = encoding_rs::Encoding::for_bom(bytes);
-        let enc = sniffed.map(|(e, _)| e).unwrap_or(encoding_rs::UTF_8);
+        let editorconfig = crate::editorconfig::for_file(path);
+        let declared = sniffed
+            .is_none()
+            .then(|| crate::file_encoding::declared_for(path, &editorconfig))
+            .flatten();
+        let enc = sniffed
+            .map(|(e, _)| e)
+            .or(declared.map(|c| c.encoding))
+            .unwrap_or(encoding_rs::UTF_8);
         // The BOM sniff comes FIRST: UTF-16 text is half NUL bytes, so the
         // binary heuristic would reject every UTF-16 file — including the ones
         // croft itself writes when the user picks UTF-16 from the encoding
@@ -5696,7 +5723,9 @@ impl Editor {
         };
         self.encoding = enc;
         // `decode` strips the BOM, so remember it or the next save drops it.
-        self.bom = sniffed.is_some();
+        // A `utf-8-bom` charset asks for one on a file that has none yet.
+        self.bom =
+            sniffed.is_some() || (enc == encoding_rs::UTF_8 && declared.is_some_and(|c| c.bom));
         let (decoded, _, decode_lossy) = enc.decode(bytes);
         let text = decoded.into_owned();
         self.decode_lossy = decode_lossy;
@@ -5724,7 +5753,7 @@ impl Editor {
         // relied on: a project that states `end_of_line` means it, and a
         // file whose current content disagrees is exactly the case the
         // property exists to fix.
-        self.editorconfig = crate::editorconfig::for_file(path);
+        self.editorconfig = editorconfig;
         if let Some(eol) = self.editorconfig.eol {
             self.eol = match eol {
                 crate::editorconfig::Eol::Lf => LineEnding::Lf,
@@ -6884,6 +6913,125 @@ impl Editor {
         self.disk_conflict = false;
         self.dirty = still_dirty;
         Ok(SaveOutcome::Saved)
+    }
+
+    /// The cell being typed into in this tab's grid, when what is typed
+    /// differs from the cell (#1593): `(sheet, row, col, value)`. It is
+    /// in no cell yet, so hot exit reads it here.
+    pub fn sheet_pending_cell(&self) -> Option<(usize, usize, usize, &str)> {
+        let view = self.sheet.as_ref()?;
+        let edit = view.editing.as_ref()?;
+        let data = view.sheets.get(view.current_sheet)?;
+        let (r, c) = (data.cur_row, data.cur_col);
+        (data.cell(r, c) != edit.value).then_some((view.current_sheet, r, c, edit.value.as_str()))
+    }
+
+    /// What hot exit and the update relaunch keep of a grid's unsaved
+    /// edits (#1593), `None` when it has none: a CSV/TSV grid as the text a
+    /// save would write, an xlsx as its edited cells `(sheet, row, col,
+    /// value)` by worksheet name, the cells its save applies. The cell being typed into
+    /// counts as edited, as a save would commit it.
+    pub fn sheet_backup(&self) -> Option<(Option<String>, Vec<SheetCellEdit>)> {
+        let view = self.sheet.as_ref()?;
+        let pending = self.sheet_pending_cell();
+        if !view.dirty && pending.is_none() {
+            return None;
+        }
+        match view.kind {
+            crate::sheet::SheetKind::Csv | crate::sheet::SheetKind::Tsv => {
+                let data = view.sheets.get(view.current_sheet)?;
+                let typed;
+                let data = match pending {
+                    Some((_, r, c, value)) => {
+                        let mut copy = data.clone();
+                        copy.set_cell(r, c, value.to_string());
+                        typed = copy;
+                        &typed
+                    }
+                    None => data,
+                };
+                let bytes =
+                    crate::sheet::serialize_delimited(data, sheet_delim(view.kind), false, &[]);
+                Some((
+                    Some(String::from_utf8_lossy(&bytes).into_owned()),
+                    Vec::new(),
+                ))
+            }
+            crate::sheet::SheetKind::Xlsx => {
+                let mut cells: Vec<_> = view
+                    .cell_edits
+                    .iter()
+                    .filter(|&&(s, r, c)| pending.is_none_or(|p| (p.0, p.1, p.2) != (s, r, c)))
+                    .filter_map(|&(s, r, c)| {
+                        let data = view.sheets.get(s)?;
+                        Some((data.name.clone(), r, c, data.cell(r, c).to_string()))
+                    })
+                    .collect();
+                if let Some((s, r, c, value)) = pending
+                    && let Some(data) = view.sheets.get(s)
+                {
+                    cells.push((data.name.clone(), r, c, value.to_string()));
+                }
+                (!cells.is_empty()).then_some((None, cells))
+            }
+            _ => None,
+        }
+    }
+
+    /// Put a grid's backed-up edits (#1593) over the file just opened in
+    /// it, as unsaved edits: a CSV/TSV's text re-read into the grid, an
+    /// xlsx's cells set again and queued for its save. Returns the xlsx
+    /// cells it could not set (their worksheet or row is gone from the
+    /// workbook), which the caller keeps rather than lose. The tab turns
+    /// dirty only when something was put back.
+    pub fn restore_sheet_edits(
+        &mut self,
+        text: Option<&str>,
+        cells: &[SheetCellEdit],
+    ) -> Vec<SheetCellEdit> {
+        let Some(view) = self.sheet.as_mut() else {
+            return cells.to_vec();
+        };
+        let mut unapplied = Vec::new();
+        match (view.kind, text) {
+            (crate::sheet::SheetKind::Csv | crate::sheet::SheetKind::Tsv, Some(text)) => {
+                let name = view
+                    .sheets
+                    .first()
+                    .map_or_else(|| String::from("Sheet1"), |d| d.name.clone());
+                let Ok(data) =
+                    crate::sheet::parse_delimited(text.as_bytes(), sheet_delim(view.kind), &name)
+                else {
+                    return Vec::new();
+                };
+                view.sheets = vec![data];
+                view.current_sheet = 0;
+            }
+            (crate::sheet::SheetKind::Xlsx, _) if !cells.is_empty() => {
+                for cell in cells {
+                    let (name, r, c, value) = cell;
+                    let Some(s) = view
+                        .sheets
+                        .iter()
+                        .position(|d| d.name == *name && *r < d.rows.len())
+                    else {
+                        unapplied.push(cell.clone());
+                        continue;
+                    };
+                    view.sheets[s].set_cell(*r, *c, value.clone());
+                    if !view.cell_edits.contains(&(s, *r, *c)) {
+                        view.cell_edits.push((s, *r, *c));
+                    }
+                }
+                if unapplied.len() == cells.len() {
+                    return unapplied;
+                }
+            }
+            _ => return cells.to_vec(),
+        }
+        view.dirty = true;
+        self.dirty = true;
+        unapplied
     }
 
     /// The page an open PDF preview is showing, if this tab is one.
@@ -8362,6 +8510,8 @@ impl Editor {
         let (decoded, used, decode_lossy) = enc.decode(&bytes);
         let text = decoded.into_owned();
         self.encoding = used;
+        // Keep the choice for the next time this file opens (#1432).
+        crate::file_encoding::remember(&path, used);
         self.decode_lossy = decode_lossy;
         // Re-sniff against the bytes just read: reinterpreting the file under a
         // new encoding must not carry the previous one's BOM answer over.
@@ -13110,20 +13260,33 @@ impl Editor {
         true
     }
 
-    /// Apply the `.editorconfig` properties that act at save time, from the
-    /// single write choke point so every save path (explicit, force, auto,
+    /// Apply the clean-ups that act at save time, from the single write
+    /// choke point so every save path (explicit, force, auto,
     /// format-on-save) gets them. Only an auto-save spares the caret lines
     /// from the trim.
     ///
-    /// Both are no-ops unless a `.editorconfig` explicitly asked for them:
-    /// rewriting someone's whitespace on an unconfigured project would be a
-    /// surprise, and a noisy diff.
+    /// Each is a no-op unless asked for: by a `.editorconfig` property, or
+    /// by the global setting (#1657), off by default as in VS Code.
+    /// Rewriting someone's whitespace unasked would be a surprise, and a
+    /// noisy diff. A `.editorconfig` value wins over the global one for its
+    /// file, either way, as it does for indentation.
     fn apply_editorconfig_on_save(&mut self, reason: SaveReason) -> bool {
         let mut changed = false;
-        if self.editorconfig.trim_trailing_whitespace == Some(true) {
+        let trim_whitespace = self
+            .editorconfig
+            .trim_trailing_whitespace
+            .unwrap_or(self.save_cleanup.trim_trailing_whitespace);
+        let final_newline = self
+            .editorconfig
+            .insert_final_newline
+            .unwrap_or(self.save_cleanup.insert_final_newline);
+        if trim_whitespace {
             changed |= self.trim_trailing_whitespace_on_save(reason);
         }
-        if self.editorconfig.insert_final_newline == Some(true) {
+        if self.save_cleanup.trim_final_newlines {
+            changed |= self.trim_final_newlines_on_save();
+        }
+        if final_newline {
             // `lines` joins with the EOL on write, so a trailing empty
             // element IS the final newline. An empty buffer is left alone:
             // a zero-byte file has no last line to terminate.
@@ -13140,6 +13303,34 @@ impl Editor {
             }
         }
         changed
+    }
+
+    /// `files.trimFinalNewlines` for a save (#1657): the empty lines after
+    /// the last line of text go, but the newline that ends that line stays.
+    /// With `final_newline` set it is written from the flag; without, it is
+    /// the one trailing empty element, so that one is kept. No line a
+    /// caret sits on goes, on any save: auto-save runs a second after
+    /// typing stops, and must not eat the line just opened with Enter. The command (`trim_final_newlines`) drops them all, as
+    /// it always has.
+    fn trim_final_newlines_on_save(&mut self) -> bool {
+        let mut text_end = self.lines.len();
+        while text_end > 1 && self.lines[text_end - 1].is_empty() {
+            text_end -= 1;
+        }
+        let ends_line = usize::from(!self.final_newline && text_end < self.lines.len());
+        let last_caret = std::iter::once(self.cursor_row)
+            .chain(self.carets.iter().map(|c| c.head.0))
+            .max()
+            .unwrap_or(0);
+        let keep = (text_end + ends_line).max(last_caret + 1);
+        if keep >= self.lines.len() {
+            return false;
+        }
+        self.push_undo(EditKind::TrimFinalNewlines);
+        self.lines.truncate(keep);
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+        true
     }
 
     /// The `.editorconfig` properties in force for this buffer.
@@ -15650,6 +15841,26 @@ fn title_case(s: &str) -> String {
         }
     }
     out
+}
+
+/// The global on-save clean-ups (#1657): VS Code's `files.insertFinalNewline`,
+/// `files.trimTrailingWhitespace` and `files.trimFinalNewlines`, all off by
+/// default as they are there.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SaveCleanup {
+    pub insert_final_newline: bool,
+    pub trim_trailing_whitespace: bool,
+    pub trim_final_newlines: bool,
+}
+
+impl SaveCleanup {
+    pub(crate) fn from_prefs(p: &crate::prefs::Prefs) -> Self {
+        Self {
+            insert_final_newline: p.insert_final_newline,
+            trim_trailing_whitespace: p.trim_trailing_whitespace,
+            trim_final_newlines: p.trim_final_newlines,
+        }
+    }
 }
 
 /// Most rulers kept (#1524). A repository's `.croft/config.json` may set
@@ -30345,6 +30556,134 @@ mod tests {
         assert_eq!(e.encoding, encoding_rs::WINDOWS_1252);
     }
 
+    /// The issue's bytes: windows-1252 for "Grüße aus Köln\nCafé crème\n".
+    const LEGACY_1432: &[u8] = b"Gr\xfc\xdfe aus K\xf6ln\nCaf\xe9 cr\xe8me\n";
+
+    fn project_1432(editorconfig: Option<&str>, bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        if let Some(ec) = editorconfig {
+            std::fs::write(dir.path().join(".editorconfig"), ec).unwrap();
+        }
+        let file = dir.path().join("notes.txt");
+        std::fs::write(&file, bytes).unwrap();
+        (dir, file)
+    }
+
+    /// #1432: `charset = latin1` decodes a BOM-less file as windows-1252, and
+    /// saving it unchanged writes back exactly the bytes it was read from.
+    #[test]
+    fn an_editorconfig_charset_decodes_a_file_without_a_bom() {
+        let (_dir, file) = project_1432(Some("root = true\n[*]\ncharset = latin1\n"), LEGACY_1432);
+        let mut e = Editor::new();
+        e.open(&file).unwrap();
+        assert_eq!(e.lines[0], "Grüße aus Köln");
+        assert_eq!(e.lines[1], "Café crème");
+        assert_eq!(e.encoding, encoding_rs::WINDOWS_1252);
+        assert!(!e.decode_lossy);
+        e.save_to_disk().unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), LEGACY_1432);
+    }
+
+    /// #1432: the issue's smallest case, `47 72 FC 44 65` under latin1.
+    #[test]
+    fn latin1_decodes_the_issue_s_five_bytes() {
+        let (_dir, file) = project_1432(Some("[*]\ncharset = latin1\n"), b"\x47\x72\xFC\x44\x65");
+        let mut e = Editor::new();
+        e.open(&file).unwrap();
+        assert_eq!(e.lines[0], "GrüDe");
+    }
+
+    /// #1432: `charset = utf-8-bom` gives a file without the mark one on
+    /// its next save.
+    #[test]
+    fn a_utf_8_bom_charset_adds_the_mark_on_save() {
+        let (_dir, file) = project_1432(Some("[*.txt]\ncharset = utf-8-bom\n"), b"");
+        let mut e = Editor::new();
+        e.open(&file).unwrap();
+        e.insert_char('h');
+        e.insert_char('i');
+        e.save_to_disk().unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"\xEF\xBB\xBFhi");
+    }
+
+    /// #1432 negative: a BOM wins over the charset, which only speaks for
+    /// files that do not say what they are.
+    #[test]
+    fn a_bom_beats_the_editorconfig_charset() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice("Grüße\n".as_bytes());
+        let (_dir, file) = project_1432(Some("[*]\ncharset = latin1\n"), &bytes);
+        let mut e = Editor::new();
+        e.open(&file).unwrap();
+        assert_eq!(e.lines[0], "Grüße");
+        assert_eq!(e.encoding, encoding_rs::UTF_8);
+        assert!(e.bom);
+    }
+
+    /// #1432 negative: a charset for other files, a value naming no
+    /// encoding, or no `.editorconfig` at all leaves the file UTF-8.
+    #[test]
+    fn without_a_charset_for_the_file_it_stays_utf_8() {
+        for ec in [
+            Some("[*.cs]\ncharset = latin1\n"),
+            Some("[*]\ncharset = latin9000\n"),
+            None,
+        ] {
+            let (_dir, file) = project_1432(ec, LEGACY_1432);
+            let mut e = Editor::new();
+            e.open(&file).unwrap();
+            assert_eq!(e.encoding, encoding_rs::UTF_8, "{ec:?}");
+            assert!(e.decode_lossy, "{ec:?}");
+            assert!(!e.bom, "{ec:?}");
+        }
+    }
+
+    /// #1432: a workspace's `files_encoding` decodes the file when no
+    /// `.editorconfig` says otherwise, and a charset that does wins.
+    #[test]
+    fn the_workspace_encoding_applies_below_the_editorconfig_charset() {
+        let (dir, file) = project_1432(None, LEGACY_1432);
+        crate::file_encoding::set_workspace_default(
+            dir.path(),
+            crate::file_encoding::parse("windows1252"),
+        );
+        let mut e = Editor::new();
+        e.open(&file).unwrap();
+        assert_eq!(e.lines[0], "Grüße aus Köln");
+        std::fs::write(dir.path().join(".editorconfig"), "[*]\ncharset = utf-8\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&file).unwrap();
+        assert_eq!(e.encoding, encoding_rs::UTF_8);
+        crate::file_encoding::set_workspace_default(dir.path(), None);
+    }
+
+    /// #1432: Reopen with Encoding is remembered for the file, so closing the
+    /// tab and opening it again keeps Shift_JIS instead of mojibake.
+    #[test]
+    fn a_reopen_with_encoding_choice_is_kept_for_the_next_open() {
+        // "日本語" in Shift_JIS.
+        let sjis: &[u8] = b"\x93\xfa\x96\x7b\x8c\xea\n";
+        let (dir, file) = project_1432(Some("[*]\ncharset = latin1\n"), sjis);
+        let other = dir.path().join("other.txt");
+        std::fs::write(&other, sjis).unwrap();
+        let mut e = Editor::new();
+        e.open(&file).unwrap();
+        e.reopen_with_encoding(encoding_rs::SHIFT_JIS).unwrap();
+        assert_eq!(e.lines[0], "日本語");
+        let mut again = Editor::new();
+        again.open(&file).unwrap();
+        assert_eq!(
+            again.encoding,
+            encoding_rs::SHIFT_JIS,
+            "the choice beats the charset"
+        );
+        assert_eq!(again.lines[0], "日本語");
+        // Negative: only that file. Its neighbour follows the charset.
+        let mut neighbour = Editor::new();
+        neighbour.open(&other).unwrap();
+        assert_eq!(neighbour.encoding, encoding_rs::WINDOWS_1252);
+    }
+
     /// A same-path reload (the FS-sync sweep on a clean buffer, or an explicit
     /// revert) re-enters `open`, which auto-detects. Without a guard that
     /// throws away the encoding the user picked through "Reopen with
@@ -31956,9 +32295,11 @@ mod tests {
         assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
         assert_eq!(std::fs::read(tmp.path()).unwrap(), b"caf\xE9\n");
         assert!(e.unmappable_chars().is_empty());
-        // The same text in UTF-8 is always representable.
+        // The same text in UTF-8 is always representable. A fresh file: the
+        // one above now opens in the encoding picked for it (#1432).
+        let fresh = NamedTempFile::new().unwrap();
         let mut u = Editor::new();
-        u.open(tmp.path()).unwrap();
+        u.open(fresh.path()).unwrap();
         u.lines = vec![String::from("日本語")];
         assert_eq!(u.encoding, encoding_rs::UTF_8);
         assert_eq!(u.save_to_disk().unwrap(), SaveOutcome::Saved);

@@ -1,1 +1,0 @@
-fix: Applying a quick fix or rename that adds or changes text above the caret, such as Add import, now keeps the caret, the selection and every extra caret on the text they were on, so typing straight after the fix no longer lands in the import block.

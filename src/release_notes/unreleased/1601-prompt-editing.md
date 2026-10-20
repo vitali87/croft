@@ -1,1 +1,0 @@
-fix: One-line prompts such as Save Workspace As and Rename Branch now open with a prefilled value selected, so typing or pasting replaces it. Ctrl+A selects it again, Ctrl+U and Ctrl+K clear to the start or end, and Ctrl+W, Alt+Backspace and Ctrl+Backspace delete a word back to the previous space or path separator. A value wider than the box scrolls to keep the caret in view.
