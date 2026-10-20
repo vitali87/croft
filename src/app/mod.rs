@@ -55162,6 +55162,13 @@ impl App {
             .take()
             .unwrap_or_else(|| self.editor.active_index());
         match cmd {
+            // A preview's placeholder lines are not the file (#916): an edit
+            // to them leaves the tab dirty with nothing a save can write.
+            Cmd::MoveLineUp | Cmd::MoveLineDown | Cmd::CopyLineUp | Cmd::CopyLineDown
+                if self.editor.has_non_text_view() =>
+            {
+                self.status = format!("{} needs a text file", cmd.title());
+            }
             Cmd::MoveLineUp => self.editor.move_lines_up(),
             Cmd::MoveLineDown => self.editor.move_lines_down(),
             Cmd::CopyLineUp => self.editor.duplicate_lines_up(),

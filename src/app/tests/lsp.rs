@@ -1990,6 +1990,30 @@ fn a_rebound_go_to_definition_on_a_non_text_view_says_so_and_sends_nothing() {
     assert_eq!(app.status, "Rename Symbol needs a text file");
 }
 
+/// #916: Copy Line Up/Down and Move Line Up/Down from the palette (or an
+/// imported binding) on a read-only preview say so, rather than editing the
+/// preview's placeholder lines and leaving the tab dirty.
+#[test]
+fn line_commands_on_a_non_text_view_say_so_and_leave_the_tab_clean() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let bin = tmp.path().join("a.bin");
+    std::fs::write(&bin, [0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+    app.editor.hex = Some(crate::hex::HexView::open(&bin).unwrap());
+    assert!(app.editor.has_non_text_view(), "precondition");
+    for cmd in [
+        Command::CopyLineDown,
+        Command::CopyLineUp,
+        Command::MoveLineDown,
+        Command::MoveLineUp,
+    ] {
+        app.run_command(cmd);
+        assert_eq!(app.status, format!("{} needs a text file", cmd.title()));
+        assert!(!app.editor.dirty, "{cmd:?} left the preview dirty");
+    }
+}
+
 #[test]
 fn rename_symbol_defers_the_prompt_until_a_verdict_arrives() {
     // #254 item 6: F2 no longer opens the prompt straight away — it fires
