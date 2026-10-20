@@ -1826,6 +1826,70 @@ fn a_compounds_own_pre_launch_task_runs_before_its_member_starts() {
     assert!(pair.debug_sessions.is_empty(), "and still nothing ran");
 }
 
+/// #1412: a preLaunchTask written the way VS Code labels auto-detected
+/// tasks (`npm: build`, `tsc: build - tsconfig.json`) runs the task croft
+/// detected, with no tasks.json; a label that names nothing still refuses,
+/// and suggests the near match.
+#[test]
+fn a_pre_launch_task_with_a_vs_code_label_runs_the_detected_task() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    std::fs::write(
+        p.join("package.json"),
+        r#"{ "name": "ts1", "scripts": { "build": "tsc" } }"#,
+    )
+    .unwrap();
+    std::fs::write(p.join("tsconfig.json"), "{}").unwrap();
+    std::fs::create_dir_all(p.join(".vscode")).unwrap();
+    std::fs::write(
+        p.join(".vscode/launch.json"),
+        r#"{ "configurations": [
+            { "type": "node", "request": "launch", "name": "Npm",
+              "program": "${workspaceFolder}/dist/main.js", "preLaunchTask": "npm: build" },
+            { "type": "node", "request": "launch", "name": "Tsc",
+              "program": "${workspaceFolder}/dist/main.js", "preLaunchTask": "tsc: build - tsconfig.json" },
+            { "type": "node", "request": "launch", "name": "Bare",
+              "program": "${workspaceFolder}/dist/main.js", "preLaunchTask": "build" }
+        ]}"#,
+    )
+    .unwrap();
+    let launch = |name: &str| {
+        let mut app = App::new(p.to_path_buf()).unwrap();
+        let cfg = crate::dap::configs::discover_configs(p)
+            .into_iter()
+            .find(|c| c.name == name)
+            .unwrap();
+        app.launch_debug_config(&cfg);
+        app
+    };
+    let app = launch("Npm");
+    assert_eq!(
+        app.pending_debug_launch
+            .as_ref()
+            .map(|l| l.command.as_str()),
+        Some("npm run build"),
+        "{}",
+        app.status
+    );
+    let app = launch("Tsc");
+    assert_eq!(
+        app.pending_debug_launch
+            .as_ref()
+            .map(|l| l.command.as_str()),
+        Some("tsc -p tsconfig.json"),
+        "{}",
+        app.status
+    );
+    let app = launch("Bare");
+    assert!(app.pending_debug_launch.is_none());
+    assert!(
+        app.status
+            .contains("preLaunchTask \"build\" not found (did you mean \"npm run build\"?)"),
+        "{}",
+        app.status
+    );
+}
+
 /// #318, the half a parked-launch assertion cannot see: what happens when the
 /// compound's task FINISHES.
 ///

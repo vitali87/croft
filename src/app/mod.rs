@@ -33941,11 +33941,15 @@ impl App {
         self.pending_debug_launch = None;
         let root = self.active_workspace_root();
         let tasks = crate::tasks::discover_tasks(&root);
-        let Some(task) = tasks.into_iter().find(|t| t.label == task_label) else {
-            self.debug_error(format!(
-                "compound preLaunchTask \"{task_label}\" not found — Tasks: Run Task lists what the workspace declares"
-            ));
-            return;
+        let task = match crate::tasks::find_task(tasks, task_label) {
+            Ok(task) => task,
+            Err(near) => {
+                self.debug_error(format!(
+                    "compound preLaunchTask \"{task_label}\" not found{} — Tasks: Run Task lists what the workspace declares",
+                    did_you_mean(near)
+                ));
+                return;
+            }
         };
         let command = self
             .task_command_line(&task)
@@ -34193,11 +34197,15 @@ impl App {
         self.debug_build = None;
         let root = self.active_workspace_root();
         let tasks = crate::tasks::discover_tasks(&root);
-        let Some(task) = tasks.into_iter().find(|t| t.label == task_label) else {
-            self.debug_error(format!(
-                "compound preLaunchTask \"{task_label}\" not found — Tasks: Run Task lists what the workspace declares"
-            ));
-            return;
+        let task = match crate::tasks::find_task(tasks, task_label) {
+            Ok(task) => task,
+            Err(near) => {
+                self.debug_error(format!(
+                    "compound preLaunchTask \"{task_label}\" not found{} — Tasks: Run Task lists what the workspace declares",
+                    did_you_mean(near)
+                ));
+                return;
+            }
         };
         let command = self
             .task_command_line(&task)
@@ -34247,11 +34255,15 @@ impl App {
         self.record_post_debug_task(&rc);
         if let Some(task_label) = rc.pre_launch_task.clone() {
             let tasks = crate::tasks::discover_tasks(&root);
-            let Some(task) = tasks.into_iter().find(|t| t.label == task_label) else {
-                self.debug_error(format!(
-                    "preLaunchTask \"{task_label}\" not found — Tasks: Run Task lists what the workspace declares"
-                ));
-                return;
+            let task = match crate::tasks::find_task(tasks, &task_label) {
+                Ok(task) => task,
+                Err(near) => {
+                    self.debug_error(format!(
+                        "preLaunchTask \"{task_label}\" not found{} — Tasks: Run Task lists what the workspace declares",
+                        did_you_mean(near)
+                    ));
+                    return;
+                }
             };
             let command = self
                 .task_command_line_in(&task, root.clone())
@@ -35852,13 +35864,14 @@ impl App {
         }
         let tasks = crate::tasks::discover_tasks(&self.active_workspace_root());
         for label in labels {
-            match tasks.iter().find(|t| t.label == label) {
-                Some(task) => {
-                    self.run_project_task(task.clone());
+            match crate::tasks::find_task(tasks.clone(), &label) {
+                Ok(task) => {
+                    self.run_project_task(task);
                 }
-                None => {
+                Err(near) => {
                     self.status = format!(
-                        "postDebugTask \"{label}\" not found — Tasks: Run Task lists what the workspace declares"
+                        "postDebugTask \"{label}\" not found{} — Tasks: Run Task lists what the workspace declares",
+                        did_you_mean(near)
                     );
                 }
             }
@@ -77812,6 +77825,13 @@ fn install_terminal_restore_panic_hook() {
             original(info);
         }));
     });
+}
+
+/// ` (did you mean "npm run build"?)` for a task label that was not found
+/// but has a near match (#1412), else nothing.
+fn did_you_mean(near: Option<String>) -> String {
+    near.map(|n| format!(" (did you mean \"{n}\"?)"))
+        .unwrap_or_default()
 }
 
 /// A paste's lines (#1274), split at `\n`, `\r\n` or a lone `\r` as a shell

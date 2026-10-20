@@ -14,6 +14,9 @@
 //! - `Cargo.toml` → the standard cargo verbs
 //! - `pyproject.toml` `[project.scripts]` → `uv run <name>` (plus
 //!   `uv run pytest` when the file mentions pytest)
+//! - `tsconfig*.json` → `tsc -p <file>` (`tsc -b <file>` when it has
+//!   project references), labelled `tsc: build - <file>` as VS Code
+//!   labels it
 //!
 //! The command line is written to a shell pane's PTY, so PATH, aliases,
 //! and env resolve exactly as if the user typed it.
@@ -331,7 +334,100 @@ pub fn discover_tasks(root: &Path) -> Vec<Task> {
     out.extend(pyproject_tasks(root));
     out.extend(go_tasks(root));
     out.extend(cmake_tasks(root));
+    out.extend(tsconfig_tasks(root));
     dedup(out)
+}
+
+/// The task a launch.json `preLaunchTask` / `postDebugTask` names (#1412).
+/// The label as written wins; failing that, the label VS Code gives the
+/// same auto-detected task: `npm: <script>` for a package.json script
+/// (whatever runner croft uses for it, as VS Code labels pnpm, yarn and
+/// bun scripts `npm:` too). Err carries a near match to suggest, if any.
+pub fn find_task(tasks: Vec<Task>, label: &str) -> Result<Task, Option<String>> {
+    if let Some(i) = tasks.iter().position(|t| t.label == label) {
+        return Ok(tasks.into_iter().nth(i).expect("found"));
+    }
+    if let Some(script) = label.strip_prefix("npm: ")
+        && let Some(i) = tasks
+            .iter()
+            .position(|t| t.source == "package.json" && package_script(&t.label) == Some(script))
+    {
+        return Ok(tasks.into_iter().nth(i).expect("found"));
+    }
+    // The last word is the script or target name in every label croft
+    // and VS Code give (`npm: build`, `npm run build`, `make build`).
+    let last = |l: &str| l.rsplit([' ', ':']).next().unwrap_or("").to_lowercase();
+    let want = last(label);
+    Err(tasks
+        .into_iter()
+        .find(|t| !want.is_empty() && last(&t.label) == want)
+        .map(|t| t.label))
+}
+
+/// The script a package.json task's label runs.
+fn package_script(label: &str) -> Option<&str> {
+    ["npm run ", "pnpm run ", "bun run ", "yarn "]
+        .iter()
+        .find_map(|runner| label.strip_prefix(runner))
+}
+
+/// VS Code's auto-detected TypeScript build task (#1412): `tsc: build -
+/// <file>` for each `tsconfig*.json` at the root, running `tsc -p <file>`
+/// with the project's own compiler when it has one.
+fn tsconfig_tasks(root: &Path) -> Vec<Task> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_file())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with("tsconfig") && n.ends_with(".json"))
+        .filter(|n| !n.contains(char::is_whitespace))
+        .collect();
+    names.sort();
+    let tsc = if root.join("node_modules/.bin/tsc").is_file() {
+        "node_modules/.bin/tsc"
+    } else {
+        "tsc"
+    };
+    names
+        .into_iter()
+        .map(|name| {
+            // The filename is repository-controlled and the terminal runs
+            // this line, so anything beyond plain text goes in as one word.
+            let word = if needs_quote(&name) {
+                quote_word(&name)
+            } else {
+                name.clone()
+            };
+            // A config with project references builds them only in build
+            // mode, which is what VS Code's task switches to.
+            let mode = if has_references(&root.join(&name)) {
+                "-b"
+            } else {
+                "-p"
+            };
+            Task {
+                label: format!("tsc: build - {name}"),
+                command: format!("{tsc} {mode} {word}"),
+                source: name,
+                is_build: true,
+                is_default: false,
+                problem_matcher: Some(serde_json::Value::String(String::from("$tsc"))),
+                vscode: None,
+            }
+        })
+        .collect()
+}
+
+/// Whether the tsconfig at `path` lists any project `references`.
+fn has_references(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&strip_jsonc(&text)).ok())
+        .and_then(|v| v.get("references")?.as_array().map(|a| !a.is_empty()))
+        .unwrap_or(false)
 }
 
 /// The task `Cmd+Shift+B` runs: the explicit `isDefault` build task when
@@ -2798,5 +2894,137 @@ mod tests {
     fn empty_workspace_has_no_tasks() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(discover_tasks(tmp.path()).is_empty());
+    }
+
+    /// #1412: launch.json names auto-detected tasks the way VS Code labels
+    /// them. `npm: <script>` finds the package.json script whatever runner
+    /// runs it, and each root `tsconfig*.json` is a `tsc: build - <file>`
+    /// task running `tsc -p <file>` (the project's own tsc when installed).
+    #[test]
+    fn vs_code_task_labels_find_package_scripts_and_tsc_builds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        std::fs::write(
+            p.join("package.json"),
+            r#"{"name":"x","scripts":{"build":"tsc","test":"jest"}}"#,
+        )
+        .unwrap();
+        std::fs::write(p.join("pnpm-lock.yaml"), "").unwrap();
+        std::fs::write(p.join("tsconfig.json"), "{}").unwrap();
+        std::fs::write(p.join("tsconfig.app.json"), "{}").unwrap();
+        let task = find_task(discover_tasks(p), "npm: build").unwrap();
+        assert_eq!(task.command, "pnpm run build");
+        assert_eq!(
+            find_task(discover_tasks(p), "npm: test").unwrap().command,
+            "pnpm run test"
+        );
+        let tsc = find_task(discover_tasks(p), "tsc: build - tsconfig.json").unwrap();
+        assert_eq!(tsc.command, "tsc -p tsconfig.json");
+        assert!(tsc.is_build);
+        assert_eq!(
+            tsc.problem_matcher,
+            Some(serde_json::Value::String(String::from("$tsc")))
+        );
+        assert_eq!(
+            find_task(discover_tasks(p), "tsc: build - tsconfig.app.json")
+                .unwrap()
+                .command,
+            "tsc -p tsconfig.app.json"
+        );
+        std::fs::create_dir_all(p.join("node_modules/.bin")).unwrap();
+        std::fs::write(p.join("node_modules/.bin/tsc"), "").unwrap();
+        assert_eq!(
+            find_task(discover_tasks(p), "tsc: build - tsconfig.json")
+                .unwrap()
+                .command,
+            "node_modules/.bin/tsc -p tsconfig.json",
+            "the project's own compiler"
+        );
+        let tasks = discover_tasks(p);
+        assert_eq!(
+            default_build_task(&tasks).map(|t| t.command.as_str()),
+            Some("pnpm run build"),
+            "the build script stays the default build"
+        );
+    }
+
+    /// #1412: a tsconfig filename with shell syntax goes to the shell as
+    /// one quoted word, and a config with project references (comments and
+    /// all) builds in `-b` mode so its dependencies build too.
+    #[test]
+    fn tsc_tasks_quote_filenames_and_build_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        let evil = "tsconfig$(touch${IFS}PWNED).json";
+        std::fs::write(p.join(evil), "{}").unwrap();
+        std::fs::write(
+            p.join("tsconfig.json"),
+            "{\n  // solution\n  \"files\": [],\n  \"references\": [{ \"path\": \"./a\" }],\n}\n",
+        )
+        .unwrap();
+        std::fs::write(p.join("tsconfig.empty.json"), r#"{"references": []}"#).unwrap();
+        let tasks = discover_tasks(p);
+        let cmd = |label: &str| {
+            tasks
+                .iter()
+                .find(|t| t.label == label)
+                .map(|t| t.command.clone())
+        };
+        assert_eq!(
+            cmd(&format!("tsc: build - {evil}")).as_deref(),
+            Some("tsc -p 'tsconfig$(touch${IFS}PWNED).json'")
+        );
+        assert_eq!(
+            cmd("tsc: build - tsconfig.json").as_deref(),
+            Some("tsc -b tsconfig.json")
+        );
+        assert_eq!(
+            cmd("tsc: build - tsconfig.empty.json").as_deref(),
+            Some("tsc -p tsconfig.empty.json")
+        );
+    }
+
+    /// #1412 negatives: an exact label wins over the alias; `npm:` does not
+    /// reach a Makefile target or a script that is not there (a near label
+    /// is only suggested); other json files and a tsconfig with a space in
+    /// its name are no tsc tasks.
+    #[test]
+    fn a_task_label_that_names_nothing_is_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        std::fs::write(p.join("Makefile"), "build:\n\tcc main.c\n").unwrap();
+        std::fs::write(p.join("jsconfig.json"), "{}").unwrap();
+        std::fs::write(p.join("tsconfig base.json"), "{}").unwrap();
+        let tasks = discover_tasks(p);
+        assert!(
+            !tasks.iter().any(|t| t.label.starts_with("tsc:")),
+            "{:?}",
+            tasks.iter().map(|t| &t.label).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            find_task(discover_tasks(p), "npm: build").map(|t| t.label),
+            Err(Some(String::from("make build"))),
+            "suggested, not run"
+        );
+        assert_eq!(
+            find_task(discover_tasks(p), "npm: deploy").map(|t| t.label),
+            Err(None)
+        );
+        std::fs::write(
+            p.join("package.json"),
+            r#"{"name":"x","scripts":{"build":"tsc"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir(p.join(".vscode")).unwrap();
+        std::fs::write(
+            p.join(".vscode/tasks.json"),
+            r#"{"version":"2.0.0","tasks":[{"label":"npm: build","type":"shell","command":"echo mine"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            find_task(discover_tasks(p), "npm: build").unwrap().source,
+            "tasks.json",
+            "a declared label wins"
+        );
     }
 }
