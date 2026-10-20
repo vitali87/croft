@@ -34441,38 +34441,59 @@ impl App {
                     ));
                     return;
                 }
-                match crate::dap::install::ensure_debug_venv() {
-                    Ok(py) => {
-                        let adapter_args =
-                            vec![String::from("-m"), String::from("debugpy.adapter")];
-                        let program_py =
-                            config_project_python(&rc, &cwd, &self.active_workspace_root(), &py);
-                        let request = configs::debugpy_request(&rc, &program_py);
-                        // Whichever interpreter runs the program, the
-                        // config's own included (#864).
-                        if rc.request == RequestKind::Launch {
-                            match launch_request_python(&request, &cwd)
-                                .as_deref()
-                                .map_or(Ok(None), debuggee_python_note)
-                            {
-                                Ok(note) => launch_note = note,
-                                Err(refusal) => {
-                                    self.debug_error(format!("config \"{name}\": {refusal}"));
-                                    return;
+                // Remote Attach (#1417): the port a `debugpy --listen`
+                // process serves is its own adapter, so the session talks to
+                // it directly; a second, local adapter in front of it waits
+                // for a debug server that never comes.
+                let attach = (rc.request == RequestKind::Attach)
+                    .then(|| configs::debugpy_request(&rc, Path::new("python3")));
+                let direct = attach
+                    .and_then(|r| configs::debugpy_connect_address(&r).map(|address| (r, address)));
+                if let Some((request, (host, port))) = direct {
+                    crate::dap::session::DapSession::attach_tcp(&host, port, request, breakpoints)
+                        .map_err(|e| {
+                            e.context(format!(
+                                "nothing answered on {host}:{port}; start the program with `python -m debugpy --listen {host}:{port}` first"
+                            ))
+                        })
+                } else {
+                    match crate::dap::install::ensure_debug_venv() {
+                        Ok(py) => {
+                            let adapter_args =
+                                vec![String::from("-m"), String::from("debugpy.adapter")];
+                            let program_py = config_project_python(
+                                &rc,
+                                &cwd,
+                                &self.active_workspace_root(),
+                                &py,
+                            );
+                            let request = configs::debugpy_request(&rc, &program_py);
+                            // Whichever interpreter runs the program, the
+                            // config's own included (#864).
+                            if rc.request == RequestKind::Launch {
+                                match launch_request_python(&request, &cwd)
+                                    .as_deref()
+                                    .map_or(Ok(None), debuggee_python_note)
+                                {
+                                    Ok(note) => launch_note = note,
+                                    Err(refusal) => {
+                                        self.debug_error(format!("config \"{name}\": {refusal}"));
+                                        return;
+                                    }
                                 }
                             }
+                            crate::dap::session::DapSession::launch_with(
+                                &py.to_string_lossy(),
+                                &adapter_args,
+                                &cwd,
+                                request,
+                                breakpoints,
+                            )
                         }
-                        crate::dap::session::DapSession::launch_with(
-                            &py.to_string_lossy(),
-                            &adapter_args,
-                            &cwd,
-                            request,
-                            breakpoints,
-                        )
-                    }
-                    Err(e) => {
-                        self.debug_error(format!("Debugger setup failed: {e}"));
-                        return;
+                        Err(e) => {
+                            self.debug_error(format!("Debugger setup failed: {e}"));
+                            return;
+                        }
                     }
                 }
             }

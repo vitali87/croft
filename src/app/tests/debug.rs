@@ -3586,6 +3586,46 @@ fn a_go_connect_to_server_attach_reaches_the_headless_delve() {
     assert!(!app.debug_sessions.is_empty(), "{}", app.status);
 }
 
+/// #1417: Python: Remote Attach (`attach` + `connect`) to a `debugpy
+/// --listen` process attaches to that port directly: croft's `initialize`
+/// and `attach` reach it, and the session is up.
+#[test]
+fn a_python_remote_attach_talks_to_the_listening_port() {
+    // The stand-in accepts within a deadline, so a session routed anywhere
+    // but this port fails here instead of hanging the join below.
+    let (port, server) = crate::dap::session::tests::listening_adapter(1);
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+    std::fs::write(
+        tmp.path().join(".vscode/launch.json"),
+        format!(
+            r#"{{ "configurations": [ {{ "name": "Python: Remote Attach", "type": "debugpy",
+                 "request": "attach", "connect": {{ "host": "127.0.0.1", "port": {port} }} }} ] }}"#
+        ),
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let cfg = crate::dap::configs::discover_configs(tmp.path()).remove(0);
+    app.launch_debug_config(&cfg);
+    assert!(
+        !app.debug_sessions.is_empty() && !app.run_debug.feedback_is_error,
+        "{}",
+        app.status
+    );
+    assert!(
+        app.status.contains("Attached: Python: Remote Attach"),
+        "{}",
+        app.status
+    );
+    let got = server.join().unwrap();
+    assert_eq!(
+        got.first().map(|m| m["command"].clone()),
+        Some(serde_json::json!("initialize")),
+        "croft's own initialize reached the port"
+    );
+    app.debug_stop();
+}
+
 fn resolved_attach(json: &str) -> crate::dap::configs::ResolvedConfig {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
