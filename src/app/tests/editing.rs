@@ -1865,6 +1865,30 @@ fn tab_expands_a_user_snippet_and_places_the_caret() {
     );
 }
 
+/// #914: variables expand to their values, from the buffer and from the
+/// workspace, instead of their names; an unknown one is a placeholder
+/// visited after the snippet's own stops, as in VS Code.
+#[test]
+fn tab_expands_snippet_variables_from_the_buffer_and_the_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("pkg")).unwrap();
+    let f = tmp.path().join("pkg/t.py");
+    std::fs::write(&f, "").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.snippets = crate::snippets::SnippetSet::from_json(
+        r#"{ "Mirror": { "prefix": "mirror", "scope": "python",
+             "body": "${1:x} = x + 1  $LINE_COMMENT $TM_FILENAME $RELATIVE_FILEPATH $CLIPBOARD $NOPE" } }"#,
+    );
+    crate::clipboard::test_clip::mock_write("clip");
+    app.editor.insert_str("mirror");
+    app.handle_editor_tab();
+    assert_eq!(app.editor.lines[0], "x = x + 1  # t.py pkg/t.py clip NOPE");
+    assert_eq!(app.editor.selection_text(), "x");
+    app.handle_editor_tab();
+    assert_eq!(app.editor.selection_text(), "NOPE");
+}
+
 // ── #1484: a repo's own snippets expand ──
 
 const TEAM_SNIPPETS_1484: &str = r#"{

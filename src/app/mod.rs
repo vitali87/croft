@@ -10051,8 +10051,32 @@ impl App {
         };
         self.completion_popup = None;
         self.completion_request_id = None;
-        self.editor.expand_snippet(&body, word.chars().count());
+        self.expand_snippet(&body, word.chars().count());
         true
+    }
+
+    /// Expand snippet `body` at the caret (see
+    /// [`Editor::expand_snippet_with`]), its variables resolving from the
+    /// buffer and from the workspace: `CLIPBOARD`, `RELATIVE_FILEPATH`,
+    /// `WORKSPACE_NAME` and `WORKSPACE_FOLDER` (#914).
+    fn expand_snippet(&mut self, body: &str, prefix_len: usize) {
+        let path = self.editor.path.clone();
+        let root = path.as_deref().and_then(|p| self.roots.owning_root(p));
+        let root = root.unwrap_or(self.workspace_root()).to_path_buf();
+        let vars = |name: &str| {
+            Some(match name {
+                "CLIPBOARD" => crate::clipboard::read_string().unwrap_or_default(),
+                "RELATIVE_FILEPATH" => path
+                    .as_deref()
+                    .map_or(String::new(), |p| relative_clipboard_text(p, &root)),
+                "WORKSPACE_NAME" => root
+                    .file_name()
+                    .map_or(String::new(), |n| n.to_string_lossy().into()),
+                "WORKSPACE_FOLDER" => root.display().to_string(),
+                _ => return None,
+            })
+        };
+        self.editor.expand_snippet_with(body, prefix_len, &vars);
     }
 
     pub fn trigger_completion(&mut self) {
@@ -16618,7 +16642,7 @@ impl App {
         self.editor.cursor_col = caret_col.max(0) as usize;
         self.editor.clamp_cursor();
         if item.is_snippet {
-            self.editor.expand_snippet(&te.new_text, 0);
+            self.expand_snippet(&te.new_text, 0);
         }
         true
     }
@@ -16675,7 +16699,7 @@ impl App {
                     if is_snippet {
                         // The body carries $1/$0 tab stops; expand_snippet
                         // removes the typed prefix itself and drives the caret.
-                        self.editor.expand_snippet(&t, prefix_len);
+                        self.expand_snippet(&t, prefix_len);
                     } else {
                         for _ in 0..prefix_len {
                             self.editor.backspace();
