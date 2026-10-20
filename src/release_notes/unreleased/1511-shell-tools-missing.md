@@ -1,0 +1,1 @@
+fix: Format Document on a shell script without shfmt now says shfmt is missing instead of "Document already formatted", and opening a shell script without shellcheck says once that it will not be linted.

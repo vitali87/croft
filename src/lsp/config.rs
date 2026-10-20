@@ -22,13 +22,18 @@ impl Language {
     pub const JSON: Language = Language("json");
     pub const YAML: Language = Language("yaml");
     pub const TOML: Language = Language("toml");
-    pub const BASH: Language = Language("shellscript");
     pub const MARKDOWN: Language = Language("markdown");
     pub const HTML: Language = Language("html");
     pub const CSS: Language = Language("css");
     pub const C: Language = Language("c");
     pub const CPP: Language = Language("cpp");
     pub const LUA: Language = Language("lua");
+}
+
+impl Language {
+    /// Shell scripts. Named outside tests too: the app tells the user when
+    /// bash-language-server's shfmt or shellcheck is missing (#1511).
+    pub const BASH: Language = Language("shellscript");
 }
 
 impl Language {
