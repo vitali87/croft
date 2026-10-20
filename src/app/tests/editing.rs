@@ -1683,6 +1683,88 @@ fn tab_switches_focus_between_the_find_and_replace_fields() {
     );
 }
 
+const LOG_PY: &str = "import logging\nlog = logging.getLogger(__name__)\n\nlog.debug(\"start\")\nlog.info(\"loaded config\")\nlog.debug(\"done\")\nlog.info(\"ready\")\n";
+
+/// #1592: with the caret in a word and nothing selected, Replace starts in
+/// the Find field with the word selected, so "debug, Tab, info" changes
+/// debug to info and not the other way round.
+#[test]
+fn replace_from_a_caret_in_a_word_starts_in_the_find_field() {
+    use crate::widgets::editor_find::FindField;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "app.py", LOG_PY);
+    app.editor.cursor_row = 3;
+    app.editor.cursor_col = 12;
+    app.handle_key(replace_chord()).unwrap();
+    let s = app.editor_find.as_ref().unwrap();
+    assert_eq!(s.query, "start", "the word at the caret is still the seed");
+    assert_eq!(s.focus, FindField::Query);
+    type_keys(&mut app, "debug");
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    type_keys(&mut app, "info");
+    let s = app.editor_find.as_ref().unwrap();
+    assert_eq!((s.query.as_str(), s.replace.as_str()), ("debug", "info"));
+    app.editor_find_replace_all();
+    assert_eq!(app.editor.lines[3], "log.info(\"start\")");
+    assert_eq!(app.editor.lines[5], "log.info(\"done\")");
+    assert_eq!(app.editor.lines[4], "log.info(\"loaded config\")");
+}
+
+/// Negative (#1592): a one-line selection is a chosen find text, so Replace
+/// still starts in the Replace field.
+#[test]
+fn replace_from_a_selection_starts_in_the_replace_field() {
+    use crate::widgets::editor_find::FindField;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "app.py", LOG_PY);
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (3, 4),
+        head: (3, 9),
+    });
+    app.editor.cursor_row = 3;
+    app.editor.cursor_col = 9;
+    app.handle_key(replace_chord()).unwrap();
+    let s = app.editor_find.as_ref().unwrap();
+    assert_eq!(s.query, "debug");
+    assert_eq!(s.focus, FindField::Replace);
+}
+
+/// Negative (#1592): a find text typed in an open bar is chosen too, so
+/// the Replace chord moves on to the Replace field.
+#[test]
+fn replace_on_an_open_find_bar_moves_to_the_replace_field() {
+    use crate::widgets::editor_find::FindField;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "app.py", LOG_PY);
+    app.editor.cursor_row = 3;
+    app.editor.cursor_col = 12;
+    app.handle_key(key(KeyCode::Char('f'), KeyModifiers::SUPER))
+        .unwrap();
+    type_keys(&mut app, "debug");
+    app.handle_key(replace_chord()).unwrap();
+    let s = app.editor_find.as_ref().unwrap();
+    assert_eq!(s.query, "debug");
+    assert_eq!(s.focus, FindField::Replace);
+}
+
+/// Negative (#1592): a multi-line selection seeds nothing, so Replace
+/// starts in an empty Find field.
+#[test]
+fn replace_from_a_multi_line_selection_starts_in_an_empty_find_field() {
+    use crate::widgets::editor_find::FindField;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "app.py", LOG_PY);
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (3, 0),
+        head: (4, 3),
+    });
+    app.editor.cursor_row = 4;
+    app.editor.cursor_col = 3;
+    app.handle_key(replace_chord()).unwrap();
+    assert_eq!(app.editor_find.as_ref().unwrap().focus, FindField::Query);
+}
+
 /// #1577: a replacement longer than the needle moves the range's end with
 /// it, so a range ending mid-line still holds every replaced match and
 /// nothing past it.

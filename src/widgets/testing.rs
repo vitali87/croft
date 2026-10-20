@@ -90,6 +90,10 @@ pub struct TestingPanel {
     /// skipped. Reset when a run starts, so it describes that run alone,
     /// never the older results still in the tree (#856).
     run_tally: (usize, usize, usize),
+    /// The first failing test (in tree order) this run reported, reset
+    /// with `run_tally`, so an older failure still in the tree is never
+    /// named as this run's (#1547).
+    run_first_failed: Option<String>,
     /// The last coverage run's report (#263).
     pub coverage: Option<crate::testing::coverage::Coverage>,
     coverage_error: Option<crate::testing::worker::CoverageError>,
@@ -152,6 +156,8 @@ impl TestingPanel {
             discovery_failed: false,
             last_output_hint: Rect::default(),
             run_tally: (0, 0, 0),
+            run_first_failed: None,
+
             scoped: false,
             scope_filter: None,
             coverage: None,
@@ -193,6 +199,7 @@ impl TestingPanel {
         self.failed_run = false;
         self.discovery_failed = false;
         self.run_tally = (0, 0, 0);
+        self.run_first_failed = None;
         self.progress = None;
         self.scroll = 0;
     }
@@ -209,6 +216,7 @@ impl TestingPanel {
         self.failed_run = false;
         self.discovery_failed = false;
         self.run_tally = (0, 0, 0);
+        self.run_first_failed = None;
         self.progress = None;
         // The refusal latch and rollback snapshot belong to the old
         // workspace; carrying either across a re-root would surface a stale
@@ -238,6 +246,7 @@ impl TestingPanel {
         self.failed_run = false;
         self.discovery_failed = false;
         self.run_tally = (0, 0, 0);
+        self.run_first_failed = None;
         // Snapshot the pre-run status (None = about to be inserted) so a
         // worker refusal can put the tree back exactly.
         let old = self.cases.iter().find(|c| c.name == name).map(|c| c.status);
@@ -280,6 +289,7 @@ impl TestingPanel {
         self.failed_run = false;
         self.discovery_failed = false;
         self.run_tally = (0, 0, 0);
+        self.run_first_failed = None;
         // Snapshot each selected case's pre-run status for a refusal rollback.
         self.prerun = Vec::new();
         self.scoped = true;
@@ -316,6 +326,13 @@ impl TestingPanel {
         }
         if case.status == TestStatus::Failed {
             self.run_reported_failed = true;
+            if self
+                .run_first_failed
+                .as_ref()
+                .is_none_or(|first| case.name < *first)
+            {
+                self.run_first_failed = Some(case.name.clone());
+            }
         }
         let (passed, failed, skipped) = &mut self.run_tally;
         match case.status {
@@ -468,6 +485,36 @@ impl TestingPanel {
                 format!("{label}: {} {took}", counts.join(", "))
             }
         }
+    }
+
+    /// How the run that just ended went, for screen reader mode (#1547):
+    /// the counts, then the first failing test by name, so the result is
+    /// heard and not only shown. `ok` is the runner's exit success.
+    pub fn spoken_outcome(&self, ok: bool) -> String {
+        let (passed, failed, skipped) = self.run_tally;
+        if !ok && failed == 0 {
+            return String::from("Test run failed, see OUTPUT, Test Runner");
+        }
+        let counts: Vec<String> = [(failed, "failed"), (passed, "passed"), (skipped, "skipped")]
+            .iter()
+            .filter(|(n, _)| *n > 0)
+            .map(|(n, what)| format!("{n} {what}"))
+            .collect();
+        let mut out = if counts.is_empty() {
+            String::from("Tests finished: no test ran")
+        } else {
+            format!("Tests finished: {}", counts.join(", "))
+        };
+        if let Some(name) = self.run_first_failure() {
+            out.push_str(&format!(". First failure: {name}"));
+        }
+        out
+    }
+
+    /// The first failing test, when the run that just ended had a failure;
+    /// a failure kept from an earlier run is not this run's news.
+    pub fn run_first_failure(&self) -> Option<String> {
+        self.run_first_failed.clone()
     }
 
     /// A coverage run's report arrived (#263): keep it for the explorer
@@ -1870,6 +1917,53 @@ mod tests {
         assert_eq!(
             p.run_outcome("gone", true, 0.1),
             "gone: no test ran (0.1 s)"
+        );
+    }
+
+    /// #1547: a finished run as screen reader mode says it: the counts,
+    /// then the first failure of this run only.
+    #[test]
+    fn a_finished_run_is_spoken_with_its_first_failure() {
+        let case = |name: &str, status| TestCase {
+            name: name.to_string(),
+            status,
+        };
+        let mut p = TestingPanel::new();
+        p.start_filter("m::");
+        for (name, status) in [
+            ("m::a", TestStatus::Passed),
+            ("m::b", TestStatus::Failed),
+            ("m::c", TestStatus::Failed),
+            ("m::d", TestStatus::Skipped),
+        ] {
+            p.apply_case(case(name, status));
+        }
+        p.on_finished(Some(false));
+        assert_eq!(
+            p.spoken_outcome(false),
+            "Tests finished: 2 failed, 1 passed, 1 skipped. First failure: m::b"
+        );
+        // A green rerun of one test: the old failures are not its news.
+        p.start_single("m::a");
+        p.apply_case(case("m::a", TestStatus::Passed));
+        p.on_finished(Some(true));
+        assert_eq!(p.spoken_outcome(true), "Tests finished: 1 passed");
+        assert_eq!(p.run_first_failure(), None);
+        p.start_single("m::a");
+        p.on_finished(Some(false));
+        assert_eq!(
+            p.spoken_outcome(false),
+            "Test run failed, see OUTPUT, Test Runner"
+        );
+        // A red rerun of a later test names that test, not the older
+        // failure (m::b) still sorted ahead of it in the tree.
+        p.start_single("m::z");
+        p.apply_case(case("m::z", TestStatus::Failed));
+        p.on_finished(Some(false));
+        assert_eq!(p.run_first_failure().as_deref(), Some("m::z"));
+        assert_eq!(
+            p.spoken_outcome(false),
+            "Tests finished: 1 failed. First failure: m::z"
         );
     }
 

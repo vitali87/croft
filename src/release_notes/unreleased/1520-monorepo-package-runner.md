@@ -1,0 +1,1 @@
+fix: Opened at a JS monorepo root whose packages each declare their own vitest or jest (Turborepo, Nx, npm/pnpm workspaces), the Testing view now runs in the focused file's package, or the first package with a runner, instead of saying no test runner was detected.

@@ -107,6 +107,9 @@ pub const WORKSPACE_ALLOWED_KEYS: &[&str] = &[
     "format_on_save",
     "default_formatter",
     "language_formatters",
+    "insert_final_newline",
+    "trim_trailing_whitespace",
+    "trim_final_newlines",
     "format_on_type",
     "auto_save",
     "auto_save_on_focus_change",
@@ -130,6 +133,7 @@ pub const WORKSPACE_ALLOWED_KEYS: &[&str] = &[
     // Per-language overrides (#1440), which hold only the editor settings
     // in `crate::prefs::LANGUAGE_KEYS`; any other key in a block is dropped.
     "languages",
+    "files_encoding",
 ];
 
 /// The synced layer's file name (#262). Config sync pushes the projection
