@@ -47815,9 +47815,11 @@ impl App {
 
     /// Vim-style chord layer for the editor: `cmd+gg` jumps to top, `cmd+G`
     /// jumps to bottom, `cmd+yy` yanks a line. Counts go between the chord
-    /// start and the completion key (`cmd+g 12 g` jumps to line 12). There is
-    /// no `cmd+dd`: `cmd+d` is Add Selection to Next Match, and Delete Line
-    /// moved to `cmd+shift+k`.
+    /// start and the completion key (`cmd+g 12 g` jumps to line 12), and
+    /// Enter completes a `cmd+g` holding one, so VS Code's Go to Line
+    /// (`ctrl+g 12 Enter`) lands there too (#902). There is no `cmd+dd`:
+    /// `cmd+d` is Add Selection to Next Match, and Delete Line moved to
+    /// `cmd+shift+k`.
     /// Returns true when the key was consumed; false means the caller
     /// should continue with normal editor handling.
     fn handle_editor_vim_chord(&mut self, key: KeyEvent) -> bool {
@@ -47873,13 +47875,15 @@ impl App {
                 }
                 return false;
             }
-            self.editor_vim_chord.reset();
-            self.status = String::from("Chord cancelled");
-            return false;
+            return self.cancel_editor_vim_chord(key);
         }
 
         let completes = match self.editor_vim_chord.op {
-            VimOp::G => is_plain_letter(key, 'g') || is_vim_chord_g(key),
+            VimOp::G => {
+                is_plain_letter(key, 'g')
+                    || is_vim_chord_g(key)
+                    || (count_pending && key.code == KeyCode::Enter && key.modifiers.is_empty())
+            }
             VimOp::Y => is_plain_letter(key, 'y') || is_vim_chord_y(key),
             VimOp::None => false,
         };
@@ -47910,9 +47914,19 @@ impl App {
             return true;
         }
 
+        self.cancel_editor_vim_chord(key)
+    }
+
+    /// Drop the pending chord on a key that completes none, returning whether
+    /// that key is consumed. It keeps its normal meaning only when nothing but
+    /// the leader was typed: after a count the digits were swallowed, so the
+    /// last key alone would edit the buffer with a fragment of what was typed
+    /// (`cmd+g 25 Tab` indenting the line). Esc only ever cancels (#902).
+    fn cancel_editor_vim_chord(&mut self, key: KeyEvent) -> bool {
+        let consumed = self.editor_vim_chord.count > 0 || key.code == KeyCode::Esc;
         self.editor_vim_chord.reset();
         self.status = String::from("Chord cancelled");
-        false
+        consumed
     }
 
     /// Apply one resolved vim intent to the editor. The vim state machine has

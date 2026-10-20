@@ -550,6 +550,89 @@ fn editor_cmd_g_multidigit_count_g_jumps_to_specific_line() {
     assert_eq!(app.editor.cursor_row, 11);
 }
 
+/// #902: VS Code's Go to Line, `Ctrl+G 25 Enter`, lands on line 25 as
+/// `Ctrl+G 25 g` does, instead of cancelling the chord and passing the Enter
+/// on as a newline.
+#[test]
+fn editor_ctrl_g_count_enter_jumps_to_the_line_without_a_newline() {
+    let lines: Vec<String> = (1..=30).map(|n| format!("line {n}")).collect();
+    let mut app = editor_app_with_lines(&lines.iter().map(String::as_str).collect::<Vec<_>>());
+    app.editor.cursor_row = 2;
+    app.handle_key(key(KeyCode::Char('g'), KeyModifiers::CONTROL))
+        .unwrap();
+    for d in ['2', '5'] {
+        app.handle_key(key(KeyCode::Char(d), KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines, lines,
+        "the Enter must not reach the buffer"
+    );
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (24, 0));
+    assert_eq!(app.status, "Line 25");
+}
+
+/// #902: a key that cancels a chord after its count was typed goes with the
+/// swallowed digits instead of editing the buffer on its own. Without a count
+/// the key keeps its meaning, except Esc, which only cancels.
+#[test]
+fn editor_key_cancelling_a_counted_chord_does_not_edit_the_buffer() {
+    let g = key(KeyCode::Char('g'), KeyModifiers::SUPER);
+    let y = key(KeyCode::Char('y'), KeyModifiers::SUPER);
+    let plain = |c| key(KeyCode::Char(c), KeyModifiers::NONE);
+    let leaders = [
+        vec![g, plain('1'), plain('2')],
+        vec![y, plain('2')],
+        vec![key(KeyCode::Char('3'), KeyModifiers::SUPER)],
+    ];
+    let cancels = [
+        key(KeyCode::Tab, KeyModifiers::NONE),
+        key(KeyCode::Backspace, KeyModifiers::NONE),
+        key(KeyCode::Enter, KeyModifiers::NONE),
+        plain('x'),
+        key(KeyCode::Esc, KeyModifiers::NONE),
+    ];
+    for leader in &leaders {
+        for &cancel in &cancels {
+            if leader[0] == g && cancel.code == KeyCode::Enter {
+                continue; // completes Go to Line, tested above
+            }
+            let mut app = editor_app_with_lines(&["alpha", "beta", "gamma"]);
+            app.editor.cursor_row = 1;
+            app.editor.cursor_col = 2;
+            for &k in leader.iter().chain([&cancel]) {
+                app.handle_key(k).unwrap();
+            }
+            let case = format!("{leader:?} then {cancel:?}");
+            assert_eq!(app.editor.lines, vec!["alpha", "beta", "gamma"], "{case}");
+            assert_eq!(
+                (app.editor.cursor_row, app.editor.cursor_col),
+                (1, 2),
+                "{case}"
+            );
+            assert_eq!(app.status, "Chord cancelled", "{case}");
+        }
+    }
+
+    let mut app = editor_app_with_lines(&["alpha"]);
+    app.handle_key(g).unwrap();
+    app.handle_key(plain('x')).unwrap();
+    assert_eq!(app.editor.lines, vec!["xalpha"], "no count: the key types");
+    app.editor.start_selection_at_cursor();
+    app.editor.move_right();
+    app.editor.extend_selection_to_cursor();
+    app.handle_key(g).unwrap();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.editor.selection.is_some(),
+        "Esc cancels the chord and nothing else"
+    );
+    assert_eq!(app.status, "Chord cancelled");
+}
+
 #[test]
 fn editor_cmd_shift_g_jumps_to_bottom_of_file() {
     let mut app = editor_app_with_lines(&["a", "b", "c", "d"]);
