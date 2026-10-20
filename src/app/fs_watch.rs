@@ -249,15 +249,24 @@ impl FsWatch {
         let mut affected: BTreeSet<PathBuf> = BTreeSet::new();
         let mut new_dirs: Vec<PathBuf> = Vec::new();
         while let Ok(result) = rx.try_recv() {
-            out.got_any = true;
             let events = match result {
                 Ok(evs) => evs,
-                Err(_) => continue,
+                Err(_) => {
+                    out.got_any = true;
+                    continue;
+                }
             };
             for ev in events {
                 if ev.event.need_rescan() {
                     out.rescan_dropped_events = true;
                 }
+                // Reading the tree and running git open the root and its
+                // files, and inotify reports every open, so acting on one
+                // here re-reads the tree and re-runs git forever (#898).
+                if is_read_only_access(&ev.event.kind) {
+                    continue;
+                }
+                out.got_any = true;
                 let mutates_content = event_mutates_content(&ev.event.kind);
                 let arrives = arrives_at_path(&ev.event.kind);
                 for path in &ev.event.paths {
@@ -776,4 +785,13 @@ fn event_mutates_content(kind: &notify::EventKind) -> bool {
         kind,
         EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(_))
     )
+}
+
+/// An open, read or close that wrote nothing. Only a close after writing
+/// (`Close(Write)`) says the path may have changed; every other access
+/// leaves the tree, git status and every open file exactly as they were.
+fn is_read_only_access(kind: &notify::EventKind) -> bool {
+    use notify::EventKind;
+    use notify::event::{AccessKind, AccessMode};
+    matches!(kind, EventKind::Access(access) if *access != AccessKind::Close(AccessMode::Write))
 }

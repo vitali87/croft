@@ -910,6 +910,63 @@ fn drain_fs_events_preserves_editor_selection_on_access_only_event() {
     );
 }
 
+/// #898: inotify reports every open, so croft's own reads (the Explorer
+/// listing the root, `git status` opening the files in it) came back as
+/// events that re-listed the tree and re-ran git, about twice a second, for
+/// as long as croft sat idle. A read-only access must leave `drain` with
+/// nothing to do, while a close after writing still counts, since the file
+/// it closed may now hold new content.
+#[test]
+fn drain_ignores_read_only_access_events_from_croft_s_own_reads() {
+    use notify::Event as NotifyEvent;
+    use notify::event::{AccessKind, AccessMode, EventKind};
+    use notify_debouncer_full::DebouncedEvent;
+    use std::sync::mpsc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let file = root.join("x.txt");
+    std::fs::write(&file, "x\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    let (tx, rx) = mpsc::channel();
+    app.fs_watch.set_test_events(rx);
+
+    let now = std::time::Instant::now();
+    let access = |kind: AccessKind, path: &std::path::Path| {
+        let event = NotifyEvent::new(EventKind::Access(kind)).add_path(path.to_path_buf());
+        DebouncedEvent::new(event, now)
+    };
+    tx.send(Ok(vec![
+        access(AccessKind::Open(AccessMode::Any), &root),
+        access(AccessKind::Close(AccessMode::Read), &root),
+        access(AccessKind::Open(AccessMode::Any), &file),
+        access(AccessKind::Read, &file),
+        access(AccessKind::Close(AccessMode::Read), &file),
+    ]))
+    .unwrap();
+    let drained = app.fs_watch.drain(&mut app.tree, &app.editor);
+    assert!(
+        !drained.got_any,
+        "reading the root and a file in it is not a change"
+    );
+    assert!(
+        !drained.dirs_changed,
+        "so it must not re-list the tree or re-run git status"
+    );
+    assert!(!drained.finder_relevant, "nor rebuild the Quick Open index");
+
+    tx.send(Ok(vec![access(
+        AccessKind::Close(AccessMode::Write),
+        &file,
+    )]))
+    .unwrap();
+    let drained = app.fs_watch.drain(&mut app.tree, &app.editor);
+    assert!(
+        drained.got_any && drained.dirs_changed,
+        "a close after writing may mean new content, so it still counts"
+    );
+}
+
 /// Same class of spurious wake-up as the Access event, via the other
 /// notify branch: `chmod`, `touch -a`, ownership changes, and xattr
 /// updates surface as `Modify(Metadata(_))`. None mutate file content,
