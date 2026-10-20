@@ -9189,6 +9189,47 @@ impl Editor {
         }
     }
 
+    /// VS Code's Delete Word Left (`Ctrl+Backspace`, `Opt+Backspace` on
+    /// macOS): delete back to where `Ctrl+Left` stops on this line, or the
+    /// selection when there is one. At the line's start it joins the line
+    /// above, as Backspace does.
+    pub fn delete_word_left(&mut self) {
+        let col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+        if col == 0 || self.selection.is_some_and(|s| s.has_area()) {
+            self.backspace();
+            return;
+        }
+        let start = word_start_before(&self.lines[self.cursor_row], col);
+        self.delete_cols_on_line(EditKind::Backspace, start, col);
+    }
+
+    /// VS Code's Delete Word Right (`Ctrl+Delete`, `Opt+Delete` on macOS):
+    /// delete forward to where `Ctrl+Right` stops on this line, or the
+    /// selection. At the line's end it joins the line below, as Delete does.
+    pub fn delete_word_right(&mut self) {
+        let len = self.line_char_len(self.cursor_row);
+        if self.cursor_col >= len || self.selection.is_some_and(|s| s.has_area()) {
+            self.delete_forward();
+            return;
+        }
+        let end = word_end_after(&self.lines[self.cursor_row], self.cursor_col);
+        self.delete_cols_on_line(EditKind::DeleteForward, self.cursor_col, end);
+    }
+
+    /// Remove chars `from..to` of the caret's line as one undo step, leaving
+    /// the caret at `from`.
+    fn delete_cols_on_line(&mut self, kind: EditKind, from: usize, to: usize) {
+        self.pin_on_edit();
+        self.push_undo(kind);
+        let row = self.cursor_row;
+        let (a, b) = (self.byte_index(row, from), self.byte_index(row, to));
+        self.lines[row].replace_range(a..b, "");
+        self.cursor_col = from;
+        self.selection = None;
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+    }
+
     /// On a symbol tab, true when a bare Backspace (`forward` false) or
     /// Delete would join the symbol's first or last line with a line outside
     /// the tab: the caret sits on the clip's first character or after its
@@ -11929,6 +11970,22 @@ impl Editor {
         }
         self.cursor_row = self.lines.len() - 1;
         self.cursor_col = 0;
+        self.last_edit_kind = None;
+    }
+
+    /// `Ctrl+Home` (`Cmd+Home` on macOS), VS Code's `cursorTop`. Unlike
+    /// `goto_top` it keeps the selection, so `Shift` extends it.
+    pub fn cursor_top(&mut self) {
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.last_edit_kind = None;
+    }
+
+    /// `Ctrl+End`, VS Code's `cursorBottom`: after the last line's last
+    /// character, keeping the selection like `cursor_top`.
+    pub fn cursor_bottom(&mut self) {
+        self.cursor_row = self.lines.len().saturating_sub(1);
+        self.cursor_col = self.line_char_len(self.cursor_row);
         self.last_edit_kind = None;
     }
 
@@ -15701,6 +15758,39 @@ fn floor_grapheme_col(line: &str, col: usize) -> usize {
 
 pub(crate) fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// Where Delete Word Left stops on `line`, going back from char `col`: over
+/// any non-word chars, then over the word before them (`move_word_left`'s
+/// stop within a line), moved back to a grapheme boundary.
+fn word_start_before(line: &str, col: usize) -> usize {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = col.min(chars.len());
+    while i > 0 && !is_word_char(chars[i - 1]) {
+        i -= 1;
+    }
+    while i > 0 && is_word_char(chars[i - 1]) {
+        i -= 1;
+    }
+    floor_grapheme_col(line, i)
+}
+
+/// Where Delete Word Right stops on `line`, going on from char `col`: over
+/// any non-word chars, then to the end of the word after them
+/// (`move_word_right`'s stop within a line), on to a grapheme boundary.
+fn word_end_after(line: &str, col: usize) -> usize {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = col.min(chars.len());
+    while i < chars.len() && !is_word_char(chars[i]) {
+        i += 1;
+    }
+    while i < chars.len() && is_word_char(chars[i]) {
+        i += 1;
+    }
+    match floor_grapheme_col(line, i) {
+        start if start < i => next_grapheme_col(line, start),
+        _ => i,
+    }
 }
 
 /// A `(row, char_col)` buffer position: a bracket character's in the
@@ -29960,6 +30050,84 @@ mod tests {
         assert_eq!(e.cursor_col, 5);
     }
 
+    // #909: Ctrl+Backspace / Ctrl+Delete delete to Ctrl+Left / Ctrl+Right's
+    // stop, never past the line, and each press is one undo step.
+    #[test]
+    fn delete_word_left_takes_the_word_and_the_gap_before_the_caret() {
+        let mut e = editor_with("alpha beta.gamma  ");
+        e.cursor_col = 18;
+        e.delete_word_left();
+        assert_eq!((e.lines[0].as_str(), e.cursor_col), ("alpha beta.", 11));
+        e.delete_word_left();
+        assert_eq!((e.lines[0].as_str(), e.cursor_col), ("alpha ", 6));
+        e.delete_word_left();
+        assert_eq!((e.lines[0].as_str(), e.cursor_col), ("", 0));
+        assert!(e.undo());
+        assert_eq!(e.lines[0], "alpha ");
+    }
+
+    #[test]
+    fn delete_word_left_at_line_start_only_joins_the_line_above() {
+        let mut e = editor_with("one two\nthree");
+        e.cursor_row = 1;
+        e.cursor_col = 0;
+        e.delete_word_left();
+        assert_eq!(e.lines, vec!["one twothree".to_string()]);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 7));
+    }
+
+    #[test]
+    fn delete_word_left_takes_an_accented_word_and_stays_on_its_line() {
+        let mut e = editor_with("x\n  cafe\u{301}");
+        e.cursor_row = 1;
+        e.cursor_col = 7;
+        e.delete_word_left();
+        assert_eq!((e.lines[1].as_str(), e.cursor_col), ("  ", 2));
+        e.delete_word_left();
+        assert_eq!(e.lines, vec!["x".to_string(), String::new()]);
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 0));
+    }
+
+    #[test]
+    fn delete_word_right_takes_the_gap_and_the_word_after_the_caret() {
+        let mut e = editor_with("alpha  beta gamma\nnext");
+        e.cursor_col = 5;
+        e.delete_word_right();
+        assert_eq!((e.lines[0].as_str(), e.cursor_col), ("alpha gamma", 5));
+        e.cursor_col = 11;
+        e.delete_word_right();
+        assert_eq!(e.lines, vec!["alpha gammanext".to_string()]);
+        e.cursor_col = 1;
+        e.delete_word_right();
+        assert_eq!(e.lines[0], "a gammanext");
+    }
+
+    #[test]
+    fn delete_word_right_never_splits_a_letter_from_its_accent() {
+        let mut e = editor_with("e\u{301}x");
+        e.delete_word_right();
+        assert_eq!(e.lines[0], "x");
+    }
+
+    #[test]
+    fn delete_word_with_a_selection_deletes_just_the_selection() {
+        let mut e = editor_with("alpha beta");
+        e.selection = Some(EditorSelection {
+            anchor: (0, 1),
+            head: (0, 3),
+        });
+        e.cursor_col = 3;
+        e.delete_word_left();
+        assert_eq!((e.lines[0].as_str(), e.cursor_col), ("aha beta", 1));
+        e.selection = Some(EditorSelection {
+            anchor: (0, 4),
+            head: (0, 5),
+        });
+        e.cursor_col = 5;
+        e.delete_word_right();
+        assert_eq!(e.lines[0], "aha eta");
+    }
+
     #[test]
     fn buffer_pos_at_maps_cells_to_line_and_char() {
         let mut e = editor_with("fn main() {}\nlet x = 1;");
@@ -30456,6 +30624,21 @@ mod tests {
         e.cursor_col = 3;
         e.goto_bottom();
         assert_eq!((e.cursor_row, e.cursor_col), (2, 0));
+    }
+
+    #[test]
+    fn cursor_top_and_bottom_keep_the_selection_anchor() {
+        let mut e = editor_with("alpha\nbeta\ngamma");
+        e.cursor_row = 1;
+        e.cursor_col = 2;
+        e.start_selection_at_cursor();
+        e.cursor_bottom();
+        e.extend_selection_to_cursor();
+        assert_eq!((e.cursor_row, e.cursor_col), (2, 5));
+        assert_eq!(e.selection_text(), "ta\ngamma");
+        e.cursor_top();
+        e.extend_selection_to_cursor();
+        assert_eq!(e.selection_text(), "alpha\nbe");
     }
 
     #[test]

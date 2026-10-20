@@ -727,6 +727,76 @@ fn editor_alt_left_jumps_one_word_backward() {
     assert_eq!(app.editor.cursor_col, 6);
 }
 
+/// #909: Ctrl is the word modifier on Linux, as in VS Code there, so
+/// Ctrl+arrows step and select by word instead of by character.
+#[test]
+fn editor_ctrl_arrows_step_and_select_by_word() {
+    let mut app = editor_app_with_lines(&["alpha beta gamma delta"]);
+    for _ in 0..2 {
+        app.handle_key(key(KeyCode::Right, KeyModifiers::CONTROL))
+            .unwrap();
+    }
+    assert_eq!(app.editor.cursor_col, 10);
+    app.handle_key(key(
+        KeyCode::Left,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert_eq!(app.editor.selection_text(), "beta");
+    app.handle_key(key(KeyCode::Left, KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!((app.editor.cursor_col, app.editor.selection), (0, None));
+}
+
+/// #909: Ctrl+Backspace / Ctrl+Delete (and macOS's Opt+Backspace) delete a
+/// word, not one character.
+#[test]
+fn editor_ctrl_backspace_and_delete_delete_a_word() {
+    let mut app = editor_app_with_lines(&["alpha beta gamma delta"]);
+    app.editor.cursor_col = 22;
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.editor.lines, vec!["alpha beta gamma "]);
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::ALT))
+        .unwrap();
+    assert_eq!(app.editor.lines, vec!["alpha beta "]);
+    app.editor.cursor_col = 0;
+    app.handle_key(key(KeyCode::Delete, KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.editor.lines, vec![" beta "]);
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines, vec!["beta "], "plain keys still take one");
+}
+
+/// #909: Ctrl+Home / Ctrl+End go to the start / end of the document, and
+/// with Shift select there, instead of acting like Home / End.
+#[test]
+fn editor_ctrl_home_and_end_go_to_the_ends_of_the_document() {
+    let mut app = editor_app_with_lines(&["alpha beta", "second line", "third"]);
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 3;
+    app.handle_key(key(KeyCode::Home, KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
+    app.handle_key(key(
+        KeyCode::End,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 5));
+    assert_eq!(
+        app.editor.selection_text(),
+        "alpha beta\nsecond line\nthird"
+    );
+    app.handle_key(key(KeyCode::Home, KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
+    assert!(app.editor.selection.is_none());
+}
+
 #[test]
 fn editor_shift_alt_right_runs_expand_selection_not_word_extension() {
     // #254 reassigned Shift+Alt+Right from word-wise extension to VS

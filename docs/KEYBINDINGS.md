@@ -287,6 +287,9 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 |------|--------|
 | Arrows, Home, End | Navigate (clears any selection). `Down` on the last line goes to its end and `Up` on the first line to its start, so `Shift`+`Down` / `Shift`+`Up` select through the ends of the file. With word wrap on, Home and End (not `Ctrl+A` / `Ctrl+E`) go to the start / end of the wrapped row the caret is on first, and to the start / end of the line on a second press |
 | `Shift`+arrows / `Home` / `End` / `PageUp` / `PageDown` | Extend the selection by the same motion |
+| `Ctrl`+`←` / `→` (`Opt`+`←` / `→` on Mac) | Move to the start of the previous word / the end of the next one; `Ctrl`+`Shift`+`←` / `→` selects by word |
+| `Ctrl`+`Backspace` / `Ctrl`+`Delete` (`Opt`+`Backspace` / `Opt`+`Delete` on Mac) | Delete the word left / right of the caret, as far as `Ctrl`+`←` / `→` would move (a selection is deleted instead). It stays on the caret's line: at the line's start or end it joins the neighbouring line, as `Backspace` / `Delete` do |
+| `Ctrl`+`Home` / `Ctrl`+`End` (`Cmd` on Mac) | Go to the start / end of the file; with `Shift`, select to there |
 | `Shift`+`Alt`+`→` / `Shift`+`Alt`+`←` | Expand / Shrink Selection (VS Code's smart select): grow every cursor to the next semantically meaningful range and retrace back exactly. Ranges come from the language server (`textDocument/selectionRange`, one request covering all cursors) when it advertises the capability, else from tree-sitter node ancestry — so the gesture works with no LSP at all; a plain-text file grows line → buffer. Any edit, click, or caret change restarts the gesture |
 | `PageUp` / `PageDown` (`fn`+`↑` / `fn`+`↓` on Mac) | Scroll one viewport |
 | Two-finger horizontal swipe, or drag the bar | Pan long lines in code files; the cursor pans the view when it passes either edge |

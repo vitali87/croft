@@ -16694,7 +16694,13 @@ impl App {
                 self.completion_request_id = None;
                 true
             }
-            KeyCode::Backspace => {
+            // Ctrl/Alt+Backspace deletes a word (#909): it closes the popup
+            // and falls through below, like any other key.
+            KeyCode::Backspace
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 self.editor.backspace();
                 self.refresh_completion_prefix();
                 true
@@ -47689,6 +47695,12 @@ impl App {
         // The command modifier: Cmd (SUPER) on macOS, Ctrl on Linux / Termux.
         let cmd = key.modifiers.contains(KeyModifiers::SUPER)
             || key.modifiers.contains(KeyModifiers::CONTROL);
+        // The word modifier for ←/→, Backspace and Delete: Option (Alt) on
+        // macOS, Ctrl on Linux as in VS Code there (#909). Ctrl with Cmd
+        // held is not it: Cmd with these keys is no word chord on macOS.
+        let word = alt
+            || key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::SUPER);
         // VS Code "Add Cursor Above/Below" (Cmd+Opt+Up / Cmd+Opt+Down). Must
         // come before the plain-Alt move-line check so the cmd+alt combo is
         // routed here, not there.
@@ -47736,10 +47748,12 @@ impl App {
             match key.code {
                 KeyCode::Up => self.editor.arrow_up(),
                 KeyCode::Down => self.editor.arrow_down(),
-                KeyCode::Left if alt => self.editor.move_word_left(),
-                KeyCode::Right if alt => self.editor.move_word_right(),
+                KeyCode::Left if word => self.editor.move_word_left(),
+                KeyCode::Right if word => self.editor.move_word_right(),
                 KeyCode::Left => self.editor.move_left(),
                 KeyCode::Right => self.editor.move_right(),
+                KeyCode::Home if cmd => self.editor.cursor_top(),
+                KeyCode::End if cmd => self.editor.cursor_bottom(),
                 KeyCode::Home => self.editor.home_key(),
                 KeyCode::End => self.editor.end_key(),
                 KeyCode::PageUp => self.editor.page_up_one_screen(),
@@ -47759,18 +47773,25 @@ impl App {
         match key.code {
             KeyCode::Up => self.editor.arrow_up(),
             KeyCode::Down => self.editor.arrow_down(),
-            KeyCode::Left if alt => self.editor.move_word_left(),
-            KeyCode::Right if alt => self.editor.move_word_right(),
+            KeyCode::Left if word => self.editor.move_word_left(),
+            KeyCode::Right if word => self.editor.move_word_right(),
             KeyCode::Left => self.editor.move_left(),
             KeyCode::Right => self.editor.move_right(),
             KeyCode::PageUp => self.editor.page_up_one_screen(),
             KeyCode::PageDown => self.editor.page_down_one_screen(),
+            KeyCode::Home if cmd => self.editor.cursor_top(),
+            KeyCode::End if cmd => self.editor.cursor_bottom(),
             KeyCode::Home => self.editor.home_key(),
             KeyCode::End => self.editor.end_key(),
             KeyCode::Backspace => {
-                self.editor.backspace();
+                if word {
+                    self.editor.delete_word_left();
+                } else {
+                    self.editor.backspace();
+                }
                 self.note_incomplete_completion_edit();
             }
+            KeyCode::Delete if word => self.editor.delete_word_right(),
             KeyCode::Delete => self.editor.delete_forward(),
             KeyCode::Enter => self.editor.insert_newline(),
             // Tab advances a live snippet, else expands a snippet whose prefix
