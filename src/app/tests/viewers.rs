@@ -725,16 +725,6 @@ fn a_cell_edit_cancelled_with_esc_is_not_saved() {
     );
 }
 
-fn xlsx_value(p: &std::path::Path, col: u32, row: u32) -> String {
-    let book = umya_spreadsheet::reader::xlsx::read(p).unwrap();
-    book.sheet(0)
-        .unwrap()
-        .cell((col, row))
-        .unwrap()
-        .value()
-        .to_string()
-}
-
 /// #1141: an xlsx cell committed by clicking another cell is saved.
 #[test]
 fn an_xlsx_cell_committed_by_a_click_is_saved() {

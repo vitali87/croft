@@ -218,6 +218,13 @@ fn as_string(v: &Value) -> Option<Value> {
     v.as_str().filter(|s| !s.is_empty()).map(Value::from)
 }
 
+/// `files.encoding` (#1432), kept as written when croft can decode it, so
+/// an id croft has no encoding for is reported rather than imported.
+fn as_encoding(v: &Value) -> Option<Value> {
+    let id = v.as_str()?;
+    crate::file_encoding::parse(id).map(|_| Value::from(id))
+}
+
 /// The croft settings a VS Code `settings.json` key maps to, for telling a
 /// user who wrote the VS Code name in croft's config which keys to use
 /// (#1607). `files.autoSave` sets two: its focus and window modes are
@@ -243,6 +250,21 @@ const SETTINGS: &[SettingMap] = &[
         vscode: "editor.defaultFormatter",
         croft: "default_formatter",
         convert: as_string,
+    },
+    SettingMap {
+        vscode: "files.insertFinalNewline",
+        croft: "insert_final_newline",
+        convert: as_bool,
+    },
+    SettingMap {
+        vscode: "files.trimTrailingWhitespace",
+        croft: "trim_trailing_whitespace",
+        convert: as_bool,
+    },
+    SettingMap {
+        vscode: "files.trimFinalNewlines",
+        croft: "trim_final_newlines",
+        convert: as_bool,
     },
     SettingMap {
         vscode: "editor.formatOnType",
@@ -318,6 +340,11 @@ const SETTINGS: &[SettingMap] = &[
         vscode: "search.exclude",
         croft: "search_exclude",
         convert: as_enabled_globs,
+    },
+    SettingMap {
+        vscode: "files.encoding",
+        croft: "files_encoding",
+        convert: as_encoding,
     },
 ];
 
@@ -3266,6 +3293,29 @@ mod tests {
             )]
         );
         assert!(report.dropped_keybindings.is_empty());
+    }
+
+    /// #1432: `files.encoding` imports when croft can decode it, and is left
+    /// out (and so reported) when it names nothing croft knows.
+    #[test]
+    fn files_encoding_imports_when_croft_knows_the_encoding() {
+        let mut report = Report::default();
+        convert_settings(&json!({ "files.encoding": "shiftjis" }), &mut report);
+        assert_eq!(
+            report.settings.get("files_encoding"),
+            Some(&json!("shiftjis"))
+        );
+        let mut report = Report::default();
+        convert_settings(&json!({ "files.encoding": "utf7" }), &mut report);
+        assert_eq!(report.settings.get("files_encoding"), None);
+        assert!(
+            report
+                .unmapped_settings
+                .iter()
+                .any(|k| k.starts_with("files.encoding")),
+            "{:?}",
+            report.unmapped_settings
+        );
     }
 
     /// #1436: import `rows` as a VS Code profile into an empty croft config

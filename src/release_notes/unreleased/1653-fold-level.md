@@ -1,1 +1,0 @@
-feature: Fold Level 1–7 (`Cmd+K Cmd+1` … `Cmd+K Cmd+7`) collapse every fold that deep or deeper for an overview of a large file, and Fold Recursively / Unfold Recursively act on the fold at the cursor and every fold inside it.

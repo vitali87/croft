@@ -1,0 +1,1 @@
+feature: New `insert_final_newline`, `trim_trailing_whitespace` and `trim_final_newlines` settings (VS Code's `files.*` equivalents, imported from them) clean up every save without needing a `.editorconfig`; a `.editorconfig` value still wins for its files.

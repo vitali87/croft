@@ -1,1 +1,0 @@
-feature: Debug: Step Into Target picks which call on the paused line to step into, as in VS Code: on `transform(load(p), scale(2))` it lists the three calls and enters the one you choose. Continue, Step Into and Step Out are now commands too (`continue`, `step_into`, `step_out`), so the Command Palette finds them and `keybindings.json` can rebind them.
