@@ -8495,8 +8495,10 @@ impl App {
             }
             // Gone is not a failed read (#900): the tab keeps its text, its
             // label says `(deleted)`, and a save puts the file back.
+            // A failed reload in the same sweep is said too: it is reported
+            // once, so dropping it here would hide it for good.
             _ if !report.deleted.is_empty() => {
-                self.status = match report.deleted.as_slice() {
+                let deleted = match report.deleted.as_slice() {
                     [one] => format!(
                         "{} was deleted on disk; save to recreate it",
                         self.status_path(one)
@@ -8506,6 +8508,18 @@ impl App {
                         many.len()
                     ),
                 };
+                let failed = match report.failed.as_slice() {
+                    [] => String::new(),
+                    [one] => format!(
+                        "; reload failed for {}, keeping its last good view",
+                        self.status_path(one)
+                    ),
+                    many => format!(
+                        "; reload failed for {} files, keeping their last good view",
+                        many.len()
+                    ),
+                };
+                self.status = format!("{deleted}{failed}");
             }
             // A failed reload used to be silently discarded (#37): the tab
             // keeps its last good view, and the status must say so instead

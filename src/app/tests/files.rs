@@ -2396,6 +2396,30 @@ fn a_failed_external_reload_reports_in_the_status_line() {
     assert_eq!(app.status, "Saved g.txt");
 }
 
+/// #900: a sweep that finds one tab's file deleted and another's reload
+/// failing says both. The failure is reported only once, so a status naming
+/// just the deletion would hide the stale tab for good.
+#[test]
+fn a_deletion_and_a_failed_reload_in_one_sweep_are_both_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gone = tmp.path().join("gone.txt");
+    let bad = tmp.path().join("bad.txt");
+    std::fs::write(&gone, "a\n").unwrap();
+    std::fs::write(&bad, "b\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&gone).unwrap();
+    app.editor.open_pinned(&bad).unwrap();
+    std::fs::remove_file(&gone).unwrap();
+    std::fs::remove_file(&bad).unwrap();
+    std::fs::create_dir(&bad).unwrap();
+    assert!(app.reload_open_file_after_external_change());
+    assert_eq!(
+        app.status,
+        "gone.txt was deleted on disk; save to recreate it; \
+         reload failed for bad.txt, keeping its last good view"
+    );
+}
+
 /// #900: a tab whose file was deleted on disk said "Reload failed" on every
 /// FS sweep, hiding every other status for the rest of the session, and
 /// with unsaved edits it opened the "changed on disk" modal and refused the
