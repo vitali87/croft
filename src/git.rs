@@ -1815,9 +1815,11 @@ fn with_listed_files<'a>(mut line: String, after: impl Iterator<Item = &'a str>)
 /// Whether git refused a branch switch because it would overwrite local
 /// changes (#925), the refusal a stash gets past. Git ends it with "Please
 /// commit your changes or stash them before you switch branches."; a switch
-/// blocked by untracked files asks to "move or remove them" instead.
+/// blocked by untracked files asks to "move or remove them" instead, and
+/// when git names both a stash of the tracked changes still leaves the
+/// switch refused, so that is not one either.
 pub fn local_changes_block_switch(err: &str) -> bool {
-    err.contains("commit your changes or stash them")
+    err.contains("commit your changes or stash them") && !err.contains("move or remove them")
 }
 
 /// A failed git operation's one line (#858), `noun` naming the operation
@@ -4394,6 +4396,9 @@ mod tests {
             "error: The following untracked working tree files would be overwritten by checkout: b.txt"
         );
         assert!(!local_changes_block_switch(untracked));
+        // Both at once, as git 2.43 words it: a stash would not clear it.
+        let both = SWITCH_REFUSED_925.replace("\nAborting", "\n") + untracked;
+        assert!(!local_changes_block_switch(&both));
     }
 
     /// #858: the conflicts are counted per file and named, three at most;

@@ -5319,8 +5319,13 @@ pub struct App {
     /// verb (checkout vs merge vs rebase vs delete vs create-from base).
     pub branch_purpose: BranchPurpose,
     /// The switch local changes blocked (#925), with the repository it is
-    /// in, while the Stash & Checkout picker offers a way through.
-    blocked_switch: Option<(PathBuf, crate::widgets::branch_picker::BranchAction)>,
+    /// in and the branch it was refused on (None when detached), while the
+    /// Stash & Checkout picker offers a way through.
+    blocked_switch: Option<(
+        PathBuf,
+        Option<String>,
+        crate::widgets::branch_picker::BranchAction,
+    )>,
     /// The Source Control "⋯" title menu (open/expanded state + hit rects).
     pub scm_menu: crate::widgets::scm_menu::ScmMenuState,
     /// Single-line input modal for SCM ops that need a typed value
@@ -57058,7 +57063,9 @@ impl App {
             },
         ];
         self.close_branch_picker();
-        self.blocked_switch = Some((self.scm_root(), action));
+        let root = self.scm_root();
+        let from = crate::git::current_branch(&root);
+        self.blocked_switch = Some((root, from, action));
         let title = format!("Your changes block the switch to {name}");
         self.open_list_picker(ListPicker::new(ListPurpose::BlockedSwitch, title, rows), "");
     }
@@ -57076,9 +57083,24 @@ impl App {
         if self.hold_for_unsaved(op) {
             return;
         }
-        if let Some((root, action)) = self.blocked_switch.take() {
-            self.stash_and_switch(root, action, migrate);
+        let Some((root, from, action)) = self.blocked_switch.take() else {
+            return;
+        };
+        // The prompt, or a formatter it waits on, leaves time to switch
+        // branches by hand: the changes to stash are then another branch's.
+        if crate::git::current_branch(&root) != from {
+            let what = if migrate {
+                "Migrate Changes"
+            } else {
+                "Stash & Checkout"
+            };
+            let line = format!("{what} cancelled: the branch changed since the switch was refused");
+            self.source_control.commit_feedback = Some(line.clone());
+            self.source_control.commit_feedback_is_error = true;
+            self.status = line;
+            return;
         }
+        self.stash_and_switch(root, action, migrate);
     }
 
     /// Stash & Checkout, or with `migrate` Migrate Changes (#925): stash the

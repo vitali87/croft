@@ -6629,6 +6629,37 @@ fn stash_and_checkout_asks_to_save_an_unsaved_tab_first() {
     assert_eq!(app.status, "Stashed your changes and switched to main");
 }
 
+/// #925 negative: a branch switched by hand while the unsaved-changes
+/// prompt waits makes the changes another branch's, so Stash & Checkout
+/// stops there, stashing nothing and switching nowhere.
+#[test]
+fn stash_and_checkout_stops_when_the_branch_changed_meanwhile() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = blocked_switch_repo_925();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.editor
+        .open_pinned(&tmp.path().join("seed.txt"))
+        .unwrap();
+    app.editor.insert_str("zero\n");
+    pick_branch_858(&mut app, ScmAction::CheckoutTo, "main");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.pending_unsaved_scm.is_some(), "the prompt opens");
+    git_858(tmp.path(), &["switch", "-q", "-c", "elsewhere"]);
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        git_858(tmp.path(), &["branch", "--show-current"]),
+        "elsewhere"
+    );
+    assert_eq!(git_858(tmp.path(), &["stash", "list"]), "");
+    assert_eq!(
+        app.status,
+        "Stash & Checkout cancelled: the branch changed since the switch was refused"
+    );
+}
+
 /// #858: popping the latest stash reported git's `git status` dump
 /// ("Stash popped: On branch main\nChanges not staged…"); it now reports
 /// the stash it dropped.
