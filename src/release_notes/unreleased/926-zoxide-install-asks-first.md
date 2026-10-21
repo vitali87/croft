@@ -1,0 +1,2 @@
+fix: croft no longer downloads and runs zoxide's installer every time it starts when zoxide is missing. The Cmd+Z / Ctrl+Z jump popup now asks first, showing the exact command and the shell rc file it would edit, and installs only when you press y.
+fix: A failed zoxide install is no longer retried on every launch: the jump popup shows why it failed and how to install zoxide yourself, and y tries again.

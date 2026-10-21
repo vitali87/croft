@@ -12,19 +12,21 @@
 //! database naturally stays consistent with the terminal pane's own
 //! zoxide `chpwd` hook (the `cd` croft writes to the PTY bumps the score).
 //!
-//! zoxide is a hard dependency: `ensure_installed_in_background` probes
-//! for the binary at startup and, if it is missing, runs the official
-//! cross-platform installer (no root, installs to `~/.local/bin`). When
-//! the binary still cannot be found the popup degrades to an "unavailable"
-//! message instead of failing.
+//! croft never installs zoxide on its own (#926). Launching croft fetches
+//! and runs nothing: when the binary is missing, the popup says so, shows
+//! the exact installer command and the rc file it would edit, and asks
+//! `[y/N]`. Only a `y` runs `install_in_background` (the official
+//! cross-platform installer, no root, installs to `~/.local/bin`; `pkg` on
+//! Termux). A failed attempt is remembered for the session with its reason,
+//! which the popup shows instead of retrying; another `y` tries again.
 //!
-//! The same background step also wires zoxide's shell hook into the host's
+//! The same consented step also wires zoxide's shell hook into the host's
 //! shell rc (`~/.zshrc` / `~/.bashrc`) so the terminal pane's `j` command
 //! and the popup share one populated database — without it a fresh remote
 //! has the binary but an empty database that no `cd` ever feeds, the exact
 //! local/remote divergence the GOLDEN RULE forbids. The write is idempotent:
 //! it is skipped whenever the rc already contains a `zoxide init` line (the
-//! user's own, or one croft wrote on a previous launch).
+//! user's own, or one croft wrote before).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -45,8 +47,9 @@ const INSTALL_SCRIPT: &str =
 /// (Android blocks exec from `$HOME` on some of them).
 const TERMUX_INSTALL_SCRIPT: &str = "pkg install -y zoxide";
 
-/// Pick the installer for this host.
-fn install_script(termux: bool) -> &'static str {
+/// Pick the installer for this host. The popup's install offer shows it
+/// verbatim, so the user sees exactly what `y` runs.
+pub fn install_script(termux: bool) -> &'static str {
     if termux {
         TERMUX_INSTALL_SCRIPT
     } else {
@@ -54,11 +57,11 @@ fn install_script(termux: bool) -> &'static str {
     }
 }
 
-/// Lifecycle of the one background install attempt per croft process,
-/// surfaced to the Cmd+Z popup so its "unavailable" message can tell the
-/// truth: `Running` while the installer is working, `Failed` once the
-/// attempt is over and the binary still cannot be found, `Done` when the
-/// binary resolves.
+/// Lifecycle of the install the user asked for from the Cmd+Z popup,
+/// surfaced there so its "unavailable" message can tell the truth: `Idle`
+/// until the user says `y`, `Running` while the installer is working,
+/// `Failed` once the attempt is over and the binary still cannot be found,
+/// `Done` when the binary resolves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallState {
     Idle = 0,
@@ -70,18 +73,50 @@ pub enum InstallState {
 static INSTALL_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 fn set_install_state(state: InstallState) {
-    INSTALL_STATE.store(state as u8, std::sync::atomic::Ordering::Relaxed);
+    // Release/Acquire: whoever reads `Failed` also reads the `OUTCOME`
+    // written just before it.
+    INSTALL_STATE.store(state as u8, std::sync::atomic::Ordering::Release);
 }
 
-/// Current install lifecycle, readable from the render path (one relaxed
-/// atomic load).
+/// Current install lifecycle, readable from the render path (one atomic
+/// load).
 pub fn install_state() -> InstallState {
-    match INSTALL_STATE.load(std::sync::atomic::Ordering::Relaxed) {
+    match INSTALL_STATE.load(std::sync::atomic::Ordering::Acquire) {
         1 => InstallState::Running,
         2 => InstallState::Done,
         3 => InstallState::Failed,
         _ => InstallState::Idle,
     }
+}
+
+/// What the last finished install attempt came to, in words for the popup
+/// and status bar: why it failed, or which rc file got the shell hook.
+static OUTCOME: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn set_outcome(outcome: String) {
+    if let Ok(mut slot) = OUTCOME.lock() {
+        *slot = Some(outcome);
+    }
+}
+
+/// The last finished attempt's outcome (see [`OUTCOME`]); `None` before the
+/// user has asked for an install.
+pub fn install_outcome() -> Option<String> {
+    OUTCOME.lock().ok().and_then(|slot| slot.clone())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Installs requested on this thread. Under `cfg(test)`
+    /// [`install_in_background`] only counts here: a test must never fetch
+    /// and run the real installer.
+    static INSTALL_REQUESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many installs this test thread has asked for.
+#[cfg(test)]
+pub(crate) fn install_requests() -> usize {
+    INSTALL_REQUESTS.with(|n| n.get())
 }
 
 /// The `--cmd` name croft wires into the shell, matching the Cmd+Z popup it
@@ -284,6 +319,19 @@ fn rc_file_name(shell: &str) -> &'static str {
     }
 }
 
+/// The rc file an install would wire the hook into for `shell_path` (a
+/// `$SHELL` value), as the user would type it (`~/.bashrc`); `None` when the
+/// shell is unset or unsupported, so no rc file would be touched.
+fn rc_hint(shell_path: Option<&str>) -> Option<String> {
+    supported_shell(shell_path?).map(|shell| format!("~/{}", rc_file_name(shell)))
+}
+
+/// [`rc_hint`] for this process's `$SHELL`: what the popup's install offer
+/// names before the user agrees to anything.
+pub fn shell_rc_hint() -> Option<String> {
+    rc_hint(std::env::var("SHELL").ok().as_deref())
+}
+
 /// The managed block croft appends for `shell`: prepend `~/.local/bin` to
 /// `PATH` (so the binary croft drops there is reachable before the eval),
 /// then install zoxide's `cd` hook and the `j` command. Wrapped in marker
@@ -309,82 +357,116 @@ fn pending_init_block(shell: &str, existing: &str) -> Option<String> {
 /// Wire zoxide's shell hook into the host's shell rc so the terminal `j`
 /// command and the Cmd+Z popup share one database. Best-effort and
 /// idempotent: resolves `$SHELL`/`$HOME`, skips unsupported shells, and
-/// appends only when no `zoxide init` line is already present.
-fn ensure_shell_init() {
+/// appends only when no `zoxide init` line is already present. Returns the
+/// rc file (`~/.bashrc`) when it appended the block, so the user is told.
+fn ensure_shell_init() -> Option<String> {
     let Ok(shell_path) = std::env::var("SHELL") else {
         log_file::log("zoxide: $SHELL unset, skipping shell-init wiring");
-        return;
+        return None;
     };
     let Some(shell) = supported_shell(&shell_path) else {
         log_file::log(&format!(
             "zoxide: unsupported shell {shell_path:?}, skipping shell-init wiring"
         ));
-        return;
+        return None;
     };
     let Some(home) = std::env::var_os("HOME") else {
         log_file::log("zoxide: $HOME unset, skipping shell-init wiring");
-        return;
+        return None;
     };
     let rc = PathBuf::from(home).join(rc_file_name(shell));
     let existing = std::fs::read_to_string(&rc).unwrap_or_default();
-    let Some(block) = pending_init_block(shell, &existing) else {
-        return;
-    };
+    let block = pending_init_block(shell, &existing)?;
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&rc)
     {
         Ok(mut f) => match f.write_all(block.as_bytes()) {
-            Ok(()) => log_file::log(&format!(
-                "zoxide: wired `{ZOXIDE_CMD}` shell init into {rc:?}"
-            )),
+            Ok(()) => {
+                log_file::log(&format!(
+                    "zoxide: wired `{ZOXIDE_CMD}` shell init into {rc:?}"
+                ));
+                return rc_hint(Some(&shell_path));
+            }
             Err(e) => log_file::log(&format!("zoxide: failed to append init to {rc:?}: {e}")),
         },
         Err(e) => log_file::log(&format!(
             "zoxide: could not open {rc:?} for init wiring: {e}"
         )),
     }
+    None
 }
 
-/// Probe for `zoxide` and, if it is missing, install it via the official
-/// script on a detached thread so launch is never blocked, then wire the
-/// shell hook. Best-effort: any failure leaves the popup in its
-/// "unavailable" state. Invoked once from `app::run`, so it covers both the
-/// local Mac and the remote Linux box (both reach `run` through the normal
-/// launch path).
-pub fn ensure_installed_in_background() {
+/// Why a failed installer run failed, in one line: the last non-blank line
+/// of its stderr (zoxide's script ends on `Error: …`), else its exit status.
+fn failure_reason(stderr: &str, status: &str) -> String {
+    stderr
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .map_or_else(
+            || format!("the installer exited with {status}"),
+            String::from,
+        )
+}
+
+/// Install zoxide on a detached thread, then wire the shell hook. Called
+/// only when the user answers `y` to the jump popup's offer: croft never
+/// fetches or runs an installer, or edits a shell rc, on its own (#926).
+/// One attempt at a time; the outcome is recorded before the state flips,
+/// so whoever sees `Failed` also finds the reason.
+pub fn install_in_background() {
+    #[cfg(test)]
+    INSTALL_REQUESTS.with(|n| n.set(n.get() + 1));
+    let running = InstallState::Running as u8;
+    if cfg!(test) || INSTALL_STATE.swap(running, std::sync::atomic::Ordering::Relaxed) == running {
+        return;
+    }
     std::thread::spawn(|| {
-        if binary().is_none() {
-            set_install_state(InstallState::Running);
-            let script = install_script(crate::iterm2_inline::detect_termux());
-            // The outcome is logged, never discarded: a host where the
-            // installer can't run (e.g. it once piped curl on a stock
-            // Termux, which has no curl) used to fail in total silence
-            // while the popup claimed "installing".
-            match Command::new("sh").arg("-c").arg(script).output() {
-                Ok(out) if out.status.success() => {
-                    log_file::log(&format!("zoxide: installer `{script}` succeeded"))
-                }
-                Ok(out) => log_file::log(&format!(
+        let script = install_script(crate::iterm2_inline::detect_termux());
+        // The outcome is logged, never discarded: a host where the
+        // installer can't run (e.g. it once piped curl on a stock
+        // Termux, which has no curl) used to fail in total silence
+        // while the popup claimed "installing".
+        let failure = match Command::new("sh").arg("-c").arg(script).output() {
+            Ok(out) if out.status.success() => {
+                log_file::log(&format!("zoxide: installer `{script}` succeeded"));
+                None
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                log_file::log(&format!(
                     "zoxide: installer `{script}` exited {}: {}",
                     out.status,
-                    String::from_utf8_lossy(&out.stderr).trim()
-                )),
-                Err(e) => log_file::log(&format!(
-                    "zoxide: installer `{script}` could not start: {e}"
-                )),
+                    stderr.trim()
+                ));
+                Some(failure_reason(&stderr, &out.status.to_string()))
             }
-        }
+            Err(e) => {
+                log_file::log(&format!(
+                    "zoxide: installer `{script}` could not start: {e}"
+                ));
+                Some(format!("could not start sh: {e}"))
+            }
+        };
         // Wire the shell hook only once the binary is actually resolvable,
         // otherwise the `eval "$(zoxide init …)"` line errors on every shell
         // start. `binary()` finds the freshly-installed `~/.local/bin` copy
         // even though it is not yet on the login shell's PATH — which is why
         // the appended block prepends that dir before the eval.
         if binary().is_some() {
+            set_outcome(match ensure_shell_init() {
+                Some(rc) => format!(
+                    "zoxide installed; added its `{ZOXIDE_CMD}` hook to {rc} between the \"{INIT_MARKER_START}\" markers"
+                ),
+                None => String::from("zoxide installed"),
+            });
             set_install_state(InstallState::Done);
-            ensure_shell_init();
         } else {
+            set_outcome(failure.unwrap_or_else(|| {
+                String::from("the installer finished, but no zoxide binary was found")
+            }));
             set_install_state(InstallState::Failed);
         }
     });
@@ -546,6 +628,30 @@ mod tests {
     fn rc_file_name_targets_the_conventional_rc_per_shell() {
         assert_eq!(rc_file_name("zsh"), ".zshrc");
         assert_eq!(rc_file_name("bash"), ".bashrc");
+    }
+
+    #[test]
+    fn rc_hint_names_the_rc_an_install_would_edit_or_none() {
+        assert_eq!(rc_hint(Some("/bin/bash")).as_deref(), Some("~/.bashrc"));
+        assert_eq!(rc_hint(Some("/bin/zsh")).as_deref(), Some("~/.zshrc"));
+        assert_eq!(rc_hint(Some("/usr/bin/fish")), None, "fish is never wired");
+        assert_eq!(rc_hint(None), None, "an unset $SHELL is never wired");
+    }
+
+    #[test]
+    fn failure_reason_is_the_installers_last_error_line() {
+        // #926: the line zoxide's install.sh ends on for an unpackaged arch.
+        let stderr = "info: downloading\n\
+                      Error: zoxide has not yet been packaged for your architecture (x86_64-unknown-linux-musl)\n\n";
+        assert_eq!(
+            failure_reason(stderr, "exit status: 1"),
+            "Error: zoxide has not yet been packaged for your architecture (x86_64-unknown-linux-musl)"
+        );
+        assert_eq!(
+            failure_reason(" \n", "exit status: 127"),
+            "the installer exited with exit status: 127",
+            "a silent failure still says how it ended"
+        );
     }
 
     #[test]

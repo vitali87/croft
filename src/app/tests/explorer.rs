@@ -1803,6 +1803,49 @@ fn cmd_z_in_explorer_opens_the_zoxide_jump_popup() {
     assert!(app.zoxide_jump.is_none(), "Esc must close the jump popup");
 }
 
+/// #926: on a host without zoxide the jump popup asks before installing
+/// anything. `n` closes it with nothing run; `y` starts the install, once.
+#[test]
+fn the_jump_popup_installs_zoxide_only_when_the_user_says_y() {
+    use crate::zoxide::{InstallState, install_requests};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let open_without_zoxide = |app: &mut App| {
+        app.handle_explorer_shortcut(key(KeyCode::Char('z'), KeyModifiers::SUPER));
+        // Whatever this machine has: the popup as a host without zoxide sees it.
+        let jump = app.zoxide_jump.as_mut().expect("Cmd+Z opens the popup");
+        jump.set_results(None);
+        jump.install_state = InstallState::Idle;
+    };
+    let before = install_requests();
+
+    open_without_zoxide(&mut app);
+    app.handle_zoxide_jump_key(key(KeyCode::Char('n'), KeyModifiers::NONE));
+    assert!(app.zoxide_jump.is_none(), "n declines and closes the popup");
+    assert_eq!(install_requests(), before, "n installs nothing");
+
+    open_without_zoxide(&mut app);
+    app.handle_zoxide_jump_key(key(KeyCode::Char('y'), KeyModifiers::NONE));
+    assert_eq!(install_requests(), before + 1, "y starts the install");
+    let jump = app.zoxide_jump.as_ref().expect("the popup stays open");
+    assert_eq!(jump.install_state, InstallState::Running);
+    assert!(
+        jump.query.is_empty(),
+        "the answer is not typed into the query"
+    );
+    assert!(
+        app.status.to_lowercase().contains("installing"),
+        "status: {}",
+        app.status
+    );
+    app.handle_zoxide_jump_key(key(KeyCode::Char('y'), KeyModifiers::NONE));
+    assert_eq!(
+        install_requests(),
+        before + 1,
+        "a second y while it runs starts nothing"
+    );
+}
+
 /// #1345: the Explorer hides a `files.exclude` folder, and only that:
 /// `search.exclude` leaves the fixtures listed, as in VS Code.
 #[test]

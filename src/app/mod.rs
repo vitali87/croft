@@ -5846,6 +5846,13 @@ const ZEN_HINT_FOR: std::time::Duration = std::time::Duration::from_secs(4);
 /// the Explorer.
 const ZOXIDE_JUMP_MIN_WIDTH: u16 = 56;
 
+/// The status-bar line for a jump popup with no zoxide to run: the first
+/// line of what the popup body says.
+fn zoxide_jump_status(jump: &crate::widgets::zoxide_jump::ZoxideJump) -> String {
+    let msg = crate::widgets::zoxide_jump::unavailable_message(jump);
+    format!("Jump: {}", msg.lines().next().unwrap_or_default())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WelcomeLayout {
     cell_x: u16,
@@ -56710,7 +56717,9 @@ impl App {
         }
         let mut jump = crate::widgets::zoxide_jump::ZoxideJump::new();
         jump.install_state = crate::zoxide::install_state();
+        jump.install_note = crate::zoxide::install_outcome();
         jump.termux = crate::iterm2_inline::detect_termux();
+        jump.rc_hint = crate::zoxide::shell_rc_hint();
         jump.set_results(crate::zoxide::query(""));
         // Snapshot the full frecency list so the typo-tolerant fuzzy
         // fallback can rank against it without re-spawning zoxide on every
@@ -56722,12 +56731,8 @@ impl App {
                 jump.results.len()
             )
         } else {
-            // Same honest copy as the popup body (single source of truth).
-            format!(
-                "Jump: {}",
-                crate::widgets::zoxide_jump::unavailable_message(jump.install_state, jump.termux)
-                    .trim_start()
-            )
+            // The popup body's first line (single source of truth).
+            zoxide_jump_status(&jump)
         };
         self.zoxide_jump = Some(jump);
         self.overlays.zoxide_jump_clear.request();
@@ -56765,6 +56770,7 @@ impl App {
         // The background install may have advanced (Running -> Done/Failed)
         // since the popup opened; keep the unavailable message current.
         jump.install_state = crate::zoxide::install_state();
+        jump.install_note = crate::zoxide::install_outcome();
         match crate::zoxide::query(&needle) {
             Some(paths) if paths.is_empty() && !needle.trim().is_empty() => {
                 let ranked = crate::zoxide::fuzzy_rank(&needle, &jump.all_dirs);
@@ -56811,12 +56817,70 @@ impl App {
                 jump.delete_char();
                 self.refresh_zoxide_results();
             }
+            // zoxide is missing: the popup is asking "Install it? [y/N]".
+            (KeyCode::Char('y' | 'Y'), m)
+                if !jump.available
+                    && !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            {
+                self.start_zoxide_install();
+            }
+            (KeyCode::Char('n' | 'N'), m)
+                if !jump.available
+                    && !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            {
+                self.close_zoxide_jump();
+            }
             (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
                 jump.push_char(c);
                 self.refresh_zoxide_results();
             }
             _ => {}
         }
+    }
+
+    /// The user's `y` to the popup's install offer (#926): the only way croft
+    /// ever runs the zoxide installer. A second `y` while it runs is a no-op.
+    fn start_zoxide_install(&mut self) {
+        use crate::zoxide::InstallState;
+        let Some(jump) = self.zoxide_jump.as_mut() else {
+            return;
+        };
+        if jump.install_state == InstallState::Running {
+            return;
+        }
+        crate::zoxide::install_in_background();
+        jump.install_state = InstallState::Running;
+        self.status = zoxide_jump_status(jump);
+    }
+
+    /// Once the install the user asked for ends, bring the open popup up to
+    /// date without a keystroke: the directory list when it worked, the
+    /// reason when it did not, and what happened in the status bar. True
+    /// when something changed.
+    fn poll_zoxide_install(&mut self) -> bool {
+        use crate::zoxide::InstallState;
+        let Some(jump) = self.zoxide_jump.as_mut() else {
+            return false;
+        };
+        let state = crate::zoxide::install_state();
+        if jump.install_state != InstallState::Running
+            || !matches!(state, InstallState::Done | InstallState::Failed)
+        {
+            return false;
+        }
+        if state == InstallState::Done {
+            jump.set_all_dirs(crate::zoxide::query("").unwrap_or_default());
+        }
+        self.refresh_zoxide_results();
+        self.status = match (state, crate::zoxide::install_outcome()) {
+            (InstallState::Done, Some(outcome)) => format!("Jump: {outcome}"),
+            _ => self
+                .zoxide_jump
+                .as_ref()
+                .map(zoxide_jump_status)
+                .unwrap_or_default(),
+        };
+        true
     }
 
     /// Jump to (or add) the highlighted directory and dismiss the popup:
@@ -79146,12 +79210,6 @@ pub fn run(
     zen: bool,
     workspace_folders: Vec<PathBuf>,
 ) -> Result<()> {
-    // zoxide is a hard dependency of the Cmd+Z jump popup. Probe for it
-    // and install it in the background if missing, off the launch path so
-    // the first frame is never blocked. Runs on every host croft starts
-    // on — the local Mac and the remote Linux box both reach `run` — so
-    // the dependency is satisfied identically on both (GOLDEN RULE).
-    crate::zoxide::ensure_installed_in_background();
     // Termux ships no font with codicon glyphs, so the activity-bar glyph
     // fallback renders blank cells out of the box. Install the Meslo Nerd
     // Font Mono into ~/.termux/font.ttf in the background (no-op on every
@@ -80090,6 +80148,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.maybe_seat_navigator() | app.poll_pair() | app.tick_proactive_navigator();
         let voice_changed = app.drain_voice();
         let zen_hint_changed = app.expire_zen_hint(std::time::Instant::now());
+        let zoxide_changed = app.poll_zoxide_install();
         // Surface managed language-server install progress in the status bar so
         // the background work (which can take a few seconds) is visible.
         let install_status_changed = match crate::lsp::install::take_status() {
@@ -80111,6 +80170,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
 
         let non_pty_dirty = needs_redraw
             || zen_hint_changed
+            || zoxide_changed
             || fs_changed
             || mcp_changed
             || pair_changed

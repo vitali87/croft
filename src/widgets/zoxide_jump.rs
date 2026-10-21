@@ -49,6 +49,13 @@ pub struct ZoxideJump {
     /// True on Termux, injected at popup open; selects the platform's
     /// install hint (`pkg install zoxide` vs the manual route).
     pub termux: bool,
+    /// The rc file an install would add the shell hook to (`~/.bashrc`),
+    /// injected at popup open so the install offer names it up front;
+    /// `None` when the shell is unsupported and no rc would be touched.
+    pub rc_hint: Option<String>,
+    /// What the last finished install came to (`crate::zoxide::install_outcome`),
+    /// injected with `install_state`; a failure's reason is shown in the popup.
+    pub install_note: Option<String>,
 }
 
 impl Default for ZoxideJump {
@@ -66,29 +73,45 @@ impl Default for ZoxideJump {
             approximate: false,
             install_state: InstallState::Idle,
             termux: false,
+            rc_hint: None,
+            install_note: None,
         }
     }
 }
 
-/// The line shown when the zoxide binary cannot be found, honest about the
-/// background install: claim "installing" only while the installer is
-/// actually running, and once it has failed, say so and name the
-/// platform's install command instead.
-pub fn unavailable_message(state: InstallState, termux: bool) -> &'static str {
-    match (state, termux) {
-        (InstallState::Running, _) => {
-            "  zoxide is not installed on this host. Installing it in the background; try again shortly."
+/// The text shown when the zoxide binary cannot be found, one `\n` per line
+/// (#926). Nothing is installed until the user says so: before any attempt
+/// it offers the install, naming the exact command `y` runs and the rc file
+/// it edits; while that install runs it says so; once it has failed it gives
+/// the reason and the platform's own install route, and `y` tries again.
+pub fn unavailable_message(jump: &ZoxideJump) -> String {
+    match jump.install_state {
+        InstallState::Running => String::from(
+            "Installing zoxide in the background; the list appears here when it is done.",
+        ),
+        InstallState::Failed => {
+            let manual = if jump.termux {
+                "Run `pkg install zoxide` in the terminal pane"
+            } else if cfg!(target_os = "macos") {
+                "Install it yourself (e.g. `brew install zoxide`)"
+            } else {
+                "Install it with your package manager (e.g. `apt install zoxide`)"
+            };
+            let reason = jump.install_note.as_deref().unwrap_or("no reason given");
+            format!("zoxide install failed: {reason}\n\n{manual}, or press y to try again.")
         }
-        (InstallState::Failed, true) => {
-            "  zoxide auto-install failed. Run `pkg install zoxide` in the terminal pane, then try again."
+        InstallState::Idle | InstallState::Done => {
+            let hook = match &jump.rc_hint {
+                Some(rc) => format!(
+                    "then adds its `j` shell hook to {rc}, in a block marked \"croft zoxide (managed)\"."
+                ),
+                None => String::from("No shell rc file is changed."),
+            };
+            format!(
+                "zoxide is not installed on this host. Install it? [y/N]\n\ny runs: {}\n{hook}",
+                crate::zoxide::install_script(jump.termux)
+            )
         }
-        (InstallState::Failed, false) if cfg!(target_os = "macos") => {
-            "  zoxide auto-install failed. Install it manually (e.g. `brew install zoxide`), then try again."
-        }
-        (InstallState::Failed, false) => {
-            "  zoxide auto-install failed. Install it with your package manager (e.g. `apt install zoxide`), then try again."
-        }
-        _ => "  zoxide is not installed on this host.",
     }
 }
 
@@ -360,16 +383,22 @@ pub fn render_zoxide_jump(
     }
 
     if !jump.available {
-        let msg = Line::from(Span::styled(
-            unavailable_message(jump.install_state, jump.termux),
-            Style::default().fg(theme.ui(Color::Rgb(0xe5, 0xc0, 0x7b))),
-        ));
+        let style = Style::default().fg(theme.ui(Color::Rgb(0xe5, 0xc0, 0x7b)));
+        let msg: Vec<Line<'static>> = unavailable_message(jump)
+            .lines()
+            .map(|line| Line::from(Span::styled(line.to_string(), style)))
+            .collect();
         // Wrapped, not clipped: the popup is as narrow as the Explorer
         // column (phone-width on Termux), and the install hint's tail is
-        // the actionable part.
+        // the actionable part. Inset two cells so wrapped lines align.
+        let text_rect = Rect {
+            x: list_rect.x + 2,
+            width: list_rect.width.saturating_sub(2),
+            ..list_rect
+        };
         Widget::render(
             Paragraph::new(msg).wrap(Wrap { trim: false }),
-            list_rect,
+            text_rect,
             buf,
         );
         return;
@@ -463,19 +492,28 @@ mod tests {
         );
     }
 
+    fn missing(state: InstallState, termux: bool) -> ZoxideJump {
+        let mut j = ZoxideJump::new();
+        j.set_results(None);
+        j.install_state = state;
+        j.termux = termux;
+        j
+    }
+
     #[test]
     fn unavailable_message_reflects_install_state_and_platform() {
         assert!(
-            unavailable_message(InstallState::Running, true)
+            unavailable_message(&missing(InstallState::Running, true))
                 .to_lowercase()
                 .contains("installing"),
             "while the installer runs, saying so is the truth"
         );
         assert!(
-            unavailable_message(InstallState::Failed, true).contains("pkg install zoxide"),
+            unavailable_message(&missing(InstallState::Failed, true))
+                .contains("pkg install zoxide"),
             "a failed install on Termux must hand the user the pkg command"
         );
-        let failed_elsewhere = unavailable_message(InstallState::Failed, false);
+        let failed_elsewhere = unavailable_message(&missing(InstallState::Failed, false));
         assert!(
             !failed_elsewhere.contains("pkg install"),
             "pkg is Termux-only; never suggest it on macOS/Linux"
@@ -489,27 +527,59 @@ mod tests {
             "the non-Termux failed message must name this platform's install route"
         );
         for termux in [false, true] {
-            assert!(
-                !unavailable_message(InstallState::Idle, termux)
-                    .to_lowercase()
-                    .contains("installing"),
-                "must not claim an install is happening when none was started"
-            );
-            assert!(
-                !unavailable_message(InstallState::Done, termux)
-                    .to_lowercase()
-                    .contains("installing"),
-                "must not claim an install is happening after it finished"
-            );
+            for state in [InstallState::Idle, InstallState::Done] {
+                assert!(
+                    !unavailable_message(&missing(state, termux))
+                        .to_lowercase()
+                        .contains("installing"),
+                    "must not claim an install is happening when none is running"
+                );
+            }
         }
+    }
+
+    /// #926: with zoxide missing and nothing asked yet, the popup asks before
+    /// installing, and shows the exact command and the rc file it would edit.
+    #[test]
+    fn a_missing_zoxide_is_offered_with_the_exact_command_and_rc_file() {
+        let mut j = missing(InstallState::Idle, false);
+        j.rc_hint = Some(String::from("~/.bashrc"));
+        let offer = unavailable_message(&j);
+        assert!(offer.contains("Install it? [y/N]"), "asks first: {offer}");
+        assert!(
+            offer.contains(crate::zoxide::install_script(false)),
+            "names the exact command y runs: {offer}"
+        );
+        assert!(
+            offer.contains("~/.bashrc") && offer.contains("croft zoxide (managed)"),
+            "says which rc file gets the hook and how the block is marked: {offer}"
+        );
+        j.rc_hint = None;
+        assert!(
+            unavailable_message(&j).contains("No shell rc file is changed"),
+            "an unsupported shell's rc is left alone, and the offer says so"
+        );
+        j.termux = true;
+        assert!(unavailable_message(&j).contains("y runs: pkg install -y zoxide"));
+    }
+
+    #[test]
+    fn a_failed_install_shows_its_reason_and_offers_a_retry() {
+        let mut j = missing(InstallState::Failed, false);
+        j.install_note = Some(String::from(
+            "Error: zoxide has not yet been packaged for your architecture (x86_64-unknown-linux-musl)",
+        ));
+        let msg = unavailable_message(&j);
+        assert!(
+            msg.contains("zoxide install failed: Error: zoxide has not yet been packaged"),
+            "the installer's own reason is shown, not just a log line: {msg}"
+        );
+        assert!(msg.contains("press y to try again"), "{msg}");
     }
 
     #[test]
     fn unavailable_message_tail_stays_visible_in_a_narrow_popup() {
-        let mut j = ZoxideJump::new();
-        j.set_results(None);
-        j.install_state = InstallState::Failed;
-        j.termux = true;
+        let mut j = missing(InstallState::Failed, true);
         let rect = Rect::new(0, 0, 30, 12);
         let mut buf = Buffer::empty(rect);
         render_zoxide_jump(&mut j, rect, &mut buf, crate::theme::Theme::default());
