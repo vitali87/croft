@@ -3246,6 +3246,7 @@ fn a_python_block_still_imports_from_the_pane_s_directory() {
         "python3",
         "import helper_1630\nprint(helper_1630.X)\n",
         scripts.path(),
+        "/bin/sh",
     );
     assert_eq!(run_typed_line(&cmd, tmp.path()), "local\n");
 }

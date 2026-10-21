@@ -1,0 +1,1 @@
+fix: A runnable shell block of several lines runs as one command, so the box under it (and its `{persist}` copy) shows the output of every line and the exit code the block ends with, not just its first command's.
