@@ -344,7 +344,7 @@ The body uses VS Code tab-stop syntax: `$1`, `$2`, … are stops visited in orde
 | `Cmd`+`Enter` (or `Cmd`+`o`) / `Cmd`+`Shift`+`Enter` | Insert Line Below / Above: open a new line under / over the current one, inheriting indent, without splitting it (in a Markdown fence `Cmd`+`Enter` runs the block instead) |
 | `Enter` in a Markdown list or quote, or a doc comment | Continue it on the new line: a `-`, `*` or `+` bullet repeats, a numbered item counts up (`1.` then `2.`), a task box comes back unticked (`- [ ] `), and `>` quotes carry over; `Enter` on an empty item ends the list instead. In Rust, JS/TS, C/C++, Java and C#, `Enter` after `/**` opens the block with ` * ` and closes it with ` */` when nothing below does, `Enter` on a ` * ` line adds the next one, and Rust `///` / `//!` lines continue. Plain `//` comments and lines inside a fenced code block are left alone |
 | `Ctrl`+`Shift`+`o` / `Cmd`+`Shift`+`O` | Go to Symbol in Editor: fuzzy-search the file's symbols and jump (type `:` then a number to go to a line) |
-| `Cmd`+`g` `g` | Go to the top of the file (`Cmd`+`N` `Cmd`+`g` `g` for line N) |
+| `Cmd`+`g` `g` | Go to the top of the file. For line N, `Cmd`+`g` N `g`, `Cmd`+`g` N `Enter` (VS Code's Go to Line, `Ctrl`+`G` `25` `Enter`), or `Cmd`+`N` `Cmd`+`g` `g`. `Esc` cancels the chord; after N any other key cancels it too, swallowed with the digits rather than typed |
 | `Cmd`+`Shift`+`G` | Go to the bottom of the file (with a leading count, that line) |
 | `Cmd`+`Shift`+`K` / `Ctrl`+`Shift`+`K` | Delete Line: remove every line touched by a cursor or its selection, so it composes with the extra cursors `Cmd`+`D` and `Opt`+click create; yanks to clipboard |
 | `Cmd`+`y` `y` | Yank the current line (`Cmd`+`N` `Cmd`+`y` `y` for N lines) |
