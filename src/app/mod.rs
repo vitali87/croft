@@ -49666,6 +49666,9 @@ impl App {
         let (path, frag) = dest
             .split_once('#')
             .map_or((dest.as_str(), None), |(p, f)| (p, Some(f)));
+        // A query is no part of the file's name: GitHub READMEs link to
+        // `guide.md?plain=1` for its source, as images add `?raw=true`.
+        let path = path.split_once('?').map_or(path, |(p, _)| p);
         let path = crate::shell_integration::percent_decode(path.as_bytes());
         let path = String::from_utf8_lossy(&path);
         // `/docs/x.md` is from the workspace root, as GitHub reads it.

@@ -1661,8 +1661,8 @@ fn dragging_in_the_markdown_preview_selects_and_copies_rendered_text() {
 
 /// #931 / #1848: preview links follow as in VS Code's preview. Pointing at
 /// one names its target; a click on a relative `.md` opens it rendered, a
-/// Ctrl+click on `file#L3` opens the file at the line, and a click on
-/// `#heading` scrolls to it.
+/// Ctrl+click on `file#L3` opens the file at the line, a click on
+/// `#heading` scrolls to it, and a `?query` is no part of the file's name.
 #[test]
 fn preview_links_follow_on_click_and_ctrl_click() {
     use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
@@ -1675,7 +1675,12 @@ fn preview_links_follow_on_click_and_ctrl_click() {
     let filler: String = (0..40).map(|i| format!("Line {i}.\n\n")).collect();
     let text = "See the [setup guide](docs/SETUP.md), jump to [Usage](#usage-notes), \
                 or open [the code](src/main.py#L3).";
-    std::fs::write(&readme, format!("{text}\n\n{filler}## Usage notes\n")).unwrap();
+    let raw = "Or read [its source](docs/SETUP.md?plain=1).";
+    std::fs::write(
+        &readme,
+        format!("{text}\n\n{raw}\n\n{filler}## Usage notes\n"),
+    )
+    .unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let rendered = |app: &mut App| {
         draw(app, 160, 40);
@@ -1722,6 +1727,9 @@ fn preview_links_follow_on_click_and_ctrl_click() {
     on_link(&mut app, "the code", &click, KeyModifiers::CONTROL);
     assert_eq!(app.editor.path, Some(tmp.path().join("src/main.py")));
     assert_eq!(app.editor.cursor_row, 2, "#L3 is the third line");
+
+    on_link(&mut app, "its source", &click, none);
+    assert_eq!(app.editor.path, Some(tmp.path().join("docs/SETUP.md")));
 
     on_link(&mut app, "Usage", &click, none);
     assert_eq!(app.status, "Went to #usage-notes");
