@@ -779,6 +779,35 @@ fn cmd_v_is_recognised_as_editor_paste_key() {
     )));
 }
 
+/// #933: where the host clipboard can't be read (Linux with no wl-paste,
+/// xclip or xsel, as over SSH), Ctrl+V pastes what croft itself last
+/// copied. Before, a copy went out by OSC 52 only and Ctrl+V found nothing.
+#[test]
+fn ctrl_v_pastes_croft_s_own_copy_where_the_host_clipboard_cant_be_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("c.py");
+    std::fs::write(&f, "one\ntwo").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&f).unwrap();
+    app.focus = Pane::Editor;
+    app.clipboard_reader = || None;
+    let ctrl_v = key(KeyCode::Char('v'), KeyModifiers::CONTROL);
+    // Negative: nothing copied yet, so nothing to paste, and it says so.
+    app.handle_key(ctrl_v).unwrap();
+    assert_eq!(app.editor.lines, vec!["one", "two"]);
+    assert!(app.status.contains("read failed"), "{}", app.status);
+    app.handle_key(key(KeyCode::End, KeyModifiers::SHIFT))
+        .unwrap();
+    assert_eq!(app.editor.selection_text(), "one", "precondition");
+    app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .unwrap();
+    app.editor.clear_selection();
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 3;
+    app.handle_key(ctrl_v).unwrap();
+    assert_eq!(app.editor.lines, vec!["one", "twoone"]);
+}
+
 #[test]
 fn typing_after_select_all_replaces_query() {
     let tmp = tempfile::tempdir().unwrap();

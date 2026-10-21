@@ -25795,7 +25795,7 @@ impl App {
         // matching the commit box; the panel is focused whenever this fires.
         self.poke_cursor();
         if is_search_paste_key(key) {
-            let text = (self.clipboard_reader)();
+            let text = self.clipboard_text();
             self.paste_clipboard_into_search(text.as_deref());
             return;
         }
@@ -26092,7 +26092,7 @@ impl App {
             return;
         }
         if is_clipboard_paste_key(key) {
-            if let Some(text) = (self.clipboard_reader)() {
+            if let Some(text) = self.clipboard_text() {
                 self.source_control.insert_str(&text);
                 self.poke_cursor();
             }
@@ -47660,7 +47660,7 @@ impl App {
             return;
         }
         if is_editor_paste_key(key) {
-            let text = (self.clipboard_reader)();
+            let text = self.clipboard_text();
             self.paste_clipboard_into_editor(text.as_deref());
             return;
         }
@@ -48455,10 +48455,12 @@ impl App {
 
     fn vim_paste(&mut self, at: crate::vim::PasteAt, count: usize) {
         use crate::vim::PasteAt;
-        let Some(text) = (self.clipboard_reader)() else {
+        let Some(text) = self.clipboard_text() else {
+            self.status = String::from("Nothing to paste: the clipboard can't be read");
             return;
         };
         if text.is_empty() {
+            self.status = String::from("Nothing to paste: the clipboard is empty");
             return;
         }
         let n = count.max(1);
@@ -49399,6 +49401,7 @@ impl App {
     /// the remote box's clipboard on a relay session.
     fn copy_where_pasted(&mut self, text: &str) -> CopyLanding {
         if self.is_relay_session && self.push_clipboard_via_relay(text) {
+            crate::clipboard::remember_copy(text);
             CopyLanding::Local
         } else if copy_to_clipboard(text) {
             CopyLanding::Clipboard
@@ -49445,15 +49448,19 @@ impl App {
     /// no Cmd+V in it, and a status line quoting a key the user never pressed
     /// reads as a bug report about the wrong thing.
     fn paste_clipboard_into_terminal(&mut self) {
-        match crate::clipboard::read_string() {
+        let text = crate::clipboard::read_string();
+        if text.is_none() && self.drop_relay_active() {
+            self.request_remote_clipboard();
+            return;
+        }
+        // Without a relay, what croft last copied, as for any other paste
+        // inside croft (#933).
+        match text.or_else(crate::clipboard::last_copy) {
             Some(text) if !text.is_empty() => {
                 self.paste_terminal_input(text.as_bytes());
             }
             Some(_) => {
                 self.status = String::from("Paste: clipboard is empty");
-            }
-            None if self.drop_relay_active() => {
-                self.request_remote_clipboard();
             }
             None => {
                 self.status =
@@ -50438,6 +50445,14 @@ impl App {
         }
         self.editor.paste_str(s, self.paste_reindent);
         self.status = format!("Pasted {} chars", s.chars().count());
+    }
+
+    /// What a paste inside croft inserts: the host clipboard, or what croft
+    /// itself last copied when the host clipboard can't be read (#933), as
+    /// on a Linux host with no clipboard tool, where copies go out only by
+    /// OSC 52.
+    fn clipboard_text(&self) -> Option<String> {
+        (self.clipboard_reader)().or_else(crate::clipboard::last_copy)
     }
 
     /// A terminal paste. While a macro records, a paste into the editor is a
@@ -53813,7 +53828,7 @@ impl App {
         // here as a key event, and reading the clipboard ourselves keeps
         // the "open finder, paste a filename" gesture working everywhere.
         if is_clipboard_paste_key(key) {
-            if let Some(text) = (self.clipboard_reader)()
+            if let Some(text) = self.clipboard_text()
                 && let Some(finder) = self.file_finder.as_mut()
             {
                 for c in text.chars() {
@@ -57526,7 +57541,7 @@ impl App {
             (KeyCode::Char('v'), m)
                 if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
             {
-                if let Some(text) = (self.clipboard_reader)() {
+                if let Some(text) = self.clipboard_text() {
                     let mut q = self
                         .terminal_find
                         .as_ref()
@@ -58729,7 +58744,7 @@ impl App {
             (KeyCode::Char('v'), m)
                 if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
             {
-                if let Some(text) = (self.clipboard_reader)() {
+                if let Some(text) = self.clipboard_text() {
                     self.editor_find_edit_focused(|s| {
                         for c in text.chars() {
                             if !c.is_control() {
@@ -61034,7 +61049,7 @@ impl App {
                 if in_tree && self.sidebar_view == SidebarView::Search {
                     self.focus_pane(Pane::Tree);
                     if self.search.paste_button_at(m.column, m.row) {
-                        let text = (self.clipboard_reader)();
+                        let text = self.clipboard_text();
                         self.paste_clipboard_into_search(text.as_deref());
                         return;
                     }
@@ -67277,7 +67292,7 @@ impl App {
             MenuAction::EditorCut => self.cut_editor_selection(),
             MenuAction::EditorCopy => self.copy_editor_selection(),
             MenuAction::EditorPaste => {
-                let text = (self.clipboard_reader)();
+                let text = self.clipboard_text();
                 self.paste_clipboard_into_editor(text.as_deref());
             }
             MenuAction::ShowCommandPalette => self.open_command_palette(),
@@ -76254,6 +76269,7 @@ fn cwd_matches(cwd: Option<&Path>, root: &Path, observable: bool) -> bool {
 }
 
 fn copy_to_clipboard(text: &str) -> bool {
+    crate::clipboard::remember_copy(text);
     if crate::clipboard::write_string(text) {
         return true;
     }
