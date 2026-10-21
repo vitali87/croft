@@ -1021,6 +1021,56 @@ fn a_peer_edit_of_several_runs_undoes_in_one_step() {
     assert!(!owner.editor.undo());
 }
 
+/// #918: a peer's edit before the caret, earlier on its line or on a line
+/// above, carries the caret and the view with the text, so the next
+/// keystrokes land where they were aimed and the lines on screen stay put.
+#[test]
+fn a_peer_edit_before_the_caret_carries_it_and_the_view() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut text: Vec<String> = (0..60).map(|i| format!("# {i}")).collect();
+    text[40] = "    return f\"hi {name}\"".into();
+    let (mut owner, mut pilot) = owner_and_pilot_on(&tmp, &text.join("\n"));
+    owner.editor.scroll = 30;
+    owner.editor.cursor_row = 40;
+    owner.editor.cursor_col = text[40].len();
+    text[40] = "    result = return f\"hi {name}\"".into();
+    pilot_writes(&mut owner, &mut pilot, &text.join("\n"));
+    text.insert(0, "import os".into());
+    pilot_writes(&mut owner, &mut pilot, &text.join("\n"));
+    assert_eq!(owner.editor.scroll, 31, "the view still starts at # 30");
+    owner.editor.insert_str("  # A");
+    assert_eq!(
+        owner.editor.lines[41],
+        "    result = return f\"hi {name}\"  # A"
+    );
+}
+
+/// #918: two people typing in turns at the same spot each get their words
+/// in the order typed; a caret left at its old column wrote each word in
+/// front of the one before it.
+#[test]
+fn turns_typed_at_one_spot_keep_each_side_s_words_in_order() {
+    let (_tmp, _file, mut owner, mut guest) = collab_owner_and_guest_on_plan();
+    for app in [&mut owner, &mut guest] {
+        app.editor.cursor_row = 0;
+        app.editor.cursor_col = "Owner: alice".len();
+    }
+    for word in ["one", "two", "three"] {
+        for typist in [0, 1] {
+            let mut apps = [&mut owner, &mut guest];
+            let tag = ["A", "B"][typist];
+            apps[typist].editor.insert_str(&format!(" {tag}-{word}"));
+            pump_apps_until(&mut apps, "the word reaches the peer", |apps| {
+                apps[0].editor.lines == apps[1].editor.lines
+            });
+        }
+    }
+    assert_eq!(
+        owner.editor.lines[0],
+        "Owner: alice A-one B-one A-two B-two A-three B-three"
+    );
+}
+
 /// A caret name tag is visible while inside its 2s fade window and signals
 /// exactly one redraw when it appears and one when it expires — no redraw
 /// churn in between (the tick loop repaints only on `poll_collab() == true`).

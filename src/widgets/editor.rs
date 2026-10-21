@@ -2344,7 +2344,22 @@ fn shift_past_span(
 /// order the edits are applied in, so each edit's coordinates still name the
 /// text it was written against.
 pub fn map_through_span_edits(pos: (usize, usize), edits: &[TextSpanEdit]) -> (usize, usize) {
-    let mut order: Vec<&TextSpanEdit> = edits.iter().filter(|e| e.end >= e.start).collect();
+    map_through_edit_refs(pos, edits.iter().collect())
+}
+
+/// Where the viewport's top line lands once char-column `edits` are applied
+/// (#918): lines added or removed above the view, by a peer's typing or an Add
+/// import, move it with them, so the text on screen stays put. Only
+/// edits that start above the top line's start count: text inserted right at
+/// it shows at the top of the view, and the top of the file stays the top.
+fn view_top_after_span_edits(top: usize, edits: &[TextSpanEdit]) -> usize {
+    let start = (top, 0);
+    map_through_edit_refs(start, edits.iter().filter(|e| e.start < start).collect()).0
+}
+
+/// [`map_through_span_edits`] over borrowed edits.
+fn map_through_edit_refs(pos: (usize, usize), mut order: Vec<&TextSpanEdit>) -> (usize, usize) {
+    order.retain(|e| e.end >= e.start);
     order.sort_by_key(|e| std::cmp::Reverse(e.start));
     order.into_iter().fold(pos, |p, e| {
         if p < e.end && p <= e.start {
@@ -8531,12 +8546,15 @@ impl Editor {
     /// Move the caret, the selection and every extra caret with the text
     /// they were on through char-column `edits` just applied (#1603): an
     /// Add import above the caret left it on its old line number, inside
-    /// the grown import block, where the next keystrokes landed.
+    /// the grown import block, where the next keystrokes landed. The view's
+    /// top line follows its text too (#918), or a peer's lines added above
+    /// it pushed the text being read down the pane.
     fn follow_span_edits(&mut self, applied: &[(TextSpanEdit, usize)]) {
         let edits: Vec<TextSpanEdit> = applied.iter().map(|(e, _)| e.clone()).collect();
         let map = |p: (usize, usize)| map_through_span_edits(p, &edits);
         (self.cursor_row, self.cursor_col) = map((self.cursor_row, self.cursor_col));
         let last = self.lines.len().saturating_sub(1);
+        self.scroll = view_top_after_span_edits(self.scroll, &edits).min(last);
         let lines = &self.lines;
         let clamp = |(r, c): (usize, usize)| {
             let r = r.min(last);
@@ -29197,6 +29215,31 @@ mod tests {
         e.cursor_col = 2;
         e.apply_remote_span_edits(&[span((0, 0), (0, 0), "zero\n")], 3);
         assert_eq!((e.cursor_row, e.cursor_col), (2, 2));
+    }
+
+    /// #918: a peer's lines added or removed above the view move its top
+    /// line with them, so the text on screen stays where it was. Negative:
+    /// text inserted right at the top line, below it, or above a view at the
+    /// top of the file leaves the top where it is.
+    #[test]
+    fn a_remote_edit_above_the_view_keeps_the_text_on_screen() {
+        let text: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
+        let mut e = editor_with(&text.join("\n"));
+        e.scroll = 20;
+        e.cursor_row = 25;
+        e.apply_remote_span_edits(&[span((3, 0), (3, 0), "a\nb\n")], 1);
+        assert_eq!((e.scroll, e.cursor_row), (22, 27));
+        assert_eq!(e.lines[e.scroll], "line 20");
+        e.apply_remote_span_edits(&[span((2, 4), (5, 4), "")], 2);
+        assert_eq!(e.scroll, 19);
+        assert_eq!(e.lines[e.scroll], "line 20");
+        e.apply_remote_span_edits(&[span((19, 0), (19, 0), "new\n")], 3);
+        e.apply_remote_span_edits(&[span((30, 0), (30, 0), "x\ny\n")], 4);
+        assert_eq!(e.scroll, 19);
+        assert_eq!(e.lines[e.scroll], "new");
+        e.scroll = 0;
+        e.apply_remote_span_edits(&[span((0, 0), (0, 0), "import os\n")], 5);
+        assert_eq!(e.scroll, 0);
     }
 
     /// Negative (#1603): edits after the caret, later on its row or on rows
