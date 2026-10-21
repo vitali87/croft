@@ -1,2 +1,0 @@
-fix: A terminal pane whose shell exits (`exit`, Ctrl+D) now closes instead of staying open, dead and swallowing input, and its shell no longer lingers as a zombie process. The last pane stays with "[Process exited with code N]" until you press a key, which starts a new shell.
-fix: A task that ends its shell, such as `make test || exit 1`, now reports its exit code instead of showing "Running" for good, and its pane stays open so you can read the output.

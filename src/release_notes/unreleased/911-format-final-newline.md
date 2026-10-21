@@ -1,1 +1,0 @@
-fix: Format Document and Format on Save no longer add a blank line at the end of a file that is already formatted: language servers now see the file's final newline, so ruff, rustfmt, rumdl and other formatters leave it alone and linters stop reporting a missing newline.

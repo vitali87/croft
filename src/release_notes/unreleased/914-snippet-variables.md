@@ -1,1 +1,0 @@
-fix: Snippet variables such as `$TM_FILENAME`, `$CLIPBOARD`, `$CURRENT_YEAR` and `$UUID` now expand to their values, as in VS Code, instead of being inserted as literal text; `${VAR:default}` falls back to its default, and an unknown variable becomes a placeholder you can type over (#914).

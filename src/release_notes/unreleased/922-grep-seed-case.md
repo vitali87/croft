@@ -1,1 +1,0 @@
-fix: Search & Replace from Last grep/rg matches case the way the command did (grep, rg, git grep and ack only ignore case with -i; -S and ag use smart case), so Replace All no longer rewrites differently-cased lines the terminal never listed.

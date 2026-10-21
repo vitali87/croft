@@ -1,3 +1,0 @@
-feature: Copy Line Up/Down, Trigger Suggest and Trigger Parameter Hints are commands: they are in the Command Palette and can be bound in keybindings.json (copy_line_up, copy_line_down, trigger_suggest, trigger_parameter_hints).
-fix: croft import-vscode carries over bindings for Toggle Word Wrap, Toggle Minimap, Copy Line Up/Down, Peek References (editor.action.referenceSearch.trigger), Peek Call Hierarchy (editor.showCallHierarchy), Trigger Suggest and Trigger Parameter Hints instead of reporting that no croft command matches.
-fix: croft import-vscode --from pointed at the VS Code folder (~/.config/Code) reads its User folder instead of importing nothing.
