@@ -202,6 +202,79 @@ fn vim_de_deletes_to_word_end_inclusive() {
     assert_eq!(app.editor.lines, vec![" bar"]);
 }
 
+/// #934: `cw` on a word changes it up to its end and keeps the blank after
+/// it, as Vim's `ce`; on a word's last letter it changes only that letter,
+/// a count spans that many words, and on a blank it is still `dw`'s span.
+#[test]
+fn vim_cw_keeps_the_blank_after_the_word() {
+    for (start, keys, want) in [
+        (0, "cwONE", "ONE two three"),
+        (2, "cwE", "onE two three"),
+        (0, "2cwX", "X three"),
+        (3, "cwX", "oneXtwo three"),
+    ] {
+        let (mut app, _t) = vim_app("one two three");
+        app.editor.cursor_col = start;
+        vim_feed_str(&mut app, keys);
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.editor.lines, vec![want], "{keys} from column {start}");
+    }
+}
+
+/// #934: a change and the text typed in its Insert session are one undo
+/// step: `ciw`, `cw`, `cc`, `o`, and `i` with a line break typed.
+#[test]
+fn vim_u_undoes_a_change_and_its_typed_text_at_once() {
+    for keys in ["wciwTWO", "cwONE", "ccNEW", "oNEW", "iA\rB"] {
+        let (mut app, _t) = vim_app("one two three\nsecond line");
+        for c in keys.chars() {
+            let code = if c == '\r' {
+                KeyCode::Enter
+            } else {
+                KeyCode::Char(c)
+            };
+            app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
+        }
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        vim_feed(&mut app, 'u');
+        assert_eq!(
+            app.editor.lines,
+            vec!["one two three", "second line"],
+            "one u after {keys}"
+        );
+    }
+}
+
+/// Negative (#934): the edit after `Esc` is its own step, so `u` takes
+/// back only it and leaves the change.
+#[test]
+fn vim_an_edit_after_a_change_undoes_on_its_own() {
+    let (mut app, _t) = vim_app("one two");
+    vim_feed_str(&mut app, "cwONE");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    vim_feed_str(&mut app, "xu");
+    assert_eq!(app.editor.lines, vec!["ONE two"]);
+    vim_feed(&mut app, 'u');
+    assert_eq!(app.editor.lines, vec!["one two"]);
+    // The undone step held `cw`'s selection: none is left to paint, and
+    // `x` deletes one char, not the word.
+    assert_eq!(app.editor.selection, None);
+    vim_feed(&mut app, 'x');
+    assert_eq!(app.editor.lines[0].chars().count(), 6);
+}
+
+/// #934: `.` is not implemented and says so instead of doing nothing.
+#[test]
+fn vim_dot_says_it_is_not_supported() {
+    let (mut app, _t) = vim_app("a\nb\nc");
+    vim_feed_str(&mut app, "dd.");
+    assert_eq!(app.editor.lines, vec!["b", "c"]);
+    assert_eq!(app.status, "Repeat (.) is not supported in vim mode");
+}
+
 #[test]
 fn vim_diw_deletes_inner_word() {
     let (mut app, _t) = vim_app("foo bar baz");

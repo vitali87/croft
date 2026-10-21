@@ -13,7 +13,8 @@
 //! doubled `dd yy cc` and the `iw`/`aw` text objects), `x`, `i a I A o O`,
 //! `p P`, `u`, numeric counts, `/ ? n N` search, and `:` ex-commands. It is an
 //! emulation, not embedded neovim: plugins and `init.lua` are out of scope (a
-//! real `nvim` still runs in croft's shell pane for that).
+//! real `nvim` still runs in croft's shell pane for that). `.` and `>>`/`<<`
+//! are not implemented, and say so rather than vanish (#934).
 //!
 //! When vim mode is disabled the machine reports [`VimKeyResult::PassThrough`]
 //! for every key, so the editor behaves exactly as before.
@@ -181,6 +182,9 @@ pub enum VimAction {
     MacroRecord(Option<char>),
     /// `@{a-z}` with a count; `@@` replays the last macro (`None`).
     MacroReplay(Option<char>, usize),
+    /// A Vim command this subset does not implement, named for the status
+    /// bar (#934).
+    Unsupported(&'static str),
 }
 
 /// The outcome of feeding one key to the machine.
@@ -781,6 +785,15 @@ impl VimState {
                 }
                 None => VimKeyResult::Consumed(vec![]),
             },
+            '.' | '>' | '<' => {
+                self.clear_pending();
+                let what = if c == '.' {
+                    "Repeat (.)"
+                } else {
+                    "Indent (>> <<)"
+                };
+                VimKeyResult::Consumed(vec![VimAction::Unsupported(what)])
+            }
             _ => {
                 // Unmapped printable key: swallow so it never lands in the
                 // buffer while in Normal mode.
@@ -1420,6 +1433,25 @@ mod tests {
         // So a stray letter never lands in the buffer while in Normal mode.
         let mut v = enabled();
         assert_eq!(v.on_key(ch('z')), VimKeyResult::Consumed(vec![]));
+    }
+
+    /// #934: `.` and `>`/`<` are not implemented; they name themselves
+    /// instead of being swallowed like an unmapped key, and drop a count.
+    #[test]
+    fn dot_and_indent_keys_report_themselves_as_unsupported() {
+        let mut v = enabled();
+        assert_eq!(
+            last_actions(&mut v, "3."),
+            vec![VimAction::Unsupported("Repeat (.)")]
+        );
+        assert_eq!(
+            last_actions(&mut v, ">"),
+            vec![VimAction::Unsupported("Indent (>> <<)")]
+        );
+        assert_eq!(
+            last_actions(&mut v, "j"),
+            vec![VimAction::Move(Motion::Down, 1)]
+        );
     }
 
     #[test]

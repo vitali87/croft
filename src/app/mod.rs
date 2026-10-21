@@ -46792,11 +46792,14 @@ impl App {
         if !self.is_extension_enabled("vim") {
             if self.vim.enabled {
                 self.vim.toggle();
+                self.editor.end_undo_group();
             }
             self.status = String::from("Vim extension is disabled");
             return;
         }
         self.vim.toggle();
+        // A change left open in Insert mode ends with the mode (#934).
+        self.editor.end_undo_group();
         if self.vim.enabled {
             self.status = String::from("vim mode on");
         } else {
@@ -46824,6 +46827,7 @@ impl App {
         let on = want && self.is_extension_enabled("vim");
         if on != self.vim.enabled {
             self.vim.toggle();
+            self.editor.end_undo_group();
             if !on {
                 self.editor
                     .set_search_highlight(None, crate::widgets::search::SearchOpts::default());
@@ -47946,7 +47950,19 @@ impl App {
     /// Apply one resolved vim intent to the editor. The vim state machine has
     /// already advanced its own mode; this only mutates the buffer/cursor.
     fn apply_vim_action(&mut self, action: crate::vim::VimAction) {
-        use crate::vim::{Target, VimAction};
+        use crate::vim::{Op, Target, VimAction};
+        // A change runs from the command that enters Insert to the next vim
+        // command, the `Esc` that leaves it: the operator's delete, the line
+        // `o` opens and the typed text undo as one step, as in Vim (#934).
+        self.editor.end_undo_group();
+        if matches!(
+            action,
+            VimAction::Insert(_)
+                | VimAction::Operate { op: Op::Change, .. }
+                | VimAction::VisualOperate(Op::Change)
+        ) {
+            self.editor.begin_undo_group();
+        }
         match action {
             VimAction::Move(motion, count) => {
                 self.vim_apply_motion(motion, count);
@@ -47966,6 +47982,9 @@ impl App {
                 } else {
                     String::from("Nothing to undo")
                 };
+                // The step an operator opened holds the selection it acted
+                // on; Normal mode shows none, and `x` must not delete it.
+                self.editor.clear_selection();
             }
             VimAction::Redo => {
                 self.status = if self.editor.redo() {
@@ -47973,6 +47992,7 @@ impl App {
                 } else {
                     String::from("Nothing to redo")
                 };
+                self.editor.clear_selection();
             }
             VimAction::EnterVisual { line } => {
                 self.editor.break_undo_coalescing();
@@ -47993,7 +48013,6 @@ impl App {
             }
             VimAction::VisualOperate(op) => self.vim_visual_operate(op),
             VimAction::ExitInsert => {
-                self.editor.break_undo_coalescing();
                 if self.editor.cursor_col > 0 {
                     self.editor.cursor_col -= 1;
                 }
@@ -48024,6 +48043,9 @@ impl App {
                 Some(r) => self.replay_macro_register(r, count),
                 None => self.replay_last_macro(count),
             },
+            VimAction::Unsupported(what) => {
+                self.status = format!("{what} is not supported in vim mode");
+            }
         }
     }
 
@@ -48268,6 +48290,17 @@ impl App {
         self.editor.cursor_col = col;
     }
 
+    /// Where `{count}cw` from a non-blank ends: `e` `count` times, except
+    /// that on a word's last char the first `e` stays put, so `cw` there
+    /// changes that char rather than running to the next word's end.
+    fn vim_change_word_end(&mut self, count: usize) {
+        let (row, col) = (self.editor.cursor_row, self.editor.cursor_col);
+        let at_word_end = self.vim_class_at(row, col + 1) != self.vim_class_at(row, col);
+        for _ in usize::from(at_word_end)..count.max(1) {
+            self.vim_word_end();
+        }
+    }
+
     fn vim_operate_lines(&mut self, op: crate::vim::Op, start_row: usize, count: usize) {
         use crate::vim::Op;
         // A symbol tab's operator stays inside its symbol (#369): `dgg`
@@ -48308,7 +48341,16 @@ impl App {
             return;
         }
         let start = (self.editor.cursor_row, self.editor.cursor_col);
-        self.vim_apply_motion(motion, count);
+        // `cw` on a word changes up to its end and keeps the blank after it
+        // (Vim's `:help cw`, #934); on a blank it is `dw`'s span.
+        let change_word = op == crate::vim::Op::Change
+            && motion == crate::vim::Motion::WordForward
+            && self.vim_class_at(start.0, start.1) != 0;
+        if change_word {
+            self.vim_change_word_end(count);
+        } else {
+            self.vim_apply_motion(motion, count);
+        }
         let end = (self.editor.cursor_row, self.editor.cursor_col);
         let (lo, hi) = if start <= end {
             (start, end)
@@ -48316,7 +48358,7 @@ impl App {
             (end, start)
         };
         // Forward-inclusive motions (f/t/e) cover the char they land on.
-        let head = if start <= end && vim_motion_is_forward_inclusive(motion) {
+        let head = if start <= end && (change_word || vim_motion_is_forward_inclusive(motion)) {
             let len = self.vim_line_len(hi.0);
             (hi.0, (hi.1 + 1).min(len))
         } else {
@@ -48449,7 +48491,6 @@ impl App {
             InsertAt::Below => self.editor.open_line_below(),
             InsertAt::Above => self.editor.open_line_above(),
         }
-        self.editor.break_undo_coalescing();
         self.status = String::from("-- INSERT --");
     }
 
@@ -55160,9 +55201,9 @@ impl App {
             // merge into the previous iteration's typing run. This bounds
             // iterations apart; it does NOT make one iteration one undo step
             // — `push_undo` coalesces only InsertChar→InsertChar, so a macro
-            // holding a delete plus an insert still undoes in two. A real
-            // one-step-per-iteration guarantee needs an undo-group API the
-            // editor does not have (its undo is whole-buffer snapshots).
+            // holding a delete plus an insert still undoes in two. Wrapping
+            // the iteration in `Editor::begin_undo_group` would not do it
+            // either: every vim command the macro runs ends that group (#934).
             self.editor.break_undo_coalescing();
             for step in &keys {
                 match step {
