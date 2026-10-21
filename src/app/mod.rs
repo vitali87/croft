@@ -1819,6 +1819,32 @@ fn index_after_removals(index: usize, removed: &[usize]) -> Option<usize> {
     (!removed.contains(&index)).then(|| index - removed.iter().filter(|&&r| r < index).count())
 }
 
+/// A session is ending: mirror to OUTPUT's "Debug Console" channel each line
+/// its console streams leave open (#932), as `console` shows it, since no
+/// newline will come to finish it. `dropped` is how many lines have left the
+/// front of `console`, which the streams' positions count from.
+fn mirror_open_console_lines(
+    streams: &mut [crate::dap::session::ConsoleStream],
+    console: &[crate::ansi_text::AnsiLine],
+    dropped: usize,
+) {
+    for stream in streams {
+        let Some(line) = stream.ansi.finish() else {
+            continue;
+        };
+        let shown = stream
+            .shown_at
+            .take()
+            .and_then(|at| at.checked_sub(dropped))
+            .and_then(|i| console.get(i));
+        crate::output::push(
+            crate::output::CHANNEL_DEBUG_CONSOLE,
+            crate::output::OutputLevel::Info,
+            &shown.unwrap_or(&line).text,
+        );
+    }
+}
+
 /// What "open shell here" types for a fleet target (#363): nothing for
 /// localhost (the pane is already a shell there), `docker exec -it` for a
 /// container, `ssh` for a host. Names are quoted for the pane's shell.
@@ -5295,6 +5321,10 @@ pub struct App {
     /// Each line is escape-free text with the colour spans its SGR sequences
     /// set (#1501), so search and copy see `FAILED`, not `[31mFAILED[0m`.
     pub debug_console: Vec<crate::ansi_text::AnsiLine>,
+    /// How many lines have left the front of `debug_console`, to the cap or
+    /// to a new run's clear, so a stream's open line keeps its place by
+    /// counting from the first line the console ever held (#932).
+    debug_console_dropped: usize,
     /// True once the current/just-ended debug session stopped at least once
     /// (breakpoint / step / exception). Drives the "exited without hitting a
     /// breakpoint" end message. Reset when a new session starts.
@@ -6935,6 +6965,7 @@ impl App {
             watch_baseline_pending: false,
             debug_copy_pending: None,
             debug_console: Vec::new(),
+            debug_console_dropped: 0,
             debug_ever_stopped: false,
             zoxide_jump: None,
             zoxide_add_folder: false,
@@ -33168,7 +33199,8 @@ impl App {
         // while in the background.
         let mut events = self.debug_sessions.take_focused_backlog();
         let mut background_ended: Vec<usize> = Vec::new();
-        let mut background_output: Vec<crate::ansi_text::AnsiLine> = Vec::new();
+        // (session index, category, text) of each background output event.
+        let mut background_output: Vec<(usize, String, String)> = Vec::new();
         // By index, not name: a compound can list one configuration twice,
         // so two members can share a name.
         let mut background_stopped: Option<usize> = None;
@@ -33192,15 +33224,7 @@ impl App {
                     DapEvent::Output { category, text }
                         if crate::dap::session::output_is_user_visible(&category) =>
                     {
-                        // Parsed with this member's own stream state, so a
-                        // sibling's colour or cut escape never runs into it.
-                        let prefix = format!("[{}] ", named.name);
-                        background_output.extend(named.console_ansi.feed(&text).into_iter().map(
-                            |mut line| {
-                                line.prefix(&prefix);
-                                line
-                            },
-                        ));
+                        background_output.push((index, category, text));
                     }
                     DapEvent::Output { .. } => {}
                     other => {
@@ -33216,8 +33240,8 @@ impl App {
                 }
             }
         }
-        for line in background_output {
-            self.debug_console_push_line(line);
+        for (index, category, text) in background_output {
+            self.debug_console_push_output(index, &category, &text, true);
         }
         // Highest index first, so removing one does not move the next.
         let mut ended_names = Vec::new();
@@ -33227,6 +33251,11 @@ impl App {
             background_stopped.and_then(|i| index_after_removals(i, &background_ended));
         for index in background_ended.into_iter().rev() {
             if let Some(mut gone) = self.debug_sessions.remove(index) {
+                mirror_open_console_lines(
+                    &mut gone.console,
+                    &self.debug_console,
+                    self.debug_console_dropped,
+                );
                 gone.session.disconnect();
                 ended_names.push(gone.name);
             }
@@ -33276,14 +33305,14 @@ impl App {
         let mut changed = !events.is_empty() || changed_background;
         for ev in events {
             match ev {
-                // Route program output to the debug console (each embedded
-                // newline becomes its own line), but drop debugpy's own
-                // `telemetry` banner (the `ptvsd` / `debugpy` noise).
+                // Route program output to the debug console (a line per
+                // newline, #932), but drop debugpy's own `telemetry` banner
+                // (the `ptvsd` / `debugpy` noise).
                 DapEvent::Output { category, text }
                     if crate::dap::session::output_is_user_visible(&category) =>
                 {
                     let focused = self.debug_sessions.focused_index();
-                    self.debug_console_push_output(&text, focused);
+                    self.debug_console_push_output(focused, &category, &text, false);
                 }
                 // REPL submissions echo "❯ expr" then the result; watch/hover
                 // results are consumed elsewhere.
@@ -33294,7 +33323,11 @@ impl App {
                     ..
                 } if context == "repl" => {
                     self.debug_console_push(format!("❯ {expression}"));
-                    self.debug_console_push(result);
+                    // A console line each (#932): a traceback is many lines,
+                    // and as one entry only its first was ever visible.
+                    for line in result.lines() {
+                        self.debug_console_push(line.to_string());
+                    }
                 }
                 DapEvent::Evaluated {
                     context,
@@ -33445,6 +33478,11 @@ impl App {
                     .focused()
                     .and_then(|s| s.launch_error.clone());
                 if let Some(mut gone) = self.debug_sessions.remove(ended) {
+                    mirror_open_console_lines(
+                        &mut gone.console,
+                        &self.debug_console,
+                        self.debug_console_dropped,
+                    );
                     gone.session.disconnect();
                 }
                 // `stopAll: true` (#567): the siblings go too, and the rest
@@ -33748,37 +33786,105 @@ impl App {
     }
 
     /// Append an output event of the session at `index` to the debug
-    /// console, one line per embedded newline, with its colour sequences
-    /// turned into spans and every other escape dropped (#1501). The parse
-    /// uses that session's own stream state: a sequence the event ends in the
-    /// middle of waits for that session's next event rather than leaking its
-    /// tail as text, and a colour it leaves on carries only into its own
-    /// lines, never a sibling's.
-    fn debug_console_push_output(&mut self, text: &str, index: usize) {
-        let lines = match self
+    /// console, with its colour sequences turned into spans and every other
+    /// escape dropped (#1501). The event is a chunk of that session's
+    /// `category` stream, not a line (#932), and is parsed with the stream's
+    /// own state: a sequence the event ends in the middle of waits for the
+    /// next event, a colour it leaves on carries only into its own lines, and
+    /// a line ends at its newline, blank ones included. The line a chunk
+    /// leaves open is shown as it reads so far and redrawn in place as later
+    /// chunks extend it, so `print: i =` and ` 0` read as one line and a
+    /// progress bar's `\r` redraws it rather than piling up copies. `tagged`
+    /// puts the session's name in front of each line, for a background member.
+    fn debug_console_push_output(
+        &mut self,
+        index: usize,
+        category: &str,
+        text: &str,
+        tagged: bool,
+    ) {
+        let Some((_, named)) = self
+            .debug_sessions
+            .iter_named_mut_indexed()
+            .find(|(i, _)| *i == index)
+        else {
+            let mut alone = crate::ansi_text::AnsiStream::default();
+            let mut lines = alone.feed(text);
+            lines.extend(alone.finish());
+            for line in lines {
+                self.debug_console_push_line(line);
+            }
+            return;
+        };
+        let prefix = tagged.then(|| format!("[{}] ", named.name));
+        let stream = named.console_stream(category);
+        let ended = stream.ansi.feed(text);
+        let open = stream.ansi.open_line().cloned();
+        let mut slot = stream
+            .shown_at
+            .take()
+            .and_then(|at| at.checked_sub(self.debug_console_dropped))
+            .filter(|&i| i < self.debug_console.len());
+        let tag = |mut line: crate::ansi_text::AnsiLine| {
+            if let Some(prefix) = &prefix {
+                line.prefix(prefix);
+            }
+            line
+        };
+        // The first line the chunk ends is the one shown open, if any:
+        // finish it where it stands.
+        for line in ended.into_iter().map(tag) {
+            match slot.take() {
+                Some(i) => {
+                    crate::output::push(
+                        crate::output::CHANNEL_DEBUG_CONSOLE,
+                        crate::output::OutputLevel::Info,
+                        &line.text,
+                    );
+                    self.debug_console[i] = line;
+                }
+                None => self.debug_console_push_line(line),
+            }
+        }
+        let shown_at = open.map(tag).map(|line| match slot {
+            Some(i) => {
+                self.debug_console[i] = line;
+                self.debug_console_dropped + i
+            }
+            None => {
+                self.debug_console_append(line);
+                self.debug_console_dropped + self.debug_console.len() - 1
+            }
+        });
+        if let Some((_, named)) = self
             .debug_sessions
             .iter_named_mut_indexed()
             .find(|(i, _)| *i == index)
         {
-            Some((_, named)) => named.console_ansi.feed(text),
-            None => crate::ansi_text::AnsiStream::default().feed(text),
-        };
-        for line in lines {
-            self.debug_console_push_line(line);
+            named.console_stream(category).shown_at = shown_at;
         }
     }
 
+    /// Append a finished line to the debug console and mirror it to
+    /// OUTPUT's "Debug Console" channel.
     fn debug_console_push_line(&mut self, line: crate::ansi_text::AnsiLine) {
-        const CAP: usize = 1000;
         crate::output::push(
             crate::output::CHANNEL_DEBUG_CONSOLE,
             crate::output::OutputLevel::Info,
             &line.text,
         );
+        self.debug_console_append(line);
+    }
+
+    /// Append a line to the debug console without mirroring it, capping the
+    /// backlog and counting the lines the cap drops off its front.
+    fn debug_console_append(&mut self, line: crate::ansi_text::AnsiLine) {
+        const CAP: usize = 1000;
         self.debug_console.push(line);
         if self.debug_console.len() > CAP {
             let overflow = self.debug_console.len() - CAP;
             self.debug_console.drain(..overflow);
+            self.debug_console_dropped += overflow;
         }
     }
 
@@ -34031,6 +34137,7 @@ impl App {
         // A fresh session: drop the previous run's retained console + stop
         // tracking so the "exited without hitting a breakpoint" hint and the
         // console reflect only this run.
+        self.debug_console_dropped += self.debug_console.len();
         self.debug_console.clear();
         self.debug_ever_stopped = false;
         self.run_debug.session_ended = false;
@@ -36493,7 +36600,7 @@ impl App {
                 DapEvent::Output { category, text }
                     if crate::dap::session::output_is_user_visible(&category) =>
                 {
-                    self.debug_console_push_output(&text, old);
+                    self.debug_console_push_output(old, &category, &text, false);
                 }
                 DapEvent::Output { .. } => {}
                 other => keep.push(other),
@@ -36744,8 +36851,13 @@ impl App {
         // several; disconnecting only the one the user happens to be looking
         // at would leave its siblings running with nothing on screen owning
         // them, which is the orphaning the issue names.
-        for session in self.debug_sessions.iter_mut() {
-            session.disconnect();
+        for (_, named) in self.debug_sessions.iter_named_mut_indexed() {
+            mirror_open_console_lines(
+                &mut named.console,
+                &self.debug_console,
+                self.debug_console_dropped,
+            );
+            named.session.disconnect();
         }
         self.debug_sessions.clear();
         // A `cargo` build still running for a launch (#1392) must not start

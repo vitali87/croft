@@ -956,9 +956,40 @@ pub struct NamedSession<S = DapSession> {
     /// dropping a background member's `stopped` left a breakpoint hit that
     /// nothing showed, so the member looked hung. Replayed in order on focus.
     pub backlog: Vec<DapEvent>,
-    /// This session's Debug Console parser state (#1501), its own so a
-    /// sibling's colour or cut escape never runs into its output.
-    pub console_ansi: crate::ansi_text::AnsiStream,
+    /// This session's Debug Console streams, one per output category: its
+    /// own (#1501), so a sibling's colour or cut escape never runs into its
+    /// output, and one per category (#932), so a `stderr` line or a progress
+    /// bar never lands in the middle of a `stdout` line still being printed.
+    pub console: Vec<ConsoleStream>,
+}
+
+impl<S> NamedSession<S> {
+    /// The console stream for output `category`, started on its first use.
+    pub fn console_stream(&mut self, category: &str) -> &mut ConsoleStream {
+        let at = match self.console.iter().position(|c| c.category == category) {
+            Some(at) => at,
+            None => {
+                self.console.push(ConsoleStream {
+                    category: category.to_string(),
+                    ..ConsoleStream::default()
+                });
+                self.console.len() - 1
+            }
+        };
+        &mut self.console[at]
+    }
+}
+
+/// One output category of a session, as the Debug Console reads it (#932).
+#[derive(Default)]
+pub struct ConsoleStream {
+    pub category: String,
+    pub ansi: crate::ansi_text::AnsiStream,
+    /// Where the stream's open line is shown in the Debug Console, counted
+    /// from the first line the console ever held so that lines dropped off
+    /// its front do not move it. The line is redrawn there as later chunks
+    /// add to it, and `None` means none is shown.
+    pub shown_at: Option<usize>,
 }
 
 /// The debug sessions in flight, one of them FOCUSED (#310).
@@ -1030,7 +1061,7 @@ impl<S> DebugSessions<S> {
             name: name.into(),
             session,
             backlog: Vec::new(),
-            console_ansi: crate::ansi_text::AnsiStream::default(),
+            console: Vec::new(),
         });
         self.focused = 0;
     }
@@ -1046,7 +1077,7 @@ impl<S> DebugSessions<S> {
             name: name.into(),
             session,
             backlog: Vec::new(),
-            console_ansi: crate::ansi_text::AnsiStream::default(),
+            console: Vec::new(),
         });
         self.focused = self.sessions.len() - 1;
     }
