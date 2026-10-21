@@ -1,0 +1,1 @@
+fix: croft no longer trusts the eMudhra root certificate whose intermediate CAs had their private keys leaked. Someone on your network could have used those keys to read the API key sent for inline completion or pair, or to swap a language server or debugger croft downloads.
