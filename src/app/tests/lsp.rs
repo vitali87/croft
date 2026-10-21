@@ -987,6 +987,38 @@ fn ctrl_space_in_a_file_no_server_takes_offers_the_words_already_in_it() {
     assert_eq!(app.editor.lines, ["configuration loader", "configuration"]);
 }
 
+/// #916: Trigger Suggest has a command id, so a chord bound to it (what
+/// `import-vscode` writes for `editor.action.triggerSuggest`) opens the
+/// popup Ctrl+Space does.
+#[test]
+fn a_chord_bound_to_trigger_suggest_opens_the_completion_popup() {
+    let (_tmp, mut app) = word_completion_app(&[("notes.txt", "configuration loader\nconfigu")]);
+    app.keymap =
+        crate::keymap::Keymap::from_json(r#"[{"key": "alt+/", "command": "trigger_suggest"}]"#);
+    app.handle_key(key(KeyCode::Char('/'), KeyModifiers::ALT))
+        .unwrap();
+    assert_eq!(popup_labels(&app), ["configuration"]);
+}
+
+/// #916: Trigger Parameter Hints has a command id, so a chord bound to it
+/// asks for the hints at the caret, as typing `(` does.
+#[test]
+fn a_chord_bound_to_trigger_parameter_hints_asks_at_the_caret() {
+    let (_tmp, mut app) = word_completion_app(&[("notes.txt", "call(")]);
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{"key": "alt+,", "command": "trigger_parameter_hints"}]"#,
+    );
+    assert!(app.signature_help_request_id.is_none());
+    app.handle_key(key(KeyCode::Char(','), KeyModifiers::ALT))
+        .unwrap();
+    assert!(app.signature_help_request_id.is_some());
+    assert_eq!(
+        app.signature_help_anchor,
+        Some((0, 5, app.editor.edit_seq)),
+        "anchored at the caret, with nothing typed"
+    );
+}
+
 #[test]
 fn a_makefile_variable_completes_from_its_definition() {
     let (_tmp, mut app) = word_completion_app(&[(
@@ -1956,6 +1988,30 @@ fn a_rebound_go_to_definition_on_a_non_text_view_says_so_and_sends_nothing() {
     app.handle_key(chord('r')).unwrap();
     assert!(app.prepare_rename_request.is_none());
     assert_eq!(app.status, "Rename Symbol needs a text file");
+}
+
+/// #916: Copy Line Up/Down and Move Line Up/Down from the palette (or an
+/// imported binding) on a read-only preview say so, rather than editing the
+/// preview's placeholder lines and leaving the tab dirty.
+#[test]
+fn line_commands_on_a_non_text_view_say_so_and_leave_the_tab_clean() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let bin = tmp.path().join("a.bin");
+    std::fs::write(&bin, [0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+    app.editor.hex = Some(crate::hex::HexView::open(&bin).unwrap());
+    assert!(app.editor.has_non_text_view(), "precondition");
+    for cmd in [
+        Command::CopyLineDown,
+        Command::CopyLineUp,
+        Command::MoveLineDown,
+        Command::MoveLineUp,
+    ] {
+        app.run_command(cmd);
+        assert_eq!(app.status, format!("{} needs a text file", cmd.title()));
+        assert!(!app.editor.dirty, "{cmd:?} left the preview dirty");
+    }
 }
 
 #[test]

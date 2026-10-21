@@ -303,7 +303,7 @@ Variables expand as in VS Code: `$TM_FILENAME`, `$TM_FILENAME_BASE`, `$TM_DIRECT
 | `Tab` | Indent: a multi-line selection indents every touched line one level; otherwise inserts to the next tab stop. The stop width and tabs-vs-spaces are detected from the file's own content on open (VS Code's `editor.detectIndentation`), falling back to the language default (4, or 2 in YAML); the status bar's indent pill shows the result and clicking it overrides both |
 | `Shift`+`Tab` | Outdent one level, tab-stop aligned, for the current line or every line a selection touches |
 | `Alt`+`↑` / `Alt`+`↓` | Move the current line (or selected block) up / down, carrying the cursor and selection |
-| `Shift`+`Alt`+`↑` / `↓` | Copy the current line (or selected block) up / down |
+| `Shift`+`Alt`+`↑` / `↓` | Copy the current line (or selected block) up / down; also Copy Line Up / Down in the Command Palette (ids `copy_line_up` / `copy_line_down`, to rebind in `keybindings.json`) |
 | `Cmd`/`Ctrl`+`Opt`+`↑` / `↓` | Add a cursor above / below the current one (multi-cursor) |
 | `Cmd`/`Ctrl`+`Shift`+`Opt`+arrows / `PageUp` / `PageDown` | Column (box) selection from the keyboard, like `Shift`+`Opt`+drag: grow the box one row, one column or one screen, with one selection per row, so typing edits the same columns of every line. The box starts at the caret and keeps growing while the carets are the ones it made |
 | View: Toggle Column Selection Mode (palette) | While on, plain `Shift`+arrows and `Shift`+`PageUp` / `PageDown` grow a column selection; the status bar shows "Column Selection" beside Ln/Col |
