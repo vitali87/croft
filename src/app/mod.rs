@@ -5915,7 +5915,7 @@ struct SarifDownload {
 /// GET `url`'s body, up to 64 MiB, for a SARIF location's source.
 fn fetch_sarif_source(url: &str) -> Result<Vec<u8>, String> {
     use std::io::Read;
-    let resp = ureq::AgentBuilder::new()
+    let resp = crate::net::builder(url)
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .get(url)
@@ -30620,7 +30620,7 @@ impl App {
                     let _ = std::fs::remove_dir_all(&repo_dir);
                     std::fs::create_dir_all(&repo_dir)
                         .map_err(|e| format!("{}: {e}", repo_dir.display()))?;
-                    let resp = ureq::AgentBuilder::new()
+                    let resp = crate::net::builder(&url)
                         .timeout(std::time::Duration::from_secs(300))
                         .build()
                         .get(&url)
@@ -32886,7 +32886,7 @@ impl App {
         if !url.starts_with("https://") {
             return Err(String::from("A database URL must be https://"));
         }
-        let resp = ureq::get(url)
+        let resp = crate::net::get(url)
             .timeout(std::time::Duration::from_secs(300))
             .call()
             .map_err(|e| format!("Download failed: {e}"))?;

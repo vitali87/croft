@@ -183,6 +183,13 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 # The rest of the tree stays on ureq 2 until those call sites migrate.
 # 3.3.0 verified current on crates.io 2026-07-31.
 ureq3 = { package = "ureq", version = "3", default-features = false, features = ["rustls"] }
+# The trust store every download uses (src/net.rs, #872): the OS's CA store
+# (where a TLS-inspecting proxy's CA lives) on top of the Mozilla roots ureq
+# compiles in, which stay as the fallback. webpki-roots is already in the tree
+# via ureq; rustls-native-certs reads the platform store (files on Linux and
+# Android, the keychain on macOS) and honours SSL_CERT_FILE / SSL_CERT_DIR.
+rustls-native-certs = "0.8"
+webpki-roots = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 # Text CRDT for multiplayer Phase D (independent viewports): tracks concurrent
