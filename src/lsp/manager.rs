@@ -55,8 +55,15 @@ pub struct CompletionItem {
     /// The item's documentation, Markdown or plain text as the server sent
     /// it, for the popup's details pane (#1527).
     pub documentation: Option<String>,
+    /// The item as the server listed it, `data` and all, when the server
+    /// resolves items lazily and the list left its imports out (#928):
+    /// vtsls sends an auto-import only from `completionItem/resolve`, which
+    /// the accept sends this back for.
+    pub resolve: Option<Arc<lsp_types::CompletionItem>>,
 }
 
+/// A completion reply. A `completionItem/resolve` reply is one too, its
+/// single item the resolved one (#928).
 #[derive(Debug)]
 pub struct CompletionResult {
     pub request_id: u64,
@@ -908,6 +915,11 @@ enum Cmd {
         /// Re-asking because the last list was incomplete (#1529).
         incomplete: bool,
     },
+    ResolveCompletion {
+        request_id: u64,
+        path: PathBuf,
+        item: Arc<lsp_types::CompletionItem>,
+    },
     RequestSignatureHelp {
         request_id: u64,
         path: PathBuf,
@@ -1458,6 +1470,21 @@ impl LspManager {
         self.next_request_id += 1;
         let _ = self.cmd_tx.send(make(id));
         id
+    }
+
+    /// Ask the completion server for the rest of an item it listed (#928).
+    /// The reply comes through [`Self::drain_completion`] with this id, its
+    /// one item the resolved one, or none when the server failed.
+    pub fn request_completion_resolve(
+        &mut self,
+        path: PathBuf,
+        item: Arc<lsp_types::CompletionItem>,
+    ) -> u64 {
+        self.send_request(|request_id| Cmd::ResolveCompletion {
+            request_id,
+            path,
+            item,
+        })
     }
 
     pub fn drain_completion(&self) -> Option<CompletionResult> {
@@ -2660,6 +2687,15 @@ async fn worker_loop(
                     )
                     .await
             }
+            Cmd::ResolveCompletion {
+                request_id,
+                path,
+                item,
+            } => {
+                state
+                    .resolve_completion(request_id, path, item, &tx.completion)
+                    .await
+            }
             Cmd::RequestSignatureHelp {
                 request_id,
                 path,
@@ -3753,16 +3789,22 @@ impl WorkerState {
             path.display()
         ));
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await.requests();
+            let (mut client, resolves) = {
+                let client = client_arc.lock().await;
+                let options = client.capabilities().completion_provider.as_ref();
+                let resolves = options.and_then(|o| o.resolve_provider) == Some(true);
+                (client.requests(), resolves)
+            };
             let resp = client.completion(uri, line, character, incomplete).await;
             drop(client);
+            let convert = |item| listed_item(item, resolves);
             let (is_incomplete, items): (Option<bool>, Vec<CompletionItem>) = match resp {
                 Ok(Some(CompletionResponse::Array(items))) => {
-                    (None, items.into_iter().map(into_item).collect())
+                    (None, items.into_iter().map(convert).collect())
                 }
                 Ok(Some(CompletionResponse::List(list))) => (
                     Some(list.is_incomplete),
-                    list.items.into_iter().map(into_item).collect(),
+                    list.items.into_iter().map(convert).collect(),
                 ),
                 Ok(None) => (None, Vec::new()),
                 Err(e) => {
@@ -3796,6 +3838,42 @@ impl WorkerState {
                 path: path_clone,
                 items,
                 is_incomplete: is_incomplete == Some(true),
+            });
+        });
+    }
+
+    /// Send `completionItem/resolve` to the server `request_completion`
+    /// asks, the one that listed the item (#928), and its answer back as a
+    /// one-item completion reply, with no item when the server failed.
+    async fn resolve_completion(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        item: Arc<lsp_types::CompletionItem>,
+        tx: &std_mpsc::Sender<CompletionResult>,
+    ) {
+        let Ok((server_name, client_arc)) =
+            self.pick_server(&path, |c| c.supports_completion).await
+        else {
+            return;
+        };
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await.requests();
+            let items = match client.completion_resolve((*item).clone()).await {
+                Ok(item) => vec![into_item(item)],
+                Err(e) => {
+                    log_file::log(&format!(
+                        "lsp[{server_name}] completion_resolve error: {e:#}"
+                    ));
+                    Vec::new()
+                }
+            };
+            let _ = tx.send(CompletionResult {
+                request_id,
+                path,
+                items,
+                is_incomplete: false,
             });
         });
     }
@@ -5953,6 +6031,19 @@ fn into_item(item: lsp_types::CompletionItem) -> CompletionItem {
         is_snippet,
         text_edit,
         additional_edits,
+        resolve: None,
+    }
+}
+
+/// [`into_item`] for an item of a list, kept whole for
+/// `completionItem/resolve` when its server `resolves` items and the list
+/// left its imports out (#928).
+fn listed_item(item: lsp_types::CompletionItem, resolves: bool) -> CompletionItem {
+    let imports = item.additional_text_edits.as_ref();
+    let resolve = (resolves && imports.is_none_or(Vec::is_empty)).then(|| Arc::new(item.clone()));
+    CompletionItem {
+        resolve,
+        ..into_item(item)
     }
 }
 
@@ -7347,6 +7438,12 @@ fn build_client_capabilities() -> ClientCapabilities {
                     preselect_support: Some(true),
                     insert_replace_support: Some(false),
                     label_details_support: Some(true),
+                    // Auto-imports may come from resolve (#928). Not docs:
+                    // rust-analyzer would then leave them out of the list,
+                    // which the details pane shows.
+                    resolve_support: Some(lsp_types::CompletionItemCapabilityResolveSupport {
+                        properties: vec![String::from("additionalTextEdits")],
+                    }),
                     ..Default::default()
                 }),
                 completion_item_kind: Some(CompletionItemKindCapability {
@@ -7931,6 +8028,33 @@ mod tests {
         let ours = into_item(item);
         assert_eq!(ours.documentation, None);
         assert_eq!(ours.detail, None);
+    }
+
+    /// #928: an item from a server that resolves lazily is kept whole,
+    /// `data` and all, to send back on accept, and croft lets servers defer
+    /// imports to that resolve. An item that already carries its imports,
+    /// or one from a server that does not resolve, needs no round trip.
+    #[test]
+    fn a_lazily_resolved_completion_item_is_kept_for_resolve() {
+        let lazy = serde_json::json!({ "label": "total", "data": { "entryNames": ["total"] } });
+        let item = serde_json::from_value(lazy.clone()).unwrap();
+        let kept = listed_item(item, true).resolve.expect("kept for resolve");
+        assert_eq!(serde_json::to_value(&*kept).unwrap(), lazy);
+        let item = serde_json::from_value(lazy).unwrap();
+        assert!(into_item(item).resolve.is_none());
+        let at = serde_json::json!({ "line": 1, "character": 0 });
+        let edit = serde_json::json!({ "range": { "start": at, "end": at }, "newText": "x" });
+        let eager = serde_json::json!({ "label": "Session", "additionalTextEdits": [edit] });
+        let eager = serde_json::from_value(eager).unwrap();
+        assert!(listed_item(eager, true).resolve.is_none());
+        let resolvable = build_client_capabilities()
+            .text_document
+            .and_then(|td| td.completion)
+            .and_then(|c| c.completion_item)
+            .and_then(|i| i.resolve_support)
+            .expect("completionItem.resolveSupport is declared")
+            .properties;
+        assert_eq!(resolvable, ["additionalTextEdits"]);
     }
 
     #[test]

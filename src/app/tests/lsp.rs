@@ -1268,8 +1268,6 @@ fn a_completion_applies_its_text_edit_and_additional_edits() {
         ]
     );
     assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 6));
-    // No text edit: the prefix path takes over.
-    assert!(!app.accept_completion_edit(&crate::lsp::CompletionItem::default()));
     // A range past the caret replaces the suffix it covers.
     app.editor.lines = vec![String::from("fooBar")];
     app.editor.cursor_row = 0;
@@ -1315,6 +1313,89 @@ fn a_completion_applies_its_text_edit_and_additional_edits() {
     );
     assert_eq!(app.editor.cursor_row, 1);
     assert!(app.editor.snippet_active(), "tab stops are live");
+}
+
+/// #928: ty sends an auto-import with a bare `insertText` and no
+/// `textEdit`. The accept replaced the typed word and dropped the import,
+/// leaving the name undefined; it goes in with the item, in one undo step.
+#[test]
+fn a_completion_without_a_text_edit_still_adds_its_auto_import() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.lines = vec![String::from("import os"), String::from("s = Sessi")];
+    (app.editor.cursor_row, app.editor.cursor_col) = (1, 9);
+    let item = crate::lsp::CompletionItem {
+        label: String::from("Session"),
+        insert_text: Some(String::from("Session")),
+        additional_edits: vec![crate::widgets::editor::TextSpanEdit {
+            start: (1, 0),
+            end: (1, 0),
+            new_text: String::from("from requests import Session\n"),
+            utf16: true,
+        }],
+        ..Default::default()
+    };
+    assert!(app.accept_completion_edit(&item));
+    let import = "from requests import Session";
+    assert_eq!(app.editor.lines, ["import os", import, "s = Session"]);
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 11));
+    assert!(app.editor.undo());
+    assert_eq!(app.editor.lines, ["import os", "s = Sessi"]);
+}
+
+/// #928: vtsls lists an auto-import item with only `data`; the import comes
+/// from `completionItem/resolve`, which croft never sent, so the name went
+/// in undefined. The accept asks for it and the reply adds it in the same
+/// undo step. Typing on before it lands keeps it, as a step of its own;
+/// undoing the item first drops it.
+#[test]
+fn an_accepted_completion_resolves_its_auto_import() {
+    let import = "from shelf import load";
+    let accept = || {
+        let (tmp, path, mut app, tx) = completion_reply_app();
+        app.trigger_completion();
+        let request_id = app.completion_request_id.unwrap();
+        draw(&mut app, 100, 30);
+        tx.send(completion_reply(request_id, &path, &["load"]))
+            .unwrap();
+        app.drain_lsp_completion();
+        let popup = app.completion_popup.as_mut().expect("the list opens");
+        popup.items[0].resolve = Some(std::sync::Arc::default());
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.editor.lines, ["import load"]);
+        let pending = app.completion_resolve.as_ref().expect("a resolve went out");
+        let mut reply = completion_reply(pending.request_id, &path, &["load"]);
+        reply.items[0].additional_edits = vec![crate::widgets::editor::TextSpanEdit {
+            start: (0, 0),
+            end: (0, 0),
+            new_text: format!("{import}\n"),
+            utf16: true,
+        }];
+        (tmp, app, tx, reply)
+    };
+    let (_tmp, mut app, tx, reply) = accept();
+    tx.send(reply).unwrap();
+    assert!(app.drain_lsp_completion());
+    assert_eq!(app.editor.lines, [import, "import load"]);
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 11));
+    assert!(app.editor.undo());
+    assert_eq!(app.editor.lines, ["import lo"]);
+
+    let (_tmp, mut app, tx, reply) = accept();
+    app.handle_key(key(KeyCode::Char(';'), KeyModifiers::NONE))
+        .unwrap();
+    tx.send(reply).unwrap();
+    assert!(app.drain_lsp_completion());
+    assert_eq!(app.editor.lines, [import, "import load;"]);
+    assert!(app.editor.undo());
+    assert_eq!(app.editor.lines, ["import load;"]);
+
+    let (_tmp, mut app, tx, reply) = accept();
+    assert!(app.editor.undo());
+    tx.send(reply).unwrap();
+    assert!(!app.drain_lsp_completion());
+    assert_eq!(app.editor.lines, ["import lo"]);
 }
 
 /// #1639: a rust-analyzer "Run Test" code lens is a task too, and saves

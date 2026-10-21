@@ -812,6 +812,19 @@ impl LspRequests {
             .context("completion")
     }
 
+    /// `completionItem/resolve`: the rest of an item the server listed
+    /// lazily (#928). vtsls sends an auto-import's `additionalTextEdits`
+    /// only here.
+    pub async fn completion_resolve(
+        &mut self,
+        item: lsp_types::CompletionItem,
+    ) -> Result<lsp_types::CompletionItem> {
+        self.server
+            .completion_item_resolve(item)
+            .await
+            .context("completion_resolve")
+    }
+
     pub async fn signature_help(
         &mut self,
         uri: Url,

@@ -4577,6 +4577,9 @@ pub struct App {
     /// Ids for completions answered here rather than by a server (#1566),
     /// counting down from the top so they never meet the manager's.
     local_completion_seq: u64,
+    /// The last accepted completion, while its server resolves the
+    /// auto-import it left out of the list (#928).
+    completion_resolve: Option<PendingCompletionResolve>,
     /// `word_based_suggestions`: which open documents word completion
     /// draws on (#1566).
     pub word_suggestions: crate::word_suggest::WordSuggestions,
@@ -6042,6 +6045,31 @@ struct LspQuestion {
     reply: tokio::sync::oneshot::Sender<Option<lsp_types::MessageActionItem>>,
 }
 
+/// An accepted completion waiting on the auto-import its server sends only
+/// from `completionItem/resolve` (#928).
+struct PendingCompletionResolve {
+    request_id: u64,
+    path: PathBuf,
+    /// Where the accepted text begins; the import must end before it.
+    start: (usize, usize),
+    /// The caret after the accept, and a hash of the text before it.
+    upto: (usize, usize),
+    text_hash: u64,
+    undo_group: u64,
+}
+
+/// A hash of the text before `(row, col)`, `None` past the buffer's end:
+/// what a completion's resolved import checks is unchanged (#928).
+fn text_hash_before(lines: &[String], (row, col): (usize, usize)) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let line = lines.get(row)?;
+    let byte = line.char_indices().nth(col).map_or(line.len(), |(b, _)| b);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    lines[..row].hash(&mut hasher);
+    line[..byte].hash(&mut hasher);
+    Some(hasher.finish())
+}
+
 /// A server's message as one status line, `server: first line`, so a
 /// multi-line cargo error does not spill over the bar.
 fn server_message_status(server: &str, text: &str) -> String {
@@ -6997,6 +7025,7 @@ impl App {
             completion_reask_due: false,
             completion_words: false,
             local_completion_seq: u64::MAX,
+            completion_resolve: None,
             word_suggestions: crate::word_suggest::WordSuggestions::from_pref(
                 &loaded_prefs.word_based_suggestions,
             ),
@@ -9927,6 +9956,13 @@ impl App {
     /// because the reply channel's sender lives inside the LSP worker. Returns
     /// true when the popup state changed.
     fn apply_completion_result(&mut self, result: crate::lsp::manager::CompletionResult) -> bool {
+        if self
+            .completion_resolve
+            .as_ref()
+            .is_some_and(|p| p.request_id == result.request_id)
+        {
+            return self.apply_resolved_completion(result);
+        }
         if Some(result.request_id) != self.completion_request_id {
             return false;
         }
@@ -10015,6 +10051,45 @@ impl App {
                 .take(caret - col)
                 .all(is_word_continuation)
         })
+    }
+
+    /// Add the auto-import a `completionItem/resolve` reply carries (#928),
+    /// in the accept's undo step while nothing else has edited the buffer.
+    /// Typing on after the item keeps it. An undo, an edit before the item,
+    /// or an import placed at or after it, where the server's positions may
+    /// no longer hold, drops it rather than put it in the wrong place.
+    fn apply_resolved_completion(&mut self, result: crate::lsp::manager::CompletionResult) -> bool {
+        let Some(pending) = self.completion_resolve.take() else {
+            return false;
+        };
+        let Some(item) = result.items.into_iter().next() else {
+            return false;
+        };
+        if self.editor.path.as_ref() != Some(&pending.path)
+            || self.editor.has_non_text_view()
+            || text_hash_before(&self.editor.lines, pending.upto) != Some(pending.text_hash)
+        {
+            return false;
+        }
+        let (row, start) = pending.start;
+        let Some(line) = self.editor.lines.get(row) else {
+            return false;
+        };
+        let before_item = |e: &crate::widgets::editor::TextSpanEdit| {
+            let col = |c| crate::widgets::editor::utf16_to_char_col(line, c as u32);
+            let end = if e.utf16 { col(e.end.1) } else { e.end.1 };
+            e.end.0 < row || (e.end.0 == row && end <= start)
+        };
+        let edits = item.additional_edits;
+        if edits.is_empty() || !edits.iter().all(before_item) {
+            return false;
+        }
+        self.editor.apply_span_edits_as_in(
+            &edits,
+            crate::provenance::Seat::Generated,
+            Some(pending.undo_group),
+        );
+        true
     }
 
     /// Tab in the editor: advance a live snippet, else expand a user snippet
@@ -16518,11 +16593,16 @@ impl App {
     /// range is cleared by the same edit and its body then expanded at the
     /// caret, tab stops and all: expanded over the typed prefix alone, a
     /// range reaching further left the rest in the buffer, and the imports
-    /// never came. False when the item has no usable edit, for the prefix
-    /// fallback.
+    /// never came. An item without an edit replaces the typed word, imports
+    /// and all, and one whose imports come on resolve asks for them (#928).
+    /// False when the item has no usable edit, for the prefix fallback.
     fn accept_completion_edit(&mut self, item: &crate::lsp::CompletionItem) -> bool {
         use crate::widgets::editor::TextSpanEdit;
-        let Some(te) = &item.text_edit else {
+        let Some(te) = item
+            .text_edit
+            .clone()
+            .or_else(|| self.typed_word_edit(item))
+        else {
             return false;
         };
         let row = self.editor.cursor_row;
@@ -16564,8 +16644,8 @@ impl App {
             }
         };
         let line_len = line.chars().count();
-        let start = to_char(te, te.start.1);
-        let end = moved(to_char(te, te.end.1)).max(caret).min(line_len);
+        let start = to_char(&te, te.start.1);
+        let end = moved(to_char(&te, te.end.1)).max(caret).min(line_len);
         if start > caret {
             return false;
         }
@@ -16611,16 +16691,64 @@ impl App {
                 };
             }
         }
-        // An accepted completion is the server's text, not the user's (#349).
+        // An accepted completion is the server's text, not the user's (#349),
+        // and an import its server resolves later joins its undo step.
+        let group = item.resolve.is_some().then(next_remote_undo_group);
         self.editor
-            .apply_span_edits_as(&edits, crate::provenance::Seat::Generated);
+            .apply_span_edits_as_in(&edits, crate::provenance::Seat::Generated, group);
         self.editor.cursor_row = caret_row.max(0) as usize;
         self.editor.cursor_col = caret_col.max(0) as usize;
         self.editor.clamp_cursor();
         if item.is_snippet {
             self.editor.expand_snippet(&te.new_text, 0);
         }
+        if let (Some(group), Some(listed)) = (group, item.resolve.clone()) {
+            self.request_completion_imports(listed, (row, start), group);
+        }
         true
+    }
+
+    /// The edit an item without a `textEdit` makes (ty's auto-imports, #928):
+    /// its text over the word typed before the caret, the end at the request
+    /// point as a server's range is. `None` for a snippet, which the prefix
+    /// path expands.
+    fn typed_word_edit(
+        &self,
+        item: &crate::lsp::CompletionItem,
+    ) -> Option<crate::widgets::editor::TextSpanEdit> {
+        let (row, caret) = (self.editor.cursor_row, self.editor.cursor_col);
+        let word = self.editor.word_before_cursor().chars().count();
+        let origin = self.completion_origin.filter(|&(r, _)| r == row);
+        let text = item.insert_text.as_ref().unwrap_or(&item.label);
+        (!item.is_snippet).then(|| crate::widgets::editor::TextSpanEdit {
+            start: (row, caret.saturating_sub(word)),
+            end: (row, origin.map_or(caret, |(_, c)| c)),
+            new_text: text.clone(),
+            utf16: false,
+        })
+    }
+
+    /// Ask the accepted item's server for the auto-import it left out of
+    /// the list (#928); [`Self::apply_resolved_completion`] adds it.
+    fn request_completion_imports(
+        &mut self,
+        item: std::sync::Arc<lsp_types::CompletionItem>,
+        start: (usize, usize),
+        undo_group: u64,
+    ) -> Option<()> {
+        let path = self.editor.path.clone()?;
+        let upto = (self.editor.cursor_row, self.editor.cursor_col);
+        let text_hash = text_hash_before(&self.editor.lines, upto)?;
+        let request_id = (self.lsp.as_mut()?).request_completion_resolve(path.clone(), item);
+        self.completion_resolve = Some(PendingCompletionResolve {
+            request_id,
+            path,
+            start,
+            upto,
+            text_hash,
+            undo_group,
+        });
+        Some(())
     }
 
     /// Route the key through the completion popup when one is open.

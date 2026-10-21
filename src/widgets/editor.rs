@@ -8366,11 +8366,23 @@ impl Editor {
         edits: &[TextSpanEdit],
         seat: crate::provenance::Seat,
     ) -> usize {
+        self.apply_span_edits_as_in(edits, seat, None)
+    }
+
+    /// [`Self::apply_span_edits_as`] in the undo step `group`, joined as by
+    /// [`Self::apply_remote_span_edits`]: a completion and the auto-import
+    /// its server resolves after it went in undo as one (#928).
+    pub fn apply_span_edits_as_in(
+        &mut self,
+        edits: &[TextSpanEdit],
+        seat: crate::provenance::Seat,
+        group: Option<u64>,
+    ) -> usize {
         if edits.is_empty() {
             return 0;
         }
         self.pin_on_edit();
-        self.push_undo(EditKind::Paste);
+        self.push_undo_step(EditKind::Paste, group);
         let edits = char_span_edits(&self.lines, edits);
         let applied = apply_char_span_edits(&mut self.lines, edits);
         let n = applied.iter().map(|(_, count)| count).sum();
