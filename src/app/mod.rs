@@ -56725,7 +56725,17 @@ impl App {
         // fallback can rank against it without re-spawning zoxide on every
         // missed keystroke.
         jump.set_all_dirs(jump.results.clone());
-        let status = if jump.available {
+        if jump.available {
+            jump.hook_offer = crate::zoxide::shell_hook_missing();
+        }
+        let status = if let Some(rc) = jump
+            .hook_offer
+            .as_deref()
+            .filter(|_| jump.hook_offer_shown())
+        {
+            let offer = crate::widgets::zoxide_jump::hook_offer_message(rc);
+            format!("Jump: {}", offer.lines().next().unwrap_or_default())
+        } else if jump.available {
             format!(
                 "Jump: {} directories — type to filter, Esc to close",
                 jump.results.len()
@@ -56817,15 +56827,20 @@ impl App {
                 jump.delete_char();
                 self.refresh_zoxide_results();
             }
-            // zoxide is missing: the popup is asking "Install it? [y/N]".
+            // The popup is asking "Install it? [y/N]" (zoxide is missing) or
+            // "Add its `j` hook there? [y/N]" (installed, but nothing feeds it).
             (KeyCode::Char('y' | 'Y'), m)
-                if !jump.available
+                if jump.asks_yes_no()
                     && !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
             {
-                self.start_zoxide_install();
+                if jump.available {
+                    self.add_zoxide_hook();
+                } else {
+                    self.start_zoxide_install();
+                }
             }
             (KeyCode::Char('n' | 'N'), m)
-                if !jump.available
+                if jump.asks_yes_no()
                     && !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
             {
                 self.close_zoxide_jump();
@@ -56851,6 +56866,21 @@ impl App {
         crate::zoxide::install_in_background();
         jump.install_state = InstallState::Running;
         self.status = zoxide_jump_status(jump);
+    }
+
+    /// The user's `y` to the popup's hook offer (#926): zoxide is installed
+    /// but no `zoxide init` line feeds its database, so the managed block
+    /// goes into the rc the offer named. Launching croft no longer does it.
+    fn add_zoxide_hook(&mut self) {
+        let Some(rc) = self.zoxide_jump.as_mut().and_then(|j| j.hook_offer.take()) else {
+            return;
+        };
+        self.status = match crate::zoxide::add_shell_hook() {
+            Some(rc) => {
+                format!("Jump: added zoxide's `j` hook to {rc}; new terminals feed this list")
+            }
+            None => format!("Jump: zoxide's hook was not added to {rc} (see croft's log)"),
+        };
     }
 
     /// Once the install the user asked for ends, bring the open popup up to

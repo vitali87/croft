@@ -26,7 +26,9 @@
 //! has the binary but an empty database that no `cd` ever feeds, the exact
 //! local/remote divergence the GOLDEN RULE forbids. The write is idempotent:
 //! it is skipped whenever the rc already contains a `zoxide init` line (the
-//! user's own, or one croft wrote before).
+//! user's own, or one croft wrote before). Where zoxide was already
+//! installed, by hand or a package manager, the popup offers the hook alone
+//! while its list is empty, and only a `y` writes it.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -332,6 +334,49 @@ pub fn shell_rc_hint() -> Option<String> {
     rc_hint(std::env::var("SHELL").ok().as_deref())
 }
 
+/// The rc file to offer zoxide's shell hook to when zoxide is already
+/// installed but that rc has no `zoxide init` line (#926): the hook no
+/// longer goes in at launch, and without it no terminal `cd` reaches the
+/// jump list. `None` for an unsupported shell, an unknown `$HOME`, or an rc
+/// that has a hook already.
+fn missing_hook_rc(shell_path: Option<&str>, home: Option<&Path>) -> Option<String> {
+    let shell = supported_shell(shell_path?)?;
+    let existing = std::fs::read_to_string(home?.join(rc_file_name(shell))).unwrap_or_default();
+    pending_init_block(shell, &existing)?;
+    rc_hint(shell_path)
+}
+
+/// [`missing_hook_rc`] for this process's `$SHELL` and `$HOME`.
+pub fn shell_hook_missing() -> Option<String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    missing_hook_rc(std::env::var("SHELL").ok().as_deref(), home.as_deref())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Hook additions requested on this thread. Under `cfg(test)`
+    /// [`add_shell_hook`] only counts here: a test must never edit the
+    /// user's rc.
+    static HOOK_REQUESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many hook additions this test thread has asked for.
+#[cfg(test)]
+pub(crate) fn hook_requests() -> usize {
+    HOOK_REQUESTS.with(|n| n.get())
+}
+
+/// Add zoxide's shell hook to the rc, on the user's `y` to the jump popup's
+/// hook offer (#926). Returns the rc file (`~/.bashrc`) when it was written.
+pub fn add_shell_hook() -> Option<String> {
+    #[cfg(test)]
+    HOOK_REQUESTS.with(|n| n.set(n.get() + 1));
+    if cfg!(test) {
+        return None;
+    }
+    ensure_shell_init()
+}
+
 /// The managed block croft appends for `shell`: prepend `~/.local/bin` to
 /// `PATH` (so the binary croft drops there is reachable before the eval),
 /// then install zoxide's `cd` hook and the `j` command. Wrapped in marker
@@ -628,6 +673,33 @@ mod tests {
     fn rc_file_name_targets_the_conventional_rc_per_shell() {
         assert_eq!(rc_file_name("zsh"), ".zshrc");
         assert_eq!(rc_file_name("bash"), ".bashrc");
+    }
+
+    /// #926: zoxide already on the host is offered the hook only for a
+    /// supported shell whose rc has no `zoxide init` line yet.
+    #[test]
+    fn missing_hook_rc_names_an_rc_without_a_zoxide_init_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (home, rc) = (Some(tmp.path()), tmp.path().join(".bashrc"));
+        assert_eq!(
+            missing_hook_rc(Some("/bin/bash"), home).as_deref(),
+            Some("~/.bashrc"),
+            "no rc yet"
+        );
+        std::fs::write(&rc, "alias ll='ls -la'\n").unwrap();
+        assert_eq!(
+            missing_hook_rc(Some("/bin/bash"), home).as_deref(),
+            Some("~/.bashrc")
+        );
+        std::fs::write(&rc, "eval \"$(zoxide init bash)\"\n").unwrap();
+        assert_eq!(
+            missing_hook_rc(Some("/bin/bash"), home),
+            None,
+            "hooked already"
+        );
+        assert_eq!(missing_hook_rc(Some("/usr/bin/fish"), home), None);
+        assert_eq!(missing_hook_rc(None, home), None);
+        assert_eq!(missing_hook_rc(Some("/bin/bash"), None), None);
     }
 
     #[test]

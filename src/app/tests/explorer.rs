@@ -1846,6 +1846,47 @@ fn the_jump_popup_installs_zoxide_only_when_the_user_says_y() {
     );
 }
 
+/// #926: with zoxide installed but no hook in the rc, launching croft no
+/// longer wires one, so the empty popup offers the hook alone: `y` adds it,
+/// installs nothing, and a typed query is a query, not an answer.
+#[test]
+fn the_jump_popup_offers_the_hook_alone_when_zoxide_is_installed() {
+    use crate::zoxide::{hook_requests, install_requests};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let open_with_unhooked_zoxide = |app: &mut App| {
+        app.handle_explorer_shortcut(key(KeyCode::Char('z'), KeyModifiers::SUPER));
+        let jump = app.zoxide_jump.as_mut().expect("Cmd+Z opens the popup");
+        jump.set_results(Some(Vec::new()));
+        jump.hook_offer = Some(String::from("~/.bashrc"));
+    };
+    let (hooks, installs) = (hook_requests(), install_requests());
+
+    open_with_unhooked_zoxide(&mut app);
+    assert!(app.zoxide_jump.as_ref().unwrap().hook_offer_shown());
+    app.handle_zoxide_jump_key(key(KeyCode::Char('n'), KeyModifiers::NONE));
+    assert!(app.zoxide_jump.is_none(), "n declines and closes the popup");
+    assert_eq!(hook_requests(), hooks, "n adds nothing");
+
+    open_with_unhooked_zoxide(&mut app);
+    app.handle_zoxide_jump_key(key(KeyCode::Char('y'), KeyModifiers::NONE));
+    assert_eq!(hook_requests(), hooks + 1, "y adds the hook");
+    assert_eq!(install_requests(), installs, "zoxide is there: no install");
+    let jump = app.zoxide_jump.as_ref().expect("the popup stays open");
+    assert!(jump.hook_offer.is_none(), "offered once");
+    assert!(
+        jump.query.is_empty(),
+        "the answer is not typed into the query"
+    );
+    app.close_zoxide_jump();
+
+    open_with_unhooked_zoxide(&mut app);
+    app.zoxide_jump.as_mut().unwrap().push_char('p');
+    app.handle_zoxide_jump_key(key(KeyCode::Char('y'), KeyModifiers::NONE));
+    assert_eq!(hook_requests(), hooks + 1, "a query's `y` is a letter");
+    assert_eq!(app.zoxide_jump.as_ref().unwrap().query, "py");
+}
+
 /// #1345: the Explorer hides a `files.exclude` folder, and only that:
 /// `search.exclude` leaves the fixtures listed, as in VS Code.
 #[test]

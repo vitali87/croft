@@ -56,6 +56,10 @@ pub struct ZoxideJump {
     /// What the last finished install came to (`crate::zoxide::install_outcome`),
     /// injected with `install_state`; a failure's reason is shown in the popup.
     pub install_note: Option<String>,
+    /// The rc file to offer zoxide's `j` hook to (`~/.bashrc`) when zoxide
+    /// is installed but no hook feeds its database (#926), injected at
+    /// popup open; `None` when there is nothing to offer.
+    pub hook_offer: Option<String>,
 }
 
 impl Default for ZoxideJump {
@@ -75,8 +79,17 @@ impl Default for ZoxideJump {
             termux: false,
             rc_hint: None,
             install_note: None,
+            hook_offer: None,
         }
     }
+}
+
+/// The empty list's text when zoxide is installed but `rc` has no hook
+/// feeding it (#926), one `\n` per line: what is missing, and the offer.
+pub fn hook_offer_message(rc: &str) -> String {
+    format!(
+        "No directories yet: {rc} has no zoxide hook, so no terminal `cd` adds one.\nAdd its `j` hook there? [y/N]\n\ny appends a block marked \"croft zoxide (managed)\"."
+    )
 }
 
 /// The text shown when the zoxide binary cannot be found, one `\n` per line
@@ -130,6 +143,21 @@ impl ZoxideJump {
             .nth(char_idx)
             .map(|(b, _)| b)
             .unwrap_or(self.query.len())
+    }
+
+    /// Whether the popup is asking `[y/N]` rather than taking a query: the
+    /// install offer when zoxide is missing, or the hook offer (#926).
+    pub fn asks_yes_no(&self) -> bool {
+        !self.available || self.hook_offer_shown()
+    }
+
+    /// Whether the list shows the hook offer: zoxide is installed, nothing
+    /// is typed, and its database is empty with no hook to feed it.
+    pub fn hook_offer_shown(&self) -> bool {
+        self.available
+            && self.hook_offer.is_some()
+            && self.query.is_empty()
+            && self.results.is_empty()
     }
 
     /// Replace the result list after the app re-queries zoxide. `None`
@@ -414,6 +442,28 @@ pub fn render_zoxide_jump(
     }
     let end = (jump.scroll + visible).min(total);
 
+    if let Some(rc) = jump
+        .hook_offer
+        .as_deref()
+        .filter(|_| jump.hook_offer_shown())
+    {
+        let style = Style::default().fg(theme.ui(Color::Rgb(0xe5, 0xc0, 0x7b)));
+        let msg: Vec<Line<'static>> = hook_offer_message(rc)
+            .lines()
+            .map(|line| Line::from(Span::styled(line.to_string(), style)))
+            .collect();
+        let text_rect = Rect {
+            x: list_rect.x + 2,
+            width: list_rect.width.saturating_sub(2),
+            ..list_rect
+        };
+        Widget::render(
+            Paragraph::new(msg).wrap(Wrap { trim: false }),
+            text_rect,
+            buf,
+        );
+        return;
+    }
     if total == 0 {
         let empty = if jump.query.trim().is_empty() {
             Line::from(Span::styled(
@@ -561,6 +611,27 @@ mod tests {
         );
         j.termux = true;
         assert!(unavailable_message(&j).contains("y runs: pkg install -y zoxide"));
+    }
+
+    /// #926: an installed zoxide with no hook is offered the hook only over
+    /// an empty list with nothing typed, naming the rc and the block.
+    #[test]
+    fn an_unhooked_zoxide_is_offered_the_hook_over_an_empty_list() {
+        let mut j = ZoxideJump::new();
+        j.set_results(Some(Vec::new()));
+        j.hook_offer = Some(String::from("~/.zshrc"));
+        assert!(j.hook_offer_shown() && j.asks_yes_no());
+        let offer = hook_offer_message("~/.zshrc");
+        assert!(
+            offer.contains("~/.zshrc") && offer.contains("[y/N]"),
+            "{offer}"
+        );
+        assert!(offer.contains("croft zoxide (managed)"), "{offer}");
+        j.push_char('p');
+        assert!(!j.asks_yes_no(), "a typed query is a query");
+        j.query.clear();
+        j.set_results(Some(paths(&["/a"])));
+        assert!(!j.hook_offer_shown(), "a list that has entries is shown");
     }
 
     #[test]
