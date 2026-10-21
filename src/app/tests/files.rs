@@ -867,6 +867,65 @@ fn an_external_write_reloads_a_tab_in_an_inactive_split_group() {
     }
 }
 
+/// #908: what the language servers hear for a directory renamed away, a
+/// file saved by renaming a temporary file over it, and a file moved into
+/// a new place. The watcher reports the directory alone, so the files it
+/// held come from the Quick Open index as it was; and the rename onto a
+/// file the index knew is a change, or a server watching changes only
+/// would never hear of the save.
+#[test]
+fn watched_file_events_cover_a_moved_directory_and_an_atomic_save() {
+    use crate::app::fs_watch::watched_file_changes;
+    use lsp_types::FileChangeType;
+    use notify::Event as NotifyEvent;
+    use notify::event::{EventKind, ModifyKind, RenameMode};
+    use notify_debouncer_full::DebouncedEvent;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("old/sub")).unwrap();
+    for f in ["old/a.rs", "old/sub/b.rs", "old2.rs", "lib.rs"] {
+        std::fs::write(root.join(f), "x").unwrap();
+    }
+    let index = crate::widgets::file_finder::build_file_index(root);
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.fs_watch.set_test_events(rx);
+    std::fs::rename(root.join("old"), root.join("new")).unwrap();
+    std::fs::write(root.join("fresh.rs"), "y").unwrap();
+    let rename = |mode, paths: &[&str]| {
+        let mut ev = NotifyEvent::new(EventKind::Modify(ModifyKind::Name(mode)));
+        for p in paths {
+            ev = ev.add_path(root.join(p));
+        }
+        DebouncedEvent::new(ev, std::time::Instant::now())
+    };
+    tx.send(Ok(vec![
+        rename(RenameMode::Both, &["old", "new"]),
+        rename(RenameMode::To, &["lib.rs"]),
+        rename(RenameMode::To, &["fresh.rs"]),
+    ]))
+    .unwrap();
+    let drain = app.fs_watch.drain(&mut app.tree, &app.editor);
+    let got = watched_file_changes(&drain, &index);
+    let typ = |rel: &str| {
+        let path = root.join(rel);
+        got.iter().find(|(p, _)| *p == path).map(|(_, t)| *t)
+    };
+    assert_eq!(
+        typ("lib.rs"),
+        Some(FileChangeType::CHANGED),
+        "an atomic save"
+    );
+    assert_eq!(typ("fresh.rs"), Some(FileChangeType::CREATED));
+    assert_eq!(typ("old/a.rs"), Some(FileChangeType::DELETED));
+    assert_eq!(typ("old/sub/b.rs"), Some(FileChangeType::DELETED));
+    assert_eq!(
+        typ("old2.rs"),
+        None,
+        "a sibling sharing the prefix is not in it"
+    );
+}
+
 /// Watcher backends on Linux fire `Access(...)` events when croft (or any
 /// other process) reads the open file — the inotify subsystem does not
 /// distinguish a benign read from a real content change. Treating those
