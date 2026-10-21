@@ -69,7 +69,7 @@ src/
 ├── review_ops.rs         the write side of review (#366): reply, resolve, submit a review, as `gh` jobs off the frame loop
 ├── review_threads.rs     GitHub review threads as the editor's comment boxes, behind "Review: Load PR Comments for This File"; distinguishes a thread's current `line` from `original_line`
 ├── scrubber.rs           moving through a branch's history, the cursor behind "Source Control: Scrub History"; the working tree is a `Position::Working` in the cursor, so leaving restores the live buffer exactly
-├── session.rs            local session persistence: `croft attach` / `croft ls` run croft under the session host so terminals/LSP/DAP survive closing the window; legacy dtach sessions keep reattaching, and `ls` skips the collab relay socket
+├── session.rs            local session persistence: `croft attach` / `croft ls` run croft under the session host so terminals/LSP/DAP survive closing the window; legacy dtach sessions keep reattaching, and `ls` lists only session sockets, never the relay, hook or pane-host sockets beside them
 ├── session_host.rs       the multiplayer session mux: a hidden `croft session-host` subcommand owning the inner croft's PTY and broadcasting it verbatim to N unix-socket clients, with write control and a presence roster
 ├── collab.rs             multiplayer Phase D, the collab layer below the app: `CollabDoc` over the `cola` text CRDT, `text_delta_ops` diffing, remote-op integration and `CollabMsg`
 ├── collab_agent.rs       a headless collab guest exposed as an MCP server on stdio (`croft collab-agent --workspace <path>`): joins the relay and serves five `collab_*` tools over JSON-RPC NDJSON so an external AI co-edits with a live named caret; croft itself contains no LLM code
@@ -1105,7 +1105,7 @@ One launch session: the initialize -> setBreakpoints -> configurationDone -> sto
 
 Local session persistence. `croft attach` and `croft ls` run croft under the session host (`session_host.rs`) so terminals, LSP and DAP survive closing the window. Live legacy dtach sessions keep reattaching through dtach.
 
-**`ls` skips the collab relay socket.** The workspace's `<hash>.collab.sock` shares the directory and the keying but is not a session, so listing it printed a phantom row. Pruning it belongs to the relay's own bind path, not here.
+**`ls` lists only session sockets.** The sessions directory also holds the workspace's `<hash>.collab.sock` relay and `<hash>.hook.sock` agent-approval listener, which share the keying, and hosted panes' `pane-<id>.sock`. None is a session, and listing them printed phantom `(unknown)` rows. So `ls` uses an allowlist, `<hash>.mux.sock` and the legacy dtach `<hash>.sock`, rather than a denylist the next socket would slip past. Pruning the others belongs to their own bind paths, not here.
 
 ### svg.rs
 
