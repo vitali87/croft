@@ -40717,24 +40717,20 @@ impl App {
         // land in a real buffer that saves, auto-saves, and reloads through
         // the one code path.
         let events = session.poll(|file| self.owner_buffer_text(&root, file));
-        // One undo step per author per file per tick (#1207): a peer's edit
-        // reaches us as one op per changed run, and undoing them run by run
-        // walked through texts nobody ever wrote.
-        let mut tick_groups: std::collections::HashMap<(String, u64), u64> =
-            std::collections::HashMap::new();
         for event in events {
             changed = true;
             match event {
                 CollabEvent::RemoteEdit { file, site, spans } => {
                     let doc_gen = session.doc_gen(&file).unwrap_or(0);
                     // An AI stream's fragments span many ticks; the whole
-                    // stream is one step, as its cancel already is.
-                    let group = match self.collab_stream.as_ref() {
-                        Some(st) if st.file == file && st.site == site => st.undo_group,
-                        _ => *tick_groups
-                            .entry((file.clone(), site))
-                            .or_insert_with(next_remote_undo_group),
-                    };
+                    // stream is one undo step, as its cancel already is, so
+                    // the driver can still reject it (#1207). Any other
+                    // peer's edit opens none (#919).
+                    let group = self
+                        .collab_stream
+                        .as_ref()
+                        .filter(|st| st.file == file && st.site == site)
+                        .map(|st| st.undo_group);
                     self.apply_collab_spans(&root, &file, &spans, doc_gen, group);
                 }
                 CollabEvent::Bootstrapped { file, text } => {
@@ -41094,8 +41090,9 @@ impl App {
     /// Replay resolved remote spans onto every open buffer for `file`,
     /// converting each byte span to the editor's char coordinates. Spans are
     /// sequential (each relative to the text with earlier ones applied), so
-    /// they go through `apply_remote_span_edits` one at a time, all in
-    /// `undo_group`'s one undo step (#1207). Every ATTACHED pane
+    /// they apply one at a time: an AI stream's all in `undo_group`'s one
+    /// undo step (#1207), a peer's (no group) in no step of their own but
+    /// carried into the undo history (#919). Every ATTACHED pane
     /// gets them (attached panes hold identical text, so the byte offsets
     /// are valid in each); a never-attached pane still holds stale disk
     /// text where the offsets would splice garbage — the attach pass seeds
@@ -41106,7 +41103,7 @@ impl App {
         file: &str,
         spans: &[crate::collab::ResolvedSpan],
         doc_gen: u64,
-        undo_group: u64,
+        undo_group: Option<u64>,
     ) {
         let Some(path) = crate::collab::contained_path(root, file) else {
             return;
@@ -41124,17 +41121,16 @@ impl App {
                 return;
             }
             for s in spans {
-                let (sr, sc) = crate::collab::position(&ed.lines, s.at);
-                let (er, ec) = crate::collab::position(&ed.lines, s.at + s.deleted);
-                ed.apply_remote_span_edits(
-                    &[crate::widgets::editor::TextSpanEdit {
-                        start: (sr, sc),
-                        end: (er, ec),
-                        new_text: s.inserted.clone(),
-                        utf16: false,
-                    }],
-                    undo_group,
-                );
+                let edit = crate::widgets::editor::TextSpanEdit {
+                    start: crate::collab::position(&ed.lines, s.at),
+                    end: crate::collab::position(&ed.lines, s.at + s.deleted),
+                    new_text: s.inserted.clone(),
+                    utf16: false,
+                };
+                match undo_group {
+                    Some(group) => ed.apply_remote_span_edits(&[edit], group),
+                    None => ed.apply_peer_span_edit(&edit),
+                };
             }
             // Echo suppression: apply_span_edits bumped edit_seq, which would
             // re-arm the tick diff and rebroadcast what was just applied.
