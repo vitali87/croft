@@ -664,6 +664,8 @@ Rendered Markdown preview (`Cmd/Ctrl+Shift+V`): a pulldown-cmark event stream tu
 
 **Remote URLs and missing files keep the labelled placeholder** — the preview never fetches.
 
+**Links can be followed (#931).** The build keeps each link's destination with the `(line, span)` of every span drawing it, and each heading's GitHub slug with its source line. `link_at` repaints the visible lines with each link's spans coloured by its index, so the paragraph's own wrap places them and the cell under the pointer names the link. The app follows a click or Ctrl+click on release: `#slug` scrolls through the scroll-sync map, a relative path opens through the file-reference path, `http(s)` goes to the browser, any other scheme is refused.
+
 **Chord forwarding.** `setup-iterm2` forwards the chord (and also relocates iTerm2's "Paste Selection" menu item off `Cmd+Shift+V`), as does `setup-ghostty`.
 
 ### testing.rs

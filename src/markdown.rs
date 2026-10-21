@@ -7,8 +7,11 @@
 //! lines through a wrapping `Paragraph`, so the preview reflows with the pane.
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Widget, Wrap};
 
 use crate::highlight::{
     HiSpan, LangKind, LangRegistry, compute_line_starts, highlight_text, lang_for_fence,
@@ -79,6 +82,8 @@ pub struct MarkdownPreview {
     /// preview opens or a split's source pane scrolls, and resolved once the
     /// wrap width is known.
     pub scroll_to_source: Option<usize>,
+    /// What a click or Ctrl+click can follow (#931).
+    pub links: MdLinks,
 }
 
 impl MarkdownPreview {
@@ -100,6 +105,67 @@ impl MarkdownPreview {
             .partition_point(|&r| r <= top)
             .saturating_sub(1);
         source_line_for_built(&self.source_map, built)
+    }
+
+    /// The link painted at screen `(col, row)` (#931), as an index into
+    /// `links.links`.
+    pub fn link_at(&self, col: u16, row: u16) -> Option<usize> {
+        let area = self.last_area;
+        if self.links.links.is_empty() || !area.contains((col, row).into()) {
+            return None;
+        }
+        // The paragraph wraps line by line, so painting from the built line
+        // at the top of the view lays the rows out exactly as the frame did.
+        let top = usize::from(self.scroll);
+        let first = self
+            .row_of_line
+            .partition_point(|&r| r <= top)
+            .saturating_sub(1);
+        let skip = top - self.row_of_line.get(first).copied().unwrap_or(0);
+        let rows = row - area.y + 1;
+        let to = (first + skip + usize::from(rows)).min(self.lines.len());
+        let area = Rect::new(area.x, area.y, area.width, rows);
+        let cells = self.link_cells(first..to, area, skip as u16);
+        link_of(cells[(col, row)].fg)
+    }
+
+    /// Built lines `range` painted into `area` as the preview paints them,
+    /// each link's spans coloured with its index: the paragraph's own wrap
+    /// places the text, so a cell names the link drawn there exactly.
+    fn link_cells(&self, range: std::ops::Range<usize>, area: Rect, scroll: u16) -> Buffer {
+        let from = range.start;
+        let raw = |l: &Line<'static>| Line::from_iter(l.spans.iter().map(|s| s.content.clone()));
+        let lines = self.lines.get(range).unwrap_or_default();
+        let mut shadow: Vec<Line> = lines.iter().map(raw).collect();
+        for (i, link) in self.links.links.iter().enumerate() {
+            let fg = Color::Rgb((i >> 16) as u8, (i >> 8) as u8, i as u8);
+            for &(line, span) in &link.spans {
+                let s = line
+                    .checked_sub(from)
+                    .and_then(|l| shadow.get_mut(l)?.spans.get_mut(span));
+                if let Some(s) = s {
+                    s.style.fg = Some(fg);
+                }
+            }
+        }
+        let mut cells = Buffer::empty(area);
+        Paragraph::new(shadow)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
+            .render(area, &mut cells);
+        cells
+    }
+
+    /// Scroll to the heading a `#fragment` names (#931), matched the way
+    /// GitHub writes the anchor. False when no heading has that slug.
+    pub fn scroll_to_heading(&mut self, fragment: &str) -> bool {
+        let decoded = crate::shell_integration::percent_decode(fragment.as_bytes());
+        let want = String::from_utf8_lossy(&decoded).to_lowercase();
+        let Some(&(_, line)) = self.links.headings.iter().find(|(s, _)| *s == want) else {
+            return false;
+        };
+        self.scroll_to_source = Some(line);
+        true
     }
 }
 
@@ -928,6 +994,39 @@ pub struct MdImage {
     pub path: std::path::PathBuf,
 }
 
+/// One link in a rendered preview (#931): its destination as written, and
+/// the `(built line, span index)` of every span that draws its text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MdLink {
+    pub dest: String,
+    pub spans: Vec<(usize, usize)>,
+}
+
+/// The preview's followable links and heading anchors (#931).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MdLinks {
+    pub links: Vec<MdLink>,
+    /// Each heading's GitHub-style slug and SOURCE line, so a `#slug` link
+    /// scrolls through the scroll-sync map like any source line.
+    pub headings: Vec<(String, usize)>,
+}
+
+/// GitHub's heading anchor: lowercased, spaces to hyphens, punctuation
+/// other than `-` and `_` dropped.
+fn heading_slug(text: &str) -> String {
+    let kept = |c: &char| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_');
+    let slug = text.to_lowercase().chars().filter(kept).collect::<String>();
+    slug.replace(' ', "-")
+}
+
+/// The link index [`MarkdownPreview::link_cells`] painted into a cell.
+fn link_of(fg: Color) -> Option<usize> {
+    match fg {
+        Color::Rgb(r, g, b) => Some(usize::from(r) << 16 | usize::from(g) << 8 | usize::from(b)),
+        _ => None,
+    }
+}
+
 /// Convert one highlighted source line into owned spans, filling unstyled
 /// gaps with `code_fg` — the theme's code foreground, never the Base16
 /// literal, so gaps match the captured tokens around them on every theme.
@@ -1011,6 +1110,11 @@ struct Renderer<'r> {
     /// letting it through painted the alt text after the reserved rows
     /// (#196 review). Placeholder images keep their alt.
     suppress_inline: bool,
+    /// The links and heading anchors found so far (#931), the link whose
+    /// text is being drawn, and the open heading's text for its slug.
+    links: MdLinks,
+    open_link: Option<usize>,
+    heading_text: String,
 }
 
 impl Renderer<'_> {
@@ -1075,8 +1179,16 @@ impl Renderer<'_> {
     }
 
     fn push_text(&mut self, text: &str, style: Style) {
+        self.push_span(Span::styled(text.to_string(), style));
+    }
+
+    /// Push an inline span, recording it on the open link (#931).
+    fn push_span(&mut self, span: Span<'static>) {
         self.begin_content();
-        self.cur.push(Span::styled(text.to_string(), style));
+        if let Some(link) = self.open_link.and_then(|i| self.links.links.get_mut(i)) {
+            link.spans.push((self.out.len(), self.cur.len()));
+        }
+        self.cur.push(span);
     }
 
     fn flush_line(&mut self) {
@@ -1331,19 +1443,26 @@ pub fn render_markdown_full(
     base_dir: Option<&std::path::Path>,
     outputs: BlockOutputs,
 ) -> (Vec<Line<'static>>, Vec<MdImage>, Vec<MdRunnable>) {
-    let (lines, images, runnables, _) =
+    let (lines, images, runnables, _, _) =
         render_markdown_mapped(text, theme, registry, base_dir, outputs);
     (lines, images, runnables)
 }
 
-/// [`render_markdown_full`] plus the source map scroll sync reads (#619).
+/// [`render_markdown_full`] plus the source map scroll sync reads (#619)
+/// and the links a click follows (#931).
 pub fn render_markdown_mapped(
     text: &str,
     theme: Theme,
     registry: &mut LangRegistry,
     base_dir: Option<&std::path::Path>,
     outputs: BlockOutputs,
-) -> (Vec<Line<'static>>, Vec<MdImage>, Vec<MdRunnable>, SourceMap) {
+) -> (
+    Vec<Line<'static>>,
+    Vec<MdImage>,
+    Vec<MdRunnable>,
+    SourceMap,
+    MdLinks,
+) {
     let mut source_map: Vec<(usize, usize)> = Vec::new();
     // `$…$` and `$$…$$` math (#1564), as VS Code's preview and GitHub read
     // it; without the option a display block ran into one paragraph line.
@@ -1376,6 +1495,9 @@ pub fn render_markdown_mapped(
         base_dir: base_dir.map(|p| p.to_path_buf()),
         images: Vec::new(),
         suppress_inline: false,
+        links: MdLinks::default(),
+        open_link: None,
+        heading_text: String::new(),
     };
     // Byte offset -> line, for the runnable fences' source ranges (#353).
     let line_starts: Vec<usize> = std::iter::once(0)
@@ -1459,7 +1581,14 @@ pub fn render_markdown_mapped(
                 Tag::Emphasis => r.italic += 1,
                 Tag::Strong => r.bold += 1,
                 Tag::Strikethrough => r.strike += 1,
-                Tag::Link { .. } => r.link += 1,
+                Tag::Link { dest_url, .. } => {
+                    r.link += 1;
+                    r.open_link = Some(r.links.links.len());
+                    r.links.links.push(MdLink {
+                        dest: dest_url.to_string(),
+                        spans: Vec::new(),
+                    });
+                }
                 Tag::Image { dest_url, .. } => {
                     // Local, existing, decodable images reserve blank
                     // lines the app's inline-image overlay paints into
@@ -1501,12 +1630,13 @@ pub fn render_markdown_mapped(
                         });
                         r.suppress_inline = true;
                     } else {
-                        r.begin_content();
+                        // Through `push_span`, so a badge inside a link
+                        // follows it.
                         let style = Style::default()
                             .fg(theme.ui(DIM))
                             .add_modifier(Modifier::ITALIC);
-                        r.cur.push(Span::styled("\u{f03e} ", style));
-                        r.cur.push(Span::styled(format!("({dest_url}) "), style));
+                        r.push_span(Span::styled("\u{f03e} ", style));
+                        r.push_span(Span::styled(format!("({dest_url}) "), style));
                     }
                 }
                 Tag::Table(aligns) => {
@@ -1535,6 +1665,15 @@ pub fn render_markdown_mapped(
             },
             Event::End(tag) => match tag {
                 TagEnd::Heading(_) => {
+                    // A repeated slug gets `-1`, `-2`, as GitHub numbers them.
+                    let base = heading_slug(&std::mem::take(&mut r.heading_text));
+                    let mut slug = base.clone();
+                    let mut n = 0;
+                    while r.links.headings.iter().any(|(s, _)| *s == slug) {
+                        n += 1;
+                        slug = format!("{base}-{n}");
+                    }
+                    r.links.headings.push((slug, block_line));
                     r.flush_line();
                     r.heading = None;
                     r.out.push(Line::default());
@@ -1564,7 +1703,15 @@ pub fn render_markdown_mapped(
                 TagEnd::Emphasis => r.italic = r.italic.saturating_sub(1),
                 TagEnd::Strong => r.bold = r.bold.saturating_sub(1),
                 TagEnd::Strikethrough => r.strike = r.strike.saturating_sub(1),
-                TagEnd::Link => r.link = r.link.saturating_sub(1),
+                TagEnd::Link => {
+                    r.link = r.link.saturating_sub(1);
+                    r.open_link = None;
+                    // A link that drew nothing (empty text, a table cell)
+                    // has nothing to click.
+                    if r.links.links.last().is_some_and(|l| l.spans.is_empty()) {
+                        r.links.links.pop();
+                    }
+                }
                 TagEnd::Image => r.suppress_inline = false,
                 TagEnd::Table => r.end_table(),
                 _ => {}
@@ -1578,6 +1725,9 @@ pub fn render_markdown_mapped(
                         cell.push_str(&text);
                     }
                 } else {
+                    if r.heading.is_some() {
+                        r.heading_text.push_str(&text);
+                    }
                     let style = r.inline_style();
                     r.push_text(&text, style);
                 }
@@ -1589,8 +1739,10 @@ pub fn render_markdown_mapped(
                         cell.push_str(&code);
                     }
                 } else {
-                    r.begin_content();
-                    r.cur.push(Span::styled(
+                    if r.heading.is_some() {
+                        r.heading_text.push_str(&code);
+                    }
+                    r.push_span(Span::styled(
                         code.to_string(),
                         Style::default().fg(theme.ui(CODE)),
                     ));
@@ -1701,6 +1853,11 @@ pub fn render_markdown_mapped(
     for run in &mut r.runnables {
         run.first_line -= removed_front;
     }
+    for link in &mut r.links.links {
+        for span in &mut link.spans {
+            span.0 -= removed_front;
+        }
+    }
     while r.out.len() > reserved_end.saturating_sub(removed_front)
         && r.out.last().is_some_and(|l| l.spans.is_empty())
     {
@@ -1710,7 +1867,7 @@ pub fn render_markdown_mapped(
     // block that starts on its parent's line would repeat it, so keep the
     // first of any run that does not advance.
     source_map.dedup_by(|b, a| b.0 <= a.0 || b.1 < a.1);
-    (r.out, r.images, r.runnables, source_map)
+    (r.out, r.images, r.runnables, source_map, r.links)
 }
 
 impl MarkdownPreview {
@@ -1842,7 +1999,7 @@ mod tests {
 
     fn preview_rows(md: &str) -> Vec<String> {
         let mut reg = LangRegistry::new();
-        let (lines, _, _, _) =
+        let (lines, ..) =
             render_markdown_mapped(md, Theme::default(), &mut reg, None, BlockOutputs::new());
         lines.iter().map(line_text).collect()
     }
@@ -1920,7 +2077,7 @@ mod tests {
     fn the_source_map_lands_each_block_on_its_rendered_line() {
         let md = "# Title\n\nfirst para\n\n```\na\nb\nc\n```\n\n## Next\n\nlast para\n";
         let mut reg = LangRegistry::new();
-        let (lines, _, _, map) =
+        let (lines, _, _, map, _) =
             render_markdown_mapped(md, Theme::default(), &mut reg, None, BlockOutputs::new());
         for (src, needle) in [
             (0, "Title"),
@@ -1951,7 +2108,7 @@ mod tests {
             },
         );
         let mut reg = LangRegistry::new();
-        let (lines, _, _, map) =
+        let (lines, _, _, map, _) =
             render_markdown_mapped(md, Theme::default(), &mut reg, None, outputs);
         for (src, needle) in [(1, "echo a"), (2, "echo b"), (3, "echo c"), (6, "after")] {
             let built = built_line_for_source(&map, src).expect("mapped");
@@ -3096,6 +3253,7 @@ mod preview_selection_tests {
             source_map: Vec::new(),
             row_of_line: Vec::new(),
             scroll_to_source: None,
+            links: MdLinks::default(),
         }
     }
 
@@ -3179,5 +3337,54 @@ mod preview_selection_tests {
         let mut p = preview(&["only row"]);
         p.selection = Some(((0, 2), (9, 40)));
         assert_eq!(p.selection_text(), "ly row");
+    }
+
+    /// #931: a link keeps its destination and is hit exactly on the cells
+    /// that paint it, wrapped and scrolled; headings slug as GitHub's do.
+    #[test]
+    fn links_hit_where_they_paint_and_headings_slug_like_github() {
+        let md =
+            "# Usage notes\n\nSee [the setup guide](docs/SETUP.md) and [](x).\n\n## Usage notes!\n";
+        let mut reg = LangRegistry::new();
+        let (lines, _, _, _, links) =
+            render_markdown_mapped(md, Theme::BLACK, &mut reg, None, BlockOutputs::new());
+        assert_eq!(
+            links.links.len(),
+            1,
+            "an empty link draws nothing to follow"
+        );
+        assert_eq!(links.links[0].dest, "docs/SETUP.md");
+        let slugs = [
+            ("usage-notes".to_string(), 0),
+            ("usage-notes-1".to_string(), 4),
+        ];
+        assert_eq!(links.headings, slugs);
+        let mut p = preview(&[]);
+        p.last_area = Rect::new(0, 0, 12, 8);
+        let mut row = 0;
+        for l in &lines {
+            p.row_of_line.push(row);
+            row += Paragraph::new(l.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(12)
+                .max(1);
+        }
+        (p.lines, p.links) = (lines, links);
+        for scroll in [0, 2] {
+            p.scroll = scroll;
+            let mut buf = Buffer::empty(p.last_area);
+            let para = Paragraph::new(p.lines.clone()).wrap(Wrap { trim: false });
+            para.scroll((scroll, 0)).render(p.last_area, &mut buf);
+            let hits: Vec<(u16, u16)> = (0..8)
+                .flat_map(|y| (0..12).map(move |x| (x, y)))
+                .filter(|&(x, y)| p.link_at(x, y) == Some(0))
+                .collect();
+            let text: String = hits.iter().map(|&c| buf[c].symbol()).collect();
+            assert_eq!(text.split_whitespace().collect::<String>(), "thesetupguide");
+            assert!(hits.last().unwrap().1 > hits[0].1, "the link wraps");
+        }
+        assert!(p.scroll_to_heading("Usage-Notes-1"));
+        assert_eq!(p.scroll_to_source, Some(4));
+        assert!(!p.scroll_to_heading("nope"));
     }
 }

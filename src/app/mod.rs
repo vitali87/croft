@@ -49636,6 +49636,64 @@ impl App {
         md.run_rows.iter().position(|r| *r == visual)
     }
 
+    /// Follow link `idx` of the open preview (#931), as VS Code's preview
+    /// does: `#heading` scrolls to it, `http(s)` opens in the browser, and a
+    /// relative path opens in the editor (`#L3` at that line; a Markdown
+    /// file rendered, at its `#heading`). Any other scheme is refused.
+    fn follow_preview_link(&mut self, idx: usize) {
+        let Some(dest) = (self.editor.markdown_preview.as_ref())
+            .and_then(|md| Some(md.links.links.get(idx)?.dest.trim().to_string()))
+        else {
+            return;
+        };
+        if let Some(frag) = dest.strip_prefix('#') {
+            let md = self.editor.markdown_preview.as_mut();
+            self.status = if md.is_some_and(|md| md.scroll_to_heading(frag)) {
+                format!("Went to {dest}")
+            } else {
+                format!("No heading {dest} in this document")
+            };
+            return;
+        }
+        let lower = dest.to_ascii_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            return self.open_url_for_user(&dest);
+        }
+        if dest.contains(':') {
+            self.status = format!("Refused to open non-web link: {dest}");
+            return;
+        }
+        let (path, frag) = dest
+            .split_once('#')
+            .map_or((dest.as_str(), None), |(p, f)| (p, Some(f)));
+        let path = crate::shell_integration::percent_decode(path.as_bytes());
+        let path = String::from_utf8_lossy(&path);
+        // `/docs/x.md` is from the workspace root, as GitHub reads it.
+        let doc_dir = self.editor.path.as_ref().and_then(|p| p.parent());
+        let base = doc_dir
+            .filter(|_| !path.starts_with('/'))
+            .map_or_else(|| self.active_workspace_root(), Path::to_path_buf);
+        let abs = base.join(path.trim_start_matches('/'));
+        let lines = frag.and_then(|f| {
+            let mut n = f
+                .split('-')
+                .map(|n| n.strip_prefix('L')?.parse::<u32>().ok());
+            Some((n.next()??, n.next().flatten()))
+        });
+        let (line, end) = lines.unwrap_or((1, None));
+        if !self.open_resolved_file_ref(&abs, line, None, end) {
+            self.status = format!("No file at {dest}");
+            return;
+        }
+        if lines.is_none()
+            && (self.editor.markdown_preview.is_some() || self.editor.toggle_markdown_preview())
+            && let Some(frag) = frag
+            && let Some(md) = self.editor.markdown_preview.as_mut()
+        {
+            md.scroll_to_heading(frag);
+        }
+    }
+
     /// The confirm popup for runnable fence `idx` of the current document.
     /// EVERY block confirms (#353): a README from a cloned repo is untrusted
     /// input, and a substring matcher cannot tell a benign block from a
@@ -50310,6 +50368,12 @@ impl App {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 md.dragging = false;
+                // A click or Ctrl+click (#1848) that did not drag follows
+                // the link under it (#931); a drag from a link selects.
+                if let Some(i) = md.link_at(m.column, m.row).filter(|_| !md.has_selection()) {
+                    self.follow_preview_link(i);
+                    return true;
+                }
                 // Mirror the editor's copy-on-select setting so a finished
                 // drag lands on the clipboard when the user asked for that.
                 if self.copy_on_select {
@@ -59815,6 +59879,14 @@ impl App {
         }
         if matches!(m.kind, MouseEventKind::Moved) {
             self.pointer_cell = Some((m.column, m.row));
+            // Name the preview link under the pointer (#931), as a
+            // browser's status bar does.
+            if in_editor
+                && let Some(md) = self.editor.markdown_preview.as_ref()
+                && let Some(i) = md.link_at(m.column, m.row)
+            {
+                self.status = format!("{} (click to follow)", md.links.links[i].dest);
+            }
             self.on_mouse_moved(m.column, m.row, in_editor);
             return;
         }

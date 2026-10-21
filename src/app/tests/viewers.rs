@@ -1659,6 +1659,79 @@ fn dragging_in_the_markdown_preview_selects_and_copies_rendered_text() {
     );
 }
 
+/// #931 / #1848: preview links follow as in VS Code's preview. Pointing at
+/// one names its target; a click on a relative `.md` opens it rendered, a
+/// Ctrl+click on `file#L3` opens the file at the line, and a click on
+/// `#heading` scrolls to it.
+#[test]
+fn preview_links_follow_on_click_and_ctrl_click() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("docs/SETUP.md"), "# Setup\n").unwrap();
+    std::fs::write(tmp.path().join("src/main.py"), "a\nb\nc\nd\n").unwrap();
+    let readme = tmp.path().join("README.md");
+    let filler: String = (0..40).map(|i| format!("Line {i}.\n\n")).collect();
+    let text = "See the [setup guide](docs/SETUP.md), jump to [Usage](#usage-notes), \
+                or open [the code](src/main.py#L3).";
+    std::fs::write(&readme, format!("{text}\n\n{filler}## Usage notes\n")).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let rendered = |app: &mut App| {
+        draw(app, 160, 40);
+        let md = app.editor.markdown_preview.as_ref();
+        md.map(|md| md.rows.concat().concat()).unwrap_or_default()
+    };
+    // Open the README's preview and send `kinds` over the link `text`.
+    let on_link = |app: &mut App, text: &str, kinds: &[MouseEventKind], modifiers| {
+        app.editor.open_pinned(&readme).unwrap();
+        app.focus_pane(Pane::Editor);
+        if app.editor.markdown_preview.is_none() {
+            app.toggle_markdown_preview();
+        }
+        rendered(app);
+        let md = app.editor.markdown_preview.as_ref().unwrap();
+        let (x, y) = (md.rows.iter().enumerate())
+            .find_map(|(y, cells)| Some((cells.concat().find(text)?, y)))
+            .expect("the link is on screen");
+        let (column, row) = (md.last_area.x + x as u16, md.last_area.y + y as u16);
+        for &kind in kinds {
+            app.handle_mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers,
+            });
+        }
+    };
+    let click = [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ];
+    let none = KeyModifiers::NONE;
+
+    on_link(&mut app, "setup", &[MouseEventKind::Moved], none);
+    assert_eq!(app.status, "docs/SETUP.md (click to follow)");
+    on_link(&mut app, "setup", &click, none);
+    assert_eq!(app.editor.path, Some(tmp.path().join("docs/SETUP.md")));
+    assert!(
+        rendered(&mut app).contains("Setup"),
+        "a Markdown file opens rendered"
+    );
+
+    on_link(&mut app, "the code", &click, KeyModifiers::CONTROL);
+    assert_eq!(app.editor.path, Some(tmp.path().join("src/main.py")));
+    assert_eq!(app.editor.cursor_row, 2, "#L3 is the third line");
+
+    on_link(&mut app, "Usage", &click, none);
+    assert_eq!(app.status, "Went to #usage-notes");
+    let shown = rendered(&mut app);
+    assert!(
+        shown.contains("Usage notes") && !shown.contains("See the"),
+        "{shown}"
+    );
+}
+
 #[test]
 fn image_eviction_wipes_the_screen_only_on_cell_buffer_protocols() {
     // The `terminal.clear()` the main loop fires when an image-clear latch is

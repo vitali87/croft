@@ -1,0 +1,1 @@
+fix: Links in the Markdown preview can be followed with a click or Ctrl+click: `#heading` scrolls to the heading, a relative path opens the file (at `#L3`, or rendered at its `#heading`), and a web link opens in the browser. Pointing at a link names its target in the status bar.
