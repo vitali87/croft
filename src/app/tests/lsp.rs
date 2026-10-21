@@ -1398,6 +1398,58 @@ fn an_accepted_completion_resolves_its_auto_import() {
     assert_eq!(app.editor.lines, ["import lo"]);
 }
 
+/// #928: rust-analyzer's completions are snippets, `load(${1:a}, ${2:b})`,
+/// with the import on resolve. An import landing above the live snippet
+/// moves its tab stops with their text, and one Undo takes the item, its
+/// body and the import back together.
+#[test]
+fn a_resolved_import_moves_a_live_snippet_and_undoes_with_it() {
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.trigger_completion();
+    let request_id = app.completion_request_id.unwrap();
+    draw(&mut app, 100, 30);
+    tx.send(completion_reply(request_id, &path, &["load"]))
+        .unwrap();
+    app.drain_lsp_completion();
+    let popup = app.completion_popup.as_mut().expect("the list opens");
+    let item = &mut popup.items[0];
+    item.resolve = Some(std::sync::Arc::default());
+    item.is_snippet = true;
+    item.text_edit = Some(crate::widgets::editor::TextSpanEdit {
+        start: (0, 7),
+        end: (0, 9),
+        new_text: String::from("load(${1:a}, ${2:b})"),
+        utf16: true,
+    });
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines, ["import load(a, b)"]);
+    let pending = app.completion_resolve.as_ref().expect("a resolve went out");
+    let mut reply = completion_reply(pending.request_id, &path, &["load"]);
+    let import = "from shelf import load";
+    reply.items[0].additional_edits = vec![crate::widgets::editor::TextSpanEdit {
+        start: (0, 0),
+        end: (0, 0),
+        new_text: format!("{import}\n"),
+        utf16: true,
+    }];
+    tx.send(reply).unwrap();
+    assert!(app.drain_lsp_completion());
+    assert_eq!(app.editor.lines, [import, "import load(a, b)"]);
+    assert!(app.editor.snippet_next(), "the second stop is still live");
+    assert_eq!(
+        (app.editor.cursor_row, app.editor.selection_text().as_str()),
+        (1, "b"),
+        "Tab lands on `b`, on the line it moved to, not in the import"
+    );
+    assert!(app.editor.undo());
+    assert_eq!(
+        app.editor.lines,
+        ["import lo"],
+        "one step for the whole accept"
+    );
+}
+
 /// #1639: a rust-analyzer "Run Test" code lens is a task too, and saves
 /// first: cargo builds the file on disk.
 #[test]

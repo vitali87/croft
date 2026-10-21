@@ -16700,7 +16700,7 @@ impl App {
         self.editor.cursor_col = caret_col.max(0) as usize;
         self.editor.clamp_cursor();
         if item.is_snippet {
-            self.editor.expand_snippet(&te.new_text, 0);
+            self.editor.expand_snippet_in(&te.new_text, 0, group);
         }
         if let (Some(group), Some(listed)) = (group, item.resolve.clone()) {
             self.request_completion_imports(listed, (row, start), group);

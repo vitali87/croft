@@ -8467,6 +8467,15 @@ impl Editor {
             sel.anchor = clamp(map(sel.anchor));
             sel.head = clamp(map(sel.head));
         }
+        // A live snippet's stops move with their text too: an import a
+        // completion's server resolved after it expanded (#928) would
+        // otherwise send the next Tab into the import block.
+        if let Some(session) = self.snippet.as_mut() {
+            session.anchor = map(session.anchor);
+            for stop in &mut session.stops {
+                (stop.0, stop.1) = map((stop.0, stop.1));
+            }
+        }
         self.clamp_cursor();
     }
 
@@ -8725,8 +8734,15 @@ impl Editor {
     /// navigator's accepted stream, an agent's write — and which one is
     /// making THIS edit is known only at the call site.
     pub fn insert_str_as(&mut self, s: &str, seat: crate::provenance::Seat) {
+        self.insert_str_as_in(s, seat, None);
+    }
+
+    /// [`Self::insert_str_as`] in the undo step `group`, joined as by
+    /// [`Self::apply_span_edits_as_in`]: a snippet completion's body goes in
+    /// the step of the edit that accepted it (#928).
+    pub fn insert_str_as_in(&mut self, s: &str, seat: crate::provenance::Seat, group: Option<u64>) {
         self.pin_on_edit();
-        self.push_undo(EditKind::Paste);
+        self.push_undo_step(EditKind::Paste, group);
         // A selection is deleted FIRST, and the map has to learn about that
         // deletion separately: without this, the lines below a multi-line
         // selection keep their old indices while the buffer's lines shift up,
@@ -8825,6 +8841,13 @@ impl Editor {
     /// first tab stop (selecting its placeholder); when more stops remain a
     /// session starts so Tab cycles through them.
     pub fn expand_snippet(&mut self, body: &str, prefix_len: usize) {
+        self.expand_snippet_in(body, prefix_len, None);
+    }
+
+    /// [`Self::expand_snippet`] in the undo step `group`: a completion that
+    /// is a snippet expands in the step of its accept, which the auto-import
+    /// its server resolves afterwards joins too (#928).
+    pub fn expand_snippet_in(&mut self, body: &str, prefix_len: usize, group: Option<u64>) {
         self.snippet = None;
         for _ in 0..prefix_len {
             self.backspace();
@@ -8870,7 +8893,7 @@ impl Editor {
             text.replace('\n', &format!("\n{indent}"))
         };
         // A snippet body is text the user chose, not text they wrote (#349).
-        self.insert_str_as(&inserted, crate::provenance::Seat::Generated);
+        self.insert_str_as_in(&inserted, crate::provenance::Seat::Generated, group);
 
         let mut abs: std::collections::VecDeque<(usize, usize, usize)> = parsed
             .stops
