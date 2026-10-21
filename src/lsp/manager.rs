@@ -7824,7 +7824,7 @@ async fn resolve_for_root(
         .lock()
         .ok()
         .and_then(|verdicts| verdicts.get(&key).cloned())
-        .filter(|(asked, lacks)| lacks.is_none() || asked.elapsed() < RUSTUP_RECHECK);
+        .filter(|(asked, _)| asked.elapsed() < RUSTUP_RECHECK);
     let lacks = match known {
         Some((_, lacks)) => lacks,
         None => {
@@ -7855,8 +7855,9 @@ async fn resolve_for_root(
 
 /// What [`rustup_lacks`] answered per (server, project root), and when, so
 /// the re-probe each request makes while croft's copy downloads does not ask
-/// rustup again. A toolchain that has the component keeps its verdict; one
-/// that lacks it is asked again after [`RUSTUP_RECHECK`].
+/// rustup again. Each verdict is asked again after [`RUSTUP_RECHECK`]: `None`
+/// also stands for a rustup that could not say in time, and a server that
+/// runs is never re-probed, so only a question still open is asked again.
 static RUSTUP_VERDICTS: StdMutex<RustupVerdicts> = StdMutex::new(std::collections::BTreeMap::new());
 
 /// [`RUSTUP_VERDICTS`]' map: (server, project root) to when rustup was
@@ -7864,9 +7865,10 @@ static RUSTUP_VERDICTS: StdMutex<RustupVerdicts> = StdMutex::new(std::collection
 type RustupVerdicts =
     std::collections::BTreeMap<(&'static str, PathBuf), (std::time::Instant, Option<RustupLack>)>;
 
-/// How long a "lacks the component" verdict holds before rustup is asked
-/// again: the status line names `rustup component add`, and once the user
-/// has run it, rustup's own server takes over without a restart (#927).
+/// How long a verdict holds before rustup is asked again: the status line
+/// names `rustup component add`, and once the user has run it, rustup's own
+/// server takes over without a restart (#927); a rustup too slow to answer
+/// once is asked again rather than trusted for good.
 const RUSTUP_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Why a rustup proxy cannot start its server for a project (#927), and the
@@ -9613,6 +9615,15 @@ esac
                 fix: String::from("rustup component add rust-analyzer --toolchain stable"),
             }),
         );
+        // Ages a verdict past its recheck, as 30 s would.
+        let backdate = |dir: &Path| {
+            if let Ok(mut verdicts) = RUSTUP_VERDICTS.lock()
+                && let Some((asked, _)) = verdicts.get_mut(&(name, dir.to_path_buf()))
+                && let Some(due) = asked.checked_sub(RUSTUP_RECHECK)
+            {
+                *asked = due;
+            }
+        };
         // The user runs that command. A fresh verdict still holds; once it is
         // due a recheck, rustup's own server is the one croft starts, with no
         // restart.
@@ -9621,12 +9632,7 @@ esac
             rt.block_on(resolve_for_root(&config, &default, false))
                 .is_none()
         );
-        if let Ok(mut verdicts) = RUSTUP_VERDICTS.lock()
-            && let Some((asked, _)) = verdicts.get_mut(&(name, default.clone()))
-            && let Some(due) = asked.checked_sub(RUSTUP_RECHECK)
-        {
-            *asked = due;
-        }
+        backdate(&default);
         assert_eq!(
             rt.block_on(resolve_for_root(&config, &default, false))
                 .map(|(c, _)| c.command),
@@ -9637,6 +9643,20 @@ esac
             rt.block_on(rustup_lacks(&rustup, "rust-analyzer", &uninstalled)),
             None,
             "a toolchain that is not installed yet is the proxy's to install"
+        );
+        // A rustup that could not say (here the toolchain was not installed
+        // yet) keeps the proxy, and is asked again too: the toolchain it
+        // installed has no rust-analyzer.
+        assert!(
+            rt.block_on(resolve_for_root(&config, &uninstalled, false))
+                .is_some()
+        );
+        std::fs::remove_file(uninstalled.join("not-installed")).unwrap();
+        backdate(&uninstalled);
+        assert!(
+            rt.block_on(resolve_for_root(&config, &uninstalled, false))
+                .is_none(),
+            "an open question is asked again, and the proxy gives way"
         );
         assert!(
             [default, pinned, uninstalled]
